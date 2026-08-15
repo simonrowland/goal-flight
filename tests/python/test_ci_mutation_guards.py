@@ -207,15 +207,31 @@ def test_cursor_position_command_round_trips_grouped_and_delimiter_bearing_strea
             "task-store:goal-flight-alpha": 13,
             "stream=with=equals": 17,
         },
+        stream_snapshots={
+            "task-store:goal-flight-alpha": "a" * 64,
+            "stream=with=equals": "b" * 64,
+        },
     )
     assert command is not None
     argv = shlex.split(command)
-    assert argv[-3:] == [
+    snapshot_index = argv.index("--stream-snapshot")
+    position_index = argv.index("--position")
+    assert argv[snapshot_index + 1 : position_index] == [
+        f"stream=with=equals={'b' * 64}",
+        f"task-store:goal-flight-alpha={'a' * 64}",
+    ]
+    assert argv[position_index:] == [
         "--position",
         "stream=with=equals=17",
         "task-store:goal-flight-alpha=13",
     ]
-    assert messages._parse_cursor_positions([argv[-2:]]) == {
+    assert messages._parse_cursor_stream_snapshots(
+        [argv[snapshot_index + 1 : position_index]]
+    ) == {
+        "stream=with=equals": "b" * 64,
+        "task-store:goal-flight-alpha": "a" * 64,
+    }
+    assert messages._parse_cursor_positions([argv[position_index + 1 :]]) == {
         "stream=with=equals": 17,
         "task-store:goal-flight-alpha": 13,
     }

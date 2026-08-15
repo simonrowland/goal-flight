@@ -1209,7 +1209,7 @@ def post_message(
     event_id: str | None = None,
     event_ts: str | None = None,
 ) -> dict:
-    """Append one goalflight.message.v1 envelope; shared by CLI, MCP, and tests."""
+    """Admit one monotonic stream envelope; shared by CLI, MCP, and tests."""
     validate_payload(payload)
     path = inbox_path(messages_dir, dispatch_id)
     _require_carrier_path(path)
@@ -1245,14 +1245,6 @@ def post_message(
     validate_envelope(envelope, expected_dispatch_id=dispatch_id)
     with carrier_transaction(path) as transaction:
         existing = _read_envelopes_for_write(transaction)
-        resolved_seq = require_positive_int_seq(
-            provided_seq
-            if provided_seq is not None
-            else next_seq(transaction.path, envelopes=existing),
-            path="seq",
-        )
-        envelope["seq"] = resolved_seq
-        validate_envelope(envelope, expected_dispatch_id=dispatch_id)
         same_identity = next(
             (
                 item
@@ -1313,6 +1305,12 @@ def post_message(
                         "detail": "matching carrier record already exists",
                     },
                 }
+        resolved_seq = require_positive_int_seq(
+            _admit_stream_seq(provided_seq=provided_seq, envelopes=existing),
+            path="seq",
+        )
+        envelope["seq"] = resolved_seq
+        validate_envelope(envelope, expected_dispatch_id=dispatch_id)
         envelope[_INGESTION_ORDER_FIELD] = _ingestion_order_for_envelope(
             messages_dir,
             envelope,
@@ -3412,10 +3410,13 @@ def _cursor_advance_command(
     lease_nonce: str,
     cursor_version: int,
     positions: dict[str, int],
+    stream_snapshots: dict[str, str],
 ) -> str | None:
-    """Return the exact snapshot-bound CAS command, safely shell quoted."""
+    """Return the exact per-stream snapshot-bound command, safely shell quoted."""
     if not positions:
         return None
+    if stream_snapshots.keys() != positions.keys():
+        raise ValueError("cursor positions and stream snapshots must name the same streams")
     argv = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -3429,6 +3430,8 @@ def _cursor_advance_command(
         "--cursor-version",
         str(cursor_version),
         "--json",
+        "--stream-snapshot",
+        *(f"{stream}={stream_snapshots[stream]}" for stream in sorted(stream_snapshots)),
         "--position",
         *(f"{stream}={positions[stream]}" for stream in sorted(positions)),
     ]
@@ -3471,6 +3474,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
         lease_nonce=lease.nonce,
         cursor_version=peek.cursor_version,
         positions=positions,
+        stream_snapshots=peek.stream_snapshots,
     )
     if getattr(args, "json", False):
         print(
@@ -3480,6 +3484,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
                     "registry_generation": peek.registry_generation,
                     "cursor_version": peek.cursor_version,
                     "positions": positions,
+                    "stream_snapshots": peek.stream_snapshots,
                     "advance_command": advance_command,
                     "items": envelopes,
                 },
@@ -3527,6 +3532,26 @@ def _parse_cursor_positions(
     return advances
 
 
+def _parse_cursor_stream_snapshots(
+    values: list[str] | list[list[str]] | None,
+) -> dict[str, str]:
+    snapshots: dict[str, str] = {}
+    for group in values or []:
+        members = [group] if isinstance(group, str) else group
+        if not isinstance(members, (list, tuple)):
+            raise ValueError("cursor stream snapshots must be STREAM=TOKEN values")
+        for raw in members:
+            stream, separator, snapshot = str(raw).rpartition("=")
+            stream = stream.strip()
+            snapshot = snapshot.strip()
+            if not separator or not stream or re.fullmatch(r"[0-9a-f]{64}", snapshot) is None:
+                raise ValueError("cursor stream snapshot must use STREAM=64_HEX_TOKEN")
+            snapshots[stream] = snapshot
+    if not snapshots:
+        raise ValueError("at least one --stream-snapshot STREAM=TOKEN is required")
+    return snapshots
+
+
 def cmd_advance_cursor(args: argparse.Namespace) -> int:
     """Advance the server cursor by CAS to validated journal positions."""
     import goalflight_journal  # type: ignore
@@ -3549,12 +3574,14 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
     ).strip()
     try:
         advances = _parse_cursor_positions(args.position)
+        stream_snapshots = _parse_cursor_stream_snapshots(args.stream_snapshot)
         if not label or not nonce:
             raise ValueError("active controller label and lease nonce are required")
         result = goalflight_journal.Journal(project_root).advance_cursor(
             label,
             nonce=nonce,
             expected_cursor_version=args.cursor_version,
+            expected_stream_snapshots=stream_snapshots,
             advances=advances,
             actor=f"controller:{os.getpid()}",
         )
@@ -3583,12 +3610,18 @@ def steering_register_path(fleet_dir: Path) -> Path:
     )
 
 
+def _admit_stream_seq(*, provided_seq: int | None, envelopes: list[dict]) -> int:
+    """Return a new position strictly above this carrier stream's high-water."""
+    high_water = max((int(envelope.get("seq", 0)) for envelope in envelopes), default=0)
+    if provided_seq is None or provided_seq <= high_water:
+        return high_water + 1
+    return provided_seq
+
+
 def next_seq(path: Path, *, envelopes: list[dict] | None = None) -> int:
     if envelopes is None:
         envelopes = read_envelopes_tolerant(path)
-    if not envelopes:
-        return 1
-    return max(int(env.get("seq", 0)) for env in envelopes) + 1
+    return _admit_stream_seq(provided_seq=None, envelopes=envelopes)
 
 
 def write_steering_envelope(
@@ -3833,6 +3866,7 @@ def cmd_listen(args) -> int:
                 lease_nonce=nonce,
                 cursor_version=snapshot.cursor_version,
                 positions=positions,
+                stream_snapshots=snapshot.stream_snapshots,
             )
             if advance_command is None:
                 return finish(
@@ -4008,6 +4042,14 @@ def main(argv: list[str] | None = None) -> int:
     advance.add_argument("--controller-label", default=None)
     advance.add_argument("--lease-nonce", default=None)
     advance.add_argument("--cursor-version", type=int, required=True)
+    advance.add_argument(
+        "--stream-snapshot",
+        action="append",
+        nargs="+",
+        default=[],
+        metavar="STREAM=TOKEN",
+        help="per-stream safety tokens emitted by relay --new --json",
+    )
     advance.add_argument(
         "--position",
         action="append",

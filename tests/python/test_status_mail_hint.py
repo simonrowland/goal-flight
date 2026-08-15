@@ -64,6 +64,7 @@ def test_wait_watermark_survives_cursor_advancement(
         "status",
         nonce=lease.nonce,
         expected_cursor_version=peek.cursor_version,
+        expected_stream_snapshots=peek.stream_snapshots,
         advances={"status-stream": 1},
         actor="status",
     ).committed

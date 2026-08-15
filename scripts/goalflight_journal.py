@@ -29,6 +29,7 @@ import contextlib
 from dataclasses import dataclass
 import datetime as dt
 from enum import Enum
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -285,6 +286,7 @@ class CursorPeek:
     project_root: str
     registry_generation: int
     cursor_version: int
+    stream_snapshots: dict[str, str]
     items: tuple[dict[str, object], ...]
 
 
@@ -2205,6 +2207,20 @@ class Journal:
                 """,
                 (now, resolved_reason, project_root, resolved_label, int(row["generation"])),
             )
+            rehomed = self._rehome_retired_delivery_events(
+                connection,
+                project_root=project_root,
+                retired_label=resolved_label,
+                retired_at=now,
+            )
+            if rehomed:
+                self._invalidate_delivery_cursor_snapshots(
+                    connection,
+                    project_root=project_root,
+                    recipient_label="*",
+                    updated_at=now,
+                    exclude_label=resolved_label,
+                )
             connection.execute(
                 """
                 UPDATE listener_coverage
@@ -2218,6 +2234,82 @@ class Journal:
             return self._lease_identity(ended)
 
         return self._domain_write(action)
+
+    @staticmethod
+    def _rehome_retired_delivery_events(
+        connection: sqlite3.Connection,
+        *,
+        project_root: str,
+        retired_label: str,
+        retired_at: str,
+    ) -> int:
+        """Move a retiring controller's unprocessed assignments to ``*``.
+
+        This runs in the lease-retirement transaction.  Rows already at or
+        below the retiring controller's stream cursor stay exact so retirement
+        cannot replay processed mail.  An unprojected row is always moved: it
+        may have committed immediately before retirement and has never been
+        visible to the retiring controller.
+        """
+        candidate_sql = """
+            SELECT exact.rowid
+            FROM delivery_events AS exact
+            LEFT JOIN controller_stream_cursors AS cursor
+              ON cursor.project_root = exact.project_root
+             AND cursor.label = ?
+             AND cursor.stream_id = exact.stream_id
+            WHERE exact.project_root = ?
+              AND exact.recipient_label = ?
+              AND exact.withdrawn_at IS NULL
+              AND (
+                    exact.projected_at IS NULL
+                    OR exact.stream_seq > COALESCE(cursor.position, 0)
+              )
+        """
+        parameters = (retired_label, project_root, retired_label)
+
+        # A wildcard may already carry the same logical event or stream
+        # position.  Preserve that durable copy and withdraw the redundant
+        # exact row before changing recipient_label across the live unique
+        # indexes.
+        withdrawn = connection.execute(
+            """
+            UPDATE delivery_events
+            SET withdrawn_at = ?
+            WHERE rowid IN (
+                SELECT candidate.rowid
+                FROM ("""
+            + candidate_sql
+            + """) AS candidate
+                JOIN delivery_events AS exact ON exact.rowid = candidate.rowid
+                JOIN delivery_events AS wildcard
+                  ON wildcard.project_root = exact.project_root
+                 AND wildcard.recipient_label = '*'
+                 AND wildcard.withdrawn_at IS NULL
+                 AND (
+                      (
+                          wildcard.origin_node = exact.origin_node
+                          AND wildcard.event_uuid = exact.event_uuid
+                      )
+                      OR (
+                          wildcard.stream_id = exact.stream_id
+                          AND wildcard.stream_seq = exact.stream_seq
+                      )
+                 )
+            )
+            """,
+            (retired_at, *parameters),
+        )
+        moved = connection.execute(
+            """
+            UPDATE delivery_events
+            SET recipient_label = '*'
+            WHERE rowid IN ("""
+            + candidate_sql
+            + ")",
+            parameters,
+        )
+        return int(withdrawn.rowcount) + int(moved.rowcount)
 
     def record_delivery_event(
         self,
@@ -2402,6 +2494,7 @@ class Journal:
         project_root = str(self.project_root)
 
         def action(connection: sqlite3.Connection) -> dict[str, object]:
+            effective_recipient = recipient
             row = connection.execute(
                 """
                 SELECT * FROM delivery_events
@@ -2410,6 +2503,21 @@ class Journal:
                 """,
                 (project_root, recipient, origin, event_id),
             ).fetchone()
+            if row is None and recipient != "*":
+                # Retirement can commit after exact assignment and before this
+                # projection step.  Follow the transactionally re-homed row so
+                # the carrier append still makes the durable wildcard visible.
+                row = connection.execute(
+                    """
+                    SELECT * FROM delivery_events
+                    WHERE project_root = ? AND recipient_label = '*'
+                      AND origin_node = ? AND event_uuid = ?
+                      AND withdrawn_at IS NULL
+                    """,
+                    (project_root, origin, event_id),
+                ).fetchone()
+                if row is not None:
+                    effective_recipient = "*"
             if row is None:
                 raise CASMismatch("delivery projection lost: assignment row is absent")
             projected_at = str(row["projected_at"] or utc_now())
@@ -2419,7 +2527,7 @@ class Journal:
                 WHERE project_root = ? AND recipient_label = ?
                   AND origin_node = ? AND event_uuid = ? AND projected_at IS NULL
                 """,
-                (projected_at, project_root, recipient, origin, event_id),
+                (projected_at, project_root, effective_recipient, origin, event_id),
             )
             if updated.rowcount == 1:
                 # Visibility is a second inbox-view mutation after the durable
@@ -2428,7 +2536,7 @@ class Journal:
                 self._invalidate_delivery_cursor_snapshots(
                     connection,
                     project_root=project_root,
-                    recipient_label=recipient,
+                    recipient_label=effective_recipient,
                     updated_at=projected_at,
                 )
             result = dict(row)
@@ -2479,6 +2587,54 @@ class Journal:
 
         return self._domain_write(action)
 
+    @staticmethod
+    def _cursor_stream_snapshot(
+        connection: sqlite3.Connection,
+        *,
+        project_root: str,
+        recipient_label: str,
+        stream_id: str,
+        requested_position: int,
+        waking_only: bool = False,
+    ) -> tuple[str, bool]:
+        """Hash the recipient-visible live range through one stream position."""
+        sql = """
+            SELECT e.rowid, e.projected_at
+            FROM delivery_events AS e
+            LEFT JOIN controller_stream_cursors AS cursor
+              ON cursor.project_root = e.project_root
+             AND cursor.label = ?
+             AND cursor.stream_id = e.stream_id
+            WHERE e.project_root = ? AND e.recipient_label IN (?, '*')
+              AND e.stream_id = ? AND e.withdrawn_at IS NULL
+              AND e.stream_seq > COALESCE(cursor.position, 0)
+              AND e.stream_seq <= ?
+        """
+        if waking_only:
+            sql += " AND e.wake_class = 'waking'"
+        sql += " ORDER BY e.rowid"
+        rows = connection.execute(
+            sql,
+            (
+                recipient_label,
+                project_root,
+                recipient_label,
+                stream_id,
+                requested_position,
+            ),
+        ).fetchall()
+        material = "|".join(
+            f"{int(row['rowid'])}:{1 if row['projected_at'] is not None else 0}"
+            for row in rows
+        )
+        return hashlib.sha256(material.encode("ascii")).hexdigest(), any(
+            row["projected_at"] is None for row in rows
+        )
+
+    @staticmethod
+    def _begin_cursor_read_snapshot(connection: sqlite3.Connection) -> None:
+        connection.execute("BEGIN")
+
     def cursor_peek(
         self,
         label: str,
@@ -2496,6 +2652,10 @@ class Journal:
             raise ValueError("cursor peek limit must be between 1 and 10000")
         project_root = str(self.project_root)
         with contextlib.closing(self._connect()) as connection:
+            # Items and their per-stream safety tokens must describe one read
+            # snapshot.  Autocommit SELECTs could otherwise straddle a writer
+            # and bless a row the caller never received.
+            self._begin_cursor_read_snapshot(connection)
             self._assert_epoch_fence(connection, for_write=False)
             lease = connection.execute(
                 """SELECT * FROM controller_leases
@@ -2532,11 +2692,29 @@ class Journal:
             sql += " ORDER BY e.stream_id, e.stream_seq, e.rowid LIMIT ?"
             parameters.append(limit)
             rows = connection.execute(sql, parameters).fetchall()
+            positions: dict[str, int] = {}
+            for row in rows:
+                stream_id = str(row["stream_id"])
+                positions[stream_id] = max(
+                    positions.get(stream_id, 0), int(row["stream_seq"])
+                )
+            stream_snapshots = {
+                stream_id: self._cursor_stream_snapshot(
+                    connection,
+                    project_root=project_root,
+                    recipient_label=resolved_label,
+                    stream_id=stream_id,
+                    requested_position=position,
+                    waking_only=waking_only,
+                )[0]
+                for stream_id, position in positions.items()
+            }
         return CursorPeek(
             resolved_label,
             project_root,
             int(cursor["registry_generation"]),
             int(cursor["cursor_version"]),
+            stream_snapshots,
             tuple(dict(row) for row in rows),
         )
 
@@ -2623,16 +2801,45 @@ class Journal:
         }
         return result
 
+    @staticmethod
+    def _cursor_snapshot_version_is_admissible(
+        *,
+        expected_cursor_version: int,
+        current_cursor_version: int,
+    ) -> bool:
+        """Treat an older aggregate snapshot as a hint, never a global veto."""
+        return expected_cursor_version <= current_cursor_version
+
+    @staticmethod
+    def _cursor_advance_has_unseen_at_or_below(
+        connection: sqlite3.Connection,
+        *,
+        project_root: str,
+        recipient_label: str,
+        stream_id: str,
+        requested_position: int,
+        expected_stream_snapshot: str,
+    ) -> bool:
+        current_snapshot, has_unprojected = Journal._cursor_stream_snapshot(
+            connection,
+            project_root=project_root,
+            recipient_label=recipient_label,
+            stream_id=stream_id,
+            requested_position=requested_position,
+        )
+        return has_unprojected or current_snapshot != expected_stream_snapshot
+
     def advance_cursor(
         self,
         label: str,
         *,
         nonce: str,
         expected_cursor_version: int,
+        expected_stream_snapshots: Mapping[str, str],
         advances: Mapping[str, int],
         actor: str,
     ) -> WriteResult[dict[str, object]]:
-        """CAS-advance only to positions that exist in the authoritative journal."""
+        """Advance only to stream-safe positions in the authoritative journal."""
         project_root = str(self.project_root)
         resolved_label = self._identity_token(label, label="cursor label")
         resolved_nonce = self._identity_token(nonce, label="cursor lease nonce")
@@ -2651,6 +2858,17 @@ class Journal:
             if not isinstance(position, int) or isinstance(position, bool) or position < 1:
                 raise ValueError("cursor position is invalid")
             normalized_advances[resolved_stream] = position
+        if not isinstance(expected_stream_snapshots, Mapping):
+            raise ValueError("expected stream snapshots are invalid")
+        normalized_snapshots: dict[str, str] = {}
+        for stream, snapshot in expected_stream_snapshots.items():
+            resolved_stream = self._identity_token(stream, label="cursor snapshot stream")
+            snapshot_value = str(snapshot)
+            if re.fullmatch(r"[0-9a-f]{64}", snapshot_value) is None:
+                raise ValueError("cursor stream snapshot is invalid")
+            normalized_snapshots[resolved_stream] = snapshot_value
+        if normalized_snapshots.keys() != normalized_advances.keys():
+            raise ValueError("cursor advances and stream snapshots must name the same streams")
 
         def action(connection: sqlite3.Connection) -> dict[str, object]:
             lease = connection.execute(
@@ -2664,6 +2882,20 @@ class Journal:
             ):
                 raise CASMismatch("cursor CAS lost: lease generation changed")
             generation = int(lease["generation"])
+            cursor = connection.execute(
+                """SELECT registry_generation, cursor_version
+                   FROM controller_cursors
+                   WHERE project_root = ? AND label = ?""",
+                (project_root, resolved_label),
+            ).fetchone()
+            if cursor is None or int(cursor["registry_generation"]) != generation:
+                raise CASMismatch("cursor CAS lost: registry generation changed")
+            current_cursor_version = int(cursor["cursor_version"])
+            if not self._cursor_snapshot_version_is_admissible(
+                expected_cursor_version=expected_cursor_version,
+                current_cursor_version=current_cursor_version,
+            ):
+                raise CASMismatch("cursor CAS lost: cursor version is from the future")
             current_positions: dict[str, int] = {}
             for stream, position in normalized_advances.items():
                 current = connection.execute(
@@ -2687,6 +2919,17 @@ class Journal:
                 if known is None:
                     raise CASMismatch(
                         f"cursor CAS lost: server has no pending position {stream}={position}"
+                    )
+                if self._cursor_advance_has_unseen_at_or_below(
+                    connection,
+                    project_root=project_root,
+                    recipient_label=resolved_label,
+                    stream_id=stream,
+                    requested_position=position,
+                    expected_stream_snapshot=normalized_snapshots[stream],
+                ):
+                    raise CASMismatch(
+                        f"cursor CAS lost: unseen position exists at or below {stream}={position}"
                     )
             now = utc_now()
             adopted_wildcards = 0
@@ -2771,7 +3014,7 @@ class Journal:
                 SET cursor_version = cursor_version + 1, updated_at = ?,
                     backlog_pending = 0, advanced_at = ?, advanced_by = ?
                 WHERE project_root = ? AND label = ?
-                  AND registry_generation = ? AND cursor_version = ?
+                  AND registry_generation = ?
                 """,
                 (
                     now,
@@ -2780,12 +3023,11 @@ class Journal:
                     project_root,
                     resolved_label,
                     generation,
-                    expected_cursor_version,
                 ),
             )
             if updated.rowcount != 1:
                 raise CASMismatch(
-                    "cursor CAS lost: registry_generation or cursor_version changed"
+                    "cursor CAS lost: registry generation changed"
                 )
             for stream, position in normalized_advances.items():
                 connection.execute(
@@ -2802,8 +3044,8 @@ class Journal:
             return {
                 "label": resolved_label,
                 "registry_generation": generation,
-                "previous_cursor_version": expected_cursor_version,
-                "cursor_version": expected_cursor_version + 1,
+                "previous_cursor_version": current_cursor_version,
+                "cursor_version": current_cursor_version + 1,
                 "advances": normalized_advances,
             }
 

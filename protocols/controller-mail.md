@@ -75,15 +75,22 @@ delivered through the listener. Peek authoritative mail after the wake:
 python3 <skill-root>/scripts/goalflight_messages.py relay --new --json
 ```
 
-After processing the returned items, advance exactly their server-known positions
-with the snapshot's cursor version, then re-arm. A fabricated position and a stale
-version both lose:
+After processing the returned items, advance exactly their server-known positions and
+carry the snapshot's cursor version and per-stream tokens, then re-arm. Producer
+admission is strictly monotonic per stream: a new explicit sequence at or below that
+stream's high-water is renumbered to the next position. Each token fingerprints the
+recipient-visible live range at or below its requested position, including projection
+state. Advance rejects if that exact range changed or still contains an unprojected
+row. A fabricated position, a future version, an already-advanced position, or a stale
+lease loses; aggregate version churn from another stream or from an arrival above the
+requested position does not invalidate a safe command:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py advance \
   --project-root "$PWD" --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
   --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE" \
-  --cursor-version <version> --position '<stream>=<seq>'
+  --cursor-version <version> --stream-snapshot '<stream>=<token>' \
+  --position '<stream>=<seq>'
 ```
 
 Peek again to derive whether more remains. A second same-generation listener loses
@@ -95,4 +102,5 @@ The held-lock ledger, not coverage rows or `ps` output, drives the missing-liste
 reminder. Coverage rows retain audit and supersession history only.
 
 Use `goalflight_status.py --wait <ids>` only for an unclaimed fixed-set join. Its mail
-watermark is journal-derived and monotonic; cursor advancement cannot erase the wake.
+watermark is journal-derived and monotonic: admission never creates a new position at
+or below the stream high-water, and cursor advancement cannot erase the wake.

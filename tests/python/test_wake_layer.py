@@ -211,6 +211,7 @@ def _advance_all(
         label,
         nonce=nonce,
         expected_cursor_version=peek.cursor_version,
+        expected_stream_snapshots=peek.stream_snapshots,
         advances=advances,
         actor="wake-finish-test",
     )

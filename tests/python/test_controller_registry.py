@@ -102,6 +102,7 @@ def test_roster_unread_is_journal_cursor_derived(
         "engine",
         nonce=lease.nonce,
         expected_cursor_version=peek.cursor_version,
+        expected_stream_snapshots=peek.stream_snapshots,
         advances={"roster-mail": 1},
         actor="engine",
     ).committed

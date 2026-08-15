@@ -647,24 +647,27 @@ def test_post_message_allocates_seq_under_mail_lock() -> None:
     with tempfile.TemporaryDirectory() as td:
         messages_dir = Path(td) / "messages"
         path = messages.inbox_path(messages_dir, "d-race")
-        original_next_seq = messages.next_seq
+        original_admit_stream_seq = messages._admit_stream_seq
         guard = threading.Lock()
         active = 0
         max_active = 0
 
-        def slow_next_seq(seq_path: Path, *, envelopes: list[dict] | None = None) -> int:
+        def slow_admit_stream_seq(*, provided_seq: int | None, envelopes: list[dict]) -> int:
             nonlocal active, max_active
             with guard:
                 active += 1
                 max_active = max(max_active, active)
             try:
                 time.sleep(0.05)
-                return original_next_seq(seq_path, envelopes=envelopes)
+                return original_admit_stream_seq(
+                    provided_seq=provided_seq,
+                    envelopes=envelopes,
+                )
             finally:
                 with guard:
                     active -= 1
 
-        messages.next_seq = slow_next_seq  # type: ignore[assignment]
+        messages._admit_stream_seq = slow_admit_stream_seq  # type: ignore[assignment]
         try:
             threads = [
                 threading.Thread(
@@ -683,10 +686,10 @@ def test_post_message_allocates_seq_under_mail_lock() -> None:
             for thread in threads:
                 thread.join()
         finally:
-            messages.next_seq = original_next_seq  # type: ignore[assignment]
+            messages._admit_stream_seq = original_admit_stream_seq  # type: ignore[assignment]
 
         loaded = read_envelopes(path)
-        assert_true("serialized next_seq critical section", max_active == 1)
+        assert_true("serialized sequence admission critical section", max_active == 1)
         assert_true("two messages", len(loaded) == 2)
         assert_true("unique monotonic seqs", [env["seq"] for env in loaded] == [1, 2])
 

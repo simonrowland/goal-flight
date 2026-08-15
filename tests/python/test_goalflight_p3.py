@@ -261,6 +261,7 @@ def test_cursor_peek_and_server_validated_cas_deliver_remainder(
         "controller",
         nonce=lease.nonce,
         expected_cursor_version=first.cursor_version,
+        expected_stream_snapshots=first.stream_snapshots,
         advances={"controller-mail": 999},
         actor="test-controller",
     )
@@ -269,6 +270,7 @@ def test_cursor_peek_and_server_validated_cas_deliver_remainder(
         "controller",
         nonce=lease.nonce,
         expected_cursor_version=first.cursor_version,
+        expected_stream_snapshots=first.stream_snapshots,
         advances={"controller-mail": 2},
         actor="test-controller",
     )
@@ -278,6 +280,7 @@ def test_cursor_peek_and_server_validated_cas_deliver_remainder(
         "controller",
         nonce=lease.nonce,
         expected_cursor_version=first.cursor_version,
+        expected_stream_snapshots=first.stream_snapshots,
         advances={"controller-mail": 2},
         actor="test-controller",
     )
@@ -291,6 +294,7 @@ def test_cursor_peek_and_server_validated_cas_deliver_remainder(
         "controller",
         nonce=lease.nonce,
         expected_cursor_version=second.cursor_version,
+        expected_stream_snapshots=second.stream_snapshots,
         advances={"controller-mail": 3},
         actor="test-controller",
     ).committed
@@ -333,22 +337,25 @@ def test_cursor_peek_and_server_validated_cas_deliver_remainder(
         replacement["envelope"]["id"],
         later["envelope"]["id"],
     }
+    assert replacement["envelope"]["seq"] == 3
     replacement_peek = authority.cursor_peek("controller", nonce=lease.nonce, limit=1)
-    assert [row["stream_seq"] for row in replacement_peek.items] == [1]
+    assert [row["stream_seq"] for row in replacement_peek.items] == [2]
     assert authority.advance_cursor(
         "controller",
         nonce=lease.nonce,
         expected_cursor_version=replacement_peek.cursor_version,
-        advances={"replace-stream": 1},
+        expected_stream_snapshots=replacement_peek.stream_snapshots,
+        advances={"replace-stream": 2},
         actor="test-controller",
     ).committed
     later_peek = authority.cursor_peek("controller", nonce=lease.nonce, limit=1)
-    assert [row["stream_seq"] for row in later_peek.items] == [2]
+    assert [row["stream_seq"] for row in later_peek.items] == [3]
     assert authority.advance_cursor(
         "controller",
         nonce=lease.nonce,
         expected_cursor_version=later_peek.cursor_version,
-        advances={"replace-stream": 2},
+        expected_stream_snapshots=later_peek.stream_snapshots,
+        advances={"replace-stream": 3},
         actor="test-controller",
     ).committed
 
@@ -373,6 +380,7 @@ def test_cursor_peek_and_server_validated_cas_deliver_remainder(
         "controller",
         nonce=lease.nonce,
         expected_cursor_version=backlog_first.cursor_version,
+        expected_stream_snapshots=backlog_first.stream_snapshots,
         advances={"a-wake": 1},
         actor="test-controller",
     )
@@ -383,7 +391,498 @@ def test_cursor_peek_and_server_validated_cas_deliver_remainder(
     assert backlog_second.items
 
 
-def test_late_lower_sequence_invalidates_emitted_advance_but_fresh_batch_succeeds(
+def test_explicit_sequence_admission_is_monotonic_per_stream_mutation_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def run_case(case: str, *, mutate_admission: bool) -> None:
+        case_root = tmp_path / case
+        case_root.mkdir()
+        with monkeypatch.context() as case_patch:
+            _set_state_env(case_patch, case_root)
+            if mutate_admission:
+                case_patch.setattr(
+                    messages,
+                    "_admit_stream_seq",
+                    lambda *, provided_seq, envelopes: (
+                        provided_seq
+                        if provided_seq is not None
+                        else max((int(row["seq"]) for row in envelopes), default=0) + 1
+                    ),
+                )
+            project = _project(case_root)
+            authority = journal.open_or_create_journal(project)
+            lease = _claim(authority)
+            messages_dir = case_root / "messages"
+            addressee = messages.controller_addressee("controller", project_root=project)
+
+            def mcp_post(dispatch_id: str, seq: int, text: str) -> dict:
+                return messages.goalflight_post_message_tool(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "type": "controller-notice",
+                        "payload": {"text": text},
+                        "source": {
+                            "node": "test-node",
+                            "adapter": "mcp",
+                            "transport": "controller",
+                        },
+                        "addressee": addressee,
+                        "seq": seq,
+                    },
+                    messages_dir=messages_dir,
+                )
+
+            first = mcp_post("monotonic-stream", 2, "sequence two")
+            assert first["envelope"]["seq"] == 2
+            emitted = authority.cursor_peek("controller", nonce=lease.nonce)
+            assert [int(row["stream_seq"]) for row in emitted.items] == [2]
+            assert authority.advance_cursor(
+                "controller",
+                nonce=lease.nonce,
+                expected_cursor_version=emitted.cursor_version,
+                expected_stream_snapshots=emitted.stream_snapshots,
+                advances={"monotonic-stream": 2},
+                actor="admission-controller",
+            ).committed
+
+            admitted = mcp_post("monotonic-stream", 1, "late explicit sequence one")
+            if mutate_admission:
+                assert admitted["envelope"]["seq"] == 1
+                assert authority.cursor_peek("controller", nonce=lease.nonce).items == ()
+            else:
+                assert admitted["envelope"]["seq"] == 3
+                pending = authority.cursor_peek("controller", nonce=lease.nonce)
+                assert [int(row["stream_seq"]) for row in pending.items] == [3]
+                independent = mcp_post("independent-stream", 1, "independent sequence one")
+                assert independent["envelope"]["seq"] == 1
+
+    run_case("fixed-admission", mutate_admission=False)
+    # Mutation control: accepting the caller's old explicit value recreates the
+    # review finding and proves the fixed half would catch that regression.
+    run_case("mutated-admission", mutate_admission=True)
+
+
+def test_stream_safe_advance_rejects_unseen_lower_row_mutation_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def run_case(case: str, *, mutate_safety: bool) -> None:
+        case_root = tmp_path / case
+        case_root.mkdir()
+        with monkeypatch.context() as case_patch:
+            _set_state_env(case_patch, case_root)
+            if mutate_safety:
+                case_patch.setattr(
+                    journal.Journal,
+                    "_cursor_advance_has_unseen_at_or_below",
+                    staticmethod(lambda *args, **kwargs: False),
+                )
+            project = _project(case_root)
+            authority = journal.open_or_create_journal(project)
+            lease = _claim(authority)
+            messages.post_message(
+                dispatch_id="late-lower-stream",
+                msg_type="controller-notice",
+                payload={"text": "sequence two"},
+                messages_dir=case_root / "messages",
+                source={"node": "test-node", "adapter": "test", "transport": "controller"},
+                addressee=messages.controller_addressee("controller", project_root=project),
+                seq=2,
+            )
+            emitted = authority.cursor_peek("controller", nonce=lease.nonce)
+            assert [int(row["stream_seq"]) for row in emitted.items] == [2]
+
+            lower_id = str(uuid.uuid4())
+            inserted = authority.record_delivery_event(
+                recipient_label="controller",
+                origin_node="mutation-probe",
+                event_uuid=lower_id,
+                stream_id="late-lower-stream",
+                stream_seq=1,
+                carrier_path=case_root / "late-lower.jsonl",
+                event_type="controller-notice",
+                wake_class="waking",
+                created_at=journal.utc_now(),
+            )
+            assert inserted.committed
+            outcome = authority.advance_cursor(
+                "controller",
+                nonce=lease.nonce,
+                expected_cursor_version=emitted.cursor_version,
+                expected_stream_snapshots=emitted.stream_snapshots,
+                advances={"late-lower-stream": 2},
+                actor="late-lower-controller",
+            )
+            if mutate_safety:
+                assert outcome.committed
+            else:
+                assert outcome.cas_lost
+                assert authority.cursor_status("controller")["positions"] == {}
+            assert authority.mark_delivery_projected(
+                recipient_label="controller",
+                origin_node="mutation-probe",
+                event_uuid=lower_id,
+            ).committed
+            if mutate_safety:
+                assert authority.cursor_peek("controller", nonce=lease.nonce).items == ()
+            else:
+                refreshed = authority.cursor_peek("controller", nonce=lease.nonce)
+                assert [int(row["stream_seq"]) for row in refreshed.items] == [1, 2]
+                assert authority.advance_cursor(
+                    "controller",
+                    nonce=lease.nonce,
+                    expected_cursor_version=refreshed.cursor_version,
+                    expected_stream_snapshots=refreshed.stream_snapshots,
+                    advances={"late-lower-stream": 2},
+                    actor="fresh-lower-controller",
+                ).committed
+
+    run_case("fixed-stream-safety", mutate_safety=False)
+    # Mutation control: removing the unseen-row predicate commits position 2
+    # and makes the later-projected position 1 unreachable.
+    run_case("mutated-stream-safety", mutate_safety=True)
+
+
+def test_stream_safe_advance_accepts_other_and_above_churn_mutation_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def run_case(case: str, *, mutate_global_cas: bool) -> None:
+        case_root = tmp_path / case
+        case_root.mkdir()
+        with monkeypatch.context() as case_patch:
+            _set_state_env(case_patch, case_root)
+            if mutate_global_cas:
+                case_patch.setattr(
+                    journal.Journal,
+                    "_cursor_snapshot_version_is_admissible",
+                    staticmethod(
+                        lambda *, expected_cursor_version, current_cursor_version: (
+                            expected_cursor_version == current_cursor_version
+                        )
+                    ),
+                )
+            project = _project(case_root)
+            authority = journal.open_or_create_journal(project)
+            lease = _claim(authority)
+            common = {
+                "msg_type": "controller-notice",
+                "messages_dir": case_root / "messages",
+                "source": {"node": "test-node", "adapter": "test", "transport": "controller"},
+                "addressee": messages.controller_addressee("controller", project_root=project),
+            }
+            messages.post_message(
+                dispatch_id="target-stream", payload={"text": "target one"}, **common
+            )
+            emitted = authority.cursor_peek("controller", nonce=lease.nonce)
+            assert [
+                (str(row["stream_id"]), int(row["stream_seq"])) for row in emitted.items
+            ] == [("target-stream", 1)]
+            messages.post_message(
+                dispatch_id="target-stream", payload={"text": "target two"}, **common
+            )
+            messages.post_message(
+                dispatch_id="other-stream", payload={"text": "other one"}, **common
+            )
+            assert authority.cursor_peek(
+                "controller", nonce=lease.nonce
+            ).cursor_version > emitted.cursor_version
+            outcome = authority.advance_cursor(
+                "controller",
+                nonce=lease.nonce,
+                expected_cursor_version=emitted.cursor_version,
+                expected_stream_snapshots=emitted.stream_snapshots,
+                advances={"target-stream": 1},
+                actor="churn-controller",
+            )
+            assert outcome.cas_lost if mutate_global_cas else outcome.committed
+
+    run_case("fixed-version-admission", mutate_global_cas=False)
+    # Mutation control: restoring equality on the aggregate version rejects a
+    # command changed only by an above-P and an other-stream arrival.
+    run_case("mutated-global-cas", mutate_global_cas=True)
+
+
+def test_stream_snapshot_rejects_projected_rehome_below_position_mutation_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def run_case(case: str, *, mutate_safety: bool) -> None:
+        case_root = tmp_path / case
+        case_root.mkdir()
+        with monkeypatch.context() as case_patch:
+            _set_state_env(case_patch, case_root)
+            if mutate_safety:
+                case_patch.setattr(
+                    journal.Journal,
+                    "_cursor_advance_has_unseen_at_or_below",
+                    staticmethod(lambda *args, **kwargs: False),
+                )
+            project = _project(case_root)
+            authority = journal.open_or_create_journal(project)
+            retiring = _claim(authority, "retiring-controller")
+            successor = _claim(authority, "successor-controller")
+            common = {
+                "dispatch_id": "retirement-stream",
+                "msg_type": "controller-notice",
+                "messages_dir": case_root / "messages",
+                "source": {
+                    "node": "test-node",
+                    "adapter": "test",
+                    "transport": "controller",
+                },
+            }
+            messages.post_message(
+                payload={"text": "retiring position one"},
+                addressee=messages.controller_addressee(
+                    "retiring-controller", project_root=project
+                ),
+                **common,
+            )
+            messages.post_message(
+                payload={"text": "successor position two"},
+                addressee=messages.controller_addressee(
+                    "successor-controller", project_root=project
+                ),
+                **common,
+            )
+            emitted = authority.cursor_peek(
+                "successor-controller", nonce=successor.nonce
+            )
+            assert [int(row["stream_seq"]) for row in emitted.items] == [2]
+
+            assert authority.release_lease(
+                "retiring-controller",
+                nonce=retiring.nonce,
+                reason="stream-snapshot-rehome",
+            ).committed
+            outcome = authority.advance_cursor(
+                "successor-controller",
+                nonce=successor.nonce,
+                expected_cursor_version=emitted.cursor_version,
+                expected_stream_snapshots=emitted.stream_snapshots,
+                advances={"retirement-stream": 2},
+                actor="successor-controller",
+            )
+            if mutate_safety:
+                assert outcome.committed
+                assert authority.cursor_peek(
+                    "successor-controller", nonce=successor.nonce
+                ).items == ()
+            else:
+                assert outcome.cas_lost
+                refreshed = authority.cursor_peek(
+                    "successor-controller", nonce=successor.nonce
+                )
+                assert [int(row["stream_seq"]) for row in refreshed.items] == [1, 2]
+                assert authority.advance_cursor(
+                    "successor-controller",
+                    nonce=successor.nonce,
+                    expected_cursor_version=refreshed.cursor_version,
+                    expected_stream_snapshots=refreshed.stream_snapshots,
+                    advances={"retirement-stream": 2},
+                    actor="successor-controller-refreshed",
+                ).committed
+
+    run_case("fixed-projected-rehome", mutate_safety=False)
+    # Mutation control: dropping the stream fingerprint lets a projected row
+    # move into the recipient's lower range after peek and be silently eaten.
+    run_case("mutated-projected-rehome", mutate_safety=True)
+
+
+def test_cursor_items_and_stream_token_share_one_read_snapshot_mutation_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def run_case(case: str, *, mutate_read_snapshot: bool) -> None:
+        case_root = tmp_path / case
+        case_root.mkdir()
+        with monkeypatch.context() as case_patch:
+            _set_state_env(case_patch, case_root)
+            if mutate_read_snapshot:
+                case_patch.setattr(
+                    journal.Journal,
+                    "_begin_cursor_read_snapshot",
+                    staticmethod(lambda _connection: None),
+                )
+            project = _project(case_root)
+            authority = journal.open_or_create_journal(project)
+            retiring = _claim(authority, "retiring-controller")
+            successor = _claim(authority, "successor-controller")
+            common = {
+                "dispatch_id": "atomic-snapshot-stream",
+                "msg_type": "controller-notice",
+                "messages_dir": case_root / "messages",
+                "source": {
+                    "node": "test-node",
+                    "adapter": "test",
+                    "transport": "controller",
+                },
+            }
+            messages.post_message(
+                payload={"text": "retiring position one"},
+                addressee=messages.controller_addressee(
+                    "retiring-controller", project_root=project
+                ),
+                **common,
+            )
+            messages.post_message(
+                payload={"text": "successor position two"},
+                addressee=messages.controller_addressee(
+                    "successor-controller", project_root=project
+                ),
+                **common,
+            )
+
+            rows_read = threading.Event()
+            allow_token = threading.Event()
+            original_snapshot = journal.Journal._cursor_stream_snapshot
+
+            def pause_between_rows_and_token(connection, **kwargs):
+                if threading.current_thread().name == f"atomic-peek-{case}":
+                    rows_read.set()
+                    assert allow_token.wait(5), "cursor token read was not released"
+                return original_snapshot(connection, **kwargs)
+
+            case_patch.setattr(
+                journal.Journal,
+                "_cursor_stream_snapshot",
+                staticmethod(pause_between_rows_and_token),
+            )
+            peek_outcome: dict[str, object] = {}
+
+            def peek_cursor() -> None:
+                try:
+                    peek_outcome["peek"] = authority.cursor_peek(
+                        "successor-controller", nonce=successor.nonce
+                    )
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    peek_outcome["error"] = exc
+
+            peeker = threading.Thread(target=peek_cursor, name=f"atomic-peek-{case}")
+            peeker.start()
+            assert rows_read.wait(5), "cursor rows were not read"
+            assert authority.release_lease(
+                "retiring-controller",
+                nonce=retiring.nonce,
+                reason="atomic-snapshot-rehome",
+            ).committed
+            allow_token.set()
+            peeker.join(timeout=5)
+            assert not peeker.is_alive()
+            assert "error" not in peek_outcome, peek_outcome.get("error")
+            emitted = peek_outcome["peek"]
+            assert isinstance(emitted, journal.CursorPeek)
+            assert [int(row["stream_seq"]) for row in emitted.items] == [2]
+            outcome = authority.advance_cursor(
+                "successor-controller",
+                nonce=successor.nonce,
+                expected_cursor_version=emitted.cursor_version,
+                expected_stream_snapshots=emitted.stream_snapshots,
+                advances={"atomic-snapshot-stream": 2},
+                actor="atomic-snapshot-controller",
+            )
+            assert outcome.committed if mutate_read_snapshot else outcome.cas_lost
+
+    run_case("fixed-atomic-snapshot", mutate_read_snapshot=False)
+    # Mutation control: autocommit SELECTs let the token include a re-homed row
+    # that was absent from the returned items, so the stale advance eats it.
+    run_case("mutated-autocommit-snapshot", mutate_read_snapshot=True)
+
+
+def test_waking_only_snapshot_cannot_ack_quiet_lower_row_mutation_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def run_case(case: str, *, mutate_filter: bool) -> None:
+        case_root = tmp_path / case
+        case_root.mkdir()
+        with monkeypatch.context() as case_patch:
+            _set_state_env(case_patch, case_root)
+            original_snapshot = journal.Journal._cursor_stream_snapshot
+            if mutate_filter:
+                def ignore_waking_filter(connection, **kwargs):
+                    kwargs["waking_only"] = False
+                    return original_snapshot(connection, **kwargs)
+
+                case_patch.setattr(
+                    journal.Journal,
+                    "_cursor_stream_snapshot",
+                    staticmethod(ignore_waking_filter),
+                )
+            project = _project(case_root)
+            authority = journal.open_or_create_journal(project)
+            lease = _claim(authority)
+            common = {
+                "dispatch_id": "filtered-stream",
+                "messages_dir": case_root / "messages",
+                "source": {
+                    "node": "test-node",
+                    "adapter": "test",
+                    "transport": "controller",
+                },
+                "addressee": messages.controller_addressee(
+                    "controller", project_root=project
+                ),
+            }
+            quiet_id = str(uuid.uuid4())
+            assert authority.record_delivery_event(
+                recipient_label="controller",
+                origin_node="test-node",
+                event_uuid=quiet_id,
+                stream_id="filtered-stream",
+                stream_seq=1,
+                carrier_path=case_root / "quiet.jsonl",
+                event_type="status",
+                wake_class="quiet",
+                created_at=journal.utc_now(),
+            ).committed
+            assert authority.mark_delivery_projected(
+                recipient_label="controller",
+                origin_node="test-node",
+                event_uuid=quiet_id,
+            ).committed
+            messages.post_message(
+                msg_type="controller-notice",
+                payload={"text": "waking two"},
+                seq=2,
+                **common,
+            )
+            emitted = authority.cursor_peek(
+                "controller", nonce=lease.nonce, waking_only=True
+            )
+            assert [int(row["stream_seq"]) for row in emitted.items] == [2]
+            outcome = authority.advance_cursor(
+                "controller",
+                nonce=lease.nonce,
+                expected_cursor_version=emitted.cursor_version,
+                expected_stream_snapshots=emitted.stream_snapshots,
+                advances={"filtered-stream": 2},
+                actor="filtered-controller",
+            )
+            if mutate_filter:
+                assert outcome.committed
+            else:
+                assert outcome.cas_lost
+                refreshed = authority.cursor_peek("controller", nonce=lease.nonce)
+                assert [int(row["stream_seq"]) for row in refreshed.items] == [1, 2]
+                assert authority.advance_cursor(
+                    "controller",
+                    nonce=lease.nonce,
+                    expected_cursor_version=refreshed.cursor_version,
+                    expected_stream_snapshots=refreshed.stream_snapshots,
+                    advances={"filtered-stream": 2},
+                    actor="full-controller",
+                ).committed
+
+    run_case("fixed-filtered-snapshot", mutate_filter=False)
+    # Mutation control: hashing quiet rows that were filtered from the returned
+    # batch lets the waking-only command silently acknowledge unseen mail.
+    run_case("mutated-filtered-snapshot", mutate_filter=True)
+
+
+def test_continuous_delivery_cannot_starve_stream_advance(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -391,80 +890,63 @@ def test_late_lower_sequence_invalidates_emitted_advance_but_fresh_batch_succeed
     project = _project(tmp_path)
     authority = journal.open_or_create_journal(project)
     lease = _claim(authority)
-    message_args = {
-        "dispatch_id": "late-lower-stream",
+    common = {
+        "dispatch_id": "continuous-stream",
         "msg_type": "controller-notice",
         "messages_dir": tmp_path / "messages",
         "source": {"node": "test-node", "adapter": "test", "transport": "controller"},
         "addressee": messages.controller_addressee("controller", project_root=project),
     }
-    messages.post_message(payload={"text": "sequence two"}, seq=2, **message_args)
-    emitted = authority.cursor_peek("controller", nonce=lease.nonce)
-    assert [int(row["stream_seq"]) for row in emitted.items] == [2]
+    messages.post_message(payload={"text": "position one"}, **common)
+    emitted = authority.cursor_peek("controller", nonce=lease.nonce, limit=1)
+    assert [int(row["stream_seq"]) for row in emitted.items] == [1]
 
-    assignment_inserted = threading.Event()
-    allow_projection = threading.Event()
-    errors: list[BaseException] = []
-    original_mark_projected = journal.Journal.mark_delivery_projected
+    stop_delivery = threading.Event()
+    delivery_started = threading.Event()
+    deliveries: list[int] = []
+    delivery_errors: list[BaseException] = []
 
-    def pause_before_lower_becomes_visible(self, *args, **kwargs):
-        assignment_inserted.set()
-        assert allow_projection.wait(5), "late lower-sequence projection was not released"
-        return original_mark_projected(self, *args, **kwargs)
-
-    monkeypatch.setattr(
-        journal.Journal,
-        "mark_delivery_projected",
-        pause_before_lower_becomes_visible,
-    )
-
-    def insert_late_lower() -> None:
+    def deliver_continuously() -> None:
+        index = 2
         try:
-            messages.post_message(payload={"text": "late sequence one"}, seq=1, **message_args)
+            while not stop_delivery.is_set():
+                posted = messages.post_message(payload={"text": f"position {index}"}, **common)
+                deliveries.append(int(posted["envelope"]["seq"]))
+                if len(deliveries) >= 3:
+                    delivery_started.set()
+                index += 1
+                time.sleep(0.001)
         except BaseException as exc:  # pragma: no cover - asserted below
-            errors.append(exc)
+            delivery_errors.append(exc)
+            delivery_started.set()
 
-    worker = threading.Thread(target=insert_late_lower, name="late-lower-delivery")
-    worker.start()
+    producer = threading.Thread(target=deliver_continuously, name="continuous-delivery")
+    producer.start()
+    outcome = None
+    attempts = 0
     try:
-        assert assignment_inserted.wait(5), "late lower-sequence assignment did not finish"
-        while_unprojected = authority.cursor_peek("controller", nonce=lease.nonce)
-        assert [int(row["stream_seq"]) for row in while_unprojected.items] == [2]
-        assert while_unprojected.cursor_version > emitted.cursor_version
-        stale_before_projection = authority.advance_cursor(
-            "controller",
-            nonce=lease.nonce,
-            expected_cursor_version=emitted.cursor_version,
-            advances={"late-lower-stream": 2},
-            actor="stale-before-projection",
-        )
-        assert stale_before_projection.cas_lost
+        assert delivery_started.wait(5), "continuous delivery did not start"
+        for attempts in range(1, 9):
+            outcome = authority.advance_cursor(
+                "controller",
+                nonce=lease.nonce,
+                expected_cursor_version=emitted.cursor_version,
+                expected_stream_snapshots=emitted.stream_snapshots,
+                advances={"continuous-stream": 1},
+                actor="starvation-free-controller",
+            )
+            if outcome.committed:
+                break
+            time.sleep(0.005)
     finally:
-        allow_projection.set()
-        worker.join(timeout=5)
-    assert not worker.is_alive()
-    assert errors == []
-
-    stale = authority.advance_cursor(
-        "controller",
-        nonce=lease.nonce,
-        expected_cursor_version=while_unprojected.cursor_version,
-        advances={"late-lower-stream": 2},
-        actor="stale-after-projection",
-    )
-    assert stale.cas_lost
-    assert authority.cursor_status("controller")["positions"] == {}
-
-    refreshed = authority.cursor_peek("controller", nonce=lease.nonce)
-    assert [int(row["stream_seq"]) for row in refreshed.items] == [1, 2]
-    assert authority.advance_cursor(
-        "controller",
-        nonce=lease.nonce,
-        expected_cursor_version=refreshed.cursor_version,
-        advances={"late-lower-stream": 2},
-        actor="fresh-emitted-command",
-    ).committed
-    assert authority.pending_delivery_events("controller", waking_only=False) == []
+        stop_delivery.set()
+        producer.join(timeout=5)
+    assert not producer.is_alive()
+    assert delivery_errors == []
+    assert len(deliveries) >= 3
+    assert attempts <= 8
+    assert outcome is not None and outcome.committed, outcome.reason if outcome else None
+    assert authority.cursor_status("controller")["positions"] == {"continuous-stream": 1}
 
 
 def test_terminal_projection_targets_owned_exactly_and_unowned_by_fanout(
@@ -608,6 +1090,163 @@ def test_unowned_terminal_revalidates_retiring_roster_inside_assignment_transact
     assert [str(row["stream_id"]) for row in pending.items] == [dispatch_id]
 
 
+def test_retirement_after_exact_assignment_rehomes_mail_mutation_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def run_case(case: str, *, mutate_rehome: bool) -> None:
+        case_root = tmp_path / case
+        case_root.mkdir()
+        with monkeypatch.context() as case_patch:
+            _set_state_env(case_patch, case_root)
+            if mutate_rehome:
+                case_patch.setattr(
+                    journal.Journal,
+                    "_rehome_retired_delivery_events",
+                    staticmethod(lambda *args, **kwargs: 0),
+                )
+            project = _project(case_root)
+            authority = journal.open_or_create_journal(project)
+            retiring = _claim(authority, "retiring-controller")
+            dispatch_id = f"retirement-after-assignment-{case}"
+            ledger.write_record(
+                {
+                    "schema": ledger.SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "project_root": str(project),
+                    "state": "running",
+                }
+            )
+
+            assignment_committed = threading.Event()
+            allow_projection = threading.Event()
+            original_record_delivery = journal.Journal.record_delivery_event
+
+            def pause_after_exact_assignment(self, *args, **kwargs):
+                result = original_record_delivery(self, *args, **kwargs)
+                if kwargs.get("recipient_label") == "retiring-controller":
+                    assert result.committed
+                    assignment_committed.set()
+                    assert allow_projection.wait(5), "post-assignment race was not released"
+                return result
+
+            case_patch.setattr(
+                journal.Journal,
+                "record_delivery_event",
+                pause_after_exact_assignment,
+            )
+            outcome: dict[str, object] = {}
+
+            def project_terminal() -> None:
+                try:
+                    outcome["result"] = messages.post_message(
+                        dispatch_id=dispatch_id,
+                        msg_type="result",
+                        payload={"complete": True, "text": "retire after assignment"},
+                        messages_dir=case_root / "messages",
+                        source={"node": "test", "adapter": "pytest", "transport": "journal"},
+                    )
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    outcome["error"] = exc
+
+            projector = threading.Thread(
+                target=project_terminal,
+                name=f"post-assignment-retirement-{case}",
+            )
+            projector.start()
+            assert assignment_committed.wait(5), "exact assignment never committed"
+            released = authority.release_lease(
+                "retiring-controller",
+                nonce=retiring.nonce,
+                reason="retired-after-assignment",
+            )
+            assert released.committed, released.reason
+            allow_projection.set()
+            projector.join(timeout=5)
+            assert not projector.is_alive()
+            assert "error" not in outcome, outcome.get("error")
+
+            rows = authority.read_all(
+                """SELECT recipient_label, projected_at, withdrawn_at
+                   FROM delivery_events WHERE stream_id = ?""",
+                (dispatch_id,),
+            )
+            assert len(rows) == 1
+            successor = _claim(authority, "successor-controller")
+            pending = authority.cursor_peek(
+                "successor-controller",
+                nonce=successor.nonce,
+            )
+            if mutate_rehome:
+                assert rows[0]["recipient_label"] == "retiring-controller"
+                assert pending.items == ()
+            else:
+                assert rows[0]["recipient_label"] == "*"
+                assert rows[0]["projected_at"] is not None
+                assert rows[0]["withdrawn_at"] is None
+                assert [str(row["stream_id"]) for row in pending.items] == [dispatch_id]
+
+    run_case("fixed-retirement", mutate_rehome=False)
+    # Mutation control: omitting the in-transaction re-home leaves the exact
+    # projected row bound to the retired label and invisible to its successor.
+    run_case("mutated-retirement", mutate_rehome=True)
+
+
+def test_retirement_rehomes_pending_but_does_not_replay_processed_mail(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    retiring = _claim(authority, "retiring-controller")
+    common = {
+        "msg_type": "controller-notice",
+        "messages_dir": tmp_path / "messages",
+        "source": {"node": "test", "adapter": "pytest", "transport": "controller"},
+        "addressee": messages.controller_addressee(
+            "retiring-controller",
+            project_root=project,
+        ),
+    }
+    messages.post_message(
+        dispatch_id="processed-before-retirement",
+        payload={"text": "processed"},
+        **common,
+    )
+    processed = authority.cursor_peek("retiring-controller", nonce=retiring.nonce)
+    assert authority.advance_cursor(
+        "retiring-controller",
+        nonce=retiring.nonce,
+        expected_cursor_version=processed.cursor_version,
+        expected_stream_snapshots=processed.stream_snapshots,
+        advances={"processed-before-retirement": 1},
+        actor="retiring-controller",
+    ).committed
+    messages.post_message(
+        dispatch_id="pending-at-retirement",
+        payload={"text": "pending"},
+        **common,
+    )
+    assert authority.release_lease(
+        "retiring-controller",
+        nonce=retiring.nonce,
+        reason="retirement-scope-probe",
+    ).committed
+    rows = authority.read_all(
+        """SELECT stream_id, recipient_label FROM delivery_events
+           WHERE stream_id IN ('processed-before-retirement', 'pending-at-retirement')
+           ORDER BY stream_id"""
+    )
+    assert [(str(row["stream_id"]), str(row["recipient_label"])) for row in rows] == [
+        ("pending-at-retirement", "*"),
+        ("processed-before-retirement", "retiring-controller"),
+    ]
+    successor = _claim(authority, "successor-controller")
+    pending = authority.cursor_peek("successor-controller", nonce=successor.nonce)
+    assert [str(row["stream_id"]) for row in pending.items] == ["pending-at-retirement"]
+
+
 def test_unowned_terminal_projection_with_no_controller_is_held_for_registration(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -713,6 +1352,7 @@ def test_first_wildcard_processor_adopts_once_while_unhandled_rows_wait(
             label,
             nonce=leases[label].nonce,
             expected_cursor_version=peeks[label].cursor_version,
+            expected_stream_snapshots=peeks[label].stream_snapshots,
             advances={"wildcard-handled-once": 1},
             actor=label,
         )
@@ -746,6 +1386,7 @@ def test_first_wildcard_processor_adopts_once_while_unhandled_rows_wait(
         "late-controller",
         nonce=late.nonce,
         expected_cursor_version=conflict.cursor_version,
+        expected_stream_snapshots=conflict.stream_snapshots,
         advances={"wildcard-conflicts-with-exact": 1},
         actor="exact-conflict-processor",
     ).committed
@@ -869,6 +1510,7 @@ def test_unowned_terminal_projection_wakes_armed_doorbell_three_runs(
                 "controller",
                 nonce=lease.nonce,
                 expected_cursor_version=peek.cursor_version,
+                expected_stream_snapshots=peek.stream_snapshots,
                 advances=advances,
                 actor="unowned-terminal-doorbell-test",
             ).committed
@@ -905,6 +1547,7 @@ def test_cursor_cas_has_one_winner_under_32_way_contention(
             "controller",
             nonce=lease.nonce,
             expected_cursor_version=peek.cursor_version,
+            expected_stream_snapshots=peek.stream_snapshots,
             advances={"contended-stream": 1},
             actor=f"contender-{index}",
         )
@@ -1231,6 +1874,7 @@ def test_listener_path_terminal_commit_wakes_under_seeded_history_three_runs(
                 "controller",
                 nonce=lease.nonce,
                 expected_cursor_version=peek.cursor_version,
+                expected_stream_snapshots=peek.stream_snapshots,
                 advances=advances,
                 actor="listener-latency-probe",
             ).committed
