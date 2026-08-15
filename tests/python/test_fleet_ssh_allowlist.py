@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import sys
 from pathlib import Path
 
@@ -484,10 +486,21 @@ def test_pid_identity_uses_helper() -> None:
         repo_root="/srv/goal-flight",
         pid="4242",
         expected_lstart="Thu Jun 11 12:00:00 2026",
+        expected_identity={
+            "pid": 4242,
+            "start_token": "linux:boot-id:12345",
+            "lstart": "Thu Jun 11 12:00:00 2026",
+            "comm": "python",
+            "args": "worker --token secret-value",
+        },
     )
     assert_true("helper", argv[1].endswith("goalflight_fleet_launch_detached.py"))
     assert_true("pid subcommand", "pid-identity" in argv)
     assert_true("pid", argv[argv.index("--pid") + 1] == "4242")
+    encoded = argv[argv.index("--expected-identity-b64") + 1]
+    identity = json.loads(base64.b64decode(encoded).decode("utf-8"))
+    assert_true("fine identity", identity["start_token"] == "linux:boot-id:12345")
+    assert_true("process args omitted", "args" not in identity)
 
 
 def main() -> None:

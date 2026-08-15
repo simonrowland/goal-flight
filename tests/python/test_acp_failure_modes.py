@@ -852,10 +852,13 @@ def case_detached_pidfile_entry_survives_ghost_cleanup() -> None:
     old_ps_meta = ac._ps_meta
     tmp = Path(tempfile.mkdtemp(prefix="gf-detach-ghost-"))
     ac._PIDFILE_DIR = tmp
-    worker = subprocess.Popen(["sleep", "30"])
+    worker = subprocess.Popen(["sleep", "30"], start_new_session=True)
     try:
         dead_controller_pid = 999999  # not a live pid
-        lstart, comm = "Mon Jan  1 00:00:00 2026", "sleep"
+        worker_identity = ac.goalflight_ledger.process_identity(worker.pid)
+        assert worker_identity and worker_identity.get("start_token"), worker_identity
+        lstart = str(worker_identity["lstart"])
+        comm = str(worker_identity.get("comm") or "sleep")
 
         def fake_ps_meta(pid: int):
             if pid == worker.pid:
@@ -869,6 +872,7 @@ def case_detached_pidfile_entry_survives_ghost_cleanup() -> None:
         base = {
             "pid": worker.pid, "pgid": worker.pid, "started_at": lstart,
             "cmd": comm, "agent": "codex-acp", "session_id": "s",
+            "worker_identity": ac._identity_token(worker_identity),
         }
         # detached worker -> NOT killed, survives.
         pidfile.write_text(json.dumps({**base, "detached": True}) + "\n")

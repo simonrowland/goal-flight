@@ -1183,11 +1183,14 @@ def kill_pid(
     pgid=None,
     process_group: bool = True,
     expected_identity: dict | None = None,
+    fallback_to_pid: bool = True,
 ) -> bool:
     """Best-effort stale-worker kill with native-Windows degradation.
 
     POSIX callers historically reap a worker's whole process group with
     ``os.killpg`` because bash-tail / ACP workers can leave child processes.
+    Identity-sensitive callers can disable the bare-PID fallback and perform
+    their own generation recheck before retrying.
     Native Windows has no ``os.killpg`` and this project intentionally does not
     add Job Objects for a native dispatch port. A bare pid is unsafe there
     because pid reuse can target an unrelated process, so Windows kills require
@@ -1235,6 +1238,8 @@ def kill_pid(
             os.killpg(target, kill_signal)
             return True
         except (ProcessLookupError, PermissionError):
+            if not fallback_to_pid:
+                return False
             try:
                 os.kill(pid_int, kill_signal)
                 return True

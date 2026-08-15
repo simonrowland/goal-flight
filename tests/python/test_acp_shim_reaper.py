@@ -38,6 +38,15 @@ def _own_all(_pid: int) -> bool:
     return True
 
 
+def _identity(pid: int, *, generation: str = "generation-1") -> dict:
+    return {
+        "pid": pid,
+        "start_token": f"test:{pid}:{generation}",
+        "lstart": "Wed Jul  1 12:00:00 2026",
+        "comm": "claude-code-cli-acp",
+    }
+
+
 def case_reaper_selects_only_qualifying_orphans() -> None:
     killed: list[int] = []
 
@@ -57,6 +66,8 @@ def case_reaper_selects_only_qualifying_orphans() -> None:
             process_rows=_fake_rows(),
             terminate_group=fake_terminate,
             provenance_check=_own_all,
+            identity_probe=_identity,
+            target_liveness_probe=lambda _pid, _pgid: False,
         )
     assert killed == [101], f"expected only pid 101 reaped, got {killed}"
     assert len(result["reaped"]) == 1
@@ -94,6 +105,8 @@ def case_reaper_does_not_reap_foreign_editor_orphan() -> None:
             process_rows=_fake_rows(),
             terminate_group=fake_terminate,
             provenance_check=no_provenance,
+            identity_probe=_identity,
+            target_liveness_probe=lambda _pid, _pgid: False,
         )
     assert killed == [], f"foreign editor orphan must NOT be reaped, got {killed}"
     assert result["reaped"] == []
@@ -124,9 +137,184 @@ def case_reaper_reaps_goalflight_launched_orphan() -> None:
             process_rows=_fake_rows(),
             terminate_group=fake_terminate,
             provenance_check=owns_101,
+            identity_probe=_identity,
+            target_liveness_probe=lambda _pid, _pgid: False,
         )
     assert killed == [101], f"expected goal-flight-owned pid 101 reaped, got {killed}"
     assert {row["pid"] for row in result["reaped"]} == {101}
+
+
+def case_reaper_refuses_generation_change_before_kill() -> None:
+    killed: list[int] = []
+    probes = iter(
+        [
+            _identity(101, generation="generation-1"),
+            _identity(101, generation="generation-2"),
+        ]
+    )
+
+    with patch(
+        "goalflight_acp_client._claude_acp_shim_executable_paths",
+        return_value={SHIM_PATH},
+    ), patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("GOALFLIGHT_NO_SHIM_REAP", None)
+        result = goalflight_acp_client.reap_orphaned_acp_shims(
+            active_worker_pids={103},
+            ttl_s=600.0,
+            process_rows=_fake_rows(),
+            terminate_group=lambda pgid: killed.append(pgid) or "SIGTERM",
+            provenance_check=lambda pid: pid == 101,
+            identity_probe=lambda _pid: next(probes),
+            target_liveness_probe=lambda _pid, _pgid: False,
+        )
+
+    assert killed == []
+    assert result["reaped"] == []
+
+
+def case_terminate_helper_rechecks_before_sigkill() -> None:
+    signals: list[tuple[int, int]] = []
+    probes = iter(
+        [
+            _identity(101, generation="generation-1"),
+            _identity(101, generation="generation-2"),
+        ]
+    )
+
+    with patch("goalflight_compat.is_windows", return_value=False), patch(
+        "goalflight_acp_client.os.killpg",
+        side_effect=lambda pgid, sig: signals.append((pgid, sig)),
+    ), patch("goalflight_acp_client._pgid_alive", return_value=True), patch(
+        "goalflight_acp_client._termination_targets_live",
+        side_effect=[True, False],
+    ), patch("goalflight_acp_client.time.sleep", return_value=None):
+        action = goalflight_acp_client._terminate_process_group(
+            101,
+            pid=101,
+            expected_identity=_identity(101, generation="generation-1"),
+            identity_probe=lambda _pid: next(probes),
+            grace_s=0,
+        )
+
+    assert signals == [(101, goalflight_acp_client.signal.SIGTERM)]
+    assert action == "SIGTERM+skip_identity:pid_reused_start_token"
+
+
+def case_terminate_helper_rechecks_before_pid_fallback() -> None:
+    probes = iter(
+        [
+            _identity(101, generation="generation-1"),
+            _identity(101, generation="generation-2"),
+        ]
+    )
+
+    with patch("goalflight_compat.is_windows", return_value=False), patch(
+        "goalflight_acp_client.os.killpg", side_effect=PermissionError
+    ), patch(
+        "goalflight_acp_client.os.kill",
+        side_effect=AssertionError("reused pid killed through PID fallback"),
+    ):
+        action = goalflight_acp_client._terminate_process_group(
+            101,
+            pid=101,
+            expected_identity=_identity(101, generation="generation-1"),
+            identity_probe=lambda _pid: next(probes),
+            grace_s=0,
+        )
+
+    assert action == "skip_identity:pid_reused_start_token"
+
+
+def case_terminate_helper_allows_exec_comm_change() -> None:
+    signals: list[tuple[int, int]] = []
+    expected = _identity(101)
+    current = {**expected, "comm": "node"}
+
+    with patch("goalflight_compat.is_windows", return_value=False), patch(
+        "goalflight_acp_client.os.killpg",
+        side_effect=lambda pgid, sig: signals.append((pgid, sig)),
+    ), patch("goalflight_acp_client._pgid_alive", return_value=False):
+        action = goalflight_acp_client._terminate_process_group(
+            101,
+            pid=101,
+            expected_identity=expected,
+            identity_probe=lambda _pid: current,
+            grace_s=0,
+        )
+
+    assert signals == [(101, goalflight_acp_client.signal.SIGTERM)]
+    assert action == "SIGTERM"
+
+
+def case_terminate_helper_escalates_surviving_group_after_leader_exit() -> None:
+    signals: list[tuple[int, int]] = []
+    probes = iter([_identity(101), None])
+
+    with patch("goalflight_compat.is_windows", return_value=False), patch(
+        "goalflight_acp_client.os.killpg",
+        side_effect=lambda pgid, sig: signals.append((pgid, sig)),
+    ), patch("goalflight_acp_client._pgid_alive", return_value=True):
+        action = goalflight_acp_client._terminate_process_group(
+            101,
+            pid=101,
+            expected_identity=_identity(101),
+            identity_probe=lambda _pid: next(probes),
+            grace_s=0,
+        )
+
+    assert signals == [
+        (101, goalflight_acp_client.signal.SIGTERM),
+        (101, goalflight_acp_client.signal.SIGKILL),
+    ]
+    assert action == "SIGTERM+SIGKILL"
+
+
+def case_live_group_keeps_termination_incomplete() -> None:
+    with patch(
+        "goalflight_acp_client._termination_targets_live", return_value=True
+    ):
+        assert goalflight_acp_client._termination_incomplete(
+            pid=101,
+            pgid=101,
+            action="SIGTERM+SIGKILL",
+        )
+
+
+def case_dead_target_completes_without_signal() -> None:
+    with patch(
+        "goalflight_acp_client._termination_targets_live", return_value=False
+    ):
+        assert not goalflight_acp_client._termination_incomplete(
+            pid=101,
+            pgid=101,
+            action="skip_identity:dead",
+        )
+
+
+def case_zombie_only_group_is_complete() -> None:
+    completed = goalflight_acp_client.subprocess.CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout="101 101 Z\n102 101 Z+\n",
+    )
+    with patch("goalflight_acp_client.subprocess.run", return_value=completed):
+        assert not goalflight_acp_client._termination_targets_live(
+            pid=101, pgid=101
+        )
+
+    completed.stdout = "101 101 Z\n102 101 S\n"
+    with patch("goalflight_acp_client.subprocess.run", return_value=completed):
+        assert goalflight_acp_client._termination_targets_live(pid=101, pgid=101)
+
+
+def case_process_state_timeout_fails_closed() -> None:
+    with patch(
+        "goalflight_acp_client.subprocess.run",
+        side_effect=goalflight_acp_client.subprocess.TimeoutExpired("ps", 5.0),
+    ), patch("goalflight_compat.pid_alive", return_value=False), patch(
+        "goalflight_acp_client._pgid_alive", return_value=True
+    ):
+        assert goalflight_acp_client._termination_targets_live(pid=101, pgid=101)
 
 
 def case_reaper_default_denies_on_unreadable_env() -> None:
@@ -155,6 +343,8 @@ def case_reaper_default_denies_on_unreadable_env() -> None:
             process_rows=_fake_rows(),
             terminate_group=fake_terminate,
             provenance_check=unreadable_env,
+            identity_probe=_identity,
+            target_liveness_probe=lambda _pid, _pgid: False,
         )
     assert killed == [], f"unreadable env must default-deny, got {killed}"
     assert result["reaped"] == []
@@ -241,6 +431,15 @@ def main() -> None:
     case_reaper_selects_only_qualifying_orphans()
     case_reaper_does_not_reap_foreign_editor_orphan()
     case_reaper_reaps_goalflight_launched_orphan()
+    case_reaper_refuses_generation_change_before_kill()
+    case_terminate_helper_rechecks_before_sigkill()
+    case_terminate_helper_rechecks_before_pid_fallback()
+    case_terminate_helper_allows_exec_comm_change()
+    case_terminate_helper_escalates_surviving_group_after_leader_exit()
+    case_live_group_keeps_termination_incomplete()
+    case_dead_target_completes_without_signal()
+    case_zombie_only_group_is_complete()
+    case_process_state_timeout_fails_closed()
     case_reaper_default_denies_on_unreadable_env()
     case_provenance_default_denies_when_env_missing_marker()
     case_reaper_opt_out_is_noop()

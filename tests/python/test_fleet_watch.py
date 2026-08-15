@@ -805,6 +805,100 @@ def test_ssh_transport_uses_node_state_dir_for_custom_status_path() -> None:
         assert_true("custom status path used", custom_state_dir in " ".join(captured[0]))
 
 
+def test_ssh_identity_check_retries_legacy_remote_helper() -> None:
+    captured: list[list[str]] = []
+    identity = {
+        "pid": 4321,
+        "start_token": "test:4321:generation-1",
+        "lstart": "Wed May 20 17:55:24 2026",
+        "comm": "node",
+    }
+
+    def capture_runner(argv: list[str]) -> tuple[int, str, str]:
+        captured.append(list(argv))
+        if len(captured) == 1:
+            return (
+                2,
+                "",
+                "error: unrecognized arguments: --expected-identity-b64 value",
+            )
+        return 0, json.dumps({"alive": True, "identity": identity}), ""
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        node_entry = fleet.read_json(fleet_dir / "fleet.json")["nodes"]["build-1"]
+        transport = fleet_watch.SshFleetWatchTransport(
+            runner=capture_runner, fleet_dir=fleet_dir
+        )
+        result = transport.check_remote_identity(
+            node_id="build-1",
+            node_entry=node_entry,
+            receipt={
+                "remote_pid": 4321,
+                "remote_identity": identity,
+            },
+        )
+
+    assert_true("legacy retry succeeds", result.ok and result.alive)
+    assert_true("identity retained", result.identity == identity)
+    assert_true("two ssh attempts", len(captured) == 2)
+    assert_true(
+        "first attempt uses fine identity",
+        "--expected-identity-b64" in " ".join(captured[0]),
+    )
+    assert_true(
+        "fallback omits unsupported flag",
+        "--expected-identity-b64" not in " ".join(captured[1]),
+    )
+    assert_true(
+        "fallback retains lstart from fine identity",
+        "--expected-lstart-b64" in " ".join(captured[1]),
+    )
+
+
+def test_ssh_identity_legacy_fallback_rejects_reused_fine_token() -> None:
+    expected = {
+        "pid": 4321,
+        "start_token": "test:4321:generation-1",
+        "lstart": "Wed May 20 17:55:24 2026",
+        "comm": "python",
+    }
+    reused = {
+        **expected,
+        "start_token": "test:4321:generation-2",
+        "comm": "node",
+    }
+    calls = 0
+
+    def capture_runner(_argv: list[str]) -> tuple[int, str, str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return (
+                2,
+                "",
+                "error: unrecognized arguments: --expected-identity-b64 value",
+            )
+        return 0, json.dumps({"alive": True, "identity": reused}), ""
+
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        node_entry = fleet.read_json(fleet_dir / "fleet.json")["nodes"]["build-1"]
+        result = fleet_watch.SshFleetWatchTransport(
+            runner=capture_runner, fleet_dir=fleet_dir
+        ).check_remote_identity(
+            node_id="build-1",
+            node_entry=node_entry,
+            receipt={"remote_pid": 4321, "remote_identity": expected},
+        )
+
+    assert_true("two ssh attempts", calls == 2)
+    assert_true("fine-token reuse is dead", result.ok and not result.alive)
+    assert_true("mismatch reason retained", result.error == "pid_reused_start_token")
+
+
 def test_until_terminal_running_to_terminal() -> None:
     dispatch_id = "acp-watch-until-terminal"
     with tempfile.TemporaryDirectory() as td:
@@ -1401,6 +1495,8 @@ def main() -> None:
     test_sync_fleet_mirrors_batch()
     test_ssh_transport_uses_injected_runner()
     test_ssh_transport_uses_node_state_dir_for_custom_status_path()
+    test_ssh_identity_check_retries_legacy_remote_helper()
+    test_ssh_identity_legacy_fallback_rejects_reused_fine_token()
     test_until_terminal_running_to_terminal()
     test_until_terminal_seq_regression_does_not_accept_stale_terminal()
     test_until_terminal_timeout_exits_live()
@@ -1422,7 +1518,7 @@ def main() -> None:
     test_release_lock_skips_foreign_lock()
     test_release_lock_releases_clean_failure_terminal()
     test_release_lock_no_double_release()
-    print("OK: 37 fleet watch tests pass")
+    print("OK: 39 fleet watch tests pass")
 
 
 if __name__ == "__main__":

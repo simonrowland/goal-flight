@@ -98,7 +98,8 @@ def _has_recorded_worker_identity(record: dict) -> bool:
     if not isinstance(ident, dict):
         return False
     return bool(
-        (ident.get("lstart") and ident.get("comm"))
+        ident.get("start_token")
+        or ident.get("lstart")
         or ident.get("creation_time")
         or ident.get("creation_time_filetime")
         or ident.get("create_time")

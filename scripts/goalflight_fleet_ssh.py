@@ -605,6 +605,7 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         if not pid_raw.isdigit():
             raise SshAllowlistError("pid_identity requires numeric pid")
         expected_lstart = str(params.get("expected_lstart") or "")
+        expected_identity = params.get("expected_identity")
         ident_python = _validate_remote_interpreter(
             str(params.get("python") or "python3"),
             repo_root=repo_root,
@@ -621,6 +622,15 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         if expected_lstart:
             lstart_b64 = base64.b64encode(expected_lstart.encode("utf-8")).decode("ascii")
             argv.extend(["--expected-lstart-b64", lstart_b64])
+        if isinstance(expected_identity, dict):
+            public_identity = {
+                key: expected_identity[key]
+                for key in ("pid", "start_token", "lstart", "comm")
+                if expected_identity.get(key)
+            }
+            identity_json = json.dumps(public_identity, sort_keys=True, separators=(",", ":"))
+            identity_b64 = base64.b64encode(identity_json.encode("utf-8")).decode("ascii")
+            argv.extend(["--expected-identity-b64", identity_b64])
     elif command_class == "auth_probe":
         account_key = str(params.get("account_key") or "")
         if not account_key:

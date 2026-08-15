@@ -266,10 +266,9 @@ def case_matching_lstart_ignores_comm_form_change() -> None:
     assert reason == "live", reason
 
 
-def case_same_second_pid_reuse_with_different_comm_is_not_alive() -> None:
-    # P1a (lstart granularity hole): lstart is second-granularity, so a pid
-    # reused within the same formatted second has an identical lstart. A matching
-    # lstart must NOT alone read "live" when comm proves a different process.
+def case_exec_comm_change_with_same_lstart_is_alive() -> None:
+    # The launcher records its Python identity before execing the worker CLI.
+    # exec preserves pid+lstart while legitimately replacing comm.
     original = goalflight_watch.goalflight_ledger.process_identity
     try:
         goalflight_watch.goalflight_ledger.process_identity = lambda pid: {
@@ -284,11 +283,11 @@ def case_same_second_pid_reuse_with_different_comm_is_not_alive() -> None:
     finally:
         goalflight_watch.goalflight_ledger.process_identity = original
 
-    assert is_alive is False, current
-    assert reason == "pid_reused_lstart_comm", reason
+    assert is_alive is True, current
+    assert reason == "live", reason
 
 
-def case_missing_lstart_uses_tolerant_comm_fallback() -> None:
+def case_missing_lstart_matching_comm_is_inconclusive_alive() -> None:
     original = goalflight_watch.goalflight_ledger.process_identity
     try:
         goalflight_watch.goalflight_ledger.process_identity = lambda pid: {
@@ -303,10 +302,10 @@ def case_missing_lstart_uses_tolerant_comm_fallback() -> None:
         goalflight_watch.goalflight_ledger.process_identity = original
 
     assert is_alive is True, current
-    assert reason == "live", reason
+    assert reason == "identity_inconclusive_missing_expected_current_lstart", reason
 
 
-def case_missing_lstart_unrelated_comm_is_not_alive() -> None:
+def case_missing_lstart_unrelated_comm_is_inconclusive_alive() -> None:
     original = goalflight_watch.goalflight_ledger.process_identity
     try:
         goalflight_watch.goalflight_ledger.process_identity = lambda pid: {
@@ -320,8 +319,8 @@ def case_missing_lstart_unrelated_comm_is_not_alive() -> None:
     finally:
         goalflight_watch.goalflight_ledger.process_identity = original
 
-    assert is_alive is False, current
-    assert reason == "pid_reused_comm", reason
+    assert is_alive is True, current
+    assert reason == "identity_inconclusive_missing_expected_current_lstart", reason
 
 
 def case_incomplete_identity_is_inconclusive_alive() -> None:
@@ -1322,9 +1321,9 @@ def main() -> None:
     case_prompt_ignore_stops_at_first_mismatch()
     case_identity_mismatch_not_alive()
     case_matching_lstart_ignores_comm_form_change()
-    case_same_second_pid_reuse_with_different_comm_is_not_alive()
-    case_missing_lstart_uses_tolerant_comm_fallback()
-    case_missing_lstart_unrelated_comm_is_not_alive()
+    case_exec_comm_change_with_same_lstart_is_alive()
+    case_missing_lstart_matching_comm_is_inconclusive_alive()
+    case_missing_lstart_unrelated_comm_is_inconclusive_alive()
     case_incomplete_identity_is_inconclusive_alive()
     case_steer_ack_is_non_terminal_marker()
     case_mid_output_marker_ignored()

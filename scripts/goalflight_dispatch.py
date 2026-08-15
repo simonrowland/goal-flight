@@ -2222,12 +2222,14 @@ def _worker_liveness_warning(record: dict) -> str | None:
     prior = record.get("worker_identity") or {}
     if goalflight_compat.is_windows() and not current.get("identity_available", True):
         return f"WARN: dispatch {dispatch_id} worker identity indeterminate; message appended"
-    for key in ("lstart", "comm"):
-        if prior.get(key) and current.get(key) and prior[key] != current[key]:
-            return (
-                f"WARN: dispatch {dispatch_id} worker pid {pid} identity mismatch "
-                f"({key}); message appended but may target stale state"
-            )
+    matched, reason = goalflight_ledger.compare_process_identities(
+        int(pid), prior, current
+    )
+    if not matched:
+        return (
+            f"WARN: dispatch {dispatch_id} worker pid {pid} identity mismatch "
+            f"({reason}); message appended but may target stale state"
+        )
     return None
 
 
@@ -4686,9 +4688,7 @@ def _identity_token(identity: dict | None) -> dict | None:
 
 def _watch_identity_token(identity: dict | None) -> dict | None:
     token = _identity_token(identity)
-    if token and (
-        token.get("start_token") or (token.get("lstart") and token.get("comm"))
-    ):
+    if token and (token.get("start_token") or token.get("lstart")):
         return token
     return None
 

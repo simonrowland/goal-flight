@@ -203,6 +203,16 @@ def _same_process(
     )
 
 
+def _identity_token(identity: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not identity:
+        return None
+    return {
+        key: identity[key]
+        for key in ("pid", "start_token", "lstart", "comm")
+        if identity.get(key)
+    }
+
+
 class AcpError(Exception):
     pass
 
@@ -278,10 +288,12 @@ def _write_through_pidfile_locked() -> None:
                 )
             )
             continue
+        identity = conn._started_identity
         meta = _ps_meta(conn.proc.pid)
-        if meta is None:
+        if identity is None and meta is None:
             continue
-        lstart, comm = meta
+        lstart = str((identity or {}).get("lstart") or (meta or ("", ""))[0])
+        comm = str((identity or {}).get("comm") or (meta or ("", ""))[1])
         entries.append(
             json.dumps(
                 {
@@ -289,6 +301,7 @@ def _write_through_pidfile_locked() -> None:
                     "pgid": conn.verified_pgid,
                     "started_at": lstart,
                     "cmd": comm,
+                    "worker_identity": _identity_token(identity),
                     "agent": conn.agent,
                     "session_id": conn.session_id,
                     "detached": conn._detached,
@@ -307,6 +320,7 @@ def _write_through_pidfile_locked() -> None:
 CLAUDE_ACP_SHIM_BASENAME = "claude-code-cli-acp"
 DEFAULT_SHIM_ORPHAN_TTL_S = 600.0
 _SHIM_REAP_GRACE_S = 5.0
+_SHIM_REAP_POST_KILL_GRACE_S = 1.0
 # Dedicated provenance marker injected into every goal-flight-launched shim's
 # environment (see spawn_acp_connection). The reaper DEFAULT-DENIES any orphan
 # whose environment does not carry this var: the claude-code-cli-acp shim's
@@ -393,6 +407,8 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                     protected_live = goalflight_compat.pid_alive(pid)
                 else:
                     meta = _ps_meta(pid)
+                    current_identity = goalflight_ledger.process_identity(pid)
+                    recorded_identity = entry.get("worker_identity")
                     recorded_lstart = entry.get("started_at")
                     recorded_comm = entry.get("cmd")
                     recorded_meta = (
@@ -400,9 +416,16 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                         if isinstance(recorded_lstart, str) and isinstance(recorded_comm, str)
                         else None
                     )
-                    protected_live = meta is not None and _same_process(
-                        recorded_meta, meta
-                    )
+                    if isinstance(recorded_identity, dict):
+                        protected_live, _reason = (
+                            goalflight_ledger.compare_process_identities(
+                                pid, recorded_identity, current_identity
+                            )
+                        )
+                    else:
+                        protected_live = meta is not None and _same_process(
+                            recorded_meta, meta
+                        )
                     if (is_bash_tail or controller_pid is None) and meta is None:
                         # Bash-tail and unowned entries lack an explicit reapable
                         # transition. When ps identity is unavailable, kill(0)
@@ -441,39 +464,76 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                 else:
                     skipped_stale += 1
                 continue
-            meta = _ps_meta(pid)
-            if meta is None:
-                continue
-            live_lstart, live_comm = meta
-            recorded_lstart = entry.get("started_at")
-            recorded_comm = entry.get("cmd")
-            recorded_meta = (
-                (recorded_lstart, recorded_comm)
-                if isinstance(recorded_lstart, str) and isinstance(recorded_comm, str)
-                else None
-            )
-            if recorded_meta is None or not _same_process(recorded_meta, meta):
+            recorded_identity = entry.get("worker_identity")
+            if not isinstance(recorded_identity, dict):
                 skipped_stale += 1
+                live_meta = _ps_meta(pid)
+                recorded_lstart = entry.get("started_at")
+                recorded_comm = entry.get("cmd")
+                recorded_meta = (
+                    (recorded_lstart, recorded_comm)
+                    if isinstance(recorded_lstart, str)
+                    and isinstance(recorded_comm, str)
+                    else None
+                )
+                if goalflight_compat.pid_alive(pid) and _same_process(
+                    recorded_meta, live_meta
+                ):
+                    preserve_pidfile = True
                 log.warning(
-                    "ghost_cleanup: pid=%d stale live=%r recorded=%r",
+                    "ghost_cleanup: pid=%d missing fine process identity; skipping kill",
                     pid,
-                    (live_lstart, live_comm),
-                    (recorded_lstart, recorded_comm),
                 )
                 continue
-            meta2 = _ps_meta(pid)
-            if meta2 is None or not _same_process(meta, meta2):
+            current_identity = goalflight_ledger.process_identity(pid)
+            matched, reason = goalflight_ledger.compare_fine_process_identities(
+                pid, recorded_identity, current_identity
+            )
+            if not matched:
                 skipped_stale += 1
+                if reason == "identity_indeterminate" and goalflight_compat.pid_alive(
+                    pid
+                ):
+                    preserve_pidfile = True
+                log.warning(
+                    "ghost_cleanup: pid=%d stale reason=%s live=%r recorded=%r",
+                    pid,
+                    reason,
+                    _identity_token(current_identity),
+                    _identity_token(recorded_identity),
+                )
+                continue
+            current_identity2 = goalflight_ledger.process_identity(pid)
+            matched2, reason2 = goalflight_ledger.compare_fine_process_identities(
+                pid, current_identity, current_identity2
+            )
+            if not matched2:
+                skipped_stale += 1
+                if reason2 == "identity_indeterminate" and goalflight_compat.pid_alive(
+                    pid
+                ):
+                    preserve_pidfile = True
                 continue
             pgid = entry.get("pgid", pid)
             agent = entry.get("agent", "")
             is_bash_tail = str(agent).endswith("-bash-tail")
             hard_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+            killed_worker = False
             if is_bash_tail and pgid != pid:
                 if goalflight_compat.kill_pid(pid, hard_signal, process_group=False):
                     killed += 1
-            elif goalflight_compat.kill_pid(pid, hard_signal, pgid=pgid, process_group=True):
+                    killed_worker = True
+            elif goalflight_compat.kill_pid(
+                pid,
+                hard_signal,
+                pgid=pgid,
+                process_group=True,
+                fallback_to_pid=False,
+            ):
                 killed += 1
+                killed_worker = True
+            if not killed_worker and goalflight_compat.pid_alive(pid):
+                preserve_pidfile = True
         if not preserve_pidfile:
             pf.unlink(missing_ok=True)
     if (
@@ -831,18 +891,74 @@ def _pgid_alive(pgid: int) -> bool:
         return True
 
 
-def _terminate_process_group(pgid: int, *, grace_s: float = _SHIM_REAP_GRACE_S) -> str:
+def _termination_targets_live(*, pid: int, pgid: int) -> bool:
+    """Report non-zombie target/group members, falling back conservatively."""
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,pgid=,stat="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return goalflight_compat.pid_alive(pid) or _pgid_alive(pgid)
+    if result.returncode != 0:
+        return goalflight_compat.pid_alive(pid) or _pgid_alive(pgid)
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            row_pid = int(parts[0])
+            row_pgid = int(parts[1])
+        except ValueError:
+            continue
+        if row_pid != pid and row_pgid != pgid:
+            continue
+        state = parts[2].strip().upper()
+        if not state or not state.startswith("Z"):
+            return True
+    return False
+
+
+def _terminate_process_group(
+    pgid: int,
+    *,
+    pid: int | None = None,
+    expected_identity: dict[str, Any] | None = None,
+    identity_probe: Callable[[int], dict[str, Any] | None] | None = None,
+    grace_s: float = _SHIM_REAP_GRACE_S,
+) -> str:
     """Escalate SIGTERM -> SIGKILL for a POSIX process group."""
     if goalflight_compat.is_windows():
         return "skipped_windows"
     target = int(pgid)
+    worker_pid = int(pid or target)
+    probe = identity_probe or goalflight_ledger.process_identity
+
+    def identity_status() -> tuple[bool, str]:
+        return goalflight_ledger.compare_fine_process_identities(
+            worker_pid, expected_identity, probe(worker_pid)
+        )
+
+    identity_ok, identity_reason = identity_status()
+    if not identity_ok:
+        return f"skip_identity:{identity_reason}"
     actions: list[str] = []
+    group_term_sent = False
     try:
         os.killpg(target, signal.SIGTERM)
         actions.append("SIGTERM")
+        group_term_sent = True
     except (ProcessLookupError, PermissionError, OSError):
+        identity_ok, identity_reason = identity_status()
+        if not identity_ok:
+            actions.append(f"skip_identity:{identity_reason}")
+            return "+".join(actions)
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.kill(target, signal.SIGTERM)
+            os.kill(worker_pid, signal.SIGTERM)
             actions.append("SIGTERM(pid)")
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline:
@@ -850,14 +966,52 @@ def _terminate_process_group(pgid: int, *, grace_s: float = _SHIM_REAP_GRACE_S) 
             break
         time.sleep(0.05)
     if _pgid_alive(target):
+        identity_ok, identity_reason = identity_status()
+        leader_exited = identity_reason == "dead"
+        if not identity_ok and not (leader_exited and group_term_sent):
+            actions.append(f"skip_identity:{identity_reason}")
+            return "+".join(actions)
+        # A successful group SIGTERM established this PGID while the leader's
+        # fine identity still matched. The group ID remains allocated while any
+        # member survives, so a dead leader does not by itself invalidate the
+        # same still-live group for escalation.
         try:
             os.killpg(target, getattr(signal, "SIGKILL", signal.SIGTERM))
             actions.append("SIGKILL")
         except (ProcessLookupError, PermissionError, OSError):
-            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-                os.kill(target, getattr(signal, "SIGKILL", signal.SIGTERM))
+            if leader_exited:
+                return "+".join(actions) if actions else "noop"
+            identity_ok, identity_reason = identity_status()
+            if not identity_ok:
+                actions.append(f"skip_identity:{identity_reason}")
+                return "+".join(actions)
+            with contextlib.suppress(
+                ProcessLookupError, PermissionError, OSError
+            ):
+                os.kill(
+                    worker_pid, getattr(signal, "SIGKILL", signal.SIGTERM)
+                )
                 actions.append("SIGKILL(pid)")
+    if any(action.startswith("SIGKILL") for action in actions):
+        deadline = time.monotonic() + _SHIM_REAP_POST_KILL_GRACE_S
+        while time.monotonic() < deadline:
+            if not _termination_targets_live(pid=worker_pid, pgid=target):
+                break
+            time.sleep(0.05)
     return "+".join(actions) if actions else "noop"
+
+
+def _termination_incomplete(
+    *,
+    pid: int,
+    pgid: int,
+    action: str,
+    target_liveness_probe: Callable[[int, int], bool] | None = None,
+) -> bool:
+    del action  # Completion is determined by live targets, not signal history.
+    if target_liveness_probe is not None:
+        return target_liveness_probe(pid, pgid)
+    return _termination_targets_live(pid=pid, pgid=pgid)
 
 
 def reap_orphaned_acp_shims(
@@ -867,6 +1021,8 @@ def reap_orphaned_acp_shims(
     process_rows: list[dict[str, Any]] | None = None,
     terminate_group: Callable[[int], str] | None = None,
     provenance_check: Callable[[int], bool] | None = None,
+    identity_probe: Callable[[int], dict[str, Any] | None] | None = None,
+    target_liveness_probe: Callable[[int, int], bool] | None = None,
 ) -> dict[str, Any]:
     """Ledger-independent reaper for orphaned claude-acp shims (ppid==1 past TTL).
 
@@ -886,23 +1042,76 @@ def reap_orphaned_acp_shims(
         rows = process_rows if process_rows is not None else _list_posix_process_rows()
         tracked = _ledger_tracked_worker_pids(active_worker_pids)
         prov = provenance_check or _shim_has_goalflight_provenance
-        candidates = _orphan_shim_candidates(
+        probe_identity = identity_probe or goalflight_ledger.process_identity
+        preliminary_candidates = _orphan_shim_candidates(
             rows,
             tracked_pids=tracked,
             shim_paths=shim_paths,
             min_age_s=ttl_s,
-            provenance_check=prov,
+            provenance_check=None,
         )
-        kill_group = terminate_group or _terminate_process_group
+        captured_identities: dict[int, dict[str, Any] | None] = {}
+        for row in preliminary_candidates:
+            pid = row.get("pid")
+            if not isinstance(pid, int):
+                continue
+            captured = probe_identity(pid)
+            listed_lstart = row.get("lstart")
+            if (
+                captured
+                and isinstance(listed_lstart, str)
+                and captured.get("lstart")
+                and _normalize_lstart(str(captured["lstart"]))
+                != _normalize_lstart(listed_lstart)
+            ):
+                captured = None
+            captured_identities[pid] = captured
+        candidates = [
+            row for row in preliminary_candidates if prov(int(row["pid"]))
+        ]
         reaped: list[dict[str, Any]] = []
         for row in candidates:
             pid = int(row["pid"])
             age_s = row.get("age_s")
+            expected_identity = captured_identities.get(pid)
             try:
                 pgid = os.getpgid(pid)
             except (OSError, ProcessLookupError):
                 pgid = pid
-            action = kill_group(pgid)
+            current_identity = probe_identity(pid)
+            identity_ok, identity_reason = (
+                goalflight_ledger.compare_fine_process_identities(
+                    pid, expected_identity, current_identity
+                )
+            )
+            if not identity_ok:
+                log.warning(
+                    "shim_reap: skip pid=%d identity=%s",
+                    pid,
+                    identity_reason,
+                )
+                continue
+            if terminate_group is not None:
+                action = terminate_group(pgid)
+            else:
+                action = _terminate_process_group(
+                    pgid,
+                    pid=pid,
+                    expected_identity=expected_identity,
+                    identity_probe=probe_identity,
+                )
+            if _termination_incomplete(
+                pid=pid,
+                pgid=pgid,
+                action=action,
+                target_liveness_probe=target_liveness_probe,
+            ):
+                log.warning(
+                    "shim_reap: pid=%d termination incomplete action=%s",
+                    pid,
+                    action,
+                )
+                continue
             entry = {
                 "pid": pid,
                 "age_s": age_s,
@@ -950,22 +1159,24 @@ def _quota_record_is_acp(record: dict[str, Any]) -> bool:
     )
 
 
-def _quota_worker_identity_matches(record: dict[str, Any], row: dict[str, Any]) -> tuple[bool, str]:
+def _quota_worker_identity_matches(
+    record: dict[str, Any],
+    row: dict[str, Any],
+    *,
+    identity_probe: Callable[[int], dict[str, Any] | None] | None = None,
+) -> tuple[bool, str]:
     recorded = record.get("worker_identity")
-    if not isinstance(recorded, dict) or not recorded.get("lstart") or not recorded.get("comm"):
+    if not isinstance(recorded, dict):
         return False, "missing_worker_identity"
-    live_lstart = row.get("lstart")
-    live_comm = row.get("comm")
-    if live_lstart and live_comm:
-        if " ".join(str(recorded.get("lstart") or "").split()) != " ".join(str(live_lstart or "").split()):
-            return False, "pid_reused_lstart"
-        if str(recorded.get("comm") or "") != str(live_comm or ""):
-            return False, "pid_reused_comm"
-        return True, "live"
-    ok, reason = goalflight_ledger.identity_matches(record)
-    if ok and reason == "live":
-        return True, reason
-    return False, reason
+    try:
+        pid = int(row.get("pid") or record.get("worker_pid") or 0)
+    except (TypeError, ValueError):
+        return False, "no_pid"
+    probe = identity_probe or goalflight_ledger.process_identity
+    current = probe(pid)
+    return goalflight_ledger.compare_fine_process_identities(
+        pid, recorded, current
+    )
 
 
 def _quota_no_controller_progress(record: dict[str, Any]) -> bool:
@@ -1050,8 +1261,18 @@ def _finish_quota_stuck_ledger(record: dict[str, Any], *, reason: dict[str, Any]
     return False
 
 
-def _terminate_quota_process_group(pgid: int) -> str:
-    return _terminate_process_group(int(pgid))
+def _terminate_quota_process_group(
+    pgid: int,
+    *,
+    expected_identity: dict[str, Any] | None = None,
+    identity_probe: Callable[[int], dict[str, Any] | None] | None = None,
+) -> str:
+    return _terminate_process_group(
+        int(pgid),
+        pid=int(pgid),
+        expected_identity=expected_identity,
+        identity_probe=identity_probe,
+    )
 
 
 def reap_quota_stuck_workers(
@@ -1063,6 +1284,8 @@ def reap_quota_stuck_workers(
     terminate_group: Callable[[int], str] | None = None,
     now_ts: float | None = None,
     enabled: bool | None = None,
+    identity_probe: Callable[[int], dict[str, Any] | None] | None = None,
+    target_liveness_probe: Callable[[int, int], bool] | None = None,
 ) -> dict[str, Any]:
     """Reap bash-tail workers proven stuck on provider quota.
 
@@ -1081,7 +1304,6 @@ def reap_quota_stuck_workers(
     rows = process_rows if process_rows is not None else _list_posix_process_rows()
     ledger_records = records if records is not None else goalflight_ledger.read_records()
     pgid_for = getpgid or os.getpgid
-    kill_group = terminate_group or _terminate_quota_process_group
     now = time.time() if now_ts is None else now_ts
     candidates: list[dict[str, Any]] = []
     reaped: list[dict[str, Any]] = []
@@ -1105,7 +1327,9 @@ def reap_quota_stuck_workers(
             continue
         if ppid != 1 and not _quota_no_controller_progress(record):
             continue
-        identity_ok, identity_reason = _quota_worker_identity_matches(record, row)
+        identity_ok, identity_reason = _quota_worker_identity_matches(
+            record, row, identity_probe=identity_probe
+        )
         if not identity_ok:
             log.info(
                 "quota_stuck_reap: skip pid=%d dispatch_id=%s identity=%s",
@@ -1142,10 +1366,35 @@ def reap_quota_stuck_workers(
             "signature": info.get("signature"),
         }
         candidates.append(candidate)
-        try:
-            action = kill_group(pgid)
-        except (ProcessLookupError, PermissionError, OSError) as exc:
-            candidate["action"] = f"failed:{type(exc).__name__}"
+        identity_ok, identity_reason = _quota_worker_identity_matches(
+            record, row, identity_probe=identity_probe
+        )
+        if not identity_ok:
+            if identity_reason != "dead":
+                candidate["action"] = f"skipped:{identity_reason}"
+                continue
+            action = "skip_identity:dead"
+        else:
+            try:
+                if terminate_group is not None:
+                    action = terminate_group(pgid)
+                else:
+                    action = _terminate_process_group(
+                        pgid,
+                        pid=pid,
+                        expected_identity=record.get("worker_identity"),
+                        identity_probe=identity_probe,
+                    )
+            except (ProcessLookupError, PermissionError, OSError) as exc:
+                candidate["action"] = f"failed:{type(exc).__name__}"
+                continue
+        if _termination_incomplete(
+            pid=pid,
+            pgid=pgid,
+            action=action,
+            target_liveness_probe=target_liveness_probe,
+        ):
+            candidate["action"] = action
             continue
         lease_result = _release_quota_stuck_lease(pid, dispatch_id=record.get("dispatch_id"), reason=reason)
         ledger_updated = _finish_quota_stuck_ledger(record, reason=reason)
@@ -2436,7 +2685,7 @@ class GoalflightAcpConnection:
     reusable: bool = True
     last_active: float = field(default_factory=time.time)
     session_reset: bool = False
-    _started_meta: tuple[str, str] | None = None
+    _started_identity: dict[str, Any] | None = None
     _stderr_task: asyncio.Task | None = None
     _registered: bool = False
     # Set when the runner intentionally DETACHES this worker on a non-destructive
@@ -2445,7 +2694,7 @@ class GoalflightAcpConnection:
     _detached: bool = False
 
     def __post_init__(self) -> None:
-        self._started_meta = _ps_meta(self.proc.pid)
+        self._started_identity = goalflight_ledger.process_identity(self.proc.pid)
         _register_connection(self)
         self._registered = True
         if self.proc.stderr is not None:
@@ -2565,31 +2814,66 @@ class GoalflightAcpConnection:
 
     async def kill(self) -> None:
         if self.alive:
-            live_meta = _ps_meta(self.proc.pid)
-            if not _same_process(self._started_meta, live_meta):
+            live_identity = goalflight_ledger.process_identity(self.proc.pid)
+            matched, reason = goalflight_ledger.compare_fine_process_identities(
+                self.proc.pid, self._started_identity, live_identity
+            )
+            if not matched:
                 log.warning(
-                    "kill skipped: pid=%d identity changed live=%r recorded=%r",
+                    "kill skipped: pid=%d identity changed reason=%s live=%r recorded=%r",
                     self.proc.pid,
-                    live_meta,
-                    self._started_meta,
+                    reason,
+                    _identity_token(live_identity),
+                    _identity_token(self._started_identity),
                 )
+                if reason == "identity_indeterminate":
+                    return
             else:
+                signal_sent = False
                 try:
                     hard_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    killed = goalflight_compat.kill_pid(
+                    signal_sent = goalflight_compat.kill_pid(
                         self.proc.pid,
                         hard_signal,
                         pgid=self.verified_pgid,
                         process_group=True,
+                        fallback_to_pid=False,
                     )
-                    if not killed:
-                        with contextlib.suppress(ProcessLookupError, PermissionError):
-                            self.proc.kill()
                 except (ProcessLookupError, PermissionError):
-                    with contextlib.suppress(ProcessLookupError, PermissionError):
-                        self.proc.kill()
-                with contextlib.suppress(Exception):
-                    await self.proc.wait()
+                    signal_sent = False
+                if not signal_sent:
+                    retry_identity = goalflight_ledger.process_identity(
+                        self.proc.pid
+                    )
+                    retry_ok, retry_reason = (
+                        goalflight_ledger.compare_fine_process_identities(
+                            self.proc.pid,
+                            self._started_identity,
+                            retry_identity,
+                        )
+                    )
+                    if not retry_ok:
+                        log.warning(
+                            "kill fallback skipped: pid=%d identity changed "
+                            "reason=%s live=%r recorded=%r",
+                            self.proc.pid,
+                            retry_reason,
+                            _identity_token(retry_identity),
+                            _identity_token(self._started_identity),
+                        )
+                        if retry_reason == "identity_indeterminate":
+                            return
+                    else:
+                        try:
+                            self.proc.kill()
+                            signal_sent = True
+                        except ProcessLookupError:
+                            pass
+                        except (PermissionError, OSError):
+                            return
+                if signal_sent:
+                    with contextlib.suppress(Exception):
+                        await self.proc.wait()
         if self._registered:
             with contextlib.suppress(Exception):
                 _unregister_connection(self)
@@ -2760,6 +3044,7 @@ async def spawn_acp_connection(
             f"process group isolation failed: pid={proc.pid} pgid={verified_pgid}; "
             "start_new_session=True did not produce a session leader"
         )
+    oversized_worker_identity = goalflight_ledger.process_identity(proc.pid)
 
     activity = activity or AcpLivenessActivity()
     effective_policy = permission_policy or permission_policy_for_dispatch(sandboxed.profile)
@@ -2780,18 +3065,51 @@ async def spawn_acp_connection(
     async def kill_pathological_oversized_frame() -> None:
         if proc.returncode is not None:
             return
+        live_identity = goalflight_ledger.process_identity(proc.pid)
+        identity_ok, identity_reason = (
+            goalflight_ledger.compare_fine_process_identities(
+                proc.pid, oversized_worker_identity, live_identity
+            )
+        )
+        if not identity_ok:
+            log.warning(
+                "oversized frame kill skipped: pid=%d identity=%s",
+                proc.pid,
+                identity_reason,
+            )
+            return
         hard_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-        killed = goalflight_compat.kill_pid(
+        signal_sent = goalflight_compat.kill_pid(
             proc.pid,
             hard_signal,
             pgid=verified_pgid,
             process_group=True,
+            fallback_to_pid=False,
         )
-        if not killed:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
+        if not signal_sent:
+            retry_identity = goalflight_ledger.process_identity(proc.pid)
+            retry_ok, retry_reason = (
+                goalflight_ledger.compare_fine_process_identities(
+                    proc.pid, oversized_worker_identity, retry_identity
+                )
+            )
+            if not retry_ok:
+                log.warning(
+                    "oversized frame fallback kill skipped: pid=%d identity=%s",
+                    proc.pid,
+                    retry_reason,
+                )
+                return
+            try:
                 proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
+                signal_sent = True
+            except ProcessLookupError:
+                return
+            except (PermissionError, OSError):
+                return
+        if signal_sent:
+            with contextlib.suppress(Exception):
+                await proc.wait()
 
     guarded_reader = GuardedStreamReader(
         stdout_reader,
