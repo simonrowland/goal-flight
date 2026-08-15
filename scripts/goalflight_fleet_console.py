@@ -1708,7 +1708,6 @@ def build_attention_plane(
     kwargs: dict[str, Any] = {
         "owned_dispatch_ids": None,
         "task_store_project_root": None,
-        "unread_only": True,
     }
     if messages_dir is not None:
         kwargs["messages_dir"] = messages_dir

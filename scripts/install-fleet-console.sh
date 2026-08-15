@@ -22,7 +22,7 @@ Usage:
   scripts/install-fleet-console.sh [--plane attention|fleet] --uninstall
 
 Installs two per-user launchd agents by default:
-  attention  every 5s, with a 4s wall-clock budget
+  attention  every 30s, with a 25s wall-clock budget
   fleet      every 60s, with a 50s wall-clock budget
 
 Environment:
@@ -128,11 +128,15 @@ plane_values() {
   LOG_VALUE="${LOG_DIR}/fleet-console-${PLANE_VALUE}-launchd.log"
   case "$PLANE_VALUE" in
     attention)
-      # Premise: renderer cadence is 5s. Reserve 1s for timeout cleanup and
-      # atomic DEGRADED publication: 5s - 1s = 4s. Units remain seconds;
-      # sanity: 0s < 4s < 5s.
-      INTERVAL_VALUE=5
-      BUDGET_VALUE=4
+      # Premise: a real attention sample measured 12.7s on a live machine
+      # with ~1.9k registered lease generations (2026-08-15), so the old
+      # 5s/4s pair published DEGRADED stubs on every tick. Cadence follows
+      # the measurement: interval 30s, budget = interval - 5s reserve for
+      # timeout cleanup and atomic publication = 25s. Units remain seconds;
+      # sanity: 12.7s < 25s < 30s (~2x measured runtime). b-151 tracks
+      # optimizing the sample back toward a faster cadence.
+      INTERVAL_VALUE=30
+      BUDGET_VALUE=25
       ;;
     fleet)
       # Premise: renderer cadence is 60s and a normal fleet sample is ~18s.
