@@ -681,7 +681,7 @@ def test_cli() -> None:
 
 
 def test_wait_cli() -> None:
-    orig_payload, orig_root = S.status_payload, S.this_project_root
+    orig_cycle, orig_root = S._wait_cycle_payload, S.this_project_root
     payload = sample_payload()
     payload["dispatch"]["records"].append(
         {
@@ -693,7 +693,11 @@ def test_wait_cli() -> None:
             "worker_still_alive": True,
         }
     )
-    S.status_payload = lambda: payload
+    for record in payload["dispatch"]["records"]:
+        record["_wait_snapshot_complete"] = True
+        record["_wait_ledger_snapshot"] = dict(record)
+        record["_wait_status_snapshot"] = {}
+    S._wait_cycle_payload = lambda *args, **kwargs: payload
     S.this_project_root = lambda: "/repo/A"
     try:
         buf = io.StringIO()
@@ -730,7 +734,7 @@ def test_wait_cli() -> None:
         check("--wait --json returns 0", rc == 0)
         check("--wait --json has dispatch row", payload_json["dispatches"][0]["dispatch_id"] == "done1")
     finally:
-        S.status_payload, S.this_project_root = orig_payload, orig_root
+        S._wait_cycle_payload, S.this_project_root = orig_cycle, orig_root
 
 
 def _wait_payload(dispatch_id: str, classification: str, *, terminal_state: str | None = None) -> dict:
@@ -744,6 +748,9 @@ def _wait_payload(dispatch_id: str, classification: str, *, terminal_state: str 
     }
     if terminal_state is not None:
         record["terminal_state"] = terminal_state
+    record["_wait_snapshot_complete"] = True
+    record["_wait_ledger_snapshot"] = dict(record)
+    record["_wait_status_snapshot"] = {}
     return {
         "schema": "goalflight.status.aggregate.v1",
         "capacity": {"operating_cap": 16},
@@ -779,20 +786,20 @@ def test_wait_default_timeout() -> None:
 
 
 def test_wait_unbounded_sentinels_and_positive_timeout() -> None:
-    orig_payload = S.status_payload
+    orig_cycle = S._wait_cycle_payload
     orig_sleep = S.time.sleep
     orig_monotonic = S.time.monotonic
 
     def run_unbounded(timeout_s: float | None) -> tuple[int, int, str]:
         calls = {"count": 0}
 
-        def payload_sequence() -> dict:
+        def payload_sequence(*_args, **_kwargs) -> dict:
             calls["count"] += 1
             if calls["count"] == 1:
                 return _wait_payload("flip", "expected_live")
             return _wait_payload("flip", "complete", terminal_state="complete")
 
-        S.status_payload = payload_sequence
+        S._wait_cycle_payload = payload_sequence
         S.time.sleep = lambda _seconds: None
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -813,7 +820,9 @@ def test_wait_unbounded_sentinels_and_positive_timeout() -> None:
         check("internal None timeout waits unbounded until terminal", rc == 0 and calls == 2)
         check("internal None reports eventual terminal state", "flip -> complete" in out)
 
-        S.status_payload = lambda: _wait_payload("pending1", "expected_live")
+        S._wait_cycle_payload = lambda *_args, **_kwargs: _wait_payload(
+            "pending1", "expected_live"
+        )
         times = itertools.count(0.0, 0.2)
         S.time.monotonic = lambda: next(times)
         S.time.sleep = lambda _seconds: None
@@ -830,13 +839,13 @@ def test_wait_unbounded_sentinels_and_positive_timeout() -> None:
         check("positive --wait-timeout reports pending ids", "pending pending1" in out)
         check("positive --wait-timeout marks nonterminal timeout", "pending1 -> timeout" in out)
     finally:
-        S.status_payload = orig_payload
+        S._wait_cycle_payload = orig_cycle
         S.time.sleep = orig_sleep
         S.time.monotonic = orig_monotonic
 
 
 def test_wait_keyboard_interrupt_returns_130_without_signal() -> None:
-    orig_payload = S.status_payload
+    orig_cycle = S._wait_cycle_payload
     orig_sleep = S.time.sleep
     orig_run = S.subprocess.run
     subprocess_calls: list[tuple] = []
@@ -861,13 +870,13 @@ def test_wait_keyboard_interrupt_returns_130_without_signal() -> None:
         interrupted["yes"] = True
         raise KeyboardInterrupt()
 
-    def payload_without_pid() -> dict:
+    def payload_without_pid(*_args, **_kwargs) -> dict:
         payload = _wait_payload("live1", "unknown_no_pid")
         payload["dispatch"]["records"][0].pop("worker_pid", None)
         return payload
 
     try:
-        S.status_payload = payload_without_pid
+        S._wait_cycle_payload = payload_without_pid
         S.time.sleep = interrupt_now
         S.subprocess.run = fail_subprocess
         err = io.StringIO()
@@ -883,7 +892,7 @@ def test_wait_keyboard_interrupt_returns_130_without_signal() -> None:
               "goalflight_status.py --wait live1" in err.getvalue())
         check("KeyboardInterrupt wait sends no subprocess signal", subprocess_calls == [])
     finally:
-        S.status_payload = orig_payload
+        S._wait_cycle_payload = orig_cycle
         S.time.sleep = orig_sleep
         S.subprocess.run = orig_run
 
@@ -951,14 +960,20 @@ def test_wait_explicit_id_uses_drain_status_identity_across_scope() -> None:
                         "classification": "unknown",
                         "state": "running",
                         "agent": "codex",
-                        "worker_pid": 98515,
+                        "worker_pid": 4242,
+                        "worker_identity": {
+                            "pid": 4242,
+                            "lstart": "Thu Jul  2 17:53:52 2026",
+                            "comm": "node",
+                        },
                         "status_path": str(status_path),
+                        "_wait_snapshot_complete": True,
                     }
                 ],
                 "surplus_processes": [],
             },
         }
-        orig_payload = S.status_payload
+        orig_cycle = S._wait_cycle_payload
         orig_read_records = S.goalflight_ledger.read_records
         orig_identity_matches = S.goalflight_ledger.identity_matches
         orig_pid_alive = S.goalflight_compat.pid_alive
@@ -968,7 +983,7 @@ def test_wait_explicit_id_uses_drain_status_identity_across_scope() -> None:
         seen: list[dict] = []
         times = iter([0.0, 0.2])
         try:
-            S.status_payload = lambda: machine_payload
+            S._wait_cycle_payload = lambda *_args, **_kwargs: machine_payload
             S.goalflight_ledger.read_records = lambda: []
             S.goalflight_compat.pid_alive = lambda _pid: False
             S.goalflight_ledger.identity_matches = lambda record: seen.append(record) or (True, "live")
@@ -992,7 +1007,7 @@ def test_wait_explicit_id_uses_drain_status_identity_across_scope() -> None:
             check("drain live wait used status identity pid",
                   seen and seen[-1].get("worker_pid") == 4242)
         finally:
-            S.status_payload = orig_payload
+            S._wait_cycle_payload = orig_cycle
             S.goalflight_ledger.read_records = orig_read_records
             S.goalflight_ledger.identity_matches = orig_identity_matches
             S.goalflight_compat.pid_alive = orig_pid_alive
@@ -1034,8 +1049,14 @@ def test_wait_dead_drain_status_identity_does_not_cast_second_verdict() -> None:
                         "classification": "unknown",
                         "state": "running",
                         "agent": "codex",
-                        "worker_pid": 98515,
+                        "worker_pid": 4242,
+                        "worker_identity": {
+                            "pid": 4242,
+                            "lstart": "Thu Jul  2 17:53:52 2026",
+                            "comm": "node",
+                        },
                         "status_path": str(status_path),
+                        "_wait_snapshot_complete": True,
                     }
                 ],
                 "surplus_processes": [],

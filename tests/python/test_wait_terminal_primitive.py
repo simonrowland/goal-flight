@@ -323,11 +323,10 @@ def test_wait_heartbeat_emits_progress_line_at_cadence() -> None:
                 "tail_path": str(tail),
             }
         )
-        saved_status, saved_scope = status.status_payload, status.scope_payload
+        saved_cycle = status._wait_cycle_payload
         saved_alive = compat.pid_alive
         saved_cpu = status._wait_process_cpu_pct
-        status.status_payload = lambda: payload  # type: ignore[assignment]
-        status.scope_payload = lambda p, root: p  # type: ignore[assignment]
+        status._wait_cycle_payload = lambda *args, **kwargs: payload  # type: ignore[assignment]
         compat.pid_alive = lambda pid: True  # type: ignore[assignment]
         status._wait_process_cpu_pct = lambda record: 3.0  # type: ignore[assignment]
         try:
@@ -343,8 +342,7 @@ def test_wait_heartbeat_emits_progress_line_at_cadence() -> None:
                 )
             out = buf.getvalue()
         finally:
-            status.status_payload = saved_status  # type: ignore[assignment]
-            status.scope_payload = saved_scope  # type: ignore[assignment]
+            status._wait_cycle_payload = saved_cycle  # type: ignore[assignment]
             compat.pid_alive = saved_alive  # type: ignore[assignment]
             status._wait_process_cpu_pct = saved_cpu  # type: ignore[assignment]
     assert_eq("heartbeat wait times out", rc, 1)
@@ -380,18 +378,18 @@ def test_arming_a_wait_announces_mail_before_it_blocks() -> None:
     import goalflight_messages as gm
 
     real_emit = gm.emit_controller_mail_notice
-    real_payload = status.status_payload
+    real_cycle = status._wait_cycle_payload
 
     def fake_emit(**kwargs):
         calls.append(("mail-notice", kwargs.get("stream")))
         return "1 new mail"
 
-    def fake_payload(*args, **kwargs):
+    def fake_cycle(*args, **kwargs):
         calls.append(("poll", None))
-        return real_payload(*args, **kwargs)
+        return real_cycle(*args, **kwargs)
 
     gm.emit_controller_mail_notice = fake_emit
-    status.status_payload = fake_payload
+    status._wait_cycle_payload = fake_cycle
     try:
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -403,7 +401,7 @@ def test_arming_a_wait_announces_mail_before_it_blocks() -> None:
             )
     finally:
         gm.emit_controller_mail_notice = real_emit
-        status.status_payload = real_payload
+        status._wait_cycle_payload = real_cycle
 
     assert_true("mail notice was emitted at all", any(c[0] == "mail-notice" for c in calls))
     assert_eq("mail notice is the FIRST thing the wait does", calls[0][0], "mail-notice")
@@ -414,6 +412,151 @@ def test_arming_a_wait_announces_mail_before_it_blocks() -> None:
         "no mail text leaked onto stdout (the --json contract)",
         "new mail" not in buf.getvalue(),
     )
+
+
+def test_live_journal_attempt_suppresses_torn_terminal_sidecar() -> None:
+    marker = {
+        "kind": "COMPLETE",
+        "text": "torn-live — stale terminal publication",
+        "line": 1,
+    }
+    record = status._wait_record_from_snapshots(
+        "torn-live",
+        {
+            "dispatch_id": "torn-live",
+            "state": "complete",
+            "terminal_state": "complete",
+            "terminal_marker": marker,
+        },
+        {
+            "dispatch_id": "torn-live",
+            "state": "complete",
+            "terminal_marker": marker,
+        },
+        {"lifecycle_state": "RUNNING"},
+    )
+    assert_true("journal live record exists", isinstance(record, dict))
+    assert_eq("journal live state wins", record.get("state"), "running")
+    assert_eq("torn marker removed", record.get("terminal_marker"), None)
+    assert_true("torn terminal does not finish wait", status.done_code(record) != 0)
+
+
+def test_terminal_journal_outbox_wins_live_ledger() -> None:
+    record = status._wait_record_from_snapshots(
+        "journal-need",
+        {"dispatch_id": "journal-need", "state": "running"},
+        {"dispatch_id": "journal-need", "state": "running"},
+        {
+            "lifecycle_state": "TERMINAL",
+            "terminal_state": "blocked",
+            "terminal_outcome_json": json.dumps(
+                {"state": "blocked", "worker_still_alive": True, "outcome": {}}
+            ),
+            "event_type": "user_need",
+            "payload_json": json.dumps({"text": "landing checkpoint"}),
+        },
+    )
+    assert_true("journal terminal record exists", isinstance(record, dict))
+    assert_eq(
+        "journal terminal wins even if process remains live",
+        status.done_code(record, worker_alive=True),
+        0,
+    )
+    assert_eq(
+        "outbox kind preserved",
+        record.get("terminal_marker", {}).get("kind"),
+        "USER-NEED",
+    )
+    assert_true(
+        "synthetic marker remains id-bound",
+        record.get("terminal_marker", {}).get("text", "").startswith("journal-need "),
+    )
+
+
+def test_unreadable_journal_never_promotes_file_terminal() -> None:
+    marker = {
+        "kind": "COMPLETE",
+        "text": "journal-error — stale file terminal",
+        "line": 1,
+    }
+    record = status._wait_record_from_snapshots(
+        "journal-error",
+        {
+            "dispatch_id": "journal-error",
+            "state": "complete",
+            "terminal_state": "complete",
+            "terminal_marker": marker,
+        },
+        {
+            "dispatch_id": "journal-error",
+            "state": "complete",
+            "terminal_marker": marker,
+        },
+        {"_wait_journal_error": True},
+    )
+    assert_true("journal error record exists", isinstance(record, dict))
+    assert_eq("journal error remains nonterminal", status.done_code(record), 2)
+    assert_eq("file marker suppressed on authority failure", record.get("terminal_marker"), None)
+
+
+def test_narrow_snapshot_reuses_one_sidecar_generation() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        status_path = Path(tmp) / "cached.status.json"
+        status_path.write_text(
+            json.dumps({"dispatch_id": "cached", "pgroup_cpu_pct": 99.0}),
+            encoding="utf-8",
+        )
+        record = status._wait_record_from_snapshots(
+            "cached",
+            {
+                "dispatch_id": "cached",
+                "state": "running",
+                "status_path": str(status_path),
+            },
+            {"dispatch_id": "cached", "pgroup_cpu_pct": 3.0},
+            None,
+        )
+        assert_true("cached narrow record exists", isinstance(record, dict))
+        assert_eq("CPU comes from cycle snapshot", status._wait_process_cpu_pct(record), 3.0)
+        assert_eq(
+            "sidecar helper does not reopen newer file",
+            status._status_json_payload(record).get("pgroup_cpu_pct"),
+            3.0,
+        )
+
+
+def test_wait_hot_loop_never_calls_machine_status_payload() -> None:
+    saved_status = status.status_payload
+    saved_cycle = status._wait_cycle_payload
+    saved_mail = status._mail_watermark
+
+    def reject_machine_aggregate() -> dict:
+        raise AssertionError("wait hot loop rebuilt machine aggregate")
+
+    record = {
+        "dispatch_id": "narrow-only",
+        "classification": "complete",
+        "state": "complete",
+        "terminal_state": "complete",
+        "_wait_snapshot_complete": True,
+        "_wait_ledger_snapshot": {},
+        "_wait_status_snapshot": {},
+    }
+    status.status_payload = reject_machine_aggregate  # type: ignore[assignment]
+    status._wait_cycle_payload = lambda *args, **kwargs: _payload(record)  # type: ignore[assignment]
+    status._mail_watermark = lambda *args, **kwargs: None  # type: ignore[assignment]
+    try:
+        code = status._wait_for_dispatches_registered(
+            ["narrow-only"],
+            project_root=str(ROOT),
+            timeout_s=1.0,
+            poll_s=0.05,
+        )
+    finally:
+        status.status_payload = saved_status  # type: ignore[assignment]
+        status._wait_cycle_payload = saved_cycle  # type: ignore[assignment]
+        status._mail_watermark = saved_mail  # type: ignore[assignment]
+    assert_eq("narrow wait completes", code, 0)
 
 
 def main() -> None:
@@ -428,6 +571,11 @@ def main() -> None:
         test_marker_helpers_share_the_aggregate_snapshot,
         test_status_marker_fallback_rejects_nonterminal_and_wrong_dispatch,
         test_wait_heartbeat_emits_progress_line_at_cadence,
+        test_live_journal_attempt_suppresses_torn_terminal_sidecar,
+        test_terminal_journal_outbox_wins_live_ledger,
+        test_unreadable_journal_never_promotes_file_terminal,
+        test_narrow_snapshot_reuses_one_sidecar_generation,
+        test_wait_hot_loop_never_calls_machine_status_payload,
     ]
     for test in tests:
         test()

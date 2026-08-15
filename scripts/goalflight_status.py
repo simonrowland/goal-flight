@@ -149,6 +149,12 @@ def _wait_liveness_record(record: dict | None) -> dict | None:
     """
     if record is None:
         return None
+    # The narrow --wait poll has already read and bound the raw ledger row and
+    # status sidecar into one cycle snapshot. Reopening either source here
+    # would tear a verdict across publication generations (and, for a missing
+    # row, could fall back to a machine-wide runs.d scan).
+    if record.get("_wait_snapshot_complete"):
+        return record
     dispatch_id = record.get("dispatch_id")
     if dispatch_id:
         raw = _raw_ledger_record_for_dispatch(dispatch_id)
@@ -386,6 +392,9 @@ def _persist_draft_artifact_reconciliation(record: dict, reconciled: dict) -> No
 
 
 def _status_json_payload(record: dict) -> dict:
+    if "_wait_status_snapshot" in record:
+        cached = record.get("_wait_status_snapshot")
+        return cached if isinstance(cached, dict) else {}
     status_path = record.get("status_path")
     if not status_path:
         return {}
@@ -397,6 +406,9 @@ def _status_json_payload(record: dict) -> dict:
 
 
 def _ledger_record_payload(record: dict) -> dict:
+    if "_wait_ledger_snapshot" in record:
+        cached = record.get("_wait_ledger_snapshot")
+        return cached if isinstance(cached, dict) else {}
     dispatch_id = record.get("dispatch_id")
     if not dispatch_id:
         return {}
@@ -1041,6 +1053,11 @@ def done_code(record: dict, *, worker_alive: bool | None = None) -> int:
         record.get("classification")
     ):
         return 0
+    # The P2 journal transition/outbox pair is the terminal authority. Unlike
+    # a marker scraped from worker prose, it cannot be contradicted by a still-
+    # live process (attention commits commonly leave that process parked).
+    if record.get("_wait_journal_terminal"):
+        return 0
     marker_code = terminal_marker_done_code(record, worker_alive=worker_alive)
     if marker_code is not None:
         # A terminal marker is scraped from worker OUTPUT, so ordinary text can
@@ -1094,6 +1111,297 @@ def _payload_with_explicit_wait_records(scoped_payload: dict, machine_payload: d
     out = dict(scoped_payload)
     out["dispatch"] = dict(scoped_payload["dispatch"], records=scoped_records + additions)
     return out
+
+
+def _wait_raw_record(dispatch_id: str) -> dict | None:
+    """Read exactly one id-bound runs.d row; never enumerate dispatch history."""
+    try:
+        path = goalflight_ledger.record_path(dispatch_id, create=False)
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict) or raw.get("dispatch_id") != dispatch_id:
+        return None
+    return raw
+
+
+def _wait_status_sidecar(raw: dict | None, dispatch_id: str) -> dict:
+    """Read one status publication and enforce its dispatch binding."""
+    if not isinstance(raw, dict):
+        return {}
+    sidecar = _status_json_payload(raw)
+    if not sidecar or sidecar.get("dispatch_id") not in (None, dispatch_id):
+        return {}
+    return sidecar
+
+
+def _wait_json_object(value: object) -> dict:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _wait_authority_rows(
+    wait_ids: list[str],
+    raw_records: dict[str, dict | None],
+    *,
+    project_root: str | None,
+    journal_cache: dict[str, object | None],
+) -> dict[str, dict]:
+    """Read journal attempt+outbox authority for only the requested ids."""
+    grouped: dict[str, list[str]] = {}
+    for dispatch_id in wait_ids:
+        raw = raw_records.get(dispatch_id) or {}
+        root_value = raw.get("project_root") or project_root or str(Path.cwd())
+        try:
+            root_key = str(goalflight_task.resolve_project_root(str(root_value)))
+        except (OSError, RuntimeError, ValueError):
+            root_key = str(Path(str(root_value)).resolve(strict=False))
+        grouped.setdefault(root_key, []).append(dispatch_id)
+
+    authority: dict[str, dict] = {}
+    for root_key, dispatch_ids in grouped.items():
+        if root_key not in journal_cache:
+            try:
+                opener = getattr(
+                    goalflight_journal.Journal,
+                    "open_reader",
+                    goalflight_journal.Journal,
+                )
+                journal_cache[root_key] = opener(root_key)
+            except Exception:
+                try:
+                    journal_exists = goalflight_journal.resolve_journal_path(root_key).exists()
+                except Exception:
+                    journal_exists = False
+                # None means a legacy/tmp project with no journal. False means
+                # authority exists but cannot be read, which must fail closed.
+                journal_cache[root_key] = False if journal_exists else None
+        journal = journal_cache[root_key]
+        if journal is None:
+            continue
+        if journal is False:
+            for dispatch_id in dispatch_ids:
+                authority[dispatch_id] = {"_wait_journal_error": True}
+            continue
+        placeholders = ",".join("?" for _ in dispatch_ids)
+        try:
+            rows = journal.read_all(
+                """
+                SELECT a.dispatch_id, a.lifecycle_state, a.terminal_state,
+                       a.terminal_outcome_json, a.terminal_at,
+                       o.event_type, o.payload_json, o.projected_at
+                FROM dispatch_attempts AS a
+                LEFT JOIN terminal_outbox AS o
+                  ON o.attempt_id = a.attempt_id
+                 AND o.transition_id = a.terminal_transition_id
+                WHERE a.project_root = ?
+                  AND a.dispatch_id IN ("""
+                + placeholders
+                + ")",
+                (root_key, *dispatch_ids),
+            )
+        except Exception:
+            journal_cache[root_key] = False
+            for dispatch_id in dispatch_ids:
+                authority[dispatch_id] = {"_wait_journal_error": True}
+            continue
+        for row in rows:
+            item = dict(row)
+            dispatch_id = str(item.get("dispatch_id") or "")
+            if dispatch_id in dispatch_ids:
+                authority[dispatch_id] = item
+    return authority
+
+
+def _wait_authority_marker(
+    dispatch_id: str,
+    authority: dict,
+    sidecar: dict,
+) -> dict | None:
+    marker = _validated_terminal_marker(sidecar, expected_dispatch_id=dispatch_id)
+    if marker is not None:
+        return marker
+
+    observation = _wait_json_object(authority.get("terminal_outcome_json"))
+    outcome = observation.get("outcome")
+    error = outcome.get("error") if isinstance(outcome, dict) else None
+    if isinstance(error, dict):
+        marker = _validated_terminal_marker(error, expected_dispatch_id=dispatch_id)
+        if marker is not None:
+            return marker
+
+    event_type = str(authority.get("event_type") or "")
+    terminal_state = str(authority.get("terminal_state") or "")
+    kind = (
+        str(error.get("marker_kind"))
+        if isinstance(error, dict) and error.get("marker_kind")
+        else "USER-NEED"
+        if event_type == "user_need"
+        else "USER-CONFIRM"
+        if event_type == "user_confirm"
+        else "COMPLETE"
+        if event_type == "result" or terminal_state == "complete"
+        else "BLOCKED"
+        if event_type == "blocked"
+        else ""
+    )
+    if kind not in _OUTPUT_TAIL_TERMINAL_MARKERS:
+        return None
+    outbox = _wait_json_object(authority.get("payload_json"))
+    text = str(
+        (error.get("text") if isinstance(error, dict) else None)
+        or outbox.get("text")
+        or f"dispatch terminal: {terminal_state or kind.lower()}"
+    )
+    if text != dispatch_id and not text.startswith(f"{dispatch_id} "):
+        text = f"{dispatch_id} — {text}"
+    return {"kind": kind, "text": text}
+
+
+def _wait_record_from_snapshots(
+    dispatch_id: str,
+    raw: dict | None,
+    sidecar: dict,
+    authority: dict | None,
+) -> dict | None:
+    """Build one immutable-enough per-cycle verdict source for one dispatch."""
+    if raw is None and authority is None:
+        return None
+    record = dict(raw or {"dispatch_id": dispatch_id})
+    record["dispatch_id"] = dispatch_id
+    record["_wait_snapshot_complete"] = True
+    record["_wait_ledger_snapshot"] = dict(raw or {})
+    record["_wait_status_snapshot"] = dict(sidecar)
+
+    # These are liveness/progress observations, not terminal authority. Copy
+    # them from the same sidecar generation used by the rest of this record.
+    for key in (
+        "trace_path",
+        "trace_mtime",
+        "trace_active",
+        "liveness_state",
+        "pgroup_cpu_pct",
+    ):
+        if key in sidecar:
+            record[key] = sidecar[key]
+    identity = sidecar.get("expected_worker_identity")
+    if not isinstance(identity, dict):
+        identity = sidecar.get("worker_identity")
+    if not isinstance(identity, dict):
+        identity = None
+    if isinstance(identity, dict):
+        record["worker_identity"] = identity
+    pid = sidecar.get("worker_pid") or (identity or {}).get("pid")
+    if pid:
+        record["worker_pid"] = pid
+    tail_path = sidecar.get("tail_path")
+    if tail_path:
+        record["tail_path"] = tail_path
+        record.setdefault("stdout_path", tail_path)
+
+    if (authority or {}).get("_wait_journal_error"):
+        # Never promote a file-side terminal while P2 authority is unreadable.
+        # Keeping the row nonterminal makes the existing wait timeout surface
+        # the problem loudly instead of manufacturing success.
+        for key in ("terminal_state", "terminal_marker", "last_marker", "markers"):
+            record.pop(key, None)
+        record["state"] = "journal_unavailable"
+        record["classification"] = "journal_unavailable"
+        return _decorate_trace_status(record)
+
+    lifecycle = str((authority or {}).get("lifecycle_state") or "")
+    if lifecycle in goalflight_journal.ATTEMPT_FINAL_STATES:
+        observation = _wait_json_object(authority.get("terminal_outcome_json"))
+        terminal_state = str(authority.get("terminal_state") or "unknown")
+        state = str(observation.get("state") or terminal_state)
+        record.update(
+            state=state,
+            classification=terminal_state,
+            terminal_state=terminal_state,
+            ended_at=authority.get("terminal_at") or record.get("ended_at"),
+            _wait_journal_terminal=True,
+        )
+        if "worker_still_alive" in observation:
+            record["worker_still_alive"] = observation["worker_still_alive"]
+        outcome = observation.get("outcome")
+        if isinstance(outcome, dict):
+            error = outcome.get("error")
+            if error not in (None, ""):
+                record["error"] = error
+                record["reason"] = error
+            elif outcome.get("reason") not in (None, ""):
+                record["reason"] = outcome["reason"]
+        marker = _wait_authority_marker(dispatch_id, authority, sidecar)
+        if marker is not None:
+            record["terminal_marker"] = marker
+        return record
+
+    if lifecycle in goalflight_journal.ATTEMPT_LIVE_STATES:
+        # Journal state wins a torn terminal sidecar/ledger publication. Do not
+        # let scraped marker text manufacture a terminal transition.
+        record["state"] = {
+            goalflight_journal.ATTEMPT_PREPARED: "queued",
+            goalflight_journal.ATTEMPT_STARTING: "starting",
+            goalflight_journal.ATTEMPT_RUNNING: "running",
+        }[lifecycle]
+        for key in ("terminal_state", "terminal_marker", "last_marker", "markers"):
+            record.pop(key, None)
+    else:
+        # Compatibility for pre-journal/tmp seams: bind state and terminal
+        # marker to the single sidecar generation already read this cycle.
+        if sidecar.get("state"):
+            record["state"] = sidecar["state"]
+        if sidecar.get("terminal_state"):
+            record["terminal_state"] = sidecar["terminal_state"]
+        marker = _validated_terminal_marker(sidecar, expected_dispatch_id=dispatch_id)
+        if marker is not None:
+            record["terminal_marker"] = marker
+
+    record["classification"] = goalflight_ledger.classify(record)
+    if lifecycle in goalflight_journal.ATTEMPT_LIVE_STATES:
+        return _decorate_trace_status(record)
+    return _decorate_trace_status(_reconcile_output_tail_record(record))
+
+
+def _wait_cycle_payload(
+    wait_ids: list[str],
+    *,
+    project_root: str | None,
+    journal_cache: dict[str, object | None],
+) -> dict:
+    """Narrow, one-generation status payload for the ids in one wait poll."""
+    raw_records = {
+        dispatch_id: _wait_raw_record(dispatch_id) for dispatch_id in wait_ids
+    }
+    authority = _wait_authority_rows(
+        wait_ids,
+        raw_records,
+        project_root=project_root,
+        journal_cache=journal_cache,
+    )
+    records = []
+    for dispatch_id in wait_ids:
+        raw = raw_records.get(dispatch_id)
+        sidecar = _wait_status_sidecar(raw, dispatch_id)
+        record = _wait_record_from_snapshots(
+            dispatch_id,
+            raw,
+            sidecar,
+            authority.get(dispatch_id),
+        )
+        if record is not None:
+            records.append(record)
+    return {
+        "schema": "goalflight.status.wait.v1",
+        "dispatch": {"records": records},
+    }
 
 
 def _signal(record: dict) -> str:
@@ -1298,6 +1606,19 @@ def _wait_process_cpu_pct(record: dict | None) -> float | None:
     """
     if not isinstance(record, dict):
         return None
+    if "_wait_status_snapshot" in record:
+        data = record.get("_wait_status_snapshot")
+        if not isinstance(data, dict) or data.get("dispatch_id") not in (
+            None,
+            record.get("dispatch_id"),
+        ):
+            return None
+        value = data.get("pgroup_cpu_pct")
+        return (
+            float(value)
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+            else None
+        )
     status_path = record.get("status_path")
     if not isinstance(status_path, str) or not status_path:
         return None
@@ -1811,14 +2132,14 @@ def _wait_for_dispatches_registered(
     heartbeat = _WAIT_HEARTBEAT_S if heartbeat_s is None else max(0.0, heartbeat_s)
     progress_state: dict[str, dict] = {}
     heartbeat_since: dict[str, float] = {dispatch_id: start for dispatch_id in wait_ids}
+    journal_cache: dict[str, object | None] = {}
     try:
         while True:
             now = time.monotonic()
-            machine_payload = status_payload()
-            payload = _payload_with_explicit_wait_records(
-                scope_payload(machine_payload, project_root),
-                machine_payload,
+            payload = _wait_cycle_payload(
                 wait_ids,
+                project_root=project_root,
+                journal_cache=journal_cache,
             )
             rows = _wait_snapshot(
                 payload,
@@ -1906,7 +2227,7 @@ def _mail_watermark(project_root: str | None, wait_ids: list[str]) -> set[tuple[
     """Monotonic journal event identity for ``--wait``; cursor advances cannot erase it."""
     try:
         root = goalflight_task.resolve_project_root(project_root or str(Path.cwd()))
-        events = goalflight_journal.Journal(root).delivery_event_watermark(
+        events = goalflight_journal.Journal.open_reader(root).delivery_event_watermark(
             stream_ids=wait_ids,
             waking_only=True,
         )
