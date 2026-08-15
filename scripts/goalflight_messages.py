@@ -2671,7 +2671,11 @@ def controller_cursor_peek(
 
 def _listener_envelope(authority, row: dict[str, object]) -> dict:
     carrier_path = str(row.get("carrier_path") or "")
-    if carrier_path.startswith("journal:attention:"):
+    # Synthetic journal carriers ("journal:attention:", "journal:outbox-quarantine:",
+    # …) have no .jsonl file; their payload lives in system_attention_items keyed by
+    # event_uuid, inserted in the same transaction as the delivery event. Match on
+    # the "journal:" prefix so a new synthetic stream cannot wedge the whole relay.
+    if carrier_path.startswith("journal:"):
         item_id = str(row.get("event_uuid") or "")
         item = next(
             (value for value in authority.attention_items() if value.get("item_id") == item_id),
