@@ -14,7 +14,25 @@
   var CLOCK_TOLERANCE_MS = 2000;
   var MAX_VISIBLE_WORKERS = 200;
   var MAX_VISIBLE_BANDS = 50;
-  var ACTIONABLE_KINDS = { user_need: true, user_confirm: true, blocked: true };
+  var ACTIONABLE_KINDS = {
+    user_need: true,
+    user_confirm: true,
+    blocked: true,
+    controller_hung: true
+  };
+  var CONTROLLER_LIVENESS_STATES = {
+    ALIVE: true,
+    HUNG: true,
+    "WAITING-ON-USER": true,
+    DEAD: true,
+    UNKNOWN: true
+  };
+  var CONTROLLER_IDENTITY_STATES = {
+    label: true,
+    session: true,
+    owned_unknown: true,
+    unowned: true
+  };
   var DISPLAY_GLYPHS = {
     attention: "attn",
     queued: "quiet",
@@ -48,6 +66,16 @@
 
   function textValue(value) {
     return value == null || value === "" ? "unknown" : String(value);
+  }
+
+  function controllerLiveness(worker) {
+    var state = textValue(worker.controller_liveness_state);
+    return CONTROLLER_LIVENESS_STATES[state] === true ? state : "UNKNOWN";
+  }
+
+  function controllerIdentityState(worker) {
+    var state = textValue(worker.controller_state);
+    return CONTROLLER_IDENTITY_STATES[state] === true ? state : "owned_unknown";
   }
 
   function parseTs(value) {
@@ -224,8 +252,19 @@
       }
       identity.appendChild(wire);
       row.appendChild(identity);
-      row.appendChild(el("div", "controller-id " + textValue(worker.controller_state),
-        textValue(worker.controller_display)));
+      var controller = el("div", "controller-cell");
+      controller.appendChild(el(
+        "div",
+        "controller-id " + controllerIdentityState(worker),
+        textValue(worker.controller_display)
+      ));
+      var controllerState = controllerLiveness(worker);
+      controller.appendChild(el(
+        "div",
+        "controller-health " + controllerState.toLowerCase(),
+        controllerState
+      ));
+      row.appendChild(controller);
       var displayState = textValue(worker.display_state);
       if (worker.classification_conflict) displayState += " · conflicting authority fields";
       row.appendChild(el("div", "state-txt", displayState));
@@ -355,6 +394,14 @@
       : "");
     header.appendChild(el("span", "count", count));
     host.appendChild(header);
+    var truncated = ATTENTION.controller_history_probes_truncated;
+    if (typeof truncated === "number" && Number.isFinite(truncated) && truncated > 0) {
+      host.appendChild(el(
+        "div",
+        "attention-truncation",
+        "+" + truncated + " older generations unprobed"
+      ));
+    }
     if (!items.length) {
       host.appendChild(el("div", "quiet-state", "Nothing is waiting on you."));
       return;

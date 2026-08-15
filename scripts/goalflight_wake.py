@@ -8,6 +8,7 @@ read or written: a waiter is live iff its process still holds the file lock.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
@@ -54,6 +55,11 @@ def _project_key(project_root: Path | str) -> str:
 
 def _label_hash(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()[:16]
+
+
+def controller_session_digest(value: object) -> str | None:
+    """Digest a controller capability with the established publication helper."""
+    return _label_hash(value) if isinstance(value, str) and value else None
 
 
 def ledger_base_dir() -> Path:
@@ -205,6 +211,29 @@ def _open_flags(*, create_exclusive: bool = False) -> int:
     return flags
 
 
+def _directory_open_flags() -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    return flags
+
+
+def _open_ledger_directory_path(directory: Path, *, create: bool) -> int:
+    if create:
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        directory.mkdir(mode=0o700, exist_ok=True)
+    # If writers followed a ledger-leaf symlink that readers refuse, a valid
+    # waiter could be written into a permanently UNKNOWN write/read wedge.
+    return os.open(directory, _directory_open_flags())
+
+
+def _unlink_at(directory_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass
+
+
 def _lock_nonblocking(fd: int) -> None:
     assert fcntl is not None
     _set_cloexec(fd)
@@ -226,32 +255,42 @@ def _generation_lock_path(
     )
 
 
-def _acquire_contended_lock(path: Path) -> int:
+def _acquire_contended_lock(path: Path, *, directory_fd: int) -> int:
     """Acquire one well-known lock without publishing an unlocked inode."""
     assert fcntl is not None
-    path.parent.mkdir(parents=True, exist_ok=True)
+    name = path.name
     while True:
         try:
-            fd = os.open(path, _open_flags())
+            fd = os.open(name, _open_flags(), dir_fd=directory_fd)
         except FileNotFoundError:
-            pending = path.parent / f".{path.name}.{uuid.uuid4().hex}.pending"
-            pending_fd = os.open(pending, _open_flags(create_exclusive=True), 0o600)
+            pending = f".{name}.{uuid.uuid4().hex}.pending"
+            pending_fd = os.open(
+                pending,
+                _open_flags(create_exclusive=True),
+                0o600,
+                dir_fd=directory_fd,
+            )
             try:
                 _lock_nonblocking(pending_fd)
                 try:
-                    os.link(pending, path)
+                    os.link(
+                        pending,
+                        name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                    )
                 except FileExistsError:
                     fcntl.flock(pending_fd, fcntl.LOCK_UN)
                     os.close(pending_fd)
                     pending_fd = -1
-                    pending.unlink(missing_ok=True)
+                    _unlink_at(directory_fd, pending)
                     continue
-                pending.unlink(missing_ok=True)
+                _unlink_at(directory_fd, pending)
                 return pending_fd
             except BaseException:
                 if pending_fd >= 0:
                     os.close(pending_fd)
-                pending.unlink(missing_ok=True)
+                _unlink_at(directory_fd, pending)
                 raise
         try:
             _lock_nonblocking(fd)
@@ -273,6 +312,7 @@ class WaiterRegistration:
         generation_key: str | None = None,
     ) -> None:
         self._fd = -1
+        self._directory_fd = -1
         self._generation_path = None
         self._generation_fd = -1
         if fcntl is None:
@@ -283,49 +323,73 @@ class WaiterRegistration:
         if kind not in LOCK_KINDS:
             raise ValueError(f"unknown held-lock kind: {kind}")
         directory = ledger_dir(project_root)
-        directory.mkdir(parents=True, exist_ok=True)
-        identity = goalflight_compat.process_start_identity(os.getpid())
-        if not isinstance(identity, dict) or not identity.get("start_token"):
-            raise RuntimeError("held-lock owner process generation is unavailable")
-        start_hash = _start_hash(identity["start_token"])
-        instance_id = uuid.uuid4().hex
-        self.record = WaiterRecord(
-            kind=kind,
-            label_hash=_label_hash(normalized_label),
-            pid=os.getpid(),
-            start_hash=start_hash,
-            instance_id=instance_id,
-            path=directory
-            / f"{_FILE_VERSION}.{kind}.{_label_hash(normalized_label)}."
-            f"{os.getpid()}.{start_hash}.{instance_id}.lock",
-        )
-        if generation_key is not None:
-            normalized_generation = str(generation_key or "").strip()
-            if not normalized_generation:
-                raise ValueError("waiter generation key is required")
-            self._generation_path = _generation_lock_path(
-                project_root,
-                kind=kind,
-                label=normalized_label,
-                generation_key=normalized_generation,
-            )
-            self._generation_fd = _acquire_contended_lock(self._generation_path)
-        pending_path = directory / f".{self.record.path.name}.{uuid.uuid4().hex}.pending"
-        self._fd = os.open(pending_path, _open_flags(create_exclusive=True), 0o600)
+        pending_name: str | None = None
+        record_name: str | None = None
         try:
+            self._directory_fd = _open_ledger_directory_path(directory, create=True)
+            identity = goalflight_compat.process_start_identity(os.getpid())
+            if not isinstance(identity, dict) or not identity.get("start_token"):
+                raise RuntimeError("held-lock owner process generation is unavailable")
+            start_hash = _start_hash(identity["start_token"])
+            instance_id = uuid.uuid4().hex
+            record_name = (
+                f"{_FILE_VERSION}.{kind}.{_label_hash(normalized_label)}."
+                f"{os.getpid()}.{start_hash}.{instance_id}.lock"
+            )
+            self.record = WaiterRecord(
+                kind=kind,
+                label_hash=_label_hash(normalized_label),
+                pid=os.getpid(),
+                start_hash=start_hash,
+                instance_id=instance_id,
+                path=directory / record_name,
+            )
+            if generation_key is not None:
+                normalized_generation = str(generation_key or "").strip()
+                if not normalized_generation:
+                    raise ValueError("waiter generation key is required")
+                self._generation_path = _generation_lock_path(
+                    project_root,
+                    kind=kind,
+                    label=normalized_label,
+                    generation_key=normalized_generation,
+                )
+                self._generation_fd = _acquire_contended_lock(
+                    self._generation_path,
+                    directory_fd=self._directory_fd,
+                )
+            pending_name = f".{record_name}.{uuid.uuid4().hex}.pending"
+            self._fd = os.open(
+                pending_name,
+                _open_flags(create_exclusive=True),
+                0o600,
+                dir_fd=self._directory_fd,
+            )
             _lock_nonblocking(self._fd)
             # Publish only after the kernel witness exists.  A concurrent probe
             # can therefore never acquire-and-prune a not-yet-locked address.
-            os.replace(pending_path, self.record.path)
+            os.replace(
+                pending_name,
+                record_name,
+                src_dir_fd=self._directory_fd,
+                dst_dir_fd=self._directory_fd,
+            )
+            pending_name = None
         except BaseException:
-            os.close(self._fd)
-            self._fd = -1
+            if self._fd >= 0:
+                os.close(self._fd)
+                self._fd = -1
             if self._generation_fd >= 0:
                 fcntl.flock(self._generation_fd, fcntl.LOCK_UN)
                 os.close(self._generation_fd)
                 self._generation_fd = -1
-            pending_path.unlink(missing_ok=True)
-            self.record.path.unlink(missing_ok=True)
+            if self._directory_fd >= 0:
+                if pending_name is not None:
+                    _unlink_at(self._directory_fd, pending_name)
+                if record_name is not None:
+                    _unlink_at(self._directory_fd, record_name)
+                os.close(self._directory_fd)
+                self._directory_fd = -1
             raise
 
     def close(self) -> None:
@@ -337,7 +401,8 @@ class WaiterRegistration:
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
-            self.record.path.unlink(missing_ok=True)
+            if self._directory_fd >= 0:
+                _unlink_at(self._directory_fd, self.record.path.name)
         generation_fd = self._generation_fd
         self._generation_fd = -1
         if generation_fd >= 0:
@@ -345,6 +410,10 @@ class WaiterRegistration:
                 fcntl.flock(generation_fd, fcntl.LOCK_UN)
             finally:
                 os.close(generation_fd)
+        directory_fd = self._directory_fd
+        self._directory_fd = -1
+        if directory_fd >= 0:
+            os.close(directory_fd)
 
     def __enter__(self) -> "WaiterRegistration":
         return self
@@ -407,9 +476,21 @@ class LeaseHolderRegistration:
     """One contended generation witness whose unlocked path is retained."""
 
     def __init__(self, path: Path, *, label_hash: str) -> None:
+        self._fd = -1
+        self._directory_fd = -1
         if fcntl is None:
             raise RuntimeError("held-flock wake ledger is unavailable on this platform")
-        self._fd = _acquire_contended_lock(path)
+        try:
+            self._directory_fd = _open_ledger_directory_path(path.parent, create=True)
+            self._fd = _acquire_contended_lock(
+                path,
+                directory_fd=self._directory_fd,
+            )
+        except BaseException:
+            if self._directory_fd >= 0:
+                os.close(self._directory_fd)
+                self._directory_fd = -1
+            raise
         self.record = WaiterRecord(
             kind=LEASE_KIND,
             label_hash=label_hash,
@@ -428,6 +509,10 @@ class LeaseHolderRegistration:
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+            directory_fd = self._directory_fd
+            self._directory_fd = -1
+            if directory_fd >= 0:
+                os.close(directory_fd)
 
     def __enter__(self) -> "LeaseHolderRegistration":
         return self
@@ -441,12 +526,12 @@ def _probe_locked_once(path: Path) -> bool:
     return _probe_locked_state(path) is True
 
 
-def _probe_locked_state(path: Path) -> bool | None:
+def _probe_locked_state_at(directory_fd: int, name: str) -> bool | None:
     """Return held/unheld, or UNKNOWN when the address cannot be opened."""
     if fcntl is None:
         return None
     try:
-        fd = os.open(path, _open_flags())
+        fd = os.open(name, _open_flags(), dir_fd=directory_fd)
     except OSError:
         return None
     try:
@@ -463,43 +548,72 @@ def _probe_locked_state(path: Path) -> bool | None:
         os.close(fd)
 
 
+def _probe_locked_state(path: Path) -> bool | None:
+    if fcntl is None:
+        return None
+    try:
+        directory_fd = _open_ledger_directory_path(path.parent, create=False)
+    except OSError:
+        return None
+    try:
+        return _probe_locked_state_at(directory_fd, path.name)
+    finally:
+        os.close(directory_fd)
+
+
 def live_waiters(
     project_root: Path | str,
     *,
     controller_label: str | None = None,
     kinds: Iterable[str] = WAITER_KINDS,
     prune_dead: bool = True,
-) -> list[WaiterRecord]:
+) -> list[WaiterRecord] | None:
     directory = ledger_dir(project_root)
     try:
-        paths = list(directory.glob(f"{_FILE_VERSION}.*.lock"))
+        directory_fd = _open_ledger_directory_path(directory, create=False)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            return None
+        # Missing/unreadable storage is also probe-unavailable, never known-zero.
+        return None
+    try:
+        with os.scandir(directory_fd) as entries:
+            names = [
+                entry.name
+                for entry in entries
+                if entry.name.startswith(f"{_FILE_VERSION}.")
+                and entry.name.endswith(".lock")
+            ]
+        accepted_kinds = set(kinds)
+        wanted_label = _label_hash(controller_label) if controller_label else None
+        live: list[WaiterRecord] = []
+        for name in names:
+            path = directory / name
+            record = _parse_waiter_path(path)
+            if record is None or record.kind not in accepted_kinds:
+                continue
+            if wanted_label is not None and record.label_hash != wanted_label:
+                continue
+            lock_state = _probe_locked_state_at(directory_fd, name)
+            identity = goalflight_compat.process_start_identity(record.pid)
+            owner_matches = bool(
+                isinstance(identity, dict)
+                and identity.get("start_token")
+                and _start_hash(identity["start_token"]) == record.start_hash
+                and goalflight_compat.pid_is_zombie(record.pid) is False
+            )
+            if owner_matches and lock_state is True:
+                live.append(record)
+            elif prune_dead:
+                try:
+                    _unlink_at(directory_fd, name)
+                except OSError:
+                    pass
+        return sorted(live, key=lambda row: (row.kind, row.pid, row.instance_id))
     except OSError:
-        return []
-    accepted_kinds = set(kinds)
-    wanted_label = _label_hash(controller_label) if controller_label else None
-    live: list[WaiterRecord] = []
-    for path in paths:
-        record = _parse_waiter_path(path)
-        if record is None or record.kind not in accepted_kinds:
-            continue
-        if wanted_label is not None and record.label_hash != wanted_label:
-            continue
-        lock_state = _probe_locked_state(path)
-        identity = goalflight_compat.process_start_identity(record.pid)
-        owner_matches = bool(
-            isinstance(identity, dict)
-            and identity.get("start_token")
-            and _start_hash(identity["start_token"]) == record.start_hash
-            and goalflight_compat.pid_is_zombie(record.pid) is False
-        )
-        if owner_matches and lock_state is True:
-            live.append(record)
-        elif prune_dead:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
-    return sorted(live, key=lambda row: (row.kind, row.pid, row.instance_id))
+        return None
+    finally:
+        os.close(directory_fd)
 
 
 def lease_holder_alive(
@@ -538,6 +652,13 @@ def coverage_status(
         controller_label=controller_label,
         kinds={"listener"},
     )
+    if waiters is None:
+        return {
+            "covered": False,
+            "reason": "waiter-probe-unavailable",
+            "waiters": [],
+            "monitor": {"required": False, "state": "not-applicable"},
+        }
     return {
         "covered": bool(waiters),
         "reason": "held-flock" if waiters else "no-live-waiter-lock",
@@ -613,7 +734,14 @@ def check_tool_entry(
         return status
     output = sys.stderr if stream is None else stream
     command = listener_start_command(project_root, controller_label=controller_label)
-    print(f"listener offline; start: {command}", file=output)
+    if status.get("reason") == "waiter-probe-unavailable":
+        print(
+            "listener coverage UNKNOWN (probe unavailable); "
+            f"if you have no listener, start: {command}",
+            file=output,
+        )
+    else:
+        print(f"listener offline; start: {command}", file=output)
     status["start_command"] = command
     if pending_probe is None:
         return status

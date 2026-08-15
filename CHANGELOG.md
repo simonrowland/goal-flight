@@ -6,6 +6,30 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Added
+
+- Fleet console controller liveness: every controller row classifies as
+  ALIVE, HUNG, WAITING-ON-USER, DEAD, or UNKNOWN from recorded facts only —
+  the holder's kernel lease lock, the live waiter pool, and in-flight journal
+  attempts. Attempt ownership is recorded in the journal at dispatch (epoch
+  5), so work is attributed to its owning controller and an idle
+  co-controller no longer pages as hung; only HUNG reaches the attention
+  plane, and probe failures classify UNKNOWN instead of guessing.
+
+### Fixed
+
+- The journal's failure messages tell the truth: the epoch fence is checked
+  before schema validation (older clients meeting a newer journal get
+  UPGRADE_REQUIRED, never a false corruption verdict), and a fully-quiesced
+  WAL journal that cannot be opened read-only is reopened through a
+  query-only fallback instead of being reported structurally invalid.
+  Corruption verdicts now require corruption evidence.
+- Wake-ledger scans hold the directory descriptor with a symmetric
+  reader/writer symlink policy; published planes carry stable digests, never
+  raw lease nonces; the bounded generation lock walk reports what it
+  skipped, and the renderer shows it.
+
+
 ## [1.4.1] — 2026-08-15
 
 ### Added

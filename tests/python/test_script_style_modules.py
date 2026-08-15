@@ -46,6 +46,14 @@ def test_isolated_test_module(
     env["GOALFLIGHT_CAPACITY_CONF"] = os.devnull
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp_path / "task-store")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+    # Journal/state isolation: without these, a module that resolves default
+    # paths write-opens LIVE journals — and a schema-carrying tree migrated
+    # two of them mid-development (b-150). Second-level spawns that build
+    # their own env are covered by the migration allow-guard, not this.
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp_path / "journals")
+    env["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp_path / "wake-ledger")
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp_path / "messages")
     test_id = test_path.relative_to(TEST_DIR).as_posix()
     env[ISOLATED_TEST_FILE_ENV] = test_id
     command = (

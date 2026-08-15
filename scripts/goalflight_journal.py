@@ -52,13 +52,14 @@ if str(REPO_ROOT) not in sys.path:
 
 import goalflight_compat  # noqa: E402
 import goalflight_task  # noqa: E402
+import goalflight_wake  # noqa: E402
 
 
-CURRENT_SCHEMA_EPOCH = 4
-CURRENT_PROTOCOL_EPOCH = 4
-CURRENT_REGISTRY_EPOCH = 4
-CURRENT_READER_EPOCH = 4
-CURRENT_WRITER_EPOCH = 4
+CURRENT_SCHEMA_EPOCH = 5
+CURRENT_PROTOCOL_EPOCH = 5
+CURRENT_REGISTRY_EPOCH = 5
+CURRENT_READER_EPOCH = 5
+CURRENT_WRITER_EPOCH = 5
 CURRENT_SCHEMA_COLUMNS = {
     "journal_migrations": ("migration_id", "applied_at"),
     "dispatch_attempts": (
@@ -66,6 +67,7 @@ CURRENT_SCHEMA_COLUMNS = {
         "launch_epoch", "launch_token", "worker_instance_json", "prepared_at",
         "state_updated_at", "start_deadline_at", "terminal_transition_id",
         "terminal_state", "terminal_outcome_json", "terminal_at",
+        "owner_controller_label", "owner_session_digest",
     ),
     "dispatch_transitions": (
         "attempt_id", "transition_id", "from_state", "to_state",
@@ -109,6 +111,7 @@ CURRENT_SCHEMA_COLUMNS = {
         "payload_json", "wake_class", "created_at", "resolved_at",
     ),
 }
+_LEGACY_DISPATCH_ATTEMPTS_COLUMNS = CURRENT_SCHEMA_COLUMNS["dispatch_attempts"][:-2]
 _LEGACY_TERMINAL_OUTBOX_COLUMNS = CURRENT_SCHEMA_COLUMNS["terminal_outbox"][:-2]
 JOURNAL_FILE_NAME = "state-journal.sqlite3"
 JOURNAL_IDENTITY_KEY = "journal_identity"
@@ -590,6 +593,133 @@ def _is_busy(exc: BaseException) -> bool:
     )
 
 
+def _sqlite_connect(
+    database: str | Path,
+    *,
+    uri: bool = False,
+    timeout: float = 5.0,
+    isolation_level: str | None = "",
+) -> sqlite3.Connection:
+    """Small injection seam for deterministic readonly-open failure tests."""
+    return sqlite3.connect(
+        database,
+        uri=uri,
+        timeout=timeout,
+        isolation_level=isolation_level,
+    )
+
+
+def _sqlite_primary_error_code(exc: BaseException) -> int | None:
+    raw = getattr(exc, "sqlite_errorcode", None)
+    if not isinstance(raw, int):
+        return None
+    return raw & 0xFF
+
+
+def _is_cantopen(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, sqlite3.DatabaseError)
+        and (
+            _sqlite_primary_error_code(exc) == sqlite3.SQLITE_CANTOPEN
+            or "unable to open database file" in str(exc).lower()
+        )
+    )
+
+
+def _is_corruption_error(exc: BaseException) -> bool:
+    corruption_codes = {
+        sqlite3.SQLITE_CORRUPT,
+        sqlite3.SQLITE_NOTADB,
+    }
+    sqlite_format = getattr(sqlite3, "SQLITE_FORMAT", None)
+    if isinstance(sqlite_format, int):
+        corruption_codes.add(sqlite_format)
+    message = str(exc).lower()
+    return _sqlite_primary_error_code(exc) in corruption_codes or any(
+        marker in message
+        for marker in (
+            "database disk image is malformed",
+            "malformed database schema",
+            "file is not a database",
+        )
+    )
+
+
+def _open_readonly_connection(
+    path: Path,
+    *,
+    timeout: float = 5.0,
+    isolation_level: str | None = "",
+) -> sqlite3.Connection:
+    """Open a query-only reader, unwedging a quiesced WAL when necessary."""
+    readonly: sqlite3.Connection | None = None
+    primary_failure: sqlite3.DatabaseError | None = None
+    try:
+        readonly = _sqlite_connect(
+            path.as_uri() + "?mode=ro",
+            uri=True,
+            timeout=timeout,
+            isolation_level=isolation_level,
+        )
+        # SQLite opens lazily. Touch the schema so CANTOPEN is attributed to
+        # this readonly open instead of a later schema query being mislabeled.
+        readonly.execute("PRAGMA schema_version").fetchone()
+        return readonly
+    except sqlite3.DatabaseError as primary_exc:
+        primary_failure = primary_exc
+        opened = readonly is not None
+        if readonly is not None:
+            readonly.close()
+        if not os.path.lexists(path):
+            # Preserve each caller's existing absent/disappeared-file handling.
+            raise
+        if not _is_cantopen(primary_exc):
+            if opened and (
+                _is_corruption_error(primary_exc) or _is_busy(primary_exc)
+            ):
+                # Parse/malformed evidence from an opened connection is real
+                # corruption evidence; busy remains retryable. A mere open
+                # failure never becomes a corruption verdict.
+                raise
+            raise JournalUnavailable(
+                f"journal readonly probe unavailable/unreadable for {path}: "
+                f"readonly open failed: {primary_exc}; failing closed"
+            ) from primary_exc
+
+    assert primary_failure is not None
+    # A mode=ro connection cannot create the WAL shared-memory file after the
+    # last connection closes on a fully-checkpointed quiesced database. A
+    # mode=rw open may recreate -shm/-wal and un-wedge it; query_only is the
+    # first statement so this handle cannot mutate journal data.
+    fallback: sqlite3.Connection | None = None
+    try:
+        fallback = _sqlite_connect(
+            path.as_uri() + "?mode=rw",
+            uri=True,
+            timeout=timeout,
+            isolation_level=isolation_level,
+        )
+    except sqlite3.DatabaseError as fallback_exc:
+        raise JournalUnavailable(
+            f"journal readonly probe unavailable/unreadable for {path}: "
+            f"readonly open failed ({primary_failure}); query-only fallback open "
+            f"failed ({fallback_exc}); failing closed"
+        ) from fallback_exc
+    try:
+        fallback.execute("PRAGMA query_only = ON")
+        fallback.execute("PRAGMA schema_version").fetchone()
+        return fallback
+    except sqlite3.DatabaseError as fallback_exc:
+        fallback.close()
+        if _is_corruption_error(fallback_exc) or _is_busy(fallback_exc):
+            raise
+        raise JournalUnavailable(
+            f"journal readonly probe unavailable/unreadable for {path}: "
+            f"readonly open failed ({primary_failure}); query-only fallback probe "
+            f"failed ({fallback_exc}); failing closed"
+        ) from fallback_exc
+
+
 class Journal:
     """Short-lived SQLite transactions with explicit retry/fence outcomes.
 
@@ -677,8 +807,9 @@ class Journal:
 
         Fast polling reads must not serialize terminal writers behind the
         whole-database startup integrity check and schema bootstrap performed by
-        the ordinary constructor. Every read still opens SQLite read-only at the
-        statement level and checks the live epoch fence in ``read_all``.
+        the ordinary constructor. Every read uses either a mode=ro connection or
+        a mode=rw handle immediately hardened with query_only, then checks the
+        live epoch fence in ``read_all``.
         """
         self = cls.__new__(cls)
         self._configure(
@@ -759,17 +890,37 @@ class Journal:
         while True:
             attempts += 1
             try:
-                mode = "ro" if self._read_only_client else "rw"
-                connection = sqlite3.connect(
-                    self.path.as_uri() + f"?mode={mode}",
-                    uri=True,
-                    timeout=0,
-                    isolation_level=None,
-                )
-            except sqlite3.OperationalError as exc:
-                if "unable to open database file" in str(exc).lower():
+                if self._read_only_client:
+                    connection = _open_readonly_connection(
+                        self.path,
+                        timeout=0,
+                        isolation_level=None,
+                    )
+                else:
+                    connection = sqlite3.connect(
+                        self.path.as_uri() + "?mode=rw",
+                        uri=True,
+                        timeout=0,
+                        isolation_level=None,
+                    )
+            except sqlite3.DatabaseError as exc:
+                if self._read_only_client and _is_busy(exc):
+                    if self._retry_delay(started):
+                        continue
+                    raise JournalUnavailable(
+                        f"journal connection remained busy after {attempts} attempts "
+                        f"within {self.retry_budget_s:.3f}s: {self.path}"
+                    ) from exc
+                if self._read_only_client and _is_corruption_error(exc):
+                    self._raise_integrity_failure(f"journal reader parse failed: {exc}")
+                if _is_cantopen(exc):
                     raise JournalUnavailable(
                         f"journal database became unavailable without creating a replacement: {self.path}"
+                    ) from exc
+                if self._read_only_client:
+                    raise JournalUnavailable(
+                        f"journal readonly probe unavailable/unreadable for {self.path}: "
+                        f"{exc}; failing closed"
                     ) from exc
                 raise
             try:
@@ -780,7 +931,14 @@ class Journal:
                 return connection
             except sqlite3.OperationalError as exc:
                 connection.close()
+                if self._read_only_client and _is_corruption_error(exc):
+                    self._raise_integrity_failure(f"journal reader parse failed: {exc}")
                 if not _is_busy(exc):
+                    if self._read_only_client:
+                        raise JournalUnavailable(
+                            f"journal readonly probe unavailable/unreadable for {self.path}: "
+                            f"{exc}; failing closed"
+                        ) from exc
                     raise
                 if not self._retry_delay(started):
                     raise JournalUnavailable(
@@ -961,11 +1119,16 @@ class Journal:
             CURRENT_READER_EPOCH,
             CURRENT_WRITER_EPOCH,
         ):
+            # The epoch fence is the first authority consulted after the epochs
+            # table is readable.  A client refused by epoch must never reach
+            # shape validation: schema deltas are expected across epochs and
+            # must not be misreported to an old client as journal corruption.
+            self._assert_epoch_fence(connection, for_write=False)
             retry_columns_migrated = self._install_outbox_retry_columns(connection)
             missing, malformed = self._current_schema_issues(connection)
             if malformed:
                 self._raise_integrity_failure(
-                    "epoch-4 journal has structurally invalid tables: "
+                    "epoch-5 journal has structurally invalid tables: "
                     + ", ".join(malformed)
                 )
             repaired = retry_columns_migrated or bool(missing)
@@ -983,7 +1146,7 @@ class Journal:
                 if malformed:
                     details.append("structurally invalid tables: " + ", ".join(malformed))
                 self._raise_integrity_failure(
-                    "epoch-4 journal has incomplete schema after the idempotent installer; "
+                    "epoch-5 journal has incomplete schema after the idempotent installer; "
                     + "; ".join(details)
                 )
             return repaired
@@ -991,6 +1154,7 @@ class Journal:
             (1, 1, 1, 1, 1),
             (2, 2, 2, 2, 2),
             (3, 3, 3, 3, 3),
+            (4, 4, 4, 4, 4),
         }:
             return False
         client = self.client_epochs
@@ -1006,6 +1170,7 @@ class Journal:
             self._install_p2_schema(connection)
         self._install_p3_schema(connection)
         self._install_p4_schema(connection)
+        self._install_attempt_owner_columns(connection)
         self._install_outbox_retry_columns(connection)
         now = utc_now()
         connection.execute(
@@ -1047,7 +1212,42 @@ class Journal:
             """,
             (now,),
         )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO journal_migrations (migration_id, applied_at)
+            VALUES ('dispatch-attempt-owner-v1', ?)
+            """,
+            (now,),
+        )
         return True
+
+    @staticmethod
+    def _install_attempt_owner_columns(connection: sqlite3.Connection) -> bool:
+        """Install nullable attempt ownership for the epoch-5 schema."""
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "dispatch_attempts" not in tables:
+            return False
+        columns = tuple(
+            str(row[1]) for row in connection.execute("PRAGMA table_info(dispatch_attempts)")
+        )
+        migrated = False
+        if columns == _LEGACY_DISPATCH_ATTEMPTS_COLUMNS:
+            connection.execute(
+                "ALTER TABLE dispatch_attempts ADD COLUMN owner_controller_label TEXT NULL"
+            )
+            columns += ("owner_controller_label",)
+            migrated = True
+        if columns == _LEGACY_DISPATCH_ATTEMPTS_COLUMNS + ("owner_controller_label",):
+            connection.execute(
+                "ALTER TABLE dispatch_attempts ADD COLUMN owner_session_digest TEXT NULL"
+            )
+            migrated = True
+        return migrated
 
     @staticmethod
     def _install_outbox_retry_columns(connection: sqlite3.Connection) -> bool:
@@ -1125,6 +1325,8 @@ class Journal:
                 terminal_state TEXT,
                 terminal_outcome_json TEXT,
                 terminal_at TEXT,
+                owner_controller_label TEXT NULL,
+                owner_session_digest TEXT NULL,
                 CHECK (
                     (lifecycle_state IN ('TERMINAL', 'ABANDONED')
                      AND terminal_transition_id IS NOT NULL
@@ -3240,6 +3442,8 @@ class Journal:
         launch_token: str | None = None,
         start_deadline_at: str | None = None,
         defer_start_deadline: bool = False,
+        owner_controller_label: str | None = None,
+        owner_session_nonce: str | None = None,
     ) -> WriteResult[AttemptIdentity]:
         dispatch = self._identity_token(dispatch_id, label="dispatch_id")
         if defer_start_deadline and start_deadline_at is not None:
@@ -3252,11 +3456,27 @@ class Journal:
         supplied_token = (
             self._identity_token(launch_token, label="launch_token") if launch_token else None
         )
+        if (owner_controller_label is None) != (owner_session_nonce is None):
+            raise ValueError(
+                "owner_controller_label and owner_session_nonce must be supplied together"
+            )
+        if owner_controller_label is not None and (
+            not isinstance(owner_controller_label, str) or not owner_controller_label
+        ):
+            raise ValueError("owner_controller_label must be a non-empty string")
+        if owner_session_nonce is not None and (
+            not isinstance(owner_session_nonce, str) or not owner_session_nonce
+        ):
+            raise ValueError("owner_session_nonce must be a non-empty string")
+        owner_session_digest = goalflight_wake.controller_session_digest(
+            owner_session_nonce
+        )
 
         def action(connection: sqlite3.Connection) -> AttemptIdentity:
             existing = connection.execute(
                 """
-                SELECT attempt_id, dispatch_id, launch_token, launch_epoch, lifecycle_state
+                SELECT attempt_id, dispatch_id, launch_token, launch_epoch, lifecycle_state,
+                       owner_controller_label, owner_session_digest
                 FROM dispatch_attempts WHERE dispatch_id = ?
                 """,
                 (dispatch,),
@@ -3273,6 +3493,13 @@ class Journal:
                     raise CASMismatch("dispatch already belongs to a different attempt_id")
                 if supplied_token and supplied_token != identity.launch_token:
                     raise CASMismatch("dispatch already belongs to a different launch_token")
+                if owner_controller_label is not None and (
+                    existing["owner_controller_label"] != owner_controller_label
+                    or existing["owner_session_digest"] != owner_session_digest
+                ):
+                    raise CASMismatch(
+                        "dispatch already belongs to a different owner capability"
+                    )
                 return identity
             allocated_attempt = supplied_attempt or str(uuid.uuid4())
             allocated_token = supplied_token or uuid.uuid4().hex
@@ -3291,8 +3518,8 @@ class Journal:
                 INSERT INTO dispatch_attempts (
                     attempt_id, dispatch_id, project_root, lifecycle_state,
                     launch_epoch, launch_token, prepared_at, state_updated_at,
-                    start_deadline_at
-                ) VALUES (?, ?, ?, 'PREPARED', 0, ?, ?, ?, ?)
+                    start_deadline_at, owner_controller_label, owner_session_digest
+                ) VALUES (?, ?, ?, 'PREPARED', 0, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     allocated_attempt,
@@ -3302,6 +3529,8 @@ class Journal:
                     now,
                     now,
                     resolved_start_deadline,
+                    owner_controller_label,
+                    owner_session_digest,
                 ),
             )
             return AttemptIdentity(
@@ -3926,7 +4155,7 @@ def _validate_snapshot_file(path: Path) -> JournalEpochs:
     if path.is_symlink() or not path.is_file():
         raise JournalIntegrityError(f"snapshot is not a regular non-symlink file: {path}")
     try:
-        with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
+        with contextlib.closing(_open_readonly_connection(path)) as connection:
             connection.row_factory = sqlite3.Row
             rows = [str(row[0]) for row in connection.execute("PRAGMA integrity_check")]
             if rows != ["ok"]:
@@ -4056,7 +4285,7 @@ def restore_snapshot(
                 )
             try:
                 with contextlib.closing(
-                    sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)
+                    _open_readonly_connection(source)
                 ) as source_connection, contextlib.closing(
                     sqlite3.connect(copied_snapshot)
                 ) as copy_connection:

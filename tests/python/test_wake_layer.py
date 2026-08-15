@@ -338,6 +338,16 @@ def test_owned_worker_finish_wakes_armed_doorbell_three_runs(
                     completed.stderr,
                 )
                 assert record["controller_session_id"] == lease.nonce
+                attempt_owner = authority.read_all(
+                    """SELECT owner_controller_label, owner_session_digest
+                       FROM dispatch_attempts WHERE dispatch_id = ?""",
+                    (dispatch_id,),
+                )[0]
+                assert attempt_owner["owner_controller_label"] == "wake-test"
+                assert attempt_owner["owner_session_digest"] == (
+                    wake.controller_session_digest(lease.nonce)
+                )
+                assert lease.nonce not in tuple(attempt_owner)
                 rows = authority.read_all(
                     """SELECT recipient_label FROM delivery_events
                        WHERE stream_id = ? ORDER BY recipient_label""",
@@ -505,6 +515,135 @@ def test_waiter_death_releases_kernel_witness_and_monitor_is_not_required(
         if child.poll() is None:
             child.kill()
             child.wait(timeout=3)
+
+
+def test_live_waiters_distinguishes_deleted_ledger_from_genuine_zero(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    root, _env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test",
+        principal={"principal_id": "deleted-ledger-test"},
+    )
+    assert claimed.committed and claimed.value is not None
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="wake-test",
+        lease_nonce=claimed.value.nonce,
+    )
+    try:
+        directory = wake.ledger_dir(root)
+        assert directory.is_dir()
+        shutil.rmtree(directory)
+        assert wake.live_waiters(root, controller_label="wake-test") is None
+        assert wake.coverage_status(root, controller_label="wake-test") == {
+            "covered": False,
+            "reason": "waiter-probe-unavailable",
+            "waiters": [],
+            "monitor": {"required": False, "state": "not-applicable"},
+        }
+    finally:
+        holder.close()
+
+    directory.mkdir(parents=True)
+    assert wake.live_waiters(root, controller_label="wake-test") == []
+    assert wake.coverage_status(root, controller_label="wake-test")["reason"] == (
+        "no-live-waiter-lock"
+    )
+
+
+def test_wake_ledger_symlink_policy_is_symmetric_and_real_dir_scan_holds_fd(
+    isolated: tuple[Path, dict[str, str]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _env = isolated
+    foreign_root = tmp_path / "foreign-project"
+    foreign_root.mkdir()
+    with wake.register_waiter(
+        foreign_root,
+        controller_label="wake-test",
+        kind="listener",
+    ):
+        foreign_directory = wake.ledger_dir(foreign_root)
+        directory = wake.ledger_dir(root)
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        directory.symlink_to(foreign_directory, target_is_directory=True)
+        assert directory.is_symlink()
+        with pytest.raises(OSError):
+            wake.register_waiter(
+                root,
+                controller_label="wake-test",
+                kind="listener",
+            )
+        with pytest.raises(OSError):
+            wake.register_lease_holder(
+                root,
+                controller_label="wake-test",
+                lease_nonce="symlink-refusal-capability",
+            )
+        assert wake.live_waiters(root, controller_label="wake-test") is None
+        assert wake.coverage_status(root, controller_label="wake-test")["reason"] == (
+            "waiter-probe-unavailable"
+        )
+
+    directory.unlink()
+    directory.mkdir()
+    real_scandir = wake.os.scandir
+    scandir_arguments: list[object] = []
+
+    def audited_scandir(target: object):
+        scandir_arguments.append(target)
+        return real_scandir(target)
+
+    with (
+        wake.register_waiter(
+            root,
+            controller_label="wake-test",
+            kind="listener",
+        ),
+        monkeypatch.context() as patch_context,
+    ):
+        patch_context.setattr(wake.os, "scandir", audited_scandir)
+        assert len(wake.live_waiters(root, controller_label="wake-test") or []) == 1
+    assert scandir_arguments and all(
+        isinstance(argument, int) for argument in scandir_arguments
+    )
+    assert wake.live_waiters(root, controller_label="wake-test") == []
+
+
+def test_entry_notice_distinguishes_probe_unavailable_from_offline(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    root, _env = isolated
+    unavailable_stream = io.StringIO()
+    unavailable = wake.check_tool_entry(
+        root,
+        controller_label="wake-test",
+        controller_claimed=True,
+        mail_bearing=True,
+        stream=unavailable_stream,
+    )
+    assert unavailable["reason"] == "waiter-probe-unavailable"
+    assert unavailable_stream.getvalue().startswith(
+        "listener coverage UNKNOWN (probe unavailable); "
+        "if you have no listener, start: "
+    )
+    assert "listener offline" not in unavailable_stream.getvalue()
+
+    wake.ledger_dir(root).mkdir(parents=True)
+    offline_stream = io.StringIO()
+    offline = wake.check_tool_entry(
+        root,
+        controller_label="wake-test",
+        controller_claimed=True,
+        mail_bearing=True,
+        stream=offline_stream,
+    )
+    assert offline["reason"] == "no-live-waiter-lock"
+    assert offline_stream.getvalue().startswith("listener offline; start: ")
+    assert "coverage UNKNOWN" not in offline_stream.getvalue()
 
 
 def test_lockfile_content_never_claims_liveness(isolated: tuple[Path, dict[str, str]]) -> None:
@@ -737,7 +876,9 @@ def test_scoped_status_wait_does_not_cover_controller_mail(
         while time.monotonic() < deadline:
             kinds = {
                 row.kind
-                for row in wake.live_waiters(root, controller_label="wake-test")
+                for row in (
+                    wake.live_waiters(root, controller_label="wake-test") or []
+                )
             }
             if kinds == {"listener", "wait"}:
                 break
@@ -750,7 +891,12 @@ def test_scoped_status_wait_does_not_cover_controller_mail(
         listener.communicate(timeout=3)
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            if {row.kind for row in wake.live_waiters(root, controller_label="wake-test")} == {"wait"}:
+            if {
+                row.kind
+                for row in (
+                    wake.live_waiters(root, controller_label="wake-test") or []
+                )
+            } == {"wait"}:
                 break
             time.sleep(0.02)
         assert wake.coverage_status(root, controller_label="wake-test")["covered"] is False

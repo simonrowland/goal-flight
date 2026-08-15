@@ -121,6 +121,10 @@
     gap:12px; align-items:center; padding:10px 12px; border-top:1px solid var(--edge-soft);
   }
   .panel-hd + .attn-row { border-top:0; }
+  .attention-truncation {
+    padding:7px 12px; border-bottom:1px solid var(--edge-soft);
+    color:var(--amber); background:var(--amber-wash); font-size:11px;
+  }
   .waited { font-size:15px; font-weight:600; color:var(--amber); text-align:right; }
   .quiet-state { padding:14px 12px; color:var(--ink-3); font-size:12px; }
   .stale-state, .overflow-state {
@@ -178,9 +182,19 @@
   .agent { font-size:11px; color:var(--ink-2); }
   .wire { font-size:9.5px; color:var(--ink-3); letter-spacing:.02em; }
   .wire b { color:var(--cyan); font-weight:600; }
+  .controller-cell { min-width:0; display:flex; flex-direction:column; align-items:flex-start; gap:2px; }
   .controller-id { font-size:10px; color:var(--ink-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .controller-id.unowned { color:var(--ink-3); font-style:italic; }
   .controller-id.owned_unknown { color:var(--amber); }
+  .controller-health { font-size:8.5px; line-height:1.25; letter-spacing:.08em; font-weight:650; color:var(--ink-3); }
+  .controller-health.alive { color:var(--jade); }
+  .controller-health.hung {
+    color:var(--amber-face); background:var(--amber-wash); border:1px solid var(--amber-face);
+    border-radius:2px; padding:1px 4px; font-weight:800;
+  }
+  .controller-health.waiting-on-user { color:var(--cyan); }
+  .controller-health.dead { color:var(--clay); text-decoration:line-through; }
+  .controller-health.unknown { color:var(--clay); border-bottom:1px dashed currentColor; }
   .state-txt { font-size:11px; }
   .host { font-size:11px; color:var(--ink-3); }
 

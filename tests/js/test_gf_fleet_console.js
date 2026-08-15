@@ -149,11 +149,12 @@ function workerRow(overrides) {
     display_state: "running",
     is_terminal: false,
     classification_conflict: false,
-    controller_session_id: null,
+    controller_session_digest: null,
     controller_pid: null,
     controller_label: null,
     controller_display: "unowned",
     controller_state: "unowned",
+    controller_liveness_state: "UNKNOWN",
     age_filter_match: false,
     age_filter_reason: "within_threshold",
     observed_live: true,
@@ -269,9 +270,22 @@ def worker(dispatch_id, started_at, **overrides):
     )
 with tempfile.TemporaryDirectory() as tmp:
     project_root = pathlib.Path(tmp)
-    F.goalflight_session_status.claim_session(
-        project_root, pid=os.getpid(), session_id="controller-session", label="battery-main",
+    os.environ.update({
+        "GOALFLIGHT_MESSAGES_DIR": str(project_root / "messages"),
+        "GOALFLIGHT_FLEET_DIR": str(project_root / "fleet"),
+        "GOALFLIGHT_JOURNAL_DIR": str(project_root / "state"),
+        "GOALFLIGHT_TASK_STORE_DIR": str(project_root / "task-store"),
+        "GOALFLIGHT_STATE_DIR": str(project_root / "state-root"),
+        "GOALFLIGHT_WAKE_LEDGER_DIR": str(project_root / "wake-ledger"),
+        "GOAL_FLIGHT_PIDFILE_DIR": str(project_root / "pids"),
+        "GOALFLIGHT_TEST_MODE": "1",
+    })
+    claimed = F.goalflight_journal.open_or_create_journal(project_root).claim_or_renew_lease(
+        "battery-main",
+        principal={"principal_id": "fleet-console-renderer-probe"},
+        nonce="controller-session",
     )
+    assert claimed.committed
     controller_labels = F._controller_labels_by_session(
         project_root, [{"controller_session_id": "controller-session"}],
     )
@@ -328,10 +342,11 @@ ordered = F._sort_worker_rows([
     worker("tie-a", "2030-01-01T00:01:00Z"),
 ])
 controller_rows = [
-    worker("owned-label", "2030-01-01T00:02:00Z", controller_session_id="controller-session", controller_pid=101),
-    worker("owned-session", "2030-01-01T00:02:00Z", controller_session_id="session-only", controller_pid=102),
-    worker("owned-unknown", "2030-01-01T00:02:00Z", controller_pid=103),
-    worker("unowned", "2030-01-01T00:02:00Z"),
+    dict(worker("owned-label", "2030-01-01T00:02:00Z", controller_session_id="controller-session", controller_pid=101), controller_liveness_state="ALIVE"),
+    dict(worker("owned-session", "2030-01-01T00:02:00Z", controller_session_id="session-only", controller_pid=102), controller_liveness_state="HUNG"),
+    dict(worker("owned-unknown", "2030-01-01T00:02:00Z", controller_pid=103), controller_liveness_state="WAITING-ON-USER"),
+    dict(worker("unowned", "2030-01-01T00:02:00Z"), controller_liveness_state="DEAD"),
+    dict(worker("unknown-probe", "2030-01-01T00:02:00Z", controller_session_id="unknown-session", controller_pid=104), controller_liveness_state="UNKNOWN"),
 ]
 try:
     F._validate_scalar_types({"sample_started_at": 2030})
@@ -673,12 +688,66 @@ print(json.dumps({
   );
   const controllers = descendants(byId.fleet)
     .filter((node) => /^controller-id /.test(node.className));
+  const controllerHealth = descendants(byId.fleet)
+    .filter((node) => /^controller-health /.test(node.className));
   assert("controller label/session/unknown-owner/unowned states remain distinct", [
     controllers.some((node) => node.textContent === "battery-main" && node.className === "controller-id label"),
-    controllers.some((node) => node.textContent === "session-only" && node.className === "controller-id session"),
+    controllers.some((node) => /^session · [0-9a-f]{16}$/.test(node.textContent) && node.className === "controller-id session"),
     controllers.some((node) => node.textContent === "owned · identity unknown" && node.className === "controller-id owned_unknown"),
     controllers.some((node) => node.textContent === "unowned" && node.className === "controller-id unowned"),
     !controllers.some((node) => node.textContent === "p" || node.textContent === "103"),
+  ].every(Boolean));
+  assert("all controller liveness states render and HUNG is distinct", [
+    controllerHealth.some((node) => node.textContent === "ALIVE" && node.className === "controller-health alive"),
+    controllerHealth.some((node) => node.textContent === "HUNG" && node.className === "controller-health hung"),
+    controllerHealth.some((node) => node.textContent === "WAITING-ON-USER" && node.className === "controller-health waiting-on-user"),
+    controllerHealth.some((node) => node.textContent === "DEAD" && node.className === "controller-health dead"),
+    controllerHealth.some((node) => node.textContent === "UNKNOWN" && node.className === "controller-health unknown"),
+  ].every(Boolean));
+}
+
+// HUNG controller attention is actionable and renderer values remain closed.
+{
+  const hostile = workerRow({ controller_liveness_state: "HUNG injected-class" });
+  const legacy = workerRow({ dispatch_id: "legacy-v2-controller" });
+  delete legacy.controller_liveness_state;
+  const fleet = fleetPayload({ projects: [projectRow([hostile, legacy])] });
+  const attention = attentionPayload({ items: [{
+    dispatch_id: "project:controller:main",
+    seq: null,
+    kind: "controller_hung",
+    action: "investigate",
+    observed_at: null,
+    headline: "Controller main is HUNG",
+  }] });
+  const { byId } = loadConsole(fleet, attention);
+  const health = descendants(byId.fleet)
+    .filter((node) => /^controller-health /.test(node.className));
+  const glyphs = descendants(byId.attention)
+    .filter((node) => /^glyph /.test(node.className));
+  assert("HUNG attention is actionable and unknown renderer input cannot inject a class", [
+    byId.attention.textContent.includes("Controller main is HUNG"),
+    byId.attention.textContent.includes("1 waiting"),
+    glyphs.some((node) => node.className === "glyph attn"),
+    health.length === 2,
+    health.every((node) => node.textContent === "UNKNOWN"),
+    health.every((node) => node.className === "controller-health unknown"),
+  ].every(Boolean));
+}
+
+// Bounded controller-history probes disclose omissions without inventing a note at zero.
+{
+  const truncated = loadConsole(
+    fleetPayload(),
+    attentionPayload({ controller_history_probes_truncated: 4 })
+  ).byId.attention.textContent;
+  const complete = loadConsole(
+    fleetPayload(),
+    attentionPayload({ controller_history_probes_truncated: 0 })
+  ).byId.attention.textContent;
+  assert("attention surfaces only positive controller history truncation", [
+    truncated.includes("+4 older generations unprobed"),
+    !complete.includes("older generations unprobed"),
   ].every(Boolean));
 }
 
@@ -758,7 +827,7 @@ print(json.dumps({
     byId.fleet.textContent.includes("Showing 200 of 1500 active or unresolved worker rows"),
     byId.fleet.textContent.includes("across 50 of 300 groups"),
     renderedBands === 50,
-    descendants(byId.fleet).length < 2800,
+    descendants(byId.fleet).length < 3200,
     clock.parses < 500,
   ].every(Boolean));
 }
@@ -872,7 +941,7 @@ print(json.dumps({
     "prose", "primary", "load-figure", "load-now", "load-of", "spark", "meter", "crit",
     "seatbars", "current", "pressure-dot", "age", "cpu", "cpubars", "lead", "kids",
     "cpu-lbl", "thinking", "subproc", "idle", "phase", "done", "now", "ticket", "bug",
-    "eye", "watched", "parked", "dead", "hung", "bad", "calm",
+    "eye", "watched", "parked", "bad", "calm",
   ];
   const deadAbsent = dead.every((name) => !(new RegExp("\\." + name + "\\b")).test(cssWithoutComments));
   assert("seven-column CSS and wrapper styles", [
@@ -882,6 +951,8 @@ print(json.dumps({
     /\.glyph\.advisory\s*\{/.test(CSS),
     /\.controller-id\.unowned\s*\{/.test(CSS),
     /\.controller-id\.owned_unknown\s*\{/.test(CSS),
+    /\.controller-health\.hung\s*\{/.test(CSS),
+    /\.controller-health\.dead\s*\{/.test(CSS),
     /\.panel-hd\s*\+\s*\.attn-row\s*\{[^}]*border-top:0/.test(CSS),
     !/\[hidden\]\s*\{/.test(cssWithoutComments),
     deadAbsent,

@@ -73,6 +73,10 @@ def test_armed_journal_row_without_held_lock_is_not_authoritative(
     assert authority.arm_listener(
         "bugs", nonce=lease.nonce, pid=52001, start_token="stored", parent_pid=51001
     ).committed
+    # The ledger directory must exist so the waiter probe can verifiably
+    # report the LOCK absent; an absent directory is probe-unavailable, not
+    # a statement about locks.
+    wake.ledger_dir(root).mkdir(parents=True, exist_ok=True)
     status = msgs.listener_coverage_status(
         root,
         "bugs",

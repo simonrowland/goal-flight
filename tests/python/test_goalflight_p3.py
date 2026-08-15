@@ -73,11 +73,11 @@ def _claim(authority: journal.Journal, label: str = "controller") -> journal.Lea
     return result.value
 
 
-def test_current_epoch_missing_table_self_heals_but_corruption_fails_closed(
+def test_epoch_four_migration_is_race_safe_idempotent_and_corruption_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    _set_state_env(monkeypatch, tmp_path)
+    env = _set_state_env(monkeypatch, tmp_path)
     project = _project(tmp_path)
     authority = journal.open_or_create_journal(project)
     with sqlite3.connect(authority.path) as connection:
@@ -88,15 +88,56 @@ def test_current_epoch_missing_table_self_heals_but_corruption_fails_closed(
                    FROM journal_epochs WHERE singleton = 1"""
             ).fetchone()
         )
-        assert epochs == (4, 4, 4, 4, 4)
+        assert epochs == (5, 5, 5, 5, 5)
+        connection.execute(
+            """UPDATE journal_epochs
+               SET schema_epoch = 4, protocol_epoch = 4, registry_epoch = 4,
+                   minimum_reader_epoch = 4, minimum_writer_epoch = 4
+               WHERE singleton = 1"""
+        )
         connection.execute("DROP TABLE listener_coverage")
         connection.execute("DROP TABLE system_attention_items")
+        connection.execute(
+            "ALTER TABLE dispatch_attempts DROP COLUMN owner_session_digest"
+        )
+        connection.execute(
+            "ALTER TABLE dispatch_attempts DROP COLUMN owner_controller_label"
+        )
         connection.execute(
             "ALTER TABLE terminal_outbox DROP COLUMN projection_quarantined_at"
         )
         connection.execute("ALTER TABLE terminal_outbox DROP COLUMN projection_retry_at")
 
+    open_code = (
+        "from pathlib import Path; "
+        "import goalflight_journal as journal; "
+        f"journal.Journal(Path({str(project)!r})); "
+        "print('opened')"
+    )
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", open_code],
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    try:
+        results = [process.communicate(timeout=10) for process in processes]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=3)
+    for process, (stdout, stderr) in zip(processes, results, strict=True):
+        assert process.returncode == 0, stderr
+        assert stdout.strip() == "opened"
+
     reopened = journal.Journal(project)
+    journal.Journal(project)
     assert reopened.read_all(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'listener_coverage'"
     )
@@ -106,6 +147,21 @@ def test_current_epoch_missing_table_self_heals_but_corruption_fails_closed(
     assert tuple(
         str(row["name"]) for row in reopened.read_all("PRAGMA table_info(terminal_outbox)")
     ) == journal.CURRENT_SCHEMA_COLUMNS["terminal_outbox"]
+    assert tuple(
+        str(row["name"])
+        for row in reopened.read_all("PRAGMA table_info(dispatch_attempts)")
+    ) == journal.CURRENT_SCHEMA_COLUMNS["dispatch_attempts"]
+    assert reopened.read_all(
+        """SELECT COUNT(*) AS marker_count FROM journal_migrations
+           WHERE migration_id = 'dispatch-attempt-owner-v1'"""
+    )[0]["marker_count"] == 1
+    assert tuple(
+        reopened.read_all(
+            """SELECT schema_epoch, protocol_epoch, registry_epoch,
+                      minimum_reader_epoch, minimum_writer_epoch
+               FROM journal_epochs WHERE singleton = 1"""
+        )[0]
+    ) == (5, 5, 5, 5, 5)
 
     corrupt_project = tmp_path / "corrupt-project"
     corrupt_project.mkdir()
@@ -114,6 +170,100 @@ def test_current_epoch_missing_table_self_heals_but_corruption_fails_closed(
     corrupt_path.write_bytes(b"not a sqlite database")
     with pytest.raises(journal.JournalIntegrityError, match="integrity check failed"):
         journal.Journal(corrupt_project)
+
+
+def test_epoch_five_fences_epoch_four_reader_writer_before_schema_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute(
+            "ALTER TABLE dispatch_attempts DROP COLUMN owner_session_digest"
+        )
+        connection.execute(
+            "ALTER TABLE dispatch_attempts DROP COLUMN owner_controller_label"
+        )
+
+    epoch_four_client = journal.ClientEpochs(
+        schema=4,
+        protocol=4,
+        registry=4,
+        reader=4,
+        writer=4,
+    )
+    fence_match = r"UPGRADE_REQUIRED:.*schema client=4 journal=5"
+    with pytest.raises(
+        journal.JournalUpgradeRequired,
+        match=fence_match,
+    ) as direct_refusal:
+        journal.Journal(project, client_epochs=epoch_four_client)
+    assert not isinstance(direct_refusal.value, journal.JournalIntegrityError)
+
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute(
+            """UPDATE journal_epochs
+               SET schema_epoch = 4, protocol_epoch = 4, registry_epoch = 4,
+                   minimum_reader_epoch = 4, minimum_writer_epoch = 4
+               WHERE singleton = 1"""
+        )
+
+    old_client = journal.Journal(project, client_epochs=epoch_four_client)
+    migrated = journal.Journal(project)
+    assert migrated.epochs() == journal.JournalEpochs(5, 5, 5, 5, 5)
+
+    with pytest.raises(journal.JournalUpgradeRequired, match=fence_match):
+        journal.Journal(project, client_epochs=epoch_four_client)
+    with pytest.raises(journal.JournalUpgradeRequired, match=fence_match):
+        old_client.read_all("SELECT attempt_id FROM dispatch_attempts")
+    with pytest.raises(journal.JournalUpgradeRequired, match=fence_match):
+        old_client.write(
+            journal.RowOperation.update(
+                "journal_epochs",
+                {"updated_at": journal.utc_now()},
+                where={"singleton": 1},
+                row_cap=1,
+            )
+        )
+
+
+def test_prepare_attempt_records_immutable_digested_owner_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    authority = journal.open_or_create_journal(_project(tmp_path))
+    owner_label = "controller-label-verbatim-" + ("x" * 70)
+    raw_nonce = "raw-controller-capability-" + ("n" * 96)
+    prepared = authority.prepare_attempt(
+        "owned-at-prepare",
+        owner_controller_label=owner_label,
+        owner_session_nonce=raw_nonce,
+    )
+    assert prepared.committed and prepared.value is not None
+    row = authority.read_all(
+        """SELECT owner_controller_label, owner_session_digest
+           FROM dispatch_attempts WHERE dispatch_id = ?""",
+        ("owned-at-prepare",),
+    )[0]
+    assert row["owner_controller_label"] == owner_label
+    assert row["owner_session_digest"] == wake.controller_session_digest(raw_nonce)
+    assert raw_nonce not in tuple(row)
+
+    replay = authority.prepare_attempt(
+        "owned-at-prepare",
+        owner_controller_label=owner_label,
+        owner_session_nonce=raw_nonce,
+    )
+    assert replay.committed and replay.value == prepared.value
+    conflicting = authority.prepare_attempt(
+        "owned-at-prepare",
+        owner_controller_label="different-owner",
+        owner_session_nonce="different-capability",
+    )
+    assert conflicting.cas_lost
 
 
 def test_current_epoch_structurally_wrong_table_stays_fail_closed(
@@ -1732,12 +1882,13 @@ def test_wait_path_terminal_commit_wakes_under_seeded_history_three_runs(
         try:
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
+                live = wake.live_waiters(
+                    project,
+                    controller_label="controller",
+                )
                 if any(
                     row.kind == "wait"
-                    for row in wake.live_waiters(
-                        project,
-                        controller_label="controller",
-                    )
+                    for row in (live or [])
                 ):
                     break
                 time.sleep(0.01)

@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -247,7 +249,10 @@ def test_attention_uses_envelope_timestamps_and_tolerates_missing_fleet_join() -
         ],
     }
     with mock.patch.object(F.goalflight_messages, "controller_mail_summary", return_value=summary):
-        payload = F.build_attention_plane(generation_id="attention-generation")
+        payload = F.build_attention_plane(
+            generation_id="attention-generation",
+            project_roots=[],
+        )
 
     assert_true("attention sorts oldest real timestamp first", [item["dispatch_id"] for item in payload["items"]] == ["older", "later", "not-in-fleet"])
     assert_true("valid envelope timestamp retained", payload["items"][0]["observed_at"] == "2026-08-02T10:00:00+00:00")
@@ -451,6 +456,7 @@ def test_unrecognised_attention_type_is_dropped_not_promoted() -> None:
         {"type": "resume-ready", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "b", "text": "276 ready"},
         {"type": "parallel-ready", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "c", "text": "fan out"},
         {"type": "totally-new-automation-kind", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "d", "text": "future"},
+        {"type": "controller-hung", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "spoof", "text": "unmeasured claim"},
         {"type": "user_need", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "e", "text": "decide"},
         {"type": "user_confirm", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "f", "text": "approve"},
         {"type": "blocked", "ts": "2026-08-02T10:00:00+00:00", "dispatch_id": "g", "text": "stuck"},
@@ -465,6 +471,10 @@ def test_unrecognised_attention_type_is_dropped_not_promoted() -> None:
     assert_true(
         "an unknown FUTURE kind is dropped, not promoted",
         all(row["dispatch_id"] != "d" for row in rows),
+    )
+    assert_true(
+        "mail cannot spoof a lock-derived HUNG verdict",
+        all(row["dispatch_id"] != "spoof" for row in rows),
     )
 
 
@@ -553,6 +563,1066 @@ def test_live_worker_count_ignores_permanent_terminal_history() -> None:
                 row["local_workers"] == 1)
 
 
+def test_controller_liveness_projection_rejects_unregistered_scalar() -> None:
+    try:
+        F._validate_scalar_types(
+            {"controller_liveness_state": "HUNG injected-class"}
+        )
+    except F.ProjectionSecurityError:
+        pass
+    else:
+        raise AssertionError("controller liveness enum accepted an unregistered scalar")
+
+
+def _controller_test_env(temp_root: Path) -> dict[str, str]:
+    return {
+        "GOALFLIGHT_MESSAGES_DIR": str(temp_root / "messages"),
+        "GOALFLIGHT_FLEET_DIR": str(temp_root / "fleet"),
+        "GOALFLIGHT_JOURNAL_DIR": str(temp_root / "state"),
+        "GOALFLIGHT_TASK_STORE_DIR": str(temp_root / "task-store"),
+        "GOALFLIGHT_STATE_DIR": str(temp_root / "state-root"),
+        "GOALFLIGHT_WAKE_LEDGER_DIR": str(temp_root / "wake-ledger"),
+        "GOAL_FLIGHT_PIDFILE_DIR": str(temp_root / "pids"),
+        "GOALFLIGHT_TEST_MODE": "1",
+    }
+
+
+def _running_attempt(
+    authority: F.goalflight_journal.Journal,
+    dispatch_id: str,
+    *,
+    owner_controller_label: str | None = None,
+    owner_session_nonce: str | None = None,
+) -> None:
+    prepared = authority.prepare_attempt(
+        dispatch_id,
+        owner_controller_label=owner_controller_label,
+        owner_session_nonce=owner_session_nonce,
+    )
+    assert_true("attempt prepared", prepared.committed and prepared.value is not None)
+    attempt = prepared.value
+    assert attempt is not None
+    starting = authority.start_attempt(attempt.attempt_id, attempt.launch_token)
+    assert_true("attempt starting", starting.committed and starting.value is not None)
+    started = starting.value
+    assert started is not None
+    running = authority.mark_attempt_running(
+        started.attempt_id,
+        started.launch_token,
+        launch_epoch=started.launch_epoch,
+        worker_instance={"pid": os.getpid(), "source": "fleet-console-test"},
+    )
+    assert_true("attempt running", running.committed)
+
+
+def _assert_controller_state(
+    expected: str,
+    *,
+    holder_mode: str,
+    waiter_count: int,
+    attempt_mode: str,
+) -> None:
+    """Exercise one classifier branch through real temp journal/flock inputs."""
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = temp_root / "project"
+        project_root.mkdir()
+        project_root = project_root.resolve()
+        isolated_env = _controller_test_env(temp_root)
+        with mock.patch.dict(os.environ, isolated_env, clear=False):
+            authority = F.goalflight_journal.open_or_create_journal(project_root)
+            claim_options = (
+                {"nonce": "alive-controller-session-" + ("x" * 160)}
+                if expected == "ALIVE"
+                else {}
+            )
+            claimed = authority.claim_or_renew_lease(
+                "console-test",
+                principal={"principal_id": f"console-{expected.lower()}"},
+                **claim_options,
+            )
+            assert_true("journal lease claimed", claimed.committed and claimed.value is not None)
+            lease = claimed.value
+            assert lease is not None
+
+            if attempt_mode in {"running", "terminal"}:
+                prepared = authority.prepare_attempt(f"dispatch-{expected.lower()}")
+                assert_true("attempt prepared", prepared.committed and prepared.value is not None)
+                attempt = prepared.value
+                assert attempt is not None
+                if attempt_mode == "running":
+                    starting = authority.start_attempt(attempt.attempt_id, attempt.launch_token)
+                    assert_true("attempt starting", starting.committed and starting.value is not None)
+                    started = starting.value
+                    assert started is not None
+                    running = authority.mark_attempt_running(
+                        started.attempt_id,
+                        started.launch_token,
+                        launch_epoch=started.launch_epoch,
+                        worker_instance={"pid": os.getpid(), "source": "fleet-console-test"},
+                    )
+                    assert_true("attempt running", running.committed)
+                else:
+                    terminal = authority.commit_terminal(
+                        attempt.attempt_id,
+                        terminal_state="complete",
+                        observation={"state": "complete", "outcome": {}},
+                    )
+                    assert_true("attempt terminal", terminal.committed)
+
+            with contextlib.ExitStack() as locks:
+                if holder_mode == "held":
+                    locks.enter_context(
+                        F.goalflight_wake.register_lease_holder(
+                            project_root,
+                            controller_label="console-test",
+                            lease_nonce=lease.nonce,
+                        )
+                    )
+                elif holder_mode == "released":
+                    released = F.goalflight_wake.register_lease_holder(
+                        project_root,
+                        controller_label="console-test",
+                        lease_nonce=lease.nonce,
+                    )
+                    released.close()
+                elif holder_mode != "unknown":
+                    raise AssertionError(f"unknown holder mode: {holder_mode}")
+
+                for _index in range(waiter_count):
+                    locks.enter_context(
+                        F.goalflight_wake.register_waiter(
+                            project_root,
+                            controller_label="console-test",
+                            kind="listener",
+                        )
+                    )
+
+                holder_lock = F.goalflight_wake.lease_holder_alive(
+                    project_root,
+                    controller_label="console-test",
+                    lease_nonce=lease.nonce,
+                )
+                live_waiters = F.goalflight_wake.live_waiters(
+                    project_root,
+                    controller_label="console-test",
+                    prune_dead=False,
+                )
+                live_waiter_count = (
+                    None if live_waiters is None else len(live_waiters)
+                )
+                reader = F.goalflight_journal.Journal.open_reader(project_root)
+                dispatch_id = f"dispatch-{expected.lower()}"
+                in_flight_count = F._journal_in_flight_count(
+                    reader,
+                    controller_label="console-test",
+                )
+                expected_inputs = {
+                    "ALIVE": (True, 1, 1),
+                    "HUNG": (True, 0, 1),
+                    "WAITING-ON-USER": (True, 0, 0),
+                    "DEAD": (False, 1, 1),
+                    "UNKNOWN": (None, None, 1),
+                }
+                assert_true(
+                    f"real probes construct the {expected} boundary",
+                    (holder_lock, live_waiter_count, in_flight_count)
+                    == expected_inputs[expected],
+                )
+                assert_true(
+                    f"pure classifier returns {expected}",
+                    F.classify_controller(
+                        holder_lock,
+                        live_waiter_count,
+                        in_flight_count,
+                    ) == expected,
+                )
+
+                machine_status = {
+                    "schema": "goalflight.status.aggregate.v1",
+                    "capacity": {},
+                    "capacity_state": {"leases": {}},
+                    "rate_pressure": {},
+                    "warnings": [],
+                    "dispatch": {
+                        "records": [
+                            {
+                                "dispatch_id": dispatch_id,
+                                "project_root": str(project_root),
+                                "state": "running",
+                                "classification": "expected_live",
+                                "controller_session_id": lease.nonce,
+                                "controller_pid": os.getpid(),
+                            }
+                        ]
+                    },
+                }
+                registry = [
+                    {
+                        "project_root": str(project_root),
+                        "last_seen": "2030-01-01T00:00:00+00:00",
+                        "skill_version": "test",
+                    }
+                ]
+                with (
+                    mock.patch.object(F.goalflight_status, "status_payload", return_value=machine_status),
+                    mock.patch.object(F.goalflight_fleet_status_cli, "build_fleet_status", return_value={}),
+                    mock.patch.object(F.goalflight_usage, "collect_usage", return_value=[]),
+                    mock.patch.object(F.goalflight_task, "read_project_registry", return_value=registry),
+                    mock.patch.object(F.goalflight_session_status, "aggregate_status", return_value={}),
+                    mock.patch.object(F.goalflight_status, "milestone_status_payload", return_value={}),
+                    mock.patch.object(F.goalflight_messages, "controller_mail_summary", return_value={"needs": []}),
+                ):
+                    fleet = F.build_fleet_plane(generation_id=f"fleet-{expected.lower()}")
+                    attention = F.build_attention_plane(
+                        generation_id=f"attention-{expected.lower()}",
+                        project_roots=[project_root],
+                    )
+
+                row = fleet["projects"][0]["workers"][0]
+                assert_true(
+                    f"fleet row returns {expected}",
+                    row["controller_liveness_state"] == expected,
+                )
+                hung_items = [
+                    item for item in attention["items"]
+                    if item["kind"] == "controller_hung"
+                ]
+                assert_true(
+                    "only HUNG enters attention",
+                    len(hung_items) == (1 if expected == "HUNG" else 0),
+                )
+
+
+def test_controller_state_alive_with_held_lease_and_one_live_waiter() -> None:
+    _assert_controller_state(
+        "ALIVE",
+        holder_mode="held",
+        waiter_count=1,
+        attempt_mode="running",
+    )
+
+
+def test_controller_state_hung_with_nonterminal_attempt() -> None:
+    _assert_controller_state(
+        "HUNG",
+        holder_mode="held",
+        waiter_count=0,
+        attempt_mode="running",
+    )
+
+
+def test_controller_state_waiting_on_user_with_terminal_attempt() -> None:
+    _assert_controller_state(
+        "WAITING-ON-USER",
+        holder_mode="held",
+        waiter_count=0,
+        attempt_mode="terminal",
+    )
+
+
+def test_controller_state_dead_with_released_lease_lock() -> None:
+    _assert_controller_state(
+        "DEAD",
+        holder_mode="released",
+        waiter_count=1,
+        attempt_mode="running",
+    )
+
+
+def test_controller_state_unknown_when_ledger_path_cannot_be_probed() -> None:
+    _assert_controller_state(
+        "UNKNOWN",
+        holder_mode="unknown",
+        waiter_count=0,
+        attempt_mode="running",
+    )
+
+
+def test_controller_in_flight_uses_recorded_owner_and_retires_to_unowned() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = (temp_root / "project").resolve()
+        project_root.mkdir()
+        with mock.patch.dict(os.environ, _controller_test_env(temp_root), clear=False):
+            authority = F.goalflight_journal.open_or_create_journal(project_root)
+            leases = {}
+            for label in ("controller-a", "controller-b"):
+                claimed = authority.claim_or_renew_lease(
+                    label,
+                    principal={"principal_id": f"principal-{label}"},
+                )
+                assert_true(f"{label} lease claimed", claimed.committed and claimed.value is not None)
+                leases[label] = claimed.value
+            lease_a = leases["controller-a"]
+            lease_b = leases["controller-b"]
+            assert lease_a is not None and lease_b is not None
+            _running_attempt(
+                authority,
+                "owned-by-a",
+                owner_controller_label="controller-a",
+                owner_session_nonce=lease_a.nonce,
+            )
+            with (
+                F.goalflight_wake.register_lease_holder(
+                    project_root,
+                    controller_label="controller-a",
+                    lease_nonce=lease_a.nonce,
+                ) as holder_a,
+                F.goalflight_wake.register_lease_holder(
+                    project_root,
+                    controller_label="controller-b",
+                    lease_nonce=lease_b.nonce,
+                ),
+            ):
+                owned_contexts = F._controller_contexts_by_session(
+                    project_root,
+                    [
+                        {
+                            "dispatch_id": "owned-by-a",
+                            # Deliberately false status ownership: the owner
+                            # recorded on the attempt remains authoritative.
+                            "controller_session_id": lease_b.nonce,
+                        }
+                    ],
+                    include_all=True,
+                )
+                assert_true(
+                    "A-owned work makes waiter-less A HUNG",
+                    owned_contexts[lease_a.nonce]["liveness_state"] == "HUNG",
+                )
+                assert_true(
+                    "A-owned work leaves idle waiter-less B waiting on the user",
+                    owned_contexts[lease_b.nonce]["liveness_state"] == "WAITING-ON-USER",
+                )
+
+                released = authority.release_lease(
+                    "controller-a",
+                    nonce=lease_a.nonce,
+                    reason="fleet-console-retirement-counterexample",
+                )
+                assert_true("controller A retired", released.committed)
+                retired_contexts = F._controller_contexts_by_session(
+                    project_root,
+                    [],
+                    include_all=True,
+                    include_locked_ended=True,
+                )
+                assert_true(
+                    "retired owner makes the attempt unowned for both generations",
+                    retired_contexts[lease_a.nonce]["liveness_state"] == "HUNG"
+                    and retired_contexts[lease_b.nonce]["liveness_state"] == "HUNG",
+                )
+
+
+def test_controller_in_flight_null_owner_counts_for_every_controller() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = (temp_root / "project").resolve()
+        project_root.mkdir()
+        with mock.patch.dict(os.environ, _controller_test_env(temp_root), clear=False):
+            authority = F.goalflight_journal.open_or_create_journal(project_root)
+            leases = []
+            for label in ("controller-a", "controller-b"):
+                claimed = authority.claim_or_renew_lease(
+                    label,
+                    principal={"principal_id": f"unowned-{label}"},
+                )
+                assert_true(f"{label} lease claimed", claimed.committed)
+                assert claimed.value is not None
+                leases.append(claimed.value)
+            _running_attempt(authority, "unowned-running")
+            with (
+                F.goalflight_wake.register_lease_holder(
+                    project_root,
+                    controller_label="controller-a",
+                    lease_nonce=leases[0].nonce,
+                ),
+                F.goalflight_wake.register_lease_holder(
+                    project_root,
+                    controller_label="controller-b",
+                    lease_nonce=leases[1].nonce,
+                ),
+            ):
+                contexts = F._controller_contexts_by_session(
+                    project_root,
+                    [],
+                    include_all=True,
+                )
+                assert_true(
+                    "NULL owner makes every waiter-less controller HUNG",
+                    all(
+                        context["liveness_state"] == "HUNG"
+                        for context in contexts.values()
+                    ),
+                )
+
+
+def test_controller_state_unknown_when_waiter_directory_is_unreadable() -> None:
+    assert_true(
+        "an unavailable waiter count is UNKNOWN even with a known held lock",
+        F.classify_controller(True, None, 1) == "UNKNOWN",
+    )
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = (temp_root / "project").resolve()
+        project_root.mkdir()
+        with mock.patch.dict(os.environ, _controller_test_env(temp_root), clear=False):
+            authority = F.goalflight_journal.open_or_create_journal(project_root)
+            claimed = authority.claim_or_renew_lease(
+                "unreadable-controller",
+                principal={"principal_id": "unreadable-controller"},
+            )
+            assert_true("unreadable lease claimed", claimed.committed and claimed.value is not None)
+            lease = claimed.value
+            assert lease is not None
+            _running_attempt(authority, "unreadable-running")
+            with (
+                F.goalflight_wake.register_lease_holder(
+                    project_root,
+                    controller_label="unreadable-controller",
+                    lease_nonce=lease.nonce,
+                ),
+                F.goalflight_wake.register_waiter(
+                    project_root,
+                    controller_label="unreadable-controller",
+                    kind="listener",
+                ),
+            ):
+                directory = F.goalflight_wake.ledger_dir(project_root)
+                original_mode = directory.stat().st_mode & 0o777
+                try:
+                    directory.chmod(0)
+                    contexts = F._controller_contexts_by_session(
+                        project_root,
+                        [
+                            {
+                                "dispatch_id": "unreadable-running",
+                                "controller_session_id": lease.nonce,
+                            }
+                        ],
+                    )
+                    assert_true(
+                        "an unreadable waiter ledger produces UNKNOWN",
+                        contexts[lease.nonce]["liveness_state"] == "UNKNOWN",
+                    )
+                finally:
+                    directory.chmod(original_mode)
+
+
+def test_controller_fields_without_session_identity_are_unknown() -> None:
+    fields = F._controller_fields(
+        {"controller_pid": os.getpid()},
+        {},
+        {},
+    )
+    assert_true(
+        "missing session identity is absence of liveness evidence",
+        fields["controller_liveness_state"] == "UNKNOWN",
+    )
+
+
+def test_long_controller_nonces_remain_distinct_context_keys() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = (temp_root / "project").resolve()
+        project_root.mkdir()
+        with mock.patch.dict(os.environ, _controller_test_env(temp_root), clear=False):
+            authority = F.goalflight_journal.open_or_create_journal(project_root)
+            shared_prefix = "nonce-" + ("x" * 150)
+            claimed_a = authority.claim_or_renew_lease(
+                "long-a",
+                principal={"principal_id": "long-a"},
+                nonce=shared_prefix + "-a",
+            )
+            claimed_b = authority.claim_or_renew_lease(
+                "long-b",
+                principal={"principal_id": "long-b"},
+                nonce=shared_prefix + "-b",
+            )
+            assert_true("long nonce A claimed", claimed_a.committed and claimed_a.value is not None)
+            assert_true("long nonce B claimed", claimed_b.committed and claimed_b.value is not None)
+            lease_a = claimed_a.value
+            lease_b = claimed_b.value
+            assert lease_a is not None and lease_b is not None
+            _running_attempt(authority, "unowned-long-nonce")
+            with (
+                F.goalflight_wake.register_lease_holder(
+                    project_root,
+                    controller_label="long-a",
+                    lease_nonce=lease_a.nonce,
+                ),
+                F.goalflight_wake.register_lease_holder(
+                    project_root,
+                    controller_label="long-b",
+                    lease_nonce=lease_b.nonce,
+                ),
+            ):
+                contexts = F._controller_contexts_by_session(
+                    project_root,
+                    [{"dispatch_id": "unowned-long-nonce"}],
+                    include_all=True,
+                )
+                machine_status = {
+                    "schema": "goalflight.status.aggregate.v1",
+                    "capacity": {},
+                    "capacity_state": {"leases": {}},
+                    "rate_pressure": {},
+                    "warnings": [],
+                    "dispatch": {
+                        "records": [
+                            {
+                                "dispatch_id": "long-a-worker",
+                                "project_root": str(project_root),
+                                "state": "running",
+                                "classification": "expected_live",
+                                "controller_session_id": lease_a.nonce,
+                            },
+                            {
+                                "dispatch_id": "long-b-worker",
+                                "project_root": str(project_root),
+                                "state": "running",
+                                "classification": "expected_live",
+                                "controller_session_id": lease_b.nonce,
+                            },
+                        ]
+                    },
+                }
+                registry = [
+                    {
+                        "project_root": str(project_root),
+                        "last_seen": "2030-01-01T00:00:00+00:00",
+                        "skill_version": "test",
+                    }
+                ]
+                with (
+                    mock.patch.object(
+                        F.goalflight_status,
+                        "status_payload",
+                        return_value=machine_status,
+                    ),
+                    mock.patch.object(
+                        F.goalflight_fleet_status_cli,
+                        "build_fleet_status",
+                        return_value={},
+                    ),
+                    mock.patch.object(F.goalflight_usage, "collect_usage", return_value=[]),
+                    mock.patch.object(
+                        F.goalflight_task,
+                        "read_project_registry",
+                        return_value=registry,
+                    ),
+                    mock.patch.object(
+                        F.goalflight_session_status,
+                        "aggregate_status",
+                        return_value={},
+                    ),
+                    mock.patch.object(
+                        F.goalflight_status,
+                        "milestone_status_payload",
+                        return_value={},
+                    ),
+                ):
+                    fleet = F.build_fleet_plane(generation_id="long-nonce-plane")
+            assert_true(
+                "raw long nonces remain two identity keys",
+                set(contexts) == {lease_a.nonce, lease_b.nonce},
+            )
+            assert_true(
+                "both long-nonce controllers retain independent HUNG contexts",
+                all(context["liveness_state"] == "HUNG" for context in contexts.values()),
+            )
+            workers = fleet["projects"][0]["workers"]
+            digests = {worker["controller_session_digest"] for worker in workers}
+            assert_true(
+                "published session digests are 16 hex characters and remain distinct",
+                len(digests) == 2
+                and all(
+                    isinstance(value, str)
+                    and len(value) == 16
+                    and all(character in "0123456789abcdef" for character in value)
+                    for value in digests
+                ),
+            )
+            encoded_plane = json.dumps(fleet, sort_keys=True)
+            assert_true(
+                "raw controller nonces never enter the full published fleet plane",
+                lease_a.nonce not in encoded_plane and lease_b.nonce not in encoded_plane,
+            )
+
+
+def test_journal_in_flight_count_follows_canonical_attempt_lifecycle_states() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = (temp_root / "project").resolve()
+        project_root.mkdir()
+        with mock.patch.dict(os.environ, _controller_test_env(temp_root), clear=False):
+            authority = F.goalflight_journal.open_or_create_journal(project_root)
+            prepared = authority.prepare_attempt("state-prepared")
+            assert_true("PREPARED attempt created", prepared.committed and prepared.value is not None)
+
+            starting = authority.prepare_attempt("state-starting")
+            assert_true("STARTING attempt prepared", starting.committed and starting.value is not None)
+            starting_value = starting.value
+            assert starting_value is not None
+            started = authority.start_attempt(starting_value.attempt_id, starting_value.launch_token)
+            assert_true("STARTING attempt transitioned", started.committed)
+
+            _running_attempt(authority, "state-running")
+
+            terminal = authority.prepare_attempt("state-terminal")
+            assert_true("TERMINAL attempt prepared", terminal.committed and terminal.value is not None)
+            terminal_value = terminal.value
+            assert terminal_value is not None
+            terminal_result = authority.commit_terminal(
+                terminal_value.attempt_id,
+                terminal_state="complete",
+                observation={"state": "complete", "outcome": {}},
+            )
+            assert_true("TERMINAL attempt committed", terminal_result.committed)
+
+            abandoned = authority.prepare_attempt("state-abandoned")
+            assert_true("ABANDONED attempt prepared", abandoned.committed and abandoned.value is not None)
+            abandoned_value = abandoned.value
+            assert abandoned_value is not None
+            abandoned_result = authority.commit_terminal(
+                abandoned_value.attempt_id,
+                terminal_state="abandoned",
+                observation={"state": "abandoned", "outcome": {}},
+            )
+            assert_true("ABANDONED attempt committed", abandoned_result.committed)
+
+            live_states = set(F.goalflight_journal.ATTEMPT_LIVE_STATES)
+            final_states = set(F.goalflight_journal.ATTEMPT_FINAL_STATES)
+            assert_true("PREPARED is canonically live", F.goalflight_journal.ATTEMPT_PREPARED in live_states)
+            assert_true("STARTING is canonically live", F.goalflight_journal.ATTEMPT_STARTING in live_states)
+            assert_true("RUNNING is canonically live", F.goalflight_journal.ATTEMPT_RUNNING in live_states)
+            assert_true("TERMINAL is canonically final", F.goalflight_journal.ATTEMPT_TERMINAL in final_states)
+            assert_true("ABANDONED is canonically final", F.goalflight_journal.ATTEMPT_ABANDONED in final_states)
+            assert_true("no canonical final state is live", live_states.isdisjoint(final_states))
+
+            count = F._journal_in_flight_count(
+                F.goalflight_journal.Journal.open_reader(project_root),
+                controller_label="owner",
+            )
+            assert_true("only PREPARED, STARTING, and RUNNING count", count == 3)
+
+
+def test_journal_in_flight_count_ignores_forged_mail_and_cursor_advances() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = (temp_root / "project").resolve()
+        project_root.mkdir()
+        with mock.patch.dict(os.environ, _controller_test_env(temp_root), clear=False):
+            authority = F.goalflight_journal.open_or_create_journal(project_root)
+            leases = {}
+            for label in ("controller-a", "controller-b"):
+                claimed = authority.claim_or_renew_lease(
+                    label,
+                    principal={"principal_id": f"pending-{label}"},
+                )
+                assert_true(
+                    f"{label} pending-test lease claimed",
+                    claimed.committed and claimed.value is not None,
+                )
+                leases[label] = claimed.value
+
+            lease_a = leases["controller-a"]
+            lease_b = leases["controller-b"]
+            assert lease_a is not None and lease_b is not None
+            _running_attempt(
+                authority,
+                "owned-live-work",
+                owner_controller_label="controller-a",
+                owner_session_nonce=lease_a.nonce,
+            )
+            reader = F.goalflight_journal.Journal.open_reader(project_root)
+            assert_true(
+                "recorded owner is the initial work attribution",
+                F._journal_in_flight_count(reader, controller_label="controller-a") == 1
+                and F._journal_in_flight_count(reader, controller_label="controller-b") == 0,
+            )
+
+            forged = F.goalflight_messages.post_message(
+                dispatch_id="owned-live-work",
+                msg_type="controller-notice",
+                payload={"text": "forged self-mail must not claim work"},
+                messages_dir=F.goalflight_messages.default_messages_dir(),
+                source={
+                    "node": "fleet-console-test",
+                    "adapter": "pytest",
+                    "transport": "controller",
+                },
+                addressee=F.goalflight_messages.controller_addressee(
+                    "controller-b",
+                    project_root=project_root,
+                ),
+            )
+            assert_true("forged self-mail was recorded", forged["recorded"] is True)
+            assert_true(
+                "forged same-dispatch-id mail cannot change work ownership",
+                F._journal_in_flight_count(reader, controller_label="controller-a") == 1
+                and F._journal_in_flight_count(reader, controller_label="controller-b") == 0,
+            )
+
+            owner_mail = F.goalflight_messages.post_message(
+                dispatch_id="owned-live-work",
+                msg_type="controller-notice",
+                payload={"text": "owner cursor independence probe"},
+                messages_dir=F.goalflight_messages.default_messages_dir(),
+                source={
+                    "node": "fleet-console-test",
+                    "adapter": "pytest",
+                    "transport": "controller",
+                },
+                addressee=F.goalflight_messages.controller_addressee(
+                    "controller-a",
+                    project_root=project_root,
+                ),
+            )
+            assert_true("owner mail was recorded", owner_mail["recorded"] is True)
+            peek = authority.cursor_peek("controller-a", nonce=lease_a.nonce)
+            stream_position = max(
+                int(item["stream_seq"])
+                for item in peek.items
+                if item["stream_id"] == "owned-live-work"
+            )
+            advanced = authority.advance_cursor(
+                "controller-a",
+                nonce=lease_a.nonce,
+                expected_cursor_version=peek.cursor_version,
+                expected_stream_snapshots=peek.stream_snapshots,
+                advances={"owned-live-work": stream_position},
+                actor="fleet-console-pending-test",
+            )
+            assert_true("controller A advanced past the owner event", advanced.committed)
+            assert_true(
+                "cursor advancement cannot hide still-running work",
+                F._journal_in_flight_count(reader, controller_label="controller-a") == 1
+                and F._journal_in_flight_count(reader, controller_label="controller-b") == 0,
+            )
+
+
+def test_controller_label_lookup_reads_history_without_wake_probes() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = (temp_root / "project").resolve()
+        project_root.mkdir()
+        with mock.patch.dict(os.environ, _controller_test_env(temp_root), clear=False):
+            authority = F.goalflight_journal.open_or_create_journal(project_root)
+            claimed = authority.claim_or_renew_lease(
+                "historical-label",
+                principal={"principal_id": "historical-label"},
+            )
+            assert_true("historical label claimed", claimed.committed and claimed.value is not None)
+            lease = claimed.value
+            assert lease is not None
+            released = authority.release_lease(
+                "historical-label",
+                nonce=lease.nonce,
+                reason="label-probe-test",
+            )
+            assert_true("historical label released", released.committed)
+            with (
+                mock.patch.object(
+                    F.goalflight_wake,
+                    "lease_holder_alive",
+                    side_effect=AssertionError("label-only lookup probed holder liveness"),
+                ),
+                mock.patch.object(
+                    F.goalflight_wake,
+                    "live_waiters",
+                    side_effect=AssertionError("label-only lookup probed waiter liveness"),
+                ),
+            ):
+                labels = F._controller_labels_by_session(
+                    project_root,
+                    [{"controller_session_id": lease.nonce}],
+                )
+            assert_true(
+                "label-only lookup retains historical identity without wake I/O",
+                labels == {lease.nonce: "historical-label"},
+            )
+
+
+def test_attention_excludes_ended_generations_without_held_kernel_locks() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = (temp_root / "project").resolve()
+        project_root.mkdir()
+        with mock.patch.dict(os.environ, _controller_test_env(temp_root), clear=False):
+            authority = F.goalflight_journal.open_or_create_journal(project_root)
+            ended_claim = authority.claim_or_renew_lease(
+                "ended-controller",
+                principal={"principal_id": "ended-controller"},
+            )
+            active_claim = authority.claim_or_renew_lease(
+                "active-controller",
+                principal={"principal_id": "active-controller"},
+            )
+            assert_true("ended controller claimed", ended_claim.committed and ended_claim.value is not None)
+            assert_true("active controller claimed", active_claim.committed and active_claim.value is not None)
+            ended = ended_claim.value
+            active = active_claim.value
+            assert ended is not None and active is not None
+            released = authority.release_lease(
+                "ended-controller",
+                nonce=ended.nonce,
+                reason="attention-scope-test",
+            )
+            assert_true("ended controller released", released.committed)
+            _running_attempt(authority, "attention-unowned")
+            machine_status = {
+                "capacity": {},
+                "capacity_state": {"leases": {}},
+                "rate_pressure": {},
+                "warnings": [],
+                "dispatch": {
+                    "records": [
+                        {
+                            "dispatch_id": "attention-unowned",
+                            "project_root": str(project_root),
+                        }
+                    ]
+                }
+            }
+            include_ended_calls: list[bool] = []
+            real_lease_records = F.goalflight_journal.Journal.lease_records
+
+            def audited_lease_records(
+                journal: F.goalflight_journal.Journal,
+                *,
+                include_ended: bool = False,
+            ) -> list[dict[str, object]]:
+                include_ended_calls.append(include_ended)
+                return real_lease_records(journal, include_ended=include_ended)
+
+            with (
+                F.goalflight_wake.register_lease_holder(
+                    project_root,
+                    controller_label="active-controller",
+                    lease_nonce=active.nonce,
+                ),
+                mock.patch.object(
+                    F.goalflight_journal.Journal,
+                    "lease_records",
+                    audited_lease_records,
+                ),
+            ):
+                attention_rows = F._controller_attention_rows(
+                    [project_root],
+                    machine_status,
+                )
+                fleet_context = F._controller_contexts_by_session(
+                    project_root,
+                    [{"controller_session_id": ended.nonce}],
+                )
+            assert_true(
+                "attention emits only the active HUNG controller",
+                len(attention_rows) == 1
+                and "active-controller" in str(attention_rows[0]["headline"]),
+            )
+            assert_true(
+                "fleet identity path still resolves historical labels",
+                fleet_context[ended.nonce]["label"] == "ended-controller",
+            )
+            assert_true(
+                "attention inspects ended rows for locks while fleet identity reads history",
+                include_ended_calls == [True, True],
+            )
+
+
+def test_attention_keeps_superseded_generation_until_kernel_lock_releases() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = (temp_root / "project").resolve()
+        project_root.mkdir()
+        with mock.patch.dict(os.environ, _controller_test_env(temp_root), clear=False):
+            authority = F.goalflight_journal.open_or_create_journal(project_root)
+            first_claim = authority.claim_or_renew_lease(
+                "takeover-controller",
+                principal={"principal_id": "takeover-first"},
+            )
+            assert_true("first takeover generation claimed", first_claim.committed)
+            first = first_claim.value
+            assert first is not None
+            first_holder = F.goalflight_wake.register_lease_holder(
+                project_root,
+                controller_label="takeover-controller",
+                lease_nonce=first.nonce,
+            )
+            second_holder = None
+            try:
+                second_claim = authority.claim_or_renew_lease(
+                    "takeover-controller",
+                    principal={"principal_id": "takeover-second"},
+                    takeover=True,
+                )
+                assert_true("second takeover generation claimed", second_claim.committed)
+                second = second_claim.value
+                assert second is not None
+                second_holder = F.goalflight_wake.register_lease_holder(
+                    project_root,
+                    controller_label="takeover-controller",
+                    lease_nonce=second.nonce,
+                )
+                _running_attempt(authority, "takeover-unowned")
+                machine_status = {
+                    "capacity": {},
+                    "capacity_state": {"leases": {}},
+                    "rate_pressure": {},
+                    "warnings": [],
+                    "dispatch": {"records": []},
+                }
+                while_locked = F._controller_attention_rows(
+                    [project_root], machine_status
+                )
+                assert_true(
+                    "superseded but still-locked N1 remains HUNG attention",
+                    len(while_locked) == 2
+                    and any(
+                        f"generation-{first.generation}" in str(row["dispatch_id"])
+                        for row in while_locked
+                    ),
+                )
+
+                first_holder.close()
+                after_release = F._controller_attention_rows(
+                    [project_root], machine_status
+                )
+                assert_true(
+                    "released N1 drops while active N2 remains",
+                    len(after_release) == 1
+                    and f"generation-{second.generation}"
+                    in str(after_release[0]["dispatch_id"]),
+                )
+            finally:
+                first_holder.close()
+                if second_holder is not None:
+                    second_holder.close()
+
+
+def test_attention_bounds_ended_generation_lock_probes_and_reports_truncation() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = (temp_root / "project").resolve()
+        project_root.mkdir()
+        with mock.patch.dict(os.environ, _controller_test_env(temp_root), clear=False):
+            authority = F.goalflight_journal.open_or_create_journal(project_root)
+            leases = []
+            holders = []
+            try:
+                for index in range(12):
+                    claimed = authority.claim_or_renew_lease(
+                        "bounded-history-controller",
+                        principal={"principal_id": f"bounded-history-{index + 1}"},
+                        takeover=index > 0,
+                    )
+                    assert_true(
+                        f"bounded history generation {index + 1} claimed",
+                        claimed.committed and claimed.value is not None,
+                    )
+                    lease = claimed.value
+                    assert lease is not None
+                    leases.append(lease)
+                    holders.append(
+                        F.goalflight_wake.register_lease_holder(
+                            project_root,
+                            controller_label="bounded-history-controller",
+                            lease_nonce=lease.nonce,
+                        )
+                    )
+                released = authority.release_lease(
+                    "bounded-history-controller",
+                    nonce=leases[-1].nonce,
+                    reason="bounded-history-test",
+                )
+                assert_true("newest bounded history generation ended", released.committed)
+                _running_attempt(authority, "bounded-history-unowned")
+                machine_status = {
+                    "capacity": {},
+                    "capacity_state": {"leases": {}},
+                    "rate_pressure": {},
+                    "warnings": [],
+                    "dispatch": {"records": []},
+                }
+                with (
+                    mock.patch.object(
+                        F.goalflight_messages,
+                        "controller_mail_summary",
+                        return_value={"needs": []},
+                    ),
+                    mock.patch.object(
+                        F.goalflight_status,
+                        "status_payload",
+                        return_value=machine_status,
+                    ),
+                ):
+                    payload = F.build_attention_plane(
+                        generation_id="bounded-history-attention",
+                        project_roots=[project_root],
+                    )
+
+                controller_rows = [
+                    row for row in payload["items"] if row["kind"] == "controller_hung"
+                ]
+                observed_generations = {
+                    int(str(row["dispatch_id"]).rsplit("generation-", 1)[1])
+                    for row in controller_rows
+                }
+                # All twelve ended generations retain held locks in the
+                # constructed ledger. Eight rows therefore proves the scan
+                # probed only the newest eight without patching the probe.
+                assert_true(
+                    "only the newest eight ended generation locks are probed",
+                    observed_generations == set(range(5, 13)),
+                )
+                assert_true(
+                    "attention metadata reports four omitted history probes",
+                    payload["controller_history_probes_truncated"] == 4,
+                )
+                assert_true(
+                    "held newest-eight lock still pages while held older lock does not",
+                    5 in observed_generations and 4 not in observed_generations,
+                )
+            finally:
+                for holder in holders:
+                    holder.close()
+
+
+def test_attention_status_failure_degrades_without_inventing_hung() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = (temp_root / "project").resolve()
+        project_root.mkdir()
+        with (
+            mock.patch.dict(os.environ, _controller_test_env(temp_root), clear=False),
+            mock.patch.object(
+                F.goalflight_messages,
+                "controller_mail_summary",
+                return_value={"needs": []},
+            ),
+            mock.patch.object(
+                F.goalflight_status,
+                "status_payload",
+                side_effect=RuntimeError("synthetic status failure"),
+            ),
+        ):
+            payload = F.build_attention_plane(
+                generation_id="attention-status-failure",
+                project_roots=[project_root],
+            )
+    assert_true(
+        "status failure is visible as degraded",
+        payload["last_success_at"] is None
+        and str(payload["last_error"]).startswith("local_status:"),
+    )
+    assert_true(
+        "missing ownership/status evidence cannot invent HUNG attention",
+        payload["items"] == [],
+    )
+
+
 def main() -> None:
     fleet_payload = test_fleet_consumes_status_once_before_project_grouping()
     attention_payload = test_attention_uses_envelope_timestamps_and_tolerates_missing_fleet_join()
@@ -564,6 +1634,24 @@ def main() -> None:
     test_controller_authored_mail_reaches_the_attention_plane()
     test_registry_membership_is_not_a_statement_about_sampling()
     test_live_worker_count_ignores_permanent_terminal_history()
+    test_controller_liveness_projection_rejects_unregistered_scalar()
+    test_controller_state_alive_with_held_lease_and_one_live_waiter()
+    test_controller_state_hung_with_nonterminal_attempt()
+    test_controller_state_waiting_on_user_with_terminal_attempt()
+    test_controller_state_dead_with_released_lease_lock()
+    test_controller_state_unknown_when_ledger_path_cannot_be_probed()
+    test_controller_in_flight_uses_recorded_owner_and_retires_to_unowned()
+    test_controller_in_flight_null_owner_counts_for_every_controller()
+    test_controller_state_unknown_when_waiter_directory_is_unreadable()
+    test_controller_fields_without_session_identity_are_unknown()
+    test_long_controller_nonces_remain_distinct_context_keys()
+    test_journal_in_flight_count_follows_canonical_attempt_lifecycle_states()
+    test_journal_in_flight_count_ignores_forged_mail_and_cursor_advances()
+    test_controller_label_lookup_reads_history_without_wake_probes()
+    test_attention_excludes_ended_generations_without_held_kernel_locks()
+    test_attention_keeps_superseded_generation_until_kernel_lock_releases()
+    test_attention_bounds_ended_generation_lock_probes_and_reports_truncation()
+    test_attention_status_failure_degrades_without_inventing_hung()
     test_allowlist_rejects_unknown_and_unsafe_fields(attention_payload)
     print("OK: fleet-console projection tests pass")
 

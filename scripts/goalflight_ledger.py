@@ -645,13 +645,15 @@ def cmd_record(args: argparse.Namespace) -> int:
     controller_pid = getattr(args, "controller_pid", None)
     controller_session_id = getattr(args, "controller_session_id", None)
     controller_label = getattr(args, "controller_label", None)
+    owner_controller_label = None
     if not controller_session_id or controller_pid is None:
         controller_pid = None
         controller_session_id = None
         controller_label = None
     else:
         controller_session_id = str(controller_session_id)
-        controller_label = str(controller_label)[:64] if controller_label else None
+        owner_controller_label = str(controller_label) if controller_label else None
+        controller_label = owner_controller_label[:64] if owner_controller_label else None
     claimant_pid = getattr(args, "claimant_pid", None)
     os_sandbox = None
     if getattr(args, "os_sandbox_json", None):
@@ -731,6 +733,10 @@ def cmd_record(args: argparse.Namespace) -> int:
             dispatch_id,
             launch_token=getattr(args, "queue_launch_token", None),
             defer_start_deadline=args.state == "waiting_capacity",
+            owner_controller_label=owner_controller_label,
+            owner_session_nonce=(
+                controller_session_id if owner_controller_label is not None else None
+            ),
         )
         if not prepared.committed or prepared.value is None:
             print(

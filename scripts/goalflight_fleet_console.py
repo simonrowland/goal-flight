@@ -35,6 +35,7 @@ import goalflight_session_status
 import goalflight_status
 import goalflight_task
 import goalflight_usage
+import goalflight_wake
 
 
 FLEET_SCHEMA = "goalflight.fleet-console.fleet.v2"
@@ -47,6 +48,15 @@ SCRIPT_GLOBALS = {"fleet": "GF_FLEET", "attention": "GF_ATTENTION"}
 # cost is ~1.0s, and the drain tick this rides is ~60s, so the whole
 # per-project pass has to fit in a fraction of that alongside everything else.
 DEFAULT_MAX_PROJECTS = 12
+
+# Zombie lock holders arise around recent controller takeovers. Probe only the
+# newest generations per label: an ancient leaked-fd lock is deliberately
+# traded away for bounded fleet scan cost, with the omitted count published.
+ENDED_CONTROLLER_GENERATION_PROBE_LIMIT = 8
+
+CONTROLLER_LIVENESS_STATES = frozenset(
+    {"ALIVE", "HUNG", "WAITING-ON-USER", "DEAD", "UNKNOWN"}
+)
 
 # A half-day is 12 hours × 60 minutes/hour × 60 seconds/minute = 43,200
 # seconds. This deliberately removes the reported 15-100 hour non-terminal
@@ -71,6 +81,7 @@ DENIED_FIELDS = frozenset(
         "account_identity",
         "argv",
         "codex_home",
+        "controller_session_id",
         "effective_account",
         "error",
         "last_marker",
@@ -155,11 +166,12 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
                 "display_state": None,
                 "is_terminal": None,
                 "classification_conflict": None,
-                "controller_session_id": None,
+                "controller_session_digest": None,
                 "controller_pid": None,
                 "controller_label": None,
                 "controller_display": None,
                 "controller_state": None,
+                "controller_liveness_state": None,
                 "age_filter_match": None,
                 "age_filter_reason": None,
                 "observed_live": None,
@@ -218,11 +230,12 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
                     "display_state": None,
                     "is_terminal": None,
                     "classification_conflict": None,
-                    "controller_session_id": None,
+                    "controller_session_digest": None,
                     "controller_pid": None,
                     "controller_label": None,
                     "controller_display": None,
                     "controller_state": None,
+                    "controller_liveness_state": None,
                     "age_filter_match": None,
                     "age_filter_reason": None,
                     "observed_live": None,
@@ -253,11 +266,12 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             "display_state": None,
             "is_terminal": None,
             "classification_conflict": None,
-            "controller_session_id": None,
+            "controller_session_digest": None,
             "controller_pid": None,
             "controller_label": None,
             "controller_display": None,
             "controller_state": None,
+            "controller_liveness_state": None,
             "age_filter_match": None,
             "age_filter_reason": None,
             "observed_live": None,
@@ -274,6 +288,7 @@ ATTENTION_FIELD_ALLOWLIST: dict[str, Any] = {
     "last_success_at": None,
     "producer": {"name": None, "plane": None},
     "last_error": None,
+    "controller_history_probes_truncated": None,
     "age_granularity": None,
     "items": [
         {
@@ -365,6 +380,16 @@ def _validate_scalar_types(value: Any, *, path: str = "$") -> None:
             if key == "generation_id":
                 if not isinstance(item, str) or not item:
                     raise ProjectionSecurityError(f"{item_path}: expected non-empty string")
+            if key == "controller_liveness_state":
+                if item not in CONTROLLER_LIVENESS_STATES:
+                    raise ProjectionSecurityError(
+                        f"{item_path}: expected a registered controller liveness state"
+                    )
+            if key == "controller_history_probes_truncated" and item is not None:
+                if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                    raise ProjectionSecurityError(
+                        f"{item_path}: expected a non-negative integer or null"
+                    )
             _validate_scalar_types(item, path=item_path)
     elif isinstance(value, list):
         for index, item in enumerate(value):
@@ -544,28 +569,276 @@ def _worker_display_verdict(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def classify_controller(
+    holder_lock: bool | None,
+    live_waiter_count: int | None,
+    in_flight_count: int,
+) -> str:
+    """Classify one controller from kernel/journal facts, without host I/O."""
+    if live_waiter_count is not None and (
+        isinstance(live_waiter_count, bool)
+        or not isinstance(live_waiter_count, int)
+        or live_waiter_count < 0
+    ):
+        raise ValueError("live_waiter_count must be a non-negative integer or None")
+    for name, count in (("in_flight_count", in_flight_count),):
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+    if live_waiter_count is None:
+        return "UNKNOWN"
+    if holder_lock is None:
+        return "UNKNOWN"
+    if holder_lock is False:
+        return "DEAD"
+    if live_waiter_count > 0:
+        return "ALIVE"
+    if in_flight_count > 0:
+        return "HUNG"
+    return "WAITING-ON-USER"
+
+
+def _raw_controller_session_id(value: object) -> str | None:
+    """Return an ownership identity unchanged; presentation is a later step."""
+    return value if isinstance(value, str) and value else None
+
+
+def _controller_session_digest(value: object) -> str | None:
+    """Return the wake layer's stable short identity hash for publication."""
+    raw_session_id = _raw_controller_session_id(value)
+    return goalflight_wake.controller_session_digest(raw_session_id)
+
+
+def _journal_in_flight_count(
+    authority: goalflight_journal.Journal,
+    *,
+    controller_label: str,
+) -> int:
+    """Count live work this controller is responsible for being wakeable for."""
+    rows = authority.read_all(
+        """
+        SELECT attempts.attempt_id, attempts.owner_controller_label,
+               EXISTS (
+                   SELECT 1
+                   FROM controller_leases AS owner_lease
+                   WHERE owner_lease.project_root = attempts.project_root
+                     AND owner_lease.label = attempts.owner_controller_label
+                     AND owner_lease.state = 'ACTIVE'
+               ) AS owner_has_active_lease
+        FROM dispatch_attempts AS attempts
+        WHERE attempts.project_root = ?
+          AND attempts.lifecycle_state IN (?, ?, ?)
+        ORDER BY attempts.attempt_id
+        """,
+        (str(authority.project_root), *goalflight_journal.ATTEMPT_LIVE_STATES),
+    )
+    # A retired/absent owner lease makes the attempt unowned. Its terminal will
+    # fan out to every controller, so everybody is responsible for being
+    # wakeable. Mail delivery and cursors are irrelevant: HUNG measures work.
+    return sum(
+        1
+        for row in rows
+        if row["owner_controller_label"] is None
+        or not bool(row["owner_has_active_lease"])
+        or row["owner_controller_label"] == controller_label
+    )
+
+
+def _controller_contexts_by_session(
+    project_root: Path,
+    records: list[dict[str, Any]] | None,
+    *,
+    include_all: bool = False,
+    include_ended: bool = True,
+    include_locked_ended: bool = False,
+    probe_metadata: dict[str, int] | None = None,
+) -> dict[str, dict[str, object | None]]:
+    """Resolve identity and liveness once per journal lease generation.
+
+    ``records`` limits the work to sessions that can appear in fleet worker
+    rows; it never supplies attempt ownership. ``include_all`` lets the
+    attention plane classify every lease generation in its selected scope.
+    """
+    requested = (
+        None
+        if records is None or include_all
+        else {
+            session_id
+            for record in records
+            if (session_id := _raw_controller_session_id(
+                record.get("controller_session_id")
+            ))
+        }
+    )
+    if requested == set():
+        return {}
+    try:
+        authority = goalflight_journal.Journal.open_reader(project_root)
+        lease_rows = authority.lease_records(include_ended=include_ended)
+    except (goalflight_journal.JournalError, OSError, ValueError):
+        return {
+            session_id: {"label": None, "liveness_state": "UNKNOWN"}
+            for session_id in (requested or set())
+        }
+
+    labels: dict[str, set[str]] = {}
+    rows_by_session: dict[str, list[dict[str, object]]] = {}
+    active_rows: dict[str, list[dict[str, object]]] = {}
+    for row in lease_rows:
+        session_id = _raw_controller_session_id(row.get("nonce"))
+        raw_label = row.get("label")
+        label = raw_label if isinstance(raw_label, str) and raw_label else None
+        if session_id is None:
+            continue
+        rows_by_session.setdefault(session_id, []).append(row)
+        if label:
+            labels.setdefault(session_id, set()).add(label)
+        if row.get("state") == goalflight_journal.LEASE_ACTIVE:
+            active_rows.setdefault(session_id, []).append(row)
+
+    holder_by_session: dict[str, bool | None] = {}
+    locked_ended_rows: dict[str, list[dict[str, object]]] = {}
+    if include_locked_ended:
+        ended_rows_by_label: dict[str, list[dict[str, object]]] = {}
+        for row in lease_rows:
+            if row.get("state") == goalflight_journal.LEASE_ACTIVE:
+                continue
+            raw_label = row.get("label")
+            if isinstance(raw_label, str) and raw_label:
+                ended_rows_by_label.setdefault(raw_label, []).append(row)
+        ended_rows_to_probe: list[dict[str, object]] = []
+        truncated = 0
+        for session_rows in ended_rows_by_label.values():
+            newest_first = sorted(
+                session_rows,
+                key=lambda row: (
+                    int(row["generation"])
+                    if isinstance(row.get("generation"), int)
+                    else -1
+                ),
+                reverse=True,
+            )
+            ended_rows_to_probe.extend(
+                newest_first[:ENDED_CONTROLLER_GENERATION_PROBE_LIMIT]
+            )
+            truncated += max(
+                0,
+                len(newest_first) - ENDED_CONTROLLER_GENERATION_PROBE_LIMIT,
+            )
+        if probe_metadata is not None:
+            probe_metadata["controller_history_probes_truncated"] = (
+                probe_metadata.get("controller_history_probes_truncated", 0)
+                + truncated
+            )
+        for row in ended_rows_to_probe:
+            session_id = _raw_controller_session_id(row.get("nonce"))
+            raw_label = row.get("label")
+            label = raw_label if isinstance(raw_label, str) and raw_label else None
+            nonce = _raw_controller_session_id(row.get("nonce"))
+            if session_id is None or label is None or nonce is None:
+                continue
+            try:
+                held = goalflight_wake.lease_holder_alive(
+                    project_root,
+                    controller_label=label,
+                    lease_nonce=nonce,
+                )
+            except (OSError, RuntimeError, ValueError):
+                held = None
+            holder_by_session[session_id] = held
+            # Kernel state outranks lease bookkeeping: a superseded or
+            # otherwise ended generation that still owns its exact lock is
+            # a live zombie candidate and remains in attention scope.
+            if held is True:
+                locked_ended_rows.setdefault(session_id, []).append(row)
+
+    if requested is not None:
+        wanted = requested
+    elif include_locked_ended:
+        wanted = set(active_rows) | set(locked_ended_rows)
+    else:
+        wanted = set(rows_by_session)
+
+    contexts: dict[str, dict[str, object | None]] = {}
+    for session_id in wanted:
+        label_values = labels.get(session_id, set())
+        label = next(iter(label_values)) if len(label_values) == 1 else None
+        matches = active_rows.get(session_id, []) or locked_ended_rows.get(
+            session_id, []
+        )
+        if not matches:
+            holder_lock: bool | None = False
+            live_waiter_count = 0
+        elif len(matches) != 1 or label is None:
+            holder_lock = None
+            live_waiter_count = 0
+        else:
+            try:
+                raw_nonce = str(matches[0].get("nonce") or "")
+                holder_lock = holder_by_session.get(session_id)
+                if session_id not in holder_by_session:
+                    holder_lock = goalflight_wake.lease_holder_alive(
+                        project_root,
+                        controller_label=label,
+                        lease_nonce=raw_nonce,
+                    )
+                live_waiters = goalflight_wake.live_waiters(
+                    project_root,
+                    controller_label=label,
+                    prune_dead=False,
+                )
+                live_waiter_count = (
+                    None if live_waiters is None else len(live_waiters)
+                )
+            except (OSError, RuntimeError, ValueError):
+                holder_lock = None
+                live_waiter_count = None
+        in_flight_count = _journal_in_flight_count(
+            authority,
+            controller_label=label or "",
+        )
+        generation_rows = matches or rows_by_session.get(session_id, [])
+        generation = (
+            int(generation_rows[0]["generation"])
+            if len(generation_rows) == 1
+            and isinstance(generation_rows[0].get("generation"), int)
+            else None
+        )
+        contexts[session_id] = {
+            "label": label,
+            "generation": generation,
+            "liveness_state": classify_controller(
+                holder_lock,
+                live_waiter_count,
+                in_flight_count,
+            ),
+        }
+    return contexts
+
+
 def _controller_labels_by_session(
     project_root: Path,
     records: list[dict[str, Any]],
 ) -> dict[str, str]:
-    """Return only unambiguous beacon labels for stamped controller sessions."""
+    """Return only unambiguous journal labels for stamped controller sessions."""
     wanted = {
-        str(record.get("controller_session_id"))
+        session_id
         for record in records
-        if record.get("controller_session_id")
+        if (session_id := _raw_controller_session_id(
+            record.get("controller_session_id")
+        ))
     }
     if not wanted:
         return {}
     try:
-        session_rows = goalflight_journal.Journal(project_root).lease_records(
-            include_ended=True
-        )
-    except goalflight_journal.JournalUnavailable:
+        lease_rows = goalflight_journal.Journal.open_reader(
+            project_root
+        ).lease_records(include_ended=True)
+    except (goalflight_journal.JournalError, OSError, ValueError):
         return {}
     labels: dict[str, set[str]] = {}
-    for session in session_rows:
-        session_id = _display(session.get("nonce"), limit=128)
-        label = _display(session.get("label"), limit=64)
+    for row in lease_rows:
+        session_id = _raw_controller_session_id(row.get("nonce"))
+        label = _display(row.get("label"), limit=64)
         if session_id in wanted and label:
             labels.setdefault(session_id, set()).add(label)
     return {
@@ -578,25 +851,35 @@ def _controller_labels_by_session(
 def _controller_fields(
     record: dict[str, Any],
     controller_labels: dict[str, str],
+    controller_liveness: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    session_id = _display(record.get("controller_session_id"), limit=128)
+    raw_session_id = _raw_controller_session_id(record.get("controller_session_id"))
+    session_digest = _controller_session_digest(raw_session_id)
     raw_pid = record.get("controller_pid")
     controller_pid = raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) and raw_pid > 0 else None
-    label = controller_labels.get(session_id) if session_id else None
+    label = controller_labels.get(raw_session_id) if raw_session_id else None
     if label:
         display, state = label, "label"
-    elif session_id:
-        display, state = session_id, "session"
+    elif session_digest:
+        display, state = f"session · {session_digest}", "session"
     elif controller_pid is not None:
         display, state = "owned · identity unknown", "owned_unknown"
     else:
         display, state = "unowned", "unowned"
+    liveness_state = (
+        (controller_liveness or {}).get(raw_session_id)
+        if raw_session_id
+        else "UNKNOWN"
+    )
+    if liveness_state not in CONTROLLER_LIVENESS_STATES:
+        liveness_state = "UNKNOWN"
     return {
-        "controller_session_id": session_id,
+        "controller_session_digest": session_digest,
         "controller_pid": controller_pid,
         "controller_label": label,
         "controller_display": display,
         "controller_state": state,
+        "controller_liveness_state": liveness_state,
     }
 
 
@@ -657,6 +940,7 @@ def _worker_row(
     node_id: str | None = "local",
     sampled_at: dt.datetime | None = None,
     controller_labels: dict[str, str] | None = None,
+    controller_liveness: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     # Raw authority fields remain available for diagnosis, while renderers use
     # only the canonical verdict below for filtering and presentation.
@@ -691,7 +975,11 @@ def _worker_row(
         "started_at": started_at,
         "ended_at": _iso_timestamp(record.get("ended_at")),
         **verdict,
-        **_controller_fields(record, controller_labels or {}),
+        **_controller_fields(
+            record,
+            controller_labels or {},
+            controller_liveness or {},
+        ),
         **observed_live,
         **_worker_age_filter_fields(
             started_at=started_at,
@@ -1129,13 +1417,25 @@ def _project_rows(
             session = {}
             milestone = {}
 
-        controller_labels = _controller_labels_by_session(Path(root), scoped_records)
+        controller_contexts = _controller_contexts_by_session(
+            Path(root), scoped_records
+        )
+        controller_labels = {
+            session_id: str(context["label"])
+            for session_id, context in controller_contexts.items()
+            if context.get("label")
+        }
+        controller_liveness = {
+            session_id: str(context["liveness_state"])
+            for session_id, context in controller_contexts.items()
+        }
         worker_rows = _sort_worker_rows(
             [
                 _worker_row(
                     record,
                     sampled_at=sampled_at,
                     controller_labels=controller_labels,
+                    controller_liveness=controller_liveness,
                 )
                 for record in scoped_records
             ]
@@ -1335,13 +1635,74 @@ def _attention_rows(summary: object) -> list[dict[str, Any]]:
     return rows
 
 
+def _controller_attention_rows(
+    project_roots: list[Path],
+    machine_status: dict[str, Any],
+    *,
+    probe_metadata: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Project only HUNG controllers into operator attention."""
+    rows: list[dict[str, Any]] = []
+    seen_roots: set[str] = set()
+    for supplied_root in project_roots:
+        root = _canonical_root(str(supplied_root))
+        if root is None or root in seen_roots:
+            continue
+        seen_roots.add(root)
+        scoped = goalflight_status.scope_payload(machine_status, root)
+        dispatch = scoped.get("dispatch") if isinstance(scoped, dict) else {}
+        records = (
+            [item for item in dispatch.get("records") or [] if isinstance(item, dict)]
+            if isinstance(dispatch, dict)
+            else []
+        )
+        contexts = _controller_contexts_by_session(
+            Path(root),
+            records,
+            include_all=True,
+            include_ended=True,
+            include_locked_ended=True,
+            probe_metadata=probe_metadata,
+        )
+        for session_id, context in sorted(contexts.items()):
+            if context.get("liveness_state") != "HUNG":
+                continue
+            label = _display(context.get("label"), limit=64)
+            if label is None:
+                label = _controller_session_digest(session_id) or "unknown"
+            generation = context.get("generation")
+            generation_text = (
+                f" generation {generation}" if isinstance(generation, int) else ""
+            )
+            rows.append(
+                {
+                    "dispatch_id": _display(
+                        f"{_project_id(root)}:controller:{label}:generation-{generation}",
+                        limit=128,
+                    ),
+                    "seq": None,
+                    "kind": "controller_hung",
+                    "action": "investigate",
+                    "observed_at": None,
+                    "headline": _display(
+                        f"Controller {label}{generation_text} is HUNG: "
+                        "in-flight work has no live wake waiter",
+                        limit=96,
+                    ),
+                }
+            )
+    rows.sort(key=lambda row: (row["dispatch_id"] or ""))
+    return rows
+
+
 def build_attention_plane(
     *,
     messages_dir: Path | None = None,
     fleet_dir: Path | None = None,
     generation_id: str | None = None,
+    project_roots: list[Path] | None = None,
 ) -> dict[str, Any]:
-    """Build the fast attention sample from timestamped mail envelopes only."""
+    """Build the fast attention sample from mail and HUNG controller facts."""
     started_at = _utc_now()
     errors: list[str] = []
     kwargs: dict[str, Any] = {
@@ -1359,6 +1720,51 @@ def build_attention_plane(
         lambda: goalflight_messages.controller_mail_summary(**kwargs),
         {},
     )
+    if project_roots is None:
+        registered = _capture(
+            "projects",
+            errors,
+            goalflight_task.read_project_registry,
+            [],
+        )
+        sampled_projects, _registry_total = _registered_projects(
+            registered,
+            limit=DEFAULT_MAX_PROJECTS,
+        )
+        resolved_project_roots = [Path(item["root"]) for item in sampled_projects]
+    else:
+        resolved_project_roots = list(project_roots)
+    machine_status = (
+        _capture(
+            "local_status",
+            errors,
+            goalflight_status.status_payload,
+            {
+                "capacity_state": {"leases": {}},
+                "dispatch": {"records": []},
+                "rate_pressure": {},
+            },
+        )
+        if resolved_project_roots
+        else {
+            "capacity_state": {"leases": {}},
+            "dispatch": {"records": []},
+            "rate_pressure": {},
+        }
+    )
+    controller_probe_metadata = {"controller_history_probes_truncated": 0}
+    items = _attention_rows(summary) + _controller_attention_rows(
+        resolved_project_roots,
+        machine_status if isinstance(machine_status, dict) else {},
+        probe_metadata=controller_probe_metadata,
+    )
+    items.sort(
+        key=lambda row: (
+            row["observed_at"] is None,
+            row["observed_at"] or "",
+            row["dispatch_id"] or "",
+        )
+    )
     finished_at = _utc_now()
     payload = {
         "schema": ATTENTION_SCHEMA,
@@ -1369,10 +1775,11 @@ def build_attention_plane(
             finished_at=finished_at,
             errors=errors,
         ),
+        **controller_probe_metadata,
         # Renderers derive minute buckets from observed_at at display time.  No
         # marker timestamp and no sample-time age is substituted.
         "age_granularity": "minute",
-        "items": _attention_rows(summary),
+        "items": items,
     }
     validate_projection(payload, "attention")
     return payload
@@ -1414,6 +1821,7 @@ def build_degraded_plane(
         payload = {
             "schema": ATTENTION_SCHEMA,
             **metadata,
+            "controller_history_probes_truncated": None,
             "age_granularity": "minute",
             "items": [],
         }
