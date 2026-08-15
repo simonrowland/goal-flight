@@ -104,6 +104,83 @@ def test_controller_startup_beacon_holds_lock_between_cli_calls_and_drops_with_h
             host.wait(timeout=3)
 
 
+def test_lock_holder_cheap_ticks_revalidate_only_on_generation_event(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "controller",
+        principal={"pid": 71001, "start_token": "cheap-tick"},
+    )
+    assert claimed.committed and claimed.value is not None
+    lease = claimed.value
+    wake.publish_lease_generation_event(
+        root,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        generation=lease.generation,
+        state=lease.state,
+    )
+
+    class Registration:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    registration = Registration()
+    monkeypatch.setattr(wake, "register_lease_holder", lambda *args, **kwargs: registration)
+    monkeypatch.setattr(
+        sessions,
+        "_controller_process_identity",
+        lambda pid: {"pid": pid, "start_token": "cheap-tick"},
+    )
+
+    def reject_write_locking_constructor(*_args, **_kwargs):
+        raise AssertionError("beacon tick constructed the write-locking Journal client")
+
+    monkeypatch.setattr(journal.Journal, "__init__", reject_write_locking_constructor)
+    open_calls: list[int] = []
+
+    def open_reader(_cls, _root):
+        open_calls.append(1)
+        return authority
+
+    monkeypatch.setattr(journal.Journal, "open_reader", classmethod(open_reader))
+    sleeps = {"count": 0}
+
+    def tick(_seconds: float) -> None:
+        sleeps["count"] += 1
+        if sleeps["count"] == 2:
+            ended = authority.release_lease(
+                "controller",
+                nonce=lease.nonce,
+                reason="retired",
+            )
+            assert ended.committed and ended.value is not None
+            wake.publish_lease_generation_event(
+                root,
+                controller_label=ended.value.label,
+                lease_nonce=ended.value.nonce,
+                generation=ended.value.generation,
+                state=ended.value.state,
+            )
+
+    monkeypatch.setattr(sessions.time, "sleep", tick)
+    assert sessions.hold_controller_lock(
+        root,
+        label="controller",
+        nonce=lease.nonce,
+        pid=71001,
+        start_token="cheap-tick",
+    ) == 0
+    assert sleeps["count"] == 2
+    assert len(open_calls) == 2
+    assert registration.closed is True
+
+
 def test_same_measured_process_generation_renews_idempotently(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

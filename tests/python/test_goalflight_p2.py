@@ -177,6 +177,82 @@ print(r.disposition.value, flush=True)
     assert reopened.path == journal.resolve_journal_path(project)
 
 
+def test_outbox_retry_backoff_quarantine_prevents_head_of_line_starvation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.Journal.create(project)
+    poison_ids = [f"poison-{index:03d}" for index in range(100)]
+
+    def terminal(dispatch_id: str) -> None:
+        prepared = authority.prepare_attempt(dispatch_id)
+        assert prepared.committed and prepared.value is not None
+        committed = authority.commit_terminal(
+            prepared.value.attempt_id,
+            terminal_state="complete",
+            observation={"state": "complete", "outcome": {}},
+        )
+        assert committed.committed
+
+    for dispatch_id in poison_ids:
+        terminal(dispatch_id)
+
+    calls: list[str] = []
+
+    def project_message(**kwargs):
+        dispatch_id = str(kwargs["dispatch_id"])
+        calls.append(dispatch_id)
+        if dispatch_id.startswith("poison-"):
+            raise messages.MessageError("constructed poison row")
+        return {
+            "recorded": True,
+            "path": str(tmp_path / "messages" / f"{dispatch_id}.jsonl"),
+        }
+
+    monkeypatch.setattr(messages, "post_message", project_message)
+    assert authority.project_terminal_outbox(messages_dir=tmp_path / "messages") == []
+    assert len(calls) == 100
+
+    terminal("fresh-after-poison")
+    calls.clear()
+    projected = authority.project_terminal_outbox(messages_dir=tmp_path / "messages")
+    assert [item.event_uuid for item in projected]
+    assert "fresh-after-poison" in calls
+
+    for attempts in (1, 2):
+        reset = authority.write(
+            journal.RowOperation.update(
+                "terminal_outbox",
+                {"projection_retry_at": "2000-01-01T00:00:00+00:00"},
+                where={"projection_attempts": attempts},
+                row_cap=101,
+            )
+        )
+        assert reset.committed
+        authority.project_terminal_outbox(messages_dir=tmp_path / "messages")
+
+    rows = authority.read_all(
+        """
+        SELECT recipient, projected_at, projection_attempts,
+               projection_retry_at, projection_quarantined_at, projection_error
+        FROM terminal_outbox ORDER BY recipient
+        """
+    )
+    poison = [row for row in rows if str(row["recipient"]).startswith("poison-")]
+    fresh = next(row for row in rows if row["recipient"] == "fresh-after-poison")
+    assert len(poison) == 100
+    assert all(row["projected_at"] is None for row in poison)
+    assert all(row["projection_attempts"] == journal.OUTBOX_MAX_PROJECTION_ATTEMPTS for row in poison)
+    assert all(row["projection_retry_at"] is None for row in poison)
+    assert all(row["projection_quarantined_at"] is not None for row in poison)
+    assert all("constructed poison row" in str(row["projection_error"]) for row in poison)
+    assert fresh["projected_at"] is not None
+    assert len(authority.attention_items()) == 100
+    assert authority.pending_outbox() == []
+
+
 def test_second_starting_transition_is_cas_lost_not_retryable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

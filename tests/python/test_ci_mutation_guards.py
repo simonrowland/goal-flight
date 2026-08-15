@@ -16,6 +16,9 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import goalflight_acp_run as acp_run  # noqa: E402
 import goalflight_capacity as capacity  # noqa: E402
 import goalflight_liveness as liveness  # noqa: E402
+import goalflight_journal as journal  # noqa: E402
+import goalflight_ledger as ledger  # noqa: E402
+import goalflight_messages as messages  # noqa: E402
 import goalflight_status as status  # noqa: E402
 import goalflight_terminal as terminal  # noqa: E402
 
@@ -138,3 +141,56 @@ def test_stale_cpu_sample_forces_a_fresh_pair(monkeypatch: pytest.MonkeyPatch) -
     assert measured == pytest.approx(100.0)
     assert sleeps == [liveness._CPU_SAMPLE_COLD_WINDOW_S]
     assert liveness._cpu_samples[pgid] == (100.6, {7: 10.6})
+
+
+def test_missing_narrow_journal_api_is_not_silently_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(status.goalflight_task, "resolve_project_root", lambda _value: project)
+
+    def expected_unavailable(_cls: object, _root: object) -> object:
+        raise journal.JournalUnavailable("expected read outage")
+
+    monkeypatch.setattr(journal.Journal, "open_reader", classmethod(expected_unavailable))
+    assert status._mail_watermark(str(project), ["shape-check"]) is None
+
+    monkeypatch.setattr(journal.Journal, "open_reader", None)
+    with pytest.raises(AttributeError):
+        status._mail_watermark(str(project), ["shape-check"])
+
+    monkeypatch.delattr(journal.Journal, "open_reader")
+    with pytest.raises(AttributeError):
+        status._mail_watermark(str(project), ["shape-check"])
+
+
+def test_dispatch_projection_lookup_is_exact_id_not_history_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "exact-projection"
+    record_path = tmp_path / f"{dispatch_id}.json"
+    record_path.write_text(
+        json.dumps({"dispatch_id": dispatch_id, "project_root": str(tmp_path)}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ledger, "record_path", lambda _dispatch_id, create=False: record_path)
+    monkeypatch.setattr(
+        ledger,
+        "read_records",
+        lambda: (_ for _ in ()).throw(AssertionError("history scan reached")),
+    )
+
+    record, error = messages._dispatch_record(dispatch_id)
+    assert error is None
+    assert record is not None and record["dispatch_id"] == dispatch_id
+
+    record_path.write_text(
+        json.dumps({"dispatch_id": "foreign-projection"}),
+        encoding="utf-8",
+    )
+    record, error = messages._dispatch_record(dispatch_id)
+    assert record is None
+    assert error == "dispatch record is malformed or bound to a different dispatch id"
