@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -514,6 +515,7 @@ def test_second_real_doorbell_loses_generation_lock_and_first_wakes_body_free(
         doorbell = json.loads(first_stdout)
         assert doorbell["reason"] == "event"
         assert set(doorbell) == {
+            "advance_command",
             "coverage_id",
             "cursor_version",
             "reason",
@@ -938,7 +940,8 @@ def test_hidden_consumers_use_journal_and_relay_is_peek_only(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _set_state_env(monkeypatch, tmp_path)
+    env = _set_state_env(monkeypatch, tmp_path)
+    env["GOALFLIGHT_TEST_LISTENER_START_TOKEN"] = "drain-loop-listener-token"
     project = _project(tmp_path)
     monkeypatch.chdir(project)
     monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", "hidden")
@@ -957,13 +960,21 @@ def test_hidden_consumers_use_journal_and_relay_is_peek_only(
         source={"node": "test-node", "adapter": "test", "transport": "controller"},
         addressee=messages.controller_addressee("hidden", project_root=project),
     )
+    messages.post_message(
+        dispatch_id="task-store:goal-flight-hidden",
+        msg_type="controller-notice",
+        payload={"text": "second stream with delimiter-shaped name"},
+        messages_dir=tmp_path / "messages",
+        source={"node": "test-node", "adapter": "test", "transport": "controller"},
+        addressee=messages.controller_addressee("hidden", project_root=project),
+    )
 
     watermark = status._mail_watermark(str(project), ["hidden-stream"])
     assert watermark is not None and len(watermark) == 1
     unread, unread_error = sessions._addressed_unread_counts(project)
-    assert unread_error is None and unread == {"hidden": 1}
+    assert unread_error is None and unread == {"hidden": 2}
     summary = messages.controller_mail_summary(task_store_project_root=project)
-    assert summary["count"] == 1
+    assert summary["count"] == 2
 
     before = authority.cursor_status("hidden")
     monkeypatch.setattr(
@@ -981,8 +992,17 @@ def test_hidden_consumers_use_journal_and_relay_is_peek_only(
         ]
     ) == 0
     relay_payload = json.loads(capsys.readouterr().out)
-    assert relay_payload["positions"] == {"hidden-stream": 1}
+    assert relay_payload["positions"] == {
+        "hidden-stream": 1,
+        "task-store:goal-flight-hidden": 1,
+    }
     assert relay_payload["cursor_version"] == 0
+    advance_argv = shlex.split(relay_payload["advance_command"])
+    assert advance_argv[-3:] == [
+        "--position",
+        "hidden-stream=1",
+        "task-store:goal-flight-hidden=1",
+    ]
     assert "cursor_token" not in relay_payload
     assert "more_pending" not in relay_payload
     assert authority.cursor_status("hidden") == before
@@ -990,26 +1010,73 @@ def test_hidden_consumers_use_journal_and_relay_is_peek_only(
     assert not (tmp_path / "messages" / ".ack-cursor.json").exists()
     assert not hasattr(messages, "load_read_cursor")
 
-    assert messages.main(
-        [
-            "advance",
-            "--project-root",
-            str(project),
-            "--controller-label",
-            "hidden",
-            "--lease-nonce",
-            lease.nonce,
-            "--cursor-version",
-            str(relay_payload["cursor_version"]),
-            "--position",
-            "hidden-stream=1",
-            "--json",
-        ]
-    ) == 0
-    capsys.readouterr()
+    advanced = subprocess.run(
+        advance_argv,
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    assert advanced.returncode == 0, (advanced.stdout, advanced.stderr)
     assert status._mail_watermark(str(project), ["hidden-stream"]) == watermark
     unread_after, unread_after_error = sessions._addressed_unread_counts(project)
     assert unread_after_error is None and unread_after == {"hidden": 0}
+
+    listener_command = [
+        sys.executable,
+        str(SCRIPTS / "goalflight_messages.py"),
+        "listen",
+        "--project-root",
+        str(project),
+        "--controller-label",
+        "hidden",
+        "--lease-nonce",
+        lease.nonce,
+        "--poll-secs",
+        "0.01",
+        "--timeout-s",
+        "5",
+        "--json",
+    ]
+    listener = subprocess.Popen(
+        listener_command,
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            coverage = authority.active_coverage("hidden")
+            if coverage is not None and coverage["pid"] == listener.pid:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("drain-loop listener never armed")
+        time.sleep(0.15)
+        assert listener.poll() is None, "drained cursor immediately re-fired the doorbell"
+
+        messages.post_message(
+            dispatch_id="hidden-stream",
+            msg_type="controller-notice",
+            payload={"text": "fresh mail after re-arm"},
+            messages_dir=tmp_path / "messages",
+            source={"node": "test-node", "adapter": "test", "transport": "controller"},
+            addressee=messages.controller_addressee("hidden", project_root=project),
+        )
+        listener_stdout, listener_stderr = listener.communicate(timeout=3)
+        assert listener.returncode == 0, listener_stderr
+        doorbell = json.loads(listener_stdout)
+        assert "advance --project-root" in doorbell["advance_command"]
+        assert "hidden-stream=2" in doorbell["advance_command"]
+    finally:
+        if listener.poll() is None:
+            listener.kill()
+            listener.communicate(timeout=3)
 
     retired = sessions.retire_controller(
         project,

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 from pathlib import Path
+import shlex
 import sys
 
 import pytest
@@ -155,7 +156,7 @@ def test_missing_narrow_journal_api_is_not_silently_skipped(
         raise journal.JournalUnavailable("expected read outage")
 
     monkeypatch.setattr(journal.Journal, "open_reader", classmethod(expected_unavailable))
-    assert status._mail_watermark(str(project), ["shape-check"]) is None
+    assert status._mail_watermark(str(project), ["shape-check"]) == set()
 
     monkeypatch.setattr(journal.Journal, "open_reader", None)
     with pytest.raises(AttributeError):
@@ -194,3 +195,31 @@ def test_dispatch_projection_lookup_is_exact_id_not_history_scan(
     record, error = messages._dispatch_record(dispatch_id)
     assert record is None
     assert error == "dispatch record is malformed or bound to a different dispatch id"
+
+
+def test_cursor_position_command_round_trips_grouped_and_delimiter_bearing_streams() -> None:
+    command = messages._cursor_advance_command(
+        project_root=Path("/tmp/project with spaces"),
+        controller_label="controller:primary",
+        lease_nonce="lease-token",
+        cursor_version=7,
+        positions={
+            "task-store:goal-flight-alpha": 13,
+            "stream=with=equals": 17,
+        },
+    )
+    assert command is not None
+    argv = shlex.split(command)
+    assert argv[-3:] == [
+        "--position",
+        "stream=with=equals=17",
+        "task-store:goal-flight-alpha=13",
+    ]
+    assert messages._parse_cursor_positions([argv[-2:]]) == {
+        "stream=with=equals": 17,
+        "task-store:goal-flight-alpha": 13,
+    }
+
+    assert messages._parse_cursor_positions(
+        [["task-store:goal-flight-alpha=11"], ["task-store:goal-flight-alpha=13"]]
+    ) == {"task-store:goal-flight-alpha": 13}
