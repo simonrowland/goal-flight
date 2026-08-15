@@ -966,6 +966,8 @@ def test_python_watcher_busy_silence_records_running_quiet() -> None:
                 str(tail),
                 "--status-json",
                 str(status),
+                "--dispatch-id",
+                "liveness-busy-silence",
                 "--poll-secs",
                 "0.5",
                 "--max-idle-secs",
@@ -993,7 +995,7 @@ def test_python_watcher_busy_silence_records_running_quiet() -> None:
                         break
                 time.sleep(0.1)
             assert saw_running_quiet, status.read_text() if status.exists() else "no status written"
-            tail.write_text("COMPLETE: done\n")
+            tail.write_text("COMPLETE: liveness-busy-silence — done\n")
             assert watcher.wait(timeout=3) == 0
         finally:
             if watcher.poll() is None:

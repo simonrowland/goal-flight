@@ -424,7 +424,10 @@ def test_moonshot_worker_dash_execution() -> None:
 
 def test_moonshot_worker_preamble_is_neutral() -> None:
     preamble = D._worker_prompt_preamble("moonshot")
-    check("moonshot preamble contains sigiled COMPLETE contract", "!COMPLETE: <summary>" in preamble)
+    check(
+        "moonshot preamble delegates to dispatch identity contract",
+        "exact shape supplied by the dispatch-specific identity contract" in preamble,
+    )
     check("moonshot preamble has neutral worker identity", "Grok worker" not in preamble)
 
 

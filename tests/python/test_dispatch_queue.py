@@ -36,6 +36,7 @@ def _env(tmp: Path) -> dict[str, str]:
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal-state")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
     env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
@@ -274,7 +275,7 @@ def _write_queue_entry(
                 "--",
                 sys.executable,
                 "-c",
-                "print('COMPLETE: queued test')",
+                f"print('COMPLETE: {dispatch_id} — queued test')",
             ],
             "request": request,
         },
@@ -383,7 +384,7 @@ def test_submit_records_replayable_request_without_capacity_acquire() -> None:
                     "--",
                     sys.executable,
                     "-c",
-                    "print('COMPLETE: should launch later')",
+                    "print('COMPLETE: submit-fast — should launch later')",
                 ]
             )
         finally:
@@ -444,7 +445,7 @@ def test_submit_default_runs_one_drain_pass_after_queue_write() -> None:
                     "--",
                     sys.executable,
                     "-c",
-                    "print('COMPLETE: default drain later')",
+                    "print('COMPLETE: submit-drain-default — default drain later')",
                 ]
             )
         finally:
@@ -491,7 +492,7 @@ def test_submit_drain_on_submit_error_does_not_fail_submit() -> None:
                         "--",
                         sys.executable,
                         "-c",
-                        "print('COMPLETE: drain failure stays queued')",
+                        "print('COMPLETE: submit-drain-fails — drain failure stays queued')",
                     ]
                 )
         finally:
@@ -518,7 +519,7 @@ def test_submit_default_drain_launches_once_and_duplicate_submit_does_not_double
             "while not release.exists():\n"
             "    if time.monotonic() >= deadline: raise TimeoutError('default drain release not received')\n"
             "    time.sleep(0.01)\n"
-            "print('COMPLETE: default drain launched', flush=True)\n"
+            "print('COMPLETE: submit-default-launch — default drain launched', flush=True)\n"
         )
         cmd = [
             sys.executable,
@@ -582,14 +583,17 @@ def test_submit_is_idempotent_for_matching_args_and_rejects_collisions() -> None
             "--",
             sys.executable,
             "-c",
-            "print('COMPLETE: same')",
+            "print('COMPLETE: submit-idempotent — same')",
         ]
         first = _run(cmd, env)
         assert first.returncode == 0, (first.stdout, first.stderr)
         second = _run(cmd, env)
         assert second.returncode == 0, (second.stdout, second.stderr)
         assert "STATUS: queued already submit-idempotent" in second.stdout
-        collision = _run([*cmd[:-1], "print('COMPLETE: different')"], env)
+        collision = _run(
+            [*cmd[:-1], "print('COMPLETE: submit-idempotent — different')"],
+            env,
+        )
         assert collision.returncode == 64, (collision.stdout, collision.stderr)
         assert "queued request already exists" in collision.stderr
 
@@ -616,7 +620,7 @@ def test_submit_ignores_matching_failed_claim_tombstone_for_requeue() -> None:
             "--",
             sys.executable,
             "-c",
-            "print('COMPLETE: same after failed tombstone')",
+            "print('COMPLETE: submit-after-failed-tombstone — same after failed tombstone')",
         ]
         first = _run(cmd, env)
         assert first.returncode == 0, (first.stdout, first.stderr)
@@ -661,7 +665,7 @@ def test_duplicate_submit_runs_opportunistic_drain() -> None:
                     "--",
                     sys.executable,
                     "-c",
-                    "print('COMPLETE: duplicate drain nudge')",
+                    "print('COMPLETE: duplicate-drain-nudge — duplicate drain nudge')",
                 ]
             )
             assert seed_rc == 0
@@ -697,7 +701,7 @@ def test_duplicate_submit_runs_opportunistic_drain() -> None:
                     "--",
                     sys.executable,
                     "-c",
-                    "print('COMPLETE: duplicate drain nudge')",
+                    "print('COMPLETE: duplicate-drain-nudge — duplicate drain nudge')",
                 ]
             )
         finally:
@@ -730,7 +734,7 @@ def test_concurrent_submit_same_id_is_idempotent() -> None:
             "--",
             sys.executable,
             "-c",
-            "print('COMPLETE: same race')",
+            "print('COMPLETE: submit-race — same race')",
         ]
         procs = [
             subprocess.Popen(
@@ -783,7 +787,7 @@ def test_submit_write_error_is_clean() -> None:
                     "--",
                     sys.executable,
                     "-c",
-                    "print('COMPLETE: should not queue')",
+                    "print('COMPLETE: submit-readonly — should not queue')",
                 ],
                 env,
             )
@@ -824,7 +828,7 @@ def test_submit_status_write_error_removes_queue_entry() -> None:
                     "--",
                     sys.executable,
                     "-c",
-                    "print('COMPLETE: should not leave queue')",
+                    "print('COMPLETE: submit-status-fails — should not leave queue')",
                 ],
                 env,
             )
@@ -884,7 +888,7 @@ def test_submit_rejects_active_waiting_capacity_ledger() -> None:
                 "--",
                 sys.executable,
                 "-c",
-                "print('COMPLETE: should not queue')",
+                "print('COMPLETE: dup-wait — should not queue')",
             ],
             env,
         )
@@ -902,7 +906,7 @@ def test_drain_launches_queued_request_once_and_exits() -> None:
             "from pathlib import Path\n"
             f"p=Path({str(marker)!r})\n"
             "p.write_text((p.read_text() if p.exists() else '') + 'x')\n"
-            "print('COMPLETE: queued launch done', flush=True)\n"
+            "print('COMPLETE: drain-launch — queued launch done', flush=True)\n"
         )
         submit = _run(
             [
@@ -961,7 +965,7 @@ def test_drain_waits_for_submit_status_recording() -> None:
         worker_code = (
             "from pathlib import Path\n"
             f"Path({str(marker)!r}).write_text('ran')\n"
-            "print('COMPLETE: delayed drain')\n"
+            "print('COMPLETE: submit-drain-race — delayed drain')\n"
         )
         submit = subprocess.Popen(
             [
@@ -1909,7 +1913,7 @@ def test_stale_claim_result_marker_with_rate_limit_text_completes() -> None:
             tail = tmp / f"{dispatch_id}.tail"
             status = tmp / f"{dispatch_id}.status.json"
             tail.write_text(
-                "work finished\nRESULT: completed; notes mention rate limit handling\n",
+                "work finished\nRESULT: queued-result-rate-mention — completed; notes mention rate limit handling\n",
                 encoding="utf-8",
             )
             claim = queue / f"{dispatch_id}.json.claimed-123"
@@ -1971,11 +1975,15 @@ def test_stale_claim_result_marker_with_rate_limit_text_completes() -> None:
 def test_claim_recovery_terminal_marker_normalization_is_moonshot_family() -> None:
     with tempfile.TemporaryDirectory() as td:
         tail = Path(td) / "normalized-marker.tail"
-        tail.write_text("  COMPLETE: normalized terminal marker\n", encoding="utf-8")
+        tail.write_text(
+            "  COMPLETE: normalized-terminal-marker — normalized terminal marker\n",
+            encoding="utf-8",
+        )
+        entry = {"dispatch_id": "normalized-terminal-marker"}
 
         for agent in ("codex", "grok"):
             state, reason, marker = D._resolve_claim_terminal_outcome(
-                {},
+                entry,
                 reason="stale_claim_launch_token_lost",
                 tail=tail,
                 ignore_prefix_lines=[],
@@ -1986,7 +1994,7 @@ def test_claim_recovery_terminal_marker_normalization_is_moonshot_family() -> No
 
         # The current handle normalizes kimi-dialect continuation markers...
         state, reason, marker = D._resolve_claim_terminal_outcome(
-            {},
+            entry,
             reason="stale_claim_launch_token_lost",
             tail=tail,
             ignore_prefix_lines=[],
@@ -1997,7 +2005,7 @@ def test_claim_recovery_terminal_marker_normalization_is_moonshot_family() -> No
 
         # ...and so does a LEGACY record carrying the retired agent value.
         state, reason, marker = D._resolve_claim_terminal_outcome(
-            {},
+            entry,
             reason="stale_claim_launch_token_lost",
             tail=tail,
             ignore_prefix_lines=[],
@@ -2928,7 +2936,7 @@ def test_b065_late_complete_wins_over_worker_dead() -> None:
                 if Path(path) == tail and injected["n"] == 0:
                     with D._tail_mutation_lock(Path(path)):
                         with Path(path).open("a", encoding="utf-8") as tail_f:
-                            tail_f.write("COMPLETE: late finish\n")
+                            tail_f.write("COMPLETE: b065-late-complete — late finish\n")
                     injected["n"] += 1
                 with original_lock(Path(path)):
                     yield
@@ -3022,7 +3030,7 @@ def test_b065_live_stdout_lock_skips_reconciliation_promptly() -> None:
                 "\nwhile not release.exists():\n"
                 "    if time.monotonic() >= deadline: raise TimeoutError('tail producer release not received')\n"
                 "    time.sleep(0.01)\n"
-                "print('COMPLETE: inherited lock', flush=True)"
+                "print('COMPLETE: b065-inherited-tail-lock — inherited lock', flush=True)"
             )
             D._spawn_daemonized_process(
                 [sys.executable, "-c", script],
@@ -3079,7 +3087,7 @@ def test_b065_live_stdout_lock_skips_reconciliation_promptly() -> None:
         assert second.get("cleared") == 1, second
         assert record_after_eof["state"] == "complete", record_after_eof
         assert record_after_eof["terminal_state"] == "complete", record_after_eof
-        assert "COMPLETE: inherited lock" in tail.read_text(encoding="utf-8")
+        assert "COMPLETE: b065-inherited-tail-lock" in tail.read_text(encoding="utf-8")
 
 
 def test_b065_unlinked_nonterminal_claim_is_preserved() -> None:
@@ -3312,7 +3320,7 @@ def test_b065_late_complete_racing_restore_wins() -> None:
                 if Path(path) == tail and injected["n"] == 0:
                     with D._tail_mutation_lock(Path(path)):
                         with Path(path).open("a", encoding="utf-8") as tail_f:
-                            tail_f.write("COMPLETE: raced the restore\n")
+                            tail_f.write("COMPLETE: b065-late-restore — raced the restore\n")
                     injected["n"] += 1
                 with original_lock(Path(path)):
                     yield
@@ -3616,7 +3624,10 @@ def test_b065_unlinked_complete_carrier_quarantines_before_authority() -> None:
             queue.mkdir(parents=True)
             dispatch_id = "b065-unlinked-complete"
             tail = tmp / f"{dispatch_id}.tail"
-            tail.write_text("COMPLETE: valid but unlinked\n", encoding="utf-8")
+            tail.write_text(
+                "COMPLETE: b065-unlinked-complete — valid but unlinked\n",
+                encoding="utf-8",
+            )
             started = (
                 __import__("datetime")
                 .datetime.now(__import__("datetime").timezone.utc)

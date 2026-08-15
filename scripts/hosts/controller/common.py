@@ -16,6 +16,9 @@ SCHEMA = "goalflight.controller-harness.v1"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_DIR = REPO_ROOT / "scripts"
 WATCHER = SCRIPT_DIR / "watch-dispatch-tail.sh"
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from goalflight_watch import _final_terminal_marker  # noqa: E402
 
 
 def run_cmd(
@@ -137,6 +140,19 @@ def run_bash_tail_watch(
         watcher_rc = 124
 
     tail_text = tail_path.read_text(encoding="utf-8") if tail_path.exists() else ""
+    prompt_lines: list[str] = []
+    if prompt_path is not None and prompt_path.exists():
+        prompt_lines = [
+            line.strip()
+            for line in prompt_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        ]
+    marker = _final_terminal_marker(
+        tail_path,
+        ignore_prefix_lines=prompt_lines,
+        expected_dispatch_id=session_id,
+    )
+    complete_marker = bool(marker and marker.get("kind") == "COMPLETE")
+    blocked_marker = bool(marker and marker.get("kind") == "BLOCKED")
     return {
         "transport": "bash_tail",
         "agent": agent_label,
@@ -144,9 +160,9 @@ def run_bash_tail_watch(
         "watcher_returncode": watcher_rc,
         "tail_path": str(tail_path),
         "tail_text": tail_text,
-        "complete_marker": "COMPLETE:" in tail_text,
-        "blocked_marker": "BLOCKED:" in tail_text,
-        "ok": worker_rc == 0 and watcher_rc == 0 and ("COMPLETE:" in tail_text),
+        "complete_marker": complete_marker,
+        "blocked_marker": blocked_marker,
+        "ok": worker_rc == 0 and watcher_rc == 0 and complete_marker,
     }
 
 

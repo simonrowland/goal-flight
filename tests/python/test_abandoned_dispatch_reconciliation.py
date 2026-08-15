@@ -336,7 +336,11 @@ def test_conflicting_identities_for_same_pid_probe_both(
 
 def test_terminal_marker_reconciles_observed_real_outcome(tmp_path: Path) -> None:
     dispatch_id = "observed-complete"
-    _record(tmp_path, dispatch_id, tail_text="work log\nCOMPLETE: verified result\n")
+    _record(
+        tmp_path,
+        dispatch_id,
+        tail_text=f"work log\nCOMPLETE: {dispatch_id} — verified result\n",
+    )
 
     result = _run(tmp_path)
     closed = _read(dispatch_id)
@@ -366,7 +370,7 @@ def test_terminal_marker_arriving_after_final_evaluation_wins(
         if not injected:
             injected = True
             with tail.open("a", encoding="utf-8") as stream:
-                stream.write("COMPLETE: terminal marker reached disk\n")
+                stream.write(f"COMPLETE: {dispatch_id} — terminal marker reached disk\n")
         return original(fresh)
 
     monkeypatch.setattr(D, "_abandoned_terminal_outcome", inject_marker)

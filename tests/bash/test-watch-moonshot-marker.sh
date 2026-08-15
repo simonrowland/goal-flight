@@ -23,7 +23,7 @@ run_watch_case() {
   local agent_label="$1"
   local tail_file="$TMP_ROOT/$agent_label.tail"
   local watcher_out="$TMP_ROOT/watcher-$agent_label.out"
-  printf '• COMPLETE: true\n' > "$tail_file"
+  printf '• COMPLETE: moonshot-marker-test-%s — done\n' "$agent_label" > "$tail_file"
 
   sleep 3 &
   WORKER_PID=$!

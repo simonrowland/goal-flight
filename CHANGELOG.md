@@ -49,13 +49,13 @@ incremented when meaningful skill behaviour changes.
   takeover path. A listener can no longer renew the lease it is covered by —
   previously a dead controller looked alive for as long as its listener
   survived, which is the opposite of what a liveness signal is for.
-- A one-shot cursor listener: bounded batches with an explicit "more pending"
-  signal, a generation-stamped token, and cursor advancement guarded by a
-  compare-and-swap on `(registry_generation, cursor_version)`. It exits by
-  itself when superseded, orphaned or corrupt, and records why it exited.
-- Listener coverage rows. Whether a controller is covered is now answered from
-  recorded coverage rather than by grepping the process table; a process scan is
-  a diagnostic, never the authority.
+- A one-shot cursor doorbell: its body-free exit reports only that authoritative
+  mail exists after the cursor. Controllers peek, process, and CAS-advance exact
+  server-known positions; batch tokens, HMAC signing, counts, and backlog flags
+  are deleted.
+- Held-lock listener coverage. Controller mail is covered only by a live
+  listener lock; scoped waits cover only their ids. Coverage rows retain audit
+  and supersession history but are not liveness authority.
 - Auto-claim at natural entry points, aware of what the caller is: a listener,
   drainer, mirror or dashboard child never claims a controller label.
 

@@ -189,7 +189,7 @@ def test_codex_runner_strips_prompt_echo_before_continue_step_checks() -> None:
                 "$ python3 tests/python/test_controller_probe_matrix.py\n"
                 "PASS tests/python/test_controller_probe_matrix.py (7 tests)\n"
                 "STEP_TWO_DONE: true\n"
-                "COMPLETE: true"
+                "COMPLETE: continue-prescribed-step-two — true"
             ),
             "complete_marker": True,
             "watcher_returncode": 0,
@@ -927,7 +927,10 @@ def test_codex_runner_writes_transcript_when_requested() -> None:
     def fake_run_codex_bash_tail(**_: object) -> dict:
         return {
             "ok": True,
-            "tail_text": 'goalflight_doctor.py host_goalflight_install {"ok": true}\nCOMPLETE: true',
+            "tail_text": (
+                'goalflight_doctor.py host_goalflight_install {"ok": true}\n'
+                "COMPLETE: doctor-loads — true"
+            ),
             "complete_marker": True,
             "watcher_returncode": 0,
             "worker_returncode": 0,
@@ -956,7 +959,7 @@ def test_codex_runner_writes_transcript_when_requested() -> None:
             text = transcript.read_text(encoding="utf-8")
             assert "controller: codex" in text
             assert "Prompt mentions goalflight_doctor.py" in text
-            assert "COMPLETE: true" in text
+            assert "COMPLETE: doctor-loads — true" in text
     finally:
         behavior_module.probe_matrix.probe_controller = original_probe
         behavior_module.doctor_snapshot = original_doctor

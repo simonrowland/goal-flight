@@ -67,17 +67,23 @@ def _aggregate_record_with_status_marker(
     classification: str = "blocked",
     status_state: str | None = None,
 ) -> dict:
+    bound_text = (
+        marker_text
+        if marker_text == dispatch_id or marker_text.startswith(f"{dispatch_id} ")
+        else f"{dispatch_id} — {marker_text}"
+    )
+    marker = {
+        "kind": marker_kind,
+        "text": bound_text,
+        "line": 1,
+    }
     status_path = directory / f"{dispatch_id}.status.json"
     status_path.write_text(
         json.dumps(
             {
                 "dispatch_id": dispatch_id,
                 "state": status_state or classification,
-                "terminal_marker": {
-                    "kind": marker_kind,
-                    "text": marker_text,
-                    "line": 1,
-                },
+                "terminal_marker": marker,
             }
         ),
         encoding="utf-8",
@@ -87,6 +93,7 @@ def _aggregate_record_with_status_marker(
         "classification": classification,
         "state": classification,
         "status_path": str(status_path),
+        "terminal_marker": marker,
     }
 
 
@@ -191,12 +198,8 @@ def test_verdict_line_stays_bare_for_complete_and_timeout() -> None:
     )
 
 
-def test_marker_kind_is_read_from_the_status_FILE_not_just_the_record() -> None:
-    """The aggregated payload record carries no marker fields - only the
-    per-dispatch status JSON does. A lookup that reads the record alone passes
-    against a hand-built record and yields nothing on every real dispatch,
-    which is exactly how this shipped broken the first time.
-    """
+def test_wait_snapshot_does_not_mix_stale_record_with_fresh_status_file() -> None:
+    """One wait verdict uses one aggregate generation, never a fresh sidecar."""
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -208,7 +211,7 @@ def test_marker_kind_is_read_from_the_status_FILE_not_just_the_record() -> None:
                     "state": "blocked",
                     "terminal_marker": {
                         "kind": "USER-NEED",
-                        "text": "landing checkpoint - session abc123",
+                        "text": "chk — landing checkpoint - session abc123",
                         "line": 5,
                     },
                 },
@@ -222,9 +225,9 @@ def test_marker_kind_is_read_from_the_status_FILE_not_just_the_record() -> None:
             "status_path": status_path,
         }
         row = _row(_payload(rec), "chk", now=10_000.0)
-        assert_eq("kind recovered from file", row.get("marker_kind"), "USER-NEED")
+        assert_eq("fresh sidecar marker ignored", row.get("marker_kind"), None)
         line = status._wait_verdict_line(row)
-        assert_true("kind in verdict", "[USER-NEED]" in line)
+        assert_eq("stale aggregate stays internally consistent", line, "chk -> blocked")
 
     # Unreadable/missing status file must degrade quietly, not raise.
     rec = {
@@ -238,7 +241,7 @@ def test_marker_kind_is_read_from_the_status_FILE_not_just_the_record() -> None:
     assert_eq("bare verdict", status._wait_verdict_line(row), "gone -> blocked")
 
 
-def test_marker_helpers_share_production_status_file_fallback() -> None:
+def test_marker_helpers_share_the_aggregate_snapshot() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         rec = _aggregate_record_with_status_marker(
             Path(tmp),
@@ -421,8 +424,8 @@ def main() -> None:
         test_completed_pid_dead_stays_complete_trust_clause,
         test_terminal_row_carries_marker_kind_and_verdict_distinguishes_checkpoint,
         test_verdict_line_stays_bare_for_complete_and_timeout,
-        test_marker_kind_is_read_from_the_status_FILE_not_just_the_record,
-        test_marker_helpers_share_production_status_file_fallback,
+        test_wait_snapshot_does_not_mix_stale_record_with_fresh_status_file,
+        test_marker_helpers_share_the_aggregate_snapshot,
         test_status_marker_fallback_rejects_nonterminal_and_wrong_dispatch,
         test_wait_heartbeat_emits_progress_line_at_cadence,
     ]

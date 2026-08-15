@@ -66,27 +66,33 @@ python3 <skill-root>/scripts/goalflight_messages.py listen \
   --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE"
 ```
 
-The listener writes an ARMED coverage row, waits for a waking journal assignment,
-returns at most `K` envelopes plus `more_pending`, prints a generation-stamped
-`cursor_token`, writes its EXITED row, and terminates. Process the batch, then re-arm
-with the previous token to CAS-advance `(registry_generation, cursor_version)`:
+The listener holds the well-known generation lock, writes an ARMED audit row,
+and terminates as soon as any assignment is newer than the controller cursor. Its
+exit is only a doorbell: no envelopes, count, backlog flag, or receipt token are
+delivered through the listener. Peek authoritative mail after the wake:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_messages.py listen \
-  --project-root "$PWD" --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
-  --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE" \
-  --cursor-token '<previous-token>'
+python3 <skill-root>/scripts/goalflight_messages.py relay --new --json
 ```
 
-A stale token loses without advancing. If backlog remains, the re-armed listener wakes
-immediately. A second listener supersedes the first coverage row. Superseded,
-orphaned, stale-lease, corrupt, upgrade-required, and journal-unavailable exits are
-all durable rows. The listener never renews the controller lease.
+After processing the returned items, advance exactly their server-known positions
+with the snapshot's cursor version, then re-arm. A fabricated position and a stale
+version both lose:
 
-Coverage rows, not `ps` output, drive the missing-listener reminder. PID/start-token
-measurement only verifies a stored row. Lease expiry with work needing care creates a
-journal attention item whether detected by the listener or by the renewal-horizon
-sweep.
+```bash
+python3 <skill-root>/scripts/goalflight_messages.py advance \
+  --project-root "$PWD" --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
+  --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE" \
+  --cursor-version <version> --position '<stream>=<seq>'
+```
+
+Peek again to derive whether more remains. A second same-generation listener loses
+the well-known lock before it can supersede the healthy doorbell. Superseded,
+orphaned, stale-lease, corrupt, upgrade-required, and journal-unavailable exits remain
+durable audit rows. The listener never renews the controller lease.
+
+The held-lock ledger, not coverage rows or `ps` output, drives the missing-listener
+reminder. Coverage rows retain audit and supersession history only.
 
 Use `goalflight_status.py --wait <ids>` only for an unclaimed fixed-set join. Its mail
 watermark is journal-derived and monotonic; cursor advancement cannot erase the wake.

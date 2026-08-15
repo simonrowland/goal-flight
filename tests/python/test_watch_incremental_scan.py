@@ -18,6 +18,7 @@ import goalflight_watch as watch  # noqa: E402
 
 
 POLL_SECS = 0.125
+DISPATCH_ID = "incremental-watch"
 
 
 def _run_live_watcher(
@@ -31,6 +32,12 @@ def _run_live_watcher(
     tail = tmp_path / "worker.tail"
     status = tmp_path / "watcher.status.json"
     tail.write_bytes(initial)
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
+    monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("GOALFLIGHT_MESSAGES_DIR", str(tmp_path / "messages"))
+    monkeypatch.setenv("GOALFLIGHT_WAKE_LEDGER_DIR", str(tmp_path / "wake-ledger"))
+    monkeypatch.setenv("GOAL_FLIGHT_PIDFILE_DIR", str(tmp_path / "pids"))
     payloads: list[dict] = []
     poll_sleeps = 0
     real_write_status = watch.write_status
@@ -56,6 +63,8 @@ def _run_live_watcher(
             str(tail),
             "--status-json",
             str(status),
+            "--dispatch-id",
+            DISPATCH_ID,
             "--poll-secs",
             str(POLL_SECS),
             "--max-idle-secs",
@@ -95,7 +104,7 @@ def test_live_entry_point_scans_only_appended_bytes(
     appends = [
         b"STATUS: delta one\n",
         b"STATUS: delta two\n",
-        b"COMPLETE: incremental accounting\n",
+        b"COMPLETE: incremental-watch - incremental accounting\n",
     ]
 
     def grow(index: int, tail: Path) -> None:
@@ -121,7 +130,7 @@ def test_live_entry_point_detects_split_marker_once(
 ) -> None:
     """Input path: partial EOF -> next poll suffix -> main terminal payload."""
 
-    suffix = b"LETE: split across polls\n"
+    suffix = b"LETE: incremental-watch - split across polls\n"
 
     def finish_line(index: int, tail: Path) -> None:
         if index == 0:
@@ -156,7 +165,7 @@ def test_live_entry_point_resyncs_replaced_tail(
             replacement.replace(tail)
             return
         if index == 1:
-            _append(tail, b"\nCOMPLETE: replacement observed\n")
+            _append(tail, b"\nCOMPLETE: incremental-watch - replacement observed\n")
             return
         raise AssertionError("watcher failed to finish after tail replacement")
 
@@ -188,7 +197,7 @@ def test_live_entry_point_resyncs_truncated_tail(
             tail.write_bytes(b"")
             return
         if index == 1:
-            _append(tail, b"COMPLETE: after truncation\n")
+            _append(tail, b"COMPLETE: incremental-watch - after truncation\n")
             return
         raise AssertionError("watcher failed to finish after tail truncation")
 
@@ -212,7 +221,7 @@ def test_live_entry_point_keeps_unbalanced_fence_state_across_polls(
 ) -> None:
     """Input path: prior-poll fence opener -> next-poll marker -> live terminal."""
 
-    marker = b"COMPLETE: unbalanced fence remains permissive\n"
+    marker = b"COMPLETE: incremental-watch - unbalanced fence remains permissive\n"
 
     def append_marker(index: int, tail: Path) -> None:
         if index == 0:

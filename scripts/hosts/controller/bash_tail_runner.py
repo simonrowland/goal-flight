@@ -47,7 +47,7 @@ def run_bash_tail_session(
 
     tail_text = watch.get("tail_text") or ""
     if watch.get("worker_returncode") == 0 and not watch.get("complete_marker") and not watch.get("blocked_marker"):
-        append_tail(tail_path, "COMPLETE: true")
+        append_tail(tail_path, f"COMPLETE: {session_id} — worker exited cleanly")
         tail_text = tail_path.read_text(encoding="utf-8")
         watch["complete_marker"] = True
         watch["ok"] = watch.get("watcher_returncode") == 0

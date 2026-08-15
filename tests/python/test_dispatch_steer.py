@@ -34,6 +34,8 @@ def _state_dir(tmp: Path):
         "GOALFLIGHT_MESSAGES_DIR": str(tmp / "messages"),
         "GOAL_FLIGHT_PIDFILE_DIR": str(tmp / "pids"),
         "GOALFLIGHT_TASK_STORE_DIR": str(tmp / "task-store"),
+        "GOALFLIGHT_JOURNAL_DIR": str(tmp / "journal"),
+        "GOALFLIGHT_WAKE_LEDGER_DIR": str(tmp / "wake-ledger"),
     }
     old = {key: os.environ.get(key) for key in isolated}
     os.environ.update(isolated)
@@ -53,6 +55,8 @@ def _env(tmp: Path) -> dict[str, str]:
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
     env["PYTHONPATH"] = str(SCRIPTS) + os.pathsep + env.get("PYTHONPATH", "")
     return env
 
@@ -310,7 +314,7 @@ def case_spawn_exports_steer_env() -> None:
         worker_code = (
             "import os; "
             "print(os.environ.get('GOALFLIGHT_STEER_FILE', '')); "
-            "print('COMPLETE: env seen', flush=True)"
+            f"print('COMPLETE: {dispatch_id} — env seen', flush=True)"
         )
         proc = subprocess.run(
             [
@@ -350,7 +354,7 @@ def _run_prompt_env_case(tmp: Path, dispatch_id: str, prompt_args: list[str], se
         f"Path({str(seen_path)!r}).write_text("
         "os.environ.get('GOALFLIGHT_PROMPT_FILE', '') + '\\n' + "
         "os.environ.get('GOALFLIGHT_STEER_FILE', ''), encoding='utf-8'); "
-        "print('COMPLETE: prompt env seen', flush=True)"
+        f"print('COMPLETE: {dispatch_id} — prompt env seen', flush=True)"
     )
 
     old_build_worker = goalflight_dispatch.build_worker
@@ -498,7 +502,7 @@ def case_prompt_preamble_is_materialized() -> None:
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         body = tmp / "body.md"
-        body_text = "Do work.\nCOMPLETE: done\n"
+        body_text = "Do work.\nCOMPLETE: prompt-case — done\n"
         body.write_text(body_text, encoding="utf-8")
         assembled = Path(goalflight_dispatch._materialize_steer_prompt(str(body), tmp / "dispatch", "prompt-case"))
         text = assembled.read_text(encoding="utf-8")
@@ -506,6 +510,11 @@ def case_prompt_preamble_is_materialized() -> None:
             goalflight_dispatch.STEER_PROMPT_PREAMBLE
             + "\n\n"
             + goalflight_dispatch.PROMPT_FILE_PREAMBLE
+            + "\n\nTerminal evidence identity contract:\n"
+            + "- Every terminal marker payload starts with the exact dispatch id `prompt-case`.\n"
+            + "- Successful final shape: `!COMPLETE: prompt-case — <summary>`.\n"
+            + "- Use the same id prefix for READY, RESULT, FAILED, USER-NEED, "
+            + "USER-CONFIRM, or BLOCKED. A generic or foreign marker is ignored."
             + "\n\n"
             + body_text
         )
@@ -516,7 +525,7 @@ def case_prompt_preamble_is_materialized() -> None:
         assert "$GOALFLIGHT_PROMPT_FILE" in text, text
         assert "Re-read it after any internal compaction/summarization" in text, text
         assert "disk file is authoritative" in text, text
-        assert "COMPLETE: done" in text, text
+        assert "COMPLETE: prompt-case — done" in text, text
         assert assembled.name == "prompt-case.assembled.prompt", assembled
 
 
@@ -603,7 +612,7 @@ def case_grok_prompt_adds_execution_and_terminal_contract() -> None:
         )
         assert text.startswith(expected_prefix), text
         assert "Use your available tools to actually perform" in text, text
-        assert "`!COMPLETE: <summary>`" in text, text
+        assert "`!COMPLETE: grok-prompt-case — <summary>`" in text, text
         assert "Legacy unprefixed marker lines remain accepted" in text, text
         assert "last non-empty line" in text, text
         assert "Write target.txt with ok." in text, text
@@ -632,6 +641,7 @@ def case_codex_prompt_does_not_add_grok_contract() -> None:
         )
         assert text.startswith(expected_prefix), text
         assert goalflight_dispatch.WORKER_EXECUTION_PREAMBLE not in text, text
+        assert "`!COMPLETE: codex-prompt-case — <summary>`" in text, text
 
 
 def case_preamble_routing_matrix() -> None:

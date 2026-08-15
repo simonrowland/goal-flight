@@ -201,12 +201,12 @@ python3 <skill-root>/scripts/goalflight_messages.py listen \
   --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>
 ```
 
-The listener writes a coverage row, returns a bounded batch and cursor token, writes
-an exit row, and terminates. After processing the batch, re-arm with
-`--cursor-token <previous-token>`; that token advances only by CAS on the lease
-generation and cursor version. `more_pending=true` means the re-arm wakes from
-backlog immediately. Listener, drainer, mirror, and dashboard roles never claim or
-renew the controller lease; a verified watchdog tick may renew it.
+The listener writes an audit row and terminates body-free when mail exists after the
+stored cursor. The controller peeks with `relay --new --json`, processes the returned
+items, advances their server-known stream positions with `advance --cursor-version
+<version> --position <stream>=<seq>`, then re-arms. Peek again to derive remaining
+mail. Listener, drainer, mirror, and dashboard roles never claim or renew the
+controller lease; a verified watchdog tick may renew it.
 
 ### Controller correspondence addressing
 

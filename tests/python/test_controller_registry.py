@@ -26,6 +26,7 @@ def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
         "GOALFLIGHT_JOURNAL_DIR": tmp_path / "journal",
         "GOALFLIGHT_MESSAGES_DIR": tmp_path / "messages",
         "GOALFLIGHT_STATE_DIR": tmp_path / "state",
+        "GOALFLIGHT_WAKE_LEDGER_DIR": tmp_path / "wake-ledger",
         "GOAL_FLIGHT_PIDFILE_DIR": tmp_path / "pidfiles",
     }.items():
         monkeypatch.setenv(key, str(value))
@@ -96,8 +97,14 @@ def test_roster_unread_is_journal_cursor_derived(
     assert roster["controllers"][0]["unread_addressed_mail"] == 1
     authority = journal.Journal(root)
     lease = authority.active_lease("engine")
-    batch = authority.cursor_batch("engine", nonce=lease.nonce, limit=10)
-    assert authority.advance_cursor(batch.token, actor="engine").committed
+    peek = authority.cursor_peek("engine", nonce=lease.nonce, limit=10)
+    assert authority.advance_cursor(
+        "engine",
+        nonce=lease.nonce,
+        expected_cursor_version=peek.cursor_version,
+        advances={"roster-mail": 1},
+        actor="engine",
+    ).committed
     assert (
         sessions.controller_roster(root, ledger_records=[])["controllers"][0][
             "unread_addressed_mail"

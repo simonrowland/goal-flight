@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
 from pathlib import Path
+import shutil
+import signal
 import shlex
 import subprocess
 import sys
@@ -44,6 +47,7 @@ def isolated_env(tmp_path: Path, *, label: str = "wake-test") -> dict[str, str]:
             "GOALFLIGHT_JOURNAL_DIR": str(tmp_path / "journals"),
             "GOALFLIGHT_TASK_STORE_DIR": str(tmp_path / "task-store"),
             "GOALFLIGHT_STATE_DIR": str(tmp_path / "state"),
+            "GOALFLIGHT_WAKE_LEDGER_DIR": str(tmp_path / "wake-ledger"),
             "GOAL_FLIGHT_PIDFILE_DIR": str(tmp_path / "pids"),
             "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
             "GOALFLIGHT_CONTROLLER_LABEL": label,
@@ -149,7 +153,60 @@ def test_lockfile_content_never_claims_liveness(isolated: tuple[Path, dict[str, 
 
 def test_waiter_coverage_rejects_transient_fork_inheritance(
     isolated: tuple[Path, dict[str, str]],
-    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, env = isolated
+    orphaned = root / "fork-child-orphaned"
+    code = f"""
+import os, sys, time
+from pathlib import Path
+sys.path.insert(0, {str(SCRIPTS)!r})
+import goalflight_wake as w
+r = w.register_waiter({str(root)!r}, controller_label='wake-test', kind='wait')
+owner = os.getpid()
+child = os.fork()
+if child:
+    print(f'{{r.record.path}}|{{child}}', flush=True)
+    os._exit(0)
+deadline = time.monotonic() + 3
+while os.getppid() == owner and time.monotonic() < deadline:
+    time.sleep(0.01)
+Path({str(orphaned)!r}).write_text('orphaned')
+time.sleep(60)
+"""
+    holder = subprocess.Popen(
+        [sys.executable, "-c", code],
+        cwd=root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    forked_pid: int | None = None
+    try:
+        assert holder.stdout is not None
+        path_text, raw_pid = holder.stdout.readline().strip().split("|", 1)
+        forked_pid = int(raw_pid)
+        deadline = time.monotonic() + 3
+        while not orphaned.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert orphaned.exists(), "fork child did not outlive its recorded owner"
+        # Sandboxed macOS may deny `ps` for a zombie that libproc no longer
+        # exposes. UNKNOWN is deliberately the same fail-noisy direction.
+        assert wake.goalflight_compat.pid_is_zombie(holder.pid) is not False
+        assert wake.live_waiters(root, controller_label="wake-test") == []
+        assert not Path(path_text).exists()
+        holder.wait(timeout=3)
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=3)
+        if forked_pid:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(forked_pid, signal.SIGKILL)
+
+
+def test_waiter_descriptor_is_close_on_exec(
+    isolated: tuple[Path, dict[str, str]],
 ) -> None:
     root, _env = isolated
     registration = wake.register_waiter(
@@ -157,15 +214,10 @@ def test_waiter_coverage_rejects_transient_fork_inheritance(
         controller_label="wake-test",
         kind="wait",
     )
-    stale_path = registration.record.path
-    registration.close()
-    stale_path.touch()
-    samples = iter((True, False))
-    monkeypatch.setattr(wake, "_probe_locked_once", lambda _path: next(samples))
-    monkeypatch.setattr(wake.time, "sleep", lambda _seconds: None)
-
-    assert wake.live_waiters(root, controller_label="wake-test") == []
-    assert not stale_path.exists()
+    try:
+        assert os.get_inheritable(registration._fd) is False
+    finally:
+        registration.close()
 
 
 def test_controller_lease_lock_releases_on_sigkill(
@@ -195,7 +247,74 @@ def test_controller_lease_lock_releases_on_sigkill(
             child.wait(timeout=3)
 
 
-def test_listener_and_status_wait_both_join_the_waiter_pool(
+def test_deleted_live_lease_address_is_unknown_not_dead(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    root, env = isolated
+    nonce = uuid.uuid4().hex
+    child = _spawn_lease_lock_holder(root, env, label="wake-test", nonce=nonce)
+    try:
+        assert child.stdout is not None
+        lock_path = Path(child.stdout.readline().strip())
+        assert wake.lease_holder_alive(
+            root,
+            controller_label="wake-test",
+            lease_nonce=nonce,
+        ) is True
+        shutil.rmtree(lock_path.parent)
+        assert wake.lease_holder_alive(
+            root,
+            controller_label="wake-test",
+            lease_nonce=nonce,
+        ) is None
+        lease_result = journal.open_or_create_journal(root).claim_or_renew_lease(
+            "wake-test",
+            principal={"principal_id": "ambient-incumbent"},
+            nonce=nonce,
+        )
+        assert lease_result.committed and lease_result.value is not None
+        liveness = sessions._lease_holder_liveness(lease_result.value)
+        assert liveness is not None and liveness.alive is None
+        refused = journal.Journal(root).claim_or_renew_lease(
+            "wake-test",
+            principal={"principal_id": "ambient-contender"},
+            incumbent_liveness=liveness,
+        )
+        assert refused.cas_lost
+        assert "label in use" in str(refused.reason)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=3)
+
+
+def test_second_generation_holder_loses_well_known_lock(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    root, env = isolated
+    nonce = uuid.uuid4().hex
+    first = _spawn_lease_lock_holder(root, env, label="wake-test", nonce=nonce)
+    second: subprocess.Popen[str] | None = None
+    try:
+        assert first.stdout is not None
+        first_path = first.stdout.readline().strip()
+        second = _spawn_lease_lock_holder(root, env, label="wake-test", nonce=nonce)
+        _stdout, _stderr = second.communicate(timeout=3)
+        assert second.returncode != 0
+        assert wake.lease_holder_alive(
+            root,
+            controller_label="wake-test",
+            lease_nonce=nonce,
+        ) is True
+        assert first_path.endswith(".lock")
+    finally:
+        for process in (first, second):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=3)
+
+
+def test_scoped_status_wait_does_not_cover_controller_mail(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
     root, env = isolated
@@ -258,6 +377,17 @@ def test_listener_and_status_wait_both_join_the_waiter_pool(
                 break
             time.sleep(0.05)
         assert kinds == {"listener", "wait"}
+        covered = wake.coverage_status(root, controller_label="wake-test")
+        assert covered["covered"] is True
+        assert {row["kind"] for row in covered["waiters"]} == {"listener"}
+        listener.kill()
+        listener.communicate(timeout=3)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if {row.kind for row in wake.live_waiters(root, controller_label="wake-test")} == {"wait"}:
+                break
+            time.sleep(0.02)
+        assert wake.coverage_status(root, controller_label="wake-test")["covered"] is False
     finally:
         for process in (listener, long_wait):
             if process.poll() is None:
@@ -266,7 +396,7 @@ def test_listener_and_status_wait_both_join_the_waiter_pool(
     assert wake.live_waiters(root, controller_label="wake-test") == []
 
 
-def test_bad_rearm_token_does_not_displace_healthy_listener(
+def test_deleted_cursor_token_cli_surface_does_not_displace_healthy_listener(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
     root, env = isolated
@@ -318,7 +448,8 @@ def test_bad_rearm_token_does_not_displace_healthy_listener(
             check=False,
             timeout=5,
         )
-        assert bad.returncode in {2, 3}
+        assert bad.returncode == 2
+        assert "unrecognized arguments: --cursor-token" in bad.stderr
         current = authority.active_coverage("wake-test")
         assert current is not None and current["coverage_id"] == coverage_id
         assert healthy.poll() is None
@@ -523,6 +654,49 @@ def test_one_shot_controller_role_without_session_beacon_never_auto_claims() -> 
         worker_dispatch=False,
         session_entry=False,
     ) == "one_shot_cli_does_not_claim"
+
+
+def test_ambient_capability_still_gets_mail_fallback_when_holder_is_unknown(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test",
+        principal={"principal_id": "constructed-ambient"},
+    )
+    assert claimed.committed and claimed.value is not None
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_SESSION_ID", claimed.value.nonce)
+    strict = messages._ambient_claimed_controller(
+        root,
+        controller_label="wake-test",
+        mail_bearing=True,
+    )
+    assert strict["claimed"] is False
+    assert strict["reason"] == "controller-lease-holder-unknown"
+    fallback = messages._ambient_claimed_controller(
+        root,
+        controller_label="wake-test",
+        mail_bearing=True,
+        require_live_holder=False,
+    )
+    assert fallback["claimed"] is True
+    assert fallback["holder_alive"] is None
+
+    with wake.register_waiter(
+        root,
+        controller_label="wake-test",
+        kind="wait",
+    ):
+        stream = io.StringIO()
+        result = messages.emit_wake_entry_notice(
+            project_root=root,
+            controller_label="wake-test",
+            stream=stream,
+        )
+    assert result["covered"] is False
+    assert stream.getvalue().startswith("listener offline; start: ")
 
 
 def test_one_shot_cli_entries_with_a_real_beacon_still_do_not_claim(

@@ -160,8 +160,9 @@ frontmatter above. New categories require a frontmatter schema bump (raise
 The controller keeps the interactive session responsive by dispatching workers in
 the background and arming a generation-bound `goalflight_messages.py listen
 --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>` in the
-background. It processes the bounded batch, then re-arms with the returned cursor
-token. Arm the wait and let work wake it. Any tool call expected to run longer than about 10
+background. Its body-free exit triggers `relay --new --json`; the controller
+processes chosen items, CAS-advances their server-known positions, then re-arms.
+Arm the wait and let work wake it. Any tool call expected to run longer than about 10
 seconds is backgrounded so typed steers remain visible and ESC/Ctrl-C cancels only
 the observer, not the detached worker.
 
@@ -281,11 +282,11 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `no-blocking-cursor-task-worker`
 - **name:** Arm the event wake without blocking
 - **category:** `worker-routing-defaults`
-- **controller_does:** The orchestrator auto-claims without stealing a live different lease, backgrounds one generation-bound listener, processes its bounded batch, re-arms with its cursor token, and uses a fixed-id wait only for a deliberate unclaimed join.
+- **controller_does:** The orchestrator auto-claims without stealing a live different lease, backgrounds one generation-bound doorbell, peeks authoritative mail on exit, cursor-CASes processed server-known positions, re-arms, and uses a fixed-id wait only for a deliberate unclaimed join.
 - **failure_mode:** The orchestrator blocks the interactive session or schedules a timer to ask whether a worker finished instead of arming the available event channel.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Arm one background generation-bound `goalflight_messages.py listen --project-root \"$PWD\" --controller-label <label> --lease-nonce <nonce>`; process its bounded batch, then re-arm with its cursor token"
+    - **pattern:** "Arm one background generation-bound `goalflight_messages.py listen --project-root \"$PWD\" --controller-label <label> --lease-nonce <nonce>`; on its body-free exit, peek authoritative mail, cursor-CAS processed server-known positions, then re-arm"
     - **max_section_lines:** 55
 - **verifier:**
     - **kind:** behaviour-scenario

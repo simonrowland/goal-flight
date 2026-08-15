@@ -26,6 +26,7 @@ def _state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, journ
         "GOALFLIGHT_JOURNAL_DIR": tmp_path / "journal",
         "GOALFLIGHT_MESSAGES_DIR": tmp_path / "messages",
         "GOALFLIGHT_STATE_DIR": tmp_path / "state",
+        "GOALFLIGHT_WAKE_LEDGER_DIR": tmp_path / "wake-ledger",
         "GOAL_FLIGHT_PIDFILE_DIR": tmp_path / "pidfiles",
     }.items():
         monkeypatch.setenv(key, str(value))
@@ -102,6 +103,12 @@ def test_dead_holder_with_unexpired_deadline_is_replaced_automatically(
     }
     monkeypatch.setattr(sessions, "_controller_process_identity", identities.get)
     monkeypatch.setattr(sessions.goalflight_compat, "pid_alive", lambda pid: pid == 62002)
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="owner",
+        lease_nonce=incumbent.value.nonce,
+    )
+    holder.close()
 
     claimed = sessions.claim_controller_startup(
         root,

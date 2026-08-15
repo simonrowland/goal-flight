@@ -42,6 +42,7 @@ def _isolate_state_env(env: dict[str, str], base: Path) -> None:
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(base / "task-store")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(base / "journal")
     env["GOALFLIGHT_MESSAGES_DIR"] = str(base / "messages")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(base / "wake-ledger")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(base / "pids")
     env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
 
@@ -95,6 +96,7 @@ def _run(
                 sys.executable, str(DISPATCH),
                 "--cwd", tmp,
                 "--agent", "test", "--tail", str(tail), "--status-json", str(status),
+                "--dispatch-id", "crash-safe-run",
                 "--poll-secs", poll, "--max-idle-secs", max_idle, "--foreground", "--", *worker_cmd,
             ],
             capture_output=True, text=True, timeout=float(max_idle) + 30, env=env,
@@ -118,7 +120,7 @@ def case_crash_detected_promptly() -> None:
 
 def case_finished_via_marker() -> None:
     rc, elapsed, end = _run(
-        ["bash", "-c", "echo working; sleep 1; printf 'COMPLETE: ok\\n'; sleep 0.3"], max_idle="20", poll="1"
+        ["bash", "-c", "echo working; sleep 1; printf 'COMPLETE: crash-safe-run — ok\\n'; sleep 0.3"], max_idle="20", poll="1"
     )
     assert rc == 0, f"expected exit 0 (complete), got {rc} ({end})"
     assert end.get("terminal_state") == "complete", end
@@ -187,7 +189,7 @@ def case_dispatch_usage_limit_exit_zero_is_exhausted() -> None:
 def case_dispatch_success_marker_with_limit_terms_stays_complete() -> None:
     worker_code = (
         "print('Docs mention usage limit, 429, try again at 6:13 AM, rate limit, at capacity.', flush=True)\n"
-        "print('READY: terminal summary includes rate limit data', flush=True)\n"
+        "print('READY: success-marker-limit-terms — terminal summary includes rate limit data', flush=True)\n"
     )
     rc, end, payload, record = _run_dispatch_with_state("success-marker-limit-terms", worker_code)
     assert rc == 0, (rc, end, payload, record)
@@ -203,7 +205,7 @@ def case_dispatch_success_marker_with_limit_terms_stays_complete() -> None:
 
 
 def case_dispatch_clean_complete_preserves_reason_without_rate_signal() -> None:
-    worker_code = "print('COMPLETE: clean', flush=True)\n"
+    worker_code = "print('COMPLETE: clean-complete — clean', flush=True)\n"
     rc, end, payload, record = _run_dispatch_with_state("clean-complete", worker_code)
     assert rc == 0, (rc, end, payload, record)
     assert end.get("terminal_state") == "complete", end
@@ -242,7 +244,7 @@ def case_post_terminal_idle_worker_times_out_inconclusively() -> None:
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
         worker_code = (
             "import time\n"
-            "print('COMPLETE: done', flush=True)\n"
+            "print('COMPLETE: post-terminal-idle — done', flush=True)\n"
             "while True:\n"
             "    time.sleep(1)\n"
         )
@@ -261,6 +263,7 @@ def case_post_terminal_idle_worker_times_out_inconclusively() -> None:
                 "--pid", str(worker.pid),
                 "--tail", str(tail),
                 "--status-json", str(status),
+                "--dispatch-id", "post-terminal-idle",
                 "--agent", "test",
                 "--poll-secs", "0.2",
                 "--max-idle-secs", "1",
@@ -308,7 +311,7 @@ def case_post_terminal_busy_worker_wait_is_bounded() -> None:
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "50.0"
         worker_code = (
             "import time\n"
-            "print('COMPLETE: done', flush=True)\n"
+            "print('COMPLETE: post-terminal-busy — done', flush=True)\n"
             "while True:\n"
             "    time.sleep(1)\n"
         )
@@ -327,6 +330,7 @@ def case_post_terminal_busy_worker_wait_is_bounded() -> None:
                 "--pid", str(worker.pid),
                 "--tail", str(tail),
                 "--status-json", str(status),
+                "--dispatch-id", "post-terminal-busy",
                 "--agent", "test",
                 "--poll-secs", "0.2",
                 "--max-idle-secs", "1",
@@ -379,7 +383,7 @@ def case_post_terminal_delayed_worker_exit_is_observed() -> None:
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "50.0"
         worker_code = (
             "import time\n"
-            "print('COMPLETE: delayed exit', flush=True)\n"
+            "print('COMPLETE: post-terminal-delayed — delayed exit', flush=True)\n"
             "time.sleep(2)\n"
         )
         with tail.open("w", encoding="utf-8") as tail_out:
@@ -397,6 +401,7 @@ def case_post_terminal_delayed_worker_exit_is_observed() -> None:
                 "--pid", str(worker.pid),
                 "--tail", str(tail),
                 "--status-json", str(status),
+                "--dispatch-id", "post-terminal-delayed",
                 "--agent", "test",
                 "--poll-secs", "0.2",
                 "--max-idle-secs", "20",
@@ -440,7 +445,7 @@ def case_dispatch_post_terminal_idle_returns_inconclusive() -> None:
         [
             sys.executable,
             "-c",
-            "import time; print('COMPLETE: dispatch done', flush=True); time.sleep(20)",
+            "import time; print('COMPLETE: crash-safe-run — dispatch done', flush=True); time.sleep(20)",
         ],
         max_idle="1",
         poll="0.2",
@@ -479,7 +484,7 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
             f"pathlib.Path({str(started)!r}).write_text('started')\n"
             "print('worker-started', flush=True)\n"
             "time.sleep(0.5)\n"
-            "print('COMPLETE: code done', flush=True)\n"
+            "print('COMPLETE: launcher-pgroup — code done', flush=True)\n"
             "time.sleep(1.0)\n"
             f"pathlib.Path({str(done)!r}).write_text('done')\n"
         )
@@ -488,6 +493,7 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
                 sys.executable, str(DISPATCH),
                 "--cwd", str(tmp_path),
                 "--agent", "test", "--tail", str(tail), "--status-json", str(status),
+                "--dispatch-id", "launcher-pgroup",
                 "--poll-secs", "0.2", "--max-idle-secs", "10", "--foreground", "--",
                 sys.executable, "-c", worker_code,
             ],
@@ -548,7 +554,7 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
             f"pathlib.Path({str(started)!r}).write_text('started')\n"
             "print('worker-started', flush=True)\n"
             "time.sleep(8.0)\n"
-            "print('COMPLETE: interrupt-safe done', flush=True)\n"
+            "print('COMPLETE: foreground-interrupt — interrupt-safe done', flush=True)\n"
             f"pathlib.Path({str(done)!r}).write_text('done')\n"
         )
         proc = subprocess.Popen(
@@ -651,6 +657,8 @@ def case_watcher_sigterm_flushes_non_running_status() -> None:
         tmp_path = Path(tmp)
         tail = tmp_path / "tail.txt"
         status = tmp_path / "status.json"
+        env = os.environ.copy()
+        _isolate_state_env(env, tmp_path)
         tail.write_text("", encoding="utf-8")
         worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
         watcher = subprocess.Popen(
@@ -659,6 +667,7 @@ def case_watcher_sigterm_flushes_non_running_status() -> None:
                 "--pid", str(worker.pid),
                 "--tail", str(tail),
                 "--status-json", str(status),
+                "--dispatch-id", "sigterm-flush",
                 "--poll-secs", "0.2",
                 "--max-idle-secs", "30",
             ],
@@ -668,6 +677,7 @@ def case_watcher_sigterm_flushes_non_running_status() -> None:
             encoding="utf-8",
             errors="replace",
             start_new_session=True,
+            env=env,
         )
         try:
             assert _wait_for(lambda: status.exists()), "watcher did not write initial status"
@@ -687,6 +697,8 @@ def case_detached_watcher_ignores_dead_controller_pid() -> None:
         tmp_path = Path(tmp)
         tail = tmp_path / "tail.txt"
         status = tmp_path / "status.json"
+        env = os.environ.copy()
+        _isolate_state_env(env, tmp_path)
         tail.write_text("", encoding="utf-8")
         dead_controller = _dead_pid()
         worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"], start_new_session=True)
@@ -696,6 +708,7 @@ def case_detached_watcher_ignores_dead_controller_pid() -> None:
                 "--pid", str(worker.pid),
                 "--tail", str(tail),
                 "--status-json", str(status),
+                "--dispatch-id", "detached-dead-controller",
                 "--poll-secs", "0.2",
                 "--max-idle-secs", "30",
                 "--controller-session-id", "dead-controller-session",
@@ -708,6 +721,7 @@ def case_detached_watcher_ignores_dead_controller_pid() -> None:
             encoding="utf-8",
             errors="replace",
             start_new_session=True,
+            env=env,
         )
         try:
             assert _wait_for(
@@ -737,6 +751,8 @@ def case_non_detached_watcher_dead_controller_remains_orphaned() -> None:
         tmp_path = Path(tmp)
         tail = tmp_path / "tail.txt"
         status = tmp_path / "status.json"
+        env = os.environ.copy()
+        _isolate_state_env(env, tmp_path)
         tail.write_text("", encoding="utf-8")
         dead_controller = _dead_pid()
         worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"], start_new_session=True)
@@ -746,6 +762,7 @@ def case_non_detached_watcher_dead_controller_remains_orphaned() -> None:
                 "--pid", str(worker.pid),
                 "--tail", str(tail),
                 "--status-json", str(status),
+                "--dispatch-id", "owned-dead-controller",
                 "--poll-secs", "0.2",
                 "--max-idle-secs", "30",
                 "--controller-session-id", "dead-controller-session",
@@ -757,6 +774,7 @@ def case_non_detached_watcher_dead_controller_remains_orphaned() -> None:
             encoding="utf-8",
             errors="replace",
             start_new_session=True,
+            env=env,
         )
         try:
             out, err = watcher.communicate(timeout=8)

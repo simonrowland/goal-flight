@@ -31,7 +31,7 @@ def _fake_worker(home: Path) -> Path:
         "#!/bin/sh\n"
         ': > "$HOME/launch-marker"\n'
         ': > "$PWD/probe"\n'
-        "printf 'COMPLETE: fake worker\\n'\n"
+        "printf 'COMPLETE: %s — fake worker\\n' \"$GOALFLIGHT_DISPATCH_ID\"\n"
         "sleep 0.5\n",
         encoding="utf-8",
     )
@@ -89,6 +89,10 @@ def case_real_dispatch_records_honest_moonshot_sandbox_posture() -> None:
             _fake_worker(fake_home)
             env = {
                 "GOALFLIGHT_STATE_DIR": str(state_dir),
+                "GOALFLIGHT_TASK_STORE_DIR": str(temp_root / "task-store"),
+                "GOALFLIGHT_JOURNAL_DIR": str(temp_root / "journal"),
+                "GOALFLIGHT_MESSAGES_DIR": str(temp_root / "messages"),
+                "GOALFLIGHT_WAKE_LEDGER_DIR": str(temp_root / "wake-ledger"),
                 "HOME": str(fake_home),
             }
             with mock.patch.dict(os.environ, env, clear=False):

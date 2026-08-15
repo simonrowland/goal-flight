@@ -72,7 +72,7 @@ def test_verify_present_via_direct_open() -> None:
         art = Path(d) / "sub" / "findings.md"
         art.parent.mkdir(parents=True)
         art.write_text("real leaf content", encoding="utf-8")
-        restore = _patch_ledger([_record(d, "READY: sub/findings.md")])
+        restore = _patch_ledger([_record(d, "READY: vx — sub/findings.md")])
         try:
             out = S.verify_artifacts("vx", project_root=None)
             assert_true("found", out["found"])
@@ -85,7 +85,7 @@ def test_verify_present_via_direct_open() -> None:
 
 def test_verify_absent_artifact() -> None:
     with tempfile.TemporaryDirectory() as d:
-        restore = _patch_ledger([_record(d, "READY: sub/missing.md")])
+        restore = _patch_ledger([_record(d, "READY: vx — sub/missing.md")])
         try:
             out = S.verify_artifacts("vx", project_root=None)
             assert_true("present false", out["results"][0]["present"] is False)
@@ -99,7 +99,9 @@ def test_failure_marker_declares_no_artifacts() -> None:
     with tempfile.TemporaryDirectory() as d:
         art = Path(d) / "partial.md"
         art.write_text("half", encoding="utf-8")
-        restore = _patch_ledger([_record(d, "FAILED: partial.md", state="blocked")])
+        restore = _patch_ledger(
+            [_record(d, "FAILED: vx — partial.md", state="blocked")]
+        )
         try:
             out = S.verify_artifacts("vx", project_root=None)
             assert_eq("no declared artifacts from failure marker", out["declared_artifacts"], [])
@@ -119,7 +121,7 @@ def test_verify_uses_open_not_enumeration() -> None:
         saved_listdir, saved_scandir = os.listdir, os.scandir
         os.listdir = lambda *a, **k: []  # type: ignore[assignment]
         os.scandir = lambda *a, **k: iter(())  # type: ignore[assignment]
-        restore = _patch_ledger([_record(d, "READY: leaves/a41-2.md")])
+        restore = _patch_ledger([_record(d, "READY: vx — leaves/a41-2.md")])
         try:
             out = S.verify_artifacts("vx", project_root=None)
             assert_true("open-by-name beats stale enumeration", out["all_present"] is True)

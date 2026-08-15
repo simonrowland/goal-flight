@@ -66,6 +66,7 @@ __all__ = [
     "LOCK_UN",
     "flock",
     "pid_alive",
+    "pid_is_zombie",
     "windows_process_identity",
     "kill_pid",
     "default_state_dir",
@@ -921,6 +922,106 @@ def pid_alive(pid) -> bool:
         kernel32.CloseHandle(handle)
 
 
+def _darwin_process_bsd_info(pid: int) -> dict[str, int] | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+
+        class ProcBsdInfo(ctypes.Structure):
+            _fields_ = [
+                ("pbi_flags", ctypes.c_uint32),
+                ("pbi_status", ctypes.c_uint32),
+                ("pbi_xstatus", ctypes.c_uint32),
+                ("pbi_pid", ctypes.c_uint32),
+                ("pbi_ppid", ctypes.c_uint32),
+                ("pbi_uid", ctypes.c_uint32),
+                ("pbi_gid", ctypes.c_uint32),
+                ("pbi_ruid", ctypes.c_uint32),
+                ("pbi_rgid", ctypes.c_uint32),
+                ("pbi_svuid", ctypes.c_uint32),
+                ("pbi_svgid", ctypes.c_uint32),
+                ("rfu_1", ctypes.c_uint32),
+                ("pbi_comm", ctypes.c_char * 16),
+                ("pbi_name", ctypes.c_char * 32),
+                ("pbi_nfiles", ctypes.c_uint32),
+                ("pbi_pgid", ctypes.c_uint32),
+                ("pbi_pjobc", ctypes.c_uint32),
+                ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32),
+                ("pbi_nice", ctypes.c_int32),
+                ("pbi_start_tvsec", ctypes.c_uint64),
+                ("pbi_start_tvusec", ctypes.c_uint64),
+            ]
+
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        libproc.proc_pidinfo.argtypes = (
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        )
+        libproc.proc_pidinfo.restype = ctypes.c_int
+        info = ProcBsdInfo()
+        size = ctypes.sizeof(info)
+        read = libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
+        if read != size or int(info.pbi_pid) != pid:
+            return None
+        return {
+            "pid": int(info.pbi_pid),
+            "status": int(info.pbi_status),
+            "ppid": int(info.pbi_ppid),
+            "pgid": int(info.pbi_pgid),
+            "start_tvsec": int(info.pbi_start_tvsec),
+            "start_tvusec": int(info.pbi_start_tvusec),
+        }
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def pid_is_zombie(pid: int) -> bool | None:
+    """Return zombie/dead state, or ``None`` when process state is unavailable.
+
+    ``kill(pid, 0)`` deliberately treats an unreaped zombie as present. Wake
+    coverage needs the stricter distinction because a forked child can retain
+    an inherited lock after the recorded owner exits.
+    """
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid_int <= 0:
+        return None
+    if is_windows():  # Windows liveness already checks STILL_ACTIVE.
+        return False if pid_alive(pid_int) else True
+    if sys.platform == "darwin":
+        info = _darwin_process_bsd_info(pid_int)
+        if info is not None:
+            return info["status"] == 5  # SZOMB
+    if sys.platform.startswith("linux"):
+        try:
+            stat = Path(f"/proc/{pid_int}/stat").read_text(encoding="utf-8")
+            fields = stat[stat.rfind(")") + 2 :].split()
+            return fields[0] in {"Z", "X"}
+        except (IndexError, OSError):
+            return None
+    try:
+        probe = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid_int)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    state = probe.stdout.strip()
+    if probe.returncode != 0 or not state:
+        return True if not pid_alive(pid_int) else None
+    return state.startswith(("Z", "X"))
+
+
 def windows_process_identity(pid) -> dict | None:
     """Native-Windows process identity from creation FILETIME.
 
@@ -1008,61 +1109,18 @@ def process_start_identity(pid: int, *, include_ancestry: bool = False) -> dict 
         return None
 
     if sys.platform == "darwin":
-        try:
-            import ctypes
-
-            class ProcBsdInfo(ctypes.Structure):
-                _fields_ = [
-                    ("pbi_flags", ctypes.c_uint32),
-                    ("pbi_status", ctypes.c_uint32),
-                    ("pbi_xstatus", ctypes.c_uint32),
-                    ("pbi_pid", ctypes.c_uint32),
-                    ("pbi_ppid", ctypes.c_uint32),
-                    ("pbi_uid", ctypes.c_uint32),
-                    ("pbi_gid", ctypes.c_uint32),
-                    ("pbi_ruid", ctypes.c_uint32),
-                    ("pbi_rgid", ctypes.c_uint32),
-                    ("pbi_svuid", ctypes.c_uint32),
-                    ("pbi_svgid", ctypes.c_uint32),
-                    ("rfu_1", ctypes.c_uint32),
-                    ("pbi_comm", ctypes.c_char * 16),
-                    ("pbi_name", ctypes.c_char * 32),
-                    ("pbi_nfiles", ctypes.c_uint32),
-                    ("pbi_pgid", ctypes.c_uint32),
-                    ("pbi_pjobc", ctypes.c_uint32),
-                    ("e_tdev", ctypes.c_uint32),
-                    ("e_tpgid", ctypes.c_uint32),
-                    ("pbi_nice", ctypes.c_int32),
-                    ("pbi_start_tvsec", ctypes.c_uint64),
-                    ("pbi_start_tvusec", ctypes.c_uint64),
-                ]
-
-            libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
-            libproc.proc_pidinfo.argtypes = (
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_uint64,
-                ctypes.c_void_p,
-                ctypes.c_int,
-            )
-            libproc.proc_pidinfo.restype = ctypes.c_int
-            info = ProcBsdInfo()
-            size = ctypes.sizeof(info)
-            read = libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), size)
-            if read == size and int(info.pbi_pid) == pid and info.pbi_start_tvsec:
-                token = f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
-                snapshot = {"pid": pid, "start_token": token}
-                if include_ancestry:
-                    snapshot.update(
-                        {
-                            "ppid": int(info.pbi_ppid),
-                            "session_id": os.getsid(pid),
-                        }
-                    )
-                return snapshot
-        except (AttributeError, OSError, TypeError, ValueError):
+        info = _darwin_process_bsd_info(pid)
+        if info is None or not info["start_tvsec"]:
             return None
-        return None
+        token = f"darwin:{info['start_tvsec']}:{info['start_tvusec']}"
+        snapshot = {"pid": pid, "start_token": token}
+        if include_ancestry:
+            try:
+                session_id = os.getsid(pid)
+            except OSError:
+                return None
+            snapshot.update({"ppid": info["ppid"], "session_id": session_id})
+        return snapshot
 
     if sys.platform.startswith("linux"):
         try:

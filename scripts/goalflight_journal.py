@@ -25,19 +25,15 @@ otherwise would be a false claim, not a defense.
 from __future__ import annotations
 
 import argparse
-import base64
 import contextlib
 from dataclasses import dataclass
 import datetime as dt
 from enum import Enum
-import hashlib
-import hmac
 import json
 import os
 from pathlib import Path
 import random
 import re
-import secrets
 import socket
 import sqlite3
 import sys
@@ -57,11 +53,11 @@ import goalflight_compat  # noqa: E402
 import goalflight_task  # noqa: E402
 
 
-CURRENT_SCHEMA_EPOCH = 3
-CURRENT_PROTOCOL_EPOCH = 3
-CURRENT_REGISTRY_EPOCH = 3
-CURRENT_READER_EPOCH = 3
-CURRENT_WRITER_EPOCH = 3
+CURRENT_SCHEMA_EPOCH = 4
+CURRENT_PROTOCOL_EPOCH = 4
+CURRENT_REGISTRY_EPOCH = 4
+CURRENT_READER_EPOCH = 4
+CURRENT_WRITER_EPOCH = 4
 CURRENT_SCHEMA_COLUMNS = {
     "journal_migrations": ("migration_id", "applied_at"),
     "dispatch_attempts": (
@@ -106,7 +102,6 @@ CURRENT_SCHEMA_COLUMNS = {
         "source_generation", "trigger_side", "reason", "payload_json", "wake_class",
         "created_at", "resolved_at",
     ),
-    "journal_secrets": ("singleton", "cursor_token_secret", "created_at"),
 }
 JOURNAL_FILE_NAME = "state-journal.sqlite3"
 JOURNAL_IDENTITY_KEY = "journal_identity"
@@ -139,7 +134,7 @@ COVERAGE_ARMED = "ARMED"
 COVERAGE_EXITED = "EXITED"
 LISTENER_EXIT_REASONS = frozenset(
     {
-        "batch",
+        "event",
         "timeout",
         "superseded",
         "orphaned",
@@ -277,15 +272,12 @@ class LeaseLivenessEvidence:
 
 
 @dataclass(frozen=True)
-class CursorBatch:
+class CursorPeek:
     label: str
     project_root: str
     registry_generation: int
     cursor_version: int
     items: tuple[dict[str, object], ...]
-    more_pending: bool
-    wake_pending: bool
-    token: str
 
 
 @dataclass(frozen=True, init=False)
@@ -890,6 +882,7 @@ class Journal:
                 )
                 self._install_p2_schema(connection)
                 self._install_p3_schema(connection)
+                self._install_p4_schema(connection)
                 connection.commit()
                 connection.execute("PRAGMA journal_mode = WAL")
                 return
@@ -928,7 +921,7 @@ class Journal:
             missing, malformed = self._current_schema_issues(connection)
             if malformed:
                 self._raise_integrity_failure(
-                    "epoch-3 journal has structurally invalid tables: "
+                    "epoch-4 journal has structurally invalid tables: "
                     + ", ".join(malformed)
                 )
             repaired = bool(missing)
@@ -937,6 +930,7 @@ class Journal:
                 # P3 table existed.  The installer is idempotent and is the
                 # only supported repair for that incomplete-but-valid state.
                 self._install_p3_schema(connection)
+                self._install_p4_schema(connection)
                 missing, malformed = self._current_schema_issues(connection)
             if missing or malformed:
                 details = []
@@ -945,11 +939,15 @@ class Journal:
                 if malformed:
                     details.append("structurally invalid tables: " + ", ".join(malformed))
                 self._raise_integrity_failure(
-                    "epoch-3 journal has incomplete schema after the idempotent P3 installer; "
+                    "epoch-4 journal has incomplete schema after the idempotent installer; "
                     + "; ".join(details)
                 )
             return repaired
-        if stored not in {(1, 1, 1, 1, 1), (2, 2, 2, 2, 2)}:
+        if stored not in {
+            (1, 1, 1, 1, 1),
+            (2, 2, 2, 2, 2),
+            (3, 3, 3, 3, 3),
+        }:
             return False
         client = self.client_epochs
         if (client.schema, client.protocol, client.registry, client.reader, client.writer) != (
@@ -963,6 +961,7 @@ class Journal:
         if stored == (1, 1, 1, 1, 1):
             self._install_p2_schema(connection)
         self._install_p3_schema(connection)
+        self._install_p4_schema(connection)
         now = utc_now()
         connection.execute(
             """
@@ -988,10 +987,18 @@ class Journal:
                 """,
                 (now,),
             )
+        if stored in {(1, 1, 1, 1, 1), (2, 2, 2, 2, 2)}:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO journal_migrations (migration_id, applied_at)
+                VALUES ('p3-leases-listener-v3', ?)
+                """,
+                (now,),
+            )
         connection.execute(
             """
             INSERT OR IGNORE INTO journal_migrations (migration_id, applied_at)
-            VALUES ('p3-leases-listener-v3', ?)
+            VALUES ('p4-doorbell-cursor-cas-v4', ?)
             """,
             (now,),
         )
@@ -1100,12 +1107,6 @@ class Journal:
 
     def _install_p3_schema(self, connection: sqlite3.Connection) -> None:
         statements = (
-            """CREATE TABLE IF NOT EXISTS journal_secrets (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                cursor_token_secret TEXT NOT NULL
-                    CHECK (length(cursor_token_secret) = 64),
-                created_at TEXT NOT NULL
-            )""",
             """CREATE TABLE IF NOT EXISTS controller_leases (
                 project_root TEXT NOT NULL,
                 label TEXT NOT NULL,
@@ -1232,12 +1233,11 @@ class Journal:
         )
         for statement in statements:
             connection.execute(statement)
-        connection.execute(
-            """INSERT OR IGNORE INTO journal_secrets (
-                   singleton, cursor_token_secret, created_at
-               ) VALUES (1, ?, ?)""",
-            (secrets.token_hex(32), utc_now()),
-        )
+
+    @staticmethod
+    def _install_p4_schema(connection: sqlite3.Connection) -> None:
+        """Delete the retired listener batch-token signing surface."""
+        connection.execute("DROP TABLE IF EXISTS journal_secrets")
 
     def _retry_delay(self, started: float) -> bool:
         remaining = self.retry_budget_s - (time.monotonic() - started)
@@ -2326,74 +2326,32 @@ class Journal:
 
         return self._domain_write(action)
 
-    @staticmethod
-    def _cursor_token_secret(connection: sqlite3.Connection) -> str:
-        row = connection.execute(
-            "SELECT cursor_token_secret FROM journal_secrets WHERE singleton = 1"
-        ).fetchone()
-        secret = str(row["cursor_token_secret"] if row is not None else "")
-        if not re.fullmatch(r"[0-9a-f]{64}", secret):
-            raise JournalIntegrityError("journal cursor-token secret is missing or corrupt")
-        return secret
-
-    @staticmethod
-    def _encode_cursor_token(payload: Mapping[str, object], secret: str) -> str:
-        raw = json.dumps(
-            dict(payload),
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        body = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-        signature = hmac.new(
-            bytes.fromhex(secret),
-            body.encode("ascii"),
-            hashlib.sha256,
-        ).digest()
-        encoded_signature = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
-        return f"{body}.{encoded_signature}"
-
-    @staticmethod
-    def _decode_cursor_token(token: str, secret: str) -> dict[str, object]:
-        try:
-            body, encoded_signature = token.split(".", 1)
-            expected = hmac.new(
-                bytes.fromhex(secret),
-                body.encode("ascii"),
-                hashlib.sha256,
-            ).digest()
-            expected_signature = base64.urlsafe_b64encode(expected).decode("ascii").rstrip("=")
-            if not hmac.compare_digest(encoded_signature, expected_signature):
-                raise ValueError("cursor token integrity check failed")
-            padded = body + "=" * (-len(body) % 4)
-            payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
-        except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("cursor token is corrupt") from exc
-        if not isinstance(payload, dict):
-            raise ValueError("cursor token must encode an object")
-        return payload
-
-    def cursor_batch(
+    def cursor_peek(
         self,
         label: str,
         *,
-        nonce: str,
-        limit: int = 50,
-    ) -> CursorBatch:
+        nonce: str | None = None,
+        waking_only: bool = False,
+        limit: int = 1000,
+    ) -> CursorPeek:
+        """Return one server-side cursor snapshot without advancing it."""
         resolved_label = self._identity_token(label, label="controller label")
-        resolved_nonce = self._identity_token(nonce, label="lease nonce")
-        if not 1 <= limit <= 1000:
-            raise ValueError("listener batch limit must be between 1 and 1000")
+        resolved_nonce = (
+            self._identity_token(nonce, label="lease nonce") if nonce is not None else None
+        )
+        if not 1 <= limit <= 10_000:
+            raise ValueError("cursor peek limit must be between 1 and 10000")
         project_root = str(self.project_root)
         with contextlib.closing(self._connect()) as connection:
             self._assert_epoch_fence(connection, for_write=False)
-            token_secret = self._cursor_token_secret(connection)
             lease = connection.execute(
                 """SELECT * FROM controller_leases
                    WHERE project_root = ? AND label = ? AND state = 'ACTIVE'""",
                 (project_root, resolved_label),
             ).fetchone()
-            if lease is None or str(lease["nonce"]) != resolved_nonce:
+            if lease is None or (
+                resolved_nonce is not None and str(lease["nonce"]) != resolved_nonce
+            ):
                 raise CASMismatch("listener lease generation or nonce is no longer active")
             cursor = connection.execute(
                 """SELECT registry_generation, cursor_version, backlog_pending
@@ -2403,25 +2361,7 @@ class Journal:
             ).fetchone()
             if cursor is None or int(cursor["registry_generation"]) != int(lease["generation"]):
                 raise JournalIntegrityError("active lease is missing its generation-matched cursor")
-            waking_event_pending = connection.execute(
-                """
-                SELECT 1
-                FROM delivery_events AS e
-                LEFT JOIN controller_stream_cursors AS c
-                  ON c.project_root = e.project_root
-                 AND c.label = ?
-                 AND c.stream_id = e.stream_id
-                WHERE e.project_root = ? AND e.recipient_label IN (?, '*')
-                  AND e.wake_class = 'waking'
-                  AND e.projected_at IS NOT NULL
-                  AND e.withdrawn_at IS NULL
-                  AND e.stream_seq > COALESCE(c.position, 0)
-                LIMIT 1
-                """,
-                (resolved_label, project_root, resolved_label),
-            ).fetchone() is not None
-            rows = connection.execute(
-                """
+            sql = """
                 SELECT e.*
                 FROM delivery_events AS e
                 LEFT JOIN controller_stream_cursors AS c
@@ -2432,39 +2372,19 @@ class Journal:
                   AND e.projected_at IS NOT NULL
                   AND e.withdrawn_at IS NULL
                   AND e.stream_seq > COALESCE(c.position, 0)
-                ORDER BY e.stream_id, e.stream_seq, e.rowid
-                LIMIT ?
-                """,
-                (resolved_label, project_root, resolved_label, limit + 1),
-            ).fetchall()
-        wake_pending = bool(rows) and (
-            bool(cursor["backlog_pending"]) or waking_event_pending
-        )
-        selected = rows[:limit] if wake_pending else []
-        more_pending = bool(wake_pending and len(rows) > limit)
-        advances: dict[str, int] = {}
-        for row in selected:
-            stream = str(row["stream_id"])
-            advances[stream] = max(advances.get(stream, 0), int(row["stream_seq"]))
-        token_payload = {
-            "project_root": project_root,
-            "label": resolved_label,
-            "registry_generation": int(cursor["registry_generation"]),
-            "cursor_version": int(cursor["cursor_version"]),
-            "lease_nonce": resolved_nonce,
-            "advances": advances,
-            "more_pending": more_pending,
-        }
-        token = self._encode_cursor_token(token_payload, token_secret) if selected else ""
-        return CursorBatch(
+            """
+            parameters: list[object] = [resolved_label, project_root, resolved_label]
+            if waking_only:
+                sql += " AND e.wake_class = 'waking'"
+            sql += " ORDER BY e.stream_id, e.stream_seq, e.rowid LIMIT ?"
+            parameters.append(limit)
+            rows = connection.execute(sql, parameters).fetchall()
+        return CursorPeek(
             resolved_label,
             project_root,
             int(cursor["registry_generation"]),
             int(cursor["cursor_version"]),
-            tuple(dict(row) for row in selected),
-            more_pending,
-            wake_pending,
-            token,
+            tuple(dict(row) for row in rows),
         )
 
     def pending_delivery_events(
@@ -2552,69 +2472,82 @@ class Journal:
 
     def advance_cursor(
         self,
-        token: str,
+        label: str,
         *,
+        nonce: str,
+        expected_cursor_version: int,
+        advances: Mapping[str, int],
         actor: str,
     ) -> WriteResult[dict[str, object]]:
-        with contextlib.closing(self._connect()) as connection:
-            self._assert_epoch_fence(connection, for_write=False)
-            token_secret = self._cursor_token_secret(connection)
-        payload = self._decode_cursor_token(token, token_secret)
-        project_root = str(payload.get("project_root") or "")
-        if project_root != str(self.project_root):
-            raise ValueError("cursor token belongs to another project")
-        label = self._identity_token(payload.get("label"), label="cursor label")
-        nonce = self._identity_token(payload.get("lease_nonce"), label="cursor lease nonce")
+        """CAS-advance only to positions that exist in the authoritative journal."""
+        project_root = str(self.project_root)
+        resolved_label = self._identity_token(label, label="cursor label")
+        resolved_nonce = self._identity_token(nonce, label="cursor lease nonce")
         actor_value = self._identity_token(actor, label="cursor actor")
-        generation = payload.get("registry_generation")
-        version = payload.get("cursor_version")
-        advances = payload.get("advances")
-        more_pending = payload.get("more_pending")
-        if not isinstance(generation, int) or generation < 1:
-            raise ValueError("cursor token registry_generation is invalid")
-        if not isinstance(version, int) or version < 0:
-            raise ValueError("cursor token cursor_version is invalid")
-        if not isinstance(advances, dict) or not advances:
-            raise ValueError("cursor token advances are empty or invalid")
-        if not isinstance(more_pending, bool):
-            raise ValueError("cursor token more_pending is invalid")
+        if (
+            not isinstance(expected_cursor_version, int)
+            or isinstance(expected_cursor_version, bool)
+            or expected_cursor_version < 0
+        ):
+            raise ValueError("expected cursor version must be a non-negative integer")
+        if not isinstance(advances, Mapping) or not advances:
+            raise ValueError("cursor advances are empty or invalid")
         normalized_advances: dict[str, int] = {}
         for stream, position in advances.items():
             resolved_stream = self._identity_token(stream, label="cursor stream")
             if not isinstance(position, int) or isinstance(position, bool) or position < 1:
-                raise ValueError("cursor token position is invalid")
+                raise ValueError("cursor position is invalid")
             normalized_advances[resolved_stream] = position
 
         def action(connection: sqlite3.Connection) -> dict[str, object]:
             lease = connection.execute(
                 """SELECT generation, nonce, state FROM controller_leases
                    WHERE project_root = ? AND label = ? AND state = 'ACTIVE'""",
-                (project_root, label),
+                (project_root, resolved_label),
             ).fetchone()
             if (
                 lease is None
-                or int(lease["generation"]) != generation
-                or str(lease["nonce"]) != nonce
+                or str(lease["nonce"]) != resolved_nonce
             ):
                 raise CASMismatch("cursor CAS lost: lease generation changed")
+            generation = int(lease["generation"])
+            for stream, position in normalized_advances.items():
+                current = connection.execute(
+                    """SELECT position FROM controller_stream_cursors
+                       WHERE project_root = ? AND label = ? AND stream_id = ?""",
+                    (project_root, resolved_label, stream),
+                ).fetchone()
+                if current is not None and int(current["position"]) >= position:
+                    raise CASMismatch("cursor CAS lost: position is already advanced")
+                known = connection.execute(
+                    """SELECT 1 FROM delivery_events
+                       WHERE project_root = ? AND recipient_label IN (?, '*')
+                         AND stream_id = ? AND stream_seq = ?
+                         AND projected_at IS NOT NULL AND withdrawn_at IS NULL
+                       LIMIT 1""",
+                    (project_root, resolved_label, stream, position),
+                ).fetchone()
+                if known is None:
+                    raise CASMismatch(
+                        f"cursor CAS lost: server has no pending position {stream}={position}"
+                    )
             now = utc_now()
             updated = connection.execute(
                 """
                 UPDATE controller_cursors
                 SET cursor_version = cursor_version + 1, updated_at = ?,
-                    backlog_pending = ?, advanced_at = ?, advanced_by = ?
+                    backlog_pending = 0, advanced_at = ?, advanced_by = ?
                 WHERE project_root = ? AND label = ?
                   AND registry_generation = ? AND cursor_version = ?
                 """,
                 (
                     now,
-                    int(more_pending),
                     now,
                     actor_value,
                     project_root,
-                    label,
+                    resolved_label,
                     generation,
-                    version,
+                    expected_cursor_version,
                 ),
             )
             if updated.rowcount != 1:
@@ -2631,15 +2564,14 @@ class Journal:
                         position = MAX(position, excluded.position),
                         updated_at = excluded.updated_at
                     """,
-                    (project_root, label, stream, position, now),
+                    (project_root, resolved_label, stream, position, now),
                 )
             return {
-                "label": label,
+                "label": resolved_label,
                 "registry_generation": generation,
-                "previous_cursor_version": version,
-                "cursor_version": version + 1,
+                "previous_cursor_version": expected_cursor_version,
+                "cursor_version": expected_cursor_version + 1,
                 "advances": normalized_advances,
-                "more_pending": more_pending,
             }
 
         return self._domain_write(action)

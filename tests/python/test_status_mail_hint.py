@@ -59,6 +59,12 @@ def test_wait_watermark_survives_cursor_advancement(
     root, authority, lease = _setup(monkeypatch, tmp_path)
     before = status._mail_watermark(str(root), ["status-stream"] )
     assert before is not None and len(before) == 1
-    batch = authority.cursor_batch("status", nonce=lease.nonce, limit=10)
-    assert authority.advance_cursor(batch.token, actor="status").committed
+    peek = authority.cursor_peek("status", nonce=lease.nonce, limit=10)
+    assert authority.advance_cursor(
+        "status",
+        nonce=lease.nonce,
+        expected_cursor_version=peek.cursor_version,
+        advances={"status-stream": 1},
+        actor="status",
+    ).committed
     assert status._mail_watermark(str(root), ["status-stream"] ) == before

@@ -254,7 +254,10 @@ def test_done_code() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tail = Path(tmp) / "detached-success.tail"
         started = S.goalflight_ledger.utc_now()
-        tail.write_text("work finished\nCOMPLETE: detached ok\n", encoding="utf-8")
+        tail.write_text(
+            "work finished\nCOMPLETE: detached-success-controller-dead\n",
+            encoding="utf-8",
+        )
         success_record = {
             **detached_controller_dead,
             "dispatch_id": "detached-success-controller-dead",
@@ -377,7 +380,10 @@ def test_done_code() -> None:
 def test_output_tail_reconciles_success_marker_after_watcher_death() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tail = Path(tmp) / "dead-worker.tail"
-        tail.write_text("work finished\nCOMPLETE: done from tail\n", encoding="utf-8")
+        tail.write_text(
+            "work finished\nCOMPLETE: tail-reconciled — done from tail\n",
+            encoding="utf-8",
+        )
         started = S.goalflight_ledger.utc_now()
         record = {
             "dispatch_id": "tail-reconciled",
@@ -402,6 +408,23 @@ def test_output_tail_reconciles_success_marker_after_watcher_death() -> None:
                   reconciled.get("raw_classification") == "stale_dead")
             check("dead-worker reconciliation records gate reason",
                   reconciled.get("output_tail_reconciliation", {}).get("promoted") is True)
+
+            tail.write_text(
+                "quota exceeded: usage limit reached\n"
+                "COMPLETE: signals-lifecycle-audit\n",
+                encoding="utf-8",
+            )
+            foreign = S._reconcile_output_tail_record(record)
+            check(
+                "foreign marker cannot outrank quota/error evidence",
+                foreign.get("classification") == "stale_dead"
+                and foreign.get("terminal_marker") is None,
+            )
+
+            tail.write_text(
+                "work finished\nCOMPLETE: tail-reconciled — done from tail\n",
+                encoding="utf-8",
+            )
 
             S.goalflight_ledger.identity_matches = lambda _record: (True, "live")
             fresh_live = S._reconcile_output_tail_record({**record, "classification": "watcher_stopped"})

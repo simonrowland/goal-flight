@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -67,6 +68,9 @@ def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
     return env
 
 
@@ -117,6 +121,12 @@ def _run_watcher_once(
             stdout=log,
             stderr=subprocess.STDOUT,
         )
+        # Reap concurrently. If the child exits while the parent blocks in the
+        # watcher subprocess, it otherwise remains a zombie whose PID still
+        # looks live and the correctly rejected foreign prompt marker masks
+        # that harness deadlock until the subprocess timeout.
+        reaper = threading.Thread(target=worker.wait)
+        reaper.start()
         args = [
             sys.executable,
             str(WATCH),
@@ -139,18 +149,22 @@ def _run_watcher_once(
         ]
         if ignore_prompt is not None:
             args.extend(["--ignore-prompt-file", str(ignore_prompt)])
-        proc = subprocess.run(
-            args,
-            cwd=str(ROOT),
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=10,
-            check=False,
-        )
-        worker.wait(timeout=5)
-        return proc
+        try:
+            return subprocess.run(
+                args,
+                cwd=str(ROOT),
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=20,
+                check=False,
+            )
+        finally:
+            reaper.join(timeout=5)
+            if reaper.is_alive():
+                worker.kill()
+                reaper.join(timeout=5)
 
 
 def test_resume_nudge_posts_on_text_only_and_coalesces() -> None:
@@ -199,7 +213,10 @@ def test_watcher_done_suggest_posts_once_per_completion_and_dedups() -> None:
         project = tmp / "project"
         env = _env(tmp)
         _write_items(project, [_item("t-001", "Ready A"), _item("t-002", "Ready B")])
-        worker_code = "import time; time.sleep(0.1); print('COMPLETE: done', flush=True)"
+        worker_code = (
+            "import time; time.sleep(0.1); "
+            "print('COMPLETE: dispatch-1 — done', flush=True)"
+        )
         for _ in range(2):
             proc = _run_watcher_once(
                 project,
@@ -225,7 +242,7 @@ def test_watcher_prompt_echo_does_not_post_done_suggest() -> None:
         env = _env(tmp)
         _write_items(project, [_item("t-001", "Ready A")])
         prompt = tmp / "prompt.md"
-        prompt.write_text("COMPLETE: done\n", encoding="utf-8")
+        prompt.write_text("COMPLETE: dispatch-echo — done\n", encoding="utf-8")
         proc = _run_watcher_once(
             project,
             env,
@@ -234,7 +251,7 @@ def test_watcher_prompt_echo_does_not_post_done_suggest() -> None:
             task_ids="t-001",
             worker_code="import time; time.sleep(0.1)",
             ignore_prompt=prompt,
-            initial_tail="COMPLETE: done\n",
+            initial_tail="COMPLETE: dispatch-echo — done\n",
         )
         assert_true(f"watcher prompt echo exits without crashing: {proc.stderr}", proc.returncode in (0, 1, 3))
         assert_eq("prompt echo posts no done-suggest", _task_store_nudges(env, project, T.DONE_SUGGEST_NUDGE_KIND), [])

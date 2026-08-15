@@ -18,6 +18,7 @@ skip_posix_on_native_windows("watch prompt echo uses bash-tail and start_new_ses
 import json
 import gzip
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -66,10 +67,21 @@ def _run_watcher(
     task_ids: str | None = None,
     agent: str | None = None,
 ):
+    if not dispatch_id:
+        # These fixtures predate dispatch-bound markers. Infer only the expected
+        # id from their parser-valid terminal payload; the watcher still applies
+        # prompt-echo/fence/position validation independently.
+        candidate = goalflight_watch._final_terminal_marker(tail)
+        candidate_text = str((candidate or {}).get("text") or "").strip()
+        candidate_id = candidate_text.split(maxsplit=1)[0] if candidate_text else ""
+        dispatch_id = (
+            candidate_id
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", candidate_id)
+            else "watch-prompt-no-terminal"
+        )
     cmd = [sys.executable, str(WATCH), "--pid", str(worker_pid), "--tail", str(tail),
-           "--status-json", str(status), "--poll-secs", poll_secs, "--max-idle-secs", max_idle_secs]
-    if dispatch_id:
-        cmd += ["--dispatch-id", dispatch_id]
+           "--status-json", str(status), "--dispatch-id", dispatch_id,
+           "--poll-secs", poll_secs, "--max-idle-secs", max_idle_secs]
     if project_root is not None:
         cmd += ["--project-root", str(project_root)]
     if task_ids:
@@ -83,6 +95,12 @@ def _run_watcher(
     env = os.environ.copy()
     env["GOALFLIGHT_TEST_MODE"] = "1"
     env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+    env["GOALFLIGHT_STATE_DIR"] = str(status.parent / "state")
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(status.parent / "task-store")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(status.parent / "journal")
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(status.parent / "messages")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(status.parent / "wake-ledger")
+    env["GOAL_FLIGHT_PIDFILE_DIR"] = str(status.parent / "pids")
     t0 = time.time()
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=40, env=env)
     elapsed = time.time() - t0
@@ -153,7 +171,14 @@ def case_ignores_echoed_prompt_marker() -> None:
         finally:
             sink.close()
         try:
-            rc, elapsed, term, _ = _run_watcher(tail, tmp / "s.json", prompt, ignore=True, worker_pid=worker.pid)
+            rc, elapsed, term, _ = _run_watcher(
+                tail,
+                tmp / "s.json",
+                prompt,
+                ignore=True,
+                worker_pid=worker.pid,
+                dispatch_id="PLACEHOLDER",
+            )
         finally:
             worker.wait()
         assert rc == 0, f"expected exit 0 (complete), got {rc}"
@@ -459,7 +484,7 @@ def case_ready_terminal_marker() -> None:
             "TL;DR: audit done\n"
             "Findings: P0 0, P1 1, P2 0, P3 0\n"
             "Strongest concern: none\n"
-            "READY: docs-private/research/2026-06-03-audit/findings.md\n",
+            "READY: ready-terminal — docs-private/research/2026-06-03-audit/findings.md\n",
             encoding="utf-8",
         )
         worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
@@ -495,7 +520,10 @@ def case_task_breadcrumb_missing_item_keeps_worker_verdict() -> None:
         project = tmp / "project"
         _write_task_store(project)  # valid store, contains t-001 only
         tail = tmp / "tail.txt"
-        tail.write_text("work done\nCOMPLETE: pinned the claim\n", encoding="utf-8")
+        tail.write_text(
+            "work done\nCOMPLETE: watch-task-breadcrumb-missing — pinned the claim\n",
+            encoding="utf-8",
+        )
         worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
         try:
             rc, _, term, payload = _run_watcher(
@@ -529,7 +557,10 @@ def case_task_terminal_breadcrumb_failure_blocks_completion() -> None:
         _write_task_store(project)
         (project / "docs-private" / "tasks.jsonl").write_text("{bad json\n", encoding="utf-8")
         tail = tmp / "tail.txt"
-        tail.write_text("work done\nCOMPLETE: linked task\n", encoding="utf-8")
+        tail.write_text(
+            "work done\nCOMPLETE: watch-task-breadcrumb-fail — linked task\n",
+            encoding="utf-8",
+        )
         worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
         try:
             rc, _, term, payload = _run_watcher(
@@ -562,7 +593,10 @@ def case_task_terminal_breadcrumb_happy_path_persists() -> None:
         project = tmp / "project"
         _write_task_store(project)
         tail = tmp / "tail.txt"
-        tail.write_text("work done\nCOMPLETE: linked task\n", encoding="utf-8")
+        tail.write_text(
+            "work done\nCOMPLETE: watch-task-breadcrumb-ok — linked task\n",
+            encoding="utf-8",
+        )
         worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
         try:
             rc, _, term, payload = _run_watcher(
@@ -691,6 +725,8 @@ def case_dead_pid_fresh_output_vetoes_worker_dead() -> None:
             str(tail),
             "--status-json",
             str(status),
+            "--dispatch-id",
+            "dead-fresh-output",
             "--poll-secs",
             "0.05",
             "--max-idle-secs",
@@ -698,7 +734,20 @@ def case_dead_pid_fresh_output_vetoes_worker_dead() -> None:
             "--ignore-prompt-file",
             str(prompt),
         ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        env = os.environ.copy()
+        env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+        env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
+        env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
+        env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
+        env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
+        env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
         try:
             payload = _wait_for_status(status)
             assert proc.poll() is None, payload
@@ -725,21 +774,17 @@ def case_dead_pid_stale_output_bounds_worker_dead() -> None:
     assert not term, term
 
 
-def case_dead_pid_done_signoff_completes() -> None:
-    cases = [
-        ("DONE.\n", "marker:COMPLETE"),
-        ("complete\n", "marker:COMPLETE"),
-        ("FINISHED!\npost-marker summary\n", "marker:COMPLETE:final_reconciliation"),
-    ]
-    for tail_text, expected_reason in cases:
+def case_dead_pid_unbound_done_signoff_is_rejected() -> None:
+    for tail_text in (
+        "DONE.\n",
+        "complete\n",
+        "FINISHED!\npost-marker summary\n",
+    ):
         rc, _elapsed, term, payload = _run_dead_worker_tail(tail_text)
-        assert rc == 0, f"{tail_text!r} must complete, got rc={rc} ({payload})"
-        assert payload.get("state") == "complete", payload
-        assert payload.get("liveness_state") == "completed", payload
-        assert payload.get("reason") == expected_reason, payload
-        assert term.get("kind") == "COMPLETE", term
-        assert term.get("text") == "", term
-        assert payload.get("markers", [])[-1].get("kind") == "COMPLETE", payload
+        assert rc == 1, f"{tail_text!r} must not satisfy dispatch identity, got {rc} ({payload})"
+        assert payload.get("state") == "worker_dead", payload
+        assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+        assert not term, term
 
 
 def case_dead_pid_usage_limit_without_success_marker_reclassifies() -> None:
@@ -934,7 +979,7 @@ def case_worker_dead_accepts_single_prefix_variants_outside_hunk() -> None:
 def case_worker_dead_accepts_prefixed_ready_with_trailing_tail() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail(
         "Structure check passed: 4 HIGH, 4 MED, 1 LOW, 1 INFO; verdict present.\n"
-        "+READY: docs-private/research/2026-06-19-v4-frame-negotiation/review-frame-adversarial.md\n"
+        "+READY: prefixed-ready — docs-private/research/2026-06-19-v4-frame-negotiation/review-frame-adversarial.md\n"
         "hook: Stop\n"
         "tokens used\n"
         "123\n"
@@ -944,7 +989,7 @@ def case_worker_dead_accepts_prefixed_ready_with_trailing_tail() -> None:
     assert payload.get("state") == "complete", payload
     assert payload.get("reason") == "marker:READY:final_reconciliation", payload
     assert term.get("kind") == "READY", term
-    assert term.get("text") == (
+    assert term.get("text", "").endswith(
         "docs-private/research/2026-06-19-v4-frame-negotiation/review-frame-adversarial.md"
     ), term
 
@@ -965,13 +1010,13 @@ def case_worker_dead_rejects_prefixed_terminal_inside_diff_hunk() -> None:
 def case_plain_ready_last_line_still_works() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail(
         "TL;DR: audit done\n"
-        "READY: docs-private/research/plain-ready/findings.md\n"
+        "READY: plain-ready — docs-private/research/plain-ready/findings.md\n"
     )
     assert rc == 0, f"plain READY terminal marker regressed, got rc={rc} ({payload})"
     assert payload.get("state") == "complete", payload
     assert payload.get("reason") == "marker:READY", payload
     assert term.get("kind") == "READY", term
-    assert term.get("text") == "docs-private/research/plain-ready/findings.md", term
+    assert term.get("text", "").endswith("docs-private/research/plain-ready/findings.md"), term
 
 
 def case_worker_dead_rejects_banner_offset_prompt_echo() -> None:
@@ -1290,7 +1335,7 @@ def main() -> None:
     case_task_terminal_breadcrumb_happy_path_persists()
     case_dead_pid_fresh_output_vetoes_worker_dead()
     case_dead_pid_stale_output_bounds_worker_dead()
-    case_dead_pid_done_signoff_completes()
+    case_dead_pid_unbound_done_signoff_is_rejected()
     case_dead_pid_usage_limit_without_success_marker_reclassifies()
     case_b054_real_evidence_marker_vocab_bullet_reclassifies_rate_limited()
     case_b054_error_after_reconciled_marker_vetoes_complete()

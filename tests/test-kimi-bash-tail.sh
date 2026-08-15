@@ -29,7 +29,7 @@ WATCHER_OUT="$(mktemp /tmp/kimi-bash-tail-watcher-XXXXXX.txt)"
 export GOAL_FLIGHT_PIDFILE_DIR="$PIDFILE_DIR"
 
 TARGET="$WORKDIR/kimi-bash-tail-smoke.txt"
-PROMPT="Create file kimi-bash-tail-smoke.txt with exactly the text done. Then output COMPLETE: true on its own line."
+PROMPT="Create file kimi-bash-tail-smoke.txt with exactly the text done. Then output COMPLETE: kimi-bash-tail-smoke — done on its own line."
 
 cleanup() {
   rm -rf "$WORKDIR" "$PIDFILE_DIR"
@@ -76,7 +76,7 @@ if [ "$WORKER_RC" -ne 0 ] || [ "$WATCHER_RC" -ne 0 ]; then
   exit 1
 fi
 
-if ! grep -Eq '^(•[[:space:]]*)?[[:space:]]*COMPLETE: true$' "$TAIL"; then
+if ! grep -Eq '^(•[[:space:]]*)?[[:space:]]*COMPLETE: kimi-bash-tail-smoke([[:space:]]+[—–:;|][[:space:]]*.*)?$' "$TAIL"; then
   auth_skip_if_needed "$TAIL"
   echo "FAIL  tests/test-kimi-bash-tail.sh (missing COMPLETE marker)"
   sed 's/^/      /' "$TAIL" || true

@@ -85,6 +85,10 @@ def _init_project_repo(tmp: Path) -> tuple[Path, str]:
 def isolated_env(tmp: Path, fleet_dir: Path):
     old = os.environ.copy()
     os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+    os.environ["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
+    os.environ["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
+    os.environ["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
+    os.environ["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
     os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     os.environ["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
     os.environ["GOALFLIGHT_FLEET_DIR"] = str(fleet_dir)
@@ -164,7 +168,10 @@ def _submit_args(project_root: Path, prompt: Path, dispatch_id: str, *, account:
 
 def _submit_remote_queue_entry(project_root: Path, tmp: Path, dispatch_id: str, *, account: str | None = None) -> Path:
     prompt = tmp / f"{dispatch_id}.prompt.md"
-    prompt.write_text("COMPLETE: remote drain submit test\n", encoding="utf-8")
+    prompt.write_text(
+        f"COMPLETE: {dispatch_id} — remote drain submit test\n",
+        encoding="utf-8",
+    )
     base = tmp / "state" / "dispatch"
     args = _submit_args(project_root, prompt, dispatch_id, account=account)
     stdout = io.StringIO()
@@ -238,7 +245,10 @@ def _drain_args(queue: Path, fleet_dir: Path, *, remote_runner=None) -> argparse
 
 def _write_remote_queue_entry(queue: Path, dispatch_id: str) -> Path:
     prompt = queue.parent / f"{dispatch_id}.prompt.md"
-    prompt.write_text("COMPLETE: remote drain test\n", encoding="utf-8")
+    prompt.write_text(
+        f"COMPLETE: {dispatch_id} — remote drain test\n",
+        encoding="utf-8",
+    )
     path = queue / f"{dispatch_id}.json"
     request = {
         "agent": "codex",
@@ -308,7 +318,7 @@ def _write_local_queue_entry(queue: Path, dispatch_id: str) -> Path:
                 "--",
                 sys.executable,
                 "-c",
-                "print('COMPLETE: local drain test')",
+                f"print('COMPLETE: {dispatch_id} — local drain test')",
             ],
             "request": {
                 "agent": "test-dispatch",

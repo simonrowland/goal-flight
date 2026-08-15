@@ -43,6 +43,7 @@ from goalflight_watch import (
     BLOCKING_TERMINAL_MARKERS,
     SUCCESS_TERMINAL_MARKERS,
     _final_terminal_marker,
+    _terminal_marker_matches_dispatch,
 )
 
 # Each aggregated record carries a precomputed ``classification`` from
@@ -252,18 +253,11 @@ def _record_has_attention_marker(record: dict | None) -> bool:
     done_code(). This covers bash-tail, where a marker is all there is.
     """
     marker = _position_validated_marker(record)
-    if marker is None:
-        status_path = (record or {}).get("status_path")
-        if isinstance(status_path, str) and status_path:
-            try:
-                with open(status_path, encoding="utf-8") as handle:
-                    data = json.load(handle)
-            except (OSError, ValueError):
-                return False
-            if isinstance(data, dict) and data.get("dispatch_id") == (record or {}).get(
-                "dispatch_id"
-            ):
-                marker = _position_validated_marker(data)
+    dispatch_id = str((record or {}).get("dispatch_id") or "").strip()
+    if not dispatch_id:
+        return False
+    if not _terminal_marker_matches_dispatch(marker, dispatch_id):
+        return False
     return goalflight_terminal.attention_marker_present(marker)
 
 
@@ -508,10 +502,16 @@ def _reconcile_output_tail_record(record: dict) -> dict:
     # which left the marker off the last line and produced a false worker_dead
     # (D022). _final_terminal_marker is the watcher's own reconciliation-grade scan
     # (skips fences/diff-hunks/prompt-echoes, takes the last valid marker).
-    marker = _final_terminal_marker(
-        tail,
-        ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")),
-        kimi_output=moonshot_family(record.get("agent")),
+    expected_dispatch_id = str(record.get("dispatch_id") or "").strip()
+    marker = (
+        _final_terminal_marker(
+            tail,
+            ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")),
+            kimi_output=moonshot_family(record.get("agent")),
+            expected_dispatch_id=expected_dispatch_id,
+        )
+        if expected_dispatch_id
+        else None
     )
     marker_kind = marker.get("kind") if isinstance(marker, dict) else None
     if marker_kind not in _OUTPUT_TAIL_TERMINAL_MARKERS:
@@ -1436,16 +1436,26 @@ def _wait_output_is_active(progress: dict, *, poll_s: float) -> bool:
     return tail_grew or tail_changed or tail_fresh
 
 
-def _validated_terminal_marker(payload: dict) -> dict | None:
+def _validated_terminal_marker(
+    payload: dict,
+    *,
+    expected_dispatch_id: str | None = None,
+) -> dict | None:
     for key in ("terminal_marker", "last_marker"):
         candidate = payload.get(key)
         if isinstance(candidate, dict):
             kind = candidate.get("kind")
-            if kind in _OUTPUT_TAIL_TERMINAL_MARKERS:
+            if (
+                kind in _OUTPUT_TAIL_TERMINAL_MARKERS
+                and _terminal_marker_matches_dispatch(
+                    candidate, expected_dispatch_id
+                )
+            ):
                 return candidate
         elif (
             isinstance(candidate, str)
             and candidate in _OUTPUT_TAIL_TERMINAL_MARKERS
+            and not expected_dispatch_id
         ):
             return {"kind": str(candidate)}
     markers = payload.get("markers")
@@ -1454,40 +1464,31 @@ def _validated_terminal_marker(payload: dict) -> dict | None:
             if (
                 isinstance(candidate, dict)
                 and candidate.get("kind") in _OUTPUT_TAIL_TERMINAL_MARKERS
+                and _terminal_marker_matches_dispatch(
+                    candidate, expected_dispatch_id
+                )
             ):
                 return candidate
     return None
 
 
 def _record_marker_info(record: dict | None) -> dict | None:
-    """Best available terminal marker for a row, from record or status file.
+    """Return terminal evidence from this aggregate snapshot only.
 
-    The aggregated payload record does NOT carry marker fields - only the
-    per-dispatch status JSON does - so reading the record alone silently yields
-    nothing on every real dispatch while looking correct against a hand-built
-    record.
+    Reopening the sidecar here tears the wait verdict across two publication
+    generations (for example stale ``unknown`` plus fresh ``COMPLETE``).
+    Status aggregation must carry any terminal marker it wants this snapshot to
+    use; a later poll will observe a fully newer snapshot.
     """
     if record is None:
         return None
-    candidate = _validated_terminal_marker(record)
-    if candidate is not None:
-        return candidate
-    status_path = record.get("status_path")
-    if not isinstance(status_path, str) or not status_path:
+    dispatch_id = str(record.get("dispatch_id") or "").strip()
+    if not dispatch_id:
         return None
-    try:
-        with open(status_path, encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
-        return None
-    dispatch_id = record.get("dispatch_id")
-    if (
-        not isinstance(data, dict)
-        or not dispatch_id
-        or data.get("dispatch_id") != dispatch_id
-    ):
-        return None
-    return _validated_terminal_marker(data)
+    return _validated_terminal_marker(
+        record,
+        expected_dispatch_id=dispatch_id,
+    )
 
 
 def _fmt_wait_bytes(value: int | None) -> str:
@@ -2119,6 +2120,7 @@ def verify_artifacts(dispatch_id: str, *, project_root: str | None) -> dict:
             tail,
             ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")),
             kimi_output=moonshot_family(record.get("agent")),
+            expected_dispatch_id=dispatch_id,
         )
     # Only a SUCCESS marker (READY/COMPLETE/RESULT) declares deliverables — a FAILED:/
     # BLOCKED: marker that happens to name a path must NOT report it as a present artifact.

@@ -91,6 +91,7 @@ run_dead_tail_case() {
   local prompt="$3"
   local out="$4"
   local expected="$5"
+  local dispatch_id="${6:-$label}"
   local worker_sleep="5"
 
   # Negative dead-tail cases need enough startup margin for the watcher to
@@ -102,7 +103,7 @@ run_dead_tail_case() {
   bash "$WATCHER" \
     --pid "$WORKER_PID" --tail "$tail" \
     --controller-pid "$$" --agent test-bashtail \
-    --session-id "$label" \
+    --session-id "$dispatch_id" \
     --ignore-prompt-file "$prompt" \
     --poll-secs 1 --max-idle-secs 30 \
     > "$out" 2>&1
@@ -120,6 +121,7 @@ run_pid_dead_grace_marker_case() {
   local out="$4"
   local marker="$5"
   local expected="$6"
+  local dispatch_id="${7:-$label}"
 
   : > "$tail"
   (
@@ -133,7 +135,7 @@ run_pid_dead_grace_marker_case() {
   bash "$WATCHER" \
     --pid "$WORKER_PID" --tail "$tail" \
     --controller-pid "$$" --agent test-bashtail \
-    --session-id "$label" \
+    --session-id "$dispatch_id" \
     --ignore-prompt-file "$prompt" \
     --poll-secs 1 --max-idle-secs 30 \
     > "$out" 2>&1
@@ -177,7 +179,7 @@ fi
 # trap contract, the pidfile must be PRESERVED on exit because the worker is
 # still alive — cleanup_ghosts() on a subsequent orchestrator startup is what
 # reaps the still-alive-but-orphaned worker.
-echo "**COMPLETE:** test fixture done" >> "$TAIL"
+echo "**COMPLETE:** $SLUG — test fixture done" >> "$TAIL"
 
 # Wait for watcher to exit
 wait "$WATCHER_PID"
@@ -200,6 +202,38 @@ wait "$WORKER_PID" 2>/dev/null
 rm -f "$TAIL" /tmp/watcher-out-marker-$$.txt
 cleanup_pidfile "$PIDFILE_STEM"
 
+# ---- Case 1a: custom regex remains dispatch-bound ----
+# A legacy --markers override may further filter a valid marker, but cannot
+# bypass the shared parser's expected-dispatch identity check.
+TAIL=/tmp/test-watch-custom-marker-$$.txt
+OUT=/tmp/watcher-out-custom-marker-$$.txt
+: > "$TAIL"
+sleep 30 & WORKER_PID=$!
+PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
+bash "$WATCHER" \
+  --pid "$WORKER_PID" --tail "$TAIL" \
+  --controller-pid "$$" --agent test-bashtail \
+  --session-id "custom-marker" --markers 'COMPLETE:' \
+  --poll-secs 1 --max-idle-secs 30 \
+  > "$OUT" 2>&1 &
+WATCHER_PID=$!
+wait_for_file "$PIDFILE_DIR/$PIDFILE_STEM" 50
+echo "COMPLETE: foreign-marker" >> "$TAIL"
+sleep 2
+if kill -0 "$WATCHER_PID" 2>/dev/null; then
+  expect_eq "case-1a custom regex rejects foreign dispatch" "running" "running"
+else
+  wait "$WATCHER_PID"
+  expect_eq "case-1a custom regex rejects foreign dispatch" "running" "exited-$?"
+fi
+echo "COMPLETE: custom-marker — done" >> "$TAIL"
+wait "$WATCHER_PID"
+expect_eq "case-1a custom regex accepts expected dispatch" "0" "$?"
+kill "$WORKER_PID" 2>/dev/null
+wait "$WORKER_PID" 2>/dev/null
+rm -f "$TAIL" "$OUT"
+cleanup_pidfile "$PIDFILE_STEM"
+
 # ---- Case 1b: marker received + worker also dead → pidfile REMOVED ----
 # Same as case 1 but the worker exits before the watcher exits, so the trap
 # removes the pidfile.
@@ -217,7 +251,7 @@ bash "$WATCHER" \
 WATCHER_PID=$!
 wait "$WORKER_PID" 2>/dev/null
 sleep 0.1
-echo "**COMPLETE:** done" >> "$TAIL"
+echo "**COMPLETE:** test-marker-dead — done" >> "$TAIL"
 sleep 0.5  # let watcher observe marker after worker exit
 wait "$WATCHER_PID"
 watcher_exit=$?
@@ -248,7 +282,7 @@ COMPLETE: W-pynec-fixes-2
 No commit made. `GOALFLIGHT_STEER_FILE` was unset in this process, so no steer ack was possible.
 
 EOF
-run_dead_tail_case "case-1c dead reconcile bare COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0"
+run_dead_tail_case "case-1c dead reconcile bare COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0" "W-pynec-fixes-2"
 if grep -q "terminal marker reconciled after worker exit" "$OUT"; then
   expect_eq "case-1c reconciliation summary emitted" "yes" "yes"
 else
@@ -280,7 +314,7 @@ FARR/PyNEC files were not touched; FARR P1 must align to this family Faraday sig
 
 EOF
 } > "$TAIL"
-run_dead_tail_case "case-1d dead reconcile STATUS COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0"
+run_dead_tail_case "case-1d dead reconcile STATUS COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0" "W-rf-b5-round5"
 rm -f "$TAIL" "$PROMPT" "$OUT"
 
 # ---- Case 1e: worker-dead final reconciliation sees markdown bullet/backtick COMPLETE ----
@@ -301,7 +335,7 @@ Verification:
 No live SynchRad run. No commit. `$GOALFLIGHT_STEER_FILE` was unset in tool env, so no steer messages to ack.
 
 EOF
-run_dead_tail_case "case-1e dead reconcile bullet backtick COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0"
+run_dead_tail_case "case-1e dead reconcile bullet backtick COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0" "W-synchrad-ctx"
 rm -f "$TAIL" "$PROMPT" "$OUT"
 
 # ---- Case 1f: diff-context marker echo is not a terminal sign-off ----
@@ -408,7 +442,7 @@ COMPLETE: gf-fence-offset-fix
 post-marker summary
 EOF
 } > "$TAIL"
-run_dead_tail_case "case-1g2 dead reconcile accepts banner-offset genuine COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0"
+run_dead_tail_case "case-1g2 dead reconcile accepts banner-offset genuine COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0" "gf-fence-offset-fix"
 rm -f "$TAIL" "$PROMPT" "$OUT"
 
 # ---- Case 1g3: pid-dead grace accepts genuine final marker even when prompt quotes it ----
@@ -420,7 +454,7 @@ Do the watcher reconciliation.
 Final line of your output MUST be exactly:
 COMPLETE: gf-fence-offset-fix-r2
 EOF
-run_pid_dead_grace_marker_case "case-1g3 pid-dead grace accepts fenceless final COMPLETE" "$TAIL" "$PROMPT" "$OUT" "COMPLETE: gf-fence-offset-fix-r2" "0"
+run_pid_dead_grace_marker_case "case-1g3 pid-dead grace accepts fenceless final COMPLETE" "$TAIL" "$PROMPT" "$OUT" "COMPLETE: gf-fence-offset-fix-r2" "0" "gf-fence-offset-fix-r2"
 rm -f "$TAIL" "$PROMPT" "$OUT"
 
 # ---- Case 1g4: early narration equal to prompt line 1 does not leave the real echo unfenced ----
@@ -466,7 +500,7 @@ tail window starts after the prompt anchor
 STATUS: COMPLETE: quoted-only
 worker died after decorated sign-off
 EOF
-	run_dead_tail_case "case-1g6 dead reconcile accepts fenceless decorated marker" "$TAIL" "$PROMPT" "$OUT" "0"
+	run_dead_tail_case "case-1g6 dead reconcile accepts fenceless decorated marker" "$TAIL" "$PROMPT" "$OUT" "0" "quoted-only"
 	rm -f "$TAIL" "$PROMPT" "$OUT"
 
 	# ---- Case 1g7: steer wrapper prompt + brief-only echo is still recognized as prompt echo ----
@@ -498,7 +532,7 @@ EOF
 	PROMPT="$FIXTURE_DIR/round4-trimmed-assembled.prompt"
 	TAIL="$FIXTURE_DIR/round4-trimmed-tail.txt"
 	OUT=/tmp/watcher-out-dead-reconcile-public-round4-$$.txt
-	run_dead_tail_case "case-1g7a public round4 trimmed fixture final COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0"
+	run_dead_tail_case "case-1g7a public round4 trimmed fixture final COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0" "public-watch-round4"
 	if grep -q "WATCHER-EXIT: marker exit_code=0" "$OUT"; then
 	  expect_eq "case-1g7a marker summary emitted" "yes" "yes"
 	else
@@ -517,7 +551,7 @@ work started
 traceback underline left the scanner in a fence-like state
 COMPLETE: unbalanced-final
 EOF
-	run_dead_tail_case "case-1g8 dead reconcile accepts unbalanced-fence final COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0"
+	run_dead_tail_case "case-1g8 dead reconcile accepts unbalanced-fence final COMPLETE" "$TAIL" "$PROMPT" "$OUT" "0" "unbalanced-final"
 	rm -f "$TAIL" "$PROMPT" "$OUT"
 
 	# ---- Case 1g9: balanced fenced marker remains suppressed ----
@@ -542,7 +576,7 @@ EOF
 TAIL=/tmp/test-watch-dead-reconcile-prefixed-status-$$.txt
 OUT=/tmp/watcher-out-dead-reconcile-prefixed-status-$$.txt
 printf '%s\n' "-STATUS: COMPLETE: x" > "$TAIL"
-run_dead_tail_case "case-1h1 dead reconcile accepts prefixed STATUS outside hunk" "$TAIL" "$PROMPT" "$OUT" "0"
+run_dead_tail_case "case-1h1 dead reconcile accepts prefixed STATUS outside hunk" "$TAIL" "$PROMPT" "$OUT" "0" "x"
 if grep -q "WATCHER-EXIT: marker exit_code=0" "$OUT"; then
   expect_eq "case-1h1 prefixed STATUS marker exit summary" "yes" "yes"
 else
@@ -581,7 +615,7 @@ PROMPT=/tmp/test-watch-dead-reconcile-failed-$$.prompt
 OUT=/tmp/watcher-out-dead-reconcile-failed-$$.txt
 : > "$PROMPT"
 printf '%s\n' "FAILED: x" > "$TAIL"
-run_dead_tail_case "case-1i dead reconcile FAILED blocks" "$TAIL" "$PROMPT" "$OUT" "4"
+run_dead_tail_case "case-1i dead reconcile FAILED blocks" "$TAIL" "$PROMPT" "$OUT" "4" "x"
 if grep -q "WATCHER-EXIT: marker exit_code=4" "$OUT"; then
   expect_eq "case-1i reconciled FAILED exit summary" "yes" "yes"
 else
@@ -598,7 +632,7 @@ cat > "$TAIL" <<'EOF'
 BLOCKED: x
 post-marker summary
 EOF
-run_dead_tail_case "case-1j dead reconcile BLOCKED blocks" "$TAIL" "$PROMPT" "$OUT" "4"
+run_dead_tail_case "case-1j dead reconcile BLOCKED blocks" "$TAIL" "$PROMPT" "$OUT" "4" "x"
 if grep -q "WATCHER-EXIT: marker exit_code=4" "$OUT"; then
   expect_eq "case-1j reconciled BLOCKED exit summary" "yes" "yes"
 else
@@ -705,7 +739,7 @@ else
   expect_eq "case-3b running_quiet state logged" "yes" "no"
 fi
 if [ "$running_quiet_watcher_alive" = "yes" ]; then
-  echo "**COMPLETE:** busy worker done" >> "$TAIL"
+  echo "**COMPLETE:** test-running-quiet — busy worker done" >> "$TAIL"
   wait "$WATCHER_PID"
   watcher_exit=$?
   expect_eq "case-3b exit code after terminal marker" "0" "$watcher_exit"

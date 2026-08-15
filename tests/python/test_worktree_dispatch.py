@@ -25,6 +25,9 @@ TEST_RUNTIME = tempfile.TemporaryDirectory(prefix="goal-flight-worktree-tests-")
 TEST_RUNTIME_ROOT = Path(TEST_RUNTIME.name)
 os.environ["GOALFLIGHT_CAPACITY_CONF"] = os.devnull
 os.environ["GOALFLIGHT_TASK_STORE_DIR"] = str(TEST_RUNTIME_ROOT / "task-store")
+os.environ["GOALFLIGHT_JOURNAL_DIR"] = str(TEST_RUNTIME_ROOT / "journal")
+os.environ["GOALFLIGHT_MESSAGES_DIR"] = str(TEST_RUNTIME_ROOT / "messages")
+os.environ["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(TEST_RUNTIME_ROOT / "wake-ledger")
 os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = str(TEST_RUNTIME_ROOT / "pids")
 os.environ.pop("GOALFLIGHT_STEER_FILE", None)
 os.environ.pop("GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE", None)
@@ -314,7 +317,7 @@ class FakePromptResult:
     early_marker = None
     permission_auto_declined: list[dict] = []
     permission_escalations: list[dict] = []
-    text = "COMPLETE: true\n"
+    text = "COMPLETE: acp-run-contract — true\n"
     stop_reason = "end_turn"
     out_of_scope_writes: list[str] = []
 

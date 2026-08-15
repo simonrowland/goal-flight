@@ -126,6 +126,7 @@ instead — it writes Goal Flight markers directly to the tail file:
 python3 <skill-root>/scripts/hosts/opencode/bash_tail.py \
   --directory "<workdir>" \
   --tail /tmp/opencode-<slug>.txt \
+  --dispatch-id "<dispatch-id>" \
   --prompt-file <prompt.md> \
   --model litellm/frontier-coder \
   > /tmp/opencode-worker-meta-<slug>.txt 2>&1 &
@@ -134,7 +135,8 @@ WORKER_PID=$!
 
 The script starts `opencode serve` if needed, sends the prompt via
 `POST /session/{id}/message`, streams `STATUS:` lines and the assistant
-reply into `--tail`, then writes `COMPLETE: true` or `BLOCKED: ...`.
+reply into `--tail`, then writes a `COMPLETE:` or `BLOCKED:` marker bound
+to `--dispatch-id`.
 
 Copy project `opencode.json` into `<workdir>` when testing outside the
 repo (set `"snapshot": false` on large trees). Requires LiteLLM env

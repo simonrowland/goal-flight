@@ -4,13 +4,13 @@ New workers emit sigiled, parseable markers on their own lines:
 
 - `!STATUS: <current activity>`
 - `!STEER-ACK: <seq>` — steer mailbox message acknowledged
-- `!RESULT: <summary of completed work>`
-- `!USER-NEED: <specific blocker requiring user input>`
-- `!USER-CONFIRM: <specific confirmation needed before risky action>`
-- `!BLOCKED: <blocker and evidence>`
-- `!FAILED: <failure and evidence>`
-- `!COMPLETE: <finished state>`
-- `!READY: <findings-path>` — Investigator file-backed findings (path only in the marker line)
+- `!RESULT: <dispatch-id> — <summary of completed work>`
+- `!USER-NEED: <dispatch-id> — <specific blocker requiring user input>`
+- `!USER-CONFIRM: <dispatch-id> — <specific confirmation needed before risky action>`
+- `!BLOCKED: <dispatch-id> — <blocker and evidence>`
+- `!FAILED: <dispatch-id> — <failure and evidence>`
+- `!COMPLETE: <dispatch-id> — <finished state>`
+- `!READY: <dispatch-id> — <findings-path>` — Investigator file-backed findings
 
 The leading `!` is optional to parsers for backward compatibility: unprefixed
 markers from deployed skills and older workers still work unchanged. New worker
@@ -23,6 +23,13 @@ auto-declined permission cleanly; otherwise a `!COMPLETE` after an auto-declined
 permission downgrades to `blocked_permission_denied`.
 
 Rules:
+
+- At a dispatch boundary every terminal payload begins with that exact dispatch
+  id, optionally followed by an em dash and details: `!COMPLETE: <dispatch-id> —
+  <summary>`. The dispatcher injects the exact id. A generic marker, bare
+  sign-off, prefix collision, or another dispatch's id is diagnostic prose and
+  cannot complete this dispatch. Parser-only calls without an expected id stay
+  permissive for offline text analysis.
 
 - Recognized terminal vocabulary: `RESULT`, `COMPLETE`, `READY`, `FAILED`,
   `USER-NEED`, `USER-CONFIRM`, `BLOCKED`. Transport policy decides whether a

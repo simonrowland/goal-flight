@@ -93,7 +93,10 @@ def test_dead_worker_complete_tail_reads_complete() -> None:
         state_dir = base / "state"
         tail = base / "complete.tail"
         status_path = base / "complete.status.json"
-        tail.write_text("finished\nCOMPLETE: done\n", encoding="utf-8")
+        tail.write_text(
+            "finished\nCOMPLETE: dead-complete — done\n",
+            encoding="utf-8",
+        )
         record = _record(dispatch_id="dead-complete", state="worker_dead", tail=tail, status_path=status_path)
         _write_dispatch(
             state_dir,
@@ -182,7 +185,11 @@ def test_summary_agrees_with_status_tail_reconciled_complete() -> None:
         state_dir = base / "state"
         tail = base / "agree.tail"
         status_path = base / "agree.status.json"
-        tail.write_text("READY: docs-private/research/findings.md\ntrailing summary\n", encoding="utf-8")
+        tail.write_text(
+            "READY: agree-complete — docs-private/research/findings.md\n"
+            "trailing summary\n",
+            encoding="utf-8",
+        )
         record = _record(dispatch_id="agree-complete", state="worker_dead", tail=tail, status_path=status_path)
         _write_dispatch(
             state_dir,

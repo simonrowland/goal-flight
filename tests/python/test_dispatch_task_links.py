@@ -29,6 +29,10 @@ def assert_true(name: str, condition: bool) -> None:
 def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
     return env
@@ -67,7 +71,7 @@ def case_dispatch_task_ids_update_ledger_and_breadcrumbs() -> None:
             "import time; "
             "print('STATUS: linked worker running', flush=True); "
             "time.sleep(0.2); "
-            "print('COMPLETE: linked worker done', flush=True)"
+            "print('COMPLETE: task-link — linked worker done', flush=True)"
         )
         proc = subprocess.run(
             [

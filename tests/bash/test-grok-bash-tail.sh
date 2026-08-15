@@ -34,7 +34,7 @@ WATCHER_OUT="$(mktemp /tmp/grok-bash-tail-watcher-XXXXXX.txt)"
 export GOAL_FLIGHT_PIDFILE_DIR="$PIDFILE_DIR"
 
 TARGET="$WORKDIR/grok-bash-tail-smoke.txt"
-PROMPT="Create file grok-bash-tail-smoke.txt with exactly the text done. Then output COMPLETE: true on its own line."
+PROMPT="Create file grok-bash-tail-smoke.txt with exactly the text done. Then output COMPLETE: grok-bash-tail-smoke — done on its own line."
 
 cleanup() {
   rm -rf "$WORKDIR" "$PIDFILE_DIR"
@@ -87,7 +87,7 @@ if [ "$WORKER_RC" -ne 0 ] || [ "$WATCHER_RC" -ne 0 ]; then
   exit 1
 fi
 
-if ! grep -q '^COMPLETE: true$' "$TAIL"; then
+if ! grep -q '^COMPLETE: grok-bash-tail-smoke' "$TAIL"; then
   auth_skip_if_needed "$TAIL"
   echo "FAIL  tests/bash/test-grok-bash-tail.sh (missing COMPLETE marker)"
   sed 's/^/      /' "$TAIL" || true

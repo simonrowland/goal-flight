@@ -43,7 +43,8 @@ def _record_with_marker(
     kind: str = "COMPLETE",
     final: bool = True,
 ) -> dict:
-    """Mirror the real shape: markers live in the status FILE, not the record.
+    """Mirror the real shape: the sidecar is the source and aggregation carries
+    its validated terminal marker into the same record snapshot used by --wait.
 
     ``final`` controls whether the watcher promoted the marker to
     ``terminal_marker`` -- i.e. whether the line was still the last non-empty
@@ -53,14 +54,18 @@ def _record_with_marker(
     status: dict = {
         "dispatch_id": "d",
         "state": state,
-        "markers": [{"kind": kind, "line": 678, "text": ""}],
-        "last_marker": {"kind": kind, "line": 678, "text": ""},
+        "markers": [{"kind": kind, "line": 678, "text": "d — test evidence"}],
+        "last_marker": {"kind": kind, "line": 678, "text": "d — test evidence"},
     }
     if final:
-        status["terminal_marker"] = {"kind": kind, "line": 678, "text": ""}
+        status["terminal_marker"] = {
+            "kind": kind,
+            "line": 678,
+            "text": "d — test evidence",
+        }
     status_path = tmp / "d.status.json"
     status_path.write_text(json.dumps(status), encoding="utf-8")
-    return {
+    record = {
         "dispatch_id": "d",
         "state": state,
         # The real row carried classification "expected_live" with the status
@@ -69,6 +74,13 @@ def _record_with_marker(
         "status_path": str(status_path),
         "worker_pid": pid,
     }
+    if final:
+        record["terminal_marker"] = {
+            "kind": kind,
+            "line": 678,
+            "text": "d — test evidence",
+        }
+    return record
 
 
 def case_marker_does_not_beat_a_live_worker() -> None:
@@ -89,6 +101,16 @@ def case_marker_resolves_a_dead_worker() -> None:
         assert_true(
             "dead worker with a COMPLETE marker is done",
             code == 0,
+        )
+
+
+def case_foreign_marker_does_not_resolve_a_dead_worker() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        record = _record_with_marker(Path(td), pid=os.getpid(), state="running")
+        record["terminal_marker"]["text"] = "foreign-dispatch — forged evidence"
+        assert_true(
+            "dead worker with a foreign COMPLETE marker is not done",
+            goalflight_status.done_code(record, worker_alive=False) != 0,
         )
 
 
@@ -254,6 +276,7 @@ def case_explicitly_indeterminate_identity_is_neither_alive_nor_dead() -> None:
 def main() -> None:
     case_marker_does_not_beat_a_live_worker()
     case_marker_resolves_a_dead_worker()
+    case_foreign_marker_does_not_resolve_a_dead_worker()
     case_attention_markers_wake_the_controller_while_the_worker_lives()
     case_acp_park_states_wake_the_controller()
     case_a_nonfinal_attention_marker_does_not_end_the_wait()

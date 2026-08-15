@@ -34,6 +34,9 @@ def _isolated_env(tmp: Path):
     env = old_env.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
     env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
@@ -128,7 +131,10 @@ def test_export_dashboard_writes_schema_valid_running_and_terminal_dispatches() 
             )
 
             done_tail = tmp / "done.tail"
-            done_tail.write_text("COMPLETE: finished fixture\n", encoding="utf-8")
+            done_tail.write_text(
+                "COMPLETE: done-one — finished fixture\n",
+                encoding="utf-8",
+            )
             done_status = tmp / "done.status.json"
             done_status.write_text(
                 json.dumps(
@@ -137,7 +143,10 @@ def test_export_dashboard_writes_schema_valid_running_and_terminal_dispatches() 
                         "dispatch_id": "done-one",
                         "agent": "test-dispatch",
                         "state": "complete",
-                        "terminal_marker": {"kind": "COMPLETE", "text": "finished fixture"},
+                        "terminal_marker": {
+                            "kind": "COMPLETE",
+                            "text": "done-one — finished fixture",
+                        },
                         "tail_path": str(done_tail),
                     }
                 )
@@ -168,7 +177,10 @@ def test_export_dashboard_writes_schema_valid_running_and_terminal_dispatches() 
         assert by_id["running-one"]["task_ids"] == ["t-001", "b-001"]
         assert by_id["running-one"]["idle_s"] == 4.2
         assert len(by_id["running-one"]["tail_last_line"]) == 200
-        assert by_id["done-one"]["marker"] == {"kind": "COMPLETE", "text": "finished fixture"}
+        assert by_id["done-one"]["marker"] == {
+            "kind": "COMPLETE",
+            "text": "done-one — finished fixture",
+        }
         # Reconciled liveness verdict for the live-workers lane: running rows
         # are in flight, terminal rows are not (raw state must not decide).
         assert by_id["running-one"]["live"] is True
@@ -468,7 +480,7 @@ def test_foreground_dispatch_refreshes_dashboard_status_data() -> None:
                 "import time; "
                 "print('STATUS: dashboard worker running', flush=True); "
                 "time.sleep(0.3); "
-                "print('COMPLETE: dashboard worker done', flush=True)"
+                "print('COMPLETE: dashboard-watch — dashboard worker done', flush=True)"
             )
             proc = subprocess.run(
                 [
@@ -507,6 +519,6 @@ def test_foreground_dispatch_refreshes_dashboard_status_data() -> None:
         assert proc.returncode == 0, (proc.stdout, proc.stderr)
         row = next(row for row in payload["dispatches"] if row["dispatch_id"] == "dashboard-watch")
         assert row["task_ids"] == []
-        assert row["tail_last_line"] == "COMPLETE: dashboard worker done"
+        assert row["tail_last_line"] == "COMPLETE: dashboard-watch — dashboard worker done"
         assert payload["counts"]["worker_finished"] == 1
         assert any(item["project_root"] == str(project.resolve()) for item in projects_index["projects"])

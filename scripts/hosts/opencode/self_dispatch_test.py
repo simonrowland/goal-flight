@@ -227,6 +227,8 @@ def _run_bash_tail(*, workdir: Path, model: str, timeout: float) -> dict[str, An
             str(workdir),
             "--tail",
             str(tail_path),
+            "--dispatch-id",
+            "opencode-self-dispatch",
             "--prompt-file",
             str(prompt_path),
             "--model",
@@ -284,7 +286,7 @@ def _run_bash_tail(*, workdir: Path, model: str, timeout: float) -> dict[str, An
         "watcher_returncode": watcher_rc,
         "tail_path": str(tail_path),
     }
-    out["complete_marker"] = "COMPLETE: true" in tail_text
+    out["complete_marker"] = "COMPLETE: opencode-self-dispatch" in tail_text
     out["reply_ok"] = _reply_has_four(tail_text)
     out["ok"] = worker_rc == 0 and watcher_rc == 0 and out["complete_marker"] and out["reply_ok"]
     if not out["ok"]:

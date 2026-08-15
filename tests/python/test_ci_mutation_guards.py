@@ -101,10 +101,19 @@ def test_terminal_rate_limit_numbers_require_token_boundaries() -> None:
 
 def test_attention_marker_helper_is_shared_by_status() -> None:
     for kind in terminal.ATTENTION_MARKERS:
-        marker = {"kind": kind, "text": "needs controller"}
+        marker = {"kind": kind, "text": "attention-marker — needs controller"}
         assert terminal.attention_marker_present(marker), kind
         assert status._record_has_attention_marker(
             {"dispatch_id": "attention-marker", "terminal_marker": marker}
+        ), kind
+        assert not status._record_has_attention_marker(
+            {
+                "dispatch_id": "attention-marker",
+                "terminal_marker": {
+                    "kind": kind,
+                    "text": "foreign-attention-marker — needs controller",
+                },
+            }
         ), kind
     for kind in terminal.SUCCESS_TERMINAL_MARKERS:
         marker = {"kind": kind, "text": "finished"}

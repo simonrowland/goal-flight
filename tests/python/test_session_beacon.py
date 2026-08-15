@@ -24,6 +24,7 @@ import goalflight_wake as wake  # noqa: E402
 def _root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
     monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("GOALFLIGHT_WAKE_LEDGER_DIR", str(tmp_path / "wake-ledger"))
     monkeypatch.setenv("GOAL_FLIGHT_PIDFILE_DIR", str(tmp_path / "pidfiles"))
     monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", "/dev/null")
     root = tmp_path / "project"
@@ -150,7 +151,7 @@ def test_lease_liveness_uses_only_lock_when_process_identity_is_unavailable(
     assert dead is not None and dead.alive is False
 
 
-def test_reused_pid_generation_proves_holder_dead_and_can_reclaim(
+def test_reused_pid_cannot_replace_active_claim_with_missing_lock_witness(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root = _root(monkeypatch, tmp_path)
@@ -169,16 +170,29 @@ def test_reused_pid_generation_proves_holder_dead_and_can_reclaim(
         role="controller",
         session_id=first["id"],
     )
-    assert result["claimed"] is True
-    assert result["session"]["generation"] == first["generation"] + 1
-    assert result["session"]["id"] != first["id"]
+    assert result["claimed"] is False
+    assert result["reason"] == "label_in_use"
+    active = journal.Journal(root).active_lease("controller")
+    assert active is not None and active.generation == first["generation"]
+
+    takeover = sessions.claim_controller_startup(
+        root,
+        pid=71001,
+        label="controller",
+        role="controller",
+        session_id=first["id"],
+        takeover=True,
+    )
+    assert takeover["claimed"] is True
+    assert takeover["session"]["generation"] == first["generation"] + 1
+    assert takeover["session"]["id"] != first["id"]
     ended = next(
         row
         for row in journal.Journal(root).lease_records(include_ended=True)
         if row["generation"] == first["generation"]
     )
-    assert ended["state"] == "EXPIRED"
-    assert ended["ended_reason"] == "holder-dead"
+    assert ended["state"] == "SUPERSEDED"
+    assert ended["ended_reason"] == "explicit-takeover"
 
 
 def test_release_requires_exact_process_generation(

@@ -85,6 +85,7 @@ from goalflight_watch import (
     _final_terminal_marker,
     _last_line_is_terminal_marker,
     _marker_state as _marker_state_for_terminal,
+    _terminal_marker_matches_dispatch,
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -637,8 +638,8 @@ WORKER_EXECUTION_PREAMBLE = (
     "research, or analysis actions before answering. Do not only plan, summarize, or "
     "describe commands.\n"
     "- For successful completion, emit a final line outside any Markdown fence in this "
-    "exact shape: `!COMPLETE: <summary>`.\n"
-    "- The `!COMPLETE: <summary>` line must be the last non-empty line of your output. "
+    "exact shape supplied by the dispatch-specific identity contract.\n"
+    "- The `!COMPLETE:` line must be the last non-empty line of your output. "
     "Do not print anything after it.\n"
     "- Legacy unprefixed marker lines remain accepted; new emissions use the `!` prefix."
 )
@@ -887,20 +888,31 @@ def _repair_watcher_terminal_status(
         payload = {}
     worker_is_alive, identity_reason = _worker_alive_from_identity(worker_pid, worker_identity)
     ignore_prefix_lines = _ignore_prefix_lines(prompt_path)
-    terminal_marker = _last_line_is_terminal_marker(
-        tail,
-        ignore_prefix_lines=ignore_prefix_lines,
-        kimi_output=moonshot_family(getattr(args, "agent", None)),
+    expected_dispatch_id = str(getattr(args, "dispatch_id", "") or "").strip()
+    terminal_marker = (
+        _last_line_is_terminal_marker(
+            tail,
+            ignore_prefix_lines=ignore_prefix_lines,
+            kimi_output=moonshot_family(getattr(args, "agent", None)),
+            expected_dispatch_id=expected_dispatch_id,
+        )
+        if expected_dispatch_id
+        else None
     )
-    if not terminal_marker and not worker_is_alive:
+    if not terminal_marker and not worker_is_alive and expected_dispatch_id:
         terminal_marker = _final_terminal_marker(
             tail,
             ignore_prefix_lines=ignore_prefix_lines,
             suppress_unfenced_prompt_markers=True,
             kimi_output=moonshot_family(getattr(args, "agent", None)),
+            expected_dispatch_id=expected_dispatch_id,
         )
     if not terminal_marker:
-        terminal_marker = payload.get("terminal_marker")
+        recorded_marker = payload.get("terminal_marker")
+        if expected_dispatch_id and _terminal_marker_matches_dispatch(
+            recorded_marker, expected_dispatch_id
+        ):
+            terminal_marker = recorded_marker
     terminal_pending_state = None
     if terminal_marker and isinstance(terminal_marker, dict):
         marker_state = _marker_state_for_terminal(terminal_marker)
@@ -2780,7 +2792,16 @@ def _materialize_steer_prompt(
         return None
     body_path = Path(prompt_path)
     body = body_path.read_text(encoding="utf-8", errors="replace")
-    full_prompt = f"{_worker_prompt_preamble(agent, orientation_path=orientation_path)}\n\n{body}"
+    preamble = _worker_prompt_preamble(agent, orientation_path=orientation_path)
+    if agent not in {*CURSOR_AGENTS, "codex-acp", "claude-acp"}:
+        preamble += (
+            "\n\nTerminal evidence identity contract:\n"
+            f"- Every terminal marker payload starts with the exact dispatch id `{dispatch_id}`.\n"
+            f"- Successful final shape: `!COMPLETE: {dispatch_id} — <summary>`.\n"
+            "- Use the same id prefix for READY, RESULT, FAILED, USER-NEED, "
+            "USER-CONFIRM, or BLOCKED. A generic or foreign marker is ignored."
+        )
+    full_prompt = f"{preamble}\n\n{body}"
     assembled = base / f"{dispatch_id}.assembled.prompt"
     assembled.parent.mkdir(parents=True, exist_ok=True)
     assembled.write_text(full_prompt, encoding="utf-8")
@@ -5548,7 +5569,7 @@ def _scan_entry_completion_marker(entry: dict) -> dict | None:
     tail_raw = request.get("tail")
     if not tail_raw and dispatch_id:
         tail_raw = str(_dispatch_base_dir() / f"{dispatch_id}.tail")
-    if not tail_raw:
+    if not tail_raw or not dispatch_id:
         return None
     tail = Path(str(tail_raw))
     prompt = request.get("prompt_file") or entry.get("prompt_file")
@@ -5558,6 +5579,7 @@ def _scan_entry_completion_marker(entry: dict) -> dict | None:
             tail,
             ignore_prefix_lines=ignore_prefix_lines,
             suppress_unfenced_prompt_markers=True,
+            expected_dispatch_id=dispatch_id,
         )
     except Exception:
         return None
@@ -7685,12 +7707,16 @@ def _resolve_claim_terminal_outcome(
     """Scan tail (with amendment-G recheck) and return (state, reason, marker)."""
 
     def _scan_marker() -> dict | None:
+        expected_dispatch_id = str(entry.get("dispatch_id") or "").strip()
+        if not expected_dispatch_id:
+            return None
         try:
             return _final_terminal_marker(
                 tail,
                 ignore_prefix_lines=ignore_prefix_lines,
                 suppress_unfenced_prompt_markers=True,
                 kimi_output=moonshot_family(agent),
+                expected_dispatch_id=expected_dispatch_id,
             )
         except Exception:
             return None

@@ -21,6 +21,7 @@ def _authority(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, j
     monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
     monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal"))
     monkeypatch.setenv("GOAL_FLIGHT_PIDFILE_DIR", str(tmp_path / "pids"))
+    monkeypatch.setenv("GOALFLIGHT_WAKE_LEDGER_DIR", str(tmp_path / "wake-ledger"))
     monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", "bugs")
     root = tmp_path / "project"
     root.mkdir()

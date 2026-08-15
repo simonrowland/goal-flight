@@ -473,41 +473,44 @@ echo "[watcher start $(date '+%H:%M:%S')] worker_pid=$WORKER_PID controller_pid=
 terminal_marker_seen() {
   [ -f "$TAIL_PATH" ] || return 1
   if [ "$MARKER_RE" != "$DEFAULT_MARKER_RE" ]; then
-    # Custom legacy override path: callers that pass --markers own that regex.
-    # Default grammar routes through goalflight_watch.py below.
-    if [ -n "$IGNORE_PROMPT_FILE" ] && [ -f "$IGNORE_PROMPT_FILE" ]; then
-      python3 - "$TAIL_PATH" "$IGNORE_PROMPT_FILE" "$MARKER_RE" <<'PY'
+    # A custom regex is an additional filter, never an alternate identity
+    # grammar. The shared parser must first bind the terminal payload to this
+    # dispatch, so a foreign marker cannot ride through the legacy override.
+    PYTHONPATH="$SCRIPT_DIR" python3 - "$TAIL_PATH" "${IGNORE_PROMPT_FILE:-}" "$MARKER_RE" "$AGENT_LABEL" "$SESSION_ID" <<'PY'
 import pathlib
 import re
 import sys
 
 tail = pathlib.Path(sys.argv[1])
-prompt = pathlib.Path(sys.argv[2])
+prompt_arg = sys.argv[2]
 marker_re = re.compile(sys.argv[3])
-prompt_lines = [line.strip() for line in prompt.read_text(encoding="utf-8", errors="replace").splitlines()]
-prompt_line_set = {line for line in prompt_lines if line}
-size = tail.stat().st_size
-start = max(0, size - 10 * 1024 * 1024)
-text = tail.read_bytes()[start:].decode(errors="replace")
-last_nonempty = ""
-for line in text.splitlines():
-    stripped = line.strip()
-    if stripped and stripped not in prompt_line_set:
-        last_nonempty = stripped
-if last_nonempty and marker_re.search(last_nonempty):
-    print("0:CUSTOM:")
+agent = sys.argv[4]
+dispatch_id = sys.argv[5]
+prompt_lines = []
+if prompt_arg:
+    prompt = pathlib.Path(prompt_arg)
+    if prompt.exists():
+        prompt_lines = [line.strip() for line in prompt.read_text(encoding="utf-8", errors="replace").splitlines()]
+
+from goalflight_agent_limits import moonshot_family
+from goalflight_watch import _last_line_is_terminal_marker
+
+marker = _last_line_is_terminal_marker(
+    tail,
+    ignore_prefix_lines=prompt_lines,
+    kimi_output=moonshot_family(agent),
+    expected_dispatch_id=dispatch_id,
+)
+lines = tail.read_text(encoding="utf-8", errors="replace").splitlines()
+raw_line = lines[int(marker["line"]) - 1] if marker else ""
+if marker and marker_re.search(raw_line.strip()):
+    print(f"{marker['line']}:{marker['kind']}:{marker['text']}")
     raise SystemExit(0)
 raise SystemExit(1)
 PY
-      return $?
-    fi
-    if grep -vE '^[[:space:]]*$' "$TAIL_PATH" 2>/dev/null | tail -1 | grep -qE "$MARKER_RE" 2>/dev/null; then
-      printf '%s\n' "0:CUSTOM:"
-      return 0
-    fi
-    return 1
+    return $?
   fi
-  PYTHONPATH="$SCRIPT_DIR" python3 - "$TAIL_PATH" "${IGNORE_PROMPT_FILE:-}" "$AGENT_LABEL" <<'PY'
+  PYTHONPATH="$SCRIPT_DIR" python3 - "$TAIL_PATH" "${IGNORE_PROMPT_FILE:-}" "$AGENT_LABEL" "$SESSION_ID" <<'PY'
 import pathlib
 import sys
 
@@ -517,6 +520,7 @@ from goalflight_watch import _last_line_is_terminal_marker
 tail = pathlib.Path(sys.argv[1])
 prompt_arg = sys.argv[2]
 agent = sys.argv[3]
+dispatch_id = sys.argv[4]
 prompt_lines = []
 if prompt_arg:
     prompt = pathlib.Path(prompt_arg)
@@ -526,6 +530,7 @@ marker = _last_line_is_terminal_marker(
     tail,
     ignore_prefix_lines=prompt_lines,
     kimi_output=moonshot_family(agent),
+    expected_dispatch_id=dispatch_id,
 )
 if marker:
     print(f"{marker['line']}:{marker['kind']}:{marker['text']}")
@@ -536,7 +541,7 @@ PY
 
 final_terminal_marker() {
   [ -f "$TAIL_PATH" ] || return 1
-  PYTHONPATH="$SCRIPT_DIR" python3 - "$TAIL_PATH" "${IGNORE_PROMPT_FILE:-}" "$AGENT_LABEL" <<'PY'
+  PYTHONPATH="$SCRIPT_DIR" python3 - "$TAIL_PATH" "${IGNORE_PROMPT_FILE:-}" "$AGENT_LABEL" "$SESSION_ID" <<'PY'
 import pathlib
 import sys
 
@@ -546,6 +551,7 @@ from goalflight_watch import _final_terminal_marker
 tail = pathlib.Path(sys.argv[1])
 prompt_arg = sys.argv[2]
 agent = sys.argv[3]
+dispatch_id = sys.argv[4]
 prompt_lines = []
 if prompt_arg:
     prompt = pathlib.Path(prompt_arg)
@@ -555,6 +561,7 @@ marker = _final_terminal_marker(
     tail,
     ignore_prefix_lines=prompt_lines,
     kimi_output=moonshot_family(agent),
+    expected_dispatch_id=dispatch_id,
 )
 if marker:
     print(f"{marker['line']}:{marker['kind']}:{marker['text']}")

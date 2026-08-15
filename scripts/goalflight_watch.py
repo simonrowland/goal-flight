@@ -651,6 +651,34 @@ def _marker_survives_unbalanced_fence(marker: dict | None) -> bool:
     return bool(marker and marker.get("kind") in SUCCESS_TERMINAL_MARKERS)
 
 
+def _terminal_marker_matches_dispatch(
+    marker: dict | None,
+    expected_dispatch_id: str | None,
+) -> bool:
+    """Bind scraped terminal evidence to the dispatch that owns the tail.
+
+    A marker payload may be exactly the dispatch id or start with it followed by
+    an explicit separator and a human summary.  Empty sign-offs and generic
+    summaries remain usable by parser-only callers that have no expected id,
+    but never satisfy a dispatch boundary.
+    """
+    expected = str(expected_dispatch_id or "").strip()
+    if not expected:
+        return marker is not None
+    if not isinstance(marker, dict):
+        return False
+    embedded = str(marker.get("dispatch_id") or "").strip()
+    if embedded:
+        return embedded == expected
+    text = _strip_marker_decoration(str(marker.get("text") or "")).strip()
+    if text == expected:
+        return True
+    if not text.startswith(expected):
+        return False
+    suffix = text[len(expected) :]
+    return bool(suffix and (suffix[0].isspace() or suffix[0] in ":;|\N{EM DASH}\N{EN DASH}"))
+
+
 def _final_terminal_marker_from_line(
     raw_line: str,
     line_no: int,
@@ -659,6 +687,7 @@ def _final_terminal_marker_from_line(
     allow_quote_prefix: bool = False,
     allow_status_prefix: bool = False,
     kimi_output: bool = False,
+    expected_dispatch_id: str | None = None,
 ) -> dict | None:
     kimi_continuation = raw_line.startswith("  ") and not raw_line.startswith("   ")
     if raw_line.startswith("\t") or (
@@ -687,17 +716,22 @@ def _final_terminal_marker_from_line(
         return None
     signoff = _completion_signoff_marker(stripped, line_no)
     if signoff:
-        return signoff
+        return (
+            signoff
+            if _terminal_marker_matches_dispatch(signoff, expected_dispatch_id)
+            else None
+        )
     match = FINAL_TERMINAL_MARKER_RE.match(stripped)
     if not match:
         return None
     if goalflight_terminal.marker_is_template_example(match.group(1), match.group(2)):
         return None
-    return {
+    marker = {
         "line": line_no,
         "kind": match.group(1),
         "text": _strip_marker_decoration(match.group(2))[:1000],
     }
+    return marker if _terminal_marker_matches_dispatch(marker, expected_dispatch_id) else None
 
 
 def _prompt_echo_anchor_indices(prompt_prefix: list[str]) -> list[int]:
@@ -971,7 +1005,12 @@ class _IncrementalMarkerState:
             )
         ]
 
-    def terminal(self, *, kimi_output: bool) -> dict | None:
+    def terminal(
+        self,
+        *,
+        kimi_output: bool,
+        expected_dispatch_id: str | None = None,
+    ) -> dict | None:
         if self.last_candidate is None:
             return None
         line_no, line, candidate_in_fence = self.last_candidate
@@ -982,6 +1021,7 @@ class _IncrementalMarkerState:
             line_no,
             allow_prefixed_marker=True,
             kimi_output=kimi_output,
+            expected_dispatch_id=expected_dispatch_id,
         )
         if candidate_in_fence and not _marker_survives_unbalanced_fence(marker):
             return None
@@ -998,9 +1038,16 @@ class IncrementalTailScanner:
     duplicated when its newline eventually arrives.
     """
 
-    def __init__(self, path: Path, ignore_prefix_lines: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        ignore_prefix_lines: list[str] | None = None,
+        *,
+        expected_dispatch_id: str | None = None,
+    ) -> None:
         self.path = path
         self.prompt_prefix = ignore_prefix_lines or []
+        self.expected_dispatch_id = expected_dispatch_id
         self._prompt_has_anchors = bool(_prompt_echo_anchor_indices(self.prompt_prefix))
         self._prompt_record_limit = PROMPT_ECHO_ANCHOR_SEARCH_LINES + len(self.prompt_prefix)
         self._identity: tuple[int, int] | None = None
@@ -1220,7 +1267,10 @@ class IncrementalTailScanner:
         return TailScanResult(
             markers=visible,
             mail_markers=mail_markers,
-            terminal=state.terminal(kimi_output=kimi_output),
+            terminal=state.terminal(
+                kimi_output=kimi_output,
+                expected_dispatch_id=self.expected_dispatch_id,
+            ),
             size=size,
             content_bytes=content_bytes,
             validation_bytes=validation_bytes,
@@ -1303,6 +1353,7 @@ def _last_line_is_terminal_marker(
     ignore_prefix_lines: list[str] | None = None,
     *,
     kimi_output: bool = False,
+    expected_dispatch_id: str | None = None,
 ) -> dict | None:
     """Return a terminal marker dict iff the *last non-empty line* of the tail
     (after prefix-echo ignore and skipping inside code fences) matches a
@@ -1373,6 +1424,7 @@ def _last_line_is_terminal_marker(
         line_no,
         allow_prefixed_marker=True,
         kimi_output=kimi_output,
+        expected_dispatch_id=expected_dispatch_id,
     )
     if candidate_in_fence and not (
         ignore_fences and _marker_survives_unbalanced_fence(marker)
@@ -1381,7 +1433,11 @@ def _last_line_is_terminal_marker(
     return marker
 
 
-def _recorded_terminal_success_marker(payload: dict) -> dict | None:
+def _recorded_terminal_success_marker(
+    payload: dict,
+    *,
+    expected_dispatch_id: str | None = None,
+) -> dict | None:
     """Return a schema-valid success marker already recorded by the watcher."""
     terminal_marker = payload.get("terminal_marker")
     if isinstance(terminal_marker, dict):
@@ -1395,7 +1451,9 @@ def _recorded_terminal_success_marker(payload: dict) -> dict | None:
             line_no = int(marker.get("line") or 0)
         except (TypeError, ValueError):
             continue
-        if line_no > 0:
+        if line_no > 0 and _terminal_marker_matches_dispatch(
+            marker, expected_dispatch_id
+        ):
             return marker
     return None
 
@@ -1409,6 +1467,7 @@ def _scan_final_terminal_marker(
     suppress_unfenced_prompt_markers: bool,
     ignore_fences: bool,
     kimi_output: bool = False,
+    expected_dispatch_id: str | None = None,
 ) -> dict | None:
     fence = goalflight_terminal.MarkdownFenceTracker()
     in_hunk = False
@@ -1437,6 +1496,7 @@ def _scan_final_terminal_marker(
             allow_quote_prefix=True,
             allow_status_prefix=True,
             kimi_output=kimi_output,
+            expected_dispatch_id=expected_dispatch_id,
         )
         if candidate:
             if marker_in_fence and not _marker_survives_unbalanced_fence(candidate):
@@ -1464,6 +1524,7 @@ def _final_terminal_marker(
     *,
     suppress_unfenced_prompt_markers: bool = True,
     kimi_output: bool = False,
+    expected_dispatch_id: str | None = None,
 ) -> dict | None:
     """Return the last terminal marker anywhere in the completed post-prompt tail.
 
@@ -1488,6 +1549,7 @@ def _final_terminal_marker(
         suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
         ignore_fences=False,
         kimi_output=kimi_output,
+        expected_dispatch_id=expected_dispatch_id,
     )
     if not _fence_state_unbalanced(lines, prompt_echo_lines):
         return terminal
@@ -1499,6 +1561,7 @@ def _final_terminal_marker(
         suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
         ignore_fences=True,
         kimi_output=kimi_output,
+        expected_dispatch_id=expected_dispatch_id,
     )
     if (
         fence_agnostic_terminal
@@ -1539,7 +1602,11 @@ def main() -> int:
     parser.add_argument("--pid", type=int, required=True)
     parser.add_argument("--tail", required=True)
     parser.add_argument("--status-json", required=True)
-    parser.add_argument("--dispatch-id")
+    parser.add_argument(
+        "--dispatch-id",
+        required=True,
+        help="Expected dispatch identity; terminal evidence for any other id is ignored.",
+    )
     parser.add_argument("--project-root")
     parser.add_argument("--task-ids")
     parser.add_argument("--agent", default="unknown")
@@ -1644,7 +1711,11 @@ def main() -> int:
         write_status(status_path, payload)
         print(json.dumps({"state": payload["state"], "reason": payload["reason"], "status_path": str(status_path)}, sort_keys=True))
         return 4
-    tail_scanner = IncrementalTailScanner(tail, ignore_prefix_lines)
+    tail_scanner = IncrementalTailScanner(
+        tail,
+        ignore_prefix_lines,
+        expected_dispatch_id=args.dispatch_id,
+    )
     last_size = -1
     trace_liveness = TraceLiveness(
         dispatch_id=args.dispatch_id,
@@ -2067,6 +2138,7 @@ def main() -> int:
                     tail,
                     ignore_prefix_lines=ignore_prefix_lines,
                     kimi_output=moonshot_family(args.agent),
+                    expected_dispatch_id=args.dispatch_id,
                 )
                 if reconciled:
                     terminal_seen = reconciled
@@ -2094,9 +2166,13 @@ def main() -> int:
                 tail,
                 ignore_prefix_lines=ignore_prefix_lines,
                 kimi_output=moonshot_family(args.agent),
+                expected_dispatch_id=args.dispatch_id,
             )
             if not reconciled:
-                recorded = _recorded_terminal_success_marker(payload)
+                recorded = _recorded_terminal_success_marker(
+                    payload,
+                    expected_dispatch_id=args.dispatch_id,
+                )
                 if (
                     recorded
                     and terminal
@@ -2124,6 +2200,7 @@ def main() -> int:
                         tail,
                         ignore_prefix_lines=ignore_prefix_lines,
                         kimi_output=moonshot_family(args.agent),
+                        expected_dispatch_id=args.dispatch_id,
                     )
                     if reconciled:
                         terminal_seen = reconciled

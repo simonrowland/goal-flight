@@ -63,7 +63,7 @@ def _watcher(
     controller_pid: int | None = None,
     long_running_secs: float = 3600,
     review_secs: float = 7200,
-    dispatch_id: str | None = None,
+    dispatch_id: str = "trace-watch",
 ) -> tuple[subprocess.Popen, Path, Path]:
     tail = root / "worker.tail"
     status_path = root / "status.json"
@@ -71,6 +71,11 @@ def _watcher(
     status_path.write_text(json.dumps({"trace_path": str(trace)}), encoding="utf-8")
     env = os.environ.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(root / "state")
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(root / "task-store")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(root / "journal")
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(root / "messages")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(root / "wake-ledger")
+    env["GOAL_FLIGHT_PIDFILE_DIR"] = str(root / "pids")
     argv = [
         sys.executable,
         str(ROOT / "scripts" / "goalflight_watch.py"),
@@ -89,8 +94,7 @@ def _watcher(
         "--trace-review-secs",
         str(review_secs),
     ]
-    if dispatch_id is not None:
-        argv.extend(["--dispatch-id", dispatch_id])
+    argv.extend(["--dispatch-id", dispatch_id])
     if controller_pid is not None:
         argv.extend(["--controller-pid", str(controller_pid)])
     process = subprocess.Popen(
@@ -450,7 +454,7 @@ def test_live_growing_trace_survives_caps_and_dead_controller_branch() -> None:
             }
             assert payload["worker_alive"] is True
             assert process.poll() is None
-            tail.write_text("COMPLETE: test finished\n", encoding="utf-8")
+            tail.write_text("COMPLETE: trace-watch — test finished\n", encoding="utf-8")
             assert process.wait(timeout=3) == 0
         finally:
             if process.poll() is None:

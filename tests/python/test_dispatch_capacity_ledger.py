@@ -35,6 +35,7 @@ def _env(tmp: Path) -> dict[str, str]:
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_CONTROLLER_SESSION_ID"] = f"test-{tmp.name}"
     # Tests assert the instant DISPATCH-BLOCKED path; disable the capacity
@@ -310,7 +311,7 @@ def case_status_sees_dispatch_and_lease_releases() -> None:
             "import time; "
             "print('worker-start', flush=True); "
             "time.sleep(15); "
-            "print('COMPLETE: done', flush=True); "
+            f"print('COMPLETE: {dispatch_id} — done', flush=True); "
             "time.sleep(0.2)"
         )
         proc = subprocess.Popen(
@@ -402,7 +403,7 @@ def case_unowned_pidfile_preserves_blocked_worker_for_reattach() -> None:
                 tmp,
                 env,
                 dispatch_id,
-                "import time; print('BLOCKED: needs controller', flush=True); time.sleep(60)",
+                f"import time; print('BLOCKED: {dispatch_id} — needs controller', flush=True); time.sleep(60)",
                 controller_pid=os.getpid(),
                 isolate_project=True,
             )
@@ -657,7 +658,7 @@ def case_default_background_finalizes_ledger_and_rate_pressure_once() -> None:
                 tmp,
                 env,
                 clean_id,
-                "print('COMPLETE: background done', flush=True)",
+                f"print('COMPLETE: {clean_id} — background done', flush=True)",
                 agent="codex",
                 poll_secs="0.1",
                 max_idle_secs="5",
@@ -755,7 +756,7 @@ def case_foreground_blocks_until_terminal_state() -> None:
             tmp,
             env,
             dispatch_id,
-            "import time; print('worker-start', flush=True); time.sleep(0.8); print('COMPLETE: worker-done', flush=True)",
+            f"import time; print('worker-start', flush=True); time.sleep(0.8); print('COMPLETE: {dispatch_id} — worker-done', flush=True)",
             poll_secs="0.1",
             max_idle_secs="20",
             foreground=True,
@@ -887,7 +888,7 @@ def case_capacity_wait_queues_until_slot_frees() -> None:
         worker_code = (
             f"from pathlib import Path; import time; "
             f"Path({str(marker)!r}).write_text('spawned'); "
-            f"print('COMPLETE: queued worker done', flush=True); time.sleep(0.3)"
+            f"print('COMPLETE: queued-dispatch — queued worker done', flush=True); time.sleep(0.3)"
         )
         proc = subprocess.Popen(
             [
@@ -1095,8 +1096,9 @@ def case_codex_routed_subscription_strips_openai_api_key() -> None:
                     "-c",
                     (
                         "import os; "
-                        "print(('BLOCKED' if os.environ.get('OPENAI_API_KEY') else 'COMPLETE') "
-                        "+ ': openai env', flush=True)"
+                        "kind = 'BLOCKED' if os.environ.get('OPENAI_API_KEY') else 'COMPLETE'; "
+                        "print(kind + ': ' + os.environ['GOALFLIGHT_DISPATCH_ID'] "
+                        "+ ' — openai env', flush=True)"
                     ),
                 ],
                 cwd=ROOT,
@@ -1130,7 +1132,8 @@ def case_state_dir_auto_paths() -> None:
                 "--",
                 sys.executable,
                 "-c",
-                "print('COMPLETE: state-dir', flush=True)",
+                "import os; print('COMPLETE: ' + os.environ['GOALFLIGHT_DISPATCH_ID'] "
+                "+ ' — state-dir', flush=True)",
             ],
             cwd=ROOT,
             env=env,
@@ -1156,7 +1159,7 @@ def case_dispatch_end_worker_still_alive_flags() -> None:
             tmp,
             env,
             "worker-still-alive-true",
-            "import time; print('COMPLETE: stays alive', flush=True); time.sleep(5)",
+            "import time; print('COMPLETE: worker-still-alive-true — stays alive', flush=True); time.sleep(5)",
             poll_secs="0.1",
             max_idle_secs="10",
             timeout_s=90,
@@ -1172,7 +1175,7 @@ def case_dispatch_end_worker_still_alive_flags() -> None:
             tmp,
             env,
             "worker-still-alive-false",
-            "print('COMPLETE: exits', flush=True)",
+            "print('COMPLETE: worker-still-alive-false — exits', flush=True)",
             poll_secs="0.2",
             max_idle_secs="10",
             timeout_s=90,
@@ -1206,7 +1209,8 @@ def case_dispatch_id_collision_suffix() -> None:
                     "--",
                     sys.executable,
                     "-c",
-                    "print('COMPLETE: collision', flush=True)",
+                    "import os; print('COMPLETE: ' + os.environ['GOALFLIGHT_DISPATCH_ID'] "
+                    "+ ' — collision', flush=True)",
                 ],
                 cwd=ROOT,
                 env=env,
@@ -1454,7 +1458,7 @@ def case_post_spawn_registration_failure_still_runs_watcher() -> None:
             tmp,
             env,
             dispatch_id,
-            "import time; print('COMPLETE: registered enough', flush=True); time.sleep(2)",
+            f"import time; print('COMPLETE: {dispatch_id} — registered enough', flush=True); time.sleep(2)",
         )
         assert proc.returncode == 0, f"dispatch rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
         assert "DISPATCH-REGISTRATION-WARN " in proc.stderr, proc.stderr

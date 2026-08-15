@@ -29,7 +29,7 @@ TAIL_WITH_TRAILING_TLDR = """\
 worker starting
 ... lots of analysis ...
 wrote proposal
-READY: docs-private/reviews/2026-06-20-arch-review/DRY-DUPLICATION-PROPOSAL.md
+READY: recon — docs-private/reviews/2026-06-20-arch-review/DRY-DUPLICATION-PROPOSAL.md
 
 TL;DR:
 1. Fleet/message env resolvers first.
@@ -121,7 +121,10 @@ def test_marker_followed_by_tldr_promotes_to_complete() -> None:
 def test_fresh_identity_mismatch_marker_stays_unpromoted() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-recon-mismatch-") as d:
         tail = Path(d) / "mismatch.tail"
-        tail.write_text("still running\nCOMPLETE: scraped too early\n", encoding="utf-8")
+        tail.write_text(
+            "still running\nCOMPLETE: recon — scraped too early\n",
+            encoding="utf-8",
+        )
         rec = _record_for(tail)
         rec["classification"] = "watcher_stopped"
         saved = ledger.identity_matches

@@ -29,7 +29,12 @@ status="$tmp/status.json"
 tail="$tmp/tail.log"
 state_dir="$tmp/state"
 
-GOALFLIGHT_STATE_DIR="$state_dir" python3 "$REPO_ROOT/scripts/goalflight_dispatch.py" \
+GOALFLIGHT_STATE_DIR="$state_dir" \
+GOALFLIGHT_TASK_STORE_DIR="$tmp/task-store" \
+GOALFLIGHT_JOURNAL_DIR="$tmp/journal" \
+GOALFLIGHT_MESSAGES_DIR="$tmp/messages" \
+GOALFLIGHT_WAKE_LEDGER_DIR="$tmp/wake-ledger" \
+python3 "$REPO_ROOT/scripts/goalflight_dispatch.py" \
   --shape bash \
   --agent wsl-smoke \
   --cwd "$REPO_ROOT" \
@@ -40,7 +45,7 @@ GOALFLIGHT_STATE_DIR="$state_dir" python3 "$REPO_ROOT/scripts/goalflight_dispatc
   --max-idle-secs 20 \
   --foreground \
   -- \
-  python3 -c 'print("STATUS: wsl smoke"); print("COMPLETE: wsl smoke")'
+  python3 -c 'import os; print("STATUS: wsl smoke"); print("COMPLETE: " + os.environ["GOALFLIGHT_DISPATCH_ID"] + " — wsl smoke")'
 rc=$?
 if [ "$rc" -ne 0 ]; then
   echo "dispatch failed rc=$rc"

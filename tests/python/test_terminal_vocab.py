@@ -281,12 +281,26 @@ def test_terminal_marker_poison_pairs() -> None:
 
     assert_eq(
         "READY chunk summary complete",
-        chunk_summary.normalize_state(None, {"last_marker": ready}, None),
+        chunk_summary.normalize_state(
+            None,
+            {
+                "dispatch_id": "d-ready",
+                "last_marker": {**ready, "text": "d-ready — findings ready"},
+            },
+            None,
+        ),
         "complete",
     )
     assert_eq(
         "FAILED chunk summary failed",
-        chunk_summary.normalize_state(None, {"last_marker": failed}, None),
+        chunk_summary.normalize_state(
+            None,
+            {
+                "dispatch_id": "d-failed",
+                "last_marker": {**failed, "text": "d-failed — missing final artifact"},
+            },
+            None,
+        ),
         "failed",
     )
 
@@ -376,6 +390,65 @@ def test_recorded_terminal_success_marker() -> None:
     )
 
 
+def test_terminal_marker_dispatch_identity_poison_pairs() -> None:
+    expected = "wake-fold"
+    assert_true(
+        "exact dispatch marker is bound",
+        goalflight_watch._terminal_marker_matches_dispatch(
+            {"kind": "COMPLETE", "text": expected}, expected
+        ),
+    )
+    assert_true(
+        "dispatch marker may carry a separated summary",
+        goalflight_watch._terminal_marker_matches_dispatch(
+            {"kind": "COMPLETE", "text": f"{expected} — all tests passed"},
+            expected,
+        ),
+    )
+    assert_true(
+        "foreign marker cannot complete expected dispatch",
+        not goalflight_watch._terminal_marker_matches_dispatch(
+            {"kind": "COMPLETE", "text": "signals-lifecycle-audit"},
+            expected,
+        ),
+    )
+    assert_true(
+        "prefix collision is foreign",
+        not goalflight_watch._terminal_marker_matches_dispatch(
+            {"kind": "COMPLETE", "text": f"{expected}-other"}, expected
+        ),
+    )
+    assert_true(
+        "bare signoff is unbound at a dispatch boundary",
+        not goalflight_watch._terminal_marker_matches_dispatch(
+            {"kind": "COMPLETE", "text": ""}, expected
+        ),
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "identity.tail"
+        tail.write_text(
+            "COMPLETE: wake-fold\n"
+            "quota exceeded: usage limit reached\n"
+            "COMPLETE: signals-lifecycle-audit\n",
+            encoding="utf-8",
+        )
+        assert_true(
+            "dead-worker scan rejects the last foreign marker",
+            goalflight_watch._final_terminal_marker(
+                tail, expected_dispatch_id=expected
+            )["text"]
+            == expected,
+        )
+        assert_true(
+            "live final-line scan rejects a foreign marker",
+            goalflight_watch._last_line_is_terminal_marker(
+                tail, expected_dispatch_id=expected
+            )
+            is None,
+        )
+
+
 def test_false_death_marker_poison_pairs() -> None:
     cases = {
         "unknown trailer": "COMPLETE: not final\narbitrary trailing content\n",
@@ -413,6 +486,7 @@ def main() -> None:
     test_diff_prefixed_terminal_markers()
     test_marker_before_known_harness_trailer()
     test_recorded_terminal_success_marker()
+    test_terminal_marker_dispatch_identity_poison_pairs()
     test_false_death_marker_poison_pairs()
     print("OK: terminal vocabulary poison-pair tests pass")
 

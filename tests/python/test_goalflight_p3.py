@@ -35,6 +35,7 @@ def _set_state_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str,
         "GOALFLIGHT_JOURNAL_DIR": str(tmp_path / "journal-state"),
         "GOALFLIGHT_MESSAGES_DIR": str(tmp_path / "messages"),
         "GOALFLIGHT_STATE_DIR": str(tmp_path / "dispatch-state"),
+        "GOALFLIGHT_WAKE_LEDGER_DIR": str(tmp_path / "wake-ledger"),
         "GOAL_FLIGHT_PIDFILE_DIR": str(tmp_path / "pidfiles"),
         "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
         "GOALFLIGHT_TEST_MODE": "1",
@@ -68,7 +69,7 @@ def _claim(authority: journal.Journal, label: str = "controller") -> journal.Lea
     return result.value
 
 
-def test_current_epoch_missing_p3_table_self_heals_but_corruption_fails_closed(
+def test_current_epoch_missing_table_self_heals_but_corruption_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -83,14 +84,13 @@ def test_current_epoch_missing_p3_table_self_heals_but_corruption_fails_closed(
                    FROM journal_epochs WHERE singleton = 1"""
             ).fetchone()
         )
-        assert epochs == (3, 3, 3, 3, 3)
-        connection.execute("DROP TABLE journal_secrets")
+        assert epochs == (4, 4, 4, 4, 4)
+        connection.execute("DROP TABLE listener_coverage")
 
     reopened = journal.Journal(project)
-    secret_rows = reopened.read_all(
-        "SELECT length(cursor_token_secret) AS secret_length FROM journal_secrets"
+    assert reopened.read_all(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'listener_coverage'"
     )
-    assert len(secret_rows) == 1 and secret_rows[0]["secret_length"] == 64
 
     corrupt_project = tmp_path / "corrupt-project"
     corrupt_project.mkdir()
@@ -101,7 +101,7 @@ def test_current_epoch_missing_p3_table_self_heals_but_corruption_fails_closed(
         journal.Journal(corrupt_project)
 
 
-def test_current_epoch_structurally_wrong_p3_table_stays_fail_closed(
+def test_current_epoch_structurally_wrong_table_stays_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -109,13 +109,13 @@ def test_current_epoch_structurally_wrong_p3_table_stays_fail_closed(
     project = _project(tmp_path)
     authority = journal.open_or_create_journal(project)
     with sqlite3.connect(authority.path) as connection:
-        connection.execute("DROP TABLE journal_secrets")
+        connection.execute("DROP TABLE listener_coverage")
         connection.execute(
-            "CREATE TABLE journal_secrets (singleton INTEGER PRIMARY KEY)"
+            "CREATE TABLE listener_coverage (coverage_id TEXT PRIMARY KEY)"
         )
     with pytest.raises(
         journal.JournalIntegrityError,
-        match="structurally invalid tables: journal_secrets",
+        match="structurally invalid tables: listener_coverage",
     ):
         journal.Journal(project)
 
@@ -123,16 +123,45 @@ def test_current_epoch_structurally_wrong_p3_table_stays_fail_closed(
     mixed_project.mkdir()
     mixed = journal.open_or_create_journal(mixed_project)
     with sqlite3.connect(mixed.path) as connection:
-        connection.execute("DROP TABLE journal_secrets")
         connection.execute("DROP TABLE listener_coverage")
         connection.execute(
-            "CREATE TABLE journal_secrets (singleton INTEGER PRIMARY KEY)"
+            "CREATE TABLE listener_coverage (coverage_id TEXT PRIMARY KEY)"
         )
     with pytest.raises(
         journal.JournalIntegrityError,
-        match="structurally invalid tables: journal_secrets",
+        match="structurally invalid tables: listener_coverage",
     ):
         journal.Journal(mixed_project)
+
+
+def test_epoch_three_migration_deletes_cursor_token_secret(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute(
+            """CREATE TABLE journal_secrets (
+                   singleton INTEGER PRIMARY KEY,
+                   cursor_token_secret TEXT NOT NULL,
+                   created_at TEXT NOT NULL
+               )"""
+        )
+        connection.execute(
+            "INSERT INTO journal_secrets VALUES (1, ?, ?)",
+            ("a" * 64, journal.utc_now()),
+        )
+        connection.execute(
+            """UPDATE journal_epochs SET schema_epoch = 3, protocol_epoch = 3,
+                   registry_epoch = 3, minimum_reader_epoch = 3,
+                   minimum_writer_epoch = 3 WHERE singleton = 1"""
+        )
+    migrated = journal.Journal(project)
+    assert migrated.read_all(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'journal_secrets'"
+    ) == []
 
 
 def test_one_active_lease_generation_and_live_different_claim_never_steals(
@@ -192,7 +221,7 @@ def test_one_active_lease_generation_and_live_different_claim_never_steals(
     assert ended["ended_at"] is not None
 
 
-def test_cursor_cas_bounded_batch_and_rearm_delivers_remainder(
+def test_cursor_peek_and_server_validated_cas_deliver_remainder(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -211,25 +240,45 @@ def test_cursor_cas_bounded_batch_and_rearm_delivers_remainder(
             addressee=messages.controller_addressee("controller", project_root=project),
         )
 
-    first = authority.cursor_batch("controller", nonce=lease.nonce, limit=2)
+    first = authority.cursor_peek("controller", nonce=lease.nonce, limit=2)
     assert len(first.items) == 2
-    assert first.more_pending is True
-    assert first.wake_pending is True
-    tampered = first.token[:-1] + ("A" if first.token[-1] != "A" else "B")
-    with pytest.raises(ValueError, match="cursor token is corrupt"):
-        authority.advance_cursor(tampered, actor="test-controller")
-    advanced = authority.advance_cursor(first.token, actor="test-controller")
+    fabricated = authority.advance_cursor(
+        "controller",
+        nonce=lease.nonce,
+        expected_cursor_version=first.cursor_version,
+        advances={"controller-mail": 999},
+        actor="test-controller",
+    )
+    assert fabricated.cas_lost
+    advanced = authority.advance_cursor(
+        "controller",
+        nonce=lease.nonce,
+        expected_cursor_version=first.cursor_version,
+        advances={"controller-mail": 2},
+        actor="test-controller",
+    )
     assert advanced.committed
 
-    stale = authority.advance_cursor(first.token, actor="test-controller")
+    stale = authority.advance_cursor(
+        "controller",
+        nonce=lease.nonce,
+        expected_cursor_version=first.cursor_version,
+        advances={"controller-mail": 2},
+        actor="test-controller",
+    )
     assert stale.cas_lost
     cursor = authority.cursor_status("controller")
     assert cursor is not None and cursor["positions"] == {"controller-mail": 2}
 
-    second = authority.cursor_batch("controller", nonce=lease.nonce, limit=2)
+    second = authority.cursor_peek("controller", nonce=lease.nonce, limit=2)
     assert [row["stream_seq"] for row in second.items] == [3]
-    assert second.more_pending is False
-    assert authority.advance_cursor(second.token, actor="test-controller").committed
+    assert authority.advance_cursor(
+        "controller",
+        nonce=lease.nonce,
+        expected_cursor_version=second.cursor_version,
+        advances={"controller-mail": 3},
+        actor="test-controller",
+    ).committed
     assert authority.pending_delivery_events("controller", waking_only=False) == []
 
     original = messages.post_message(
@@ -269,13 +318,24 @@ def test_cursor_cas_bounded_batch_and_rearm_delivers_remainder(
         replacement["envelope"]["id"],
         later["envelope"]["id"],
     }
-    replacement_batch = authority.cursor_batch("controller", nonce=lease.nonce, limit=1)
-    assert [row["stream_seq"] for row in replacement_batch.items] == [1]
-    assert replacement_batch.more_pending is True
-    assert authority.advance_cursor(replacement_batch.token, actor="test-controller").committed
-    later_batch = authority.cursor_batch("controller", nonce=lease.nonce, limit=1)
-    assert [row["stream_seq"] for row in later_batch.items] == [2]
-    assert authority.advance_cursor(later_batch.token, actor="test-controller").committed
+    replacement_peek = authority.cursor_peek("controller", nonce=lease.nonce, limit=1)
+    assert [row["stream_seq"] for row in replacement_peek.items] == [1]
+    assert authority.advance_cursor(
+        "controller",
+        nonce=lease.nonce,
+        expected_cursor_version=replacement_peek.cursor_version,
+        advances={"replace-stream": 1},
+        actor="test-controller",
+    ).committed
+    later_peek = authority.cursor_peek("controller", nonce=lease.nonce, limit=1)
+    assert [row["stream_seq"] for row in later_peek.items] == [2]
+    assert authority.advance_cursor(
+        "controller",
+        nonce=lease.nonce,
+        expected_cursor_version=later_peek.cursor_version,
+        advances={"replace-stream": 2},
+        actor="test-controller",
+    ).committed
 
     messages.post_message(
         dispatch_id="a-wake",
@@ -292,18 +352,20 @@ def test_cursor_cas_bounded_batch_and_rearm_delivers_remainder(
         messages_dir=messages_dir,
         source={"node": "test-node", "adapter": "test", "transport": "controller"},
     )
-    backlog_first = authority.cursor_batch("controller", nonce=lease.nonce, limit=1)
+    backlog_first = authority.cursor_peek("controller", nonce=lease.nonce, limit=1)
     assert [row["stream_id"] for row in backlog_first.items] == ["a-wake"]
-    assert backlog_first.more_pending is True
     backlog_advanced = authority.advance_cursor(
-        backlog_first.token,
+        "controller",
+        nonce=lease.nonce,
+        expected_cursor_version=backlog_first.cursor_version,
+        advances={"a-wake": 1},
         actor="test-controller",
     )
-    assert backlog_advanced.committed and backlog_advanced.value["more_pending"] is True
-    backlog_second = authority.cursor_batch("controller", nonce=lease.nonce, limit=1)
+    assert backlog_advanced.committed
+    backlog_second = authority.cursor_peek("controller", nonce=lease.nonce, limit=1)
     assert [row["stream_id"] for row in backlog_second.items] == ["z-quiet"]
     assert [row["wake_class"] for row in backlog_second.items] == ["quiet"]
-    assert backlog_second.wake_pending is True
+    assert backlog_second.items
 
 
 def test_cursor_cas_has_one_winner_under_32_way_contention(
@@ -322,12 +384,18 @@ def test_cursor_cas_has_one_winner_under_32_way_contention(
         source={"node": "test-node", "adapter": "test", "transport": "controller"},
         addressee=messages.controller_addressee("controller", project_root=project),
     )
-    token = authority.cursor_batch("controller", nonce=lease.nonce, limit=1).token
+    peek = authority.cursor_peek("controller", nonce=lease.nonce, limit=1)
     barrier = threading.Barrier(32)
 
     def race(index: int):
         barrier.wait()
-        return journal.Journal(project).advance_cursor(token, actor=f"contender-{index}")
+        return journal.Journal(project).advance_cursor(
+            "controller",
+            nonce=lease.nonce,
+            expected_cursor_version=peek.cursor_version,
+            advances={"contended-stream": 1},
+            actor=f"contender-{index}",
+        )
 
     with ThreadPoolExecutor(max_workers=32) as pool:
         outcomes = list(pool.map(race, range(32)))
@@ -375,7 +443,7 @@ def test_second_listener_supersedes_first_and_listener_never_renews_lease(
     assert after.renew_deadline_at == before.renew_deadline_at
 
 
-def test_two_real_one_shot_listeners_supersede_and_record_both_exits(
+def test_second_real_doorbell_loses_generation_lock_and_first_wakes_body_free(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -417,23 +485,28 @@ def test_two_real_one_shot_listeners_supersede_and_record_both_exits(
             pytest.fail("first listener never armed coverage")
 
         second = subprocess.Popen(command, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        first_stdout, first_stderr = first.communicate(timeout=3)
-        assert first.returncode == 3, first_stderr
-        assert json.loads(first_stdout)["reason"] == "superseded"
+        second_stdout, second_stderr = second.communicate(timeout=3)
+        assert second.returncode == 3, (second_stdout, second_stderr)
+        assert "generation already has a live doorbell" in second_stderr
 
         messages.post_message(
             dispatch_id="listener-real",
             msg_type="controller-notice",
-            payload={"text": "wake second listener"},
+            payload={"text": "wake first listener"},
             messages_dir=tmp_path / "messages",
             source={"node": "test-node", "adapter": "test", "transport": "controller"},
             addressee=messages.controller_addressee("controller", project_root=project),
         )
-        second_stdout, second_stderr = second.communicate(timeout=3)
-        assert second.returncode == 0, second_stderr
-        second_payload = json.loads(second_stdout)
-        assert second_payload["reason"] == "batch"
-        assert second_payload["count"] == 1
+        first_stdout, first_stderr = first.communicate(timeout=3)
+        assert first.returncode == 0, first_stderr
+        doorbell = json.loads(first_stdout)
+        assert doorbell["reason"] == "event"
+        assert set(doorbell) == {
+            "coverage_id",
+            "cursor_version",
+            "reason",
+            "registry_generation",
+        }
     finally:
         for process in (first, second):
             if process is not None and process.poll() is None:
@@ -443,9 +516,8 @@ def test_two_real_one_shot_listeners_supersede_and_record_both_exits(
     rows = authority.read_all(
         "SELECT state, exit_reason FROM listener_coverage ORDER BY armed_at, coverage_id"
     )
-    assert sorted((row["state"], row["exit_reason"]) for row in rows) == [
-        ("EXITED", "batch"),
-        ("EXITED", "superseded"),
+    assert [(row["state"], row["exit_reason"]) for row in rows] == [
+        ("EXITED", "event"),
     ]
     after = authority.active_lease("controller")
     assert after is not None
@@ -683,16 +755,41 @@ def test_hidden_consumers_use_journal_and_relay_is_peek_only(
         lambda *args, **kwargs: pytest.fail("peek-only relay attempted to claim a lease"),
     )
     assert messages.main(
-        ["--messages-dir", str(tmp_path / "messages"), "relay", "--new"]
+        [
+            "--messages-dir",
+            str(tmp_path / "messages"),
+            "relay",
+            "--new",
+            "--json",
+        ]
     ) == 0
-    capsys.readouterr()
+    relay_payload = json.loads(capsys.readouterr().out)
+    assert relay_payload["positions"] == {"hidden-stream": 1}
+    assert relay_payload["cursor_version"] == 0
+    assert "cursor_token" not in relay_payload
+    assert "more_pending" not in relay_payload
     assert authority.cursor_status("hidden") == before
     assert not (tmp_path / "messages" / ".read-cursor.json").exists()
     assert not (tmp_path / "messages" / ".ack-cursor.json").exists()
     assert not hasattr(messages, "load_read_cursor")
 
-    batch = authority.cursor_batch("hidden", nonce=lease.nonce, limit=10)
-    assert authority.advance_cursor(batch.token, actor="hidden-controller").committed
+    assert messages.main(
+        [
+            "advance",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            "hidden",
+            "--lease-nonce",
+            lease.nonce,
+            "--cursor-version",
+            str(relay_payload["cursor_version"]),
+            "--position",
+            "hidden-stream=1",
+            "--json",
+        ]
+    ) == 0
+    capsys.readouterr()
     assert status._mail_watermark(str(project), ["hidden-stream"]) == watermark
     unread_after, unread_after_error = sessions._addressed_unread_counts(project)
     assert unread_after_error is None and unread_after == {"hidden": 0}

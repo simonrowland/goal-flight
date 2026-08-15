@@ -10,6 +10,7 @@ Usage (background from execute.md bash-tail branch):
   python3 scripts/hosts/opencode/bash_tail.py \\
     --directory /path/to/repo \\
     --tail /tmp/opencode-<slug>.txt \\
+    --dispatch-id <dispatch-id> \\
     --prompt-file /tmp/prompt-<slug>.md
 
 The orchestrator backgrounds this process and attaches ``watch-dispatch-tail.sh``
@@ -55,6 +56,7 @@ def run_bash_tail(
     directory: Path,
     tail_path: Path,
     message: str,
+    dispatch_id: str,
     model: str,
     port: int,
     boot_timeout_s: float,
@@ -75,14 +77,14 @@ def run_bash_tail(
             log_path=log_path,
         )
     except Exception as exc:
-        _write_tail(tail_path, f"BLOCKED: {exc}")
+        _write_tail(tail_path, f"BLOCKED: {dispatch_id} — {exc}")
         return 1
 
     _write_tail(tail_path, "STATUS: model reply received")
     for line in reply.splitlines():
         if line.strip():
             _write_tail(tail_path, line)
-    _write_tail(tail_path, "COMPLETE: true")
+    _write_tail(tail_path, f"COMPLETE: {dispatch_id} — done")
     return 0
 
 
@@ -90,6 +92,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="OpenCode bash-tail worker (HTTP API + markers)")
     parser.add_argument("--directory", "-C", default=str(_PROMPT_REPO_ROOT), help="Project directory")
     parser.add_argument("--tail", required=True, help="Tail file path (stdout/stderr log for watcher)")
+    parser.add_argument("--dispatch-id", required=True, help="Expected Goal Flight dispatch identity")
     parser.add_argument("--prompt-file", type=Path, help="Prompt file path")
     parser.add_argument("--prompt-text", help="Inline prompt text")
     parser.add_argument("--model", "-m", default=DEFAULT_MODEL, help=f"provider/model (default: {DEFAULT_MODEL})")
@@ -112,6 +115,7 @@ def main() -> int:
         directory=directory,
         tail_path=tail_path,
         message=message,
+        dispatch_id=args.dispatch_id,
         model=args.model,
         port=args.port,
         boot_timeout_s=args.boot_timeout,

@@ -68,7 +68,8 @@ duration; wait separately on anything you need back early.
 **Arm the wait; let it wake you.** A controller entry auto-claims its canonical
 project lease, then backgrounds one generation-bound `goalflight_messages.py
 listen --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>`.
-After each bounded batch, process it and re-arm with its `--cursor-token`; an unclaimed
+When it exits, peek with `relay --new --json`, process the items, cursor-CAS their
+server-known positions with `advance`, then re-arm; an unclaimed
 fixed-set join backgrounds the printed `goalflight_status.py --wait <ids>`
 command. Do not block the turn on either. A timer is only for non-notifiable
 external state such as CI, a remote queue, or a deploy. Scheduling one to ask
@@ -215,16 +216,17 @@ existed, worker escalations sat unread for hours while a human relayed messages
 between sessions.
 
 For the normal claimed-controller path, background the one-shot journal listener.
-It prints nothing until a waking assignment arrives, then returns a bounded batch
-plus a cursor token and exits:
+It prints nothing until an assignment exists after the cursor, then exits as a
+body-free doorbell:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py listen \
   --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>
 ```
 
-Process the batch, then re-arm with `--cursor-token <previous-token>` so the cursor
-advances by generation/version CAS. Never use the listener to renew the lease.
+Peek with `relay --new --json`, process the items, advance their server-known
+positions with the returned cursor version, then re-arm. Never use the listener to
+renew the lease.
 
 7. Completion:
 

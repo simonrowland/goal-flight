@@ -53,6 +53,7 @@ EOF
 python3 "$WORKER" \
   --directory "$WORKDIR" \
   --tail "$TAIL" \
+  --dispatch-id opencode-bash-tail-smoke \
   --prompt-file "$PROMPT" \
   --model litellm/nano \
   --timeout 120 \
@@ -90,7 +91,7 @@ if ! wait "$WATCHER_PID"; then
   exit 1
 fi
 
-if ! grep -q '^COMPLETE: true$' "$TAIL"; then
+if ! grep -q '^COMPLETE: opencode-bash-tail-smoke' "$TAIL"; then
   echo "FAIL  tests/bash/test-opencode-bash-tail.sh (missing COMPLETE marker)"
   cat "$TAIL" | sed 's/^/      /'
   exit 1

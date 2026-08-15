@@ -2580,18 +2580,18 @@ def controller_pending_events(
         return []
 
 
-def controller_cursor_batch(
+def controller_cursor_peek(
     *,
     project_root: Path | str,
     controller_label: str,
-    lease_nonce: str,
+    lease_nonce: str | None = None,
     limit: int,
 ):
     import goalflight_journal  # type: ignore
     import goalflight_task  # type: ignore
 
     root = goalflight_task.resolve_project_root(str(project_root))
-    return goalflight_journal.Journal(root).cursor_batch(
+    return goalflight_journal.Journal(root).cursor_peek(
         controller_label,
         nonce=lease_nonce,
         limit=limit,
@@ -2913,6 +2913,7 @@ def _ambient_claimed_controller(
     *,
     controller_label: str | None,
     mail_bearing: bool,
+    require_live_holder: bool = True,
 ) -> dict[str, object]:
     """Resolve a capability-matched ambient controller without mutating state."""
     if not mail_bearing:
@@ -2961,17 +2962,24 @@ def _ambient_claimed_controller(
         return {"claimed": False, "reason": "no-active-controller-lease", "label": label}
     if lease.nonce != capability:
         return {"claimed": False, "reason": "controller-capability-mismatch", "label": label}
-    if not goalflight_wake.lease_holder_alive(
+    holder_alive = goalflight_wake.lease_holder_alive(
         project_root,
         controller_label=label,
         lease_nonce=lease.nonce,
-    ):
-        return {"claimed": False, "reason": "controller-lease-holder-dead", "label": label}
+    )
+    if require_live_holder and holder_alive is not True:
+        reason = (
+            "controller-lease-holder-dead"
+            if holder_alive is False
+            else "controller-lease-holder-unknown"
+        )
+        return {"claimed": False, "reason": reason, "label": label}
     return {
         "claimed": True,
         "reason": "ambient-controller-lease",
         "label": label,
         "lease_generation": lease.generation,
+        "holder_alive": holder_alive,
     }
 
 
@@ -2993,6 +3001,7 @@ def emit_wake_entry_notice(
         root,
         controller_label=controller_label,
         mail_bearing=mail_bearing,
+        require_live_holder=False,
     )
     label = str(ambient.get("label") or "").strip() or None
 
@@ -3291,15 +3300,33 @@ def cmd_relay(args: argparse.Namespace) -> int:
         if controller_label is None:
             print("no pending journal events")
             return 0
-        rows = authority.pending_delivery_events(
-            controller_label,
-            waking_only=False,
-            limit=1000,
-        )
+        peek = authority.cursor_peek(controller_label, limit=1000)
+        rows = list(peek.items)
         envelopes = [_listener_envelope(authority, row) for row in rows]
     except (goalflight_journal.JournalUnavailable, MessageError, ValueError) as exc:
         print(f"relay: {exc}", file=sys.stderr)
         return 2
+    positions: dict[str, int] = {}
+    for row in rows:
+        stream_id = str(row.get("stream_id") or "")
+        if stream_id:
+            positions[stream_id] = max(
+                positions.get(stream_id, 0), int(row.get("stream_seq") or 0)
+            )
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                {
+                    "controller_label": controller_label,
+                    "registry_generation": peek.registry_generation,
+                    "cursor_version": peek.cursor_version,
+                    "positions": positions,
+                    "items": envelopes,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
     if getattr(args, "bodies", False):
         print(json.dumps(envelopes))
     else:
@@ -3312,6 +3339,72 @@ def cmd_relay(args: argparse.Namespace) -> int:
         dispatch_id = str(envelope.get("dispatch_id") or "unknown")
         counts[dispatch_id] = counts.get(dispatch_id, 0) + 1
     print(format_pending_counts(counts))
+    return 0
+
+
+def _parse_cursor_positions(values: list[str] | None) -> dict[str, int]:
+    advances: dict[str, int] = {}
+    for raw in values or []:
+        stream, separator, position_text = str(raw).partition("=")
+        stream = stream.strip()
+        if not separator or not stream:
+            raise ValueError("cursor position must use STREAM=SEQ")
+        try:
+            position = int(position_text)
+        except ValueError as exc:
+            raise ValueError("cursor position sequence must be an integer") from exc
+        if position <= 0:
+            raise ValueError("cursor position sequence must be positive")
+        advances[stream] = max(advances.get(stream, 0), position)
+    if not advances:
+        raise ValueError("at least one --position STREAM=SEQ is required")
+    return advances
+
+
+def cmd_advance_cursor(args: argparse.Namespace) -> int:
+    """Advance the server cursor by CAS to validated journal positions."""
+    import goalflight_journal  # type: ignore
+    import goalflight_session_status as sessions  # type: ignore
+    import goalflight_task  # type: ignore
+
+    project_root = goalflight_task.resolve_project_root(
+        args.project_root or str(Path.cwd())
+    )
+    label = str(
+        args.controller_label
+        or sessions.resolve_controller_label(project_root=project_root)
+        or ""
+    ).strip()
+    nonce = str(
+        args.lease_nonce
+        or os.environ.get("GOALFLIGHT_CONTROLLER_LEASE_NONCE")
+        or os.environ.get("GOALFLIGHT_CONTROLLER_SESSION_ID")
+        or ""
+    ).strip()
+    try:
+        advances = _parse_cursor_positions(args.position)
+        if not label or not nonce:
+            raise ValueError("active controller label and lease nonce are required")
+        result = goalflight_journal.Journal(project_root).advance_cursor(
+            label,
+            nonce=nonce,
+            expected_cursor_version=args.cursor_version,
+            advances=advances,
+            actor=f"controller:{os.getpid()}",
+        )
+    except (ValueError, goalflight_journal.JournalError) as exc:
+        print(f"advance: {exc}", file=sys.stderr)
+        return 2
+    if not result.committed or result.value is None:
+        print(f"advance: {result.reason or 'cursor CAS lost'}", file=sys.stderr)
+        return 3
+    if args.json:
+        print(json.dumps(result.value, sort_keys=True))
+    else:
+        print(
+            f"cursor advanced {result.value['previous_cursor_version']}"
+            f"->{result.value['cursor_version']}"
+        )
     return 0
 
 
@@ -3468,24 +3561,6 @@ def cmd_listen(args) -> int:
         print(f"listen: {exc}", file=sys.stderr)
         return 2
 
-    # Validate and advance the processed batch before arming.  A stale or
-    # corrupt token must not supersede an already healthy listener.
-    if args.cursor_token:
-        try:
-            identity_stamp = hashlib.sha256(
-                str(identity["start_token"]).encode("utf-8")
-            ).hexdigest()[:16]
-            advanced = authority.advance_cursor(
-                args.cursor_token,
-                actor=f"listener:{os.getpid()}:{identity_stamp}",
-            )
-        except (ValueError, goalflight_journal.JournalError) as exc:
-            print(f"listen: {exc}", file=sys.stderr)
-            return 2
-        if not advanced.committed:
-            print(f"listen: {advanced.reason or 'cursor advance lost'}", file=sys.stderr)
-            return 3
-
     # Acquire the kernel witness before superseding journal coverage.  If the
     # ledger is unavailable, the incumbent listener remains both ARMED and
     # locked instead of being displaced by a replacement that cannot stay live.
@@ -3494,7 +3569,11 @@ def cmd_listen(args) -> int:
             project_root,
             controller_label=label,
             kind="listener",
+            generation_key=nonce,
         )
+    except BlockingIOError:
+        print("listen: listener generation already has a live doorbell", file=sys.stderr)
+        return 3
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"listen: wake ledger registration failed: {exc}", file=sys.stderr)
         return 2
@@ -3568,7 +3647,7 @@ def cmd_listen(args) -> int:
             )
             if reason:
                 return finish(reason, code=3, detail="listener self-check failed")
-            batch = authority.cursor_batch(label, nonce=nonce, limit=args.batch_limit)
+            peek = authority.cursor_peek(label, nonce=nonce, limit=1)
         except goalflight_journal.CASMismatch as exc:
             lease = authority.active_lease(label)
             reason = "stale-lease" if lease is not None else "superseded"
@@ -3579,51 +3658,26 @@ def cmd_listen(args) -> int:
             return finish("journal-unavailable", code=2, detail=str(exc))
         except (goalflight_journal.JournalError, ValueError) as exc:
             return finish("corrupt", code=2, detail=str(exc))
-        if batch.wake_pending:
-            try:
-                items = [_listener_envelope(authority, dict(row)) for row in batch.items]
-            except (MessageError, OSError, ValueError, json.JSONDecodeError) as exc:
-                return finish("corrupt", code=2, detail=str(exc))
-            exited = authority.exit_listener(coverage_id, reason="batch")
+        if peek.items:
+            exited = authority.exit_listener(coverage_id, reason="event")
             if not exited.committed or not exited.value:
                 return finish("superseded", code=3, detail=exited.reason)
-            if exited.value.get("exit_reason") != "batch":
+            if exited.value.get("exit_reason") != "event":
                 return finish(
                     "superseded",
                     code=3,
-                    detail="listener coverage changed before batch exit",
+                    detail="listener coverage changed before doorbell exit",
                 )
             payload = {
-                "reason": "batch",
+                "reason": "event",
                 "coverage_id": coverage_id,
-                "registry_generation": batch.registry_generation,
-                "cursor_version": batch.cursor_version,
-                "cursor_token": batch.token,
-                "items": items,
-                "count": len(items),
-                "more_pending": batch.more_pending,
+                "registry_generation": peek.registry_generation,
+                "cursor_version": peek.cursor_version,
             }
-            rearm_command = (
-                goalflight_wake.listener_start_command(
-                    project_root,
-                    controller_label=label,
-                )
-                + " --cursor-token "
-                + shlex.quote(batch.token)
-            )
-            payload["rearm_command"] = rearm_command
             if args.json:
                 print(json.dumps(payload, sort_keys=True))
             else:
-                print(format_mail_notice(len(items)))
-                for item in items:
-                    body = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-                    print(
-                        f"  {item.get('dispatch_id')} [{item.get('type')}] "
-                        f"{sanitize_display(body.get('text') or '', limit=140)}"
-                    )
-                print(f"cursor_token={batch.token} more_pending={str(batch.more_pending).lower()}")
-                print(f"re-arm after processing: {rearm_command}")
+                print("mail available; peek: goalflight_messages.py relay --new")
             waiter.close()
             return 0
         sleep_until = time.monotonic() + poll
@@ -3754,7 +3808,24 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="With --new, print full envelope JSON instead of one headline per message",
     )
+    relay.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit one cursor snapshot with items and server-known positions",
+    )
     relay.set_defaults(func=cmd_relay)
+
+    advance = sub.add_parser(
+        "advance",
+        help="CAS-advance the controller cursor to processed server-known positions",
+    )
+    advance.add_argument("--project-root", default=None)
+    advance.add_argument("--controller-label", default=None)
+    advance.add_argument("--lease-nonce", default=None)
+    advance.add_argument("--cursor-version", type=int, required=True)
+    advance.add_argument("--position", action="append", default=[])
+    advance.add_argument("--json", action="store_true")
+    advance.set_defaults(func=cmd_advance_cursor)
 
     def add_listen_arguments(command_parser: argparse.ArgumentParser) -> None:
         command_parser.add_argument("--project-root", default=None)
@@ -3768,12 +3839,6 @@ def main(argv: list[str] | None = None) -> int:
             default=None,
             help="active lease capability; defaults to GOALFLIGHT_CONTROLLER_LEASE_NONCE",
         )
-        command_parser.add_argument(
-            "--cursor-token",
-            default=None,
-            help="previous one-shot batch token to CAS-advance before re-arming",
-        )
-        command_parser.add_argument("--batch-limit", type=int, default=50)
         command_parser.add_argument("--poll-secs", type=float, default=5.0)
         command_parser.add_argument(
             "--timeout-s", type=float, default=0.0, help="0 = wait indefinitely"
