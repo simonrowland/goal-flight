@@ -47,6 +47,7 @@ import json
 import os
 import select
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -76,6 +77,16 @@ CONTROLLER_LOCK_READY_TIMEOUT_S = 3.0
 CONTROLLER_LOCK_STARTUP_GRACE_S = 5.0
 CONTROLLER_LOCK_POLL_S = 0.5
 
+_EXPECTED_OPTIONAL_ERRORS = (
+    ImportError,
+    OSError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+    sqlite3.DatabaseError,
+    subprocess.SubprocessError,
+)
+
 
 # --- session id (per-terminal) ----------------------------------------------
 
@@ -87,7 +98,7 @@ def _session_file(project_root: Path) -> Path:
 def _git_project_root() -> Path | None:
     try:
         return goalflight_task.resolve_project_root(str(Path.cwd()))
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         # Project discovery is best-effort identity evidence, never a launch gate.
         return None
 
@@ -228,7 +239,7 @@ def _index_controller_project(project_root: Path) -> None:
         import goalflight_task  # type: ignore
 
         goalflight_task.upsert_project_registry(project_root)
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         pass
 
 
@@ -519,6 +530,26 @@ def _same_lease_principal(
     )
 
 
+def _publish_lease_generation_event(
+    project_root: Path,
+    lease: goalflight_journal.LeaseIdentity,
+    *,
+    only_if_present: bool = False,
+) -> None:
+    if only_if_present and goalflight_wake.lease_generation_event_stamp(
+        project_root,
+        controller_label=lease.label,
+    ) is None:
+        return
+    goalflight_wake.publish_lease_generation_event(
+        project_root,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        generation=lease.generation,
+        state=lease.state,
+    )
+
+
 def _stop_lock_holder(process: subprocess.Popen[str] | None) -> None:
     if process is None or process.poll() is not None:
         return
@@ -594,7 +625,7 @@ def hold_controller_lock(
     pid: int,
     start_token: str,
 ) -> int:
-    """Hold one session lock until its host dies or its generation ends."""
+    """Hold one session lock; cheap ticks stat one event token and check the host."""
     expected_identity = {"pid": pid, "start_token": start_token}
     if _controller_process_identity(pid) != expected_identity:
         return 2
@@ -609,20 +640,55 @@ def hold_controller_lock(
     print(json.dumps({"ready": True, "pid": os.getpid()}), flush=True)
     startup_deadline = time.monotonic() + CONTROLLER_LOCK_STARTUP_GRACE_S
     matched_generation = False
+    validated_generation: int | None = None
+    validated_stamp: tuple[int, int, int] | None = None
     try:
         while _controller_process_identity(pid) == expected_identity:
             try:
-                lease = goalflight_journal.Journal(project_root).active_lease(label)
-            except goalflight_journal.JournalError:
-                lease = None
-                journal_unavailable = True
-            else:
-                journal_unavailable = False
-            if lease is not None and lease.nonce == nonce:
-                matched_generation = True
-            elif matched_generation and not journal_unavailable:
-                return 0
-            elif not matched_generation and time.monotonic() >= startup_deadline:
+                candidate_stamp = goalflight_wake.lease_generation_event_stamp(
+                    project_root,
+                    controller_label=label,
+                )
+            except OSError:
+                return 2
+            if candidate_stamp != validated_stamp:
+                try:
+                    event = goalflight_wake.read_lease_generation_event(
+                        project_root,
+                        controller_label=label,
+                    )
+                    if event is None:
+                        lease = None
+                    else:
+                        event_label = str(event.get("label") or "")
+                        event_nonce = str(event.get("nonce") or "")
+                        event_generation = int(event.get("generation") or 0)
+                        if event_label != label or event_generation < 1:
+                            return 2
+                        lease = goalflight_journal.Journal.open_reader(project_root).active_lease(label)
+                        if (
+                            str(event.get("state") or "") == goalflight_journal.LEASE_ACTIVE
+                            and lease is not None
+                            and lease.nonce == event_nonce
+                            and lease.generation == event_generation
+                        ):
+                            validated_stamp = candidate_stamp
+                            validated_generation = event_generation
+                            if event_nonce == nonce:
+                                matched_generation = True
+                            elif matched_generation:
+                                return 0
+                        elif matched_generation and (
+                            lease is None
+                            or lease.nonce != nonce
+                            or lease.generation != validated_generation
+                        ):
+                            return 0
+                except _EXPECTED_OPTIONAL_ERRORS:
+                    # A transiently unreadable event/journal never manufactures
+                    # a generation change. Leave the stamp unconsumed and retry.
+                    pass
+            if not matched_generation and time.monotonic() >= startup_deadline:
                 return 2
             time.sleep(CONTROLLER_LOCK_POLL_S)
         return 0
@@ -708,6 +774,12 @@ def claim_session(
     if holder is not None and lease.nonce != candidate_nonce:
         _stop_lock_holder(holder)
         raise RuntimeError("controller lease nonce changed after lock registration")
+    if hold_lock:
+        try:
+            _publish_lease_generation_event(root, lease)
+        except (OSError, RuntimeError, ValueError):
+            _stop_lock_holder(holder)
+            raise
     return {
         "id": lease.nonce,
         "lease_nonce": lease.nonce,
@@ -855,7 +927,7 @@ def claim_controller_startup(
                 "reason": "controller_label_conflict",
                 "conflicting_beacons": live["conflicting_beacons"],
             }
-    except Exception as exc:
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
         detail = str(exc)
         if "label in use" in detail:
             return {
@@ -913,7 +985,7 @@ def register_controller(
                 process_identity=process_identity,
                 hold_lock=True,
             )
-        except Exception as exc:
+        except _EXPECTED_OPTIONAL_ERRORS as exc:
             detail = str(exc)
             return {
                 "registered": False,
@@ -942,7 +1014,7 @@ def register_controller(
             nonce=session_id,
             incumbent_liveness=incumbent_liveness,
         )
-    except Exception as exc:
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
         return {"registered": False, "reason": "claim_failed", "message": str(exc)}
     if not result.committed or result.value is None:
         return {
@@ -1011,7 +1083,7 @@ def join_controller(
                 takeover=acknowledge_conflict,
                 hold_lock=True,
             )
-        except Exception as exc:
+        except _EXPECTED_OPTIONAL_ERRORS as exc:
             detail = str(exc)
             return {
                 "joined": False,
@@ -1119,7 +1191,7 @@ def _addressed_unread_counts(
             for record in authority.lease_records()
         }
         return counts, None
-    except Exception as exc:
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
         return None, type(exc).__name__
 
 
@@ -1151,7 +1223,7 @@ def _nonterminal_owned_dispatches(
                 }
             )
         return by_label, None
-    except Exception as exc:
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
         return None, type(exc).__name__
 
 
@@ -1308,6 +1380,7 @@ def retire_controller(
             "message": result.reason,
         }
     ended = result.value
+    _publish_lease_generation_event(project_root, ended, only_if_present=True)
     return {
         "retired": True,
         "label": label,
@@ -1335,6 +1408,12 @@ def release_session(project_root: Path, *, pid: int) -> bool:
             nonce=str(row["nonce"]),
             reason="released",
         )
+        if released.committed and released.value is not None:
+            _publish_lease_generation_event(
+                project_root,
+                released.value,
+                only_if_present=True,
+            )
         return released.committed
     return False
 
@@ -1663,7 +1742,13 @@ def _task_backlog_counts(project_root: Path) -> tuple[dict[str, int] | None, str
         import goalflight_task
 
         rows = goalflight_task.list(project_root=project_root)
-    except Exception as exc:
+    except goalflight_task.TaskError as exc:
+        # A present-but-unreadable store degrades to a counted absence with the
+        # reason surfaced; it must not crash session status. TaskError cannot
+        # live in _EXPECTED_OPTIONAL_ERRORS because goalflight_task imports
+        # lazily inside this function.
+        return None, f"{tasks_path}: {exc}"
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
         return None, f"{tasks_path}: {exc}"
 
     def done_reviewed(row: dict) -> bool:
@@ -1692,7 +1777,10 @@ def _ready_frontier(project_root: Path) -> tuple[dict[str, object] | None, str |
         import goalflight_task
 
         rows = goalflight_task.TaskStore(project_root).next_frontier()
-    except Exception as exc:
+    except goalflight_task.TaskError as exc:
+        # Same degradation contract as _task_backlog_counts above.
+        return None, f"{tasks_path}: {exc}"
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
         return None, f"{tasks_path}: {exc}"
     if not rows:
         return {"count": 0}, None
@@ -1713,7 +1801,7 @@ def _post_resume_nudge(project_root: Path) -> None:
         import goalflight_task
 
         goalflight_task.post_resume_nudge(project_root)
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return
 
 
@@ -2195,7 +2283,7 @@ def main(argv: list[str] | None = None) -> int:
             controller_label=args.session_label,
             stream=sys.stderr,
         )
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         pass
 
     if args.list_controllers:
@@ -2290,7 +2378,7 @@ def main(argv: list[str] | None = None) -> int:
                 takeover=args.takeover,
                 hold_lock=True,
             )
-        except Exception as exc:
+        except _EXPECTED_OPTIONAL_ERRORS as exc:
             print(
                 json.dumps(
                     {

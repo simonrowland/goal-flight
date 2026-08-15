@@ -473,6 +473,70 @@ def test_terminal_journal_outbox_wins_live_ledger() -> None:
     )
 
 
+def test_journal_terminal_supersedes_contradictory_sidecar_marker() -> None:
+    contradictory = {
+        "dispatch_id": "journal-blocked",
+        "state": "complete",
+        "terminal_marker": {
+            "kind": "COMPLETE",
+            "text": "journal-blocked — late sidecar",
+        },
+    }
+    record = status._wait_record_from_snapshots(
+        "journal-blocked",
+        {"dispatch_id": "journal-blocked", "state": "complete"},
+        contradictory,
+        {
+            "lifecycle_state": "TERMINAL",
+            "terminal_state": "blocked",
+            "terminal_outcome_json": json.dumps(
+                {"state": "complete", "outcome": {}}
+            ),
+            "event_type": "blocked",
+            "payload_json": json.dumps({"text": "authoritative block"}),
+        },
+    )
+    assert_true("journal terminal record exists", isinstance(record, dict))
+    assert_eq("journal state is authoritative", record.get("state"), "blocked")
+    assert_eq("journal marker meaning is authoritative", record["terminal_marker"]["kind"], "BLOCKED")
+    assert_eq(
+        "contradictory observation retained only as observation",
+        record.get("terminal_observation_state"),
+        "complete",
+    )
+    assert_eq(
+        "late sidecar is explicitly superseded",
+        record["superseded_terminal_marker"]["superseded"],
+        True,
+    )
+    assert_eq(
+        "superseded sidecar kind remains diagnostic only",
+        record["superseded_terminal_marker"]["kind"],
+        "COMPLETE",
+    )
+
+    matching = status._wait_record_from_snapshots(
+        "journal-complete",
+        {"dispatch_id": "journal-complete", "state": "complete"},
+        {
+            "dispatch_id": "journal-complete",
+            "terminal_marker": {
+                "kind": "COMPLETE",
+                "text": "journal-complete — done",
+            },
+        },
+        {
+            "lifecycle_state": "TERMINAL",
+            "terminal_state": "complete",
+            "terminal_outcome_json": json.dumps({"state": "complete", "outcome": {}}),
+            "event_type": "result",
+            "payload_json": json.dumps({"text": "done"}),
+        },
+    )
+    assert_eq("matching journal state remains complete", matching.get("state"), "complete")
+    assert_eq("matching journal marker remains complete", matching["terminal_marker"]["kind"], "COMPLETE")
+
+
 def test_unreadable_journal_never_promotes_file_terminal() -> None:
     marker = {
         "kind": "COMPLETE",
@@ -497,6 +561,27 @@ def test_unreadable_journal_never_promotes_file_terminal() -> None:
     assert_true("journal error record exists", isinstance(record, dict))
     assert_eq("journal error remains nonterminal", status.done_code(record), 2)
     assert_eq("file marker suppressed on authority failure", record.get("terminal_marker"), None)
+
+
+def test_wait_journal_presence_distinguishes_absent_from_unobservable() -> None:
+    original_resolve = status.goalflight_journal.resolve_journal_path
+    original_lstat = status.os.lstat
+    status.goalflight_journal.resolve_journal_path = lambda _root: Path("/journal/state.sqlite3")  # type: ignore[assignment]
+    try:
+        def absent(_path: object) -> object:
+            raise FileNotFoundError(2, "missing")
+
+        status.os.lstat = absent  # type: ignore[assignment]
+        assert_eq("ENOENT is genuine legacy absence", status._wait_journal_presence("/project"), None)
+
+        def denied(_path: object) -> object:
+            raise PermissionError(13, "denied")
+
+        status.os.lstat = denied  # type: ignore[assignment]
+        assert_eq("EACCES is unobservable authority", status._wait_journal_presence("/project"), False)
+    finally:
+        status.goalflight_journal.resolve_journal_path = original_resolve  # type: ignore[assignment]
+        status.os.lstat = original_lstat  # type: ignore[assignment]
 
 
 def test_narrow_snapshot_reuses_one_sidecar_generation() -> None:
@@ -573,7 +658,9 @@ def main() -> None:
         test_wait_heartbeat_emits_progress_line_at_cadence,
         test_live_journal_attempt_suppresses_torn_terminal_sidecar,
         test_terminal_journal_outbox_wins_live_ledger,
+        test_journal_terminal_supersedes_contradictory_sidecar_marker,
         test_unreadable_journal_never_promotes_file_terminal,
+        test_wait_journal_presence_distinguishes_absent_from_unobservable,
         test_narrow_snapshot_reuses_one_sidecar_generation,
         test_wait_hot_loop_never_calls_machine_status_payload,
     ]

@@ -73,7 +73,8 @@ CURRENT_SCHEMA_COLUMNS = {
     "terminal_outbox": (
         "attempt_id", "transition_id", "origin_node", "event_uuid", "recipient",
         "event_type", "payload_json", "created_at", "projected_at",
-        "projection_attempts", "projection_error",
+        "projection_attempts", "projection_error", "projection_retry_at",
+        "projection_quarantined_at",
     ),
     "controller_leases": (
         "project_root", "label", "generation", "nonce", "principal_json", "pid",
@@ -102,7 +103,12 @@ CURRENT_SCHEMA_COLUMNS = {
         "source_generation", "trigger_side", "reason", "payload_json", "wake_class",
         "created_at", "resolved_at",
     ),
+    "system_attention_items": (
+        "item_id", "project_root", "item_type", "state", "reason",
+        "payload_json", "wake_class", "created_at", "resolved_at",
+    ),
 }
+_LEGACY_TERMINAL_OUTBOX_COLUMNS = CURRENT_SCHEMA_COLUMNS["terminal_outbox"][:-2]
 JOURNAL_FILE_NAME = "state-journal.sqlite3"
 JOURNAL_IDENTITY_KEY = "journal_identity"
 JOURNAL_IDENTITY_VALUE = "goalflight.state-journal.v1"
@@ -110,6 +116,8 @@ MAX_TRANSACTION_OPERATIONS = 128
 MAX_OPERATION_ROWS = 10_000
 MAX_PARAMETER_VALUE_BYTES = 65_536
 MAX_TRANSACTION_PARAMETER_BYTES = 1_048_576
+OUTBOX_MAX_PROJECTION_ATTEMPTS = 3
+OUTBOX_RETRY_BASE_S = 1.0
 _SQL_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _STATE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 _IDENTITY_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}\Z")
@@ -652,6 +660,37 @@ class Journal:
                 raise
         return self
 
+    @classmethod
+    def open_reader(
+        cls,
+        project_root: Path | str,
+        *,
+        client_epochs: ClientEpochs | None = None,
+        retry_budget_s: float = 1.0,
+        transaction_budget_s: float = 1.0,
+        jitter_min_s: float = 0.005,
+        jitter_max_s: float = 0.050,
+    ) -> "Journal":
+        """Open a fenced read client without taking the journal write lock.
+
+        Fast polling reads must not serialize terminal writers behind the
+        whole-database startup integrity check and schema bootstrap performed by
+        the ordinary constructor. Every read still opens SQLite read-only at the
+        statement level and checks the live epoch fence in ``read_all``.
+        """
+        self = cls.__new__(cls)
+        self._configure(
+            project_root,
+            client_epochs=client_epochs,
+            retry_budget_s=retry_budget_s,
+            transaction_budget_s=transaction_budget_s,
+            jitter_min_s=jitter_min_s,
+            jitter_max_s=jitter_max_s,
+        )
+        self._require_existing_database()
+        self._read_only_client = True
+        return self
+
     def _configure(
         self,
         project_root: Path | str,
@@ -675,6 +714,7 @@ class Journal:
         self.transaction_budget_s = transaction_budget_s
         self.jitter_min_s = jitter_min_s
         self.jitter_max_s = jitter_max_s
+        self._read_only_client = False
 
     def _require_existing_database(self) -> None:
         if not os.path.lexists(self.path):
@@ -717,8 +757,9 @@ class Journal:
         while True:
             attempts += 1
             try:
+                mode = "ro" if self._read_only_client else "rw"
                 connection = sqlite3.connect(
-                    self.path.as_uri() + "?mode=rw",
+                    self.path.as_uri() + f"?mode={mode}",
                     uri=True,
                     timeout=0,
                     isolation_level=None,
@@ -918,13 +959,14 @@ class Journal:
             CURRENT_READER_EPOCH,
             CURRENT_WRITER_EPOCH,
         ):
+            retry_columns_migrated = self._install_outbox_retry_columns(connection)
             missing, malformed = self._current_schema_issues(connection)
             if malformed:
                 self._raise_integrity_failure(
                     "epoch-4 journal has structurally invalid tables: "
                     + ", ".join(malformed)
                 )
-            repaired = bool(missing)
+            repaired = retry_columns_migrated or bool(missing)
             if repaired:
                 # In-progress P3 builds could stamp epoch 3 before every final
                 # P3 table existed.  The installer is idempotent and is the
@@ -962,6 +1004,7 @@ class Journal:
             self._install_p2_schema(connection)
         self._install_p3_schema(connection)
         self._install_p4_schema(connection)
+        self._install_outbox_retry_columns(connection)
         now = utc_now()
         connection.execute(
             """
@@ -1001,6 +1044,34 @@ class Journal:
             VALUES ('p4-doorbell-cursor-cas-v4', ?)
             """,
             (now,),
+        )
+        return True
+
+    @staticmethod
+    def _install_outbox_retry_columns(connection: sqlite3.Connection) -> bool:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "terminal_outbox" not in tables:
+            return False
+        columns = tuple(
+            str(row[1]) for row in connection.execute("PRAGMA table_info(terminal_outbox)")
+        )
+        if columns != _LEGACY_TERMINAL_OUTBOX_COLUMNS:
+            return False
+        connection.execute("ALTER TABLE terminal_outbox ADD COLUMN projection_retry_at TEXT")
+        connection.execute(
+            "ALTER TABLE terminal_outbox ADD COLUMN projection_quarantined_at TEXT"
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO journal_migrations (migration_id, applied_at)
+            VALUES ('terminal-outbox-retry-quarantine-v1', ?)
+            """,
+            (utc_now(),),
         )
         return True
 
@@ -1092,6 +1163,8 @@ class Journal:
                 projection_attempts INTEGER NOT NULL DEFAULT 0
                     CHECK (typeof(projection_attempts) = 'integer' AND projection_attempts >= 0),
                 projection_error TEXT,
+                projection_retry_at TEXT,
+                projection_quarantined_at TEXT,
                 PRIMARY KEY (attempt_id, transition_id),
                 UNIQUE (origin_node, event_uuid, recipient),
                 FOREIGN KEY (attempt_id, transition_id)
@@ -1237,6 +1310,23 @@ class Journal:
     @staticmethod
     def _install_p4_schema(connection: sqlite3.Connection) -> None:
         """Delete the retired listener batch-token signing surface."""
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS system_attention_items (
+                item_id TEXT PRIMARY KEY,
+                project_root TEXT NOT NULL,
+                item_type TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('OPEN', 'RESOLVED')),
+                reason TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                wake_class TEXT NOT NULL CHECK (wake_class = 'waking'),
+                created_at TEXT NOT NULL,
+                resolved_at TEXT
+            )"""
+        )
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS system_attention_items_open_idx
+               ON system_attention_items (project_root, state, created_at, item_id)"""
+        )
         connection.execute("DROP TABLE IF EXISTS journal_secrets")
 
     def _retry_delay(self, started: float) -> bool:
@@ -1365,6 +1455,8 @@ class Journal:
         SQLite VM work; stronger CPU-latency enforcement beyond that handler is
         explicitly P2 work.
         """
+        if self._read_only_client:
+            raise JournalError("read-only journal client cannot write")
         if isinstance(operations, RowOperation):
             prepared_operations = (operations,)
         else:
@@ -2713,14 +2805,29 @@ class Journal:
 
     def attention_items(self, *, state: str = "OPEN") -> list[dict[str, object]]:
         resolved_state = self._state_token(state, label="attention state")
-        rows = self.read_all(
+        controller_rows = self.read_all(
             """
             SELECT * FROM attention_items
             WHERE project_root = ? AND state = ? ORDER BY created_at, item_id
             """,
             (str(self.project_root), resolved_state),
         )
-        return [dict(row) for row in rows]
+        system_rows = self.read_all(
+            """
+            SELECT item_id, project_root, item_type, state,
+                   'journal-outbox' AS source_label,
+                   0 AS source_generation,
+                   'projection' AS trigger_side,
+                   reason, payload_json, wake_class, created_at, resolved_at
+            FROM system_attention_items
+            WHERE project_root = ? AND state = ? ORDER BY created_at, item_id
+            """,
+            (str(self.project_root), resolved_state),
+        )
+        return sorted(
+            [dict(row) for row in (*controller_rows, *system_rows)],
+            key=lambda row: (str(row.get("created_at") or ""), str(row.get("item_id") or "")),
+        )
 
     def attempt_for_dispatch(self, dispatch_id: str) -> AttemptIdentity | None:
         dispatch = self._identity_token(dispatch_id, label="dispatch_id")
@@ -3141,19 +3248,156 @@ class Journal:
     def pending_outbox(self, *, limit: int = 100) -> list[dict[str, object]]:
         if not 1 <= limit <= 1000:
             raise ValueError("outbox limit must be between 1 and 1000")
-        rows = self.read_all(
-            """
+        select = """
             SELECT attempt_id, transition_id, origin_node, event_uuid,
                    recipient, event_type, payload_json, created_at,
-                   projection_attempts
+                   projection_attempts, projection_retry_at,
+                   projection_quarantined_at
             FROM terminal_outbox
             WHERE projected_at IS NULL
+              AND projection_quarantined_at IS NULL
+        """
+        fresh = self.read_all(
+            select
+            + """
+              AND projection_attempts = 0
             ORDER BY created_at, attempt_id, transition_id
             LIMIT ?
             """,
             (limit,),
         )
-        return [dict(row) for row in rows]
+        retries = self.read_all(
+            select
+            + """
+              AND projection_attempts > 0
+              AND (projection_retry_at IS NULL OR projection_retry_at <= ?)
+            ORDER BY COALESCE(projection_retry_at, created_at),
+                     created_at, attempt_id, transition_id
+            LIMIT ?
+            """,
+            (utc_now(), limit),
+        )
+        # Alternate classes so a sustained fresh stream cannot starve retries,
+        # while old poison retries can never monopolize the batch either.
+        merged: list[dict[str, object]] = []
+        fresh_rows = [dict(row) for row in fresh]
+        retry_rows = [dict(row) for row in retries]
+        for index in range(max(len(fresh_rows), len(retry_rows))):
+            if index < len(fresh_rows):
+                merged.append(fresh_rows[index])
+            if len(merged) >= limit:
+                break
+            if index < len(retry_rows):
+                merged.append(retry_rows[index])
+            if len(merged) >= limit:
+                break
+        return merged
+
+    def _record_outbox_projection_failure(
+        self,
+        row: Mapping[str, object],
+        exc: BaseException,
+    ) -> WriteResult[dict[str, object]]:
+        attempts = int(row["projection_attempts"]) + 1
+        error_text = f"{type(exc).__name__}: {exc}"[:2000]
+        quarantined = attempts >= OUTBOX_MAX_PROJECTION_ATTEMPTS
+        now = utc_now()
+        retry_at = None if quarantined else _utc_after(
+            OUTBOX_RETRY_BASE_S * (2 ** (attempts - 1))
+        )
+
+        def action(connection: sqlite3.Connection) -> dict[str, object]:
+            cursor = connection.execute(
+                """
+                UPDATE terminal_outbox
+                SET projection_attempts = ?, projection_error = ?,
+                    projection_retry_at = ?, projection_quarantined_at = ?
+                WHERE attempt_id = ? AND transition_id = ?
+                  AND projected_at IS NULL AND projection_quarantined_at IS NULL
+                """,
+                (
+                    attempts,
+                    error_text,
+                    retry_at,
+                    now if quarantined else None,
+                    str(row["attempt_id"]),
+                    str(row["transition_id"]),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise CASMismatch("outbox projection failure lost to another projector")
+            if not quarantined:
+                return {"attempts": attempts, "retry_at": retry_at, "quarantined": False}
+
+            item_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    "goalflight:outbox-quarantine:"
+                    + str(row["attempt_id"])
+                    + ":"
+                    + str(row["transition_id"]),
+                )
+            )
+            payload = {
+                "item_id": item_id,
+                "type": "terminal_outbox_quarantined",
+                "attempt_id": str(row["attempt_id"]),
+                "transition_id": str(row["transition_id"]),
+                "dispatch_id": str(row["recipient"]),
+                "projection_attempts": attempts,
+                "projection_error": error_text,
+                "text": (
+                    f"terminal outbox event for {row['recipient']} quarantined after "
+                    f"{attempts} projection failures: {error_text}"
+                ),
+            }
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO system_attention_items (
+                    item_id, project_root, item_type, state, reason,
+                    payload_json, wake_class, created_at
+                ) VALUES (?, ?, 'terminal_outbox_quarantined', 'OPEN',
+                          'projection_retry_exhausted', ?, 'waking', ?)
+                """,
+                (
+                    item_id,
+                    str(self.project_root),
+                    self._json_object(payload, label="outbox_quarantine_attention"),
+                    now,
+                ),
+            )
+            next_seq = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(stream_seq), 0) + 1
+                    FROM delivery_events
+                    WHERE project_root = ? AND recipient_label = '*'
+                      AND stream_id = 'attention'
+                    """,
+                    (str(self.project_root),),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO delivery_events (
+                    project_root, recipient_label, origin_node, event_uuid,
+                    stream_id, stream_seq, carrier_path, event_type,
+                    wake_class, created_at, projected_at
+                ) VALUES (?, '*', 'journal', ?, 'attention', ?, ?,
+                          'controller_attention', 'waking', ?, ?)
+                """,
+                (
+                    str(self.project_root),
+                    item_id,
+                    next_seq,
+                    f"journal:outbox-quarantine:{item_id}",
+                    now,
+                    now,
+                ),
+            )
+            return {"attempts": attempts, "retry_at": None, "quarantined": True}
+
+        return self._domain_write(action)
 
     def project_terminal_outbox(
         self,
@@ -3181,21 +3425,15 @@ class Journal:
                     event_id=str(row["event_uuid"]),
                     event_ts=str(row["created_at"]),
                 )
-            except Exception as exc:
-                self.write(
-                    RowOperation.update(
-                        "terminal_outbox",
-                        {
-                            "projection_attempts": int(row["projection_attempts"]) + 1,
-                            "projection_error": f"{type(exc).__name__}: {exc}"[:2000],
-                        },
-                        where={
-                            "attempt_id": str(row["attempt_id"]),
-                            "transition_id": str(row["transition_id"]),
-                        },
-                        row_cap=1,
-                    )
-                )
+            except (
+                goalflight_messages.MessageError,
+                OSError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+                sqlite3.DatabaseError,
+            ) as exc:
+                self._record_outbox_projection_failure(row, exc)
                 continue
             marked = self.write(
                 RowOperation.update(
@@ -3204,6 +3442,8 @@ class Journal:
                         "projected_at": utc_now(),
                         "projection_attempts": int(row["projection_attempts"]) + 1,
                         "projection_error": None,
+                        "projection_retry_at": None,
+                        "projection_quarantined_at": None,
                     },
                     where={
                         "attempt_id": str(row["attempt_id"]),
@@ -3544,13 +3784,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         import goalflight_messages
-
-        goalflight_messages.emit_wake_entry_notice(
-            project_root=goalflight_task.resolve_project_root(str(args.project_root)),
-            stream=sys.stderr,
-        )
-    except Exception:
+    except ImportError:
         pass
+    else:
+        try:
+            goalflight_messages.emit_wake_entry_notice(
+                project_root=goalflight_task.resolve_project_root(str(args.project_root)),
+                stream=sys.stderr,
+            )
+        except (
+            goalflight_messages.MessageError,
+            OSError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            sqlite3.DatabaseError,
+        ):
+            pass
     try:
         if args.command == "init":
             print(Journal.create(args.project_root).path)

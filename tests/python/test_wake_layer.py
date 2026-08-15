@@ -396,6 +396,120 @@ def test_scoped_status_wait_does_not_cover_controller_mail(
     assert wake.live_waiters(root, controller_label="wake-test") == []
 
 
+def test_wait_mail_watermark_does_not_take_the_journal_write_lock(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test",
+        principal={"principal_id": "fast-wait-reader-test"},
+    )
+    assert claimed.committed and claimed.value is not None
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_SESSION_ID", claimed.value.nonce)
+
+    def reject_slow_constructor(*_args, **_kwargs):
+        raise AssertionError("wait watermark used the write-locking Journal constructor")
+
+    monkeypatch.setattr(journal.Journal, "__init__", reject_slow_constructor)
+
+    reader = journal.Journal.open_reader(root)
+    with pytest.raises(journal.JournalError, match="read-only journal client"):
+        reader.write([])
+    with reader._connect() as connection:
+        with pytest.raises(journal.sqlite3.OperationalError, match="readonly"):
+            connection.execute("CREATE TABLE forbidden_reader_write (value TEXT)")
+
+    ambient = messages._ambient_claimed_controller(
+        root,
+        controller_label="wake-test",
+        mail_bearing=True,
+        require_live_holder=False,
+    )
+    assert ambient["claimed"] is True
+    assert messages.controller_mail_summary(
+        task_store_project_root=root,
+        controller_label="wake-test",
+    )["count"] == 0
+    assert status._mail_watermark(str(root), ["wake-probe"]) == set()
+
+
+def test_real_journal_mail_arrival_wakes_live_worker_wait_with_exit_three(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _env = isolated
+    dispatch_id = "real-mail-wake"
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test",
+        principal={"principal_id": "real-mail-wake-controller"},
+    )
+    assert claimed.committed and claimed.value is not None
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_SESSION_ID", claimed.value.nonce)
+
+    prepared = authority.prepare_attempt(dispatch_id)
+    assert prepared.committed and prepared.value is not None
+    started = authority.start_attempt(
+        prepared.value.attempt_id,
+        prepared.value.launch_token,
+    )
+    assert started.committed and started.value is not None
+    running = authority.mark_attempt_running(
+        started.value.attempt_id,
+        started.value.launch_token,
+        launch_epoch=started.value.launch_epoch,
+        worker_instance={"pid": os.getpid(), "source": "mail-wake-probe"},
+    )
+    assert running.committed
+
+    baseline_read = threading.Event()
+    producer_errors: list[BaseException] = []
+    real_watermark = status._mail_watermark
+
+    def observed_watermark(*args, **kwargs):
+        watermark = real_watermark(*args, **kwargs)
+        baseline_read.set()
+        return watermark
+
+    monkeypatch.setattr(status, "_mail_watermark", observed_watermark)
+
+    def post_after_arm() -> None:
+        try:
+            assert baseline_read.wait(timeout=2)
+            messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="controller-notice",
+                payload={"text": "wake the live worker wait"},
+                messages_dir=messages.default_messages_dir(),
+                source={"node": "test", "adapter": "pytest", "transport": "controller"},
+                addressee=messages.controller_addressee(
+                    "wake-test",
+                    project_root=root,
+                ),
+            )
+        except BaseException as exc:  # thread transports its failure to the test.
+            producer_errors.append(exc)
+
+    producer = threading.Thread(target=post_after_arm)
+    producer.start()
+    code = status._wait_for_dispatches_registered(
+        [dispatch_id],
+        project_root=str(root),
+        timeout_s=3,
+        poll_s=0.02,
+        heartbeat_s=10,
+    )
+    producer.join(timeout=2)
+
+    assert not producer_errors
+    assert code == 3
+    live_attempt = journal.Journal.open_reader(root).attempt_for_dispatch(dispatch_id)
+    assert live_attempt is not None
+    assert live_attempt.lifecycle_state == journal.ATTEMPT_RUNNING
+
+
 def test_deleted_cursor_token_cli_surface_does_not_displace_healthy_listener(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:

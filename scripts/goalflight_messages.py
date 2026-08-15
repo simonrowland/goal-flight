@@ -16,6 +16,7 @@ import math
 import os
 import re
 import shlex
+import sqlite3
 import stat
 import subprocess
 import tempfile
@@ -48,6 +49,16 @@ import goalflight_compat  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
 import goalflight_wake  # noqa: E402
 from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS  # noqa: E402
+
+_EXPECTED_OPTIONAL_ERRORS = (
+    ImportError,
+    OSError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+    sqlite3.DatabaseError,
+    subprocess.SubprocessError,
+)
 
 
 @dataclass(frozen=True)
@@ -1353,16 +1364,15 @@ def post_message(
 def _dispatch_record(dispatch_id: str) -> tuple[dict | None, str | None]:
     try:
         import goalflight_ledger  # type: ignore
-
-        return (
-            next(
-                (record for record in goalflight_ledger.read_records() if record.get("dispatch_id") == dispatch_id),
-                None,
-            ),
-            None,
-        )
-    except Exception as exc:  # noqa: BLE001 - surfaced as a delivery failure
+        path = goalflight_ledger.record_path(dispatch_id, create=False)
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, None
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
         return None, f"{type(exc).__name__}: {exc}"
+    if not isinstance(record, dict) or record.get("dispatch_id") != dispatch_id:
+        return None, "dispatch record is malformed or bound to a different dispatch id"
+    return record, None
 
 
 def _journal_delivery_target(envelope: dict) -> tuple[Path, str] | None:
@@ -1373,7 +1383,7 @@ def _journal_delivery_target(envelope: dict) -> tuple[Path, str] | None:
             import goalflight_task  # type: ignore
 
             return goalflight_task.resolve_project_root(addressee_root), addressee_label
-        except Exception as exc:
+        except _EXPECTED_OPTIONAL_ERRORS as exc:
             raise MessageError(f"cannot resolve controller delivery project: {exc}") from exc
     record, lookup_error = _dispatch_record(str(envelope.get("dispatch_id") or ""))
     if lookup_error is not None:
@@ -1386,7 +1396,7 @@ def _journal_delivery_target(envelope: dict) -> tuple[Path, str] | None:
             import goalflight_task  # type: ignore
 
             return goalflight_task.resolve_project_root(str(record["project_root"])), label
-        except Exception as exc:
+        except _EXPECTED_OPTIONAL_ERRORS as exc:
             raise MessageError(f"cannot resolve dispatch project: {exc}") from exc
     payload = envelope.get("payload")
     if isinstance(payload, dict) and payload.get("project_root"):
@@ -1394,7 +1404,7 @@ def _journal_delivery_target(envelope: dict) -> tuple[Path, str] | None:
             import goalflight_task  # type: ignore
 
             return goalflight_task.resolve_project_root(str(payload["project_root"])), "*"
-        except Exception as exc:
+        except _EXPECTED_OPTIONAL_ERRORS as exc:
             raise MessageError(f"cannot resolve project-scoped delivery: {exc}") from exc
     return None
 
@@ -1461,7 +1471,7 @@ def _prepare_journal_delivery(
         }
     except MessageError:
         raise
-    except Exception as exc:
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
         raise MessageError(f"journal delivery assignment failed: {type(exc).__name__}: {exc}") from exc
 
 
@@ -1523,7 +1533,7 @@ def _deliver_message_to_worker(
         import goalflight_ledger  # type: ignore
 
         classification = goalflight_ledger.classify(record)
-    except Exception as exc:  # noqa: BLE001 - surfaced as a delivery failure
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
         return {
             "requested": True,
             "delivered": False,
@@ -1655,7 +1665,7 @@ def _controller_sender_session_id(dispatch_id: str) -> str | None:
             label=label,
             pid=pid,
         )
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return None
     if not session or session.get("conflicting_beacons") or not session.get("id"):
         return None
@@ -2261,7 +2271,7 @@ def _task_store_dispatch_id(
             else _canonical_project_root(project_root)
         )
         return goalflight_task._next_nudge_dispatch_id(root)
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return None
 
 
@@ -2371,7 +2381,7 @@ def _current_project_root() -> Path | None:
         import goalflight_task  # type: ignore
 
         return goalflight_task.resolve_project_root(str(Path.cwd()))
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         pass
     return None
 
@@ -2386,7 +2396,7 @@ def _project_ledger_records(project_root: Path) -> list[dict]:
             for record in goalflight_ledger.read_records()
             if record.get("project_root") == root
         ]
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return []
 
 
@@ -2455,7 +2465,7 @@ def _verified_controller_identity(
             "session_id": str(live["id"]),
             "pid": live.get("pid"),
         }
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return None
 
 
@@ -2661,7 +2671,7 @@ def _current_frontier_ids(project_root: Path) -> list[str] | None:
         import goalflight_task  # type: ignore
 
         return [str(row["id"]) for row in goalflight_task.TaskStore(Path(project_root)).next_frontier()]
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return None
 
 
@@ -2672,7 +2682,7 @@ def _task_items_by_id(project_root: Path) -> dict[str, dict] | None:
         import goalflight_task  # type: ignore
 
         return {str(row.get("id") or ""): row for row in goalflight_task.list(project_root=Path(project_root))}
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return None
 
 
@@ -2719,7 +2729,7 @@ def _record_is_terminal(record: dict) -> bool:
             dispatch_states.is_terminal_state(record.get(key))
             for key in ("state", "terminal_state")
         )
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return False
 
 
@@ -2834,7 +2844,7 @@ def controller_mail_summary(
         import goalflight_task  # type: ignore
 
         root = goalflight_task.resolve_project_root(str(task_store_project_root))
-        authority = goalflight_journal.Journal(root)
+        authority = goalflight_journal.Journal.open_reader(root)
         label = sessions.resolve_controller_label(
             controller_label,
             project_root=root,
@@ -2954,7 +2964,7 @@ def _ambient_claimed_controller(
     if not label:
         return {"claimed": False, "reason": "missing-controller-label"}
     try:
-        authority = goalflight_journal.Journal(project_root)
+        authority = goalflight_journal.Journal.open_reader(project_root)
         lease = authority.active_lease(label)
     except goalflight_journal.JournalError:
         return {"claimed": False, "reason": "journal-unavailable", "label": label}
@@ -3080,7 +3090,7 @@ def emit_listener_reminder(
             line = listener_reminder_line(root, label)
         print(line, file=sys.stderr if stream is None else stream)
         return line
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return None
 
 
@@ -3120,7 +3130,7 @@ def emit_controller_mail_notice(
         # advice; stdout is data.
         print(notice, file=sys.stderr if stream is None else stream)
         return notice
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return None
 
 
@@ -3153,7 +3163,7 @@ def emit_controller_milestone_notice(
         notice = f"{line}  # milestone sweep due: see protocols/milestone-review.md"
         print(notice, file=sys.stderr if stream is None else stream)
         return notice
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return None
 
 

@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_journal as journal  # noqa: E402
+import goalflight_ledger as ledger  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
 import goalflight_status as status  # noqa: E402
@@ -86,11 +87,22 @@ def test_current_epoch_missing_table_self_heals_but_corruption_fails_closed(
         )
         assert epochs == (4, 4, 4, 4, 4)
         connection.execute("DROP TABLE listener_coverage")
+        connection.execute("DROP TABLE system_attention_items")
+        connection.execute(
+            "ALTER TABLE terminal_outbox DROP COLUMN projection_quarantined_at"
+        )
+        connection.execute("ALTER TABLE terminal_outbox DROP COLUMN projection_retry_at")
 
     reopened = journal.Journal(project)
     assert reopened.read_all(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'listener_coverage'"
     )
+    assert reopened.read_all(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'system_attention_items'"
+    )
+    assert tuple(
+        str(row["name"]) for row in reopened.read_all("PRAGMA table_info(terminal_outbox)")
+    ) == journal.CURRENT_SCHEMA_COLUMNS["terminal_outbox"]
 
     corrupt_project = tmp_path / "corrupt-project"
     corrupt_project.mkdir()
@@ -523,6 +535,211 @@ def test_second_real_doorbell_loses_generation_lock_and_first_wakes_body_free(
     assert after is not None
     assert after.renewed_at == before.renewed_at
     assert after.renew_deadline_at == before.renew_deadline_at
+
+
+def test_wait_path_terminal_commit_wakes_under_seeded_history_three_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    env = _set_state_env(monkeypatch, tmp_path)
+    env["GOALFLIGHT_CONTROLLER_LABEL"] = "controller"
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    dispatch_ids = [f"wait-latency-{index}" for index in range(3)]
+    seeded_ids = [f"wait-seeded-history-{index:04d}" for index in range(1397)] + dispatch_ids
+    for dispatch_id in seeded_ids:
+        path = ledger.record_path(dispatch_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "dispatch_id": dispatch_id,
+                    "project_root": str(project),
+                    "controller_label": "controller",
+                    "state": "running",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    measurements: list[float] = []
+    for index, dispatch_id in enumerate(dispatch_ids, start=1):
+        prepared = authority.prepare_attempt(dispatch_id)
+        assert prepared.committed and prepared.value is not None
+        waiter = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPTS / "goalflight_status.py"),
+                "--project",
+                str(project),
+                "--wait",
+                dispatch_id,
+                "--timeout-s",
+                "8",
+                "--poll-s",
+                "0.01",
+            ],
+            cwd=project,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if any(
+                    row.kind == "wait"
+                    for row in wake.live_waiters(
+                        project,
+                        controller_label="controller",
+                    )
+                ):
+                    break
+                time.sleep(0.01)
+            else:
+                pytest.fail("wait latency probe never armed")
+
+            terminal_started = time.monotonic()
+            committed = authority.commit_terminal(
+                prepared.value.attempt_id,
+                terminal_state="complete",
+                observation={"state": "complete", "outcome": {}},
+            )
+            assert committed.committed
+            stdout, stderr = waiter.communicate(timeout=6)
+            elapsed = time.monotonic() - terminal_started
+            assert waiter.returncode == 0, stderr
+            assert "wait complete: 1/1 terminal" in stdout
+            assert elapsed < 5.0
+            measurements.append(elapsed)
+            print(
+                f"WAIT_PATH_PROBE run={index} seeded={len(seeded_ids)} "
+                f"seconds={elapsed:.3f}"
+            )
+        finally:
+            if waiter.poll() is None:
+                waiter.terminate()
+                waiter.wait(timeout=2)
+
+    assert len(measurements) == 3
+    assert all(value < 5.0 for value in measurements)
+
+
+def test_listener_path_terminal_commit_wakes_under_seeded_history_three_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    env = _set_state_env(monkeypatch, tmp_path)
+    env["GOALFLIGHT_TEST_LISTENER_START_TOKEN"] = "listener-latency-token"
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    lease = _claim(authority)
+    dispatch_ids = [f"listener-latency-{index}" for index in range(3)]
+
+    seeded_ids = [f"seeded-history-{index:04d}" for index in range(1397)] + dispatch_ids
+    for dispatch_id in seeded_ids:
+        path = ledger.record_path(dispatch_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "dispatch_id": dispatch_id,
+                    "project_root": str(project),
+                    "controller_label": "controller",
+                    "state": "running",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    command = [
+        sys.executable,
+        str(SCRIPTS / "goalflight_messages.py"),
+        "--messages-dir",
+        str(tmp_path / "messages"),
+        "listen",
+        "--project-root",
+        str(project),
+        "--controller-label",
+        "controller",
+        "--lease-nonce",
+        lease.nonce,
+        "--poll-secs",
+        "0.01",
+        "--timeout-s",
+        "8",
+        "--json",
+    ]
+    measurements: list[float] = []
+    for index, dispatch_id in enumerate(dispatch_ids, start=1):
+        prepared = authority.prepare_attempt(dispatch_id)
+        assert prepared.committed and prepared.value is not None
+        listener = subprocess.Popen(
+            command,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                coverage = authority.active_coverage("controller")
+                if coverage is not None and coverage["pid"] == listener.pid:
+                    break
+                time.sleep(0.01)
+            else:
+                pytest.fail("listener latency probe never armed its real doorbell")
+
+            terminal_started = time.monotonic()
+            committed = authority.commit_terminal(
+                prepared.value.attempt_id,
+                terminal_state="complete",
+                observation={"state": "complete", "outcome": {}},
+            )
+            assert committed.committed
+            projected = authority.project_terminal_outbox(
+                messages_dir=tmp_path / "messages"
+            )
+            assert len(projected) == 1
+            stdout, stderr = listener.communicate(timeout=6)
+            elapsed = time.monotonic() - terminal_started
+            assert listener.returncode == 0, stderr
+            assert json.loads(stdout)["reason"] == "event"
+            assert elapsed < 5.0
+            measurements.append(elapsed)
+            print(
+                f"LISTENER_PATH_PROBE run={index} seeded={len(seeded_ids)} "
+                f"seconds={elapsed:.3f}"
+            )
+            peek = authority.cursor_peek(
+                "controller",
+                nonce=lease.nonce,
+                waking_only=False,
+            )
+            advances: dict[str, int] = {}
+            for item in peek.items:
+                stream_id = str(item["stream_id"])
+                advances[stream_id] = max(
+                    advances.get(stream_id, 0),
+                    int(item["stream_seq"]),
+                )
+            assert advances
+            assert authority.advance_cursor(
+                "controller",
+                nonce=lease.nonce,
+                expected_cursor_version=peek.cursor_version,
+                advances=advances,
+                actor="listener-latency-probe",
+            ).committed
+        finally:
+            if listener.poll() is None:
+                listener.terminate()
+                listener.wait(timeout=2)
+
+    assert len(measurements) == 3
+    assert all(value < 5.0 for value in measurements)
 
 
 def test_lease_death_attention_materializes_on_listener_and_holder_lock_sides(

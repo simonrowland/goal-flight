@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import time
 import tempfile
@@ -44,6 +45,16 @@ from goalflight_watch import (
     SUCCESS_TERMINAL_MARKERS,
     _final_terminal_marker,
     _terminal_marker_matches_dispatch,
+)
+
+_EXPECTED_OPTIONAL_ERRORS = (
+    ImportError,
+    OSError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+    sqlite3.DatabaseError,
+    subprocess.SubprocessError,
 )
 
 # Each aggregated record carries a precomputed ``classification`` from
@@ -652,7 +663,7 @@ def this_project_root() -> str | None:
     """Worktree-collapsed canonical project root, or None outside a project."""
     try:
         return str(goalflight_task.resolve_project_root(str(Path.cwd())))
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         pass
     return None
 
@@ -992,7 +1003,7 @@ def write_script_data_js(
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_name, path)
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         if tmp_name:
             with contextlib.suppress(OSError):
                 Path(tmp_name).unlink()
@@ -1147,6 +1158,28 @@ def _wait_json_object(value: object) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _wait_journal_presence(project_root: str) -> bool | None:
+    """Return present, absent, or unobservable without collapsing ``EACCES``."""
+    try:
+        path = goalflight_journal.resolve_journal_path(project_root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return False
+    return True
+
+
+def _open_wait_journal_reader(project_root: str):
+    opener = goalflight_journal.Journal.open_reader
+    if not callable(opener):
+        raise AttributeError("Journal.open_reader is missing or not callable")
+    return opener(project_root)
+
+
 def _wait_authority_rows(
     wait_ids: list[str],
     raw_records: dict[str, dict | None],
@@ -1169,20 +1202,12 @@ def _wait_authority_rows(
     for root_key, dispatch_ids in grouped.items():
         if root_key not in journal_cache:
             try:
-                opener = getattr(
-                    goalflight_journal.Journal,
-                    "open_reader",
-                    goalflight_journal.Journal,
-                )
-                journal_cache[root_key] = opener(root_key)
-            except Exception:
-                try:
-                    journal_exists = goalflight_journal.resolve_journal_path(root_key).exists()
-                except Exception:
-                    journal_exists = False
+                journal_cache[root_key] = _open_wait_journal_reader(root_key)
+            except _EXPECTED_OPTIONAL_ERRORS:
+                journal_exists = _wait_journal_presence(root_key)
                 # None means a legacy/tmp project with no journal. False means
                 # authority exists but cannot be read, which must fail closed.
-                journal_cache[root_key] = False if journal_exists else None
+                journal_cache[root_key] = None if journal_exists is None else False
         journal = journal_cache[root_key]
         if journal is None:
             continue
@@ -1207,7 +1232,7 @@ def _wait_authority_rows(
                 + ")",
                 (root_key, *dispatch_ids),
             )
-        except Exception:
+        except _EXPECTED_OPTIONAL_ERRORS:
             journal_cache[root_key] = False
             for dispatch_id in dispatch_ids:
                 authority[dispatch_id] = {"_wait_journal_error": True}
@@ -1223,26 +1248,14 @@ def _wait_authority_rows(
 def _wait_authority_marker(
     dispatch_id: str,
     authority: dict,
-    sidecar: dict,
 ) -> dict | None:
-    marker = _validated_terminal_marker(sidecar, expected_dispatch_id=dispatch_id)
-    if marker is not None:
-        return marker
-
     observation = _wait_json_object(authority.get("terminal_outcome_json"))
     outcome = observation.get("outcome")
     error = outcome.get("error") if isinstance(outcome, dict) else None
-    if isinstance(error, dict):
-        marker = _validated_terminal_marker(error, expected_dispatch_id=dispatch_id)
-        if marker is not None:
-            return marker
-
     event_type = str(authority.get("event_type") or "")
     terminal_state = str(authority.get("terminal_state") or "")
     kind = (
-        str(error.get("marker_kind"))
-        if isinstance(error, dict) and error.get("marker_kind")
-        else "USER-NEED"
+        "USER-NEED"
         if event_type == "user_need"
         else "USER-CONFIRM"
         if event_type == "user_confirm"
@@ -1250,6 +1263,8 @@ def _wait_authority_marker(
         if event_type == "result" or terminal_state == "complete"
         else "BLOCKED"
         if event_type == "blocked"
+        else str(error.get("marker_kind"))
+        if isinstance(error, dict) and error.get("marker_kind")
         else ""
     )
     if kind not in _OUTPUT_TAIL_TERMINAL_MARKERS:
@@ -1320,14 +1335,16 @@ def _wait_record_from_snapshots(
     if lifecycle in goalflight_journal.ATTEMPT_FINAL_STATES:
         observation = _wait_json_object(authority.get("terminal_outcome_json"))
         terminal_state = str(authority.get("terminal_state") or "unknown")
-        state = str(observation.get("state") or terminal_state)
         record.update(
-            state=state,
+            state=terminal_state,
             classification=terminal_state,
             terminal_state=terminal_state,
             ended_at=authority.get("terminal_at") or record.get("ended_at"),
             _wait_journal_terminal=True,
         )
+        observed_state = str(observation.get("state") or "")
+        if observed_state and observed_state != terminal_state:
+            record["terminal_observation_state"] = observed_state
         if "worker_still_alive" in observation:
             record["worker_still_alive"] = observation["worker_still_alive"]
         outcome = observation.get("outcome")
@@ -1338,9 +1355,19 @@ def _wait_record_from_snapshots(
                 record["reason"] = error
             elif outcome.get("reason") not in (None, ""):
                 record["reason"] = outcome["reason"]
-        marker = _wait_authority_marker(dispatch_id, authority, sidecar)
+        marker = _wait_authority_marker(dispatch_id, authority)
         if marker is not None:
             record["terminal_marker"] = marker
+        sidecar_marker = _validated_terminal_marker(
+            sidecar,
+            expected_dispatch_id=dispatch_id,
+        )
+        if sidecar_marker is not None and sidecar_marker != marker:
+            record["superseded_terminal_marker"] = {
+                **sidecar_marker,
+                "superseded": True,
+                "superseded_by": marker,
+            }
         return record
 
     if lifecycle in goalflight_journal.ATTEMPT_LIVE_STATES:
@@ -1455,7 +1482,7 @@ def _milestone_payload(project_root: str | None) -> dict:
             project_root=Path(project_root),
             require_active_queue=True,
         )
-    except Exception as exc:
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
         detail = " ".join(f"{exc.__class__.__name__}: {exc}".split())
         return {
             "schema": goalflight_milestone.SCHEMA,
@@ -2061,7 +2088,7 @@ def wait_for_dispatches(
                 owned_dispatch_ids=set(wait_ids),
                 stream=sys.stderr,
             )
-        except Exception:
+        except _EXPECTED_OPTIONAL_ERRORS:
             pass
         return _wait_for_dispatches_registered(
             wait_ids,
@@ -2100,7 +2127,7 @@ def _wait_for_dispatches_registered(
     # the two cannot drift.
     try:
         import goalflight_messages as _gm
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         pass
     else:
         try:
@@ -2115,7 +2142,7 @@ def _wait_for_dispatches_registered(
                 project_root=Path(project_root) if project_root else None,
                 stream=sys.stderr,
             )
-        except Exception:
+        except _EXPECTED_OPTIONAL_ERRORS:
             pass
 
     # Baseline AFTER the arming notice: only mail that arrives while the
@@ -2227,12 +2254,12 @@ def _mail_watermark(project_root: str | None, wait_ids: list[str]) -> set[tuple[
     """Monotonic journal event identity for ``--wait``; cursor advances cannot erase it."""
     try:
         root = goalflight_task.resolve_project_root(project_root or str(Path.cwd()))
-        events = goalflight_journal.Journal.open_reader(root).delivery_event_watermark(
+        events = _open_wait_journal_reader(str(root)).delivery_event_watermark(
             stream_ids=wait_ids,
             waking_only=True,
         )
         return {(recipient, f"{origin}:{event_uuid}") for recipient, origin, event_uuid in events}
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return None
 
 
@@ -2256,7 +2283,7 @@ def _mail_summary(owned_dispatch_ids: set[str] | None = None, *, project_root: P
             owned_dispatch_ids=owned_dispatch_ids,
             task_store_project_root=project_root,
         )
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return {}
 
 
@@ -2267,7 +2294,7 @@ def _posted_advisory_keys(messages_dir: Path) -> set[str]:
         envelopes = _gm.read_envelopes_tolerant(
             _gm.inbox_path(messages_dir, goalflight_quota_stuck.QUOTA_STUCK_CONTROLLER_DISPATCH_ID)
         )
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return set()
     keys: set[str] = set()
     for env in envelopes:
@@ -2302,7 +2329,7 @@ def _post_quota_advisories(payload: dict) -> None:
                 source={"adapter": "goalflight_status", "transport": "controller"},
             )
             posted.add(key)
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return
 
 
@@ -2402,7 +2429,7 @@ def _verify_record(dispatch_id: str, project_root: str | None) -> dict | None:
             if project_root and record.get("project_root") not in (None, project_root):
                 continue
             match = record  # latest matching record wins
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         return None
     return match
 
@@ -2561,7 +2588,7 @@ def main(argv: list[str] | None = None) -> int:
                 project_root=Path(project_root) if project_root else Path.cwd(),
                 stream=sys.stderr,
             )
-        except Exception:
+        except _EXPECTED_OPTIONAL_ERRORS:
             pass
 
     if args.record_milestone_sweep:
@@ -2663,7 +2690,7 @@ def main(argv: list[str] | None = None) -> int:
     # status JSON or worker-liveness payload.
     try:
         import goalflight_messages as _gm
-    except Exception:
+    except _EXPECTED_OPTIONAL_ERRORS:
         pass
     else:
         _gm.emit_controller_mail_notice(

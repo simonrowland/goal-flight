@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import shlex
 import sys
 import time
+import tempfile
 import uuid
 from collections.abc import Callable, Iterable
 
@@ -32,6 +34,7 @@ ENTRY_POLL_WINDOW_S = 1.0
 ENTRY_POLL_INTERVAL_S = 0.1
 _FILE_VERSION = "v2"
 _GENERATION_FILE_VERSION = "generation-v1"
+_LEASE_EVENT_SCHEMA = "goalflight.lease-generation-event.v1"
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,98 @@ def ledger_base_dir() -> Path:
 
 def ledger_dir(project_root: Path | str) -> Path:
     return ledger_base_dir() / _project_key(project_root)
+
+
+def lease_generation_event_path(project_root: Path | str, *, controller_label: str) -> Path:
+    label = str(controller_label or "").strip()
+    if not label:
+        raise ValueError("controller label is required")
+    return ledger_dir(project_root) / f"lease-event-v1.{_label_hash(label)}.json"
+
+
+def publish_lease_generation_event(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    generation: int,
+    state: str,
+) -> Path:
+    """Publish the small nonce/generation token watched by the cheap beacon tick."""
+    nonce = str(lease_nonce or "").strip()
+    if not nonce or generation < 1:
+        raise ValueError("lease nonce and positive generation are required")
+    path = lease_generation_event_path(
+        project_root,
+        controller_label=controller_label,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": _LEASE_EVENT_SCHEMA,
+        "label": str(controller_label).strip(),
+        "nonce": nonce,
+        "generation": generation,
+        "state": str(state or "").strip(),
+    }
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as handle:
+            tmp_name = handle.name
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except OSError:
+        if tmp_name is not None:
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    return path
+
+
+def lease_generation_event_stamp(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+) -> tuple[int, int, int] | None:
+    path = lease_generation_event_path(
+        project_root,
+        controller_label=controller_label,
+    )
+    try:
+        observed = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return observed.st_ino, observed.st_mtime_ns, observed.st_size
+
+
+def read_lease_generation_event(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+) -> dict[str, object] | None:
+    path = lease_generation_event_path(
+        project_root,
+        controller_label=controller_label,
+    )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"lease generation event is unreadable: {path}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("schema") != _LEASE_EVENT_SCHEMA:
+        raise RuntimeError(f"lease generation event is malformed: {path}")
+    return payload
 
 
 def _parse_waiter_path(path: Path) -> WaiterRecord | None:
@@ -177,6 +272,9 @@ class WaiterRegistration:
         *,
         generation_key: str | None = None,
     ) -> None:
+        self._fd = -1
+        self._generation_path = None
+        self._generation_fd = -1
         if fcntl is None:
             raise RuntimeError("held-flock wake ledger is unavailable on this platform")
         normalized_label = str(label or "").strip()
@@ -201,8 +299,6 @@ class WaiterRegistration:
             / f"{_FILE_VERSION}.{kind}.{_label_hash(normalized_label)}."
             f"{os.getpid()}.{start_hash}.{instance_id}.lock",
         )
-        self._generation_path = None
-        self._generation_fd = -1
         if generation_key is not None:
             normalized_generation = str(generation_key or "").strip()
             if not normalized_generation:
@@ -259,7 +355,7 @@ class WaiterRegistration:
     def __del__(self) -> None:  # pragma: no cover - process death is authority.
         try:
             self.close()
-        except Exception:
+        except (OSError, RuntimeError):
             pass
 
 
