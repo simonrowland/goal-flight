@@ -6,6 +6,8 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-08-15
+
 ### Added
 
 - The wake layer. Backgrounded waiters — the mail listener and dispatch waits —
@@ -2460,7 +2462,7 @@ the fix-up.
 ### Tests
 3 suites / 46 assertions remain green throughout.
 
-## [Unreleased]
+## [0.2.x era, never promoted — strip refactor]
 
 ### **STRIP REFACTOR — skill collapsed from ~230 KB to ~30 KB**
 
