@@ -381,6 +381,231 @@ def test_cursor_peek_and_server_validated_cas_deliver_remainder(
     assert backlog_second.items
 
 
+def test_terminal_projection_targets_owned_exactly_and_unowned_by_fanout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    _claim(authority, "primary")
+    _claim(authority, "secondary")
+
+    for dispatch_id, controller_label in (
+        ("owned-terminal", "primary"),
+        ("unowned-terminal", None),
+    ):
+        record = {
+            "dispatch_id": dispatch_id,
+            "project_root": str(project),
+            "state": "running",
+        }
+        if controller_label is not None:
+            record["controller_label"] = controller_label
+        path = ledger.record_path(dispatch_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record), encoding="utf-8")
+        prepared = authority.prepare_attempt(dispatch_id)
+        assert prepared.committed and prepared.value is not None
+        committed = authority.commit_terminal(
+            prepared.value.attempt_id,
+            terminal_state="complete",
+            observation={"state": "complete", "outcome": {}},
+        )
+        assert committed.committed
+        assert len(
+            authority.project_terminal_outbox(messages_dir=tmp_path / "messages")
+        ) == 1
+
+    recipients = {
+        (str(row["stream_id"]), str(row["recipient_label"]))
+        for row in authority.read_all(
+            "SELECT stream_id, recipient_label FROM delivery_events"
+        )
+    }
+    assert recipients == {
+        ("owned-terminal", "primary"),
+        ("unowned-terminal", "primary"),
+        ("unowned-terminal", "secondary"),
+    }
+    assert {
+        str(row["stream_id"])
+        for row in authority.pending_delivery_events("primary")
+    } == {"owned-terminal", "unowned-terminal"}
+    assert {
+        str(row["stream_id"])
+        for row in authority.pending_delivery_events("secondary")
+    } == {"unowned-terminal"}
+
+    messages.post_message(
+        dispatch_id="unowned-terminal",
+        msg_type="advisory",
+        payload={"text": "retain non-terminal unowned behavior"},
+        messages_dir=tmp_path / "messages",
+        source={"node": "test", "adapter": "test", "transport": "controller"},
+    )
+    assert len(authority.read_all("SELECT 1 FROM delivery_events")) == 3
+
+
+def test_unowned_terminal_projection_with_no_controller_is_held_for_registration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    dispatch_id = "unowned-terminal-held"
+    path = ledger.record_path(dispatch_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "project_root": str(project),
+                "state": "running",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    prepared = authority.prepare_attempt(dispatch_id)
+    assert prepared.committed and prepared.value is not None
+    committed = authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="complete",
+        observation={"state": "complete", "outcome": {}},
+    )
+    assert committed.committed
+    assert len(authority.project_terminal_outbox(messages_dir=tmp_path / "messages")) == 1
+
+    rows = authority.read_all(
+        """SELECT recipient_label, projected_at, withdrawn_at
+           FROM delivery_events WHERE stream_id = ?""",
+        (dispatch_id,),
+    )
+    assert len(rows) == 1
+    assert rows[0]["recipient_label"] == "*"
+    assert rows[0]["projected_at"] is not None
+    assert rows[0]["withdrawn_at"] is None
+
+    lease = _claim(authority, "late-controller")
+    pending = authority.cursor_peek(
+        "late-controller",
+        nonce=lease.nonce,
+    )
+    assert [str(row["stream_id"]) for row in pending.items] == [dispatch_id]
+
+
+def test_unowned_terminal_projection_wakes_armed_doorbell_three_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    env = _set_state_env(monkeypatch, tmp_path)
+    env["GOALFLIGHT_TEST_LISTENER_START_TOKEN"] = "unowned-terminal-listener-token"
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    lease = _claim(authority, "controller")
+    command = [
+        sys.executable,
+        str(SCRIPTS / "goalflight_messages.py"),
+        "--messages-dir",
+        str(tmp_path / "messages"),
+        "listen",
+        "--project-root",
+        str(project),
+        "--controller-label",
+        "controller",
+        "--lease-nonce",
+        lease.nonce,
+        "--poll-secs",
+        "0.01",
+        "--timeout-s",
+        "8",
+        "--json",
+    ]
+
+    measurements: list[float] = []
+    for run in range(1, 4):
+        dispatch_id = f"unowned-terminal-doorbell-{run}"
+        path = ledger.record_path(dispatch_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "dispatch_id": dispatch_id,
+                    "project_root": str(project),
+                    "state": "running",
+                }
+            ),
+            encoding="utf-8",
+        )
+        prepared = authority.prepare_attempt(dispatch_id)
+        assert prepared.committed and prepared.value is not None
+        listener = subprocess.Popen(
+            command,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                coverage = authority.active_coverage("controller")
+                if coverage is not None and coverage["pid"] == listener.pid:
+                    break
+                time.sleep(0.01)
+            else:
+                pytest.fail("unowned terminal listener never armed its doorbell")
+
+            started = time.monotonic()
+            committed = authority.commit_terminal(
+                prepared.value.attempt_id,
+                terminal_state="complete",
+                observation={"state": "complete", "outcome": {}},
+            )
+            assert committed.committed
+            assert len(
+                authority.project_terminal_outbox(messages_dir=tmp_path / "messages")
+            ) == 1
+            stdout, stderr = listener.communicate(timeout=6)
+            elapsed = time.monotonic() - started
+            assert listener.returncode == 0, stderr
+            assert json.loads(stdout)["reason"] == "event"
+            assert elapsed < 5.0
+            measurements.append(elapsed)
+            recipients = authority.read_all(
+                """SELECT recipient_label FROM delivery_events
+                   WHERE stream_id = ? ORDER BY recipient_label""",
+                (dispatch_id,),
+            )
+            assert [str(row["recipient_label"]) for row in recipients] == ["controller"]
+            print(f"UNOWNED_TERMINAL_DOORBELL run={run} seconds={elapsed:.3f}")
+
+            peek = authority.cursor_peek(
+                "controller",
+                nonce=lease.nonce,
+            )
+            assert peek.items
+            advances = {
+                str(row["stream_id"]): int(row["stream_seq"])
+                for row in peek.items
+            }
+            assert authority.advance_cursor(
+                "controller",
+                nonce=lease.nonce,
+                expected_cursor_version=peek.cursor_version,
+                advances=advances,
+                actor="unowned-terminal-doorbell-test",
+            ).committed
+        finally:
+            if listener.poll() is None:
+                listener.terminate()
+                listener.wait(timeout=2)
+
+    assert len(measurements) == 3
+
+
 def test_cursor_cas_has_one_winner_under_32_way_contention(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

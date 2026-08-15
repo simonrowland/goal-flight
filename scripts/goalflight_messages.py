@@ -1375,14 +1375,14 @@ def _dispatch_record(dispatch_id: str) -> tuple[dict | None, str | None]:
     return record, None
 
 
-def _journal_delivery_target(envelope: dict) -> tuple[Path, str] | None:
+def _journal_delivery_targets(envelope: dict) -> tuple[tuple[Path, str], ...]:
     addressee_label = controller_addressee_label(envelope)
     addressee_root = controller_addressee_project_root(envelope)
     if addressee_label and addressee_root:
         try:
             import goalflight_task  # type: ignore
 
-            return goalflight_task.resolve_project_root(addressee_root), addressee_label
+            return ((goalflight_task.resolve_project_root(addressee_root), addressee_label),)
         except _EXPECTED_OPTIONAL_ERRORS as exc:
             raise MessageError(f"cannot resolve controller delivery project: {exc}") from exc
     record, lookup_error = _dispatch_record(str(envelope.get("dispatch_id") or ""))
@@ -1390,23 +1390,46 @@ def _journal_delivery_target(envelope: dict) -> tuple[Path, str] | None:
         raise MessageError(f"cannot resolve dispatch delivery assignment: {lookup_error}")
     if isinstance(record, dict) and record.get("project_root"):
         label = str(record.get("controller_label") or "").strip()
-        if not label:
-            return None
-        try:
-            import goalflight_task  # type: ignore
+        # The ledger stores CANONICAL project roots at write time (the single-
+        # canonicalizer invariant from the worktree-collapse fix), so the stored
+        # value is trusted as-is here. Re-deriving it would spawn git on every
+        # delivery-targeting call -- including the steer path, which must never
+        # spawn anything (test_dispatch_steer enforces that contract).
+        root = Path(str(record["project_root"]))
+        if label:
+            return ((root, label),)
+        if canonical_event_type(str(envelope.get("type") or "")) in {
+            "result",
+            "blocked",
+            "user_need",
+            "user_confirm",
+        }:
+            try:
+                import goalflight_journal  # type: ignore
 
-            return goalflight_task.resolve_project_root(str(record["project_root"])), label
-        except _EXPECTED_OPTIONAL_ERRORS as exc:
-            raise MessageError(f"cannot resolve dispatch project: {exc}") from exc
+                recipients = tuple(
+                    str(row["label"])
+                    for row in goalflight_journal.Journal.open_reader(root).lease_records()
+                    if str(row.get("label") or "").strip()
+                )
+            except _EXPECTED_OPTIONAL_ERRORS as exc:
+                raise MessageError(
+                    f"cannot resolve unowned terminal recipients: {exc}"
+                ) from exc
+            # A terminal transition must remain deliverable even when the
+            # controller roster is momentarily empty. The wildcard is the
+            # durable orphan recipient observed by a later registration.
+            return tuple((root, recipient) for recipient in recipients) or ((root, "*"),)
+        return ()
     payload = envelope.get("payload")
     if isinstance(payload, dict) and payload.get("project_root"):
         try:
             import goalflight_task  # type: ignore
 
-            return goalflight_task.resolve_project_root(str(payload["project_root"])), "*"
+            return ((goalflight_task.resolve_project_root(str(payload["project_root"])), "*"),)
         except _EXPECTED_OPTIONAL_ERRORS as exc:
             raise MessageError(f"cannot resolve project-scoped delivery: {exc}") from exc
-    return None
+    return ()
 
 
 def _prepare_journal_delivery(
@@ -1414,96 +1437,108 @@ def _prepare_journal_delivery(
     path: Path,
     *,
     replaced_envelopes: Iterable[dict] = (),
-) -> dict[str, object] | None:
-    target = _journal_delivery_target(envelope)
-    if target is None:
+) -> tuple[dict[str, object], ...]:
+    targets = _journal_delivery_targets(envelope)
+    if not targets:
         for replaced in replaced_envelopes:
             _withdraw_journal_delivery(replaced, path)
-        return None
-    project_root, recipient_label = target
+        return ()
     try:
         import goalflight_journal  # type: ignore
 
-        authority = goalflight_journal.open_or_create_journal(project_root)
         source = envelope.get("source")
         origin_node = str(source.get("node") if isinstance(source, dict) else "local")
-        replacement_keys: list[tuple[str, str, str]] = []
+        replacement_keys_by_root: dict[Path, list[tuple[str, str, str]]] = {}
         for replaced in replaced_envelopes:
-            old_target = _journal_delivery_target(replaced)
-            if old_target is None:
-                continue
-            old_root, old_recipient = old_target
-            if old_root != project_root:
-                raise MessageError(
-                    "journal replacement cannot move an assigned event between projects"
+            replaced_source = replaced.get("source")
+            replaced_origin = str(
+                replaced_source.get("node")
+                if isinstance(replaced_source, dict)
+                else "local"
+            )
+            for old_root, old_recipient in _journal_delivery_targets(replaced):
+                replacement_keys_by_root.setdefault(old_root, []).append(
+                    (
+                        old_recipient,
+                        replaced_origin,
+                        str(replaced.get("id") or ""),
+                    )
                 )
-            old_source = replaced.get("source")
-            old_origin = str(
-                old_source.get("node") if isinstance(old_source, dict) else "local"
-            )
-            replacement_keys.append(
-                (old_recipient, old_origin, str(replaced.get("id") or ""))
-            )
-        recorded = authority.record_delivery_event(
-            recipient_label=recipient_label,
-            origin_node=origin_node,
-            event_uuid=str(envelope.get("id") or ""),
-            stream_id=str(envelope.get("dispatch_id") or ""),
-            stream_seq=int(envelope.get("seq") or 0),
-            carrier_path=path,
-            event_type=str(envelope.get("type") or ""),
-            wake_class=event_wake_class(
-                str(envelope.get("type") or ""),
-                envelope.get("payload"),
-            ),
-            created_at=str(envelope.get("ts") or ""),
-            replaces=replacement_keys,
-        )
-        if not recorded.committed:
+        target_roots = {project_root for project_root, _recipient in targets}
+        if any(old_root not in target_roots for old_root in replacement_keys_by_root):
             raise MessageError(
-                f"journal delivery assignment was not committed: {recorded.reason or recorded.disposition.value}"
+                "journal replacement cannot move an assigned event between projects"
             )
-        return {
-            "authority": authority,
-            "recipient_label": recipient_label,
-            "origin_node": origin_node,
-            "event_uuid": str(envelope["id"]),
-        }
+        assignments: list[dict[str, object]] = []
+        authorities: dict[Path, object] = {}
+        for project_root, recipient_label in targets:
+            authority = authorities.get(project_root)
+            if authority is None:
+                authority = goalflight_journal.open_or_create_journal(project_root)
+                authorities[project_root] = authority
+            recorded = authority.record_delivery_event(
+                recipient_label=recipient_label,
+                origin_node=origin_node,
+                event_uuid=str(envelope.get("id") or ""),
+                stream_id=str(envelope.get("dispatch_id") or ""),
+                stream_seq=int(envelope.get("seq") or 0),
+                carrier_path=path,
+                event_type=str(envelope.get("type") or ""),
+                wake_class=event_wake_class(
+                    str(envelope.get("type") or ""),
+                    envelope.get("payload"),
+                ),
+                created_at=str(envelope.get("ts") or ""),
+                replaces=replacement_keys_by_root.get(project_root, ()),
+            )
+            if not recorded.committed:
+                raise MessageError(
+                    "journal delivery assignment was not committed: "
+                    + str(recorded.reason or recorded.disposition.value)
+                )
+            assignments.append(
+                {
+                    "authority": authority,
+                    "recipient_label": recipient_label,
+                    "origin_node": origin_node,
+                    "event_uuid": str(envelope["id"]),
+                }
+            )
+        return tuple(assignments)
     except MessageError:
         raise
     except _EXPECTED_OPTIONAL_ERRORS as exc:
         raise MessageError(f"journal delivery assignment failed: {type(exc).__name__}: {exc}") from exc
 
 
-def _mark_journal_delivery(assignment: dict[str, object] | None) -> None:
-    if assignment is None:
-        return
-    authority = assignment["authority"]
-    result = authority.mark_delivery_projected(
-        recipient_label=str(assignment["recipient_label"]),
-        origin_node=str(assignment["origin_node"]),
-        event_uuid=str(assignment["event_uuid"]),
-    )
-    if not result.committed:
-        raise MessageError(
-            f"journal delivery projection was not committed: {result.reason or result.disposition.value}"
+def _mark_journal_delivery(assignments: Iterable[dict[str, object]]) -> None:
+    for assignment in assignments:
+        authority = assignment["authority"]
+        result = authority.mark_delivery_projected(
+            recipient_label=str(assignment["recipient_label"]),
+            origin_node=str(assignment["origin_node"]),
+            event_uuid=str(assignment["event_uuid"]),
         )
+        if not result.committed:
+            raise MessageError(
+                "journal delivery projection was not committed: "
+                + str(result.reason or result.disposition.value)
+            )
 
 
 def _withdraw_journal_delivery(envelope: dict, path: Path) -> None:
-    assignment = _prepare_journal_delivery(envelope, path)
-    if assignment is None:
-        return
-    authority = assignment["authority"]
-    result = authority.withdraw_delivery_event(
-        recipient_label=str(assignment["recipient_label"]),
-        origin_node=str(assignment["origin_node"]),
-        event_uuid=str(assignment["event_uuid"]),
-    )
-    if not result.committed:
-        raise MessageError(
-            f"journal delivery withdrawal was not committed: {result.reason or result.disposition.value}"
+    for assignment in _prepare_journal_delivery(envelope, path):
+        authority = assignment["authority"]
+        result = authority.withdraw_delivery_event(
+            recipient_label=str(assignment["recipient_label"]),
+            origin_node=str(assignment["origin_node"]),
+            event_uuid=str(assignment["event_uuid"]),
         )
+        if not result.committed:
+            raise MessageError(
+                "journal delivery withdrawal was not committed: "
+                + str(result.reason or result.disposition.value)
+            )
 
 
 def _deliver_message_to_worker(
