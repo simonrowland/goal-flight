@@ -2854,6 +2854,23 @@ def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
     requested_session_id = goalflight_session_status.resolve_controller_session_id(
         getattr(args, "controller_session_id", None)
     )
+    ambient_lease_nonce = str(
+        os.environ.get("GOALFLIGHT_CONTROLLER_LEASE_NONCE") or ""
+    ).strip() or None
+    carried_capabilities = {
+        value for value in (requested_session_id, ambient_lease_nonce) if value
+    }
+    if len(carried_capabilities) > 1:
+        args.controller_session_id = None
+        args._controller_beacon_pid = None
+        args.controller_label = None
+        return {
+            "claimed": False,
+            "reason": "conflicting_controller_capabilities",
+            "visible_warning": True,
+        }
+    if ambient_lease_nonce is not None:
+        requested_session_id = ambient_lease_nonce
     child_role = bool(
         getattr(args, "from_queue", False)
         or getattr(args, "launch_detached", False)
@@ -2861,7 +2878,30 @@ def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
     )
     session: dict | None = None
     claim_result: dict[str, object]
-    if requested_label and not child_role and requested_pid is not None:
+    if requested_label and ambient_lease_nonce is not None:
+        candidate = (
+            goalflight_session_status.live_session(
+                root,
+                label=requested_label,
+                pid=requested_pid,
+            )
+            if requested_pid is not None
+            else goalflight_session_status.live_session(root, label=requested_label)
+        )
+        if isinstance(candidate, dict) and candidate.get("id") == requested_session_id:
+            session = candidate
+            claim_result = {
+                "claimed": False,
+                "reason": "inherited_controller_capability",
+                "inherited": True,
+            }
+        else:
+            claim_result = {
+                "claimed": False,
+                "reason": "controller_capability_mismatch",
+                "visible_warning": True,
+            }
+    elif requested_label and not child_role and requested_pid is not None:
         claim_result = goalflight_session_status.claim_controller_startup(
             root,
             pid=requested_pid,

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -25,6 +26,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_journal as journal  # noqa: E402
+import goalflight_dispatch as dispatch  # noqa: E402
+import goalflight_ledger as ledger  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
 import goalflight_status as status  # noqa: E402
@@ -119,6 +122,368 @@ def _spawn_lease_lock_holder(
         stderr=subprocess.PIPE,
         text=True,
     )
+
+
+def _completion_dispatch_command(
+    root: Path,
+    tmp_path: Path,
+    dispatch_id: str,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(SCRIPTS / "goalflight_dispatch.py"),
+        "--agent",
+        "wake-test-worker",
+        "--dispatch-id",
+        dispatch_id,
+        "--tail",
+        str(tmp_path / f"{dispatch_id}.tail"),
+        "--status-json",
+        str(tmp_path / f"{dispatch_id}.status.json"),
+        "--cwd",
+        str(root),
+        "--poll-secs",
+        "0.02",
+        "--max-idle-secs",
+        "20",
+        "--foreground",
+        "--",
+        sys.executable,
+        "-c",
+        f"print('COMPLETE: {dispatch_id} — done', flush=True)",
+    ]
+
+
+def _listener_command(
+    root: Path,
+    tmp_path: Path,
+    *,
+    label: str,
+    nonce: str,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(SCRIPTS / "goalflight_messages.py"),
+        "--messages-dir",
+        str(tmp_path / "messages"),
+        "listen",
+        "--project-root",
+        str(root),
+        "--controller-label",
+        label,
+        "--lease-nonce",
+        nonce,
+        "--poll-secs",
+        "0.01",
+        "--timeout-s",
+        "8",
+        "--json",
+    ]
+
+
+def _wait_for_listener(
+    authority: journal.Journal,
+    label: str,
+    listener: subprocess.Popen[str],
+) -> None:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        coverage = authority.active_coverage(label)
+        if coverage is not None and coverage["pid"] == listener.pid:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"listener for {label} never armed")
+
+
+def _advance_all(
+    authority: journal.Journal,
+    *,
+    label: str,
+    nonce: str,
+) -> None:
+    peek = authority.cursor_peek(label, nonce=nonce, waking_only=False)
+    advances: dict[str, int] = {}
+    for item in peek.items:
+        stream_id = str(item["stream_id"])
+        advances[stream_id] = max(advances.get(stream_id, 0), int(item["stream_seq"]))
+    assert advances
+    advanced = authority.advance_cursor(
+        label,
+        nonce=nonce,
+        expected_cursor_version=peek.cursor_version,
+        advances=advances,
+        actor="wake-finish-test",
+    )
+    assert advanced.committed, advanced.reason
+
+
+def test_dispatch_inherits_ambient_lease_nonce_without_claim(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _env = isolated
+    authority = journal.open_or_create_journal(root)
+    process_identity = sessions._controller_process_identity(os.getpid())
+    assert process_identity is not None
+    claimed = authority.claim_or_renew_lease(
+        "wake-test",
+        principal={**process_identity, "hostname": "test-host"},
+    )
+    assert claimed.committed and claimed.value is not None
+    lease = claimed.value
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LEASE_NONCE", lease.nonce)
+    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_SESSION_ID", raising=False)
+    monkeypatch.setattr(
+        sessions,
+        "claim_controller_startup",
+        lambda *args, **kwargs: pytest.fail("capability inheritance attempted to claim"),
+    )
+    args = SimpleNamespace(
+        agent="wake-test-worker",
+        shape="bash",
+        dispatch_id="ambient-owner",
+        controller_label=None,
+        controller_beacon_pid=None,
+        controller_session_id=None,
+        from_queue=False,
+        launch_detached=False,
+        acp_detached_child=False,
+        takeover=False,
+        task_ids=[],
+        parent_dispatch_id=None,
+        codex_session_id=None,
+        codex_resume_home=None,
+        codex_home_owner_dispatch_id=None,
+    )
+    with wake.register_lease_holder(
+        root,
+        controller_label="wake-test",
+        lease_nonce=lease.nonce,
+    ):
+        result = dispatch._stamp_controller_session(args, root)
+    assert result == {
+        "claimed": False,
+        "reason": "inherited_controller_capability",
+        "inherited": True,
+    }
+    metadata = dispatch._prelaunch_status_metadata(args)
+    assert metadata["controller_label"] == "wake-test"
+    assert metadata["controller_session_id"] == lease.nonce
+    assert metadata["controller_pid"] == os.getpid()
+    assert authority.active_lease("wake-test") == lease
+
+
+def test_owned_worker_finish_wakes_armed_doorbell_three_runs(
+    isolated: tuple[Path, dict[str, str]],
+    tmp_path: Path,
+) -> None:
+    root, env = isolated
+    authority = journal.open_or_create_journal(root)
+    process_identity = sessions._controller_process_identity(os.getpid())
+    assert process_identity is not None
+    claimed = authority.claim_or_renew_lease(
+        "wake-test",
+        principal={**process_identity, "hostname": "test-host"},
+    )
+    assert claimed.committed and claimed.value is not None
+    lease = claimed.value
+    env["GOALFLIGHT_CONTROLLER_LEASE_NONCE"] = lease.nonce
+    env.pop("GOALFLIGHT_CONTROLLER_SESSION_ID", None)
+    env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
+    measurements: list[float] = []
+    with wake.register_lease_holder(
+        root,
+        controller_label="wake-test",
+        lease_nonce=lease.nonce,
+    ):
+        for run in range(1, 4):
+            dispatch_id = f"owned-finish-{run}"
+            listener = subprocess.Popen(
+                _listener_command(
+                    root,
+                    tmp_path,
+                    label="wake-test",
+                    nonce=lease.nonce,
+                ),
+                cwd=root,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                _wait_for_listener(authority, "wake-test", listener)
+                started = time.monotonic()
+                completed = subprocess.run(
+                    _completion_dispatch_command(root, tmp_path, dispatch_id),
+                    cwd=root,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=20,
+                )
+                listener_stdout, listener_stderr = listener.communicate(timeout=6)
+                elapsed = time.monotonic() - started
+                assert completed.returncode == 0, (completed.stdout, completed.stderr)
+                assert listener.returncode == 0, listener_stderr
+                assert json.loads(listener_stdout)["reason"] == "event"
+                assert elapsed < 5.0
+                measurements.append(elapsed)
+                record = json.loads(ledger.record_path(dispatch_id, create=False).read_text())
+                assert record["controller_label"] == "wake-test", (
+                    record,
+                    completed.stdout,
+                    completed.stderr,
+                )
+                assert record["controller_session_id"] == lease.nonce
+                rows = authority.read_all(
+                    """SELECT recipient_label FROM delivery_events
+                       WHERE stream_id = ? ORDER BY recipient_label""",
+                    (dispatch_id,),
+                )
+                assert [str(row["recipient_label"]) for row in rows] == ["wake-test"]
+                print(f"OWNED_FINISH_DOORBELL run={run} seconds={elapsed:.3f}")
+                _advance_all(authority, label="wake-test", nonce=lease.nonce)
+            finally:
+                if listener.poll() is None:
+                    listener.kill()
+                    listener.communicate(timeout=3)
+    assert len(measurements) == 3
+
+
+def test_unowned_worker_finish_fans_out_and_wakes_registered_controller(
+    isolated: tuple[Path, dict[str, str]],
+    tmp_path: Path,
+) -> None:
+    root, env = isolated
+    authority = journal.open_or_create_journal(root)
+    first = authority.claim_or_renew_lease(
+        "wake-test",
+        principal={"principal_id": "unowned-fanout-first"},
+    )
+    second = authority.claim_or_renew_lease(
+        "second-controller",
+        principal={"principal_id": "unowned-fanout-second"},
+    )
+    assert first.committed and first.value is not None
+    assert second.committed and second.value is not None
+    dispatch_env = dict(env)
+    for key in (
+        "GOALFLIGHT_CONTROLLER_LABEL",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+        "GOALFLIGHT_CONTROLLER_SESSION_ID",
+        "GOALFLIGHT_CONTROLLER_PID",
+    ):
+        dispatch_env.pop(key, None)
+    dispatch_env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
+    dispatch_id = "unowned-finish-fanout"
+    listener = subprocess.Popen(
+        _listener_command(
+            root,
+            tmp_path,
+            label="wake-test",
+            nonce=first.value.nonce,
+        ),
+        cwd=root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_listener(authority, "wake-test", listener)
+        started = time.monotonic()
+        completed = subprocess.run(
+            _completion_dispatch_command(root, tmp_path, dispatch_id),
+            cwd=root,
+            env=dispatch_env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+        listener_stdout, listener_stderr = listener.communicate(timeout=6)
+        elapsed = time.monotonic() - started
+        assert completed.returncode == 0, (completed.stdout, completed.stderr)
+        assert listener.returncode == 0, listener_stderr
+        assert json.loads(listener_stdout)["reason"] == "event"
+        assert elapsed < 5.0
+        record = json.loads(ledger.record_path(dispatch_id, create=False).read_text())
+        assert not record.get("controller_label")
+        rows = authority.read_all(
+            """SELECT recipient_label, projected_at FROM delivery_events
+               WHERE stream_id = ? ORDER BY recipient_label""",
+            (dispatch_id,),
+        )
+        assert [str(row["recipient_label"]) for row in rows] == [
+            "second-controller",
+            "wake-test",
+        ]
+        assert all(row["projected_at"] is not None for row in rows)
+        print(
+            "UNOWNED_FINISH_FANOUT "
+            f"seconds={elapsed:.3f} recipients=second-controller,wake-test"
+        )
+    finally:
+        if listener.poll() is None:
+            listener.kill()
+            listener.communicate(timeout=3)
+
+
+def test_unowned_terminal_replacement_withdraws_every_fanout_recipient(
+    isolated: tuple[Path, dict[str, str]],
+    tmp_path: Path,
+) -> None:
+    root, _env = isolated
+    authority = journal.open_or_create_journal(root)
+    for label in ("first-controller", "second-controller"):
+        claimed = authority.claim_or_renew_lease(
+            label,
+            principal={"principal_id": f"replacement-{label}"},
+        )
+        assert claimed.committed and claimed.value is not None
+
+    dispatch_id = "unowned-terminal-replacement"
+    record_path = ledger.record_path(dispatch_id)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(
+        json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "project_root": str(root),
+                "state": "running",
+            }
+        ),
+        encoding="utf-8",
+    )
+    first = messages.post_message(
+        dispatch_id=dispatch_id,
+        msg_type="result",
+        payload={"complete": True, "text": "terminal fanout"},
+        messages_dir=tmp_path / "messages",
+        source={"node": "test", "adapter": "pytest", "transport": "journal"},
+    )
+    terminal_event_id = str(first["envelope"]["id"])
+    messages.post_message(
+        dispatch_id=dispatch_id,
+        msg_type="advisory",
+        payload={"text": "replace terminal carrier"},
+        messages_dir=tmp_path / "messages",
+        source={"node": "test", "adapter": "pytest", "transport": "controller"},
+        replace_if=lambda envelope: envelope.get("id") == terminal_event_id,
+    )
+
+    rows = authority.read_all(
+        """SELECT recipient_label, withdrawn_at FROM delivery_events
+           WHERE event_uuid = ? ORDER BY recipient_label""",
+        (terminal_event_id,),
+    )
+    assert [str(row["recipient_label"]) for row in rows] == [
+        "first-controller",
+        "second-controller",
+    ]
+    assert all(row["withdrawn_at"] is not None for row in rows)
 
 
 def test_waiter_death_releases_kernel_witness_and_monitor_is_not_required(

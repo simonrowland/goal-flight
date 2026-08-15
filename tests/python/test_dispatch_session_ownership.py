@@ -220,6 +220,80 @@ def test_owning_controller_child_renews_with_nonce_and_measured_beacon(
     assert replay[replay.index("--controller-beacon-pid") + 1] == "62001"
 
 
+def test_ambient_lease_capability_inherits_owner_without_claiming(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root, authority = _state(monkeypatch, tmp_path)
+    incumbent = authority.claim_or_renew_lease(
+        "owner", principal={"pid": 62001, "start_token": "incumbent"}
+    )
+    assert incumbent.committed and incumbent.value is not None
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="owner",
+        lease_nonce=incumbent.value.nonce,
+    )
+    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_SESSION_ID", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LEASE_NONCE", incumbent.value.nonce)
+    monkeypatch.setattr(
+        sessions,
+        "claim_controller_startup",
+        lambda *_args, **_kwargs: pytest.fail("ambient inheritance attempted to claim"),
+    )
+
+    args = _args(controller_beacon_pid=None)
+    stamped = dispatch._stamp_controller_session(args, root)
+
+    assert stamped["reason"] == "inherited_controller_capability"
+    assert args.controller_label == "owner"
+    assert args.controller_session_id == incumbent.value.nonce
+    assert args._controller_beacon_pid == 62001
+    after = authority.active_lease("owner")
+    assert after is not None
+    assert after.renewed_at == incumbent.value.renewed_at
+    assert after.renew_deadline_at == incumbent.value.renew_deadline_at
+    holder.close()
+
+
+def test_mismatched_ambient_lease_capability_stays_unowned_without_claiming(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root, authority = _state(monkeypatch, tmp_path)
+    incumbent = authority.claim_or_renew_lease(
+        "owner", principal={"pid": 62001, "start_token": "incumbent"}
+    )
+    assert incumbent.committed and incumbent.value is not None
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="owner",
+        lease_nonce=incumbent.value.nonce,
+    )
+    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_SESSION_ID", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LEASE_NONCE", "foreign-capability")
+    monkeypatch.setattr(
+        sessions,
+        "claim_controller_startup",
+        lambda *_args, **_kwargs: pytest.fail("mismatched capability attempted to claim"),
+    )
+
+    args = _args(controller_beacon_pid=None)
+    stamped = dispatch._stamp_controller_session(args, root)
+
+    assert stamped["reason"] == "controller_capability_mismatch"
+    assert args.controller_label is None
+    assert args.controller_session_id is None
+    assert args._controller_beacon_pid is None
+
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_SESSION_ID", incumbent.value.nonce)
+    conflicting = _args(controller_beacon_pid=None)
+    conflict = dispatch._stamp_controller_session(conflicting, root)
+    assert conflict["reason"] == "conflicting_controller_capabilities"
+    assert conflicting.controller_label is None
+    assert conflicting.controller_session_id is None
+    assert conflicting._controller_beacon_pid is None
+    holder.close()
+
+
 def test_different_live_controller_is_refused_even_with_incumbent_nonce(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
