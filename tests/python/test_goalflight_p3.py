@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import threading
+import uuid
 
 import pytest
 
@@ -24,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_journal as journal  # noqa: E402
+import goalflight_fleet_dispatch as fleet_dispatch  # noqa: E402
 import goalflight_ledger as ledger  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
@@ -381,6 +383,90 @@ def test_cursor_peek_and_server_validated_cas_deliver_remainder(
     assert backlog_second.items
 
 
+def test_late_lower_sequence_invalidates_emitted_advance_but_fresh_batch_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    lease = _claim(authority)
+    message_args = {
+        "dispatch_id": "late-lower-stream",
+        "msg_type": "controller-notice",
+        "messages_dir": tmp_path / "messages",
+        "source": {"node": "test-node", "adapter": "test", "transport": "controller"},
+        "addressee": messages.controller_addressee("controller", project_root=project),
+    }
+    messages.post_message(payload={"text": "sequence two"}, seq=2, **message_args)
+    emitted = authority.cursor_peek("controller", nonce=lease.nonce)
+    assert [int(row["stream_seq"]) for row in emitted.items] == [2]
+
+    assignment_inserted = threading.Event()
+    allow_projection = threading.Event()
+    errors: list[BaseException] = []
+    original_mark_projected = journal.Journal.mark_delivery_projected
+
+    def pause_before_lower_becomes_visible(self, *args, **kwargs):
+        assignment_inserted.set()
+        assert allow_projection.wait(5), "late lower-sequence projection was not released"
+        return original_mark_projected(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        journal.Journal,
+        "mark_delivery_projected",
+        pause_before_lower_becomes_visible,
+    )
+
+    def insert_late_lower() -> None:
+        try:
+            messages.post_message(payload={"text": "late sequence one"}, seq=1, **message_args)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    worker = threading.Thread(target=insert_late_lower, name="late-lower-delivery")
+    worker.start()
+    try:
+        assert assignment_inserted.wait(5), "late lower-sequence assignment did not finish"
+        while_unprojected = authority.cursor_peek("controller", nonce=lease.nonce)
+        assert [int(row["stream_seq"]) for row in while_unprojected.items] == [2]
+        assert while_unprojected.cursor_version > emitted.cursor_version
+        stale_before_projection = authority.advance_cursor(
+            "controller",
+            nonce=lease.nonce,
+            expected_cursor_version=emitted.cursor_version,
+            advances={"late-lower-stream": 2},
+            actor="stale-before-projection",
+        )
+        assert stale_before_projection.cas_lost
+    finally:
+        allow_projection.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert errors == []
+
+    stale = authority.advance_cursor(
+        "controller",
+        nonce=lease.nonce,
+        expected_cursor_version=while_unprojected.cursor_version,
+        advances={"late-lower-stream": 2},
+        actor="stale-after-projection",
+    )
+    assert stale.cas_lost
+    assert authority.cursor_status("controller")["positions"] == {}
+
+    refreshed = authority.cursor_peek("controller", nonce=lease.nonce)
+    assert [int(row["stream_seq"]) for row in refreshed.items] == [1, 2]
+    assert authority.advance_cursor(
+        "controller",
+        nonce=lease.nonce,
+        expected_cursor_version=refreshed.cursor_version,
+        advances={"late-lower-stream": 2},
+        actor="fresh-emitted-command",
+    ).committed
+    assert authority.pending_delivery_events("controller", waking_only=False) == []
+
+
 def test_terminal_projection_targets_owned_exactly_and_unowned_by_fanout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -447,6 +533,81 @@ def test_terminal_projection_targets_owned_exactly_and_unowned_by_fanout(
     assert len(authority.read_all("SELECT 1 FROM delivery_events")) == 3
 
 
+def test_unowned_terminal_revalidates_retiring_roster_inside_assignment_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    retiring = _claim(authority, "retiring-controller")
+    dispatch_id = "retirement-race-terminal"
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": dispatch_id,
+            "project_root": str(project),
+            "state": "running",
+        }
+    )
+
+    roster_snapshotted = threading.Event()
+    allow_assignment = threading.Event()
+    original_record_delivery = journal.Journal.record_delivery_event
+
+    def pause_after_roster_snapshot(self, *args, **kwargs):
+        if kwargs.get("recipient_label") == "retiring-controller":
+            roster_snapshotted.set()
+            assert allow_assignment.wait(5), "retirement race was not released"
+        return original_record_delivery(self, *args, **kwargs)
+
+    monkeypatch.setattr(journal.Journal, "record_delivery_event", pause_after_roster_snapshot)
+    outcome: dict[str, object] = {}
+
+    def project_terminal() -> None:
+        try:
+            outcome["result"] = messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="result",
+                payload={"complete": True, "text": "retirement race"},
+                messages_dir=tmp_path / "messages",
+                source={"node": "test", "adapter": "pytest", "transport": "journal"},
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            outcome["error"] = exc
+
+    projector = threading.Thread(target=project_terminal, name="retirement-race-projector")
+    projector.start()
+    assert roster_snapshotted.wait(5), "projection never reached the assignment boundary"
+    released = authority.release_lease(
+        "retiring-controller",
+        nonce=retiring.nonce,
+        reason="retired-during-projection",
+    )
+    assert released.committed
+    allow_assignment.set()
+    projector.join(timeout=5)
+    assert not projector.is_alive()
+    assert "error" not in outcome, outcome.get("error")
+
+    rows = authority.read_all(
+        """SELECT recipient_label, projected_at, withdrawn_at
+           FROM delivery_events WHERE stream_id = ?""",
+        (dispatch_id,),
+    )
+    assert len(rows) == 1
+    assert rows[0]["recipient_label"] == "*"
+    assert rows[0]["projected_at"] is not None
+    assert rows[0]["withdrawn_at"] is None
+
+    successor = _claim(authority, "successor-controller")
+    pending = authority.cursor_peek(
+        "successor-controller",
+        nonce=successor.nonce,
+    )
+    assert [str(row["stream_id"]) for row in pending.items] == [dispatch_id]
+
+
 def test_unowned_terminal_projection_with_no_controller_is_held_for_registration(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -494,6 +655,119 @@ def test_unowned_terminal_projection_with_no_controller_is_held_for_registration
         nonce=lease.nonce,
     )
     assert [str(row["stream_id"]) for row in pending.items] == [dispatch_id]
+
+
+def test_first_wildcard_processor_adopts_once_while_unhandled_rows_wait(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+
+    def insert_delivery(
+        stream_id: str,
+        *,
+        recipient_label: str = "*",
+        event_id: str | None = None,
+    ) -> str:
+        event_id = event_id or str(uuid.uuid4())
+        recorded = authority.record_delivery_event(
+            recipient_label=recipient_label,
+            origin_node="test-node",
+            event_uuid=event_id,
+            stream_id=stream_id,
+            stream_seq=1,
+            carrier_path=tmp_path / f"{stream_id}.jsonl",
+            event_type="result",
+            wake_class="waking",
+            created_at=journal.utc_now(),
+        )
+        assert recorded.committed
+        projected = authority.mark_delivery_projected(
+            recipient_label=recipient_label,
+            origin_node="test-node",
+            event_uuid=event_id,
+        )
+        assert projected.committed
+        return event_id
+
+    insert_delivery("wildcard-handled-once")
+    leases = {
+        label: _claim(authority, label)
+        for label in ("first-processor", "second-processor")
+    }
+    peeks = {
+        label: authority.cursor_peek(label, nonce=lease.nonce)
+        for label, lease in leases.items()
+    }
+    assert all(
+        [str(row["stream_id"]) for row in peek.items] == ["wildcard-handled-once"]
+        for peek in peeks.values()
+    )
+    barrier = threading.Barrier(2)
+
+    def process(label: str):
+        barrier.wait()
+        return journal.Journal(project).advance_cursor(
+            label,
+            nonce=leases[label].nonce,
+            expected_cursor_version=peeks[label].cursor_version,
+            advances={"wildcard-handled-once": 1},
+            actor=label,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = dict(zip(leases, pool.map(process, leases)))
+    assert sum(result.committed for result in outcomes.values()) == 1
+    assert sum(result.cas_lost for result in outcomes.values()) == 1
+    winner = next(label for label, result in outcomes.items() if result.committed)
+    handled = authority.read_all(
+        """SELECT recipient_label, withdrawn_at FROM delivery_events
+           WHERE stream_id = 'wildcard-handled-once'"""
+    )
+    assert len(handled) == 1
+    assert handled[0]["recipient_label"] == winner
+    assert handled[0]["withdrawn_at"] is None
+
+    late = _claim(authority, "late-controller")
+    assert authority.cursor_peek("late-controller", nonce=late.nonce).items == ()
+
+    conflict_event = str(uuid.uuid4())
+    insert_delivery(
+        "wildcard-conflicts-with-exact",
+        recipient_label="late-controller",
+        event_id=conflict_event,
+    )
+    insert_delivery("wildcard-conflicts-with-exact", event_id=conflict_event)
+    conflict = authority.cursor_peek("late-controller", nonce=late.nonce)
+    assert len(conflict.items) == 2
+    assert authority.advance_cursor(
+        "late-controller",
+        nonce=late.nonce,
+        expected_cursor_version=conflict.cursor_version,
+        advances={"wildcard-conflicts-with-exact": 1},
+        actor="exact-conflict-processor",
+    ).committed
+    conflict_rows = authority.read_all(
+        """SELECT recipient_label, withdrawn_at FROM delivery_events
+           WHERE stream_id = 'wildcard-conflicts-with-exact'
+           ORDER BY recipient_label"""
+    )
+    assert [str(row["recipient_label"]) for row in conflict_rows] == [
+        "*",
+        "late-controller",
+    ]
+    assert conflict_rows[0]["withdrawn_at"] is not None
+    assert conflict_rows[1]["withdrawn_at"] is None
+
+    later = _claim(authority, "later-controller")
+    assert authority.cursor_peek("later-controller", nonce=later.nonce).items == ()
+    insert_delivery("wildcard-still-unhandled")
+    waiting = authority.cursor_peek("later-controller", nonce=later.nonce)
+    assert [str(row["stream_id"]) for row in waiting.items] == [
+        "wildcard-still-unhandled"
+    ]
 
 
 def test_unowned_terminal_projection_wakes_armed_doorbell_three_runs(
@@ -641,7 +915,7 @@ def test_cursor_cas_has_one_winner_under_32_way_contention(
     assert all(result.committed or result.cas_lost or result.retryable for result in outcomes)
     cursor = authority.cursor_status("controller")
     assert cursor is not None
-    assert cursor["cursor_version"] == 1
+    assert cursor["cursor_version"] == peek.cursor_version + 1
     assert cursor["positions"] == {"contended-stream": 1}
 
 
@@ -1097,6 +1371,87 @@ def test_worktree_and_parent_share_one_lease_journal(
     assert worktree_authority.path == parent_authority.path
 
 
+def test_every_dispatch_writer_stores_main_root_before_worktree_disappears(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    main = tmp_path / "canonical-main"
+    worktree = tmp_path / "disposable-worktree"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=main, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"], cwd=main, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "P3 Test"], cwd=main, check=True)
+    (main / "seed").write_text("seed\n")
+    subprocess.run(["git", "add", "seed"], cwd=main, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=main, check=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "--detach", str(worktree)],
+        cwd=main,
+        check=True,
+    )
+    canonical_main = str(main.resolve())
+
+    monkeypatch.chdir(worktree)
+    assert ledger.main(
+        [
+            "record",
+            "--dispatch-id",
+            "local-worktree-writer",
+            "--agent",
+            "test-worker",
+            "--project-root",
+            ".",
+            "--state",
+            "complete",
+            "--json",
+        ]
+    ) == 0
+    preview = fleet_dispatch.DispatchPreview(
+        dispatch_id="fleet-worktree-writer",
+        node_id="test-node",
+        agent="codex-acp",
+        billing_account="openai/test",
+        prompt="race.md",
+        worktree_path="/remote/disposable",
+        base_sha="a" * 40,
+    )
+    fleet_dispatch.record_dispatch_ledger(
+        preview,
+        fleet_dispatch.LockChainResult(remote_lease_id="remote-lease"),
+    )
+
+    for dispatch_id in ("local-worktree-writer", "fleet-worktree-writer"):
+        stored = json.loads(ledger.record_path(dispatch_id, create=False).read_text())
+        assert stored["project_root"] == canonical_main
+
+    authority = journal.open_or_create_journal(main)
+    lease = _claim(authority, "surviving-controller")
+    monkeypatch.chdir(main)
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(worktree)],
+        cwd=main,
+        check=True,
+    )
+    assert not worktree.exists()
+
+    for dispatch_id in ("local-worktree-writer", "fleet-worktree-writer"):
+        messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="result",
+            payload={"complete": True, "text": "after worktree removal"},
+            messages_dir=tmp_path / "messages",
+            source={"node": "test", "adapter": "pytest", "transport": "journal"},
+        )
+    pending = authority.cursor_peek("surviving-controller", nonce=lease.nonce)
+    assert {str(row["stream_id"]) for row in pending.items} == {
+        "local-worktree-writer",
+        "fleet-worktree-writer",
+    }
+
+
 def test_auto_claim_is_controller_only_and_never_steals_live_label(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1221,7 +1576,7 @@ def test_hidden_consumers_use_journal_and_relay_is_peek_only(
         "hidden-stream": 1,
         "task-store:goal-flight-hidden": 1,
     }
-    assert relay_payload["cursor_version"] == 0
+    assert relay_payload["cursor_version"] == before["cursor_version"]
     advance_argv = shlex.split(relay_payload["advance_command"])
     assert advance_argv[-3:] == [
         "--position",

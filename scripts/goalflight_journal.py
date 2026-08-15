@@ -1932,6 +1932,12 @@ class Journal:
                 now,
             ),
         )
+        cls._invalidate_delivery_cursor_snapshots(
+            connection,
+            project_root=project_root,
+            recipient_label="*",
+            updated_at=now,
+        )
         return payload
 
     def active_lease(self, label: str) -> LeaseIdentity | None:
@@ -2226,6 +2232,7 @@ class Journal:
         wake_class: str,
         created_at: str,
         replaces: Iterable[tuple[str, str, str]] = (),
+        fallback_to_wildcard_if_inactive: bool = False,
     ) -> WriteResult[dict[str, object]]:
         recipient = (
             "*"
@@ -2263,13 +2270,23 @@ class Journal:
         project_root = str(self.project_root)
 
         def action(connection: sqlite3.Connection) -> dict[str, object]:
+            effective_recipient = recipient
+            if fallback_to_wildcard_if_inactive and recipient != "*":
+                active = connection.execute(
+                    """SELECT 1 FROM controller_leases
+                       WHERE project_root = ? AND label = ? AND state = 'ACTIVE'
+                       LIMIT 1""",
+                    (project_root, recipient),
+                ).fetchone()
+                if active is None:
+                    effective_recipient = "*"
             existing = connection.execute(
                 """
                 SELECT * FROM delivery_events
                 WHERE project_root = ? AND recipient_label = ?
                   AND origin_node = ? AND event_uuid = ?
                 """,
-                (project_root, recipient, origin, event_id),
+                (project_root, effective_recipient, origin, event_id),
             ).fetchone()
             expected = {
                 "stream_id": stream,
@@ -2312,7 +2329,7 @@ class Journal:
                 """,
                 (
                     project_root,
-                    recipient,
+                    effective_recipient,
                     origin,
                     event_id,
                     stream,
@@ -2323,9 +2340,15 @@ class Journal:
                     created_at,
                 ),
             )
+            self._invalidate_delivery_cursor_snapshots(
+                connection,
+                project_root=project_root,
+                recipient_label=effective_recipient,
+                updated_at=utc_now(),
+            )
             return {
                 "project_root": project_root,
-                "recipient_label": recipient,
+                "recipient_label": effective_recipient,
                 "origin_node": origin,
                 "event_uuid": event_id,
                 **expected,
@@ -2333,6 +2356,34 @@ class Journal:
             }
 
         return self._domain_write(action)
+
+    @staticmethod
+    def _invalidate_delivery_cursor_snapshots(
+        connection: sqlite3.Connection,
+        *,
+        project_root: str,
+        recipient_label: str,
+        updated_at: str,
+        exclude_label: str | None = None,
+    ) -> int:
+        """Bump every cursor whose pending view can change for a delivery row."""
+        predicates = ["project_root = ?"]
+        parameters: list[object] = [updated_at, project_root]
+        if recipient_label != "*":
+            predicates.append("label = ?")
+            parameters.append(recipient_label)
+        if exclude_label is not None:
+            predicates.append("label != ?")
+            parameters.append(exclude_label)
+        updated = connection.execute(
+            """
+            UPDATE controller_cursors
+            SET cursor_version = cursor_version + 1, updated_at = ?
+            WHERE """
+            + " AND ".join(predicates),
+            parameters,
+        )
+        return int(updated.rowcount)
 
     def mark_delivery_projected(
         self,
@@ -2362,7 +2413,7 @@ class Journal:
             if row is None:
                 raise CASMismatch("delivery projection lost: assignment row is absent")
             projected_at = str(row["projected_at"] or utc_now())
-            connection.execute(
+            updated = connection.execute(
                 """
                 UPDATE delivery_events SET projected_at = ?
                 WHERE project_root = ? AND recipient_label = ?
@@ -2370,6 +2421,16 @@ class Journal:
                 """,
                 (projected_at, project_root, recipient, origin, event_id),
             )
+            if updated.rowcount == 1:
+                # Visibility is a second inbox-view mutation after the durable
+                # assignment insert.  Invalidating both closes the prepare /
+                # projection window for commands emitted concurrently.
+                self._invalidate_delivery_cursor_snapshots(
+                    connection,
+                    project_root=project_root,
+                    recipient_label=recipient,
+                    updated_at=projected_at,
+                )
             result = dict(row)
             result["projected_at"] = projected_at
             return result
@@ -2603,6 +2664,7 @@ class Journal:
             ):
                 raise CASMismatch("cursor CAS lost: lease generation changed")
             generation = int(lease["generation"])
+            current_positions: dict[str, int] = {}
             for stream, position in normalized_advances.items():
                 current = connection.execute(
                     """SELECT position FROM controller_stream_cursors
@@ -2611,6 +2673,9 @@ class Journal:
                 ).fetchone()
                 if current is not None and int(current["position"]) >= position:
                     raise CASMismatch("cursor CAS lost: position is already advanced")
+                current_positions[stream] = (
+                    int(current["position"]) if current is not None else 0
+                )
                 known = connection.execute(
                     """SELECT 1 FROM delivery_events
                        WHERE project_root = ? AND recipient_label IN (?, '*')
@@ -2624,6 +2689,82 @@ class Journal:
                         f"cursor CAS lost: server has no pending position {stream}={position}"
                     )
             now = utc_now()
+            adopted_wildcards = 0
+            for stream, position in normalized_advances.items():
+                current_position = current_positions[stream]
+                # A recipient can already have an exact fanout row at the same
+                # stream position as a wildcard (for example when another
+                # snapshotted recipient retired).  The wildcard cannot be
+                # renamed across the live stream-position uniqueness boundary,
+                # so the first successful processor withdraws that duplicate.
+                withdrawn = connection.execute(
+                    """
+                    UPDATE delivery_events
+                    SET withdrawn_at = ?
+                    WHERE rowid IN (
+                        SELECT wildcard.rowid
+                        FROM delivery_events AS wildcard
+                        JOIN delivery_events AS exact
+                          ON exact.project_root = wildcard.project_root
+                         AND exact.recipient_label = ?
+                         AND (
+                              (
+                                  exact.origin_node = wildcard.origin_node
+                                  AND exact.event_uuid = wildcard.event_uuid
+                              )
+                              OR (
+                                  exact.stream_id = wildcard.stream_id
+                                  AND exact.stream_seq = wildcard.stream_seq
+                                  AND exact.withdrawn_at IS NULL
+                              )
+                         )
+                        WHERE wildcard.project_root = ?
+                          AND wildcard.recipient_label = '*'
+                          AND wildcard.stream_id = ?
+                          AND wildcard.stream_seq > ? AND wildcard.stream_seq <= ?
+                          AND wildcard.projected_at IS NOT NULL
+                          AND wildcard.withdrawn_at IS NULL
+                    )
+                    """,
+                    (
+                        now,
+                        resolved_label,
+                        project_root,
+                        stream,
+                        current_position,
+                        position,
+                    ),
+                )
+                adopted_wildcards += int(withdrawn.rowcount)
+                adopted = connection.execute(
+                    """
+                    UPDATE delivery_events
+                    SET recipient_label = ?
+                    WHERE project_root = ? AND recipient_label = '*'
+                      AND stream_id = ? AND stream_seq > ? AND stream_seq <= ?
+                      AND projected_at IS NOT NULL AND withdrawn_at IS NULL
+                    """,
+                    (
+                        resolved_label,
+                        project_root,
+                        stream,
+                        current_position,
+                        position,
+                    ),
+                )
+                adopted_wildcards += int(adopted.rowcount)
+            if adopted_wildcards:
+                # Adoption removes rows from every other controller's wildcard
+                # view.  Invalidate their emitted commands in the same
+                # transaction; the advancing controller performs its ordinary
+                # version increment below.
+                self._invalidate_delivery_cursor_snapshots(
+                    connection,
+                    project_root=project_root,
+                    recipient_label="*",
+                    updated_at=now,
+                    exclude_label=resolved_label,
+                )
             updated = connection.execute(
                 """
                 UPDATE controller_cursors
@@ -3377,7 +3518,7 @@ class Journal:
                     (str(self.project_root),),
                 ).fetchone()[0]
             )
-            connection.execute(
+            inserted = connection.execute(
                 """
                 INSERT OR IGNORE INTO delivery_events (
                     project_root, recipient_label, origin_node, event_uuid,
@@ -3395,6 +3536,13 @@ class Journal:
                     now,
                 ),
             )
+            if inserted.rowcount == 1:
+                self._invalidate_delivery_cursor_snapshots(
+                    connection,
+                    project_root=str(self.project_root),
+                    recipient_label="*",
+                    updated_at=now,
+                )
             return {"attempts": attempts, "retry_at": None, "quarantined": True}
 
         return self._domain_write(action)

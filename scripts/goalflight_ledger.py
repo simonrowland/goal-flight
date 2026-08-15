@@ -68,6 +68,16 @@ def state_dir() -> Path:
     return goalflight_compat.resolve_state_dir()
 
 
+def canonicalize_project_root_on_store(project_root: object) -> str:
+    """Return the worktree-collapsed project identity persisted in the ledger.
+
+    Delivery targeting deliberately trusts stored roots and must not spawn git
+    while reading a record.  Every ledger persistence therefore crosses this
+    write-side boundary; repeating it for updates is intentionally idempotent.
+    """
+    return str(goalflight_task.resolve_project_root(str(project_root)))
+
+
 def runs_dir(*, create: bool = True) -> Path:
     path = state_dir() / "runs.d"
     if create:
@@ -386,6 +396,10 @@ def record_path(dispatch_id: str, *, create: bool = True) -> Path:
 
 
 def write_record(record: dict) -> Path:
+    if record.get("project_root") not in (None, ""):
+        record["project_root"] = canonicalize_project_root_on_store(
+            record["project_root"]
+        )
     record["updated_at"] = utc_now()
     path = record_path(record["dispatch_id"])
     tmp = path.with_suffix(".json.tmp")

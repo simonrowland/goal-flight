@@ -1375,14 +1375,21 @@ def _dispatch_record(dispatch_id: str) -> tuple[dict | None, str | None]:
     return record, None
 
 
-def _journal_delivery_targets(envelope: dict) -> tuple[tuple[Path, str], ...]:
+def _journal_delivery_targets(envelope: dict) -> tuple[tuple[Path, str, bool], ...]:
+    """Return root, recipient, and whether an exact roster choice must stay active."""
     addressee_label = controller_addressee_label(envelope)
     addressee_root = controller_addressee_project_root(envelope)
     if addressee_label and addressee_root:
         try:
             import goalflight_task  # type: ignore
 
-            return ((goalflight_task.resolve_project_root(addressee_root), addressee_label),)
+            return (
+                (
+                    goalflight_task.resolve_project_root(addressee_root),
+                    addressee_label,
+                    False,
+                ),
+            )
         except _EXPECTED_OPTIONAL_ERRORS as exc:
             raise MessageError(f"cannot resolve controller delivery project: {exc}") from exc
     record, lookup_error = _dispatch_record(str(envelope.get("dispatch_id") or ""))
@@ -1397,7 +1404,7 @@ def _journal_delivery_targets(envelope: dict) -> tuple[tuple[Path, str], ...]:
         # spawn anything (test_dispatch_steer enforces that contract).
         root = Path(str(record["project_root"]))
         if label:
-            return ((root, label),)
+            return ((root, label, False),)
         if canonical_event_type(str(envelope.get("type") or "")) in {
             "result",
             "blocked",
@@ -1419,14 +1426,25 @@ def _journal_delivery_targets(envelope: dict) -> tuple[tuple[Path, str], ...]:
             # A terminal transition must remain deliverable even when the
             # controller roster is momentarily empty. The wildcard is the
             # durable orphan recipient observed by a later registration.
-            return tuple((root, recipient) for recipient in recipients) or ((root, "*"),)
+            # Exact labels came from a non-transactional roster snapshot.  The
+            # assignment write revalidates each one under BEGIN IMMEDIATE and
+            # degrades a retired choice to the durable wildcard.
+            return tuple((root, recipient, True) for recipient in recipients) or (
+                (root, "*", False),
+            )
         return ()
     payload = envelope.get("payload")
     if isinstance(payload, dict) and payload.get("project_root"):
         try:
             import goalflight_task  # type: ignore
 
-            return ((goalflight_task.resolve_project_root(str(payload["project_root"])), "*"),)
+            return (
+                (
+                    goalflight_task.resolve_project_root(str(payload["project_root"])),
+                    "*",
+                    False,
+                ),
+            )
         except _EXPECTED_OPTIONAL_ERRORS as exc:
             raise MessageError(f"cannot resolve project-scoped delivery: {exc}") from exc
     return ()
@@ -1456,7 +1474,11 @@ def _prepare_journal_delivery(
                 if isinstance(replaced_source, dict)
                 else "local"
             )
-            for old_root, old_recipient in _journal_delivery_targets(replaced):
+            for (
+                old_root,
+                old_recipient,
+                _require_active,
+            ) in _journal_delivery_targets(replaced):
                 replacement_keys_by_root.setdefault(old_root, []).append(
                     (
                         old_recipient,
@@ -1464,14 +1486,16 @@ def _prepare_journal_delivery(
                         str(replaced.get("id") or ""),
                     )
                 )
-        target_roots = {project_root for project_root, _recipient in targets}
+        target_roots = {
+            project_root for project_root, _recipient, _require_active in targets
+        }
         if any(old_root not in target_roots for old_root in replacement_keys_by_root):
             raise MessageError(
                 "journal replacement cannot move an assigned event between projects"
             )
         assignments: list[dict[str, object]] = []
         authorities: dict[Path, object] = {}
-        for project_root, recipient_label in targets:
+        for project_root, recipient_label, require_active_recipient in targets:
             authority = authorities.get(project_root)
             if authority is None:
                 authority = goalflight_journal.open_or_create_journal(project_root)
@@ -1490,16 +1514,20 @@ def _prepare_journal_delivery(
                 ),
                 created_at=str(envelope.get("ts") or ""),
                 replaces=replacement_keys_by_root.get(project_root, ()),
+                fallback_to_wildcard_if_inactive=require_active_recipient,
             )
             if not recorded.committed:
                 raise MessageError(
                     "journal delivery assignment was not committed: "
                     + str(recorded.reason or recorded.disposition.value)
                 )
+            actual_recipient = str(
+                (recorded.value or {}).get("recipient_label") or recipient_label
+            )
             assignments.append(
                 {
                     "authority": authority,
-                    "recipient_label": recipient_label,
+                    "recipient_label": actual_recipient,
                     "origin_node": origin_node,
                     "event_uuid": str(envelope["id"]),
                 }
