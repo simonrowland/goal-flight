@@ -64,3 +64,4 @@ tests/python/ext
 # committing one both leaks the operator's tree and makes every tick a diff.
 templates/fleet-console/fleet-data.js
 templates/fleet-console/attention-data.js
+*.assembled.prompt
