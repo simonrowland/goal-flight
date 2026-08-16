@@ -460,7 +460,10 @@ def test_windows_acp_warnings_written_to_tail() -> None:
         orig_run_acp_dispatch = ACP.run_acp_dispatch
         try:
             D.goalflight_compat.is_windows = lambda: True
-            D._build_acp_cfg = lambda patched_args, status_json: SimpleNamespace(
+            # Signature mirrors the real _build_acp_cfg (base= added with the
+            # persisted-prompt work); extra kwargs are absorbed so this double
+            # does not drift red again on additive parameters.
+            D._build_acp_cfg = lambda patched_args, status_json, **_kw: SimpleNamespace(
                 dispatch_id=patched_args.dispatch_id,
                 agent=patched_args.agent,
             )

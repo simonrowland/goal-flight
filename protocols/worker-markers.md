@@ -1,6 +1,9 @@
 # Worker Marker Protocol
 
-New workers emit sigiled, parseable markers on their own lines:
+New workers emit sigiled, parseable markers on their own lines. `STATUS` is
+the progress verb. `READY` and `COMPLETE` are terminal-only, and `FAILED` is a
+failure terminal. `RESULT` is a completed-work summary that may precede the
+terminal marker:
 
 - `!STATUS: <current activity>`
 - `!STEER-ACK: <seq>` — steer mailbox message acknowledged
@@ -24,6 +27,10 @@ permission downgrades to `blocked_permission_denied`.
 
 Rules:
 
+- Use `!STATUS:` for loading, planning, testing, and every other mid-run update.
+  `!RESULT:` records a completed item or gate summary and may be followed by
+  more output plus the final `!COMPLETE:` or `!READY:` marker.
+
 - At a dispatch boundary every terminal payload begins with that exact dispatch
   id, optionally followed by an em dash and details: `!COMPLETE: <dispatch-id> —
   <summary>`. The dispatcher injects the exact id. A generic marker, bare
@@ -35,9 +42,16 @@ Rules:
   `USER-NEED`, `USER-CONFIRM`, `BLOCKED`. Transport policy decides whether a
   recognized marker stops the current loop.
 - The live watcher recognizes a terminal marker only as the worker's **final** non-empty line (mid-output / code-fence markers are ignored — the injection guard).
+- A success-terminal candidate does not become irrevocable while its worker is
+  still live. If the identity-checked worker keeps producing output after the
+  candidate, the watcher logs and discards that false positive after its short
+  exit grace, then resumes watching. A later legitimate terminal marker still
+  completes normally when the worker exits or reaches the no-growth idle path.
 - Dead/stale reconciliation may promote the last valid terminal marker from anywhere in the completed post-prompt tail. This handles workers that emit `!READY:` and then a trailing TL;DR after the marker.
-- `RESULT` and `COMPLETE` mean done unless the status JSON shows a process error.
-- `COMPLETE`, `READY`, and `RESULT` are success terminals; `FAILED` is a failure terminal.
+- `COMPLETE` and `READY` are success terminals; `FAILED` is a failure terminal.
+  `RESULT` is a success candidate, but watchers terminalize it only after worker
+  exit or the no-growth idle rule. Live growth after `RESULT` discards that
+  candidate and keeps watching for the actual terminal marker.
 - `USER-NEED`, `BLOCKED`, and `FAILED` stop the dispatch loop and surface to the orchestrator.
 - Bash-tail keeps `USER-CONFIRM` terminal. Unattended ACP routes it to the
   controller without cancelling the turn, preserves partial output, and waits

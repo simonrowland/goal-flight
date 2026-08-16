@@ -477,6 +477,62 @@ def test_false_death_marker_poison_pairs() -> None:
             )
 
 
+def test_marker_docs_preserve_result_summary_workflows() -> None:
+    protocol = (ROOT / "protocols" / "worker-markers.md").read_text(encoding="utf-8")
+    skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+    chunk_review = (ROOT / "protocols" / "chunk-review.md").read_text(encoding="utf-8")
+    dispatch_wrapper = (ROOT / "prompts" / "dispatch-wrapper.md").read_text(encoding="utf-8")
+    task_lifecycle = (ROOT / "protocols" / "task-lifecycle.md").read_text(encoding="utf-8")
+    assert_true(
+        "protocol says RESULT may precede terminal",
+        "`RESULT` is a completed-work summary that may precede the\nterminal marker" in protocol,
+    )
+    assert_true(
+        "protocol limits RESULT terminalization to exit or idle",
+        "watchers terminalize it only after worker\n  exit or the no-growth idle rule" in protocol,
+    )
+    assert_true(
+        "protocol keeps READY and COMPLETE terminal-only",
+        "`READY` and `COMPLETE` are terminal-only" in protocol,
+    )
+    assert_true("protocol keeps FAILED terminal", "`FAILED` is a\nfailure terminal" in protocol)
+    assert_true(
+        "skill mirrors RESULT summary semantics",
+        "`RESULT:` is a completed-work summary that may precede\nthe final marker" in skill,
+    )
+    assert_true("skill identifies STATUS as progress", "`STATUS:` is progress" in skill)
+    claimed_surfaces = {
+        "chunk review": chunk_review,
+        "dispatch wrapper": dispatch_wrapper,
+        "task lifecycle": task_lifecycle,
+    }
+    expected_summary_phrases = {
+        "chunk review": "optionally summarize them with `RESULT:`, then finish with a terminal",
+        "dispatch wrapper": "`RESULT` is a pre-terminal completed-work summary",
+        "task lifecycle": "optionally after a pre-terminal `RESULT` summary",
+    }
+    forbidden_final_phrases = (
+        "finish with `result`",
+        "`result` as the final",
+        "`result` is terminal",
+        "`result` is a terminal",
+        "`result` terminal-only",
+        "final `result`",
+        "actual terminal marker (`result`",
+    )
+    for name, body in claimed_surfaces.items():
+        assert_true(
+            f"{name} preserves RESULT as a summary",
+            expected_summary_phrases[name] in body,
+        )
+        lowered = body.lower()
+        for phrase in forbidden_final_phrases:
+            assert_true(
+                f"{name} does not describe RESULT as final via {phrase!r}",
+                phrase not in lowered,
+            )
+
+
 def main() -> None:
     test_terminal_state_poison_pairs()
     test_terminal_state_shared_sets_cover_lease_pruning()
@@ -488,6 +544,7 @@ def main() -> None:
     test_recorded_terminal_success_marker()
     test_terminal_marker_dispatch_identity_poison_pairs()
     test_false_death_marker_poison_pairs()
+    test_marker_docs_preserve_result_summary_workflows()
     print("OK: terminal vocabulary poison-pair tests pass")
 
 

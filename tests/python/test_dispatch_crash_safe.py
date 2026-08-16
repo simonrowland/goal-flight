@@ -18,6 +18,8 @@ from support import skip_posix_on_native_windows
 skip_posix_on_native_windows("crash-safety tests launch POSIX bash workers")
 
 import json
+import contextlib
+import io
 import os
 import signal
 import subprocess
@@ -35,6 +37,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_acp_client  # noqa: E402
 import goalflight_rate_pressure  # noqa: E402
+import goalflight_watch  # noqa: E402
 
 
 def _isolate_state_env(env: dict[str, str], base: Path) -> None:
@@ -243,8 +246,18 @@ def case_post_terminal_idle_worker_times_out_inconclusively() -> None:
         env["GOALFLIGHT_TEST_MODE"] = "1"
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
         worker_code = (
-            "import time\n"
+            "import json, pathlib, time\n"
+            f"status = pathlib.Path({str(status)!r})\n"
             "print('COMPLETE: post-terminal-idle — done', flush=True)\n"
+            "deadline = time.monotonic() + 5\n"
+            "while time.monotonic() < deadline:\n"
+            "    try:\n"
+            "        if json.loads(status.read_text()).get('state') == 'running_after_terminal':\n"
+            "            break\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "    time.sleep(0.02)\n"
+            "print('TL;DR: summary flushed after the candidate', flush=True)\n"
             "while True:\n"
             "    time.sleep(1)\n"
         )
@@ -289,6 +302,11 @@ def case_post_terminal_idle_worker_times_out_inconclusively() -> None:
             assert payload.get("worker_alive") is True, payload
             assert payload.get("reason") == "marker:COMPLETE:post_terminal_idle_timeout", payload
             assert payload.get("terminal_pending_state") == "complete", payload
+            evidence = payload.get("last_discarded_terminal_evidence") or {}
+            assert evidence.get("kind") == "COMPLETE", evidence
+            assert evidence.get("dispatch_id_binding") == "post-terminal-idle", evidence
+            assert isinstance(evidence.get("offset"), int) and evidence["offset"] > 0, evidence
+            assert not payload.get("terminal_marker"), payload
             assert worker.poll() is None, "worker should still be alive until test cleanup"
         finally:
             if watcher.poll() is None:
@@ -299,7 +317,401 @@ def case_post_terminal_idle_worker_times_out_inconclusively() -> None:
                 worker.wait(timeout=5)
 
 
-def case_post_terminal_busy_worker_wait_is_bounded() -> None:
+def case_worker_death_reconciliation_streams_beyond_tail_window() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        tail = tmp_path / "tail.txt"
+        status = tmp_path / "status.json"
+        with tail.open("wb") as stream:
+            stream.write(b"COMPLETE: deep-death-reconcile -- durable marker\n")
+            stream.seek(11 * 1024 * 1024, os.SEEK_SET)
+            stream.write(b"trailing worker log after sparse gap\n")
+        assert tail.stat().st_size > 10 * 1024 * 1024
+
+        env = os.environ.copy()
+        _isolate_state_env(env, tmp_path)
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(WATCH),
+                "--pid",
+                str(_dead_pid()),
+                "--tail",
+                str(tail),
+                "--status-json",
+                str(status),
+                "--dispatch-id",
+                "deep-death-reconcile",
+                "--poll-secs",
+                "0.1",
+                "--max-idle-secs",
+                "20",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=12,
+            env=env,
+        )
+        payload = json.loads(status.read_text(encoding="utf-8"))
+        assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr, payload)
+        assert payload.get("state") == "complete", payload
+        assert payload.get("reason") == "marker:COMPLETE:final_reconciliation", payload
+        assert payload.get("terminal_marker", {}).get("kind") == "COMPLETE", payload
+
+
+def case_full_file_reconciliation_caps_newline_free_reads() -> None:
+    """A huge physical line is skipped through sized readline calls only."""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        block = b"x" * (1024 * 1024)
+        with tail.open("wb") as handle:
+            for _ in range(24):
+                handle.write(block)
+            handle.write(
+                (
+                    "\n"
+                    "!COMPLETE: bounded-stream — earlier accepted marker\n"
+                    "!READY: foreign-dispatch — rejected later marker\n"
+                    "!READY: bounded-stream — docs-private/research/bounded/findings.md\n"
+                ).encode("utf-8")
+            )
+
+        original_open = Path.open
+        observed_sizes: list[int] = []
+
+        class SizedReadlineOnly:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+
+            def __enter__(self):
+                self.wrapped.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.wrapped.__exit__(*args)
+
+            def readline(self, size: int = -1):
+                observed_sizes.append(size)
+                assert 0 < size <= goalflight_watch.STREAM_READ_CHUNK_CHARS, size
+                return self.wrapped.readline(size)
+
+            def __iter__(self):
+                raise AssertionError("stream reconciliation used uncapped file iteration")
+
+        def tracked_open(path: Path, *args, **kwargs):
+            return SizedReadlineOnly(original_open(path, *args, **kwargs))
+
+        with patch.object(Path, "open", tracked_open):
+            terminal = goalflight_watch._full_file_terminal_marker(
+                tail,
+                prompt_prefix=[],
+                suppress_unfenced_prompt_markers=True,
+                kimi_output=False,
+                expected_dispatch_id="bounded-stream",
+            )
+
+        assert observed_sizes, "streaming reconciliation did not call readline"
+        assert max(observed_sizes) <= goalflight_watch.STREAM_READ_CHUNK_CHARS
+        assert terminal is not None, terminal
+        assert terminal.get("kind") == "READY", terminal
+        assert terminal.get("text") == (
+            "bounded-stream — docs-private/research/bounded/findings.md"
+        ), terminal
+
+
+def case_bound_marker_survives_stream_read_cap_boundary() -> None:
+    dispatch_id = "bounded-marker-line"
+    marker_prefix = f"!COMPLETE: {dispatch_id} — "
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        for total_chars in (
+            goalflight_watch.STREAM_READ_CHUNK_CHARS,
+            goalflight_watch.STREAM_READ_CHUNK_CHARS + 1,
+        ):
+            line = (
+                marker_prefix
+                + ("x" * (total_chars - len(marker_prefix) - 1))
+                + "\n"
+            )
+            assert len(line) == total_chars
+            tail.write_text(line, encoding="utf-8")
+
+            terminal = goalflight_watch._full_file_terminal_marker(
+                tail,
+                prompt_prefix=[],
+                suppress_unfenced_prompt_markers=True,
+                kimi_output=False,
+                expected_dispatch_id=dispatch_id,
+            )
+
+            assert terminal is not None, (total_chars, terminal)
+            assert terminal.get("kind") == "COMPLETE", terminal
+            assert str(terminal.get("text") or "").startswith(dispatch_id), terminal
+
+
+def test_oversized_prefix_requires_terminated_dispatch_id() -> None:
+    dispatch_id = "edge-bound"
+    marker_prefix = f"!COMPLETE: {dispatch_id}"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(marker_prefix + "-foreign" + ("x" * 80) + "\n", encoding="utf-8")
+        bounded_iter = goalflight_watch._iter_bounded_text_lines
+
+        def edge_bounded_iter(handle):
+            return bounded_iter(handle, max_chars=len(marker_prefix))
+
+        with patch.object(
+            goalflight_watch,
+            "_iter_bounded_text_lines",
+            edge_bounded_iter,
+        ):
+            terminal = goalflight_watch._full_file_terminal_marker(
+                tail,
+                prompt_prefix=[],
+                suppress_unfenced_prompt_markers=True,
+                kimi_output=False,
+                expected_dispatch_id=dispatch_id,
+            )
+
+    assert terminal is None, terminal
+
+
+def test_oversized_line_marker_in_second_of_three_chunks_is_documented_miss() -> None:
+    dispatch_id = "chunk-two"
+    chunk_chars = 64
+    # Only the first bounded chunk of an oversized physical line is parsed.
+    # This marker begins in chunk 2 of a 3-chunk line and is deliberately missed.
+    line = (
+        ("x" * chunk_chars)
+        + f"!COMPLETE: {dispatch_id} — later chunk"
+        + ("y" * (2 * chunk_chars))
+        + "\n"
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(line, encoding="utf-8")
+        bounded_iter = goalflight_watch._iter_bounded_text_lines
+
+        def three_chunk_iter(handle):
+            return bounded_iter(handle, max_chars=chunk_chars)
+
+        with patch.object(
+            goalflight_watch,
+            "_iter_bounded_text_lines",
+            three_chunk_iter,
+        ):
+            terminal = goalflight_watch._full_file_terminal_marker(
+                tail,
+                prompt_prefix=[],
+                suppress_unfenced_prompt_markers=True,
+                kimi_output=False,
+                expected_dispatch_id=dispatch_id,
+            )
+
+    assert terminal is None, terminal
+
+
+def case_stability_recheck_uses_its_own_growth_baseline() -> None:
+    first_marker = {
+        "line": 1,
+        "kind": "COMPLETE",
+        "text": "recheck-baseline — first candidate",
+    }
+    rechecked_marker = {
+        "line": 2,
+        "kind": "COMPLETE",
+        "text": "recheck-baseline — stable replacement",
+    }
+
+    def scan_result(marker: dict, size: int) -> goalflight_watch.TailScanResult:
+        return goalflight_watch.TailScanResult(
+            markers=[marker],
+            mail_markers=[],
+            terminal=marker,
+            size=size,
+            content_bytes=0,
+            validation_bytes=0,
+            lines_materialized=0,
+            resynced=False,
+            resync_reason=None,
+            fence_unbalanced=False,
+        )
+
+    class FakeScanner:
+        def __init__(self, *_args, **_kwargs):
+            self.calls = 0
+
+        def scan(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return scan_result(first_marker, 100)
+            return scan_result(rechecked_marker, 200)
+
+    class FakeTraceLiveness:
+        def __init__(self, **_kwargs):
+            pass
+
+        def sample(self, **_kwargs):
+            return {"trace_active": False}
+
+    clock = [0.0]
+
+    def fake_active_monotonic() -> float:
+        clock[0] += 0.5
+        return clock[0]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        tail = tmp_path / "tail.txt"
+        status = tmp_path / "status.json"
+        tail.write_text("synthetic tail\n", encoding="utf-8")
+        env = os.environ.copy()
+        _isolate_state_env(env, tmp_path)
+        argv = [
+            str(WATCH),
+            "--pid",
+            "4242",
+            "--pgid",
+            "4242",
+            "--tail",
+            str(tail),
+            "--status-json",
+            str(status),
+            "--dispatch-id",
+            "recheck-baseline",
+            "--poll-secs",
+            "0.1",
+            "--max-idle-secs",
+            "0.1",
+            "--stay-after-terminal",
+        ]
+        output = io.StringIO()
+        with patch.dict(os.environ, env, clear=False), \
+                patch.object(sys, "argv", argv), \
+                patch.object(goalflight_watch, "IncrementalTailScanner", FakeScanner), \
+                patch.object(goalflight_watch, "TraceLiveness", FakeTraceLiveness), \
+                patch.object(goalflight_watch, "worker_alive", return_value=(True, "match", {"pid": 4242})), \
+                patch.object(goalflight_watch, "pgroup_cpu_pct", return_value=0.0), \
+                patch.object(goalflight_watch, "system_starved", return_value=False), \
+                patch.object(goalflight_watch, "active_monotonic", side_effect=fake_active_monotonic), \
+                patch.object(goalflight_watch.time, "sleep", return_value=None), \
+                patch.object(goalflight_watch.signal, "signal", return_value=None), \
+                patch.object(goalflight_watch.atexit, "register", return_value=None), \
+                contextlib.redirect_stdout(output):
+            rc = goalflight_watch.main()
+
+        payload = json.loads(status.read_text(encoding="utf-8"))
+        assert rc == 1, (rc, output.getvalue(), payload)
+        assert "WATCHER-DISCARD" not in output.getvalue(), output.getvalue()
+        assert payload.get("state") == "inconclusive_timeout", payload
+        assert payload.get("terminal_marker", {}).get("text") == rechecked_marker["text"], payload
+        assert payload.get("reason") == "marker:COMPLETE:post_terminal_idle_timeout", payload
+
+
+def case_stability_recheck_detects_growth_after_surviving_candidate() -> None:
+    survivor = {
+        "line": 1,
+        "kind": "COMPLETE",
+        "text": "recheck-survivor — same candidate",
+    }
+
+    def scan_result(marker: dict | None, size: int) -> goalflight_watch.TailScanResult:
+        return goalflight_watch.TailScanResult(
+            markers=[marker] if marker else [],
+            mail_markers=[],
+            terminal=marker,
+            size=size,
+            content_bytes=0,
+            validation_bytes=0,
+            lines_materialized=0,
+            resynced=False,
+            resync_reason=None,
+            fence_unbalanced=False,
+        )
+
+    class FakeScanner:
+        observed_sizes: list[int] = []
+
+        def __init__(self, *_args, **_kwargs):
+            self.calls = 0
+            type(self).observed_sizes = []
+
+        def scan(self, **_kwargs):
+            self.calls += 1
+            if self.calls <= 2:
+                size = 100
+            elif self.calls <= 4:
+                size = 200
+            else:
+                # After the growth discard, the same marker reappears at a new
+                # stable offset and must receive this fresh baseline.
+                size = 300
+            type(self).observed_sizes.append(size)
+            return scan_result(dict(survivor), size)
+
+    class FakeTraceLiveness:
+        def __init__(self, **_kwargs):
+            pass
+
+        def sample(self, **_kwargs):
+            return {"trace_active": False}
+
+    clock = [0.0]
+
+    def fake_active_monotonic() -> float:
+        clock[0] += 2.0
+        return clock[0]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        tail = tmp_path / "tail.txt"
+        status = tmp_path / "status.json"
+        tail.write_text("synthetic tail\n", encoding="utf-8")
+        env = os.environ.copy()
+        _isolate_state_env(env, tmp_path)
+        argv = [
+            str(WATCH),
+            "--pid", "4242",
+            "--pgid", "4242",
+            "--tail", str(tail),
+            "--status-json", str(status),
+            "--dispatch-id", "recheck-survivor",
+            "--poll-secs", "0.1",
+            "--max-idle-secs", "0.1",
+            "--stay-after-terminal",
+        ]
+        output = io.StringIO()
+        with patch.dict(os.environ, env, clear=False), \
+                patch.object(sys, "argv", argv), \
+                patch.object(goalflight_watch, "IncrementalTailScanner", FakeScanner), \
+                patch.object(goalflight_watch, "TraceLiveness", FakeTraceLiveness), \
+                patch.object(goalflight_watch, "worker_alive", return_value=(True, "match", {"pid": 4242})), \
+                patch.object(goalflight_watch, "pgroup_cpu_pct", return_value=0.0), \
+                patch.object(goalflight_watch, "system_starved", return_value=False), \
+                patch.object(goalflight_watch, "active_monotonic", side_effect=fake_active_monotonic), \
+                patch.object(goalflight_watch.time, "sleep", return_value=None), \
+                patch.object(goalflight_watch.signal, "signal", return_value=None), \
+                patch.object(goalflight_watch.atexit, "register", return_value=None), \
+                contextlib.redirect_stdout(output):
+            rc = goalflight_watch.main()
+
+        payload = json.loads(status.read_text(encoding="utf-8"))
+        assert rc == 1, (rc, output.getvalue(), payload)
+        assert FakeScanner.observed_sizes[:3] == [100, 100, 200]
+        assert output.getvalue().count("WATCHER-DISCARD") == 1, output.getvalue()
+        evidence = payload.get("last_discarded_terminal_evidence") or {}
+        assert evidence.get("offset") == 100, payload
+        assert evidence.get("marker", {}).get("text") == survivor["text"], payload
+        assert payload.get("tail_scan", {}).get("offset") == 300, payload
+        assert payload.get("terminal_marker", {}).get("text") == survivor["text"], payload
+        assert payload.get("reason") == "marker:COMPLETE:post_terminal_idle_timeout", payload
+
+
+def case_post_terminal_busy_worker_stays_armed_after_grace() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         tail = tmp_path / "tail.txt"
@@ -344,24 +756,21 @@ def case_post_terminal_busy_worker_wait_is_bounded() -> None:
             errors="replace",
             env=env,
         )
-        t0 = time.monotonic()
         try:
-            try:
-                out, err = watcher.communicate(timeout=8)
-            except subprocess.TimeoutExpired as exc:
-                raise AssertionError("post-terminal busy worker left watcher running past 8s") from exc
-            elapsed = time.monotonic() - t0
-            assert watcher.returncode == 1, (watcher.returncode, out, err)
-            assert elapsed < 8, f"post-terminal wait took {elapsed:.1f}s"
+            deadline = time.monotonic() + 7
+            payload = {}
+            while time.monotonic() < deadline:
+                if status.exists():
+                    payload = json.loads(status.read_text(encoding="utf-8"))
+                time.sleep(0.1)
+            assert watcher.poll() is None, "busy live worker must stay watched past exit grace"
             payload = json.loads(status.read_text(encoding="utf-8"))
-            assert payload.get("state") == "inconclusive_timeout", payload
-            assert payload.get("liveness_state") == "inconclusive_timeout", payload
+            assert payload.get("state") == "running_after_terminal", payload
+            assert payload.get("liveness_state") == "running_quiet", payload
             assert payload.get("worker_alive") is True, payload
             assert payload.get("terminal_pending_state") == "complete", payload
             assert payload.get("terminal_marker", {}).get("kind") == "COMPLETE", payload
-            assert payload.get("reason") == "marker:COMPLETE:post_terminal_exit_timeout", payload
-            assert payload.get("post_terminal_wait_elapsed_secs", 0) >= 6, payload
-            assert payload.get("post_terminal_wait_limit_secs") == 6.0, payload
+            assert payload.get("reason") == "marker:COMPLETE:worker_alive", payload
         finally:
             if watcher.poll() is None:
                 watcher.terminate()
@@ -803,7 +1212,14 @@ def main() -> None:
     case_dispatch_clean_complete_preserves_reason_without_rate_signal()
     case_dispatch_worker_dead_ledger_liveness()
     case_post_terminal_idle_worker_times_out_inconclusively()
-    case_post_terminal_busy_worker_wait_is_bounded()
+    case_worker_death_reconciliation_streams_beyond_tail_window()
+    case_full_file_reconciliation_caps_newline_free_reads()
+    case_bound_marker_survives_stream_read_cap_boundary()
+    test_oversized_prefix_requires_terminated_dispatch_id()
+    test_oversized_line_marker_in_second_of_three_chunks_is_documented_miss()
+    case_stability_recheck_uses_its_own_growth_baseline()
+    case_stability_recheck_detects_growth_after_surviving_candidate()
+    case_post_terminal_busy_worker_stays_armed_after_grace()
     case_post_terminal_delayed_worker_exit_is_observed()
     case_dispatch_post_terminal_idle_returns_inconclusive()
     case_worker_and_watcher_survive_launcher_pgroup_sigterm()

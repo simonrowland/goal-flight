@@ -135,8 +135,9 @@ findings (P0/P1/P2/P3) and apply per the chunk-review policy below.
 Read-only dispatch workers must not be asked to write the review file
 themselves. If the worker is launched with `goalflight_dispatch.py --read-only`,
 use an inline-return prompt: ask for severity-tagged findings in the final
-response, with `RESULT:`/`READY:` as the final marker, and have the controller
-capture that response into `docs-private/reviews/...` afterward. If the review
+response, optionally summarize them with `RESULT:`, then finish with a terminal
+`COMPLETE:` marker, and have the controller capture that response into
+`docs-private/reviews/...` afterward. If the review
 must create files directly, dispatch it in a writable worktree/sandbox instead
 of pairing `--read-only` with a write-artifact prompt.
 

@@ -5,9 +5,10 @@
 # USER-NEED / USER-CONFIRM / READY, with optional markdown emphasis tolerance
 # for grok).
 # Exits when:
-#   - terminal marker observed in tail            → exit 0  ("WATCHER-EXIT: marker")
+#   - terminal marker reconciled after exit/idle  → exit 0  ("WATCHER-EXIT: marker")
 #   - worker PID dies without terminal marker     → exit 1  ("WATCHER-EXIT: pid-dead")
 #   - no tail update for --max-idle-secs seconds  → exit 2  ("WATCHER-EXIT: idle-timeout")
+#   - direct watcher exceeds total runtime         → exit 2  ("WATCHER-EXIT: runtime-timeout")
 #   - orchestrator PID dies                         → exit 3  ("WATCHER-EXIT: controller-dead")
 #
 # Registers a per-watcher entry in the same pidfile dir scripts/acp_client.py uses
@@ -34,6 +35,7 @@
 #                   (terminal-marker subset; emphasis-tolerant for grok's **MARKER:**)
 #   --poll-secs     15
 #   --max-idle-secs 180   (matches protocol idle/no-progress guidance)
+#   GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS defaults to 10x max-idle (direct-call bound)
 #   --cpu-epsilon   0.1   (process-group CPU % of one core above this is running_quiet;
 #                          measured as a cputime delta, not ps's decaying %cpu average)
 #
@@ -280,6 +282,7 @@ POLL_SECS=15
 MAX_IDLE_SECS=180
 CPU_EPSILON=0.1
 PID_DEAD_MARKER_GRACE_SECS=1
+POST_TERMINAL_EXIT_GRACE_SECS=6
 # CPU-sampling-failure grace (codex 2026-05-20 P2): require this many consecutive
 # wedged polls before exiting idle-timeout, so transient `ps` low/zero samples
 # can't false-positive a healthy CPU-busy worker. Full-suite load on macOS can
@@ -315,6 +318,24 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; usage ;;
   esac
 done
+
+# Direct invocations need a hard lifetime even when a forever-chatty worker
+# continuously resets the idle clock. Managed callers already impose their own
+# process timeout (scripts/hosts/controller/common.py:132), so this generous
+# default is primarily a standalone-watcher backstop. The environment override
+# keeps short hermetic tests and unusual direct callers configurable without
+# expanding the public CLI surface.
+TOTAL_RUNTIME_SECS="${GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS:-$(( MAX_IDLE_SECS * 10 ))}"
+case "$TOTAL_RUNTIME_SECS" in
+  ''|*[!0-9]*)
+    echo "invalid GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS '$TOTAL_RUNTIME_SECS' (must be a positive integer)" >&2
+    exit 64
+    ;;
+esac
+if [ "$TOTAL_RUNTIME_SECS" -le 0 ]; then
+  echo "invalid GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS '$TOTAL_RUNTIME_SECS' (must be a positive integer)" >&2
+  exit 64
+fi
 
 # Map of REQUIRED_VAR → --flag-name for missing-arg diagnostics. Spelled
 # out long-form (rather than computed via `${var,,}`) because that bash 4+
@@ -453,6 +474,7 @@ trap cleanup_pidfile_on_exit EXIT INT TERM
 # Track tail file size for idle detection. Re-stat at each poll.
 last_size=0
 last_size_change_ts=$(date +%s)
+runtime_started_ts=$last_size_change_ts
 wedge_streak=0
 if [ -f "$TAIL_PATH" ]; then
   last_size=$(wc -c < "$TAIL_PATH" 2>/dev/null | tr -d ' ')
@@ -468,7 +490,7 @@ fi
 SLEEP_GAP_GRACE_SECS=$(( POLL_SECS * 5 + 120 ))
 prev_loop_ts=$(date +%s)
 
-echo "[watcher start $(date '+%H:%M:%S')] worker_pid=$WORKER_PID controller_pid=$CONTROLLER_PID tail=$TAIL_PATH markers='$MARKER_RE' poll=${POLL_SECS}s max_idle=${MAX_IDLE_SECS}s"
+echo "[watcher start $(date '+%H:%M:%S')] worker_pid=$WORKER_PID controller_pid=$CONTROLLER_PID tail=$TAIL_PATH markers='$MARKER_RE' poll=${POLL_SECS}s max_idle=${MAX_IDLE_SECS}s total_runtime=${TOTAL_RUNTIME_SECS}s"
 
 terminal_marker_seen() {
   [ -f "$TAIL_PATH" ] || return 1
@@ -580,6 +602,17 @@ emit_marker_exit() {
   exit "$exit_code"
 }
 
+emit_runtime_timeout() {
+  local elapsed="$1"
+  echo "[$(date '+%H:%M:%S')] watcher total runtime ${elapsed}s reached ${TOTAL_RUNTIME_SECS}s bound"
+  if [ -f "$TAIL_PATH" ]; then
+    echo "=== tail last 30 lines ==="
+    tail -30 "$TAIL_PATH"
+  fi
+  echo "WATCHER-EXIT: runtime-timeout exit_code=2"
+  exit 2
+}
+
 exit_code_for_reconciled_marker_kind() {
   case "$1" in
     COMPLETE|RESULT|READY) echo 0 ;;
@@ -596,6 +629,7 @@ while true; do
   if [ "$loop_gap" -gt "$SLEEP_GAP_GRACE_SECS" ]; then
     echo "[$(date '+%H:%M:%S')] WATCHER-STATE: suspend-gap detected (${loop_gap}s between polls > ${SLEEP_GAP_GRACE_SECS}s grace) — resetting idle clock (system slept; worker not idle)"
     last_size_change_ts=$now_loop_ts
+    runtime_started_ts=$(( runtime_started_ts + loop_gap ))
     wedge_streak=0
   fi
   prev_loop_ts=$now_loop_ts
@@ -611,6 +645,11 @@ while true; do
     exit 3
   fi
 
+  runtime_elapsed=$(( now_loop_ts - runtime_started_ts ))
+  if [ "$runtime_elapsed" -ge "$TOTAL_RUNTIME_SECS" ]; then
+    emit_runtime_timeout "$runtime_elapsed"
+  fi
+
   # 2. Terminal marker in tail?
   # Hardening (C-P1/D-P1 marker injection): only the LAST non-empty line counts as
   # a terminal. A worker that prints/cats/logs a marker token mid-output must not
@@ -621,7 +660,48 @@ while true; do
     seen_kind=${seen_marker#*:}
     seen_kind=${seen_kind%%:*}
     seen_exit_code=$(exit_code_for_reconciled_marker_kind "$seen_kind")
-    emit_marker_exit "terminal marker matched in tail ($seen_marker)" "$seen_exit_code"
+    case "$seen_kind" in
+      COMPLETE|RESULT|READY)
+        if kill -0 "$WORKER_PID" 2>/dev/null; then
+          candidate_size=$(wc -c < "$TAIL_PATH" 2>/dev/null | tr -d ' ')
+          candidate_size=${candidate_size:-0}
+          candidate_started=$(date +%s)
+          candidate_discarded=0
+          while kill -0 "$WORKER_PID" 2>/dev/null; do
+            candidate_now=$(date +%s)
+            candidate_idle_for=$(( candidate_now - candidate_started ))
+            candidate_runtime_elapsed=$(( candidate_now - runtime_started_ts ))
+            if [ "$candidate_runtime_elapsed" -ge "$TOTAL_RUNTIME_SECS" ]; then
+              emit_runtime_timeout "$candidate_runtime_elapsed"
+            fi
+            if [ "$candidate_idle_for" -ge "$POST_TERMINAL_EXIT_GRACE_SECS" ]; then
+              echo "[$(date '+%H:%M:%S')] WATCHER-STATE: terminal candidate still pending while worker is alive (${candidate_idle_for}s no growth; $seen_marker)"
+              break
+            fi
+            sleep "$POLL_SECS"
+            candidate_current_size=$(wc -c < "$TAIL_PATH" 2>/dev/null | tr -d ' ')
+            candidate_current_size=${candidate_current_size:-0}
+            if [ "$candidate_current_size" -gt "$candidate_size" ]; then
+              echo "[$(date '+%H:%M:%S')] WATCHER-DISCARD: terminal candidate disproved by live tail growth (${candidate_size}->${candidate_current_size}; $seen_marker)"
+              candidate_discarded=1
+              break
+            fi
+          done
+          if [ "$candidate_discarded" -eq 1 ]; then
+            continue
+          fi
+          # The worker exited during the grace. Fall through to the pid-dead
+          # reconciliation below so historical post-marker output is included.
+        else
+          emit_marker_exit "terminal marker matched after worker exit ($seen_marker)" "$seen_exit_code"
+        fi
+        ;;
+      *)
+        # Blocking/user-decision terminals must wake the controller even while
+        # the worker waits for a response; the live-growth veto is success-only.
+        emit_marker_exit "terminal marker matched in tail ($seen_marker)" "$seen_exit_code"
+        ;;
+    esac
   fi
 
   # 3. Worker PID still alive?

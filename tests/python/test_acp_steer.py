@@ -482,8 +482,21 @@ def case_acp_mailbox_steer_delivered_at_next_turn_and_acked() -> None:
         )
         try:
             _wait_for(Path(env["GOALFLIGHT_FAKE_ACP_TURN1_FILE"]), proc=proc)
+            watcher_prompt = tmp / "status.assembled.prompt"
+            _wait_for(watcher_prompt, proc=proc)
+            assert watcher_prompt.read_text(encoding="utf-8") == (
+                "Your FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. "
+                "Re-read it after any internal compaction/summarization, at the "
+                "start of each long-run goal-loop iteration, and before final "
+                "commit/exit; the disk file is authoritative over summarized memory."
+                "\n\ninitial task"
+            )
+            steer_text = (
+                "redirect now; prompt example "
+                "!READY: acp-between-turn-steer — not terminal"
+            )
             steer = subprocess.run(
-                [sys.executable, str(DISPATCH), "steer", dispatch_id, "redirect now"],
+                [sys.executable, str(DISPATCH), "steer", dispatch_id, steer_text],
                 cwd=ROOT,
                 env=env,
                 text=True,
@@ -508,6 +521,10 @@ def case_acp_mailbox_steer_delivered_at_next_turn_and_acked() -> None:
         assert status.get("steer_acked_seqs") == [1], status
         assert "STEER-ACK" in (status.get("markers") or {}), status
         assert (status.get("markers") or {}).get("STEER-ACK") == ["1"], status
+        persisted_turn = watcher_prompt.read_text(encoding="utf-8")
+        assert steer_text in persisted_turn, persisted_turn
+        assert "initial task" in persisted_turn, persisted_turn
+        assert persisted_turn.index("initial task") < persisted_turn.index("redirect now")
 
         listed = subprocess.run(
             [sys.executable, str(DISPATCH), "steer", dispatch_id, "--list"],

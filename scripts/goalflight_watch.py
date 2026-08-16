@@ -129,20 +129,50 @@ PROMPT_ECHO_ANCHOR_SEARCH_LINES = 200
 PROMPT_ECHO_MAX_ANCHORS = 10
 TAIL_SCAN_CHUNK_BYTES = 64 * 1024
 TAIL_SCAN_BOUNDARY_BYTES = 64
+# Completed-tail reconciliation may scan beyond the bounded live window, but a
+# single physical line must never defeat that memory bound. Every text read is
+# capped; overlong physical lines keep only this prefix and skip the remainder.
+STREAM_READ_CHUNK_CHARS = 64 * 1024
 # CPU-sampling-failure grace (codex 2026-05-20 P2): idle_timeout exits only on
 # confirmed-idle CPU. Unavailable CPU (ps failure -> None) keeps waiting instead
 # of false-killing a healthy quiet worker. The streak still protects against
 # one-off noisy idle samples.
 WEDGE_CONFIRM_SAMPLES = 2
 # A terminal marker is the worker's final act. Three default two-second poll
-# intervals give wrappers time to flush and exit while keeping this handoff
-# grace independent from the much longer general worker-idle timeout.
+# intervals give wrappers time to flush and exit before the watcher decides
+# whether later output disproved the candidate. This is a minimum decision
+# grace, not a hard timeout for a live worker.
 POST_TERMINAL_EXIT_GRACE_SECS = 6.0
 BLOCKED_TASK_BREADCRUMB_STATE = "blocked_task_breadcrumb"
 TRACE_RESOLUTION_RETRY_SECS = 300.0
 TRACE_LSOF_TIMEOUT_SECS = 1.0
 TRACE_LONG_RUNNING_SECS = 12 * 60 * 60.0
 TRACE_REVIEW_SECS = 48 * 60 * 60.0
+
+
+def _post_terminal_candidate_action(
+    *,
+    worker_alive: bool,
+    tail_grew: bool,
+    grace_expired: bool,
+    idle_confirmed: bool,
+) -> str:
+    """Choose the pure state transition for a pending success marker.
+
+    Continued output from the same live worker disproves a terminal candidate
+    once the short exit grace has elapsed. Without growth, the watcher keeps
+    the candidate pending until either process identity says the worker died or
+    the ordinary max-idle path is confirmed.
+    """
+    if not worker_alive:
+        return "terminalize"
+    if not grace_expired:
+        return "pending"
+    if tail_grew:
+        return "discard"
+    if idle_confirmed:
+        return "terminalize"
+    return "pending"
 
 
 def _known_trace_roots(*, state_dir: Path | None = None, home: Path | None = None) -> tuple[Path, ...]:
@@ -654,6 +684,8 @@ def _marker_survives_unbalanced_fence(marker: dict | None) -> bool:
 def _terminal_marker_matches_dispatch(
     marker: dict | None,
     expected_dispatch_id: str | None,
+    *,
+    require_terminated: bool = False,
 ) -> bool:
     """Bind scraped terminal evidence to the dispatch that owns the tail.
 
@@ -672,7 +704,9 @@ def _terminal_marker_matches_dispatch(
         return embedded == expected
     text = _strip_marker_decoration(str(marker.get("text") or "")).strip()
     if text == expected:
-        return True
+        # A bounded oversized-line prefix that ends exactly at the expected id
+        # has not proved the binding: the discarded byte may continue the id.
+        return not require_terminated
     if not text.startswith(expected):
         return False
     suffix = text[len(expected) :]
@@ -856,6 +890,7 @@ class TailScanResult:
         "resynced",
         "resync_reason",
         "fence_unbalanced",
+        "terminal_observed_size",
     )
 
     def __init__(
@@ -871,6 +906,7 @@ class TailScanResult:
         resynced: bool,
         resync_reason: str | None,
         fence_unbalanced: bool,
+        terminal_observed_size: int | None = None,
     ) -> None:
         self.markers = markers
         self.mail_markers = mail_markers
@@ -882,6 +918,11 @@ class TailScanResult:
         self.resynced = resynced
         self.resync_reason = resync_reason
         self.fence_unbalanced = fence_unbalanced
+        self.terminal_observed_size = (
+            terminal_observed_size
+            if terminal_observed_size is not None
+            else (size if terminal is not None else None)
+        )
 
     def metrics(self) -> dict:
         result = {
@@ -909,6 +950,15 @@ def _combine_tail_scan_results(first: TailScanResult, second: TailScanResult) ->
             continue
         seen.add(key)
         mail_markers.append(marker)
+    terminal_observed_size: int | None = None
+    if second.terminal is not None:
+        if first.terminal == second.terminal:
+            # The winning candidate survived from scan one. Bytes that arrived
+            # during the recheck are growth after that first observation.
+            terminal_observed_size = first.terminal_observed_size
+        else:
+            # The recheck found a new winner, so its own offset is the baseline.
+            terminal_observed_size = second.terminal_observed_size
     return TailScanResult(
         markers=second.markers,
         mail_markers=mail_markers,
@@ -920,6 +970,7 @@ def _combine_tail_scan_results(first: TailScanResult, second: TailScanResult) ->
         resynced=first.resynced or second.resynced,
         resync_reason=second.resync_reason or first.resync_reason,
         fence_unbalanced=second.fence_unbalanced,
+        terminal_observed_size=terminal_observed_size,
     )
 
 
@@ -930,7 +981,7 @@ class _IncrementalMarkerState:
         self.fence = goalflight_terminal.MarkdownFenceTracker()
         self.all_markers: deque[dict] = deque(maxlen=20)
         self.outside_markers: deque[dict] = deque(maxlen=20)
-        self.last_candidate: tuple[int, str, bool] | None = None
+        self.last_candidate: tuple[int, str, bool, int | None] | None = None
         self.previous_candidate = ""
 
     def clone(self) -> _IncrementalMarkerState:
@@ -945,18 +996,31 @@ class _IncrementalMarkerState:
         clone.previous_candidate = self.previous_candidate
         return clone
 
-    def _consume_candidate(self, line_no: int, line: str, in_fence: bool) -> None:
+    def _consume_candidate(
+        self,
+        line_no: int,
+        line: str,
+        in_fence: bool,
+        observed_offset: int | None,
+    ) -> None:
         stripped = line.strip()
         if not stripped:
             return
         if HARNESS_TOKEN_COUNT_RE.fullmatch(stripped):
             if self.previous_candidate != "tokens used":
-                self.last_candidate = (line_no, line, in_fence)
+                self.last_candidate = (line_no, line, in_fence, observed_offset)
         elif stripped != "tokens used" and not _is_harness_trailer_line(stripped):
-            self.last_candidate = (line_no, line, in_fence)
+            self.last_candidate = (line_no, line, in_fence, observed_offset)
         self.previous_candidate = stripped
 
-    def consume(self, line_no: int, line: str, *, ignored: bool = False) -> tuple[dict, bool] | None:
+    def consume(
+        self,
+        line_no: int,
+        line: str,
+        *,
+        ignored: bool = False,
+        observed_offset: int | None = None,
+    ) -> tuple[dict, bool] | None:
         if ignored:
             return None
 
@@ -964,7 +1028,7 @@ class _IncrementalMarkerState:
         fence_was_open = self.fence.in_fence
         fence_line = self.fence.consume_boundary(line)
         line_in_fence = fence_was_open or self.fence.in_fence
-        self._consume_candidate(line_no, line, line_in_fence)
+        self._consume_candidate(line_no, line, line_in_fence, observed_offset)
         if fence_line:
             return None
 
@@ -1013,7 +1077,7 @@ class _IncrementalMarkerState:
     ) -> dict | None:
         if self.last_candidate is None:
             return None
-        line_no, line, candidate_in_fence = self.last_candidate
+        line_no, line, candidate_in_fence, _observed_offset = self.last_candidate
         if candidate_in_fence and not self.fence.in_fence:
             return None
         marker = _final_terminal_marker_from_line(
@@ -1026,6 +1090,9 @@ class _IncrementalMarkerState:
         if candidate_in_fence and not _marker_survives_unbalanced_fence(marker):
             return None
         return marker
+
+    def terminal_observed_offset(self) -> int | None:
+        return self.last_candidate[3] if self.last_candidate is not None else None
 
 
 class IncrementalTailScanner:
@@ -1055,39 +1122,63 @@ class IncrementalTailScanner:
         self._offset = 0
         self._boundary = b""
         self._partial = bytearray()
+        self._accepted_bytes = 0
         self._next_line_no = 1
         self._prompt_stable = not self._prompt_has_anchors
-        self._prompt_records: list[tuple[int, str]] = []
+        self._prompt_records: list[tuple[int, str, int]] = []
         self._state = _IncrementalMarkerState()
 
     def _reset_content_state(self) -> None:
         self._offset = 0
         self._boundary = b""
         self._partial = bytearray()
+        self._accepted_bytes = 0
         self._next_line_no = 1
         self._prompt_stable = not self._prompt_has_anchors
         self._prompt_records = []
         self._state = _IncrementalMarkerState()
 
+    def update_prompt_prefix(self, prompt_prefix: list[str]) -> None:
+        """Replace prompt exclusions and replay the tail under the new window."""
+
+        self.prompt_prefix = list(prompt_prefix)
+        self._prompt_has_anchors = bool(
+            _prompt_echo_anchor_indices(self.prompt_prefix)
+        )
+        self._prompt_record_limit = (
+            PROMPT_ECHO_ANCHOR_SEARCH_LINES + len(self.prompt_prefix)
+        )
+        self._identity = None
+        self._mtime_ns = None
+        self._reset_content_state()
+
     def _parse_prompt_records(
-        self, records: list[tuple[int, str]]
+        self, records: list[tuple[int, str, int]]
     ) -> tuple[_IncrementalMarkerState, list[tuple[dict, bool]]]:
-        lines = [line for _line_no, line in records]
+        lines = [line for _line_no, line, _offset in records]
         prompt_echo_lines, _anchor_found, _prompt_line_set = _prompt_echo_scan(
             lines, self.prompt_prefix
         )
         state = _IncrementalMarkerState()
         found: list[tuple[dict, bool]] = []
-        for index, (line_no, line) in enumerate(records):
-            marker = state.consume(line_no, line, ignored=index in prompt_echo_lines)
+        for index, (line_no, line, observed_offset) in enumerate(records):
+            marker = state.consume(
+                line_no,
+                line,
+                ignored=index in prompt_echo_lines,
+                observed_offset=observed_offset,
+            )
             if marker:
                 found.append(marker)
         return state, found
 
     def _accept_completed_line(
-        self, line: str, scan_markers: list[tuple[dict, bool]]
+        self,
+        line: str,
+        observed_offset: int,
+        scan_markers: list[tuple[dict, bool]],
     ) -> None:
-        record = (self._next_line_no, line)
+        record = (self._next_line_no, line, observed_offset)
         self._next_line_no += 1
         if not self._prompt_stable:
             self._prompt_records.append(record)
@@ -1097,7 +1188,9 @@ class IncrementalTailScanner:
                 self._prompt_records = []
                 self._prompt_stable = True
             return
-        marker = self._state.consume(*record)
+        marker = self._state.consume(
+            record[0], record[1], observed_offset=record[2]
+        )
         if marker:
             scan_markers.append(marker)
 
@@ -1115,12 +1208,15 @@ class IncrementalTailScanner:
             if raw_line.endswith(b"\r"):
                 raw_line = raw_line[:-1]
             self._accept_completed_line(
-                raw_line.decode("utf-8", errors="replace"), scan_markers
+                raw_line.decode("utf-8", errors="replace"),
+                self._accepted_bytes + newline + 1,
+                scan_markers,
             )
             line_start = newline + 1
             line_count += 1
         if line_start:
             del self._partial[:line_start]
+            self._accepted_bytes += line_start
         return line_count
 
     def _preview(
@@ -1134,6 +1230,7 @@ class IncrementalTailScanner:
                     (
                         self._next_line_no,
                         self._partial.decode("utf-8", errors="replace"),
+                        self._accepted_bytes + len(self._partial),
                     )
                 )
                 materialized = 1
@@ -1147,6 +1244,7 @@ class IncrementalTailScanner:
             marker = state.consume(
                 self._next_line_no,
                 self._partial.decode("utf-8", errors="replace"),
+                observed_offset=self._accepted_bytes + len(self._partial),
             )
             if marker:
                 found.append(marker)
@@ -1264,13 +1362,14 @@ class IncrementalTailScanner:
                 continue
             seen.add(key)
             mail_markers.append(dict(marker))
+        terminal = state.terminal(
+            kimi_output=kimi_output,
+            expected_dispatch_id=self.expected_dispatch_id,
+        )
         return TailScanResult(
             markers=visible,
             mail_markers=mail_markers,
-            terminal=state.terminal(
-                kimi_output=kimi_output,
-                expected_dispatch_id=self.expected_dispatch_id,
-            ),
+            terminal=terminal,
             size=size,
             content_bytes=content_bytes,
             validation_bytes=validation_bytes,
@@ -1278,6 +1377,9 @@ class IncrementalTailScanner:
             resynced=resync_reason is not None,
             resync_reason=resync_reason,
             fence_unbalanced=state.fence.in_fence,
+            terminal_observed_size=(
+                state.terminal_observed_offset() if terminal is not None else None
+            ),
         )
 
 
@@ -1518,6 +1620,155 @@ def _scan_final_terminal_marker(
     return terminal
 
 
+def _iter_bounded_text_lines(handle, max_chars: int = STREAM_READ_CHUNK_CHARS):
+    """Yield one capped prefix per physical line without unbounded readline.
+
+    The boolean result marks a physical line whose remainder was discarded.
+    Such a line can still update fence/diff state from its bounded prefix. A
+    dispatch-bound marker is also decided from that prefix because marker kind
+    and dispatch id are prefix-positioned; other oversized lines are rejected.
+    """
+
+    line_no = 0
+    while True:
+        prefix = handle.readline(max_chars)
+        if not prefix:
+            return
+        line_no += 1
+        oversized = False
+        chunk = prefix
+        while not chunk.endswith("\n"):
+            chunk = handle.readline(max_chars)
+            if not chunk:
+                break
+            oversized = True
+        yield line_no, prefix.rstrip("\r\n"), oversized
+
+
+def _stream_final_terminal_marker(
+    path: Path,
+    *,
+    prompt_prefix: list[str],
+    suppress_unfenced_prompt_markers: bool,
+    ignore_fences: bool,
+    kimi_output: bool,
+    expected_dispatch_id: str,
+) -> tuple[dict | None, bool]:
+    """Scan a completed tail from disk without materializing the whole file."""
+
+    prompt_buffer_lines = PROMPT_ECHO_ANCHOR_SEARCH_LINES + len(prompt_prefix)
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        line_iter = iter(_iter_bounded_text_lines(handle))
+        leading_records: list[tuple[int, str, bool]] = []
+        for _ in range(prompt_buffer_lines):
+            try:
+                record = next(line_iter)
+            except StopIteration:
+                break
+            leading_records.append(record)
+        leading = [line for _line_no, line, _oversized in leading_records]
+        prompt_echo_lines, echo_anchor_found, prompt_line_set = _prompt_echo_scan(
+            leading,
+            prompt_prefix,
+        )
+
+        fence = goalflight_terminal.MarkdownFenceTracker()
+        in_hunk = False
+        terminal: dict | None = None
+
+        def consume(line: str, line_no: int, *, oversized: bool) -> None:
+            nonlocal in_hunk, terminal
+            stripped = line.strip()
+            if line_no - 1 in prompt_echo_lines:
+                return
+            fence_was_open = fence.in_fence
+            if fence.consume_boundary(line):
+                return
+            marker_in_fence = fence_was_open or fence.in_fence
+            if marker_in_fence and not ignore_fences:
+                return
+            if in_hunk:
+                if line.startswith((" ", "+", "-", "\\")):
+                    return
+                in_hunk = False
+            if HUNK_HEADER_RE.match(line):
+                in_hunk = True
+                return
+            candidate = _final_terminal_marker_from_line(
+                line,
+                line_no,
+                allow_prefixed_marker=True,
+                allow_quote_prefix=True,
+                allow_status_prefix=True,
+                kimi_output=kimi_output,
+                expected_dispatch_id=expected_dispatch_id,
+            )
+            # An oversized prefix is trustworthy only when the dispatch-id
+            # match is terminated by the normal separator grammar before the
+            # cut. A prefix ending exactly at the id could continue with a
+            # foreign suffix in discarded bytes and therefore never binds.
+            if oversized and not _terminal_marker_matches_dispatch(
+                candidate,
+                expected_dispatch_id,
+                require_terminated=True,
+            ):
+                return
+            if not candidate:
+                return
+            if marker_in_fence and not _marker_survives_unbalanced_fence(candidate):
+                return
+            prompt_candidate = stripped
+            if kimi_output:
+                prompt_candidate = _strip_kimi_terminal_marker_prefix(prompt_candidate)
+            if _is_unfenced_prompt_quoted_bare_marker(
+                prompt_candidate,
+                prompt_line_set=prompt_line_set,
+                echo_anchor_found=echo_anchor_found,
+                suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
+            ):
+                return
+            terminal = candidate
+
+        for line_no, line, oversized in leading_records:
+            consume(line, line_no, oversized=oversized)
+        for line_no, line, oversized in line_iter:
+            consume(line, line_no, oversized=oversized)
+    return terminal, fence.in_fence
+
+
+def _full_file_terminal_marker(
+    path: Path,
+    *,
+    prompt_prefix: list[str],
+    suppress_unfenced_prompt_markers: bool,
+    kimi_output: bool,
+    expected_dispatch_id: str,
+) -> dict | None:
+    terminal, fence_unbalanced = _stream_final_terminal_marker(
+        path,
+        prompt_prefix=prompt_prefix,
+        suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
+        ignore_fences=False,
+        kimi_output=kimi_output,
+        expected_dispatch_id=expected_dispatch_id,
+    )
+    if not fence_unbalanced:
+        return terminal
+    fence_agnostic, _still_unbalanced = _stream_final_terminal_marker(
+        path,
+        prompt_prefix=prompt_prefix,
+        suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
+        ignore_fences=True,
+        kimi_output=kimi_output,
+        expected_dispatch_id=expected_dispatch_id,
+    )
+    if fence_agnostic and (
+        not terminal or fence_agnostic.get("line", -1) >= terminal.get("line", -1)
+    ):
+        return fence_agnostic
+    return terminal
+
+
 def _final_terminal_marker(
     path: Path,
     ignore_prefix_lines: list[str] | None = None,
@@ -1525,6 +1776,7 @@ def _final_terminal_marker(
     suppress_unfenced_prompt_markers: bool = True,
     kimi_output: bool = False,
     expected_dispatch_id: str | None = None,
+    full_file_fallback: bool = False,
 ) -> dict | None:
     """Return the last terminal marker anywhere in the completed post-prompt tail.
 
@@ -1551,24 +1803,36 @@ def _final_terminal_marker(
         kimi_output=kimi_output,
         expected_dispatch_id=expected_dispatch_id,
     )
-    if not _fence_state_unbalanced(lines, prompt_echo_lines):
+    if _fence_state_unbalanced(lines, prompt_echo_lines):
+        fence_agnostic_terminal = _scan_final_terminal_marker(
+            lines,
+            prompt_echo_lines=prompt_echo_lines,
+            echo_anchor_found=echo_anchor_found,
+            prompt_line_set=prompt_line_set,
+            suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
+            ignore_fences=True,
+            kimi_output=kimi_output,
+            expected_dispatch_id=expected_dispatch_id,
+        )
+        if fence_agnostic_terminal and (
+            not terminal
+            or fence_agnostic_terminal.get("line", -1) >= terminal.get("line", -1)
+        ):
+            terminal = fence_agnostic_terminal
+    if terminal:
         return terminal
-    fence_agnostic_terminal = _scan_final_terminal_marker(
-        lines,
-        prompt_echo_lines=prompt_echo_lines,
-        echo_anchor_found=echo_anchor_found,
-        prompt_line_set=prompt_line_set,
-        suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
-        ignore_fences=True,
-        kimi_output=kimi_output,
-        expected_dispatch_id=expected_dispatch_id,
-    )
-    if (
-        fence_agnostic_terminal
-        and (not terminal or fence_agnostic_terminal.get("line", -1) >= terminal.get("line", -1))
-    ):
-        return fence_agnostic_terminal
-    return terminal
+    if full_file_fallback and start > 0 and expected_dispatch_id:
+        # The bounded live scan is intentionally cheap. Once worker identity is
+        # dead, output is immutable, so one streamed whole-file pass is safe and
+        # prevents >10 MiB of post-marker logs from erasing terminal evidence.
+        return _full_file_terminal_marker(
+            path,
+            prompt_prefix=prompt_prefix,
+            suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
+            kimi_output=kimi_output,
+            expected_dispatch_id=expected_dispatch_id,
+        )
+    return None
 
 
 def _terminal_marker_from_ignored_prompt(
@@ -1595,6 +1859,68 @@ def _terminal_marker_from_ignored_prompt(
     if 0 <= line_idx < len(lines) and lines[line_idx].strip() in prompt_line_set:
         return True
     return False
+
+
+def _prompt_file_signature(stat_result: os.stat_result) -> tuple[int, int, int]:
+    return (stat_result.st_mtime_ns, stat_result.st_size, stat_result.st_ino)
+
+
+def _read_prompt_exclusion_snapshot(
+    path: Path,
+) -> tuple[list[str], tuple[int, int, int]] | None:
+    """Read exclusions and replacement signature from one opened sidecar."""
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            lines = [line.strip() for line in handle.read().splitlines()]
+            opened = os.fstat(handle.fileno())
+    except OSError:
+        return None
+    return lines, _prompt_file_signature(opened)
+
+
+def _prompt_reload_due(
+    current_signature: tuple[int, int, int] | None,
+    loaded_signature: tuple[int, int, int] | None,
+    *,
+    last_reload_at: float | None,
+    now: float,
+    poll_secs: float,
+) -> bool:
+    if current_signature is None or current_signature == loaded_signature:
+        return False
+    interval = max(0.0, poll_secs)
+    return last_reload_at is None or now - last_reload_at >= interval - 1e-9
+
+
+def _discarded_terminal_candidate_matches(
+    evidence: dict | None,
+    marker: dict | None,
+    observed_offset: int | None,
+) -> bool:
+    if not evidence or not marker or observed_offset is None:
+        return False
+    try:
+        vetoed_offset = int(evidence.get("offset"))
+    except (TypeError, ValueError):
+        return False
+    return evidence.get("marker") == marker and vetoed_offset == observed_offset
+
+
+def _dispatch_record_is_nonterminal(dispatch_id: str) -> bool:
+    try:
+        path = goalflight_ledger.record_path(dispatch_id, create=False)
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+    state = record.get("state")
+    terminal = record.get("terminal_state") or goalflight_ledger.terminal_state_for(
+        state,
+        record.get("reason") or record.get("error"),
+    )
+    return terminal == "unknown" and not goalflight_dispatch_states.is_terminal_state(
+        state
+    )
 
 
 def main() -> int:
@@ -1649,6 +1975,10 @@ def main() -> int:
                         help="After a terminal marker, keep watching until the worker exits or this watcher is stopped.")
     args = parser.parse_args()
 
+    tail = Path(args.tail)
+    status_path = Path(args.status_json)
+    status_existed_at_startup = status_path.exists()
+
     controller_session_id = args.controller_session_id
     controller_pid = args.controller_pid
     controller_label = args.controller_label
@@ -1658,19 +1988,38 @@ def main() -> int:
         controller_label = None
 
     ignore_prefix_lines: list[str] = []
+    ignore_prompt_path: Path | None = None
+    ignore_prompt_signature: tuple[int, int, int] | None = None
+    dispatch_record_nonterminal_at_startup = False
     if args.ignore_prompt_file:
-        _pf = Path(args.ignore_prompt_file)
-        if _pf.exists():
-            ignore_prefix_lines = [
-                ln.strip()
-                for ln in _pf.read_text(encoding="utf-8", errors="replace").splitlines()
-            ]
+        ignore_prompt_path = Path(args.ignore_prompt_file)
+        prompt_snapshot = _read_prompt_exclusion_snapshot(ignore_prompt_path)
+        if prompt_snapshot is not None:
+            ignore_prefix_lines, ignore_prompt_signature = prompt_snapshot
+        if not ignore_prompt_path.exists() and not status_existed_at_startup:
+            print(
+                "goalflight_watch: dispatch retired; prompt sidecar and status "
+                f"are absent for {args.dispatch_id}",
+                flush=True,
+            )
+            return 0
+        dispatch_record_nonterminal_at_startup = _dispatch_record_is_nonterminal(
+            args.dispatch_id
+        )
+        if (
+            not status_existed_at_startup
+            and not dispatch_record_nonterminal_at_startup
+        ):
+            print(
+                "goalflight_watch: dispatch retired; status is absent without "
+                f"a non-terminal record for {args.dispatch_id}",
+                flush=True,
+            )
+            return 0
     expected_identity = _load_identity(args.worker_identity_json)
     task_ids = _split_task_ids(args.task_ids)
     task_project_root = goalflight_task.resolve_project_root(args.project_root)
 
-    tail = Path(args.tail)
-    status_path = Path(args.status_json)
     effective_account = _trace_ledger_account(args.dispatch_id)
     codex_home = (
         Path(args.codex_dispatch_home).expanduser()
@@ -1742,8 +2091,27 @@ def main() -> int:
     last_payload: dict | None = None
     terminal_seen: dict | None = None
     terminal_seen_at: float | None = None
+    terminal_seen_size: int | None = None
+    last_discarded_terminal_evidence: dict | None = None
     final_status_written = False
     working_breadcrumb_written = False
+    dispatch_retired = False
+    last_prompt_reload_at: float | None = None
+    status_recreation_authorized_at_startup = (
+        not status_existed_at_startup
+        and dispatch_record_nonterminal_at_startup
+    )
+
+    def status_write_allowed() -> bool:
+        """Refuse to recreate an ACP status deliberately retired with its prompt."""
+
+        if status_path.exists() or ignore_prompt_path is None:
+            return True
+        if not status_existed_at_startup:
+            return status_recreation_authorized_at_startup
+        if ignore_prompt_path.exists():
+            return True
+        return _dispatch_record_is_nonterminal(args.dispatch_id)
 
     def append_task_breadcrumb(state: str, payload: dict) -> dict | None:
         if not task_ids:
@@ -1769,6 +2137,11 @@ def main() -> int:
     def write_payload(payload: dict, *, reason: str | None = None, terminal_write: bool = False) -> dict | None:
         nonlocal codex_session_id, codex_session_recorded
         nonlocal last_payload, final_status_written, working_breadcrumb_written
+        nonlocal dispatch_retired
+        if not status_write_allowed():
+            dispatch_retired = True
+            final_status_written = True
+            return {"type": "DispatchRetired", "message": "status recreation refused"}
         if effective_account:
             payload["effective_account"] = effective_account
         payload["controller_session_id"] = controller_session_id
@@ -1898,6 +2271,13 @@ def main() -> int:
                 payload["state"] = "terminal_pending"
                 payload["liveness_state"] = "terminal_pending"
                 payload["ledger_finalize_error"] = ledger_error
+        # Recheck immediately before the atomic status write: cleanup retires
+        # prompt first and status second, so a watcher started in that gap must
+        # observe the paired absence instead of recreating the cleaned status.
+        if not status_write_allowed():
+            dispatch_retired = True
+            final_status_written = True
+            return {"type": "DispatchRetired", "message": "status recreation refused"}
         write_status(status_path, payload)
         last_payload = dict(payload)
         if terminal_write and not ledger_error:
@@ -1982,6 +2362,43 @@ def main() -> int:
 
     posted_trace_attention: set[str] = set()
     while True:
+        if dispatch_retired:
+            break
+        if ignore_prompt_path is not None:
+            try:
+                current_prompt_stat = ignore_prompt_path.stat()
+                current_prompt_signature = _prompt_file_signature(
+                    current_prompt_stat
+                )
+            except OSError:
+                current_prompt_signature = None
+            reload_now = active_monotonic()
+            if _prompt_reload_due(
+                current_prompt_signature,
+                ignore_prompt_signature,
+                last_reload_at=last_prompt_reload_at,
+                now=reload_now,
+                poll_secs=args.poll_secs,
+            ):
+                prompt_snapshot = _read_prompt_exclusion_snapshot(
+                    ignore_prompt_path
+                )
+                if prompt_snapshot is not None:
+                    ignore_prefix_lines, ignore_prompt_signature = prompt_snapshot
+                    last_prompt_reload_at = reload_now
+                    # ACP steers regenerate the delivered prompt between turns.
+                    # A startup-only snapshot lets a later echoed steer marker
+                    # escape exclusions during recovery, so replay the tail
+                    # after this cheap per-poll signature check observes a change.
+                    # Coalescing permits at most one zero-offset replay per poll
+                    # interval, bounding replay work to O(changes x tail size)
+                    # for the coalesced sidecar changes a watcher observes.
+                    # Clear any candidate parsed in the narrow stat/replace
+                    # race under the prior exclusions before trusting replay.
+                    tail_scanner.update_prompt_prefix(ignore_prefix_lines)
+                    terminal_seen = None
+                    terminal_seen_at = None
+                    terminal_seen_size = None
         scan = tail_scanner.scan(kimi_output=moonshot_family(args.agent))
         markers = scan.markers
         size = scan.size
@@ -2007,9 +2424,25 @@ def main() -> int:
             scan = _combine_tail_scan_results(scan, recheck)
             markers = scan.markers
             terminal = scan.terminal
+            # A terminal found by the stability recheck belongs to the recheck's
+            # offset. Using the first scan's size makes those marker bytes look
+            # like later growth and falsely vetoes the new candidate.
+            size = scan.size
             if scan.size != last_size:
                 last_size = scan.size
                 last_change = active_monotonic()
+        retained_discarded_candidate = _discarded_terminal_candidate_matches(
+            last_discarded_terminal_evidence,
+            terminal,
+            scan.terminal_observed_size,
+        )
+        if retained_discarded_candidate:
+            # Prompt replay (or any same-offset reparse) must not resurrect a
+            # candidate already vetoed by later live-worker growth. Keep the
+            # durable evidence, but leave the candidate unarmed until a marker
+            # is genuinely re-emitted at a new byte offset.
+            terminal = None
+            scan.terminal = None
         worker_is_alive, identity_reason, current_identity = worker_alive(args.pid, expected_identity)
         if worker_is_alive:
             pgid = args.pgid or process_group_id(args.pid) or pgid
@@ -2060,7 +2493,20 @@ def main() -> int:
             "state": "running_quiet" if liveness_state == "running_quiet" else "running",
             "updated_at": int(now),
         }
+        if ignore_prompt_signature is not None:
+            payload["ignore_prompt_mtime_ns"] = ignore_prompt_signature[0]
+            payload["ignore_prompt_signature"] = {
+                "mtime_ns": ignore_prompt_signature[0],
+                "size": ignore_prompt_signature[1],
+                "ino": ignore_prompt_signature[2],
+            }
         payload.update(trace_sample)
+        if last_discarded_terminal_evidence:
+            payload["last_discarded_terminal_evidence"] = dict(
+                last_discarded_terminal_evidence
+            )
+        if retained_discarded_candidate:
+            payload["replayed_discarded_terminal_evidence"] = True
         if trace_idle_veto:
             payload["reason"] = "quiet_console_active_trace"
         trace_attention = _trace_attention_state(
@@ -2079,10 +2525,21 @@ def main() -> int:
             )
         if low_power_relax:
             payload["low_power_relax"] = True
-        if terminal:
-            if terminal_seen is None:
-                terminal_seen_at = active_monotonic()
+        if liveness_state == "wedged":
+            wedge_streak += 1
+        else:
+            wedge_streak = 0
+        idle_confirmed = (
+            liveness_state == "wedged" and wedge_streak >= WEDGE_CONFIRM_SAMPLES
+        )
+        if terminal and terminal != terminal_seen:
             terminal_seen = terminal
+            terminal_seen_at = active_monotonic()
+            terminal_seen_size = (
+                scan.terminal_observed_size
+                if scan.terminal_observed_size is not None
+                else size
+            )
         terminal_state = _marker_state(terminal_seen) if terminal_seen else None
         terminal_reason = f"marker:{terminal_seen['kind']}" if terminal_seen else None
         post_terminal_wait = (
@@ -2098,20 +2555,54 @@ def main() -> int:
             if post_terminal_wait and terminal_seen_at is not None
             else None
         )
-        if (
-            post_terminal_wait
-            and post_terminal_wait_elapsed is not None
-            and post_terminal_wait_elapsed >= POST_TERMINAL_EXIT_GRACE_SECS
-        ):
-            payload["state"] = "inconclusive_timeout"
-            payload["terminal_pending_state"] = terminal_state
-            payload["post_terminal_wait_elapsed_secs"] = round(post_terminal_wait_elapsed, 3)
-            payload["post_terminal_wait_limit_secs"] = POST_TERMINAL_EXIT_GRACE_SECS
-            exit_reason = f"{terminal_reason}:post_terminal_exit_timeout"
-            write_payload(payload, reason=exit_reason, terminal_write=True)
-            exit_code = _exit_code_for_state(payload["state"])
-            exit_reason = payload.get("reason", exit_reason)
-            break
+        post_terminal_action = "pending"
+        if post_terminal_wait:
+            post_terminal_action = _post_terminal_candidate_action(
+                worker_alive=worker_is_alive,
+                tail_grew=(
+                    terminal_seen_size is not None and size > terminal_seen_size
+                ),
+                grace_expired=(
+                    post_terminal_wait_elapsed is not None
+                    and post_terminal_wait_elapsed >= POST_TERMINAL_EXIT_GRACE_SECS
+                ),
+                idle_confirmed=idle_confirmed,
+            )
+        if post_terminal_action == "discard":
+            discarded_marker = terminal_seen
+            last_discarded_terminal_evidence = {
+                "kind": str((discarded_marker or {}).get("kind") or ""),
+                "dispatch_id_binding": args.dispatch_id,
+                "offset": int(terminal_seen_size if terminal_seen_size is not None else size),
+                "marker": dict(discarded_marker or {}),
+            }
+            print(
+                "WATCHER-DISCARD "
+                + json.dumps(
+                    {
+                        "marker": discarded_marker,
+                        "reason": "worker_alive_tail_grew_since_marker",
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            payload["discarded_terminal_marker"] = discarded_marker
+            payload["last_discarded_terminal_evidence"] = dict(
+                last_discarded_terminal_evidence
+            )
+            payload.pop("terminal_marker", None)
+            terminal_seen = None
+            terminal_seen_at = None
+            terminal_seen_size = None
+            wedge_streak = 0
+            write_payload(
+                payload,
+                reason="discarded_terminal_marker:worker_alive_tail_grew_since_marker",
+                terminal_write=False,
+            )
+            time.sleep(args.poll_secs)
+            continue
         if terminal_seen and not post_terminal_wait:
             payload["state"] = terminal_state
             exit_code = _exit_code_for_state(payload["state"])
@@ -2167,6 +2658,7 @@ def main() -> int:
                 ignore_prefix_lines=ignore_prefix_lines,
                 kimi_output=moonshot_family(args.agent),
                 expected_dispatch_id=args.dispatch_id,
+                full_file_fallback=True,
             )
             if not reconciled:
                 recorded = _recorded_terminal_success_marker(
@@ -2201,6 +2693,7 @@ def main() -> int:
                         ignore_prefix_lines=ignore_prefix_lines,
                         kimi_output=moonshot_family(args.agent),
                         expected_dispatch_id=args.dispatch_id,
+                        full_file_fallback=True,
                     )
                     if reconciled:
                         terminal_seen = reconciled
@@ -2246,9 +2739,9 @@ def main() -> int:
             exit_reason = payload.get("reason", exit_reason)
             break
         if liveness_state == "wedged":
-            wedge_streak += 1
-            if wedge_streak >= WEDGE_CONFIRM_SAMPLES:
-                if post_terminal_wait:
+            if idle_confirmed:
+                terminal_liveness_exit = False
+                if post_terminal_wait and post_terminal_action == "terminalize":
                     payload["state"] = "inconclusive_timeout"
                     payload["terminal_pending_state"] = terminal_state
                     if post_terminal_wait_elapsed is not None:
@@ -2258,19 +2751,40 @@ def main() -> int:
                     payload["post_terminal_wait_limit_secs"] = POST_TERMINAL_EXIT_GRACE_SECS
                     exit_reason = f"{terminal_reason}:post_terminal_idle_timeout"
                     exit_code = _exit_code_for_state(payload["state"])
-                else:
-                    payload["state"] = "idle_timeout"
-                    exit_reason = "idle_timeout"
-                    exit_code = 2
-                    if apply_tail_quota_status(payload, previous_state="idle_timeout", previous_reason=exit_reason):
-                        exit_reason = payload["reason"]
-                        exit_code = 1
-                write_payload(payload, reason=exit_reason, terminal_write=True)
-                exit_code = _exit_code_for_state(payload["state"])
-                exit_reason = payload.get("reason", exit_reason)
-                break
-        else:
-            wedge_streak = 0
+                    terminal_liveness_exit = True
+                elif not post_terminal_wait:
+                    if last_discarded_terminal_evidence:
+                        evidence_kind = str(
+                            last_discarded_terminal_evidence.get("kind") or "COMPLETE"
+                        )
+                        payload["state"] = "inconclusive_timeout"
+                        payload["terminal_pending_state"] = _marker_state(
+                            last_discarded_terminal_evidence
+                        )
+                        payload["last_discarded_terminal_evidence"] = dict(
+                            last_discarded_terminal_evidence
+                        )
+                        exit_reason = (
+                            f"marker:{evidence_kind}:post_terminal_idle_timeout"
+                        )
+                        exit_code = _exit_code_for_state(payload["state"])
+                    else:
+                        payload["state"] = "idle_timeout"
+                        exit_reason = "idle_timeout"
+                        exit_code = 2
+                        if apply_tail_quota_status(
+                            payload,
+                            previous_state="idle_timeout",
+                            previous_reason=exit_reason,
+                        ):
+                            exit_reason = payload["reason"]
+                            exit_code = 1
+                    terminal_liveness_exit = True
+                if terminal_liveness_exit:
+                    write_payload(payload, reason=exit_reason, terminal_write=True)
+                    exit_code = _exit_code_for_state(payload["state"])
+                    exit_reason = payload.get("reason", exit_reason)
+                    break
         if post_terminal_wait:
             payload["state"] = "running_after_terminal"
             payload["terminal_pending_state"] = terminal_state
@@ -2279,6 +2793,13 @@ def main() -> int:
             write_payload(payload)
         time.sleep(args.poll_secs)
 
+    if dispatch_retired:
+        print(
+            "goalflight_watch: dispatch retired; prompt sidecar and status "
+            f"are absent for {args.dispatch_id}",
+            flush=True,
+        )
+        return 0
     print(json.dumps({"state": payload["state"], "reason": exit_reason, "status_path": str(status_path)}, sort_keys=True))
     return exit_code
 

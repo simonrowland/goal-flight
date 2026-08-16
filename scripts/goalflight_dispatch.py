@@ -1785,6 +1785,7 @@ def _status_reminder_lines(
     controller_pid: int | None = None,
     poll_secs: float | None = None,
     max_idle_secs: float | None = None,
+    prompt_path: Path | str | None = None,
 ) -> list[str]:
     """Terse post-dispatch status-tooling reminder (stderr only; path-not-payload)."""
     root = (skill_root or _skill_root()).resolve()
@@ -1814,10 +1815,19 @@ def _status_reminder_lines(
         f"  mail:   python3 {messages_py} relay   # current project, open + unread",
     ]
     if shape == "acp":
-        lines.append(
-            f"  watch:  python3 {watch_py} --pid {worker_pid} --tail {tail} "
-            f"--status-json {status_path}"
-        )
+        watch_parts = [
+            "python3",
+            str(watch_py),
+            "--pid",
+            str(worker_pid),
+            "--tail",
+            str(tail),
+            "--status-json",
+            str(status_path),
+        ]
+        if prompt_path is not None:
+            watch_parts += ["--ignore-prompt-file", str(Path(prompt_path).resolve())]
+        lines.append("  watch:  " + " ".join(watch_parts))
     else:
         # Moonshot (kimi CLI) renderer normalization keys off the production
         # preset label; synthetic -bash-tail aliases are not first-class dispatch agents.
@@ -1846,6 +1856,8 @@ def _status_reminder_lines(
             watch_parts += ["--poll-secs", str(poll_secs)]
         if max_idle_secs is not None:
             watch_parts += ["--max-idle-secs", str(max_idle_secs)]
+        if prompt_path is not None:
+            watch_parts += ["--ignore-prompt-file", str(Path(prompt_path).resolve())]
         lines.append("  watch:  " + " ".join(watch_parts))
     return lines
 
@@ -1862,6 +1874,7 @@ def _print_status_reminder(
     controller_pid: int | None = None,
     poll_secs: float | None = None,
     max_idle_secs: float | None = None,
+    prompt_path: Path | str | None = None,
 ) -> None:
     for line in _status_reminder_lines(
         dispatch_id,
@@ -1874,6 +1887,7 @@ def _print_status_reminder(
         controller_pid=controller_pid,
         poll_secs=poll_secs,
         max_idle_secs=max_idle_secs,
+        prompt_path=prompt_path,
     ):
         print(line, file=sys.stderr, flush=True)
 
@@ -3770,10 +3784,19 @@ def _queue_entry_counts_as_active(path: Path, entry: dict) -> bool:
 
 
 def _cleanup_partial_submit(queue_path: Path, status_json: Path) -> None:
+    prompt_sidecar = _acp_watcher_prompt_path(status_json)
     with contextlib.suppress(OSError):
         queue_path.unlink()
     with contextlib.suppress(OSError):
+        # Retire the sidecar first: a crash may leave status + sidecar paired,
+        # but must not leave prompt material orphaned after status disappears.
+        prompt_sidecar.unlink()
+    with contextlib.suppress(OSError):
         status_json.unlink()
+    if prompt_sidecar.exists() and not status_json.exists():
+        # Re-pair a pre-existing orphan, or retry a transient first unlink.
+        with contextlib.suppress(OSError):
+            prompt_sidecar.unlink()
     with contextlib.suppress(OSError):
         status_json.with_suffix(status_json.suffix + ".tmp").unlink()
     for tmp in queue_path.parent.glob(f"{queue_path.name}.tmp.*"):
@@ -4691,6 +4714,101 @@ def _watch_identity_token(identity: dict | None) -> dict | None:
     if token and (token.get("start_token") or token.get("lstart")):
         return token
     return None
+
+
+def _watcher_spawn_argv(
+    *,
+    worker_pid: int,
+    tail: Path,
+    status_json: Path,
+    agent: str,
+    poll_secs: float,
+    max_idle_secs: float,
+    dispatch_id: str,
+    pgid: int,
+    project_root: Path | None = None,
+    task_ids: list[str] | None = None,
+    worker_identity: dict | None = None,
+    launch_detached: bool = False,
+    codex_dispatch_home: str | None = None,
+    codex_session_id: str | None = None,
+    parent_dispatch_id: str | None = None,
+    codex_home_owner_dispatch_id: str | None = None,
+    controller_pid: int | None = None,
+    controller_session_id: str | None = None,
+    controller_label: str | None = None,
+    prompt_path: Path | None = None,
+) -> list[str]:
+    """Build the detached Python watcher's argv without spawning it.
+
+    Keeping this assembly pure makes the prompt-echo exclusion a directly
+    testable dispatch contract instead of an incidental branch in ``main``.
+    """
+    watch_cmd = [
+        sys.executable,
+        str(WATCH_PY),
+        "--pid",
+        str(worker_pid),
+        "--tail",
+        str(tail),
+        "--status-json",
+        str(status_json),
+        "--agent",
+        agent,
+        "--poll-secs",
+        str(poll_secs),
+        "--max-idle-secs",
+        str(max_idle_secs),
+        "--dispatch-id",
+        dispatch_id,
+        "--pgid",
+        str(pgid),
+        "--stay-after-terminal",
+    ]
+    if task_ids:
+        if project_root is None:
+            raise ValueError("project_root is required when task_ids are present")
+        watch_cmd += [
+            "--project-root",
+            str(project_root),
+            "--task-ids",
+            ",".join(task_ids),
+        ]
+    watch_identity_token = _watch_identity_token(worker_identity)
+    if watch_identity_token:
+        watch_cmd += [
+            "--worker-identity-json",
+            json.dumps(watch_identity_token, sort_keys=True),
+        ]
+    if launch_detached:
+        watch_cmd += ["--detached"]
+    if codex_dispatch_home is not None:
+        watch_cmd += [
+            "--codex-dispatch-home-resolved",
+            "--codex-dispatch-home",
+            codex_dispatch_home,
+        ]
+    if codex_session_id is not None:
+        watch_cmd += ["--codex-session-id", codex_session_id]
+    if parent_dispatch_id is not None:
+        watch_cmd += ["--parent-dispatch-id", parent_dispatch_id]
+    if codex_home_owner_dispatch_id is not None:
+        watch_cmd += [
+            "--codex-home-owner-dispatch-id",
+            codex_home_owner_dispatch_id,
+        ]
+    if controller_pid is not None and controller_session_id is not None:
+        watch_cmd += [
+            "--controller-pid",
+            str(controller_pid),
+            "--controller-session-id",
+            controller_session_id,
+        ]
+        if controller_label is not None:
+            watch_cmd += ["--controller-label", controller_label]
+    if prompt_path is not None:
+        watch_cmd += ["--ignore-prompt-file", str(prompt_path)]
+    return watch_cmd
 
 
 def _process_identity_after_spawn(worker_pid: int) -> dict | None:
@@ -8809,6 +8927,29 @@ def _normalize_acp_agent(args) -> None:
         )
 
 
+def _acp_watcher_prompt_path(status_json: Path) -> Path:
+    status_path = status_json.expanduser().resolve()
+    name = status_path.name
+    if name.endswith(".status.json"):
+        stem = name[: -len(".status.json")]
+    else:
+        stem = status_path.stem
+    return status_path.with_name(f"{stem}.assembled.prompt")
+
+
+def _persist_acp_watcher_prompt(
+    *,
+    status_json: Path,
+    prompt_text: str,
+) -> Path:
+    """Persist the exact ACP prompt text used for prompt-echo suppression."""
+
+    prompt_path = _acp_watcher_prompt_path(status_json)
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(prompt_text, encoding="utf-8")
+    return prompt_path
+
+
 def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
     from goalflight_acp_run import (
         DEFAULT_MAX_TOOL_S,
@@ -8829,6 +8970,20 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         body = Path(prompt_path).read_text(encoding="utf-8", errors="replace")
         acp_prompt_path = None
         acp_prompt_text = f"{_project_orientation_preamble(orientation_path)}\n\n{body}"
+    delivered_body = (
+        acp_prompt_text
+        if acp_prompt_text is not None
+        else Path(prompt_path).read_text(encoding="utf-8", errors="replace")
+    )
+    delivered_prompt = (
+        f"{PROMPT_FILE_PREAMBLE}\n\n{delivered_body}"
+        if prompt_path
+        else delivered_body
+    )
+    watcher_prompt_path = _persist_acp_watcher_prompt(
+        status_json=status_json,
+        prompt_text=delivered_prompt,
+    )
     explicit_os_sandbox = getattr(args, "os_sandbox", None)
     if explicit_os_sandbox:
         os_sandbox = explicit_os_sandbox
@@ -8857,6 +9012,7 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         prompt_text=acp_prompt_text,
         prompt_b64=None,
         original_prompt_file=prompt_path,
+        watcher_prompt_file=str(watcher_prompt_path),
         mode="one-shot",
         idle_timeout=float(args.max_idle_secs or 300.0),
         status_json=str(status_json),
@@ -9146,7 +9302,7 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
         allow_queued=getattr(args, "from_queue", False),
     )
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
-    cfg = _build_acp_cfg(args, status_json=status_json)
+    cfg = _build_acp_cfg(args, status_json=status_json, base=base)
     env_remove = []
     if args.billing == "sub":
         engine = _account_engine(args.agent)
@@ -9221,6 +9377,7 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
             tail_path=tail_path,
             worker_pid=int(worker_pid),
             shape="acp",
+            prompt_path=getattr(cfg, "watcher_prompt_file", None),
         )
     end_payload = {
         "dispatch_id": payload.get("dispatch_id", cfg.dispatch_id),
@@ -10149,56 +10306,36 @@ def main(argv: list[str] | None = None) -> int:
             controller_pid=_controller_pid(args),
             poll_secs=args.poll_secs,
             max_idle_secs=args.max_idle_secs,
+            prompt_path=prompt_path,
         )
 
         # 2. Run the decoupled watcher detached from this launcher. We still poll
         # status and return when it records a terminal state, but launcher teardown
         # no longer tears down the watcher with the worker.
-        watch_cmd = [
-            sys.executable, str(WATCH_PY),
-            "--pid", str(worker_pid),
-            "--tail", str(tail),
-            "--status-json", str(status_json),
-            "--agent", args.agent,
-            "--poll-secs", str(args.poll_secs),
-            "--max-idle-secs", str(args.max_idle_secs),
-            "--dispatch-id", args.dispatch_id,
-            "--pgid", str(pgid),
-            "--stay-after-terminal",
-        ]
-        if getattr(args, "task_ids", None):
-            watch_cmd += ["--project-root", str(project_root), "--task-ids", ",".join(args.task_ids)]
-        watch_identity_token = _watch_identity_token(worker_identity_token)
-        if watch_identity_token:
-            watch_cmd += ["--worker-identity-json", json.dumps(watch_identity_token, sort_keys=True)]
-        if args.launch_detached:
-            watch_cmd += ["--detached"]
-        if codex_dispatch_home is not None:
-            watch_cmd += ["--codex-dispatch-home-resolved"]
-            watch_cmd += ["--codex-dispatch-home", codex_dispatch_home]
-        if codex_session_id is not None:
-            watch_cmd += ["--codex-session-id", codex_session_id]
-        if getattr(args, "parent_dispatch_id", None):
-            watch_cmd += ["--parent-dispatch-id", args.parent_dispatch_id]
-        if codex_home_owner_dispatch_id is not None:
-            watch_cmd += [
-                "--codex-home-owner-dispatch-id",
-                codex_home_owner_dispatch_id,
-            ]
         controller_pid = _controller_pid(args)
         controller_session_id = _controller_session_id(args)
-        if controller_pid is not None and controller_session_id is not None:
-            watch_cmd += [
-                "--controller-pid",
-                str(controller_pid),
-                "--controller-session-id",
-                controller_session_id,
-            ]
-            controller_label = _controller_label(args)
-            if controller_label is not None:
-                watch_cmd += ["--controller-label", controller_label]
-        if prompt_path:
-            watch_cmd += ["--ignore-prompt-file", str(prompt_path)]
+        watch_cmd = _watcher_spawn_argv(
+            worker_pid=worker_pid,
+            tail=tail,
+            status_json=status_json,
+            agent=args.agent,
+            poll_secs=args.poll_secs,
+            max_idle_secs=args.max_idle_secs,
+            dispatch_id=args.dispatch_id,
+            pgid=pgid,
+            project_root=project_root,
+            task_ids=getattr(args, "task_ids", None),
+            worker_identity=worker_identity_token,
+            launch_detached=bool(args.launch_detached),
+            codex_dispatch_home=codex_dispatch_home,
+            codex_session_id=codex_session_id,
+            parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
+            codex_home_owner_dispatch_id=codex_home_owner_dispatch_id,
+            controller_pid=controller_pid,
+            controller_session_id=controller_session_id,
+            controller_label=_controller_label(args),
+            prompt_path=prompt_path,
+        )
 
         watch_log = base / f"{args.dispatch_id}.watcher.log"
         with contextlib.suppress(Exception):

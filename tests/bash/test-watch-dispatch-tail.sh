@@ -151,10 +151,17 @@ run_pid_dead_grace_marker_case() {
 # and prints the orphaned sleep PID so same-PGID test harness CPU cannot mask a
 # quiet fake worker as running_quiet.
 
-# ---- Case 1: terminal marker → exit 0 ----
+# ---- Case 1: live growth vetoes candidate; worker exit reconciles it → exit 0 ----
 TAIL=/tmp/test-watch-marker-$$.txt
 : > "$TAIL"
-sleep 30 & WORKER_PID=$!
+TRIGGER=/tmp/test-watch-marker-trigger-$$
+(
+  while [ ! -f "$TRIGGER" ]; do sleep 0.05; done
+  echo "**COMPLETE:** test-marker — test fixture candidate"
+  sleep 1.5
+  echo "worker output continued after the candidate"
+  sleep 2
+) >> "$TAIL" & WORKER_PID=$!
 SLUG="test-marker"
 PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
 
@@ -174,32 +181,126 @@ else
   expect_eq "case-1 pidfile written at startup" "yes" "no"
 fi
 
-# Append terminal marker to tail. Worker is still alive (sleep 30 doesn't
-# exit just because we wrote a marker to a different file). By the new exit-
-# trap contract, the pidfile must be PRESERVED on exit because the worker is
-# still alive — cleanup_ghosts() on a subsequent orchestrator startup is what
-# reaps the still-alive-but-orphaned worker.
-echo "**COMPLETE:** $SLUG — test fixture done" >> "$TAIL"
-
-# Wait for watcher to exit
-wait "$WATCHER_PID"
-watcher_exit=$?
-expect_eq "case-1 exit code on terminal-marker" "0" "$watcher_exit"
-# New behavior post-hardening: pidfile PRESERVED when worker still alive.
-if [ -f "$PIDFILE_DIR/$PIDFILE_STEM" ]; then
-  expect_eq "case-1 pidfile preserved (worker still alive on exit)" "preserved" "preserved"
+# Let the worker expose a marker as its last line, then grow the tail while it
+# remains alive. The watcher must discard that candidate instead of exiting 0.
+: > "$TRIGGER"
+sleep 2.3
+watcher_finished_early=0
+watcher_exit=0
+if kill -0 "$WATCHER_PID" 2>/dev/null; then
+  expect_eq "case-1 live growth keeps watcher running" "running" "running"
 else
-  expect_eq "case-1 pidfile preserved (worker still alive on exit)" "preserved" "removed"
+  wait "$WATCHER_PID"
+  watcher_exit=$?
+  watcher_finished_early=1
+  expect_eq "case-1 live growth keeps watcher running" "running" "exited-$watcher_exit"
+fi
+
+# The same historical marker becomes legitimate terminal evidence once the
+# worker exits. Death reconciliation must then return the normal success code.
+wait "$WORKER_PID" 2>/dev/null
+if [ "$watcher_finished_early" -eq 0 ]; then
+  wait "$WATCHER_PID"
+  watcher_exit=$?
+fi
+expect_eq "case-1 marker then worker exit" "0" "$watcher_exit"
+if [ -f "$PIDFILE_DIR/$PIDFILE_STEM" ]; then
+  expect_eq "case-1 pidfile removed after worker exit" "removed" "preserved"
+else
+  expect_eq "case-1 pidfile removed after worker exit" "removed" "removed"
+fi
+if grep -q "WATCHER-DISCARD: terminal candidate disproved by live tail growth" /tmp/watcher-out-marker-$$.txt; then
+  expect_eq "case-1 growth veto recorded" "yes" "yes"
+else
+  expect_eq "case-1 growth veto recorded" "yes" "no"
 fi
 if grep -q "WATCHER-EXIT: marker exit_code=0" /tmp/watcher-out-marker-$$.txt; then
   expect_eq "case-1 WATCHER-EXIT summary line emitted" "yes" "yes"
 else
   expect_eq "case-1 WATCHER-EXIT summary line emitted" "yes" "no"
 fi
-# Kill worker + cleanup pidfile manually (test-controlled, not via watcher trap)
+rm -f "$TAIL" "$TRIGGER" /tmp/watcher-out-marker-$$.txt
+cleanup_pidfile "$PIDFILE_STEM"
+if [ "${GOALFLIGHT_TEST_CASE1_ONLY:-0}" = "1" ]; then
+  echo "===== watch-dispatch-tail case-1: $pass passed, $fail failed ====="
+  exit "$fail"
+fi
+
+# ---- Case 1q: a quiet live success candidate stays pending through grace ----
+# The six-second candidate grace is only a growth-veto window. A live worker
+# that remains quiet past it is still live evidence, so the watcher must keep
+# watching until worker exit (or the ordinary max-idle classifier).
+TAIL=/tmp/test-watch-quiet-live-marker-$$.txt
+OUT=/tmp/watcher-out-quiet-live-marker-$$.txt
+: > "$TAIL"
+(
+  echo "**COMPLETE:** quiet-live-marker — bounded work complete"
+  sleep 8
+) >> "$TAIL" & WORKER_PID=$!
+PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
+bash "$WATCHER" \
+  --pid "$WORKER_PID" --tail "$TAIL" \
+  --controller-pid "$$" --agent test-bashtail \
+  --session-id quiet-live-marker \
+  --poll-secs 1 --max-idle-secs 30 \
+  > "$OUT" 2>&1 &
+WATCHER_PID=$!
+
+# Wait past POST_TERMINAL_EXIT_GRACE_SECS (6s) while the worker remains alive.
+sleep 7
+quiet_watcher_finished_early=0
+watcher_exit=0
+if kill -0 "$WATCHER_PID" 2>/dev/null; then
+  expect_eq "case-1q quiet live marker stays pending through grace" "running" "running"
+else
+  wait "$WATCHER_PID"
+  watcher_exit=$?
+  quiet_watcher_finished_early=1
+  expect_eq "case-1q quiet live marker stays pending through grace" "running" "exited-$watcher_exit"
+fi
+wait "$WORKER_PID" 2>/dev/null
+if [ "$quiet_watcher_finished_early" -eq 0 ]; then
+  wait "$WATCHER_PID"
+  watcher_exit=$?
+fi
+expect_eq "case-1q worker exit reconciles quiet marker" "0" "$watcher_exit"
+if grep -q "terminal candidate still pending while worker is alive" "$OUT"; then
+  expect_eq "case-1q pending state recorded" "yes" "yes"
+else
+  expect_eq "case-1q pending state recorded" "yes" "no"
+fi
+rm -f "$TAIL" "$OUT"
+cleanup_pidfile "$PIDFILE_STEM"
+
+# ---- Case 1r: direct watcher total-runtime bound stops forever-chatty workers ----
+TAIL=/tmp/test-watch-runtime-bound-$$.txt
+OUT=/tmp/watcher-out-runtime-bound-$$.txt
+: > "$TAIL"
+(
+  i=0
+  while true; do
+    echo "STATUS: runtime-bound tick $i"
+    i=$((i + 1))
+    sleep 1
+  done
+) >> "$TAIL" & WORKER_PID=$!
+PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
+GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS=3 bash "$WATCHER" \
+  --pid "$WORKER_PID" --tail "$TAIL" \
+  --controller-pid "$$" --agent test-bashtail \
+  --session-id runtime-bound \
+  --poll-secs 1 --max-idle-secs 30 \
+  > "$OUT" 2>&1
+watcher_exit=$?
+expect_eq "case-1r total-runtime exit code" "2" "$watcher_exit"
+if grep -q "WATCHER-EXIT: runtime-timeout exit_code=2" "$OUT"; then
+  expect_eq "case-1r total-runtime summary" "yes" "yes"
+else
+  expect_eq "case-1r total-runtime summary" "yes" "no"
+fi
 kill "$WORKER_PID" 2>/dev/null
 wait "$WORKER_PID" 2>/dev/null
-rm -f "$TAIL" /tmp/watcher-out-marker-$$.txt
+rm -f "$TAIL" "$OUT"
 cleanup_pidfile "$PIDFILE_STEM"
 
 # ---- Case 1a: custom regex remains dispatch-bound ----
@@ -894,8 +995,12 @@ _CPU_CACHE_TS=""
 _CPU_CACHE_SAMPLE=""
 # Wait briefly for the child to enter its spin.
 sleep 0.3
-SPIN_PGID=$(ps -o pgid= -p "$SPIN_PID" 2>/dev/null | tr -d ' ')
-if [ -z "$SPIN_PGID" ]; then
+SPIN_PGID_RAW=$(ps -o pgid= -p "$SPIN_PID" 2>/dev/null)
+spin_ps_rc=$?
+SPIN_PGID=$(printf '%s' "$SPIN_PGID_RAW" | tr -d ' ')
+if [ "$spin_ps_rc" -ne 0 ]; then
+  note "SKIP  case-6 live sampler (process inspection denied by test sandbox)"
+elif [ -z "$SPIN_PGID" ]; then
   expect_eq "case-6 live spinner started" "yes" "no"
 else
   busy=$(pgroup_cpu_pct "$SPIN_PGID")

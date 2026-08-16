@@ -80,7 +80,7 @@ If a slice the mapping calls for doesn't exist (e.g. `patterns/<X>.md` was skipp
 [Layer 5: self-review categories + universal null-hypothesis floor — abstract; specialize in REPORT]
 
 Report format: see prompts/executor-self-review.md.
-Return shape: see `commands/execute.md` step 7 — pick one of Investigator (READY + file-backed findings), Executor (COMMIT + TL;DR + DETAILED), or Blocked (BLOCKED + reason + recommended orchestrator action). The dispatch prompt MUST specify which shape applies so the orchestrator can parse the headline without reading the body. The terminal marker (`READY` / `COMPLETE` / `RESULT` / `BLOCKED` / etc.) MUST be the worker's **final** non-empty line (emit TL;DR/findings before `READY:`). Workers do NOT execute workarounds (alternate APIs, git plumbing, inline content dumps) when blocked — escalate via Blocked shape; orchestrator decides.
+Return shape: see `commands/execute.md` step 7 — pick one of Investigator (READY + file-backed findings), Executor (COMMIT + TL;DR + DETAILED), or Blocked (BLOCKED + reason + recommended orchestrator action). The dispatch prompt MUST specify which shape applies so the orchestrator can parse the headline without reading the body. `RESULT` is a pre-terminal completed-work summary and may be followed by more output; emit the actual terminal marker (`READY` / `COMPLETE` / `BLOCKED` / etc.) as the worker's **final** non-empty line (emit TL;DR/findings before `READY:`). Workers do NOT execute workarounds (alternate APIs, git plumbing, inline content dumps) when blocked — escalate via Blocked shape; orchestrator decides.
 Read AGENTS.md (or worker-context.md if it exists) before starting — treat as starting hypothesis you verify against current code.
 ```
 

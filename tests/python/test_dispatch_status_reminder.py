@@ -16,6 +16,7 @@ import goalflight_dispatch  # noqa: E402
 def _reminder_text(shape: str) -> tuple[str, Path, Path]:
     status_json = Path("/tmp/goal-flight-state/dispatch/reminder-dispatch-42.status.json")
     tail_path = Path("/tmp/goal-flight-state/dispatch/reminder-dispatch-42.tail")
+    prompt_path = Path("/tmp/goal-flight-state/dispatch/reminder-dispatch-42.prompt.md")
     lines = goalflight_dispatch._status_reminder_lines(
         "reminder-dispatch-42",
         status_json=status_json,
@@ -27,6 +28,7 @@ def _reminder_text(shape: str) -> tuple[str, Path, Path]:
         controller_pid=9999,
         poll_secs=2.0,
         max_idle_secs=180.0,
+        prompt_path=prompt_path,
     )
     return "\n".join(lines), status_json.resolve(), tail_path.resolve()
 
@@ -49,6 +51,8 @@ def test_status_reminder_bash_shape() -> None:
     assert "--session-id reminder-dispatch-42" in text
     assert "--poll-secs 2.0" in text
     assert "--max-idle-secs 180.0" in text
+    prompt = Path("/tmp/goal-flight-state/dispatch/reminder-dispatch-42.prompt.md").resolve()
+    assert f"--ignore-prompt-file {prompt}" in text
     assert "goalflight_watch.py" not in text
 
 
@@ -66,6 +70,8 @@ def test_status_reminder_acp_shape() -> None:
     assert "--pid 4242" in text
     assert f"--tail {tail}" in text
     assert f"--status-json {status_json}" in text
+    prompt = Path("/tmp/goal-flight-state/dispatch/reminder-dispatch-42.prompt.md").resolve()
+    assert f"--ignore-prompt-file {prompt}" in text
     assert "watch-dispatch-tail.sh" not in text
 
 

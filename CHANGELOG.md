@@ -6,6 +6,20 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- Watchers tell the truth about live workers. A terminal-vocabulary marker
+  echoed mid-run no longer kills the watch: with the worker alive and output
+  growing, the candidate is discarded and watching resumes — in both the
+  python watcher and the bash tail watcher — while legitimate terminals keep
+  their evidence through discards, reloads, and death reconciliation (which
+  now scans the whole tail, chunk-capped, beyond the old 10 MiB window).
+  Dispatchers hand every watcher the worker's own prompt file (persisted for
+  ACP, steer-refreshed, cleanup-paired) so brief echoes can never look
+  terminal. Marker docs now agree everywhere: READY and COMPLETE are
+  terminal-only, RESULT is a pre-terminal summary, STATUS is progress.
+
+
 ### Added
 
 - Fleet console controller liveness: every controller row classifies as

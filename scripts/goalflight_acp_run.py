@@ -85,6 +85,7 @@ DEFAULT_STALL_WAKE_CAP = 3
 DEFAULT_BETWEEN_TURN_STEER_GRACE_S = 10.0
 DEFAULT_EMPTY_BETWEEN_TURN_STEER_POLL_S = 0.25
 DEFAULT_USER_CONFIRM_TIMEOUT_S = 600.0
+WATCHER_PROMPT_HISTORY_RECENT_TURNS = 8
 AGENT_STDERR_CAPTURE_BYTES = 64 * 1024
 AGENT_STDERR_ERROR_TAIL_CHARS = 1000
 LIVENESS_PROFILES = {"remote_api", "local_compute", "hybrid"}
@@ -724,6 +725,57 @@ def _prompt_with_original_prompt_file_preamble(base_prompt: str, original_prompt
     if not original_prompt_file:
         return base_prompt
     return f"{_prompt_file_preamble()}\n\n{base_prompt}"
+
+
+def _persist_watcher_prompt_turn(cfg: argparse.Namespace, prompt_text: str) -> Path | None:
+    """Atomically replace the recovery watcher's delivered-prompt history."""
+
+    configured = getattr(cfg, "watcher_prompt_file", None)
+    if not configured:
+        return None
+    path = Path(str(configured)).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(prompt_text, encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+    return path
+
+
+class _WatcherPromptHistory:
+    """Bound prompt exclusions to the original plus the latest steer turns."""
+
+    def __init__(self, max_recent: int = WATCHER_PROMPT_HISTORY_RECENT_TURNS) -> None:
+        self.max_recent = max(0, int(max_recent))
+        self.original: str | None = None
+        self.recent: list[str] = []
+        self.omitted = 0
+
+    def append(self, prompt_text: str) -> None:
+        if self.original is None:
+            self.original = prompt_text
+            return
+        self.recent.append(prompt_text)
+        overflow = len(self.recent) - self.max_recent
+        if overflow > 0:
+            del self.recent[:overflow]
+            self.omitted += overflow
+
+    def render(self) -> str:
+        if self.original is None:
+            return ""
+        parts = [self.original]
+        if self.omitted:
+            parts.append(
+                "[Goal Flight watcher prompt history truncated: "
+                f"omitted {self.omitted} earlier turn(s); exclusions retain "
+                f"the original prompt plus the {len(self.recent)} most recent turn(s).]"
+            )
+        parts.extend(self.recent)
+        return "\n\n".join(parts)
 
 
 def _read_steer_entries(path: Path) -> list[dict]:
@@ -3631,6 +3683,7 @@ async def _run_acp_dispatch_impl(
         acked_steer_seqs: set[int] = set()
         turn_index = 0
         next_prompt = prompt
+        delivered_prompt_history = _WatcherPromptHistory()
         while True:
             seen_steer_seqs = delivered_steer_seqs | acked_steer_seqs
             (
@@ -3699,6 +3752,17 @@ async def _run_acp_dispatch_impl(
                 )
                 raise RuntimeError("internal error: ACP steer delivery attempted while prompt in flight")
 
+            # The recovery watcher must exclude the prompt actually delivered
+            # on every turn, including regenerated steer wrappers. Retain the
+            # original plus a bounded recent window: death reconciliation scans
+            # historical output, while an unlimited sidecar grows quadratically
+            # across repeated rewrites. Re-persist immediately before run_prompt
+            # owns the prompt lock.
+            delivered_prompt_history.append(next_prompt)
+            _persist_watcher_prompt_turn(
+                cfg,
+                delivered_prompt_history.render(),
+            )
             prompt_task = asyncio.create_task(run_prompt(
                 conn,
                 next_prompt,

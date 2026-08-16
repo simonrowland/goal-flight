@@ -457,6 +457,11 @@ Workers communicate with one-line markers:
 - `COMPLETE:`
 - `READY:`
 
+`STATUS:` is progress. `READY:` and `COMPLETE:` are terminal-only, and
+`FAILED:` is terminal. `RESULT:` is a completed-work summary that may precede
+the final marker; watchers terminalize it only after worker exit or no-growth
+idle.
+
 `PERMISSION-OK-PROCEEDED:` is ACP-only. Details live in
 `protocols/worker-markers.md`.
 

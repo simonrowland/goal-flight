@@ -137,7 +137,7 @@ every record — before joining), mapping the dispatch lifecycle + markers:
 | `pending` | in registry, no dispatch, not blocked |
 | `waiting` | has unresolved `blocked_by` (question, task, bug, or decision id) |
 | `working` | a live, non-terminal dispatch includes this id in `task_ids` |
-| `awaiting-review` | **DONE**: latest dispatch terminal (`RESULT`/`COMPLETE`) or `goalflight_task.py done <id>`; review/accept still pending |
+| `awaiting-review` | **DONE**: latest dispatch reached `READY`/`COMPLETE` (optionally after a pre-terminal `RESULT` summary), or `goalflight_task.py done <id>`; review/accept still pending |
 | `worker-failed` | dispatch dead PID / no terminal marker / `BLOCKED` / error — needs attention |
 | `done-reviewed` | **DONE-REVIEWED**: `goalflight_task.py accept <id>` after a logged clean review |
 

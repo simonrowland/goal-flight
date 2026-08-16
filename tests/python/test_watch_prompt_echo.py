@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -33,6 +34,7 @@ PUBLIC_ROUND4_FIXTURES = ROOT / "tests" / "fixtures" / "watch_prompt_echo"
 sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_watch  # noqa: E402
+import goalflight_dispatch  # noqa: E402
 
 
 CODEX_BANNER_14 = (
@@ -51,6 +53,34 @@ CODEX_BANNER_14 = (
     "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `STEER-ACK\n"
     "\n"
 )
+
+
+def _watcher_command(
+    *,
+    tail: Path,
+    status: Path,
+    worker_pid: int,
+    dispatch_id: str,
+    poll_secs: str,
+    max_idle_secs: str,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(WATCH),
+        "--pid",
+        str(worker_pid),
+        "--tail",
+        str(tail),
+        "--status-json",
+        str(status),
+        "--dispatch-id",
+        dispatch_id,
+        "--poll-secs",
+        poll_secs,
+        "--max-idle-secs",
+        max_idle_secs,
+        "--stay-after-terminal",
+    ]
 
 
 def _run_watcher(
@@ -79,9 +109,14 @@ def _run_watcher(
             if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", candidate_id)
             else "watch-prompt-no-terminal"
         )
-    cmd = [sys.executable, str(WATCH), "--pid", str(worker_pid), "--tail", str(tail),
-           "--status-json", str(status), "--dispatch-id", dispatch_id,
-           "--poll-secs", poll_secs, "--max-idle-secs", max_idle_secs]
+    cmd = _watcher_command(
+        tail=tail,
+        status=status,
+        worker_pid=worker_pid,
+        dispatch_id=dispatch_id,
+        poll_secs=poll_secs,
+        max_idle_secs=max_idle_secs,
+    )
     if project_root is not None:
         cmd += ["--project-root", str(project_root)]
     if task_ids:
@@ -92,15 +127,12 @@ def _run_watcher(
         cmd += ["--worker-identity-json", json.dumps(identity, sort_keys=True)]
     if ignore:
         cmd += ["--ignore-prompt-file", str(prompt)]
-    env = os.environ.copy()
-    env["GOALFLIGHT_TEST_MODE"] = "1"
-    env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
-    env["GOALFLIGHT_STATE_DIR"] = str(status.parent / "state")
-    env["GOALFLIGHT_TASK_STORE_DIR"] = str(status.parent / "task-store")
-    env["GOALFLIGHT_JOURNAL_DIR"] = str(status.parent / "journal")
-    env["GOALFLIGHT_MESSAGES_DIR"] = str(status.parent / "messages")
-    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(status.parent / "wake-ledger")
-    env["GOAL_FLIGHT_PIDFILE_DIR"] = str(status.parent / "pids")
+        # Production recovery has either an existing status or a live runs.d
+        # record. Most legacy fixtures predate the ledger, so preserve the
+        # existing-status half of that startup contract.
+        if not status.exists():
+            status.write_text("{}\n", encoding="utf-8")
+    env = _watcher_env(status)
     t0 = time.time()
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=40, env=env)
     elapsed = time.time() - t0
@@ -110,6 +142,19 @@ def _run_watcher(
         payload = json.loads(status.read_text(encoding="utf-8"))
         term = (payload.get("terminal_marker") or {})
     return proc.returncode, elapsed, term, payload
+
+
+def _watcher_env(status: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["GOALFLIGHT_TEST_MODE"] = "1"
+    env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+    env["GOALFLIGHT_STATE_DIR"] = str(status.parent / "state")
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(status.parent / "task-store")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(status.parent / "journal")
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(status.parent / "messages")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(status.parent / "wake-ledger")
+    env["GOAL_FLIGHT_PIDFILE_DIR"] = str(status.parent / "pids")
+    return env
 
 
 def _wait_for_status(status: Path, timeout_s: float = 2.0) -> dict:
@@ -124,6 +169,127 @@ def _wait_for_status(status: Path, timeout_s: float = 2.0) -> dict:
         time.sleep(0.05)
     detail = f"; last error: {last_error}" if last_error else ""
     raise AssertionError(f"status was not readable within {timeout_s:.1f}s{detail}")
+
+
+def _wait_for_status_matching(
+    status: Path,
+    predicate,
+    *,
+    timeout_s: float = 30.0,
+) -> dict:
+    deadline = time.monotonic() + timeout_s
+    last_payload: dict = {}
+    while time.monotonic() < deadline:
+        if status.exists():
+            try:
+                last_payload = json.loads(status.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                pass
+            else:
+                if predicate(last_payload):
+                    return last_payload
+        time.sleep(0.05)
+    raise AssertionError(
+        f"watcher status did not reach expected state within {timeout_s:.1f}s: "
+        f"{last_payload}"
+    )
+
+
+def _run_live_veto_scenario(
+    *,
+    tail: Path,
+    status: Path,
+    dispatch_id: str,
+    final_marker: str,
+) -> tuple[dict, str]:
+    """Hold the worker until the live-growth veto is positively observed."""
+
+    hold = status.with_suffix(".hold")
+    hold.write_text("hold\n", encoding="utf-8")
+    worker_code = (
+        "from pathlib import Path\n"
+        "import sys, time\n"
+        "hold = Path(sys.argv[1])\n"
+        "while hold.exists():\n"
+        "    time.sleep(0.05)\n"
+        "print(sys.argv[2], flush=True)\n"
+    )
+    sink = tail.open("ab")
+    try:
+        worker = subprocess.Popen(
+            [sys.executable, "-c", worker_code, str(hold), final_marker],
+            stdout=sink,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        sink.close()
+
+    watcher = subprocess.Popen(
+        _watcher_command(
+            tail=tail,
+            status=status,
+            worker_pid=worker.pid,
+            dispatch_id=dispatch_id,
+            poll_secs="0.1",
+            max_idle_secs="30",
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=_watcher_env(status),
+    )
+    output_lines: list[str] = []
+    discard_seen = threading.Event()
+
+    def collect_output() -> None:
+        assert watcher.stdout is not None
+        for line in watcher.stdout:
+            output_lines.append(line)
+            if line.startswith("WATCHER-DISCARD "):
+                discard_seen.set()
+
+    reader = threading.Thread(target=collect_output)
+    reader.start()
+    try:
+        pending = _wait_for_status_matching(
+            status,
+            lambda payload: (
+                payload.get("state") == "running_after_terminal"
+                and payload.get("worker_alive") is True
+            ),
+        )
+        assert pending.get("terminal_marker", {}).get("kind") in {"COMPLETE", "READY"}
+        with tail.open("a", encoding="utf-8") as stream:
+            stream.write("worker continued after provisional terminal evidence\n")
+        assert discard_seen.wait(timeout=30), "live-growth veto did not emit WATCHER-DISCARD"
+        assert worker.poll() is None, "worker died before the live-veto branch was observed"
+
+        # Releasing the hold is the only way the worker can emit the scenario's
+        # final marker, so WATCHER-DISCARD is causally before the final verdict.
+        hold.unlink()
+        worker.wait(timeout=30)
+        watcher.wait(timeout=30)
+        reader.join(timeout=2)
+        assert not reader.is_alive(), "watcher output reader did not finish"
+    finally:
+        hold.unlink(missing_ok=True)
+        if worker.poll() is None:
+            worker.terminate()
+            worker.wait(timeout=5)
+        if watcher.poll() is None:
+            watcher.terminate()
+            watcher.wait(timeout=5)
+        reader.join(timeout=2)
+
+    output = "".join(output_lines)
+    payload = json.loads(status.read_text(encoding="utf-8"))
+    assert watcher.returncode == 0, (watcher.returncode, output, payload)
+    assert payload.get("state") == "complete", payload
+    assert "WATCHER-DISCARD " in output, output
+    assert output.index("WATCHER-DISCARD ") < output.rfind('"state": "complete"'), output
+    return payload, output
 
 
 def _write_task_store(project: Path) -> None:
@@ -170,6 +336,8 @@ def case_ignores_echoed_prompt_marker() -> None:
                 stdout=sink, stderr=subprocess.STDOUT, start_new_session=True)
         finally:
             sink.close()
+        reaper = threading.Thread(target=worker.wait)
+        reaper.start()
         try:
             rc, elapsed, term, _ = _run_watcher(
                 tail,
@@ -180,26 +348,29 @@ def case_ignores_echoed_prompt_marker() -> None:
                 dispatch_id="PLACEHOLDER",
             )
         finally:
-            worker.wait()
+            reaper.join(timeout=5)
+            assert not reaper.is_alive(), "worker was not reaped after its real terminal exit"
         assert rc == 0, f"expected exit 0 (complete), got {rc}"
         assert term.get("text") == "PLACEHOLDER", f"must complete on the REAL marker, got {term}"
         assert elapsed > 1.5, f"must wait past the echoed prompt, elapsed={elapsed:.1f}s (false-completed?)"
 
 
-def case_without_ignore_trips_on_echo() -> None:
-    # Control: WITHOUT the guard, the echoed PLACEHOLDER trips the watcher early.
+def case_without_ignore_accepts_echo_only_after_live_worker_exit() -> None:
+    # Control: WITHOUT the prompt guard, the echo remains valid evidence, but a
+    # live worker keeps the success candidate pending through the exit grace.
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         prompt = tmp / "prompt.md"
         prompt.write_text("COMPLETE: PLACEHOLDER\n", encoding="utf-8")
         tail = tmp / "tail.txt"
         tail.write_text("COMPLETE: PLACEHOLDER\n", encoding="utf-8")  # only the echo so far
-        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
-        try:
-            rc, elapsed, term, _ = _run_watcher(tail, tmp / "s.json", prompt, ignore=False, worker_pid=worker.pid)
-        finally:
-            worker.terminate()
-            worker.wait()
+        payload, _output = _run_live_veto_scenario(
+            tail=tail,
+            status=tmp / "s.json",
+            dispatch_id="PLACEHOLDER",
+            final_marker="COMPLETE: PLACEHOLDER",
+        )
+        term = payload.get("terminal_marker") or {}
         assert term.get("text") == "PLACEHOLDER", f"control should trip on the echo, got {term}"
 
 
@@ -210,19 +381,16 @@ def case_prompt_ignore_stops_at_first_mismatch() -> None:
         prompt.write_text("Do the review.\nCOMPLETE: PLACEHOLDER\n", encoding="utf-8")
         tail = tmp / "tail.txt"
         tail.write_text("Different first line.\nCOMPLETE: PLACEHOLDER\n", encoding="utf-8")
-        worker = subprocess.Popen(["bash", "-c", "sleep 10"], start_new_session=True)
-        try:
-            rc, elapsed, term, _ = _run_watcher(
-                tail,
-                tmp / "s.json",
-                prompt,
-                ignore=True,
-                worker_pid=worker.pid,
-                max_idle_secs="3",
-            )
-        finally:
-            worker.terminate()
-            worker.wait()
+        worker = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        worker.wait()
+        rc, elapsed, term, _ = _run_watcher(
+            tail,
+            tmp / "s.json",
+            prompt,
+            ignore=True,
+            worker_pid=worker.pid,
+            max_idle_secs="3",
+        )
         assert rc == 0, f"mismatch before marker must not mask real marker, got rc={rc}"
         assert term.get("text") == "PLACEHOLDER", f"real marker after mismatch was masked, got {term}"
         assert elapsed < 4.0, f"watcher should wake on real marker, elapsed={elapsed:.1f}s"
@@ -339,13 +507,16 @@ def case_incomplete_identity_is_inconclusive_alive() -> None:
                 ignore=False,
                 worker_pid=worker.pid,
                 identity={"pid": worker.pid},
+                poll_secs="0.2",
+                max_idle_secs="1",
             )
         finally:
             worker.terminate()
             worker.wait()
-        assert rc == 0, f"incomplete identity should not classify live worker dead, got rc={rc}"
+        assert rc == 1, f"idle live worker with terminal evidence must be inconclusive, got rc={rc}"
         assert term.get("text") == "identity stayed fail-safe", term
         assert payload.get("worker_alive") is True, payload
+        assert payload.get("state") == "inconclusive_timeout", payload
         assert payload.get("worker_identity_reason", "").startswith("identity_inconclusive_"), payload
 
 
@@ -402,16 +573,13 @@ def case_mid_output_marker_ignored() -> None:
             "COMPLETE: genuine-payload\n",
             encoding="utf-8",
         )
-        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
-        try:
-            rc, elapsed, term, _ = _run_watcher(
-                tail, tmp / "s.json", tmp / "p.md", ignore=False, worker_pid=worker.pid,
-                poll_secs="0.2", max_idle_secs="2",
-            )
-        finally:
-            worker.terminate()
-            worker.wait()
-        assert rc == 0, f"genuine last-line terminal must complete, got {rc}"
+        payload, _output = _run_live_veto_scenario(
+            tail=tail,
+            status=tmp / "s.json",
+            dispatch_id="genuine-payload",
+            final_marker="COMPLETE: genuine-payload",
+        )
+        term = payload.get("terminal_marker") or {}
         assert term.get("kind") == "COMPLETE", term
         assert term.get("text") == "genuine-payload", term
 
@@ -486,18 +654,389 @@ def case_ready_terminal_marker() -> None:
             "READY: ready-terminal — docs-private/research/2026-06-03-audit/findings.md\n",
             encoding="utf-8",
         )
-        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
-        try:
-            rc, elapsed, term, _ = _run_watcher(
-                tail, tmp / "s.json", tmp / "p.md", ignore=False, worker_pid=worker.pid,
-                poll_secs="0.2", max_idle_secs="2",
-            )
-        finally:
-            worker.terminate()
-            worker.wait()
-        assert rc == 0, f"last-line READY must complete, got {rc}"
+        payload, _output = _run_live_veto_scenario(
+            tail=tail,
+            status=tmp / "s.json",
+            dispatch_id="ready-terminal",
+            final_marker=(
+                "READY: ready-terminal — "
+                "docs-private/research/2026-06-03-audit/findings.md"
+            ),
+        )
+        term = payload.get("terminal_marker") or {}
         assert term.get("kind") == "READY", term
         assert "findings.md" in term.get("text", ""), term
+
+
+def test_alive_growing_terminal_candidate_is_discarded_then_final_completes() -> None:
+    """Constructed tails exercise the watcher decision without consulting ps."""
+    dispatch_id = "b-143-constructed"
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(
+            f"!READY: {dispatch_id} — loading the requested files\n",
+            encoding="utf-8",
+        )
+        scanner = goalflight_watch.IncrementalTailScanner(
+            tail,
+            expected_dispatch_id=dispatch_id,
+        )
+        premature = scanner.scan()
+        assert premature.terminal is not None, premature.metrics()
+        assert premature.terminal["kind"] == "READY", premature.terminal
+
+        with tail.open("a", encoding="utf-8") as stream:
+            stream.write("implementation still running\ntests are producing output\n")
+        growing = scanner.scan()
+        assert growing.size > premature.size
+        assert growing.terminal is None
+        assert goalflight_watch._post_terminal_candidate_action(
+            worker_alive=True,
+            tail_grew=growing.size > premature.size,
+            grace_expired=True,
+            idle_confirmed=False,
+        ) == "discard"
+
+        with tail.open("a", encoding="utf-8") as stream:
+            stream.write(f"!COMPLETE: {dispatch_id} — implementation and tests done\n")
+        final = scanner.scan()
+        assert final.terminal is not None, final.metrics()
+        assert final.terminal["kind"] == "COMPLETE", final.terminal
+        assert goalflight_watch._post_terminal_candidate_action(
+            worker_alive=False,
+            tail_grew=False,
+            grace_expired=False,
+            idle_confirmed=False,
+        ) == "terminalize"
+        assert goalflight_watch._marker_state(final.terminal) == "complete"
+
+
+def test_scenario_helper_matches_production_stay_after_terminal() -> None:
+    cmd = _watcher_command(
+        tail=Path("/tmp/isolated-watch/scenario.tail"),
+        status=Path("/tmp/isolated-watch/scenario.status.json"),
+        worker_pid=4242,
+        dispatch_id="scenario-production-parity",
+        poll_secs="0.2",
+        max_idle_secs="30",
+    )
+    assert cmd.count("--stay-after-terminal") == 1, cmd
+
+
+def test_dispatch_watcher_argv_ignores_the_materialized_prompt() -> None:
+    """The spawn argv binds prompt-echo filtering to the dispatched brief."""
+    prompt = Path("/tmp/isolated-dispatch/b-143.prompt.md")
+    argv = goalflight_dispatch._watcher_spawn_argv(
+        worker_pid=4242,
+        tail=Path("/tmp/isolated-dispatch/b-143.tail"),
+        status_json=Path("/tmp/isolated-dispatch/b-143.status.json"),
+        agent="codex",
+        poll_secs=2.0,
+        max_idle_secs=600.0,
+        dispatch_id="b-143-dispatch",
+        pgid=4242,
+        prompt_path=prompt,
+    )
+    prompt_flag = argv.index("--ignore-prompt-file")
+    assert argv[prompt_flag + 1] == str(prompt)
+
+
+def test_recovery_watcher_reloads_same_mtime_atomic_prompt_replacement() -> None:
+    dispatch_id = "reload-steer-prompt"
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        tail = tmp / "tail.txt"
+        status = tmp / "status.json"
+        prompt = tmp / "assembled.prompt"
+        hold = tmp / "worker.hold"
+        tail.write_text("worker began\n", encoding="utf-8")
+        prompt.write_text("Original task\n", encoding="utf-8")
+        status.write_text("{}\n", encoding="utf-8")
+        hold.write_text("hold\n", encoding="utf-8")
+        initial_prompt_stat = prompt.stat()
+        initial_mtime_ns = initial_prompt_stat.st_mtime_ns
+        initial_ino = initial_prompt_stat.st_ino
+        worker_code = (
+            "from pathlib import Path\n"
+            "import sys, time\n"
+            "hold = Path(sys.argv[1])\n"
+            "while hold.exists():\n"
+            "    time.sleep(0.05)\n"
+            "print(sys.argv[2], flush=True)\n"
+        )
+        sink = tail.open("ab")
+        try:
+            worker = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    worker_code,
+                    str(hold),
+                    f"COMPLETE: {dispatch_id} — genuine final",
+                ],
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            sink.close()
+
+        watcher_cmd = _watcher_command(
+            tail=tail,
+            status=status,
+            worker_pid=worker.pid,
+            dispatch_id=dispatch_id,
+            poll_secs="0.1",
+            max_idle_secs="30",
+        ) + ["--ignore-prompt-file", str(prompt)]
+        watcher = subprocess.Popen(
+            watcher_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=_watcher_env(status),
+        )
+        try:
+            _wait_for_status_matching(
+                status,
+                lambda payload: payload.get("ignore_prompt_mtime_ns")
+                == initial_mtime_ns,
+            )
+            steer_echo = (
+                "Steer turn: inspect the next result\n"
+                f"READY: {dispatch_id} — echoed steer, not terminal\n"
+            )
+            replacement = prompt.with_name(".assembled.prompt.tmp")
+            replacement.write_text(
+                "Original task\n\n" + steer_echo,
+                encoding="utf-8",
+            )
+            os.utime(replacement, ns=(initial_mtime_ns, initial_mtime_ns))
+            replacement.replace(prompt)
+            refreshed_prompt_stat = prompt.stat()
+            refreshed_mtime_ns = refreshed_prompt_stat.st_mtime_ns
+            refreshed_ino = refreshed_prompt_stat.st_ino
+            assert refreshed_mtime_ns == initial_mtime_ns
+            assert refreshed_ino != initial_ino
+
+            # Append immediately after replacement to cover the narrow race in
+            # which a poll scanned the new echo under the old exclusions.
+            with tail.open("a", encoding="utf-8") as stream:
+                stream.write(steer_echo)
+            echo_size = tail.stat().st_size
+            after_echo = _wait_for_status_matching(
+                status,
+                lambda payload: (
+                    payload.get("ignore_prompt_mtime_ns") == refreshed_mtime_ns
+                    and payload.get("ignore_prompt_signature", {}).get("ino")
+                    == refreshed_ino
+                    and payload.get("tail_scan", {}).get("offset", -1)
+                    >= echo_size
+                ),
+            )
+            assert after_echo.get("terminal_marker") in (None, {}), after_echo
+            assert after_echo.get("state") != "running_after_terminal", after_echo
+
+            hold.unlink()
+            worker.wait(timeout=10)
+            stdout, _stderr = watcher.communicate(timeout=10)
+        finally:
+            hold.unlink(missing_ok=True)
+            if worker.poll() is None:
+                worker.terminate()
+                worker.wait(timeout=5)
+            if watcher.poll() is None:
+                watcher.terminate()
+                stdout, _stderr = watcher.communicate(timeout=5)
+
+        payload = json.loads(status.read_text(encoding="utf-8"))
+        assert watcher.returncode == 0, (watcher.returncode, stdout, payload)
+        assert payload.get("state") == "complete", payload
+        assert payload.get("terminal_marker", {}).get("kind") == "COMPLETE", payload
+        assert "WATCHER-DISCARD " not in stdout, stdout
+
+
+def test_prompt_reload_coalesces_changes_within_one_poll_interval() -> None:
+    loaded = (100, 10, 1)
+    changed = (100, 20, 2)
+
+    assert not goalflight_watch._prompt_reload_due(
+        changed,
+        loaded,
+        last_reload_at=10.0,
+        now=10.19,
+        poll_secs=0.2,
+    )
+    assert goalflight_watch._prompt_reload_due(
+        changed,
+        loaded,
+        last_reload_at=10.0,
+        now=10.2,
+        poll_secs=0.2,
+    )
+    assert not goalflight_watch._prompt_reload_due(
+        loaded,
+        loaded,
+        last_reload_at=None,
+        now=20.0,
+        poll_secs=0.2,
+    )
+
+
+def test_prompt_signature_detects_same_mtime_different_inode() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        first = tmp / "first.prompt"
+        second = tmp / "second.prompt"
+        first.write_text("same bytes\n", encoding="utf-8")
+        second.write_text("same bytes\n", encoding="utf-8")
+        shared_mtime_ns = first.stat().st_mtime_ns
+        os.utime(second, ns=(shared_mtime_ns, shared_mtime_ns))
+
+        first_signature = goalflight_watch._prompt_file_signature(first.stat())
+        second_signature = goalflight_watch._prompt_file_signature(second.stat())
+
+    assert first_signature[:2] == second_signature[:2]
+    assert first_signature[2] != second_signature[2]
+    assert first_signature != second_signature
+
+
+def test_discarded_candidate_identity_requires_same_marker_and_offset() -> None:
+    marker = {"line": 7, "kind": "COMPLETE", "text": "veto-id — candidate"}
+    evidence = {"marker": dict(marker), "offset": 321}
+
+    assert goalflight_watch._discarded_terminal_candidate_matches(
+        evidence,
+        marker,
+        321,
+    )
+    assert not goalflight_watch._discarded_terminal_candidate_matches(
+        evidence,
+        marker,
+        322,
+    )
+    assert not goalflight_watch._discarded_terminal_candidate_matches(
+        evidence,
+        {**marker, "text": "veto-id — fresh"},
+        321,
+    )
+
+
+def test_prompt_reload_does_not_resurrect_same_offset_vetoed_candidate() -> None:
+    dispatch_id = "reload-veto"
+    marker_line = f"COMPLETE: {dispatch_id} — same marker"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        tail = tmp / "tail.txt"
+        status = tmp / "status.json"
+        prompt = tmp / "assembled.prompt"
+        hold = tmp / "worker.hold"
+        tail.write_text(marker_line + "\n", encoding="utf-8")
+        status.write_text("{}\n", encoding="utf-8")
+        prompt.write_text("Original task\n", encoding="utf-8")
+        hold.write_text("hold\n", encoding="utf-8")
+        initial_marker_offset = len((marker_line + "\n").encode("utf-8"))
+
+        worker_code = (
+            "from pathlib import Path\n"
+            "import sys, time\n"
+            "hold = Path(sys.argv[1])\n"
+            "while hold.exists():\n"
+            "    time.sleep(0.05)\n"
+            "print(sys.argv[2], flush=True)\n"
+        )
+        sink = tail.open("ab")
+        try:
+            worker = subprocess.Popen(
+                [sys.executable, "-c", worker_code, str(hold), marker_line],
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            sink.close()
+
+        watcher = subprocess.Popen(
+            _watcher_command(
+                tail=tail,
+                status=status,
+                worker_pid=worker.pid,
+                dispatch_id=dispatch_id,
+                poll_secs="0.1",
+                max_idle_secs="30",
+            )
+            + ["--ignore-prompt-file", str(prompt)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=_watcher_env(status),
+        )
+        output_lines: list[str] = []
+        discard_seen = threading.Event()
+
+        def collect_output() -> None:
+            assert watcher.stdout is not None
+            for line in watcher.stdout:
+                output_lines.append(line)
+                if line.startswith("WATCHER-DISCARD "):
+                    discard_seen.set()
+
+        reader = threading.Thread(target=collect_output)
+        reader.start()
+        try:
+            _wait_for_status_matching(
+                status,
+                lambda payload: payload.get("state") == "running_after_terminal",
+            )
+            # Blank growth disproves the live candidate without replacing it as
+            # the scanner's last nonempty line.
+            with tail.open("a", encoding="utf-8") as stream:
+                stream.write("\n")
+            assert discard_seen.wait(timeout=30), "candidate was not vetoed"
+
+            replacement = prompt.with_name(".assembled.prompt.tmp")
+            replacement.write_text("Original task\n\nUnrelated steer\n", encoding="utf-8")
+            replacement.replace(prompt)
+            refreshed_ino = prompt.stat().st_ino
+            retained = _wait_for_status_matching(
+                status,
+                lambda payload: (
+                    payload.get("ignore_prompt_signature", {}).get("ino")
+                    == refreshed_ino
+                    and payload.get("replayed_discarded_terminal_evidence") is True
+                ),
+            )
+            evidence = retained.get("last_discarded_terminal_evidence") or {}
+            assert evidence.get("offset") == initial_marker_offset, retained
+            assert evidence.get("marker", {}).get("text") == (
+                f"{dispatch_id} — same marker"
+            ), retained
+            assert retained.get("terminal_marker") in (None, {}), retained
+            assert retained.get("state") != "running_after_terminal", retained
+
+            # The same marker genuinely re-emitted at a later offset is fresh.
+            hold.unlink()
+            worker.wait(timeout=10)
+            watcher.wait(timeout=10)
+            reader.join(timeout=2)
+        finally:
+            hold.unlink(missing_ok=True)
+            if worker.poll() is None:
+                worker.terminate()
+                worker.wait(timeout=5)
+            if watcher.poll() is None:
+                watcher.terminate()
+                watcher.wait(timeout=5)
+            reader.join(timeout=2)
+
+        payload = json.loads(status.read_text(encoding="utf-8"))
+        assert watcher.returncode == 0, (watcher.returncode, "".join(output_lines), payload)
+        assert payload.get("state") == "complete", payload
+        assert payload.get("terminal_marker", {}).get("text") == (
+            f"{dispatch_id} — same marker"
+        ), payload
 
 
 def case_task_breadcrumb_missing_item_keeps_worker_verdict() -> None:
@@ -523,9 +1062,9 @@ def case_task_breadcrumb_missing_item_keeps_worker_verdict() -> None:
             "work done\nCOMPLETE: watch-task-breadcrumb-missing — pinned the claim\n",
             encoding="utf-8",
         )
-        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
-        try:
-            rc, _, term, payload = _run_watcher(
+        worker = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        worker.wait()
+        rc, _, term, payload = _run_watcher(
                 tail,
                 tmp / "s.json",
                 tmp / "p.md",
@@ -538,9 +1077,6 @@ def case_task_breadcrumb_missing_item_keeps_worker_verdict() -> None:
                 task_ids="t-482",  # not in the store
                 agent="codex",
             )
-        finally:
-            worker.terminate()
-            worker.wait()
         assert term.get("kind") == "COMPLETE", term
         assert payload["state"] == "complete", payload
         assert payload["reason"] != "task_breadcrumb_error", payload
@@ -560,9 +1096,9 @@ def case_task_terminal_breadcrumb_failure_blocks_completion() -> None:
             "work done\nCOMPLETE: watch-task-breadcrumb-fail — linked task\n",
             encoding="utf-8",
         )
-        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
-        try:
-            rc, _, term, payload = _run_watcher(
+        worker = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        worker.wait()
+        rc, _, term, payload = _run_watcher(
                 tail,
                 tmp / "s.json",
                 tmp / "p.md",
@@ -575,9 +1111,6 @@ def case_task_terminal_breadcrumb_failure_blocks_completion() -> None:
                 task_ids="t-001",
                 agent="codex",
             )
-        finally:
-            worker.terminate()
-            worker.wait()
         assert rc == 4, (rc, payload)
         assert payload["state"] == "blocked_task_breadcrumb", payload
         assert payload["reason"] == "task_breadcrumb_error", payload
@@ -596,9 +1129,9 @@ def case_task_terminal_breadcrumb_happy_path_persists() -> None:
             "work done\nCOMPLETE: watch-task-breadcrumb-ok — linked task\n",
             encoding="utf-8",
         )
-        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"], start_new_session=True)
-        try:
-            rc, _, term, payload = _run_watcher(
+        worker = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        worker.wait()
+        rc, _, term, payload = _run_watcher(
                 tail,
                 tmp / "s.json",
                 tmp / "p.md",
@@ -611,9 +1144,6 @@ def case_task_terminal_breadcrumb_happy_path_persists() -> None:
                 task_ids="t-001",
                 agent="codex",
             )
-        finally:
-            worker.terminate()
-            worker.wait()
         assert rc == 0, (rc, payload)
         assert payload["state"] == "complete", payload
         assert "task_breadcrumb_error" not in payload, payload
@@ -713,6 +1243,7 @@ def case_dead_pid_fresh_output_vetoes_worker_dead() -> None:
         tail = tmp / "tail.txt"
         tail.write_text("still producing output\n", encoding="utf-8")
         status = tmp / "s.json"
+        status.write_text("{}\n", encoding="utf-8")
         worker = subprocess.Popen([sys.executable, "-c", ""], start_new_session=True)
         worker.wait()
         cmd = [
@@ -748,7 +1279,10 @@ def case_dead_pid_fresh_output_vetoes_worker_dead() -> None:
             env=env,
         )
         try:
-            payload = _wait_for_status(status)
+            payload = _wait_for_status_matching(
+                status,
+                lambda candidate: candidate.get("state") == "running",
+            )
             assert proc.poll() is None, payload
             assert payload.get("state") == "running", payload
             assert payload.get("liveness_state") == "running_via_output", payload
@@ -1317,7 +1851,7 @@ def case_balanced_fence_marker_still_suppressed() -> None:
 
 def main() -> None:
     case_ignores_echoed_prompt_marker()
-    case_without_ignore_trips_on_echo()
+    case_without_ignore_accepts_echo_only_after_live_worker_exit()
     case_prompt_ignore_stops_at_first_mismatch()
     case_identity_mismatch_not_alive()
     case_matching_lstart_ignores_comm_form_change()
@@ -1329,6 +1863,14 @@ def main() -> None:
     case_mid_output_marker_ignored()
     case_live_failed_marker_blocks_not_rate_limited()
     case_ready_terminal_marker()
+    test_alive_growing_terminal_candidate_is_discarded_then_final_completes()
+    test_scenario_helper_matches_production_stay_after_terminal()
+    test_dispatch_watcher_argv_ignores_the_materialized_prompt()
+    test_recovery_watcher_reloads_same_mtime_atomic_prompt_replacement()
+    test_prompt_reload_coalesces_changes_within_one_poll_interval()
+    test_prompt_signature_detects_same_mtime_different_inode()
+    test_discarded_candidate_identity_requires_same_marker_and_offset()
+    test_prompt_reload_does_not_resurrect_same_offset_vetoed_candidate()
     case_task_breadcrumb_missing_item_keeps_worker_verdict()
     case_task_terminal_breadcrumb_failure_blocks_completion()
     case_task_terminal_breadcrumb_happy_path_persists()
