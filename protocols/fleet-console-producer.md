@@ -12,19 +12,25 @@ Two LaunchAgents keep the planes independent:
 
 | Plane | Label | Cadence | Budget | Output |
 |---|---|---:|---:|---|
-| attention | `com.goalflight.fleet-console.attention` | 5s | 2s | `templates/fleet-console/attention-data.js` |
-| fleet | `com.goalflight.fleet-console.fleet` | 30s | 2s | `templates/fleet-console/fleet-data.js` |
+| attention | `com.goalflight.fleet-console.attention` | 5s | 3s | `templates/fleet-console/attention-data.js` |
+| fleet | `com.goalflight.fleet-console.fleet` | 30s | 4s | `templates/fleet-console/fleet-data.js` |
 
 The cadence matches the renderer's reload cadence. Attention remains the 5s
 mailbox plane; fleet now reloads every 30s because immutable terminal history
 and prompt bodies no longer pollute either short poll.
 
-Post-split constructed samples with 50 dispatch records complete each fast
-plane in under one second. Both child budgets are twice that asserted measured
-upper bound: `2 × 1s = 2s`. Attention retains `5s - 2s = 3s` and fleet retains
-`30s - 2s = 28s` for child termination and atomic DEGRADED publication. The
-hourly slow-history catch-up runs only after a successful fast publication and
-outside this deadline; normal dispatch/finish hooks make it a no-op.
+Live read-only samples through the deployed wrapper on 1,404 local rows and
+1,954 registered projects (2026-08-16) measured attention at 1.12s and fleet
+at 1.84s / 76,473 bytes. Budgets are the integer ceilings of twice those
+measurements: attention 3s, fleet 4s. With explicit cleanup reserves,
+`5s > 3s + 1s` and `30s > 4s + 2s`.
+The hourly slow-history catch-up runs only after a successful fast publication
+and outside this deadline; normal dispatch/finish hooks make it a no-op.
+
+Fast projection is live-only by record class: terminal dispatches, inactive
+projects/worktrees, ended controller generations, and inactive remote
+registrations contribute counts and immutable slow history but never trigger
+short-poll liveness probes or per-project repository scans.
 
 The installer records the console output directory in the user-private
 `~/.goal-flight/fleet-console-output-dir` file so dispatch/finish hooks can

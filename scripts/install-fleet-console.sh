@@ -22,8 +22,8 @@ Usage:
   scripts/install-fleet-console.sh [--plane attention|fleet] --uninstall
 
 Installs two per-user launchd agents by default:
-  attention  every 5s, with a 2s wall-clock budget
-  fleet      every 30s, with a 2s wall-clock budget
+  attention  every 5s, with a 3s wall-clock budget
+  fleet      every 30s, with a 4s wall-clock budget
 
 Environment:
   SKILL_ROOT or GOALFLIGHT_SKILL_ROOT       override ~/.goal-flight/skill
@@ -130,18 +130,21 @@ plane_values() {
   LOG_VALUE="${LOG_DIR}/fleet-console-${PLANE_VALUE}-launchd.log"
   case "$PLANE_VALUE" in
     attention)
-      # Post-split constructed attention samples with 50 dispatches finish in
-      # <1s. Budget = 2 × the asserted 1s measured upper bound = 2s, leaving
-      # 5s - 2s = 3s for termination and atomic DEGRADED publication.
+      # Live read-only sample on 1,404 local rows / 1,954 registered projects
+      # measured 1.12s through the deployed wrapper (2026-08-16).
+      # Budget = ceil(2 × 1.12s) = 3s.
+      # Reserve = 1s for termination + atomic DEGRADED publication; cadence
+      # sanity: 5s > 3s budget + 1s reserve.
       INTERVAL_VALUE=5
-      BUDGET_VALUE=2
+      BUDGET_VALUE=3
       ;;
     fleet)
-      # The same post-split 50-dispatch sample builds fleet-data.js in <1s.
-      # Budget = 2 × 1s = 2s; the hourly slow-history catch-up runs only after
-      # fast publication and outside this deadline. 2s < 30s leaves 28s.
+      # Live read-only deployed-wrapper sample measured 1.84s and 76,473B.
+      # Budget = ceil(2 × 1.84s) = 4s. Reserve = 2s for termination + atomic
+      # DEGRADED publication; cadence sanity: 30s > 4s budget + 2s reserve.
+      # Hourly slow-history catch-up starts after fast publication/deadline.
       INTERVAL_VALUE=30
-      BUDGET_VALUE=2
+      BUDGET_VALUE=4
       ;;
   esac
   PLIST_PATH_VALUE="${HOME_DIR}/Library/LaunchAgents/${LABEL_VALUE}.plist"

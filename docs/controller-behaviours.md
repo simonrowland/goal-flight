@@ -289,7 +289,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **failure_mode:** The orchestrator blocks the interactive session or schedules a timer to ask whether a worker finished instead of arming the available event channel.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Arm one background generation-bound `goalflight_messages.py listen --project-root \"$PWD\" --controller-label <label> --lease-nonce <nonce>`; on its body-free exit, peek authoritative mail, cursor-CAS processed server-known positions, then re-arm"
+    - **pattern:** "Arm a pool of two background generation-bound `goalflight_messages.py listen --project-root \"$PWD\" --controller-label <label> --lease-nonce <nonce> --report-pending` tasks; on each exit, process the reported or authoritative mail, cursor-CAS settled server-known positions, then re-arm one task to restore depth two"
     - **max_section_lines:** 55
 - **verifier:**
     - **kind:** behaviour-scenario

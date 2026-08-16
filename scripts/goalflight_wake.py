@@ -35,7 +35,19 @@ ENTRY_POLL_WINDOW_S = 1.0
 ENTRY_POLL_INTERVAL_S = 0.1
 _FILE_VERSION = "v2"
 _GENERATION_FILE_VERSION = "generation-v1"
+_LISTENER_SLOT_FILE_VERSION = "listener-slot-v1"
+_RING_STAMP_FILE_VERSION = "ring-stamp-v1"
 _LEASE_EVENT_SCHEMA = "goalflight.lease-generation-event.v1"
+DEFAULT_LISTENER_SLOTS = 2
+MAX_LISTENER_SLOTS = 32
+
+
+class ListenerSlotsFull(BlockingIOError):
+    """Every bounded one-shot listener slot is held by a live process."""
+
+    def __init__(self, slots: int) -> None:
+        self.slots = slots
+        super().__init__(errno.EAGAIN, f"all {slots} listener slots are held")
 
 
 @dataclass(frozen=True)
@@ -255,6 +267,32 @@ def _generation_lock_path(
     )
 
 
+def _listener_slot_lock_path(
+    project_root: Path | str,
+    *,
+    label: str,
+    generation_key: str,
+    slot: int,
+) -> Path:
+    generation_hash = hashlib.sha256(generation_key.encode("utf-8")).hexdigest()[:16]
+    return ledger_dir(project_root) / (
+        f"{_LISTENER_SLOT_FILE_VERSION}.{_label_hash(label)}.{generation_hash}."
+        f"listener-slot-{slot}.lock"
+    )
+
+
+def _ring_stamp_path(project_root: Path | str, *, controller_label: str) -> Path:
+    return ledger_dir(project_root) / (
+        f"{_RING_STAMP_FILE_VERSION}.{_label_hash(controller_label)}.cursor"
+    )
+
+
+def _ring_stamp_lock_path(project_root: Path | str, *, controller_label: str) -> Path:
+    return ledger_dir(project_root) / (
+        f"{_RING_STAMP_FILE_VERSION}.{_label_hash(controller_label)}.lock"
+    )
+
+
 def _acquire_contended_lock(path: Path, *, directory_fd: int) -> int:
     """Acquire one well-known lock without publishing an unlocked inode."""
     assert fcntl is not None
@@ -310,11 +348,13 @@ class WaiterRegistration:
         kind: str,
         *,
         generation_key: str | None = None,
+        generation_slots: int | None = None,
     ) -> None:
         self._fd = -1
         self._directory_fd = -1
         self._generation_path = None
         self._generation_fd = -1
+        self.slot_index: int | None = None
         if fcntl is None:
             raise RuntimeError("held-flock wake ledger is unavailable on this platform")
         normalized_label = str(label or "").strip()
@@ -348,16 +388,45 @@ class WaiterRegistration:
                 normalized_generation = str(generation_key or "").strip()
                 if not normalized_generation:
                     raise ValueError("waiter generation key is required")
-                self._generation_path = _generation_lock_path(
-                    project_root,
-                    kind=kind,
-                    label=normalized_label,
-                    generation_key=normalized_generation,
-                )
-                self._generation_fd = _acquire_contended_lock(
-                    self._generation_path,
-                    directory_fd=self._directory_fd,
-                )
+                if generation_slots is None:
+                    candidates = [
+                        _generation_lock_path(
+                            project_root,
+                            kind=kind,
+                            label=normalized_label,
+                            generation_key=normalized_generation,
+                        )
+                    ]
+                else:
+                    if kind != "listener":
+                        raise ValueError("generation slots are only valid for listeners")
+                    if not 1 <= generation_slots <= MAX_LISTENER_SLOTS:
+                        raise ValueError(
+                            f"listener slots must be between 1 and {MAX_LISTENER_SLOTS}"
+                        )
+                    candidates = [
+                        _listener_slot_lock_path(
+                            project_root,
+                            label=normalized_label,
+                            generation_key=normalized_generation,
+                            slot=slot,
+                        )
+                        for slot in range(generation_slots)
+                    ]
+                for slot, candidate in enumerate(candidates):
+                    try:
+                        generation_fd = _acquire_contended_lock(
+                            candidate,
+                            directory_fd=self._directory_fd,
+                        )
+                    except BlockingIOError:
+                        continue
+                    self._generation_path = candidate
+                    self._generation_fd = generation_fd
+                    self.slot_index = slot if generation_slots is not None else None
+                    break
+                if self._generation_fd < 0:
+                    raise ListenerSlotsFull(len(candidates))
             pending_name = f".{record_name}.{uuid.uuid4().hex}.pending"
             self._fd = os.open(
                 pending_name,
@@ -434,6 +503,7 @@ def register_waiter(
     controller_label: str,
     kind: str,
     generation_key: str | None = None,
+    generation_slots: int | None = None,
 ) -> WaiterRegistration:
     if kind not in WAITER_KINDS:
         raise ValueError(f"unknown waiter kind: {kind}")
@@ -442,7 +512,174 @@ def register_waiter(
         controller_label,
         kind,
         generation_key=generation_key,
+        generation_slots=generation_slots,
     )
+
+
+def listener_slot_count(value: object = None) -> int:
+    """Resolve and validate the bounded listener-pool size."""
+    raw = value
+    if raw is None:
+        raw = os.environ.get("GOALFLIGHT_LISTENER_SLOTS", str(DEFAULT_LISTENER_SLOTS))
+    try:
+        slots = int(str(raw))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("listener slots must be an integer") from exc
+    if not 1 <= slots <= MAX_LISTENER_SLOTS:
+        raise ValueError(f"listener slots must be between 1 and {MAX_LISTENER_SLOTS}")
+    return slots
+
+
+def register_listener_waiter(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    generation_key: str,
+    slots: int | None = None,
+) -> WaiterRegistration:
+    """Take the first free listener-slot-N lock for one lease generation."""
+    resolved_slots = listener_slot_count(slots)
+    return register_waiter(
+        project_root,
+        controller_label=controller_label,
+        kind="listener",
+        generation_key=generation_key,
+        generation_slots=resolved_slots,
+    )
+
+
+def listener_slot_holder_pids(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+) -> list[int]:
+    waiters = live_waiters(
+        project_root,
+        controller_label=controller_label,
+        kinds={"listener"},
+    )
+    return sorted({record.pid for record in (waiters or [])})
+
+
+def _ring_stamp_needs_claim(observed: int | None, cursor_version: int) -> bool:
+    """A cursor mutation stales the last ring even when no process owns a lock."""
+    return observed != cursor_version
+
+
+def claim_ring(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    cursor_version: int,
+) -> bool:
+    """Atomically claim the one ring allowed for a controller cursor version."""
+    label = str(controller_label or "").strip()
+    if not label:
+        raise ValueError("controller label is required")
+    if (
+        not isinstance(cursor_version, int)
+        or isinstance(cursor_version, bool)
+        or cursor_version < 0
+    ):
+        raise ValueError("cursor version must be a non-negative integer")
+    path = _ring_stamp_path(project_root, controller_label=label)
+    lock_path = _ring_stamp_lock_path(project_root, controller_label=label)
+    directory_fd = _open_ledger_directory_path(path.parent, create=True)
+    lock_fd = -1
+    try:
+        try:
+            lock_fd = _acquire_contended_lock(lock_path, directory_fd=directory_fd)
+        except BlockingIOError:
+            # Another listener is comparing/writing. It will publish the version
+            # before releasing; this listener can observe the result next poll.
+            return False
+        stamp_fd = -1
+        try:
+            stamp_fd = os.open(path.name, _open_flags(), dir_fd=directory_fd)
+            raw = os.read(stamp_fd, 65)
+        except FileNotFoundError:
+            raw = b""
+        finally:
+            if stamp_fd >= 0:
+                os.close(stamp_fd)
+        malformed = len(raw) > 64
+        if raw:
+            try:
+                observed = int(raw.decode("ascii").strip())
+            except (UnicodeDecodeError, ValueError):
+                malformed = True
+                observed = None
+            if observed is not None and observed < 0:
+                malformed = True
+        else:
+            observed = None
+        if not malformed and not _ring_stamp_needs_claim(observed, cursor_version):
+            return False
+
+        corrupt_name: str | None = None
+        if malformed:
+            corrupt_epoch = time.time_ns()
+            while True:
+                corrupt_name = f"{path.name}.corrupt-{corrupt_epoch}"
+                try:
+                    os.stat(
+                        corrupt_name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    break
+                corrupt_epoch += 1
+            os.rename(
+                path.name,
+                corrupt_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        encoded = f"{cursor_version}\n".encode("ascii")
+        pending = f".{path.name}.{uuid.uuid4().hex}.pending"
+        pending_fd = -1
+        try:
+            pending_fd = os.open(
+                pending,
+                _open_flags(create_exclusive=True),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            remaining = memoryview(encoded)
+            while remaining:
+                written = os.write(pending_fd, remaining)
+                if written <= 0:
+                    raise OSError(errno.EIO, "short listener ring stamp write")
+                remaining = remaining[written:]
+            os.fsync(pending_fd)
+            os.replace(
+                pending,
+                path.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            pending = ""
+            os.fsync(directory_fd)
+        finally:
+            if pending_fd >= 0:
+                os.close(pending_fd)
+            if pending:
+                _unlink_at(directory_fd, pending)
+        if corrupt_name is not None:
+            print(
+                f"listener ring stamp quarantined as {corrupt_name}; "
+                f"rewrote cursor version {cursor_version}",
+                file=sys.stderr,
+            )
+        return True
+    finally:
+        if lock_fd >= 0:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        os.close(directory_fd)
 
 
 def _lease_lock_identity(label: str, nonce: str) -> str:
@@ -640,10 +877,13 @@ def coverage_status(
     *,
     controller_label: str | None,
 ) -> dict[str, object]:
+    target_waiters = listener_slot_count()
     if not controller_label:
         return {
             "covered": False,
             "reason": "missing-label",
+            "live_waiters": 0,
+            "target_waiters": target_waiters,
             "waiters": [],
             "monitor": {"required": False, "state": "not-applicable"},
         }
@@ -656,12 +896,16 @@ def coverage_status(
         return {
             "covered": False,
             "reason": "waiter-probe-unavailable",
+            "live_waiters": None,
+            "target_waiters": target_waiters,
             "waiters": [],
             "monitor": {"required": False, "state": "not-applicable"},
         }
     return {
         "covered": bool(waiters),
         "reason": "held-flock" if waiters else "no-live-waiter-lock",
+        "live_waiters": len(waiters),
+        "target_waiters": target_waiters,
         "waiters": [
             {
                 "kind": row.kind,
@@ -690,6 +934,7 @@ def listener_start_command(
     ]
     if controller_label:
         argv.extend(["--controller-label", controller_label])
+    argv.append("--report-pending")
     return shlex.join(argv)
 
 
@@ -730,7 +975,9 @@ def check_tool_entry(
             "monitor": {"required": False, "state": "not-applicable"},
         }
     status = coverage_status(project_root, controller_label=controller_label)
-    if status["covered"]:
+    live_waiters = status.get("live_waiters")
+    target_waiters = int(status.get("target_waiters") or listener_slot_count())
+    if isinstance(live_waiters, int) and live_waiters >= target_waiters:
         return status
     output = sys.stderr if stream is None else stream
     command = listener_start_command(project_root, controller_label=controller_label)
@@ -740,8 +987,14 @@ def check_tool_entry(
             f"if you have no listener, start: {command}",
             file=output,
         )
+    elif live_waiters == 0:
+        print(f"listener pool n=0; start: {command}", file=output)
     else:
-        print(f"listener offline; start: {command}", file=output)
+        print(
+            f"listener pool n={live_waiters}/{target_waiters} — reserve down; "
+            f"re-arm: {command}",
+            file=output,
+        )
     status["start_command"] = command
     if pending_probe is None:
         return status

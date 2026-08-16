@@ -11,11 +11,13 @@ independent so a fast mailbox refresh never pretends to refresh worker liveness.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import datetime as dt
 import hashlib
 import json
 import math
+import os
 import re
 import shlex
 import sys
@@ -52,10 +54,10 @@ PLANE_CADENCE_SECONDS = {"attention": 5, "fleet": 30}
 # per-project pass has to fit in a fraction of that alongside everything else.
 DEFAULT_MAX_PROJECTS = 12
 
-# Zombie lock holders arise around recent controller takeovers. Probe only the
-# newest generations per label: an ancient leaked-fd lock is deliberately
-# traded away for bounded fleet scan cost, with the omitted count published.
-ENDED_CONTROLLER_GENERATION_PROBE_LIMIT = 8
+# Only ACTIVE controller lease generations belong to the short-poll plane.
+# Bound even malformed/multi-active history to the newest eight per label;
+# ended generations remain available through immutable slow history.
+CONTROLLER_GENERATION_PROBE_LIMIT = 8
 
 # The short-poll mirror keeps a small warm terminal window for continuity.
 # Permanent immutable rows live in history-data.js instead: per project the
@@ -389,6 +391,11 @@ def _is_listener_start_action(value: str) -> bool:
         argv = shlex.split(value)
     except ValueError:
         return False
+    # The generated command carries --report-pending (the arm doubles as the
+    # peek); it is a bare flag, so drop it before the positional shape check
+    # rather than duplicating every accepted length.
+    if argv and argv[-1] == "--report-pending":
+        argv = argv[:-1]
     if len(argv) not in {5, 7}:
         return False
     if not (
@@ -608,7 +615,12 @@ def _fast_plane_records(
     for record in records:
         journal = (journal_authority or {}).get(str(record.get("dispatch_id") or ""))
         lifecycle = str((journal or {}).get("lifecycle_state") or "")
-        if lifecycle in goalflight_journal.ATTEMPT_FINAL_STATES:
+        if _record_is_terminal(record):
+            # A committed terminal ledger row is immutable fast-path history.
+            # Never reopen a status sidecar/journal contradiction to promote it
+            # back into every short-poll sample.
+            verdict = {"is_terminal": True}
+        elif lifecycle in goalflight_journal.ATTEMPT_FINAL_STATES:
             verdict = {"is_terminal": True}
         elif lifecycle in goalflight_journal.ATTEMPT_LIVE_STATES:
             verdict = {"is_terminal": False}
@@ -642,6 +654,24 @@ def _fast_plane_records(
     return kept, len(records) - len(kept)
 
 
+def _record_is_reconciled_detached_live(record: object) -> bool:
+    """True when the ledger rechecked a detached orphan's exact identity.
+
+    ``orphaned``/``controller_dead`` describe how the controller exited, not
+    whether its detached worker died.  The ledger emits ``expected_live`` only
+    after the worker PID and start identity still match, so that measured
+    verdict outranks the stale controller-exit state on fast-plane retention.
+    """
+    if not isinstance(record, dict) or record.get("detached") is not True:
+        return False
+    state = record.get("state")
+    reason = record.get("reason") or record.get("error")
+    controller_exit = state == "controller_dead" or (
+        state == "orphaned" and reason == "controller_dead"
+    )
+    return controller_exit and record.get("classification") == "expected_live"
+
+
 def _state_evidence(value: object) -> str | None:
     normalized = goalflight_dispatch_states.normalize_dispatch_state(value)
     if not normalized or normalized == "unknown":
@@ -666,8 +696,14 @@ def _authority_snapshot(
     """Resolve a display verdict and name every disagreeing source field."""
     base = _worker_display_verdict(record)
     evidence: list[tuple[str, object, str]] = []
+    reconciled_detached_live = _record_is_reconciled_detached_live(record)
     for field in ("state", "terminal_state", "classification"):
         value = record.get(field)
+        if reconciled_detached_live and field == "state":
+            # The state records controller exit; expected_live records the
+            # newer exact worker-identity check.  Treating both as concurrent
+            # worker verdicts would invent an authority conflict.
+            continue
         normalized = _state_evidence(value)
         if normalized is not None:
             evidence.append((f"ledger.{field}", value, normalized))
@@ -784,9 +820,10 @@ def _authority_snapshot(
             return verdict, detail, resolution
 
     if len(distinct) > 1:
+        polarities = {item.split(":", 1)[0] for item in distinct}
         base = {
             "display_state": "unknown",
-            "is_terminal": None,
+            "is_terminal": True if polarities == {"terminal"} else None,
             "classification_conflict": True,
         }
     return base, detail, resolution
@@ -795,6 +832,9 @@ def _authority_snapshot(
 def _journal_authority_by_dispatch(
     project_root: Path,
     records: list[dict[str, Any]],
+    *,
+    authority: goalflight_journal.Journal | None = None,
+    open_if_missing: bool = True,
 ) -> dict[str, dict[str, Any]]:
     dispatch_ids = sorted(
         {
@@ -806,7 +846,10 @@ def _journal_authority_by_dispatch(
     if not dispatch_ids:
         return {}
     try:
-        authority = goalflight_journal.Journal.open_reader(project_root)
+        if authority is None and open_if_missing:
+            authority = goalflight_journal.Journal.open_reader(project_root)
+        if authority is None:
+            return {}
         rows = []
         # Keep bind counts comfortably below conservative SQLite builds while
         # retaining one reader generation for the whole project.
@@ -831,8 +874,24 @@ def _journal_authority_by_dispatch(
     }
 
 
+def _project_journal_reader(
+    project_root: Path,
+) -> goalflight_journal.Journal | None:
+    """Open at most one read-only journal handle for a fast-plane project."""
+    try:
+        return goalflight_journal.Journal.open_reader(project_root)
+    except (goalflight_journal.JournalError, OSError, ValueError):
+        return None
+
+
 def _worker_display_verdict(record: dict[str, Any]) -> dict[str, Any]:
     """Resolve one presentation verdict from the reconciled authority fields."""
+    if _record_is_reconciled_detached_live(record):
+        return {
+            "display_state": "running",
+            "is_terminal": False,
+            "classification_conflict": False,
+        }
     limit_kind = goalflight_dispatch_states.limit_kind_for_record(record)
     state_values = [record.get(key) for key in ("state", "terminal_state", "classification")]
     terminal_values = [
@@ -860,6 +919,12 @@ def _worker_display_verdict(record: dict[str, Any]) -> dict[str, Any]:
         or len(terminal_states) > 1
     )
 
+    if conflict and len(terminal_states) > 1 and not live_evidence:
+        return {
+            "display_state": "unknown",
+            "is_terminal": True,
+            "classification_conflict": True,
+        }
     if conflict:
         return {
             "display_state": "unknown",
@@ -982,9 +1047,11 @@ def _controller_contexts_by_session(
     records: list[dict[str, Any]] | None,
     *,
     include_all: bool = False,
-    include_ended: bool = True,
+    include_ended: bool = False,
     include_locked_ended: bool = False,
     probe_metadata: dict[str, int] | None = None,
+    authority: goalflight_journal.Journal | None = None,
+    open_if_missing: bool = True,
 ) -> dict[str, dict[str, object | None]]:
     """Resolve identity and liveness once per journal lease generation.
 
@@ -1006,13 +1073,55 @@ def _controller_contexts_by_session(
     if requested == set():
         return {}
     try:
-        authority = goalflight_journal.Journal.open_reader(project_root)
-        lease_rows = authority.lease_records(include_ended=include_ended)
+        if authority is None and open_if_missing:
+            authority = goalflight_journal.Journal.open_reader(project_root)
+        if authority is None:
+            return {
+                session_id: {"label": None, "liveness_state": "UNKNOWN"}
+                for session_id in (requested or set())
+            }
+        lease_rows = authority.lease_records(
+            include_ended=include_ended or include_locked_ended
+        )
     except (goalflight_journal.JournalError, OSError, ValueError):
         return {
             session_id: {"label": None, "liveness_state": "UNKNOWN"}
             for session_id in (requested or set())
         }
+
+    if not include_ended:
+        candidates_by_label: dict[str, list[dict[str, object]]] = {}
+        for row in lease_rows:
+            raw_label = row.get("label")
+            if (
+                (
+                    row.get("state") == goalflight_journal.LEASE_ACTIVE
+                    or include_locked_ended
+                )
+                and isinstance(raw_label, str)
+                and raw_label
+            ):
+                candidates_by_label.setdefault(raw_label, []).append(row)
+        bounded_rows: list[dict[str, object]] = []
+        truncated = 0
+        for rows in candidates_by_label.values():
+            newest = sorted(
+                rows,
+                key=lambda row: (
+                    int(row["generation"])
+                    if isinstance(row.get("generation"), int)
+                    else -1
+                ),
+                reverse=True,
+            )
+            bounded_rows.extend(newest[:CONTROLLER_GENERATION_PROBE_LIMIT])
+            truncated += max(0, len(newest) - CONTROLLER_GENERATION_PROBE_LIMIT)
+        if probe_metadata is not None:
+            probe_metadata["controller_history_probes_truncated"] = (
+                probe_metadata.get("controller_history_probes_truncated", 0)
+                + truncated
+            )
+        lease_rows = bounded_rows
 
     labels: dict[str, set[str]] = {}
     rows_by_session: dict[str, list[dict[str, object]]] = {}
@@ -1032,38 +1141,12 @@ def _controller_contexts_by_session(
     holder_by_session: dict[str, bool | None] = {}
     locked_ended_rows: dict[str, list[dict[str, object]]] = {}
     if include_locked_ended:
-        ended_rows_by_label: dict[str, list[dict[str, object]]] = {}
+        # ``lease_rows`` is already the newest-eight-per-label union. Probe
+        # every ended row in that bounded set; the truncation counter above
+        # says exactly how many generations were not checked.
         for row in lease_rows:
             if row.get("state") == goalflight_journal.LEASE_ACTIVE:
                 continue
-            raw_label = row.get("label")
-            if isinstance(raw_label, str) and raw_label:
-                ended_rows_by_label.setdefault(raw_label, []).append(row)
-        ended_rows_to_probe: list[dict[str, object]] = []
-        truncated = 0
-        for session_rows in ended_rows_by_label.values():
-            newest_first = sorted(
-                session_rows,
-                key=lambda row: (
-                    int(row["generation"])
-                    if isinstance(row.get("generation"), int)
-                    else -1
-                ),
-                reverse=True,
-            )
-            ended_rows_to_probe.extend(
-                newest_first[:ENDED_CONTROLLER_GENERATION_PROBE_LIMIT]
-            )
-            truncated += max(
-                0,
-                len(newest_first) - ENDED_CONTROLLER_GENERATION_PROBE_LIMIT,
-            )
-        if probe_metadata is not None:
-            probe_metadata["controller_history_probes_truncated"] = (
-                probe_metadata.get("controller_history_probes_truncated", 0)
-                + truncated
-            )
-        for row in ended_rows_to_probe:
             session_id = _raw_controller_session_id(row.get("nonce"))
             raw_label = row.get("label")
             label = raw_label if isinstance(raw_label, str) and raw_label else None
@@ -1280,8 +1363,16 @@ def _worker_row(
 ) -> dict[str, Any]:
     # Raw authority fields remain available for diagnosis, while renderers use
     # only the canonical verdict below for filtering and presentation.
+    record = goalflight_status.reconcile_fast_plane_record(
+        record,
+        retain_status_snapshot=True,
+        tail_hint_required=True,
+    )
     alive = record.get("worker_still_alive")
     started_at = _iso_timestamp(record.get("started_at"))
+    # This runs only after retention has bounded the warm rows. Reading their
+    # sidecars preserves presentation truth without reopening every permanent
+    # runs.d record in the machine-wide status pass.
     status = goalflight_status._status_json_payload(record)  # noqa: SLF001
     verdict, authority_detail, authority_resolution = _authority_snapshot(
         record,
@@ -1464,6 +1555,7 @@ def _remote_row(
         raw_dispatches,
         sampled_at=sampled_at,
     )
+    history_excluded += max(0, int(data.get("history_excluded") or 0))
     workers = []
     for row in fast_dispatches:
         reachable = row.get("ssh_reachable")
@@ -1518,6 +1610,32 @@ def _session_row(payload: object) -> dict[str, Any]:
     }
 
 
+def _fast_session_row(machine_status: object, project_root: str) -> dict[str, Any]:
+    """Measured lease count without asserting unscanned repository state."""
+    status = machine_status if isinstance(machine_status, dict) else {}
+    capacity_state = status.get("capacity_state")
+    leases = (
+        capacity_state.get("leases")
+        if isinstance(capacity_state, dict)
+        else {}
+    )
+    leases = leases if isinstance(leases, dict) else {}
+    active_leases = sum(
+        1
+        for lease in leases.values()
+        if isinstance(lease, dict)
+        and lease.get("state") == "active"
+        and _canonical_root(lease.get("project_root")) == project_root
+    )
+    return {
+        "available": False,
+        "active": None,
+        "queue_state": None,
+        "queue_last_touched": None,
+        "active_leases": active_leases,
+    }
+
+
 def _milestone_row(payload: object) -> dict[str, Any]:
     data = payload if isinstance(payload, dict) else {}
     return {
@@ -1551,6 +1669,38 @@ def _roots_with_records(machine_status: object) -> set[str]:
             if root is not None:
                 roots.add(root)
     return roots
+
+
+def _roots_with_active_leases(machine_status: object) -> set[str]:
+    """Canonical roots named by machine-capacity leases that are ACTIVE now."""
+    status = machine_status if isinstance(machine_status, dict) else {}
+    capacity_state = status.get("capacity_state")
+    leases = (
+        capacity_state.get("leases")
+        if isinstance(capacity_state, dict)
+        else {}
+    )
+    roots: set[str] = set()
+    for lease in leases.values() if isinstance(leases, dict) else []:
+        if not isinstance(lease, dict) or lease.get("state") != "active":
+            continue
+        root = _canonical_root(lease.get("project_root"))
+        if root is not None:
+            roots.add(root)
+    return roots
+
+
+def _fast_project_roots(
+    machine_status: object,
+    *,
+    queue_by_root: dict[str, dict[str, Any]] | None = None,
+) -> set[str]:
+    """Projects whose state can still change on the short-poll plane."""
+    return (
+        _roots_with_records(machine_status)
+        | _roots_with_active_leases(machine_status)
+        | set(queue_by_root or {})
+    )
 
 
 def _without_terminal_history(machine_status: object) -> dict[str, Any]:
@@ -1643,19 +1793,15 @@ def _attach_queue_rows(
 
 
 def _record_is_terminal(record: object) -> bool:
-    """True when a dispatch record is finished by ANY of its own accounts.
+    """True only when the reconciled worker verdict is terminal.
 
-    Checks classification and terminal_state as well as state. A record can read
-    state="running" while its classification says worker_dead; trusting the
-    state string alone let a dead root win scarce deep-sample priority over a
-    live one.
+    Retention is based on terminality and age.  It must not reinterpret a
+    liveness class or capacity-lease absence as terminal: detached orphans whose
+    exact worker identity still matches remain live fast-plane work.
     """
     if not isinstance(record, dict):
         return True
-    for key in ("state", "terminal_state", "classification"):
-        if goalflight_dispatch_states.is_terminal_state(record.get(key)):
-            return True
-    return False
+    return _worker_display_verdict(record)["is_terminal"] is True
 
 
 def _record_is_running(record: object) -> bool:
@@ -1685,6 +1831,7 @@ def _registered_projects(
     payload: object,
     *,
     active_roots: set[str] | None = None,
+    only_roots: set[str] | None = None,
     limit: int = DEFAULT_MAX_PROJECTS,
 ) -> tuple[list[dict[str, Any]], int]:
     """Return (sampled projects, total registered).
@@ -1696,11 +1843,9 @@ def _registered_projects(
     pass costs ~1433s against a ~60s drain tick. That 24x overrun is why this
     projection hung and emitted nothing at all.
 
-    Bounded by RECENCY, because the operator cares about projects with current
-    activity and the registry already records ``last_seen``. ISO-8601 sorts
-    lexicographically, so newest-first is a plain reverse string sort; entries
-    with no timestamp sort last rather than being dropped, since a missing
-    timestamp is unknown recency, not proven staleness.
+    The fast plane supplies ``only_roots`` so 1,954 historical worktree paths
+    contribute to the total without filesystem-resolving or projecting each
+    one. Legacy callers may still request the recency-ordered bounded head.
 
     The total is returned alongside so the payload can say how many were NOT
     sampled. A silent cap would read as "these are all your projects" -- the
@@ -1709,14 +1854,31 @@ def _registered_projects(
     """
     rows = payload if isinstance(payload, list) else []
     result = []
-    seen: set[str] = set()
+    seen_total: set[str] = set()
+    seen_result: set[str] = set()
     for row in rows:
         if not isinstance(row, dict):
             continue
-        root = _canonical_root(row.get("project_root"))
-        if root is None or root in seen:
+        supplied = row.get("project_root")
+        if not isinstance(supplied, str) or not supplied:
             continue
-        seen.add(root)
+        # Registry writes are already canonical. abspath/expanduser avoids a
+        # stat/readlink walk across thousands of deleted worktrees merely to
+        # count them; only live candidates pay canonical_root's filesystem I/O.
+        registry_root = os.path.abspath(os.path.expanduser(supplied))
+        if registry_root in seen_total:
+            continue
+        seen_total.add(registry_root)
+        if only_roots is not None and registry_root not in only_roots:
+            continue
+        root = _canonical_root(registry_root)
+        if (
+            root is None
+            or root in seen_result
+            or (only_roots is not None and root not in only_roots)
+        ):
+            continue
+        seen_result.add(root)
         result.append(
             {
                 "root": root,
@@ -1724,7 +1886,7 @@ def _registered_projects(
                 "skill_version": _display(row.get("skill_version"), limit=32),
             }
         )
-    total = len(result)
+    total = len(seen_total)
     # A project with work in flight outranks a merely-recent one: that is what
     # the operator is actually watching. Recency breaks ties.
     active = active_roots or set()
@@ -1747,43 +1909,74 @@ def _project_rows(
     errors: list[str],
     all_registered_roots: set[str] | None = None,
     sampled_at: dt.datetime | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Rows for every project with a record, deep-sampling only the head.
+    visible_roots: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Rows only for projects with mutable work or an ACTIVE capacity lease.
 
-    ``registered_projects`` is the CAPPED sample; ``all_registered_roots`` is the
-    whole registry. They are different questions and were previously the same
-    set: "registered" answered from the sample, so the 13th registered project
-    was emitted as registered=false purely because this tick did not sample it.
-    Whether a project is registered has nothing to do with which head we chose.
+    Historical terminal-only roots are counted for the slow blob without path
+    resolution, journal opens, status-sidecar reads, or project-row projection.
     """
     dispatch = machine_status.get("dispatch")
     dispatch = dispatch if isinstance(dispatch, dict) else {}
     records = [item for item in dispatch.get("records") or [] if isinstance(item, dict)]
-    by_root = {item["root"]: item for item in registered_projects}
+    active_roots = (
+        set(visible_roots)
+        if visible_roots is not None
+        else _fast_project_roots(machine_status)
+    )
+    by_root = {
+        item["root"]: item
+        for item in registered_projects
+        if item.get("root") in active_roots
+    }
+    records_by_root: dict[str, list[dict[str, Any]]] = {}
+    rooted_dispatches: set[int] = set()
+    hidden_history_excluded = 0
     for record in records:
-        root = _canonical_root(record.get("project_root"))
-        if root is not None:
-            by_root.setdefault(root, {"root": root, "last_seen": None, "skill_version": None})
+        supplied = record.get("project_root")
+        if not isinstance(supplied, str) or not supplied:
+            continue
+        rooted_dispatches.add(id(record))
+        if _record_is_terminal(record):
+            # Ledger project roots are canonical at write time. Avoid resolving
+            # thousands of deleted historical worktrees merely to discard them.
+            root = os.path.abspath(os.path.expanduser(supplied))
+            if root not in active_roots:
+                hidden_history_excluded += 1
+                continue
+        else:
+            root = _canonical_root(supplied)
+            if root is None:
+                rooted_dispatches.discard(id(record))
+                continue
+            active_roots.add(root)
+        records_by_root.setdefault(root, []).append(record)
+
+    for root in active_roots:
+        by_root.setdefault(
+            root,
+            {"root": root, "last_seen": None, "skill_version": None},
+        )
 
     projects = []
-    assigned_dispatches: set[int] = set()
     # Deep-sample membership: who gets session/milestone calls this tick.
     sampled_roots = {item["root"] for item in registered_projects}
     # Registry membership: a fact about the project, independent of sampling.
     registered_roots = set(all_registered_roots) if all_registered_roots is not None else sampled_roots
     for root in sorted(by_root):
         metadata = by_root[root]
-        scoped = goalflight_status.scope_payload(machine_status, root)
-        scoped_dispatch = scoped.get("dispatch") if isinstance(scoped, dict) else {}
-        scoped_records = (
-            [item for item in scoped_dispatch.get("records") or [] if isinstance(item, dict)]
-            if isinstance(scoped_dispatch, dict)
-            else []
+        scoped_records = records_by_root.get(root, [])
+        probe_records = [
+            record for record in scoped_records if not _record_is_terminal(record)
+        ]
+        journal_reader = (
+            _project_journal_reader(Path(root)) if probe_records else None
         )
-        for record in scoped_records:
-            assigned_dispatches.add(id(record))
         all_journal_authority = _journal_authority_by_dispatch(
-            Path(root), scoped_records
+            Path(root),
+            probe_records,
+            authority=journal_reader,
+            open_if_missing=False,
         )
         fast_records, history_excluded = _fast_plane_records(
             scoped_records,
@@ -1791,25 +1984,11 @@ def _project_rows(
             journal_authority=all_journal_authority,
         )
 
-        if root in sampled_roots:
-            session = _capture(
-                "session",
-                errors,
-                lambda root=root: goalflight_session_status.aggregate_status(Path(root)),
-                {},
-            )
-            milestone = _capture(
-                "milestone",
-                errors,
-                lambda root=root: goalflight_status.milestone_status_payload(root),
-                {},
-            )
-        else:
-            session = {}
-            milestone = {}
-
         controller_contexts = _controller_contexts_by_session(
-            Path(root), fast_records
+            Path(root),
+            [record for record in fast_records if not _record_is_terminal(record)],
+            authority=journal_reader,
+            open_if_missing=False,
         )
         controller_labels = {
             session_id: str(context["label"])
@@ -1843,8 +2022,11 @@ def _project_rows(
                 "last_seen": metadata.get("last_seen"),
                 "skill_version": metadata.get("skill_version"),
                 "history_excluded": history_excluded,
-                "session": _session_row(session),
-                "milestone": _milestone_row(milestone),
+                # Queue/store/milestone history changes far more slowly than
+                # worker liveness. Keep deep repository claims unknown while
+                # publishing the machine sample's exact active-lease count.
+                "session": _fast_session_row(machine_status, root),
+                "milestone": _milestone_row({}),
                 "workers": worker_rows,
             }
         )
@@ -1853,7 +2035,7 @@ def _project_rows(
     # controller/project association.  Object identity is stable across the
     # shallow scope_payload filtering used above.
     unassigned_records, _unassigned_excluded = _fast_plane_records(
-        [record for record in records if id(record) not in assigned_dispatches],
+        [record for record in records if id(record) not in rooted_dispatches],
         sampled_at=sampled_at,
     )
     unassigned = _sort_worker_rows(
@@ -1870,7 +2052,7 @@ def _project_rows(
             str(project.get("project_id") or ""),
         )
     )
-    return projects, unassigned
+    return projects, unassigned, hidden_history_excluded
 
 
 def build_fleet_plane(
@@ -1885,54 +2067,78 @@ def build_fleet_plane(
     sampled_at = _parse_timestamp(started_at)
     errors: list[str] = []
 
-    # Machine-wide facts first.  The unscoped local authority is invoked once,
-    # and its reconciled records are only filtered afterward via scope_payload.
-    machine_status = _capture(
-        "local_status",
-        errors,
-        goalflight_status.status_payload,
-        {
+    empty_machine_status = {
             "capacity": {},
             "capacity_state": {"leases": {}},
             "rate_pressure": {},
             "dispatch": {"records": []},
             "warnings": [],
-        },
-    )
+        }
     resolved_fleet_dir = fleet_dir or goalflight_messages.default_fleet_dir()
-    remote_status = _capture(
-        "remote",
-        errors,
-        lambda: goalflight_fleet_status_cli.build_fleet_status(resolved_fleet_dir),
-        {},
-    )
     usage_kwargs: dict[str, Any] = {"timeout_s": usage_timeout_s}
     if readers_dir is not None:
         usage_kwargs["readers_dir"] = readers_dir
-    usage_rows = _capture(
-        "usage",
-        errors,
-        lambda: goalflight_usage.collect_usage(**usage_kwargs),
-        [],
-    )
-    registered = _capture(
-        "projects",
-        errors,
-        goalflight_task.read_project_registry,
-        [],
-    )
+    # These sources share no mutable transaction and dominate live wall time
+    # (status and usage each walk runs.d). Read them concurrently, then consume
+    # results in a fixed order so captured errors and the payload stay stable.
+    source_specs: list[tuple[str, Callable[[], Any], Any]] = [
+        (
+            "local_status",
+            lambda: goalflight_status.status_payload(
+                reconcile_terminal_history=False
+            ),
+            empty_machine_status,
+        ),
+        (
+            "remote",
+            lambda: goalflight_fleet_status_cli.build_fleet_status(
+                resolved_fleet_dir,
+                live_only=True,
+            ),
+            {},
+        ),
+        ("usage", lambda: goalflight_usage.collect_usage(**usage_kwargs), []),
+        ("projects", goalflight_task.read_project_registry, []),
+    ]
+    source_values: dict[str, Any] = {}
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(source_specs),
+        thread_name_prefix="fleet-console-source",
+    ) as pool:
+        futures = {
+            source: (pool.submit(producer), fallback)
+            for source, producer, fallback in source_specs
+        }
+        for source, _producer, _fallback in source_specs:
+            future, fallback = futures[source]
+            try:
+                source_values[source] = future.result()
+            except Exception as exc:  # source failures remain projection data
+                errors.append(_safe_error(source, exc))
+                source_values[source] = fallback
+    machine_status = source_values["local_status"]
+    remote_status = source_values["remote"]
+    usage_rows = source_values["usage"]
+    registered = source_values["projects"]
 
     queue_by_root, queue_total = _queue_summary(machine_status)
+    fast_roots = _fast_project_roots(
+        machine_status,
+        queue_by_root=queue_by_root,
+    )
     sampled_projects, registry_total = _registered_projects(
         registered,
-        active_roots=_roots_with_records(machine_status),
+        active_roots=fast_roots,
+        only_roots=fast_roots,
+        limit=None,
     )
-    projects, unassigned = _project_rows(
+    projects, unassigned, hidden_history_excluded = _project_rows(
         machine_status if isinstance(machine_status, dict) else {},
         sampled_projects,
         errors,
-        all_registered_roots=_all_registered_roots(registered),
+        all_registered_roots={item["root"] for item in sampled_projects},
         sampled_at=sampled_at,
+        visible_roots=fast_roots,
     )
     # Attach queue depth by the project's own root. Every row gets the key --
     # the allowlist requires it, and an absent queue must read as depth 0, not
@@ -1942,7 +2148,7 @@ def build_fleet_plane(
     # Only project history has a disclosure/fetch path in the renderer. Remote
     # and unassigned retention remains bounded, but its omitted rows must not
     # inflate the global '+N in history' claim into unreachable inventory.
-    history_excluded = sum(
+    history_excluded = hidden_history_excluded + sum(
         max(0, int(project.get("history_excluded") or 0))
         for project in projects
     )
@@ -2064,13 +2270,15 @@ def _controller_attention_rows(
             if isinstance(dispatch, dict)
             else []
         )
+        journal_reader = _project_journal_reader(Path(root))
         contexts = _controller_contexts_by_session(
             Path(root),
             records,
             include_all=True,
-            include_ended=True,
             include_locked_ended=True,
             probe_metadata=probe_metadata,
+            authority=journal_reader,
+            open_if_missing=False,
         )
         for session_id, context in sorted(contexts.items()):
             if context.get("liveness_state") != "HUNG":
@@ -2124,45 +2332,42 @@ def build_attention_plane(
         kwargs["messages_dir"] = messages_dir
     if fleet_dir is not None:
         kwargs["fleet_dir"] = fleet_dir
+    empty_machine_status = {
+        "capacity_state": {"leases": {}},
+        "dispatch": {"records": []},
+        "rate_pressure": {},
+    }
     summary = _capture(
         "mail",
         errors,
         lambda: goalflight_messages.controller_mail_summary(**kwargs),
         {},
     )
-    if project_roots is None:
-        registered = _capture(
-            "projects",
-            errors,
-            goalflight_task.read_project_registry,
-            [],
-        )
-        sampled_projects, _registry_total = _registered_projects(
-            registered,
-            limit=DEFAULT_MAX_PROJECTS,
-        )
-        resolved_project_roots = [Path(item["root"]) for item in sampled_projects]
-    else:
-        resolved_project_roots = list(project_roots)
     machine_status = (
         _capture(
             "local_status",
             errors,
-            goalflight_status.status_payload,
-            {
-                "capacity_state": {"leases": {}},
-                "dispatch": {"records": []},
-                "rate_pressure": {},
-            },
+            lambda: goalflight_status.status_payload(
+                reconcile_terminal_history=False
+            ),
+            empty_machine_status,
         )
-        if resolved_project_roots
-        else {
-            "capacity_state": {"leases": {}},
-            "dispatch": {"records": []},
-            "rate_pressure": {},
-        }
+        if project_roots is None or project_roots
+        else empty_machine_status
     )
     machine_status = _without_terminal_history(machine_status)
+    if project_roots is None:
+        # Machine status already names every root with live work or an ACTIVE
+        # capacity lease. Do not re-enumerate the permanent 1,954-row project
+        # registry on the five-second attention plane.
+        resolved_project_roots = [
+            Path(root)
+            for root in sorted(_fast_project_roots(machine_status))[
+                :DEFAULT_MAX_PROJECTS
+            ]
+        ]
+    else:
+        resolved_project_roots = list(project_roots)
     controller_probe_metadata = {"controller_history_probes_truncated": 0}
     items = _attention_rows(summary) + _controller_attention_rows(
         resolved_project_roots,

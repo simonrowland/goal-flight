@@ -81,7 +81,7 @@ def test_arm_reports_backlog_stays_armed_and_rings_on_new(
             text=True,
         )
         try:
-            # The backlog must be REPORTED, with the advance command, and the
+            # The backlog must be REPORTED tersely, with the advance command, and the
             # listener must remain armed (no pop for pending-at-arm events).
             deadline = time.monotonic() + 20
             header_lines: list[str] = []
@@ -91,16 +91,15 @@ def test_arm_reports_backlog_stays_armed_and_rings_on_new(
                 if not line:
                     break
                 header_lines.append(line)
-                if "item(s) reported" in line:
+                if line.startswith("advance: "):
                     break
             joined = "".join(header_lines)
-            assert "pending-at-arm: [controller-notice] arm-backlog seq=1" in joined
-            assert "pending-at-arm: [controller-notice] arm-backlog seq=2" in joined
-            json_line = next(
-                l for l in header_lines if l.startswith("pending-at-arm-json: ")
-            )
-            payload = json.loads(json_line.split("pending-at-arm-json: ", 1)[1])
-            assert payload["advance_command"]
+            assert "[controller-notice] arm-backlog seq=1 — backlog one" in joined
+            assert "[controller-notice] arm-backlog seq=2 — backlog two" in joined
+            advance_lines = [line for line in header_lines if line.startswith("advance: ")]
+            assert len(advance_lines) == 1
+            assert "pending-at-arm-json" not in joined
+            assert "item(s) reported" not in joined
             time.sleep(2)
             assert proc.poll() is None, "listener popped on the arm-time backlog"
 

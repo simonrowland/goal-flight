@@ -1178,6 +1178,46 @@ async function testInteractiveHistoryAndKeyedRows() {
     ].every(Boolean));
   }
 
+  // Count-only terminal projects remain reachable through one collapsed band.
+  // Dropping the global-minus-visible count recreates a '+N' with no button.
+  {
+    const archivedRows = [
+      terminalRow("archived-1", "complete"),
+      terminalRow("archived-2", "failed"),
+    ];
+    const history = {
+      schema: "goalflight.fleet-console.history.v1",
+      updated_at: "2030-01-01T00:02:00Z",
+      projects: [{ project_id: "archived-project", name: "archived-project", workers: archivedRows }],
+    };
+    const fetches = [];
+    const fetchStub = (url) => {
+      fetches.push(url);
+      return Promise.resolve({ text: () => Promise.resolve("window.GF_HISTORY = " + JSON.stringify(history) + ";\n") });
+    };
+    const { api, byId } = loadConsole(
+      fleetPayload({ projects: [], history_excluded: 2 }),
+      attentionPayload({ items: [] }),
+      fetchStub
+    );
+    assert("count-only projects have one collapsed lazy archived band", [
+      byId.fleet.textContent.includes("Archived projects (+2)"),
+      byId.fleet.textContent.includes("Open archived projects · +2 in history"),
+      api.rowNode("archived-1") === null,
+      fetches.length === 0,
+    ].every(Boolean));
+    await api.showArchived();
+    assert("archived band lazily makes every counted row reachable", [
+      fetches.length === 1,
+      api.rowNode("archived-1") !== null,
+      api.rowNode("archived-2") !== null,
+      byId.fleet.textContent.includes("+2 in history · loaded"),
+    ].every(Boolean));
+    api.setFleetData(fleetPayload({ generation_id: "archived-count-removed", projects: [], history_excluded: 0 }));
+    assert("zero-count mutation removes the archived disclosure band",
+      !byId.fleet.textContent.includes("Archived projects"));
+  }
+
   // Mutation pair: a page-lifetime cache reports '+3 loaded' from the stale
   // two-row blob; keying it by the fleet exclusion counter forces a refetch.
   {

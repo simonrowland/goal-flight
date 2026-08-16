@@ -41,6 +41,13 @@ python3 <skill-root>/scripts/goalflight_messages.py read --dispatch-id <id> --la
 Do not hand-parse JSONL or look for `.read-cursor.json` / `.ack-cursor.json`; those
 surfaces do not exist. The journal cursor is the sole delivery position.
 
+`relay --drain` is the explicit composed read-receipt path. It prints one bounded
+`[type] stream seq=N — payload head` line for every item before the terse cursor
+receipt; `--json` carries those same receipted envelopes in `items`. Use it only
+when reading those headlines settles the work. If an item needs its body or any
+other processing, peek first and run the emitted exact `advance` command only after
+that processing finishes. Receipt means settled, not merely observed.
+
 ## Send
 
 ```bash
@@ -55,21 +62,38 @@ current canonical git project and is needed only for explicit cross-project mail
 Producers record the journal assignment before projecting the JSONL carrier; retry
 heals an unprojected assignment rather than creating a second store.
 
-## One-shot listener
+## Pop-one listener pool
 
-Arm exactly one background listener for the active lease:
+Arm a pool of two tracked background tasks for the active lease. Two is the default
+slot count; repeat this same command twice through the host's tracked-background-task
+surface:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py listen \
   --project-root "$PWD" \
   --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
-  --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE"
+  --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE" \
+  --report-pending
 ```
 
-The listener holds the well-known generation lock, writes an ARMED audit row,
-and terminates as soon as any assignment is newer than the controller cursor. Its
-exit is only a doorbell: no envelopes, count, backlog flag, or receipt token are
-delivered through the listener. Peek authoritative mail after the wake:
+Each listener holds one `listener-slot-N` lock. When foreign waking mail is newer
+than the cursor, the listeners race to stamp that cursor version; exactly one wins
+and exits, while the other stays blocked. Cursor advance changes the version, so
+leftovers or later arrivals permit exactly one fresh ring from the survivors. The
+stamp persists independently of process lock ownership, making crash staleness a
+version comparison rather than a guess about which process lived.
+
+Self-authored events carry an author digest derived from the lease capability the
+poster actually presented. Only that digest can suppress a ring or plain relay
+headline; source labels are descriptive metadata and never prove authorship. Events
+without a proven author digest remain visible. Self-authored rows remain cursor items
+and are advanced as read receipts by a drain alongside foreign mail.
+
+`--report-pending` prints only terse pending headlines followed by one exact
+`advance: <command>` line; the full pending-at-arm object is available only with
+`--json`. The listener stays armed above that reported high-water. A normal ring is
+still only a doorbell; peek authoritative mail after it when processing needs more
+than the drain headlines:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py relay --new --json
@@ -93,10 +117,31 @@ python3 <skill-root>/scripts/goalflight_messages.py advance \
   --position '<stream>=<seq>'
 ```
 
-Peek again to derive whether more remains. A second same-generation listener loses
-the well-known lock before it can supersede the healthy doorbell. Superseded,
-orphaned, stale-lease, corrupt, upgrade-required, and journal-unavailable exits remain
-durable audit rows. The listener never renews the controller lease.
+The tidy steady-state loop is:
+
+1. Keep two tracked `--report-pending` listeners armed.
+2. One rings; use `relay --drain` when its headlines settle every item, or peek,
+   process bodies, and advance explicitly.
+3. Re-arm one tracked listener to restore pool depth two.
+
+Never advance before processing is settled. If all slots are occupied, startup
+reports their exact PIDs and says not to kill by pattern. If all listeners have rung
+and none was re-armed, entry hints report `n=0`; if one member of the default pool is
+lost, they report `n=1/2` and the exact `--report-pending` re-arm command. A listener
+reparented to PID 1 waits through a short startup grace, then refuses with one exact
+re-arm command: its exit cannot wake an untracked parent. Superseded, orphaned,
+stale-lease, corrupt, upgrade-required, and journal-unavailable exits remain durable
+audit rows. A listener never renews the controller lease.
+
+Supervisors must branch on the listener's exit code instead of blindly restarting:
+
+| Code | Meaning | Supervisor action |
+|---:|---|---|
+| 0 | Ring: waking mail won the cursor-version claim. | Process the reported or authoritative mail, advance only settled positions, then re-arm one tracked listener to restore pool depth. |
+| 1 | Timeout: no waking event arrived before the requested deadline. | Treat it as a clean timer expiry; re-arm only when ongoing coverage is still required. |
+| 2 | Infrastructure or corruption failure. | Preserve the one-line diagnostic, repair or escalate the journal/wake substrate, and avoid a restart loop until the fault is cleared. |
+| 3 | Contention, supersession, orphaning, or stale lease. | Reconcile the active lease and held slot PIDs; do not kill by pattern, and re-arm only under the current lease. |
+| 4 | Detached-listener refusal: its exit cannot wake a tracked controller. | Use the emitted command to launch a tracked background listener; do not detach it again. |
 
 The held-lock ledger, not coverage rows or `ps` output, drives the missing-listener
 reminder. Coverage rows retain audit and supersession history only.

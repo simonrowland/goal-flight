@@ -8,10 +8,13 @@ import datetime as dt
 import io
 import json
 import os
+import statistics
+import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,6 +22,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT))
 
 import goalflight_fleet_console as F
+import goalflight_fleet_console_producer as producer
 import goalflight_ledger
 
 
@@ -28,6 +32,14 @@ LAST_FAST_PLANE_MEASUREMENT: dict[str, float | int] = {}
 def assert_true(name: str, condition: bool) -> None:
     if not condition:
         raise AssertionError(name)
+
+
+def _script_payload(path: Path, global_name: str) -> dict:
+    text = path.read_text(encoding="utf-8")
+    prefix = f"window.{global_name} = "
+    assignment = text[text.index(prefix) + len(prefix) :]
+    assert assignment.endswith(";\n")
+    return json.loads(assignment[:-2])
 
 
 def _status_payload(project_root: Path) -> dict:
@@ -139,11 +151,13 @@ def test_fleet_consumes_status_once_before_project_grouping() -> dict:
         project.mkdir()
         events: list[str] = []
 
-        def local_status() -> dict:
+        def local_status(**kwargs: object) -> dict:
+            assert kwargs == {"reconcile_terminal_history": False}
             events.append("status")
             return _status_payload(project)
 
-        def remote_status(_fleet_dir: Path) -> dict:
+        def remote_status(_fleet_dir: Path, **kwargs: object) -> dict:
+            assert kwargs == {"live_only": True}
             events.append("remote")
             return _remote_payload()
 
@@ -198,8 +212,8 @@ def test_fleet_consumes_status_once_before_project_grouping() -> dict:
             mock.patch.object(F.goalflight_fleet_status_cli, "build_fleet_status", side_effect=remote_status),
             mock.patch.object(F.goalflight_usage, "collect_usage", side_effect=usage),
             mock.patch.object(F.goalflight_task, "read_project_registry", side_effect=projects),
-            mock.patch.object(F.goalflight_session_status, "aggregate_status", side_effect=session),
-            mock.patch.object(F.goalflight_status, "milestone_status_payload", side_effect=milestone),
+            mock.patch.object(F.goalflight_session_status, "aggregate_status", side_effect=session) as session_mock,
+            mock.patch.object(F.goalflight_status, "milestone_status_payload", side_effect=milestone) as milestone_mock,
         ):
             payload = F.build_fleet_plane(
                 fleet_dir=Path(td) / "fleet",
@@ -207,7 +221,13 @@ def test_fleet_consumes_status_once_before_project_grouping() -> dict:
             )
 
         assert_true("status sampled exactly once", status_mock.call_count == 1)
-        assert_true("machine facts precede grouping", events == ["status", "remote", "usage", "projects", "session", "milestone"])
+        assert_true(
+            "all machine facts finish before grouping regardless of concurrent order",
+            len(events) == 4
+            and set(events) == {"status", "remote", "usage", "projects"},
+        )
+        assert_true("fast plane skips deep session scans", session_mock.call_count == 0)
+        assert_true("fast plane skips per-project milestone scans", milestone_mock.call_count == 0)
         worker = payload["projects"][0]["workers"][0]
         assert_true("canonical classification preserved", worker["classification"] == "expected_live")
         assert_true("raw state preserved without reclassification", worker["state"] == "complete")
@@ -217,6 +237,8 @@ def test_fleet_consumes_status_once_before_project_grouping() -> dict:
         assert_true("project path replaced by opaque id", payload["projects"][0]["project_id"].startswith("safe-project-"))
         assert_true("full success timestamped", payload["last_success_at"] == payload["sample_finished_at"])
         assert_true("fleet producer cadence stamped", payload["cadence_seconds"] == 30)
+        assert_true("active lease count comes from machine sample", payload["projects"][0]["session"]["active_leases"] == 1)
+        assert_true("deep milestone data stays unknown on fast plane", payload["projects"][0]["milestone"]["available"] is False)
 
         encoded = json.dumps(payload, sort_keys=True)
         assert_true("absolute project path denied", str(project) not in encoded)
@@ -360,7 +382,7 @@ def test_script_publication_escapes_injection_and_is_atomic(
 
 
 def test_source_error_is_bounded_and_not_a_false_success() -> None:
-    def fail_remote(_fleet_dir: Path) -> dict:
+    def fail_remote(_fleet_dir: Path, **_kwargs: object) -> dict:
         raise RuntimeError("secret /Users/alice/fleet")
 
     with (
@@ -599,7 +621,7 @@ def test_registry_membership_is_not_a_statement_about_sampling() -> None:
         ]},
     }
     sampled = [{"root": F._canonical_root("/tmp/inside"), "last_seen": None, "skill_version": None}]
-    projects, _ = F._project_rows(
+    projects, _, _ = F._project_rows(
         machine, sampled, [],
         # Canonical form: _canonical_root resolves /tmp -> /private/tmp on
         # macOS, and the join is on the resolved value.
@@ -611,8 +633,195 @@ def test_registry_membership_is_not_a_statement_about_sampling() -> None:
     by_name = {p["name"]: p for p in projects}
     assert_true("the unsampled project still reports registered",
                 by_name["outside-the-cap"]["registered"] is True)
-    assert_true("and it did NOT get a deep sample",
-                by_name["outside-the-cap"]["session"]["available"] is False)
+    assert_true(
+        "live project gets only machine-derived session data, not a deep sample",
+        by_name["outside-the-cap"]["session"]["available"] is False
+        and by_name["outside-the-cap"]["session"]["active"] is None
+        and by_name["outside-the-cap"]["session"]["queue_state"] is None
+        and by_name["outside-the-cap"]["milestone"]["available"] is False,
+    )
+
+
+def test_fast_plane_project_classes_are_live_only_mutation_pair() -> None:
+    """Idle registry/worktree rows and ended generations stay in slow history."""
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        live_root = (temp_root / "live-project").resolve()
+        lease_root = (temp_root / "lease-only-project").resolve()
+        idle_worktree = (temp_root / "old-worktree").resolve()
+        for root in (live_root, lease_root, idle_worktree):
+            root.mkdir()
+        ancient = "2020-01-01T00:00:00+00:00"
+        terminal_status = temp_root / "terminal-status.json"
+        terminal_status.write_text(
+            json.dumps({"dispatch_id": "live-terminal", "state": "complete"}),
+            encoding="utf-8",
+        )
+        machine = {
+            "schema": "goalflight.status.aggregate.v1",
+            "capacity": {"operating_cap": 12},
+            "capacity_state": {
+                "leases": {
+                    "active": {
+                        "state": "active",
+                        "project_root": str(lease_root),
+                    },
+                    "ended": {
+                        "state": "released",
+                        "project_root": str(idle_worktree),
+                    },
+                }
+            },
+            "rate_pressure": {},
+            "warnings": [],
+            "dispatch": {
+                "records": [
+                    {
+                        "dispatch_id": "live-worker",
+                        "project_root": str(live_root),
+                        "state": "running",
+                        "classification": "expected_live",
+                    },
+                    {
+                        "dispatch_id": "live-terminal",
+                        "project_root": str(live_root),
+                        "state": "complete",
+                        "classification": "complete",
+                        "terminal_state": "complete",
+                        "ended_at": ancient,
+                        "status_path": str(terminal_status),
+                    },
+                    {
+                        "dispatch_id": "idle-terminal",
+                        "project_root": str(idle_worktree),
+                        "state": "complete",
+                        "classification": "complete",
+                        "terminal_state": "complete",
+                        "ended_at": ancient,
+                    },
+                ]
+            },
+        }
+        registry = [
+            {
+                "project_root": str(root),
+                "last_seen": "2030-01-01T00:00:00+00:00",
+            }
+            for root in (live_root, lease_root, idle_worktree)
+        ]
+        probed_statuses: list[str] = []
+
+        def status_probe(record: dict) -> dict:
+            probed_statuses.append(str(record.get("dispatch_id")))
+            return {
+                "dispatch_id": record.get("dispatch_id"),
+                "state": record.get("state"),
+            }
+
+        with (
+            mock.patch.dict(os.environ, _controller_test_env(temp_root), clear=False),
+            mock.patch.object(F.goalflight_status, "status_payload", return_value=machine),
+            mock.patch.object(F.goalflight_status, "_status_json_payload", side_effect=status_probe),
+            mock.patch.object(F.goalflight_fleet_status_cli, "build_fleet_status", return_value={}),
+            mock.patch.object(F.goalflight_usage, "collect_usage", return_value=[]),
+            mock.patch.object(F.goalflight_task, "read_project_registry", return_value=registry),
+            mock.patch.object(F.goalflight_session_status, "aggregate_status", return_value={}),
+            mock.patch.object(F.goalflight_status, "milestone_status_payload", return_value={}),
+        ):
+            payload = F.build_fleet_plane(generation_id="record-class-mutation-pair")
+
+    names = {project["name"] for project in payload["projects"]}
+    assert_true(
+        "only live-work and active-lease projects cross the fast plane",
+        names == {"live-project", "lease-only-project"},
+    )
+    assert_true(
+        "idle registry/worktree project is counted but not deep-sampled",
+        payload["registry_total"] == 3
+        and payload["registry_deep_sampled"] == 2,
+    )
+    assert_true(
+        "the hidden terminal remains disclosed through slow-history count",
+        payload["history_excluded"] == 1,
+    )
+    assert_true(
+        "retained warm terminal rows reconcile their status sidecars",
+        probed_statuses.count("live-terminal") >= 1,
+    )
+
+
+def test_detached_orphan_with_matching_identity_stays_fast_without_lease_mutation_pair() -> None:
+    """Controller exit cannot erase a still-matching detached worker."""
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = (temp_root / "orphan-project").resolve()
+        project_root.mkdir()
+        orphan = {
+            "dispatch_id": "orphan-still-live",
+            "project_root": str(project_root),
+            "state": "orphaned",
+            "reason": "controller_dead",
+            "classification": "expected_live",
+            "terminal_state": "unknown",
+            "detached": True,
+            "worker_still_alive": True,
+            "started_at": "2030-01-01T00:00:00+00:00",
+        }
+        machine = {
+            "schema": "goalflight.status.aggregate.v1",
+            "capacity": {"operating_cap": 12},
+            "capacity_state": {"leases": {}},
+            "rate_pressure": {},
+            "warnings": [],
+            "dispatch": {"records": [orphan]},
+        }
+        registry = [{"project_root": str(project_root), "last_seen": "2030-01-01T00:00:00+00:00"}]
+        attention_scans: list[str] = []
+
+        def capture_attention_roots(
+            roots: list[Path],
+            _machine_status: dict,
+            **_kwargs: object,
+        ) -> list[dict]:
+            attention_scans.extend(str(root) for root in roots)
+            return []
+
+        with (
+            mock.patch.dict(os.environ, _controller_test_env(temp_root), clear=False),
+            mock.patch.object(F.goalflight_status, "status_payload", return_value=machine),
+            mock.patch.object(F.goalflight_fleet_status_cli, "build_fleet_status", return_value={}),
+            mock.patch.object(F.goalflight_usage, "collect_usage", return_value=[]),
+            mock.patch.object(F.goalflight_task, "read_project_registry", return_value=registry),
+            mock.patch.object(F.goalflight_messages, "controller_mail_summary", return_value={"needs": []}),
+            mock.patch.object(F, "_controller_attention_rows", side_effect=capture_attention_roots),
+        ):
+            fleet = F.build_fleet_plane(generation_id="orphan-live-fleet")
+            F.build_attention_plane(generation_id="orphan-live-attention")
+
+    workers = [worker for project in fleet["projects"] for worker in project["workers"]]
+    assert_true(
+        "matching detached orphan remains a visible live worker without a capacity lease",
+        len(workers) == 1
+        and workers[0]["dispatch_id"] == "orphan-still-live"
+        and workers[0]["display_state"] == "running"
+        and workers[0]["is_terminal"] is False,
+    )
+    assert_true(
+        "matching detached orphan keeps its project eligible for attention scanning",
+        attention_scans == [str(project_root)],
+    )
+    dead_mutant = {
+        **orphan,
+        "classification": "worker_dead",
+        "worker_still_alive": False,
+    }
+    assert_true(
+        "identity-dead mutation leaves the fast project set",
+        str(project_root)
+        not in F._fast_project_roots(
+            {**machine, "dispatch": {"records": [dead_mutant]}}
+        ),
+    )
 
 
 def test_live_worker_count_ignores_permanent_terminal_history() -> None:
@@ -1504,16 +1713,16 @@ def test_attention_excludes_ended_generations_without_held_kernel_locks() -> Non
                 and "active-controller" in str(attention_rows[0]["headline"]),
             )
             assert_true(
-                "fleet identity path still resolves historical labels",
-                fleet_context[ended.nonce]["label"] == "ended-controller",
+                "fleet fast path does not resolve historical lease labels",
+                fleet_context[ended.nonce]["label"] is None,
             )
             assert_true(
-                "attention inspects ended rows for locks while fleet identity reads history",
-                include_ended_calls == [True, True],
+                "attention reads bounded ended generations while fleet labels stay ACTIVE-only",
+                include_ended_calls == [True, False],
             )
 
 
-def test_attention_keeps_superseded_generation_until_kernel_lock_releases() -> None:
+def test_attention_scans_superseded_generation_while_exact_lock_is_held() -> None:
     with tempfile.TemporaryDirectory() as td:
         temp_root = Path(td)
         project_root = (temp_root / "project").resolve()
@@ -1532,7 +1741,6 @@ def test_attention_keeps_superseded_generation_until_kernel_lock_releases() -> N
                 controller_label="takeover-controller",
                 lease_nonce=first.nonce,
             )
-            second_holder = None
             try:
                 second_claim = authority.claim_or_renew_lease(
                     "takeover-controller",
@@ -1542,11 +1750,6 @@ def test_attention_keeps_superseded_generation_until_kernel_lock_releases() -> N
                 assert_true("second takeover generation claimed", second_claim.committed)
                 second = second_claim.value
                 assert second is not None
-                second_holder = F.goalflight_wake.register_lease_holder(
-                    project_root,
-                    controller_label="takeover-controller",
-                    lease_nonce=second.nonce,
-                )
                 _running_attempt(authority, "takeover-unowned")
                 machine_status = {
                     "capacity": {},
@@ -1559,12 +1762,12 @@ def test_attention_keeps_superseded_generation_until_kernel_lock_releases() -> N
                     [project_root], machine_status
                 )
                 assert_true(
-                    "superseded but still-locked N1 remains HUNG attention",
-                    len(while_locked) == 2
-                    and any(
-                        f"generation-{first.generation}" in str(row["dispatch_id"])
-                        for row in while_locked
-                    ),
+                    "ended N1 zombie is scanned while holder-less active N2 is not HUNG",
+                    len(while_locked) == 1
+                    and f"generation-{first.generation}"
+                    in str(while_locked[0]["dispatch_id"])
+                    and f"generation-{second.generation}"
+                    not in str(while_locked[0]["dispatch_id"]),
                 )
 
                 first_holder.close()
@@ -1572,103 +1775,59 @@ def test_attention_keeps_superseded_generation_until_kernel_lock_releases() -> N
                     [project_root], machine_status
                 )
                 assert_true(
-                    "released N1 drops while active N2 remains",
-                    len(after_release) == 1
-                    and f"generation-{second.generation}"
-                    in str(after_release[0]["dispatch_id"]),
+                    "releasing N1's exact lock removes the zombie attention row",
+                    after_release == [],
                 )
             finally:
                 first_holder.close()
-                if second_holder is not None:
-                    second_holder.close()
 
 
-def test_attention_bounds_ended_generation_lock_probes_and_reports_truncation() -> None:
+def test_attention_bounds_ended_generation_probes_to_newest_eight() -> None:
     with tempfile.TemporaryDirectory() as td:
         temp_root = Path(td)
         project_root = (temp_root / "project").resolve()
         project_root.mkdir()
         with mock.patch.dict(os.environ, _controller_test_env(temp_root), clear=False):
             authority = F.goalflight_journal.open_or_create_journal(project_root)
-            leases = []
-            holders = []
-            try:
-                for index in range(12):
-                    claimed = authority.claim_or_renew_lease(
-                        "bounded-history-controller",
-                        principal={"principal_id": f"bounded-history-{index + 1}"},
-                        takeover=index > 0,
-                    )
-                    assert_true(
-                        f"bounded history generation {index + 1} claimed",
-                        claimed.committed and claimed.value is not None,
-                    )
-                    lease = claimed.value
-                    assert lease is not None
-                    leases.append(lease)
-                    holders.append(
-                        F.goalflight_wake.register_lease_holder(
-                            project_root,
-                            controller_label="bounded-history-controller",
-                            lease_nonce=lease.nonce,
-                        )
-                    )
-                released = authority.release_lease(
-                    "bounded-history-controller",
-                    nonce=leases[-1].nonce,
-                    reason="bounded-history-test",
-                )
-                assert_true("newest bounded history generation ended", released.committed)
-                _running_attempt(authority, "bounded-history-unowned")
-                machine_status = {
-                    "capacity": {},
-                    "capacity_state": {"leases": {}},
-                    "rate_pressure": {},
-                    "warnings": [],
-                    "dispatch": {"records": []},
+            _running_attempt(authority, "bounded-active-unowned")
+            fake_rows = [
+                {
+                    "label": "bounded-active-controller",
+                    "nonce": f"active-{generation}",
+                    "generation": generation,
+                    "state": F.goalflight_journal.LEASE_RETIRED,
                 }
-                with (
-                    mock.patch.object(
-                        F.goalflight_messages,
-                        "controller_mail_summary",
-                        return_value={"needs": []},
-                    ),
-                    mock.patch.object(
-                        F.goalflight_status,
-                        "status_payload",
-                        return_value=machine_status,
-                    ),
-                ):
-                    payload = F.build_attention_plane(
-                        generation_id="bounded-history-attention",
-                        project_roots=[project_root],
-                    )
+                for generation in range(1, 13)
+            ]
+            probe_metadata = {"controller_history_probes_truncated": 0}
+            with (
+                mock.patch.object(authority, "lease_records", return_value=fake_rows),
+                mock.patch.object(F.goalflight_wake, "lease_holder_alive", return_value=True),
+                mock.patch.object(F.goalflight_wake, "live_waiters", return_value=[]),
+            ):
+                contexts = F._controller_contexts_by_session(
+                    project_root,
+                    [],
+                    include_all=True,
+                    include_locked_ended=True,
+                    probe_metadata=probe_metadata,
+                    authority=authority,
+                    open_if_missing=False,
+                )
 
-                controller_rows = [
-                    row for row in payload["items"] if row["kind"] == "controller_hung"
-                ]
-                observed_generations = {
-                    int(str(row["dispatch_id"]).rsplit("generation-", 1)[1])
-                    for row in controller_rows
-                }
-                # All twelve ended generations retain held locks in the
-                # constructed ledger. Eight rows therefore proves the scan
-                # probed only the newest eight without patching the probe.
-                assert_true(
-                    "only the newest eight ended generation locks are probed",
-                    observed_generations == set(range(5, 13)),
-                )
-                assert_true(
-                    "attention metadata reports four omitted history probes",
-                    payload["controller_history_probes_truncated"] == 4,
-                )
-                assert_true(
-                    "held newest-eight lock still pages while held older lock does not",
-                    5 in observed_generations and 4 not in observed_generations,
-                )
-            finally:
-                for holder in holders:
-                    holder.close()
+            observed_generations = {
+                int(context["generation"])
+                for context in contexts.values()
+                if isinstance(context.get("generation"), int)
+            }
+            assert_true(
+                "only the newest eight ended generations are probed",
+                observed_generations == set(range(5, 13)),
+            )
+            assert_true(
+                "metadata reports four omitted ended generation probes",
+                probe_metadata["controller_history_probes_truncated"] == 4,
+            )
 
 
 def test_attention_status_failure_degrades_without_inventing_hung() -> None:
@@ -1791,6 +1950,278 @@ def test_fast_plane_retention_is_small_and_prompt_free() -> None:
     assert_true("attention carries no terminal dispatch history", all("terminal-" not in str(item) for item in attention["items"]))
 
 
+def test_real_shape_2000_record_fast_plane_guard_mutation_pair() -> None:
+    """Measure the installed producer quantity over production-shaped runs.d."""
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        isolated_env = _controller_test_env(temp_root)
+        live_roots = [
+            (temp_root / "active-project-a").resolve(),
+            (temp_root / "active-project-b").resolve(),
+        ]
+        for root in live_roots:
+            root.mkdir()
+        readers_dir = temp_root / "usage-readers"
+        readers_dir.mkdir()
+        terminal_tail = temp_root / "ancient-worker-output.log"
+        terminal_tail.write_text(
+            "historical output without a terminal marker\n" * 1024,
+            encoding="utf-8",
+        )
+        terminal_status = temp_root / "ancient-worker-status.json"
+        terminal_status.write_text(
+            json.dumps({"dispatch_id": "historical-worker", "state": "worker_dead"}),
+            encoding="utf-8",
+        )
+        prompt_path = temp_root / "production-prompt.md"
+        prompt_path.write_text("production-shaped performance prompt\n", encoding="utf-8")
+        registry: list[dict[str, str]] = []
+
+        with mock.patch.dict(os.environ, isolated_env, clear=False):
+            runs_dir = goalflight_ledger.runs_dir()
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            first_root = temp_root / "worktrees" / "ancient-0000"
+            request_envelope = {
+                "dispatch_argv": [
+                    "--agent",
+                    "codex",
+                    "--shape",
+                    "acp",
+                    "--task",
+                    "t-246",
+                    "--frame",
+                    "context-package-" + ("x" * 3200),
+                ],
+                "request": {
+                    "agent": "codex",
+                    "shape": "acp",
+                    "task_ids": ["t-246"],
+                    "os_sandbox": "workspace-write",
+                },
+            }
+            # Generate the template through the real ledger writer so schema,
+            # process identity, request envelope, and sandbox posture match v1.
+            args = SimpleNamespace(
+                dispatch_id="ancient-0000",
+                prompt_id="perf-production-shape",
+                prompt_path=str(prompt_path),
+                agent="codex",
+                engine="codex",
+                shape="acp",
+                account="perf-seat",
+                effective_account="perf-seat",
+                transport="acp",
+                project_root=str(first_root),
+                controller_pid=None,
+                controller_session_id=None,
+                controller_label=None,
+                claimant_pid=None,
+                worker_pid=os.getpid(),
+                acp_session_id="acp-performance-session",
+                logical_session_id="logical-performance-session",
+                lease_id="performance-lease",
+                stdout_path=str(terminal_tail),
+                stderr_path=str(temp_root / "ancient-worker-stderr.log"),
+                status_path=str(terminal_status),
+                os_sandbox_json=json.dumps(
+                    {
+                        "requested_profile": "workspace-write",
+                        "supported_profile": "workspace-write",
+                        "enforced_profile": "workspace-write",
+                    }
+                ),
+                state="worker_dead",
+                request_envelope_json=json.dumps(request_envelope),
+                task_id=None,
+                task_ids=["t-246"],
+                detached=True,
+                queue_launch_token=None,
+                json=True,
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                assert_true("real ledger schema template writes", goalflight_ledger.cmd_record(args) == 0)
+            template = json.loads(
+                goalflight_ledger.record_path("ancient-0000").read_text(encoding="utf-8")
+            )
+            for index in range(1994):
+                root = (temp_root / "worktrees" / f"ancient-{index:04d}").resolve()
+                dispatch_id = f"ancient-{index:04d}"
+                record = json.loads(json.dumps(template))
+                record.update(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "project_root": str(root),
+                        "state": "worker_dead",
+                        "terminal_state": "worker_dead",
+                        "started_at": "2020-01-01T00:00:00+00:00",
+                        "ended_at": "2020-01-01T00:01:00+00:00",
+                        "updated_at": "2020-01-01T00:01:00+00:00",
+                        "worker_pid": 99_000_000 + index,
+                        "worker_still_alive": False,
+                    }
+                )
+                record["worker_identity"] = {
+                    "pid": record["worker_pid"],
+                    "ppid": 1,
+                    "pgid": record["worker_pid"],
+                    "lstart": "Thu Jul  2 17:53:52 2026",
+                    "comm": "codex",
+                    "args": "codex exec --sandbox workspace-write --enable web_search_cached",
+                    "start_token": f"perf-start-{index:04d}",
+                }
+                (runs_dir / f"{dispatch_id}.json").write_text(
+                    json.dumps(record), encoding="utf-8"
+                )
+                registry.append(
+                    {
+                        "project_root": str(root),
+                        "last_seen": "2020-01-01T00:01:00+00:00",
+                    }
+                )
+            for index in range(6):
+                root = live_roots[index % len(live_roots)]
+                dispatch_id = f"live-{index}"
+                status_path = temp_root / f"{dispatch_id}.status.json"
+                status_path.write_text(
+                    json.dumps(
+                        {
+                            "schema": "goalflight.status.v1",
+                            "dispatch_id": dispatch_id,
+                            "state": "running",
+                            "worker_pid": os.getpid(),
+                            "worker_alive": True,
+                            "heartbeat_at": "2030-01-01T00:00:01+00:00",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                record = json.loads(json.dumps(template))
+                record.update(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "project_root": str(root),
+                        "state": "running",
+                        "terminal_state": "unknown",
+                        "started_at": "2030-01-01T00:00:00+00:00",
+                        "ended_at": None,
+                        "updated_at": "2030-01-01T00:00:01+00:00",
+                        "worker_pid": os.getpid(),
+                        "worker_identity": goalflight_ledger.process_identity(os.getpid()),
+                        "worker_still_alive": True,
+                        "status_path": str(status_path),
+                    }
+                )
+                (runs_dir / f"{dispatch_id}.json").write_text(
+                    json.dumps(record), encoding="utf-8"
+                )
+            registry.extend(
+                {
+                    "project_root": str(root),
+                    "last_seen": "2030-01-01T00:00:00+00:00",
+                }
+                for root in live_roots
+            )
+            registry_path = F.goalflight_task.project_registry_index_path()
+            registry_path.parent.mkdir(parents=True, exist_ok=True)
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "schema": F.goalflight_task.PROJECT_REGISTRY_INDEX_SCHEMA,
+                        "updated_at": "2030-01-01T00:00:00+00:00",
+                        "projects": registry,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            record_sizes = [path.stat().st_size for path in runs_dir.glob("*.json")]
+            fixture_p50 = statistics.median(record_sizes)
+            # Live runs.d p50 measured read-only on 2026-08-16 was 5,847 bytes;
+            # keep this fixture within 2x so byte-sensitive regressions are real.
+            live_p50 = 5_847
+            assert_true(
+                f"fixture median {fixture_p50}B stays within 2x of live p50 {live_p50}B",
+                live_p50 / 2 <= fixture_p50 <= live_p50 * 2,
+            )
+            assert_true(
+                "production records carry request envelopes and worker identities",
+                isinstance(template.get("request_envelope"), dict)
+                and isinstance(template.get("worker_identity"), dict),
+            )
+            thin_mutant = dict(template)
+            thin_mutant.pop("request_envelope", None)
+            thin_mutant.pop("worker_identity", None)
+            thin_mutant_bytes = len(json.dumps(thin_mutant).encode("utf-8"))
+            assert_true(
+                "removing production envelope and identity recreates an undersized fixture",
+                thin_mutant_bytes < live_p50 / 2,
+            )
+
+            output_dir = temp_root / "producer-output"
+            output_dir.mkdir()
+            # Usage readers use the real collector against an empty isolated
+            # directory: provider credentials/network are outside this pipeline guard.
+            subprocess_env = dict(os.environ)
+            subprocess_env.update(isolated_env)
+            subprocess_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            elapsed_by_plane: dict[str, float] = {}
+            payload_by_plane: dict[str, dict] = {}
+            for plane in ("attention", "fleet"):
+                output = output_dir / f"{plane}-data.js"
+                if plane == "fleet":
+                    # Slow-history catch-up is a separate hourly quantity; the
+                    # installed fast tick normally sees this fresh stamp.
+                    (output_dir / ".history-catchup").touch()
+                command = [
+                    sys.executable,
+                    str(ROOT / "scripts" / "goalflight_fleet_console_producer.py"),
+                    plane,
+                    "--output",
+                    str(output),
+                    "--lock-dir",
+                    str(temp_root / "producer-locks"),
+                ]
+                if plane == "fleet":
+                    command.extend(("--readers-dir", str(readers_dir)))
+                started = time.perf_counter()
+                completed = subprocess.run(
+                    command,
+                    cwd=ROOT,
+                    env=subprocess_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=producer.DEFAULT_BUDGET_S[plane] + 5.0,
+                    check=False,
+                )
+                elapsed_by_plane[plane] = time.perf_counter() - started
+                assert_true(
+                    f"{plane} production entrypoint publishes healthy ({completed.stderr})",
+                    completed.returncode == 0,
+                )
+                payload_by_plane[plane] = _script_payload(
+                    output,
+                    "GF_ATTENTION" if plane == "attention" else "GF_FLEET",
+                )
+
+    payload = payload_by_plane["fleet"]
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    assert_true("guard exercised all 2,000 v1 records", payload["history_excluded"] == 1994)
+    assert_true("only two live worktrees become project rows", len(payload["projects"]) == 2)
+    assert_true("real-shape fast payload stays under 200KB", len(encoded) < 200_000)
+    for plane, budget in producer.DEFAULT_BUDGET_S.items():
+        headroom_limit = budget * 0.70
+        elapsed = elapsed_by_plane[plane]
+        assert_true(
+            f"{plane} producer entrypoint keeps 30% headroom ({elapsed:.3f}s < {headroom_limit:.3f}s)",
+            elapsed < headroom_limit,
+        )
+        old_guard_counterexample = budget * 0.85
+        assert_true(
+            f"{plane} guard mutation fails inside installed budget instead of accepting old 5s bound",
+            old_guard_counterexample < 5.0
+            and not old_guard_counterexample < headroom_limit,
+        )
+
+
 def test_authority_detail_names_sources_and_journal_reconciles() -> None:
     row = F._worker_row(
         {
@@ -1852,12 +2283,13 @@ def test_authority_detail_names_sources_and_journal_reconciles() -> None:
             }
         )
     assert_true(
-        "newer status sidecar reconciles and names both authority fields",
+        "newer running status sidecar reopens a stale terminal ledger presentation",
         newer_status["display_state"] == "running"
+        and newer_status["is_terminal"] is False
         and newer_status["classification_conflict"] is False
         and newer_status["authority_resolution"] == "status.json:newer"
-        and "ledger.state=complete" in str(newer_status["authority_detail"])
-        and "status.json.state=running" in str(newer_status["authority_detail"]),
+        and "reconciled by newer status.json observation"
+        in str(newer_status["authority_detail"]),
     )
     with tempfile.TemporaryDirectory() as td:
         mismatched_path = Path(td) / "status.json"
@@ -1887,6 +2319,66 @@ def test_authority_detail_names_sources_and_journal_reconciles() -> None:
         and mismatched_status["classification_conflict"] is False
         and mismatched_status["authority_resolution"] is None,
     )
+
+
+def test_fast_worker_row_runs_ready_promotion_recovery_mutation_pair() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        tail = root / "ready-worker.tail"
+        tail.write_text(
+            "work complete\n"
+            "READY: ready-promoted — artifact written\n"
+            "trailing summary after the terminal marker\n",
+            encoding="utf-8",
+        )
+        status_path = root / "ready-worker.status.json"
+        status_path.write_text(
+            json.dumps(
+                {
+                    "dispatch_id": "ready-promoted",
+                    "last_marker": {
+                        "kind": "READY",
+                        "text": "ready-promoted — artifact written",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        record = {
+            "dispatch_id": "ready-promoted",
+            "state": "worker_dead",
+            "classification": "worker_dead",
+            "terminal_state": "worker_dead",
+            "worker_pid": 999_999_991,
+            "worker_identity": {
+                "pid": 999_999_991,
+                "lstart": "Tue Jun  9 09:00:00 2026",
+                "comm": "python3",
+            },
+            "stdout_path": str(tail),
+            "status_path": str(status_path),
+            "started_at": "2026-08-16T00:00:00+00:00",
+            "updated_at": "2026-08-16T00:01:00+00:00",
+        }
+        with mock.patch.object(
+            F.goalflight_status.goalflight_ledger,
+            "identity_matches",
+            return_value=(False, "dead"),
+        ):
+            row = F._worker_row(record)
+
+    assert_true(
+        "bounded fast-row reconciliation promotes READY plus trailing summary",
+        row["display_state"] == "complete"
+        and row["is_terminal"] is True
+        and row["classification"] == "complete",
+    )
+    unreconciled = F._worker_display_verdict(record)
+    assert_true(
+        "removing fast-row recovery recreates the false worker_dead presentation",
+        unreconciled["display_state"] == "worker_dead"
+        and unreconciled["is_terminal"] is True,
+    )
     old = "2029-01-01T00:00:00+00:00"
     records = [
         {
@@ -1899,7 +2391,7 @@ def test_authority_detail_names_sources_and_journal_reconciles() -> None:
         for index in range(10)
     ]
     journal_live = {
-        "old-9": {
+        "old-0": {
             "lifecycle_state": F.goalflight_journal.ATTEMPT_RUNNING,
             "terminal_state": None,
         }
@@ -1909,8 +2401,11 @@ def test_authority_detail_names_sources_and_journal_reconciles() -> None:
         sampled_at=F._parse_timestamp("2030-01-01T00:00:00+00:00"),
         journal_authority=journal_live,
     )
-    assert_true("journal-live row cannot be retired to slow history", "old-9" in {item["dispatch_id"] for item in kept})
-    assert_true("journal-live row is additional to newest-five terminals", len(kept) == 6 and excluded == 4)
+    assert_true(
+        "journal contradiction cannot resurrect a structurally terminal row",
+        "old-0" not in {item["dispatch_id"] for item in kept},
+    )
+    assert_true("only newest-five terminals remain warm", len(kept) == 5 and excluded == 5)
 
 
 def test_finish_projects_history_and_dispatch_projects_prompt_once() -> None:
@@ -2025,6 +2520,8 @@ def main() -> None:
     test_unrecognised_attention_type_is_dropped_not_promoted()
     test_controller_authored_mail_reaches_the_attention_plane()
     test_registry_membership_is_not_a_statement_about_sampling()
+    test_fast_plane_project_classes_are_live_only_mutation_pair()
+    test_detached_orphan_with_matching_identity_stays_fast_without_lease_mutation_pair()
     test_live_worker_count_ignores_permanent_terminal_history()
     test_controller_liveness_projection_rejects_unregistered_scalar()
     test_controller_state_alive_with_held_lease_and_one_live_waiter()
@@ -2041,11 +2538,13 @@ def main() -> None:
     test_journal_in_flight_count_ignores_forged_mail_and_cursor_advances()
     test_controller_label_lookup_reads_history_without_wake_probes()
     test_attention_excludes_ended_generations_without_held_kernel_locks()
-    test_attention_keeps_superseded_generation_until_kernel_lock_releases()
-    test_attention_bounds_ended_generation_lock_probes_and_reports_truncation()
+    test_attention_scans_superseded_generation_while_exact_lock_is_held()
+    test_attention_bounds_ended_generation_probes_to_newest_eight()
     test_attention_status_failure_degrades_without_inventing_hung()
     test_fast_plane_retention_is_small_and_prompt_free()
+    test_real_shape_2000_record_fast_plane_guard_mutation_pair()
     test_authority_detail_names_sources_and_journal_reconciles()
+    test_fast_worker_row_runs_ready_promotion_recovery_mutation_pair()
     test_finish_projects_history_and_dispatch_projects_prompt_once()
     test_history_catch_up_publishes_missed_terminals_in_one_batch()
     test_history_hooks_require_explicit_console_opt_in()

@@ -35,6 +35,31 @@ def _write_python(path: Path, body: str) -> None:
     path.write_text("#!/usr/bin/env python3\n" + body, encoding="utf-8")
 
 
+def test_default_budgets_follow_live_measurement_and_leave_reserve() -> None:
+    assert producer.DEFAULT_BUDGET_S == {"attention": 3.0, "fleet": 4.0}
+    assert console.PLANE_CADENCE_SECONDS["attention"] > 3.0 + 1.0
+    assert console.PLANE_CADENCE_SECONDS["fleet"] > 4.0 + 2.0
+
+
+def test_isolated_usage_reader_dir_is_forwarded_only_to_fleet_sampler() -> None:
+    command = producer._producer_command(
+        "fleet",
+        Path("/tmp/fleet.js"),
+        producer_script=Path("/tmp/producer.py"),
+        python_executable="python3",
+        readers_dir=Path("/tmp/readers"),
+    )
+    assert command[-2:] == ["--readers-dir", "/tmp/readers"]
+    attention = producer._producer_command(
+        "attention",
+        Path("/tmp/attention.js"),
+        producer_script=Path("/tmp/producer.py"),
+        python_executable="python3",
+        readers_dir=Path("/tmp/readers"),
+    )
+    assert "--readers-dir" not in attention
+
+
 def test_second_tick_refuses_held_plane_lock_visibly() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)

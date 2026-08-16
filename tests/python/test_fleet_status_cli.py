@@ -146,6 +146,28 @@ def test_missing_ssh_reachability_fails_closed_for_release_gate() -> None:
         assert_true("may not release", row["may_release"] is False)
 
 
+def test_live_only_status_counts_history_without_projecting_registry_rows() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        fleet_dir = Path(td) / "fleet"
+        _fixture_fleet(fleet_dir)
+        dispatch_id = _write_quarantined_dispatch(fleet_dir)
+        register_dir = fleet_dir / "register" / "dispatches"
+        for index in range(25):
+            (register_dir / f"ancient-{index:02d}.jsonl").write_text(
+                '{"state":"complete"}\n', encoding="utf-8"
+            )
+
+        payload = fleet_status_cli.build_fleet_status(
+            fleet_dir,
+            live_only=True,
+        )
+
+        assert_true("only live metadata directory is classified", len(payload["dispatches"]) == 1)
+        assert_true("active dispatch remains visible", payload["dispatches"][0]["dispatch_id"] == dispatch_id)
+        assert_true("history registry rows become a scalar count", payload["history_excluded"] == 25)
+        assert_true("node row counts only live dispatches", payload["nodes"][0]["dispatches"] == payload["dispatches"])
+
+
 def test_cmd_status_legacy_shape_unchanged() -> None:
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
@@ -191,6 +213,7 @@ class argparse_namespace:
 def main() -> None:
     test_build_fleet_status_quarantined_mirror_stale_row()
     test_missing_ssh_reachability_fails_closed_for_release_gate()
+    test_live_only_status_counts_history_without_projecting_registry_rows()
     test_cmd_status_legacy_shape_unchanged()
     test_cmd_status_fleet_json_and_table()
     print("OK: fleet status CLI tests pass")

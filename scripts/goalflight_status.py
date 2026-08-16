@@ -669,19 +669,76 @@ def this_project_root() -> str | None:
     return None
 
 
-def status_payload() -> dict:
+def _record_is_structurally_terminal(record: object) -> bool:
+    """Recognize immutable rows without opening tails or status sidecars."""
+    if not isinstance(record, dict):
+        return True
+    return any(
+        dispatch_states.is_terminal_state(record.get(key))
+        for key in ("state", "terminal_state", "classification")
+    )
+
+
+def reconcile_fast_plane_record(
+    record: dict,
+    *,
+    retain_status_snapshot: bool = False,
+    tail_hint_required: bool = False,
+) -> dict:
+    """Apply presentation recovery to one already-retained fast-plane row.
+
+    The caller owns the bound.  Fleet retention invokes this only for its small
+    live-plus-warm union, so READY recovery and newer sidecars remain truthful
+    without reopening every permanent terminal record in runs.d.
+    """
+    staged = dict(record)
+    if "_wait_status_snapshot" not in staged:
+        staged["_wait_status_snapshot"] = _status_json_payload(record)
+    status_snapshot = staged.get("_wait_status_snapshot")
+    expected_dispatch_id = str(staged.get("dispatch_id") or "").strip()
+    hinted_terminal = bool(
+        expected_dispatch_id
+        and isinstance(status_snapshot, dict)
+        and _validated_terminal_marker(
+            status_snapshot,
+            expected_dispatch_id=expected_dispatch_id,
+        )
+    )
+    # Machine-wide status keeps the exhaustive recovery path. The fleet caller
+    # has already bounded rows, then requires the sidecar's scraped marker hint
+    # before paying for a whole-tail scan; READY plus trailing prose carries
+    # exactly that hint even though it was not position-promoted by the watcher.
+    candidate = (
+        _reconcile_output_tail_record(staged)
+        if not tail_hint_required or hinted_terminal
+        else staged
+    )
+    reconciled = _decorate_trace_status(candidate)
+    if not retain_status_snapshot:
+        reconciled.pop("_wait_status_snapshot", None)
+    return reconciled
+
+
+def status_payload(*, reconcile_terminal_history: bool = True) -> dict:
+    """Build aggregate status, optionally omitting immutable-history probes.
+
+    The normal controller status surface keeps terminal tail reconciliation for
+    recovery. Short-poll projections already have an event-driven slow-history
+    repair path, so repeating that recovery scan for every permanent runs.d row
+    is both redundant and catastrophically expensive on a mature machine.
+    """
     with goalflight_capacity.StateLock():
         capacity_state = goalflight_capacity.load_state()
     goalflight_capacity.prune_state(capacity_state)
     rate_pressure = goalflight_capacity.current_rate_pressure(argparse.Namespace())
     dispatch = goalflight_ledger.status_payload()
-    dispatch = dict(
-        dispatch,
-        records=[
-            _decorate_trace_status(_reconcile_output_tail_record(record))
-            for record in dispatch.get("records", [])
-        ],
-    )
+    projected_records = []
+    for record in dispatch.get("records", []):
+        if not reconcile_terminal_history and _record_is_structurally_terminal(record):
+            projected_records.append(record)
+            continue
+        projected_records.append(reconcile_fast_plane_record(record))
+    dispatch = dict(dispatch, records=projected_records)
     return {
         "schema": "goalflight.status.aggregate.v1",
         "capacity": goalflight_capacity.profile(argparse.Namespace()),

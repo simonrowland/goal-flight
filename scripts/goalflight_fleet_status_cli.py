@@ -26,15 +26,20 @@ def _dispatch_register_dir(fleet_dir: Path) -> Path:
     return fleet_dir / "register" / "dispatches"
 
 
-def _collect_dispatch_meta(fleet_dir: Path) -> dict[str, dict[str, Any]]:
+def _collect_dispatch_meta(
+    fleet_dir: Path,
+    *,
+    include_history: bool = True,
+) -> dict[str, dict[str, Any]]:
     """Map dispatch_id -> meta dict from aggregate.json and register/dispatches/*."""
     entries: dict[str, dict[str, Any]] = {}
 
-    aggregate_path = fleet_dir / "register" / "aggregate.json"
-    aggregate = _read_json_object(aggregate_path) or {}
-    for dispatch_id in aggregate.get("active_dispatches") or []:
-        if isinstance(dispatch_id, str) and dispatch_id:
-            entries.setdefault(dispatch_id, {"dispatch_id": dispatch_id})
+    if include_history:
+        aggregate_path = fleet_dir / "register" / "aggregate.json"
+        aggregate = _read_json_object(aggregate_path) or {}
+        for dispatch_id in aggregate.get("active_dispatches") or []:
+            if isinstance(dispatch_id, str) and dispatch_id:
+                entries.setdefault(dispatch_id, {"dispatch_id": dispatch_id})
 
     register_dir = _dispatch_register_dir(fleet_dir)
     if register_dir.is_dir():
@@ -44,7 +49,7 @@ def _collect_dispatch_meta(fleet_dir: Path) -> dict[str, dict[str, Any]]:
                 meta = _read_json_object(path / "meta.json") or {}
                 meta.setdefault("dispatch_id", dispatch_id)
                 entries[dispatch_id] = {**entries.get(dispatch_id, {}), **meta}
-            elif path.suffix == ".jsonl":
+            elif include_history and path.suffix == ".jsonl":
                 dispatch_id = path.stem
                 entries.setdefault(dispatch_id, {"dispatch_id": dispatch_id})
 
@@ -90,7 +95,36 @@ def _classify_dispatch_row(
     )
 
 
-def build_fleet_status(fleet_dir: Path) -> dict[str, Any]:
+def _registered_dispatch_count(fleet_dir: Path) -> int:
+    """Count durable remote registrations without opening every history row."""
+    dispatch_ids: set[str] = set()
+    aggregate = _read_json_object(fleet_dir / "register" / "aggregate.json") or {}
+    dispatch_ids.update(
+        dispatch_id
+        for dispatch_id in aggregate.get("active_dispatches") or []
+        if isinstance(dispatch_id, str) and dispatch_id
+    )
+    register_dir = _dispatch_register_dir(fleet_dir)
+    if register_dir.is_dir():
+        for path in register_dir.iterdir():
+            if path.is_dir() or path.suffix == ".jsonl":
+                dispatch_ids.add(path.stem if path.suffix == ".jsonl" else path.name)
+    return len(dispatch_ids)
+
+
+def _live_fast_row(meta: dict[str, Any], row: dict[str, Any]) -> bool:
+    return bool(
+        meta.get("lease_active") is True
+        or row.get("pid_hint") == "alive"
+        or row.get("state") in {"running", "reconciling", "salvage"}
+    )
+
+
+def build_fleet_status(
+    fleet_dir: Path,
+    *,
+    live_only: bool = False,
+) -> dict[str, Any]:
     """Aggregate per-node auth probes and dispatch rows for fleet status."""
     import goalflight_fleet_store as fleet
 
@@ -115,7 +149,11 @@ def build_fleet_status(fleet_dir: Path) -> dict[str, Any]:
         str(entry.get("node_id")): entry for entry in auth_summary.get("nodes") or [] if isinstance(entry, dict)
     }
 
-    dispatch_meta = _collect_dispatch_meta(fleet_dir)
+    registered_total = _registered_dispatch_count(fleet_dir) if live_only else None
+    dispatch_meta = _collect_dispatch_meta(
+        fleet_dir,
+        include_history=not live_only,
+    )
     rows_by_node: dict[str, list[dict[str, Any]]] = {node_id: [] for node_id in node_ids}
 
     for dispatch_id, meta in sorted(dispatch_meta.items()):
@@ -134,7 +172,13 @@ def build_fleet_status(fleet_dir: Path) -> dict[str, Any]:
             "quarantine_reason": classification.quarantine_reason,
             "ssh_reachable": meta.get("ssh_reachable") if isinstance(meta.get("ssh_reachable"), bool) else "unknown",
             "may_release": status.may_release_locks(classification),
+            # Internal fast-plane selectors; the shareable console projection
+            # consumes but never publishes these raw authority fields.
+            "lease_active": meta.get("lease_active") is True,
+            "pid_hint": _pid_hint(meta, mirror_result.payload if mirror_result and mirror_result.ok else None),
         }
+        if live_only and not _live_fast_row(meta, row):
+            continue
         result["dispatches"].append(row)
         rows_by_node.setdefault(node_id, []).append(row)
 
@@ -148,6 +192,11 @@ def build_fleet_status(fleet_dir: Path) -> dict[str, Any]:
         result["nodes"].append({"node_id": "unknown", "accounts": [], "dispatches": unknown_rows})
 
     result["available"] = True
+    if live_only:
+        result["history_excluded"] = max(
+            0,
+            int(registered_total or 0) - len(result["dispatches"]),
+        )
     return result
 
 

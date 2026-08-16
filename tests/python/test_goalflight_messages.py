@@ -267,10 +267,15 @@ def test_relay_drain_backlog_none_and_json_mutation_pair() -> None:
             drained_lines = stdout.getvalue().splitlines()
             assert_true("drain backlog succeeds", drained_rc == 0)
             assert_true("drain backlog writes no stderr", stderr.getvalue() == "")
-            assert_true("drain backlog is one terse line", len(drained_lines) == 1)
+            assert_true("drain backlog emits headline then receipt", len(drained_lines) == 2)
+            assert_true(
+                "every receipted item has its pre-receipt headline",
+                drained_lines[0]
+                == "[controller-notice] drain-one seq=1 — mail for drain-one",
+            )
             assert_true(
                 "drain backlog reports the exact snapshot-bound cursor move",
-                drained_lines[0]
+                drained_lines[1]
                 == (
                     f"drained 1 · cursor {before_drain.cursor_version}"
                     f"->{after_drain.cursor_version}"
@@ -302,11 +307,151 @@ def test_relay_drain_backlog_none_and_json_mutation_pair() -> None:
             assert_true("JSON drain reports composed success", payload["status"] == "drained")
             assert_true("JSON drain reports exact count", payload["drained"] == 1)
             assert_true(
+                "JSON drain includes every receipted item",
+                len(payload["items"]) == 1
+                and payload["items"][0]["dispatch_id"] == "drain-json",
+            )
+            assert_true(
                 "JSON drain reports advancing cursor",
                 payload["cursor_version"] > payload["previous_cursor_version"],
             )
             assert_true("JSON drain writes no stderr", stderr.getvalue() == "")
             assert_true("drain bypasses wake-entry notices", wake_notice.call_count == 0)
+
+
+def test_relay_skips_self_peek_but_drain_receipts_self_and_foreign_mutation_pair() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        label = "self-skip-controller"
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        with (
+            mock.patch.dict(
+                os.environ,
+                {**env, "GOALFLIGHT_CONTROLLER_LABEL": label},
+                clear=False,
+            ),
+            mock.patch.object(
+                _carrier_messages,
+                "_current_project_root",
+                return_value=project,
+            ),
+        ):
+            os.environ.pop("GOALFLIGHT_DISPATCH_ID", None)
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "self-skip-test"},
+            )
+            assert_true("self-skip lease claimed", claimed.committed)
+            lease = authority.active_lease(label)
+            assert_true("self-skip lease readable", lease is not None)
+            assert lease is not None
+            os.environ["GOALFLIGHT_CONTROLLER_LEASE_NONCE"] = lease.nonce
+            addressee = _carrier_messages.controller_addressee(
+                label,
+                project_root=project,
+            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self_post_rc = _carrier_messages.main(
+                    [
+                        "--messages-dir",
+                        str(messages_dir),
+                        "post",
+                        "--dispatch-id",
+                        "self-mail",
+                        "--type",
+                        "controller-notice",
+                        "--text",
+                        "controller wrote this",
+                        "--to-controller",
+                        label,
+                        "--controller-project-root",
+                        str(project),
+                    ]
+                )
+            assert_true("ambient controller self-post succeeds", self_post_rc == 0)
+            self_post = json.loads(stdout.getvalue())["envelope"]
+            assert_true(
+                "self-post publishes label authorship",
+                self_post["source"]["controller_label"] == label,
+            )
+            assert_true(
+                "self-post publishes capability-derived author digest",
+                self_post["author_digest"]
+                == _carrier_messages.goalflight_wake.controller_session_digest(lease.nonce),
+            )
+            foreign_post = _carrier_messages.post_message(
+                dispatch_id="foreign-mail",
+                msg_type="controller-notice",
+                payload={"text": "peer wrote this"},
+                messages_dir=messages_dir,
+                source={
+                    "node": "peer",
+                    "adapter": "pytest",
+                    "transport": "controller",
+                    "controller_label": label,
+                },
+                addressee=addressee,
+            )["envelope"]
+            assert_true(
+                "foreign label claim cannot mint an author digest",
+                "author_digest" not in foreign_post,
+            )
+
+            # Mutation control: replacing the digest comparison with the source
+            # label comparison makes the spoofed foreign post self-authored.
+            assert_true(
+                "production author compare identifies self",
+                _carrier_messages.envelope_authored_by_controller(
+                    self_post,
+                    controller_label=label,
+                    lease_nonce=lease.nonce,
+                ),
+            )
+            assert_true(
+                "production author compare rejects label spoof",
+                not _carrier_messages.envelope_authored_by_controller(
+                    foreign_post,
+                    controller_label=label,
+                    lease_nonce=lease.nonce,
+                ),
+            )
+            assert_true(
+                "labels-instead-of-digests mutant would suppress spoof",
+                foreign_post["source"]["controller_label"] == label,
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                peek_rc = _carrier_messages.main(["relay", "--new"])
+            assert_true("self-filtered relay peek succeeds", peek_rc == 0)
+            assert_true("foreign mail remains visible", "foreign-mail" in stdout.getvalue())
+            assert_true("self mail is hidden from peek", "self-mail" not in stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                drain_rc = _carrier_messages.main(["relay", "--drain"])
+            drain_lines = stdout.getvalue().splitlines()
+            assert_true("self+foreign drain succeeds", drain_rc == 0)
+            assert_true(
+                "drain headlines both receipted events",
+                drain_lines[:2]
+                == [
+                    "[controller-notice] foreign-mail seq=1 — peer wrote this",
+                    "[controller-notice] self-mail seq=1 — controller wrote this",
+                ],
+            )
+            assert_true("drain receipts both", drain_lines[-1].startswith("drained 2 · cursor "))
+            assert_true(
+                "drain advances past self and foreign",
+                not authority.cursor_peek(label, nonce=lease.nonce).items,
+            )
 
 
 def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
@@ -405,9 +550,14 @@ def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
                 if line
             ]
             assert_true("drain race exits CAS-lost", outcome["rc"] == 3)
-            assert_true("drain race prints one line", combined_lines == [
-                "drain conflict · retry relay --drain"
-            ])
+            assert_true(
+                "drain race shows the attempted item before reporting CAS loss",
+                combined_lines
+                == [
+                    "[controller-notice] drain-race seq=1 — mail for drain-race",
+                    "drain conflict · retry relay --drain",
+                ],
+            )
             assert_true("racing drain bypasses wake-entry notices", wake_notice.call_count == 0)
 
 

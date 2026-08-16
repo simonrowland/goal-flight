@@ -1754,6 +1754,12 @@ def test_second_real_doorbell_loses_generation_lock_and_first_wakes_body_free(
 ) -> None:
     env = _set_state_env(monkeypatch, tmp_path)
     env["GOALFLIGHT_TEST_LISTENER_START_TOKEN"] = "constructed-listener-token"
+    # Slot pools made a second doorbell legitimate; this test is about the
+    # contention refusal itself, so it pins a single-slot pool and asserts the
+    # FIRST surplus listener is refused. Pool-depth behavior is covered by the
+    # listener-pool tests.
+    env["GOALFLIGHT_LISTENER_SLOTS"] = "1"
+    monkeypatch.setenv("GOALFLIGHT_LISTENER_SLOTS", "1")
     project = _project(tmp_path)
     authority = journal.open_or_create_journal(project)
     lease = _claim(authority)
@@ -1792,7 +1798,11 @@ def test_second_real_doorbell_loses_generation_lock_and_first_wakes_body_free(
         second = subprocess.Popen(command, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         second_stdout, second_stderr = second.communicate(timeout=3)
         assert second.returncode == 3, (second_stdout, second_stderr)
-        assert "generation already has a live doorbell" in second_stderr
+        # The refusal is actionable now: it names the slot budget and the
+        # holder pids, and warns against pattern-kills (a broad pkill once
+        # took out a sibling session's doorbell).
+        assert "listener slots hold live doorbells" in second_stderr
+        assert "do NOT kill by pattern" in second_stderr
 
         messages.post_message(
             dispatch_id="listener-real",

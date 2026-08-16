@@ -8,6 +8,30 @@ incremented when meaningful skill behaviour changes.
 
 ### Added
 
+- Listener pools. A controller arms two doorbells instead of one, and a
+  single event wakes exactly one of them: the winner claims a ring stamped
+  with the cursor version it saw, the others stay armed, and the stamp goes
+  stale only when the controller advances — so a reserve is always listening
+  while its sibling is being processed. Entry hints grade the pool (n=1/2
+  reserve down, n=0 offline) and a listener that was launched detached says
+  so and exits instead of pretending to be a wake path.
+- Self-authored events no longer wake their author: authorship is proven by
+  the capability the sender actually held, not a label it claims, so a
+  forged label cannot silence a controller.
+
+### Changed
+
+- The fleet console's live planes stay live on real fleets: a machine that
+  took 31 seconds and 3.5 MB per fleet sample now publishes in 2 seconds at
+  76 KB, with history reachable behind disclosure rather than dropped —
+  live work is never traded away for speed, and skipped generations are
+  counted, not hidden.
+- `relay --drain` shows each item's headline before it receipts it, and
+  producer budgets are derived from measured production runs.
+
+
+### Added
+
 - Fleet console v2. Live state and history are separate planes: the
   short-poll files carry only what changes (non-terminal work, controller
   liveness, counters — built in milliseconds at kilobytes, from megabytes at

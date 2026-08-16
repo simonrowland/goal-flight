@@ -44,8 +44,9 @@ def test_reminder_uses_held_waiter_lock_not_journal_row(
         project_root=root, controller_label="bugs", exposure=1, stream=stream
     )
     assert line is not None
-    assert line.startswith("listener offline; start: ")
+    assert line.startswith("listener pool n=0; start: ")
     assert "--controller-label bugs" in line
+    assert "--report-pending" in line
 
     armed = authority.arm_listener(
         "bugs",
@@ -57,13 +58,24 @@ def test_reminder_uses_held_waiter_lock_not_journal_row(
     assert armed.committed
     with wake.register_waiter(root, controller_label="bugs", kind="listener"):
         stream = io.StringIO()
-        assert msgs.emit_listener_reminder(
+        reserve_line = msgs.emit_listener_reminder(
             project_root=root,
             controller_label="bugs",
             exposure=1,
             stream=stream,
-        ) is None
-        assert stream.getvalue() == ""
+        )
+        assert reserve_line is not None
+        assert reserve_line.startswith("listener pool n=1/2 — reserve down; re-arm: ")
+        assert "--report-pending" in reserve_line
+        with wake.register_waiter(root, controller_label="bugs", kind="listener"):
+            stream = io.StringIO()
+            assert msgs.emit_listener_reminder(
+                project_root=root,
+                controller_label="bugs",
+                exposure=1,
+                stream=stream,
+            ) is None
+            assert stream.getvalue() == ""
 
 
 def test_armed_journal_row_without_held_lock_is_not_authoritative(
@@ -102,3 +114,26 @@ def test_reminder_gates_on_exposure_and_reports_missing_identity(
     assert line is not None
     assert "not registered" in line
     assert "--controller-startup" in line
+
+
+def test_controller_mail_exit_code_actions_and_skill_pool_instruction() -> None:
+    doctrine = (ROOT / "protocols" / "controller-mail.md").read_text(encoding="utf-8")
+    expected_rows = (
+        ("| 0 | Ring:", "restore pool depth"),
+        ("| 1 | Timeout:", "clean timer expiry"),
+        ("| 2 | Infrastructure or corruption", "avoid a restart loop"),
+        ("| 3 | Contention, supersession", "Reconcile the active lease"),
+        ("| 4 | Detached-listener refusal", "tracked background listener"),
+    )
+    for meaning, action in expected_rows:
+        row = next((line for line in doctrine.splitlines() if meaning in line), "")
+        assert row, f"missing listener exit-code row: {meaning}"
+        assert action in row, f"listener exit-code row lacks supervisor action: {meaning}"
+
+    skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+    controller_entry = next(
+        line for line in skill.splitlines() if line.startswith("Controller entry auto-claims")
+    )
+    assert "pool of two" in controller_entry
+    assert "--report-pending" in controller_entry
+    assert "restore depth two" in controller_entry

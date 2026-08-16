@@ -360,7 +360,7 @@ Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background
 Dispatch defaults detached; `--foreground` only for sync scripts/tests. Queue: `--submit --drain-on-submit`.
 Do not hand-iterate (>~3 edit/test cycles) what a goal-loop should converge.
 
-Controller entry auto-claims without stealing a live different lease. Arm one background generation-bound `goalflight_messages.py listen --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>`; on its body-free exit, peek authoritative mail, cursor-CAS processed server-known positions, then re-arm. Background fixed-id `goalflight_status.py --wait <ids>` only for an unclaimed join; exit 3 is mail, not completion. Timers cover non-notifiable external state, never worker completion.
+Controller entry auto-claims without stealing a live different lease. Arm a pool of two background generation-bound `goalflight_messages.py listen --project-root "$PWD" --controller-label <label> --lease-nonce <nonce> --report-pending` tasks; on each exit, process the reported or authoritative mail, cursor-CAS settled server-known positions, then re-arm one task to restore depth two. Background fixed-id `goalflight_status.py --wait <ids>` only for an unclaimed join; exit 3 is mail, not completion. Timers cover non-notifiable external state, never worker completion.
 Controller-direct: held context, fully stateable edit, clean Axis 2; plan marks do not waive it.
 Routing detail: typed dispatch roles; five-layer prompts; parallel forbid lists; split broad chunks; host tool maps; same-provider review policy. See `protocols/dispatch-routing.md`.
 Triggered lanes need pinned context and the execute pre-wave check (`worker-context-package.md`).

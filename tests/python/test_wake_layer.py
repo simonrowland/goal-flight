@@ -160,8 +160,10 @@ def _listener_command(
     *,
     label: str,
     nonce: str,
+    slots: int | None = None,
+    timeout_s: float = 8,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(SCRIPTS / "goalflight_messages.py"),
         "--messages-dir",
@@ -176,9 +178,12 @@ def _listener_command(
         "--poll-secs",
         "0.01",
         "--timeout-s",
-        "8",
+        str(timeout_s),
         "--json",
     ]
+    if slots is not None:
+        command.extend(["--listener-slots", str(slots)])
+    return command
 
 
 def _wait_for_listener(
@@ -193,6 +198,61 @@ def _wait_for_listener(
             return
         time.sleep(0.01)
     raise AssertionError(f"listener for {label} never armed")
+
+
+def _wait_for_listener_count(
+    root: Path,
+    *,
+    label: str,
+    count: int,
+    timeout_s: float = 5,
+) -> list[wake.WaiterRecord]:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        waiters = wake.live_waiters(root, controller_label=label) or []
+        if len(waiters) == count:
+            return waiters
+        time.sleep(0.02)
+    raise AssertionError(f"listener pool for {label} never reached n={count}")
+
+
+def _post_notice(
+    root: Path,
+    tmp_path: Path,
+    *,
+    label: str,
+    dispatch_id: str,
+    text: str,
+    source: dict[str, str] | None = None,
+    author_capability: str | None = None,
+) -> dict:
+    return messages.post_message(
+        dispatch_id=dispatch_id,
+        msg_type="controller-notice",
+        payload={"text": text},
+        messages_dir=tmp_path / "messages",
+        source=source
+        or {"node": "peer", "adapter": "pytest", "transport": "controller"},
+        author_capability=author_capability,
+        addressee=messages.controller_addressee(label, project_root=root),
+    )["envelope"]
+
+
+def _wait_for_exited_count(
+    processes: list[subprocess.Popen[str]],
+    count: int,
+    *,
+    timeout_s: float = 5,
+) -> list[subprocess.Popen[str]]:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        exited = [process for process in processes if process.poll() is not None]
+        if len(exited) == count:
+            return exited
+        if len(exited) > count:
+            break
+        time.sleep(0.02)
+    return [process for process in processes if process.poll() is not None]
 
 
 def _advance_all(
@@ -497,6 +557,606 @@ def test_unowned_terminal_replacement_withdraws_every_fanout_recipient(
     assert all(row["withdrawn_at"] is not None for row in rows)
 
 
+def test_listener_pool_one_event_pops_exactly_one_real_process(
+    isolated: tuple[Path, dict[str, str]],
+    tmp_path: Path,
+) -> None:
+    root, env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test", principal={"principal_id": "pool-pop-one"}
+    )
+    assert claimed.committed and claimed.value is not None
+    processes = [
+        subprocess.Popen(
+            _listener_command(
+                root,
+                tmp_path,
+                label="wake-test",
+                nonce=claimed.value.nonce,
+                slots=3,
+                timeout_s=15,
+            ),
+            cwd=root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _index in range(3)
+    ]
+    try:
+        waiters = _wait_for_listener_count(root, label="wake-test", count=3)
+        assert len({row.pid for row in waiters}) == 3
+        assert wake.coverage_status(root, controller_label="wake-test")[
+            "live_waiters"
+        ] == 3
+        slot_names = {
+            path.name
+            for path in wake.ledger_dir(root).iterdir()
+            if path.name.startswith("listener-slot-v1.")
+        }
+        assert len(slot_names) == 3
+        assert all(
+            any(name.endswith(f"listener-slot-{index}.lock") for name in slot_names)
+            for index in range(3)
+        )
+
+        _post_notice(
+            root,
+            tmp_path,
+            label="wake-test",
+            dispatch_id="pool-one-event",
+            text="one event",
+        )
+        exited = _wait_for_exited_count(processes, 1)
+        assert len(exited) == 1
+        stdout, stderr = exited[0].communicate(timeout=3)
+        assert exited[0].returncode == 0, stderr
+        assert json.loads(stdout)["kind"] == "ring"
+        assert all(process.poll() is None for process in processes if process not in exited)
+        assert len(_wait_for_listener_count(root, label="wake-test", count=2)) == 2
+
+        # Mutation pair for the ring-stamp comparison: equality must suppress
+        # duplicate pops, while any cursor change makes the stamp stale.
+        assert wake._ring_stamp_needs_claim(None, 7) is True
+        assert wake._ring_stamp_needs_claim(7, 7) is False
+        assert wake._ring_stamp_needs_claim(7, 8) is True
+        inverted_compare = lambda observed, cursor: observed == cursor
+        assert inverted_compare(7, 7) is True
+        assert inverted_compare(7, 8) is False
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=3)
+
+
+def test_malformed_ring_stamp_is_quarantined_and_next_observation_recovers(
+    isolated: tuple[Path, dict[str, str]],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root, _env = isolated
+    stamp = wake._ring_stamp_path(root, controller_label="wake-test")
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_bytes(b"17-torn\n")
+
+    # The pre-fix/remove-recovery mutation raises here on every observation,
+    # which makes each listener exit 2. Production quarantines once and rings.
+    assert wake.claim_ring(
+        root,
+        controller_label="wake-test",
+        cursor_version=18,
+    ) is True
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert len(captured.err.splitlines()) == 1
+    assert "listener ring stamp quarantined as " in captured.err
+    corrupt = list(stamp.parent.glob(f"{stamp.name}.corrupt-*"))
+    assert len(corrupt) == 1
+    assert corrupt[0].read_bytes() == b"17-torn\n"
+    assert stamp.read_text(encoding="ascii") == "18\n"
+
+    assert wake.claim_ring(
+        root,
+        controller_label="wake-test",
+        cursor_version=18,
+    ) is False
+    assert capsys.readouterr().err == ""
+
+
+def test_malformed_ring_stamp_does_not_trap_listener_in_exit_two_loop(
+    isolated: tuple[Path, dict[str, str]],
+    tmp_path: Path,
+) -> None:
+    root, env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test", principal={"principal_id": "ring-stamp-listener-recovery"}
+    )
+    assert claimed.committed and claimed.value is not None
+    _post_notice(
+        root,
+        tmp_path,
+        label="wake-test",
+        dispatch_id="ring-stamp-recovery",
+        text="ring after torn stamp",
+    )
+    stamp = wake._ring_stamp_path(root, controller_label="wake-test")
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_bytes(b"nonnumeric-torn-write\n")
+
+    first = subprocess.run(
+        _listener_command(
+            root,
+            tmp_path,
+            label="wake-test",
+            nonce=claimed.value.nonce,
+            slots=1,
+            timeout_s=2,
+        ),
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert first.returncode == 0, (first.stdout, first.stderr)
+    recovery_lines = [
+        line for line in first.stderr.splitlines() if "listener ring stamp" in line
+    ]
+    assert len(recovery_lines) == 1
+    assert "listener ring stamp quarantined as " in recovery_lines[0]
+    assert json.loads(first.stdout)["kind"] == "ring"
+
+    # The same still-pending cursor version was stamped by the first listener.
+    # A re-arm therefore times out cleanly instead of repeating exit 2 forever.
+    second = subprocess.run(
+        _listener_command(
+            root,
+            tmp_path,
+            label="wake-test",
+            nonce=claimed.value.nonce,
+            slots=1,
+            timeout_s=0.1,
+        ),
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert second.returncode == 1, (second.stdout, second.stderr)
+    assert "ring stamp" not in second.stderr
+    assert json.loads(second.stdout)["reason"] == "timeout"
+
+
+def test_listener_pool_defaults_to_two_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_LISTENER_SLOTS", raising=False)
+    assert wake.listener_slot_count() == 2
+    monkeypatch.setenv("GOALFLIGHT_LISTENER_SLOTS", "3")
+    assert wake.listener_slot_count() == 3
+    with pytest.raises(ValueError, match="between 1 and"):
+        wake.listener_slot_count(0)
+
+
+def test_entry_hint_grades_crashed_pool_member_and_full_pool_is_silent(
+    isolated: tuple[Path, dict[str, str]],
+    tmp_path: Path,
+) -> None:
+    root, env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test", principal={"principal_id": "pool-depth-hint"}
+    )
+    assert claimed.committed and claimed.value is not None
+    command = _listener_command(
+        root,
+        tmp_path,
+        label="wake-test",
+        nonce=claimed.value.nonce,
+        slots=2,
+        timeout_s=20,
+    )
+    processes = [
+        subprocess.Popen(
+            command,
+            cwd=root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _index in range(2)
+    ]
+    try:
+        _wait_for_listener_count(root, label="wake-test", count=2)
+        full_stream = io.StringIO()
+        full = wake.check_tool_entry(
+            root,
+            controller_label="wake-test",
+            controller_claimed=True,
+            mail_bearing=True,
+            stream=full_stream,
+        )
+        assert full["live_waiters"] == full["target_waiters"] == 2
+        assert full_stream.getvalue() == ""
+
+        processes[0].kill()
+        processes[0].communicate(timeout=3)
+        _wait_for_listener_count(root, label="wake-test", count=1)
+        reserve_stream = io.StringIO()
+        reserve = wake.check_tool_entry(
+            root,
+            controller_label="wake-test",
+            controller_claimed=True,
+            mail_bearing=True,
+            stream=reserve_stream,
+        )
+        assert reserve["covered"] is True  # old any-listener mutation would stop here.
+        assert reserve["live_waiters"] == 1
+        assert reserve["target_waiters"] == 2
+        assert reserve_stream.getvalue().startswith(
+            "listener pool n=1/2 — reserve down; re-arm: "
+        )
+        assert "--report-pending" in reserve_stream.getvalue()
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=3)
+
+
+def test_cursor_advance_with_leftovers_pops_one_more_pool_member(
+    isolated: tuple[Path, dict[str, str]],
+    tmp_path: Path,
+) -> None:
+    root, env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test", principal={"principal_id": "pool-leftovers"}
+    )
+    assert claimed.committed and claimed.value is not None
+    for dispatch_id in ("leftover-a", "leftover-b"):
+        _post_notice(
+            root,
+            tmp_path,
+            label="wake-test",
+            dispatch_id=dispatch_id,
+            text=dispatch_id,
+        )
+    processes = [
+        subprocess.Popen(
+            _listener_command(
+                root,
+                tmp_path,
+                label="wake-test",
+                nonce=claimed.value.nonce,
+                slots=3,
+                timeout_s=15,
+            ),
+            cwd=root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _index in range(3)
+    ]
+    try:
+        exited = _wait_for_exited_count(processes, 1)
+        assert len(exited) == 1
+        _wait_for_listener_count(root, label="wake-test", count=2)
+        peek = authority.cursor_peek(
+            "wake-test",
+            nonce=claimed.value.nonce,
+            limit=1000,
+        )
+        first_stream = sorted(peek.stream_snapshots)[0]
+        first_position = max(
+            int(item["stream_seq"])
+            for item in peek.items
+            if item["stream_id"] == first_stream
+        )
+        advanced = authority.advance_cursor(
+            "wake-test",
+            nonce=claimed.value.nonce,
+            expected_cursor_version=peek.cursor_version,
+            expected_stream_snapshots={first_stream: peek.stream_snapshots[first_stream]},
+            advances={first_stream: first_position},
+            actor="pool-leftover-test",
+        )
+        assert advanced.committed, advanced.reason
+        assert len(authority.cursor_peek("wake-test", nonce=claimed.value.nonce).items) == 1
+
+        exited = _wait_for_exited_count(processes, 2)
+        assert len(exited) == 2
+        assert sum(process.poll() is None for process in processes) == 1
+        assert len(_wait_for_listener_count(root, label="wake-test", count=1)) == 1
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=3)
+
+
+def test_listener_slot_exhaustion_is_actionable_then_hint_reports_n_zero(
+    isolated: tuple[Path, dict[str, str]],
+    tmp_path: Path,
+) -> None:
+    root, env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test", principal={"principal_id": "pool-exhaustion"}
+    )
+    assert claimed.committed and claimed.value is not None
+    command = _listener_command(
+        root,
+        tmp_path,
+        label="wake-test",
+        nonce=claimed.value.nonce,
+        slots=3,
+        timeout_s=20,
+    )
+    processes = [
+        subprocess.Popen(
+            command,
+            cwd=root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _index in range(3)
+    ]
+    try:
+        waiters = _wait_for_listener_count(root, label="wake-test", count=3)
+        contender = subprocess.run(
+            command,
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert contender.returncode == 3
+        assert contender.stdout == ""
+        assert len(contender.stderr.splitlines()) == 1
+        assert "all 3 listener slots hold live doorbells" in contender.stderr
+        assert "do NOT kill by pattern" in contender.stderr
+        assert all(str(row.pid) in contender.stderr for row in waiters)
+        assert all(process.poll() is None for process in processes)
+
+        # Removing the slot-lock acquisition lets this fourth process arm; the
+        # refusal above and the three-PID witness are the mutation-killing pair.
+        for index in range(3):
+            _post_notice(
+                root,
+                tmp_path,
+                label="wake-test",
+                dispatch_id=f"exhaust-{index}",
+                text=f"ring {index}",
+            )
+            exited = _wait_for_exited_count(processes, index + 1)
+            assert len(exited) == index + 1
+            if index < 2:
+                _advance_all(
+                    authority,
+                    label="wake-test",
+                    nonce=claimed.value.nonce,
+                )
+        _wait_for_listener_count(root, label="wake-test", count=0)
+        stream = io.StringIO()
+        status_payload = wake.check_tool_entry(
+            root,
+            controller_label="wake-test",
+            controller_claimed=True,
+            mail_bearing=True,
+            stream=stream,
+        )
+        assert status_payload["live_waiters"] == 0
+        assert stream.getvalue().startswith("listener pool n=0; start: ")
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=3)
+
+
+def test_self_post_does_not_ring_pool_foreign_post_does(
+    isolated: tuple[Path, dict[str, str]],
+    tmp_path: Path,
+) -> None:
+    root, env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test", principal={"principal_id": "self-wake-pool"}
+    )
+    assert claimed.committed and claimed.value is not None
+    processes = [
+        subprocess.Popen(
+            _listener_command(
+                root,
+                tmp_path,
+                label="wake-test",
+                nonce=claimed.value.nonce,
+                slots=2,
+                timeout_s=15,
+            ),
+            cwd=root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _index in range(2)
+    ]
+    try:
+        _wait_for_listener_count(root, label="wake-test", count=2)
+        self_post = _post_notice(
+            root,
+            tmp_path,
+            label="wake-test",
+            dispatch_id="self-authored",
+            text="my own receipt",
+            source={
+                "node": "local",
+                "adapter": "pytest",
+                "transport": "controller",
+                "controller_label": "wake-test",
+            },
+            author_capability=claimed.value.nonce,
+        )
+        assert messages.envelope_authored_by_controller(
+            self_post,
+            controller_label="wake-test",
+            lease_nonce=claimed.value.nonce,
+        )
+        time.sleep(0.4)
+        assert all(process.poll() is None for process in processes)
+
+        spoofed_post = _post_notice(
+            root,
+            tmp_path,
+            label="wake-test",
+            dispatch_id="label-spoofed-foreign",
+            text="wake despite my claimed label",
+            source={
+                "node": "foreign",
+                "adapter": "pytest",
+                "transport": "controller",
+                "controller_label": "wake-test",
+            },
+        )
+        assert "author_digest" not in spoofed_post
+        assert not messages.envelope_authored_by_controller(
+            spoofed_post,
+            controller_label="wake-test",
+            lease_nonce=claimed.value.nonce,
+        )
+        # A labels-instead-of-digests mutation returns true and makes the ring
+        # assertion below time out, so the spoof path kills that exact mutant.
+        assert spoofed_post["source"]["controller_label"] == "wake-test"
+        exited = _wait_for_exited_count(processes, 1)
+        assert len(exited) == 1
+        assert exited[0].returncode == 0
+        assert len(authority.cursor_peek("wake-test", nonce=claimed.value.nonce).items) == 2
+        _advance_all(authority, label="wake-test", nonce=claimed.value.nonce)
+        assert not authority.cursor_peek("wake-test", nonce=claimed.value.nonce).items
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=3)
+
+
+def test_detached_listener_refuses_ppid_one_with_distinct_code_and_one_line(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root, _env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test", principal={"principal_id": "detached-code-test"}
+    )
+    assert claimed.committed and claimed.value is not None
+    monkeypatch.setenv("GOALFLIGHT_LISTENER_STARTUP_GRACE_S", "0.05")
+    monkeypatch.setattr(messages.os, "getppid", lambda: 1)
+    args = SimpleNamespace(
+        project_root=str(root),
+        controller_label="wake-test",
+        lease_nonce=claimed.value.nonce,
+        poll_secs=0.01,
+        listener_slots=1,
+        timeout_s=2,
+        json=False,
+        report_pending=False,
+    )
+
+    code = messages.cmd_listen(args)
+    captured = capsys.readouterr()
+
+    assert code == messages.DETACHED_LISTENER_EXIT_CODE
+    assert code not in {0, 1, 2, 3}
+    assert captured.out == ""
+    lines = captured.err.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith(
+        f"DETACHED LISTENER: my exit wakes nobody; kill me (pid {os.getpid()}) "
+        "and re-arm as a tracked background task: "
+    )
+    assert "--report-pending" in lines[0]
+
+
+def test_shell_detached_listener_is_reaped_after_startup_grace_real_process(
+    isolated: tuple[Path, dict[str, str]],
+    tmp_path: Path,
+) -> None:
+    root, env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test", principal={"principal_id": "detached-regression"}
+    )
+    assert claimed.committed and claimed.value is not None
+    env = dict(env)
+    env["GOALFLIGHT_LISTENER_STARTUP_GRACE_S"] = "0.2"
+    command = _listener_command(
+        root,
+        tmp_path,
+        label="wake-test",
+        nonce=claimed.value.nonce,
+        slots=1,
+        timeout_s=10,
+    )
+    stdout_path = tmp_path / "detached-listener.stdout"
+    stderr_path = tmp_path / "detached-listener.stderr"
+    pid_path = tmp_path / "detached-listener.pid"
+    launcher_code = (
+        "import subprocess; from pathlib import Path; "
+        f"out=open({str(stdout_path)!r},'w'); err=open({str(stderr_path)!r},'w'); "
+        f"p=subprocess.Popen({command!r},cwd={str(root)!r},stdout=out,stderr=err,"
+        "text=True,start_new_session=True); "
+        f"Path({str(pid_path)!r}).write_text(str(p.pid)); out.close(); err.close()"
+    )
+    launcher = subprocess.run(
+        [sys.executable, "-c", launcher_code],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert launcher.returncode == 0, launcher.stderr
+    listener_pid = int(pid_path.read_text(encoding="utf-8"))
+    try:
+        deadline = time.monotonic() + 5
+        lines: list[str] = []
+        while time.monotonic() < deadline:
+            if stderr_path.exists():
+                lines = stderr_path.read_text(encoding="utf-8").splitlines()
+                if lines:
+                    break
+            time.sleep(0.05)
+        assert len(lines) == 1
+        assert lines[0] == (
+            "DETACHED LISTENER: my exit wakes nobody; kill me "
+            f"(pid {listener_pid}) and re-arm as a tracked background task: "
+            f"{shlex.join([*command, '--report-pending'])}"
+        )
+        assert stdout_path.read_text(encoding="utf-8") == ""
+        _wait_for_listener_count(root, label="wake-test", count=0)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(listener_pid, signal.SIGKILL)
+
+
 def test_waiter_death_releases_kernel_witness_and_monitor_is_not_required(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
@@ -540,6 +1200,8 @@ def test_live_waiters_distinguishes_deleted_ledger_from_genuine_zero(
         assert wake.coverage_status(root, controller_label="wake-test") == {
             "covered": False,
             "reason": "waiter-probe-unavailable",
+            "live_waiters": None,
+            "target_waiters": 2,
             "waiters": [],
             "monitor": {"required": False, "state": "not-applicable"},
         }
@@ -642,7 +1304,7 @@ def test_entry_notice_distinguishes_probe_unavailable_from_offline(
         stream=offline_stream,
     )
     assert offline["reason"] == "no-live-waiter-lock"
-    assert offline_stream.getvalue().startswith("listener offline; start: ")
+    assert offline_stream.getvalue().startswith("listener pool n=0; start: ")
     assert "coverage UNKNOWN" not in offline_stream.getvalue()
 
 
@@ -1262,7 +1924,7 @@ def test_unclaimed_cli_entries_stay_quiet_and_claimed_mail_entries_warn_once(
             check=False,
             timeout=10,
         )
-        assert "listener offline; start: " not in result.stderr, (
+        assert "listener pool n=0; start: " not in result.stderr, (
             command,
             result.returncode,
             result.stdout,
@@ -1295,7 +1957,7 @@ def test_unclaimed_cli_entries_stay_quiet_and_claimed_mail_entries_warn_once(
             offline = [
                 line
                 for line in result.stderr.splitlines()
-                if line.startswith("listener offline; start: ")
+                if line.startswith("listener pool n=0; start: ")
             ]
             assert len(offline) == int(mail_bearing), (
                 command,
@@ -1391,7 +2053,7 @@ def test_ambient_capability_still_gets_mail_fallback_when_holder_is_unknown(
             stream=stream,
         )
     assert result["covered"] is False
-    assert stream.getvalue().startswith("listener offline; start: ")
+    assert stream.getvalue().startswith("listener pool n=0; start: ")
 
 
 def test_one_shot_cli_entries_with_a_real_beacon_still_do_not_claim(
@@ -1453,7 +2115,7 @@ def test_worker_non_mail_and_mismatched_capability_entries_stay_quiet(
     assert non_mail_stream.getvalue() == ""
 
 
-def test_live_waiter_coverage_skips_notice_and_poll(
+def test_full_listener_pool_coverage_skips_notice_and_poll(
     isolated: tuple[Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root, _env = isolated
@@ -1470,13 +2132,17 @@ def test_live_waiter_coverage_skips_notice_and_poll(
         controller_label="wake-test",
         lease_nonce=claimed.value.nonce,
     )
-    with wake.register_waiter(root, controller_label="wake-test", kind="listener"):
+    with (
+        wake.register_waiter(root, controller_label="wake-test", kind="listener"),
+        wake.register_waiter(root, controller_label="wake-test", kind="listener"),
+    ):
         stream = io.StringIO()
         result = messages.emit_wake_entry_notice(project_root=root, stream=stream)
     lease_holder.close()
 
     assert result["covered"] is True
     assert result["reason"] == "held-flock"
+    assert result["live_waiters"] == result["target_waiters"] == 2
     assert stream.getvalue() == ""
 
 

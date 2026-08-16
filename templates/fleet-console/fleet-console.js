@@ -54,6 +54,7 @@
   var historyPromise = null;
   var historyPayloadKey = null;
   var historyPages = Object.create(null);
+  var archivedHistoryPages = 0;
   var historyPageSize = 20;
   var promptCache = Object.create(null);
   var promptPromises = Object.create(null);
@@ -744,6 +745,8 @@
     if (historyPayloadKey !== key) {
       historyPayload = null;
       historyPromise = null;
+      historyPages = Object.create(null);
+      archivedHistoryPages = 0;
       historyPayloadKey = key;
     }
     return key;
@@ -800,6 +803,40 @@
     });
   }
 
+  function archivedHistoryCount() {
+    var reachableInCurrentBands = (FLEET && FLEET.projects || []).reduce(function (total, project) {
+      return total + Math.max(0, Number(project.history_excluded || 0));
+    }, 0);
+    return Math.max(0, Number((FLEET || {}).history_excluded || 0) - reachableInCurrentBands);
+  }
+
+  function allArchivedHistoryWorkers() {
+    if (!historyPayload) return [];
+    var currentProjectIds = Object.create(null);
+    (FLEET && FLEET.projects || []).forEach(function (project) {
+      currentProjectIds[textValue(project.project_id)] = true;
+    });
+    var workers = [];
+    (historyPayload.projects || []).forEach(function (project) {
+      if (!currentProjectIds[textValue(project.project_id)]) {
+        workers = workers.concat(project.workers || []);
+      }
+    });
+    return workers;
+  }
+
+  function archivedHistoryWorkers() {
+    return allArchivedHistoryWorkers().slice(0, archivedHistoryPages * historyPageSize);
+  }
+
+  function showArchived() {
+    return loadHistory().then(function () {
+      archivedHistoryPages += 1;
+      render();
+      return archivedHistoryWorkers();
+    });
+  }
+
   function projectBands() {
     var result = [];
     (FLEET.projects || []).forEach(function (project) {
@@ -812,7 +849,18 @@
     if (unassigned.length) result.push({ kind: "unassigned", workers: unassigned });
     var remote = (((FLEET.remote || {}).workers) || []).filter(displayedWorker);
     if (remote.length) result.push({ kind: "remote", workers: remote });
+    var archivedCount = archivedHistoryCount();
+    if (archivedCount > 0) {
+      result.push({
+        kind: "archived",
+        history_excluded: archivedCount,
+        workers: archivedHistoryWorkers().filter(displayedWorker)
+      });
+    }
     result.sort(function (left, right) {
+      if (left.kind === "archived" || right.kind === "archived") {
+        if (left.kind !== right.kind) return left.kind === "archived" ? 1 : -1;
+      }
       var leftLive = (((left.workers || [])[0] || {}).observed_live) === true;
       var rightLive = (((right.workers || [])[0] || {}).observed_live) === true;
       if (leftLive !== rightLive) return leftLive ? -1 : 1;
@@ -851,6 +899,7 @@
         var projectId = textValue(project.project_id);
         if (currentProjectIds[projectId]) addRows(projectId, project.workers);
       });
+      addRows("archived", archivedHistoryWorkers());
     }
     addRows("unassigned", FLEET && FLEET.unassigned_workers);
     addRows("remote", FLEET && FLEET.remote && FLEET.remote.workers);
@@ -895,13 +944,15 @@
     header.textContent = "";
     var identity = el("div");
     var name = entry.kind === "remote" ? "Remote workers" :
-      (entry.kind === "unassigned" ? "Unassigned workers" : textValue(project.name));
+      (entry.kind === "unassigned" ? "Unassigned workers" :
+        (entry.kind === "archived" ? "Archived projects (+" + entry.history_excluded + ")" : textValue(project.name)));
     identity.appendChild(el("div", "proj", name));
     if (entry.kind === "project") {
       identity.appendChild(el("div", "proj-path", (project.registered ? "registered" : "unregistered") +
         (project.skill_version ? " · skill " + project.skill_version : "")));
     } else {
-      identity.appendChild(el("div", "proj-path", entry.kind === "remote" ? "remote authority" : "no measured project"));
+      identity.appendChild(el("div", "proj-path", entry.kind === "remote" ? "remote authority" :
+        (entry.kind === "archived" ? "terminal-only projects · lazy slow history" : "no measured project")));
     }
     header.appendChild(identity);
     var vitals = el("div", "vitals");
@@ -934,6 +985,25 @@
         });
       });
       vitals.appendChild(more);
+    }
+    if (entry.kind === "archived") {
+      var archivedMore = el("button", "ghost-btn history-more archived-history-more");
+      archivedMore.setAttribute("type", "button");
+      var archivedLoaded = archivedHistoryWorkers().length;
+      var archivedTotal = historyPayload ? allArchivedHistoryWorkers().length : Number(entry.history_excluded || 0);
+      var archivedRemaining = Math.max(0, archivedTotal - archivedLoaded);
+      archivedMore.textContent = historyPayload && archivedRemaining === 0
+        ? "+" + entry.history_excluded + " in history · loaded"
+        : (archivedLoaded ? "Show more · +" + archivedRemaining + " in history" : "Open archived projects · +" + entry.history_excluded + " in history");
+      archivedMore.addEventListener("click", function () {
+        archivedMore.textContent = "Loading history…";
+        archivedMore.disabled = true;
+        showArchived().catch(function () {
+          archivedMore.textContent = "History unavailable · retry";
+          archivedMore.disabled = false;
+        });
+      });
+      vitals.appendChild(archivedMore);
     }
     header.appendChild(vitals);
 
@@ -1185,6 +1255,7 @@
       return ticketFilter;
     },
     showMore: showMore,
+    showArchived: showArchived,
     openPrompt: function (dispatchId) {
       var wanted = String(dispatchId);
       var found = null;

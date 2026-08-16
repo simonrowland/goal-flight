@@ -31,11 +31,11 @@ render_plane fleet > "$fleet"
 
 grep -qF '<string>com.goalflight.fleet-console.attention</string>' "$attention"
 grep -qF '<integer>5</integer>' "$attention"
-grep -qF '<string>2</string>' "$attention"
+grep -qF '<string>3</string>' "$attention"
 grep -qF "<string>$SANDBOX_SKILL/templates/fleet-console/attention-data.js</string>" "$attention"
 grep -qF '<string>com.goalflight.fleet-console.fleet</string>' "$fleet"
 grep -qF '<integer>30</integer>' "$fleet"
-grep -qF '<string>2</string>' "$fleet"
+grep -qF '<string>4</string>' "$fleet"
 grep -qF "<string>$SANDBOX_SKILL/templates/fleet-console/fleet-data.js</string>" "$fleet"
 echo "test1 pass: separate launchd planes render their documented cadence and budget"
 

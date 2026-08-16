@@ -26,11 +26,10 @@ import goalflight_ledger
 PLANES = ("attention", "fleet")
 EXIT_OVERLAP = 75  # EX_TEMPFAIL: another tick owns this plane, so retry later.
 
-# Post-split constructed samples build in under one second. A two-second budget
-# is twice that measured upper bound while leaving three seconds of the 5s
-# attention cadence and 28 seconds of the 30s fleet cadence for kill/reap plus
-# atomic DEGRADED publication.
-DEFAULT_BUDGET_S = {"attention": 2.0, "fleet": 2.0}
+# Live read-only deployed-wrapper samples (2026-08-16) measured attention at
+# 1.12s and fleet at 1.84s / 76,473B. Integer-ceiling budgets are twice those
+# measurements; both cadences exceed budget plus installer-documented reserve.
+DEFAULT_BUDGET_S = {"attention": 3.0, "fleet": 4.0}
 
 
 class PlaneLock:
@@ -85,14 +84,18 @@ def _producer_command(
     *,
     producer_script: Path,
     python_executable: str,
+    readers_dir: Path | None = None,
 ) -> list[str]:
-    return [
+    command = [
         python_executable,
         str(producer_script),
         plane,
         "--output",
         str(output),
     ]
+    if plane == "fleet" and readers_dir is not None:
+        command.extend(("--readers-dir", str(readers_dir)))
+    return command
 
 
 def _run_with_budget(
@@ -128,6 +131,7 @@ def run_tick(
     lock_dir: Path | None = None,
     budget_s: float | None = None,
     producer_script: Path | None = None,
+    readers_dir: Path | None = None,
     python_executable: str = sys.executable,
     popen_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
     monotonic: Callable[[], float] = time.monotonic,
@@ -158,6 +162,7 @@ def run_tick(
             resolved_output,
             producer_script=(producer_script or (SCRIPT_DIR / "goalflight_fleet_console.py")),
             python_executable=python_executable,
+            readers_dir=readers_dir,
         )
         try:
             return_code = _run_with_budget(
@@ -214,6 +219,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--lock-dir", type=Path)
     parser.add_argument("--budget-s", type=float)
+    parser.add_argument(
+        "--readers-dir",
+        type=Path,
+        help="fleet usage-reader directory forwarded to the sampler",
+    )
     return parser
 
 
@@ -225,6 +235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output=args.output,
             lock_dir=args.lock_dir,
             budget_s=args.budget_s,
+            readers_dir=args.readers_dir,
         )
     except (OSError, ValueError) as exc:
         print(f"fleet-console {args.plane} tick ERROR: {exc}", file=sys.stderr)

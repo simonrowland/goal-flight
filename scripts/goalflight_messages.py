@@ -253,6 +253,7 @@ STREAM_TOKEN_RE = re.compile(
     rf"[A-Za-z0-9](?:[A-Za-z0-9._:@+\-]{{0,{STREAM_TOKEN_MAX - 2}}}[A-Za-z0-9])?\Z"
 )
 MESSAGE_TYPE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+AUTHOR_DIGEST_RE = re.compile(r"[0-9a-f]{16}\Z")
 RFC3339_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})\Z"
 )
@@ -613,6 +614,12 @@ def validate_envelope(
         _bounded_nonblank_string(
             source.get(key), path=f"{path}.source.{key}", limit=MAX_SOURCE_VALUE_LENGTH
         )
+    author_digest = envelope.get("author_digest")
+    if author_digest is not None and (
+        not isinstance(author_digest, str)
+        or AUTHOR_DIGEST_RE.fullmatch(author_digest) is None
+    ):
+        raise MessageError(f"{path}.author_digest: expected a 16-character hex digest")
     msg_type = envelope.get("type")
     if not isinstance(msg_type, str) or not MESSAGE_TYPE_RE.fullmatch(msg_type):
         raise MessageError(f"{path}.type: expected a bounded message-type token")
@@ -1208,6 +1215,7 @@ def post_message(
     replace_if: Callable[[dict], bool] | None = None,
     event_id: str | None = None,
     event_ts: str | None = None,
+    author_capability: str | None = None,
 ) -> dict:
     """Admit one monotonic stream envelope; shared by CLI, MCP, and tests."""
     validate_payload(payload)
@@ -1235,6 +1243,12 @@ def post_message(
         "priority": priority or PRIORITY_BY_TYPE.get(canonical_event_type(msg_type), "normal"),
         "payload": payload,
     }
+    author_digest = goalflight_wake.controller_session_digest(author_capability)
+    if author_digest is not None:
+        # The digest is derived here from a capability the caller actually
+        # presented. Source fields remain descriptive, caller-controlled
+        # metadata and can never mint self-authorship by claiming a label.
+        envelope["author_digest"] = author_digest
     if addressee is not None:
         if not isinstance(addressee, dict):
             raise MessageError("addressee must be an object")
@@ -1267,6 +1281,7 @@ def post_message(
                 "priority",
                 "payload",
                 "addressee",
+                "author_digest",
             )
             if any(same_identity.get(key) != envelope.get(key) for key in comparable_fields):
                 raise MessageError(
@@ -1703,6 +1718,21 @@ def _controller_delivery_requested(dispatch_id: str, msg_type: str) -> bool:
     )
 
 
+def _presented_ambient_controller_capability() -> str | None:
+    """Return one unambiguous controller capability carried by this poster."""
+    if str(os.environ.get("GOALFLIGHT_DISPATCH_ID") or "").strip():
+        return None
+    capabilities = {
+        value
+        for value in (
+            str(os.environ.get("GOALFLIGHT_CONTROLLER_LEASE_NONCE") or "").strip(),
+            str(os.environ.get("GOALFLIGHT_CONTROLLER_SESSION_ID") or "").strip(),
+        )
+        if value
+    }
+    return next(iter(capabilities)) if len(capabilities) == 1 else None
+
+
 def _controller_sender_session_id(dispatch_id: str) -> str | None:
     """Return the declared live controller that authored an outbound steer.
 
@@ -1754,6 +1784,7 @@ def post_controller_steer(dispatch_id: str, text: str) -> dict:
         payload={"text": text},
         messages_dir=default_messages_dir(),
         source=source,
+        author_capability=_presented_ambient_controller_capability(),
         deliver_to_worker=True,
         retain_terminal_worker_view=True,
     )
@@ -2206,6 +2237,16 @@ def cmd_post(args: argparse.Namespace) -> int:
         "adapter": args.adapter,
         "transport": args.transport,
     }
+    # A controller posting into its own journal still gets a read receipt, but
+    # must not pay for a doorbell wake. The descriptive label remains source
+    # metadata; proof is stamped separately from the capability this process
+    # actually carried. Workers cannot inherit authorship from a leftover label.
+    author_capability = None
+    if not os.environ.get("GOALFLIGHT_DISPATCH_ID"):
+        source_label = os.environ.get("GOALFLIGHT_CONTROLLER_LABEL", "").strip()
+        if source_label:
+            source["controller_label"] = source_label
+        author_capability = _presented_ambient_controller_capability()
     addressee = None
     if getattr(args, "to_controller", None):
         addressed_root = getattr(args, "controller_project_root", None) or _current_project_root()
@@ -2225,6 +2266,7 @@ def cmd_post(args: argparse.Namespace) -> int:
         payload=payload,
         messages_dir=args.messages_dir,
         source=source,
+        author_capability=author_capability,
         addressee=addressee,
         fleet_dir=args.fleet_dir,
         update_aggregate=args.refresh_aggregate,
@@ -3021,7 +3063,7 @@ def listener_reminder_line(project_root: Path | str, controller_label: str) -> s
         _canonical_project_root(Path(project_root)),
         controller_label=controller_label,
     )
-    return f"listener offline; start: {command}"
+    return f"listener pool n=0; start: {command}"
 
 
 def _ambient_claimed_controller(
@@ -3191,9 +3233,24 @@ def emit_listener_reminder(
                 label,
                 identity_probe=identity_probe,
             )
-            if coverage.get("covered"):
+            live_waiters = coverage.get("live_waiters")
+            target_waiters = int(
+                coverage.get("target_waiters")
+                or goalflight_wake.listener_slot_count()
+            )
+            if isinstance(live_waiters, int) and live_waiters >= target_waiters:
                 return None
-            line = listener_reminder_line(root, label)
+            if not isinstance(live_waiters, int) or live_waiters == 0:
+                line = listener_reminder_line(root, label)
+            else:
+                line = (
+                    f"listener pool n={live_waiters}/{target_waiters} — reserve down; "
+                    "re-arm: "
+                    + goalflight_wake.listener_start_command(
+                        root,
+                        controller_label=label,
+                    )
+                )
         print(line, file=sys.stderr if stream is None else stream)
         return line
     except _EXPECTED_OPTIONAL_ERRORS:
@@ -3315,6 +3372,7 @@ def split_fresh_and_stale(
 
 
 HEADLINE_MAX = 96
+DRAIN_HEADLINE_MAX = 100
 
 
 def sanitize_display(value: object, *, limit: int | None = None) -> str:
@@ -3375,6 +3433,58 @@ def envelope_from(envelope: dict) -> str:
         if isinstance(value, str) and value.strip() and value.strip() != "unknown":
             return sanitize_display(value)
     return sanitize_display(envelope.get("dispatch_id") or "?")
+
+
+def envelope_authored_by_controller(
+    envelope: dict,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> bool:
+    """Match capability-derived authorship; unproved claims remain visible."""
+    if not isinstance(envelope, dict):
+        return False
+    del controller_label  # labels address mail; they never prove who posted it.
+    expected_digest = goalflight_wake.controller_session_digest(lease_nonce)
+    author_digest = envelope.get("author_digest")
+    return bool(
+        expected_digest
+        and isinstance(author_digest, str)
+        and author_digest == expected_digest
+    )
+
+
+def format_receipt_headline(row: dict, envelope: dict) -> str:
+    """The terse item line shared by arm reports and drain receipts."""
+    kind = sanitize_display(
+        envelope.get("type") or row.get("event_type") or "event",
+        limit=32,
+    )
+    stream = sanitize_display(row.get("stream_id") or envelope.get("dispatch_id") or "?", limit=80)
+    seq = sanitize_display(row.get("stream_seq") or envelope.get("seq") or "?", limit=20)
+    payload_head = sanitize_display(envelope_headline(envelope), limit=DRAIN_HEADLINE_MAX)
+    return f"[{kind}] {stream} seq={seq} — {payload_head}"
+
+
+def _envelopes_with_rows(authority, rows: list[dict] | tuple[dict, ...]) -> list[tuple[dict, dict]]:
+    return [(row, _listener_envelope(authority, row)) for row in rows]
+
+
+def _foreign_controller_items(
+    items: list[tuple[dict, dict]],
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> list[tuple[dict, dict]]:
+    return [
+        (row, envelope)
+        for row, envelope in items
+        if not envelope_authored_by_controller(
+            envelope,
+            controller_label=controller_label,
+            lease_nonce=lease_nonce,
+        )
+    ]
 
 
 def format_envelope_headlines(envelopes: list) -> str:
@@ -3463,7 +3573,12 @@ def cmd_relay(args: argparse.Namespace) -> int:
         if controller_label is None:
             if drain:
                 if getattr(args, "json", False):
-                    print(json.dumps({"drained": 0, "status": "no_mail"}, sort_keys=True))
+                    print(
+                        json.dumps(
+                            {"drained": 0, "items": [], "status": "no_mail"},
+                            sort_keys=True,
+                        )
+                    )
                 else:
                     print("no mail")
             else:
@@ -3474,7 +3589,14 @@ def cmd_relay(args: argparse.Namespace) -> int:
             raise MessageError("active controller lease is unavailable")
         peek = authority.cursor_peek(controller_label, nonce=lease.nonce, limit=1000)
         rows = list(peek.items)
-        envelopes = [_listener_envelope(authority, row) for row in rows]
+        items_with_rows = _envelopes_with_rows(authority, rows)
+        envelopes = [envelope for _row, envelope in items_with_rows]
+        visible_items = _foreign_controller_items(
+            items_with_rows,
+            controller_label=controller_label,
+            lease_nonce=lease.nonce,
+        )
+        visible_envelopes = [envelope for _row, envelope in visible_items]
     except (goalflight_journal.JournalUnavailable, MessageError, ValueError) as exc:
         print(f"relay: {exc}", file=sys.stderr)
         return 2
@@ -3496,6 +3618,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
                             "controller_label": controller_label,
                             "cursor_version": peek.cursor_version,
                             "drained": 0,
+                            "items": [],
                             "status": "no_mail",
                         },
                         sort_keys=True,
@@ -3504,6 +3627,11 @@ def cmd_relay(args: argparse.Namespace) -> int:
             else:
                 print("no mail")
             return 0
+        if not getattr(args, "json", False):
+            # Visibility precedes receipt: if this process dies during the CAS,
+            # the controller has still seen every item it attempted to settle.
+            for row, envelope in items_with_rows:
+                print(format_receipt_headline(row, envelope), flush=True)
         try:
             advanced = authority.advance_cursor(
                 controller_label,
@@ -3549,6 +3677,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
                         "controller_label": controller_label,
                         "cursor_version": cursor_version,
                         "drained": len(envelopes),
+                        "items": envelopes,
                         "previous_cursor_version": previous_version,
                         "status": "drained",
                     },
@@ -3571,21 +3700,21 @@ def cmd_relay(args: argparse.Namespace) -> int:
                     "positions": positions,
                     "stream_snapshots": peek.stream_snapshots,
                     "advance_command": advance_command,
-                    "items": envelopes,
+                    "items": visible_envelopes,
                 },
                 sort_keys=True,
             )
         )
         return 0
     if getattr(args, "bodies", False):
-        print(json.dumps(envelopes))
+        print(json.dumps(visible_envelopes))
     else:
-        headlines = format_envelope_headlines(envelopes)
+        headlines = format_envelope_headlines(visible_envelopes)
         if headlines:
             print(headlines)
             print("bodies: re-run with --bodies")
     counts: dict[str, int] = {}
-    for envelope in envelopes:
+    for envelope in visible_envelopes:
         dispatch_id = str(envelope.get("dispatch_id") or "unknown")
         counts[dispatch_id] = counts.get(dispatch_id, 0) + 1
     print(format_pending_counts(counts))
@@ -3795,6 +3924,25 @@ def merge_remote_register(
     }
 
 
+DETACHED_LISTENER_EXIT_CODE = 4
+
+
+def _listener_startup_grace_s() -> float:
+    raw = os.environ.get("GOALFLIGHT_LISTENER_STARTUP_GRACE_S", "").strip()
+    default = 0.2 if os.environ.get("GOALFLIGHT_TEST_MODE") == "1" else 2.5
+    try:
+        return min(5.0, max(0.05, float(raw))) if raw else default
+    except ValueError:
+        return default
+
+
+def _exact_listener_command() -> str:
+    argv = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+    if "--report-pending" not in argv:
+        argv.append("--report-pending")
+    return shlex.join(argv)
+
+
 def cmd_listen(args) -> int:
     """One-shot journal cursor listener; its exit is the wake."""
     import goalflight_journal  # type: ignore
@@ -3821,6 +3969,13 @@ def cmd_listen(args) -> int:
         return 2
     test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
     poll = max(0.01 if test_mode else 0.5, float(args.poll_secs or 5.0))
+    try:
+        listener_slots = goalflight_wake.listener_slot_count(
+            getattr(args, "listener_slots", None)
+        )
+    except ValueError as exc:
+        print(f"listen: {exc}", file=sys.stderr)
+        return 2
     deadline = (
         time.monotonic() + float(args.timeout_s)
         if args.timeout_s and float(args.timeout_s) > 0
@@ -3849,12 +4004,25 @@ def cmd_listen(args) -> int:
     # ledger is unavailable, the incumbent listener remains both ARMED and
     # locked instead of being displaced by a replacement that cannot stay live.
     try:
-        waiter = goalflight_wake.register_waiter(
+        waiter = goalflight_wake.register_listener_waiter(
             project_root,
             controller_label=label,
-            kind="listener",
             generation_key=nonce,
+            slots=listener_slots,
         )
+    except goalflight_wake.ListenerSlotsFull:
+        holder_pids = goalflight_wake.listener_slot_holder_pids(
+            project_root,
+            controller_label=label,
+        )
+        targets = ", ".join(str(pid) for pid in holder_pids) or "unknown"
+        print(
+            f"listen: all {listener_slots} listener slots hold live doorbells — "
+            "likely your own tracked tasks; do NOT kill by pattern "
+            f"(targets: {targets})",
+            file=sys.stderr,
+        )
+        return 3
     except BlockingIOError:
         print("listen: listener generation already has a live doorbell", file=sys.stderr)
         return 3
@@ -3879,14 +4047,15 @@ def cmd_listen(args) -> int:
         return 2
 
     coverage_id = str(coverage["coverage_id"])
+    listener_started = time.monotonic()
+    detached_grace = _listener_startup_grace_s()
+    rearm_command = _exact_listener_command()
 
     def finish(reason: str, *, code: int, detail: str | None = None) -> int:
         try:
             exited = authority.exit_listener(coverage_id, reason=reason)
             if not exited.committed:
                 detail = detail or exited.reason or "coverage exit CAS lost"
-            elif exited.value and exited.value.get("exit_reason"):
-                reason = str(exited.value["exit_reason"])
             payload = {
                 "kind": "exit",
                 "reason": reason,
@@ -3901,6 +4070,30 @@ def cmd_listen(args) -> int:
         finally:
             if waiter is not None:
                 waiter.close()
+
+    def finish_detached() -> int:
+        # Best-effort journal audit must never turn the refusal into multiple
+        # lines; the one diagnostic is deliberately copy/paste actionable.
+        with contextlib.suppress(Exception):
+            authority.exit_listener(coverage_id, reason="orphaned")
+        waiter.close()
+        print(
+            "DETACHED LISTENER: my exit wakes nobody; kill me "
+            f"(pid {os.getpid()}) and re-arm as a tracked background task: "
+            f"{rearm_command}",
+            file=sys.stderr,
+        )
+        return DETACHED_LISTENER_EXIT_CODE
+
+    def parent_exit() -> int | None:
+        current_parent = os.getppid()
+        if current_parent == 1:
+            if time.monotonic() - listener_started >= detached_grace:
+                return finish_detached()
+            return None
+        if current_parent != parent_pid:
+            return finish("orphaned", code=3, detail="listener parent changed")
+        return None
 
     emit_wake_entry_notice(
         project_root=project_root,
@@ -3945,41 +4138,42 @@ def cmd_listen(args) -> int:
                 flush=True,
             )
         else:
-            for item in arm_snapshot.items:
-                stream = str(item.get("stream_id") or "")
-                seq = int(item.get("stream_seq") or 0)
-                kind = str(item.get("event_type") or item.get("type") or "event")
-                print(
-                    f"pending-at-arm: [{kind}] {stream} seq={seq}",
-                    flush=True,
-                )
-            print(
-                "pending-at-arm-json: "
-                + json.dumps(arm_payload, sort_keys=True, default=str),
-                flush=True,
+            arm_items = _envelopes_with_rows(authority, list(arm_snapshot.items))
+            visible_arm_items = _foreign_controller_items(
+                arm_items,
+                controller_label=label,
+                lease_nonce=nonce,
             )
-            print(
-                f"pending-at-arm: {len(arm_snapshot.items)} item(s) reported; "
-                "listener stays armed and rings only for newer events; run the "
-                "advance command above to drain the backlog",
-                flush=True,
-            )
+            for row, envelope in visible_arm_items:
+                print(format_receipt_headline(row, envelope), flush=True)
+            print(f"advance: {arm_advance}", flush=True)
 
     while True:
-        if os.getppid() != parent_pid:
-            return finish("orphaned", code=3, detail="listener parent changed")
+        parent_result = parent_exit()
+        if parent_result is not None:
+            return parent_result
+        # A shell-detached listener can already have PPID 1 at process start.
+        # Give launch/track plumbing a bounded grace, but never let that
+        # untracked process consume the ring during the grace window.
+        if os.getppid() == 1:
+            time.sleep(min(0.05, max(0.0, detached_grace)))
+            continue
         if deadline is not None and time.monotonic() >= deadline:
             return finish("timeout", code=1, detail="no waking event before timeout")
         try:
-            stored_coverage = authority.coverage(coverage_id)
             lease = authority.active_lease(label)
             measured = (
                 {"pid": os.getpid(), "start_token": test_start_token}
                 if test_start_token
                 else goalflight_compat.process_start_identity(os.getpid())
             )
+            # Journal coverage remains the single-row audit surface. Pool peers
+            # supersede that row as they arm, while their kernel slot locks stay
+            # authoritative for actual liveness; evaluate this process's
+            # immutable arm record against the lease rather than treating a
+            # sibling's audit supersession as process death.
             reason = goalflight_journal.listener_exit_reason(
-                stored_coverage,
+                coverage,
                 lease.__dict__ if lease is not None else None,
                 current_parent_pid=os.getppid(),
                 identity_matches=bool(
@@ -3992,16 +4186,27 @@ def cmd_listen(args) -> int:
             # With an arm-time backlog the cheap limit-1 peek would forever
             # see the oldest (already-reported) item; peek wide and ring only
             # for events beyond the arm-time high-water.
-            peek = authority.cursor_peek(
-                label, nonce=nonce, limit=1000 if arm_high else 1
-            )
-            wakeable_items = bool(peek.items)
-            if arm_high and wakeable_items:
-                wakeable_items = any(
-                    int(item.get("stream_seq") or 0)
+            # Self-authored rows can sort before foreign mail indefinitely, so
+            # a limit-1 peek cannot implement skip-without-wedging semantics.
+            peek = authority.cursor_peek(label, nonce=nonce, limit=1000)
+            candidate_rows = [
+                item
+                for item in peek.items
+                if str(item.get("wake_class") or "") == "waking"
+                and (
+                    not arm_high
+                    or int(item.get("stream_seq") or 0)
                     > arm_high.get(str(item.get("stream_id") or ""), 0)
-                    for item in peek.items
                 )
+            ]
+            candidate_items = _envelopes_with_rows(authority, candidate_rows)
+            wakeable_items = bool(
+                _foreign_controller_items(
+                    candidate_items,
+                    controller_label=label,
+                    lease_nonce=nonce,
+                )
+            )
         except goalflight_journal.CASMismatch as exc:
             lease = authority.active_lease(label)
             reason = "stale-lease" if lease is not None else "superseded"
@@ -4013,7 +4218,22 @@ def cmd_listen(args) -> int:
         except (goalflight_journal.JournalError, ValueError) as exc:
             return finish("corrupt", code=2, detail=str(exc))
         if wakeable_items:
-            snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
+            snapshot = peek
+            try:
+                ring_claimed = goalflight_wake.claim_ring(
+                    project_root,
+                    controller_label=label,
+                    cursor_version=snapshot.cursor_version,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                return finish(
+                    "journal-unavailable",
+                    code=2,
+                    detail=f"listener ring stamp unavailable: {exc}",
+                )
+            if not ring_claimed:
+                time.sleep(min(0.05, poll))
+                continue
             positions = _cursor_positions(snapshot.items)
             advance_command = _cursor_advance_command(
                 project_root=project_root,
@@ -4029,15 +4249,10 @@ def cmd_listen(args) -> int:
                     code=2,
                     detail="waking cursor snapshot has no advance positions",
                 )
-            exited = authority.exit_listener(coverage_id, reason="event")
-            if not exited.committed or not exited.value:
-                return finish("superseded", code=3, detail=exited.reason)
-            if exited.value.get("exit_reason") != "event":
-                return finish(
-                    "superseded",
-                    code=3,
-                    detail="listener coverage changed before doorbell exit",
-                )
+            # The cursor-version stamp, not the single audit row, arbitrates a
+            # pool ring. A sibling may already have superseded this row.
+            with contextlib.suppress(goalflight_journal.JournalError, ValueError):
+                authority.exit_listener(coverage_id, reason="event")
             payload = {
                 "kind": "ring",
                 "reason": "event",
@@ -4057,8 +4272,9 @@ def cmd_listen(args) -> int:
             return 0
         sleep_until = time.monotonic() + poll
         while time.monotonic() < sleep_until:
-            if os.getppid() != parent_pid:
-                return finish("orphaned", code=3, detail="listener parent changed")
+            parent_result = parent_exit()
+            if parent_result is not None:
+                return parent_result
             if deadline is not None and time.monotonic() >= deadline:
                 return finish("timeout", code=1, detail="no waking event before timeout")
             time.sleep(min(0.25, max(0.0, sleep_until - time.monotonic())))
@@ -4235,6 +4451,15 @@ def _run_cli(argv: list[str] | None = None) -> int:
             help="active lease capability; defaults to GOALFLIGHT_CONTROLLER_LEASE_NONCE",
         )
         command_parser.add_argument("--poll-secs", type=float, default=5.0)
+        command_parser.add_argument(
+            "--listener-slots",
+            type=int,
+            default=None,
+            help=(
+                "bounded one-shot pool size; defaults to GOALFLIGHT_LISTENER_SLOTS "
+                f"or {goalflight_wake.DEFAULT_LISTENER_SLOTS}"
+            ),
+        )
         command_parser.add_argument(
             "--timeout-s", type=float, default=0.0, help="0 = wait indefinitely"
         )
