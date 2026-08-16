@@ -139,12 +139,14 @@ plane_values() {
       BUDGET_VALUE=3
       ;;
     fleet)
-      # Live read-only deployed-wrapper sample measured 1.84s and 76,473B.
-      # Budget = ceil(2 × 1.84s) = 4s. Reserve = 2s for termination + atomic
-      # DEGRADED publication; cadence sanity: 30s > 4s budget + 2s reserve.
-      # Hourly slow-history catch-up starts after fast publication/deadline.
+      # Budget from the PRODUCTION quantity, not the in-process build: a live
+      # tick (interpreter start + scan + validate + serialize + publish)
+      # measured 7.0s wall on this fleet on 2026-08-16, while the in-process
+      # build alone is ~2s. Budget = 2 x 7s = 14s; interval 30s leaves 16s of
+      # headroom for termination and atomic DEGRADED publication.
+      # Sanity: 7s < 14s < 30s.
       INTERVAL_VALUE=30
-      BUDGET_VALUE=4
+      BUDGET_VALUE=14
       ;;
   esac
   PLIST_PATH_VALUE="${HOME_DIR}/Library/LaunchAgents/${LABEL_VALUE}.plist"
