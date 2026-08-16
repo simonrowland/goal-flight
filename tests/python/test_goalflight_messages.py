@@ -3,14 +3,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import io
 import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 import threading
 import time
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -168,6 +172,270 @@ def write_ledger_record(
 def init_git_project(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+
+
+def _journal_test_env(base: Path) -> dict[str, str]:
+    return {
+        "GOALFLIGHT_TASK_STORE_DIR": str(base / "task-store"),
+        "GOALFLIGHT_JOURNAL_DIR": str(base / "journals"),
+        "GOALFLIGHT_MESSAGES_DIR": str(base / "messages"),
+        "GOALFLIGHT_FLEET_DIR": str(base / "fleet"),
+        "GOALFLIGHT_STATE_DIR": str(base / "state"),
+        "GOALFLIGHT_WAKE_LEDGER_DIR": str(base / "wake-ledger"),
+        "GOAL_FLIGHT_PIDFILE_DIR": str(base / "pids"),
+        "GOALFLIGHT_CAPACITY_CONF": os.devnull,
+        "GOALFLIGHT_TEST_MODE": "1",
+    }
+
+
+def _post_journal_controller_mail(
+    *,
+    project: Path,
+    messages_dir: Path,
+    label: str,
+    dispatch_id: str,
+) -> None:
+    _carrier_messages.post_message(
+        dispatch_id=dispatch_id,
+        msg_type="controller-notice",
+        payload={"text": f"mail for {dispatch_id}"},
+        messages_dir=messages_dir,
+        source={"node": "test", "adapter": "pytest", "transport": "controller"},
+        addressee=_carrier_messages.controller_addressee(
+            label,
+            project_root=project,
+        ),
+    )
+
+
+def test_relay_drain_backlog_none_and_json_mutation_pair() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        label = "drain-controller"
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        argv = [
+            "--messages-dir",
+            str(messages_dir),
+            "--fleet-dir",
+            env["GOALFLIGHT_FLEET_DIR"],
+            "relay",
+            "--drain",
+        ]
+        with (
+            mock.patch.dict(
+                os.environ,
+                {**env, "GOALFLIGHT_CONTROLLER_LABEL": label},
+                clear=False,
+            ),
+            mock.patch.object(
+                _carrier_messages,
+                "_current_project_root",
+                return_value=project,
+            ),
+            mock.patch.object(
+                _carrier_messages,
+                "emit_wake_entry_notice",
+                side_effect=AssertionError("drain must not emit a wake-entry notice"),
+            ) as wake_notice,
+        ):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "drain-test"},
+            )
+            assert_true("drain controller lease claimed", claimed.committed)
+            _post_journal_controller_mail(
+                project=project,
+                messages_dir=messages_dir,
+                label=label,
+                dispatch_id="drain-one",
+            )
+            lease = authority.active_lease(label)
+            assert_true("drain controller lease readable", lease is not None)
+            before_drain = authority.cursor_peek(label, nonce=lease.nonce, limit=1000)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                drained_rc = _carrier_messages.main(argv)
+            after_drain = authority.cursor_peek(label, nonce=lease.nonce, limit=1000)
+            drained_lines = stdout.getvalue().splitlines()
+            assert_true("drain backlog succeeds", drained_rc == 0)
+            assert_true("drain backlog writes no stderr", stderr.getvalue() == "")
+            assert_true("drain backlog is one terse line", len(drained_lines) == 1)
+            assert_true(
+                "drain backlog reports the exact snapshot-bound cursor move",
+                drained_lines[0]
+                == (
+                    f"drained 1 · cursor {before_drain.cursor_version}"
+                    f"->{after_drain.cursor_version}"
+                ),
+            )
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                empty_rc = _carrier_messages.main(argv)
+            assert_true("empty drain succeeds", empty_rc == 0)
+            assert_true("empty drain is exact one-line no-op", stdout.getvalue() == "no mail\n")
+            assert_true("empty drain writes no stderr", stderr.getvalue() == "")
+
+            _post_journal_controller_mail(
+                project=project,
+                messages_dir=messages_dir,
+                label=label,
+                dispatch_id="drain-json",
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                json_rc = _carrier_messages.main([*argv, "--json"])
+            json_lines = stdout.getvalue().splitlines()
+            assert_true("JSON drain succeeds", json_rc == 0)
+            assert_true("JSON drain emits one object", len(json_lines) == 1)
+            payload = json.loads(json_lines[0])
+            assert_true("JSON drain reports composed success", payload["status"] == "drained")
+            assert_true("JSON drain reports exact count", payload["drained"] == 1)
+            assert_true(
+                "JSON drain reports advancing cursor",
+                payload["cursor_version"] > payload["previous_cursor_version"],
+            )
+            assert_true("JSON drain writes no stderr", stderr.getvalue() == "")
+            assert_true("drain bypasses wake-entry notices", wake_notice.call_count == 0)
+
+
+def test_relay_drain_concurrent_advance_is_one_line_cas_loss() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        label = "drain-race-controller"
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        argv = [
+            "--messages-dir",
+            str(messages_dir),
+            "--fleet-dir",
+            env["GOALFLIGHT_FLEET_DIR"],
+            "relay",
+            "--drain",
+        ]
+        with (
+            mock.patch.dict(
+                os.environ,
+                {**env, "GOALFLIGHT_CONTROLLER_LABEL": label},
+                clear=False,
+            ),
+            mock.patch.object(
+                _carrier_messages,
+                "_current_project_root",
+                return_value=project,
+            ),
+            mock.patch.object(
+                _carrier_messages,
+                "emit_wake_entry_notice",
+                side_effect=AssertionError("drain must not emit a wake-entry notice"),
+            ) as wake_notice,
+        ):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "drain-race-test"},
+            )
+            assert_true("race controller lease claimed", claimed.committed)
+            lease = authority.active_lease(label)
+            assert_true("race controller lease readable", lease is not None)
+            _post_journal_controller_mail(
+                project=project,
+                messages_dir=messages_dir,
+                label=label,
+                dispatch_id="drain-race",
+            )
+
+            snapshot_ready = threading.Event()
+            release_snapshot = threading.Event()
+            captured: dict[str, object] = {}
+            original_peek = goalflight_journal.Journal.cursor_peek
+
+            def blocked_peek(self, *args, **kwargs):
+                snapshot = original_peek(self, *args, **kwargs)
+                if threading.current_thread().name == "drain-race-cli":
+                    captured["snapshot"] = snapshot
+                    snapshot_ready.set()
+                    assert release_snapshot.wait(5), "drain race snapshot was not released"
+                return snapshot
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            outcome: dict[str, int] = {}
+
+            def drain() -> None:
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    outcome["rc"] = _carrier_messages.main(argv)
+
+            with mock.patch.object(goalflight_journal.Journal, "cursor_peek", blocked_peek):
+                worker = threading.Thread(target=drain, name="drain-race-cli")
+                worker.start()
+                assert_true("drain captured its snapshot", snapshot_ready.wait(5))
+                snapshot = captured["snapshot"]
+                positions = _carrier_messages._cursor_positions(snapshot.items)
+                advanced = authority.advance_cursor(
+                    label,
+                    nonce=lease.nonce,
+                    expected_cursor_version=snapshot.cursor_version,
+                    expected_stream_snapshots=snapshot.stream_snapshots,
+                    advances=positions,
+                    actor="concurrent-test-controller",
+                )
+                assert_true("concurrent cursor advance committed", advanced.committed)
+                release_snapshot.set()
+                worker.join(timeout=5)
+                assert_true("drain race thread exited", not worker.is_alive())
+
+            combined_lines = [
+                line
+                for line in (stdout.getvalue() + stderr.getvalue()).splitlines()
+                if line
+            ]
+            assert_true("drain race exits CAS-lost", outcome["rc"] == 3)
+            assert_true("drain race prints one line", combined_lines == [
+                "drain conflict · retry relay --drain"
+            ])
+            assert_true("racing drain bypasses wake-entry notices", wake_notice.call_count == 0)
+
+
+def test_messages_main_trap_is_one_actionable_line_mutation_pair() -> None:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with mock.patch.object(
+        _carrier_messages,
+        "_run_cli",
+        side_effect=RuntimeError("forced\ninternal error"),
+    ):
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            fixed_rc = _carrier_messages.main(["relay", "--drain"])
+        try:
+            _carrier_messages._run_cli(["relay", "--drain"])
+        except RuntimeError as exc:
+            mutant_error = exc
+        else:  # pragma: no cover - mutation control must raise
+            raise AssertionError("unguarded mutation did not propagate")
+
+    lines = stderr.getvalue().splitlines()
+    assert_true("top-level trap exits nonzero", fixed_rc != 0)
+    assert_true("top-level trap writes no stdout", stdout.getvalue() == "")
+    assert_true("top-level trap emits one line", len(lines) == 1)
+    assert_true("top-level trap names error class", "RuntimeError" in lines[0])
+    assert_true("top-level trap is actionable", "next: run" in lines[0])
+    assert_true("top-level trap suppresses traceback", "Traceback" not in lines[0])
+    assert_true("mutation half exposes the raw exception", "forced" in str(mutant_error))
 
 
 def mirror_remote_message(

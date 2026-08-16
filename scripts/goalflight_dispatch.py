@@ -2818,9 +2818,11 @@ def _materialize_steer_prompt(
             "USER-CONFIRM, or BLOCKED. A generic or foreign marker is ignored."
         )
     full_prompt = f"{preamble}\n\n{body}"
+    # Lazy hardening at the other dispatch-dir writer (see the note in
+    # _persist_acp_watcher_prompt); idempotent and marker-guarded.
+    _prepare_private_dispatch_dir()
     assembled = base / f"{dispatch_id}.assembled.prompt"
-    assembled.parent.mkdir(parents=True, exist_ok=True)
-    assembled.write_text(full_prompt, encoding="utf-8")
+    _atomic_write_private_text(assembled, full_prompt)
     return str(assembled)
 
 
@@ -8937,6 +8939,88 @@ def _acp_watcher_prompt_path(status_json: Path) -> Path:
     return status_path.with_name(f"{stem}.assembled.prompt")
 
 
+LEGACY_PROMPT_SWEEP_MARKER = ".legacy-assembled-prompts-private-v1"
+
+
+def _atomic_write_private_text(path: Path, text: str) -> None:
+    """Replace a text sidecar atomically without ever exposing its contents."""
+
+    parent_was_missing = not path.parent.exists()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if parent_was_missing:
+        path.parent.chmod(0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    fd: int | None = None
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def _prepare_private_dispatch_dir() -> Path:
+    """Create the dispatch dir privately and repair legacy prompt sidecars."""
+
+    base = _dispatch_base_dir()
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        base.chmod(0o700)
+    except FileNotFoundError:
+        # A concurrent cleaner can delete the directory between mkdir and
+        # chmod; recreate once and continue — hardening is best-effort and
+        # must never abort dispatcher startup.
+        base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with contextlib.suppress(OSError):
+            base.chmod(0o700)
+    marker = base / LEGACY_PROMPT_SWEEP_MARKER
+    marker_fd: int | None = None
+    try:
+        # Claim the version before scanning. O_EXCL makes concurrent dispatcher
+        # startups observe the same one-shot decision instead of racing through
+        # the directory together. A claimed-but-interrupted sweep is still a
+        # completed best-effort compatibility attempt; new writes are private.
+        marker_fd = os.open(
+            marker,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        os.write(marker_fd, b"legacy assembled prompt sweep v1 claimed\n")
+        os.fsync(marker_fd)
+    except FileExistsError:
+        return base
+    except OSError as exc:
+        print(
+            f"goalflight dispatch: legacy prompt sweep marker failed for {marker}: {exc}",
+            file=sys.stderr,
+        )
+        return base
+    finally:
+        if marker_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(marker_fd)
+    # One versioned compatibility sweep for sidecars created as 0644 by older
+    # dispatchers. Every file is best-effort so one concurrent deletion or
+    # permission error cannot abort a real dispatch.
+    for prompt_path in base.glob("*.assembled.prompt"):
+        try:
+            prompt_path.chmod(0o600)
+        except OSError as exc:
+            print(
+                f"goalflight dispatch: legacy prompt repair failed for {prompt_path}: {exc}",
+                file=sys.stderr,
+            )
+    return base
+
+
 def _persist_acp_watcher_prompt(
     *,
     status_json: Path,
@@ -8944,9 +9028,12 @@ def _persist_acp_watcher_prompt(
 ) -> Path:
     """Persist the exact ACP prompt text used for prompt-echo suppression."""
 
+    # Lazy hardening: the dir-privacy sweep runs only when something is
+    # actually written into the dispatch dir — never as a main() side effect,
+    # so a refused dispatch leaves zero state (the prompt-guard contract).
+    _prepare_private_dispatch_dir()
     prompt_path = _acp_watcher_prompt_path(status_json)
-    prompt_path.parent.mkdir(parents=True, exist_ok=True)
-    prompt_path.write_text(prompt_text, encoding="utf-8")
+    _atomic_write_private_text(prompt_path, prompt_text)
     return prompt_path
 
 
@@ -9592,6 +9679,10 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == DAEMON_SPAWN_ARG:
         return _cmd_spawn_daemon()
+    option_argv = argv[: argv.index("--")] if "--" in argv else argv
+    # The dir-privacy sweep is invoked lazily by dispatch-dir writers (see
+    # _persist_acp_watcher_prompt and the launch path), never here: a refused
+    # dispatch must leave zero side effects before its guards run.
     try:
         import goalflight_messages
 

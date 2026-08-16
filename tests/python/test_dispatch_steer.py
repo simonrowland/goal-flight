@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -527,6 +528,8 @@ def case_prompt_preamble_is_materialized() -> None:
         assert "disk file is authoritative" in text, text
         assert "COMPLETE: prompt-case — done" in text, text
         assert assembled.name == "prompt-case.assembled.prompt", assembled
+        assert stat.S_IMODE(assembled.stat().st_mode) == 0o600
+        assert stat.S_IMODE(assembled.parent.stat().st_mode) == 0o700
 
 
 def case_orientation_preamble_is_materialized_when_present() -> None:

@@ -74,6 +74,9 @@ fixed-set join backgrounds the printed `goalflight_status.py --wait <ids>`
 command. Do not block the turn on either. A timer is only for non-notifiable
 external state such as CI, a remote queue, or a deploy. Scheduling one to ask
 whether a worker finished is polling a channel that would have told you.
+Updated controllers should prefer `--report-pending`, which reports an arm-time
+backlog in place and stays armed for only newer mail while omission preserves the
+exit-driven compatibility loop.
 
 ## Steps
 

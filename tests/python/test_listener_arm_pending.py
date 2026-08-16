@@ -1,5 +1,4 @@
-"""Arm-reports-pending: a listener armed over a backlog reports it and stays
-armed; only events beyond the arm-time high-water ring it.
+"""Opt-in arm-reports-pending listener behavior and exit-driven compatibility.
 
 Live-verified 2026-08-15 (operator-designed semantics: the arm doubles as the
 peek, and a controller that is awake enough to arm does not need the pop)."""
@@ -42,6 +41,7 @@ def isolated(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, str]]:
         monkeypatch.setenv(key, value)
     monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LABEL", raising=False)
     monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LEASE_NONCE", raising=False)
+    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
     project = td / "project"
     project.mkdir()
     return project, {**os.environ, **env}
@@ -76,7 +76,7 @@ def test_arm_reports_backlog_stays_armed_and_rings_on_new(
         proc = subprocess.Popen(
             [sys.executable, str(SCRIPTS / "goalflight_messages.py"),
              "listen-auto", "--project-root", str(project),
-             "--controller-label", "armtest"],
+             "--controller-label", "armtest", "--report-pending"],
             env=listener_env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True,
         )
@@ -112,6 +112,142 @@ def test_arm_reports_backlog_stays_armed_and_rings_on_new(
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+
+
+def test_default_arm_over_backlog_exits_promptly(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "arm-compat-test"}
+    ).value
+    assert lease is not None
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        _post(env, project, "compat backlog")
+        listener_env = {
+            **env,
+            "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+            "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+        }
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "goalflight_messages.py"),
+                "listen-auto",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                "armtest",
+                "--poll-secs",
+                "0.01",
+                "--timeout-s",
+                "1",
+            ],
+            env=listener_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1, result.stdout
+    assert lines[0].startswith("mail available; peek:")
+    assert "pending-at-arm" not in result.stdout
+
+
+def test_report_pending_json_is_jsonl_through_ring(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "arm-json-test"}
+    ).value
+    assert lease is not None
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        _post(env, project, "json backlog one")
+        _post(env, project, "json backlog two")
+        listener_env = {
+            **env,
+            "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+            "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+        }
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPTS / "goalflight_messages.py"),
+                "listen-auto",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                "armtest",
+                "--report-pending",
+                "--json",
+                "--poll-secs",
+                "0.01",
+            ],
+            env=listener_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            arm_line = proc.stdout.readline()
+            arm_payload = json.loads(arm_line)
+            assert arm_payload["kind"] == "pending-at-arm"
+            assert len(arm_payload["items"]) == 2
+
+            _post(env, project, "json ring")
+            remaining_stdout, _stderr = proc.communicate(timeout=30)
+            lines = [arm_line, *remaining_stdout.splitlines(keepends=True)]
+            payloads = [json.loads(line) for line in lines if line.strip()]
+            assert len(payloads) == 2, lines
+            assert payloads[1]["kind"] == "ring"
+            assert payloads[1]["reason"] == "event"
+            assert proc.returncode == 0
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+        timeout_result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "goalflight_messages.py"),
+                "listen-auto",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                "armtest",
+                "--report-pending",
+                "--json",
+                "--poll-secs",
+                "0.01",
+                "--timeout-s",
+                "0.05",
+            ],
+            env=listener_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    timeout_payloads = [
+        json.loads(line) for line in timeout_result.stdout.splitlines() if line.strip()
+    ]
+    assert timeout_result.returncode == 1, timeout_result.stderr
+    assert [payload["kind"] for payload in timeout_payloads] == [
+        "pending-at-arm",
+        "exit",
+    ]
+    assert timeout_payloads[-1]["reason"] == "timeout"
 
 
 def main() -> None:

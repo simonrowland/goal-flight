@@ -3443,7 +3443,8 @@ def _cursor_advance_command(
 
 
 def cmd_relay(args: argparse.Namespace) -> int:
-    """Peek at journal-pending assignments; never advance or acknowledge state."""
+    """Peek at journal-pending assignments, optionally draining that snapshot."""
+    drain = bool(getattr(args, "drain", False))
     project_root = _current_project_root()
     if project_root is None:
         print("relay: no current git project", file=sys.stderr)
@@ -3460,7 +3461,13 @@ def cmd_relay(args: argparse.Namespace) -> int:
             active = authority.lease_records()
             controller_label = str(active[0]["label"]) if len(active) == 1 else None
         if controller_label is None:
-            print("no pending journal events")
+            if drain:
+                if getattr(args, "json", False):
+                    print(json.dumps({"drained": 0, "status": "no_mail"}, sort_keys=True))
+                else:
+                    print("no mail")
+            else:
+                print("no pending journal events")
             return 0
         lease = authority.active_lease(controller_label)
         if lease is None:
@@ -3480,6 +3487,80 @@ def cmd_relay(args: argparse.Namespace) -> int:
         positions=positions,
         stream_snapshots=peek.stream_snapshots,
     )
+    if drain:
+        if not positions:
+            if getattr(args, "json", False):
+                print(
+                    json.dumps(
+                        {
+                            "controller_label": controller_label,
+                            "cursor_version": peek.cursor_version,
+                            "drained": 0,
+                            "status": "no_mail",
+                        },
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print("no mail")
+            return 0
+        try:
+            advanced = authority.advance_cursor(
+                controller_label,
+                nonce=lease.nonce,
+                expected_cursor_version=peek.cursor_version,
+                expected_stream_snapshots=peek.stream_snapshots,
+                advances=positions,
+                actor=f"controller:{os.getpid()}:relay-drain",
+            )
+        except goalflight_journal.CASMismatch as exc:
+            advanced = None
+            conflict_reason = str(exc)
+        except goalflight_journal.JournalError as exc:
+            print(f"relay: {exc}", file=sys.stderr)
+            return 2
+        else:
+            conflict_reason = advanced.reason if not advanced.committed else None
+        if advanced is None or not advanced.committed or advanced.value is None:
+            if getattr(args, "json", False):
+                print(
+                    json.dumps(
+                        {
+                            "drained": 0,
+                            "error": sanitize_display(
+                                conflict_reason or "cursor CAS lost",
+                                limit=240,
+                            ),
+                            "next": "retry relay --drain",
+                            "status": "conflict",
+                        },
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print("drain conflict · retry relay --drain", file=sys.stderr)
+            return 3
+        previous_version = int(advanced.value["previous_cursor_version"])
+        cursor_version = int(advanced.value["cursor_version"])
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    {
+                        "controller_label": controller_label,
+                        "cursor_version": cursor_version,
+                        "drained": len(envelopes),
+                        "previous_cursor_version": previous_version,
+                        "status": "drained",
+                    },
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(
+                f"drained {len(envelopes)} · cursor "
+                f"{previous_version}->{cursor_version}"
+            )
+        return 0
     if getattr(args, "json", False):
         print(
             json.dumps(
@@ -3807,6 +3888,7 @@ def cmd_listen(args) -> int:
             elif exited.value and exited.value.get("exit_reason"):
                 reason = str(exited.value["exit_reason"])
             payload = {
+                "kind": "exit",
                 "reason": reason,
                 "coverage_id": coverage_id,
                 "detail": detail,
@@ -3826,27 +3908,19 @@ def cmd_listen(args) -> int:
         stream=sys.stderr,
     )
 
-    # Arm-reports-pending: events already pending when the controller arms do
-    # not pop the listener — the controller is awake and reading this output
-    # right now, so popping would only force an arm/pop/arm cycle. Report the
-    # backlog headlines here and raise the ring threshold to the arm-time
-    # high-water; only events BEYOND it ring. The eventual ring's advance
-    # snapshot still covers the arm-time backlog, so nothing is lost.
+    # Opt-in arm-reports-pending: report the backlog and raise the ring threshold
+    # to the arm-time high-water so only events BEYOND it ring. Without the
+    # option, the pre-existing exit-driven contract remains intact: pending mail
+    # immediately follows the ordinary one-line ring path below.
     arm_high: dict[str, int] = {}
-    try:
-        arm_snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
-    except goalflight_journal.JournalError:
-        arm_snapshot = None
+    arm_snapshot = None
+    if getattr(args, "report_pending", False):
+        try:
+            arm_snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
+        except goalflight_journal.JournalError:
+            arm_snapshot = None
     if arm_snapshot is not None and arm_snapshot.items:
         arm_high = _cursor_positions(arm_snapshot.items)
-        for item in arm_snapshot.items:
-            stream = str(item.get("stream_id") or "")
-            seq = int(item.get("stream_seq") or 0)
-            kind = str(item.get("event_type") or item.get("type") or "event")
-            print(
-                f"pending-at-arm: [{kind}] {stream} seq={seq}",
-                flush=True,
-            )
         # The arm doubles as the peek: emit the same machine-readable snapshot
         # relay --new --json would, advance command included, so the awake
         # controller drains the backlog straight from this output without a
@@ -3859,25 +3933,37 @@ def cmd_listen(args) -> int:
             positions=_cursor_positions(arm_snapshot.items),
             stream_snapshots=arm_snapshot.stream_snapshots,
         )
-        print(
-            "pending-at-arm-json: "
-            + json.dumps(
-                {
-                    "items": arm_snapshot.items,
-                    "cursor_version": arm_snapshot.cursor_version,
-                    "advance_command": arm_advance,
-                },
-                sort_keys=True,
-                default=str,
-            ),
-            flush=True,
-        )
-        print(
-            f"pending-at-arm: {len(arm_snapshot.items)} item(s) reported; "
-            "listener stays armed and rings only for newer events; run the "
-            "advance command above to drain the backlog",
-            flush=True,
-        )
+        arm_payload = {
+            "kind": "pending-at-arm",
+            "items": arm_snapshot.items,
+            "cursor_version": arm_snapshot.cursor_version,
+            "advance_command": arm_advance,
+        }
+        if args.json:
+            print(
+                json.dumps(arm_payload, sort_keys=True, default=str),
+                flush=True,
+            )
+        else:
+            for item in arm_snapshot.items:
+                stream = str(item.get("stream_id") or "")
+                seq = int(item.get("stream_seq") or 0)
+                kind = str(item.get("event_type") or item.get("type") or "event")
+                print(
+                    f"pending-at-arm: [{kind}] {stream} seq={seq}",
+                    flush=True,
+                )
+            print(
+                "pending-at-arm-json: "
+                + json.dumps(arm_payload, sort_keys=True, default=str),
+                flush=True,
+            )
+            print(
+                f"pending-at-arm: {len(arm_snapshot.items)} item(s) reported; "
+                "listener stays armed and rings only for newer events; run the "
+                "advance command above to drain the backlog",
+                flush=True,
+            )
 
     while True:
         if os.getppid() != parent_pid:
@@ -3953,6 +4039,7 @@ def cmd_listen(args) -> int:
                     detail="listener coverage changed before doorbell exit",
                 )
             payload = {
+                "kind": "ring",
                 "reason": "event",
                 "coverage_id": coverage_id,
                 "registry_generation": snapshot.registry_generation,
@@ -4027,7 +4114,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def _run_cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Goal Flight message envelopes")
     parser.add_argument("--messages-dir", type=Path, default=default_messages_dir())
     parser.add_argument("--fleet-dir", type=Path, default=default_fleet_dir())
@@ -4092,6 +4179,11 @@ def main(argv: list[str] | None = None) -> int:
     relay = sub.add_parser("relay")
     relay.add_argument("--new", action="store_true", help="Peek at events pending after the journal cursor")
     relay.add_argument(
+        "--drain",
+        action="store_true",
+        help="peek and CAS-advance that exact snapshot in one process",
+    )
+    relay.add_argument(
         "--bodies",
         action="store_true",
         help="With --new, print full envelope JSON instead of one headline per message",
@@ -4147,6 +4239,11 @@ def main(argv: list[str] | None = None) -> int:
             "--timeout-s", type=float, default=0.0, help="0 = wait indefinitely"
         )
         command_parser.add_argument("--json", action="store_true")
+        command_parser.add_argument(
+            "--report-pending",
+            action="store_true",
+            help="report an arm-time backlog and stay armed for only newer events",
+        )
 
     listen = sub.add_parser(
         "listen",
@@ -4176,7 +4273,9 @@ def main(argv: list[str] | None = None) -> int:
         "post": "producer",
     }
     role = role_by_command.get(args.cmd, "controller")
-    if args.cmd not in {"listen", "listen-auto"}:
+    if args.cmd not in {"listen", "listen-auto"} and not (
+        args.cmd == "relay" and args.drain
+    ):
         entry_root = getattr(args, "controller_project_root", None) or Path.cwd()
         emit_wake_entry_notice(
             project_root=entry_root,
@@ -4190,6 +4289,23 @@ def main(argv: list[str] | None = None) -> int:
     except MessageError as exc:
         print(f"{args.cmd}: refused: {exc}", file=sys.stderr)
         return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the messages CLI without leaking unhandled tracebacks to operators."""
+    try:
+        return _run_cli(argv)
+    except Exception as exc:
+        try:
+            detail = sanitize_display(str(exc), limit=240) or "internal failure"
+        except Exception:
+            detail = "internal failure"
+        print(
+            f"goalflight_messages: {type(exc).__name__}: {detail} · "
+            "next: run goalflight_messages.py --help",
+            file=sys.stderr,
+        )
+        return 1
 
 
 if __name__ == "__main__":

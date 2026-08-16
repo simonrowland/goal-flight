@@ -1806,10 +1806,15 @@ def test_second_real_doorbell_loses_generation_lock_and_first_wakes_body_free(
         assert first.returncode == 0, first_stderr
         doorbell = json.loads(first_stdout)
         assert doorbell["reason"] == "event"
+        # "kind" is the jsonl discriminator added with --report-pending's
+        # multi-object output; it is a scalar tag, not a payload, so the
+        # body-free contract admits it — and nothing else.
+        assert doorbell["kind"] == "ring"
         assert set(doorbell) == {
             "advance_command",
             "coverage_id",
             "cursor_version",
+            "kind",
             "reason",
             "registry_generation",
         }
@@ -1919,6 +1924,87 @@ def test_wait_path_terminal_commit_wakes_under_seeded_history_three_runs(
 
     assert len(measurements) == 3
     assert all(value < 5.0 for value in measurements)
+
+
+def test_reconcile_projects_wake_before_slow_failing_history_mutation_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reverting wake-before-history makes the first event wait time out."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    _claim(authority)
+    dispatch_id = "reconcile-wake-before-history"
+    status_path = tmp_path / "terminal-status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "state": "complete",
+                "terminal_state": "complete",
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": dispatch_id,
+            "project_root": str(project),
+            "state": "running",
+            "status_path": str(status_path),
+        }
+    )
+
+    projected = threading.Event()
+    history_entered = threading.Event()
+    release_history = threading.Event()
+    original_project_outbox = journal.Journal.project_terminal_outbox
+
+    def observe_outbox(self, *args, **kwargs):
+        result = original_project_outbox(self, *args, **kwargs)
+        projected.set()
+        return result
+
+    def slow_failing_history(_record: dict) -> None:
+        history_entered.set()
+        assert release_history.wait(5), "slow history hook was not released"
+        raise RuntimeError("constructed history failure")
+
+    monkeypatch.setattr(journal.Journal, "project_terminal_outbox", observe_outbox)
+    monkeypatch.setattr(
+        ledger.goalflight_fleet_console_history,
+        "project_terminal",
+        slow_failing_history,
+    )
+    outcome: dict[str, object] = {}
+
+    def reconcile() -> None:
+        try:
+            outcome["result"] = ledger.reconcile_terminal_outbox(
+                project,
+                messages_dir=tmp_path / "messages",
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=reconcile, name="reconcile-history-order")
+    worker.start()
+    try:
+        assert projected.wait(2), "terminal wake projection was delayed by history"
+        assert history_entered.wait(2), "history hook was not attempted after projection"
+        assert worker.is_alive(), "slow history hook did not block the reconciliation tail"
+    finally:
+        release_history.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert "error" not in outcome, outcome.get("error")
+    result = outcome["result"]
+    assert isinstance(result, dict)
+    assert result["ok"] is True
+    assert result["projected"] == 1
 
 
 def test_listener_path_terminal_commit_wakes_under_seeded_history_three_runs(

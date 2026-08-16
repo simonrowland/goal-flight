@@ -9,6 +9,7 @@ import io
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,7 +24,12 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_acp_run  # noqa: E402
 import goalflight_dispatch as dispatch_mod  # noqa: E402
+import goalflight_journal  # noqa: E402
 import goalflight_watch  # noqa: E402
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
 
 
 def _normalize(agent: str) -> str:
@@ -178,6 +184,8 @@ def test_acp_production_path_persists_and_reminds_with_assembled_prompt() -> Non
         watcher_prompt = Path(cfg.watcher_prompt_file)
         assert watcher_prompt.parent == status_json.parent.resolve()
         assert watcher_prompt.is_file()
+        assert _mode(watcher_prompt) == 0o600
+        assert _mode(watcher_prompt.parent) == 0o700
         persisted = watcher_prompt.read_text(encoding="utf-8")
         assert dispatch_mod.PROMPT_FILE_PREAMBLE in persisted
         assert "PROJECT ORIENTATION\n" in persisted
@@ -206,6 +214,135 @@ def test_acp_inline_prompt_uses_same_assembled_prompt_path() -> None:
         assert watcher_prompt.read_text(encoding="utf-8") == (
             f"{dispatch_mod.PROMPT_FILE_PREAMBLE}\n\n{args.prompt}"
         )
+
+
+def test_acp_prompt_history_rewrite_remains_private() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "dispatch" / "private.assembled.prompt"
+        cfg = SimpleNamespace(watcher_prompt_file=str(path))
+
+        assert (
+            goalflight_acp_run._persist_watcher_prompt_turn(cfg, "first")
+            == path.resolve()
+        )
+        assert path.read_text(encoding="utf-8") == "first"
+        assert _mode(path) == 0o600
+        assert _mode(path.parent) == 0o700
+
+        path.chmod(0o644)
+        goalflight_acp_run._persist_watcher_prompt_turn(cfg, "replacement")
+        assert path.read_text(encoding="utf-8") == "replacement"
+        assert _mode(path) == 0o600
+
+
+def test_dispatch_help_skips_legacy_prompt_sweep_mutation_pair() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatch"
+        dispatch_dir.mkdir(parents=True, mode=0o755)
+        dispatch_dir.chmod(0o755)
+        legacy_prompt = dispatch_dir / "legacy.assembled.prompt"
+        legacy_prompt.write_text("legacy private prompt", encoding="utf-8")
+        legacy_prompt.chmod(0o644)
+
+        with patch.dict(os.environ, _capacity_env(state_dir), clear=True):
+            with contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    dispatch_mod.main(["--help"])
+                except SystemExit as exc:
+                    assert exc.code == 0
+                else:  # pragma: no cover - argparse --help always exits
+                    raise AssertionError("dispatcher --help did not exit")
+
+        assert _mode(dispatch_dir) == 0o755
+        assert _mode(legacy_prompt) == 0o644
+        assert not (dispatch_dir / dispatch_mod.LEGACY_PROMPT_SWEEP_MARKER).exists()
+
+
+def test_dispatch_startup_sweep_is_once_and_best_effort_mutation_pair() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatch"
+        dispatch_dir.mkdir(parents=True, mode=0o755)
+        dispatch_dir.chmod(0o755)
+        repaired_prompt = dispatch_dir / "repaired.assembled.prompt"
+        repaired_prompt.write_text("repair me", encoding="utf-8")
+        repaired_prompt.chmod(0o644)
+        error_prompt = dispatch_dir / "error.assembled.prompt"
+        error_prompt.write_text("constructed chmod failure", encoding="utf-8")
+        error_prompt.chmod(0o644)
+        original_chmod = Path.chmod
+        chmod_errors = 0
+
+        def selective_chmod(path: Path, mode: int, *args, **kwargs):
+            nonlocal chmod_errors
+            if path == error_prompt:
+                chmod_errors += 1
+                raise PermissionError("constructed sidecar chmod failure")
+            return original_chmod(path, mode, *args, **kwargs)
+
+        stderr = io.StringIO()
+        with patch.dict(os.environ, _capacity_env(state_dir), clear=True):
+            with patch.object(Path, "chmod", selective_chmod):
+                with contextlib.redirect_stderr(stderr):
+                    assert dispatch_mod._prepare_private_dispatch_dir() == dispatch_dir
+
+            assert _mode(dispatch_dir) == 0o700
+            assert _mode(repaired_prompt) == 0o600
+            assert _mode(error_prompt) == 0o644
+            marker = dispatch_dir / dispatch_mod.LEGACY_PROMPT_SWEEP_MARKER
+            assert marker.is_file()
+            assert "constructed sidecar chmod failure" in stderr.getvalue()
+
+            # Mutation control: without the marker guard, the second call would
+            # repair this deliberately re-loosened file and retry the error.
+            repaired_prompt.chmod(0o644)
+            with patch.object(Path, "chmod", selective_chmod):
+                assert dispatch_mod._prepare_private_dispatch_dir() == dispatch_dir
+
+        assert _mode(repaired_prompt) == 0o644
+        assert chmod_errors == 1
+
+
+def test_dispatch_startup_sweep_marker_serializes_concurrent_first_run() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        dispatch_dir = state_dir / "dispatch"
+        dispatch_dir.mkdir(parents=True)
+        legacy_prompt = dispatch_dir / "concurrent.assembled.prompt"
+        legacy_prompt.write_text("repair once", encoding="utf-8")
+        legacy_prompt.chmod(0o644)
+        original_chmod = Path.chmod
+        prompt_chmods = 0
+        count_lock = threading.Lock()
+        start = threading.Barrier(3)
+        outcomes: list[Path] = []
+
+        def counted_chmod(path: Path, mode: int, *args, **kwargs):
+            nonlocal prompt_chmods
+            if path == legacy_prompt:
+                with count_lock:
+                    prompt_chmods += 1
+                time.sleep(0.05)
+            return original_chmod(path, mode, *args, **kwargs)
+
+        def prepare() -> None:
+            start.wait()
+            outcomes.append(dispatch_mod._prepare_private_dispatch_dir())
+
+        with patch.dict(os.environ, _capacity_env(state_dir), clear=True):
+            with patch.object(Path, "chmod", counted_chmod):
+                workers = [threading.Thread(target=prepare) for _ in range(2)]
+                for worker in workers:
+                    worker.start()
+                start.wait()
+                for worker in workers:
+                    worker.join(timeout=5)
+                    assert not worker.is_alive()
+
+        assert outcomes == [dispatch_dir, dispatch_dir]
+        assert prompt_chmods == 1
+        assert _mode(legacy_prompt) == 0o600
 
 
 def test_partial_submit_cleanup_retires_assembled_prompt_with_status() -> None:
@@ -575,10 +712,53 @@ def test_watcher_prompt_history_retains_original_and_bounded_recent_turns() -> N
 
 def _capacity_env(state_dir: Path, **extra: str) -> dict[str, str]:
     env = os.environ.copy()
+    isolation_root = state_dir.parent
     env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(isolation_root / "journal")
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(isolation_root / "task-store")
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(isolation_root / "messages")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(isolation_root / "wake-ledger")
+    env["GOAL_FLIGHT_PIDFILE_DIR"] = str(isolation_root / "pids")
     env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "1"
     env.update(extra)
     return env
+
+
+def test_capacity_env_ignores_constructed_live_journal() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        live_journal_dir = tmp / "live-journal"
+        with patch.dict(
+            os.environ,
+            {"GOALFLIGHT_JOURNAL_DIR": str(live_journal_dir)},
+        ):
+            live_authority = goalflight_journal.open_or_create_journal(ROOT)
+            prepared = live_authority.prepare_attempt("queued-acp")
+            assert prepared.committed and prepared.value is not None
+            terminal = live_authority.commit_terminal(
+                prepared.value.attempt_id,
+                terminal_state="complete",
+                observation={"source": "constructed live epoch-5 journal"},
+            )
+            assert terminal.committed
+            env = _capacity_env(tmp / "isolated" / "state")
+
+        expected = {
+            "GOALFLIGHT_JOURNAL_DIR",
+            "GOALFLIGHT_TASK_STORE_DIR",
+            "GOALFLIGHT_MESSAGES_DIR",
+            "GOALFLIGHT_WAKE_LEDGER_DIR",
+            "GOAL_FLIGHT_PIDFILE_DIR",
+        }
+        assert expected <= env.keys()
+        assert env["GOALFLIGHT_JOURNAL_DIR"] != str(live_journal_dir)
+        with patch.dict(os.environ, env, clear=True):
+            isolated_authority = goalflight_journal.open_or_create_journal(ROOT)
+            assert isolated_authority.attempt_for_dispatch("queued-acp") is None
+
+        live_attempt = live_authority.attempt_for_dispatch("queued-acp")
+        assert live_attempt is not None
+        assert live_attempt.lifecycle_state == goalflight_journal.ATTEMPT_TERMINAL
 
 
 def _capacity_cmd(state_dir: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -762,30 +942,20 @@ def test_acp_capacity_wait_queues_until_slot_frees() -> None:
         lease_id = _hold_capacity(state_dir)
         cfg = _acp_cfg(tmp, dispatch_id="queued-acp", status_json=status_json, capacity_wait_s=6.0)
         saved = _install_fake_acp_after_capacity()
-        old_state = os.environ.get("GOALFLIGHT_STATE_DIR")
-        old_max = os.environ.get("GOALFLIGHT_CAPACITY_MAX_TOTAL")
-        os.environ.update(_capacity_env(state_dir))
         try:
-            thread, result = _run_acp_thread(cfg)
-            waiting = _wait_for_status(status_json, "waiting_capacity", timeout_s=5.0)
-            assert waiting["reason"]["decision"] == "wait", waiting
-            _release_capacity(state_dir, lease_id)
-            thread.join(timeout=20)
-            if thread.is_alive():
-                raise AssertionError("ACP queued run did not finish after capacity release")
-            if "exc" in result:
-                raise result["exc"]  # type: ignore[misc]
-            payload = result["payload"]
+            with patch.dict(os.environ, _capacity_env(state_dir), clear=True):
+                thread, result = _run_acp_thread(cfg)
+                waiting = _wait_for_status(status_json, "waiting_capacity", timeout_s=5.0)
+                assert waiting["reason"]["decision"] == "wait", waiting
+                _release_capacity(state_dir, lease_id)
+                thread.join(timeout=20)
+                if thread.is_alive():
+                    raise AssertionError("ACP queued run did not finish after capacity release")
+                if "exc" in result:
+                    raise result["exc"]  # type: ignore[misc]
+                payload = result["payload"]
         finally:
             _restore_fake_acp(saved)
-            if old_state is None:
-                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
-            else:
-                os.environ["GOALFLIGHT_STATE_DIR"] = old_state
-            if old_max is None:
-                os.environ.pop("GOALFLIGHT_CAPACITY_MAX_TOTAL", None)
-            else:
-                os.environ["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = old_max
         final = json.loads(status_json.read_text())
         assert payload["state"] == "complete", payload
         assert final["state"] == "complete", final
@@ -799,22 +969,12 @@ def test_acp_capacity_wait_deadline_blocks() -> None:
         lease_id = _hold_capacity(state_dir)
         cfg = _acp_cfg(tmp, dispatch_id="deadline-acp", status_json=status_json, capacity_wait_s=0.2)
         saved = _install_fake_acp_after_capacity()
-        old_state = os.environ.get("GOALFLIGHT_STATE_DIR")
-        old_max = os.environ.get("GOALFLIGHT_CAPACITY_MAX_TOTAL")
-        os.environ.update(_capacity_env(state_dir))
         try:
-            payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+            with patch.dict(os.environ, _capacity_env(state_dir), clear=True):
+                payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
         finally:
             _restore_fake_acp(saved)
             _release_capacity(state_dir, lease_id)
-            if old_state is None:
-                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
-            else:
-                os.environ["GOALFLIGHT_STATE_DIR"] = old_state
-            if old_max is None:
-                os.environ.pop("GOALFLIGHT_CAPACITY_MAX_TOTAL", None)
-            else:
-                os.environ["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = old_max
         status = json.loads(status_json.read_text())
         assert payload["state"] == "blocked_capacity", payload
         assert status["reason"]["decision"] == "wait", status
@@ -830,22 +990,12 @@ def test_acp_capacity_wait_zero_single_shot() -> None:
         lease_id = _hold_capacity(state_dir)
         cfg = _acp_cfg(tmp, dispatch_id="zero-acp", status_json=status_json, capacity_wait_s=0.0)
         saved = _install_fake_acp_after_capacity()
-        old_state = os.environ.get("GOALFLIGHT_STATE_DIR")
-        old_max = os.environ.get("GOALFLIGHT_CAPACITY_MAX_TOTAL")
-        os.environ.update(_capacity_env(state_dir))
         try:
-            payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+            with patch.dict(os.environ, _capacity_env(state_dir), clear=True):
+                payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
         finally:
             _restore_fake_acp(saved)
             _release_capacity(state_dir, lease_id)
-            if old_state is None:
-                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
-            else:
-                os.environ["GOALFLIGHT_STATE_DIR"] = old_state
-            if old_max is None:
-                os.environ.pop("GOALFLIGHT_CAPACITY_MAX_TOTAL", None)
-            else:
-                os.environ["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = old_max
         status = json.loads(status_json.read_text())
         assert payload["state"] == "blocked_capacity", payload
         assert "attempts" not in status["reason"] and "waited_s" not in status["reason"], status
@@ -859,8 +1009,6 @@ def test_acp_capacity_wait_sigterm_terminalizes() -> None:
         lease_id = _hold_capacity(state_dir)
         cfg = _acp_cfg(tmp, dispatch_id="sigterm-acp", status_json=status_json, capacity_wait_s=6.0)
         saved = _install_fake_acp_after_capacity()
-        old_state = os.environ.get("GOALFLIGHT_STATE_DIR")
-        old_max = os.environ.get("GOALFLIGHT_CAPACITY_MAX_TOTAL")
         signal_thread_errors: list[BaseException] = []
 
         def send_sigterm_after_waiting() -> None:
@@ -870,22 +1018,14 @@ def test_acp_capacity_wait_sigterm_terminalizes() -> None:
             except BaseException as exc:  # pragma: no cover - surfaced below
                 signal_thread_errors.append(exc)
 
-        os.environ.update(_capacity_env(state_dir))
         signal_thread = threading.Thread(target=send_sigterm_after_waiting, daemon=True)
         try:
-            signal_thread.start()
-            payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+            with patch.dict(os.environ, _capacity_env(state_dir), clear=True):
+                signal_thread.start()
+                payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
         finally:
             _restore_fake_acp(saved)
             _release_capacity(state_dir, lease_id)
-            if old_state is None:
-                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
-            else:
-                os.environ["GOALFLIGHT_STATE_DIR"] = old_state
-            if old_max is None:
-                os.environ.pop("GOALFLIGHT_CAPACITY_MAX_TOTAL", None)
-            else:
-                os.environ["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = old_max
         signal_thread.join(timeout=1)
         if signal_thread_errors:
             raise signal_thread_errors[0]
@@ -990,6 +1130,10 @@ def main() -> None:
     test_build_acp_cfg_injects_orientation_prompt_text()
     test_acp_production_path_persists_and_reminds_with_assembled_prompt()
     test_acp_inline_prompt_uses_same_assembled_prompt_path()
+    test_acp_prompt_history_rewrite_remains_private()
+    test_dispatch_help_skips_legacy_prompt_sweep_mutation_pair()
+    test_dispatch_startup_sweep_is_once_and_best_effort_mutation_pair()
+    test_dispatch_startup_sweep_marker_serializes_concurrent_first_run()
     test_partial_submit_cleanup_retires_assembled_prompt_with_status()
     test_partial_submit_cleanup_repairs_orphaned_prompt_sidecar()
     test_watcher_with_retired_prompt_and_status_exits_without_status_write()
@@ -998,6 +1142,7 @@ def main() -> None:
     test_missing_status_without_nonterminal_record_returns_before_scan()
     test_cleanup_gap_watcher_exits_without_recreating_status()
     test_watcher_prompt_history_retains_original_and_bounded_recent_turns()
+    test_capacity_env_ignores_constructed_live_journal()
     test_acp_capacity_wait_queues_until_slot_frees()
     test_acp_capacity_wait_deadline_blocks()
     test_acp_capacity_wait_zero_single_shot()

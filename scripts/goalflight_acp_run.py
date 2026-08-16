@@ -734,12 +734,24 @@ def _persist_watcher_prompt_turn(cfg: argparse.Namespace, prompt_text: str) -> P
     if not configured:
         return None
     path = Path(str(configured)).expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    parent_was_missing = not path.parent.exists()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if parent_was_missing:
+        path.parent.chmod(0o700)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    fd: int | None = None
     try:
-        tmp.write_text(prompt_text, encoding="utf-8")
-        tmp.replace(path)
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None
+        with handle:
+            handle.write(prompt_text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
     finally:
+        if fd is not None:
+            os.close(fd)
         with contextlib.suppress(OSError):
             tmp.unlink()
     return path

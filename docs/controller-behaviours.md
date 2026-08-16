@@ -165,6 +165,9 @@ processes chosen items, CAS-advances their server-known positions, then re-arms.
 Arm the wait and let work wake it. Any tool call expected to run longer than about 10
 seconds is backgrounded so typed steers remain visible and ESC/Ctrl-C cancels only
 the observer, not the detached worker.
+Updated controllers should prefer `--report-pending`, which reports an arm-time
+backlog in place and stays armed for only newer mail while omission preserves the
+exit-driven compatibility loop.
 
 Use background `goalflight_status.py --wait <ids>` only for a deliberate fixed-set
 join without claimed ownership. Exit 3 means mail, not completion, and prints the
