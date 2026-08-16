@@ -424,8 +424,8 @@ print(json.dumps({
   ].every(Boolean));
 }
 
-// Staleness follows the producer stamp in both directions, never the renderer
-// reload interval supplied by the caller.
+// Comparison mutation pair: staleness follows the producer stamp in both
+// directions, never the renderer reload interval supplied by the caller.
 {
   const slowProducer = attentionPayload({
     cadence_seconds: 30,
@@ -439,10 +439,39 @@ print(json.dumps({
     sample_finished_at: "2030-01-01T00:02:49.999Z",
     last_success_at: "2030-01-01T00:02:49.999Z",
   });
-  const { api } = loadConsole();
+  const freshRendered = loadConsole(fleetPayload(), slowProducer);
+  const staleRendered = loadConsole(fleetPayload(), fastProducer);
+  const { api } = freshRendered;
   assert("producer-stamped cadence controls staleness both directions", [
     api.planeState(slowProducer, api.schemas.attention, 5000, NOW).stale === false,
     api.planeState(fastProducer, api.schemas.attention, 30000, NOW).stale === true,
+    !freshRendered.byId.attention.textContent.includes("STALE"),
+    staleRendered.byId.attention.textContent.includes("STALE · attention plane"),
+    staleRendered.byId.attention.textContent.includes("Last observed 11 sec"),
+    staleRendered.byId.attention.textContent.includes("Reason: age exceeds 10 sec freshness limit"),
+    !staleRendered.byId.attention.textContent.includes("stale now"),
+  ].every(Boolean));
+}
+
+// An absent or invalid producer stamp is unmeasurable, not evidence that a
+// just-observed plane is stale at a silently coerced zero-ms cadence.
+{
+  const missingCadence = attentionPayload({ items: [] });
+  delete missingCadence.cadence_seconds;
+  const zeroCadence = attentionPayload({ cadence_seconds: 0, items: [] });
+  const missing = loadConsole(fleetPayload(), missingCadence);
+  const zero = loadConsole(fleetPayload(), zeroCadence);
+  const missingState = missing.api.planeState(missingCadence, missing.api.schemas.attention, 5000, NOW);
+  assert("missing cadence fails closed with honest unknown wording", [
+    missingState.stale === true,
+    missingState.freshnessIssue === "cadence unknown",
+    missing.byId.attention.textContent.includes("CADENCE UNKNOWN · attention plane"),
+    missing.byId.attention.textContent.includes("Last observed 4 sec"),
+    missing.byId.attention.textContent.includes("Reason: cadence unknown"),
+    !missing.byId.attention.textContent.includes("STALE"),
+    !missing.byId.attention.textContent.includes("stale now"),
+    zero.byId.attention.textContent.includes("CADENCE UNKNOWN · attention plane"),
+    !zero.byId.attention.textContent.includes("stale now"),
   ].every(Boolean));
 }
 
@@ -1086,6 +1115,8 @@ async function testInteractiveHistoryAndKeyedRows() {
     const collapsedText = summary && summary.textContent;
     const collapsedRows = descendants(byId.fleet).filter((node) => node.className === "row");
     summary.click();
+    const openedText = summary.textContent;
+    const openedAria = summary.getAttribute("aria-expanded");
     const before = api.rowNode("term-5");
     const changed = terminals.map((row) => Object.assign({}, row));
     changed[5].ended_at = "2030-01-01T00:02:30Z";
@@ -1093,10 +1124,14 @@ async function testInteractiveHistoryAndKeyedRows() {
     const after = api.rowNode("term-5");
     const expandedSummary = descendants(byId.fleet).find((node) => node.className === "controller-toggle");
     assert("keyed update preserves open controller disclosure", [
+      collapsedText.startsWith("▸ "),
       collapsedText.includes("4 complete / 2 failed / newest 3 visible"),
       collapsedRows.some((node) => node.textContent.includes("live-always")),
       collapsedRows.length === 4,
+      openedText.startsWith("▾ "),
+      openedAria === "true",
       before && before === after,
+      expandedSummary.textContent.startsWith("▾ "),
       expandedSummary.getAttribute("aria-expanded") === "true",
       storage["goalflight-fleet-open-controllers"].includes("open|p|main"),
     ].every(Boolean));

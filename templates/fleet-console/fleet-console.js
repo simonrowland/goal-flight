@@ -142,6 +142,18 @@
     return hours < 48 ? hours + " h" : Math.round(hours / 24) + " d";
   }
 
+  /* Fast planes can be stale while the general UI age bucket still says
+   * "now". Preserve that friendly bucket elsewhere, but give freshness
+   * notices enough precision to explain a sub-minute stale verdict. */
+  function freshnessAgeFrom(iso, now) {
+    var parsed = parseTs(iso);
+    if (parsed == null) return "age unknown";
+    if (parsed - now > CLOCK_TOLERANCE_MS) return "clock ahead";
+    var elapsed = Math.max(0, now - parsed);
+    if (elapsed < 60 * 1000) return Math.ceil(elapsed / 1000) + " sec";
+    return ageFrom(iso, now);
+  }
+
   function whenFrom(value, now) {
     var parsed = typeof value === "number" ? value * 1000 : parseTs(value);
     if (parsed == null || isNaN(parsed)) return null;
@@ -180,22 +192,30 @@
              success - now > CLOCK_TOLERANCE_MS) issue = "clock ahead";
     else if (finished < started) issue = "timestamp order invalid";
     else if (typeof data.generation_id !== "string" || !data.generation_id) issue = "generation missing";
-    else if (cadenceMs == null) issue = "producer cadence missing";
+    else if (cadenceMs == null) issue = "cadence unknown";
 
     var age = success == null ? null : Math.max(0, now - success);
-    var stale = issue !== null || age > cadenceMs * 2;
+    /* Guard both operands explicitly: null cadence must not be coerced to a
+     * zero-ms threshold, and null age must not participate in arithmetic. */
+    var exceededCadence = age != null && cadenceMs != null && age > cadenceMs * 2;
+    var stale = issue !== null || exceededCadence;
     var observed = schemaMatches ? data.last_success_at : null;
+    var observedAge = freshnessAgeFrom(observed, now);
+    var reason = issue || (exceededCadence
+      ? "age exceeds " + (cadenceMs * 2 / 1000) + " sec freshness limit"
+      : null);
     return {
       stale: stale,
       freshnessIssue: issue,
-      label: stale ? (issue || "stale " + ageFrom(observed, now)) : "live",
+      label: stale ? (issue || "stale " + observedAge) : "live",
       detail: ((schemaMatches && data.producer && data.producer.plane) || "plane") +
         " · last success " + ageFrom(observed, now) +
         (schemaMatches && data.generation_id ? " · " + data.generation_id : "") +
         (schemaMatches && data.last_error ? " · last error: " + data.last_error : ""),
-      lastObservedAge: ageFrom(observed, now),
+      lastObservedAge: observedAge,
       lastError: schemaMatches ? data.last_error : null,
-      cadenceMs: cadenceMs
+      cadenceMs: cadenceMs,
+      reason: reason
     };
   }
 
@@ -206,9 +226,10 @@
 
   function staleNotice(plane, state) {
     var notice = el("div", "stale-state");
-    notice.appendChild(el("strong", null, "STALE · " + plane + " plane"));
+    var heading = state.freshnessIssue === "cadence unknown" ? "CADENCE UNKNOWN" : "STALE";
+    notice.appendChild(el("strong", null, heading + " · " + plane + " plane"));
     notice.appendChild(el("span", null, "Last observed " + state.lastObservedAge));
-    notice.appendChild(el("span", null, "Reason: " + (state.freshnessIssue || state.label)));
+    notice.appendChild(el("span", null, "Reason: " + (state.reason || state.label)));
     if (state.lastError) notice.appendChild(el("span", null, "Last error: " + state.lastError));
     notice.appendChild(el("span", "operator-action", "Next: " + operatorAction(plane)));
     return notice;
