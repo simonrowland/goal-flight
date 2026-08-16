@@ -130,13 +130,14 @@ plane_values() {
   LOG_VALUE="${LOG_DIR}/fleet-console-${PLANE_VALUE}-launchd.log"
   case "$PLANE_VALUE" in
     attention)
-      # Live read-only sample on 1,404 local rows / 1,954 registered projects
-      # measured 1.12s through the deployed wrapper (2026-08-16).
-      # Budget = ceil(2 × 1.12s) = 3s.
-      # Reserve = 1s for termination + atomic DEGRADED publication; cadence
-      # sanity: 5s > 3s budget + 1s reserve.
-      INTERVAL_VALUE=5
-      BUDGET_VALUE=3
+      # Budget from the PRODUCTION quantity under launchd: the tick measures
+      # ~1.3s by hand but exceeded a 3s budget under the agent on 2026-08-16
+      # (cold caches, contended CPU while the fleet plane runs). Interval 20s,
+      # budget 10s = ~3x the hand-measured tick with 10s of headroom for
+      # termination and atomic publication. Sanity: 1.3s < 3.1s < 10s < 20s.
+      # The renderer derives freshness from this stamped interval.
+      INTERVAL_VALUE=20
+      BUDGET_VALUE=10
       ;;
     fleet)
       # Budget from the PRODUCTION quantity under launchd, which runs slower
