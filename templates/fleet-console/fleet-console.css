@@ -53,6 +53,7 @@
     font-family:var(--mono); font-size:13px; line-height:1.5;
     font-variant-numeric:tabular-nums; -webkit-font-smoothing:antialiased;
   }
+  [hidden] { display:none !important; }
   .shell {
     max-width:1360px; margin:0 auto; padding:20px 20px 64px;
     display:grid; grid-template-columns:246px minmax(0,1fr); gap:20px; align-items:start;
@@ -179,6 +180,31 @@
   .glyph.unknown { border:1px dashed var(--clay); background:none; transform:rotate(45deg); }
 
   .did { font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .dispatch-cell { min-width:0; display:flex; align-items:center; flex-wrap:wrap; gap:4px; }
+  .dispatch-cell .did { min-width:0; }
+  .prompt-toggle, .controller-toggle, .task-chip {
+    font:inherit; color:var(--ink-2); background:none; border:0; cursor:pointer; padding:0;
+  }
+  .prompt-toggle { color:var(--amber); width:14px; flex:none; }
+  .task-list { display:inline-flex; gap:3px; flex-wrap:wrap; }
+  .task-chip {
+    border:1px solid var(--cyan); color:var(--cyan); border-radius:2px;
+    padding:0 4px; font-size:9px; line-height:1.45;
+  }
+  .task-chip:hover, .task-chip:focus-visible { background:var(--cyan-wash); outline:none; }
+  .prompt-body {
+    grid-column:1/-1; margin:2px 0 4px 21px; padding:9px 10px;
+    border:1px solid var(--edge); background:var(--ground-2); color:var(--ink-2);
+    white-space:pre-wrap; overflow-wrap:anywhere; max-height:24rem; overflow:auto;
+  }
+  .controller-summary {
+    padding:5px 12px 5px 33px; border-top:1px solid var(--edge-soft);
+    background:var(--ground-2); color:var(--ink-3); font-size:10px;
+  }
+  .controller-toggle { color:var(--ink-2); }
+  .authority-detail { display:block; margin-top:2px; color:var(--clay); font-size:9px; line-height:1.3; }
+  .history-more { text-transform:none; letter-spacing:0; }
+  .ticket-filter-clear { margin:0 0 8px auto; display:block; }
   .agent { font-size:11px; color:var(--ink-2); }
   .wire { font-size:9.5px; color:var(--ink-3); letter-spacing:.02em; }
   .wire b { color:var(--cyan); font-weight:600; }

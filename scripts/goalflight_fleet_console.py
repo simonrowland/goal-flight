@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Backend-only, shareable projections for the Goal Flight fleet console.
 
-This module is a consumer of the existing status authorities.  It does not
-read dispatch ledgers, status sidecars, tails, marker files, or process tables,
-and it deliberately does not classify workers.  Fleet and attention samples
-are independent so a fast mailbox refresh never pretends to refresh worker
-liveness.
+This module consumes the aggregate status authority, then uses bounded
+read-only journal and status-sidecar evidence to explain or reconcile authority
+disagreements. It does not inspect tails, marker bodies, or process tables, and
+it does not invent a worker classification. Fleet and attention samples remain
+independent so a fast mailbox refresh never pretends to refresh worker liveness.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import hashlib
 import json
 import math
 import re
+import shlex
 import sys
 import uuid
 from pathlib import Path
@@ -28,6 +29,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(ROOT))
 
 import goalflight_dispatch_states
+import goalflight_fleet_console_history
 import goalflight_fleet_status_cli
 import goalflight_journal
 import goalflight_messages
@@ -42,6 +44,7 @@ FLEET_SCHEMA = "goalflight.fleet-console.fleet.v2"
 ATTENTION_SCHEMA = "goalflight.fleet-console.attention.v1"
 PRODUCER_NAME = "goalflight_fleet_console.py"
 SCRIPT_GLOBALS = {"fleet": "GF_FLEET", "attention": "GF_ATTENTION"}
+PLANE_CADENCE_SECONDS = {"attention": 5, "fleet": 30}
 
 # Head of the recency-ordered project registry to sample per tick. See
 # _registered_projects for the measurement that sets this: the per-project
@@ -53,6 +56,12 @@ DEFAULT_MAX_PROJECTS = 12
 # newest generations per label: an ancient leaked-fd lock is deliberately
 # traded away for bounded fleet scan cost, with the omitted count published.
 ENDED_CONTROLLER_GENERATION_PROBE_LIMIT = 8
+
+# The short-poll mirror keeps a small warm terminal window for continuity.
+# Permanent immutable rows live in history-data.js instead: per project the
+# union is terminals ended in the last two hours plus the newest five.
+FAST_TERMINAL_RECENCY_SECONDS = 2 * 60 * 60
+FAST_TERMINAL_MIN_PER_PROJECT = 5
 
 CONTROLLER_LIVENESS_STATES = frozenset(
     {"ALIVE", "HUNG", "WAITING-ON-USER", "DEAD", "UNKNOWN"}
@@ -114,8 +123,10 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
     "last_success_at": None,
     "producer": {"name": None, "plane": None},
     "last_error": None,
+    "cadence_seconds": None,
     "registry_total": None,
     "registry_deep_sampled": None,
+    "history_excluded": None,
     "worker_age_filter": {
         "threshold_seconds": None,
         "default_enabled": None,
@@ -143,6 +154,7 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
     ],
     "remote": {
         "available": None,
+        "history_excluded": None,
         "nodes": [{"node_id": None, "dispatches": None, "auth_states": [None]}],
         "workers": [
             {
@@ -166,6 +178,8 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
                 "display_state": None,
                 "is_terminal": None,
                 "classification_conflict": None,
+                "authority_detail": None,
+                "authority_resolution": None,
                 "controller_session_digest": None,
                 "controller_pid": None,
                 "controller_label": None,
@@ -176,6 +190,8 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
                 "age_filter_reason": None,
                 "observed_live": None,
                 "observed_live_source": None,
+                "task_ids": [None],
+                "prompt_file": None,
                 "quarantine_reason": None,
                 "ssh_reachable": None,
                 "may_release": None,
@@ -189,6 +205,7 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             "registered": None,
             "last_seen": None,
             "skill_version": None,
+            "history_excluded": None,
             "queue": {
                 "depth": None,
                 "lanes": [{"agent": None, "count": None}],
@@ -230,6 +247,8 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
                     "display_state": None,
                     "is_terminal": None,
                     "classification_conflict": None,
+                    "authority_detail": None,
+                    "authority_resolution": None,
                     "controller_session_digest": None,
                     "controller_pid": None,
                     "controller_label": None,
@@ -240,6 +259,8 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
                     "age_filter_reason": None,
                     "observed_live": None,
                     "observed_live_source": None,
+                    "task_ids": [None],
+                    "prompt_file": None,
                 }
             ],
         }
@@ -266,6 +287,8 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             "display_state": None,
             "is_terminal": None,
             "classification_conflict": None,
+            "authority_detail": None,
+            "authority_resolution": None,
             "controller_session_digest": None,
             "controller_pid": None,
             "controller_label": None,
@@ -276,6 +299,8 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             "age_filter_reason": None,
             "observed_live": None,
             "observed_live_source": None,
+            "task_ids": [None],
+            "prompt_file": None,
         }
     ],
 }
@@ -288,6 +313,7 @@ ATTENTION_FIELD_ALLOWLIST: dict[str, Any] = {
     "last_success_at": None,
     "producer": {"name": None, "plane": None},
     "last_error": None,
+    "cadence_seconds": None,
     "controller_history_probes_truncated": None,
     "age_granularity": None,
     "items": [
@@ -358,6 +384,30 @@ def _validate_allowlist(value: Any, schema: Any, *, path: str) -> None:
     raise ProjectionSecurityError(f"{path}: invalid allowlist schema")
 
 
+def _is_listener_start_action(value: str) -> bool:
+    try:
+        argv = shlex.split(value)
+    except ValueError:
+        return False
+    if len(argv) not in {5, 7}:
+        return False
+    if not (
+        argv[0] == "python3"
+        and Path(argv[1]).resolve()
+        == Path(str(goalflight_messages.__file__)).resolve()
+        and argv[2:4] == ["listen-auto", "--project-root"]
+        and Path(argv[4]).is_absolute()
+    ):
+        return False
+    if len(argv) == 7 and argv[5] != "--controller-label":
+        return False
+    label = argv[6] if len(argv) == 7 else None
+    return value == goalflight_wake.listener_start_command(
+        argv[4],
+        controller_label=label,
+    )
+
+
 def _validate_no_absolute_paths(value: Any, *, path: str = "$") -> None:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -365,6 +415,14 @@ def _validate_no_absolute_paths(value: Any, *, path: str = "$") -> None:
     elif isinstance(value, list):
         for index, item in enumerate(value):
             _validate_no_absolute_paths(item, path=f"{path}[{index}]")
+    elif (
+        isinstance(value, str)
+        and path.endswith(".action")
+        and _is_listener_start_action(value)
+    ):
+        # HUNG recovery is intentionally an exact wake-layer command. This is
+        # the one narrow shareable-boundary exception to path redaction.
+        return
     elif isinstance(value, str) and _ABSOLUTE_PATH.search(value):
         raise ProjectionSecurityError(f"{path}: absolute path denied")
 
@@ -380,6 +438,11 @@ def _validate_scalar_types(value: Any, *, path: str = "$") -> None:
             if key == "generation_id":
                 if not isinstance(item, str) or not item:
                     raise ProjectionSecurityError(f"{item_path}: expected non-empty string")
+            if key == "cadence_seconds":
+                if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+                    raise ProjectionSecurityError(
+                        f"{item_path}: expected a positive integer"
+                    )
             if key == "controller_liveness_state":
                 if item not in CONTROLLER_LIVENESS_STATES:
                     raise ProjectionSecurityError(
@@ -389,6 +452,16 @@ def _validate_scalar_types(value: Any, *, path: str = "$") -> None:
                 if isinstance(item, bool) or not isinstance(item, int) or item < 0:
                     raise ProjectionSecurityError(
                         f"{item_path}: expected a non-negative integer or null"
+                    )
+            if key == "history_excluded" and item is not None:
+                if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                    raise ProjectionSecurityError(
+                        f"{item_path}: expected a non-negative integer or null"
+                    )
+            if key == "prompt_file" and item is not None:
+                if not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{32}\.txt", item) is None:
+                    raise ProjectionSecurityError(
+                        f"{item_path}: expected a hashed prompt filename or null"
                     )
             _validate_scalar_types(item, path=item_path)
     elif isinstance(value, list):
@@ -461,14 +534,27 @@ def _metadata(
     finished_at: str,
     errors: list[str],
 ) -> dict[str, Any]:
+    error = (
+        f"{errors[-1]} · {_operator_action(plane)}"
+        if errors
+        else None
+    )
     return {
         "generation_id": generation_id,
         "sample_started_at": started_at,
         "sample_finished_at": finished_at,
         "last_success_at": finished_at if not errors else None,
         "producer": {"name": PRODUCER_NAME, "plane": plane},
-        "last_error": errors[-1] if errors else None,
+        "last_error": error,
+        "cadence_seconds": PLANE_CADENCE_SECONDS[plane],
     }
+
+
+def _operator_action(plane: str) -> str:
+    return (
+        f"action: read ~/.goal-flight/fleet-console-{plane}-launchd.log; "
+        f"run scripts/install-fleet-console.sh --status --plane {plane}"
+    )
 
 
 def _capture(
@@ -495,6 +581,254 @@ def _canonical_root(value: object) -> str | None:
     if not isinstance(value, str) or not value:
         return None
     return str(Path(value).expanduser().resolve(strict=False))
+
+
+def _record_time(record: dict[str, Any]) -> dt.datetime | None:
+    for key in ("ended_at", "updated_at", "started_at"):
+        parsed = _parse_timestamp(record.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _fast_plane_records(
+    records: list[dict[str, Any]],
+    *,
+    sampled_at: dt.datetime | None,
+    journal_authority: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return the live rows plus the bounded warm terminal union.
+
+    Unresolved contradictions are retained as live/changing state. A row is
+    terminal only when the producer verdict says so, preventing an old stale
+    classification from hiding a record whose authorities still disagree.
+    """
+    live: list[dict[str, Any]] = []
+    terminal: list[dict[str, Any]] = []
+    for record in records:
+        journal = (journal_authority or {}).get(str(record.get("dispatch_id") or ""))
+        lifecycle = str((journal or {}).get("lifecycle_state") or "")
+        if lifecycle in goalflight_journal.ATTEMPT_FINAL_STATES:
+            verdict = {"is_terminal": True}
+        elif lifecycle in goalflight_journal.ATTEMPT_LIVE_STATES:
+            verdict = {"is_terminal": False}
+        else:
+            verdict = _worker_display_verdict(record)
+        (terminal if verdict["is_terminal"] is True else live).append(record)
+    terminal.sort(
+        key=lambda record: (
+            _record_time(record) is not None,
+            _record_time(record) or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+            str(record.get("dispatch_id") or ""),
+        ),
+        reverse=True,
+    )
+    newest_ids = {
+        id(record) for record in terminal[:FAST_TERMINAL_MIN_PER_PROJECT]
+    }
+    recent_ids: set[int] = set()
+    if sampled_at is not None:
+        cutoff = sampled_at - dt.timedelta(seconds=FAST_TERMINAL_RECENCY_SECONDS)
+        recent_ids = {
+            id(record)
+            for record in terminal
+            if (observed := _record_time(record)) is not None and observed >= cutoff
+        }
+    kept_terminal = [
+        record for record in terminal if id(record) in newest_ids or id(record) in recent_ids
+    ]
+    kept_ids = {id(record) for record in live + kept_terminal}
+    kept = [record for record in records if id(record) in kept_ids]
+    return kept, len(records) - len(kept)
+
+
+def _state_evidence(value: object) -> str | None:
+    normalized = goalflight_dispatch_states.normalize_dispatch_state(value)
+    if not normalized or normalized == "unknown":
+        return None
+    if goalflight_dispatch_states.is_terminal_state(value):
+        return "terminal:" + normalized
+    if (
+        goalflight_dispatch_states.is_running_state(value)
+        or goalflight_dispatch_states.is_attention_state(value)
+        or normalized in {"queued", "waiting", "starting"}
+    ):
+        return "live:" + normalized
+    return None
+
+
+def _authority_snapshot(
+    record: dict[str, Any],
+    *,
+    status: dict[str, Any] | None,
+    journal: dict[str, Any] | None,
+) -> tuple[dict[str, Any], str | None, str | None]:
+    """Resolve a display verdict and name every disagreeing source field."""
+    base = _worker_display_verdict(record)
+    evidence: list[tuple[str, object, str]] = []
+    for field in ("state", "terminal_state", "classification"):
+        value = record.get(field)
+        normalized = _state_evidence(value)
+        if normalized is not None:
+            evidence.append((f"ledger.{field}", value, normalized))
+    worker_alive = record.get("worker_still_alive")
+    if isinstance(worker_alive, bool):
+        terminal_kind = next(
+            (kind for _name, _value, kind in evidence if kind.startswith("terminal:")),
+            "terminal:worker_dead",
+        )
+        evidence.append(
+            (
+                "ledger.worker_still_alive",
+                worker_alive,
+                "live:running" if worker_alive else terminal_kind,
+            )
+        )
+
+    status_field = None
+    status_value = None
+    status_matches = (
+        isinstance(status, dict)
+        and bool(record.get("dispatch_id"))
+        and status.get("dispatch_id") == record.get("dispatch_id")
+    )
+    if status_matches:
+        assert isinstance(status, dict)
+        for field in ("terminal_pending_state", "terminal_state", "state"):
+            if _state_evidence(status.get(field)) is not None:
+                status_field, status_value = field, status.get(field)
+                evidence.append(
+                    (f"status.json.{field}", status_value, _state_evidence(status_value) or "")
+                )
+                break
+
+    journal_value = None
+    journal_field = None
+    lifecycle = str((journal or {}).get("lifecycle_state") or "")
+    if lifecycle in goalflight_journal.ATTEMPT_FINAL_STATES:
+        journal_field = "terminal_state"
+        journal_value = (journal or {}).get("terminal_state") or "terminal"
+    elif lifecycle in goalflight_journal.ATTEMPT_LIVE_STATES:
+        journal_field = "lifecycle_state"
+        journal_value = {
+            goalflight_journal.ATTEMPT_PREPARED: "queued",
+            goalflight_journal.ATTEMPT_STARTING: "starting",
+            goalflight_journal.ATTEMPT_RUNNING: "running",
+        }.get(lifecycle, "running")
+    if journal_field is not None:
+        evidence.append(
+            (
+                f"journal.{journal_field}",
+                journal_value,
+                _state_evidence(journal_value) or "",
+            )
+        )
+
+    distinct = {item[2] for item in evidence if item[2]}
+    detail = None
+    resolution = None
+    if len(distinct) > 1:
+        detail = "; ".join(f"{name}={value}" for name, value, _kind in evidence)
+
+    if journal_field is not None:
+        resolution = "journal"
+        if goalflight_dispatch_states.is_terminal_state(journal_value):
+            verdict = {
+                "display_state": (
+                    goalflight_dispatch_states.normalize_dispatch_state(journal_value)
+                    or "terminal"
+                ),
+                "is_terminal": True,
+                "classification_conflict": False,
+            }
+        else:
+            verdict = {
+                "display_state": (
+                    goalflight_dispatch_states.normalize_dispatch_state(journal_value)
+                    or "running"
+                ),
+                "is_terminal": False,
+                "classification_conflict": False,
+            }
+        if detail:
+            detail += "; reconciled by journal authority"
+        return verdict, detail, resolution
+
+    # A status sidecar is structurally newer only when both sources carry an
+    # observation time and the sidecar's is later. Otherwise disagreement is
+    # honestly unresolved rather than guessed away.
+    if status_field is not None:
+        assert isinstance(status, dict)
+        status_time = _parse_timestamp((status or {}).get("heartbeat_at"))
+        if status_time is None:
+            numeric_updated = _number((status or {}).get("updated_at"))
+            if numeric_updated is not None:
+                with contextlib.suppress(OverflowError, OSError, ValueError):
+                    status_time = dt.datetime.fromtimestamp(
+                        numeric_updated, tz=dt.timezone.utc
+                    )
+        ledger_time = _parse_timestamp(record.get("updated_at"))
+        if status_time is not None and ledger_time is not None and status_time > ledger_time:
+            resolution = "status.json:newer"
+            is_terminal = goalflight_dispatch_states.is_terminal_state(status_value)
+            verdict = {
+                "display_state": (
+                    goalflight_dispatch_states.normalize_dispatch_state(status_value)
+                    or ("terminal" if is_terminal else "running")
+                ),
+                "is_terminal": bool(is_terminal),
+                "classification_conflict": False,
+            }
+            if detail:
+                detail += "; reconciled by newer status.json observation"
+            return verdict, detail, resolution
+
+    if len(distinct) > 1:
+        base = {
+            "display_state": "unknown",
+            "is_terminal": None,
+            "classification_conflict": True,
+        }
+    return base, detail, resolution
+
+
+def _journal_authority_by_dispatch(
+    project_root: Path,
+    records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    dispatch_ids = sorted(
+        {
+            str(record.get("dispatch_id"))
+            for record in records
+            if record.get("dispatch_id")
+        }
+    )
+    if not dispatch_ids:
+        return {}
+    try:
+        authority = goalflight_journal.Journal.open_reader(project_root)
+        rows = []
+        # Keep bind counts comfortably below conservative SQLite builds while
+        # retaining one reader generation for the whole project.
+        for offset in range(0, len(dispatch_ids), 400):
+            chunk = dispatch_ids[offset : offset + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                authority.read_all(
+                    "SELECT dispatch_id, lifecycle_state, terminal_state, state_updated_at "
+                    "FROM dispatch_attempts WHERE dispatch_id IN ("
+                    + placeholders
+                    + ")",
+                    tuple(chunk),
+                )
+            )
+    except (goalflight_journal.JournalError, OSError, ValueError):
+        return {}
+    return {
+        str(item["dispatch_id"]): item
+        for row in rows
+        if (item := dict(row)).get("dispatch_id")
+    }
 
 
 def _worker_display_verdict(record: dict[str, Any]) -> dict[str, Any]:
@@ -911,11 +1245,12 @@ def _worker_observed_live_fields(
     record: dict[str, Any],
     *,
     sampled_at: dt.datetime | None,
+    status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     alive = record.get("worker_still_alive")
     if isinstance(alive, bool):
         return {"observed_live": alive, "observed_live_source": "identity_recheck"}
-    status = goalflight_status._status_json_payload(record)  # noqa: SLF001
+    status = status or {}
     dispatch_id = record.get("dispatch_id")
     if not status or not dispatch_id or status.get("dispatch_id") != dispatch_id:
         return {"observed_live": None, "observed_live_source": "unobserved"}
@@ -941,13 +1276,23 @@ def _worker_row(
     sampled_at: dt.datetime | None = None,
     controller_labels: dict[str, str] | None = None,
     controller_liveness: dict[str, str] | None = None,
+    journal_authority: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # Raw authority fields remain available for diagnosis, while renderers use
     # only the canonical verdict below for filtering and presentation.
     alive = record.get("worker_still_alive")
     started_at = _iso_timestamp(record.get("started_at"))
-    verdict = _worker_display_verdict(record)
-    observed_live = _worker_observed_live_fields(record, sampled_at=sampled_at)
+    status = goalflight_status._status_json_payload(record)  # noqa: SLF001
+    verdict, authority_detail, authority_resolution = _authority_snapshot(
+        record,
+        status=status,
+        journal=journal_authority,
+    )
+    observed_live = _worker_observed_live_fields(
+        record,
+        sampled_at=sampled_at,
+        status=status,
+    )
     os_sandbox = record.get("os_sandbox")
     sandbox_posture = os_sandbox if isinstance(os_sandbox, dict) else {}
     return {
@@ -975,6 +1320,8 @@ def _worker_row(
         "started_at": started_at,
         "ended_at": _iso_timestamp(record.get("ended_at")),
         **verdict,
+        "authority_detail": _display(authority_detail, limit=512),
+        "authority_resolution": _display(authority_resolution, limit=64),
         **_controller_fields(
             record,
             controller_labels or {},
@@ -986,6 +1333,21 @@ def _worker_row(
             is_terminal=verdict["is_terminal"],
             sampled_at=sampled_at,
             observed_live=observed_live["observed_live"],
+        ),
+        "task_ids": [
+            item
+            for item in (
+                _display(task_id, limit=64)
+                for task_id in (
+                    record.get("task_ids")
+                    if isinstance(record.get("task_ids"), list)
+                    else []
+                )
+            )
+            if item is not None
+        ],
+        "prompt_file": goalflight_fleet_console_history.prompt_filename(
+            record.get("dispatch_id")
         ),
     }
 
@@ -1095,10 +1457,15 @@ def _remote_row(
     sampled_at: dt.datetime | None = None,
 ) -> dict[str, Any]:
     data = payload if isinstance(payload, dict) else {}
+    raw_dispatches = [
+        row for row in data.get("dispatches") or [] if isinstance(row, dict)
+    ]
+    fast_dispatches, history_excluded = _fast_plane_records(
+        raw_dispatches,
+        sampled_at=sampled_at,
+    )
     workers = []
-    for row in data.get("dispatches") or []:
-        if not isinstance(row, dict):
-            continue
+    for row in fast_dispatches:
         reachable = row.get("ssh_reachable")
         worker = _worker_row(
             row,
@@ -1134,6 +1501,7 @@ def _remote_row(
         )
     return {
         "available": data.get("available") if isinstance(data.get("available"), bool) else False,
+        "history_excluded": history_excluded,
         "nodes": nodes,
         "workers": _sort_worker_rows(workers),
     }
@@ -1183,6 +1551,21 @@ def _roots_with_records(machine_status: object) -> set[str]:
             if root is not None:
                 roots.add(root)
     return roots
+
+
+def _without_terminal_history(machine_status: object) -> dict[str, Any]:
+    """Copy aggregate status with only non-terminal/unresolved dispatch rows."""
+    payload = dict(machine_status) if isinstance(machine_status, dict) else {}
+    dispatch = payload.get("dispatch")
+    dispatch = dict(dispatch) if isinstance(dispatch, dict) else {}
+    dispatch["records"] = [
+        record
+        for record in dispatch.get("records") or []
+        if isinstance(record, dict)
+        and _worker_display_verdict(record)["is_terminal"] is not True
+    ]
+    payload["dispatch"] = dispatch
+    return payload
 
 
 def _queue_summary(machine_status: object) -> tuple[dict[str, dict[str, Any]], int]:
@@ -1399,6 +1782,14 @@ def _project_rows(
         )
         for record in scoped_records:
             assigned_dispatches.add(id(record))
+        all_journal_authority = _journal_authority_by_dispatch(
+            Path(root), scoped_records
+        )
+        fast_records, history_excluded = _fast_plane_records(
+            scoped_records,
+            sampled_at=sampled_at,
+            journal_authority=all_journal_authority,
+        )
 
         if root in sampled_roots:
             session = _capture(
@@ -1418,7 +1809,7 @@ def _project_rows(
             milestone = {}
 
         controller_contexts = _controller_contexts_by_session(
-            Path(root), scoped_records
+            Path(root), fast_records
         )
         controller_labels = {
             session_id: str(context["label"])
@@ -1429,6 +1820,7 @@ def _project_rows(
             session_id: str(context["liveness_state"])
             for session_id, context in controller_contexts.items()
         }
+        journal_authority = all_journal_authority
         worker_rows = _sort_worker_rows(
             [
                 _worker_row(
@@ -1436,8 +1828,11 @@ def _project_rows(
                     sampled_at=sampled_at,
                     controller_labels=controller_labels,
                     controller_liveness=controller_liveness,
+                    journal_authority=journal_authority.get(
+                        str(record.get("dispatch_id") or "")
+                    ),
                 )
-                for record in scoped_records
+                for record in fast_records
             ]
         )
         projects.append(
@@ -1447,6 +1842,7 @@ def _project_rows(
                 "registered": root in registered_roots,
                 "last_seen": metadata.get("last_seen"),
                 "skill_version": metadata.get("skill_version"),
+                "history_excluded": history_excluded,
                 "session": _session_row(session),
                 "milestone": _milestone_row(milestone),
                 "workers": worker_rows,
@@ -1456,11 +1852,14 @@ def _project_rows(
     # Records with no usable project root remain visible without inventing a
     # controller/project association.  Object identity is stable across the
     # shallow scope_payload filtering used above.
+    unassigned_records, _unassigned_excluded = _fast_plane_records(
+        [record for record in records if id(record) not in assigned_dispatches],
+        sampled_at=sampled_at,
+    )
     unassigned = _sort_worker_rows(
         [
             _worker_row(record, sampled_at=sampled_at)
-            for record in records
-            if id(record) not in assigned_dispatches
+            for record in unassigned_records
         ]
     )
     projects.sort(
@@ -1539,6 +1938,14 @@ def build_fleet_plane(
     # the allowlist requires it, and an absent queue must read as depth 0, not
     # as a missing field a renderer has to guess about.
     _attach_queue_rows(projects, queue_by_root)
+    remote = _remote_row(remote_status, sampled_at=sampled_at)
+    # Only project history has a disclosure/fetch path in the renderer. Remote
+    # and unassigned retention remains bounded, but its omitted rows must not
+    # inflate the global '+N in history' claim into unreachable inventory.
+    history_excluded = sum(
+        max(0, int(project.get("history_excluded") or 0))
+        for project in projects
+    )
     finished_at = _utc_now()
     payload = {
         "schema": FLEET_SCHEMA,
@@ -1556,13 +1963,14 @@ def build_fleet_plane(
         # were listed.
         "registry_total": registry_total,
         "registry_deep_sampled": len(sampled_projects),
+        "history_excluded": history_excluded,
         "worker_age_filter": dict(WORKER_AGE_FILTER_POLICY),
         "machine": {
             **_machine_row(machine_status if isinstance(machine_status, dict) else {}),
             "queue_depth": queue_total,
         },
         "vendors": _vendor_rows(usage_rows),
-        "remote": _remote_row(remote_status, sampled_at=sampled_at),
+        "remote": remote,
         "projects": projects,
         "unassigned_workers": unassigned,
     }
@@ -1682,7 +2090,10 @@ def _controller_attention_rows(
                     ),
                     "seq": None,
                     "kind": "controller_hung",
-                    "action": "investigate",
+                    "action": goalflight_wake.listener_start_command(
+                        root,
+                        controller_label=label,
+                    ),
                     "observed_at": None,
                     "headline": _display(
                         f"Controller {label}{generation_text} is HUNG: "
@@ -1751,6 +2162,7 @@ def build_attention_plane(
             "rate_pressure": {},
         }
     )
+    machine_status = _without_terminal_history(machine_status)
     controller_probe_metadata = {"controller_history_probes_truncated": 0}
     items = _attention_rows(summary) + _controller_attention_rows(
         resolved_project_roots,
@@ -1830,6 +2242,7 @@ def build_degraded_plane(
             **metadata,
             "registry_total": None,
             "registry_deep_sampled": 0,
+            "history_excluded": None,
             # The age-filter policy is a property of this build, not of the
             # tick, so a degraded sample still declares it. Omitting it made a
             # budget timeout fail its own schema validation and raise instead of

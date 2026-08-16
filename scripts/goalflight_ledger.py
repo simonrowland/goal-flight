@@ -26,6 +26,7 @@ import uuid
 import goalflight_compat
 import goalflight_compat as fcntl
 import goalflight_dispatch_states
+import goalflight_fleet_console_history
 import goalflight_journal
 import goalflight_task
 import goalflight_terminal
@@ -832,6 +833,13 @@ def cmd_record(args: argparse.Namespace) -> int:
                 if key not in record and existing.get(key):
                     record[key] = existing[key]
         path = write_record(record)
+    try:
+        # Prompt mirrors are immutable and write-once. This derived projection
+        # must never make a dispatch fail; the hourly producer catch-up repairs
+        # a missed write.
+        goalflight_fleet_console_history.project_prompt(record)
+    except Exception:
+        pass
     payload = {"ok": True, "dispatch_id": dispatch_id, "path": str(path), "state": record["state"]}
     print(json.dumps(payload, indent=None if args.json else 2, sort_keys=True))
     return 0
@@ -916,6 +924,21 @@ def cmd_finish(args: argparse.Namespace) -> int:
         # Projection is derived and retried by reconciliation. The committed
         # journal state/outbox pair remains the terminal authority.
         pass
+    try:
+        goalflight_fleet_console_history.project_terminal(record)
+    except (KeyboardInterrupt, SystemExit):
+        # The terminal commit and wake projection above are already durable;
+        # say so before honoring the interrupt, so the abort cannot be read
+        # as a lost terminal.
+        print(
+            "history projection interrupted; terminal and wake are already durable",
+            file=sys.stderr,
+        )
+        raise
+    except BaseException:
+        # Like the terminal outbox projection, history is derived and repaired
+        # by the producer's slow catch-up sweep.
+        pass
     print(json.dumps({
         "ok": True,
         "dispatch_id": args.dispatch_id,
@@ -963,6 +986,7 @@ def reconcile_terminal_outbox(
     already_terminal = 0
     retryable = 0
     cas_lost = 0
+    history_records: list[dict] = []
     records = read_records()
     known_dispatch_ids = {
         str(record.get("dispatch_id"))
@@ -1131,6 +1155,7 @@ def reconcile_terminal_outbox(
                         }
                     )
                     write_record(current)
+                history_records.append(dict(current))
         elif result.cas_lost:
             cas_lost += 1
         else:
@@ -1140,6 +1165,20 @@ def reconcile_terminal_outbox(
 
         messages_dir = goalflight_messages.default_messages_dir()
     projected = authority.project_terminal_outbox(messages_dir=messages_dir)
+    # Match cmd_finish's ordering: the wake projection is latency-sensitive,
+    # while the console history blob is derived, blocking, and repairable by
+    # catch-up. A slow or broken history writer must never delay or fail wake.
+    for current in history_records:
+        try:
+            goalflight_fleet_console_history.project_terminal(current)
+        except (KeyboardInterrupt, SystemExit):
+            print(
+                "history projection interrupted; terminals and wake are already durable",
+                file=sys.stderr,
+            )
+            raise
+        except BaseException:
+            pass
     return {
         "ok": retryable == 0,
         "project_root": str(canonical_root),
@@ -1200,6 +1239,7 @@ def status_payload() -> dict:
             "controller_pid": r.get("controller_pid"),
             "controller_session_id": r.get("controller_session_id"),
             "prompt_path": r.get("prompt_path"),
+            "task_ids": r.get("task_ids") if isinstance(r.get("task_ids"), list) else [],
             "stdout_path": r.get("stdout_path"),
             "stderr_path": r.get("stderr_path"),
             "status_path": r.get("status_path"),

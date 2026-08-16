@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -112,6 +113,33 @@ def test_plane_locks_are_independent() -> None:
             attention_holder.release()
 
 
+def test_slow_catch_up_does_not_hold_the_fast_plane_lock() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        lock_was_free: list[bool] = []
+
+        def catch_up(*_args: object, **_kwargs: object) -> dict[str, int]:
+            contender = producer.PlaneLock(root / "locks", "fleet")
+            acquired = contender.acquire()
+            lock_was_free.append(acquired)
+            contender.release()
+            return {"prompts": 0, "history": 0}
+
+        with (
+            mock.patch.object(producer, "_run_with_budget", return_value=0),
+            mock.patch.object(producer.history, "catch_up_if_due", side_effect=catch_up),
+        ):
+            code = producer.run_tick(
+                "fleet",
+                output=root / "fleet-data.js",
+                lock_dir=root / "locks",
+                budget_s=0.5,
+            )
+
+    assert code == 0
+    assert lock_was_free == [True]
+
+
 def test_budget_timeout_publishes_degraded_sample_and_exit_one() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -142,7 +170,9 @@ def test_budget_timeout_publishes_degraded_sample_and_exit_one() -> None:
         assert elapsed < 1.5, f"budget failed to stop slow child: {elapsed:.3f}s"
         payload = _script_payload(output, "GF_FLEET")
         assert payload["last_success_at"] is None
-        assert payload["last_error"] == "budget:TimeoutExpired"
+        assert str(payload["last_error"]).startswith("budget:TimeoutExpired")
+        assert "fleet-console-fleet-launchd.log" in str(payload["last_error"])
+        assert "install-fleet-console.sh --status --plane fleet" in str(payload["last_error"])
         assert payload["registry_deep_sampled"] == 0
         assert payload["registry_total"] is None
         assert payload["projects"] == []

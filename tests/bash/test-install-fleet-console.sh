@@ -30,12 +30,12 @@ render_plane attention > "$attention"
 render_plane fleet > "$fleet"
 
 grep -qF '<string>com.goalflight.fleet-console.attention</string>' "$attention"
-grep -qF '<integer>30</integer>' "$attention"
-grep -qF '<string>25</string>' "$attention"
+grep -qF '<integer>5</integer>' "$attention"
+grep -qF '<string>2</string>' "$attention"
 grep -qF "<string>$SANDBOX_SKILL/templates/fleet-console/attention-data.js</string>" "$attention"
 grep -qF '<string>com.goalflight.fleet-console.fleet</string>' "$fleet"
-grep -qF '<integer>60</integer>' "$fleet"
-grep -qF '<string>50</string>' "$fleet"
+grep -qF '<integer>30</integer>' "$fleet"
+grep -qF '<string>2</string>' "$fleet"
 grep -qF "<string>$SANDBOX_SKILL/templates/fleet-console/fleet-data.js</string>" "$fleet"
 echo "test1 pass: separate launchd planes render their documented cadence and budget"
 
@@ -60,6 +60,21 @@ if command -v plutil >/dev/null 2>&1; then
   plutil -lint "$fleet" >/dev/null
 fi
 echo "test4 pass: each rendered plist is valid"
+
+printf '%s\n' '#!/bin/sh' 'if [ "${1:-}" = help ]; then echo bootstrap; fi' 'exit 0' > "$FAKEBIN/launchctl"
+chmod +x "$FAKEBIN/launchctl"
+HOME="$SANDBOX_HOME" \
+SKILL_ROOT="$SANDBOX_SKILL" \
+PATH="$FAKEBIN:/usr/bin:/bin" \
+bash "$SCRIPT" --plane fleet > "$TMPROOT/install.log"
+CONFIG_PATH="$SANDBOX_HOME/.goal-flight/fleet-console-output-dir"
+grep -qF "$SANDBOX_SKILL/templates/fleet-console" "$CONFIG_PATH"
+HOME="$SANDBOX_HOME" \
+SKILL_ROOT="$SANDBOX_SKILL" \
+PATH="$FAKEBIN:/usr/bin:/bin" \
+bash "$SCRIPT" --uninstall > "$TMPROOT/uninstall.log"
+[ ! -e "$CONFIG_PATH" ]
+echo "test5 pass: install opts history hooks in and full uninstall opts them out"
 
 echo
 echo "all install-fleet-console tests passed"

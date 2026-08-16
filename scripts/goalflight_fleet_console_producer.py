@@ -19,16 +19,18 @@ ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import goalflight_fleet_console as console
+import goalflight_fleet_console_history as history
+import goalflight_ledger
 
 
 PLANES = ("attention", "fleet")
 EXIT_OVERLAP = 75  # EX_TEMPFAIL: another tick owns this plane, so retry later.
 
-# Premise: the shipped renderer reloads attention every 5s and fleet every 60s.
-# Reserve 1s and 10s respectively for child termination plus the atomic DEGRADED
-# write: 5s - 1s = 4s; 60s - 10s = 50s. Unit check: seconds - seconds =
-# seconds. Sanity: the measured fleet sample is ~18s, so 18s < 50s < 60s.
-DEFAULT_BUDGET_S = {"attention": 4.0, "fleet": 50.0}
+# Post-split constructed samples build in under one second. A two-second budget
+# is twice that measured upper bound while leaving three seconds of the 5s
+# attention cadence and 28 seconds of the 30s fleet cadence for kill/reap plus
+# atomic DEGRADED publication.
+DEFAULT_BUDGET_S = {"attention": 2.0, "fleet": 2.0}
 
 
 class PlaneLock:
@@ -183,6 +185,22 @@ def run_tick(
                 file=sys.stderr,
             )
             return console.sample_exit_code(payload, plane)
+        # Catch-up is slow-plane work. Run it only after the fast file is
+        # current and outside the short-poll child deadline; event hooks make
+        # the hourly pass normally empty. Explicit producer_script injections
+        # are unit-test/fake producers and deliberately skip machine state.
+        if plane == "fleet" and producer_script is None and return_code == 0:
+            # The slow sweep owns a separate nonblocking lock. Release the
+            # cadence lock first so even an unusually large recovery pass can
+            # never suppress the next fast-plane publication.
+            lock.release()
+            try:
+                history.catch_up_if_due(
+                    goalflight_ledger.read_records,
+                    output_dir=resolved_output.parent,
+                )
+            except Exception as exc:
+                print(f"fleet-console history catch-up warning: {type(exc).__name__}", file=sys.stderr)
         return return_code
     finally:
         lock.release()

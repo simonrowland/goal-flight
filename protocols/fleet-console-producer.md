@@ -12,18 +12,32 @@ Two LaunchAgents keep the planes independent:
 
 | Plane | Label | Cadence | Budget | Output |
 |---|---|---:|---:|---|
-| attention | `com.goalflight.fleet-console.attention` | 5s | 4s | `templates/fleet-console/attention-data.js` |
-| fleet | `com.goalflight.fleet-console.fleet` | 60s | 50s | `templates/fleet-console/fleet-data.js` |
+| attention | `com.goalflight.fleet-console.attention` | 5s | 2s | `templates/fleet-console/attention-data.js` |
+| fleet | `com.goalflight.fleet-console.fleet` | 30s | 2s | `templates/fleet-console/fleet-data.js` |
 
-The cadence matches the renderer's reload cadence. Attention is a cheap mailbox
-summary and is wanted quickly. Fleet is measured at about 18 seconds and walks
-the bounded registry projection, so it runs less often.
+The cadence matches the renderer's reload cadence. Attention remains the 5s
+mailbox plane; fleet now reloads every 30s because immutable terminal history
+and prompt bodies no longer pollute either short poll.
 
-Budget derivation: reserve one second of a five-second attention interval and
-ten seconds of a sixty-second fleet interval for child termination and atomic
-DEGRADED publication. Thus `5s - 1s = 4s` and `60s - 10s = 50s`; units remain
-seconds. Sanity checks: `0 < 4 < 5`, and `18 < 50 < 60` (the fleet budget is
-about `50 / 18 = 2.8` times its measured normal runtime).
+Post-split constructed samples with 50 dispatch records complete each fast
+plane in under one second. Both child budgets are twice that asserted measured
+upper bound: `2 × 1s = 2s`. Attention retains `5s - 2s = 3s` and fleet retains
+`30s - 2s = 28s` for child termination and atomic DEGRADED publication. The
+hourly slow-history catch-up runs only after a successful fast publication and
+outside this deadline; normal dispatch/finish hooks make it a no-op.
+
+The installer records the console output directory in the user-private
+`~/.goal-flight/fleet-console-output-dir` file so dispatch/finish hooks can
+publish immutable prompts and history without coupling to a producer tick. A
+full uninstall removes that opt-in; catch-up still receives its output path
+directly from the fleet producer.
+
+Each payload stamps its producer cadence. The renderer declares a plane stale
+at two missed stamped intervals; its own reload timer is transport, never
+freshness authority. Every degraded `last_error` and stale banner names the
+plane launchd log plus `scripts/install-fleet-console.sh --status --plane
+<plane>`. HUNG controller attention carries the exact `listen-auto` command
+rendered by the wake layer.
 
 ## Tick behavior
 

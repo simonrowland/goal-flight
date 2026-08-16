@@ -30,6 +30,9 @@ function element(tagName) {
     attributes: {},
     _text: "",
     appendChild(child) {
+      if (child.parentNode) {
+        child.parentNode.children = child.parentNode.children.filter((item) => item !== child);
+      }
       this.children.push(child);
       child.parentNode = this;
       return child;
@@ -59,7 +62,7 @@ function descendants(node) {
   return [node].concat(node.children.flatMap(descendants));
 }
 
-function makeDom(fleet, attention) {
+function makeDom(fleet, attention, fetchImpl) {
   const byId = {};
   [
     "plane-status", "machine", "vendors", "attention", "fleet",
@@ -81,14 +84,19 @@ function makeDom(fleet, attention) {
     addEventListener() {},
   };
   const storage = {};
+  const warnings = [];
   const clock = { now: NOW };
   const window = {
     document,
     GF_FLEET: fleet || null,
     GF_ATTENTION: attention || null,
+    fetch: fetchImpl,
     localStorage: {
       getItem(key) { return Object.prototype.hasOwnProperty.call(storage, key) ? storage[key] : null; },
       setItem(key, value) { storage[key] = String(value); },
+    },
+    console: {
+      warn(...args) { warnings.push(args.map(String).join(" ")); },
     },
     intervals: [],
     timeouts: [],
@@ -108,11 +116,11 @@ function makeDom(fleet, attention) {
     parse(value) { clock.parses = (clock.parses || 0) + 1; return Date.parse(value); },
     now: () => clock.now,
   };
-  return { byId, document, documentElement, storage, window, clock, FakeDate };
+  return { byId, document, documentElement, storage, warnings, window, clock, FakeDate };
 }
 
-function loadConsole(fleet, attention) {
-  const dom = makeDom(fleet, attention);
+function loadConsole(fleet, attention, fetchImpl, source) {
+  const dom = makeDom(fleet, attention, fetchImpl);
   const context = vm.createContext({
     window: dom.window,
     document: dom.document,
@@ -123,7 +131,7 @@ function loadConsole(fleet, attention) {
     String,
     Set,
   });
-  vm.runInContext(JS, context, { filename: JS_PATH, timeout: 5000 });
+  vm.runInContext(source || JS, context, { filename: JS_PATH, timeout: 5000 });
   return { ...dom, api: context.window.GFFleetConsole };
 }
 
@@ -149,6 +157,8 @@ function workerRow(overrides) {
     display_state: "running",
     is_terminal: false,
     classification_conflict: false,
+    authority_detail: null,
+    authority_resolution: null,
     controller_session_digest: null,
     controller_pid: null,
     controller_label: null,
@@ -159,6 +169,8 @@ function workerRow(overrides) {
     age_filter_reason: "within_threshold",
     observed_live: true,
     observed_live_source: "identity_recheck",
+    task_ids: [],
+    prompt_file: null,
   }, overrides || {});
 }
 
@@ -171,8 +183,10 @@ function fleetPayload(overrides) {
     last_success_at: "2030-01-01T00:02:10Z",
     producer: { name: "goalflight_fleet_console.py", plane: "fleet" },
     last_error: null,
+    cadence_seconds: 30,
     registry_total: 1433,
     registry_deep_sampled: 12,
+    history_excluded: 0,
     worker_age_filter: {
       threshold_seconds: 43200,
       default_enabled: true,
@@ -193,13 +207,14 @@ function fleetPayload(overrides) {
       reset_at: 1893459600,
       flags: ["healthy"],
     }],
-    remote: { available: true, nodes: [], workers: [] },
+    remote: { available: true, history_excluded: 0, nodes: [], workers: [] },
     projects: [{
       project_id: "kiln-abc123",
       name: "kiln",
       registered: true,
       last_seen: "2030-01-01T00:02:00Z",
       skill_version: "1.3.0",
+      history_excluded: 0,
       queue: {
         depth: 7,
         lanes: [{ agent: "codex", count: 5 }, { agent: "claude", count: 2 }],
@@ -222,6 +237,7 @@ function fleetPayload(overrides) {
 function projectRow(workers, overrides) {
   return Object.assign({
     project_id: "p", name: "p", registered: true, last_seen: null, skill_version: null,
+    history_excluded: 0,
     queue: { depth: 0, lanes: [], oldest_created_at: null },
     session: { available: false, active: null, queue_state: null, queue_last_touched: null, active_leases: null },
     milestone: { available: false, active_cadence: null, commits_since: null, cadence: null, due: null },
@@ -238,6 +254,7 @@ function attentionPayload(overrides) {
     last_success_at: "2030-01-01T00:02:56Z",
     producer: { name: "goalflight_fleet_console.py", plane: "attention" },
     last_error: null,
+    cadence_seconds: 5,
     age_granularity: "minute",
     items: [{
       dispatch_id: "needs-review",
@@ -378,14 +395,14 @@ print(json.dumps({
 {
   const { api } = loadConsole();
   const fresh = fleetPayload({
-    sample_started_at: "2030-01-01T00:01:00.001Z",
-    sample_finished_at: "2030-01-01T00:01:00.001Z",
-    last_success_at: "2030-01-01T00:01:00.001Z",
+    sample_started_at: "2030-01-01T00:02:00Z",
+    sample_finished_at: "2030-01-01T00:02:00Z",
+    last_success_at: "2030-01-01T00:02:00Z",
   });
   const stale = fleetPayload({
-    sample_started_at: "2030-01-01T00:01:00Z",
-    sample_finished_at: "2030-01-01T00:01:00Z",
-    last_success_at: "2030-01-01T00:01:00Z",
+    sample_started_at: "2030-01-01T00:01:59.999Z",
+    sample_finished_at: "2030-01-01T00:01:59.999Z",
+    last_success_at: "2030-01-01T00:01:59.999Z",
   });
   const future = fleetPayload({
     sample_started_at: "2030-01-01T00:04:00Z",
@@ -404,6 +421,44 @@ print(json.dumps({
     api.planeState(stale, api.schemas.fleet, 60000, NOW).stale === true,
     api.planeState(future, api.schemas.fleet, 60000, NOW).freshnessIssue === "clock ahead",
     api.planeState(reversed, api.schemas.fleet, 60000, NOW).freshnessIssue === "timestamp order invalid",
+  ].every(Boolean));
+}
+
+// Staleness follows the producer stamp in both directions, never the renderer
+// reload interval supplied by the caller.
+{
+  const slowProducer = attentionPayload({
+    cadence_seconds: 30,
+    sample_started_at: "2030-01-01T00:02:01Z",
+    sample_finished_at: "2030-01-01T00:02:01Z",
+    last_success_at: "2030-01-01T00:02:01Z",
+  });
+  const fastProducer = attentionPayload({
+    cadence_seconds: 5,
+    sample_started_at: "2030-01-01T00:02:49.999Z",
+    sample_finished_at: "2030-01-01T00:02:49.999Z",
+    last_success_at: "2030-01-01T00:02:49.999Z",
+  });
+  const { api } = loadConsole();
+  assert("producer-stamped cadence controls staleness both directions", [
+    api.planeState(slowProducer, api.schemas.attention, 5000, NOW).stale === false,
+    api.planeState(fastProducer, api.schemas.attention, 30000, NOW).stale === true,
+  ].every(Boolean));
+}
+
+// A degraded payload and the stale banner both tell the operator exactly what
+// to read and which status command to run.
+{
+  const degraded = attentionPayload({
+    last_success_at: null,
+    last_error: "mail:RuntimeError · action: read ~/.goal-flight/fleet-console-attention-launchd.log; run scripts/install-fleet-console.sh --status --plane attention",
+    items: [],
+  });
+  const { byId } = loadConsole(fleetPayload(), degraded);
+  assert("constructed DEGRADED payload renders operator action", [
+    byId.attention.textContent.includes("~/.goal-flight/fleet-console-attention-launchd.log"),
+    byId.attention.textContent.includes("scripts/install-fleet-console.sh --status --plane attention"),
+    byId.attention.textContent.includes("Next:"),
   ].every(Boolean));
 }
 
@@ -436,7 +491,7 @@ print(json.dumps({
   const wrongSchema = fleetPayload({ schema: "goalflight.fleet-console.fleet.v1" });
   const failedSample = fleetPayload({
     last_success_at: null,
-    last_error: "local_status:PermissionError",
+    last_error: "local_status:PermissionError · action: read ~/.goal-flight/fleet-console-fleet-launchd.log; run scripts/install-fleet-console.sh --status --plane fleet",
   });
   const wrong = loadConsole(wrongSchema, attentionPayload()).byId;
   const failed = loadConsole(failedSample, attentionPayload()).byId;
@@ -747,6 +802,7 @@ print(json.dumps({
   ).byId.attention.textContent;
   assert("attention surfaces only positive controller history truncation", [
     truncated.includes("+4 older generations unprobed"),
+    truncated.includes("click Show more"),
     !complete.includes("older generations unprobed"),
   ].every(Boolean));
 }
@@ -850,7 +906,7 @@ print(json.dumps({
 {
   const { byId, document, window } = loadConsole(fleetPayload(), attentionPayload());
   const attentionTimer = window.intervals.find((timer) => timer.delay === 5000);
-  const fleetTimer = window.intervals.find((timer) => timer.delay === 60000);
+  const fleetTimer = window.intervals.find((timer) => timer.delay === 30000);
   attentionTimer.handler();
   const attentionScript = document.head.children[document.head.children.length - 1];
   window.GF_ATTENTION = attentionPayload({
@@ -897,9 +953,9 @@ print(json.dumps({
 // Age polling alone crosses stale thresholds even if neither file changes.
 {
   const fleet = fleetPayload({
-    sample_started_at: "2030-01-01T00:01:01Z",
-    sample_finished_at: "2030-01-01T00:01:01Z",
-    last_success_at: "2030-01-01T00:01:01Z",
+    sample_started_at: "2030-01-01T00:02:01Z",
+    sample_finished_at: "2030-01-01T00:02:01Z",
+    last_success_at: "2030-01-01T00:02:01Z",
   });
   const attention = attentionPayload({
     sample_started_at: "2030-01-01T00:02:51Z",
@@ -918,13 +974,15 @@ print(json.dumps({
   ].every(Boolean));
 }
 
-// Offline and injection boundaries remain unchanged by reload support.
+// Lazy fetches stay same-origin and all content sinks remain text-only.
 {
   const executableSink = /\.\s*innerHTML\b|\[\s*["']innerHTML["']\s*\]/;
-  const networkCall = /\b(?:fetch|XMLHttpRequest|WebSocket|EventSource)\s*\(/;
+  const remoteNetworkCall = /fetch\(\s*["'](?:https?:)?\/\//;
   assert("offline and text-only source contracts", [
     !executableSink.test(JS),
-    !networkCall.test(JS),
+    !remoteNetworkCall.test(JS),
+    JS.includes('window.fetch("./history-data.js?history_check="'),
+    JS.includes('window.fetch("./prompts/"'),
     !/(?:src|href)=["'](?:https?:)?\/\//.test(HTML),
     HTML.includes('<script src="./fleet-data.js"></script>'),
     HTML.includes('<script src="./attention-data.js"></script>'),
@@ -940,7 +998,7 @@ print(json.dumps({
   const dead = [
     "prose", "primary", "load-figure", "load-now", "load-of", "spark", "meter", "crit",
     "seatbars", "current", "pressure-dot", "age", "cpu", "cpubars", "lead", "kids",
-    "cpu-lbl", "thinking", "subproc", "idle", "phase", "done", "now", "ticket", "bug",
+    "cpu-lbl", "thinking", "subproc", "idle", "phase", "done", "now", "bug",
     "eye", "watched", "parked", "bad", "calm",
   ];
   const deadAbsent = dead.every((name) => !(new RegExp("\\." + name + "\\b")).test(cssWithoutComments));
@@ -954,7 +1012,7 @@ print(json.dumps({
     /\.controller-health\.hung\s*\{/.test(CSS),
     /\.controller-health\.dead\s*\{/.test(CSS),
     /\.panel-hd\s*\+\s*\.attn-row\s*\{[^}]*border-top:0/.test(CSS),
-    !/\[hidden\]\s*\{/.test(cssWithoutComments),
+    /\[hidden\]\s*\{/.test(cssWithoutComments),
     deadAbsent,
   ].every(Boolean));
 }
@@ -973,4 +1031,428 @@ print(json.dumps({
   ].every(Boolean));
 }
 
-console.log("OK: fleet console renderer tests pass");
+// Key dictionaries cannot be confused by JavaScript prototype property names.
+{
+  const hostileNames = fleetPayload({
+    history_excluded: 3,
+    vendors: [{ provider: "__proto__", seat_index: 1, remaining: "ok", reset_at: null, flags: [] }],
+    projects: [projectRow([workerRow({
+      dispatch_id: "prototype-controller",
+      controller_label: "__proto__",
+      controller_display: "__proto__",
+      controller_state: "label",
+    })])],
+  });
+  const { byId } = loadConsole(hostileNames, attentionPayload({ items: [] }));
+  assert("prototype-shaped labels render and the global excluded counter is visible", [
+    byId.vendors.textContent.includes("__proto__"),
+    byId.fleet.textContent.includes("prototype-controller"),
+    byId.machine.textContent.includes("+3 in history"),
+  ].every(Boolean));
+}
+
+async function testInteractiveHistoryAndKeyedRows() {
+  function terminalRow(id, state, taskIds) {
+    return workerRow({
+      dispatch_id: id,
+      state,
+      classification: state,
+      terminal_state: state,
+      display_state: state,
+      is_terminal: true,
+      worker_alive: false,
+      observed_live: false,
+      observed_live_source: "terminal_history",
+      age_filter_reason: "terminal",
+      controller_label: "main",
+      controller_display: "main",
+      controller_state: "label",
+      task_ids: taskIds || [],
+    });
+  }
+
+  // More than five terminals collapse by controller, live rows remain, and a
+  // keyed refresh preserves both the open state and the exact row node.
+  {
+    const terminals = [
+      terminalRow("term-0", "complete"), terminalRow("term-1", "complete"),
+      terminalRow("term-2", "complete"), terminalRow("term-3", "complete"),
+      terminalRow("term-4", "failed"), terminalRow("term-5", "failed"),
+    ];
+    const live = workerRow({ dispatch_id: "live-always", controller_label: "main", controller_display: "main", controller_state: "label" });
+    const initial = fleetPayload({ projects: [projectRow([live].concat(terminals))] });
+    const { api, byId, storage } = loadConsole(initial, attentionPayload({ items: [] }));
+    const summary = descendants(byId.fleet).find((node) => node.className === "controller-toggle");
+    const collapsedText = summary && summary.textContent;
+    const collapsedRows = descendants(byId.fleet).filter((node) => node.className === "row");
+    summary.click();
+    const before = api.rowNode("term-5");
+    const changed = terminals.map((row) => Object.assign({}, row));
+    changed[5].ended_at = "2030-01-01T00:02:30Z";
+    api.setFleetData(fleetPayload({ generation_id: "fleet-keyed-refresh", projects: [projectRow([live].concat(changed))] }));
+    const after = api.rowNode("term-5");
+    const expandedSummary = descendants(byId.fleet).find((node) => node.className === "controller-toggle");
+    assert("keyed update preserves open controller disclosure", [
+      collapsedText.includes("4 complete / 2 failed / newest 3 visible"),
+      collapsedRows.some((node) => node.textContent.includes("live-always")),
+      collapsedRows.length === 4,
+      before && before === after,
+      expandedSummary.getAttribute("aria-expanded") === "true",
+      storage["goalflight-fleet-open-controllers"].includes("open|p|main"),
+    ].every(Boolean));
+  }
+
+  // Mutation pair for keyed reconciliation: removing either appendChild move
+  // leaves the old row/band order or the old controller grouping in place.
+  {
+    const alpha = workerRow({ dispatch_id: "alpha", started_at: "2030-01-01T00:02:00Z" });
+    const beta = workerRow({ dispatch_id: "beta", started_at: "2030-01-01T00:01:00Z" });
+    const projectA = projectRow([alpha], { project_id: "a", name: "project-a" });
+    const projectB = projectRow([beta], { project_id: "b", name: "project-b" });
+    const { api, byId } = loadConsole(
+      fleetPayload({ projects: [projectA, projectB] }),
+      attentionPayload({ items: [] })
+    );
+
+    const betaNewest = Object.assign({}, beta, { started_at: "2030-01-01T00:02:30Z" });
+    api.setFleetData(fleetPayload({
+      generation_id: "fleet-band-reorder",
+      projects: [
+        projectRow([Object.assign({}, alpha, { started_at: "2030-01-01T00:00:30Z" })], { project_id: "a", name: "project-a" }),
+        projectRow([betaNewest], { project_id: "b", name: "project-b" }),
+      ],
+    }));
+    const bandNames = descendants(byId.fleet)
+      .filter((node) => node.className === "proj").map((node) => node.textContent);
+
+    const ownedA = terminalRow("owned-a", "complete");
+    Object.assign(ownedA, { controller_label: "owner-a", controller_display: "owner-a", controller_state: "label" });
+    const ownedB = terminalRow("owned-b", "complete");
+    Object.assign(ownedB, { controller_label: "owner-b", controller_display: "owner-b", controller_state: "label" });
+    api.setFleetData(fleetPayload({
+      generation_id: "fleet-owner-initial",
+      projects: [projectRow([ownedA, ownedB])],
+    }));
+    const regroupedA = Object.assign({}, ownedA, {
+      controller_label: "owner-b", controller_display: "owner-b", controller_state: "label",
+    });
+    api.setFleetData(fleetPayload({
+      generation_id: "fleet-owner-regrouped",
+      projects: [projectRow([ownedB, regroupedA])],
+    }));
+    const summaries = descendants(byId.fleet).filter((node) => node.className === "controller-toggle");
+    const regroupedRows = descendants(byId.fleet)
+      .filter((node) => node.className === "row" && node._gf && node._gf.worker)
+      .map((node) => node._gf.worker.dispatch_id);
+    assert("keyed reconciliation reorders bands and follows ownership regrouping", [
+      JSON.stringify(bandNames) === JSON.stringify(["project-b", "project-a"]),
+      summaries.length === 1,
+      summaries[0].textContent.includes("owner-b"),
+      JSON.stringify(regroupedRows) === JSON.stringify(["owned-b", "owned-a"]),
+    ].every(Boolean));
+  }
+
+  // The first show-more action fetches the slow blob once and pages older
+  // rows into the existing keyed project band.
+  {
+    const oldRows = [terminalRow("history-1", "complete"), terminalRow("history-2", "failed")];
+    const history = {
+      schema: "goalflight.fleet-console.history.v1",
+      updated_at: "2030-01-01T00:02:00Z",
+      projects: [{ project_id: "p", name: "p", workers: oldRows }],
+    };
+    const fetches = [];
+    const fetchStub = (url) => {
+      fetches.push(url);
+      return Promise.resolve({ text: () => Promise.resolve("window.GF_HISTORY = " + JSON.stringify(history) + ";\n") });
+    };
+    const fleet = fleetPayload({ projects: [projectRow([], { history_excluded: 2 })], history_excluded: 2 });
+    const { api, byId } = loadConsole(fleet, attentionPayload({ items: [] }), fetchStub);
+    assert("excluded-rows counter is visible before history fetch", byId.fleet.textContent.includes("+2 in history"));
+    await api.showMore("p");
+    assert("show-more lazily fetches and renders slow history", [
+      fetches.length === 1 && fetches[0].startsWith("./history-data.js?history_check="),
+      byId.fleet.textContent.includes("history-1"),
+      byId.fleet.textContent.includes("history-2"),
+      byId.fleet.textContent.includes("+2 in history · loaded"),
+    ].every(Boolean));
+  }
+
+  // Mutation pair: a page-lifetime cache reports '+3 loaded' from the stale
+  // two-row blob; keying it by the fleet exclusion counter forces a refetch.
+  {
+    const versions = [
+      [terminalRow("grow-1", "complete"), terminalRow("grow-2", "failed")],
+      [terminalRow("grow-1", "complete"), terminalRow("grow-2", "failed"), terminalRow("grow-3", "complete")],
+    ];
+    const fetches = [];
+    const fetchStub = (url) => {
+      const workers = versions[Math.min(fetches.length, versions.length - 1)];
+      fetches.push(url);
+      const history = {
+        schema: "goalflight.fleet-console.history.v1",
+        updated_at: "2030-01-01T00:02:00Z",
+        projects: [{ project_id: "p", name: "p", workers }],
+      };
+      return Promise.resolve({ text: () => Promise.resolve("window.GF_HISTORY = " + JSON.stringify(history) + ";\n") });
+    };
+    const { api, byId } = loadConsole(
+      fleetPayload({ projects: [projectRow([], { history_excluded: 2 })], history_excluded: 2 }),
+      attentionPayload({ items: [] }),
+      fetchStub
+    );
+    await api.showMore("p");
+    api.setFleetData(fleetPayload({
+      generation_id: "fleet-history-grew",
+      projects: [projectRow([], { history_excluded: 3 })],
+      history_excluded: 3,
+    }));
+    await api.showMore("p");
+    assert("history counter growth invalidates and refetches the cache", [
+      fetches.length === 2,
+      byId.fleet.textContent.includes("grow-3"),
+      byId.fleet.textContent.includes("+3 in history · loaded"),
+    ].every(Boolean));
+  }
+
+  // A response for the old counter may finish after the replacement fetch;
+  // the request key must prevent it from overwriting the newer cache.
+  {
+    const oldWorkers = [terminalRow("race-1", "complete"), terminalRow("race-2", "failed")];
+    const newWorkers = oldWorkers.concat([terminalRow("race-3", "complete")]);
+    const fetches = [];
+    let releaseOld;
+    function responseFor(workers) {
+      const history = {
+        schema: "goalflight.fleet-console.history.v1",
+        updated_at: "2030-01-01T00:02:00Z",
+        projects: [{ project_id: "p", name: "p", workers }],
+      };
+      return { text: () => Promise.resolve("window.GF_HISTORY = " + JSON.stringify(history) + ";\n") };
+    }
+    const fetchStub = (url) => {
+      fetches.push(url);
+      if (fetches.length === 1) {
+        return new Promise((resolve) => { releaseOld = () => resolve(responseFor(oldWorkers)); });
+      }
+      return Promise.resolve(responseFor(newWorkers));
+    };
+    const { api, byId } = loadConsole(
+      fleetPayload({ projects: [projectRow([], { history_excluded: 2 })], history_excluded: 2 }),
+      attentionPayload({ items: [] }),
+      fetchStub
+    );
+    const oldShowMore = api.showMore("p");
+    api.setFleetData(fleetPayload({
+      generation_id: "fleet-history-race-grew",
+      projects: [projectRow([], { history_excluded: 3 })],
+      history_excluded: 3,
+    }));
+    await api.showMore("p");
+    releaseOld();
+    await oldShowMore;
+    assert("stale in-flight history response cannot replace the newer counter", [
+      fetches.length === 2,
+      byId.fleet.textContent.includes("race-3"),
+      byId.fleet.textContent.includes("+3 in history · loaded"),
+    ].every(Boolean));
+  }
+
+  // The stale request's rejection must not clear a newer pending request.
+  // Removing the promise-identity guard makes the joined call issue fetch #3.
+  {
+    const workers = [
+      terminalRow("reject-1", "complete"),
+      terminalRow("reject-2", "failed"),
+      terminalRow("reject-3", "complete"),
+    ];
+    const history = {
+      schema: "goalflight.fleet-console.history.v1",
+      updated_at: "2030-01-01T00:02:00Z",
+      projects: [{ project_id: "p", name: "p", workers }],
+    };
+    const response = { text: () => Promise.resolve("window.GF_HISTORY = " + JSON.stringify(history) + ";\n") };
+    const fetches = [];
+    let rejectOld;
+    let resolveReplacement;
+    const fetchStub = (url) => {
+      fetches.push(url);
+      if (fetches.length === 1) {
+        return new Promise((_resolve, reject) => { rejectOld = reject; });
+      }
+      if (fetches.length === 2) {
+        return new Promise((resolve) => { resolveReplacement = () => resolve(response); });
+      }
+      return Promise.resolve(response);
+    };
+    const { api, byId } = loadConsole(
+      fleetPayload({ projects: [projectRow([], { history_excluded: 2 })], history_excluded: 2 }),
+      attentionPayload({ items: [] }),
+      fetchStub
+    );
+    const staleRequest = api.showMore("p").catch(() => null);
+    api.setFleetData(fleetPayload({
+      generation_id: "fleet-history-rejection-race",
+      projects: [projectRow([], { history_excluded: 3 })],
+      history_excluded: 3,
+    }));
+    const replacement = api.showMore("p");
+    rejectOld(new Error("stale history request failed"));
+    await staleRequest;
+    const joinedReplacement = api.showMore("p");
+    const fetchCountBeforeRelease = fetches.length;
+    resolveReplacement();
+    await Promise.all([replacement, joinedReplacement]);
+    assert("stale rejection cannot clear the replacement history promise", [
+      fetchCountBeforeRelease === 2,
+      fetches.length === 2,
+      byId.fleet.textContent.includes("reject-3"),
+    ].every(Boolean));
+  }
+
+  // Prompt text is fetched only on disclosure and enters the DOM via
+  // textContent, so hostile markup remains inert text.
+  {
+    const fetches = [];
+    const promptText = "<img src=x onerror=alert(1)>\noperator prompt";
+    const fetchStub = (url) => {
+      fetches.push(url);
+      return Promise.resolve({ text: () => Promise.resolve(promptText) });
+    };
+    const promptRow = workerRow({ dispatch_id: "prompt-worker", prompt_file: "safe-prompt.txt" });
+    const { api, byId } = loadConsole(
+      fleetPayload({ projects: [projectRow([promptRow])] }),
+      attentionPayload({ items: [] }),
+      fetchStub
+    );
+    assert("prompt is not fetched while disclosure is closed", fetches.length === 0);
+    await api.openPrompt("prompt-worker");
+    const body = descendants(byId.fleet).find((node) => node.className === "prompt-body");
+    assert("prompt disclosure fetches once and renders through textContent", [
+      fetches.length === 1 && fetches[0] === "./prompts/safe-prompt.txt",
+      body && body.textContent === promptText,
+      body.children.length === 0,
+    ].every(Boolean));
+  }
+
+  // Mutation pair: retaining the first rejected promise makes the second
+  // disclosure reuse the rejection instead of observing the recovery.
+  {
+    const fetches = [];
+    const fetchStub = (url) => {
+      fetches.push(url);
+      if (fetches.length === 1) return Promise.reject(new Error("transient prompt failure"));
+      return Promise.resolve({ text: () => Promise.resolve("prompt recovered") });
+    };
+    const promptRow = workerRow({ dispatch_id: "prompt-retry", prompt_file: "retry.txt" });
+    const { api, byId } = loadConsole(
+      fleetPayload({ projects: [projectRow([promptRow])] }),
+      attentionPayload({ items: [] }),
+      fetchStub
+    );
+    await api.openPrompt("prompt-retry");
+    await api.openPrompt("prompt-retry");
+    const body = descendants(byId.fleet).find((node) => node.className === "prompt-body");
+    assert("transient prompt rejection is evicted before retry", [
+      fetches.length === 2,
+      body && body.textContent === "prompt recovered",
+    ].every(Boolean));
+  }
+
+  // Mutation pair: without per-render pruning, a disappeared identity inherits
+  // its old open states. Quota failure must change only persistence, not the
+  // in-session pruning decision, and warn once for both set writes.
+  {
+    const terminals = Array.from({ length: 6 }, (_, index) => terminalRow(
+      "persist-" + index,
+      "complete"
+    ));
+    terminals[0].prompt_file = "persist.txt";
+    const fetchStub = () => Promise.resolve({ text: () => Promise.resolve("persisted prompt") });
+    const { api, byId, warnings, window } = loadConsole(
+      fleetPayload({ projects: [projectRow(terminals)] }),
+      attentionPayload({ items: [] }),
+      fetchStub
+    );
+    const summary = descendants(byId.fleet).find((node) => node.className === "controller-toggle");
+    summary.click();
+    await api.openPrompt("persist-0");
+    window.localStorage.setItem = () => { throw new Error("quota exceeded"); };
+    api.setFleetData(fleetPayload({ generation_id: "fleet-row-gone", projects: [] }));
+    api.setFleetData(fleetPayload({ generation_id: "fleet-row-returned", projects: [projectRow(terminals)] }));
+    const returnedSummary = descendants(byId.fleet).find((node) => node.className === "controller-toggle");
+    const returnedPrompt = descendants(byId.fleet).find((node) => node.className === "prompt-toggle");
+    assert("disclosure keys prune and quota failure warns once", [
+      returnedSummary.getAttribute("aria-expanded") === "false",
+      returnedPrompt.getAttribute("aria-expanded") === "false",
+      warnings.length === 1,
+      warnings[0].includes("localStorage"),
+    ].every(Boolean));
+  }
+
+  // Loaded slow-history rows count as current only while their project remains
+  // in the fleet payload. Removing the currentProjectIds guard recreates the
+  // stale prompt disclosure when the project disappears and later returns.
+  {
+    const historyWorker = terminalRow("history-disclosure", "complete");
+    historyWorker.prompt_file = "history-disclosure.txt";
+    const history = {
+      schema: "goalflight.fleet-console.history.v1",
+      updated_at: "2030-01-01T00:02:00Z",
+      projects: [{ project_id: "p", name: "p", workers: [historyWorker] }],
+    };
+    const fetchStub = (url) => url.startsWith("./history-data.js")
+      ? Promise.resolve({ text: () => Promise.resolve("window.GF_HISTORY = " + JSON.stringify(history) + ";\n") })
+      : Promise.resolve({ text: () => Promise.resolve("history prompt") });
+    const currentProject = projectRow([], { history_excluded: 1 });
+    const { api, byId } = loadConsole(
+      fleetPayload({ projects: [currentProject], history_excluded: 1 }),
+      attentionPayload({ items: [] }),
+      fetchStub
+    );
+    await api.showMore("p");
+    await api.openPrompt("history-disclosure");
+    api.setFleetData(fleetPayload({ generation_id: "history-project-gone", projects: [], history_excluded: 1 }));
+    api.setFleetData(fleetPayload({ generation_id: "history-project-returned", projects: [currentProject], history_excluded: 1 }));
+    const returnedPrompt = descendants(byId.fleet).find((node) => node.className === "prompt-toggle");
+    assert("history disclosure key prunes when its project leaves the fleet payload", [
+      returnedPrompt,
+      returnedPrompt.getAttribute("aria-expanded") === "false",
+    ].every(Boolean));
+  }
+
+  // Task chips are scalar buttons; clicking one filters every project to the
+  // ticket's linked dispatches and exposes a clear-filter control.
+  {
+    const first = workerRow({ dispatch_id: "ticket-one", task_ids: ["b-151"] });
+    const second = workerRow({ dispatch_id: "ticket-two", task_ids: ["t-243"] });
+    const conflict = workerRow({
+      dispatch_id: "named-conflict",
+      task_ids: ["b-151"],
+      display_state: "unknown",
+      classification_conflict: true,
+      authority_detail: "status.json.state=running; ledger.terminal_state=failed",
+    });
+    const { api, byId } = loadConsole(
+      fleetPayload({ projects: [projectRow([first, second, conflict])] }),
+      attentionPayload({ items: [] })
+    );
+    const chip = descendants(byId.fleet).find((node) => node.className === "task-chip" && node.textContent === "b-151");
+    chip.click();
+    const detail = descendants(byId.fleet).find((node) => node.className === "authority-detail");
+    assert("ticket chip filters dispatches and named authority detail renders", [
+      api.rowNode("ticket-one") !== null,
+      api.rowNode("ticket-two") === null,
+      api.rowNode("named-conflict") !== null,
+      byId.fleet.textContent.includes("Ticket b-151 · clear filter"),
+      detail && detail.textContent.includes("status.json.state") && detail.textContent.includes("ledger.terminal_state"),
+    ].every(Boolean));
+  }
+}
+
+testInteractiveHistoryAndKeyedRows().then(function () {
+  console.log("OK: fleet console renderer tests pass");
+}).catch(function (error) {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});

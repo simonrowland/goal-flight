@@ -22,12 +22,13 @@ Usage:
   scripts/install-fleet-console.sh [--plane attention|fleet] --uninstall
 
 Installs two per-user launchd agents by default:
-  attention  every 30s, with a 25s wall-clock budget
-  fleet      every 60s, with a 50s wall-clock budget
+  attention  every 5s, with a 2s wall-clock budget
+  fleet      every 30s, with a 2s wall-clock budget
 
 Environment:
   SKILL_ROOT or GOALFLIGHT_SKILL_ROOT       override ~/.goal-flight/skill
   GOALFLIGHT_FLEET_CONSOLE_OUTPUT_DIR       override <skill-root>/templates/fleet-console
+  GOALFLIGHT_FLEET_CONSOLE_CONFIG           override ~/.goal-flight/fleet-console-output-dir
   GOALFLIGHT_FLEET_CONSOLE_LOCK_DIR         override ~/.goal-flight/locks
   GOALFLIGHT_FLEET_CONSOLE_LOG_DIR          override ~/.goal-flight
   GOALFLIGHT_FLEET_CONSOLE_PATH             override rendered launchd PATH
@@ -86,6 +87,7 @@ if [ -z "$SKILL_ROOT" ]; then
 fi
 SKILL_ROOT="$(expand_home "$SKILL_ROOT")"
 OUTPUT_DIR="$(expand_home "${GOALFLIGHT_FLEET_CONSOLE_OUTPUT_DIR:-${SKILL_ROOT}/templates/fleet-console}")"
+CONFIG_PATH="$(expand_home "${GOALFLIGHT_FLEET_CONSOLE_CONFIG:-${HOME_DIR}/.goal-flight/fleet-console-output-dir}")"
 LOCK_DIR="$(expand_home "${GOALFLIGHT_FLEET_CONSOLE_LOCK_DIR:-${HOME_DIR}/.goal-flight/locks}")"
 LOG_DIR="$(expand_home "${GOALFLIGHT_FLEET_CONSOLE_LOG_DIR:-${HOME_DIR}/.goal-flight}")"
 LAUNCH_DOMAIN="gui/$(id -u)"
@@ -128,22 +130,18 @@ plane_values() {
   LOG_VALUE="${LOG_DIR}/fleet-console-${PLANE_VALUE}-launchd.log"
   case "$PLANE_VALUE" in
     attention)
-      # Premise: a real attention sample measured 12.7s on a live machine
-      # with ~1.9k registered lease generations (2026-08-15), so the old
-      # 5s/4s pair published DEGRADED stubs on every tick. Cadence follows
-      # the measurement: interval 30s, budget = interval - 5s reserve for
-      # timeout cleanup and atomic publication = 25s. Units remain seconds;
-      # sanity: 12.7s < 25s < 30s (~2x measured runtime). b-151 tracks
-      # optimizing the sample back toward a faster cadence.
-      INTERVAL_VALUE=30
-      BUDGET_VALUE=25
+      # Post-split constructed attention samples with 50 dispatches finish in
+      # <1s. Budget = 2 × the asserted 1s measured upper bound = 2s, leaving
+      # 5s - 2s = 3s for termination and atomic DEGRADED publication.
+      INTERVAL_VALUE=5
+      BUDGET_VALUE=2
       ;;
     fleet)
-      # Premise: renderer cadence is 60s and a normal fleet sample is ~18s.
-      # Reserve 10s for timeout cleanup/publication: 60s - 10s = 50s. Units
-      # remain seconds; sanity: 18s < 50s < 60s (~2.8x normal runtime).
-      INTERVAL_VALUE=60
-      BUDGET_VALUE=50
+      # The same post-split 50-dispatch sample builds fleet-data.js in <1s.
+      # Budget = 2 × 1s = 2s; the hourly slow-history catch-up runs only after
+      # fast publication and outside this deadline. 2s < 30s leaves 28s.
+      INTERVAL_VALUE=30
+      BUDGET_VALUE=2
       ;;
   esac
   PLIST_PATH_VALUE="${HOME_DIR}/Library/LaunchAgents/${LABEL_VALUE}.plist"
@@ -250,12 +248,16 @@ if [ "$UNINSTALL" -eq 1 ]; then
   done <<EOF
 $(planes)
 EOF
+  if [ -z "$SELECTED_PLANE" ]; then
+    rm -f "$CONFIG_PATH"
+    echo "fleet-console output config removed (${CONFIG_PATH})"
+  fi
   exit 0
 fi
 
 require_launchctl
 [ -f "$TEMPLATE" ] || { echo "ERROR: missing template: $TEMPLATE" >&2; exit 2; }
-mkdir -p "${HOME_DIR}/Library/LaunchAgents" "$LOG_DIR" "$LOCK_DIR" "$OUTPUT_DIR"
+mkdir -p "${HOME_DIR}/Library/LaunchAgents" "$LOG_DIR" "$LOCK_DIR" "$OUTPUT_DIR" "$(dirname "$CONFIG_PATH")"
 while IFS= read -r plane; do
   plane_values "$plane"
   render_plist "$plane" > "$PLIST_PATH_VALUE"
@@ -271,3 +273,11 @@ while IFS= read -r plane; do
 done <<EOF
 $(planes)
 EOF
+CONFIG_TMP="$(mktemp "${CONFIG_PATH}.tmp.XXXXXX")"
+trap 'if [ -n "${CONFIG_TMP:-}" ]; then rm -f -- "$CONFIG_TMP"; fi' EXIT
+printf '%s\n' "$OUTPUT_DIR" > "$CONFIG_TMP"
+chmod 600 "$CONFIG_TMP"
+mv "$CONFIG_TMP" "$CONFIG_PATH"
+CONFIG_TMP=""
+trap - EXIT
+echo "output config: ${CONFIG_PATH}"

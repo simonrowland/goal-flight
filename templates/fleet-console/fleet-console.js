@@ -7,10 +7,10 @@
     attention: "goalflight.fleet-console.attention.v1"
   };
   /* Each mirror reloads once per producer cadence. Seconds × 1,000 ms/s gives
-   * 5 × 1,000 = 5,000 ms for attention and 60 × 1,000 = 60,000 ms for fleet;
+   * 5 × 1,000 = 5,000 ms for attention and 30 × 1,000 = 30,000 ms for fleet;
    * one interval therefore observes the next scheduled publication without
    * coupling the fast mailbox plane to the slower fleet sample. */
-  var CADENCES = { attention: 5000, fleet: 60000 };
+  var CADENCES = { attention: 5000, fleet: 30000 };
   var CLOCK_TOLERANCE_MS = 2000;
   var MAX_VISIBLE_WORKERS = 200;
   var MAX_VISIBLE_BANDS = 50;
@@ -49,6 +49,47 @@
   var lastAgeSignature = null;
   var themeMode = "auto";
   var ageFilterEnabled = true;
+  var ticketFilter = null;
+  var historyPayload = null;
+  var historyPromise = null;
+  var historyPayloadKey = null;
+  var historyPages = Object.create(null);
+  var historyPageSize = 20;
+  var promptCache = Object.create(null);
+  var promptPromises = Object.create(null);
+  var bandNodes = Object.create(null);
+  var storageWriteWarned = false;
+
+  function storedSet(key) {
+    try {
+      var value = JSON.parse(window.localStorage.getItem(key) || "[]");
+      return new Set(Array.isArray(value) ? value.map(String) : []);
+    } catch (_error) {
+      return new Set();
+    }
+  }
+
+  var openControllers = storedSet("goalflight-fleet-open-controllers");
+  var openPrompts = storedSet("goalflight-fleet-open-prompts");
+
+  function persistValue(key, value) {
+    try {
+      window.localStorage.setItem(key, value);
+      return true;
+    } catch (error) {
+      if (!storageWriteWarned) {
+        storageWriteWarned = true;
+        if (window.console && typeof window.console.warn === "function") {
+          window.console.warn("Goal Flight localStorage unavailable; disclosure state is session-only.", error);
+        }
+      }
+      return false;
+    }
+  }
+
+  function persistSet(key, values) {
+    persistValue(key, JSON.stringify(Array.from(values)));
+  }
 
   function el(tag, cls, txt) {
     var node = document.createElement(tag);
@@ -110,10 +151,11 @@
     return hours < 48 ? "in " + hours + " h" : "in " + Math.round(hours / 24) + " d";
   }
 
-  /* Stale after two missed producer cadences. Units: cadence ms × 2 = ms;
-   * 5 s attention becomes stale at 10 s, while 60 s fleet becomes stale at
-   * 120 s. A sample one millisecond younger remains usable. */
-  function planeState(payload, schema, cadenceMs, now) {
+  /* Stale after two missed PRODUCER-stamped cadences. Units: stamped seconds ×
+   * 1,000 ms/s × 2 = ms. The renderer reload interval is intentionally not an
+   * authority: changing a producer schedule without this stamp once made every
+   * healthy sample look stale. */
+  function planeState(payload, schema, _reloadCadenceMs, now) {
     var present = payload && typeof payload === "object" && !Array.isArray(payload);
     var data = present ? payload : {};
     var schemaMatches = present && data.schema === schema;
@@ -123,6 +165,10 @@
     var started = schemaMatches ? parseTs(data.sample_started_at) : null;
     var finished = schemaMatches ? parseTs(data.sample_finished_at) : null;
     var success = schemaMatches ? parseTs(data.last_success_at) : null;
+    var cadenceSeconds = schemaMatches ? Number(data.cadence_seconds) : NaN;
+    var cadenceMs = Number.isFinite(cadenceSeconds) && cadenceSeconds > 0
+      ? cadenceSeconds * 1000
+      : null;
     var issue = null;
 
     if (!present) issue = "payload absent";
@@ -133,9 +179,10 @@
              success - now > CLOCK_TOLERANCE_MS) issue = "clock ahead";
     else if (finished < started) issue = "timestamp order invalid";
     else if (typeof data.generation_id !== "string" || !data.generation_id) issue = "generation missing";
+    else if (cadenceMs == null) issue = "producer cadence missing";
 
     var age = success == null ? null : Math.max(0, now - success);
-    var stale = issue !== null || age >= cadenceMs * 2;
+    var stale = issue !== null || age > cadenceMs * 2;
     var observed = schemaMatches ? data.last_success_at : null;
     return {
       stale: stale,
@@ -146,8 +193,14 @@
         (schemaMatches && data.generation_id ? " · " + data.generation_id : "") +
         (schemaMatches && data.last_error ? " · last error: " + data.last_error : ""),
       lastObservedAge: ageFrom(observed, now),
-      lastError: schemaMatches ? data.last_error : null
+      lastError: schemaMatches ? data.last_error : null,
+      cadenceMs: cadenceMs
     };
+  }
+
+  function operatorAction(plane) {
+    return "Read ~/.goal-flight/fleet-console-" + plane +
+      "-launchd.log; run scripts/install-fleet-console.sh --status --plane " + plane + ".";
   }
 
   function staleNotice(plane, state) {
@@ -156,6 +209,7 @@
     notice.appendChild(el("span", null, "Last observed " + state.lastObservedAge));
     notice.appendChild(el("span", null, "Reason: " + (state.freshnessIssue || state.label)));
     if (state.lastError) notice.appendChild(el("span", null, "Last error: " + state.lastError));
+    notice.appendChild(el("span", "operator-action", "Next: " + operatorAction(plane)));
     return notice;
   }
 
@@ -166,11 +220,13 @@
   }
 
   function visibleWorker(worker) {
-    return worker && typeof worker === "object" && worker.is_terminal !== true;
+    return worker && typeof worker === "object";
   }
 
   function displayedWorker(worker) {
-    return visibleWorker(worker) && (!ageFilterEnabled || worker.age_filter_match !== true);
+    return visibleWorker(worker) &&
+      (worker.is_terminal === true || !ageFilterEnabled || worker.age_filter_match !== true) &&
+      (!ticketFilter || (worker.task_ids || []).map(String).indexOf(ticketFilter) !== -1);
   }
 
   function workerAgeSummary() {
@@ -180,7 +236,7 @@
     });
     rows = rows.concat(FLEET.unassigned_workers || [], ((FLEET.remote || {}).workers) || []);
     var summary = { matches: 0, hidden: 0, unknown: 0 };
-    rows.filter(visibleWorker).forEach(function (worker) {
+    rows.filter(function (worker) { return visibleWorker(worker) && worker.is_terminal !== true; }).forEach(function (worker) {
       if (worker.age_filter_match === true) summary.matches += 1;
       if (worker.age_filter_reason === "started_at_unknown") summary.unknown += 1;
     });
@@ -201,7 +257,7 @@
     var note = document.getElementById("age-filter-note");
     if (!button || !note) return;
     if (fleetState.stale) {
-      button.textContent = "Older rows: unavailable";
+      button.textContent = "Age filter: unavailable";
       button.setAttribute("aria-pressed", ageFilterEnabled ? "true" : "false");
       note.textContent = "Fleet data stale; age filter not applied.";
       return;
@@ -210,7 +266,8 @@
     button.textContent = "Non-terminal / unresolved >" + ageThresholdLabel() + ": " +
       (ageFilterEnabled ? "hidden · " + summary.hidden + " hidden" : "shown");
     button.setAttribute("aria-pressed", ageFilterEnabled ? "true" : "false");
-    note.textContent = "Observed live first · otherwise newest started · unknown start time stays visible.";
+    note.textContent = (ticketFilter ? "Ticket " + ticketFilter + " selected · " : "") +
+      "Observed live first · otherwise newest started · unknown start time stays visible.";
   }
 
   function glyphFor(worker) {
@@ -218,61 +275,298 @@
     return DISPLAY_GLYPHS[worker.display_state] || "unknown";
   }
 
-  function appendWorkerTable(parent, workers, now, budget) {
-    var rows = el("div", "rows scroll-frame");
-    if (!workers.length) {
-      rows.appendChild(el("div", "quiet-state", "No active or unresolved worker rows."));
+  function controllerKey(worker) {
+    return textValue(worker.controller_label || worker.controller_session_digest ||
+      worker.controller_display || "unowned");
+  }
+
+  function controllerExpanded(key, terminalCount) {
+    if (openControllers.has("open|" + key)) return true;
+    if (openControllers.has("closed|" + key)) return false;
+    return terminalCount <= 5;
+  }
+
+  function setControllerExpanded(key, expanded) {
+    openControllers.delete("open|" + key);
+    openControllers.delete("closed|" + key);
+    openControllers.add((expanded ? "open|" : "closed|") + key);
+    persistSet("goalflight-fleet-open-controllers", openControllers);
+  }
+
+  function workerKey(worker) {
+    return textValue(worker.dispatch_id) + "|" + textValue(worker.node_id);
+  }
+
+  function setHidden(node, hidden) {
+    if (hidden) node.setAttribute("hidden", "hidden");
+    else node.removeAttribute("hidden");
+  }
+
+  function fetchPrompt(entry) {
+    var worker = entry._gf.worker;
+    var filename = worker && worker.prompt_file;
+    var key = workerKey(worker || {});
+    if (!filename || typeof window.fetch !== "function") return Promise.resolve(null);
+    if (Object.prototype.hasOwnProperty.call(promptCache, filename)) {
+      entry._gf.prompt.textContent = promptCache[filename];
+      return Promise.resolve(promptCache[filename]);
+    }
+    if (!promptPromises[filename]) {
+      promptPromises[filename] = window.fetch("./prompts/" + encodeURIComponent(filename))
+        .then(function (response) {
+          if (!response || typeof response.text !== "function") throw new Error("prompt response unreadable");
+          if (response.ok === false) throw new Error("prompt response unavailable");
+          return response.text();
+        })
+        .then(function (text) {
+          promptCache[filename] = String(text);
+          return promptCache[filename];
+        })
+        .catch(function (error) {
+          delete promptPromises[filename];
+          throw error;
+        });
+    }
+    return promptPromises[filename].then(function (text) {
+      if (entry._gf.worker && workerKey(entry._gf.worker) === key) {
+        entry._gf.prompt.textContent = text;
+      }
+      return text;
+    }).catch(function () {
+      entry._gf.prompt.textContent = "Prompt unavailable.";
+      return null;
+    });
+  }
+
+  function setPromptOpen(entry, open) {
+    var worker = entry._gf.worker || {};
+    var key = workerKey(worker);
+    if (open) openPrompts.add(key); else openPrompts.delete(key);
+    persistSet("goalflight-fleet-open-prompts", openPrompts);
+    entry._gf.promptToggle.textContent = open ? "▾" : "▸";
+    entry._gf.promptToggle.setAttribute("aria-expanded", open ? "true" : "false");
+    setHidden(entry._gf.prompt, !open);
+    return open ? fetchPrompt(entry) : Promise.resolve(null);
+  }
+
+  function createWorkerEntry() {
+    var entry = el("div", "row");
+    var row = entry;
+    var glyph = el("i", "glyph unknown");
+    var dispatch = el("div", "did");
+    var promptToggle = el("button", "prompt-toggle", "▸");
+    promptToggle.setAttribute("type", "button");
+    var dispatchLabel = el("span", "did");
+    var taskList = el("span", "task-list");
+    var identity = el("div");
+    var agent = el("div", "agent");
+    var wire = el("div", "wire");
+    identity.appendChild(agent);
+    identity.appendChild(wire);
+    var controller = el("div", "controller-cell");
+    var controllerId = el("div", "controller-id");
+    var controllerHealth = el("div", "controller-health unknown");
+    controller.appendChild(controllerId);
+    controller.appendChild(controllerHealth);
+    var state = el("div", "state-txt");
+    var started = el("div", "host");
+    var host = el("div", "host");
+    [glyph, dispatch, identity, controller, state, started, host].forEach(function (node) {
+      row.appendChild(node);
+    });
+    var prompt = el("pre", "prompt-body");
+    setHidden(prompt, true);
+    entry._gf = {
+      row: row, glyph: glyph, promptToggle: promptToggle,
+      dispatchLabel: dispatchLabel, taskList: taskList,
+      agent: agent, wire: wire, controllerId: controllerId,
+      controllerHealth: controllerHealth, state: state,
+      started: started, host: host, prompt: prompt, worker: null
+    };
+    promptToggle.addEventListener("click", function () {
+      var current = entry._gf.worker || {};
+      setPromptOpen(entry, !openPrompts.has(workerKey(current)));
+    });
+    return entry;
+  }
+
+  function updateWorkerEntry(entry, worker, now) {
+    var refs = entry._gf;
+    refs.worker = worker;
+    entry.setAttribute("data-dispatch-id", textValue(worker.dispatch_id));
+    refs.glyph.className = "glyph " + glyphFor(worker);
+    var tasks = worker.task_ids || [];
+    refs.dispatchLabel.textContent = textValue(worker.dispatch_id);
+    refs.promptToggle.remove();
+    refs.taskList.remove();
+    refs.dispatchLabel.remove();
+    refs.taskList.textContent = "";
+    refs.row.children[1].textContent = "";
+    if (worker.prompt_file || tasks.length) {
+      refs.row.children[1].className = "dispatch-cell";
+      if (worker.prompt_file) refs.row.children[1].appendChild(refs.promptToggle);
+      refs.row.children[1].appendChild(refs.dispatchLabel);
+      if (tasks.length) refs.row.children[1].appendChild(refs.taskList);
+    } else {
+      refs.row.children[1].className = "did";
+      refs.row.children[1].textContent = textValue(worker.dispatch_id);
+    }
+    tasks.forEach(function (taskId) {
+      var button = el("button", "task-chip", textValue(taskId));
+      button.setAttribute("type", "button");
+      button._taskId = String(taskId);
+      button.addEventListener("click", function () {
+        ticketFilter = button._taskId;
+        render();
+      });
+      refs.taskList.appendChild(button);
+    });
+    refs.agent.textContent = textValue(worker.agent);
+    refs.wire.textContent = textValue(worker.transport);
+    if (worker.os_sandbox_requested || worker.os_sandbox_supported || worker.os_sandbox_enforced) {
+      refs.wire.appendChild(el("b", null,
+        " sandbox req=" + textValue(worker.os_sandbox_requested) +
+        " sup=" + textValue(worker.os_sandbox_supported) +
+        " enf=" + textValue(worker.os_sandbox_enforced)));
+    } else if (worker.os_sandbox === "read-only") {
+      refs.wire.appendChild(el("b", null, " ro"));
+    }
+    refs.controllerId.className = "controller-id " + controllerIdentityState(worker);
+    refs.controllerId.textContent = textValue(worker.controller_display);
+    var health = controllerLiveness(worker);
+    refs.controllerHealth.className = "controller-health " + health.toLowerCase();
+    refs.controllerHealth.textContent = health;
+    var displayState = textValue(worker.display_state);
+    if (worker.classification_conflict) displayState += " · conflicting authority fields";
+    refs.state.textContent = displayState;
+    refs.state.title = worker.authority_detail || "";
+    if (worker.authority_detail) {
+      refs.state.appendChild(el("small", "authority-detail", worker.authority_detail));
+    }
+    refs.started.textContent = ageFrom(worker.started_at, now);
+    refs.host.textContent = textValue(worker.node_id);
+    var isOpen = openPrompts.has(workerKey(worker));
+    refs.promptToggle.textContent = isOpen ? "▾" : "▸";
+    refs.promptToggle.setAttribute("aria-expanded", isOpen ? "true" : "false");
+    if (worker.prompt_file) {
+      if (!refs.prompt.parentNode) refs.row.appendChild(refs.prompt);
+      setHidden(refs.prompt, !isOpen);
+      if (isOpen) fetchPrompt(entry);
+    } else {
+      refs.prompt.remove();
+    }
+  }
+
+  function createControllerSummary() {
+    var summary = el("div", "controller-summary");
+    var button = el("button", "controller-toggle");
+    button.setAttribute("type", "button");
+    summary.appendChild(button);
+    summary._gf = { button: button, controllerKey: null };
+    button.addEventListener("click", function () {
+      var key = summary._gf.controllerKey;
+      setControllerExpanded(key, !controllerExpanded(key, summary._gf.terminalCount));
+      render();
+    });
+    return summary;
+  }
+
+  function updateControllerSummary(summary, key, terminal, expanded) {
+    var complete = terminal.filter(function (worker) {
+      return String(worker.terminal_state || worker.display_state || "").toLowerCase() === "complete";
+    }).length;
+    var failed = terminal.length - complete;
+    var visible = expanded ? terminal.length : Math.min(3, terminal.length);
+    summary._gf.controllerKey = key;
+    summary._gf.terminalCount = terminal.length;
+    summary._gf.button.textContent = (expanded ? "▾ " : "▸ ") + key + " · " +
+      complete + " complete / " + failed + " failed / newest " + visible + " visible";
+    summary._gf.button.setAttribute("aria-expanded", expanded ? "true" : "false");
+  }
+
+  function appendWorkerTable(parent, workers, now, budget, bandKey) {
+    var rows = parent._gfRows;
+    if (!rows) {
+      rows = el("div", "rows scroll-frame");
+      var header = el("div", "row-hd");
+      ["", "dispatch", "agent · via", "controller", "state", "started", "host"].forEach(function (label) {
+        header.appendChild(el("div", null, label));
+      });
+      rows.appendChild(header);
+      rows._gf = { header: header, nodes: {}, quiet: null };
+      parent._gfRows = rows;
       parent.appendChild(rows);
-      return;
     }
 
-    var header = el("div", "row-hd");
-    ["", "dispatch", "agent · via", "controller", "state", "started", "host"].forEach(function (label) {
-      header.appendChild(el("div", null, label));
-    });
-    rows.appendChild(header);
-
+    var groups = Object.create(null);
+    var groupOrder = [];
     workers.forEach(function (worker) {
-      budget.total += 1;
-      if (budget.shown >= MAX_VISIBLE_WORKERS) return;
-      budget.shown += 1;
-      var row = el("div", "row");
-      row.appendChild(el("i", "glyph " + glyphFor(worker)));
-      row.appendChild(el("div", "did", textValue(worker.dispatch_id)));
-      var identity = el("div");
-      identity.appendChild(el("div", "agent", textValue(worker.agent)));
-      var wire = el("div", "wire", textValue(worker.transport));
-      if (worker.os_sandbox_requested || worker.os_sandbox_supported || worker.os_sandbox_enforced) {
-        wire.appendChild(el("b", null,
-          " sandbox req=" + textValue(worker.os_sandbox_requested) +
-          " sup=" + textValue(worker.os_sandbox_supported) +
-          " enf=" + textValue(worker.os_sandbox_enforced)));
-      } else if (worker.os_sandbox === "read-only") {
-        wire.appendChild(el("b", null, " ro"));
+      var key = controllerKey(worker);
+      if (!groups[key]) {
+        groups[key] = { live: [], terminal: [] };
+        groupOrder.push(key);
       }
-      identity.appendChild(wire);
-      row.appendChild(identity);
-      var controller = el("div", "controller-cell");
-      controller.appendChild(el(
-        "div",
-        "controller-id " + controllerIdentityState(worker),
-        textValue(worker.controller_display)
-      ));
-      var controllerState = controllerLiveness(worker);
-      controller.appendChild(el(
-        "div",
-        "controller-health " + controllerState.toLowerCase(),
-        controllerState
-      ));
-      row.appendChild(controller);
-      var displayState = textValue(worker.display_state);
-      if (worker.classification_conflict) displayState += " · conflicting authority fields";
-      row.appendChild(el("div", "state-txt", displayState));
-      row.appendChild(el("div", "host", ageFrom(worker.started_at, now)));
-      row.appendChild(el("div", "host", textValue(worker.node_id)));
-      rows.appendChild(row);
+      groups[key][worker.is_terminal === true ? "terminal" : "live"].push(worker);
     });
-    parent.appendChild(rows);
+    var desired = Object.create(null);
+    groupOrder.forEach(function (controller) {
+      var group = groups[controller];
+      group.live.forEach(function (worker) {
+        desired["worker|" + workerKey(worker)] = { kind: "worker", worker: worker };
+      });
+      if (group.terminal.length) {
+        var stateKey = bandKey + "|" + controller;
+        var expanded = controllerExpanded(stateKey, group.terminal.length);
+        desired["summary|" + stateKey] = {
+          kind: "summary", key: stateKey, terminal: group.terminal, expanded: expanded
+        };
+        (expanded ? group.terminal : group.terminal.slice(0, 3)).forEach(function (worker) {
+          desired["worker|" + workerKey(worker)] = { kind: "worker", worker: worker };
+        });
+      }
+    });
+
+    Object.keys(rows._gf.nodes).forEach(function (key) {
+      if (!desired[key]) {
+        rows._gf.nodes[key].remove();
+        delete rows._gf.nodes[key];
+      }
+    });
+    Object.keys(desired).forEach(function (key) {
+      var item = desired[key];
+      var node = rows._gf.nodes[key];
+      if (item.kind === "worker") {
+        budget.total += 1;
+        if (budget.shown >= MAX_VISIBLE_WORKERS) {
+          if (node) { node.remove(); delete rows._gf.nodes[key]; }
+          return;
+        }
+        budget.shown += 1;
+      }
+      if (!node) {
+        node = item.kind === "worker" ? createWorkerEntry() : createControllerSummary();
+        rows._gf.nodes[key] = node;
+        rows.appendChild(node);
+      }
+      if (item.kind === "worker") {
+        setHidden(node, false);
+        updateWorkerEntry(node, item.worker, now);
+      } else {
+        updateControllerSummary(node, item.key, item.terminal, item.expanded);
+      }
+      // appendChild moves an existing node, making keyed reconciliation also
+      // reconcile order after recency or controller ownership changes.
+      rows.appendChild(node);
+    });
+    if (!Object.keys(desired).length) {
+      if (!rows._gf.quiet) {
+        rows._gf.quiet = el("div", "quiet-state", "No worker rows match this view.");
+        rows.appendChild(rows._gf.quiet);
+      }
+      setHidden(rows._gf.quiet, false);
+    } else if (rows._gf.quiet) {
+      setHidden(rows._gf.quiet, true);
+    }
   }
 
   function renderPlaneStatus(fleetState, attentionState) {
@@ -307,12 +601,16 @@
     host.textContent = "";
     var machine = FLEET.machine || {};
     var list = el("dl", "kv");
-    [
+    var facts = [
       ["leases", textValue(machine.active_leases) + " / " + textValue(machine.operating_cap)],
       ["local running", textValue(machine.local_workers)],
       ["queued", textValue(machine.queue_depth)],
       ["registry sample", textValue(FLEET.registry_deep_sampled) + " / " + textValue(FLEET.registry_total)]
-    ].forEach(function (item) {
+    ];
+    if (Number(FLEET.history_excluded) > 0) {
+      facts.push(["history", "+" + FLEET.history_excluded + " in history"]);
+    }
+    facts.forEach(function (item) {
       list.appendChild(el("dt", null, item[0]));
       list.appendChild(el("dd", null, item[1]));
     });
@@ -336,7 +634,7 @@
     host.textContent = "";
     var vendors = FLEET.vendors || [];
     var groups = [];
-    var index = {};
+    var index = Object.create(null);
     vendors.forEach(function (vendor) {
       var name = textValue(vendor.provider);
       if (!index[name]) {
@@ -399,7 +697,7 @@
       host.appendChild(el(
         "div",
         "attention-truncation",
-        "+" + truncated + " older generations unprobed"
+        "+" + truncated + " older generations unprobed · click Show more in a project band for retained history"
       ));
     }
     if (!items.length) {
@@ -424,11 +722,89 @@
     });
   }
 
+  function parseHistoryScript(text) {
+    var prefix = "window.GF_HISTORY = ";
+    var source = String(text || "").trim();
+    var start = source.indexOf(prefix);
+    if (start < 0 || source.charAt(source.length - 1) !== ";") throw new Error("history schema wrapper missing");
+    var payload = JSON.parse(source.slice(start + prefix.length, -1));
+    if (!payload || payload.schema !== "goalflight.fleet-console.history.v1" || !Array.isArray(payload.projects)) {
+      throw new Error("history schema mismatch");
+    }
+    return payload;
+  }
+
+  function currentHistoryPayloadKey() {
+    var count = Number((FLEET || {}).history_excluded);
+    return String(Number.isFinite(count) && count > 0 ? count : 0);
+  }
+
+  function syncHistoryCacheKey() {
+    var key = currentHistoryPayloadKey();
+    if (historyPayloadKey !== key) {
+      historyPayload = null;
+      historyPromise = null;
+      historyPayloadKey = key;
+    }
+    return key;
+  }
+
+  function loadHistory() {
+    var requestKey = syncHistoryCacheKey();
+    if (historyPayload) return Promise.resolve(historyPayload);
+    if (historyPromise) return historyPromise;
+    if (typeof window.fetch !== "function") return Promise.reject(new Error("history fetch unavailable"));
+    var request = window.fetch("./history-data.js?history_check=" + Date.now())
+      .then(function (response) {
+        if (!response || typeof response.text !== "function") throw new Error("history response unreadable");
+        if (response.ok === false) throw new Error("history response unavailable");
+        return response.text();
+      })
+      .then(parseHistoryScript)
+      .then(function (payload) {
+        if (historyPayloadKey === requestKey) historyPayload = payload;
+        return payload;
+      })
+      .catch(function (error) {
+        if (historyPromise === request) historyPromise = null;
+        throw error;
+      });
+    historyPromise = request;
+    return request;
+  }
+
+  function historyProject(projectId) {
+    syncHistoryCacheKey();
+    if (!historyPayload) return null;
+    return (historyPayload.projects || []).filter(function (project) {
+      return project.project_id === projectId;
+    })[0] || null;
+  }
+
+  function historyWorkers(project) {
+    var found = historyProject(project.project_id);
+    var pageCount = historyPages[project.project_id] || 0;
+    if (!found || pageCount <= 0) return [];
+    var fastIds = {};
+    (project.workers || []).forEach(function (worker) { fastIds[workerKey(worker)] = true; });
+    return (found.workers || []).filter(function (worker) {
+      return !fastIds[workerKey(worker)];
+    }).slice(0, pageCount * historyPageSize);
+  }
+
+  function showMore(projectId) {
+    return loadHistory().then(function () {
+      historyPages[projectId] = (historyPages[projectId] || 0) + 1;
+      render();
+      return historyProject(projectId);
+    });
+  }
+
   function projectBands() {
     var result = [];
     (FLEET.projects || []).forEach(function (project) {
-      var workers = (project.workers || []).filter(displayedWorker);
-      if (workers.length || ((project.queue || {}).depth || 0) > 0) {
+      var workers = (project.workers || []).concat(historyWorkers(project)).filter(displayedWorker);
+      if (workers.length || ((project.queue || {}).depth || 0) > 0 || (project.history_excluded || 0) > 0) {
         result.push({ kind: "project", project: project, workers: workers });
       }
     });
@@ -452,10 +828,71 @@
     return result;
   }
 
-  function renderBand(entry, now, budget) {
-    var project = entry.project || {};
+  function disclosurePayloadKeys() {
+    var workerKeys = Object.create(null);
+    var controllerKeys = Object.create(null);
+    var currentProjectIds = Object.create(null);
+    function addRows(bandKey, workers) {
+      (workers || []).forEach(function (worker) {
+        if (!visibleWorker(worker)) return;
+        workerKeys[workerKey(worker)] = true;
+        if (worker.is_terminal === true) {
+          controllerKeys[bandKey + "|" + controllerKey(worker)] = true;
+        }
+      });
+    }
+    (FLEET && FLEET.projects || []).forEach(function (project) {
+      var projectId = textValue(project.project_id);
+      currentProjectIds[projectId] = true;
+      addRows(projectId, project.workers);
+    });
+    if (historyPayload) {
+      (historyPayload.projects || []).forEach(function (project) {
+        var projectId = textValue(project.project_id);
+        if (currentProjectIds[projectId]) addRows(projectId, project.workers);
+      });
+    }
+    addRows("unassigned", FLEET && FLEET.unassigned_workers);
+    addRows("remote", FLEET && FLEET.remote && FLEET.remote.workers);
+    return { workers: workerKeys, controllers: controllerKeys };
+  }
+
+  function pruneDisclosureState() {
+    var valid = disclosurePayloadKeys();
+    var controllersChanged = false;
+    Array.from(openControllers).forEach(function (entry) {
+      var separator = entry.indexOf("|");
+      var stateKey = separator < 0 ? "" : entry.slice(separator + 1);
+      if (!valid.controllers[stateKey]) {
+        openControllers.delete(entry);
+        controllersChanged = true;
+      }
+    });
+    if (controllersChanged) persistSet("goalflight-fleet-open-controllers", openControllers);
+    var promptsChanged = false;
+    Array.from(openPrompts).forEach(function (entry) {
+      if (!valid.workers[entry]) {
+        openPrompts.delete(entry);
+        promptsChanged = true;
+      }
+    });
+    if (promptsChanged) persistSet("goalflight-fleet-open-prompts", openPrompts);
+  }
+
+  function createBand() {
     var panel = el("section", "panel band");
     var header = el("div", "band-hd");
+    var queueHost = el("div", "queue-host");
+    panel.appendChild(header);
+    panel._gf = { header: header, queueHost: queueHost };
+    return panel;
+  }
+
+  function renderBand(entry, now, budget, panel) {
+    var project = entry.project || {};
+    panel = panel || createBand();
+    var header = panel._gf.header;
+    header.textContent = "";
     var identity = el("div");
     var name = entry.kind === "remote" ? "Remote workers" :
       (entry.kind === "unassigned" ? "Unassigned workers" : textValue(project.name));
@@ -475,11 +912,36 @@
     if (milestone.available && milestone.due) {
       vitals.appendChild(chip("warn", "sweep due", milestone.commits_since + "/" + milestone.cadence));
     }
+    if (entry.kind === "project" && (project.history_excluded || 0) > 0) {
+      var more = el("button", "ghost-btn history-more");
+      more.setAttribute("type", "button");
+      var found = historyProject(project.project_id);
+      var loadedCount = historyWorkers(project).length;
+      var totalOlder = found ? (found.workers || []).filter(function (worker) {
+        return !(project.workers || []).some(function (fast) { return workerKey(fast) === workerKey(worker); });
+      }).length : Number(project.history_excluded || 0);
+      var remaining = Math.max(0, totalOlder - loadedCount);
+      more.textContent = found && remaining === 0
+        ? "+" + project.history_excluded + " in history · loaded"
+        : "Show more · +" + (found ? remaining : project.history_excluded) + " in history";
+      more._projectId = project.project_id;
+      more.addEventListener("click", function () {
+        more.textContent = "Loading history…";
+        more.disabled = true;
+        showMore(more._projectId).catch(function () {
+          more.textContent = "History unavailable · retry";
+          more.disabled = false;
+        });
+      });
+      vitals.appendChild(more);
+    }
     header.appendChild(vitals);
-    panel.appendChild(header);
 
     var queue = project.queue || {};
+    var queueHost = panel._gf.queueHost;
+    queueHost.textContent = "";
     if (queue.depth) {
+      if (!queueHost.parentNode) panel.appendChild(queueHost);
       var strip = el("div", "qstrip");
       strip.appendChild(el("span", "lbl", "queue"));
       (queue.lanes || []).forEach(function (lane) {
@@ -488,47 +950,86 @@
         laneNode.appendChild(el("b", null, textValue(lane.count)));
         var bar = el("div", "qbar");
         var fill = el("i");
-        /* Lane share is count ÷ total depth × 100. Workers cancel, leaving
-         * percent; 5 ÷ 10 × 100 = 50%, a midpoint sanity check. */
         fill.setAttribute("style", "width:" + Math.round((lane.count / queue.depth) * 100) + "%");
         bar.appendChild(fill);
         laneNode.appendChild(bar);
         strip.appendChild(laneNode);
       });
       strip.appendChild(el("span", "drain", "oldest " + ageFrom(queue.oldest_created_at, now)));
-      panel.appendChild(strip);
+      queueHost.appendChild(strip);
+    } else {
+      queueHost.remove();
     }
-    appendWorkerTable(panel, entry.workers, now, budget);
+    appendWorkerTable(panel, entry.workers, now, budget, textValue(project.project_id || entry.kind));
     return panel;
   }
 
   function renderFleet(fleetState, now) {
     var host = document.getElementById("fleet");
     if (!host) return;
-    host.textContent = "";
     if (fleetState.stale) {
+      host.textContent = "";
+      bandNodes = Object.create(null);
+      host._gf = null;
       host.appendChild(staleNotice("fleet", fleetState));
       return;
     }
     var entries = projectBands();
     var ageSummary = workerAgeSummary();
+    if (!host._gf) host._gf = { quiet: null, overflow: null, ticket: null };
+    if (ticketFilter) {
+      if (!host._gf.ticket) {
+        host._gf.ticket = el("button", "ghost-btn ticket-filter-clear");
+        host._gf.ticket.setAttribute("type", "button");
+        host._gf.ticket.addEventListener("click", function () { ticketFilter = null; render(); });
+        host.appendChild(host._gf.ticket);
+      }
+      host._gf.ticket.textContent = "Ticket " + ticketFilter + " · clear filter";
+      setHidden(host._gf.ticket, false);
+    } else if (host._gf.ticket) {
+      setHidden(host._gf.ticket, true);
+    }
     if (!entries.length) {
-      host.appendChild(el("div", "quiet-state", ageSummary.hidden ?
+      Object.keys(bandNodes).forEach(function (key) { bandNodes[key].remove(); delete bandNodes[key]; });
+      if (!host._gf.quiet) {
+        host._gf.quiet = el("div", "quiet-state");
+        host.appendChild(host._gf.quiet);
+      }
+      host._gf.quiet.textContent = ageSummary.hidden ?
         "No recent active or unresolved worker rows. " + ageSummary.hidden + " older rows hidden by age filter." :
-        "No project has active workers or queued work."));
+        "No project has active workers, retained history, or queued work in this view.";
+      setHidden(host._gf.quiet, false);
+      if (host._gf.overflow) setHidden(host._gf.overflow, true);
       return;
     }
+    if (host._gf.quiet) setHidden(host._gf.quiet, true);
     var budget = { shown: 0, total: 0 };
+    var desiredBands = Object.create(null);
     entries.slice(0, MAX_VISIBLE_BANDS).forEach(function (entry) {
-      host.appendChild(renderBand(entry, now, budget));
+      var key = textValue(((entry.project || {}).project_id) || entry.kind);
+      desiredBands[key] = true;
+      if (!bandNodes[key]) {
+        bandNodes[key] = createBand();
+      }
+      renderBand(entry, now, budget, bandNodes[key]);
+      // Move retained bands into the producer-derived recency order.
+      host.appendChild(bandNodes[key]);
     });
-    entries.slice(MAX_VISIBLE_BANDS).forEach(function (entry) {
-      budget.total += entry.workers.length;
+    Object.keys(bandNodes).forEach(function (key) {
+      if (!desiredBands[key]) { bandNodes[key].remove(); delete bandNodes[key]; }
     });
+    entries.slice(MAX_VISIBLE_BANDS).forEach(function (entry) { budget.total += entry.workers.length; });
     if (budget.shown < budget.total || entries.length > MAX_VISIBLE_BANDS) {
-      host.appendChild(el("div", "overflow-state",
-        "Showing " + budget.shown + " of " + budget.total + " active or unresolved worker rows" +
-        (entries.length > MAX_VISIBLE_BANDS ? " across " + MAX_VISIBLE_BANDS + " of " + entries.length + " groups" : "") + "."));
+      if (!host._gf.overflow) {
+        host._gf.overflow = el("div", "overflow-state");
+        host.appendChild(host._gf.overflow);
+      }
+      host._gf.overflow.textContent = "Showing " + budget.shown + " of " + budget.total + " active or unresolved worker rows" +
+        (entries.length > MAX_VISIBLE_BANDS ? " across " + MAX_VISIBLE_BANDS + " of " + entries.length + " groups" : "") + ".";
+      setHidden(host._gf.overflow, false);
+      host.appendChild(host._gf.overflow);
+    } else if (host._gf.overflow) {
+      setHidden(host._gf.overflow, true);
     }
   }
 
@@ -561,6 +1062,8 @@
 
   function render(nowMs) {
     var now = nowMs != null ? nowMs : Date.now();
+    syncHistoryCacheKey();
+    pruneDisclosureState();
     var fleetState = planeState(FLEET, SCHEMAS.fleet, CADENCES.fleet, now);
     var attentionState = planeState(ATTENTION, SCHEMAS.attention, CADENCES.attention, now);
     renderPlaneStatus(fleetState, attentionState);
@@ -586,7 +1089,7 @@
      * timer unit; if the repeating interval fires before this watchdog it skips
      * once, the watchdog releases the plane, and the following interval retries.
      * Worst case is therefore two cadences: 2 × 5 s = 10 s for attention and
-     * 2 × 60 s = 120 s for fleet, exactly when the old sample becomes stale. */
+     * 2 × 30 s = 60 s for fleet, exactly when the stamped sample becomes stale. */
     var watchdog = window.setTimeout(function () { finish(false); }, CADENCES[name]);
     function finish(ok) {
       if (finished) return;
@@ -620,7 +1123,7 @@
     var button = document.getElementById("theme-toggle");
     if (button) button.textContent = "Theme: " + themeMode;
     if (persist !== false) {
-      try { window.localStorage.setItem("goalflight-fleet-theme", themeMode); } catch (_error) { /* optional */ }
+      persistValue("goalflight-fleet-theme", themeMode);
     }
     return themeMode;
   }
@@ -640,7 +1143,7 @@
   function applyAgeFilter(enabled, persist) {
     ageFilterEnabled = enabled === true;
     if (persist !== false) {
-      try { window.localStorage.setItem("goalflight-fleet-age-filter", ageFilterEnabled ? "hide" : "show"); } catch (_error) { /* optional */ }
+      persistValue("goalflight-fleet-age-filter", ageFilterEnabled ? "hide" : "show");
     }
     return ageFilterEnabled;
   }
@@ -670,6 +1173,52 @@
     applyAgeFilter: applyAgeFilter,
     render: render,
     reloadPlane: reloadPlane,
+    setFleetData: function (payload) {
+      FLEET = payload;
+      window.GF_FLEET = payload;
+      render();
+      return payload;
+    },
+    setTicketFilter: function (taskId) {
+      ticketFilter = taskId == null ? null : String(taskId);
+      render();
+      return ticketFilter;
+    },
+    showMore: showMore,
+    openPrompt: function (dispatchId) {
+      var wanted = String(dispatchId);
+      var found = null;
+      Object.keys(bandNodes).some(function (bandKey) {
+        var rows = (bandNodes[bandKey]._gfRows || {})._gf;
+        if (!rows) return false;
+        return Object.keys(rows.nodes).some(function (key) {
+          var node = rows.nodes[key];
+          if (node._gf && node._gf.worker && String(node._gf.worker.dispatch_id) === wanted) {
+            found = node;
+            return true;
+          }
+          return false;
+        });
+      });
+      return found ? setPromptOpen(found, true) : Promise.resolve(null);
+    },
+    rowNode: function (dispatchId) {
+      var wanted = String(dispatchId);
+      var found = null;
+      Object.keys(bandNodes).some(function (bandKey) {
+        var rows = (bandNodes[bandKey]._gfRows || {})._gf;
+        if (!rows) return false;
+        return Object.keys(rows.nodes).some(function (key) {
+          var node = rows.nodes[key];
+          if (node._gf && node._gf.worker && String(node._gf.worker.dispatch_id) === wanted) {
+            found = node;
+            return true;
+          }
+          return false;
+        });
+      });
+      return found;
+    },
     schemas: SCHEMAS,
     maxVisibleWorkers: MAX_VISIBLE_WORKERS
   };

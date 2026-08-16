@@ -8,6 +8,35 @@ incremented when meaningful skill behaviour changes.
 
 ### Added
 
+- Fleet console v2. Live state and history are separate planes: the
+  short-poll files carry only what changes (non-terminal work, controller
+  liveness, counters — built in milliseconds at kilobytes, from megabytes at
+  double-digit seconds), while terminal history and prompts are written once,
+  event-driven at finish time, and fetched lazily behind "show more" and
+  per-dispatch disclosure triangles. Controllers collapse their finished
+  work to a summary line; rows keep their open state across refreshes; task
+  chips filter by ticket; staleness is judged against the producer's own
+  stamped cadence; and every degraded banner names the operator's next
+  command. Conflicting-authority rows now say which authorities disagree.
+- `relay --drain`: peek and the snapshot-bound cursor advance composed into
+  one command with one line of output — the hand-rolled snapshot/eval
+  ceremony (and its traceback noise) is retired. Message CLI errors are now
+  one actionable line, never a stack trace.
+
+### Fixed
+
+- Arming a listener over pending mail exits promptly again by default,
+  restoring the deployed wait-for-exit contract; the arm-as-peek behavior is
+  opt-in via --report-pending, and JSON output is clean per-line JSONL with
+  kind discriminators on every record, exits included.
+- Persisted prompt sidecars are private (0600, 0700 directory) with a
+  one-time repair of existing world-readable files, run lazily so a refused
+  dispatch leaves no side effects. Wake projection always precedes the
+  best-effort history write, interrupts included.
+
+
+### Added
+
 - The arm is the peek. Arming a listener over pending mail no longer pops it
   back instantly: the backlog's headlines and its ready-to-run advance
   command are printed into the arm's own output, the listener stays armed,
