@@ -6,6 +6,20 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Added
+
+- The arm is the peek. Arming a listener over pending mail no longer pops it
+  back instantly: the backlog's headlines and its ready-to-run advance
+  command are printed into the arm's own output, the listener stays armed,
+  and only events beyond the arm-time high-water ring — one command, no
+  arm/pop/arm cycle, nothing lost (the eventual ring still covers the
+  backlog).
+- An ordered events smoke suite (scripts/goalflight_events_smoke.py) that
+  walks the wake chain in session-lifecycle order — claim, coverage,
+  self-mail ring, peek/advance, worker-terminal ring, entry hints, and the
+  five-state classifier — hermetically, against real locks and journals.
+
+
 ### Fixed
 
 - Watchers tell the truth about live workers. A terminal-vocabulary marker

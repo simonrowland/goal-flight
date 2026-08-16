@@ -3826,6 +3826,59 @@ def cmd_listen(args) -> int:
         stream=sys.stderr,
     )
 
+    # Arm-reports-pending: events already pending when the controller arms do
+    # not pop the listener — the controller is awake and reading this output
+    # right now, so popping would only force an arm/pop/arm cycle. Report the
+    # backlog headlines here and raise the ring threshold to the arm-time
+    # high-water; only events BEYOND it ring. The eventual ring's advance
+    # snapshot still covers the arm-time backlog, so nothing is lost.
+    arm_high: dict[str, int] = {}
+    try:
+        arm_snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
+    except goalflight_journal.JournalError:
+        arm_snapshot = None
+    if arm_snapshot is not None and arm_snapshot.items:
+        arm_high = _cursor_positions(arm_snapshot.items)
+        for item in arm_snapshot.items:
+            stream = str(item.get("stream_id") or "")
+            seq = int(item.get("stream_seq") or 0)
+            kind = str(item.get("event_type") or item.get("type") or "event")
+            print(
+                f"pending-at-arm: [{kind}] {stream} seq={seq}",
+                flush=True,
+            )
+        # The arm doubles as the peek: emit the same machine-readable snapshot
+        # relay --new --json would, advance command included, so the awake
+        # controller drains the backlog straight from this output without a
+        # second CLI round-trip.
+        arm_advance = _cursor_advance_command(
+            project_root=project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+            cursor_version=arm_snapshot.cursor_version,
+            positions=_cursor_positions(arm_snapshot.items),
+            stream_snapshots=arm_snapshot.stream_snapshots,
+        )
+        print(
+            "pending-at-arm-json: "
+            + json.dumps(
+                {
+                    "items": arm_snapshot.items,
+                    "cursor_version": arm_snapshot.cursor_version,
+                    "advance_command": arm_advance,
+                },
+                sort_keys=True,
+                default=str,
+            ),
+            flush=True,
+        )
+        print(
+            f"pending-at-arm: {len(arm_snapshot.items)} item(s) reported; "
+            "listener stays armed and rings only for newer events; run the "
+            "advance command above to drain the backlog",
+            flush=True,
+        )
+
     while True:
         if os.getppid() != parent_pid:
             return finish("orphaned", code=3, detail="listener parent changed")
@@ -3850,7 +3903,19 @@ def cmd_listen(args) -> int:
             )
             if reason:
                 return finish(reason, code=3, detail="listener self-check failed")
-            peek = authority.cursor_peek(label, nonce=nonce, limit=1)
+            # With an arm-time backlog the cheap limit-1 peek would forever
+            # see the oldest (already-reported) item; peek wide and ring only
+            # for events beyond the arm-time high-water.
+            peek = authority.cursor_peek(
+                label, nonce=nonce, limit=1000 if arm_high else 1
+            )
+            wakeable_items = bool(peek.items)
+            if arm_high and wakeable_items:
+                wakeable_items = any(
+                    int(item.get("stream_seq") or 0)
+                    > arm_high.get(str(item.get("stream_id") or ""), 0)
+                    for item in peek.items
+                )
         except goalflight_journal.CASMismatch as exc:
             lease = authority.active_lease(label)
             reason = "stale-lease" if lease is not None else "superseded"
@@ -3861,7 +3926,7 @@ def cmd_listen(args) -> int:
             return finish("journal-unavailable", code=2, detail=str(exc))
         except (goalflight_journal.JournalError, ValueError) as exc:
             return finish("corrupt", code=2, detail=str(exc))
-        if peek.items:
+        if wakeable_items:
             snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
             positions = _cursor_positions(snapshot.items)
             advance_command = _cursor_advance_command(
