@@ -139,14 +139,14 @@ plane_values() {
       BUDGET_VALUE=3
       ;;
     fleet)
-      # Budget from the PRODUCTION quantity, not the in-process build: a live
-      # tick (interpreter start + scan + validate + serialize + publish)
-      # measured 7.0s wall on this fleet on 2026-08-16, while the in-process
-      # build alone is ~2s. Budget = 2 x 7s = 14s; interval 30s leaves 16s of
-      # headroom for termination and atomic DEGRADED publication.
-      # Sanity: 7s < 14s < 30s.
-      INTERVAL_VALUE=30
-      BUDGET_VALUE=14
+      # Budget from the PRODUCTION quantity under launchd, which runs slower
+      # than an interactive shell: the same tick measured 7.0s by hand and
+      # >14s under the agent on 2026-08-16 (cold caches, contended CPU).
+      # Interval 60s, budget 30s = ~2x the worst observed tick with 30s of
+      # headroom for termination and atomic publication. Sanity: 14s < 30s <
+      # 60s. Profiling the remaining scan cost is tracked in the store.
+      INTERVAL_VALUE=60
+      BUDGET_VALUE=30
       ;;
   esac
   PLIST_PATH_VALUE="${HOME_DIR}/Library/LaunchAgents/${LABEL_VALUE}.plist"
