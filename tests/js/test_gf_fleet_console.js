@@ -183,7 +183,7 @@ function fleetPayload(overrides) {
     last_success_at: "2030-01-01T00:02:10Z",
     producer: { name: "goalflight_fleet_console.py", plane: "fleet" },
     last_error: null,
-    cadence_seconds: 30,
+    cadence_seconds: 60,
     registry_total: 1433,
     registry_deep_sampled: 12,
     history_excluded: 0,
@@ -254,7 +254,7 @@ function attentionPayload(overrides) {
     last_success_at: "2030-01-01T00:02:56Z",
     producer: { name: "goalflight_fleet_console.py", plane: "attention" },
     last_error: null,
-    cadence_seconds: 5,
+    cadence_seconds: 20,
     age_granularity: "minute",
     items: [{
       dispatch_id: "needs-review",
@@ -395,14 +395,14 @@ print(json.dumps({
 {
   const { api } = loadConsole();
   const fresh = fleetPayload({
-    sample_started_at: "2030-01-01T00:02:00Z",
-    sample_finished_at: "2030-01-01T00:02:00Z",
-    last_success_at: "2030-01-01T00:02:00Z",
+    sample_started_at: "2030-01-01T00:01:00Z",
+    sample_finished_at: "2030-01-01T00:01:00Z",
+    last_success_at: "2030-01-01T00:01:00Z",
   });
   const stale = fleetPayload({
-    sample_started_at: "2030-01-01T00:01:59.999Z",
-    sample_finished_at: "2030-01-01T00:01:59.999Z",
-    last_success_at: "2030-01-01T00:01:59.999Z",
+    sample_started_at: "2030-01-01T00:00:59.999Z",
+    sample_finished_at: "2030-01-01T00:00:59.999Z",
+    last_success_at: "2030-01-01T00:00:59.999Z",
   });
   const future = fleetPayload({
     sample_started_at: "2030-01-01T00:04:00Z",
@@ -421,6 +421,45 @@ print(json.dumps({
     api.planeState(stale, api.schemas.fleet, 60000, NOW).stale === true,
     api.planeState(future, api.schemas.fleet, 60000, NOW).freshnessIssue === "clock ahead",
     api.planeState(reversed, api.schemas.fleet, 60000, NOW).freshnessIssue === "timestamp order invalid",
+  ].every(Boolean));
+}
+
+// Factor mutation pair: 1.5 stamped cadences is healthy while 2.5 is stale.
+// Both the header chips and panel banners consume the same helper-derived
+// planeState, so neither can silently regress to a one-cadence constant.
+{
+  const freshAtOneAndAHalf = attentionPayload({
+    cadence_seconds: 20,
+    sample_started_at: "2030-01-01T00:02:30Z",
+    sample_finished_at: "2030-01-01T00:02:30Z",
+    last_success_at: "2030-01-01T00:02:30Z",
+    items: [],
+  });
+  const staleAtTwoAndAHalf = attentionPayload({
+    cadence_seconds: 20,
+    sample_started_at: "2030-01-01T00:02:10Z",
+    sample_finished_at: "2030-01-01T00:02:10Z",
+    last_success_at: "2030-01-01T00:02:10Z",
+    items: [],
+  });
+  const freshRendered = loadConsole(fleetPayload(), freshAtOneAndAHalf);
+  const staleRendered = loadConsole(fleetPayload(), staleAtTwoAndAHalf);
+  assert("two stamped cadences govern every freshness surface", [
+    freshRendered.api.freshnessLimitMs(20) === 40000,
+    freshRendered.api.planeState(
+      freshAtOneAndAHalf, freshRendered.api.schemas.attention, 5000, NOW
+    ).stale === false,
+    staleRendered.api.planeState(
+      staleAtTwoAndAHalf, staleRendered.api.schemas.attention, 30000, NOW
+    ).stale === true,
+    freshRendered.byId["plane-status"].textContent.includes("mailbox live"),
+    !freshRendered.byId.attention.textContent.includes("STALE"),
+    staleRendered.byId["plane-status"].textContent.includes("mailbox stale 50 sec"),
+    staleRendered.byId["live-status"].textContent.includes("Untrusted: mailbox"),
+    staleRendered.byId.attention.textContent.includes("STALE · attention plane"),
+    staleRendered.byId.attention.textContent.includes(
+      "Reason: age exceeds 40 sec freshness limit"
+    ),
   ].every(Boolean));
 }
 
@@ -982,14 +1021,14 @@ print(json.dumps({
 // Age polling alone crosses stale thresholds even if neither file changes.
 {
   const fleet = fleetPayload({
-    sample_started_at: "2030-01-01T00:02:01Z",
-    sample_finished_at: "2030-01-01T00:02:01Z",
-    last_success_at: "2030-01-01T00:02:01Z",
+    sample_started_at: "2030-01-01T00:01:01Z",
+    sample_finished_at: "2030-01-01T00:01:01Z",
+    last_success_at: "2030-01-01T00:01:01Z",
   });
   const attention = attentionPayload({
-    sample_started_at: "2030-01-01T00:02:51Z",
-    sample_finished_at: "2030-01-01T00:02:51Z",
-    last_success_at: "2030-01-01T00:02:51Z",
+    sample_started_at: "2030-01-01T00:02:21Z",
+    sample_finished_at: "2030-01-01T00:02:21Z",
+    last_success_at: "2030-01-01T00:02:21Z",
   });
   const { byId, clock, window } = loadConsole(fleet, attention);
   const ageTimer = window.intervals.find((timer) => timer.delay === 1000);

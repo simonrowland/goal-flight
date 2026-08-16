@@ -6,10 +6,8 @@
     fleet: "goalflight.fleet-console.fleet.v2",
     attention: "goalflight.fleet-console.attention.v1"
   };
-  /* Each mirror reloads once per producer cadence. Seconds × 1,000 ms/s gives
-   * 5 × 1,000 = 5,000 ms for attention and 30 × 1,000 = 30,000 ms for fleet;
-   * one interval therefore observes the next scheduled publication without
-   * coupling the fast mailbox plane to the slower fleet sample. */
+  /* Mirror reload polling is intentionally independent of producer cadence.
+   * Freshness never reads these UI timers; it follows each payload's stamp. */
   var CADENCES = { attention: 5000, fleet: 30000 };
   var CLOCK_TOLERANCE_MS = 2000;
   var MAX_VISIBLE_WORKERS = 200;
@@ -164,10 +162,16 @@
     return hours < 48 ? "in " + hours + " h" : "in " + Math.round(hours / 24) + " d";
   }
 
-  /* Stale after two missed PRODUCER-stamped cadences. Units: stamped seconds ×
-   * 1,000 ms/s × 2 = ms. The renderer reload interval is intentionally not an
-   * authority: changing a producer schedule without this stamp once made every
-   * healthy sample look stale. */
+  /* The one freshness threshold authority for headers and panel banners.
+   * Units: producer-stamped seconds × 1,000 ms/s × 2 cadences = ms. */
+  function freshnessLimitMs(cadenceSeconds) {
+    var seconds = Number(cadenceSeconds);
+    return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 * 2 : null;
+  }
+
+  /* Stale after two missed PRODUCER-stamped cadences. The renderer reload
+   * interval is intentionally not an authority: changing a producer schedule
+   * without this stamp once made every healthy sample look stale. */
   function planeState(payload, schema, _reloadCadenceMs, now) {
     var present = payload && typeof payload === "object" && !Array.isArray(payload);
     var data = present ? payload : {};
@@ -178,10 +182,7 @@
     var started = schemaMatches ? parseTs(data.sample_started_at) : null;
     var finished = schemaMatches ? parseTs(data.sample_finished_at) : null;
     var success = schemaMatches ? parseTs(data.last_success_at) : null;
-    var cadenceSeconds = schemaMatches ? Number(data.cadence_seconds) : NaN;
-    var cadenceMs = Number.isFinite(cadenceSeconds) && cadenceSeconds > 0
-      ? cadenceSeconds * 1000
-      : null;
+    var freshnessLimit = schemaMatches ? freshnessLimitMs(data.cadence_seconds) : null;
     var issue = null;
 
     if (!present) issue = "payload absent";
@@ -192,17 +193,17 @@
              success - now > CLOCK_TOLERANCE_MS) issue = "clock ahead";
     else if (finished < started) issue = "timestamp order invalid";
     else if (typeof data.generation_id !== "string" || !data.generation_id) issue = "generation missing";
-    else if (cadenceMs == null) issue = "cadence unknown";
+    else if (freshnessLimit == null) issue = "cadence unknown";
 
     var age = success == null ? null : Math.max(0, now - success);
     /* Guard both operands explicitly: null cadence must not be coerced to a
      * zero-ms threshold, and null age must not participate in arithmetic. */
-    var exceededCadence = age != null && cadenceMs != null && age > cadenceMs * 2;
+    var exceededCadence = age != null && freshnessLimit != null && age > freshnessLimit;
     var stale = issue !== null || exceededCadence;
     var observed = schemaMatches ? data.last_success_at : null;
     var observedAge = freshnessAgeFrom(observed, now);
     var reason = issue || (exceededCadence
-      ? "age exceeds " + (cadenceMs * 2 / 1000) + " sec freshness limit"
+      ? "age exceeds " + (freshnessLimit / 1000) + " sec freshness limit"
       : null);
     return {
       stale: stale,
@@ -214,7 +215,7 @@
         (schemaMatches && data.last_error ? " · last error: " + data.last_error : ""),
       lastObservedAge: observedAge,
       lastError: schemaMatches ? data.last_error : null,
-      cadenceMs: cadenceMs,
+      freshnessLimitMs: freshnessLimit,
       reason: reason
     };
   }
@@ -1176,11 +1177,10 @@
     var script = document.createElement("script");
     script.src = config.file + "?generation_check=" + Date.now();
     var finished = false;
-    /* A reload gets one producer cadence to settle. Cadence ms is already the
-     * timer unit; if the repeating interval fires before this watchdog it skips
-     * once, the watchdog releases the plane, and the following interval retries.
-     * Worst case is therefore two cadences: 2 × 5 s = 10 s for attention and
-     * 2 × 30 s = 60 s for fleet, exactly when the stamped sample becomes stale. */
+    /* A reload gets one UI polling interval to settle. If the repeating
+     * interval fires before this watchdog it skips once, the watchdog releases
+     * the plane, and the following interval retries. Freshness remains governed
+     * only by the payload's producer-stamped cadence. */
     var watchdog = window.setTimeout(function () { finish(false); }, CADENCES[name]);
     function finish(ok) {
       if (finished) return;
@@ -1259,6 +1259,7 @@
 
   window.GFFleetConsole = {
     ageBucket: ageFrom,
+    freshnessLimitMs: freshnessLimitMs,
     planeState: planeState,
     applyTheme: applyTheme,
     applyAgeFilter: applyAgeFilter,

@@ -542,7 +542,13 @@ def commit_terminal_authority(
     authority = goalflight_journal.open_or_create_journal(project_root)
     attempt = authority.attempt_for_dispatch(dispatch_id)
     if attempt is None:
-        prepared = authority.prepare_attempt(dispatch_id)
+        owner_label = str(record.get("controller_label") or "").strip()
+        owner_session = str(record.get("controller_session_id") or "").strip()
+        prepared = authority.prepare_attempt(
+            dispatch_id,
+            owner_controller_label=owner_label if owner_label and owner_session else None,
+            owner_session_nonce=owner_session if owner_label and owner_session else None,
+        )
         if not prepared.committed or prepared.value is None:
             return goalflight_journal.WriteResult(
                 prepared.disposition,

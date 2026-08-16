@@ -206,9 +206,16 @@ def test_outbox_retry_backoff_quarantine_prevents_head_of_line_starvation(
         calls.append(dispatch_id)
         if dispatch_id.startswith("poison-"):
             raise messages.MessageError("constructed poison row")
+        # Mirror post_message's real return shape: journal completion reads
+        # the envelope it appended, so a double omitting it is not a double.
         return {
             "recorded": True,
             "path": str(tmp_path / "messages" / f"{dispatch_id}.jsonl"),
+            "envelope": {
+                "id": str(kwargs.get("event_id") or dispatch_id),
+                "dispatch_id": dispatch_id,
+                "seq": 1,
+            },
         }
 
     monkeypatch.setattr(messages, "post_message", project_message)

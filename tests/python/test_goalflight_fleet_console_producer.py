@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import io
 import json
 import os
@@ -35,8 +36,27 @@ def _write_python(path: Path, body: str) -> None:
     path.write_text("#!/usr/bin/env python3\n" + body, encoding="utf-8")
 
 
+def _healthy_sampler_body(generation_id: str) -> str:
+    return (
+        "import pathlib, sys\n"
+        f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+        "import goalflight_fleet_console as console\n"
+        "plane = sys.argv[1]\n"
+        "output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+        "cadence = int(sys.argv[sys.argv.index('--cadence-seconds') + 1])\n"
+        "generation = sys.argv[sys.argv.index('--generation-id') + 1]\n"
+        "payload = console.build_degraded_plane(\n"
+        "    plane, error='synthetic:RuntimeError', generation_id=generation,\n"
+        "    cadence_seconds=cadence)\n"
+        "payload['last_success_at'] = payload['sample_finished_at']\n"
+        "payload['last_error'] = None\n"
+        "console.publish_plane(output, payload, plane)\n"
+    )
+
+
 def test_default_budgets_follow_live_measurement_and_leave_reserve() -> None:
     assert producer.DEFAULT_BUDGET_S == {"attention": 3.0, "fleet": 4.0}
+    assert console.PLANE_CADENCE_SECONDS == {"attention": 20, "fleet": 60}
     assert console.PLANE_CADENCE_SECONDS["attention"] > 3.0 + 1.0
     assert console.PLANE_CADENCE_SECONDS["fleet"] > 4.0 + 2.0
 
@@ -47,17 +67,475 @@ def test_isolated_usage_reader_dir_is_forwarded_only_to_fleet_sampler() -> None:
         Path("/tmp/fleet.js"),
         producer_script=Path("/tmp/producer.py"),
         python_executable="python3",
+        cadence_s=60,
+        generation_id="fleet-test-generation",
         readers_dir=Path("/tmp/readers"),
     )
     assert command[-2:] == ["--readers-dir", "/tmp/readers"]
+    assert command[command.index("--cadence-seconds") + 1] == "60"
+    assert command[command.index("--generation-id") + 1] == "fleet-test-generation"
     attention = producer._producer_command(
         "attention",
         Path("/tmp/attention.js"),
         producer_script=Path("/tmp/producer.py"),
         python_executable="python3",
+        cadence_s=20,
+        generation_id="attention-test-generation",
         readers_dir=Path("/tmp/readers"),
     )
     assert "--readers-dir" not in attention
+    assert attention[attention.index("--cadence-seconds") + 1] == "20"
+    assert attention[attention.index("--generation-id") + 1] == "attention-test-generation"
+
+
+def test_console_cli_embeds_requested_generation_token() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output = root / "attention-data.js"
+        generation = "attention-requested-generation"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "goalflight_fleet_console.py"),
+                "attention",
+                "--messages-dir",
+                str(root / "messages"),
+                "--fleet-dir",
+                str(root / "fleet"),
+                "--output",
+                str(output),
+                "--cadence-seconds",
+                "20",
+                "--generation-id",
+                generation,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert completed.returncode in {0, 1}, completed.stderr
+        published = _script_payload(output, "GF_ATTENTION")
+        assert published["generation_id"] == generation
+        assert published["cadence_seconds"] == 20
+
+
+def test_cadence_change_republishes_current_interval_mutation_pair() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output = root / "attention-data.js"
+        stale_sampler = root / "stale-sampler.py"
+        old_payload = console.build_degraded_plane(
+            "attention",
+            error="synthetic:RuntimeError",
+            generation_id="before-cadence-change",
+            cadence_seconds=5,
+        )
+        old_payload["last_success_at"] = old_payload["sample_finished_at"]
+        old_payload["last_error"] = None
+        console.publish_plane(output, old_payload, "attention")
+        _write_python(
+            stale_sampler,
+            "import pathlib, sys\n"
+            f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+            "import goalflight_fleet_console as console\n"
+            "output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            "generation = sys.argv[sys.argv.index('--generation-id') + 1]\n"
+            "payload = console.build_degraded_plane(\n"
+            "    'attention', error='synthetic:RuntimeError',\n"
+            "    generation_id=generation, cadence_seconds=5)\n"
+            "payload['last_success_at'] = payload['sample_finished_at']\n"
+            "payload['last_error'] = None\n"
+            "console.publish_plane(output, payload, 'attention')\n",
+        )
+
+        code = producer.run_tick(
+            "attention",
+            output=output,
+            lock_dir=root / "locks",
+            interval_s=20,
+            producer_script=stale_sampler,
+            budget_s=0.5,
+        )
+
+        published = _script_payload(output, "GF_ATTENTION")
+        assert code == 0
+        assert old_payload["cadence_seconds"] == 5  # observed-stamp mutant
+        assert published["generation_id"] != "before-cadence-change"
+        assert published["last_success_at"] is not None
+        assert published["cadence_seconds"] == 20  # current interval wins
+
+
+def test_corrupt_prior_payload_does_not_block_healthy_replacement() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output = root / "attention-data.js"
+        output.write_text("window.GF_ATTENTION = {\n", encoding="utf-8")
+        healthy_sampler = root / "healthy-sampler.py"
+        _write_python(
+            healthy_sampler,
+            "import pathlib, sys\n"
+            f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+            "import goalflight_fleet_console as console\n"
+            "output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            "cadence = int(sys.argv[sys.argv.index('--cadence-seconds') + 1])\n"
+            "generation = sys.argv[sys.argv.index('--generation-id') + 1]\n"
+            "payload = console.build_degraded_plane(\n"
+            "    'attention', error='synthetic:RuntimeError',\n"
+            "    generation_id=generation, cadence_seconds=cadence)\n"
+            "payload['last_success_at'] = payload['sample_finished_at']\n"
+            "payload['last_error'] = None\n"
+            "console.publish_plane(output, payload, 'attention')\n",
+        )
+        err = io.StringIO()
+
+        with contextlib.redirect_stderr(err):
+            code = producer.run_tick(
+                "attention",
+                output=output,
+                lock_dir=root / "locks",
+                interval_s=20,
+                producer_script=healthy_sampler,
+                budget_s=0.5,
+            )
+
+        published = _script_payload(output, "GF_ATTENTION")
+        assert code == 0
+        assert published["generation_id"].startswith("attention-")
+        assert published["last_success_at"] is not None
+        assert published["last_error"] is None
+        assert published["cadence_seconds"] == 20
+        assert err.getvalue().count("prior payload ignored:") == 1
+
+
+def test_unreadable_prior_payload_does_not_block_healthy_replacement() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output = root / "attention-data.js"
+        old_payload = console.build_degraded_plane(
+            "attention",
+            error="synthetic:RuntimeError",
+            generation_id="unreadable-prior",
+        )
+        console.publish_plane(output, old_payload, "attention")
+        output.chmod(0)
+        healthy_sampler = root / "healthy-sampler.py"
+        _write_python(healthy_sampler, _healthy_sampler_body("healthy-after-unreadable"))
+        err = io.StringIO()
+
+        try:
+            with contextlib.redirect_stderr(err):
+                code = producer.run_tick(
+                    "attention",
+                    output=output,
+                    lock_dir=root / "locks",
+                    interval_s=20,
+                    producer_script=healthy_sampler,
+                    budget_s=0.5,
+                )
+        finally:
+            # Atomic replacement normally creates a readable file. Keep temp
+            # cleanup reliable if the sampler failed before replacing it.
+            output.chmod(0o600)
+
+        published = _script_payload(output, "GF_ATTENTION")
+        assert code == 0
+        assert published["generation_id"].startswith("attention-")
+        assert published["last_success_at"] is not None
+        assert published["last_error"] is None
+        assert err.getvalue().count("prior payload ignored:") == 1
+
+
+def test_permission_only_readability_is_not_a_sampler_replacement() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output = root / "attention-data.js"
+        old_payload = console.build_degraded_plane(
+            "attention",
+            error="synthetic:RuntimeError",
+            generation_id="old-unreadable",
+            cadence_seconds=5,
+        )
+        old_payload["last_success_at"] = old_payload["sample_finished_at"]
+        old_payload["last_error"] = None
+        console.publish_plane(output, old_payload, "attention")
+        output.chmod(0)
+        permission_only_sampler = root / "permission-only-sampler.py"
+        _write_python(
+            permission_only_sampler,
+            "import pathlib, sys\n"
+            "output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            "output.chmod(0o600)\n"
+            "raise SystemExit(2)\n",
+        )
+
+        try:
+            code = producer.run_tick(
+                "attention",
+                output=output,
+                lock_dir=root / "locks",
+                interval_s=20,
+                producer_script=permission_only_sampler,
+                budget_s=0.5,
+            )
+        finally:
+            output.chmod(0o600)
+
+        published = _script_payload(output, "GF_ATTENTION")
+        assert code == 1
+        assert published["generation_id"] != "old-unreadable"
+        assert published["last_success_at"] is None
+        assert str(published["last_error"]).startswith("sampler:exit 2")
+        assert published["cadence_seconds"] == 20
+
+
+def test_unstatable_prior_path_cannot_authorize_old_bytes_after_permissions_return() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        locked = root / "locked"
+        locked.mkdir()
+        output = locked / "attention-data.js"
+        old_payload = console.build_degraded_plane(
+            "attention",
+            error="synthetic:RuntimeError",
+            generation_id="old-unstatable",
+            cadence_seconds=5,
+        )
+        old_payload["last_success_at"] = old_payload["sample_finished_at"]
+        old_payload["last_error"] = None
+        console.publish_plane(output, old_payload, "attention")
+        locked.chmod(0)
+        permission_only_sampler = root / "parent-permission-only-sampler.py"
+        _write_python(
+            permission_only_sampler,
+            "import pathlib, sys\n"
+            "output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            "output.parent.chmod(0o700)\n"
+            "raise SystemExit(2)\n",
+        )
+        err = io.StringIO()
+
+        try:
+            with contextlib.redirect_stderr(err):
+                code = producer.run_tick(
+                    "attention",
+                    output=output,
+                    lock_dir=root / "locks",
+                    interval_s=20,
+                    producer_script=permission_only_sampler,
+                    budget_s=0.5,
+                )
+        finally:
+            locked.chmod(0o700)
+
+        published = _script_payload(output, "GF_ATTENTION")
+        assert code == 1
+        assert published["generation_id"] != "old-unstatable"
+        assert published["last_success_at"] is None
+        assert str(published["last_error"]).startswith("sampler:exit 2")
+        assert published["cadence_seconds"] == 20
+        assert err.getvalue().count("prior payload ignored:") == 1
+
+
+def test_unstatable_prior_path_accepts_token_bound_atomic_replacement() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        locked = root / "locked"
+        locked.mkdir()
+        output = locked / "attention-data.js"
+        old_payload = console.build_degraded_plane(
+            "attention",
+            error="synthetic:RuntimeError",
+            generation_id="old-unstatable",
+            cadence_seconds=5,
+        )
+        console.publish_plane(output, old_payload, "attention")
+        locked.chmod(0)
+        healthy_sampler = root / "healthy-after-unknown-sampler.py"
+        _write_python(
+            healthy_sampler,
+            "import pathlib, sys\n"
+            f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+            "import goalflight_fleet_console as console\n"
+            "output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            "output.parent.chmod(0o700)\n"
+            "cadence = int(sys.argv[sys.argv.index('--cadence-seconds') + 1])\n"
+            "generation = sys.argv[sys.argv.index('--generation-id') + 1]\n"
+            "payload = console.build_degraded_plane(\n"
+            "    'attention', error='synthetic:RuntimeError',\n"
+            "    generation_id=generation, cadence_seconds=cadence)\n"
+            "payload['last_success_at'] = payload['sample_finished_at']\n"
+            "payload['last_error'] = None\n"
+            "console.publish_plane(output, payload, 'attention')\n",
+        )
+        err = io.StringIO()
+
+        try:
+            with contextlib.redirect_stderr(err):
+                code = producer.run_tick(
+                    "attention",
+                    output=output,
+                    lock_dir=root / "locks",
+                    interval_s=20,
+                    producer_script=healthy_sampler,
+                    budget_s=0.5,
+                )
+        finally:
+            locked.chmod(0o700)
+
+        published = _script_payload(output, "GF_ATTENTION")
+        assert code == 0
+        assert published["generation_id"].startswith("attention-")
+        assert published["generation_id"] != "old-unstatable"
+        assert published["last_success_at"] is not None
+        assert published["last_error"] is None
+        assert published["cadence_seconds"] == 20
+        assert err.getvalue().count("prior payload ignored:") == 1
+
+
+def test_failed_sampler_without_replacement_publishes_degraded_not_restamped_stale() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output = root / "attention-data.js"
+        failed_sampler = root / "failed-sampler.py"
+        _write_python(failed_sampler, "raise SystemExit(2)\n")
+        observed_at = (
+            dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=30)
+        ).isoformat().replace("+00:00", "Z")
+        old_payload = console.build_degraded_plane(
+            "attention",
+            error="synthetic:RuntimeError",
+            generation_id="thirty-seconds-old",
+            cadence_seconds=5,
+        )
+        old_payload["sample_started_at"] = observed_at
+        old_payload["sample_finished_at"] = observed_at
+        old_payload["last_success_at"] = observed_at
+        old_payload["last_error"] = None
+        console.publish_plane(output, old_payload, "attention")
+        err = io.StringIO()
+
+        with contextlib.redirect_stderr(err):
+            code = producer.run_tick(
+                "attention",
+                output=output,
+                lock_dir=root / "locks",
+                interval_s=20,
+                producer_script=failed_sampler,
+                budget_s=0.5,
+            )
+
+        published = _script_payload(output, "GF_ATTENTION")
+        assert code == 1
+        assert old_payload["cadence_seconds"] == 5  # ten-second freshness mutant
+        assert published["generation_id"] != "thirty-seconds-old"
+        assert published["last_success_at"] is None
+        assert str(published["last_error"]).startswith("sampler:exit 2")
+        assert published["cadence_seconds"] == 20
+        assert "without a valid replacement; published DEGRADED" in err.getvalue()
+
+
+def test_zero_exit_without_replacement_is_degraded_not_refreshed_success() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output = root / "attention-data.js"
+        no_op_sampler = root / "no-op-sampler.py"
+        _write_python(no_op_sampler, "raise SystemExit(0)\n")
+        observed_at = (
+            dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=30)
+        ).isoformat().replace("+00:00", "Z")
+        old_payload = console.build_degraded_plane(
+            "attention",
+            error="synthetic:RuntimeError",
+            generation_id="old-zero-exit-sample",
+            cadence_seconds=5,
+        )
+        old_payload["sample_started_at"] = observed_at
+        old_payload["sample_finished_at"] = observed_at
+        old_payload["last_success_at"] = observed_at
+        old_payload["last_error"] = None
+        console.publish_plane(output, old_payload, "attention")
+
+        code = producer.run_tick(
+            "attention",
+            output=output,
+            lock_dir=root / "locks",
+            interval_s=20,
+            producer_script=no_op_sampler,
+            budget_s=0.5,
+        )
+
+        published = _script_payload(output, "GF_ATTENTION")
+        assert code == 1
+        assert published["generation_id"] != "old-zero-exit-sample"
+        assert published["last_success_at"] is None
+        assert str(published["last_error"]).startswith("sampler:exit 0")
+        assert published["cadence_seconds"] == 20
+
+
+def test_nonzero_sampler_valid_replacement_is_retained() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output = root / "attention-data.js"
+        sampler = root / "degraded-sampler.py"
+        _write_python(
+            sampler,
+            "import pathlib, sys\n"
+            f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+            "import goalflight_fleet_console as console\n"
+            "output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            "cadence = int(sys.argv[sys.argv.index('--cadence-seconds') + 1])\n"
+            "generation = sys.argv[sys.argv.index('--generation-id') + 1]\n"
+            "payload = console.build_degraded_plane(\n"
+            "    'attention', error='sampler:specific failure',\n"
+            "    generation_id=generation, cadence_seconds=cadence)\n"
+            "console.publish_plane(output, payload, 'attention')\n"
+            "raise SystemExit(2)\n",
+        )
+
+        code = producer.run_tick(
+            "attention",
+            output=output,
+            lock_dir=root / "locks",
+            interval_s=20,
+            producer_script=sampler,
+            budget_s=0.5,
+        )
+
+        published = _script_payload(output, "GF_ATTENTION")
+        assert code == 2
+        assert published["generation_id"].startswith("attention-")
+        assert str(published["last_error"]).startswith("sampler:specific failure")
+        assert published["cadence_seconds"] == 20
+
+
+def test_nonzero_sampler_invalid_replacement_is_rejected_for_degraded() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        output = root / "attention-data.js"
+        invalid_sampler = root / "invalid-sampler.py"
+        _write_python(
+            invalid_sampler,
+            "import pathlib, sys\n"
+            "output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            "output.write_text('window.GF_ATTENTION = {\\n', encoding='utf-8')\n"
+            "raise SystemExit(2)\n",
+        )
+
+        code = producer.run_tick(
+            "attention",
+            output=output,
+            lock_dir=root / "locks",
+            interval_s=20,
+            producer_script=invalid_sampler,
+            budget_s=0.5,
+        )
+
+        published = _script_payload(output, "GF_ATTENTION")
+        assert code == 1
+        assert published["last_success_at"] is None
+        assert str(published["last_error"]).startswith("sampler:exit 2")
+        assert published["cadence_seconds"] == 20
 
 
 def test_second_tick_refuses_held_plane_lock_visibly() -> None:
@@ -69,7 +547,8 @@ def test_second_tick_refuses_held_plane_lock_visibly() -> None:
             slow,
             "import pathlib, time\n"
             f"pathlib.Path({str(ready)!r}).write_text('ready', encoding='utf-8')\n"
-            "time.sleep(0.5)\n",
+            "time.sleep(0.5)\n"
+            + _healthy_sampler_body("lock-holder-success"),
         )
         holder_code = (
             "import pathlib, sys; "
@@ -109,7 +588,7 @@ def test_plane_locks_are_independent() -> None:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         quick = root / "quick.py"
-        _write_python(quick, "raise SystemExit(0)\n")
+        _write_python(quick, _healthy_sampler_body("independent-plane-success"))
 
         fleet_holder = producer.PlaneLock(root / "locks", "fleet")
         assert fleet_holder.acquire()
@@ -150,8 +629,24 @@ def test_slow_catch_up_does_not_hold_the_fast_plane_lock() -> None:
             contender.release()
             return {"prompts": 0, "history": 0}
 
+        def publish_success(command: list[str], **_kwargs: object) -> int:
+            plane = command[2]
+            output = Path(command[command.index("--output") + 1])
+            cadence = int(command[command.index("--cadence-seconds") + 1])
+            generation = command[command.index("--generation-id") + 1]
+            payload = console.build_degraded_plane(
+                plane,
+                error="synthetic:RuntimeError",
+                generation_id=generation,
+                cadence_seconds=cadence,
+            )
+            payload["last_success_at"] = payload["sample_finished_at"]
+            payload["last_error"] = None
+            console.publish_plane(output, payload, plane)
+            return 0
+
         with (
-            mock.patch.object(producer, "_run_with_budget", return_value=0),
+            mock.patch.object(producer, "_run_with_budget", side_effect=publish_success),
             mock.patch.object(producer.history, "catch_up_if_due", side_effect=catch_up),
         ):
             code = producer.run_tick(
@@ -188,6 +683,7 @@ def test_budget_timeout_publishes_degraded_sample_and_exit_one() -> None:
                 lock_dir=root / "locks",
                 producer_script=slow,
                 budget_s=0.5,
+                interval_s=75,
             )
         elapsed = time.monotonic() - began
 
@@ -195,6 +691,7 @@ def test_budget_timeout_publishes_degraded_sample_and_exit_one() -> None:
         assert elapsed < 1.5, f"budget failed to stop slow child: {elapsed:.3f}s"
         payload = _script_payload(output, "GF_FLEET")
         assert payload["last_success_at"] is None
+        assert payload["cadence_seconds"] == 75
         assert str(payload["last_error"]).startswith("budget:TimeoutExpired")
         assert "fleet-console-fleet-launchd.log" in str(payload["last_error"])
         assert "install-fleet-console.sh --status --plane fleet" in str(payload["last_error"])

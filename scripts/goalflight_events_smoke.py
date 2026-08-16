@@ -63,9 +63,13 @@ def main() -> int:
     # hermetic project — relay/advance resolve their controller from these.
     env.pop("GOALFLIGHT_CONTROLLER_LABEL", None)
     env.pop("GOALFLIGHT_CONTROLLER_LEASE_NONCE", None)
+    env.pop("GOALFLIGHT_DISPATCH_ID", None)
+    env.pop("GOALFLIGHT_PROCESS_ROLE", None)
     os.environ.update(env)  # module-level probes below use the same isolation
     os.environ.pop("GOALFLIGHT_CONTROLLER_LABEL", None)
     os.environ.pop("GOALFLIGHT_CONTROLLER_LEASE_NONCE", None)
+    os.environ.pop("GOALFLIGHT_DISPATCH_ID", None)
+    os.environ.pop("GOALFLIGHT_PROCESS_ROLE", None)
 
     import goalflight_journal as journal
     import goalflight_wake as wake
@@ -87,8 +91,17 @@ def main() -> int:
                         "GOALFLIGHT_CONTROLLER_LEASE_NONCE": nonce}
         return subprocess.Popen(
             listener_cmd,
-            env=listener_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=listener_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
         )
+
+    def listener_detail(proc: subprocess.Popen, detail: str) -> str:
+        if proc.returncode == 0:
+            return detail
+        stdout = proc.stdout.read().strip() if proc.stdout is not None else ""
+        stderr = proc.stderr.read().strip() if proc.stderr is not None else ""
+        reason = stderr or stdout or "no listener diagnostic"
+        return f"{detail}; rc={proc.returncode}; {reason[:240]}"
 
     def wait_exit(proc: subprocess.Popen, timeout_s: float) -> float | None:
         t0 = time.monotonic()
@@ -136,7 +149,8 @@ def main() -> int:
     latency = wait_exit(proc, 30)
     stage("S4 self-mail rings the doorbell",
           latency is not None and proc.returncode == 0,
-          f"{(time.monotonic() - t_post):.2f}s post->exit" if latency is not None else "no exit")
+          listener_detail(proc, f"{(time.monotonic() - t_post):.2f}s post->exit")
+          if latency is not None else "no exit")
 
     # S5 — peek shows the item; CAS advance drains it; re-peek is empty.
     # relay has no label flag: identity arrives ambiently, the way a live
@@ -175,13 +189,15 @@ def main() -> int:
         attempt.attempt_id, terminal_state="complete",
         observation={"state": "complete", "outcome": {"reason": "marker:COMPLETE"}},
     )
-    # commit_terminal writes the outbox row; the watcher's pipeline then
-    # projects outbox rows onto the carrier, which is what rings doorbells.
+    # This is the watcher's wake projection itself. No attention/fleet-console
+    # producer runs in this hermetic smoke, so the projector must also complete
+    # the journal delivery that the listener observes.
     authority.project_terminal_outbox(messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]))
     latency = wait_exit(proc, 30)
     stage("S6 worker terminal rings the doorbell",
           latency is not None and proc.returncode == 0,
-          f"{(time.monotonic() - t_term):.2f}s terminal->exit" if latency is not None else "no exit")
+          listener_detail(proc, f"{(time.monotonic() - t_term):.2f}s terminal->exit")
+          if latency is not None else "no exit")
 
     # S7 — entry hint: exposure with zero coverage produces the actionable
     # one-line reminder; zero exposure stays silent.

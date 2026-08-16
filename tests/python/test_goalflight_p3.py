@@ -78,6 +78,7 @@ def test_epoch_four_migration_is_race_safe_idempotent_and_corruption_fails_close
     tmp_path: Path,
 ) -> None:
     env = _set_state_env(monkeypatch, tmp_path)
+    env[journal.ALLOW_MIGRATION_ENV] = "1"
     project = _project(tmp_path)
     authority = journal.open_or_create_journal(project)
     with sqlite3.connect(authority.path) as connection:
@@ -172,6 +173,145 @@ def test_epoch_four_migration_is_race_safe_idempotent_and_corruption_fails_close
         journal.Journal(corrupt_project)
 
 
+def test_older_journal_requires_explicit_migration_without_mutating(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    monkeypatch.delenv(journal.ALLOW_MIGRATION_ENV, raising=False)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute(
+            """UPDATE journal_epochs
+               SET schema_epoch = 4, protocol_epoch = 4, registry_epoch = 4,
+                   minimum_reader_epoch = 4, minimum_writer_epoch = 4
+               WHERE singleton = 1"""
+        )
+        expected_epochs = tuple(
+            connection.execute(
+                """SELECT schema_epoch, protocol_epoch, registry_epoch,
+                          minimum_reader_epoch, minimum_writer_epoch
+                   FROM journal_epochs WHERE singleton = 1"""
+            ).fetchone()
+        )
+    before_mtime = authority.path.stat().st_mtime_ns
+    before_bytes = authority.path.read_bytes()
+
+    with pytest.raises(
+        journal.JournalUpgradeRequired,
+        match=r"UPGRADE_REQUIRED:.*goalflight_journal\.py.*migrate",
+    ):
+        journal.Journal(project)
+
+    with sqlite3.connect(authority.path) as connection:
+        actual_epochs = tuple(
+            connection.execute(
+                """SELECT schema_epoch, protocol_epoch, registry_epoch,
+                          minimum_reader_epoch, minimum_writer_epoch
+                   FROM journal_epochs WHERE singleton = 1"""
+            ).fetchone()
+        )
+    assert actual_epochs == expected_epochs == (4, 4, 4, 4, 4)
+    assert authority.path.stat().st_mtime_ns == before_mtime
+    assert authority.path.read_bytes() == before_bytes
+    assert journal.main(["--project-root", str(project), "migrate"]) == 0
+    assert journal.Journal(project).epochs() == journal.JournalEpochs(5, 5, 5, 5, 5)
+
+
+def test_explicit_migration_runs_once_and_status_mixed_epoch_walk_is_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    monkeypatch.delenv(journal.ALLOW_MIGRATION_ENV, raising=False)
+    old_project = _project(tmp_path)
+    current_project = tmp_path / "current-project"
+    current_project.mkdir()
+    old_authority = journal.open_or_create_journal(old_project)
+    current_authority = journal.open_or_create_journal(current_project)
+    for authority, dispatch_id in (
+        (old_authority, "old-epoch-dispatch"),
+        (current_authority, "current-epoch-dispatch"),
+    ):
+        prepared = authority.prepare_attempt(dispatch_id)
+        assert prepared.committed
+    with sqlite3.connect(old_authority.path) as connection:
+        connection.execute(
+            """UPDATE journal_epochs
+               SET schema_epoch = 4, protocol_epoch = 4, registry_epoch = 4,
+                   minimum_reader_epoch = 4, minimum_writer_epoch = 4
+               WHERE singleton = 1"""
+        )
+
+    migrated = journal.Journal(old_project, allow_migration=True)
+    assert migrated.epochs() == journal.JournalEpochs(5, 5, 5, 5, 5)
+    first_markers = migrated.read_all(
+        """SELECT migration_id, COUNT(*) AS count
+           FROM journal_migrations GROUP BY migration_id ORDER BY migration_id"""
+    )
+    journal.Journal(old_project, allow_migration=True)
+    assert migrated.read_all(
+        """SELECT migration_id, COUNT(*) AS count
+           FROM journal_migrations GROUP BY migration_id ORDER BY migration_id"""
+    ) == first_markers
+
+    # Return one member of the aggregate set to an old epoch. The status walk
+    # must use Journal.open_reader: replacing it with Journal(...) would trip
+    # the constructor mutation below before it could inspect either project.
+    with sqlite3.connect(old_authority.path) as connection:
+        connection.execute(
+            """UPDATE journal_epochs
+               SET schema_epoch = 4, protocol_epoch = 4, registry_epoch = 4,
+                   minimum_reader_epoch = 4, minimum_writer_epoch = 4
+               WHERE singleton = 1"""
+        )
+    def fingerprint(authority: journal.Journal) -> tuple[int, bytes, tuple[int, ...]]:
+        with sqlite3.connect(authority.path) as connection:
+            epochs = tuple(
+                connection.execute(
+                    """SELECT schema_epoch, protocol_epoch, registry_epoch,
+                              minimum_reader_epoch, minimum_writer_epoch
+                       FROM journal_epochs WHERE singleton = 1"""
+                ).fetchone()
+            )
+        return authority.path.stat().st_mtime_ns, authority.path.read_bytes(), epochs
+
+    before = {
+        authority.path: fingerprint(authority)
+        for authority in (old_authority, current_authority)
+    }
+
+    def ordinary_open_forbidden(*_args, **_kwargs):
+        raise AssertionError("aggregate walk used a migration-capable Journal open")
+
+    monkeypatch.setattr(journal.Journal, "__init__", ordinary_open_forbidden)
+    rows = status._wait_authority_rows(
+        ["old-epoch-dispatch", "current-epoch-dispatch"],
+        {
+            "old-epoch-dispatch": {"project_root": str(old_project)},
+            "current-epoch-dispatch": {"project_root": str(current_project)},
+        },
+        project_root=None,
+        journal_cache={},
+    )
+    assert rows["old-epoch-dispatch"] == {"_wait_journal_error": True}
+    assert rows["current-epoch-dispatch"]["lifecycle_state"] == "PREPARED"
+    assert messages.controller_mail_summary(
+        task_store_project_root=old_project
+    ) == {}
+    for path, fingerprint in before.items():
+        with sqlite3.connect(path) as connection:
+            epochs = tuple(
+                connection.execute(
+                    """SELECT schema_epoch, protocol_epoch, registry_epoch,
+                              minimum_reader_epoch, minimum_writer_epoch
+                       FROM journal_epochs WHERE singleton = 1"""
+                ).fetchone()
+            )
+        assert (path.stat().st_mtime_ns, path.read_bytes(), epochs) == fingerprint
+
+
 def test_epoch_five_fences_epoch_four_reader_writer_before_schema_validation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -210,8 +350,12 @@ def test_epoch_five_fences_epoch_four_reader_writer_before_schema_validation(
                WHERE singleton = 1"""
         )
 
-    old_client = journal.Journal(project, client_epochs=epoch_four_client)
-    migrated = journal.Journal(project)
+    old_client = journal.Journal(
+        project,
+        client_epochs=epoch_four_client,
+        allow_migration=True,
+    )
+    migrated = journal.Journal(project, allow_migration=True)
     assert migrated.epochs() == journal.JournalEpochs(5, 5, 5, 5, 5)
 
     with pytest.raises(journal.JournalUpgradeRequired, match=fence_match):
@@ -323,7 +467,7 @@ def test_epoch_three_migration_deletes_cursor_token_secret(
                    registry_epoch = 3, minimum_reader_epoch = 3,
                    minimum_writer_epoch = 3 WHERE singleton = 1"""
         )
-    migrated = journal.Journal(project)
+    migrated = journal.Journal(project, allow_migration=True)
     assert migrated.read_all(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'journal_secrets'"
     ) == []
@@ -1106,8 +1250,10 @@ def test_terminal_projection_targets_owned_exactly_and_unowned_by_fanout(
     _set_state_env(monkeypatch, tmp_path)
     project = _project(tmp_path)
     authority = journal.open_or_create_journal(project)
-    _claim(authority, "primary")
-    _claim(authority, "secondary")
+    leases = {
+        label: _claim(authority, label)
+        for label in ("primary", "secondary")
+    }
 
     for dispatch_id, controller_label in (
         ("owned-terminal", "primary"),
@@ -1123,7 +1269,13 @@ def test_terminal_projection_targets_owned_exactly_and_unowned_by_fanout(
         path = ledger.record_path(dispatch_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(record), encoding="utf-8")
-        prepared = authority.prepare_attempt(dispatch_id)
+        prepared = authority.prepare_attempt(
+            dispatch_id,
+            owner_controller_label=controller_label,
+            owner_session_nonce=(
+                leases[controller_label].nonce if controller_label is not None else None
+            ),
+        )
         assert prepared.committed and prepared.value is not None
         committed = authority.commit_terminal(
             prepared.value.attempt_id,
@@ -1163,6 +1315,236 @@ def test_terminal_projection_targets_owned_exactly_and_unowned_by_fanout(
         source={"node": "test", "adapter": "test", "transport": "controller"},
     )
     assert len(authority.read_all("SELECT 1 FROM delivery_events")) == 3
+
+
+def test_terminal_projection_rehomes_retired_owner_to_current_roster(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    retired = _claim(authority, "retired-owner")
+    successor = _claim(authority, "successor-owner")
+    dispatch_id = "terminal-after-owner-retirement"
+    record_path = ledger.record_path(dispatch_id)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(
+        json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "project_root": str(project),
+                "state": "running",
+                "controller_label": "retired-owner",
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared = authority.prepare_attempt(
+        dispatch_id,
+        owner_controller_label="retired-owner",
+        owner_session_nonce=retired.nonce,
+    )
+    assert prepared.committed and prepared.value is not None
+    committed = authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="complete",
+        observation={"state": "complete", "outcome": {}},
+    )
+    assert committed.committed
+    released = authority.release_lease(
+        "retired-owner",
+        nonce=retired.nonce,
+        reason="retired-before-terminal-projection",
+    )
+    assert released.committed
+
+    assert len(authority.project_terminal_outbox(messages_dir=tmp_path / "messages")) == 1
+    live = authority.read_all(
+        """SELECT recipient_label FROM delivery_events
+           WHERE stream_id = ? AND withdrawn_at IS NULL""",
+        (dispatch_id,),
+    )
+    assert [str(row["recipient_label"]) for row in live] == ["successor-owner"]
+    pending = authority.cursor_peek("successor-owner", nonce=successor.nonce)
+    assert [str(row["stream_id"]) for row in pending.items] == [dispatch_id]
+
+
+def test_terminal_projection_uses_full_immutable_owner_not_truncated_ledger_label(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    owner_label = "controller-label-verbatim-" + ("x" * 70)
+    owner = _claim(authority, owner_label)
+    dispatch_id = "terminal-with-long-owner-label"
+    record_path = ledger.record_path(dispatch_id)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(
+        json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "project_root": str(project),
+                "state": "running",
+                "controller_label": owner_label[:64],
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared = authority.prepare_attempt(
+        dispatch_id,
+        owner_controller_label=owner_label,
+        owner_session_nonce=owner.nonce,
+    )
+    assert prepared.committed and prepared.value is not None
+    committed = authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="complete",
+        observation={"state": "complete", "outcome": {}},
+    )
+    assert committed.committed
+
+    assert len(authority.project_terminal_outbox(messages_dir=tmp_path / "messages")) == 1
+    live = authority.read_all(
+        """SELECT recipient_label FROM delivery_events
+           WHERE stream_id = ? AND withdrawn_at IS NULL""",
+        (dispatch_id,),
+    )
+    assert [str(row["recipient_label"]) for row in live] == [owner_label]
+    assert owner_label[:64] != owner_label
+    pending = authority.cursor_peek(owner_label, nonce=owner.nonce)
+    assert [str(row["stream_id"]) for row in pending.items] == [dispatch_id]
+
+
+def test_terminal_outbox_never_exposes_truncated_carrier_recipient(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    owner_label = "controller-label-verbatim-" + ("x" * 70)
+    truncated_label = owner_label[:64]
+    owner = _claim(authority, owner_label)
+    truncated = _claim(authority, truncated_label)
+    dispatch_id = "terminal-with-transient-ledger-recipient"
+    record_path = ledger.record_path(dispatch_id)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(
+        json.dumps(
+            {
+                "dispatch_id": dispatch_id,
+                "project_root": str(project),
+                "state": "running",
+                "controller_label": truncated_label,
+            }
+        ),
+        encoding="utf-8",
+    )
+    prepared = authority.prepare_attempt(
+        dispatch_id,
+        owner_controller_label=owner_label,
+        owner_session_nonce=owner.nonce,
+    )
+    assert prepared.committed and prepared.value is not None
+    committed = authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="complete",
+        observation={"state": "complete", "outcome": {}},
+    )
+    assert committed.committed
+    carrier_appended = threading.Event()
+    allow_completion = threading.Event()
+    original_complete = journal.Journal._complete_terminal_delivery
+
+    def pause_before_authoritative_completion(self, *args, **kwargs):
+        carrier_appended.set()
+        assert allow_completion.wait(5), "terminal completion pause was not released"
+        return original_complete(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        journal.Journal,
+        "_complete_terminal_delivery",
+        pause_before_authoritative_completion,
+    )
+    outcome: dict[str, object] = {}
+
+    def project() -> None:
+        outcome["result"] = authority.project_terminal_outbox(
+            messages_dir=tmp_path / "messages"
+        )
+
+    projector = threading.Thread(target=project, name="terminal-outbox-projector")
+    projector.start()
+    assert carrier_appended.wait(5), "carrier append did not reach completion boundary"
+    transient = authority.cursor_peek(truncated_label, nonce=truncated.nonce)
+    assert [str(row["stream_id"]) for row in transient.items] == []
+    allow_completion.set()
+    projector.join(timeout=5)
+    assert not projector.is_alive()
+    assert len(outcome["result"]) == 1
+    live = authority.read_all(
+        """SELECT recipient_label FROM delivery_events
+           WHERE stream_id = ? AND withdrawn_at IS NULL""",
+        (dispatch_id,),
+    )
+    assert [str(row["recipient_label"]) for row in live] == [owner_label]
+
+
+def test_terminal_projection_keeps_wildcard_rehomed_during_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    owner = _claim(authority, "retiring-owner")
+    successor = _claim(authority, "successor-owner")
+    dispatch_id = "terminal-owner-retires-during-projection"
+    prepared = authority.prepare_attempt(
+        dispatch_id,
+        owner_controller_label="retiring-owner",
+        owner_session_nonce=owner.nonce,
+    )
+    assert prepared.committed and prepared.value is not None
+    committed = authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="complete",
+        observation={"state": "complete", "outcome": {}},
+    )
+    assert committed.committed
+    original_reconcile = journal.Journal._reconcile_terminal_delivery_recipients
+    retired = False
+
+    def retire_after_projection(self, *args, **kwargs):
+        nonlocal retired
+        if not retired:
+            retired = True
+            released = self.release_lease(
+                "retiring-owner",
+                nonce=owner.nonce,
+                reason="retired-between-projection-and-reconciliation",
+            )
+            assert released.committed
+        return original_reconcile(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        journal.Journal,
+        "_reconcile_terminal_delivery_recipients",
+        retire_after_projection,
+    )
+    assert len(authority.project_terminal_outbox(messages_dir=tmp_path / "messages")) == 1
+    assert retired
+    live = authority.read_all(
+        """SELECT recipient_label FROM delivery_events
+           WHERE stream_id = ? AND withdrawn_at IS NULL""",
+        (dispatch_id,),
+    )
+    assert [str(row["recipient_label"]) for row in live] == ["*"]
+    pending = authority.cursor_peek("successor-owner", nonce=successor.nonce)
+    assert [str(row["stream_id"]) for row in pending.items] == [dispatch_id]
 
 
 def test_unowned_terminal_revalidates_retiring_roster_inside_assignment_transaction(
@@ -1444,6 +1826,121 @@ def test_unowned_terminal_projection_with_no_controller_is_held_for_registration
         nonce=lease.nonce,
     )
     assert [str(row["stream_id"]) for row in pending.items] == [dispatch_id]
+
+
+def test_terminal_outbox_without_ledger_completes_journal_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Mutation guard: deleting direct delivery makes this producer-free wake vanish."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    leases = {
+        label: _claim(authority, label)
+        for label in ("primary", "secondary")
+    }
+    dispatch_id = "terminal-without-ledger"
+    assert not ledger.record_path(dispatch_id).exists()
+    prepared = authority.prepare_attempt(dispatch_id)
+    assert prepared.committed and prepared.value is not None
+    committed = authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="complete",
+        observation={"state": "complete", "outcome": {}},
+    )
+    assert committed.committed
+
+    projected = authority.project_terminal_outbox(messages_dir=tmp_path / "messages")
+    assert len(projected) == 1
+    assert authority.project_terminal_outbox(messages_dir=tmp_path / "messages") == []
+    rows = authority.read_all(
+        """SELECT recipient_label, origin_node, event_uuid, projected_at
+           FROM delivery_events WHERE stream_id = ? ORDER BY recipient_label""",
+        (dispatch_id,),
+    )
+    assert [str(row["recipient_label"]) for row in rows] == ["primary", "secondary"]
+    assert {str(row["event_uuid"]) for row in rows} == {committed.value.event_uuid}
+    assert all(row["projected_at"] is not None for row in rows)
+    for label, lease in leases.items():
+        pending = authority.cursor_peek(label, nonce=lease.nonce)
+        assert [str(row["stream_id"]) for row in pending.items] == [dispatch_id]
+
+
+def test_terminal_outbox_retry_heals_partial_recipient_fanout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A crash after recipient A commits must not strand recipient B."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    for label in ("recipient-a", "recipient-b"):
+        _claim(authority, label)
+    dispatch_id = "terminal-partial-fanout"
+    assert not ledger.record_path(dispatch_id).exists()
+    prepared = authority.prepare_attempt(dispatch_id)
+    assert prepared.committed and prepared.value is not None
+    committed = authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="complete",
+        observation={"state": "complete", "outcome": {}},
+    )
+    assert committed.committed
+
+    original_record = journal.Journal.record_delivery_event
+    failed_after_first_commit = False
+
+    def crash_after_first_recipient(self, *args, **kwargs):
+        nonlocal failed_after_first_commit
+        result = original_record(self, *args, **kwargs)
+        if not failed_after_first_commit:
+            failed_after_first_commit = True
+            raise RuntimeError("synthetic crash after recipient A commit")
+        return result
+
+    monkeypatch.setattr(
+        journal.Journal,
+        "record_delivery_event",
+        crash_after_first_recipient,
+    )
+    assert authority.project_terminal_outbox(messages_dir=tmp_path / "messages") == []
+    partial = authority.read_all(
+        """SELECT recipient_label, COUNT(*) AS count FROM delivery_events
+           WHERE stream_id = ? GROUP BY recipient_label ORDER BY recipient_label""",
+        (dispatch_id,),
+    )
+    assert [(str(row["recipient_label"]), int(row["count"])) for row in partial] == [
+        ("recipient-a", 1),
+    ]
+    assert authority.read_all(
+        """SELECT projected_at FROM terminal_outbox WHERE attempt_id = ?""",
+        (prepared.value.attempt_id,),
+    )[0]["projected_at"] is None
+
+    monkeypatch.setattr(journal.Journal, "record_delivery_event", original_record)
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute(
+            """UPDATE terminal_outbox SET projection_retry_at = ?
+               WHERE attempt_id = ?""",
+            ("1970-01-01T00:00:00+00:00", prepared.value.attempt_id),
+        )
+
+    assert len(authority.project_terminal_outbox(messages_dir=tmp_path / "messages")) == 1
+    healed = authority.read_all(
+        """SELECT recipient_label, COUNT(*) AS count, projected_at
+           FROM delivery_events WHERE stream_id = ?
+           GROUP BY recipient_label ORDER BY recipient_label""",
+        (dispatch_id,),
+    )
+    assert [
+        (str(row["recipient_label"]), int(row["count"])) for row in healed
+    ] == [("recipient-a", 1), ("recipient-b", 1)]
+    assert all(row["projected_at"] is not None for row in healed)
+    assert authority.read_all(
+        """SELECT projected_at FROM terminal_outbox WHERE attempt_id = ?""",
+        (prepared.value.attempt_id,),
+    )[0]["projected_at"] is not None
 
 
 def test_first_wildcard_processor_adopts_once_while_unhandled_rows_wait(

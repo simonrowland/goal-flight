@@ -6,6 +6,24 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- Worker terminals wake controllers on their own. Delivery rows are written
+  by the terminal projection itself instead of riding the fleet console's
+  producer tick, so a finished worker wakes its controller even on a machine
+  with no console installed — and a crash midway through a multi-recipient
+  fanout now heals on retry instead of leaving one recipient permanently
+  undelivered.
+- Journal migrations require explicit authorization. An ordinary open of an
+  older-epoch journal refuses with the upgrade command instead of silently
+  migrating it and fencing every other controller; aggregate readers open
+  read-only, so walking projects can never mutate them.
+- Each console plane judges staleness against its own producer cadence, and
+  the producers recover rather than wedge: a corrupt prior payload no longer
+  blocks the next sample, and a failed sampler can no longer leave stale data
+  wearing a fresh timestamp.
+
+
 ### Added
 
 - Listener pools. A controller arms two doorbells instead of one, and a

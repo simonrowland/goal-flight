@@ -236,7 +236,7 @@ def test_fleet_consumes_status_once_before_project_grouping() -> dict:
         assert_true("sandbox consumed from aggregate", worker["os_sandbox"] == "workspace-write")
         assert_true("project path replaced by opaque id", payload["projects"][0]["project_id"].startswith("safe-project-"))
         assert_true("full success timestamped", payload["last_success_at"] == payload["sample_finished_at"])
-        assert_true("fleet producer cadence stamped", payload["cadence_seconds"] == 30)
+        assert_true("fleet producer cadence stamped", payload["cadence_seconds"] == 60)
         assert_true("active lease count comes from machine sample", payload["projects"][0]["session"]["active_leases"] == 1)
         assert_true("deep milestone data stays unknown on fast plane", payload["projects"][0]["milestone"]["available"] is False)
 
@@ -329,7 +329,7 @@ def test_attention_uses_envelope_timestamps_and_tolerates_missing_fleet_join() -
 
     assert_true("attention sorts oldest real timestamp first", [item["dispatch_id"] for item in payload["items"]] == ["older", "later", "not-in-fleet"])
     assert_true("valid envelope timestamp retained", payload["items"][0]["observed_at"] == "2026-08-02T10:00:00+00:00")
-    assert_true("attention producer cadence stamped", payload["cadence_seconds"] == 5)
+    assert_true("attention producer cadence stamped", payload["cadence_seconds"] == 20)
     assert_true("invalid timestamp stays unmeasurable", payload["items"][-1]["observed_at"] is None)
     assert_true("missing fleet join tolerated", payload["items"][-1]["dispatch_id"] == "not-in-fleet")
     assert_true("absolute path redacted from bounded headline", "/Users/alice/secret" not in payload["items"][-1]["headline"])
@@ -2179,6 +2179,8 @@ def test_real_shape_2000_record_fast_plane_guard_mutation_pair() -> None:
                     str(output),
                     "--lock-dir",
                     str(temp_root / "producer-locks"),
+                    "--interval-s",
+                    str({"attention": 20, "fleet": 60}[plane]),
                 ]
                 if plane == "fleet":
                     command.extend(("--readers-dir", str(readers_dir)))
@@ -2203,6 +2205,11 @@ def test_real_shape_2000_record_fast_plane_guard_mutation_pair() -> None:
                 )
 
     payload = payload_by_plane["fleet"]
+    assert_true(
+        "installed intervals reach both published payload stamps",
+        payload_by_plane["attention"]["cadence_seconds"] == 20
+        and payload_by_plane["fleet"]["cadence_seconds"] == 60,
+    )
     encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     assert_true("guard exercised all 2,000 v1 records", payload["history_excluded"] == 1994)
     assert_true("only two live worktrees become project rows", len(payload["projects"]) == 2)

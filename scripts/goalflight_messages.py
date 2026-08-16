@@ -1216,6 +1216,7 @@ def post_message(
     event_id: str | None = None,
     event_ts: str | None = None,
     author_capability: str | None = None,
+    project_journal_delivery: bool = True,
 ) -> dict:
     """Admit one monotonic stream envelope; shared by CLI, MCP, and tests."""
     validate_payload(payload)
@@ -1287,7 +1288,11 @@ def post_message(
                 raise MessageError(
                     "event identity integrity conflict: same origin_node + event_uuid has different content"
                 )
-            assignment = _prepare_journal_delivery(same_identity, path)
+            assignment = (
+                _prepare_journal_delivery(same_identity, path)
+                if project_journal_delivery
+                else ()
+            )
             _mark_journal_delivery(assignment)
             return {
                 "envelope": same_identity,
@@ -1305,7 +1310,11 @@ def post_message(
         if skip_if is not None:
             duplicate = next((item for item in existing if skip_if(item)), None)
             if duplicate is not None:
-                assignment = _prepare_journal_delivery(duplicate, path)
+                assignment = (
+                    _prepare_journal_delivery(duplicate, path)
+                    if project_journal_delivery
+                    else ()
+                )
                 _mark_journal_delivery(assignment)
                 return {
                     "envelope": duplicate,
@@ -1332,10 +1341,14 @@ def post_message(
         )
         line = serialize_envelope_line(envelope)
         replaced = [item for item in existing if replace_if is not None and replace_if(item)]
-        assignment = _prepare_journal_delivery(
-            envelope,
-            path,
-            replaced_envelopes=replaced,
+        assignment = (
+            _prepare_journal_delivery(
+                envelope,
+                path,
+                replaced_envelopes=replaced,
+            )
+            if project_journal_delivery
+            else ()
         )
         if replace_if is not None:
             _carrier_rewrite_locked(
@@ -2682,14 +2695,14 @@ def controller_pending_events(
         import goalflight_task  # type: ignore
 
         root = goalflight_task.resolve_project_root(str(project_root))
-        authority = goalflight_journal.Journal(root)
+        authority = goalflight_journal.Journal.open_reader(root)
         return authority.pending_delivery_events(
             controller_label,
             waking_only=waking_only,
             stream_ids=dispatch_ids,
             limit=limit,
         )
-    except goalflight_journal.JournalUnavailable:
+    except goalflight_journal.JournalError:
         return []
 
 
@@ -2704,7 +2717,7 @@ def controller_cursor_peek(
     import goalflight_task  # type: ignore
 
     root = goalflight_task.resolve_project_root(str(project_root))
-    return goalflight_journal.Journal(root).cursor_peek(
+    return goalflight_journal.Journal.open_reader(root).cursor_peek(
         controller_label,
         nonce=lease_nonce,
         limit=limit,
@@ -3003,7 +3016,7 @@ def controller_mail_summary(
         if label is None:
             return {}
         rows = authority.pending_delivery_events(label, waking_only=True, limit=1000)
-    except (goalflight_journal.JournalUnavailable, ValueError):
+    except (goalflight_journal.JournalError, ValueError):
         return {}
 
     items: list[dict[str, object]] = []

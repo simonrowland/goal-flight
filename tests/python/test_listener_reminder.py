@@ -65,7 +65,7 @@ def test_reminder_uses_held_waiter_lock_not_journal_row(
             stream=stream,
         )
         assert reserve_line is not None
-        assert reserve_line.startswith("listener pool n=1/2 — reserve down; re-arm: ")
+        assert reserve_line.startswith(f"listener pool n=1/{wake.DEFAULT_LISTENER_SLOTS} — reserve down; re-arm: ")
         assert "--report-pending" in reserve_line
         with wake.register_waiter(root, controller_label="bugs", kind="listener"):
             stream = io.StringIO()

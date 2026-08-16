@@ -31,13 +31,30 @@ render_plane fleet > "$fleet"
 
 grep -qF '<string>com.goalflight.fleet-console.attention</string>' "$attention"
 grep -qF '<integer>20</integer>' "$attention"
+grep -qF '<string>--interval-s</string>' "$attention"
+grep -qF '<string>20</string>' "$attention"
 grep -qF '<string>10</string>' "$attention"
 grep -qF "<string>$SANDBOX_SKILL/templates/fleet-console/attention-data.js</string>" "$attention"
 grep -qF '<string>com.goalflight.fleet-console.fleet</string>' "$fleet"
 grep -qF '<integer>60</integer>' "$fleet"
+grep -qF '<string>--interval-s</string>' "$fleet"
+grep -qF '<string>60</string>' "$fleet"
 grep -qF '<string>30</string>' "$fleet"
 grep -qF "<string>$SANDBOX_SKILL/templates/fleet-console/fleet-data.js</string>" "$fleet"
 echo "test1 pass: separate launchd planes render their documented cadence and budget"
+
+"$REAL_PYTHON" - "$attention" "$fleet" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+
+for path, expected in zip(map(Path, sys.argv[1:]), (20, 60)):
+    payload = plistlib.loads(path.read_bytes())
+    argv = payload["ProgramArguments"]
+    forwarded = int(argv[argv.index("--interval-s") + 1])
+    assert payload["StartInterval"] == forwarded == expected
+PY
+echo "test1b pass: each plist StartInterval reaches its producer argv unchanged"
 
 for rendered in "$attention" "$fleet"; do
   grep -qF "<string>$FAKEBIN/python3</string>" "$rendered"

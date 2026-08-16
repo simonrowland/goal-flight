@@ -35,6 +35,7 @@ import os
 from pathlib import Path
 import random
 import re
+import shlex
 import socket
 import sqlite3
 import sys
@@ -122,6 +123,7 @@ MAX_PARAMETER_VALUE_BYTES = 65_536
 MAX_TRANSACTION_PARAMETER_BYTES = 1_048_576
 OUTBOX_MAX_PROJECTION_ATTEMPTS = 3
 OUTBOX_RETRY_BASE_S = 1.0
+ALLOW_MIGRATION_ENV = "GOALFLIGHT_ALLOW_JOURNAL_MIGRATION"
 _SQL_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _STATE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 _IDENTITY_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}\Z")
@@ -733,6 +735,7 @@ class Journal:
         project_root: Path | str,
         *,
         client_epochs: ClientEpochs | None = None,
+        allow_migration: bool | None = None,
         retry_budget_s: float = 1.0,
         transaction_budget_s: float = 1.0,
         jitter_min_s: float = 0.005,
@@ -741,6 +744,7 @@ class Journal:
         self._configure(
             project_root,
             client_epochs=client_epochs,
+            allow_migration=allow_migration,
             retry_budget_s=retry_budget_s,
             transaction_budget_s=transaction_budget_s,
             jitter_min_s=jitter_min_s,
@@ -767,6 +771,7 @@ class Journal:
         self._configure(
             project_root,
             client_epochs=client_epochs,
+            allow_migration=False,
             retry_budget_s=retry_budget_s,
             transaction_budget_s=transaction_budget_s,
             jitter_min_s=jitter_min_s,
@@ -815,6 +820,7 @@ class Journal:
         self._configure(
             project_root,
             client_epochs=client_epochs,
+            allow_migration=False,
             retry_budget_s=retry_budget_s,
             transaction_budget_s=transaction_budget_s,
             jitter_min_s=jitter_min_s,
@@ -829,6 +835,7 @@ class Journal:
         project_root: Path | str,
         *,
         client_epochs: ClientEpochs | None,
+        allow_migration: bool | None,
         retry_budget_s: float,
         transaction_budget_s: float,
         jitter_min_s: float,
@@ -843,6 +850,11 @@ class Journal:
         self.project_root = goalflight_task.resolve_project_root(str(project_root))
         self.path = resolve_journal_path(self.project_root)
         self.client_epochs = client_epochs or ClientEpochs()
+        self.allow_migration = (
+            os.environ.get(ALLOW_MIGRATION_ENV) == "1"
+            if allow_migration is None
+            else bool(allow_migration)
+        )
         self.retry_budget_s = retry_budget_s
         self.transaction_budget_s = transaction_budget_s
         self.jitter_min_s = jitter_min_s
@@ -1124,6 +1136,23 @@ class Journal:
             # shape validation: schema deltas are expected across epochs and
             # must not be misreported to an old client as journal corruption.
             self._assert_epoch_fence(connection, for_write=False)
+            missing_before, malformed_before = self._current_schema_issues(connection)
+            outbox_columns = tuple(
+                str(column[1])
+                for column in connection.execute("PRAGMA table_info(terminal_outbox)")
+            )
+            legacy_outbox = outbox_columns == _LEGACY_TERMINAL_OUTBOX_COLUMNS
+            nonrepairable_malformed = sorted(
+                set(malformed_before) - ({"terminal_outbox"} if legacy_outbox else set())
+            )
+            if nonrepairable_malformed:
+                self._raise_integrity_failure(
+                    "epoch-5 journal has structurally invalid tables: "
+                    + ", ".join(nonrepairable_malformed)
+                )
+            repairable_shape = bool(missing_before) or legacy_outbox
+            if repairable_shape and not self.allow_migration:
+                self._raise_migration_required(stored)
             retry_columns_migrated = self._install_outbox_retry_columns(connection)
             missing, malformed = self._current_schema_issues(connection)
             if malformed:
@@ -1157,6 +1186,8 @@ class Journal:
             (4, 4, 4, 4, 4),
         }:
             return False
+        if not self.allow_migration:
+            self._raise_migration_required(stored)
         client = self.client_epochs
         if (client.schema, client.protocol, client.registry, client.reader, client.writer) != (
             CURRENT_SCHEMA_EPOCH,
@@ -1220,6 +1251,23 @@ class Journal:
             (now,),
         )
         return True
+
+    def _raise_migration_required(self, stored: tuple[int, ...]) -> None:
+        command = shlex.join(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--project-root",
+                str(self.project_root),
+                "migrate",
+            ]
+        )
+        raise JournalUpgradeRequired(
+            "UPGRADE_REQUIRED: journal migration is disabled for ordinary opens; "
+            f"journal epochs={stored}, client epochs="
+            f"{(CURRENT_SCHEMA_EPOCH, CURRENT_PROTOCOL_EPOCH, CURRENT_REGISTRY_EPOCH, CURRENT_READER_EPOCH, CURRENT_WRITER_EPOCH)}. "
+            f"Run the explicit upgrade command: {command}"
+        )
 
     @staticmethod
     def _install_attempt_owner_columns(connection: sqlite3.Connection) -> bool:
@@ -2775,7 +2823,7 @@ class Journal:
             if row is None:
                 return None
             withdrawn_at = str(row["withdrawn_at"] or utc_now())
-            connection.execute(
+            withdrawn = connection.execute(
                 """
                 UPDATE delivery_events SET withdrawn_at = ?
                 WHERE project_root = ? AND recipient_label = ?
@@ -2783,6 +2831,13 @@ class Journal:
                 """,
                 (withdrawn_at, project_root, recipient, origin, event_id),
             )
+            if withdrawn.rowcount:
+                self._invalidate_delivery_cursor_snapshots(
+                    connection,
+                    project_root=project_root,
+                    recipient_label=recipient,
+                    updated_at=withdrawn_at,
+                )
             result = dict(row)
             result["withdrawn_at"] = withdrawn_at
             return result
@@ -4024,7 +4079,15 @@ class Journal:
         messages_dir: Path,
         limit: int = 100,
     ) -> list[OutboxProjection]:
-        """Project terminal events to the carrier; event UUID makes retries idempotent."""
+        """Project terminal events to carrier and delivery journal idempotently.
+
+        Delivery completion belongs here, on the wake projection path, instead
+        of in the fleet-console producer or the listener's idle poll.  The
+        projector already runs only for pending outbox rows, so completing the
+        delivery beside the carrier append avoids perpetual listener writes and
+        keeps console installation irrelevant to correctness.  ``event_uuid``
+        is the retry identity across both records.
+        """
         import goalflight_messages
 
         projected: list[OutboxProjection] = []
@@ -4043,6 +4106,24 @@ class Journal:
                     },
                     event_id=str(row["event_uuid"]),
                     event_ts=str(row["created_at"]),
+                    # Terminal attempt ownership, active-roster fanout, and
+                    # partial retry healing are journal authority here. Do not
+                    # expose a presentation-ledger target in the gap between
+                    # the carrier append and authoritative completion.
+                    project_journal_delivery=False,
+                )
+                # A carrier that returns an unexpected shape must degrade to a
+                # recorded projection failure, never a KeyError that aborts the
+                # whole loop and strands every remaining row.
+                if not isinstance(result, dict) or "envelope" not in result or "path" not in result:
+                    raise ValueError(
+                        "carrier append returned no envelope/path for "
+                        f"{row['event_uuid']}"
+                    )
+                self._complete_terminal_delivery(
+                    row,
+                    envelope=result["envelope"],
+                    carrier_path=Path(str(result["path"])),
                 )
             except (
                 goalflight_messages.MessageError,
@@ -4083,6 +4164,143 @@ class Journal:
                     )
                 )
         return projected
+
+    def _complete_terminal_delivery(
+        self,
+        row: Mapping[str, object],
+        *,
+        envelope: Mapping[str, object],
+        carrier_path: Path,
+    ) -> None:
+        """Ensure a carrier-projected terminal has a visible delivery row."""
+        origin_node = str(row["origin_node"])
+        event_uuid = str(row["event_uuid"])
+        attempt = self.read_all(
+            """SELECT owner_controller_label FROM dispatch_attempts
+               WHERE attempt_id = ?""",
+            (str(row["attempt_id"]),),
+        )
+        owner = str(attempt[0]["owner_controller_label"] or "") if attempt else ""
+        if owner and self.active_lease(owner) is not None:
+            # Attempt ownership is immutable and preserves the full controller
+            # identity even when the presentation-only ledger label truncates
+            # it. Revalidate the lease inside the assignment transaction so a
+            # concurrent retirement falls back to the durable wildcard.
+            recipients = ((owner, True),)
+        else:
+            # A retired or absent attempt owner is unowned work. Snapshot the
+            # complete current roster on every retry and revalidate each label
+            # transactionally; an empty or concurrently retiring roster falls
+            # back to the durable wildcard.
+            labels = tuple(
+                str(lease["label"])
+                for lease in self.lease_records()
+                if str(lease.get("label") or "")
+            )
+            recipients = tuple((label, True) for label in labels) or (("*", False),)
+
+        # Recompute the complete target set on every retry. A prior projection
+        # may have committed only a prefix of this fanout before crashing;
+        # record_delivery_event's recipient/origin/event UUID identity makes
+        # the committed prefix idempotent while the missing suffix is filled.
+        actual_recipients: set[str] = set()
+        for recipient, require_active in recipients:
+            recorded = self.record_delivery_event(
+                recipient_label=recipient,
+                origin_node=origin_node,
+                event_uuid=event_uuid,
+                stream_id=str(envelope.get("dispatch_id") or row["recipient"]),
+                stream_seq=int(envelope.get("seq") or 0),
+                carrier_path=carrier_path,
+                event_type=str(row["event_type"]),
+                wake_class="waking",
+                created_at=str(row["created_at"]),
+                fallback_to_wildcard_if_inactive=require_active,
+            )
+            if not recorded.committed or recorded.value is None:
+                raise JournalUnavailable(
+                    recorded.reason or "terminal delivery assignment was not committed"
+                )
+            actual_recipient = str(recorded.value["recipient_label"])
+            marked = self.mark_delivery_projected(
+                recipient_label=actual_recipient,
+                origin_node=origin_node,
+                event_uuid=event_uuid,
+            )
+            if not marked.committed or marked.value is None:
+                raise JournalUnavailable(
+                    marked.reason or "terminal delivery projection was not committed"
+                )
+            # Retirement can transactionally rehome an exact row to wildcard
+            # between assignment and projection. Reconcile against the row
+            # that projection actually made visible.
+            actual_recipients.add(str(marked.value["recipient_label"]))
+
+        # post_message also assigns the carrier using presentation metadata.
+        # Reconcile any stale or truncated carrier-side choice only after every
+        # authoritative target is durable, so a crash can always retry safely.
+        reconciled = self._reconcile_terminal_delivery_recipients(
+            origin_node=origin_node,
+            event_uuid=event_uuid,
+            authoritative_recipients=actual_recipients,
+        )
+        if not reconciled.committed:
+            raise JournalUnavailable(
+                reconciled.reason or "stale terminal delivery reconciliation was not committed"
+            )
+
+    def _reconcile_terminal_delivery_recipients(
+        self,
+        *,
+        origin_node: str,
+        event_uuid: str,
+        authoritative_recipients: Iterable[str],
+    ) -> WriteResult[tuple[str, ...]]:
+        """Withdraw stale carrier targets without racing lease retirement."""
+        origin = self._identity_token(origin_node, label="origin node")
+        event_id = self._canonical_uuid(event_uuid, label="event_uuid")
+        requested = {
+            "*" if recipient == "*" else self._identity_token(recipient, label="recipient label")
+            for recipient in authoritative_recipients
+        }
+        project_root = str(self.project_root)
+
+        def action(connection: sqlite3.Connection) -> tuple[str, ...]:
+            rows = connection.execute(
+                """SELECT recipient_label FROM delivery_events
+                   WHERE project_root = ? AND origin_node = ? AND event_uuid = ?
+                     AND withdrawn_at IS NULL""",
+                (project_root, origin, event_id),
+            ).fetchall()
+            live = {str(row["recipient_label"]) for row in rows}
+            preserved = set(requested)
+            # Lease retirement may rehome an exact assignment after its mark
+            # commits but before reconciliation starts. If a requested exact
+            # row disappeared and wildcard is now live, that wildcard is the
+            # authoritative successor rather than stale carrier metadata.
+            if "*" in live and any(recipient not in live for recipient in requested):
+                preserved.add("*")
+            stale = tuple(sorted(live - preserved))
+            if not stale:
+                return ()
+            withdrawn_at = utc_now()
+            for recipient in stale:
+                connection.execute(
+                    """UPDATE delivery_events SET withdrawn_at = ?
+                       WHERE project_root = ? AND recipient_label = ?
+                         AND origin_node = ? AND event_uuid = ?
+                         AND withdrawn_at IS NULL""",
+                    (withdrawn_at, project_root, recipient, origin, event_id),
+                )
+                self._invalidate_delivery_cursor_snapshots(
+                    connection,
+                    project_root=project_root,
+                    recipient_label=recipient,
+                    updated_at=withdrawn_at,
+                )
+            return stale
+
+        return self._domain_write(action)
 
     def inspect(self) -> dict[str, object]:
         with contextlib.closing(self._connect()) as connection:
@@ -4138,17 +4356,21 @@ class Journal:
             tmp.unlink(missing_ok=True)
 
 
-def open_or_create_journal(project_root: Path | str) -> Journal:
+def open_or_create_journal(
+    project_root: Path | str,
+    *,
+    allow_migration: bool | None = None,
+) -> Journal:
     """Open authority, explicitly bootstrapping only a truly absent path."""
     path = resolve_journal_path(project_root)
     if os.path.lexists(path):
-        return Journal(project_root)
+        return Journal(project_root, allow_migration=allow_migration)
     try:
         return Journal.create(project_root)
     except JournalError:
         if not os.path.lexists(path):
             raise
-        return Journal(project_root)
+        return Journal(project_root, allow_migration=allow_migration)
 
 
 def _validate_snapshot_file(path: Path) -> JournalEpochs:
@@ -4393,6 +4615,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project-root", type=Path, default=Path.cwd())
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="explicitly create a first-bootstrap journal")
+    sub.add_parser("migrate", help="explicitly migrate an existing journal")
     sub.add_parser("inspect", help="validate and describe the live journal")
     sub.add_parser("dump", help="validate and emit a logical SQL dump")
     snapshot_parser = sub.add_parser("snapshot", help="create a validated online SQLite backup")
@@ -4423,6 +4646,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "init":
             print(Journal.create(args.project_root).path)
+        elif args.command == "migrate":
+            migrated = Journal(args.project_root, allow_migration=True)
+            print(json.dumps(migrated.inspect(), indent=2, sort_keys=True))
         elif args.command == "inspect":
             print(json.dumps(Journal(args.project_root).inspect(), indent=2, sort_keys=True))
         elif args.command == "dump":

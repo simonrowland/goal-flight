@@ -46,7 +46,10 @@ FLEET_SCHEMA = "goalflight.fleet-console.fleet.v2"
 ATTENTION_SCHEMA = "goalflight.fleet-console.attention.v1"
 PRODUCER_NAME = "goalflight_fleet_console.py"
 SCRIPT_GLOBALS = {"fleet": "GF_FLEET", "attention": "GF_ATTENTION"}
-PLANE_CADENCE_SECONDS = {"attention": 5, "fleet": 30}
+# Standalone/manual defaults mirror the installer. Installed launchd jobs pass
+# their StartInterval explicitly, so that value remains authoritative if these
+# defaults and a deployed schedule ever diverge again.
+PLANE_CADENCE_SECONDS = {"attention": 20, "fleet": 60}
 
 # Head of the recency-ordered project registry to sample per tick. See
 # _registered_projects for the measurement that sets this: the per-project
@@ -533,6 +536,13 @@ def _generation_id(plane: str, supplied: str | None) -> str:
     return _display(value, limit=128) or f"{plane}-unknown"
 
 
+def _current_cadence_seconds(plane: str, supplied: int | None) -> int:
+    cadence = PLANE_CADENCE_SECONDS[plane] if supplied is None else supplied
+    if isinstance(cadence, bool) or not isinstance(cadence, int) or cadence <= 0:
+        raise ValueError("cadence must be a positive integer number of seconds")
+    return cadence
+
+
 def _metadata(
     plane: str,
     *,
@@ -540,6 +550,7 @@ def _metadata(
     started_at: str,
     finished_at: str,
     errors: list[str],
+    cadence_seconds: int | None = None,
 ) -> dict[str, Any]:
     error = (
         f"{errors[-1]} · {_operator_action(plane)}"
@@ -553,7 +564,7 @@ def _metadata(
         "last_success_at": finished_at if not errors else None,
         "producer": {"name": PRODUCER_NAME, "plane": plane},
         "last_error": error,
-        "cadence_seconds": PLANE_CADENCE_SECONDS[plane],
+        "cadence_seconds": _current_cadence_seconds(plane, cadence_seconds),
     }
 
 
@@ -2061,6 +2072,7 @@ def build_fleet_plane(
     readers_dir: Path | None = None,
     usage_timeout_s: float = goalflight_usage.DEFAULT_TIMEOUT_S,
     generation_id: str | None = None,
+    cadence_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Build one machine-wide fleet sample, then group it by registered project."""
     started_at = _utc_now()
@@ -2161,6 +2173,7 @@ def build_fleet_plane(
             started_at=started_at,
             finished_at=finished_at,
             errors=errors,
+            cadence_seconds=cadence_seconds,
         ),
         # These count the REGISTRY pass, not len(projects): a project with a
         # live dispatch record gets a row even when it is outside the deep
@@ -2320,6 +2333,7 @@ def build_attention_plane(
     fleet_dir: Path | None = None,
     generation_id: str | None = None,
     project_roots: list[Path] | None = None,
+    cadence_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Build the fast attention sample from mail and HUNG controller facts."""
     started_at = _utc_now()
@@ -2359,7 +2373,7 @@ def build_attention_plane(
     if project_roots is None:
         # Machine status already names every root with live work or an ACTIVE
         # capacity lease. Do not re-enumerate the permanent 1,954-row project
-        # registry on the five-second attention plane.
+        # registry on the fast attention plane.
         resolved_project_roots = [
             Path(root)
             for root in sorted(_fast_project_roots(machine_status))[
@@ -2390,6 +2404,7 @@ def build_attention_plane(
             started_at=started_at,
             finished_at=finished_at,
             errors=errors,
+            cadence_seconds=cadence_seconds,
         ),
         **controller_probe_metadata,
         # Renderers derive minute buckets from observed_at at display time.  No
@@ -2407,6 +2422,7 @@ def build_degraded_plane(
     error: str,
     started_at: str | None = None,
     generation_id: str | None = None,
+    cadence_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Build an empty, schema-valid sample for a whole-tick producer failure.
 
@@ -2432,6 +2448,7 @@ def build_degraded_plane(
         started_at=began,
         finished_at=finished_at,
         errors=[bounded_error],
+        cadence_seconds=cadence_seconds,
     )
     if plane == "attention":
         payload = {
@@ -2497,11 +2514,15 @@ def build_parser() -> argparse.ArgumentParser:
     fleet.add_argument("--fleet-dir", type=Path)
     fleet.add_argument("--readers-dir", type=Path)
     fleet.add_argument("--usage-timeout-s", type=float, default=goalflight_usage.DEFAULT_TIMEOUT_S)
+    fleet.add_argument("--cadence-seconds", type=int)
+    fleet.add_argument("--generation-id")
     fleet.add_argument("--output", type=Path, help="atomic GF_FLEET script output; JSON stdout when omitted")
 
     attention = subparsers.add_parser("attention", help="sample timestamped operator attention mail")
     attention.add_argument("--messages-dir", type=Path)
     attention.add_argument("--fleet-dir", type=Path)
+    attention.add_argument("--cadence-seconds", type=int)
+    attention.add_argument("--generation-id")
     attention.add_argument("--output", type=Path, help="atomic GF_ATTENTION script output; JSON stdout when omitted")
     return parser
 
@@ -2513,11 +2534,15 @@ def main(argv: list[str] | None = None) -> int:
             fleet_dir=args.fleet_dir,
             readers_dir=args.readers_dir,
             usage_timeout_s=args.usage_timeout_s,
+            generation_id=args.generation_id,
+            cadence_seconds=args.cadence_seconds,
         )
     else:
         payload = build_attention_plane(
             messages_dir=args.messages_dir,
             fleet_dir=args.fleet_dir,
+            generation_id=args.generation_id,
+            cadence_seconds=args.cadence_seconds,
         )
     if args.output is not None:
         # A missing parent directory is a first-run footgun, not a reason to
