@@ -57,6 +57,9 @@ PLANE_CADENCE_SECONDS = {"attention": 20, "fleet": 60}
 # cost is ~1.0s, and the drain tick this rides is ~60s, so the whole
 # per-project pass has to fit in a fraction of that alongside everything else.
 DEFAULT_MAX_PROJECTS = 12
+# Basenames that collide across scratch/tmp checkouts. Prefer repo_identity;
+# these leftovers get a short project_id suffix so the omitted list is readable.
+GENERIC_PROJECT_BASENAMES = frozenset({"project", "proj"})
 
 # Only ACTIVE controller lease generations belong to the short-poll plane.
 # Bound even malformed/multi-active history to the newest eight per label;
@@ -301,6 +304,8 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             "last_seen": None,
             "generation": None,
             "retire_command": None,
+            "last_error": None,
+            "probe_command": None,
         }
     ],
     "unassigned_workers": [
@@ -577,6 +582,29 @@ def _repo_identity_scalar(value: object) -> str | None:
     if not text:
         return None
     return _display(text, limit=160)
+
+
+def _repo_display(identity: object) -> str | None:
+    """Operator label for a cached identity: owner/name, never a filesystem path."""
+    text = _repo_identity_scalar(identity)
+    if text is None:
+        return None
+    if text.startswith("file"):
+        tail = text.rsplit("/", 1)[-1]
+        return _display(tail or "local", limit=64)
+    parts = text.split("/")
+    shown = "/".join(parts[1:]) if len(parts) >= 3 else text
+    return _display(shown, limit=64)
+
+
+def _generic_basename_label(basename: str, project_id: str) -> str:
+    """Disambiguate leftover generic basenames with the short project_id digest."""
+    if basename.casefold() not in GENERIC_PROJECT_BASENAMES:
+        return basename
+    suffix = project_id.rsplit("-", 1)[-1]
+    if suffix and suffix != basename:
+        return _display(f"{basename} · {suffix}", limit=64) or project_id
+    return project_id
 
 
 def _safe_error(source: str, exc: BaseException) -> str:
@@ -1131,6 +1159,81 @@ def _controller_retire_command(label: str) -> str:
     return "python3 scripts/goalflight_session_status.py --retire " + shlex.quote(label)
 
 
+def _controller_probe_command(label: str, generation: int | None = None) -> str:
+    """Read-only lock probe; relative so the plane stays path-free."""
+    command = (
+        "python3 scripts/goalflight_fleet_console.py probe-holder --label "
+        + shlex.quote(label)
+    )
+    if isinstance(generation, int) and not isinstance(generation, bool) and generation >= 0:
+        command += f" --generation {generation}"
+    return command
+
+
+def probe_holder_lock(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    generation: int | None = None,
+) -> bool | None:
+    """Return lease_holder_alive for one labelled generation.
+
+    Read-only: never expire, claim, or prune. Missing journal, missing lock,
+    or an ambiguous generation is None — the same UNKNOWN the console shows.
+    """
+    root = Path(project_root)
+    try:
+        authority = goalflight_journal.Journal.open_reader(root)
+        rows = authority.lease_records(include_ended=generation is not None)
+    except (goalflight_journal.JournalError, OSError, ValueError):
+        return None
+    matches: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("label") != controller_label:
+            continue
+        nonce = row.get("nonce")
+        if not isinstance(nonce, str) or not nonce:
+            continue
+        if generation is None:
+            if row.get("state") != goalflight_journal.LEASE_ACTIVE:
+                continue
+        elif row.get("generation") != generation:
+            continue
+        matches.append(row)
+    if len(matches) != 1:
+        return None
+    try:
+        return goalflight_wake.lease_holder_alive(
+            root,
+            controller_label=controller_label,
+            lease_nonce=str(matches[0]["nonce"]),
+        )
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _controller_unknown_error(
+    *,
+    holder_lock: bool | None,
+    live_waiter_count: int | None,
+    lock_reason: str | None,
+    probe_error: str | None,
+) -> str | None:
+    """Why classify_controller returned UNKNOWN; None when the state is known."""
+    if live_waiter_count is not None and holder_lock is not None:
+        return None
+    parts: list[str] = []
+    if probe_error:
+        parts.append(f"lease probe failed:{probe_error}")
+    elif holder_lock is None and lock_reason:
+        parts.append(lock_reason)
+    if live_waiter_count is None:
+        parts.append("waiter probe unavailable")
+    return " · ".join(parts) or None
+
+
 def _journals_dir() -> Path | None:
     override = os.environ.get("GOALFLIGHT_JOURNAL_DIR", "").strip()
     if override:
@@ -1184,6 +1287,7 @@ def _empty_controller_context() -> dict[str, object | None]:
         "listener_target": None,
         "in_flight_count": 0,
         "last_seen": None,
+        "last_error": "journal unreadable",
     }
 
 
@@ -1205,6 +1309,19 @@ def _controller_panel_row(
         if state == "DEAD" and label
         else None
     )
+    probe = (
+        _controller_probe_command(
+            label,
+            generation if isinstance(generation, int) and not isinstance(generation, bool) else None,
+        )
+        if state == "UNKNOWN" and label
+        else None
+    )
+    last_error = (
+        _display(context.get("last_error"), limit=160)
+        if state == "UNKNOWN"
+        else None
+    )
     parent = _parent_fields(project_root)
     return {
         "controller_key": _display(
@@ -1224,6 +1341,8 @@ def _controller_panel_row(
         "last_seen": _iso_timestamp(context.get("last_seen")),
         "generation": generation if isinstance(generation, int) and not isinstance(generation, bool) else None,
         "retire_command": _display(retire, limit=160) if retire else None,
+        "last_error": last_error,
+        "probe_command": _display(probe, limit=160) if probe else None,
     }
 
 
@@ -1289,6 +1408,8 @@ def _aggregate_controller_rows(
             current["listener_target"] = row.get("listener_target")
             current["generation"] = row.get("generation")
             current["retire_command"] = row.get("retire_command")
+            current["last_error"] = row.get("last_error")
+            current["probe_command"] = row.get("probe_command")
         current_flight = current.get("in_flight_count")
         new_flight = row.get("in_flight_count")
         if isinstance(current_flight, int) and isinstance(new_flight, int):
@@ -1307,6 +1428,18 @@ def _aggregate_controller_rows(
         elif row.get("label"):
             row["retire_command"] = _display(
                 _controller_retire_command(str(row["label"])), limit=160
+            )
+        if row.get("controller_liveness_state") != "UNKNOWN":
+            row["last_error"] = None
+            row["probe_command"] = None
+        elif row.get("label") and not row.get("probe_command"):
+            generation = row.get("generation")
+            row["probe_command"] = _display(
+                _controller_probe_command(
+                    str(row["label"]),
+                    generation if isinstance(generation, int) and not isinstance(generation, bool) else None,
+                ),
+                limit=160,
             )
     return sorted(grouped.values(), key=_controller_sort_key)
 
@@ -1498,12 +1631,15 @@ def _controller_contexts_by_session(
             session_id, []
         )
         listener_records: list[Any] | None = []
+        lock_reason: str | None = None
+        probe_error: str | None = None
         if not matches:
             holder_lock: bool | None = False
             live_waiter_count = 0
         elif len(matches) != 1 or label is None:
             holder_lock = None
             live_waiter_count = 0
+            lock_reason = "lease generation is ambiguous"
         else:
             try:
                 raw_nonce = str(matches[0].get("nonce") or "")
@@ -1514,6 +1650,8 @@ def _controller_contexts_by_session(
                         controller_label=label,
                         lease_nonce=raw_nonce,
                     )
+                if holder_lock is None:
+                    lock_reason = "lease lock file missing"
                 live_waiters = goalflight_wake.live_waiters(
                     project_root,
                     controller_label=label,
@@ -1525,10 +1663,12 @@ def _controller_contexts_by_session(
                 else:
                     live_waiter_count = len(live_waiters)
                     listener_records = list(live_waiters)
-            except (OSError, RuntimeError, ValueError):
+            except (OSError, RuntimeError, ValueError) as exc:
                 holder_lock = None
                 live_waiter_count = None
                 listener_records = None
+                probe_error = type(exc).__name__
+                lock_reason = "lease probe failed"
         in_flight_count = _journal_in_flight_count(
             authority,
             controller_label=label or "",
@@ -1567,6 +1707,12 @@ def _controller_contexts_by_session(
             "listener_target": listener_target,
             "in_flight_count": in_flight_count,
             "last_seen": last_seen,
+            "last_error": _controller_unknown_error(
+                holder_lock=holder_lock,
+                live_waiter_count=live_waiter_count,
+                lock_reason=lock_reason,
+                probe_error=probe_error,
+            ),
         }
     return contexts
 
@@ -2286,11 +2432,20 @@ def _registry_omitted_identity(row: dict[str, Any], root: str) -> dict[str, Any]
     paths never leave this helper -- the allowlist sees a basename and a hash.
     """
     return {
-        "name": _display(Path(root).name or "project", limit=64),
+        "name": _omitted_display_name(row, root),
         "project_id": _project_id(root),
         "repo_identity": _repo_identity_scalar(row.get("repo_identity")),
         "last_seen": _iso_timestamp(row.get("last_seen")),
     }
+
+
+def _omitted_display_name(row: dict[str, Any], root: str) -> str:
+    """Prefer cached owner/name; fall back to basename; suffix leftover generics."""
+    shown = _repo_display(row.get("repo_identity"))
+    if shown:
+        return shown
+    basename = _display(Path(root).name or "project", limit=64) or "project"
+    return _generic_basename_label(basename, _project_id(root))
 
 
 def _project_rows(
@@ -2940,6 +3095,10 @@ def _backfill_projection_fields(payload: dict[str, Any], plane: str) -> None:
     if plane == "fleet":
         payload.setdefault("registry_unsampled", None)
         payload.setdefault("registry_unsampled_projects", [])
+        for row in payload.get("controllers") or []:
+            if isinstance(row, dict):
+                row.setdefault("last_error", None)
+                row.setdefault("probe_command", None)
 
 
 def _is_retainable_sample(payload: dict[str, Any], plane: str) -> bool:
@@ -3038,11 +3197,28 @@ def build_parser() -> argparse.ArgumentParser:
     attention.add_argument("--cadence-seconds", type=int)
     attention.add_argument("--generation-id")
     attention.add_argument("--output", type=Path, help="atomic GF_ATTENTION script output; JSON stdout when omitted")
+
+    probe = subparsers.add_parser(
+        "probe-holder",
+        help="read-only lease-holder lock probe; prints True, False, or None",
+    )
+    probe.add_argument("--label", required=True)
+    probe.add_argument("--generation", type=int)
+    probe.add_argument("--project-root", type=Path, default=Path("."))
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.plane == "probe-holder":
+        print(
+            probe_holder_lock(
+                args.project_root,
+                controller_label=args.label,
+                generation=args.generation,
+            )
+        )
+        return 0
     if args.plane == "fleet":
         payload = build_fleet_plane(
             fleet_dir=args.fleet_dir,

@@ -693,8 +693,8 @@
     if (Number.isFinite(unsampled) && unsampled > 0) {
       var omittedNames = [];
       omitted.forEach(function (row) {
-        var name = row && textValue(row.name);
-        if (name && name !== "unknown") omittedNames.push(name);
+        var name = omittedDisplayName(row);
+        if (name) omittedNames.push(name);
       });
       var truncation = "+" + unsampled + " registered projects unsampled";
       if (omittedNames.length) truncation += " · " + omittedNames.join(", ");
@@ -1060,6 +1060,25 @@
     return text;
   }
 
+  var GENERIC_PROJECT_NAMES = { project: true, proj: true };
+
+  function omittedDisplayName(row) {
+    var shown = repoDisplay(row && row.repo_identity);
+    if (shown) return shown;
+    var name = row && textValue(row.name);
+    if (name && name !== "unknown" && !GENERIC_PROJECT_NAMES[String(name).toLowerCase()]) {
+      return name;
+    }
+    var projectId = row && textValue(row.project_id);
+    if (name && name !== "unknown" && projectId && projectId !== "unknown") {
+      var parts = String(projectId).split("-");
+      var suffix = parts.length ? parts[parts.length - 1] : "";
+      if (suffix && suffix !== name) return name + " · " + suffix;
+    }
+    if (name && name !== "unknown") return name;
+    return projectId && projectId !== "unknown" ? projectId : "";
+  }
+
   function repoIdentityOf(project) {
     var identity = project && project.repo_identity;
     return typeof identity === "string" && identity ? identity : null;
@@ -1323,7 +1342,18 @@
     var ownedCount = item.owned_live == null ? item.in_flight_count : item.owned_live;
     refs.inflight.textContent = ownedCount == null ? "0" : String(ownedCount);
     refs.seen.textContent = ageFrom(item.last_seen, now);
-    refs.action.textContent = item.retire_command ? String(item.retire_command) : "";
+    refs.action.textContent = "";
+    if (state === "UNKNOWN") {
+      if (item.last_error) {
+        refs.action.appendChild(el("div", "controller-error", textValue(item.last_error)));
+      }
+      if (item.probe_command) {
+        refs.action.appendChild(el("div", "controller-probe", String(item.probe_command)));
+      }
+    } else if (item.retire_command) {
+      refs.action.textContent = String(item.retire_command);
+    }
+    refs.action.title = refs.action.textContent || "";
     wrap.setAttribute("data-controller-label", textValue(item.label));
     refs.row.className = "controller-row" + (state === "DEAD" ? " dead" : "");
     var canExpand = state !== "DEAD";
@@ -1461,7 +1491,9 @@
       owned_live: liveCount,
       last_seen: null,
       generation: null,
-      retire_command: null
+      retire_command: null,
+      last_error: null,
+      probe_command: null
     };
   }
 

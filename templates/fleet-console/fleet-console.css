@@ -234,7 +234,9 @@
   .controller-label { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .controller-row.dead .controller-label { text-decoration:line-through; color:var(--ink-3); }
   .controller-project, .controller-pool, .controller-inflight, .controller-seen { color:var(--ink-2); }
-  .controller-action { font-size:10px; color:var(--amber); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .controller-action { font-size:10px; color:var(--amber); overflow:hidden; text-overflow:ellipsis; white-space:normal; }
+  .controller-error { color:var(--clay); }
+  .controller-probe { color:var(--amber); }
   .dead-controllers-toggle {
     display:block; width:100%; text-align:left; padding:7px 12px;
     border-top:1px solid var(--edge-soft); background:var(--ground-2);

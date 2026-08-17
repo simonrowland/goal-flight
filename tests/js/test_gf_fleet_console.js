@@ -271,6 +271,8 @@ function controllerRow(overrides) {
     last_seen: "2030-01-01T00:02:00Z",
     generation: 1,
     retire_command: null,
+    last_error: null,
+    probe_command: null,
   }, overrides || {});
 }
 
@@ -967,12 +969,17 @@ print(json.dumps({
     registry_unsampled_projects: [
       { name: "kiln-old", project_id: "kiln-old-aaa", repo_identity: null, last_seen: null },
       { name: "papers-propulsion", project_id: "pp-bbb", repo_identity: null, last_seen: null },
+      { name: "project", project_id: "project-b6a85f68da", repo_identity: "github.com/simonrowland/regolith-pyrolysis-simulator", last_seen: null },
+      { name: "project", project_id: "project-95bdb94978", repo_identity: null, last_seen: null },
     ],
   }), attentionPayload({ items: [] }));
   assert("truncated registry names omitted projects", [
     byId.machine.textContent.includes("+436 registered projects unsampled"),
     byId.machine.textContent.includes("kiln-old"),
     byId.machine.textContent.includes("papers-propulsion"),
+    byId.machine.textContent.includes("simonrowland/regolith-pyrolysis-simulator"),
+    byId.machine.textContent.includes("project · 95bdb94978"),
+    !/\bproject, project\b/.test(byId.machine.textContent),
   ].every(Boolean));
 }
 
@@ -1799,6 +1806,37 @@ async function testInteractiveHistoryAndKeyedRows() {
       toggle.getAttribute("aria-expanded") === "true",
     ].every(Boolean));
     void api;
+  }
+
+  {
+    const { byId } = loadConsole(
+      fleetPayload({
+        controllers: [controllerRow({
+          controller_key: "pm2:pm2",
+          label: "pm2",
+          project_id: "pm2",
+          project_name: "pm2",
+          parent_project_id: "pm2",
+          parent_name: "pm2",
+          controller_liveness_state: "UNKNOWN",
+          listener_live: 0,
+          listener_target: 4,
+          in_flight_count: 0,
+          owned_live: 0,
+          generation: 11,
+          last_error: "lease lock file missing",
+          probe_command: "python3 scripts/goalflight_fleet_console.py probe-holder --label pm2 --generation 11",
+        })],
+      }),
+      attentionPayload({ items: [] })
+    );
+    const section = byId["fleet-section"].textContent;
+    assert("UNKNOWN controller names the missing lock and the probe that settles it", [
+      section.includes("UNKNOWN"),
+      section.includes("lease lock file missing"),
+      section.includes("python3 scripts/goalflight_fleet_console.py probe-holder --label pm2 --generation 11"),
+      !section.includes("--retire"),
+    ].every(Boolean));
   }
 
   {

@@ -497,8 +497,13 @@ def test_registry_pass_is_bounded_and_reports_what_it_skipped() -> None:
         "p0000" in omitted_names,
     )
     assert_true(
-        "omitted identities are shareable names, not paths",
-        all("/" not in str(item["name"]) for item in omitted),
+        "omitted identities are shareable names, not filesystem paths",
+        all(
+            not str(item["name"]).startswith("/")
+            and "\\" not in str(item["name"])
+            and ":/" not in str(item["name"])
+            for item in omitted
+        ),
     )
     roots = [item["root"] for item in sampled]
     assert_true(
@@ -3168,6 +3173,163 @@ def test_worker_row_uses_journal_owner_when_session_label_is_absent() -> None:
     )
 
 
+def test_omitted_names_prefer_repo_identity_and_disambiguate_generics_mutation_pair() -> None:
+    """Omitted labels must tell the operator which root was skipped."""
+    registry = [
+        {
+            "project_root": "/tmp/kiln",
+            "last_seen": "2026-08-17T16:00:00+00:00",
+            "repo_identity": "github.com/simonrowland/kiln",
+        },
+        {
+            "project_root": "/tmp/left/project",
+            "last_seen": "2026-08-17T15:00:00+00:00",
+        },
+        {
+            "project_root": "/tmp/right/project",
+            "last_seen": "2026-08-17T14:00:00+00:00",
+        },
+        {
+            "project_root": "/tmp/unique-scratch",
+            "last_seen": "2026-08-17T13:00:00+00:00",
+        },
+        {
+            "project_root": "/tmp/proj",
+            "last_seen": "2026-08-17T12:00:00+00:00",
+        },
+    ]
+    sampled, total, omitted = F._registered_projects(registry, only_roots=set(), limit=None)
+    assert_true("identity-bearing and nameless roots stay in the omitted set", sampled == [])
+    assert_true("every registered root is counted", total == 5)
+    assert_true("no omitted row is dropped because it is hard to name", len(omitted) == 5)
+    names = [item["name"] for item in omitted]
+    by_id = {item["project_id"]: item["name"] for item in omitted}
+    left_id = F._project_id(str(Path("/tmp/left/project")))
+    right_id = F._project_id(str(Path("/tmp/right/project")))
+    proj_id = F._project_id(str(Path("/tmp/proj")))
+    assert_true("cached owner/name is the display label", "simonrowland/kiln" in names)
+    assert_true(
+        "generic leftover names keep a short project_id suffix",
+        by_id[left_id] == f"project · {left_id.rsplit('-', 1)[-1]}"
+        and by_id[right_id] == f"project · {right_id.rsplit('-', 1)[-1]}"
+        and by_id[left_id] != by_id[right_id],
+    )
+    assert_true("a root with no identity still appears under its honest basename", "unique-scratch" in names)
+    assert_true(
+        "proj is treated as a leftover generic and not collapsed",
+        by_id[proj_id] == f"proj · {proj_id.rsplit('-', 1)[-1]}",
+    )
+    assert_true("the bare string project is never the published label", "project" not in names)
+    encoded = json.dumps(omitted)
+    assert_true("omitted identities still redact absolute roots", "/tmp/" not in encoded)
+
+
+def test_unknown_controller_carries_last_error_and_runnable_probe_mutation_pair() -> None:
+    """UNKNOWN must stay un-dead and name the lock probe that settles it."""
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = (temp_root / "pm2").resolve()
+        project_root.mkdir()
+        isolated_env = _controller_test_env(temp_root)
+        with mock.patch.dict(os.environ, isolated_env, clear=False):
+            authority = F.goalflight_journal.open_or_create_journal(project_root)
+            claimed = authority.claim_or_renew_lease(
+                "pm2",
+                principal={"principal_id": "unknown-live-holder"},
+            )
+            assert_true("lease claimed", claimed.committed and claimed.value is not None)
+            lease = claimed.value
+            assert lease is not None
+            # Create the waiter ledger directory without leaving a live waiter,
+            # matching the live UNKNOWN case: lock file missing, waiters known-zero.
+            waiter = F.goalflight_wake.register_waiter(
+                project_root,
+                controller_label="pm2",
+                kind="listener",
+            )
+            waiter.close()
+            contexts = F._controller_contexts_by_session(
+                project_root,
+                [{"controller_session_id": lease.nonce}],
+                include_all=True,
+                authority=authority,
+                open_if_missing=False,
+            )
+            context = contexts[lease.nonce]
+            assert_true("missing lock classifies UNKNOWN, not DEAD", context["liveness_state"] == "UNKNOWN")
+            assert_true(
+                "UNKNOWN names the missing lock file",
+                context["last_error"] == "lease lock file missing",
+            )
+            row = F._controller_panel_row(str(project_root), context)
+            assert_true("panel publishes UNKNOWN", row["controller_liveness_state"] == "UNKNOWN")
+            assert_true("UNKNOWN is not offered a retire command", row["retire_command"] is None)
+            assert_true(
+                "panel carries the same last_error",
+                row["last_error"] == "lease lock file missing",
+            )
+            expected_probe = (
+                "python3 scripts/goalflight_fleet_console.py probe-holder "
+                f"--label pm2 --generation {lease.generation}"
+            )
+            assert_true("panel prints the read-only probe command", row["probe_command"] == expected_probe)
+            assert_true(
+                "classifier still refuses to treat missing lock as dead",
+                F.classify_controller(None, 0, 1) == "UNKNOWN",
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "goalflight_fleet_console.py"),
+                    "probe-holder",
+                    "--label",
+                    "pm2",
+                    "--generation",
+                    str(lease.generation),
+                    "--project-root",
+                    str(project_root),
+                ],
+                cwd=ROOT,
+                env={**os.environ, **isolated_env},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert_true(
+                f"printed probe runs ({completed.stderr})",
+                completed.returncode == 0 and completed.stdout.strip() == "None",
+            )
+            with F.goalflight_wake.register_lease_holder(
+                project_root,
+                controller_label="pm2",
+                lease_nonce=lease.nonce,
+            ):
+                held = subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / "scripts" / "goalflight_fleet_console.py"),
+                        "probe-holder",
+                        "--label",
+                        "pm2",
+                        "--generation",
+                        str(lease.generation),
+                        "--project-root",
+                        str(project_root),
+                    ],
+                    cwd=ROOT,
+                    env={**os.environ, **isolated_env},
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            assert_true(
+                f"same probe reports held when the lock exists ({held.stderr})",
+                held.returncode == 0 and held.stdout.strip() == "True",
+            )
+            encoded = json.dumps(row)
+            assert_true("UNKNOWN row publishes no absolute paths", str(project_root) not in encoded)
+
+
 def test_worker_row_without_owner_stays_visible_and_unowned() -> None:
     sampled_at = F._parse_timestamp("2030-01-01T00:03:00Z")
     row = F._worker_row(
@@ -3217,6 +3379,8 @@ def main() -> None:
     test_controllers_aggregate_by_owner_label_across_repos_mutation_pair()
     test_one_repo_several_controllers_keep_workers_partitioned_mutation_pair()
     test_worker_row_uses_journal_owner_when_session_label_is_absent()
+    test_omitted_names_prefer_repo_identity_and_disambiguate_generics_mutation_pair()
+    test_unknown_controller_carries_last_error_and_runnable_probe_mutation_pair()
     test_worker_row_without_owner_stays_visible_and_unowned()
     test_long_controller_nonces_remain_distinct_context_keys()
     test_journal_in_flight_count_follows_canonical_attempt_lifecycle_states()
