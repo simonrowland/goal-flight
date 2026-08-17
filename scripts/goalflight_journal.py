@@ -176,6 +176,39 @@ class JournalUnavailable(JournalError):
     """The journal could not complete required startup work in budget."""
 
 
+# Operator-facing repair pointers. Keep these as the first clause of a refusal
+# (the arithmetic is context). Commands named here must exist.
+_RESUME_SKILL_COMMAND = "/goal-flight resume"
+# Relay matches carrier_path.startswith("journal:"); a new kind must keep that
+# prefix. Do not claim "attention" — name the repair.
+_JOURNAL_CARRIER_PREFIX = "journal:"
+_JOURNAL_RESUME_CARRIER_KIND = "goal-flight-resume"
+
+
+def _doctor_command() -> str:
+    return shlex.join([sys.executable, str(SCRIPT_DIR / "goalflight_doctor.py")])
+
+
+def _upgrade_required_resume(detail: str) -> str:
+    return (
+        "UPGRADE_REQUIRED: restart this session onto the deployed skill: "
+        f"{_RESUME_SKILL_COMMAND}; {detail}"
+    )
+
+
+def _dual_open_unavailable(path: Path, primary: BaseException, fallback: BaseException, *, stage: str) -> str:
+    return (
+        f"journal readonly probe unavailable/unreadable for {path}: "
+        f"readonly open failed ({primary}); query-only fallback {stage} "
+        f"failed ({fallback}); failing closed · next: run {_doctor_command()}; "
+        f"inspect {path}"
+    )
+
+
+def _synthetic_journal_carrier(kind: str, item_id: str) -> str:
+    return f"{_JOURNAL_CARRIER_PREFIX}{kind}:{item_id}"
+
+
 class CASMismatch(Exception):
     """Internal signal for a declarative affected-row predicate loss."""
 
@@ -703,9 +736,7 @@ def _open_readonly_connection(
         )
     except sqlite3.DatabaseError as fallback_exc:
         raise JournalUnavailable(
-            f"journal readonly probe unavailable/unreadable for {path}: "
-            f"readonly open failed ({primary_failure}); query-only fallback open "
-            f"failed ({fallback_exc}); failing closed"
+            _dual_open_unavailable(path, primary_failure, fallback_exc, stage="open")
         ) from fallback_exc
     try:
         fallback.execute("PRAGMA query_only = ON")
@@ -716,9 +747,7 @@ def _open_readonly_connection(
         if _is_corruption_error(fallback_exc) or _is_busy(fallback_exc):
             raise
         raise JournalUnavailable(
-            f"journal readonly probe unavailable/unreadable for {path}: "
-            f"readonly open failed ({primary_failure}); query-only fallback probe "
-            f"failed ({fallback_exc}); failing closed"
+            _dual_open_unavailable(path, primary_failure, fallback_exc, stage="probe")
         ) from fallback_exc
 
 
@@ -1263,10 +1292,10 @@ class Journal:
             ]
         )
         raise JournalUpgradeRequired(
-            "UPGRADE_REQUIRED: journal migration is disabled for ordinary opens; "
+            f"UPGRADE_REQUIRED: run {command}; journal migration is disabled "
+            "for ordinary opens; "
             f"journal epochs={stored}, client epochs="
-            f"{(CURRENT_SCHEMA_EPOCH, CURRENT_PROTOCOL_EPOCH, CURRENT_REGISTRY_EPOCH, CURRENT_READER_EPOCH, CURRENT_WRITER_EPOCH)}. "
-            f"Run the explicit upgrade command: {command}"
+            f"{(CURRENT_SCHEMA_EPOCH, CURRENT_PROTOCOL_EPOCH, CURRENT_REGISTRY_EPOCH, CURRENT_READER_EPOCH, CURRENT_WRITER_EPOCH)}"
         )
 
     @staticmethod
@@ -1662,8 +1691,9 @@ class Journal:
             )
         if mismatches:
             raise JournalUpgradeRequired(
-                "UPGRADE_REQUIRED: journal epoch fence refused client: "
-                + "; ".join(mismatches)
+                _upgrade_required_resume(
+                    "journal epoch fence refused client: " + "; ".join(mismatches)
+                )
             )
         return stored
 
@@ -2135,7 +2165,10 @@ class Journal:
             "source_generation": generation,
             "trigger_side": trigger_side,
             "reason": reason,
-            "text": f"controller lease {label} generation {generation} needs reassignment",
+            "text": (
+                f"controller lease {label} generation {generation} needs "
+                f"reassignment · next: {_RESUME_SKILL_COMMAND}"
+            ),
         }
         connection.execute(
             """
@@ -2184,7 +2217,7 @@ class Journal:
                 label,
                 item_id,
                 next_seq,
-                f"journal:attention:{item_id}",
+                _synthetic_journal_carrier(_JOURNAL_RESUME_CARRIER_KIND, item_id),
                 now,
                 now,
             ),
@@ -4447,8 +4480,10 @@ def _assert_snapshot_epoch_compatibility(
         )
     if mismatches:
         raise JournalUpgradeRequired(
-            f"UPGRADE_REQUIRED: {subject} epoch fence refused restore before replacement: "
-            + "; ".join(mismatches)
+            _upgrade_required_resume(
+                f"{subject} epoch fence refused restore before replacement: "
+                + "; ".join(mismatches)
+            )
         )
 
 
