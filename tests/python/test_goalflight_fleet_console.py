@@ -2968,6 +2968,133 @@ def test_controllers_aggregate_by_owner_label_across_repos_mutation_pair() -> No
     assert_true("label-keyed counts are not the parent-keyed mutation", owned != legacy)
 
 
+def test_one_repo_several_controllers_keep_workers_partitioned_mutation_pair() -> None:
+    """battery-main/bugs/webui workers stay that controller's, not a merged bag."""
+    projects = [
+        {
+            "project_id": "battery-tool-v2",
+            "parent_project_id": "battery-tool-v2",
+            "repo_identity": "github.com/timdrpp/battery-tool-v2",
+            "workers": [
+                {"controller_label": "battery-main", "is_terminal": False, "dispatch_id": "main-a"},
+                {"controller_label": "battery-bugs", "is_terminal": False, "dispatch_id": "bugs-a"},
+                {"controller_label": "battery-webui", "is_terminal": False, "dispatch_id": "webui-a"},
+                {"controller_label": "battery-webui", "is_terminal": False, "dispatch_id": "webui-b"},
+                {"controller_label": None, "is_terminal": False, "dispatch_id": "orphan-a"},
+            ],
+        }
+    ]
+    rows = [
+        {
+            "label": label,
+            "parent_project_id": "battery-tool-v2",
+            "project_id": "battery-tool-v2",
+            "project_name": "battery-tool-v2",
+            "parent_name": "battery-tool-v2",
+            "controller_liveness_state": "ALIVE",
+            "in_flight_count": 1,
+            "owned_live": 0,
+            "last_seen": "2030-01-01T00:00:00+00:00",
+            "listener_live": 1,
+            "listener_target": 4,
+            "generation": 1,
+            "retire_command": None,
+            "controller_key": f"battery-tool-v2:{label}",
+        }
+        for label in ("battery-main", "battery-bugs", "battery-webui")
+    ]
+    owned = F._owned_live_counts(projects, [], [])
+    aggregated = F._aggregate_controller_rows(rows, owned)
+    by_label = {row["label"]: row for row in aggregated}
+    assert_true("three owner rows stay distinct", set(by_label) == {"battery-main", "battery-bugs", "battery-webui"})
+    assert_true("battery-main keeps its own live worker", by_label["battery-main"]["owned_live"] == 1)
+    assert_true("battery-bugs keeps its own live worker", by_label["battery-bugs"]["owned_live"] == 1)
+    assert_true("battery-webui keeps both of its live workers", by_label["battery-webui"]["owned_live"] == 2)
+    assert_true(
+        "unlabeled workers are not assigned to a named controller",
+        sum(row["owned_live"] for row in aggregated) == 4,
+    )
+    assert_true(
+        "the unlabeled worker remains in the project payload",
+        any(
+            worker["dispatch_id"] == "orphan-a" and not worker.get("controller_label")
+            for worker in projects[0]["workers"]
+        ),
+    )
+
+    def merged_as_repo_bag(scoped: list[dict]) -> int:
+        return sum(
+            1
+            for project in scoped
+            for worker in project.get("workers") or []
+            if worker.get("is_terminal") is not True
+        )
+
+    assert_true(
+        "a repo-bag mutation would count five live workers as one pool",
+        merged_as_repo_bag(projects) == 5 and by_label["battery-webui"]["owned_live"] != 5,
+    )
+
+
+def test_worker_row_uses_journal_owner_when_session_label_is_absent() -> None:
+    sampled_at = F._parse_timestamp("2030-01-01T00:03:00Z")
+    row = F._worker_row(
+        {
+            "dispatch_id": "webui-journal-owned",
+            "state": "running",
+            "classification": "expected_live",
+            "worker_still_alive": True,
+            "started_at": "2030-01-01T00:00:00Z",
+        },
+        sampled_at=sampled_at,
+        journal_authority={
+            "lifecycle_state": "RUNNING",
+            "owner_controller_label": "battery-webui",
+        },
+    )
+    assert_true("journal owner becomes the published controller label", row["controller_label"] == "battery-webui")
+    assert_true("journal-owned worker is displayed as that label", row["controller_display"] == "battery-webui")
+    assert_true("journal-owned worker is a labelled identity", row["controller_state"] == "label")
+
+    def session_only_fields(
+        record: dict,
+        labels: dict[str, str],
+        liveness: dict[str, str] | None = None,
+        *,
+        journal_owner_label: object = None,
+    ) -> dict:
+        del journal_owner_label
+        return F._controller_fields(record, labels, liveness)
+
+    dropped = session_only_fields(
+        {"dispatch_id": "webui-journal-owned"},
+        {},
+        journal_owner_label="battery-webui",
+    )
+    assert_true(
+        "ignoring journal owner would unown a worker the journal still names",
+        dropped["controller_label"] is None and dropped["controller_state"] == "unowned",
+    )
+
+
+def test_worker_row_without_owner_stays_visible_and_unowned() -> None:
+    sampled_at = F._parse_timestamp("2030-01-01T00:03:00Z")
+    row = F._worker_row(
+        {
+            "dispatch_id": "orphan-visible",
+            "state": "running",
+            "classification": "expected_live",
+            "worker_still_alive": True,
+            "started_at": "2030-01-01T00:00:00Z",
+        },
+        sampled_at=sampled_at,
+    )
+    assert_true("unowned worker is still projected", row["dispatch_id"] == "orphan-visible")
+    assert_true("missing owner is None, not a invented label", row["controller_label"] is None)
+    assert_true("missing owner is labelled unowned", row["controller_display"] == "unowned")
+    assert_true("missing owner uses the unowned identity state", row["controller_state"] == "unowned")
+
+
 def main() -> None:
     fleet_payload = test_fleet_consumes_status_once_before_project_grouping()
     test_global_history_count_excludes_unreachable_remote_terminals_mutation_pair()
@@ -2996,6 +3123,9 @@ def main() -> None:
     test_controller_panel_aggregates_owned_workers_across_worktrees()
     test_fast_plane_carries_cached_repo_identity_without_guessing_mutation_pair()
     test_controllers_aggregate_by_owner_label_across_repos_mutation_pair()
+    test_one_repo_several_controllers_keep_workers_partitioned_mutation_pair()
+    test_worker_row_uses_journal_owner_when_session_label_is_absent()
+    test_worker_row_without_owner_stays_visible_and_unowned()
     test_long_controller_nonces_remain_distinct_context_keys()
     test_journal_in_flight_count_follows_canonical_attempt_lifecycle_states()
     test_journal_in_flight_count_ignores_forged_mail_and_cursor_advances()

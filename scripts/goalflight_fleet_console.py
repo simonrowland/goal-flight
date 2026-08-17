@@ -902,7 +902,8 @@ def _journal_authority_by_dispatch(
             placeholders = ",".join("?" for _ in chunk)
             rows.extend(
                 authority.read_all(
-                    "SELECT dispatch_id, lifecycle_state, terminal_state, state_updated_at "
+                    "SELECT dispatch_id, lifecycle_state, terminal_state, "
+                    "state_updated_at, owner_controller_label "
                     "FROM dispatch_attempts WHERE dispatch_id IN ("
                     + placeholders
                     + ")",
@@ -1587,12 +1588,26 @@ def _controller_fields(
     record: dict[str, Any],
     controller_labels: dict[str, str],
     controller_liveness: dict[str, str] | None = None,
+    *,
+    journal_owner_label: object = None,
 ) -> dict[str, Any]:
     raw_session_id = _raw_controller_session_id(record.get("controller_session_id"))
     session_digest = _controller_session_digest(raw_session_id)
     raw_pid = record.get("controller_pid")
     controller_pid = raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) and raw_pid > 0 else None
-    label = controller_labels.get(raw_session_id) if raw_session_id else None
+    session_label = (
+        _display(controller_labels.get(raw_session_id), limit=64)
+        if raw_session_id
+        else None
+    )
+    # Session map is the live lease identity. Journal owner and the stamped
+    # record label are the same attribution when the session is absent, so a
+    # worker is not silently unowned while in_flight_count still names it.
+    label = (
+        session_label
+        or _display(journal_owner_label, limit=64)
+        or _display(record.get("controller_label"), limit=64)
+    )
     if label:
         display, state = label, "label"
     elif session_digest:
@@ -1735,6 +1750,11 @@ def _worker_row(
             record,
             controller_labels or {},
             controller_liveness or {},
+            journal_owner_label=(
+                journal_authority.get("owner_controller_label")
+                if isinstance(journal_authority, dict)
+                else None
+            ),
         ),
         **observed_live,
         **_worker_age_filter_fields(

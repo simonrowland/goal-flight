@@ -1262,7 +1262,7 @@
     wrap._gf = {
       row: row, expand: expand, label: label, project: project, health: health,
       pool: pool, inflight: inflight, seen: seen, action: action, owned: owned,
-      ownerKey: null
+      ownedNodes: Object.create(null), ownerKey: null
     };
     expand.addEventListener("click", function () {
       var key = wrap._gf.ownerKey;
@@ -1290,30 +1290,63 @@
     refs.inflight.textContent = ownedCount == null ? "0" : String(ownedCount);
     refs.seen.textContent = ageFrom(item.last_seen, now);
     refs.action.textContent = item.retire_command ? String(item.retire_command) : "";
+    wrap.setAttribute("data-controller-label", textValue(item.label));
     refs.row.className = "controller-row" + (state === "DEAD" ? " dead" : "");
-    var expanded = state !== "DEAD" && ownerExpanded(key);
+    var canExpand = state !== "DEAD";
+    var expanded = canExpand && ownerExpanded(key);
     refs.expand.textContent = expanded ? "▾" : "▸";
     refs.expand.setAttribute("aria-expanded", expanded ? "true" : "false");
-    setHidden(refs.expand, state === "DEAD");
-    refs.owned.textContent = "";
-    if (!expanded) {
+    setHidden(refs.expand, !canExpand);
+    if (!canExpand || !expanded) {
       setHidden(refs.owned, true);
       return;
     }
     var groups = ownedWorkerGroups(item.label);
+    var desired = Object.create(null);
     if (!groups.length) {
-      refs.owned.appendChild(el("div", "quiet-state", "No live workers attributed to this label."));
+      desired.quiet = { kind: "quiet" };
     } else {
       groups.forEach(function (group) {
-        var block = el("div", "owned-group");
-        block.appendChild(el("div", "owned-title", group.title + " · " + group.workers.length));
-        group.workers.forEach(function (worker) {
-          block.appendChild(el("div", "owned-dispatch", textValue(worker.dispatch_id)));
-        });
-        refs.owned.appendChild(block);
+        desired["group|" + group.title] = { kind: "group", group: group };
       });
     }
+    var ownerBudget = { shown: 0, total: 0 };
+    reconcileKeyed(
+      refs.owned,
+      refs.ownedNodes,
+      desired,
+      createOwnedGroup,
+      function (node, desiredItem) {
+        updateOwnedGroup(node, desiredItem, now, key, ownerBudget);
+      }
+    );
     setHidden(refs.owned, false);
+  }
+
+  function createOwnedGroup(item) {
+    if (item.kind === "quiet") {
+      return el("div", "quiet-state", "No displayed workers attributed to this label.");
+    }
+    var block = el("div", "owned-group");
+    var title = el("div", "owned-title");
+    block.appendChild(title);
+    block._gf = { title: title };
+    return block;
+  }
+
+  function updateOwnedGroup(block, item, now, ownerKey, ownerBudget) {
+    if (item.kind === "quiet") {
+      block.textContent = "No displayed workers attributed to this label.";
+      return;
+    }
+    block._gf.title.textContent = item.group.title + " · " + item.group.workers.length;
+    appendWorkerTable(
+      block,
+      item.group.workers,
+      now,
+      ownerBudget || { shown: 0, total: 0 },
+      "owner|" + ownerKey + "|" + item.group.title
+    );
   }
 
   var openControllerOwners = storedSet("goalflight-fleet-open-controller-owners");
@@ -1329,12 +1362,20 @@
     persistSet("goalflight-fleet-open-controller-owners", openControllerOwners);
   }
 
+  function workerOwnerLabel(worker) {
+    var label = worker && worker.controller_label;
+    return typeof label === "string" && label ? label : null;
+  }
+
   function ownedWorkerGroups(label) {
     var wanted = String(label || "");
+    var matchUnowned = wanted === "unowned";
     var groups = [];
     function collect(project, workers) {
       var matched = (workers || []).filter(function (worker) {
-        return displayedWorker(worker) && String(worker.controller_label || "") === wanted;
+        if (!displayedWorker(worker)) return false;
+        var owner = workerOwnerLabel(worker);
+        return matchUnowned ? owner == null : owner === wanted;
       });
       if (!matched.length) return;
       var repoName = repoDisplay(project.repo_identity);
@@ -1348,6 +1389,46 @@
     collect({ name: "unassigned" }, FLEET && FLEET.unassigned_workers);
     collect({ name: "remote" }, FLEET && FLEET.remote && FLEET.remote.workers);
     return groups;
+  }
+
+  function unlabeledDisplayedWorkers() {
+    var rows = [];
+    function add(workers) {
+      (workers || []).forEach(function (worker) {
+        if (displayedWorker(worker) && workerOwnerLabel(worker) == null) rows.push(worker);
+      });
+    }
+    (FLEET && FLEET.projects || []).forEach(function (project) {
+      add(project.workers);
+    });
+    add(FLEET && FLEET.unassigned_workers);
+    add(FLEET && FLEET.remote && FLEET.remote.workers);
+    return rows;
+  }
+
+  function unownedControllerRow() {
+    var workers = unlabeledDisplayedWorkers();
+    if (!workers.length) return null;
+    var liveCount = 0;
+    workers.forEach(function (worker) {
+      if (worker.is_terminal !== true) liveCount += 1;
+    });
+    return {
+      controller_key: "unowned",
+      label: "unowned",
+      project_id: null,
+      project_name: "no recorded owner",
+      parent_project_id: null,
+      parent_name: "no recorded owner",
+      controller_liveness_state: "UNKNOWN",
+      listener_live: null,
+      listener_target: null,
+      in_flight_count: liveCount,
+      owned_live: liveCount,
+      last_seen: null,
+      generation: null,
+      retire_command: null
+    };
   }
 
   function deadControllersExpanded() {
@@ -1416,6 +1497,11 @@
       if (textValue(row.controller_liveness_state) === "DEAD") dead.push(row);
       else live.push(row);
     });
+    var hasUnownedLabel = live.concat(dead).some(function (row) {
+      return textValue(row.label) === "unowned";
+    });
+    var unowned = hasUnownedLabel ? null : unownedControllerRow();
+    if (unowned) live.push(unowned);
     ctl.count.textContent = live.length + " live" + (dead.length ? " · " + dead.length + " dead" : "");
     if (!live.length && !dead.length) {
       Object.keys(ctl.liveNodes).forEach(function (key) {

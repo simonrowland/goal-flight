@@ -252,6 +252,38 @@ function fleetPayload(overrides) {
   }, overrides || {});
 }
 
+function controllerRow(overrides) {
+  return Object.assign({
+    controller_key: "ctl",
+    label: "ctl",
+    project_id: "p",
+    project_name: "battery-tool-v2",
+    parent_project_id: "p",
+    parent_name: "battery-tool-v2",
+    controller_liveness_state: "ALIVE",
+    listener_live: 1,
+    listener_target: 4,
+    in_flight_count: 1,
+    owned_live: 1,
+    last_seen: "2030-01-01T00:02:00Z",
+    generation: 1,
+    retire_command: null,
+  }, overrides || {});
+}
+
+function controllerEntry(root, label) {
+  return descendants(root).find((node) =>
+    node.getAttribute && node.getAttribute("data-controller-label") === label
+  );
+}
+
+function ownedDispatchIds(entry) {
+  if (!entry) return [];
+  return descendants(entry)
+    .filter((node) => node.className === "row" && node.getAttribute("data-dispatch-id"))
+    .map((node) => node.getAttribute("data-dispatch-id"));
+}
+
 function projectRow(workers, overrides) {
   const row = Object.assign({
     project_id: "p", name: "p", registered: true, last_seen: null, skill_version: null,
@@ -1884,6 +1916,103 @@ async function testInteractiveHistoryAndKeyedRows() {
     assert("expanding idle checkouts reveals the collapsed child", [
       byId.fleet.textContent.includes("bt-idle"),
       toggle.getAttribute("aria-expanded") === "true",
+    ].every(Boolean));
+  }
+
+  {
+    const repo = "github.com/timdrpp/battery-tool-v2";
+    const labeled = (dispatchId, label, extras) => workerRow(Object.assign({
+      dispatch_id: dispatchId,
+      controller_label: label,
+      controller_display: label,
+      controller_state: "label",
+      controller_liveness_state: "ALIVE",
+      task_ids: extras && extras.task_ids || [],
+    }, extras || {}));
+    const payload = fleetPayload({
+      projects: [projectRow([
+        labeled("main-a", "battery-main"),
+        labeled("bugs-a", "battery-bugs"),
+        labeled("webui-a", "battery-webui", { task_ids: ["t-262"] }),
+        labeled("webui-b", "battery-webui"),
+        workerRow({
+          dispatch_id: "orphan-a",
+          controller_label: null,
+          controller_display: "unowned",
+          controller_state: "unowned",
+        }),
+      ], {
+        project_id: "battery", name: "battery-tool-v2",
+        parent_project_id: "battery", parent_name: "battery-tool-v2",
+        repo_identity: repo,
+      })],
+      controllers: [
+        controllerRow({ controller_key: "battery-main", label: "battery-main", owned_live: 1 }),
+        controllerRow({ controller_key: "battery-bugs", label: "battery-bugs", owned_live: 1 }),
+        controllerRow({ controller_key: "battery-webui", label: "battery-webui", owned_live: 2 }),
+      ],
+    });
+    const { api, byId } = loadConsole(payload, attentionPayload({ items: [] }));
+    assert("repo band still lists every worker, including unlabeled", [
+      byId.fleet.textContent.includes("main-a"),
+      byId.fleet.textContent.includes("bugs-a"),
+      byId.fleet.textContent.includes("webui-a"),
+      byId.fleet.textContent.includes("webui-b"),
+      byId.fleet.textContent.includes("orphan-a"),
+      byId.fleet.textContent.includes("unowned"),
+    ].every(Boolean));
+
+    const webui = controllerEntry(byId["fleet-section"], "battery-webui");
+    const main = controllerEntry(byId["fleet-section"], "battery-main");
+    const bugs = controllerEntry(byId["fleet-section"], "battery-bugs");
+    const unowned = controllerEntry(byId["fleet-section"], "unowned");
+    assert("unowned controller row is present for unlabeled workers", unowned != null);
+    const expandOf = (entry) => descendants(entry).find((node) =>
+      node.className === "controller-toggle owner-expand"
+    );
+    expandOf(webui).click();
+    expandOf(main).click();
+    expandOf(bugs).click();
+    expandOf(unowned).click();
+    const webuiIds = ownedDispatchIds(webui);
+    const mainIds = ownedDispatchIds(main);
+    const bugsIds = ownedDispatchIds(bugs);
+    const unownedIds = ownedDispatchIds(unowned);
+    assert("one repo, several controllers: workers stay under their owner", [
+      webuiIds.includes("webui-a") && webuiIds.includes("webui-b"),
+      !webuiIds.includes("main-a") && !webuiIds.includes("bugs-a") && !webuiIds.includes("orphan-a"),
+      mainIds.includes("main-a") && !mainIds.includes("webui-a") && !mainIds.includes("bugs-a"),
+      bugsIds.includes("bugs-a") && !bugsIds.includes("webui-a") && !bugsIds.includes("main-a"),
+    ].every(Boolean));
+    assert("a worker with no controller_label stays visible and is labelled unowned", [
+      unowned != null,
+      unownedIds.includes("orphan-a"),
+      !unownedIds.includes("webui-a"),
+      byId.fleet.textContent.includes("orphan-a"),
+      descendants(unowned).some((node) => node.className === "controller-label" && node.textContent === "unowned"),
+    ].every(Boolean));
+
+    const before = descendants(webui).find((node) =>
+      node.getAttribute && node.getAttribute("data-dispatch-id") === "webui-a"
+    );
+    api.setFleetData(Object.assign({}, payload, { generation_id: "same-data-second-tick" }));
+    const after = descendants(webui).find((node) =>
+      node.getAttribute && node.getAttribute("data-dispatch-id") === "webui-a"
+    );
+    assert("controller-owned worker rows keep node identity across identical ticks", [
+      before != null,
+      before === after,
+    ].every(Boolean));
+
+    const chip = descendants(webui).find((node) =>
+      node.className && String(node.className).includes("task-chip") && node.textContent === "t-262"
+    );
+    chip.click();
+    assert("ticket chips on owned worker rows stay clickable", [
+      chip != null,
+      api.rowNode("webui-a") !== null,
+      api.rowNode("webui-b") === null,
+      api.rowNode("main-a") === null,
     ].every(Boolean));
   }
 }
