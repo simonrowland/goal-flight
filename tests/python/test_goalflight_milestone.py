@@ -749,3 +749,124 @@ def test_status_predicate_modes_skip_milestone_probe() -> None:
         S.status_payload = orig_payload
         S.this_project_root = orig_root
         S.goalflight_milestone.check_status = orig_check
+
+
+def _ok_check_payload() -> dict:
+    return {
+        "schema": M.SCHEMA,
+        "active_cadence": True,
+        "commits_since": 0,
+        "K": 5,
+        "last_marker": None,
+        "last_clean_marker": None,
+        "due": False,
+        "reason": "ok",
+        "warnings": [],
+        "error": None,
+        "arc_start": "9896bf6abc",
+    }
+
+
+def _run_milestone_check(payload: dict, argv: list[str] | None = None) -> tuple[int, str, str]:
+    orig = M.check_status
+    M.check_status = lambda **_kwargs: payload
+    try:
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = M.main(["check", *(argv or [])])
+        return rc, out.getvalue(), err.getvalue()
+    finally:
+        M.check_status = orig
+
+
+def test_cmd_check_silent_when_ok() -> None:
+    payload = _ok_check_payload()
+    expected = M.format_line(payload)
+    assert expected.endswith("-> ok")
+    assert M.format_check_output(payload) is None
+    rc, out, err = _run_milestone_check(payload)
+    assert rc == 0
+    assert out == ""
+    assert err == ""
+
+
+def test_cmd_check_verbose_recovers_ok_line() -> None:
+    payload = _ok_check_payload()
+    expected = M.format_line(payload)
+    assert M.format_check_output(payload, verbose=True) == expected
+    rc, out, err = _run_milestone_check(payload, ["--verbose"])
+    assert rc == 0
+    assert out == expected + "\n"
+    assert err == ""
+
+
+def test_cmd_check_prints_due() -> None:
+    payload = _ok_check_payload()
+    payload["due"] = True
+    payload["commits_since"] = 7
+    payload["reason"] = "commit cadence reached"
+    expected = M.format_line(payload)
+    assert "-> DUE" in expected
+    rc, out, err = _run_milestone_check(payload)
+    assert rc == 0
+    assert out == expected + "\n"
+    assert err == ""
+
+
+def test_cmd_check_prints_unavailable_and_no_cadence() -> None:
+    unavailable = {
+        "schema": M.SCHEMA,
+        "active_cadence": True,
+        "commits_since": None,
+        "K": 5,
+        "due": None,
+        "error": "not a git repository: /tmp/x",
+        "warnings": [],
+        "last_marker": None,
+        "last_clean_marker": None,
+    }
+    rc, out, err = _run_milestone_check(unavailable)
+    assert rc == 0
+    assert "milestone: unavailable" in out
+    assert "-> ok" not in out
+    assert err == ""
+
+    idle = {
+        "schema": M.SCHEMA,
+        "active_cadence": False,
+        "commits_since": None,
+        "K": None,
+        "due": False,
+        "error": None,
+        "warnings": [],
+        "reason": "no active cadence",
+    }
+    rc, out, err = _run_milestone_check(idle)
+    assert rc == 0
+    assert out == "milestone: no active cadence\n"
+
+
+def test_cmd_check_json_and_exit_codes_unchanged() -> None:
+    payload = _ok_check_payload()
+    rc, out, err = _run_milestone_check(payload, ["--json"])
+    assert rc == 0
+    assert err == ""
+    data = json.loads(out)
+    assert data["reason"] == "ok"
+    assert data["due"] is False
+    assert data["commits_since"] == 0
+
+    orig = M.check_status
+    M.check_status = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = M.main(["check"])
+        assert rc == 2
+        assert out.getvalue() == ""
+        assert err.getvalue().startswith("goalflight_milestone: boom")
+    finally:
+        M.check_status = orig
+

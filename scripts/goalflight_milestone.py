@@ -629,6 +629,21 @@ def format_line(status: dict[str, Any]) -> str:
     return line
 
 
+def is_healthy_ok(status: dict[str, Any]) -> bool:
+    return (
+        not status.get("error")
+        and bool(status.get("active_cadence"))
+        and not status.get("due")
+        and not (status.get("warnings") or [])
+    )
+
+
+def format_check_output(status: dict[str, Any], *, verbose: bool = False) -> str | None:
+    if verbose or not is_healthy_ok(status):
+        return format_line(status)
+    return None
+
+
 def _one_line(value: Any) -> str:
     return " ".join(str(value).split())
 
@@ -674,7 +689,9 @@ def cmd_check(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     else:
-        print(format_line(payload))
+        line = format_check_output(payload, verbose=getattr(args, "verbose", False))
+        if line is not None:
+            print(line)
     return 0
 
 
@@ -692,6 +709,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     check = sub.add_parser("check", help="report whether a milestone sweep is due")
     check.add_argument("--json", action="store_true", help="emit machine JSON")
+    check.add_argument(
+        "--verbose",
+        action="store_true",
+        help="print the ok line even when no sweep is due",
+    )
     check.add_argument("--repo", help="git repository root; defaults to cwd git root")
     check.add_argument("--project", help="project root for active queue discovery")
     check.add_argument("--queue", help="override active goal queue path")

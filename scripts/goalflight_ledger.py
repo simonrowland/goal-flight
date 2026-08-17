@@ -1461,34 +1461,84 @@ def format_stats_table(payload: dict) -> str:
     return "\n".join(lines)
 
 
+NONE_SANDBOX_TRIPLET = "requested=none supported=none enforced=none"
+
+
+def sandbox_triplet(posture: object) -> str | None:
+    if not isinstance(posture, dict):
+        return None
+    if not any(
+        key in posture
+        for key in ("requested_profile", "supported_profile", "enforced_profile")
+    ):
+        return None
+    return (
+        f"requested={posture.get('requested_profile') or 'none'}"
+        f" supported={posture.get('supported_profile') or 'none'}"
+        f" enforced={posture.get('enforced_profile') or 'none'}"
+    )
+
+
+def _record_status_line(row: dict, sandbox_suffix: str) -> str:
+    return (
+        f"- {row['classification']}: {row.get('dispatch_id')} "
+        f"agent={row.get('agent')} pid={row.get('worker_pid')} "
+        f"state={row.get('state')}{sandbox_suffix}"
+    )
+
+
+def format_status_lines(
+    payload: dict, *, limit: int = 20, verbose: bool = False
+) -> list[str]:
+    """Human ledger status. Uniform none-sandbox is omitted unless --verbose."""
+    lines = [f"dispatch ledger: {payload['state_dir']}"]
+    rows = list(payload.get("records") or [])[:limit]
+    triplets = [sandbox_triplet(row.get("os_sandbox")) for row in rows]
+    interesting = {item for item in triplets if item and item != NONE_SANDBOX_TRIPLET}
+    unique = set(triplets)
+    if verbose:
+        show_on = "all"
+        summary: str | None = None
+    elif not interesting:
+        show_on = "none"
+        summary = None
+    elif unique == interesting and len(interesting) == 1:
+        show_on = "none"
+        summary = f"sandbox {next(iter(interesting))}"
+    else:
+        show_on = "interesting"
+        summary = None
+    if summary:
+        lines.append(summary)
+    for row, triplet in zip(rows, triplets):
+        if show_on == "all" and triplet:
+            suffix = f" sandbox {triplet}"
+        elif show_on == "interesting" and triplet and triplet != NONE_SANDBOX_TRIPLET:
+            suffix = f" sandbox {triplet}"
+        else:
+            suffix = ""
+        lines.append(_record_status_line(row, suffix))
+    surplus = list(payload.get("surplus_processes") or [])[:limit]
+    if surplus:
+        lines.append("surplus worker-like processes:")
+        for proc in surplus:
+            lines.append(
+                f"- pid={proc['pid']} comm={proc['comm']} args={proc['args']}"
+            )
+    return lines
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     payload = status_payload()
     if args.json:
         print(json.dumps(payload, sort_keys=True))
         return 0
-    print(f"dispatch ledger: {payload['state_dir']}")
-    for row in payload["records"][: args.limit]:
-        posture = row.get("os_sandbox")
-        sandbox = ""
-        if isinstance(posture, dict) and any(
-            key in posture
-            for key in ("requested_profile", "supported_profile", "enforced_profile")
-        ):
-            sandbox = (
-                " sandbox"
-                f" requested={posture.get('requested_profile') or 'none'}"
-                f" supported={posture.get('supported_profile') or 'none'}"
-                f" enforced={posture.get('enforced_profile') or 'none'}"
-            )
-        print(
-            f"- {row['classification']}: {row.get('dispatch_id')} "
-            f"agent={row.get('agent')} pid={row.get('worker_pid')} "
-            f"state={row.get('state')}{sandbox}"
-        )
-    if payload["surplus_processes"]:
-        print("surplus worker-like processes:")
-        for proc in payload["surplus_processes"][: args.limit]:
-            print(f"- pid={proc['pid']} comm={proc['comm']} args={proc['args']}")
+    for line in format_status_lines(
+        payload,
+        limit=args.limit,
+        verbose=getattr(args, "verbose", False),
+    ):
+        print(line)
     return 0
 
 
@@ -1552,6 +1602,11 @@ def build_parser() -> argparse.ArgumentParser:
     stat = sub.add_parser("status")
     stat.add_argument("--json", action="store_true")
     stat.add_argument("--limit", type=int, default=20)
+    stat.add_argument(
+        "--verbose",
+        action="store_true",
+        help="include per-row sandbox triplets even when they are uniform",
+    )
     stat.set_defaults(func=cmd_status)
     return parser
 

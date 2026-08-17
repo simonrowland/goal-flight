@@ -404,6 +404,135 @@ def case_doctor_json_verdict_ok_when_text_has_no_warns() -> None:
     assert summary["verdict"] == "ok"
 
 
+def case_doctor_human_omits_ok_keeps_warn_and_info() -> None:
+    payload = _minimal_human_payload(
+        worker_currency={
+            "claude": {"behind": True, "current": "2.1.220", "latest": "2.1.233"},
+        },
+        grok={"present": True, "version": "1.0", "headless_flags": None},
+    )
+    full = goalflight_doctor.collect_human_lines(payload)
+    shown = goalflight_doctor.display_human_lines(full)
+    assert any(line.startswith("[OK]") for line in full)
+    assert shown
+    assert all(not line.startswith("[OK]") for line in shown)
+    assert any(line.startswith("[WARN]") for line in shown)
+    assert any(line.startswith("[INFO]") for line in shown)
+    assert shown == [line for line in full if not line.startswith("[OK]")]
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        goalflight_doctor.print_human(payload)
+    assert buf.getvalue() == "".join(f"{line}\n" for line in shown)
+
+
+def case_doctor_verbose_recovers_ok_lines_verbatim() -> None:
+    payload = _minimal_human_payload(
+        worker_currency={
+            "claude": {"behind": True, "current": "2.1.220", "latest": "2.1.233"},
+        },
+        grok={"present": True, "version": "1.0", "headless_flags": None},
+    )
+    full = goalflight_doctor.collect_human_lines(payload)
+    assert goalflight_doctor.display_human_lines(full, verbose=True) == full
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        goalflight_doctor.print_human(payload, verbose=True)
+    assert buf.getvalue() == "".join(f"{line}\n" for line in full)
+
+
+def case_doctor_human_all_ok_is_silent() -> None:
+    # collect_human_lines always emits at least one [INFO] (gstack-browser);
+    # silence is defined on the [OK] chorus, so pin the filter directly.
+    lines = [
+        "[OK] package plugin manifest — ok",
+        "[OK] claude CLI — 1.0",
+        "[OK] rate-pressure — no provider under pressure (0 records examined)",
+    ]
+    assert goalflight_doctor.display_human_lines(lines) == []
+    assert goalflight_doctor.display_human_lines(lines, verbose=True) == lines
+    payload = _minimal_human_payload()
+    shown = goalflight_doctor.display_human_lines(
+        goalflight_doctor.collect_human_lines(payload)
+    )
+    assert all(not line.startswith("[OK]") for line in shown)
+    assert goalflight_doctor.verdict_summary(payload)["verdict"] == "ok"
+
+
+def case_doctor_unhealthy_still_reports_warn() -> None:
+    payload = _minimal_human_payload(
+        worker_currency={
+            "claude": {"behind": True, "current": "2.1.220", "latest": "2.1.233"},
+        },
+    )
+    shown = goalflight_doctor.display_human_lines(
+        goalflight_doctor.collect_human_lines(payload)
+    )
+    assert any(
+        line.startswith("[WARN] worker CLI currency") and "Run /goal-flight update" in line
+        for line in shown
+    ), shown
+
+
+def case_doctor_json_untouched_by_human_filter() -> None:
+    payload = _minimal_human_payload(
+        worker_currency={
+            "claude": {"behind": True, "current": "2.1.220", "latest": "2.1.233"},
+        },
+    )
+    buf = io.StringIO()
+    with patch.object(goalflight_doctor, "doctor", return_value=payload), redirect_stdout(buf):
+        rc = goalflight_doctor.main(["--json", "--project-root", str(ROOT)])
+    assert rc == 0
+    data = json.loads(buf.getvalue())
+    verbose_buf = io.StringIO()
+    with patch.object(goalflight_doctor, "doctor", return_value=payload), redirect_stdout(verbose_buf):
+        verbose_rc = goalflight_doctor.main(
+            ["--json", "--verbose", "--project-root", str(ROOT)]
+        )
+    assert verbose_rc == 0
+    assert verbose_buf.getvalue() == buf.getvalue()
+    assert data["plugin"]["manifest"] == "ok"
+    assert data["claude"]["present"] is True
+    assert data["claude"]["version"] == "1.0"
+    assert data["verdict"] == "warn"
+    assert "warnings" in data
+    assert "info" in data
+    human = "".join(
+        f"{line}\n"
+        for line in goalflight_doctor.display_human_lines(
+            goalflight_doctor.collect_human_lines(payload)
+        )
+    )
+    assert "[OK] claude CLI" not in human
+    assert data["claude"]["version"] == "1.0"
+
+
+def case_doctor_exit_codes_unchanged() -> None:
+    healthy = _minimal_human_payload()
+    with patch.object(goalflight_doctor, "doctor", return_value=healthy), \
+        patch("goalflight_messages.emit_controller_mail_notice"), \
+        patch("goalflight_messages.emit_controller_milestone_notice"), \
+        redirect_stdout(io.StringIO()):
+        assert goalflight_doctor.main(["--project-root", str(ROOT)]) == 0
+        assert goalflight_doctor.main(["--verbose", "--project-root", str(ROOT)]) == 0
+        assert goalflight_doctor.main(["--json", "--project-root", str(ROOT)]) == 0
+    broken = _minimal_human_payload()
+    broken["plugin"] = {
+        "skipped": False,
+        "manifest_exists": False,
+        "manifest": None,
+        "validate_ok": False,
+        "validate_first_line": "missing",
+    }
+    with patch.object(goalflight_doctor, "doctor", return_value=broken), \
+        patch("goalflight_messages.emit_controller_mail_notice"), \
+        patch("goalflight_messages.emit_controller_milestone_notice"), \
+        redirect_stdout(io.StringIO()):
+        assert goalflight_doctor.main(["--project-root", str(ROOT)]) == 1
+        assert goalflight_doctor.main(["--verbose", "--project-root", str(ROOT)]) == 1
+        assert goalflight_doctor.main(["--json", "--project-root", str(ROOT)]) == 1
+
+
 def case_doctor_json_cli_attaches_verdict_alongside_probes() -> None:
     payload = _minimal_human_payload(
         worker_currency={
@@ -456,6 +585,12 @@ def main() -> None:
     case_doctor_json_verdict_matches_text_warnings_and_info()
     case_doctor_json_verdict_ok_when_text_has_no_warns()
     case_doctor_json_cli_attaches_verdict_alongside_probes()
+    case_doctor_human_omits_ok_keeps_warn_and_info()
+    case_doctor_verbose_recovers_ok_lines_verbatim()
+    case_doctor_human_all_ok_is_silent()
+    case_doctor_unhealthy_still_reports_warn()
+    case_doctor_json_untouched_by_human_filter()
+    case_doctor_exit_codes_unchanged()
     print("OK: doctor tests pass")
 
 

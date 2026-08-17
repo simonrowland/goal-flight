@@ -572,6 +572,19 @@ def validate_repository(repo_root: Path) -> tuple[int, int, list[str]]:
     return passed, len(EXPECTED_ADAPTERS), errors
 
 
+def format_validation_result(
+    passed: int, total: int, errors: list[str], *, verbose: bool = False
+) -> tuple[int, str, str]:
+    """Return (exit_code, stdout, stderr). Silent on success unless --verbose."""
+    summary = f"schema_validates={passed}/{total}"
+    if errors:
+        stderr = "".join(f"{error}\n" for error in errors) + f"{summary}\n"
+        return 1, "", stderr
+    if verbose:
+        return 0, f"{summary}\n", ""
+    return 0, "", ""
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -579,16 +592,22 @@ def main(argv: list[str] | None = None) -> int:
         default=str(Path(__file__).resolve().parents[1]),
         help="repository root to validate",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="print schema_validates=N/N when every adapter passes",
+    )
     args = parser.parse_args(argv)
     repo_root = Path(args.repo).resolve()
     passed, total, errors = validate_repository(repo_root)
-    if errors:
-        for error in errors:
-            print(error, file=sys.stderr)
-        print(f"schema_validates={passed}/{total}", file=sys.stderr)
-        return 1
-    print(f"schema_validates={passed}/{total}")
-    return 0
+    code, out, err = format_validation_result(
+        passed, total, errors, verbose=args.verbose
+    )
+    if out:
+        print(out, end="")
+    if err:
+        print(err, end="", file=sys.stderr)
+    return code
 
 
 if __name__ == "__main__":

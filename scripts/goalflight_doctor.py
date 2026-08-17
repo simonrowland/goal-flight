@@ -3157,8 +3157,15 @@ def verdict_summary(payload: dict) -> dict:
     return verdict_from_lines(collect_human_lines(payload))
 
 
-def print_human(payload: dict) -> None:
-    for line in collect_human_lines(payload):
+def display_human_lines(lines: list[str], *, verbose: bool = False) -> list[str]:
+    """Human text: silence [OK] unless --verbose. WARN/INFO stay."""
+    if verbose:
+        return list(lines)
+    return [line for line in lines if not line.startswith("[OK]")]
+
+
+def print_human(payload: dict, *, verbose: bool = False) -> None:
+    for line in display_human_lines(collect_human_lines(payload), verbose=verbose):
         print(line)
 
 
@@ -3476,6 +3483,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project-root", default=os.getcwd())
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="include [OK] probe lines (default: only [WARN] and [INFO])",
+    )
+    parser.add_argument(
         "--fleet-reconcile-stale",
         action="store_true",
         help="Release stale capacity leases and expired account locks before reporting",
@@ -3533,7 +3545,7 @@ def main(argv: list[str] | None = None) -> int:
         payload.update(verdict_summary(payload))
         print(json.dumps(payload, sort_keys=True))
     else:
-        print_human(payload)
+        print_human(payload, verbose=args.verbose)
         try:
             import goalflight_messages
         except Exception:

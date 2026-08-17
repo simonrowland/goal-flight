@@ -3,7 +3,22 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
-python3 "$REPO_ROOT/scripts/goalflight_validate_adapters.py" >/tmp/goal-flight-adapters-$$.out
+if ! python3 "$REPO_ROOT/scripts/goalflight_validate_adapters.py" \
+  >/tmp/goal-flight-adapters-$$.out 2>/tmp/goal-flight-adapters-$$.err; then
+  cat /tmp/goal-flight-adapters-$$.out /tmp/goal-flight-adapters-$$.err
+  rm -f /tmp/goal-flight-adapters-$$.out /tmp/goal-flight-adapters-$$.err
+  exit 1
+fi
+if [ -s /tmp/goal-flight-adapters-$$.out ] || [ -s /tmp/goal-flight-adapters-$$.err ]; then
+  echo "expected silence when every adapter validates"
+  cat /tmp/goal-flight-adapters-$$.out /tmp/goal-flight-adapters-$$.err
+  rm -f /tmp/goal-flight-adapters-$$.out /tmp/goal-flight-adapters-$$.err
+  exit 1
+fi
+rm -f /tmp/goal-flight-adapters-$$.out /tmp/goal-flight-adapters-$$.err
+
+python3 "$REPO_ROOT/scripts/goalflight_validate_adapters.py" --verbose \
+  >/tmp/goal-flight-adapters-$$.out
 grep -q "schema_validates=17/17" /tmp/goal-flight-adapters-$$.out || {
   cat /tmp/goal-flight-adapters-$$.out
   rm -f /tmp/goal-flight-adapters-$$.out
