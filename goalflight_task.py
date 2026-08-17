@@ -664,6 +664,332 @@ def read_project_registry() -> list[dict[str, Any]]:
     return [dict(item) for item in projects if isinstance(item, dict)]
 
 
+_REGISTRY_ABSENT_ERRNOS = {errno.ENOENT, errno.ENOTDIR}
+_CONVENTIONAL_MOUNT_CONTAINERS = (
+    Path("/Volumes"),
+    Path("/mnt"),
+    Path("/media"),
+    Path("/net"),
+)
+
+
+def _path_presence(path: Path) -> str:
+    """Return present / absent / unknown via lstat errno.
+
+    ``Path.exists()`` is ``os.path.exists()``: it swallows OSError
+    (including EACCES) and returns False. A permission error is not
+    evidence the checkout is gone, so prune decisions must not use it.
+    """
+    try:
+        os.lstat(path)
+    except OSError as exc:
+        if exc.errno in _REGISTRY_ABSENT_ERRNOS:
+            return "absent"
+        return "unknown"
+    return "present"
+
+
+def _is_conventional_mount_parent(parent: Path) -> bool:
+    """True when *parent* is a conventional volume-mount container.
+
+    This is a platform CONVENTION, not a guarantee. Direct children of
+    ``/Volumes``, ``/mnt``, ``/media``, ``/net``, ``/run/media/<user>``,
+    ``/media/<user>``, and ``$HOME/mnt`` are typical mount points.
+
+    Residual risk, fail-closed: a deleted checkout that lived at exactly
+    one of those paths is left in the registry (reported as
+    ``ambiguous``). Residual risk, fail-open: a volume *root* at an
+    unconventional prefix (``/data``, ``/opt/ssd``) that is removed
+    entirely still looks like a deleted checkout, because the parent
+    (``/`` or ``/opt``) exists, is not empty, and is not a conventional
+    container. Checkouts *under* such a prefix are covered by the
+    empty-parent guard in ``classify_registry_root`` when unmount leaves
+    the mountpoint empty.
+    """
+    try:
+        home_mnt: Path | None = Path.home() / "mnt"
+    except (RuntimeError, KeyError):
+        home_mnt = None
+    candidates = _CONVENTIONAL_MOUNT_CONTAINERS
+    if home_mnt is not None:
+        candidates = candidates + (home_mnt,)
+    parent_norm = os.path.normcase(os.path.normpath(str(parent)))
+    for candidate in candidates:
+        try:
+            if os.path.samefile(parent, candidate):
+                return True
+        except OSError:
+            pass
+        if parent_norm == os.path.normcase(os.path.normpath(str(candidate))):
+            return True
+    parts = Path(os.path.normpath(str(parent))).parts
+    if len(parts) == 4 and parts[1:3] == ("run", "media") and parts[3]:
+        return True
+    if len(parts) == 3 and parts[1] == "media" and parts[2]:
+        return True
+    return False
+
+
+def classify_registry_root(project_root: str | Path) -> str:
+    """Classify a registry root as live, prunable, unreachable, or ambiguous.
+
+    ``live`` — the path is present (directory, file, or symlink, including a
+    dangling symlink whose dirent still exists).
+    ``prunable`` — the parent directory exists, is listable, is not empty,
+    and is not a conventional mount container, and the root itself does
+    not. That is the only case we treat as "deliberately deleted": the
+    containing tree is reachable and holds other entries, this one
+    checkout is gone.
+    ``unreachable`` — the parent is also absent, a stat failed (EACCES,
+    EPERM, ELOOP, …), the parent could not be listed, or the path could
+    not be parsed.
+    ``ambiguous`` — the root is absent and the parent exists, but absence
+    matches both "deleted checkout" and "volume not mounted". Two
+    independent guards, each covering a distinct unmount shape:
+
+    * The parent is a conventional mount container (``/Volumes``,
+      ``/mnt``, …). This is the macOS shape: ejecting a volume removes
+      ``/Volumes/Name`` entirely, so the registry row for the volume
+      root itself would otherwise look like a deleted checkout.
+      ``/Volumes`` is usually not empty (other disks stay mounted), so
+      an empty-parent rule alone would miss this.
+    * The parent exists but is empty. This is the Linux shape: ``umount
+      /mnt/nas`` leaves ``/mnt/nas`` in place as an empty directory, so
+      a checkout at ``/mnt/nas/goal-flight`` is ENOENT with a present
+      parent that is not itself a container. An unmounted mountpoint is
+      always empty; the same rule also covers an unconventional prefix
+      (``/data``, ``/opt/ssd``) without a prefix list.
+
+    An unmount does not make every child vanish at once on every
+    platform. On macOS, ejecting a volume removes the volume directory
+    under ``/Volumes``. On Linux, unmounting an fstab/NFS/CIFS mount
+    leaves the mountpoint directory behind, empty. Neither is evidence
+    the checkouts were removed, so we must not prune them.
+
+    A dangling symlink is live, not prunable: the path still exists as a
+    dirent and may point at a volume that is merely unmounted.
+
+    Presence is decided with ``os.lstat`` and errno, never ``Path.exists()``.
+    See ``_is_conventional_mount_parent`` for the mount-container
+    convention and its residual risk.
+    """
+    try:
+        root = Path(project_root).expanduser()
+    except (TypeError, ValueError, RuntimeError):
+        return "unreachable"
+    if not str(root):
+        return "unreachable"
+    presence = _path_presence(root)
+    if presence == "unknown":
+        return "unreachable"
+    if presence == "present":
+        return "live"
+    parent = root.parent
+    if parent == root:
+        return "unreachable"
+    parent_presence = _path_presence(parent)
+    if parent_presence != "present":
+        return "unreachable"
+    if _is_conventional_mount_parent(parent):
+        return "ambiguous"
+    try:
+        with os.scandir(parent) as entries:
+            empty = next(entries, None) is None
+    except OSError:
+        return "unreachable"
+    if empty:
+        return "ambiguous"
+    return "prunable"
+
+
+def _registry_identity_needs_backfill(entry: dict[str, Any]) -> bool:
+    """True when the cached identity was never written or is an empty string.
+
+    An explicit ``None`` is an honest prior resolution (no origin) and must
+    not be re-guessed from the directory name. A missing key is a pre-field
+    row and is what the backfill exists to fill.
+    """
+    if "repo_identity" not in entry:
+        return True
+    value = entry.get("repo_identity")
+    return isinstance(value, str) and not value.strip()
+
+
+def measure_project_registry(
+    projects: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Read-only census of identity cache and ghosts. Never shells git, never writes."""
+    rows = projects if projects is not None else read_project_registry()
+    surviving = 0
+    surviving_with_identity = 0
+    surviving_without_identity = 0
+    ghosts = 0
+    prunable = 0
+    unreachable = 0
+    ambiguous = 0
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        raw_root = item.get("project_root")
+        if not isinstance(raw_root, str) or not raw_root:
+            continue
+        kind = classify_registry_root(raw_root)
+        if kind == "live":
+            surviving += 1
+            identity = item.get("repo_identity")
+            if isinstance(identity, str) and identity.strip():
+                surviving_with_identity += 1
+            else:
+                surviving_without_identity += 1
+        else:
+            ghosts += 1
+            if kind == "prunable":
+                prunable += 1
+            elif kind == "ambiguous":
+                ambiguous += 1
+            else:
+                unreachable += 1
+    return {
+        "projects_index": str(project_registry_index_path()),
+        "total": surviving + ghosts,
+        "surviving": surviving,
+        "surviving_with_identity": surviving_with_identity,
+        "surviving_without_identity": surviving_without_identity,
+        "ghosts": ghosts,
+        "prunable": prunable,
+        "unreachable": unreachable,
+        "ambiguous": ambiguous,
+    }
+
+
+def _registry_backup_path(index_path: Path, now_text: str) -> Path:
+    stamp = now_text.replace(":", "").replace("+00:00", "Z")
+    candidate = index_path.with_name(f"{index_path.name}.bak-{stamp}")
+    suffix = 1
+    while candidate.exists():
+        candidate = index_path.with_name(f"{index_path.name}.bak-{stamp}-{suffix}")
+        suffix += 1
+    return candidate
+
+
+def maintain_project_registry(
+    *,
+    prune_ghosts: bool = False,
+    dry_run: bool = False,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Backfill missing ``repo_identity``; optionally prune parent-exists ghosts.
+
+    Identity is resolved with ``git_repo_identity`` — the same function the
+    registry writer uses — and only for surviving roots that lack a cached
+    value. A root with no origin stays ``None``; the directory name is never
+    consulted. Ghosts are not probed (they cannot be interrogated).
+
+    Prune is off by default and drops a row only when ``classify_registry_root``
+    returns ``prunable``. ``ambiguous`` and ``unreachable`` rows are kept and
+    counted separately so the operator can see how many ghosts were declined
+    as mount-container ambiguity. The registry is copied to a sibling
+    ``.bak-*`` file before any rewrite that removes rows.
+    """
+    index_path = project_registry_index_path()
+    lock_path = index_path.with_name(f"{index_path.name}.lock")
+    now_text = now or utc_now()
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(lock_path):
+        existing_index = _read_json_object(index_path)
+        raw_projects = existing_index.get("projects")
+        projects = (
+            [dict(item) for item in raw_projects if isinstance(item, dict)]
+            if isinstance(raw_projects, LIST_TYPE)
+            else []
+        )
+        kept: list[dict[str, Any]] = []
+        backfilled_roots: list[str] = []
+        honest_none_roots: list[str] = []
+        already_identified = 0
+        pruned_roots: list[str] = []
+        surviving = 0
+        ghosts = 0
+        prunable = 0
+        unreachable = 0
+        ambiguous = 0
+        for item in projects:
+            raw_root = item.get("project_root")
+            if not isinstance(raw_root, str) or not raw_root:
+                kept.append(item)
+                continue
+            kind = classify_registry_root(raw_root)
+            if kind == "live":
+                surviving += 1
+                if _registry_identity_needs_backfill(item):
+                    identity = git_repo_identity(Path(raw_root).expanduser())
+                    updated = dict(item)
+                    updated["repo_identity"] = identity
+                    kept.append(updated)
+                    backfilled_roots.append(raw_root)
+                    if identity is None:
+                        honest_none_roots.append(raw_root)
+                else:
+                    kept.append(item)
+                    if isinstance(item.get("repo_identity"), str) and str(item.get("repo_identity")).strip():
+                        already_identified += 1
+                    else:
+                        honest_none_roots.append(raw_root)
+                continue
+            ghosts += 1
+            if kind == "prunable":
+                prunable += 1
+                if prune_ghosts:
+                    pruned_roots.append(raw_root)
+                    continue
+            elif kind == "ambiguous":
+                ambiguous += 1
+            else:
+                unreachable += 1
+            kept.append(item)
+
+        changed = kept != projects
+        will_prune = bool(pruned_roots)
+        backup_path: Path | None = None
+        wrote = False
+        if changed and not dry_run:
+            if will_prune and index_path.is_file():
+                backup_path = _registry_backup_path(index_path, now_text)
+                shutil.copy2(index_path, backup_path)
+            _write_json_atomic(
+                index_path,
+                {
+                    "schema": PROJECT_REGISTRY_INDEX_SCHEMA,
+                    "updated_at": now_text,
+                    "projects": kept,
+                },
+            )
+            wrote = True
+
+        return {
+            "ok": True,
+            "dry_run": dry_run,
+            "prune_ghosts": prune_ghosts,
+            "projects_index": str(index_path),
+            "backup": str(backup_path) if backup_path is not None else None,
+            "wrote": wrote,
+            "unchanged": not changed,
+            "total_before": len(projects),
+            "total_after": len(kept),
+            "surviving": surviving,
+            "ghosts": ghosts,
+            "prunable": prunable,
+            "unreachable": unreachable,
+            "ambiguous": ambiguous,
+            "backfilled": len(backfilled_roots),
+            "backfilled_roots": backfilled_roots,
+            "honest_none": len(honest_none_roots),
+            "already_identified": already_identified,
+            "pruned": len(pruned_roots),
+            "pruned_roots": pruned_roots,
+        }
+
+
 def view_manifest_path(project_root: Path) -> Path:
     return resolve_task_store_dir(project_root) / "view-manifest.json"
 
@@ -4155,6 +4481,28 @@ def _cmd_sync(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_maintain_registry(_store: TaskStore, args: argparse.Namespace) -> int:
+    result = maintain_project_registry(
+        prune_ghosts=bool(args.prune_ghosts),
+        dry_run=bool(args.dry_run),
+    )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+    print(
+        f"registry: {result['projects_index']}\n"
+        f"total {result['total_before']} -> {result['total_after']} "
+        f"surviving={result['surviving']} ghosts={result['ghosts']} "
+        f"prunable={result['prunable']} unreachable={result['unreachable']} "
+        f"ambiguous={result['ambiguous']}\n"
+        f"backfilled={result['backfilled']} honest_none={result['honest_none']} "
+        f"already_identified={result['already_identified']}\n"
+        f"pruned={result['pruned']} wrote={result['wrote']} "
+        f"dry_run={result['dry_run']} backup={result['backup'] or 'none'}"
+    )
+    return 0
+
+
 def _api_store(project_root: str | Path | None = None) -> TaskStore:
     return TaskStore(resolve_project_root(str(project_root) if project_root is not None else None))
 
@@ -4531,6 +4879,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync.add_argument("--by", help=argparse.SUPPRESS)
     sync.set_defaults(func=_cmd_sync)
+
+    maintain_registry = sub.add_parser(
+        "maintain-registry",
+        help="Backfill cached repo_identity; optionally prune deleted checkouts.",
+        epilog=(
+            "examples:\n"
+            "  goalflight_task.py maintain-registry --dry-run --json\n"
+            "  goalflight_task.py maintain-registry\n"
+            "  goalflight_task.py maintain-registry --prune-ghosts\n"
+            "prune only when the parent directory exists and the root does not; "
+            "an unmounted volume is not evidence the checkout was deleted. "
+            "A backup is written next to projects.json before any destructive rewrite."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    maintain_registry.add_argument("--by", help=argparse.SUPPRESS)
+    maintain_registry.add_argument(
+        "--prune-ghosts",
+        action="store_true",
+        help="Drop rows whose parent exists and whose root does not. Off by default.",
+    )
+    maintain_registry.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would change without writing the registry or a backup.",
+    )
+    maintain_registry.add_argument("--json", action="store_true")
+    maintain_registry.set_defaults(func=_cmd_maintain_registry)
     return parser
 
 
