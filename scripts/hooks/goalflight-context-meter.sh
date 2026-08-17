@@ -1,12 +1,23 @@
 #!/bin/sh
 
 # Claude Code PostToolUse hook. Emits one additionalContext line when the
-# session transcript crosses 80/90/95% of an *explicit* context window so
+# session transcript crosses 80/90/95% of the resolved context window so
 # the controller can write the RESUME handoff before compaction fires.
 #
 # Fail silent: a thrown hook must never break the session. Silence is also
 # the healthy-state output — nothing prints below 80%, on an unknown
 # reading, or when a band has already fired.
+#
+# The meter resolves the window from the newest assistant model in the
+# transcript (fleet map) or GOALFLIGHT_CONTEXT_WINDOW. It is on by
+# default. GOALFLIGHT_CONTEXT_METER=0 is the opt-out.
+#
+# A previous env-window guard skipped the interpreter when the export
+# was unset. That made the export mandatory and defeated model-from-
+# transcript. The cost it avoided was real (python3 on matcher '.*' =
+# ~43ms per tool call), so this file keeps a SHELL-SIDE 1-in-20 call
+# throttle instead. Growth-based recheck and band de-dupe stay in
+# Python; this script does not parse stdin JSON.
 
 resolve_repo_root() {
   hook_src=${1:-$0}
@@ -23,22 +34,71 @@ resolve_repo_root() {
   cd "$(dirname "$hook_src")/../.." 2>/dev/null && pwd
 }
 
+meter_opted_out() {
+  case "${GOALFLIGHT_CONTEXT_METER:-}" in
+    0|false|FALSE|False|off|OFF|Off) return 0 ;;
+  esac
+  return 1
+}
+
+shell_every() {
+  every=${GOALFLIGHT_CONTEXT_METER_EVERY:-20}
+  case "$every" in
+    ''|*[!0-9]*) every=20 ;;
+  esac
+  if [ "$every" -lt 1 ]; then
+    every=20
+  fi
+  printf '%s' "$every"
+}
+
+counter_file_path() {
+  if [ -n "${GOALFLIGHT_CONTEXT_METER_CALLS:-}" ]; then
+    printf '%s' "$GOALFLIGHT_CONTEXT_METER_CALLS"
+    return
+  fi
+  state_dir=${GOALFLIGHT_CONTEXT_METER_STATE_DIR:-}
+  if [ -z "$state_dir" ]; then
+    if [ -n "${GOALFLIGHT_STATE_DIR:-}" ]; then
+      state_dir="${GOALFLIGHT_STATE_DIR}/context-meter"
+    else
+      uid=$(id -u 2>/dev/null || echo 0)
+      state_dir="/tmp/goal-flight-${uid}/context-meter"
+    fi
+  fi
+  printf '%s' "${state_dir}/hook-calls"
+}
+
+# Return 0 if this call should spawn Python (sampled), 1 to skip.
+shell_should_spawn() {
+  every=$(shell_every)
+  if [ "$every" -le 1 ]; then
+    return 0
+  fi
+  counter_file=$(counter_file_path)
+  counter_dir=$(dirname "$counter_file")
+  mkdir -p "$counter_dir" 2>/dev/null || true
+  calls=0
+  if [ -f "$counter_file" ]; then
+    calls=$(cat "$counter_file" 2>/dev/null || echo 0)
+  fi
+  case "$calls" in
+    ''|*[!0-9]*) calls=0 ;;
+  esac
+  calls=$((calls + 1))
+  printf '%s\n' "$calls" > "$counter_file" 2>/dev/null || true
+  # Call 1, 21, 41, ... so the first tool call can still fire 80%.
+  remainder=$((calls % every))
+  [ "$remainder" -eq 1 ]
+}
+
 main() {
-  # Decide the opt-in in SHELL, before paying for a Python interpreter.
-  #
-  # The meter cannot produce a reading without an explicit window: there is no
-  # default and KNOWN_MODEL_WINDOWS is deliberately empty, so an unset
-  # GOALFLIGHT_CONTEXT_WINDOW already meant "print nothing". Doing that check
-  # here rather than after startup is semantically identical and removes the
-  # cost for everyone who has not enabled the feature.
-  #
-  # Measured on an M-series mac, 20 iterations each: bare `python3 -c pass` =
-  # 15.7ms; this hook before the guard = 42.9ms per tool call with the variable
-  # UNSET (the same 40.9ms it cost when SET, because the check happened inside
-  # Python). hooks.json wires this at matcher '.*', so that was ~43ms on EVERY
-  # tool call of EVERY downstream session for a dormant feature. The in-Python
-  # 20-call/1MB throttle cannot help: it runs after the interpreter has started.
-  [ -n "${GOALFLIGHT_CONTEXT_WINDOW:-}" ] || return 0
+  if meter_opted_out; then
+    return 0
+  fi
+  if ! shell_should_spawn; then
+    return 0
+  fi
 
   if [ "${1:-}" = "--dry-run" ]; then
     shift

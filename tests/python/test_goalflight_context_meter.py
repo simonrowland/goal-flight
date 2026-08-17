@@ -31,10 +31,12 @@ WINDOW = 1_000_000
 METER_ENV = (
     "GOALFLIGHT_CONTEXT_WINDOW",
     "GOALFLIGHT_CONTEXT_MODEL",
+    "GOALFLIGHT_CONTEXT_METER",
     "GOALFLIGHT_CONTEXT_METER_EVERY",
     "GOALFLIGHT_CONTEXT_METER_GROWTH",
     "GOALFLIGHT_CONTEXT_METER_STATE",
     "GOALFLIGHT_CONTEXT_METER_STATE_DIR",
+    "GOALFLIGHT_CONTEXT_METER_CALLS",
 )
 
 
@@ -49,6 +51,7 @@ def _usage_record(
     cache_read: int = 0,
     cache_creation: int = 0,
     extra: dict | None = None,
+    model: str | None = None,
 ) -> dict:
     message = {
         "role": "assistant",
@@ -59,6 +62,8 @@ def _usage_record(
             "output_tokens": 12,
         },
     }
+    if model is not None:
+        message["model"] = model
     if extra:
         message.update(extra)
     return {"type": "assistant", "message": message}
@@ -122,6 +127,7 @@ def _cli(tmp_path: Path, extra: list[str], env: dict[str, str] | None = None) ->
 def _hook_env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_CONTEXT_METER_STATE"] = str(tmp_path / "meter-state.json")
+    env["GOALFLIGHT_CONTEXT_METER_STATE_DIR"] = str(tmp_path / "meter-state-dir")
     env["GOALFLIGHT_CONTEXT_METER_EVERY"] = "1"
     env["GOALFLIGHT_CONTEXT_WINDOW"] = str(WINDOW)
     if extra:
@@ -216,14 +222,87 @@ def test_missing_window_is_unknown_not_a_number(tmp_path: Path) -> None:
 
 
 def test_unknown_model_is_not_a_number() -> None:
-    assert meter.KNOWN_MODEL_WINDOWS == {}
     assert meter.window_for_model("claude-opus-4-6") is None
     assert meter.window_for_model("mystery-model") is None
     assert meter.resolve_window(model="claude-opus-4-6") is None
+    assert meter.resolve_window(model="mystery-model") is None
+
+
+def test_opus_5_maps_to_fleet_1m() -> None:
+    """1M is a fleet operator directive, not a vendor guarantee."""
+    assert meter.KNOWN_MODEL_WINDOWS.get("claude-opus-5") == 1_000_000
+    assert meter.window_for_model("claude-opus-5") == 1_000_000
+    assert meter.resolve_window(model="claude-opus-5") == 1_000_000
+
+
+def test_fable_5_maps_to_fleet_1m() -> None:
+    """Same fleet directive as Opus. This fleet runs Fable too."""
+    assert meter.KNOWN_MODEL_WINDOWS.get("claude-fable-5") == 1_000_000
+    assert meter.window_for_model("claude-fable-5") == 1_000_000
+    assert meter.resolve_window(model="claude-fable-5") == 1_000_000
+
+
+def test_map_is_exactly_opus_and_fable() -> None:
+    assert set(meter.KNOWN_MODEL_WINDOWS) == {"claude-opus-5", "claude-fable-5"}
+    assert set(meter.KNOWN_MODEL_WINDOWS.values()) == {1_000_000}
+
+
+def test_dated_family_suffix_inherits_fleet_window() -> None:
+    assert meter.window_for_model("claude-opus-5-20260501") == 1_000_000
+    assert meter.window_for_model("claude-fable-5-20260817") == 1_000_000
+    assert meter.classify_model("claude-opus-5-20260501") == (
+        "dated-family",
+        1_000_000,
+    )
+
+
+def test_non_date_family_suffix_is_unmapped_variant_not_a_number() -> None:
+    """claude-opus-5-mini must NOT inherit 1M (too-large / silent)."""
+    assert meter.window_for_model("claude-opus-5-mini") is None
+    kind, mapped = meter.classify_model("claude-opus-5-mini")
+    assert kind == "unmapped-variant"
+    assert mapped is None
+
+
+def test_sonnet_and_haiku_stay_unknown() -> None:
+    assert meter.window_for_model("claude-sonnet-4-5") is None
+    assert meter.window_for_model("claude-haiku-4-5-20251001") is None
+    assert meter.classify_model("claude-sonnet-4-5") == ("unknown", None)
+
+
+def test_inflated_map_would_under_report_the_80_band() -> None:
+    """Dangerous direction: a too-LARGE window is a silent under-report.
+
+    800k / 1M = 80% (must fire). 800k / 2M = 40% (silent). If the fleet
+    map is inflated this test goes red — that is the failure mode the
+    meter exists to prevent.
+    """
+    tokens = 800_000
+    for model_id in ("claude-opus-5", "claude-fable-5"):
+        mapped = meter.window_for_model(model_id)
+        assert mapped == 1_000_000, model_id
+        assert meter.band_for((tokens / mapped) * 100.0) == 80
+    inflated = 2_000_000
+    assert meter.band_for((tokens / inflated) * 100.0) is None
 
 
 def test_explicit_window_wins_over_unknown_model() -> None:
     assert meter.resolve_window(window=1_000_000, model="mystery-model") == 1_000_000
+
+
+def test_explicit_window_wins_over_env_and_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_CONTEXT_WINDOW", "200000")
+    assert (
+        meter.resolve_window(window=500_000, model="claude-opus-5") == 500_000
+    )
+
+
+def test_env_window_wins_over_model_map(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOALFLIGHT_CONTEXT_WINDOW", "200000")
+    assert meter.resolve_window(model="claude-opus-5") == 200_000
+    assert meter.context_window() == 200_000
 
 
 def test_garbage_window_raises() -> None:
@@ -302,6 +381,166 @@ def test_cli_unknown_model_prints_unknown_not_a_percent(tmp_path: Path) -> None:
     assert "%" not in proc.stdout
 
 
+def test_transcript_model_resolves_window_without_export(tmp_path: Path) -> None:
+    path = _write_transcript(
+        tmp_path / "t.jsonl",
+        [_usage_record(0, cache_read=680_000, model="claude-opus-5")],
+    )
+    reading = meter.measure_transcript(path)
+    assert reading.unknown is False
+    assert reading.window == 1_000_000
+    assert reading.tokens == 680_000
+    assert reading.pct == 68.0
+    assert reading.verdict == "ok"
+
+
+def test_unknown_transcript_model_is_silent(tmp_path: Path) -> None:
+    path = _write_transcript(
+        tmp_path / "t.jsonl",
+        [_usage_record(800_000, model="mystery-model")],
+    )
+    reading = meter.measure_transcript(path)
+    assert reading.unknown is True
+    assert reading.pct is None
+    assert reading.reason == "unrecognized-model"
+    assert meter.render_text(reading) == "unknown"
+
+
+def test_unmapped_variant_is_observable_not_a_percent(tmp_path: Path) -> None:
+    path = _write_transcript(
+        tmp_path / "t.jsonl",
+        [_usage_record(800_000, model="claude-opus-5-mini")],
+    )
+    reading = meter.measure_transcript(path)
+    assert reading.unknown is True
+    assert reading.pct is None
+    assert reading.reason == "unmapped-variant"
+    assert reading.model == "claude-opus-5-mini"
+    rendered = meter.render_text(reading)
+    assert rendered == "unmapped-variant: claude-opus-5-mini"
+    assert "%" not in rendered
+
+
+def test_dated_transcript_model_resolves_without_export(tmp_path: Path) -> None:
+    path = _write_transcript(
+        tmp_path / "t.jsonl",
+        [_usage_record(0, cache_read=680_000, model="claude-fable-5-20260817")],
+    )
+    reading = meter.measure_transcript(path)
+    assert reading.unknown is False
+    assert reading.window == 1_000_000
+    assert reading.pct == 68.0
+
+
+def test_explicit_unknown_model_does_not_fall_through_to_transcript(
+    tmp_path: Path,
+) -> None:
+    path = _write_transcript(
+        tmp_path / "t.jsonl",
+        [_usage_record(800_000, model="claude-opus-5")],
+    )
+    reading = meter.measure_transcript(path, model="mystery-model")
+    assert reading.unknown is True
+    assert reading.reason == "unrecognized-model"
+    assert reading.pct is None
+
+
+def test_newest_assistant_model_wins(tmp_path: Path) -> None:
+    path = _write_transcript(
+        tmp_path / "t.jsonl",
+        [
+            _usage_record(100_000, model="mystery-model"),
+            {"type": "user", "message": {"content": "later"}},
+            _usage_record(250_000, model="claude-opus-5"),
+        ],
+    )
+    reading = meter.measure_transcript(path)
+    assert reading.window == 1_000_000
+    assert reading.tokens == 250_000
+
+
+def test_newest_unknown_model_is_silent_even_if_older_is_known(
+    tmp_path: Path,
+) -> None:
+    path = _write_transcript(
+        tmp_path / "t.jsonl",
+        [
+            _usage_record(100_000, model="claude-opus-5"),
+            _usage_record(250_000, model="mystery-model"),
+        ],
+    )
+    reading = meter.measure_transcript(path)
+    assert reading.unknown is True
+    assert reading.reason == "unrecognized-model"
+
+
+def test_stale_window_guard_when_tokens_exceed_window(tmp_path: Path) -> None:
+    path = _write_transcript(tmp_path / "t.jsonl", [_usage_record(1_200_000)])
+    reading = meter.measure_transcript(path, 1_000_000)
+    assert reading.unknown is True
+    assert reading.reason == "stale-window"
+    assert reading.verdict == "stale-window"
+    assert reading.tokens == 1_200_000
+    assert reading.window == 1_000_000
+    assert reading.pct is None
+    assert reading.band is None
+    rendered = meter.render_text(reading)
+    assert "%" not in rendered
+    assert "stale-window" in rendered
+    assert "1200000" in rendered
+    assert "1000000" in rendered
+
+
+def test_tokens_equal_to_window_is_100_not_stale(tmp_path: Path) -> None:
+    path = _write_transcript(tmp_path / "t.jsonl", [_usage_record(1_000_000)])
+    reading = meter.measure_transcript(path, 1_000_000)
+    assert reading.unknown is False
+    assert reading.pct == 100.0
+    assert reading.reason is None
+    assert reading.band == 95
+
+
+def test_cli_uses_transcript_model_without_window(tmp_path: Path) -> None:
+    path = _write_transcript(
+        tmp_path / "t.jsonl",
+        [_usage_record(0, cache_read=680_000, model="claude-opus-5")],
+    )
+    proc = _cli(tmp_path, ["--transcript", str(path)])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "68% ok"
+    blob = _cli(tmp_path, ["--transcript", str(path), "--json"])
+    payload = json.loads(blob.stdout)
+    assert payload["window"] == 1_000_000
+    assert payload["pct"] == 68.0
+    assert payload["unknown"] is False
+
+
+def test_cli_env_overrides_transcript_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_transcript(
+        tmp_path / "t.jsonl",
+        [_usage_record(100_000, model="claude-opus-5")],
+    )
+    proc = _cli(
+        tmp_path,
+        ["--transcript", str(path), "--json"],
+        env={"GOALFLIGHT_CONTEXT_WINDOW": "200000"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["window"] == 200_000
+    assert payload["pct"] == 50.0
+
+
+def test_cli_stale_window_is_not_a_percent(tmp_path: Path) -> None:
+    path = _write_transcript(tmp_path / "t.jsonl", [_usage_record(1_200_000)])
+    proc = _cli(tmp_path, ["--transcript", str(path), "--window", "1000000"])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().startswith("stale-window:")
+    assert "%" not in proc.stdout
+
+
 def test_cli_garbage_window_exits_2(tmp_path: Path) -> None:
     path = _write_transcript(tmp_path / "t.jsonl", [_usage_record(1)])
     proc = _cli(tmp_path, ["--transcript", str(path), "--window", "nope"])
@@ -335,6 +574,54 @@ def test_hook_silent_on_unrecognized_model(tmp_path: Path) -> None:
         state_path=tmp_path / "state.json",
     )
     assert out is None
+
+
+def test_hook_uses_transcript_model_without_export(tmp_path: Path) -> None:
+    path = _write_transcript(
+        tmp_path / "t.jsonl",
+        [_usage_record(820_000, model="claude-opus-5")],
+    )
+    out = meter.hook_tick(
+        {"transcript_path": str(path), "session_id": "s1"},
+        state_path=tmp_path / "state.json",
+        today=dt.date(2026, 8, 17),
+    )
+    assert out is not None
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert ctx.startswith("CONTEXT 82% (band 80):")
+    assert "RESUME-NOTES-2026-08-17.md" in ctx
+
+
+def test_hook_unmapped_variant_fires_once(tmp_path: Path) -> None:
+    path = _write_transcript(
+        tmp_path / "t.jsonl",
+        [_usage_record(800_000, model="claude-opus-5-mini")],
+    )
+    payload = {"transcript_path": str(path), "session_id": "s1"}
+    state = tmp_path / "state.json"
+    first = meter.hook_tick(payload, state_path=state)
+    assert first is not None
+    ctx = first["hookSpecificOutput"]["additionalContext"]
+    assert "unmapped-variant" in ctx
+    assert "claude-opus-5-mini" in ctx
+    second = meter.hook_tick(payload, state_path=state)
+    assert second is None
+
+
+def test_hook_stale_window_fires_once_not_a_percent(tmp_path: Path) -> None:
+    path = _write_transcript(tmp_path / "t.jsonl", [_usage_record(1_200_000)])
+    payload = {"transcript_path": str(path), "session_id": "s1"}
+    state = tmp_path / "state.json"
+    first = meter.hook_tick(
+        payload, window=1_000_000, state_path=state, today=dt.date(2026, 8, 17)
+    )
+    assert first is not None
+    ctx = first["hookSpecificOutput"]["additionalContext"]
+    assert "stale-window" in ctx
+    assert "1200000" in ctx
+    assert "%" not in ctx.split(":")[0]
+    second = meter.hook_tick(payload, window=1_000_000, state_path=state)
+    assert second is None
 
 
 def test_band_80_fires_once_even_after_down_and_up(
@@ -391,45 +678,34 @@ def test_jump_to_95_fires_once_at_highest_band(tmp_path: Path) -> None:
     assert second is None
 
 
-def test_throttle_skips_until_20_calls_or_1mb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GOALFLIGHT_CONTEXT_METER_EVERY", raising=False)
-    monkeypatch.delenv("GOALFLIGHT_CONTEXT_METER_GROWTH", raising=False)
+def test_should_recheck_interval_and_growth() -> None:
+    """Helper still encodes 20-call / 1MB. Shell now owns the call skip."""
+    state = {"calls": 5, "last_checked_calls": 5, "last_checked_size": 100}
+    assert meter.should_recheck(state, 100) is False
+    state["calls"] = 25
+    assert meter.should_recheck(state, 100) is True
+    state["calls"] = 5
+    assert (
+        meter.should_recheck(state, 100 + meter.RECHECK_GROWTH_BYTES + 1) is True
+    )
+
+
+def test_hook_tick_measures_every_call_and_band_dedupes(tmp_path: Path) -> None:
+    """Once Python is invoked, measure. Band de-dupe is what stays quiet."""
     path = _write_transcript(tmp_path / "t.jsonl", [_usage_record(820_000)])
     state = tmp_path / "state.json"
     payload = {"transcript_path": str(path), "session_id": "s1"}
-
     first = meter.hook_tick(payload, window=WINDOW, state_path=state)
     assert first is not None
+    assert "band 80" in first["hookSpecificOutput"]["additionalContext"]
 
     _write_transcript(path, [_usage_record(930_000)])
-    skipped = 0
-    late = None
-    for _ in range(19):
-        late = meter.hook_tick(payload, window=WINDOW, state_path=state)
-        if late is None:
-            skipped += 1
-    assert skipped == 19
-    assert late is None
+    next_band = meter.hook_tick(payload, window=WINDOW, state_path=state)
+    assert next_band is not None
+    assert "band 90" in next_band["hookSpecificOutput"]["additionalContext"]
 
-    fired = meter.hook_tick(payload, window=WINDOW, state_path=state)
-    assert fired is not None
-    assert "band 90" in fired["hookSpecificOutput"]["additionalContext"]
-
-
-def test_throttle_growth_forces_recheck(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GOALFLIGHT_CONTEXT_METER_EVERY", raising=False)
-    path = _write_transcript(tmp_path / "t.jsonl", [_usage_record(820_000)])
-    state = tmp_path / "state.json"
-    payload = {"transcript_path": str(path), "session_id": "s1"}
-    assert meter.hook_tick(payload, window=WINDOW, state_path=state) is not None
-
-    with path.open("ab") as handle:
-        handle.write(b"x" * (meter.RECHECK_GROWTH_BYTES + 64))
-        handle.write((json.dumps(_usage_record(930_000)) + "\n").encode("utf-8"))
-
-    grown = meter.hook_tick(payload, window=WINDOW, state_path=state)
-    assert grown is not None
-    assert "band 90" in grown["hookSpecificOutput"]["additionalContext"]
+    again = meter.hook_tick(payload, window=WINDOW, state_path=state)
+    assert again is None
 
 
 def test_hook_main_fail_silent_on_garbage() -> None:
@@ -481,6 +757,31 @@ def test_o1_bytes_read_and_time_do_not_scale_with_file_size(tmp_path: Path) -> N
         f"MEASURE o1 small={small_s:.6f}s bytes={small_bytes} "
         f"size={small.stat().st_size} large={large_s:.6f}s "
         f"bytes={large_bytes} size={large.stat().st_size}"
+    )
+
+
+def test_model_resolution_does_not_increase_bytes_read(tmp_path: Path) -> None:
+    """Adding model lookup must not turn the tail read into a scan."""
+    usage = _usage_record(321_000, model="claude-opus-5")
+    large = _write_padded_transcript(
+        tmp_path / "large.jsonl",
+        prefix_bytes=40 * 1024 * 1024,
+        usage=usage,
+    )
+    assert large.stat().st_size > 30 * 1024 * 1024
+    usage_obj, found_model, bytes_read = meter.read_newest_assistant(large)
+    assert usage_obj is not None
+    assert found_model == "claude-opus-5"
+    assert bytes_read == meter.TAIL_BYTES
+    assert bytes_read == 65_536
+    reading = meter.measure_transcript(large)
+    assert reading.unknown is False
+    assert reading.window == 1_000_000
+    assert reading.tokens == 321_000
+    assert reading.bytes_read == meter.TAIL_BYTES
+    print(
+        f"MEASURE model-o1 bytes_read={reading.bytes_read} "
+        f"size={large.stat().st_size} model={found_model}"
     )
 
 
@@ -629,13 +930,26 @@ def _python_recorder(tmp_path: Path) -> tuple[Path, Path]:
     return bin_dir, marker
 
 
-def _run_hook(tmp_path: Path, bin_dir: Path, window: str | None) -> None:
+def _run_hook(
+    tmp_path: Path,
+    bin_dir: Path | None,
+    *,
+    window: str | None = None,
+    extra: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env.pop("GOALFLIGHT_CONTEXT_WINDOW", None)
+    env.pop("GOALFLIGHT_CONTEXT_METER", None)
+    env.pop("GOALFLIGHT_CONTEXT_METER_EVERY", None)
     if window is not None:
         env["GOALFLIGHT_CONTEXT_WINDOW"] = window
-    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
-    subprocess.run(
+    env["GOALFLIGHT_CONTEXT_METER_STATE_DIR"] = str(tmp_path / "meter-state-dir")
+    env["GOALFLIGHT_CONTEXT_METER_STATE"] = str(tmp_path / "meter-state.json")
+    if bin_dir is not None:
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    if extra:
+        env.update(extra)
+    return subprocess.run(
         ["sh", str(HOOK)],
         input=json.dumps({"transcript_path": str(tmp_path / "missing.jsonl")}),
         text=True,
@@ -645,22 +959,58 @@ def _run_hook(tmp_path: Path, bin_dir: Path, window: str | None) -> None:
     )
 
 
-def test_hook_does_not_start_python_when_window_is_unset(tmp_path: Path) -> None:
-    """A session that never enabled the meter must not pay for an interpreter.
+def test_hook_does_not_start_python_when_opted_out(tmp_path: Path) -> None:
+    bin_dir, marker = _python_recorder(tmp_path)
+    _run_hook(tmp_path, bin_dir, extra={"GOALFLIGHT_CONTEXT_METER": "0"})
+    assert not marker.exists(), "opt-out must skip the interpreter"
 
-    hooks.json wires this hook at matcher '.*', so a Python start here is a
-    per-tool-call tax on every downstream session. Measured before the shell
-    guard existed: 42.9ms per call with the window UNSET, versus 15.7ms for a
-    bare `python3 -c pass` — i.e. the dormant path cost as much as the active
-    one, because the window check happened after startup.
-    """
+
+def test_hook_starts_python_without_window_on_first_call(tmp_path: Path) -> None:
+    """Default-on: the first tool call must measure even with no export."""
     bin_dir, marker = _python_recorder(tmp_path)
     _run_hook(tmp_path, bin_dir, window=None)
-    assert not marker.exists(), "hook started python3 for a session with no context window set"
+    assert marker.exists(), "first call must start python without GOALFLIGHT_CONTEXT_WINDOW"
 
 
 def test_hook_starts_python_when_window_is_set(tmp_path: Path) -> None:
-    """The guard is an opt-in gate, not a mute: an enabled session still measures."""
     bin_dir, marker = _python_recorder(tmp_path)
     _run_hook(tmp_path, bin_dir, window=str(WINDOW))
     assert marker.exists(), "hook must still run the meter when a window is configured"
+
+
+def test_hook_shell_throttle_skips_python_on_non_sampled_calls(tmp_path: Path) -> None:
+    bin_dir, marker = _python_recorder(tmp_path)
+    extra = {"GOALFLIGHT_CONTEXT_METER_EVERY": "20"}
+    _run_hook(tmp_path, bin_dir, extra=extra)
+    assert marker.exists(), "call 1 must be sampled"
+    marker.unlink()
+    for _ in range(19):
+        _run_hook(tmp_path, bin_dir, extra=extra)
+        assert not marker.exists(), "calls 2-20 must not start python"
+    _run_hook(tmp_path, bin_dir, extra=extra)
+    assert marker.exists(), "call 21 must be sampled again"
+
+
+def test_hook_throttled_path_stays_cheap(tmp_path: Path) -> None:
+    """Shell skip must not regress to a ~43ms python start per tool call.
+
+    The number that matters is wall time of the hook process Claude
+    already launches. A bare ``sh -c exit`` is the floor; spawning the
+    meter used to cost ~43ms. Stay well below that.
+    """
+    extra = {"GOALFLIGHT_CONTEXT_METER_EVERY": "20"}
+    _run_hook(tmp_path, None, extra=extra)
+    n = 40
+    t0 = time.perf_counter()
+    for _ in range(n):
+        _run_hook(tmp_path, None, extra=extra)
+    hook_per = (time.perf_counter() - t0) / n
+    t1 = time.perf_counter()
+    for _ in range(n):
+        subprocess.run(["sh", "-c", "exit 0"], check=False, capture_output=True)
+    bare_per = (time.perf_counter() - t1) / n
+    print(
+        f"MEASURE hook-throttled per-call={hook_per * 1000:.3f}ms "
+        f"bare-sh={bare_per * 1000:.3f}ms n={n}"
+    )
+    assert hook_per < 0.030, f"throttled hook path too slow: {hook_per * 1000:.3f}ms"

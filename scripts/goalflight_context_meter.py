@@ -7,8 +7,16 @@ The newest assistant ``usage`` block carries the live context size:
 
 A full JSONL scan is the slow path (transcripts run to many MB). This
 reader seeks to EOF and inspects a bounded tail. If that tail has no
-usage block it widens once, then reports unknown. The window is never
-guessed: a missing or unrecognized window/model is unknown, not a number.
+usage block it widens once, then reports unknown. The same tail also
+carries ``message.model``; that is how a reading can exist with no
+export. An unrecognized model stays unknown, not a guessed number.
+
+Window precedence, stated once so it cannot drift: explicit ``--window``
+> ``GOALFLIGHT_CONTEXT_WINDOW`` > model map > unknown/silent.
+
+If observed tokens exceed the resolved window the map (or override) is
+too small. That contradiction is reported as ``stale-window``, never as
+a confident percent over 100.
 
 The hook stays silent below 80% and fires each band (80 → 90 → 95) once.
 """
@@ -21,6 +29,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+import re
 import sys
 from typing import Any, Mapping
 
@@ -31,11 +40,19 @@ WIDEN_BYTES = 1024 * 1024
 BANDS = (80, 90, 95)
 RECHECK_EVERY_CALLS = 20
 RECHECK_GROWTH_BYTES = 1024 * 1024
-# Empty on purpose. The same model id can be 200k or 1M depending on the
-# session; a hardcoded map produced a 340% reading. Unlisted → unknown.
-KNOWN_MODEL_WINDOWS: dict[str, int] = {}
+# Only the two Claude Code models this fleet actually runs. Unlisted
+# models (sonnet, haiku, anything else) stay unknown. A too-large
+# unverified entry is the silent under-report this meter exists to
+# prevent; do not add one.
+KNOWN_MODEL_WINDOWS: dict[str, int] = {
+    # operator directive 2026-08-17 about this fleet, not a vendor guarantee
+    "claude-opus-5": 1_000_000,
+    # operator directive 2026-08-17 about this fleet, not a vendor guarantee
+    "claude-fable-5": 1_000_000,
+}
 STATE_SCHEMA = "goalflight.context-meter.v1"
 USAGE_KEY = b'"usage"'
+_MODEL_STRING = re.compile(rb'"model"\s*:\s*"([^"\\]+)"')
 
 
 @dataclass(frozen=True)
@@ -48,6 +65,7 @@ class Reading:
     verdict: str
     band: int | None
     bytes_read: int
+    model: str | None = None
 
 
 def context_tokens(usage: Mapping[str, Any]) -> int:
@@ -69,7 +87,8 @@ def context_window(value: object = None) -> int | None:
     """Resolve an explicit context window. None means 'not provided'.
 
     Garbage raises (caller decides whether to surface or stay silent).
-    There is no default: a wrong window is worse than no reading.
+    There is no numeric default: unknown stays silent. Precedence lives
+    in ``resolve_window`` / ``measure_transcript``.
     """
     raw = value
     if raw is None:
@@ -88,23 +107,66 @@ def context_window(value: object = None) -> int | None:
     return window
 
 
-def window_for_model(model: object = None) -> int | None:
-    """Fail-closed model → window lookup. Unrecognized is unknown, not 200k."""
+def _model_key(model: object = None) -> str | None:
     raw = model
     if raw is None:
         raw = os.environ.get("GOALFLIGHT_CONTEXT_MODEL")
     if raw is None:
         return None
     key = str(raw).strip()
-    if not key:
-        return None
+    return key or None
+
+
+def classify_model(model: object = None) -> tuple[str, int | None]:
+    """Classify a model id against the fleet map.
+
+    Match policy (evidence, not preference): exact key, or that key plus
+    a ``YYYYMMDD`` date suffix. Dated ids are a real shape in this
+    ecosystem (``claude-haiku-4-5-20251001``). Opus and Fable are
+    unsuffixed today; a future ``claude-opus-5-20260501`` must keep
+    resolving or the meter goes quietly dark — close to the defect we
+    are preventing.
+
+    A naive ``startswith`` would also swallow ``claude-opus-5-mini`` (or
+    any future smaller-window variant). That is the dangerous
+    too-large direction. So only an 8-digit date suffix inherits the
+    family window. Any other suffix on a known family is
+    ``unmapped-variant``: observable, no number. Unknown families stay
+    silent.
+    """
+    key = _model_key(model)
+    if key is None:
+        return "absent", None
     mapped = KNOWN_MODEL_WINDOWS.get(key)
     if mapped is None:
         mapped = KNOWN_MODEL_WINDOWS.get(key.lower())
-    return int(mapped) if mapped is not None else None
+    if mapped is not None:
+        return "mapped", int(mapped)
+    lower = key.lower()
+    for family, window in KNOWN_MODEL_WINDOWS.items():
+        prefix = family.lower() + "-"
+        if not lower.startswith(prefix):
+            continue
+        suffix = lower[len(prefix) :]
+        if len(suffix) == 8 and suffix.isdigit():
+            return "dated-family", int(window)
+        return "unmapped-variant", None
+    return "unknown", None
+
+
+def window_for_model(model: object = None) -> int | None:
+    """Fail-closed model → window lookup. Unrecognized is unknown, not 200k."""
+    _kind, mapped = classify_model(model)
+    return mapped
 
 
 def resolve_window(*, window: object = None, model: object = None) -> int | None:
+    """explicit --window > env > model map > unknown/silent.
+
+    Does not read a transcript. ``measure_transcript`` applies the same
+    order and then the newest assistant ``message.model`` as the model
+    source when neither an explicit window nor an explicit model is set.
+    """
     explicit = context_window(window)
     if explicit is not None:
         return explicit
@@ -196,7 +258,56 @@ def _parse_usage_object(buf: bytes, key_at: int) -> dict[str, Any] | None:
     return None
 
 
-def newest_usage_in_bytes(buf: bytes) -> dict[str, Any] | None:
+def _clean_model(value: object) -> str | None:
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            return text
+    return None
+
+
+def _model_from_obj(obj: object) -> str | None:
+    if not isinstance(obj, dict):
+        return None
+    message = obj.get("message")
+    if isinstance(message, dict):
+        found = _clean_model(message.get("model"))
+        if found is not None:
+            return found
+    return _clean_model(obj.get("model"))
+
+
+def _last_model_string(raw: bytes) -> str | None:
+    found = None
+    for match in _MODEL_STRING.finditer(raw):
+        text = match.group(1).decode("ascii", errors="ignore").strip()
+        if text:
+            found = text
+    return found
+
+
+def _model_in_record(buf: bytes, usage_at: int) -> str | None:
+    """Model on the JSONL record that contains ``usage`` at *usage_at*.
+
+    Same buffer as the usage parse — no extra read. A truncated line
+    falls back to the last ``"model":"..."`` before the usage key.
+    """
+    line_start = buf.rfind(b"\n", 0, usage_at) + 1
+    line_end = buf.find(b"\n", usage_at)
+    if line_end < 0:
+        line_end = len(buf)
+    raw = buf[line_start:line_end]
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return _last_model_string(raw)
+    return _model_from_obj(obj)
+
+
+def newest_assistant_in_bytes(
+    buf: bytes,
+) -> tuple[dict[str, Any], str | None] | None:
+    """Newest parseable usage in *buf*, plus that record's model if present."""
     pos = len(buf)
     while True:
         pos = buf.rfind(USAGE_KEY, 0, pos)
@@ -204,7 +315,12 @@ def newest_usage_in_bytes(buf: bytes) -> dict[str, Any] | None:
             return None
         usage = _parse_usage_object(buf, pos)
         if usage is not None:
-            return usage
+            return usage, _model_in_record(buf, pos)
+
+
+def newest_usage_in_bytes(buf: bytes) -> dict[str, Any] | None:
+    found = newest_assistant_in_bytes(buf)
+    return None if found is None else found[0]
 
 
 def _read_tail(path: Path, nbytes: int) -> bytes:
@@ -220,26 +336,42 @@ def _read_tail(path: Path, nbytes: int) -> bytes:
         return handle.read(take)
 
 
-def read_newest_usage(path: Path) -> tuple[dict[str, Any] | None, int]:
-    """Return (usage, bytes_read). Never scans the whole file."""
+def read_newest_assistant(
+    path: Path,
+) -> tuple[dict[str, Any] | None, str | None, int]:
+    """Return (usage, model, bytes_read). Never scans the whole file.
+
+    Model is taken from the same tail that produced usage. Finding usage
+    in the first tail does not widen just to chase a model — that would
+    change the O(1) bound.
+    """
     try:
         size = path.stat().st_size
     except OSError:
-        return None, 0
+        return None, None, 0
     if size <= 0:
-        return None, 0
+        return None, None, 0
     first = min(size, TAIL_BYTES)
-    usage = newest_usage_in_bytes(_read_tail(path, first))
+    found = newest_assistant_in_bytes(_read_tail(path, first))
     bytes_read = first
-    if usage is not None:
-        return usage, bytes_read
+    if found is not None:
+        return found[0], found[1], bytes_read
     if size <= TAIL_BYTES:
-        return None, bytes_read
+        return None, None, bytes_read
     second = min(size, WIDEN_BYTES)
     if second <= first:
-        return None, bytes_read
-    usage = newest_usage_in_bytes(_read_tail(path, second))
-    return usage, bytes_read + second
+        return None, None, bytes_read
+    found = newest_assistant_in_bytes(_read_tail(path, second))
+    bytes_read = bytes_read + second
+    if found is None:
+        return None, None, bytes_read
+    return found[0], found[1], bytes_read
+
+
+def read_newest_usage(path: Path) -> tuple[dict[str, Any] | None, int]:
+    """Return (usage, bytes_read). Never scans the whole file."""
+    usage, _model, bytes_read = read_newest_assistant(path)
+    return usage, bytes_read
 
 
 def reading_from_usage(
@@ -248,17 +380,25 @@ def reading_from_usage(
     *,
     bytes_read: int = 0,
     reason: str | None = None,
+    model: str | None = None,
 ) -> Reading:
     if window is None:
+        tokens = context_tokens(usage) if usage is not None else None
+        verdict = "unknown"
+        if reason == "unmapped-variant":
+            verdict = "unmapped-variant"
+        elif reason == "stale-window":
+            verdict = "stale-window"
         return Reading(
             unknown=True,
             reason=reason or "no-window",
-            tokens=None,
+            tokens=tokens if reason == "unmapped-variant" else None,
             window=None,
             pct=None,
-            verdict="unknown",
+            verdict=verdict,
             band=None,
             bytes_read=bytes_read,
+            model=model,
         )
     if usage is None:
         return Reading(
@@ -270,8 +410,23 @@ def reading_from_usage(
             verdict="unknown",
             band=None,
             bytes_read=bytes_read,
+            model=model,
         )
     tokens = context_tokens(usage)
+    if tokens > window:
+        # Too-small window (stale map or bad override). A confident
+        # 340% is nonsensical; name the contradiction instead.
+        return Reading(
+            unknown=True,
+            reason="stale-window",
+            tokens=tokens,
+            window=window,
+            pct=None,
+            verdict="stale-window",
+            band=None,
+            bytes_read=bytes_read,
+            model=model,
+        )
     pct = (tokens / window) * 100.0
     band = band_for(pct)
     return Reading(
@@ -283,16 +438,59 @@ def reading_from_usage(
         verdict=verdict_for(pct),
         band=band,
         bytes_read=bytes_read,
+        model=model,
     )
 
 
-def measure_transcript(path: Path, window: int | None) -> Reading:
-    if window is None:
-        return reading_from_usage(None, None, reason="no-window")
+def _missing_window_reason(model: object) -> str:
+    kind, _window = classify_model(model)
+    if kind == "absent":
+        return "no-window"
+    if kind == "unmapped-variant":
+        return "unmapped-variant"
+    return "unrecognized-model"
+
+
+def measure_transcript(
+    path: Path,
+    window: int | None = None,
+    *,
+    model: object = None,
+) -> Reading:
+    """Measure a transcript.
+
+    *window* is an already-chosen token count, or None to resolve via
+    env / *model* / the newest assistant record's ``message.model``.
+    """
+    resolved = resolve_window(window=window, model=model)
     if not path.is_file():
-        return reading_from_usage(None, window, reason="missing-transcript")
-    usage, bytes_read = read_newest_usage(path)
-    return reading_from_usage(usage, window, bytes_read=bytes_read)
+        source = _clean_model(model)
+        if resolved is None:
+            return reading_from_usage(
+                None,
+                None,
+                reason=_missing_window_reason(model),
+                model=source,
+            )
+        return reading_from_usage(
+            None, resolved, reason="missing-transcript", model=source
+        )
+    usage, found_model, bytes_read = read_newest_assistant(path)
+    if resolved is None and model is None:
+        resolved = window_for_model(found_model)
+    source_model = _clean_model(model if model is not None else found_model)
+    if resolved is None:
+        source = model if model is not None else found_model
+        return reading_from_usage(
+            usage,
+            None,
+            bytes_read=bytes_read,
+            reason=_missing_window_reason(source),
+            model=source_model,
+        )
+    return reading_from_usage(
+        usage, resolved, bytes_read=bytes_read, model=source_model
+    )
 
 
 def format_pct(pct: float) -> str:
@@ -306,6 +504,7 @@ def reading_to_json(reading: Reading) -> dict[str, Any]:
     return {
         "band": reading.band,
         "bytes_read": reading.bytes_read,
+        "model": reading.model,
         "pct": reading.pct,
         "reason": reading.reason,
         "tokens": reading.tokens,
@@ -316,6 +515,14 @@ def reading_to_json(reading: Reading) -> dict[str, Any]:
 
 
 def render_text(reading: Reading) -> str:
+    if reading.reason == "stale-window":
+        return (
+            f"stale-window: {reading.tokens} tokens exceed "
+            f"window {reading.window}"
+        )
+    if reading.reason == "unmapped-variant":
+        label = reading.model or "unknown-id"
+        return f"unmapped-variant: {label}"
     if reading.unknown or reading.pct is None:
         return "unknown"
     return f"{format_pct(reading.pct)} {reading.verdict}"
@@ -323,6 +530,19 @@ def render_text(reading: Reading) -> str:
 
 def cue_line(reading: Reading, *, today: dt.date | None = None) -> str:
     day = (today or dt.date.today()).isoformat()
+    if reading.reason == "stale-window":
+        return (
+            f"CONTEXT stale-window: {reading.tokens} tokens exceed "
+            f"window {reading.window}. The resolved window is too small; "
+            f"write docs-private/RESUME-NOTES-{day}.md now and do not trust a percent."
+        )
+    if reading.reason == "unmapped-variant":
+        label = reading.model or "unknown-id"
+        return (
+            f"CONTEXT unmapped-variant: {label} is a known family without a "
+            "mapped window (only exact ids and YYYYMMDD suffixes resolve). "
+            "Meter will not emit a percent."
+        )
     pct = 0 if reading.pct is None else round(reading.pct)
     band = reading.band if reading.band is not None else BANDS[0]
     return (
@@ -467,18 +687,20 @@ def hook_tick(
 
     payload_model = payload.get("model")
     resolved_model = model if model is not None else payload_model
-    resolved = resolve_window(window=window, model=resolved_model)
-    if resolved is None:
-        save_state(state_file, state)
-        return None
 
-    if not should_recheck(state, size):
-        save_state(state_file, state)
-        return None
-
-    reading = measure_transcript(transcript, resolved)
+    # Shell owns the 1-in-20 spawn. Once Python is running, measure:
+    # band de-dupe needs the reading, and growth is visible in size.
+    reading = measure_transcript(transcript, window, model=resolved_model)
     state["last_checked_calls"] = state["calls"]
     state["last_checked_size"] = size
+    if reading.reason in {"stale-window", "unmapped-variant"}:
+        flag = f"{reading.reason}_fired"
+        if state.get(flag):
+            save_state(state_file, state)
+            return None
+        state[flag] = True
+        save_state(state_file, state)
+        return hook_payload(reading, today=today)
     if reading.unknown or reading.pct is None:
         save_state(state_file, state)
         return None
@@ -526,11 +748,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transcript", help="Session transcript JSONL path")
     parser.add_argument(
         "--window",
-        help="Context window in tokens. Required for a numeric reading; never defaulted.",
+        help="Context window in tokens. Overrides env and the model map.",
     )
     parser.add_argument(
         "--model",
-        help="Optional model id. Unrecognized models yield unknown, not a guessed window.",
+        help="Optional model id. Overrides the transcript model. Unrecognized is unknown.",
     )
     parser.add_argument("--json", action="store_true", help="JSON object on stdout")
     parser.add_argument("--hook", action="store_true", help="PostToolUse hook mode (stdin JSON)")
@@ -554,27 +776,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         parser.error("--transcript is required")
     try:
-        window = resolve_window(window=args.window, model=args.model)
+        explicit = context_window(args.window)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    if args.window is None and args.model and window is None:
-        reading = Reading(
-            unknown=True,
-            reason="unrecognized-model",
-            tokens=None,
-            window=None,
-            pct=None,
-            verdict="unknown",
-            band=None,
-            bytes_read=0,
-        )
-    else:
-        reading = measure_transcript(Path(args.transcript), window)
-        if window is None:
-            reading = reading_from_usage(
-                None, None, bytes_read=reading.bytes_read, reason="no-window"
-            )
+    reading = measure_transcript(
+        Path(args.transcript), explicit, model=args.model
+    )
     if args.json:
         print(json.dumps(reading_to_json(reading), sort_keys=True))
     else:
