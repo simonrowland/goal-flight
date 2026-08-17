@@ -122,7 +122,7 @@
     gap:12px; align-items:center; padding:10px 12px; border-top:1px solid var(--edge-soft);
   }
   .panel-hd + .attn-row { border-top:0; }
-  .attention-truncation {
+  .attention-truncation, .registry-truncation {
     padding:7px 12px; border-bottom:1px solid var(--edge-soft);
     color:var(--amber); background:var(--amber-wash); font-size:11px;
   }

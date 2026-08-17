@@ -129,9 +129,19 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
     "last_success_at": None,
     "producer": {"name": None, "plane": None},
     "last_error": None,
+    "incomplete": None,
     "cadence_seconds": None,
     "registry_total": None,
     "registry_deep_sampled": None,
+    "registry_unsampled": None,
+    "registry_unsampled_projects": [
+        {
+            "name": None,
+            "project_id": None,
+            "repo_identity": None,
+            "last_seen": None,
+        }
+    ],
     "history_excluded": None,
     "worker_age_filter": {
         "threshold_seconds": None,
@@ -341,6 +351,7 @@ ATTENTION_FIELD_ALLOWLIST: dict[str, Any] = {
     "last_success_at": None,
     "producer": {"name": None, "plane": None},
     "last_error": None,
+    "incomplete": None,
     "cadence_seconds": None,
     "controller_history_probes_truncated": None,
     "age_granularity": None,
@@ -481,7 +492,15 @@ def _validate_scalar_types(value: Any, *, path: str = "$") -> None:
                     raise ProjectionSecurityError(
                         f"{item_path}: expected a registered controller liveness state"
                     )
+            if key == "incomplete" and item is not None:
+                if not isinstance(item, bool):
+                    raise ProjectionSecurityError(f"{item_path}: expected a boolean")
             if key == "controller_history_probes_truncated" and item is not None:
+                if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                    raise ProjectionSecurityError(
+                        f"{item_path}: expected a non-negative integer or null"
+                    )
+            if key == "registry_unsampled" and item is not None:
                 if isinstance(item, bool) or not isinstance(item, int) or item < 0:
                     raise ProjectionSecurityError(
                         f"{item_path}: expected a non-negative integer or null"
@@ -597,6 +616,7 @@ def _metadata(
         "last_success_at": finished_at if not errors else None,
         "producer": {"name": PRODUCER_NAME, "plane": plane},
         "last_error": error,
+        "incomplete": bool(errors),
         "cadence_seconds": _current_cadence_seconds(plane, cadence_seconds),
     }
 
@@ -2171,8 +2191,8 @@ def _registered_projects(
     active_roots: set[str] | None = None,
     only_roots: set[str] | None = None,
     limit: int = DEFAULT_MAX_PROJECTS,
-) -> tuple[list[dict[str, Any]], int]:
-    """Return (sampled projects, total registered).
+) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
+    """Return (sampled projects, total registered, omitted identities).
 
     Sampling every registered project is not viable. The registry accumulates a
     root for every project any dispatch ever ran in, including throwaway
@@ -2192,6 +2212,7 @@ def _registered_projects(
     """
     rows = payload if isinstance(payload, list) else []
     result = []
+    omitted: list[dict[str, Any]] = []
     seen_total: set[str] = set()
     seen_result: set[str] = set()
     for row in rows:
@@ -2208,6 +2229,7 @@ def _registered_projects(
             continue
         seen_total.add(registry_root)
         if only_roots is not None and registry_root not in only_roots:
+            omitted.append(_registry_omitted_identity(row, registry_root))
             continue
         root = _canonical_root(registry_root)
         if (
@@ -2215,6 +2237,8 @@ def _registered_projects(
             or root in seen_result
             or (only_roots is not None and root not in only_roots)
         ):
+            if root is None or (only_roots is not None and root not in only_roots):
+                omitted.append(_registry_omitted_identity(row, registry_root))
             continue
         seen_result.add(root)
         result.append(
@@ -2238,8 +2262,35 @@ def _registered_projects(
         reverse=True,
     )
     if limit is not None and limit >= 0:
+        omitted.extend(
+            _registry_omitted_identity(item, str(item["root"]))
+            for item in result[limit:]
+        )
         result = result[:limit]
-    return result, total
+    omitted.sort(
+        key=lambda item: (
+            item["last_seen"] is not None,
+            item["last_seen"] or "",
+            item["name"] or "",
+        ),
+        reverse=True,
+    )
+    return result, total, omitted
+
+
+def _registry_omitted_identity(row: dict[str, Any], root: str) -> dict[str, Any]:
+    """Shareable identity for a registered root this tick did not deep-sample.
+
+    Uses the registry path string only: no filesystem resolve, so thousands of
+    deleted worktrees stay a name+digest rather than a stat storm. Absolute
+    paths never leave this helper -- the allowlist sees a basename and a hash.
+    """
+    return {
+        "name": _display(Path(root).name or "project", limit=64),
+        "project_id": _project_id(root),
+        "repo_identity": _repo_identity_scalar(row.get("repo_identity")),
+        "last_seen": _iso_timestamp(row.get("last_seen")),
+    }
 
 
 def _project_rows(
@@ -2488,7 +2539,7 @@ def build_fleet_plane(
         machine_status,
         queue_by_root=queue_by_root,
     )
-    sampled_projects, registry_total = _registered_projects(
+    sampled_projects, registry_total, registry_omitted = _registered_projects(
         registered,
         active_roots=fast_roots,
         only_roots=fast_roots,
@@ -2559,6 +2610,11 @@ def build_fleet_plane(
         # were listed.
         "registry_total": registry_total,
         "registry_deep_sampled": len(sampled_projects),
+        "registry_unsampled": len(registry_omitted),
+        # Bound the named omissions the same way attention bounds unprobed
+        # generations: a count plus a recency-ordered head, never the full
+        # 1,900-row registry dumped into the short-poll mirror.
+        "registry_unsampled_projects": registry_omitted[:DEFAULT_MAX_PROJECTS],
         "history_excluded": history_excluded,
         "worker_age_filter": dict(WORKER_AGE_FILTER_POLICY),
         "machine": {
@@ -2693,7 +2749,7 @@ def _controller_attention_rows(
                         root,
                         controller_label=label,
                     ),
-                    "observed_at": None,
+                    "observed_at": _iso_timestamp(context.get("last_seen")),
                     "headline": _display(
                         f"Controller {label}{generation_text} is HUNG: "
                         "in-flight work has no live wake waiter",
@@ -2701,7 +2757,17 @@ def _controller_attention_rows(
                     ),
                 }
             )
-    rows.sort(key=lambda row: (row["dispatch_id"] or ""))
+    # Same key as mail rows and the merged attention plane: dated first,
+    # then by observed_at, then dispatch_id. Leaving this on dispatch_id
+    # alone would re-sort HUNG rows away from their timestamps the moment
+    # a caller used this list without the merge sort below.
+    rows.sort(
+        key=lambda row: (
+            row["observed_at"] is None,
+            row["observed_at"] or "",
+            row["dispatch_id"] or "",
+        )
+    )
     return rows
 
 
@@ -2842,6 +2908,8 @@ def build_degraded_plane(
             **metadata,
             "registry_total": None,
             "registry_deep_sampled": 0,
+            "registry_unsampled": None,
+            "registry_unsampled_projects": [],
             "history_excluded": None,
             # The age-filter policy is a property of this build, not of the
             # tick, so a degraded sample still declares it. Omitting it made a
@@ -2861,6 +2929,66 @@ def build_degraded_plane(
     return payload
 
 
+def _backfill_projection_fields(payload: dict[str, Any], plane: str) -> None:
+    """Fill fields added after a prior sample was published.
+
+    A retained last-good payload may predate ``incomplete`` / the unsampled
+    registry list. The allowlist requires every key, so a timeout overlay
+    cannot republish the old shape verbatim.
+    """
+    payload.setdefault("incomplete", False)
+    if plane == "fleet":
+        payload.setdefault("registry_unsampled", None)
+        payload.setdefault("registry_unsampled_projects", [])
+
+
+def _is_retainable_sample(payload: dict[str, Any], plane: str) -> bool:
+    """True when this payload is a last-good sample worth keeping on failure."""
+    expected = FLEET_SCHEMA if plane == "fleet" else ATTENTION_SCHEMA
+    return (
+        isinstance(payload, dict)
+        and payload.get("schema") == expected
+        and payload.get("last_success_at") is not None
+    )
+
+
+def retain_or_degrade(
+    plane: str,
+    *,
+    prior: dict[str, Any] | None,
+    error: str,
+    started_at: str | None = None,
+    generation_id: str | None = None,
+    cadence_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Keep last-good rows on a failed tick; otherwise publish empty DEGRADED.
+
+    A timeout used to atomically replace the previous sample with emptiness.
+    The operator then saw an empty screen plus an error, instead of the last
+    real picture marked incomplete. last_success_at stays the prior success
+    so freshness still names when the data was good; last_error and
+    incomplete mark this publication as a failed tick.
+    """
+    if prior is not None and _is_retainable_sample(prior, plane):
+        payload = json.loads(json.dumps(prior))
+        _backfill_projection_fields(payload, plane)
+        bounded_error = _display(error, limit=96) or "producer:RuntimeError"
+        payload["last_error"] = f"{bounded_error} · {_operator_action(plane)}"
+        payload["incomplete"] = True
+        payload["generation_id"] = _generation_id(plane, generation_id)
+        if cadence_seconds is not None:
+            payload["cadence_seconds"] = _current_cadence_seconds(plane, cadence_seconds)
+        validate_projection(payload, plane)
+        return payload
+    return build_degraded_plane(
+        plane,
+        error=error,
+        started_at=started_at,
+        generation_id=generation_id,
+        cadence_seconds=cadence_seconds,
+    )
+
+
 def publish_plane(path: str | Path, payload: dict[str, Any], plane: str) -> Path:
     """Validate and atomically publish one independently generated plane."""
     validate_projection(payload, plane)
@@ -2875,14 +3003,21 @@ def publish_plane(path: str | Path, payload: dict[str, Any], plane: str) -> Path
 
 def sample_exit_code(payload: dict[str, Any], plane: str) -> int:
     """Report and return the shared healthy/degraded producer exit contract."""
-    if payload.get("last_success_at") is not None:
-        return 0
-    print(
-        f"fleet-console {plane} sample DEGRADED: "
-        f"{payload.get('last_error') or 'one or more sources failed'}",
-        file=sys.stderr,
-    )
-    return 1
+    # A retained last-good sample keeps last_success_at so the renderer can
+    # age the data. That stamp is no longer "this tick succeeded": last_error
+    # or incomplete means the tick failed even when older rows remain.
+    if (
+        payload.get("last_error")
+        or payload.get("incomplete")
+        or payload.get("last_success_at") is None
+    ):
+        print(
+            f"fleet-console {plane} sample DEGRADED: "
+            f"{payload.get('last_error') or 'one or more sources failed'}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:

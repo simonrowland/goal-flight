@@ -222,6 +222,7 @@ def run_tick(
         # old bytes becoming readable cannot prove that the child published.
         baseline_state = "missing"
         before_identity: tuple[int, int] | None = None
+        prior_payload: dict[str, object] | None = None
         try:
             prior_stat = resolved_output.stat()
         except FileNotFoundError:
@@ -238,7 +239,9 @@ def run_tick(
             before_identity = (int(prior_stat.st_dev), int(prior_stat.st_ino))
             try:
                 prior = _published_payload(resolved_output, plane)
+                console._backfill_projection_fields(prior, plane)
                 console.validate_projection(prior, plane)
+                prior_payload = prior
             except (OSError, TypeError, ValueError) as exc:
                 # A corrupt or unreadable prior artifact is non-authoritative.
                 # Log once, then let the sampler atomically replace it.
@@ -270,13 +273,13 @@ def run_tick(
                 monotonic=monotonic,
             )
         except subprocess.TimeoutExpired:
-            # subprocess.run has killed and reaped the sampler before raising.
-            # Publish through the projection's existing DEGRADED payload and
-            # exit contract; the renderer sees a producer error, never an old
-            # sample that merely looks current.
+            # The sampler is dead. Keep the last good rows when they exist so
+            # one slow tick does not wipe the operator's picture; mark the
+            # publication incomplete instead of publishing emptiness.
             resolved_output.parent.mkdir(parents=True, exist_ok=True)
-            payload = console.build_degraded_plane(
+            payload = console.retain_or_degrade(
                 plane,
+                prior=prior_payload,
                 error="budget:TimeoutExpired",
                 started_at=started_at,
                 cadence_seconds=resolved_interval,
@@ -314,10 +317,12 @@ def run_tick(
         if not replacement_is_valid:
             # A zero exit without a publication is not success, and a nonzero
             # exit must never relabel the previous generation as current.
-            # Publish one explicit operator-facing failure in both cases.
+            # Keep last-good rows when they exist; otherwise publish empty
+            # DEGRADED. Either way last_error names this failed tick.
             resolved_output.parent.mkdir(parents=True, exist_ok=True)
-            payload = console.build_degraded_plane(
+            payload = console.retain_or_degrade(
                 plane,
+                prior=prior_payload,
                 error=f"sampler:exit {return_code} without valid replacement",
                 started_at=started_at,
                 cadence_seconds=resolved_interval,

@@ -483,22 +483,33 @@ def test_registry_pass_is_bounded_and_reports_what_it_skipped() -> None:
     ]
     registry.append({"project_root": "/tmp/stale-but-busy", "last_seen": "1999-01-01T00:00:00+00:00"})
 
-    sampled, total = F._registered_projects(
+    sampled, total, omitted = F._registered_projects(
         registry,
         active_roots={str(Path("/tmp/stale-but-busy").resolve())},
         limit=5,
     )
     assert_true("cap applied", len(sampled) == 5)
     assert_true("total reported, not the capped length", total == 401)
+    assert_true("omitted count is the unsampled remainder", len(omitted) == 396)
+    omitted_names = {item["name"] for item in omitted}
+    assert_true(
+        "omitted identities name a skipped registry project",
+        "p0000" in omitted_names,
+    )
+    assert_true(
+        "omitted identities are shareable names, not paths",
+        all("/" not in str(item["name"]) for item in omitted),
+    )
     roots = [item["root"] for item in sampled]
     assert_true(
         "a project with work in flight outranks newer idle ones",
         str(Path("/tmp/stale-but-busy").resolve()) in roots,
     )
 
-    unbounded, total_again = F._registered_projects(registry, limit=None)
+    unbounded, total_again, omitted_none = F._registered_projects(registry, limit=None)
     assert_true("limit=None samples everything", len(unbounded) == 401)
     assert_true("total is stable regardless of limit", total_again == 401)
+    assert_true("a complete pass omits nothing", omitted_none == [])
 
 
 def test_degraded_sample_exits_nonzero_instead_of_looking_healthy() -> None:
@@ -738,7 +749,13 @@ def test_fast_plane_project_classes_are_live_only_mutation_pair() -> None:
     assert_true(
         "idle registry/worktree project is counted but not deep-sampled",
         payload["registry_total"] == 3
-        and payload["registry_deep_sampled"] == 2,
+        and payload["registry_deep_sampled"] == 2
+        and payload["registry_unsampled"] == 1,
+    )
+    assert_true(
+        "truncated sample names the unsampled live-capable-excluded root",
+        [item["name"] for item in payload["registry_unsampled_projects"]]
+        == ["old-worktree"],
     )
     assert_true(
         "the hidden terminal remains disclosed through slow-history count",
@@ -1082,6 +1099,23 @@ def _assert_controller_state(
                             controller_label="console-test",
                         ),
                     )
+                    hung_context = F._controller_contexts_by_session(
+                        project_root,
+                        machine_status["dispatch"]["records"],
+                        include_all=True,
+                        include_locked_ended=True,
+                        authority=reader,
+                        open_if_missing=False,
+                    )
+                    last_seen = next(iter(hung_context.values())).get("last_seen")
+                    assert_true(
+                        "HUNG last_seen is a real journal timestamp",
+                        last_seen is not None,
+                    )
+                    assert_true(
+                        "HUNG observed_at is the normalised last_seen, not None",
+                        hung_items[0]["observed_at"] == F._iso_timestamp(last_seen),
+                    )
 
 
 def test_controller_state_alive_with_held_lease_and_one_live_waiter() -> None:
@@ -1099,6 +1133,63 @@ def test_controller_state_hung_with_nonterminal_attempt() -> None:
         holder_mode="held",
         waiter_count=0,
         attempt_mode="running",
+    )
+
+
+def test_hung_attention_observed_at_follows_last_seen_or_stays_unknown() -> None:
+    """A HUNG row reports last_seen as age; a missing stamp stays unknown."""
+    with tempfile.TemporaryDirectory() as td:
+        project_root = (Path(td) / "project").resolve()
+        project_root.mkdir()
+        machine = {
+            "capacity_state": {"leases": {}},
+            "dispatch": {"records": []},
+        }
+        seen = "2026-08-02T10:00:00+00:00"
+        later = "2026-08-02T11:00:00+00:00"
+        with mock.patch.object(
+            F,
+            "_controller_contexts_by_session",
+            return_value={
+                "sess-old": {
+                    "label": "older",
+                    "generation": 1,
+                    "liveness_state": "HUNG",
+                    "last_seen": seen,
+                },
+                "sess-new": {
+                    "label": "newer",
+                    "generation": 2,
+                    "liveness_state": "HUNG",
+                    "last_seen": later,
+                },
+                "sess-blank": {
+                    "label": "blank",
+                    "generation": 3,
+                    "liveness_state": "HUNG",
+                    "last_seen": None,
+                },
+            },
+        ):
+            rows = F._controller_attention_rows([project_root], machine)
+
+    by_label = {
+        (row["headline"] or "").split()[1]: row
+        for row in rows
+    }
+    assert_true("all three HUNG contexts become attention rows", len(rows) == 3)
+    assert_true(
+        "dated HUNG row carries the normalised last_seen",
+        by_label["older"]["observed_at"] == seen
+        and by_label["newer"]["observed_at"] == later,
+    )
+    assert_true(
+        "a HUNG row without last_seen stays honestly unmeasurable",
+        by_label["blank"]["observed_at"] is None,
+    )
+    assert_true(
+        "controller rows sort like mail rows: dated first, then by time",
+        [row["observed_at"] for row in rows] == [seen, later, None],
     )
 
 
@@ -3112,6 +3203,7 @@ def main() -> None:
     test_controller_liveness_projection_rejects_unregistered_scalar()
     test_controller_state_alive_with_held_lease_and_one_live_waiter()
     test_controller_state_hung_with_nonterminal_attempt()
+    test_hung_attention_observed_at_follows_last_seen_or_stays_unknown()
     test_controller_state_waiting_on_user_with_terminal_attempt()
     test_controller_state_dead_with_released_lease_lock()
     test_controller_state_unknown_when_ledger_path_cannot_be_probed()

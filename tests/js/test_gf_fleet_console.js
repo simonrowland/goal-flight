@@ -196,9 +196,12 @@ function fleetPayload(overrides) {
     last_success_at: "2030-01-01T00:02:10Z",
     producer: { name: "goalflight_fleet_console.py", plane: "fleet" },
     last_error: null,
+    incomplete: false,
     cadence_seconds: 60,
     registry_total: 1433,
     registry_deep_sampled: 12,
+    registry_unsampled: 0,
+    registry_unsampled_projects: [],
     history_excluded: 0,
     worker_age_filter: {
       threshold_seconds: 43200,
@@ -309,6 +312,7 @@ function attentionPayload(overrides) {
     last_success_at: "2030-01-01T00:02:56Z",
     producer: { name: "goalflight_fleet_console.py", plane: "attention" },
     last_error: null,
+    incomplete: false,
     cadence_seconds: 20,
     age_granularity: "minute",
     items: [{
@@ -910,6 +914,65 @@ print(json.dumps({
     health.length === 2,
     health.every((node) => node.textContent === "UNKNOWN"),
     health.every((node) => node.className === "controller-health unknown"),
+  ].every(Boolean));
+}
+
+// HUNG attention ages from observed_at and stays honest when the stamp is absent.
+{
+  const aged = loadConsole(fleetPayload(), attentionPayload({ items: [{
+    dispatch_id: "project:controller:main",
+    seq: null,
+    kind: "controller_hung",
+    action: "investigate",
+    observed_at: "2030-01-01T00:01:00Z",
+    headline: "Controller main is HUNG",
+  }] }));
+  const unknown = loadConsole(fleetPayload(), attentionPayload({ items: [{
+    dispatch_id: "project:controller:main",
+    seq: null,
+    kind: "controller_hung",
+    action: "investigate",
+    observed_at: null,
+    headline: "Controller main is HUNG",
+  }] }));
+  assert("HUNG attention renders last_seen age and stays unknown without a stamp", [
+    aged.byId.attention.textContent.includes("2 min"),
+    !aged.byId.attention.textContent.includes("age unknown"),
+    unknown.byId.attention.textContent.includes("age unknown"),
+  ].every(Boolean));
+}
+
+// An incomplete last-good fleet keeps prior rows and still names the error.
+{
+  const kept = fleetPayload({
+    last_error: "budget:TimeoutExpired · action: read ~/.goal-flight/fleet-console-fleet-launchd.log; run scripts/install-fleet-console.sh --status --plane fleet",
+    incomplete: true,
+    last_success_at: "2030-01-01T00:01:00Z",
+  });
+  const { byId } = loadConsole(kept, attentionPayload({ items: [] }));
+  const all = [byId.machine, byId.fleet, byId["live-status"]].map((node) => node.textContent).join("|");
+  assert("incomplete last-good fleet still shows prior rows plus the error", [
+    all.includes("kiln") || all.includes("local-"),
+    all.includes("budget:TimeoutExpired"),
+    all.includes("Untrusted: fleet"),
+  ].every(Boolean));
+}
+
+// A truncated registry sample names what it omitted, matching unprobed generations.
+{
+  const { byId } = loadConsole(fleetPayload({
+    registry_total: 440,
+    registry_deep_sampled: 4,
+    registry_unsampled: 436,
+    registry_unsampled_projects: [
+      { name: "kiln-old", project_id: "kiln-old-aaa", repo_identity: null, last_seen: null },
+      { name: "papers-propulsion", project_id: "pp-bbb", repo_identity: null, last_seen: null },
+    ],
+  }), attentionPayload({ items: [] }));
+  assert("truncated registry names omitted projects", [
+    byId.machine.textContent.includes("+436 registered projects unsampled"),
+    byId.machine.textContent.includes("kiln-old"),
+    byId.machine.textContent.includes("papers-propulsion"),
   ].every(Boolean));
 }
 

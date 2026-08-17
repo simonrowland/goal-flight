@@ -50,8 +50,66 @@ def _healthy_sampler_body(generation_id: str) -> str:
         "    cadence_seconds=cadence)\n"
         "payload['last_success_at'] = payload['sample_finished_at']\n"
         "payload['last_error'] = None\n"
+        "payload['incomplete'] = False\n"
         "console.publish_plane(output, payload, plane)\n"
     )
+
+
+def _retainable_fleet_payload(generation_id: str, *, observed_at: str) -> dict:
+    payload = console.build_degraded_plane(
+        "fleet",
+        error="synthetic:RuntimeError",
+        generation_id=generation_id,
+        cadence_seconds=60,
+    )
+    payload["last_success_at"] = observed_at
+    payload["sample_started_at"] = observed_at
+    payload["sample_finished_at"] = observed_at
+    payload["last_error"] = None
+    payload["incomplete"] = False
+    payload["registry_total"] = 77
+    payload["registry_deep_sampled"] = 3
+    payload["registry_unsampled"] = 74
+    payload["registry_unsampled_projects"] = [
+        {
+            "name": "kept-idle",
+            "project_id": "kept-idle-abc123def0",
+            "repo_identity": None,
+            "last_seen": observed_at,
+        }
+    ]
+    payload["projects"] = [
+        {
+            "project_id": "kept-alive-abc123def0",
+            "name": "kept-alive",
+            "registered": True,
+            "last_seen": observed_at,
+            "skill_version": "1",
+            "history_excluded": 0,
+            "parent_project_id": "kept-alive-abc123def0",
+            "parent_name": "kept-alive",
+            "worktree_name": None,
+            "repo_identity": None,
+            "queue": {"depth": 0, "lanes": [], "oldest_created_at": None},
+            "session": {
+                "available": False,
+                "active": None,
+                "queue_state": None,
+                "queue_last_touched": None,
+                "active_leases": None,
+            },
+            "milestone": {
+                "available": False,
+                "active_cadence": None,
+                "commits_since": None,
+                "cadence": None,
+                "due": None,
+            },
+            "workers": [],
+        }
+    ]
+    console.validate_projection(payload, "fleet")
+    return payload
 
 
 def test_default_budgets_follow_live_measurement_and_leave_reserve() -> None:
@@ -429,7 +487,8 @@ def test_failed_sampler_without_replacement_publishes_degraded_not_restamped_sta
         assert code == 1
         assert old_payload["cadence_seconds"] == 5  # ten-second freshness mutant
         assert published["generation_id"] != "thirty-seconds-old"
-        assert published["last_success_at"] is None
+        assert published["last_success_at"] == observed_at
+        assert published["incomplete"] is True
         assert str(published["last_error"]).startswith("sampler:exit 2")
         assert published["cadence_seconds"] == 20
         assert "without a valid replacement; published DEGRADED" in err.getvalue()
@@ -468,7 +527,8 @@ def test_zero_exit_without_replacement_is_degraded_not_refreshed_success() -> No
         published = _script_payload(output, "GF_ATTENTION")
         assert code == 1
         assert published["generation_id"] != "old-zero-exit-sample"
-        assert published["last_success_at"] is None
+        assert published["last_success_at"] == observed_at
+        assert published["incomplete"] is True
         assert str(published["last_error"]).startswith("sampler:exit 0")
         assert published["cadence_seconds"] == 20
 
@@ -691,6 +751,7 @@ def test_budget_timeout_publishes_degraded_sample_and_exit_one() -> None:
         assert elapsed < 1.5, f"budget failed to stop slow child: {elapsed:.3f}s"
         payload = _script_payload(output, "GF_FLEET")
         assert payload["last_success_at"] is None
+        assert payload["incomplete"] is True
         assert payload["cadence_seconds"] == 75
         assert str(payload["last_error"]).startswith("budget:TimeoutExpired")
         assert "fleet-console-fleet-launchd.log" in str(payload["last_error"])
@@ -717,6 +778,46 @@ def test_budget_timeout_publishes_degraded_sample_and_exit_one() -> None:
         after = producer.PlaneLock(root / "locks", "fleet")
         assert after.acquire()
         after.release()
+
+
+def test_budget_timeout_retains_last_good_sample_mutation_pair() -> None:
+    """A timeout must not replace a real sample with an empty plane."""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        slow = root / "slow.py"
+        _write_python(slow, "import time\ntime.sleep(2)\n")
+        output = root / "fleet-data.js"
+        observed_at = "2026-08-02T10:00:00+00:00"
+        console.publish_plane(
+            output,
+            _retainable_fleet_payload("prior-good-sample", observed_at=observed_at),
+            "fleet",
+        )
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = producer.run_tick(
+                "fleet",
+                output=output,
+                lock_dir=root / "locks",
+                producer_script=slow,
+                budget_s=0.5,
+                interval_s=60,
+            )
+        payload = _script_payload(output, "GF_FLEET")
+
+    assert code == 1
+    assert payload["incomplete"] is True
+    assert payload["last_success_at"] == observed_at
+    assert str(payload["last_error"]).startswith("budget:TimeoutExpired")
+    assert payload["generation_id"] != "prior-good-sample"
+    assert payload["registry_total"] == 77
+    assert payload["registry_deep_sampled"] == 3
+    assert [project["name"] for project in payload["projects"]] == ["kept-alive"]
+    assert [item["name"] for item in payload["registry_unsampled_projects"]] == [
+        "kept-idle"
+    ]
+    assert "budget exhausted" in err.getvalue()
+    assert "DEGRADED" in err.getvalue()
 
 
 def _large_attention_payload(generation_id: str, marker: str) -> dict:

@@ -244,6 +244,16 @@
     host.appendChild(staleNotice(plane, state));
   }
 
+  /* A failed tick can keep last-good rows and set incomplete. Show those
+   * rows with the existing stale/Untrusted chrome instead of wiping them. */
+  function keepLastGood(payload) {
+    return !!(payload && payload.incomplete === true);
+  }
+
+  function shouldReplaceWithStale(payload, state) {
+    return !!(state && state.stale && !keepLastGood(payload));
+  }
+
   function visibleWorker(worker) {
     return worker && typeof worker === "object";
   }
@@ -281,7 +291,7 @@
     var button = document.getElementById("age-filter-toggle");
     var note = document.getElementById("age-filter-note");
     if (!button || !note) return;
-    if (fleetState.stale) {
+    if (shouldReplaceWithStale(FLEET, fleetState)) {
       button.textContent = "Age filter: unavailable";
       button.setAttribute("aria-pressed", ageFilterEnabled ? "true" : "false");
       note.textContent = "Fleet data stale; age filter not applied.";
@@ -654,11 +664,14 @@
   function renderMachine(fleetState) {
     var host = document.getElementById("machine");
     if (!host) return;
-    if (fleetState.stale) {
+    if (shouldReplaceWithStale(FLEET, fleetState)) {
       replaceWithStale(host, "fleet", fleetState);
       return;
     }
     host.textContent = "";
+    if (fleetState.stale && keepLastGood(FLEET)) {
+      host.appendChild(staleNotice("fleet", fleetState));
+    }
     var machine = FLEET.machine || {};
     var list = el("dl", "kv");
     var facts = [
@@ -675,6 +688,18 @@
       list.appendChild(el("dd", null, item[1]));
     });
     host.appendChild(list);
+    var unsampled = Number(FLEET.registry_unsampled);
+    var omitted = FLEET.registry_unsampled_projects || [];
+    if (Number.isFinite(unsampled) && unsampled > 0) {
+      var omittedNames = [];
+      omitted.forEach(function (row) {
+        var name = row && textValue(row.name);
+        if (name && name !== "unknown") omittedNames.push(name);
+      });
+      var truncation = "+" + unsampled + " registered projects unsampled";
+      if (omittedNames.length) truncation += " · " + omittedNames.join(", ");
+      host.appendChild(el("div", "registry-truncation", truncation));
+    }
     if ((machine.rate_pressure || []).length) {
       var pressure = el("div", "legend");
       machine.rate_pressure.forEach(function (row) {
@@ -687,11 +712,14 @@
   function renderVendors(fleetState, now) {
     var host = document.getElementById("vendors");
     if (!host) return;
-    if (fleetState.stale) {
+    if (shouldReplaceWithStale(FLEET, fleetState)) {
       replaceWithStale(host, "fleet", fleetState);
       return;
     }
     host.textContent = "";
+    if (fleetState.stale && keepLastGood(FLEET)) {
+      host.appendChild(staleNotice("fleet", fleetState));
+    }
     var vendors = FLEET.vendors || [];
     var groups = [];
     var index = Object.create(null);
@@ -782,7 +810,7 @@
       };
     }
     var state = host._gf;
-    if (attentionState.stale) {
+    if (shouldReplaceWithStale(ATTENTION, attentionState)) {
       if (panel) panel.className = "panel attention-section";
       Object.keys(state.nodes).forEach(function (key) {
         state.nodes[key].remove();
@@ -801,7 +829,13 @@
       }
       return;
     }
-    if (state.stale) {
+    if (attentionState.stale && keepLastGood(ATTENTION)) {
+      if (!state.stale) {
+        state.stale = staleNotice("attention", attentionState);
+        if (host.firstChild) host.insertBefore(state.stale, host.firstChild);
+        else host.appendChild(state.stale);
+      }
+    } else if (state.stale) {
       state.stale.remove();
       state.stale = null;
     }
@@ -1474,7 +1508,7 @@
       else section.appendChild(panel);
     }
     var ctl = section._gfCtl;
-    if (fleetState.stale) {
+    if (shouldReplaceWithStale(FLEET, fleetState)) {
       setHidden(ctl.liveHost, true);
       setHidden(ctl.deadToggle, true);
       setHidden(ctl.deadHost, true);
@@ -1658,12 +1692,22 @@
   function renderFleet(fleetState, now) {
     var host = document.getElementById("fleet");
     if (!host) return;
-    if (fleetState.stale) {
+    if (shouldReplaceWithStale(FLEET, fleetState)) {
       host.textContent = "";
       bandNodes = Object.create(null);
       host._gf = null;
       host.appendChild(staleNotice("fleet", fleetState));
       return;
+    }
+    if (fleetState.stale && keepLastGood(FLEET)) {
+      if (!host._gfLastGood) {
+        host._gfLastGood = staleNotice("fleet", fleetState);
+        if (host.firstChild) host.insertBefore(host._gfLastGood, host.firstChild);
+        else host.appendChild(host._gfLastGood);
+      }
+    } else if (host._gfLastGood) {
+      host._gfLastGood.remove();
+      host._gfLastGood = null;
     }
     var entries = repoGroups();
     var ageSummary = workerAgeSummary();
@@ -1731,10 +1775,10 @@
     var fleetState = planeState(FLEET, SCHEMAS.fleet, CADENCES.fleet, now);
     var attentionState = planeState(ATTENTION, SCHEMAS.attention, CADENCES.attention, now);
     var values = [fleetState.label, attentionState.label];
-    if (!attentionState.stale) {
+    if (!attentionState.stale || keepLastGood(ATTENTION)) {
       (ATTENTION.items || []).forEach(function (item) { values.push(ageFrom(item.observed_at, now)); });
     }
-    if (!fleetState.stale) {
+    if (!fleetState.stale || keepLastGood(FLEET)) {
       (FLEET.controllers || []).forEach(function (row) { values.push(ageFrom(row.last_seen, now)); });
       (FLEET.vendors || []).forEach(function (vendor) { values.push(whenFrom(vendor.reset_at, now)); });
       var remainingWorkers = MAX_VISIBLE_WORKERS;
