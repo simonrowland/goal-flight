@@ -669,6 +669,120 @@ def listener_floor_hint(
     return f"{header}\n{numbered}"
 
 
+ACTIVITY_DEPTH_SCHEMA = "goalflight.listener-activity-signal.v1"
+_ACTIVITY_DEPTH_FILE_VERSION = "activity-depth-v1"
+
+
+def listener_activity_hint(
+    live_waiters: int,
+    target_waiters: int,
+    command: str,
+    *,
+    work_in_flight: bool,
+) -> str:
+    """One-line remaining-depth cue for relay/status/next.
+
+    The numbered list stays on listen-exit. Empty when there is no
+    in-flight work or the pool is already at target.
+    """
+    if not work_in_flight:
+        return ""
+    live = int(live_waiters)
+    target = int(target_waiters)
+    missing = max(0, target - live)
+    if missing == 0:
+        return ""
+    return f"listener depth {live}/{target} — {missing} missing; {command}"
+
+
+def _activity_depth_state_path(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+) -> Path:
+    label = str(controller_label or "").strip()
+    if not label:
+        raise ValueError("controller label is required")
+    return ledger_dir(project_root) / (
+        f"{_ACTIVITY_DEPTH_FILE_VERSION}.{_label_hash(label)}.json"
+    )
+
+
+def _activity_depth_key(plan: dict[str, object]) -> dict[str, object]:
+    return {
+        "live": int(plan["live"]),
+        "target": int(plan["target"]),
+        "work_in_flight": bool(plan["work_in_flight"]),
+    }
+
+
+def _load_activity_depth_state(path: Path) -> dict[str, object] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(data, dict) or data.get("schema") != ACTIVITY_DEPTH_SCHEMA:
+        return None
+    try:
+        return _activity_depth_key(data)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _save_activity_depth_state(path: Path, key: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"schema": ACTIVITY_DEPTH_SCHEMA, **key}
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as handle:
+            tmp_name = handle.name
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except OSError:
+        if tmp_name is not None:
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def consume_listener_activity_signal(
+    project_root: Path | str,
+    controller_label: str,
+    plan: dict[str, object],
+) -> str:
+    """Return the one-line cue once per depth transition; empty otherwise.
+
+    Same band-suppression idea as the context meter: a live controller
+    runs these surfaces constantly, so a repeat of the same (live,
+    target, work_in_flight) tuple is not news.
+    """
+    hint = listener_activity_hint(
+        int(plan["live"]),
+        int(plan["target"]),
+        str(plan["command"]),
+        work_in_flight=bool(plan["work_in_flight"]),
+    )
+    current = _activity_depth_key(plan)
+    path = _activity_depth_state_path(
+        project_root, controller_label=controller_label
+    )
+    last = _load_activity_depth_state(path)
+    _save_activity_depth_state(path, current)
+    if not hint or last == current:
+        return ""
+    return hint
+
+
 def listener_low_water(target: int | None = None) -> int:
     """Depth at or below which the pool is 'running low' and worth a hint.
 

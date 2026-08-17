@@ -2789,10 +2789,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json:
         print(json.dumps(payload, sort_keys=True))
-        return 0
-
-    for line in render_text(payload, args.limit):
-        print(line)
+    else:
+        for line in render_text(payload, args.limit):
+            print(line)
     # Read-side only: compute fresh after rendering, never add mail to the
     # status JSON or worker-liveness payload.
     try:
@@ -2800,8 +2799,12 @@ def main(argv: list[str] | None = None) -> int:
     except _EXPECTED_OPTIONAL_ERRORS:
         pass
     else:
-        _gm.emit_controller_mail_notice(
-            owned_dispatch_ids=_owned,
+        if not args.json:
+            _gm.emit_controller_mail_notice(
+                owned_dispatch_ids=_owned,
+                project_root=Path(project_root) if project_root else None,
+            )
+        _gm.emit_listener_activity_signal(
             project_root=Path(project_root) if project_root else None,
         )
     return 0

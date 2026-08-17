@@ -3154,6 +3154,154 @@ def _ambient_claimed_controller(
     }
 
 
+def _listen_auto_live_generations(
+    authority,
+    project_root: Path,
+    label: str,
+) -> list[dict[str, object]]:
+    """ACTIVE lease plus same-label generations whose holder lock is still live."""
+    found: list[dict[str, object]] = []
+    seen: set[str] = set()
+    try:
+        records = authority.lease_records(include_ended=True)
+    except Exception:
+        records = []
+    for rec in records:
+        if str(rec.get("label") or "") != label:
+            continue
+        nonce = str(rec.get("nonce") or "").strip()
+        if not nonce or nonce in seen:
+            continue
+        state = str(rec.get("state") or "")
+        holder_alive = goalflight_wake.lease_holder_alive(
+            project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+        )
+        if state != "ACTIVE" and holder_alive is not True:
+            continue
+        seen.add(nonce)
+        found.append(
+            {
+                "nonce": nonce,
+                "generation": rec.get("generation"),
+                "state": state,
+                "holder_alive": holder_alive,
+            }
+        )
+    return found
+
+
+def _resolve_listen_auto_lease(
+    project_root: Path,
+    *,
+    controller_label: str,
+    explicit_nonce: str | None,
+) -> dict[str, object]:
+    """Resolve which lease generation listen-auto should arm.
+
+    Ambient env is one input, not the only one. The journal ACTIVE lease
+    for ``(project, label)`` is the default. ``--lease-nonce`` pins a
+    generation. Two live generations plus a disagreeing env capability
+    refuse rather than silently picking.
+    """
+    if str(os.environ.get("GOALFLIGHT_DISPATCH_ID") or "").strip():
+        return {"claimed": False, "reason": "worker-dispatch", "label": controller_label}
+    role = str(os.environ.get("GOALFLIGHT_PROCESS_ROLE") or "controller").strip()
+    if role != "controller":
+        return {
+            "claimed": False,
+            "reason": "non-controller-role",
+            "role": role,
+            "label": controller_label,
+        }
+    import goalflight_journal  # type: ignore
+
+    try:
+        authority = goalflight_journal.Journal.open_reader(project_root)
+    except goalflight_journal.JournalError:
+        return {
+            "claimed": False,
+            "reason": "journal-unavailable",
+            "label": controller_label,
+        }
+    live = _listen_auto_live_generations(authority, project_root, controller_label)
+    active = [row for row in live if row.get("state") == "ACTIVE"]
+    pinned = str(explicit_nonce or "").strip()
+    if pinned:
+        match = next((row for row in live if row.get("nonce") == pinned), None)
+        if match is None:
+            return {
+                "claimed": False,
+                "reason": "lease-nonce-not-live",
+                "label": controller_label,
+            }
+        return {
+            "claimed": True,
+            "reason": "explicit-lease-nonce",
+            "label": controller_label,
+            "nonce": pinned,
+            "lease_generation": match.get("generation"),
+            "holder_alive": match.get("holder_alive"),
+        }
+
+    env_cap = _presented_ambient_controller_capability()
+    if env_cap and len(live) > 1:
+        match = next((row for row in live if row.get("nonce") == env_cap), None)
+        active_nonce = str(active[0]["nonce"]) if len(active) == 1 else None
+        if match is None or env_cap != active_nonce:
+            return {
+                "claimed": False,
+                "reason": "ambiguous-controller-generation",
+                "label": controller_label,
+            }
+        return {
+            "claimed": True,
+            "reason": "ambient-controller-lease",
+            "label": controller_label,
+            "nonce": env_cap,
+            "lease_generation": match.get("generation"),
+            "holder_alive": match.get("holder_alive"),
+        }
+    if env_cap:
+        match = next((row for row in live if row.get("nonce") == env_cap), None)
+        if match is None:
+            return {
+                "claimed": False,
+                "reason": "controller-capability-mismatch",
+                "label": controller_label,
+            }
+        return {
+            "claimed": True,
+            "reason": "ambient-controller-lease",
+            "label": controller_label,
+            "nonce": env_cap,
+            "lease_generation": match.get("generation"),
+            "holder_alive": match.get("holder_alive"),
+        }
+    if len(active) == 1:
+        match = active[0]
+        return {
+            "claimed": True,
+            "reason": "journal-active-lease",
+            "label": controller_label,
+            "nonce": str(match["nonce"]),
+            "lease_generation": match.get("generation"),
+            "holder_alive": match.get("holder_alive"),
+        }
+    if not live:
+        return {
+            "claimed": False,
+            "reason": "no-active-controller-lease",
+            "label": controller_label,
+        }
+    return {
+        "claimed": False,
+        "reason": "ambiguous-controller-generation",
+        "label": controller_label,
+    }
+
+
 def emit_wake_entry_notice(
     *,
     project_root: Path | str,
@@ -3309,6 +3457,65 @@ def emit_controller_mail_notice(
         return notice
     except _EXPECTED_OPTIONAL_ERRORS:
         return None
+
+
+def emit_listener_activity_signal(
+    *,
+    project_root: Path | str | None,
+    controller_label: str | None = None,
+    stream=None,
+) -> str:
+    """One-line remaining-depth cue for relay/status/next. Fail-open.
+
+    Stderr by default: those surfaces' stdout is a data contract. The
+    numbered listen-exit list is not emitted here.
+    """
+    try:
+        if project_root is None:
+            return ""
+        import goalflight_journal  # type: ignore
+        import goalflight_session_status as sessions  # type: ignore
+        import goalflight_task  # type: ignore
+
+        root = goalflight_task.resolve_project_root(str(project_root))
+        label = str(controller_label or "").strip()
+        if not label:
+            label = str(sessions.resolve_controller_label(project_root=root) or "").strip()
+        authority = goalflight_journal.Journal.open_reader(root)
+        active = authority.lease_records()
+        matching = [
+            row
+            for row in active
+            if label and str(row.get("label") or "") == label
+        ]
+        if matching:
+            label = str(matching[0]["label"])
+        elif len(active) == 1:
+            # Bash tool calls do not inherit the session label. A unique
+            # ACTIVE lease is the same journal fact listen-auto now uses.
+            label = str(active[0]["label"])
+        else:
+            return ""
+        coverage = goalflight_wake.coverage_status(root, controller_label=label)
+        live = coverage.get("live_waiters")
+        target = int(
+            coverage.get("target_waiters") or goalflight_wake.listener_slot_count()
+        )
+        command = goalflight_wake.listener_start_command(
+            root, controller_label=label
+        )
+        plan = goalflight_wake.listener_depth_plan(
+            live if isinstance(live, int) else 0,
+            target,
+            command,
+            work_in_flight=authority.care_work_exists(label),
+        )
+        hint = goalflight_wake.consume_listener_activity_signal(root, label, plan)
+        if hint:
+            print(hint, file=sys.stderr if stream is None else stream)
+        return hint
+    except Exception:
+        return ""
 
 
 def emit_controller_milestone_notice(
@@ -3597,6 +3804,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
                     print("no mail")
             else:
                 print("no pending journal events")
+            emit_listener_activity_signal(project_root=root)
             return 0
         lease = authority.active_lease(controller_label)
         if lease is None:
@@ -3640,6 +3848,9 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 )
             else:
                 print("no mail")
+            emit_listener_activity_signal(
+                project_root=root, controller_label=controller_label
+            )
             return 0
         if not getattr(args, "json", False):
             # Visibility precedes receipt: if this process dies during the CAS,
@@ -3681,6 +3892,9 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 )
             else:
                 print("drain conflict · retry relay --drain", file=sys.stderr)
+            emit_listener_activity_signal(
+                project_root=root, controller_label=controller_label
+            )
             return 3
         previous_version = int(advanced.value["previous_cursor_version"])
         cursor_version = int(advanced.value["cursor_version"])
@@ -3703,6 +3917,9 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 f"drained {len(envelopes)} · cursor "
                 f"{previous_version}->{cursor_version}"
             )
+        emit_listener_activity_signal(
+            project_root=root, controller_label=controller_label
+        )
         return 0
     if getattr(args, "json", False):
         print(
@@ -3719,6 +3936,9 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 sort_keys=True,
             )
         )
+        emit_listener_activity_signal(
+            project_root=root, controller_label=controller_label
+        )
         return 0
     if getattr(args, "bodies", False):
         print(json.dumps(visible_envelopes))
@@ -3732,6 +3952,9 @@ def cmd_relay(args: argparse.Namespace) -> int:
         dispatch_id = str(envelope.get("dispatch_id") or "unknown")
         counts[dispatch_id] = counts.get(dispatch_id, 0) + 1
     print(format_pending_counts(counts))
+    emit_listener_activity_signal(
+        project_root=root, controller_label=controller_label
+    )
     return 0
 
 
@@ -4351,7 +4574,6 @@ def cmd_listen(args) -> int:
 
 def cmd_listen_auto(args) -> int:
     """Resolve an existing ambient lease, then run the foreground listener."""
-    import goalflight_journal  # type: ignore
     import goalflight_session_status as sessions  # type: ignore
     import goalflight_task  # type: ignore
 
@@ -4363,25 +4585,25 @@ def cmd_listen_auto(args) -> int:
     if not label:
         print("listen-auto: controller label is unavailable", file=sys.stderr)
         return 2
-    ambient = _ambient_claimed_controller(
+    explicit_nonce = str(getattr(args, "lease_nonce", None) or "").strip() or None
+    resolved = _resolve_listen_auto_lease(
         project_root,
         controller_label=label,
-        mail_bearing=True,
+        explicit_nonce=explicit_nonce,
     )
-    if not ambient.get("claimed"):
+    if not resolved.get("claimed"):
         print(
-            "listen-auto: " + str(ambient.get("reason") or "ambient lease unavailable"),
+            "listen-auto: " + str(resolved.get("reason") or "ambient lease unavailable"),
             file=sys.stderr,
         )
         return 2
-    authority = goalflight_journal.Journal(project_root)
-    lease = authority.active_lease(label)
-    if lease is None:
+    nonce = str(resolved.get("nonce") or "").strip()
+    if not nonce:
         print("listen-auto: active controller lease is unavailable", file=sys.stderr)
         return 2
     args.project_root = str(project_root)
     args.controller_label = label
-    args.lease_nonce = lease.nonce
+    args.lease_nonce = nonce
     return cmd_listen(args)
 
 
@@ -4517,7 +4739,10 @@ def _run_cli(argv: list[str] | None = None) -> int:
         command_parser.add_argument(
             "--lease-nonce",
             default=None,
-            help="active lease capability; defaults to GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+            help=(
+                "pin a specific lease generation; listen-auto otherwise "
+                "resolves the journal ACTIVE lease for (project, label)"
+            ),
         )
         command_parser.add_argument("--poll-secs", type=float, default=5.0)
         command_parser.add_argument(

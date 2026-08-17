@@ -4344,17 +4344,21 @@ def _cmd_next(store: TaskStore, args: argparse.Namespace) -> int:
     _post_next_nudge(rows, store.project_root)
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, sort_keys=True))
-        return 0
-    if rows:
-        print(_continue_directive(store, rows[0]), file=sys.stderr)
-    for row in rows:
-        print(f"{row['id']} {row.get('title', '')}")
+    else:
+        if rows:
+            print(_continue_directive(store, rows[0]), file=sys.stderr)
+        for row in rows:
+            print(f"{row['id']} {row.get('title', '')}")
     try:
         import goalflight_messages as gm
     except Exception:
         pass
     else:
-        gm.emit_controller_mail_notice(
+        if not args.json:
+            gm.emit_controller_mail_notice(
+                project_root=store.project_root,
+            )
+        gm.emit_listener_activity_signal(
             project_root=store.project_root,
         )
     return 0

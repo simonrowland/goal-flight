@@ -2483,8 +2483,17 @@ def main(argv: list[str] | None = None) -> int:
             print(to_text(status))
         else:
             print(json.dumps(status, indent=2))
-        return 0
-    print(to_text(status))
+    else:
+        print(to_text(status))
+    try:
+        import goalflight_messages
+
+        goalflight_messages.emit_listener_activity_signal(
+            project_root=project_root,
+            controller_label=args.session_label,
+        )
+    except _EXPECTED_OPTIONAL_ERRORS:
+        pass
     return 0
 
 
