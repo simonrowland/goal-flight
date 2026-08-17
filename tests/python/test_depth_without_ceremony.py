@@ -120,11 +120,17 @@ def _wait_live(project: Path, label: str, count: int, *, timeout_s: float = 6) -
     )
 
 
-def _listen_auto_cmd(project: Path, *, label: str, nonce: str | None = None) -> list[str]:
+def _listen_cmd(
+    project: Path,
+    *,
+    label: str,
+    nonce: str | None = None,
+    command: str = "listen-auto",
+) -> list[str]:
     cmd = [
         sys.executable,
         str(SCRIPTS / "goalflight_messages.py"),
-        "listen-auto",
+        command,
         "--project-root",
         str(project),
         "--controller-label",
@@ -138,6 +144,10 @@ def _listen_auto_cmd(project: Path, *, label: str, nonce: str | None = None) -> 
     if nonce:
         cmd.extend(["--lease-nonce", nonce])
     return cmd
+
+
+def _listen_auto_cmd(project: Path, *, label: str, nonce: str | None = None) -> list[str]:
+    return _listen_cmd(project, label=label, nonce=nonce, command="listen-auto")
 
 
 def _arm_listen_auto(
@@ -227,6 +237,36 @@ def test_listen_auto_arms_without_capability_env(
             _wait_live(project, "depth-ctl", 1)
             live = wake.live_waiters(project, controller_label="depth-ctl") or []
             assert len(live) == 1
+            assert _generation_hash(lease.nonce) in _slot_generation_hashes(
+                project, "depth-ctl"
+            )
+        finally:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+                proc.wait(timeout=5)
+
+
+def test_listen_self_resolves_without_nonce(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    """Plain listen is the auto path: no --lease-nonce, no env nonce."""
+    project, env = isolated
+    lease = _claim(project)
+    _work(project)
+    assert "GOALFLIGHT_CONTROLLER_LEASE_NONCE" not in env
+    with wake.register_lease_holder(
+        project, controller_label="depth-ctl", lease_nonce=lease.nonce
+    ):
+        proc = subprocess.Popen(
+            _listen_cmd(project, label="depth-ctl", command="listen"),
+            cwd=project,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _wait_live(project, "depth-ctl", 1)
             assert _generation_hash(lease.nonce) in _slot_generation_hashes(
                 project, "depth-ctl"
             )

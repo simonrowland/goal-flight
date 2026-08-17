@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import contextlib
 import datetime as dt
 import errno
@@ -26,7 +27,9 @@ from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parent
-LIST_TYPE = list
+# The module later defines def list(...). Binding the builtin by name here
+# makes isinstance(..., LIST_TYPE) survive importlib.reload().
+LIST_TYPE = builtins.list
 SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))

@@ -2726,8 +2726,9 @@ def controller_cursor_peek(
 
 def _listener_envelope(authority, row: dict[str, object]) -> dict:
     carrier_path = str(row.get("carrier_path") or "")
-    # Synthetic journal carriers ("journal:attention:", "journal:outbox-quarantine:",
-    # …) have no .jsonl file; their payload lives in system_attention_items keyed by
+    # Synthetic journal carriers ("journal:goal-flight-resume:",
+    # "journal:outbox-quarantine:", …) have no .jsonl file; their payload lives
+    # in system_attention_items keyed by
     # event_uuid, inserted in the same transaction as the delivery event. Match on
     # the "journal:" prefix so a new synthetic stream cannot wedge the whole relay.
     if carrier_path.startswith("journal:"):
@@ -3198,7 +3199,7 @@ def _resolve_listen_auto_lease(
     controller_label: str,
     explicit_nonce: str | None,
 ) -> dict[str, object]:
-    """Resolve which lease generation listen-auto should arm.
+    """Resolve which lease generation listen should arm.
 
     Ambient env is one input, not the only one. The journal ACTIVE lease
     for ``(project, label)`` is the default. ``--lease-nonce`` pins a
@@ -3492,7 +3493,7 @@ def emit_listener_activity_signal(
             label = str(matching[0]["label"])
         elif len(active) == 1:
             # Bash tool calls do not inherit the session label. A unique
-            # ACTIVE lease is the same journal fact listen-auto now uses.
+            # ACTIVE lease is the same journal fact listen now uses.
             label = str(active[0]["label"])
         else:
             return ""
@@ -4180,30 +4181,47 @@ def _exact_listener_command() -> str:
     return shlex.join(argv)
 
 
+def _listen_cli_name() -> str:
+    return "listen-auto" if sys.argv[1:2] == ["listen-auto"] else "listen"
+
+
 def cmd_listen(args) -> int:
-    """One-shot journal cursor listener; its exit is the wake."""
+    """One-shot journal cursor listener; its exit is the wake.
+
+    Self-resolves the journal ACTIVE lease when ``--lease-nonce`` is omitted.
+    """
     import goalflight_journal  # type: ignore
     import goalflight_session_status as sessions  # type: ignore
     import goalflight_task  # type: ignore
 
+    prefix = _listen_cli_name()
     project_root = goalflight_task.resolve_project_root(args.project_root or str(Path.cwd()))
-    label = str(
-        args.controller_label
-        or sessions.resolve_controller_label(project_root=project_root)
-        or ""
-    ).strip()
-    nonce = str(
-        args.lease_nonce
-        or os.environ.get("GOALFLIGHT_CONTROLLER_LEASE_NONCE")
-        or os.environ.get("GOALFLIGHT_CONTROLLER_SESSION_ID")
-        or ""
-    ).strip()
-    if not label or not nonce:
+    label = sessions.resolve_controller_label(
+        args.controller_label,
+        project_root=project_root,
+    )
+    if not label:
+        print(f"{prefix}: controller label is unavailable", file=sys.stderr)
+        return 2
+    explicit_nonce = str(getattr(args, "lease_nonce", None) or "").strip() or None
+    resolved = _resolve_listen_auto_lease(
+        project_root,
+        controller_label=label,
+        explicit_nonce=explicit_nonce,
+    )
+    if not resolved.get("claimed"):
         print(
-            "listen: active controller label and lease nonce are required; claim the lease first",
+            f"{prefix}: " + str(resolved.get("reason") or "ambient lease unavailable"),
             file=sys.stderr,
         )
         return 2
+    nonce = str(resolved.get("nonce") or "").strip()
+    if not nonce:
+        print(f"{prefix}: active controller lease is unavailable", file=sys.stderr)
+        return 2
+    args.project_root = str(project_root)
+    args.controller_label = label
+    args.lease_nonce = nonce
     test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
     poll = max(0.01 if test_mode else 0.5, float(args.poll_secs or 5.0))
     try:
@@ -4573,37 +4591,7 @@ def cmd_listen(args) -> int:
 
 
 def cmd_listen_auto(args) -> int:
-    """Resolve an existing ambient lease, then run the foreground listener."""
-    import goalflight_session_status as sessions  # type: ignore
-    import goalflight_task  # type: ignore
-
-    project_root = goalflight_task.resolve_project_root(args.project_root or str(Path.cwd()))
-    label = sessions.resolve_controller_label(
-        args.controller_label,
-        project_root=project_root,
-    )
-    if not label:
-        print("listen-auto: controller label is unavailable", file=sys.stderr)
-        return 2
-    explicit_nonce = str(getattr(args, "lease_nonce", None) or "").strip() or None
-    resolved = _resolve_listen_auto_lease(
-        project_root,
-        controller_label=label,
-        explicit_nonce=explicit_nonce,
-    )
-    if not resolved.get("claimed"):
-        print(
-            "listen-auto: " + str(resolved.get("reason") or "ambient lease unavailable"),
-            file=sys.stderr,
-        )
-        return 2
-    nonce = str(resolved.get("nonce") or "").strip()
-    if not nonce:
-        print("listen-auto: active controller lease is unavailable", file=sys.stderr)
-        return 2
-    args.project_root = str(project_root)
-    args.controller_label = label
-    args.lease_nonce = nonce
+    """Alias for listen. Kept so live fleet and SessionStart invocations stay valid."""
     return cmd_listen(args)
 
 
@@ -4740,7 +4728,7 @@ def _run_cli(argv: list[str] | None = None) -> int:
             "--lease-nonce",
             default=None,
             help=(
-                "pin a specific lease generation; listen-auto otherwise "
+                "pin a specific lease generation; without this, listen "
                 "resolves the journal ACTIVE lease for (project, label)"
             ),
         )
@@ -4766,12 +4754,15 @@ def _run_cli(argv: list[str] | None = None) -> int:
 
     listen = sub.add_parser(
         "listen",
-        help="one-shot journal cursor listener; its exit is the wake",
+        help=(
+            "one-shot journal cursor listener; self-resolves the ACTIVE lease "
+            "unless --lease-nonce pins one"
+        ),
     )
     add_listen_arguments(listen)
     listen_auto = sub.add_parser(
         "listen-auto",
-        help="resolve the ambient lease and start the one-shot listener",
+        help="alias for listen (kept for live fleet and SessionStart invocations)",
     )
     add_listen_arguments(listen_auto)
 

@@ -2288,6 +2288,9 @@ def test_attention_generation_noise_collapses_to_one_open_item(
                 """,
                 (item_id, str(root.resolve()), "wake-test", generation, json.dumps(payload), now),
             )
+            carrier = journal._synthetic_journal_carrier(
+                journal._JOURNAL_RESUME_CARRIER_KIND, item_id
+            )
             connection.execute(
                 """
                 INSERT INTO delivery_events (
@@ -2297,7 +2300,7 @@ def test_attention_generation_noise_collapses_to_one_open_item(
                 ) VALUES (?, '*', 'journal', ?, 'attention', ?, ?,
                           'controller_attention', 'waking', ?, ?)
                 """,
-                (str(root.resolve()), item_id, seq, f"journal:attention:{item_id}", now, now),
+                (str(root.resolve()), item_id, seq, carrier, now, now),
             )
 
     seeded = authority._domain_write(seed)
@@ -2313,8 +2316,13 @@ def test_attention_generation_noise_collapses_to_one_open_item(
     assert open_items[0]["source_generation"] == generations[-1]
     assert len(authority.attention_items(state="RESOLVED")) == 2
     withdrawn = authority.read_all(
-        "SELECT withdrawn_at FROM delivery_events WHERE event_type = 'controller_attention'"
+        "SELECT carrier_path, withdrawn_at FROM delivery_events "
+        "WHERE event_type = 'controller_attention'"
     )
+    resume_prefix = (
+        f"{journal._JOURNAL_CARRIER_PREFIX}{journal._JOURNAL_RESUME_CARRIER_KIND}:"
+    )
+    assert all(str(row["carrier_path"]).startswith(resume_prefix) for row in withdrawn)
     assert sum(row["withdrawn_at"] is not None for row in withdrawn) == 2
 
 

@@ -851,6 +851,95 @@ def test_wait_help_distinguishes_unclaimed_join_from_claimed_doorbell() -> None:
     check("--wait help directs claimed controllers to doorbell", "claimed controllers" in help_text)
 
 
+def _empty_wait_payload() -> dict:
+    return {
+        "schema": "goalflight.status.wait.v1",
+        "dispatch": {"records": []},
+    }
+
+
+def test_wait_names_missing_ids_after_grace_once() -> None:
+    orig_cycle = S._wait_cycle_payload
+    orig_sleep = S.time.sleep
+    orig_monotonic = S.time.monotonic
+    orig_grace = S._WAIT_MISSING_RECORD_GRACE_S
+    S._WAIT_MISSING_RECORD_GRACE_S = 0.5
+    times = itertools.count(0.0, 0.2)
+    S.time.monotonic = lambda: next(times)
+    S.time.sleep = lambda _seconds: None
+    S._wait_cycle_payload = lambda *_args, **_kwargs: _empty_wait_payload()
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = S.wait_for_dispatches(
+                ["no-such-id", "also-missing"],
+                project_root="/repo/A",
+                timeout_s=1.0,
+                poll_s=0.01,
+            )
+        out = buf.getvalue()
+        check("missing-id wait still times out rather than refusing", rc == 1)
+        check(
+            "missing-id wait names the first unknown id",
+            out.count("wait: no-such-id has no dispatch record yet (continuing to wait)")
+            == 1,
+        )
+        check(
+            "missing-id wait names the second unknown id",
+            out.count("wait: also-missing has no dispatch record yet (continuing to wait)")
+            == 1,
+        )
+        check("missing-id wait does not refuse unknown ids", "wait requires" not in out)
+    finally:
+        S._wait_cycle_payload = orig_cycle
+        S.time.sleep = orig_sleep
+        S.time.monotonic = orig_monotonic
+        S._WAIT_MISSING_RECORD_GRACE_S = orig_grace
+
+
+def test_wait_armed_before_dispatch_exists_still_succeeds() -> None:
+    orig_cycle = S._wait_cycle_payload
+    orig_sleep = S.time.sleep
+    orig_monotonic = S.time.monotonic
+    orig_grace = S._WAIT_MISSING_RECORD_GRACE_S
+    S._WAIT_MISSING_RECORD_GRACE_S = 0.3
+    times = itertools.count(0.0, 0.2)
+    calls = {"n": 0}
+
+    def payload_sequence(*_args, **_kwargs) -> dict:
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            return _empty_wait_payload()
+        if calls["n"] == 4:
+            return _wait_payload("late-id", "expected_live")
+        return _wait_payload("late-id", "complete", terminal_state="complete")
+
+    S._wait_cycle_payload = payload_sequence
+    S.time.monotonic = lambda: next(times)
+    S.time.sleep = lambda _seconds: None
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = S.wait_for_dispatches(
+                ["late-id"],
+                project_root="/repo/A",
+                timeout_s=5.0,
+                poll_s=0.01,
+            )
+        out = buf.getvalue()
+        check("wait armed before dispatch exists returns success", rc == 0)
+        check("wait armed before dispatch exists reports terminal", "late-id -> complete" in out)
+        check(
+            "late-appearing id is named once then succeeds",
+            out.count("wait: late-id has no dispatch record yet (continuing to wait)") == 1,
+        )
+    finally:
+        S._wait_cycle_payload = orig_cycle
+        S.time.sleep = orig_sleep
+        S.time.monotonic = orig_monotonic
+        S._WAIT_MISSING_RECORD_GRACE_S = orig_grace
+
+
 def test_wait_unbounded_sentinels_and_positive_timeout() -> None:
     orig_cycle = S._wait_cycle_payload
     orig_sleep = S.time.sleep
@@ -1159,6 +1248,8 @@ def main() -> int:
     test_wait_cli_accepts_space_separated_ids()
     test_wait_default_timeout()
     test_wait_help_distinguishes_unclaimed_join_from_claimed_doorbell()
+    test_wait_names_missing_ids_after_grace_once()
+    test_wait_armed_before_dispatch_exists_still_succeeds()
     test_wait_unbounded_sentinels_and_positive_timeout()
     test_wait_keyboard_interrupt_returns_130_without_signal()
     test_wait_snapshot_uses_single_liveness_result()

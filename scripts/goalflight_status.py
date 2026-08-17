@@ -79,6 +79,10 @@ _QUEUE_PENDING_NO_DRAINER = "queue_pending_no_drainer"
 # confirmed-dead worker before --wait resolves it to a terminal worker_dead
 # verdict (instead of polling to the wait-timeout). >= 2 default poll intervals.
 _WAIT_HEARTBEAT_S = 1200.0
+# --wait missing-id grace: a wait may be armed in the same breath as the
+# dispatch, so an unknown id is not refused. After this many seconds with
+# still no ledger/journal record, name it once (typo signal) and keep waiting.
+_WAIT_MISSING_RECORD_GRACE_S = 30.0
 _WAIT_CPU_EPSILON = 0.1
 _WAIT_TAIL_COUNT_BYTES = 128 * 1024
 _DASHBOARD_COUNT_KEYS = ("running", "worker_finished", "worker_failed", "worker_dead", "stalled")
@@ -2035,6 +2039,7 @@ def _wait_snapshot(
             "state": state,
             "status_path": None if record is None else record.get("status_path"),
             "progress": progress,
+            "missing_record": record is None,
         }
         # Carry the marker kind on every terminal row. The state taxonomy
         # collapses all non-success terminals to "blocked", which makes an
@@ -2234,6 +2239,7 @@ def _wait_for_dispatches_registered(
     progress_state: dict[str, dict] = {}
     heartbeat_since: dict[str, float] = {dispatch_id: start for dispatch_id in wait_ids}
     journal_cache: dict[str, object | None] = {}
+    warned_missing: set[str] = set()
     try:
         while True:
             now = time.monotonic()
@@ -2249,6 +2255,23 @@ def _wait_for_dispatches_registered(
                 now=now,
                 poll_s=poll_s,
             )
+            if (
+                not json_output
+                and now - start >= _WAIT_MISSING_RECORD_GRACE_S
+            ):
+                for row in rows:
+                    dispatch_id = str(row["dispatch_id"])
+                    if (
+                        row.get("missing_record")
+                        and not row["terminal"]
+                        and dispatch_id not in warned_missing
+                    ):
+                        print(
+                            f"wait: {dispatch_id} has no dispatch record yet "
+                            "(continuing to wait)",
+                            flush=True,
+                        )
+                        warned_missing.add(dispatch_id)
             if not json_output:
                 for row in rows:
                     if row["terminal"]:
@@ -2624,8 +2647,10 @@ def main(argv: list[str] | None = None) -> int:
             "unclaimed fixed-set join (does not claim/renew): block until all "
             "ids are terminal. Accepts space-separated (`--wait a b`), "
             "comma-separated (`--wait a,b`), or repeated (`--wait a --wait b`); "
-            "new waking mail on any waited ID exits 3. For claimed controllers "
-            "use the messages listen -> relay -> advance doorbell loop"
+            "new waking mail on any waited ID exits 3. After 30s, ids with no "
+            "dispatch record at all are named once; the wait continues. For "
+            "claimed controllers use the messages listen -> relay -> advance "
+            "doorbell loop"
         ),
     )
     parser.add_argument(
