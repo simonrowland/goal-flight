@@ -14,6 +14,12 @@ Easy path (agent preset — the common case):
     python3 goalflight_dispatch.py --agent grok-code --prompt-file p.md --cwd .
     python3 goalflight_dispatch.py --agent codex --prompt-file p.md --cwd . --foreground  # synchronous scripts/tests
 
+After launch, stderr is one line (dispatch id + status path). DISPATCH-LAUNCHED
+JSON on stdout carries the rest. Pass --hints for the teaching block (status /
+wait / done commands, and why not to hand-roll ps/tail -f/backgrounded
+watchers — they race the worker and exit early). Argument errors are one line;
+--help stays the verbose map.
+
 Presets bake in the canonical NON-INTERACTIVE + SAFE flags per worker, so you
 never spell them out (and cannot fat-finger `--dangerously-bypass`). Paths and a
 dispatch id are auto-derived under the state dir; override with --tail /
@@ -243,6 +249,29 @@ class _ReconcileTransaction:
 # (which the presets never emit and this never enables). "read-only" == --read-only.
 OS_SANDBOX_OFF = "off"
 OS_SANDBOX_PROFILES = ("workspace-write", "read-only", OS_SANDBOX_OFF)
+
+
+def _parse_os_sandbox_arg(value: str) -> str:
+    """Accept hyphen/underscore/collapsed aliases of the sanctioned profiles.
+
+    ``readonly`` / ``read_only`` are the same profile as ``read-only``; rejecting
+    them was an error class, not a real ambiguity.
+    """
+    collapsed = (value or "").strip().lower().replace("_", "-")
+    if collapsed.replace("-", "") == "workspacewrite":
+        return "workspace-write"
+    aliases = {
+        "workspace-write": "workspace-write",
+        "read-only": "read-only",
+        "readonly": "read-only",
+        "off": "off",
+    }
+    mapped = aliases.get(collapsed)
+    if mapped is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid choice: {value!r} (choose from {', '.join(OS_SANDBOX_PROFILES)})"
+        )
+    return mapped
 _CODEX_SANDBOX_VALUE = {
     "workspace-write": "workspace-write",
     "read-only": "read-only",
@@ -648,6 +677,28 @@ STEER_ACK_RE = goalflight_terminal.STEER_ACK_RE
 
 class DispatchUsageError(Exception):
     pass
+
+
+class _TerseArgumentParser(argparse.ArgumentParser):
+    """One-line argument errors. ``--help`` stays the verbose path.
+
+    Default argparse reprints the full usage stanza (1.6KB+ here) on every
+    typo, burying the actual problem. Controllers re-run with ``--help`` when
+    they want the map; a failure should name the problem and the correct form.
+    """
+
+    def __init__(self, *args, usage_hint: str | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.usage_hint = usage_hint
+
+    def error(self, message: str) -> None:
+        hint = self.usage_hint or "see --help"
+        self.exit(2, f"{self.prog}: {message}. {hint}\n")
+
+
+_DISPATCH_USAGE_HINT = (
+    "try --agent <preset> --prompt-file <path> [--cwd .] (or --help)"
+)
 
 
 class UnsupportedAgentSandboxRequest(DispatchUsageError):
@@ -1392,7 +1443,10 @@ def _dashboard_refresh_loop(
 
 
 def _cmd_dashboard_refresh(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=argparse.SUPPRESS)
+    parser = _TerseArgumentParser(
+        description=argparse.SUPPRESS,
+        usage_hint="try dashboard-refresh --project-root <path> (or --help)",
+    )
     parser.add_argument("--project-root", required=True)
     parser.add_argument("--interval-s", type=float, default=15.0)
     parser.add_argument("--max-lifetime-s", type=float, default=_DASHBOARD_REFRESH_MAX_LIFETIME_S)
@@ -1786,10 +1840,22 @@ def _status_reminder_lines(
     poll_secs: float | None = None,
     max_idle_secs: float | None = None,
     prompt_path: Path | str | None = None,
+    hints: bool = False,
 ) -> list[str]:
-    """Terse post-dispatch status-tooling reminder (stderr only; path-not-payload)."""
-    root = (skill_root or _skill_root()).resolve()
+    """Post-dispatch stderr reminder.
+
+    Default is one line: dispatch id + status path. The DISPATCH-LAUNCHED JSON
+    already carries wait/done/watch fields, so repeating them on every launch
+    is wallpaper. Pass ``hints=True`` (CLI ``--hints``) for the teaching block
+    that names the status/wait/done tools and why not to hand-roll
+    ``ps`` / ``tail -f`` / backgrounded watchers — they race the worker and
+    exit early. That warning lives here, in the module docstring, and in
+    ``protocols/legacy/tail-f.md``; it does not belong on the hot-loop default.
+    """
     status_path = Path(status_json).resolve()
+    if not hints:
+        return [f"[goal-flight] dispatched {dispatch_id}  status={status_path}"]
+    root = (skill_root or _skill_root()).resolve()
     tail = Path(tail_path).resolve()
     status_py = root / "scripts" / "goalflight_status.py"
     watch_py = root / "scripts" / "goalflight_watch.py"
@@ -1875,6 +1941,7 @@ def _print_status_reminder(
     poll_secs: float | None = None,
     max_idle_secs: float | None = None,
     prompt_path: Path | str | None = None,
+    hints: bool = False,
 ) -> None:
     for line in _status_reminder_lines(
         dispatch_id,
@@ -1888,6 +1955,7 @@ def _print_status_reminder(
         poll_secs=poll_secs,
         max_idle_secs=max_idle_secs,
         prompt_path=prompt_path,
+        hints=hints,
     ):
         print(line, file=sys.stderr, flush=True)
 
@@ -2284,9 +2352,10 @@ def _list_steer_messages(dispatch_id: str, record: dict) -> int:
 
 
 def _cmd_steer(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(
+    parser = _TerseArgumentParser(
         prog=f"{Path(sys.argv[0]).name} steer",
         description="Append or list mailbox steers for an existing dispatch.",
+        usage_hint="try steer <dispatch-id> <message> | steer <dispatch-id> --list",
     )
     parser.add_argument("dispatch_id")
     parser.add_argument("message", nargs="?")
@@ -2665,9 +2734,10 @@ def _rebuild_codex_resume_home(
 
 
 def _cmd_resume(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(
+    parser = _TerseArgumentParser(
         prog=f"{Path(sys.argv[0]).name} resume",
         description="Resume a recorded Codex rollout as a tracked dispatch.",
+        usage_hint="try resume <dispatch-id> --prompt-file <path>",
     )
     parser.add_argument("dispatch_id")
     parser.add_argument("--prompt-file", required=True)
@@ -5591,8 +5661,9 @@ def _reconcile_abandoned_for_drain(queue_dir: Path) -> dict:
 
 
 def _cmd_reconcile_abandoned(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(
-        description="Dry-run abandoned dispatch reconciliation; never changes ledger records."
+    parser = _TerseArgumentParser(
+        description="Dry-run abandoned dispatch reconciliation; never changes ledger records.",
+        usage_hint="try reconcile-abandoned [--json] [--stale-s N] (or --help)",
     )
     parser.add_argument("--queue-dir")
     parser.add_argument("--stale-s", type=float, default=ABANDONED_RECONCILE_STALE_S)
@@ -8845,7 +8916,10 @@ def _drain_error_payload(args, exc: BaseException) -> dict:
 
 
 def _cmd_drain(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Drain queued goal-flight dispatch requests.")
+    parser = _TerseArgumentParser(
+        description="Drain queued goal-flight dispatch requests.",
+        usage_hint="try drain [--json] [--limit N] (or --help)",
+    )
     parser.add_argument("--queue-dir")
     parser.add_argument("--capacity-wait-s", type=float, default=0.0)
     parser.add_argument("--claim-stale-s", type=float, default=QUEUE_CLAIM_STALE_S)
@@ -9465,6 +9539,7 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
             worker_pid=int(worker_pid),
             shape="acp",
             prompt_path=getattr(cfg, "watcher_prompt_file", None),
+            hints=bool(getattr(args, "hints", False)),
         )
     end_payload = {
         "dispatch_id": payload.get("dispatch_id", cfg.dispatch_id),
@@ -9703,8 +9778,9 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "dashboard-refresh":
         return _cmd_dashboard_refresh(argv[1:])
 
-    parser = argparse.ArgumentParser(
-        description="Crash-safe worker dispatch: detached worker + decoupled watcher."
+    parser = _TerseArgumentParser(
+        description="Crash-safe worker dispatch: detached worker + decoupled watcher.",
+        usage_hint=_DISPATCH_USAGE_HINT,
     )
     parser.add_argument("--agent", default="worker",
                         help="Preset (codex|grok-code|grok-research|moonshot) OR a label when you pass `-- <cmd>`")
@@ -9721,10 +9797,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default=None,
                         help="Worker model id (grok-code/grok-research/moonshot/codex --model passthrough). "
                              "Default = agent label's own default.")
-    parser.add_argument("--read-only", action="store_true",
+    parser.add_argument("--read-only", "--readonly", action="store_true",
                         help="Read-only sandbox (review/analysis dispatches). Equivalent to "
                              "--os-sandbox read-only.")
-    parser.add_argument("--os-sandbox", choices=list(OS_SANDBOX_PROFILES), default=None,
+    parser.add_argument("--os-sandbox", type=_parse_os_sandbox_arg, default=None,
+                        metavar="{workspace-write,read-only,off}",
                         help="Opt-in OS sandbox profile for the bash-shape codex worker. Unset = "
                              "workspace-write (the unchanged default; existing dispatches are "
                              "unaffected). 'off' disables codex's Seatbelt sandbox "
@@ -9864,6 +9941,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stats", nargs="?", const="7d", metavar="WINDOW",
                         help="No-worker stats view over dispatch history; WINDOW is <N>h, <N>d, or bare <N> days.")
     parser.add_argument("--json", action="store_true", help="With --stats, emit machine-readable JSON.")
+    parser.add_argument(
+        "--hints",
+        action="store_true",
+        help=(
+            "Print the post-launch teaching block (status/wait/done/mail commands "
+            "and why not to hand-roll ps/tail -f/backgrounded watchers). "
+            "Default is one line: dispatch id + status path."
+        ),
+    )
     parser.add_argument("worker", nargs=argparse.REMAINDER,
                         help="Optional `-- <cmd...>` raw worker (overrides the preset)")
     parser.set_defaults(drain_on_submit=True)
@@ -10398,6 +10484,7 @@ def main(argv: list[str] | None = None) -> int:
             poll_secs=args.poll_secs,
             max_idle_secs=args.max_idle_secs,
             prompt_path=prompt_path,
+            hints=bool(getattr(args, "hints", False)),
         )
 
         # 2. Run the decoupled watcher detached from this launcher. We still poll

@@ -191,7 +191,25 @@ def test_acp_production_path_persists_and_reminds_with_assembled_prompt() -> Non
         assert "PROJECT ORIENTATION\n" in persisted
         assert f"Path: {orientation.resolve()}" in persisted
         assert "Do ACP production work." in persisted
-        assert f"--ignore-prompt-file {watcher_prompt}" in stderr.getvalue()
+        # The post-dispatch reminder is one line now: dispatch id + status path.
+        # The watcher invocation that names --ignore-prompt-file moved behind
+        # --hints, because repeating it on every launch turned a real guard rail
+        # into wallpaper. Assert BOTH halves so neither can silently regress:
+        # the terse default, and the hinted block still naming the prompt file.
+        assert "[goal-flight] dispatched" in stderr.getvalue()
+        assert f"--ignore-prompt-file {watcher_prompt}" not in stderr.getvalue()
+        hinted = "\n".join(
+            dispatch_mod._status_reminder_lines(
+                "acp-agents",
+                status_json=status_json,
+                tail_path=status_json.with_suffix(".tail"),
+                worker_pid=4321,
+                shape="acp",
+                prompt_path=watcher_prompt,
+                hints=True,
+            )
+        )
+        assert f"--ignore-prompt-file {watcher_prompt}" in hinted
 
 
 def test_acp_inline_prompt_uses_same_assembled_prompt_path() -> None:

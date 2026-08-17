@@ -13,7 +13,7 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_dispatch  # noqa: E402
 
 
-def _reminder_text(shape: str) -> tuple[str, Path, Path]:
+def _reminder_text(shape: str, *, hints: bool = False) -> tuple[str, Path, Path]:
     status_json = Path("/tmp/goal-flight-state/dispatch/reminder-dispatch-42.status.json")
     tail_path = Path("/tmp/goal-flight-state/dispatch/reminder-dispatch-42.tail")
     prompt_path = Path("/tmp/goal-flight-state/dispatch/reminder-dispatch-42.prompt.md")
@@ -29,12 +29,28 @@ def _reminder_text(shape: str) -> tuple[str, Path, Path]:
         poll_secs=2.0,
         max_idle_secs=180.0,
         prompt_path=prompt_path,
+        hints=hints,
     )
     return "\n".join(lines), status_json.resolve(), tail_path.resolve()
 
 
+def test_default_reminder_is_one_line_with_id_and_status() -> None:
+    for shape in ("bash", "acp"):
+        text, status_json, _tail = _reminder_text(shape, hints=False)
+        lines = [line for line in text.splitlines() if line]
+        assert len(lines) == 1, f"{shape}: default reminder must be one line, got {lines!r}"
+        assert "reminder-dispatch-42" in text, shape
+        assert str(status_json) in text, shape
+        assert "do NOT hand-roll" not in text, shape
+        assert "--wait" not in text, shape
+        assert "goalflight_watch.py" not in text, shape
+        assert "watch-dispatch-tail.sh" not in text, shape
+        assert "goalflight_messages.py" not in text, shape
+        assert "BACKGROUND" not in text, shape
+
+
 def test_status_reminder_bash_shape() -> None:
-    text, _status_json, tail = _reminder_text("bash")
+    text, _status_json, tail = _reminder_text("bash", hints=True)
     assert "reminder-dispatch-42" in text
     assert "--dispatch reminder-dispatch-42" in text
     assert "--wait reminder-dispatch-42" in text
@@ -57,7 +73,7 @@ def test_status_reminder_bash_shape() -> None:
 
 
 def test_status_reminder_acp_shape() -> None:
-    text, status_json, tail = _reminder_text("acp")
+    text, status_json, tail = _reminder_text("acp", hints=True)
     assert "reminder-dispatch-42" in text
     assert "--dispatch reminder-dispatch-42" in text
     assert "--wait reminder-dispatch-42" in text
@@ -76,7 +92,7 @@ def test_status_reminder_acp_shape() -> None:
 
 
 def test_wait_hint_teaches_the_backgrounded_form() -> None:
-    """The hint must show a wait a controller can actually run.
+    """--hints must show a wait a controller can actually run.
 
     Printed as a bare foreground command it collided with the rule against long
     foreground calls, leaving no legal move: the same hint forbids hand-rolled
@@ -84,12 +100,13 @@ def test_wait_hint_teaches_the_backgrounded_form() -> None:
     harness task file, which cannot observe `awaiting_user_confirm` at all -- a
     worker paused for approval looked exactly like a worker still working.
 
+    The teaching block is opt-in (--hints) so the hot loop stays one line.
     Pinned because stripping this advice left every existing assertion green:
     the hint's *commands* were tested, the guidance that makes them usable was
     not.
     """
     for shape in ("bash", "acp"):
-        text, _status_json, _tail = _reminder_text(shape)
+        text, _status_json, _tail = _reminder_text(shape, hints=True)
         assert "--wait reminder-dispatch-42" in text, shape
         assert "BACKGROUND" in text, f"{shape}: hint must say to background the wait"
         assert "timer" in text, f"{shape}: hint must warn against substituting a timer"
@@ -98,6 +115,7 @@ def test_wait_hint_teaches_the_backgrounded_form() -> None:
 
 
 def main() -> None:
+    test_default_reminder_is_one_line_with_id_and_status()
     test_status_reminder_bash_shape()
     test_status_reminder_acp_shape()
     test_wait_hint_teaches_the_backgrounded_form()
