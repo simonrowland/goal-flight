@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -83,6 +84,58 @@ def _task_store_nudges(env: dict[str, str], project: Path, kind: str) -> list[di
         for envelope in M.read_envelopes(inbox)
         if envelope.get("type") == "user_need" and (envelope.get("payload") or {}).get("nudge_kind") == kind
     ]
+
+
+_ISOLATED_ENV_KEYS = (
+    "GOALFLIGHT_MESSAGES_DIR",
+    "GOALFLIGHT_STATE_DIR",
+    "GOALFLIGHT_TASK_STORE_DIR",
+    "GOALFLIGHT_JOURNAL_DIR",
+    "GOALFLIGHT_WAKE_LEDGER_DIR",
+)
+
+
+@contextlib.contextmanager
+def _applied_env(env: dict[str, str]):
+    old = {key: os.environ.get(key) for key in _ISOLATED_ENV_KEYS}
+    try:
+        for key in _ISOLATED_ENV_KEYS:
+            os.environ[key] = env[key]
+        yield
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _user_need_deliveries(env: dict[str, str], project: Path) -> list[dict]:
+    """Every journaled user_need row, including later-replaced ones.
+
+    Inbox coalesce is the wrong signal for this bug: replace_if already leaves
+    one carrier envelope while each new event_uuid still lands in delivery_events.
+    """
+    import goalflight_journal as J
+
+    with _applied_env(env):
+        path = J.resolve_journal_path(project)
+        if not path.exists():
+            return []
+        authority = J.Journal(project)
+        rows = authority.read_all(
+            "SELECT event_uuid, stream_seq, event_type, wake_class, withdrawn_at "
+            "FROM delivery_events WHERE event_type = 'user_need' "
+            "ORDER BY stream_seq, event_uuid"
+        )
+        return [dict(row) for row in rows]
+
+
+def _ready_items(count: int, *, top_id: str = "t-022") -> list[dict]:
+    items = [_item(top_id, "Frontier work")]
+    for index in range(1, count):
+        items.append(_item(f"t-x{index:03d}", f"Ready {index}"))
+    return items
 
 
 def _run_session_status(project: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
@@ -186,14 +239,43 @@ def test_resume_nudge_posts_on_text_only_and_coalesces() -> None:
         assert_eq("resume nudge deduped", len(nudges), 1)
         payload = nudges[0]["payload"]
         assert_eq("resume frontier ids", payload["frontier_ids"], ["t-001", "t-002"])
-        assert_true("resume text names top task", "2 tasks ready (top: t-001) -> continue?" in payload["text"])
+        assert_true("resume text names top task", "2 tasks ready (top: t-001)" in payload["text"])
+        assert_true("resume text has no interrogative", "?" not in payload["text"])
 
         _write_items(project, [_item("t-001", "Ready A"), _item("t-002", "Ready B"), _item("t-003", "Ready C")])
         proc = _run_session_status(project, env, "--text")
         assert_true(f"changed session-status --text exits 0: {proc.stderr}", proc.returncode == 0)
         nudges = _task_store_nudges(env, project, T.RESUME_NUDGE_KIND)
-        assert_eq("changed resume frontier coalesces to one current nudge", len(nudges), 1)
-        assert_eq("changed resume frontier ids", nudges[0]["payload"]["frontier_ids"], ["t-001", "t-002", "t-003"])
+        assert_eq("added ready item keeps one standing resume nudge", len(nudges), 1)
+        assert_eq("same top does not rewrite frontier ids", nudges[0]["payload"]["frontier_ids"], ["t-001", "t-002"])
+        assert_eq("same top does not journal a second event", len(_user_need_deliveries(env, project)), 1)
+
+
+def test_resume_nudge_count_drift_same_top_is_one_journal_event() -> None:
+    """Reproduce relay seq 50/53/58/62/67: count drift is not five events.
+
+    The live session re-evaluated a standing ready frontier (top stayed t-022)
+    as 76→77→76→78→76 and journaled a new drain line each time. Inbox
+    coalesce hid the repetition on the carrier; the journal did not.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        env = _env(tmp)
+        _write_active_notes(project)
+        counts = (76, 77, 76, 78, 76)
+        for count in counts:
+            _write_items(project, _ready_items(count, top_id="t-022"))
+            proc = _run_session_status(project, env, "--text")
+            assert_true(f"session-status --text exits 0 at count={count}: {proc.stderr}", proc.returncode == 0)
+        deliveries = _user_need_deliveries(env, project)
+        assert_eq("count-drift standing state is one journal event, not five", len(deliveries), 1)
+        nudges = _task_store_nudges(env, project, T.RESUME_NUDGE_KIND)
+        assert_eq("inbox still has the one standing resume nudge", len(nudges), 1)
+        text = str(nudges[0]["payload"]["text"])
+        assert_true("standing text names the unchanged top", "top: t-022" in text)
+        assert_true("standing text is not an engagement prompt", "?" not in text)
+        assert_eq("wake_class stays quiet", deliveries[0]["wake_class"], "quiet")
 
 
 def test_resume_nudge_silent_on_empty_frontier() -> None:
@@ -202,9 +284,11 @@ def test_resume_nudge_silent_on_empty_frontier() -> None:
         project = tmp / "project"
         env = _env(tmp)
         _write_items(project, [])
+        _write_active_notes(project)
         proc = _run_session_status(project, env, "--text")
         assert_true(f"empty session-status --text exits 0: {proc.stderr}", proc.returncode == 0)
         assert_eq("empty frontier posts no resume nudge", _task_store_nudges(env, project, T.RESUME_NUDGE_KIND), [])
+        assert_eq("empty frontier journals no user_need", len(_user_need_deliveries(env, project)), 0)
 
 
 def test_watcher_done_suggest_posts_once_per_completion_and_dedups() -> None:
@@ -232,7 +316,8 @@ def test_watcher_done_suggest_posts_once_per_completion_and_dedups() -> None:
         payload = nudges[0]["payload"]
         assert_eq("done-suggest task ids sorted", payload["task_ids"], ["t-001", "t-002"])
         assert_eq("done-suggest dispatch", payload["worker_dispatch_id"], "dispatch-1")
-        assert_true("done-suggest text asks review accept", "worker says done: t-001, t-002 -> review + accept?" in payload["text"])
+        assert_true("done-suggest text names the finished tasks", "worker says done: t-001, t-002" in payload["text"])
+        assert_true("done-suggest text has no interrogative", "?" not in payload["text"])
 
 
 def test_watcher_prompt_echo_does_not_post_done_suggest() -> None:
@@ -257,11 +342,75 @@ def test_watcher_prompt_echo_does_not_post_done_suggest() -> None:
         assert_eq("prompt echo posts no done-suggest", _task_store_nudges(env, project, T.DONE_SUGGEST_NUDGE_KIND), [])
 
 
+def test_resume_nudge_new_top_still_posts() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        env = _env(tmp)
+        _write_active_notes(project)
+        _write_items(project, [_item("t-022", "Old top"), _item("t-040", "Still ready")])
+        proc = _run_session_status(project, env, "--text")
+        assert_true(f"first session-status --text exits 0: {proc.stderr}", proc.returncode == 0)
+        assert_eq("first top is one event", len(_user_need_deliveries(env, project)), 1)
+
+        _write_items(project, [_item("t-023", "New top"), _item("t-040", "Still ready")])
+        proc = _run_session_status(project, env, "--text")
+        assert_true(f"new-top session-status --text exits 0: {proc.stderr}", proc.returncode == 0)
+        deliveries = _user_need_deliveries(env, project)
+        assert_eq("new frontier item is a second event", len(deliveries), 2)
+        assert_eq("new top stays quiet", {row["wake_class"] for row in deliveries}, {"quiet"})
+        nudges = _task_store_nudges(env, project, T.RESUME_NUDGE_KIND)
+        assert_eq("inbox coalesces to the current top", len(nudges), 1)
+        text = str(nudges[0]["payload"]["text"])
+        assert_true("current text names the new top", "top: t-023" in text)
+        assert_true("new-top text has no interrogative", "?" not in text)
+
+
+def test_done_suggest_same_tasks_new_dispatch_is_one_event() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        env = _env(tmp)
+        with _applied_env(env):
+            T.post_done_suggest_nudge(["t-257"], project, "dispatch-a")
+            T.post_done_suggest_nudge(["t-257"], project, "dispatch-b")
+        deliveries = _user_need_deliveries(env, project)
+        assert_eq("same finished task is one event across dispatches", len(deliveries), 1)
+        assert_eq("done-suggest wake_class stays quiet", deliveries[0]["wake_class"], "quiet")
+        nudges = _task_store_nudges(env, project, T.DONE_SUGGEST_NUDGE_KIND)
+        assert_eq("one standing done-suggest", len(nudges), 1)
+        text = str(nudges[0]["payload"]["text"])
+        assert_true("done-suggest names the task", "worker says done: t-257" in text)
+        assert_true("done-suggest has no interrogative", "?" not in text)
+
+
+def test_done_suggest_new_task_still_posts() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = tmp / "project"
+        env = _env(tmp)
+        with _applied_env(env):
+            T.post_done_suggest_nudge(["t-257"], project, "dispatch-a")
+            T.post_done_suggest_nudge(["t-258"], project, "dispatch-b")
+        deliveries = _user_need_deliveries(env, project)
+        assert_eq("a newly finished task is a second event", len(deliveries), 2)
+        assert_eq("new done-suggest stays quiet", {row["wake_class"] for row in deliveries}, {"quiet"})
+        nudges = _task_store_nudges(env, project, T.DONE_SUGGEST_NUDGE_KIND)
+        assert_eq("inbox coalesces to the latest done-suggest", len(nudges), 1)
+        text = str(nudges[0]["payload"]["text"])
+        assert_true("latest text names the new task", "worker says done: t-258" in text)
+        assert_true("new-task done-suggest has no interrogative", "?" not in text)
+
+
 def main() -> None:
     test_resume_nudge_posts_on_text_only_and_coalesces()
+    test_resume_nudge_count_drift_same_top_is_one_journal_event()
+    test_resume_nudge_new_top_still_posts()
     test_resume_nudge_silent_on_empty_frontier()
     test_watcher_done_suggest_posts_once_per_completion_and_dedups()
     test_watcher_prompt_echo_does_not_post_done_suggest()
+    test_done_suggest_same_tasks_new_dispatch_is_one_event()
+    test_done_suggest_new_task_still_posts()
     print("OK: task nudge tests pass")
 
 

@@ -4162,6 +4162,52 @@ def _cmd_list(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
+def _current_task_store_nudge(project_root: Path, nudge_kind: str) -> dict[str, Any] | None:
+    """Newest carrier envelope for this project's task-store nudge kind."""
+    try:
+        import goalflight_messages as gm
+    except Exception:
+        return None
+    try:
+        inbox = gm.inbox_path(gm.default_messages_dir(), _next_nudge_dispatch_id(project_root))
+        if not inbox.is_file():
+            return None
+        for envelope in reversed(gm.read_envelopes(inbox)):
+            payload = envelope.get("payload")
+            if (
+                envelope.get("type") == "user_need"
+                and isinstance(payload, dict)
+                and payload.get("nudge_kind") == nudge_kind
+            ):
+                return envelope
+    except Exception:
+        return None
+    return None
+
+
+def _resume_nudge_top(payload: dict[str, Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    top = str(payload.get("top_id") or "").strip()
+    if top:
+        return top
+    frontier = payload.get("frontier_ids") or []
+    if isinstance(frontier, LIST_TYPE) and frontier:
+        return str(frontier[0] or "").strip()
+    return ""
+
+
+def _announced_done_task_ids(payload: dict[str, Any] | None) -> set[str]:
+    if not isinstance(payload, dict):
+        return set()
+    recorded = payload.get("announced_task_ids")
+    if not isinstance(recorded, LIST_TYPE):
+        recorded = payload.get("task_ids") or []
+    if not isinstance(recorded, LIST_TYPE):
+        return set()
+    return {str(item) for item in recorded if str(item).strip()}
+
+
 def _post_task_store_nudge(
     *,
     project_root: Path,
@@ -4231,7 +4277,7 @@ def _post_next_nudge(rows: list[dict[str, Any]], project_root: Path) -> None:
         project_root=project_root,
         nudge_kind=NEXT_NUDGE_KIND,
         dedup_suffix=",".join(ids),
-        text=f"you've got mail: {len(ids)} parallel-ready ({', '.join(ids)}) -> fan out?",
+        text=f"{len(ids)} parallel-ready ({', '.join(ids)})",
         payload={"frontier_ids": ids},
         transport="next-frontier",
     )
@@ -4248,12 +4294,23 @@ def post_done_suggest_nudge(task_ids: list[str], project_root: str | Path, dispa
     ids = sorted(_dedupe_strs(task_ids))
     if not ids or not dispatch_id:
         return
+    root = Path(project_root)
+    existing = _current_task_store_nudge(root, DONE_SUGGEST_NUDGE_KIND)
+    announced = _announced_done_task_ids(existing.get("payload") if existing else None)
+    fresh = [item_id for item_id in ids if item_id not in announced]
+    if not fresh:
+        return
+    announced.update(ids)
     _post_task_store_nudge(
-        project_root=Path(project_root),
+        project_root=root,
         nudge_kind=DONE_SUGGEST_NUDGE_KIND,
-        dedup_suffix=f"{dispatch_id}:" + ",".join(ids),
-        text=f"worker says done: {', '.join(ids)} -> review + accept?",
-        payload={"task_ids": ids, "worker_dispatch_id": dispatch_id},
+        dedup_suffix=",".join(sorted(announced)),
+        text=f"worker says done: {', '.join(fresh)}",
+        payload={
+            "task_ids": ids,
+            "worker_dispatch_id": dispatch_id,
+            "announced_task_ids": sorted(announced),
+        },
         transport="done-suggest",
     )
 
@@ -4265,11 +4322,18 @@ def post_resume_nudge(project_root: str | Path) -> None:
         return
     ids = [str(row["id"]) for row in rows]
     top = ids[0]
+    # Standing ready-state is level-triggered. Re-post only when the frontier
+    # item (what `next` would continue) changes. A bare ready-count delta is
+    # not news: harvest/capture moves the count while the same top sits there,
+    # which is what turned one condition into five drain lines.
+    existing = _current_task_store_nudge(store.project_root, RESUME_NUDGE_KIND)
+    if existing is not None and _resume_nudge_top(existing.get("payload")) == top:
+        return
     _post_task_store_nudge(
         project_root=store.project_root,
         nudge_kind=RESUME_NUDGE_KIND,
-        dedup_suffix=",".join(ids),
-        text=f"{len(ids)} tasks ready (top: {top}) -> continue?",
+        dedup_suffix=top,
+        text=f"{len(ids)} tasks ready (top: {top})",
         payload={"frontier_ids": ids, "top_id": top},
         transport="resume-frontier",
     )

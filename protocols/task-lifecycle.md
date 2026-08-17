@@ -81,12 +81,13 @@ single-current coalescing by nudge kind, and fail-open lazy imports; set
 `GOALFLIGHT_DISABLE_NUDGES=1` to suppress them.
 
 - `next` parallel-nudge: when multiple frontier tasks are ready, post
-  `N parallel-ready (...) -> fan out?`.
+  `N parallel-ready (...)`.
 - done-suggest: when the watcher records a terminal successful dispatch
   breadcrumb for linked `task_ids`, post
-  `worker says done: <ids> -> review + accept?`.
+  `worker says done: <ids>` once per newly finished task.
 - resume-nudge: on human `session-status --text`, when the ready frontier is
-  non-empty, post `N tasks ready (top: <id>) -> continue?`. The default JSON
+  non-empty, post `N tasks ready (top: <id>)` once when that top becomes
+  current. Count drift under the same top is not a new event. The default JSON
   path and explicit `--json` stay side-effect-free.
 
 Consumption path: the controller's habitual `goalflight_status.py` read-side

@@ -81,6 +81,9 @@ def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
     return env
 
 
@@ -226,7 +229,8 @@ def test_parallel_nudge_posts_once_for_same_frontier() -> None:
         assert_eq("frontier ids sorted", payload["frontier_ids"], ["t-001", "t-002"])
         assert_eq("project root carried", payload["project_root"], str(project.resolve()))
         assert_true("project-scoped dispatch id", envelopes[0]["dispatch_id"].startswith("task-store:"))
-        assert_true("nudge text asks fan out", "2 parallel-ready (t-001, t-002) -> fan out?" in payload["text"])
+        assert_true("nudge text states the parallel frontier", "2 parallel-ready (t-001, t-002)" in payload["text"])
+        assert_true("parallel-ready text has no interrogative", "?" not in payload["text"])
 
 
 def test_parallel_nudge_coalesces_changed_frontier_to_single_current() -> None:
@@ -248,7 +252,8 @@ def test_parallel_nudge_coalesces_changed_frontier_to_single_current() -> None:
         envelopes = M.read_envelopes(inbox)
         assert_eq("changed frontier remains one current nudge", len(envelopes), 1)
         assert_eq("current frontier ids replace stale ids", envelopes[0]["payload"]["frontier_ids"], ["t-001", "t-002", "t-003"])
-        assert_true("current nudge text updated", "3 parallel-ready (t-001, t-002, t-003) -> fan out?" in envelopes[0]["payload"]["text"])
+        assert_true("current nudge text updated", "3 parallel-ready (t-001, t-002, t-003)" in envelopes[0]["payload"]["text"])
+        assert_true("updated parallel-ready text has no interrogative", "?" not in envelopes[0]["payload"]["text"])
 
 
 def test_parallel_nudge_preserves_unrelated_inbox_envelopes_when_coalescing() -> None:
