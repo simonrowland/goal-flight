@@ -1580,11 +1580,27 @@ def _milestone_nudge_line(status: dict) -> str | None:
     )
 
 
-def _parse_wait_ids(values: list[str] | None) -> list[str]:
+def _parse_wait_ids(values: object) -> list[str]:
+    # --wait is nargs='+' + append, so values is list[list[str]] from the
+    # parser. Tests and helpers may still pass a flat list[str]. Dispatch ids
+    # cannot contain spaces or commas, so flattening then comma-splitting is
+    # unambiguous: `--wait a b`, `--wait a,b`, and `--wait a --wait b` agree.
+    tokens: list[str] = []
+    if values is None:
+        raw_values: list[object] = []
+    elif isinstance(values, (str, bytes)):
+        raw_values = [values]
+    else:
+        raw_values = list(values)
+    for raw in raw_values:
+        if isinstance(raw, (list, tuple)):
+            tokens.extend(str(part) for part in raw)
+        elif raw is not None:
+            tokens.append(str(raw))
     ids: list[str] = []
     seen: set[str] = set()
-    for raw in values or []:
-        for part in str(raw).split(","):
+    for raw in tokens:
+        for part in raw.split(","):
             dispatch_id = part.strip()
             if dispatch_id and dispatch_id not in seen:
                 ids.append(dispatch_id)
@@ -2601,13 +2617,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--wait",
-        metavar="IDS",
+        metavar="ID",
+        nargs="+",
         action="append",
         help=(
             "unclaimed fixed-set join (does not claim/renew): block until all "
-            "comma-separated/repeated ids are terminal; new waking mail on any "
-            "waited ID exits 3. For claimed controllers use the messages "
-            "listen -> relay -> advance doorbell loop"
+            "ids are terminal. Accepts space-separated (`--wait a b`), "
+            "comma-separated (`--wait a,b`), or repeated (`--wait a --wait b`); "
+            "new waking mail on any waited ID exits 3. For claimed controllers "
+            "use the messages listen -> relay -> advance doorbell loop"
         ),
     )
     parser.add_argument(

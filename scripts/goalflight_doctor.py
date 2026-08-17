@@ -3109,7 +3109,60 @@ def status_line(ok: bool | None, label: str, detail: str | None = None) -> str:
     return f"{prefix} {label}" + (f" — {detail}" if detail else "")
 
 
+_STATUS_LINE_RE = re.compile(r"^\[(OK|WARN|INFO)\] (.*)$")
+_HUMAN_LINE_CAP = 80
+
+
+def parse_status_line(line: str) -> dict:
+    match = _STATUS_LINE_RE.match(line)
+    if match is None:
+        raise ValueError(f"unparseable doctor status line: {line!r}")
+    level = {"OK": "ok", "WARN": "warn", "INFO": "info"}[match.group(1)]
+    rest = match.group(2)
+    if " — " in rest:
+        probe, detail = rest.split(" — ", 1)
+    else:
+        probe, detail = rest, ""
+    return {
+        "probe": probe,
+        "level": level,
+        "detail": detail,
+        "fix": "",
+    }
+
+
+def verdict_from_lines(lines: list[str]) -> dict:
+    warnings: list[dict] = []
+    info: list[dict] = []
+    for line in lines:
+        entry = parse_status_line(line)
+        rec = {
+            "probe": entry["probe"],
+            "level": entry["level"],
+            "detail": entry["detail"],
+            "fix": entry["fix"],
+        }
+        if rec["level"] == "warn":
+            warnings.append(rec)
+        elif rec["level"] == "info":
+            info.append(rec)
+    return {
+        "verdict": "warn" if warnings else "ok",
+        "warnings": warnings,
+        "info": info,
+    }
+
+
+def verdict_summary(payload: dict) -> dict:
+    return verdict_from_lines(collect_human_lines(payload))
+
+
 def print_human(payload: dict) -> None:
+    for line in collect_human_lines(payload):
+        print(line)
+
+
+def collect_human_lines(payload: dict) -> list[str]:
     plugin = payload["plugin"]
     lines = [
         status_line(
@@ -3415,8 +3468,7 @@ def print_human(payload: dict) -> None:
         records = rp.get("records_examined", 0)
         lines.append(status_line(True, "rate-pressure", f"no provider under pressure ({records} records examined)"))
 
-    for line in lines[:80]:
-        print(line)
+    return lines[:_HUMAN_LINE_CAP]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3478,6 +3530,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.fleet_reconcile_stale:
         payload["fleet_reconcile"] = _fleet_reconcile_summary(release_stale=True)
     if args.json:
+        payload.update(verdict_summary(payload))
         print(json.dumps(payload, sort_keys=True))
     else:
         print_human(payload)

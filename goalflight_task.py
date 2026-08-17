@@ -3821,6 +3821,13 @@ def _cmd_done(store: TaskStore, args: argparse.Namespace) -> int:
             raise TaskError(f"{args.item_id}: already done")
         if item.get("blocked_by") and not args.force:
             raise TaskError(f"{args.item_id}: blocked_by is non-empty; use --force to close anyway")
+        note_text = str(getattr(args, "note", "") or "").strip()
+        if note_text:
+            notes = item.setdefault("notes", [])
+            if not isinstance(notes, LIST_TYPE):
+                raise TaskError(f"item {args.item_id}: notes must be an array")
+            notes.append({"at": utc_now(), "actor": actor, "text": note_text})
+            _append_audit(item, "append", actor)
         item["done"] = True
         item["done_at"] = utc_now()
         item["done_by"] = actor
@@ -4709,6 +4716,10 @@ def build_parser() -> argparse.ArgumentParser:
     done.add_argument("--by", help=argparse.SUPPRESS)
     done.add_argument("item_id")
     done.add_argument("--resolution", default="done")
+    done.add_argument(
+        "--note",
+        help="Optional closing note; appended before the item is marked done.",
+    )
     done.add_argument("--force", action="store_true")
     done.set_defaults(func=_cmd_done)
 

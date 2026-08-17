@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
+import io
+import json
 import os
 from pathlib import Path
 import sys
@@ -263,6 +265,164 @@ def case_doctor_pty_shim_health_ok_when_no_orphans() -> None:
     assert payload["warnings"] == []
 
 
+def _minimal_human_payload(**overrides: object) -> dict:
+    payload = {
+        "plugin": {
+            "skipped": False,
+            "manifest_exists": True,
+            "manifest": "ok",
+            "validate_ok": True,
+            "validate_first_line": "ok",
+        },
+        "claude": {"present": True, "version": "1.0"},
+        "codex": {
+            "cli": {"present": True, "version": "1.0"},
+            "desktop_without_cli": False,
+            "install_hint": None,
+        },
+        "context_mode": {"register_script_exists": True, "check_returncode": 0},
+        "cursor_context_mode": {
+            "global_check_returncode": 0,
+            "global_path": "/tmp/cursor-global",
+            "npx_present": True,
+            "project_check_returncode": 0,
+            "project_path": "/tmp/cursor-project",
+        },
+        "opencode_context_mode": {
+            "global_check_returncode": 0,
+            "global_path": "/tmp/oc-global",
+            "npx_present": True,
+            "project_check_returncode": 0,
+            "project_path": "/tmp/oc-project",
+        },
+        "gstack": {"present": True, "version": "1.0", "detail": None, "level": None},
+        "gstack_browser": {"present": True, "detail": "ok"},
+        "agent_traits": {"ok": True, "detail": "ok"},
+        "autoreview": {"present": True, "version": "1.0"},
+        "cursor": {
+            "desktop_present": True,
+            "agent": {"present": True, "version": "1.0"},
+            "models": {
+                "user_behind": False,
+                "current_user_model": "x",
+                "leading_internal": "x",
+            },
+        },
+        "opencode": {"present": True, "version": "1.0"},
+        "grok": {"present": True, "version": "1.0", "headless_flags": True},
+        "claude_acp_stopgap": {"ok": True, "detail": "ok"},
+        "worker_write_probe": {
+            "ok": True,
+            "agent": "grok-code",
+            "kind": "write-file",
+            "detail": "ok",
+        },
+        "pty_shim_health": {"warnings": []},
+        "wsl_filesystems": {},
+        "host_goalflight_install": {},
+        "installed_skill_drift": {"entries": []},
+        "acp": {},
+        "capacity": {"operating_cap": 4, "raw_ram_ceiling": 8, "ram_mb": 8192},
+        "project": {"present": True, "branch": "main", "head": "abc", "dirty": False},
+        "worktrees": {"ok": True, "count": 0, "stale": [], "blocking_paths": []},
+        "project_goalflight_readiness": {
+            "init_done": True,
+            "env_caveats": "ok",
+            "repo_skill": {"exists": True, "path": "SKILL.md"},
+            "routing": {
+                "has_goalflight_block": True,
+                "path": "AGENTS.md",
+                "pins_newest_resume_notes": True,
+            },
+            "state_layout": {
+                "ok": True,
+                "missing_files": [],
+                "missing_dirs": [],
+                "view_schema_skew": [],
+                "view_customizations": [],
+            },
+            "skill_root": {"exists": True, "path": "/tmp/skill", "source": "repo"},
+            "commands": {"test": "./tests/run.sh", "lint": None, "build": None},
+            "resume_notes": ["docs-private/RESUME-NOTES-2026-08-17.md"],
+        },
+        "router": {"ok": True, "recommended_entrypoint": "status"},
+        "worker_currency": {},
+        "rate_pressure": {"providers_under_pressure": [], "records_examined": 64},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _text_entries(payload: dict, level: str) -> list[tuple[str, str]]:
+    prefix = {"warn": "[WARN]", "info": "[INFO]", "ok": "[OK]"}[level]
+    out: list[tuple[str, str]] = []
+    for line in goalflight_doctor.collect_human_lines(payload):
+        if not line.startswith(prefix):
+            continue
+        parsed = goalflight_doctor.parse_status_line(line)
+        out.append((parsed["probe"], parsed["detail"]))
+    return out
+
+
+def case_doctor_json_verdict_matches_text_warnings_and_info() -> None:
+    payload = _minimal_human_payload(
+        worker_currency={
+            "claude": {"behind": True, "current": "2.1.220", "latest": "2.1.233"},
+        },
+        grok={"present": True, "version": "1.0", "headless_flags": None},
+    )
+    summary = goalflight_doctor.verdict_summary(payload)
+    text_warns = _text_entries(payload, "warn")
+    text_infos = _text_entries(payload, "info")
+    json_warns = [(row["probe"], row["detail"]) for row in summary["warnings"]]
+    json_infos = [(row["probe"], row["detail"]) for row in summary["info"]]
+    assert text_warns == json_warns
+    assert text_infos == json_infos
+    for line in goalflight_doctor.collect_human_lines(payload):
+        parsed = goalflight_doctor.parse_status_line(line)
+        prefix = {"ok": "[OK]", "warn": "[WARN]", "info": "[INFO]"}[parsed["level"]]
+        remainder = parsed["detail"]
+        if parsed["fix"]:
+            remainder = f"{remainder} {parsed['fix']}".strip() if remainder else parsed["fix"]
+        rebuilt = f"{prefix} {parsed['probe']}" + (f" — {remainder}" if remainder else "")
+        assert rebuilt == line
+    assert summary["verdict"] == "warn"
+    assert any(probe == "worker CLI currency" for probe, _detail in json_warns)
+    for row in summary["warnings"]:
+        assert set(row) == {"probe", "level", "detail", "fix"}
+        assert row["level"] == "warn"
+    for row in summary["info"]:
+        assert set(row) == {"probe", "level", "detail", "fix"}
+        assert row["level"] == "info"
+
+
+def case_doctor_json_verdict_ok_when_text_has_no_warns() -> None:
+    payload = _minimal_human_payload()
+    summary = goalflight_doctor.verdict_summary(payload)
+    assert _text_entries(payload, "warn") == []
+    assert summary["warnings"] == []
+    assert summary["verdict"] == "ok"
+
+
+def case_doctor_json_cli_attaches_verdict_alongside_probes() -> None:
+    payload = _minimal_human_payload(
+        worker_currency={
+            "claude": {"behind": True, "current": "2.1.220", "latest": "2.1.233"},
+        },
+    )
+    buf = io.StringIO()
+    with patch.object(goalflight_doctor, "doctor", return_value=payload), redirect_stdout(buf):
+        rc = goalflight_doctor.main(["--json", "--project-root", str(ROOT)])
+    assert rc == 0
+    data = json.loads(buf.getvalue())
+    assert data["verdict"] == "warn"
+    assert data["plugin"]["manifest"] == "ok"
+    text_warns = _text_entries(payload, "warn")
+    json_warns = [(row["probe"], row["detail"]) for row in data["warnings"]]
+    assert text_warns == json_warns
+    assert "info" in data
+
+
 def case_claude_acp_reports_pinned_build_when_orig_differs() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-doctor-claude-acp-") as tmp:
         binary = Path(tmp) / "claude-code-cli-acp"
@@ -293,6 +453,9 @@ def main() -> None:
     case_doctor_pty_shim_health_all_foreign_says_reaper_wont_act()
     case_doctor_pty_shim_health_ok_when_no_orphans()
     case_claude_acp_reports_pinned_build_when_orig_differs()
+    case_doctor_json_verdict_matches_text_warnings_and_info()
+    case_doctor_json_verdict_ok_when_text_has_no_warns()
+    case_doctor_json_cli_attaches_verdict_alongside_probes()
     print("OK: doctor tests pass")
 
 

@@ -759,6 +759,59 @@ def _wait_payload(dispatch_id: str, classification: str, *, terminal_state: str 
     }
 
 
+def test_parse_wait_ids_accepts_space_comma_and_repeated() -> None:
+    check(
+        "comma-separated --wait still splits",
+        S._parse_wait_ids(["a,b"]) == ["a", "b"],
+    )
+    check(
+        "space-separated nargs list flattens",
+        S._parse_wait_ids([["a", "b"]]) == ["a", "b"],
+    )
+    check(
+        "repeated --wait flags flatten",
+        S._parse_wait_ids([["a"], ["b"]]) == ["a", "b"],
+    )
+    check(
+        "mixed comma and space dedupes",
+        S._parse_wait_ids([["a,b", "c"], ["a"]]) == ["a", "b", "c"],
+    )
+    check(
+        "flat list of strings still works",
+        S._parse_wait_ids(["done1,dead1"]) == ["done1", "dead1"],
+    )
+
+
+def test_wait_cli_accepts_space_separated_ids() -> None:
+    orig_wait, orig_root = S.wait_for_dispatches, S.this_project_root
+    seen: dict = {}
+
+    def fake_wait(wait_ids, **_kwargs):
+        seen["wait_ids"] = list(wait_ids)
+        return 0
+
+    try:
+        S.wait_for_dispatches = fake_wait
+        S.this_project_root = lambda: "/repo/A"
+        rc = S.main(["--wait", "alpha", "bravo"])
+        check("space-separated --wait exits via waiter", rc == 0)
+        check("space-separated --wait ids", seen.get("wait_ids") == ["alpha", "bravo"])
+
+        rc = S.main(["--wait", "alpha,bravo"])
+        check("comma-separated --wait still accepted", rc == 0)
+        check("comma-separated --wait ids", seen.get("wait_ids") == ["alpha", "bravo"])
+
+        rc = S.main(["--wait", "alpha", "--wait", "bravo"])
+        check("repeated --wait still accepted", rc == 0)
+        check("repeated --wait ids", seen.get("wait_ids") == ["alpha", "bravo"])
+
+        rc = S.main(["--wait", "alpha,bravo", "charlie"])
+        check("mixed comma and space --wait accepted", rc == 0)
+        check("mixed comma and space --wait ids", seen.get("wait_ids") == ["alpha", "bravo", "charlie"])
+    finally:
+        S.wait_for_dispatches, S.this_project_root = orig_wait, orig_root
+
+
 def test_wait_default_timeout() -> None:
     orig_wait, orig_root = S.wait_for_dispatches, S.this_project_root
     seen: dict = {}
@@ -1102,6 +1155,8 @@ def main() -> int:
     test_drain_process_running_matches_only_real_invocation()
     test_cli()
     test_wait_cli()
+    test_parse_wait_ids_accepts_space_comma_and_repeated()
+    test_wait_cli_accepts_space_separated_ids()
     test_wait_default_timeout()
     test_wait_help_distinguishes_unclaimed_join_from_claimed_doorbell()
     test_wait_unbounded_sentinels_and_positive_timeout()
