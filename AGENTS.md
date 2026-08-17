@@ -60,6 +60,36 @@
   Canonical sequence: `SKILL.md` §State → `commands/resume.md` →
   `protocols/state-handoff.md`.
 
+## Living state — read the newest docs-private/RESUME-NOTES-*.md first
+
+Durable project state lives at fixed paths under `docs-private/` (convention over
+configuration). At session start read the newest `RESUME-NOTES-*.md` (current
+goals, next action, key pins), then re-ground in the docs it points to. Update the
+relevant living doc when its subject changes — don't leave it only in chat.
+Find newest: `ls -1 docs-private/RESUME-NOTES-*.md | sort | tail -1`.
+
+Canonical name: `RESUME-NOTES-<YYYY-MM-DD>[-rev<N>].md` — ISO date so a
+lexicographic sort is chronological, and no topic prefix (the topic goes inside
+the file). Historical exceptions are left in place; new files follow the form.
+
+`docs-private/` is gitignored, so git status and git diff are structurally blind
+to it. Verify anything written there on the filesystem (`test -f`, `ls`), never
+via git.
+
+## Project commands (this repo)
+
+- test: `./tests/run.sh`
+
+The repo-wide gate. Run it under env isolation so a test run cannot touch live
+state — point `GOALFLIGHT_JOURNAL_DIR`, `GOALFLIGHT_STATE_DIR`,
+`GOALFLIGHT_WAKE_LEDGER`, `GOALFLIGHT_MESSAGES_DIR`, `GOALFLIGHT_TASK_STORE` and
+`GOALFLIGHT_PIDFILE_DIR` at a temp root and set
+`GOALFLIGHT_CAPACITY_CONF=/dev/null`.
+
+Never run the gate while a dispatched worker holds the tree: concurrent edits
+produce phantom failures that belong to neither change. Workers run only their
+own test files; the controller runs the full gate once after the fold.
+
 ## Git workflow (this repo)
 
 - **Commit as work completes** — one logical chunk at a time after focused tests
