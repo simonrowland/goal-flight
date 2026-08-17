@@ -126,7 +126,7 @@ def test_reminder_gates_on_exposure_and_reports_missing_identity(
 def test_controller_mail_exit_code_actions_and_skill_pool_instruction() -> None:
     doctrine = (ROOT / "protocols" / "controller-mail.md").read_text(encoding="utf-8")
     expected_rows = (
-        ("| 0 | Ring:", "restore pool depth"),
+        ("| 0 | Ring:", "remaining-depth"),
         ("| 1 | Timeout:", "clean timer expiry"),
         ("| 2 | Infrastructure or corruption", "avoid a restart loop"),
         ("| 3 | Contention, supersession", "Reconcile the active lease"),

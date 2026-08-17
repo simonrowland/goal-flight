@@ -4065,25 +4065,60 @@ def cmd_listen(args) -> int:
     detached_grace = _listener_startup_grace_s()
     rearm_command = _exact_listener_command()
 
+    def rearm_plan_after_release() -> dict[str, object] | None:
+        try:
+            status = goalflight_wake.coverage_status(
+                project_root, controller_label=label
+            )
+            live = status.get("live_waiters")
+            target = int(
+                status.get("target_waiters") or goalflight_wake.listener_slot_count()
+            )
+            return goalflight_wake.listener_depth_plan(
+                live if isinstance(live, int) else 0,
+                target,
+                rearm_command,
+                work_in_flight=authority.care_work_exists(label),
+            )
+        except Exception:
+            return None
+
+    def emit_payload(payload: dict[str, object], *, detail: str | None = None) -> None:
+        plan = rearm_plan_after_release()
+        if plan and plan.get("hint"):
+            payload["rearm"] = {
+                "live": plan["live"],
+                "target": plan["target"],
+                "missing": plan["missing"],
+                "work_in_flight": plan["work_in_flight"],
+                "commands": plan["commands"],
+                "hint": plan["hint"],
+            }
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            if detail:
+                print(f"listen: {payload.get('reason')}: {detail}", file=sys.stderr)
+            hint = str((plan or {}).get("hint") or "")
+            if hint:
+                print(hint, file=sys.stderr)
+
     def finish(reason: str, *, code: int, detail: str | None = None) -> int:
+        payload = {
+            "kind": "exit",
+            "reason": reason,
+            "coverage_id": coverage_id,
+            "detail": detail,
+        }
         try:
             exited = authority.exit_listener(coverage_id, reason=reason)
             if not exited.committed:
-                detail = detail or exited.reason or "coverage exit CAS lost"
-            payload = {
-                "kind": "exit",
-                "reason": reason,
-                "coverage_id": coverage_id,
-                "detail": detail,
-            }
-            if args.json:
-                print(json.dumps(payload, sort_keys=True))
-            elif detail:
-                print(f"listen: {reason}: {detail}", file=sys.stderr)
-            return code
+                payload["detail"] = detail or exited.reason or "coverage exit CAS lost"
         finally:
             if waiter is not None:
                 waiter.close()
+        emit_payload(payload, detail=None if args.json else payload.get("detail"))
+        return code
 
     def finish_detached() -> int:
         # Best-effort journal audit must never turn the refusal into multiple
@@ -4275,14 +4310,13 @@ def cmd_listen(args) -> int:
                 "cursor_version": snapshot.cursor_version,
                 "advance_command": advance_command,
             }
-            if args.json:
-                print(json.dumps(payload, sort_keys=True))
-            else:
+            waiter.close()
+            if not args.json:
                 print(
                     "mail available; peek: goalflight_messages.py relay --new; "
                     f"advance after processing: {advance_command}"
                 )
-            waiter.close()
+            emit_payload(payload)
             return 0
         sleep_until = time.monotonic() + poll
         while time.monotonic() < sleep_until:

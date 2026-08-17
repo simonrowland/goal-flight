@@ -547,6 +547,84 @@ def listener_reserve_hint(
     return f"{header}\n{extra}"
 
 
+# One shell `&` loop is one harness task. The N doorbells it forks are
+# invisible, so their exits wake nobody. The post-exit / lease-claim
+# hint must be impossible to satisfy that way.
+SEPARATE_TRACKED_ARM_RULE = (
+    "issue each as its own tracked background task; "
+    "a shell `&` loop is one untracked call and those wakes reach nobody"
+)
+
+
+def listener_depth_plan(
+    live_waiters: int | None,
+    target_waiters: int,
+    command: str,
+    *,
+    work_in_flight: bool,
+) -> dict[str, object]:
+    """Remaining-depth plan after a listen exit or a lease claim.
+
+    Entry nagging stays in ``listener_reserve_hint`` (silent above
+    low-water). This plan always speaks when work is in flight and the
+    pool is short, because that is the moment a forgotten re-arm leaves
+    the controller deaf.
+    """
+    target = int(target_waiters)
+    live = 0 if live_waiters is None else int(live_waiters)
+    missing = max(0, target - live)
+    commands = [command] * missing if work_in_flight and missing else []
+    return {
+        "live": live,
+        "target": target,
+        "missing": missing,
+        "work_in_flight": bool(work_in_flight),
+        "commands": commands,
+        "hint": listener_floor_hint(
+            live,
+            target,
+            command,
+            work_in_flight=work_in_flight,
+        ),
+        "separate_tracked_tasks": True,
+    }
+
+
+def listener_floor_hint(
+    live_waiters: int,
+    target_waiters: int,
+    command: str,
+    *,
+    work_in_flight: bool,
+) -> str:
+    """Exact remaining-depth commands after a listen exit or lease claim.
+
+    Numbered lines so the correct response is N separate tracked calls,
+    not one detached loop. Empty when there is no in-flight work or the
+    pool is already at target.
+    """
+    if not work_in_flight:
+        return ""
+    live = int(live_waiters)
+    target = int(target_waiters)
+    missing = max(0, target - live)
+    if missing == 0:
+        return ""
+    if live == 0:
+        header = (
+            f"listener floor: work in flight and live=0/{target} — "
+            f"{missing} slots missing; {SEPARATE_TRACKED_ARM_RULE}:"
+        )
+    else:
+        slot_word = "slot" if missing == 1 else "slots"
+        header = (
+            f"listener pool n={live}/{target} — {missing} {slot_word} missing; "
+            f"{SEPARATE_TRACKED_ARM_RULE}:"
+        )
+    numbered = "\n".join(f"{index}. {command}" for index in range(1, missing + 1))
+    return f"{header}\n{numbered}"
+
+
 def listener_low_water(target: int | None = None) -> int:
     """Depth at or below which the pool is 'running low' and worth a hint.
 

@@ -2161,22 +2161,27 @@ class Journal:
                 """
                 SELECT COALESCE(MAX(stream_seq), 0) + 1
                 FROM delivery_events
-                WHERE project_root = ? AND recipient_label = '*' AND stream_id = 'attention'
+                WHERE project_root = ? AND recipient_label = ? AND stream_id = 'attention'
                 """,
-                (project_root,),
+                (project_root, label),
             ).fetchone()[0]
         )
+        # Address the source controller and keep the doorbell quiet. A
+        # waking `*` broadcast would pop a sibling's live slot; care
+        # already ignores this event type, and operator surfaces read
+        # attention_items rather than this wake class.
         connection.execute(
             """
             INSERT INTO delivery_events (
                 project_root, recipient_label, origin_node, event_uuid,
                 stream_id, stream_seq, carrier_path, event_type,
                 wake_class, created_at, projected_at
-            ) VALUES (?, '*', 'journal', ?, 'attention', ?, ?,
-                      'controller_attention', 'waking', ?, ?)
+            ) VALUES (?, ?, 'journal', ?, 'attention', ?, ?,
+                      'controller_attention', 'quiet', ?, ?)
             """,
             (
                 project_root,
+                label,
                 item_id,
                 next_seq,
                 f"journal:attention:{item_id}",
@@ -2187,10 +2192,21 @@ class Journal:
         cls._invalidate_delivery_cursor_snapshots(
             connection,
             project_root=project_root,
-            recipient_label="*",
+            recipient_label=label,
             updated_at=now,
         )
         return payload
+
+    def care_work_exists(self, label: str) -> bool:
+        """True when this project still has live attempts or unread waking mail."""
+        resolved_label = self._identity_token(label, label="controller label")
+        with contextlib.closing(self._connect()) as connection:
+            self._assert_epoch_fence(connection, for_write=False)
+            return self._care_work_exists(
+                connection,
+                project_root=str(self.project_root),
+                label=resolved_label,
+            )
 
     def active_lease(self, label: str) -> LeaseIdentity | None:
         resolved_label = self._identity_token(label, label="controller label")
@@ -4051,7 +4067,7 @@ class Journal:
                     stream_id, stream_seq, carrier_path, event_type,
                     wake_class, created_at, projected_at
                 ) VALUES (?, '*', 'journal', ?, 'attention', ?, ?,
-                          'controller_attention', 'waking', ?, ?)
+                          'controller_attention', 'quiet', ?, ?)
                 """,
                 (
                     str(self.project_root),

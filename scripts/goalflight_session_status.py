@@ -856,6 +856,33 @@ def live_session(
     }
 
 
+def _listener_depth_after_claim(
+    project_root: Path,
+    label: str,
+) -> dict[str, object] | None:
+    """Fail-open remaining-depth plan so a claim never blocks on the wake plane."""
+    try:
+        status = goalflight_wake.coverage_status(
+            project_root, controller_label=label
+        )
+        live = status.get("live_waiters")
+        target = int(
+            status.get("target_waiters") or goalflight_wake.listener_slot_count()
+        )
+        authority = goalflight_journal.Journal.open_reader(project_root)
+        command = goalflight_wake.listener_start_command(
+            project_root, controller_label=label
+        )
+        return goalflight_wake.listener_depth_plan(
+            live if isinstance(live, int) else 0,
+            target,
+            command,
+            work_in_flight=authority.care_work_exists(label),
+        )
+    except Exception:
+        return None
+
+
 def claim_controller_startup(
     project_root: Path,
     *,
@@ -944,6 +971,9 @@ def claim_controller_startup(
     result = {"claimed": True, "session": record}
     if resolution.get("warning"):
         result["warnings"] = [resolution["warning"]]
+    depth = _listener_depth_after_claim(project_root, resolved_label)
+    if depth is not None:
+        result["listener_depth"] = depth
     return result
 
 
@@ -2408,6 +2438,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         if result.get("claimed"):
             _index_controller_project(project_root)
+            hint = ""
+            depth = result.get("listener_depth")
+            if isinstance(depth, dict):
+                hint = str(depth.get("hint") or "")
+            if hint:
+                print(hint, file=sys.stderr)
         print(json.dumps(result))
         return 0
 

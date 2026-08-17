@@ -2314,17 +2314,20 @@ def test_second_real_doorbell_loses_generation_lock_and_first_wakes_body_free(
         doorbell = json.loads(first_stdout)
         assert doorbell["reason"] == "event"
         # "kind" is the jsonl discriminator added with --report-pending's
-        # multi-object output; it is a scalar tag, not a payload, so the
-        # body-free contract admits it — and nothing else.
+        # multi-object output. "rearm" is the remaining-depth floor plan
+        # after the slot is consumed; it is not a mail body.
         assert doorbell["kind"] == "ring"
         assert set(doorbell) == {
             "advance_command",
             "coverage_id",
             "cursor_version",
             "kind",
+            "rearm",
             "reason",
             "registry_generation",
         }
+        assert doorbell["rearm"]["work_in_flight"] is True
+        assert doorbell["rearm"]["missing"] >= 1
     finally:
         for process in (first, second):
             if process is not None and process.poll() is None:

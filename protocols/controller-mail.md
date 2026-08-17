@@ -120,10 +120,14 @@ python3 <skill-root>/scripts/goalflight_messages.py advance \
 
 The tidy steady-state loop is:
 
-1. Keep four tracked `--report-pending` listeners armed.
+1. Keep four tracked `--report-pending` listeners armed — four separate
+   tracked background calls, never a shell `&` loop (one harness task
+   cannot own four doorbells).
 2. One rings; use `relay --drain` when its headlines settle every item, or peek,
    process bodies, and advance explicitly.
-3. Re-arm one tracked listener to restore pool depth four.
+3. Re-arm toward target: the listen exit (and a lease claim while work is
+   in flight) prints the exact remaining-depth commands, numbered, one
+   per missing slot. Issue each as its own tracked background task.
 
 Never advance before processing is settled. If all slots are occupied, startup
 reports their exact PIDs and says not to kill by pattern. If all listeners have rung
@@ -138,7 +142,7 @@ Supervisors must branch on the listener's exit code instead of blindly restartin
 
 | Code | Meaning | Supervisor action |
 |---:|---|---|
-| 0 | Ring: waking mail won the cursor-version claim. | Process the reported or authoritative mail, advance only settled positions, then re-arm one tracked listener to restore pool depth. |
+| 0 | Ring: waking mail won the cursor-version claim. | Process the reported or authoritative mail, advance only settled positions, then issue each printed remaining-depth command as its own tracked background task. |
 | 1 | Timeout: no waking event arrived before the requested deadline. | Treat it as a clean timer expiry; re-arm only when ongoing coverage is still required. |
 | 2 | Infrastructure or corruption failure. | Preserve the one-line diagnostic, repair or escalate the journal/wake substrate, and avoid a restart loop until the fault is cleared. |
 | 3 | Contention, supersession, orphaning, or stale lease. | Reconcile the active lease and held slot PIDs; do not kill by pattern, and re-arm only under the current lease. |
