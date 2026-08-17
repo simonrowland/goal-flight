@@ -2755,16 +2755,27 @@ def _build_constructed_repo_lens_fleet(
     return fleet, elapsed
 
 
+def _repo_band_key(project: dict) -> str:
+    """Renderer grouping key: one GitHub identity is one band; unknown is path-id."""
+    identity = project.get("repo_identity")
+    if isinstance(identity, str) and identity:
+        return f"repo|{identity}"
+    return f"unlinked|{project['project_id']}"
+
+
 def test_fast_plane_carries_cached_repo_identity_without_guessing_mutation_pair() -> None:
     """Registry cache is the only identity source; missing stays unknown."""
     with tempfile.TemporaryDirectory() as td:
         temp_root = Path(td)
         clone_a = (temp_root / "battery-tool-v2").resolve()
         clone_b = (temp_root / "bt-verify").resolve()
-        solo = (temp_root / "scratch").resolve()
-        for root in (clone_a, clone_b, solo):
-            root.mkdir()
+        unlinked_a = (temp_root / "left" / "scratch").resolve()
+        unlinked_b = (temp_root / "right" / "scratch").resolve()
+        kiln = (temp_root / "kiln").resolve()
+        for root in (clone_a, clone_b, unlinked_a, unlinked_b, kiln):
+            root.mkdir(parents=True)
         shared = "github.com/timdrpp/battery-tool-v2"
+        kiln_identity = "github.com/simonrowland/kiln"
         registry = [
             {
                 "project_root": str(clone_a),
@@ -2779,52 +2790,87 @@ def test_fast_plane_carries_cached_repo_identity_without_guessing_mutation_pair(
                 "repo_identity": shared,
             },
             {
-                "project_root": str(solo),
+                "project_root": str(unlinked_a),
                 "last_seen": "2030-01-01T00:00:00+00:00",
                 "skill_version": "test",
+            },
+            {
+                "project_root": str(unlinked_b),
+                "last_seen": "2030-01-01T00:00:00+00:00",
+                "skill_version": "test",
+            },
+            {
+                "project_root": str(kiln),
+                "last_seen": "2030-01-01T00:00:00+00:00",
+                "skill_version": "test",
+                "repo_identity": kiln_identity,
             },
         ]
         records = [
             {
-                "dispatch_id": f"{root.name}-live",
+                "dispatch_id": f"{root.parent.name}-{root.name}-live"
+                if root.name == "scratch"
+                else f"{root.name}-live",
                 "project_root": str(root),
                 "state": "running",
                 "classification": "expected_live",
             }
-            for root in (clone_a, clone_b, solo)
+            for root in (clone_a, clone_b, unlinked_a, unlinked_b, kiln)
         ]
         fleet, elapsed = _build_constructed_repo_lens_fleet(
             temp_root, registry, records, generation_id="repo-identity-cache"
         )
 
     LAST_FAST_PLANE_MEASUREMENT["repo_lens_seconds"] = elapsed
-    by_name = {project["name"]: project for project in fleet["projects"]}
-    assert_true("constructed set keeps all three checkouts", set(by_name) == {"battery-tool-v2", "bt-verify", "scratch"})
-    assert_true(
-        "two clones share the cached GitHub identity",
-        by_name["battery-tool-v2"]["repo_identity"] == shared
-        and by_name["bt-verify"]["repo_identity"] == shared,
-    )
+    clones = [
+        project
+        for project in fleet["projects"]
+        if project["repo_identity"] == shared
+    ]
+    unlinked = [
+        project
+        for project in fleet["projects"]
+        if project["name"] == "scratch"
+    ]
+    kiln_row = next(project for project in fleet["projects"] if project["name"] == "kiln")
+    assert_true("constructed set keeps every checkout as its own project row", len(fleet["projects"]) == 5)
+    assert_true("two clones share the cached GitHub identity", len(clones) == 2)
     assert_true(
         "a record without the field stays unknown instead of being guessed",
-        by_name["scratch"]["repo_identity"] is None,
+        all(project["repo_identity"] is None for project in unlinked) and len(unlinked) == 2,
     )
     assert_true(
         "separate clones keep distinct parent ids — directory roll-up cannot unify them",
-        by_name["battery-tool-v2"]["parent_project_id"]
-        != by_name["bt-verify"]["parent_project_id"],
+        clones[0]["parent_project_id"] != clones[1]["parent_project_id"],
+    )
+    band_keys = [_repo_band_key(project) for project in fleet["projects"]]
+    assert_true(
+        "two clones sharing one identity form one repo band",
+        band_keys.count(f"repo|{shared}") == 2,
+    )
+    assert_true(
+        "each unlinked checkout keeps its own path-id band and is not merged",
+        len({_repo_band_key(project) for project in unlinked}) == 2,
+    )
+    assert_true(
+        "a single-checkout repo is its own band (renderer flattens the nest)",
+        band_keys.count(f"repo|{kiln_identity}") == 1 and kiln_row["repo_identity"] == kiln_identity,
     )
     encoded = json.dumps(fleet)
     assert_true("constructed repo-lens plane publishes no absolute paths", str(clone_a) not in encoded)
+    assert_true("unlinked display labels are folder names, not paths", "scratch" in encoded and str(unlinked_a) not in encoded)
     assert_true("constructed repo-lens fleet build stays under one second", elapsed < 1.0)
-    # Mutation control: if the producer shelled git for a missing cache, the
-    # patched git_repo_identity would have raised before we reached these asserts.
-    guessed = dict(by_name["scratch"])
-    guessed["repo_identity"] = "github.com/should/not-guess"
+    # Mutation: guessing from a missing cache (or from the checkout path) is
+    # rejected. The patched git_repo_identity would have raised if the producer
+    # shelled git; a silent invented identity would fail the None asserts above.
+    def guessed_when_missing(project: dict) -> str | None:
+        return project.get("repo_identity") or "github.com/should/not-guess"
+
     assert_true(
-        "guessing an identity for a missing cache is a different, rejected payload",
-        guessed["repo_identity"] != by_name["scratch"]["repo_identity"],
+        "the guessing mutation would invent an identity the plane left unknown",
+        all(guessed_when_missing(project) != project["repo_identity"] for project in unlinked),
     )
+    assert_true("path-id keys stay distinct for same-name unlinked checkouts", unlinked[0]["project_id"] != unlinked[1]["project_id"])
 
 
 def test_controllers_aggregate_by_owner_label_across_repos_mutation_pair() -> None:

@@ -1783,9 +1783,14 @@ async function testInteractiveHistoryAndKeyedRows() {
       parent_project_id: "bt-verify", parent_name: "bt-verify",
       repo_identity: shared,
     });
-    const unlinked = projectRow([workerRow({ dispatch_id: "scratch-live" })], {
-      project_id: "scratch-id", name: "scratch",
-      parent_project_id: "scratch-id", parent_name: "scratch",
+    const unlinkedA = projectRow([workerRow({ dispatch_id: "scratch-left-live" })], {
+      project_id: "scratch-left", name: "scratch",
+      parent_project_id: "scratch-left", parent_name: "scratch",
+      repo_identity: null,
+    });
+    const unlinkedB = projectRow([workerRow({ dispatch_id: "scratch-right-live" })], {
+      project_id: "scratch-right", name: "scratch",
+      parent_project_id: "scratch-right", parent_name: "scratch",
       repo_identity: null,
     });
     const solo = projectRow([workerRow({ dispatch_id: "kiln-live" })], {
@@ -1794,12 +1799,15 @@ async function testInteractiveHistoryAndKeyedRows() {
       repo_identity: "github.com/simonrowland/kiln",
     });
     const { byId } = loadConsole(
-      fleetPayload({ projects: [cloneA, cloneB, unlinked, solo] }),
+      fleetPayload({ projects: [cloneA, cloneB, unlinkedA, unlinkedB, solo] }),
       attentionPayload({ items: [] })
     );
     const fleetText = byId.fleet.textContent;
     const titles = descendants(byId.fleet)
       .filter((node) => node.className === "proj")
+      .map((node) => node.textContent);
+    const pathBits = descendants(byId.fleet)
+      .filter((node) => node.className === "proj-path")
       .map((node) => node.textContent);
     assert("separate clones of one GitHub repo share one owner/name band", [
       titles.filter((title) => title === "timdrpp/battery-tool-v2").length === 1,
@@ -1807,13 +1815,20 @@ async function testInteractiveHistoryAndKeyedRows() {
       fleetText.includes("clone-a-live"),
       fleetText.includes("bt-verify-live"),
     ].every(Boolean));
+    assert("multi-checkout children show a display label and live worker count", [
+      titles.includes("battery-tool-v2"),
+      titles.includes("bt-verify"),
+      pathBits.filter((text) => text.includes("1 live")).length >= 2,
+    ].every(Boolean));
     assert("a checkout with no identity stands alone and is labelled unlinked", [
-      titles.includes("scratch"),
-      fleetText.includes("unlinked"),
-      fleetText.includes("scratch-live"),
-      !titles.includes("scratch") || descendants(byId.fleet)
-        .filter((node) => node.className === "proj-path")
-        .some((node) => node.textContent.includes("unlinked")),
+      titles.filter((title) => title === "scratch").length === 2,
+      pathBits.filter((text) => text.includes("unlinked")).length === 2,
+      fleetText.includes("scratch-left-live"),
+      fleetText.includes("scratch-right-live"),
+    ].every(Boolean));
+    assert("same-name unlinked checkouts are not silently merged", [
+      titles.filter((title) => title === "scratch").length === 2,
+      pathBits.filter((text) => text === "2 checkouts").length === 1,
     ].every(Boolean));
     assert("a repo with one checkout renders flat, without a nested checkout list", [
       titles.includes("simonrowland/kiln"),
@@ -1824,6 +1839,7 @@ async function testInteractiveHistoryAndKeyedRows() {
     assert("parent ids stay distinct so a directory lens would have split the clones", [
       cloneA.parent_project_id !== cloneB.parent_project_id,
       cloneA.repo_identity === cloneB.repo_identity,
+      unlinkedA.project_id !== unlinkedB.project_id,
     ].every(Boolean));
   }
 
