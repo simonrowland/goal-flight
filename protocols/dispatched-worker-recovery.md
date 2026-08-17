@@ -1,5 +1,10 @@
 # Dispatched-Worker Recovery Protocol
 
+Before taking over or relaunching, decide resume-vs-redispatch:
+`protocols/dispatch-resume.md`. Recovering a worker's context is often
+cheaper than re-deriving it, and a reviewer must never resume the
+implementer's session.
+
 The controller-takeover pattern for when an ACP-dispatched worker reaches a
 terminal blocked state before its chunk landed. This is recovery, not normal
 operation — the canonical path is worker-completes-and-commits. Use this when

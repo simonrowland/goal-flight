@@ -3253,16 +3253,17 @@ def emit_listener_reminder(
             )
             if isinstance(live_waiters, int) and live_waiters >= target_waiters:
                 return None
+            command = goalflight_wake.listener_start_command(
+                root,
+                controller_label=label,
+            )
             if not isinstance(live_waiters, int) or live_waiters == 0:
                 line = listener_reminder_line(root, label)
             else:
-                line = (
-                    f"listener pool n={live_waiters}/{target_waiters} — reserve down; "
-                    "re-arm: "
-                    + goalflight_wake.listener_start_command(
-                        root,
-                        controller_label=label,
-                    )
+                line = goalflight_wake.listener_reserve_hint(
+                    live_waiters,
+                    target_waiters,
+                    command,
                 )
         print(line, file=sys.stderr if stream is None else stream)
         return line

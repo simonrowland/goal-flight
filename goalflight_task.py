@@ -386,6 +386,69 @@ def _git_canonical_root(start: Path) -> Path | None:
     return common.parent if common.name == ".git" else top
 
 
+def normalize_repo_remote(url: str | None) -> str | None:
+    """Reduce a git remote URL to a stable ``host/owner/name`` identity.
+
+    A GitHub repo is one repo whether it is cloned twice, worktree'd, fetched
+    over ssh or https, or suffixed with .git — so the identity has to be the
+    remote, not the directory. ``--git-common-dir`` unifies WORKTREES of one
+    checkout but cannot unify separate CLONES; the remote does both.
+    """
+    if not url:
+        return None
+    text = str(url).strip()
+    if not text:
+        return None
+    # A filesystem remote (bare repo on disk, or file://) is a real identity
+    # too: two clones of /srv/x.git are one repo. Key it by the resolved path
+    # so they converge, namespaced to keep it distinct from a host/owner/name.
+    local = text
+    if local.startswith("file://"):
+        local = local[len("file://"):]
+    if local.startswith(("/", "./", "../", "~")):
+        resolved = Path(local).expanduser()
+        try:
+            resolved = resolved.resolve(strict=False)
+        except OSError:
+            pass
+        as_text = str(resolved)
+        if as_text.endswith(".git"):
+            as_text = as_text[: -len(".git")]
+        return f"file{as_text.lower()}" if as_text else None
+    # scp-style (git@host:owner/name.git) and URL forms converge here
+    match = re.match(r"^[A-Za-z0-9._-]+@([^:]+):(.+)$", text)
+    if match:
+        host, path = match.group(1), match.group(2)
+    else:
+        stripped = re.sub(r"^[A-Za-z][A-Za-z0-9+.-]*://", "", text)
+        stripped = re.sub(r"^[^@/]+@", "", stripped)  # user@host/...
+        host, _, path = stripped.partition("/")
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    if not host or not path:
+        return None
+    return f"{host.lower()}/{path.lower()}"
+
+
+def git_repo_identity(start: Path) -> str | None:
+    """Cached-at-write-time repo identity for ``start``; None when unknown.
+
+    Deliberately shells git ONCE per registry write, never per row or per
+    console tick: consumers read the stored scalar.
+    """
+    try:
+        url = subprocess.check_output(
+            ["git", "remote", "get-url", "origin"],
+            cwd=str(start),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return normalize_repo_remote(url)
+
+
 def resolve_project_root(value: str | None = None) -> Path:
     """Canonical project root, identical from any worktree of the same repo.
 
@@ -496,10 +559,14 @@ def _parse_utc_iso(value: Any) -> dt.datetime | None:
 
 def _project_registry_entry(project_root: Path, *, skill_version: str | None, now: str) -> dict[str, Any]:
     root = _strip_managed_worktree(project_root).resolve(strict=False)
+    # Repo identity is resolved HERE, once per registry write, and stored as a
+    # scalar: consumers (fleet console grouping, aggregates) must never shell
+    # git per row or per tick. None when the checkout has no origin.
     return {
         "project_root": str(root),
         "last_seen": now,
         "skill_version": skill_version or _skill_version(),
+        "repo_identity": git_repo_identity(root),
     }
 
 

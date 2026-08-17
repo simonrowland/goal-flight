@@ -70,6 +70,8 @@
 
   var openControllers = storedSet("goalflight-fleet-open-controllers");
   var openPrompts = storedSet("goalflight-fleet-open-prompts");
+  var openDeadControllers = storedSet("goalflight-fleet-open-dead-controllers");
+  var openIdleCheckouts = storedSet("goalflight-fleet-open-idle-checkouts");
 
   function persistValue(key, value) {
     try {
@@ -325,6 +327,39 @@
     else node.removeAttribute("hidden");
   }
 
+  function reconcileKeyed(parent, nodes, desired, createFn, updateFn) {
+    Object.keys(nodes).forEach(function (key) {
+      if (!Object.prototype.hasOwnProperty.call(desired, key)) {
+        nodes[key].remove();
+        delete nodes[key];
+      }
+    });
+    Object.keys(desired).forEach(function (key) {
+      var item = desired[key];
+      var node = nodes[key];
+      if (!node) {
+        node = createFn(item);
+        nodes[key] = node;
+      }
+      updateFn(node, item);
+      parent.appendChild(node);
+    });
+  }
+
+  function persistTicketFilter(value) {
+    ticketFilter = value == null || value === "" ? null : String(value);
+    persistValue("goalflight-fleet-ticket-filter", ticketFilter || "");
+    return ticketFilter;
+  }
+
+  function initializeTicketFilter() {
+    try {
+      var saved = window.localStorage.getItem("goalflight-fleet-ticket-filter");
+      if (saved) ticketFilter = saved;
+    } catch (_error) { /* optional */ }
+    return ticketFilter;
+  }
+
   function fetchPrompt(entry) {
     var worker = entry._gf.worker;
     var filename = worker && worker.prompt_file;
@@ -438,8 +473,10 @@
       var button = el("button", "task-chip", textValue(taskId));
       button.setAttribute("type", "button");
       button._taskId = String(taskId);
+      button.setAttribute("aria-pressed", ticketFilter && ticketFilter === button._taskId ? "true" : "false");
+      if (ticketFilter && ticketFilter === button._taskId) button.className = "task-chip active";
       button.addEventListener("click", function () {
-        ticketFilter = button._taskId;
+        persistTicketFilter(button._taskId);
         render();
       });
       refs.taskList.appendChild(button);
@@ -693,56 +730,135 @@
     });
   }
 
+  function attentionItemKey(item) {
+    return textValue(item.dispatch_id) + "|" + textValue(item.seq) + "|" + textValue(item.kind);
+  }
+
+  function createAttentionRow() {
+    var row = el("div", "attn-row");
+    var glyph = el("i", "glyph unknown");
+    var identity = el("div");
+    var dispatch = el("div", "did");
+    var kind = el("div", "agent");
+    identity.appendChild(dispatch);
+    identity.appendChild(kind);
+    var spacer = el("div");
+    var headline = el("div", "state-txt");
+    var waited = el("div", "waited");
+    var action = el("div", "host");
+    [glyph, identity, spacer, headline, waited, action].forEach(function (node) {
+      row.appendChild(node);
+    });
+    row._gf = { glyph: glyph, dispatch: dispatch, kind: kind, headline: headline, waited: waited, action: action };
+    return row;
+  }
+
+  function updateAttentionRow(row, item, now) {
+    var refs = row._gf;
+    var attentionGlyph = ACTIONABLE_KINDS[item.kind] === true
+      ? "attn"
+      : (item.kind === "advisory" ? "advisory" : "unknown");
+    refs.glyph.className = "glyph " + attentionGlyph;
+    refs.dispatch.textContent = textValue(item.dispatch_id);
+    refs.kind.textContent = textValue(item.kind);
+    refs.headline.textContent = textValue(item.headline);
+    refs.waited.textContent = ageFrom(item.observed_at, now);
+    refs.action.textContent = textValue(item.action);
+  }
+
   function renderAttention(attentionState, now) {
     var host = document.getElementById("attention");
     var panel = document.getElementById("attention-section");
     if (!host) return;
-    host.textContent = "";
+    if (!host._gf) {
+      host._gf = {
+        header: null,
+        title: null,
+        count: null,
+        truncation: null,
+        quiet: null,
+        stale: null,
+        nodes: Object.create(null)
+      };
+    }
+    var state = host._gf;
     if (attentionState.stale) {
       if (panel) panel.className = "panel attention-section";
-      host.appendChild(staleNotice("attention", attentionState));
+      Object.keys(state.nodes).forEach(function (key) {
+        state.nodes[key].remove();
+        delete state.nodes[key];
+      });
+      if (state.header) setHidden(state.header, true);
+      if (state.truncation) setHidden(state.truncation, true);
+      if (state.quiet) setHidden(state.quiet, true);
+      if (!state.stale) {
+        state.stale = staleNotice("attention", attentionState);
+        host.appendChild(state.stale);
+      } else {
+        state.stale.remove();
+        state.stale = staleNotice("attention", attentionState);
+        host.appendChild(state.stale);
+      }
       return;
+    }
+    if (state.stale) {
+      state.stale.remove();
+      state.stale = null;
     }
 
     var items = (ATTENTION.items || []).slice();
     var waiting = items.filter(function (item) { return ACTIONABLE_KINDS[item.kind] === true; }).length;
     var advisories = items.filter(function (item) { return item.kind === "advisory"; }).length;
     if (panel) panel.className = "panel attention-section" + (waiting ? " attn" : "");
-    var header = el("div", "panel-hd");
-    header.appendChild(el("span", null, "Operator mailbox"));
-    var count = waiting + " waiting" + (advisories
+    if (!state.header) {
+      state.header = el("div", "panel-hd");
+      state.title = el("span", null, "Operator mailbox");
+      state.count = el("span", "count");
+      state.header.appendChild(state.title);
+      state.header.appendChild(state.count);
+      host.appendChild(state.header);
+    }
+    setHidden(state.header, false);
+    state.count.textContent = waiting + " waiting" + (advisories
       ? " · " + advisories + (advisories === 1 ? " advisory" : " advisories")
       : "");
-    header.appendChild(el("span", "count", count));
-    host.appendChild(header);
     var truncated = ATTENTION.controller_history_probes_truncated;
-    if (typeof truncated === "number" && Number.isFinite(truncated) && truncated > 0) {
-      host.appendChild(el(
-        "div",
-        "attention-truncation",
-        "+" + truncated + " older generations unprobed · click Show more in a project band for retained history"
-      ));
+    var showTruncation = typeof truncated === "number" && Number.isFinite(truncated) && truncated > 0;
+    if (showTruncation) {
+      if (!state.truncation) {
+        state.truncation = el("div", "attention-truncation");
+        host.appendChild(state.truncation);
+      }
+      state.truncation.textContent = "+" + truncated +
+        " older generations unprobed · click Show more in a project band for retained history";
+      setHidden(state.truncation, false);
+    } else if (state.truncation) {
+      setHidden(state.truncation, true);
     }
     if (!items.length) {
-      host.appendChild(el("div", "quiet-state", "Nothing is waiting on you."));
+      Object.keys(state.nodes).forEach(function (key) {
+        state.nodes[key].remove();
+        delete state.nodes[key];
+      });
+      if (!state.quiet) {
+        state.quiet = el("div", "quiet-state", "Nothing is waiting on you.");
+        host.appendChild(state.quiet);
+      }
+      setHidden(state.quiet, false);
       return;
     }
+    if (state.quiet) setHidden(state.quiet, true);
+    var desired = Object.create(null);
     items.forEach(function (item) {
-      var row = el("div", "attn-row");
-      var attentionGlyph = ACTIONABLE_KINDS[item.kind] === true
-        ? "attn"
-        : (item.kind === "advisory" ? "advisory" : "unknown");
-      row.appendChild(el("i", "glyph " + attentionGlyph));
-      var identity = el("div");
-      identity.appendChild(el("div", "did", textValue(item.dispatch_id)));
-      identity.appendChild(el("div", "agent", textValue(item.kind)));
-      row.appendChild(identity);
-      row.appendChild(el("div"));
-      row.appendChild(el("div", "state-txt", textValue(item.headline)));
-      row.appendChild(el("div", "waited", ageFrom(item.observed_at, now)));
-      row.appendChild(el("div", "host", textValue(item.action)));
-      host.appendChild(row);
+      desired[attentionItemKey(item)] = item;
     });
+    reconcileKeyed(
+      host,
+      state.nodes,
+      desired,
+      function () { return createAttentionRow(); },
+      function (node, item) { updateAttentionRow(node, item, now); }
+    );
   }
 
   function parseHistoryScript(text) {
@@ -898,6 +1014,53 @@
     return result;
   }
 
+  function repoDisplay(identity) {
+    if (identity == null || identity === "") return null;
+    var text = String(identity);
+    if (text.indexOf("file") === 0) {
+      var segs = text.split("/");
+      return segs[segs.length - 1] || "local";
+    }
+    var parts = text.split("/");
+    if (parts.length >= 3) return parts.slice(1).join("/");
+    return text;
+  }
+
+  function repoIdentityOf(project) {
+    var identity = project && project.repo_identity;
+    return typeof identity === "string" && identity ? identity : null;
+  }
+
+  function repoGroups() {
+    var groups = [];
+    var index = Object.create(null);
+    projectBands().forEach(function (entry) {
+      if (entry.kind !== "project") {
+        groups.push(entry);
+        return;
+      }
+      var project = entry.project || {};
+      var identity = repoIdentityOf(project);
+      var key = identity ? "repo|" + identity : "unlinked|" + textValue(project.project_id);
+      if (!index[key]) {
+        var group = {
+          kind: "repo",
+          repo_key: key,
+          repo_identity: identity,
+          repo_label: identity ? repoDisplay(identity) : textValue(project.name),
+          unlinked: !identity,
+          children: [],
+          workers: []
+        };
+        index[key] = group;
+        groups.push(group);
+      }
+      index[key].children.push(entry);
+      index[key].workers = index[key].workers.concat(entry.workers || []);
+    });
+    return groups;
+  }
+
   function disclosurePayloadKeys() {
     var workerKeys = Object.create(null);
     var controllerKeys = Object.create(null);
@@ -959,19 +1122,37 @@
     return panel;
   }
 
-  function renderBand(entry, now, budget, panel) {
+  function renderBand(entry, now, budget, panel, opts) {
     var project = entry.project || {};
+    opts = opts || {};
     panel = panel || createBand();
     var header = panel._gf.header;
     header.textContent = "";
     var identity = el("div");
-    var name = entry.kind === "remote" ? "Remote workers" :
-      (entry.kind === "unassigned" ? "Unassigned workers" :
-        (entry.kind === "archived" ? "Archived projects (+" + entry.history_excluded + ")" : textValue(project.name)));
+    var name;
+    if (entry.kind === "remote") name = "Remote workers";
+    else if (entry.kind === "unassigned") name = "Unassigned workers";
+    else if (entry.kind === "archived") name = "Archived projects (+" + entry.history_excluded + ")";
+    else if (opts.title) name = opts.title;
+    else if (opts.asChild) name = textValue(project.name);
+    else name = repoDisplay(project.repo_identity) || textValue(project.name);
     identity.appendChild(el("div", "proj", name));
     if (entry.kind === "project") {
-      identity.appendChild(el("div", "proj-path", (project.registered ? "registered" : "unregistered") +
-        (project.skill_version ? " · skill " + project.skill_version : "")));
+      var pathBits = [];
+      if (opts.unlinked || !repoIdentityOf(project)) pathBits.push("unlinked");
+      else if (opts.asChild) {
+        var liveCount = (entry.workers || []).filter(function (worker) {
+          return displayedWorker(worker) && worker.is_terminal !== true;
+        }).length;
+        pathBits.push(liveCount + " live");
+      } else {
+        pathBits.push(project.registered ? "registered" : "unregistered");
+        if (project.skill_version) pathBits.push("skill " + project.skill_version);
+        if (project.name && repoDisplay(project.repo_identity) !== String(project.name)) {
+          pathBits.push(textValue(project.name));
+        }
+      }
+      identity.appendChild(el("div", "proj-path", pathBits.join(" · ")));
     } else {
       identity.appendChild(el("div", "proj-path", entry.kind === "remote" ? "remote authority" :
         (entry.kind === "archived" ? "terminal-only projects · lazy slow history" : "no measured project")));
@@ -1056,6 +1237,338 @@
     return panel;
   }
 
+  function controllerPanelKey(row) {
+    return textValue(row.controller_key || ((row.project_id || "") + ":" + (row.label || "")));
+  }
+
+  function createControllerPanelRow() {
+    var wrap = el("div", "controller-entry");
+    var row = el("div", "controller-row");
+    var expand = el("button", "controller-toggle owner-expand", "▸");
+    expand.setAttribute("type", "button");
+    var label = el("div", "controller-label");
+    var project = el("div", "controller-project");
+    var health = el("div", "controller-health unknown");
+    var pool = el("div", "controller-pool");
+    var inflight = el("div", "controller-inflight");
+    var seen = el("div", "controller-seen");
+    var action = el("div", "controller-action");
+    [expand, label, project, health, pool, inflight, seen, action].forEach(function (node) {
+      row.appendChild(node);
+    });
+    var owned = el("div", "controller-owned");
+    wrap.appendChild(row);
+    wrap.appendChild(owned);
+    wrap._gf = {
+      row: row, expand: expand, label: label, project: project, health: health,
+      pool: pool, inflight: inflight, seen: seen, action: action, owned: owned,
+      ownerKey: null
+    };
+    expand.addEventListener("click", function () {
+      var key = wrap._gf.ownerKey;
+      if (!key) return;
+      setOwnerExpanded(key, !ownerExpanded(key));
+      render();
+    });
+    return wrap;
+  }
+
+  function updateControllerPanelRow(wrap, item, now) {
+    var refs = wrap._gf;
+    var state = textValue(item.controller_liveness_state);
+    if (CONTROLLER_LIVENESS_STATES[state] !== true) state = "UNKNOWN";
+    var key = controllerPanelKey(item);
+    refs.ownerKey = key;
+    refs.label.textContent = textValue(item.label);
+    refs.project.textContent = textValue(item.parent_name || item.project_name);
+    refs.health.className = "controller-health " + state.toLowerCase();
+    refs.health.textContent = state;
+    var live = item.listener_live;
+    var target = item.listener_target;
+    refs.pool.textContent = (live == null ? "?" : String(live)) + "/" + (target == null ? "?" : String(target));
+    var ownedCount = item.owned_live == null ? item.in_flight_count : item.owned_live;
+    refs.inflight.textContent = ownedCount == null ? "0" : String(ownedCount);
+    refs.seen.textContent = ageFrom(item.last_seen, now);
+    refs.action.textContent = item.retire_command ? String(item.retire_command) : "";
+    refs.row.className = "controller-row" + (state === "DEAD" ? " dead" : "");
+    var expanded = state !== "DEAD" && ownerExpanded(key);
+    refs.expand.textContent = expanded ? "▾" : "▸";
+    refs.expand.setAttribute("aria-expanded", expanded ? "true" : "false");
+    setHidden(refs.expand, state === "DEAD");
+    refs.owned.textContent = "";
+    if (!expanded) {
+      setHidden(refs.owned, true);
+      return;
+    }
+    var groups = ownedWorkerGroups(item.label);
+    if (!groups.length) {
+      refs.owned.appendChild(el("div", "quiet-state", "No live workers attributed to this label."));
+    } else {
+      groups.forEach(function (group) {
+        var block = el("div", "owned-group");
+        block.appendChild(el("div", "owned-title", group.title + " · " + group.workers.length));
+        group.workers.forEach(function (worker) {
+          block.appendChild(el("div", "owned-dispatch", textValue(worker.dispatch_id)));
+        });
+        refs.owned.appendChild(block);
+      });
+    }
+    setHidden(refs.owned, false);
+  }
+
+  var openControllerOwners = storedSet("goalflight-fleet-open-controller-owners");
+
+  function ownerExpanded(key) {
+    return openControllerOwners.has("open|" + key);
+  }
+
+  function setOwnerExpanded(key, expanded) {
+    openControllerOwners.delete("open|" + key);
+    openControllerOwners.delete("closed|" + key);
+    openControllerOwners.add((expanded ? "open|" : "closed|") + key);
+    persistSet("goalflight-fleet-open-controller-owners", openControllerOwners);
+  }
+
+  function ownedWorkerGroups(label) {
+    var wanted = String(label || "");
+    var groups = [];
+    function collect(project, workers) {
+      var matched = (workers || []).filter(function (worker) {
+        return displayedWorker(worker) && String(worker.controller_label || "") === wanted;
+      });
+      if (!matched.length) return;
+      var repoName = repoDisplay(project.repo_identity);
+      var checkout = textValue(project.worktree_name || project.name || project.parent_name);
+      var title = repoName ? repoName + " / " + checkout : checkout + " (unlinked)";
+      groups.push({ title: title, workers: matched });
+    }
+    (FLEET && FLEET.projects || []).forEach(function (project) {
+      collect(project, project.workers);
+    });
+    collect({ name: "unassigned" }, FLEET && FLEET.unassigned_workers);
+    collect({ name: "remote" }, FLEET && FLEET.remote && FLEET.remote.workers);
+    return groups;
+  }
+
+  function deadControllersExpanded() {
+    return openDeadControllers.has("open");
+  }
+
+  function setDeadControllersExpanded(expanded) {
+    openDeadControllers.clear();
+    if (expanded) openDeadControllers.add("open");
+    persistSet("goalflight-fleet-open-dead-controllers", openDeadControllers);
+  }
+
+  function renderControllers(fleetState, now) {
+    var section = document.getElementById("fleet-section");
+    if (!section) return;
+    if (!section._gfCtl) {
+      var panel = el("section", "panel controllers-panel");
+      var header = el("div", "panel-hd");
+      var title = el("span", null, "Controllers");
+      var count = el("span", "count");
+      header.appendChild(title);
+      header.appendChild(count);
+      var liveHost = el("div", "controller-live");
+      var deadToggle = el("button", "controller-toggle dead-controllers-toggle");
+      deadToggle.setAttribute("type", "button");
+      deadToggle.addEventListener("click", function () {
+        setDeadControllersExpanded(!deadControllersExpanded());
+        render();
+      });
+      var deadHost = el("div", "controller-dead");
+      var quiet = el("div", "quiet-state", "No registered controllers in this sample.");
+      panel.appendChild(header);
+      panel.appendChild(liveHost);
+      panel.appendChild(deadToggle);
+      panel.appendChild(deadHost);
+      panel.appendChild(quiet);
+      section._gfCtl = {
+        panel: panel, header: header, count: count, liveHost: liveHost,
+        deadToggle: deadToggle, deadHost: deadHost, quiet: quiet,
+        liveNodes: Object.create(null), deadNodes: Object.create(null)
+      };
+      if (section.firstChild) section.insertBefore(panel, section.firstChild);
+      else section.appendChild(panel);
+    }
+    var ctl = section._gfCtl;
+    if (fleetState.stale) {
+      setHidden(ctl.liveHost, true);
+      setHidden(ctl.deadToggle, true);
+      setHidden(ctl.deadHost, true);
+      setHidden(ctl.quiet, true);
+      if (!ctl.stale) {
+        ctl.stale = staleNotice("fleet", fleetState);
+        ctl.panel.appendChild(ctl.stale);
+      }
+      return;
+    }
+    if (ctl.stale) {
+      ctl.stale.remove();
+      ctl.stale = null;
+    }
+    var rows = (FLEET && FLEET.controllers) || [];
+    var live = [];
+    var dead = [];
+    rows.forEach(function (row) {
+      if (!row || typeof row !== "object") return;
+      if (textValue(row.controller_liveness_state) === "DEAD") dead.push(row);
+      else live.push(row);
+    });
+    ctl.count.textContent = live.length + " live" + (dead.length ? " · " + dead.length + " dead" : "");
+    if (!live.length && !dead.length) {
+      Object.keys(ctl.liveNodes).forEach(function (key) {
+        ctl.liveNodes[key].remove();
+        delete ctl.liveNodes[key];
+      });
+      Object.keys(ctl.deadNodes).forEach(function (key) {
+        ctl.deadNodes[key].remove();
+        delete ctl.deadNodes[key];
+      });
+      setHidden(ctl.liveHost, true);
+      setHidden(ctl.deadToggle, true);
+      setHidden(ctl.deadHost, true);
+      setHidden(ctl.quiet, false);
+      return;
+    }
+    setHidden(ctl.quiet, true);
+    setHidden(ctl.liveHost, false);
+    var liveDesired = Object.create(null);
+    live.forEach(function (row) { liveDesired[controllerPanelKey(row)] = row; });
+    reconcileKeyed(
+      ctl.liveHost,
+      ctl.liveNodes,
+      liveDesired,
+      function () { return createControllerPanelRow(); },
+      function (node, item) { updateControllerPanelRow(node, item, now); }
+    );
+    if (!dead.length) {
+      Object.keys(ctl.deadNodes).forEach(function (key) {
+        ctl.deadNodes[key].remove();
+        delete ctl.deadNodes[key];
+      });
+      setHidden(ctl.deadToggle, true);
+      setHidden(ctl.deadHost, true);
+      return;
+    }
+    var expanded = deadControllersExpanded();
+    ctl.deadToggle.textContent = (expanded ? "▾ " : "▸ ") + dead.length +
+      " dead · retire leftover labels";
+    ctl.deadToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+    setHidden(ctl.deadToggle, false);
+    if (!expanded) {
+      Object.keys(ctl.deadNodes).forEach(function (key) {
+        setHidden(ctl.deadNodes[key], true);
+      });
+      setHidden(ctl.deadHost, true);
+      return;
+    }
+    setHidden(ctl.deadHost, false);
+    var deadDesired = Object.create(null);
+    dead.forEach(function (row) { deadDesired[controllerPanelKey(row)] = row; });
+    reconcileKeyed(
+      ctl.deadHost,
+      ctl.deadNodes,
+      deadDesired,
+      function () { return createControllerPanelRow(); },
+      function (node, item) {
+        setHidden(node, false);
+        updateControllerPanelRow(node, item, now);
+      }
+    );
+  }
+
+  function checkoutHasLiveWork(entry) {
+    return (entry.workers || []).some(function (worker) {
+      return displayedWorker(worker) && worker.is_terminal !== true;
+    });
+  }
+
+  function idleCheckoutsExpanded(key) {
+    return openIdleCheckouts.has("open|" + key);
+  }
+
+  function setIdleCheckoutsExpanded(key, expanded) {
+    openIdleCheckouts.delete("open|" + key);
+    openIdleCheckouts.delete("closed|" + key);
+    openIdleCheckouts.add((expanded ? "open|" : "closed|") + key);
+    persistSet("goalflight-fleet-open-idle-checkouts", openIdleCheckouts);
+  }
+
+  function renderRepo(entry, now, budget, panel) {
+    var children = entry.children || [];
+    if (children.length === 1) {
+      return renderBand(children[0], now, budget, panel, {
+        title: entry.unlinked ? textValue((children[0].project || {}).name) : entry.repo_label,
+        unlinked: entry.unlinked === true,
+        asChild: false
+      });
+    }
+    panel = panel || createBand();
+    var header = panel._gf.header;
+    header.textContent = "";
+    var identity = el("div");
+    identity.appendChild(el("div", "proj", textValue(entry.repo_label)));
+    identity.appendChild(el("div", "proj-path", children.length + " checkouts"));
+    header.appendChild(identity);
+    if (!panel._gf.childHost) {
+      panel._gf.childHost = el("div", "repo-checkouts repo-worktrees");
+      panel._gf.childBands = Object.create(null);
+      panel.appendChild(panel._gf.childHost);
+    }
+    var live = [];
+    var idle = [];
+    children.forEach(function (child) {
+      if (checkoutHasLiveWork(child)) live.push(child);
+      else idle.push(child);
+    });
+    var desired = Object.create(null);
+    function place(child, host) {
+      var key = textValue(((child.project || {}).project_id) || child.kind);
+      desired[key] = child;
+      if (!panel._gf.childBands[key]) {
+        panel._gf.childBands[key] = createBand();
+      }
+      renderBand(child, now, budget, panel._gf.childBands[key], { asChild: true });
+      host.appendChild(panel._gf.childBands[key]);
+    }
+    live.forEach(function (child) { place(child, panel._gf.childHost); });
+    if (idle.length) {
+      if (!panel._gf.idleToggle) {
+        panel._gf.idleToggle = el("button", "ghost-btn collapsed-checkouts-toggle");
+        panel._gf.idleToggle.setAttribute("type", "button");
+        panel._gf.idleHost = el("div", "repo-collapsed-checkouts");
+        panel._gf.idleToggle.addEventListener("click", function () {
+          setIdleCheckoutsExpanded(entry.repo_key, !idleCheckoutsExpanded(entry.repo_key));
+          render();
+        });
+      }
+      var expanded = idleCheckoutsExpanded(entry.repo_key);
+      panel._gf.idleToggle.textContent = (expanded ? "▾ " : "▸ ") + idle.length +
+        " idle checkout" + (idle.length === 1 ? "" : "s");
+      panel._gf.idleToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+      panel._gf.childHost.appendChild(panel._gf.idleToggle);
+      panel._gf.childHost.appendChild(panel._gf.idleHost);
+      setHidden(panel._gf.idleHost, !expanded);
+      if (expanded) {
+        idle.forEach(function (child) { place(child, panel._gf.idleHost); });
+      }
+    } else if (panel._gf.idleToggle) {
+      panel._gf.idleToggle.remove();
+      panel._gf.idleHost.remove();
+      panel._gf.idleToggle = null;
+      panel._gf.idleHost = null;
+    }
+    Object.keys(panel._gf.childBands).forEach(function (key) {
+      if (!desired[key]) {
+        panel._gf.childBands[key].remove();
+        delete panel._gf.childBands[key];
+      }
+    });
+    return panel;
+  }
+
   function renderFleet(fleetState, now) {
     var host = document.getElementById("fleet");
     if (!host) return;
@@ -1066,19 +1579,20 @@
       host.appendChild(staleNotice("fleet", fleetState));
       return;
     }
-    var entries = projectBands();
+    var entries = repoGroups();
     var ageSummary = workerAgeSummary();
     if (!host._gf) host._gf = { quiet: null, overflow: null, ticket: null };
     if (ticketFilter) {
       if (!host._gf.ticket) {
         host._gf.ticket = el("button", "ghost-btn ticket-filter-clear");
         host._gf.ticket.setAttribute("type", "button");
-        host._gf.ticket.addEventListener("click", function () { ticketFilter = null; render(); });
+        host._gf.ticket.addEventListener("click", function () { persistTicketFilter(null); render(); });
         host.appendChild(host._gf.ticket);
       }
       host._gf.ticket.textContent = "Ticket " + ticketFilter + " · clear filter";
       setHidden(host._gf.ticket, false);
     } else if (host._gf.ticket) {
+      host._gf.ticket.textContent = "";
       setHidden(host._gf.ticket, true);
     }
     if (!entries.length) {
@@ -1098,13 +1612,15 @@
     var budget = { shown: 0, total: 0 };
     var desiredBands = Object.create(null);
     entries.slice(0, MAX_VISIBLE_BANDS).forEach(function (entry) {
-      var key = textValue(((entry.project || {}).project_id) || entry.kind);
+      var key = entry.kind === "repo"
+        ? textValue(entry.repo_key)
+        : textValue(((entry.project || {}).project_id) || entry.kind);
       desiredBands[key] = true;
       if (!bandNodes[key]) {
         bandNodes[key] = createBand();
       }
-      renderBand(entry, now, budget, bandNodes[key]);
-      // Move retained bands into the producer-derived recency order.
+      if (entry.kind === "repo") renderRepo(entry, now, budget, bandNodes[key]);
+      else renderBand(entry, now, budget, bandNodes[key]);
       host.appendChild(bandNodes[key]);
     });
     Object.keys(bandNodes).forEach(function (key) {
@@ -1133,6 +1649,7 @@
       (ATTENTION.items || []).forEach(function (item) { values.push(ageFrom(item.observed_at, now)); });
     }
     if (!fleetState.stale) {
+      (FLEET.controllers || []).forEach(function (row) { values.push(ageFrom(row.last_seen, now)); });
       (FLEET.vendors || []).forEach(function (vendor) { values.push(whenFrom(vendor.reset_at, now)); });
       var remainingWorkers = MAX_VISIBLE_WORKERS;
       /* Age work follows the same visible limits as DOM work: at most 50 groups
@@ -1163,6 +1680,7 @@
     renderMachine(fleetState);
     renderVendors(fleetState, now);
     renderAttention(attentionState, now);
+    renderControllers(fleetState, now);
     renderFleet(fleetState, now);
     lastAgeSignature = ageSignature(now);
   }
@@ -1272,9 +1790,15 @@
       return payload;
     },
     setTicketFilter: function (taskId) {
-      ticketFilter = taskId == null ? null : String(taskId);
+      persistTicketFilter(taskId == null ? null : String(taskId));
       render();
       return ticketFilter;
+    },
+    setAttentionData: function (payload) {
+      ATTENTION = payload;
+      window.GF_ATTENTION = payload;
+      render();
+      return payload;
     },
     showMore: showMore,
     showArchived: showArchived,
@@ -1318,6 +1842,7 @@
 
   initializeTheme();
   initializeAgeFilter();
+  initializeTicketFilter();
   render();
   window.setInterval(function () { reloadPlane("attention"); }, CADENCES.attention);
   window.setInterval(function () { reloadPlane("fleet"); }, CADENCES.fleet);

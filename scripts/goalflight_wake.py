@@ -38,7 +38,11 @@ _GENERATION_FILE_VERSION = "generation-v1"
 _LISTENER_SLOT_FILE_VERSION = "listener-slot-v1"
 _RING_STAMP_FILE_VERSION = "ring-stamp-v1"
 _LEASE_EVENT_SCHEMA = "goalflight.lease-generation-event.v1"
-DEFAULT_LISTENER_SLOTS = 2
+# Depth is resilience, not efficiency: one event wakes exactly one slot, so
+# the remaining slots are the margin for a controller that forgets to re-arm.
+# 4 survives three consecutive missed re-arms. Override with
+# GOALFLIGHT_LISTENER_SLOTS; MAX_LISTENER_SLOTS stays 32.
+DEFAULT_LISTENER_SLOTS = 4
 MAX_LISTENER_SLOTS = 32
 
 
@@ -516,6 +520,53 @@ def register_waiter(
     )
 
 
+def listener_reserve_hint(
+    live_waiters: int,
+    target_waiters: int,
+    command: str,
+) -> str:
+    """Operator hint when the listener pool is short of its configured depth.
+
+    n=0 keeps the loud offline wording. Otherwise print the exact arm
+    command once per missing slot (n=1/4 -> three pasteable lines).
+    """
+    if live_waiters == 0:
+        return f"listener pool n=0; start: {command}"
+    if int(live_waiters) > listener_low_water(int(target_waiters)):
+        # Healthy depth: a missing slot is not news. Silence here is the
+        # difference between a signal and a nag.
+        return ""
+    missing = max(0, int(target_waiters) - int(live_waiters))
+    header = (
+        f"listener pool n={live_waiters}/{target_waiters} — reserve down; "
+        f"re-arm: {command}"
+    )
+    if missing <= 1:
+        return header
+    extra = "\n".join(command for _ in range(missing - 1))
+    return f"{header}\n{extra}"
+
+
+def listener_low_water(target: int | None = None) -> int:
+    """Depth at or below which the pool is 'running low' and worth a hint.
+
+    A pool exists so a missed re-arm is survivable; nagging at the first
+    missing slot (3/4) is noise, so hints stay silent while depth is
+    healthy and speak only when the margin is genuinely thin. Default is
+    half the target (4 -> 2), floored at 1 so a single-slot pool still
+    warns when it empties.
+    """
+    resolved = int(target) if target is not None else listener_slot_count()
+    raw = os.environ.get("GOALFLIGHT_LISTENER_LOW_WATER")
+    if raw is not None:
+        try:
+            value = int(str(raw))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("listener low water must be an integer") from exc
+        return max(0, min(value, resolved))
+    return max(1, resolved // 2)
+
+
 def listener_slot_count(value: object = None) -> int:
     """Resolve and validate the bounded listener-pool size."""
     raw = value
@@ -987,12 +1038,9 @@ def check_tool_entry(
             f"if you have no listener, start: {command}",
             file=output,
         )
-    elif live_waiters == 0:
-        print(f"listener pool n=0; start: {command}", file=output)
     else:
         print(
-            f"listener pool n={live_waiters}/{target_waiters} — reserve down; "
-            f"re-arm: {command}",
+            listener_reserve_hint(int(live_waiters or 0), target_waiters, command),
             file=output,
         )
     status["start_command"] = command

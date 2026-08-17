@@ -289,7 +289,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **failure_mode:** The orchestrator blocks the interactive session or schedules a timer to ask whether a worker finished instead of arming the available event channel.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Arm a pool of two background generation-bound `goalflight_messages.py listen --project-root \"$PWD\" --controller-label <label> --lease-nonce <nonce> --report-pending` tasks; on each exit, process the reported or authoritative mail, cursor-CAS settled server-known positions, then re-arm one task to restore depth two"
+    - **pattern:** "Arm a pool of four background generation-bound `goalflight_messages.py listen --project-root \"$PWD\" --controller-label <label> --lease-nonce <nonce> --report-pending` tasks; on each exit, process the reported or authoritative mail, cursor-CAS settled server-known positions, then re-arm one task to restore depth four"
     - **max_section_lines:** 55
 - **verifier:**
     - **kind:** behaviour-scenario
@@ -2450,6 +2450,7 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background exec."
+    - **pattern:** "A dead worker is not automatically a lost worker: resume when its accumulated context outvalues a clean read (quota death mid-task, partial edits only its author understands), redispatch when the premise moved (fix rounds, steers, reviews — a reviewer must never resume the implementer). See `protocols/dispatch-resume.md`."
     - **max_section_lines:** 45
 - **verifier:**
     - **kind:** behaviour-scenario

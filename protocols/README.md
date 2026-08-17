@@ -18,6 +18,7 @@ protocol files carry the detailed operating procedures.
 | `user-status-cadence.md` | in-flight worker poll + user progress updates (≤15 min) |
 | `chunk-review.md` | pre-commit gstack `/review` (default; complementary parallel autoreview optional) before chunk land |
 | `dispatched-worker-recovery.md` | orchestrator takeover when an ACP-dispatched worker terminal-blocks before commit |
+| `dispatch-resume.md` | resume the dead worker or dispatch a fresh one: keep its context or buy a clean read |
 | `engagement-lint.md` | data contract for engagement-prompt verb patterns (the future PostToolUse/Stop lint; Wave-A) |
 | `foreground-duration-hook.md` | data contract for slow-command families that should auto-background (the future PreToolUse rule; Wave-A) |
 | `premises.md` | init/decompose needs premise distillation |

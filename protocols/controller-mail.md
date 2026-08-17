@@ -64,8 +64,9 @@ heals an unprojected assignment rather than creating a second store.
 
 ## Pop-one listener pool
 
-Arm a pool of two tracked background tasks for the active lease. Two is the default
-slot count; repeat this same command twice through the host's tracked-background-task
+Arm a pool of four tracked background tasks for the active lease. Four is the default
+slot count — depth is resilience, not efficiency, and survives three missed re-arms.
+Repeat this same command four times through the host's tracked-background-task
 surface:
 
 ```bash
@@ -119,15 +120,15 @@ python3 <skill-root>/scripts/goalflight_messages.py advance \
 
 The tidy steady-state loop is:
 
-1. Keep two tracked `--report-pending` listeners armed.
+1. Keep four tracked `--report-pending` listeners armed.
 2. One rings; use `relay --drain` when its headlines settle every item, or peek,
    process bodies, and advance explicitly.
-3. Re-arm one tracked listener to restore pool depth two.
+3. Re-arm one tracked listener to restore pool depth four.
 
 Never advance before processing is settled. If all slots are occupied, startup
 reports their exact PIDs and says not to kill by pattern. If all listeners have rung
-and none was re-armed, entry hints report `n=0`; if one member of the default pool is
-lost, they report `n=1/2` and the exact `--report-pending` re-arm command. A listener
+and none was re-armed, entry hints report `n=0`; if the default pool is short, they
+report `n=1/4` and the exact `--report-pending` re-arm command once per missing slot. A listener
 reparented to PID 1 waits through a short startup grace, then refuses with one exact
 re-arm command: its exit cannot wake an untracked parent. Superseded, orphaned,
 stale-lease, corrupt, upgrade-required, and journal-unavailable exits remain durable

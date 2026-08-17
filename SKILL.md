@@ -114,6 +114,7 @@ Orchestrator behaviour probes run through portable host adapters, not host-speci
 | worker context packages / lane pinning | Dispatch Model | `protocols/worker-context-package.md` |
 | worker permissions | Worker Routing | `scripts/goalflight_acp_run.py`, doctor `--worker-write-probe`, `scripts/install_claude_acp_patch.sh` |
 | **worker blocked: orchestrator takeover** | Worker Routing | `protocols/dispatched-worker-recovery.md` |
+| **dead worker: resume or redispatch** | Dispatch Model | `protocols/dispatch-resume.md`, `scripts/goalflight_dispatch.py resume <id>` |
 | rate limits & caps | Capacity and rate limits | `scripts/goalflight_capacity.py`, `scripts/goalflight_rate_pressure.py` |
 | worker markers | Worker Markers | `protocols/worker-markers.md`, `scripts/goalflight_watch.py` |
 | resume/compaction | State | `commands/resume.md`, `protocols/state-handoff.md`, `scripts/goalflight_session_status.py` |
@@ -357,10 +358,11 @@ Two orthogonal axes:
 - Goal-loop returns converged result, never draft: plan/act/test/self-review until green.
 - Comms shape: `controller-direct`, `acp`, or `bash-tail`.
 Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background exec.
+A dead worker is not automatically a lost worker: resume when its accumulated context outvalues a clean read (quota death mid-task, partial edits only its author understands), redispatch when the premise moved (fix rounds, steers, reviews — a reviewer must never resume the implementer). See `protocols/dispatch-resume.md`.
 Dispatch defaults detached; `--foreground` only for sync scripts/tests. Queue: `--submit --drain-on-submit`.
 Do not hand-iterate (>~3 edit/test cycles) what a goal-loop should converge.
 
-Controller entry auto-claims without stealing a live different lease. Arm a pool of two background generation-bound `goalflight_messages.py listen --project-root "$PWD" --controller-label <label> --lease-nonce <nonce> --report-pending` tasks; on each exit, process the reported or authoritative mail, cursor-CAS settled server-known positions, then re-arm one task to restore depth two. Background fixed-id `goalflight_status.py --wait <ids>` only for an unclaimed join; exit 3 is mail, not completion. Timers cover non-notifiable external state, never worker completion.
+Controller entry auto-claims without stealing a live different lease. Arm a pool of four background generation-bound `goalflight_messages.py listen --project-root "$PWD" --controller-label <label> --lease-nonce <nonce> --report-pending` tasks; on each exit, process the reported or authoritative mail, cursor-CAS settled server-known positions, then re-arm one task to restore depth four. Background fixed-id `goalflight_status.py --wait <ids>` only for an unclaimed join; exit 3 is mail, not completion. Timers cover non-notifiable external state, never worker completion.
 Controller-direct: held context, fully stateable edit, clean Axis 2; plan marks do not waive it.
 Routing detail: typed dispatch roles; five-layer prompts; parallel forbid lists; split broad chunks; host tool maps; same-provider review policy. See `protocols/dispatch-routing.md`.
 Triggered lanes need pinned context and the execute pre-wave check (`worker-context-package.md`).

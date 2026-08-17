@@ -200,6 +200,19 @@ def _wait_for_listener(
     raise AssertionError(f"listener for {label} never armed")
 
 
+def _configured_pool_size() -> int:
+    return wake.listener_slot_count()
+
+
+def _assert_arbitration_pool_legal(slots: int) -> int:
+    """Explicit N-listener arbitration fixture; must stay under the slot ceiling."""
+    assert 1 <= slots <= wake.MAX_LISTENER_SLOTS, (
+        f"arbitration fixture of {slots} exceeds MAX_LISTENER_SLOTS="
+        f"{wake.MAX_LISTENER_SLOTS}"
+    )
+    return slots
+
+
 def _wait_for_listener_count(
     root: Path,
     *,
@@ -567,6 +580,8 @@ def test_listener_pool_one_event_pops_exactly_one_real_process(
         "wake-test", principal={"principal_id": "pool-pop-one"}
     )
     assert claimed.committed and claimed.value is not None
+    # Deliberate three-listener arbitration: one event must pop exactly one.
+    arbitration_slots = _assert_arbitration_pool_legal(3)
     processes = [
         subprocess.Popen(
             _listener_command(
@@ -574,7 +589,7 @@ def test_listener_pool_one_event_pops_exactly_one_real_process(
                 tmp_path,
                 label="wake-test",
                 nonce=claimed.value.nonce,
-                slots=3,
+                slots=arbitration_slots,
                 timeout_s=15,
             ),
             cwd=root,
@@ -583,23 +598,25 @@ def test_listener_pool_one_event_pops_exactly_one_real_process(
             stderr=subprocess.PIPE,
             text=True,
         )
-        for _index in range(3)
+        for _index in range(arbitration_slots)
     ]
     try:
-        waiters = _wait_for_listener_count(root, label="wake-test", count=3)
-        assert len({row.pid for row in waiters}) == 3
+        waiters = _wait_for_listener_count(
+            root, label="wake-test", count=arbitration_slots
+        )
+        assert len({row.pid for row in waiters}) == arbitration_slots
         assert wake.coverage_status(root, controller_label="wake-test")[
             "live_waiters"
-        ] == 3
+        ] == arbitration_slots
         slot_names = {
             path.name
             for path in wake.ledger_dir(root).iterdir()
             if path.name.startswith("listener-slot-v1.")
         }
-        assert len(slot_names) == 3
+        assert len(slot_names) == arbitration_slots
         assert all(
             any(name.endswith(f"listener-slot-{index}.lock") for name in slot_names)
-            for index in range(3)
+            for index in range(arbitration_slots)
         )
 
         _post_notice(
@@ -615,7 +632,8 @@ def test_listener_pool_one_event_pops_exactly_one_real_process(
         assert exited[0].returncode == 0, stderr
         assert json.loads(stdout)["kind"] == "ring"
         assert all(process.poll() is None for process in processes if process not in exited)
-        assert len(_wait_for_listener_count(root, label="wake-test", count=2)) == 2
+        remaining = arbitration_slots - 1
+        assert len(_wait_for_listener_count(root, label="wake-test", count=remaining)) == remaining
 
         # Mutation pair for the ring-stamp comparison: equality must suppress
         # duplicate pops, while any cursor change makes the stamp stale.
@@ -733,15 +751,38 @@ def test_malformed_ring_stamp_does_not_trap_listener_in_exit_two_loop(
     assert json.loads(second.stdout)["reason"] == "timeout"
 
 
-def test_listener_pool_defaults_to_two_slots(
+def test_listener_pool_defaults_to_the_configured_depth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("GOALFLIGHT_LISTENER_SLOTS", raising=False)
-    assert wake.listener_slot_count() == 2
+    assert wake.listener_slot_count() == wake.DEFAULT_LISTENER_SLOTS
+    assert _configured_pool_size() == wake.DEFAULT_LISTENER_SLOTS
     monkeypatch.setenv("GOALFLIGHT_LISTENER_SLOTS", "3")
     assert wake.listener_slot_count() == 3
     with pytest.raises(ValueError, match="between 1 and"):
         wake.listener_slot_count(0)
+
+
+def test_listener_reserve_hint_prints_one_command_per_missing_slot() -> None:
+    target = wake.DEFAULT_LISTENER_SLOTS
+    command = "python3 scripts/goalflight_messages.py listen --report-pending"
+    assert wake.listener_reserve_hint(0, target, command) == (
+        f"listener pool n=0; start: {command}"
+    )
+    one_live = wake.listener_reserve_hint(1, target, command)
+    assert one_live.startswith(
+        f"listener pool n=1/{target} — reserve down; re-arm: {command}"
+    )
+    assert one_live.count(command) == max(0, target - 1)
+    # An almost-full pool is deliberately SILENT: one missing slot is not
+    # news (operator ruling 2026-08-16). Only at or below the low-water mark
+    # does the hint speak.
+    if target >= 2:
+        assert wake.listener_reserve_hint(target - 1, target, command) == ""
+        low = wake.listener_low_water(target)
+        at_low = wake.listener_reserve_hint(low, target, command)
+        assert at_low.startswith(f"listener pool n={low}/{target}")
+        assert at_low.count(command) == target - low
 
 
 def test_entry_hint_grades_crashed_pool_member_and_full_pool_is_silent(
@@ -759,7 +800,7 @@ def test_entry_hint_grades_crashed_pool_member_and_full_pool_is_silent(
         tmp_path,
         label="wake-test",
         nonce=claimed.value.nonce,
-        slots=2,
+        slots=wake.DEFAULT_LISTENER_SLOTS,
         timeout_s=20,
     )
     processes = [
@@ -771,10 +812,10 @@ def test_entry_hint_grades_crashed_pool_member_and_full_pool_is_silent(
             stderr=subprocess.PIPE,
             text=True,
         )
-        for _index in range(2)
+        for _index in range(wake.DEFAULT_LISTENER_SLOTS)
     ]
     try:
-        _wait_for_listener_count(root, label="wake-test", count=2)
+        _wait_for_listener_count(root, label="wake-test", count=wake.DEFAULT_LISTENER_SLOTS)
         full_stream = io.StringIO()
         full = wake.check_tool_entry(
             root,
@@ -783,12 +824,17 @@ def test_entry_hint_grades_crashed_pool_member_and_full_pool_is_silent(
             mail_bearing=True,
             stream=full_stream,
         )
-        assert full["live_waiters"] == full["target_waiters"] == 2
+        assert full["live_waiters"] == full["target_waiters"] == wake.DEFAULT_LISTENER_SLOTS
         assert full_stream.getvalue() == ""
 
-        processes[0].kill()
+        # Kill down TO the low-water mark: a single missing slot is deliberately
+        # silent now, so the graded hint needs a genuinely thin pool.
+        for victim in processes[: wake.DEFAULT_LISTENER_SLOTS - wake.listener_low_water(wake.DEFAULT_LISTENER_SLOTS)]:
+            victim.kill()
         processes[0].communicate(timeout=3)
-        _wait_for_listener_count(root, label="wake-test", count=1)
+        _wait_for_listener_count(
+        root, label="wake-test", count=wake.listener_low_water(wake.DEFAULT_LISTENER_SLOTS)
+    )
         reserve_stream = io.StringIO()
         reserve = wake.check_tool_entry(
             root,
@@ -798,12 +844,18 @@ def test_entry_hint_grades_crashed_pool_member_and_full_pool_is_silent(
             stream=reserve_stream,
         )
         assert reserve["covered"] is True  # old any-listener mutation would stop here.
-        assert reserve["live_waiters"] == 1
-        assert reserve["target_waiters"] == 2
-        assert reserve_stream.getvalue().startswith(
-            "listener pool n=1/2 — reserve down; re-arm: "
+        assert reserve["live_waiters"] == wake.listener_low_water(wake.DEFAULT_LISTENER_SLOTS)
+        assert reserve["target_waiters"] == wake.DEFAULT_LISTENER_SLOTS
+        hint = reserve_stream.getvalue()
+        assert hint.startswith(
+            f"listener pool n={wake.listener_low_water(wake.DEFAULT_LISTENER_SLOTS)}/"
+            f"{wake.DEFAULT_LISTENER_SLOTS} — reserve down; re-arm: "
         )
-        assert "--report-pending" in reserve_stream.getvalue()
+        # One arm command per MISSING slot (at depth 2 that happened to equal
+        # DEFAULT-1; state the real relation so any depth holds).
+        assert hint.count("--report-pending") == (
+            wake.DEFAULT_LISTENER_SLOTS - reserve["live_waiters"]
+        )
     finally:
         for process in processes:
             if process.poll() is None:
@@ -829,6 +881,8 @@ def test_cursor_advance_with_leftovers_pops_one_more_pool_member(
             dispatch_id=dispatch_id,
             text=dispatch_id,
         )
+    # Deliberate three-listener arbitration against two leftover notices.
+    arbitration_slots = _assert_arbitration_pool_legal(3)
     processes = [
         subprocess.Popen(
             _listener_command(
@@ -836,7 +890,7 @@ def test_cursor_advance_with_leftovers_pops_one_more_pool_member(
                 tmp_path,
                 label="wake-test",
                 nonce=claimed.value.nonce,
-                slots=3,
+                slots=arbitration_slots,
                 timeout_s=15,
             ),
             cwd=root,
@@ -845,12 +899,14 @@ def test_cursor_advance_with_leftovers_pops_one_more_pool_member(
             stderr=subprocess.PIPE,
             text=True,
         )
-        for _index in range(3)
+        for _index in range(arbitration_slots)
     ]
     try:
         exited = _wait_for_exited_count(processes, 1)
         assert len(exited) == 1
-        _wait_for_listener_count(root, label="wake-test", count=2)
+        _wait_for_listener_count(
+            root, label="wake-test", count=arbitration_slots - 1
+        )
         peek = authority.cursor_peek(
             "wake-test",
             nonce=claimed.value.nonce,
@@ -978,6 +1034,8 @@ def test_self_post_does_not_ring_pool_foreign_post_does(
         "wake-test", principal={"principal_id": "self-wake-pool"}
     )
     assert claimed.committed and claimed.value is not None
+    # Two-listener self-vs-foreign arbitration; legal under the slot ceiling.
+    arbitration_slots = _assert_arbitration_pool_legal(2)
     processes = [
         subprocess.Popen(
             _listener_command(
@@ -985,7 +1043,7 @@ def test_self_post_does_not_ring_pool_foreign_post_does(
                 tmp_path,
                 label="wake-test",
                 nonce=claimed.value.nonce,
-                slots=2,
+                slots=arbitration_slots,
                 timeout_s=15,
             ),
             cwd=root,
@@ -994,10 +1052,10 @@ def test_self_post_does_not_ring_pool_foreign_post_does(
             stderr=subprocess.PIPE,
             text=True,
         )
-        for _index in range(2)
+        for _index in range(arbitration_slots)
     ]
     try:
-        _wait_for_listener_count(root, label="wake-test", count=2)
+        _wait_for_listener_count(root, label="wake-test", count=arbitration_slots)
         self_post = _post_notice(
             root,
             tmp_path,
@@ -1201,7 +1259,7 @@ def test_live_waiters_distinguishes_deleted_ledger_from_genuine_zero(
             "covered": False,
             "reason": "waiter-probe-unavailable",
             "live_waiters": None,
-            "target_waiters": 2,
+            "target_waiters": wake.DEFAULT_LISTENER_SLOTS,
             "waiters": [],
             "monitor": {"required": False, "state": "not-applicable"},
         }
@@ -2132,17 +2190,18 @@ def test_full_listener_pool_coverage_skips_notice_and_poll(
         controller_label="wake-test",
         lease_nonce=claimed.value.nonce,
     )
-    with (
-        wake.register_waiter(root, controller_label="wake-test", kind="listener"),
-        wake.register_waiter(root, controller_label="wake-test", kind="listener"),
-    ):
+    with contextlib.ExitStack() as pool:
+        for _slot in range(wake.DEFAULT_LISTENER_SLOTS):
+            pool.enter_context(
+                wake.register_waiter(root, controller_label="wake-test", kind="listener")
+            )
         stream = io.StringIO()
         result = messages.emit_wake_entry_notice(project_root=root, stream=stream)
     lease_holder.close()
 
     assert result["covered"] is True
     assert result["reason"] == "held-flock"
-    assert result["live_waiters"] == result["target_waiters"] == 2
+    assert result["live_waiters"] == result["target_waiters"] == wake.DEFAULT_LISTENER_SLOTS
     assert stream.getvalue() == ""
 
 
@@ -2262,3 +2321,37 @@ def test_attention_generation_noise_collapses_to_one_open_item(
 def test_lease_horizon_outlives_wait_heartbeat_and_hourly_watchdog() -> None:
     assert journal.DEFAULT_LEASE_HORIZON_S >= 2 * 60 * 60
     assert journal.DEFAULT_LEASE_HORIZON_S > status._WAIT_HEARTBEAT_S
+
+def test_hint_stays_quiet_until_the_pool_runs_low() -> None:
+    """A missing slot is not news; a thin pool is.
+
+    Operator ruling 2026-08-16: hints must not nag at 3/4. Silence holds
+    while depth is above the low-water mark, and only then does the hint
+    speak — with the loud offline wording reserved for an empty pool.
+    """
+    target = wake.DEFAULT_LISTENER_SLOTS
+    low = wake.listener_low_water(target)
+    assert 1 <= low < target, "low water must leave healthy depth silent"
+
+    for healthy in range(low + 1, target + 1):
+        assert wake.listener_reserve_hint(healthy, target, "CMD") == "", (
+            f"pool n={healthy}/{target} should be silent"
+        )
+    for thin in range(1, low + 1):
+        hint = wake.listener_reserve_hint(thin, target, "CMD")
+        assert hint.startswith(f"listener pool n={thin}/{target}")
+        assert hint.count("CMD") == target - thin
+    assert wake.listener_reserve_hint(0, target, "CMD").startswith("listener pool n=0;")
+
+
+def test_low_water_override_is_honored_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_LISTENER_LOW_WATER", "3")
+    assert wake.listener_low_water(4) == 3
+    assert wake.listener_reserve_hint(3, 4, "CMD") != ""
+    monkeypatch.setenv("GOALFLIGHT_LISTENER_LOW_WATER", "99")
+    assert wake.listener_low_water(4) == 4, "override cannot exceed the target"
+    monkeypatch.setenv("GOALFLIGHT_LISTENER_LOW_WATER", "nonsense")
+    with pytest.raises(ValueError):
+        wake.listener_low_water(4)

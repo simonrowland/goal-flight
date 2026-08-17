@@ -6,6 +6,30 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Added
+
+- A repo is one repo however it reaches the disk. Project records now carry a
+  normalized repo identity derived from the origin remote — resolved once when
+  the record is written, never per query — so separate clones of one GitHub
+  repo are recognized as the same repo, which the git common directory alone
+  cannot do. Worktrees inherit their parent's identity, and a checkout with no
+  origin says so rather than being merged with a stranger.
+- Guidance for resuming a dead worker instead of redispatching it, reachable
+  from the places a controller actually looks: the navigation map, the
+  dispatch model itself, the protocol index, and the recovery protocol.
+
+### Changed
+
+- Controllers arm four doorbells by default instead of two, so three missed
+  re-arms in a row still leave someone listening; the depth is genuinely
+  tunable, proven by running the pool suites at three different depths.
+- Pool hints stay quiet until the pool is actually thin: silence at full and
+  near-full depth, a graded hint at or below half, and the loud offline line
+  only when nothing is listening.
+- The fleet console gains a controllers panel, banners that reconcile instead
+  of blinking, and ticket chips that filter.
+
+
 ### Fixed
 
 - Worker terminals wake controllers on their own. Delivery rows are written

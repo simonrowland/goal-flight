@@ -37,6 +37,16 @@ function element(tagName) {
       child.parentNode = this;
       return child;
     },
+    insertBefore(child, ref) {
+      if (child.parentNode) {
+        child.parentNode.children = child.parentNode.children.filter((item) => item !== child);
+      }
+      const index = this.children.indexOf(ref);
+      if (index < 0) this.children.push(child);
+      else this.children.splice(index, 0, child);
+      child.parentNode = this;
+      return child;
+    },
     remove() {
       if (!this.parentNode) return;
       this.parentNode.children = this.parentNode.children.filter((child) => child !== this);
@@ -54,6 +64,9 @@ function element(tagName) {
   Object.defineProperty(node, "textContent", {
     get() { return this._text + this.children.map((child) => child.textContent).join(""); },
     set(value) { this._text = String(value); this.children = []; },
+  });
+  Object.defineProperty(node, "firstChild", {
+    get() { return this.children[0] || null; },
   });
   return node;
 }
@@ -208,6 +221,7 @@ function fleetPayload(overrides) {
       flags: ["healthy"],
     }],
     remote: { available: true, history_excluded: 0, nodes: [], workers: [] },
+    controllers: [],
     projects: [{
       project_id: "kiln-abc123",
       name: "kiln",
@@ -215,6 +229,10 @@ function fleetPayload(overrides) {
       last_seen: "2030-01-01T00:02:00Z",
       skill_version: "1.3.0",
       history_excluded: 0,
+      parent_project_id: "kiln-abc123",
+      parent_name: "kiln",
+      worktree_name: null,
+      repo_identity: "github.com/simonrowland/kiln",
       queue: {
         depth: 7,
         lanes: [{ agent: "codex", count: 5 }, { agent: "claude", count: 2 }],
@@ -235,14 +253,19 @@ function fleetPayload(overrides) {
 }
 
 function projectRow(workers, overrides) {
-  return Object.assign({
+  const row = Object.assign({
     project_id: "p", name: "p", registered: true, last_seen: null, skill_version: null,
+    parent_project_id: null, parent_name: null, worktree_name: null,
+    repo_identity: null,
     history_excluded: 0,
     queue: { depth: 0, lanes: [], oldest_created_at: null },
     session: { available: false, active: null, queue_state: null, queue_last_touched: null, active_leases: null },
     milestone: { available: false, active_cadence: null, commits_since: null, cadence: null, due: null },
     workers,
   }, overrides || {});
+  if (!row.parent_project_id) row.parent_project_id = row.project_id;
+  if (!row.parent_name) row.parent_name = row.name;
+  return row;
 }
 
 function attentionPayload(overrides) {
@@ -1560,6 +1583,291 @@ async function testInteractiveHistoryAndKeyedRows() {
       api.rowNode("named-conflict") !== null,
       byId.fleet.textContent.includes("Ticket b-151 · clear filter"),
       detail && detail.textContent.includes("status.json.state") && detail.textContent.includes("ledger.terminal_state"),
+    ].every(Boolean));
+    api.setFleetData(fleetPayload({
+      generation_id: "ticket-filter-survives",
+      projects: [projectRow([
+        Object.assign({}, first, { started_at: "2030-01-01T00:02:40Z" }),
+        second,
+        conflict,
+        workerRow({ dispatch_id: "ticket-three", task_ids: ["b-151"] }),
+      ])],
+    }));
+    assert("ticket filter survives a re-render with changed data", [
+      api.rowNode("ticket-one") !== null,
+      api.rowNode("ticket-two") === null,
+      api.rowNode("ticket-three") !== null,
+      byId.fleet.textContent.includes("Ticket b-151 · clear filter"),
+    ].every(Boolean));
+    const clear = descendants(byId.fleet).find((node) => node.className === "ghost-btn ticket-filter-clear");
+    clear.click();
+    assert("clearing the ticket filter restores every dispatch", [
+      api.rowNode("ticket-one") !== null,
+      api.rowNode("ticket-two") !== null,
+      api.rowNode("ticket-three") !== null,
+      clear.getAttribute("hidden") === "hidden",
+      !clear.textContent.includes("b-151"),
+    ].every(Boolean));
+  }
+
+  // Banners reconcile by key: an attention row keeps its node identity across
+  // fleet-plane ticks and disappears only when its condition is gone.
+  {
+    const attention = attentionPayload({ items: [{
+      dispatch_id: "needs-review",
+      seq: 1,
+      kind: "user_need",
+      action: "Review",
+      observed_at: "2030-01-01T00:00:00Z",
+      headline: "Need a review",
+    }] });
+    const { api, byId } = loadConsole(
+      fleetPayload({ generation_id: "banner-fleet-a" }),
+      attention
+    );
+    const banner = descendants(byId.attention).find((node) => node.className === "attn-row");
+    api.setFleetData(fleetPayload({ generation_id: "banner-fleet-b" }));
+    const afterFleet = descendants(byId.attention).find((node) => node.className === "attn-row");
+    api.setAttentionData(attentionPayload({
+      generation_id: "attention-same-banner",
+      items: attention.items,
+    }));
+    const afterAttention = descendants(byId.attention).find((node) => node.className === "attn-row");
+    api.setAttentionData(attentionPayload({ generation_id: "attention-resolved", items: [] }));
+    const gone = descendants(byId.attention).find((node) => node.className === "attn-row");
+    assert("attention banners keep node identity across plane ticks and drop when resolved", [
+      banner != null,
+      banner === afterFleet,
+      afterFleet === afterAttention,
+      gone == null,
+    ].every(Boolean));
+  }
+
+  // CONTROLLERS panel lists live rows first and collapses DEAD leftovers.
+  {
+    const { api, byId } = loadConsole(
+      fleetPayload({
+        controllers: [
+          {
+            controller_key: "p:battery-tool-v2",
+            label: "battery-tool-v2",
+            project_id: "p",
+            project_name: "battery",
+            parent_project_id: "p",
+            parent_name: "battery",
+            controller_liveness_state: "DEAD",
+            listener_live: 0,
+            listener_target: 4,
+            in_flight_count: 0,
+            owned_live: 0,
+            last_seen: "2026-01-01T00:00:00Z",
+            generation: 1,
+            retire_command: "python3 scripts/goalflight_session_status.py --retire battery-tool-v2",
+          },
+          {
+            controller_key: "p:battery-main",
+            label: "battery-main",
+            project_id: "p",
+            project_name: "battery",
+            parent_project_id: "p",
+            parent_name: "battery",
+            controller_liveness_state: "ALIVE",
+            listener_live: 4,
+            listener_target: 4,
+            in_flight_count: 2,
+            owned_live: 2,
+            last_seen: "2030-01-01T00:02:00Z",
+            generation: 3,
+            retire_command: null,
+          },
+        ],
+      }),
+      attentionPayload({ items: [] })
+    );
+    const liveLabels = descendants(byId["fleet-section"])
+      .filter((node) => node.className === "controller-label")
+      .map((node) => node.textContent);
+    const toggle = descendants(byId["fleet-section"]).find((node) =>
+      node.className === "controller-toggle dead-controllers-toggle"
+    );
+    assert("controllers panel shows live rows and collapses dead leftovers", [
+      liveLabels.includes("battery-main"),
+      !liveLabels.includes("battery-tool-v2"),
+      toggle && toggle.textContent.includes("1 dead"),
+      toggle && toggle.getAttribute("aria-expanded") === "false",
+      !byId["fleet-section"].textContent.includes("--retire battery-tool-v2"),
+    ].every(Boolean));
+    toggle.click();
+    assert("dead controller disclosure shows the retire command", [
+      byId["fleet-section"].textContent.includes("battery-tool-v2"),
+      byId["fleet-section"].textContent.includes("python3 scripts/goalflight_session_status.py --retire battery-tool-v2"),
+      toggle.getAttribute("aria-expanded") === "true",
+    ].every(Boolean));
+    void api;
+  }
+
+  {
+    const mainWorkers = [workerRow({
+      dispatch_id: "webui-main",
+      controller_label: "webui",
+      controller_display: "webui",
+      controller_state: "label",
+      controller_liveness_state: "ALIVE",
+    })];
+    const adapterWorkers = [workerRow({
+      dispatch_id: "webui-adapter",
+      controller_label: "webui",
+      controller_display: "webui",
+      controller_state: "label",
+      controller_liveness_state: "ALIVE",
+    })];
+    const { byId } = loadConsole(
+      fleetPayload({
+        projects: [
+          projectRow(mainWorkers, {
+            project_id: "battery", name: "battery-tool-v2",
+            parent_project_id: "battery", parent_name: "battery-tool-v2", worktree_name: null,
+            repo_identity: "github.com/timdrpp/battery-tool-v2"
+          }),
+          projectRow(adapterWorkers, {
+            project_id: "bt-adapter", name: "bt-adapter",
+            parent_project_id: "battery", parent_name: "battery-tool-v2", worktree_name: "bt-adapter",
+            repo_identity: "github.com/timdrpp/battery-tool-v2"
+          }),
+        ],
+        controllers: [{
+          controller_key: "battery:webui",
+          label: "webui",
+          project_id: "battery",
+          project_name: "battery-tool-v2",
+          parent_project_id: "battery",
+          parent_name: "battery-tool-v2",
+          controller_liveness_state: "ALIVE",
+          listener_live: 4,
+          listener_target: 4,
+          in_flight_count: 2,
+          owned_live: 2,
+          last_seen: "2030-01-01T00:02:00Z",
+          generation: 1,
+          retire_command: null,
+        }],
+      }),
+      attentionPayload({ items: [] })
+    );
+    assert("worktree projects group under the parent repo band", [
+      byId.fleet.textContent.includes("timdrpp/battery-tool-v2"),
+      byId.fleet.textContent.includes("2 checkouts") || byId.fleet.textContent.includes("bt-adapter"),
+      byId.fleet.textContent.includes("webui-adapter"),
+    ].every(Boolean));
+    const expand = descendants(byId["fleet-section"]).find((node) =>
+      node.className === "controller-toggle owner-expand"
+    );
+    expand.click();
+    assert("controller expansion lists owned workers by worktree name, not a raw path", [
+      byId["fleet-section"].textContent.includes("webui-main"),
+      byId["fleet-section"].textContent.includes("webui-adapter"),
+      byId["fleet-section"].textContent.includes("timdrpp/battery-tool-v2 / bt-adapter"),
+      !byId["fleet-section"].textContent.includes("/Users/"),
+    ].every(Boolean));
+  }
+
+  {
+    const shared = "github.com/timdrpp/battery-tool-v2";
+    const cloneA = projectRow([workerRow({ dispatch_id: "clone-a-live" })], {
+      project_id: "bt-main", name: "battery-tool-v2",
+      parent_project_id: "bt-main", parent_name: "battery-tool-v2",
+      repo_identity: shared,
+    });
+    const cloneB = projectRow([workerRow({ dispatch_id: "bt-verify-live" })], {
+      project_id: "bt-verify", name: "bt-verify",
+      parent_project_id: "bt-verify", parent_name: "bt-verify",
+      repo_identity: shared,
+    });
+    const unlinked = projectRow([workerRow({ dispatch_id: "scratch-live" })], {
+      project_id: "scratch-id", name: "scratch",
+      parent_project_id: "scratch-id", parent_name: "scratch",
+      repo_identity: null,
+    });
+    const solo = projectRow([workerRow({ dispatch_id: "kiln-live" })], {
+      project_id: "kiln-id", name: "kiln-checkout",
+      parent_project_id: "kiln-id", parent_name: "kiln-checkout",
+      repo_identity: "github.com/simonrowland/kiln",
+    });
+    const { byId } = loadConsole(
+      fleetPayload({ projects: [cloneA, cloneB, unlinked, solo] }),
+      attentionPayload({ items: [] })
+    );
+    const fleetText = byId.fleet.textContent;
+    const titles = descendants(byId.fleet)
+      .filter((node) => node.className === "proj")
+      .map((node) => node.textContent);
+    assert("separate clones of one GitHub repo share one owner/name band", [
+      titles.filter((title) => title === "timdrpp/battery-tool-v2").length === 1,
+      fleetText.includes("2 checkouts"),
+      fleetText.includes("clone-a-live"),
+      fleetText.includes("bt-verify-live"),
+    ].every(Boolean));
+    assert("a checkout with no identity stands alone and is labelled unlinked", [
+      titles.includes("scratch"),
+      fleetText.includes("unlinked"),
+      fleetText.includes("scratch-live"),
+      !titles.includes("scratch") || descendants(byId.fleet)
+        .filter((node) => node.className === "proj-path")
+        .some((node) => node.textContent.includes("unlinked")),
+    ].every(Boolean));
+    assert("a repo with one checkout renders flat, without a nested checkout list", [
+      titles.includes("simonrowland/kiln"),
+      !fleetText.includes("1 checkouts"),
+      fleetText.includes("kiln-live"),
+    ].every(Boolean));
+    // Mutation control: parent-checkout grouping cannot unify these clones.
+    assert("parent ids stay distinct so a directory lens would have split the clones", [
+      cloneA.parent_project_id !== cloneB.parent_project_id,
+      cloneA.repo_identity === cloneB.repo_identity,
+    ].every(Boolean));
+  }
+
+  {
+    const shared = "github.com/timdrpp/battery-tool-v2";
+    const live = projectRow([workerRow({ dispatch_id: "bt-live" })], {
+      project_id: "bt-live-id", name: "bt-live",
+      repo_identity: shared,
+    });
+    const idle = projectRow([workerRow({
+      dispatch_id: "bt-idle",
+      is_terminal: true,
+      observed_live: false,
+      state: "complete",
+      classification: "complete",
+      display_state: "complete",
+      ended_at: "2020-01-01T00:00:00Z",
+    })], {
+      project_id: "bt-idle-id", name: "bt-idle",
+      repo_identity: shared,
+      history_excluded: 1,
+    });
+    const { byId } = loadConsole(
+      fleetPayload({ projects: [live, idle] }),
+      attentionPayload({ items: [] })
+    );
+    assert("multi-checkout repos collapse idle checkouts by default", [
+      byId.fleet.textContent.includes("timdrpp/battery-tool-v2"),
+      byId.fleet.textContent.includes("2 checkouts"),
+      byId.fleet.textContent.includes("bt-live"),
+      !byId.fleet.textContent.includes("bt-idle"),
+    ].every(Boolean));
+    const toggle = descendants(byId.fleet).find((node) =>
+      node.className === "ghost-btn collapsed-checkouts-toggle"
+    );
+    assert("idle checkout disclosure names the hidden children", [
+      toggle != null,
+      toggle.textContent.includes("1 idle checkout"),
+      toggle.getAttribute("aria-expanded") === "false",
+    ].every(Boolean));
+    toggle.click();
+    assert("expanding idle checkouts reveals the collapsed child", [
+      byId.fleet.textContent.includes("bt-idle"),
+      toggle.getAttribute("aria-expanded") === "true",
     ].every(Boolean));
   }
 }

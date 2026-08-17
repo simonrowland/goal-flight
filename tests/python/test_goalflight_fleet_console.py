@@ -621,7 +621,7 @@ def test_registry_membership_is_not_a_statement_about_sampling() -> None:
         ]},
     }
     sampled = [{"root": F._canonical_root("/tmp/inside"), "last_seen": None, "skill_version": None}]
-    projects, _, _ = F._project_rows(
+    projects, _, _, _ = F._project_rows(
         machine, sampled, [],
         # Canonical form: _canonical_root resolves /tmp -> /private/tmp on
         # macOS, and the join is on the resolved value.
@@ -2516,6 +2516,412 @@ def test_history_hooks_require_explicit_console_opt_in() -> None:
     assert_true("unconfigured history hooks do not write implicitly", configured is None)
 
 
+def test_controller_panel_lists_live_first_and_shows_retire_command() -> None:
+    """FAST-plane controllers reuse lease rows; DEAD leftovers offer retire."""
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        project_root = (temp_root / "battery").resolve()
+        project_root.mkdir()
+        isolated_env = _controller_test_env(temp_root)
+        with mock.patch.dict(os.environ, isolated_env, clear=False):
+            authority = F.goalflight_journal.open_or_create_journal(project_root)
+            live = authority.claim_or_renew_lease(
+                "battery-main",
+                principal={"principal_id": "battery-live"},
+            )
+            leftover = authority.claim_or_renew_lease(
+                "battery-tool-v2",
+                principal={"principal_id": "battery-legacy"},
+            )
+            assert_true("live lease claimed", live.committed and live.value is not None)
+            assert_true("legacy lease claimed", leftover.committed and leftover.value is not None)
+            live_lease = live.value
+            leftover_lease = leftover.value
+            assert live_lease is not None and leftover_lease is not None
+            leftover_holder = F.goalflight_wake.register_lease_holder(
+                project_root,
+                controller_label="battery-tool-v2",
+                lease_nonce=leftover_lease.nonce,
+            )
+            leftover_holder.close()
+            machine_status = {
+                "schema": "goalflight.status.aggregate.v1",
+                "capacity": {},
+                "capacity_state": {"leases": {}},
+                "rate_pressure": {},
+                "warnings": [],
+                "dispatch": {
+                    "records": [
+                        {
+                            "dispatch_id": "battery-live-worker",
+                            "project_root": str(project_root),
+                            "state": "running",
+                            "classification": "expected_live",
+                            "controller_session_id": live_lease.nonce,
+                            "controller_pid": os.getpid(),
+                        }
+                    ]
+                },
+            }
+            registry = [
+                {
+                    "project_root": str(project_root),
+                    "last_seen": "2030-01-01T00:00:00+00:00",
+                    "skill_version": "test",
+                }
+            ]
+            with (
+                contextlib.ExitStack() as locks,
+                mock.patch.object(F.goalflight_status, "status_payload", return_value=machine_status),
+                mock.patch.object(F.goalflight_fleet_status_cli, "build_fleet_status", return_value={}),
+                mock.patch.object(F.goalflight_usage, "collect_usage", return_value=[]),
+                mock.patch.object(F.goalflight_task, "read_project_registry", return_value=registry),
+                mock.patch.object(F.goalflight_session_status, "aggregate_status", return_value={}),
+                mock.patch.object(F.goalflight_status, "milestone_status_payload", return_value={}),
+                mock.patch.object(F.goalflight_messages, "controller_mail_summary", return_value={"needs": []}),
+            ):
+                locks.enter_context(
+                    F.goalflight_wake.register_lease_holder(
+                        project_root,
+                        controller_label="battery-main",
+                        lease_nonce=live_lease.nonce,
+                    )
+                )
+                locks.enter_context(
+                    F.goalflight_wake.register_waiter(
+                        project_root,
+                        controller_label="battery-main",
+                        kind="listener",
+                    )
+                )
+                started = time.perf_counter()
+                fleet = F.build_fleet_plane(generation_id="controllers-panel")
+                elapsed = time.perf_counter() - started
+
+        LAST_FAST_PLANE_MEASUREMENT["controller_panel_seconds"] = elapsed
+        rows = fleet["controllers"]
+        labels = [row["label"] for row in rows]
+        assert_true("both lease labels are projected", labels == ["battery-main", "battery-tool-v2"])
+        assert_true("live controller is classified ALIVE", rows[0]["controller_liveness_state"] == "ALIVE")
+        assert_true("legacy leftover is classified DEAD", rows[1]["controller_liveness_state"] == "DEAD")
+        assert_true(
+            "DEAD row carries the real retire command",
+            rows[1]["retire_command"]
+            == "python3 scripts/goalflight_session_status.py --retire battery-tool-v2",
+        )
+        assert_true("live row has no retire command", rows[0]["retire_command"] is None)
+        assert_true("listener depth is n/target scalars", rows[0]["listener_target"] == F.goalflight_wake.DEFAULT_LISTENER_SLOTS)
+        encoded = json.dumps(fleet)
+        assert_true("controller panel publishes no absolute paths", str(project_root) not in encoded)
+        assert_true("constructed controller-panel fleet build stays under one second", elapsed < 1.0)
+
+
+def test_controller_panel_aggregates_owned_workers_across_worktrees() -> None:
+    """Owner labels roll up worktree projects without publishing their paths."""
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        parent = (temp_root / "battery-tool-v2").resolve()
+        worktree = (temp_root / "bt-adapter").resolve()
+        parent.mkdir()
+        worktree.mkdir()
+        (parent / ".git").mkdir()
+        worktree_git = parent / ".git" / "worktrees" / "bt-adapter"
+        worktree_git.mkdir(parents=True)
+        (worktree_git / "commondir").write_text("../..\n", encoding="utf-8")
+        (worktree / ".git").write_text(f"gitdir: {worktree_git}\n", encoding="utf-8")
+        isolated_env = _controller_test_env(temp_root)
+        with mock.patch.dict(os.environ, isolated_env, clear=False):
+            authority = F.goalflight_journal.open_or_create_journal(parent)
+            claimed = authority.claim_or_renew_lease(
+                "webui",
+                principal={"principal_id": "webui-owner"},
+            )
+            assert_true("webui lease claimed", claimed.committed and claimed.value is not None)
+            lease = claimed.value
+            assert lease is not None
+            machine_status = {
+                "schema": "goalflight.status.aggregate.v1",
+                "capacity": {},
+                "capacity_state": {"leases": {}},
+                "rate_pressure": {},
+                "warnings": [],
+                "dispatch": {
+                    "records": [
+                        {
+                            "dispatch_id": "webui-main",
+                            "project_root": str(parent),
+                            "state": "running",
+                            "classification": "expected_live",
+                            "controller_session_id": lease.nonce,
+                            "controller_pid": os.getpid(),
+                            "controller_label": "webui",
+                        },
+                        {
+                            "dispatch_id": "webui-adapter",
+                            "project_root": str(worktree),
+                            "state": "running",
+                            "classification": "expected_live",
+                            "controller_session_id": lease.nonce,
+                            "controller_pid": os.getpid(),
+                            "controller_label": "webui",
+                        },
+                    ]
+                },
+            }
+            registry = [
+                {"project_root": str(parent), "last_seen": "2030-01-01T00:00:00+00:00"},
+                {"project_root": str(worktree), "last_seen": "2030-01-01T00:00:00+00:00"},
+            ]
+            with (
+                contextlib.ExitStack() as locks,
+                mock.patch.object(F.goalflight_status, "status_payload", return_value=machine_status),
+                mock.patch.object(F.goalflight_fleet_status_cli, "build_fleet_status", return_value={}),
+                mock.patch.object(F.goalflight_usage, "collect_usage", return_value=[]),
+                mock.patch.object(F.goalflight_task, "read_project_registry", return_value=registry),
+                mock.patch.object(F.goalflight_session_status, "aggregate_status", return_value={}),
+                mock.patch.object(F.goalflight_status, "milestone_status_payload", return_value={}),
+                mock.patch.object(F.goalflight_messages, "controller_mail_summary", return_value={"needs": []}),
+            ):
+                locks.enter_context(
+                    F.goalflight_wake.register_lease_holder(
+                        parent,
+                        controller_label="webui",
+                        lease_nonce=lease.nonce,
+                    )
+                )
+                locks.enter_context(
+                    F.goalflight_wake.register_waiter(
+                        parent,
+                        controller_label="webui",
+                        kind="listener",
+                    )
+                )
+                fleet = F.build_fleet_plane(generation_id="worktree-roll-up")
+
+        by_id = {project["project_id"]: project for project in fleet["projects"]}
+        parent_id = F._project_id(str(parent))
+        worktree_id = F._project_id(str(worktree))
+        assert_true("parent checkout is not a worktree", by_id[parent_id]["worktree_name"] is None)
+        assert_true("worktree publishes only its folder name", by_id[worktree_id]["worktree_name"] == "bt-adapter")
+        assert_true(
+            "worktree parent id matches the main checkout",
+            by_id[worktree_id]["parent_project_id"] == parent_id,
+        )
+        webui = [row for row in fleet["controllers"] if row["label"] == "webui"]
+        assert_true("one controller row per owner label", len(webui) == 1)
+        assert_true("owned live workers count across worktrees", webui[0]["owned_live"] == 2)
+        encoded = json.dumps(fleet)
+        assert_true("worktree absolute path stays off the plane", str(worktree) not in encoded)
+        assert_true("parent absolute path stays off the plane", str(parent) not in encoded)
+
+
+def _constructed_repo_lens_env(temp_root: Path) -> dict[str, str]:
+    return _controller_test_env(temp_root)
+
+
+def _build_constructed_repo_lens_fleet(
+    temp_root: Path,
+    registry: list[dict],
+    records: list[dict],
+    *,
+    generation_id: str = "repo-lens",
+) -> tuple[dict, float]:
+    machine_status = {
+        "schema": "goalflight.status.aggregate.v1",
+        "capacity": {},
+        "capacity_state": {"leases": {}},
+        "rate_pressure": {},
+        "warnings": [],
+        "dispatch": {"records": records},
+    }
+    with (
+        mock.patch.dict(os.environ, _constructed_repo_lens_env(temp_root), clear=False),
+        mock.patch.object(F.goalflight_status, "status_payload", return_value=machine_status),
+        mock.patch.object(F.goalflight_fleet_status_cli, "build_fleet_status", return_value={}),
+        mock.patch.object(F.goalflight_usage, "collect_usage", return_value=[]),
+        mock.patch.object(F.goalflight_task, "read_project_registry", return_value=registry),
+        mock.patch.object(F.goalflight_session_status, "aggregate_status", return_value={}),
+        mock.patch.object(F.goalflight_status, "milestone_status_payload", return_value={}),
+        mock.patch.object(F.goalflight_messages, "controller_mail_summary", return_value={"needs": []}),
+        mock.patch.object(
+            F.goalflight_task,
+            "git_repo_identity",
+            side_effect=AssertionError("producer must not shell git"),
+        ),
+    ):
+        started = time.perf_counter()
+        fleet = F.build_fleet_plane(generation_id=generation_id)
+        elapsed = time.perf_counter() - started
+    return fleet, elapsed
+
+
+def test_fast_plane_carries_cached_repo_identity_without_guessing_mutation_pair() -> None:
+    """Registry cache is the only identity source; missing stays unknown."""
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        clone_a = (temp_root / "battery-tool-v2").resolve()
+        clone_b = (temp_root / "bt-verify").resolve()
+        solo = (temp_root / "scratch").resolve()
+        for root in (clone_a, clone_b, solo):
+            root.mkdir()
+        shared = "github.com/timdrpp/battery-tool-v2"
+        registry = [
+            {
+                "project_root": str(clone_a),
+                "last_seen": "2030-01-01T00:00:00+00:00",
+                "skill_version": "test",
+                "repo_identity": shared,
+            },
+            {
+                "project_root": str(clone_b),
+                "last_seen": "2030-01-01T00:00:00+00:00",
+                "skill_version": "test",
+                "repo_identity": shared,
+            },
+            {
+                "project_root": str(solo),
+                "last_seen": "2030-01-01T00:00:00+00:00",
+                "skill_version": "test",
+            },
+        ]
+        records = [
+            {
+                "dispatch_id": f"{root.name}-live",
+                "project_root": str(root),
+                "state": "running",
+                "classification": "expected_live",
+            }
+            for root in (clone_a, clone_b, solo)
+        ]
+        fleet, elapsed = _build_constructed_repo_lens_fleet(
+            temp_root, registry, records, generation_id="repo-identity-cache"
+        )
+
+    LAST_FAST_PLANE_MEASUREMENT["repo_lens_seconds"] = elapsed
+    by_name = {project["name"]: project for project in fleet["projects"]}
+    assert_true("constructed set keeps all three checkouts", set(by_name) == {"battery-tool-v2", "bt-verify", "scratch"})
+    assert_true(
+        "two clones share the cached GitHub identity",
+        by_name["battery-tool-v2"]["repo_identity"] == shared
+        and by_name["bt-verify"]["repo_identity"] == shared,
+    )
+    assert_true(
+        "a record without the field stays unknown instead of being guessed",
+        by_name["scratch"]["repo_identity"] is None,
+    )
+    assert_true(
+        "separate clones keep distinct parent ids — directory roll-up cannot unify them",
+        by_name["battery-tool-v2"]["parent_project_id"]
+        != by_name["bt-verify"]["parent_project_id"],
+    )
+    encoded = json.dumps(fleet)
+    assert_true("constructed repo-lens plane publishes no absolute paths", str(clone_a) not in encoded)
+    assert_true("constructed repo-lens fleet build stays under one second", elapsed < 1.0)
+    # Mutation control: if the producer shelled git for a missing cache, the
+    # patched git_repo_identity would have raised before we reached these asserts.
+    guessed = dict(by_name["scratch"])
+    guessed["repo_identity"] = "github.com/should/not-guess"
+    assert_true(
+        "guessing an identity for a missing cache is a different, rejected payload",
+        guessed["repo_identity"] != by_name["scratch"]["repo_identity"],
+    )
+
+
+def test_controllers_aggregate_by_owner_label_across_repos_mutation_pair() -> None:
+    """A controller's workers stay its own wherever they run."""
+    projects = [
+        {
+            "project_id": "clone-a",
+            "parent_project_id": "clone-a",
+            "repo_identity": "github.com/timdrpp/battery-tool-v2",
+            "workers": [
+                {"controller_label": "webui", "is_terminal": False, "dispatch_id": "a"},
+            ],
+        },
+        {
+            "project_id": "clone-b",
+            "parent_project_id": "clone-b",
+            "repo_identity": "github.com/timdrpp/battery-tool-v2",
+            "workers": [
+                {"controller_label": "webui", "is_terminal": False, "dispatch_id": "b"},
+            ],
+        },
+        {
+            "project_id": "kiln",
+            "parent_project_id": "kiln",
+            "repo_identity": "github.com/simonrowland/kiln",
+            "workers": [
+                {"controller_label": "webui", "is_terminal": False, "dispatch_id": "k"},
+            ],
+        },
+    ]
+    rows = [
+        {
+            "label": "webui",
+            "parent_project_id": "clone-a",
+            "project_id": "clone-a",
+            "project_name": "battery-tool-v2",
+            "parent_name": "battery-tool-v2",
+            "controller_liveness_state": "ALIVE",
+            "in_flight_count": 1,
+            "owned_live": 0,
+            "last_seen": "2030-01-01T00:00:00+00:00",
+            "listener_live": 4,
+            "listener_target": 4,
+            "generation": 1,
+            "retire_command": None,
+            "controller_key": "clone-a:webui",
+        },
+        {
+            "label": "webui",
+            "parent_project_id": "kiln",
+            "project_id": "kiln",
+            "project_name": "kiln",
+            "parent_name": "kiln",
+            "controller_liveness_state": "ALIVE",
+            "in_flight_count": 1,
+            "owned_live": 0,
+            "last_seen": "2030-01-02T00:00:00+00:00",
+            "listener_live": 4,
+            "listener_target": 4,
+            "generation": 2,
+            "retire_command": None,
+            "controller_key": "kiln:webui",
+        },
+    ]
+
+    def parent_keyed_counts(
+        scoped: list[dict],
+        unassigned: list[dict],
+        remote_workers: list[dict],
+    ) -> dict[tuple[str, str], int]:
+        counts: dict[tuple[str, str], int] = {}
+        for project in scoped:
+            parent_id = str(project.get("parent_project_id") or "")
+            for worker in project.get("workers") or []:
+                label = worker.get("controller_label")
+                if not isinstance(label, str) or not label:
+                    continue
+                if worker.get("is_terminal") is True:
+                    continue
+                key = (parent_id, label)
+                counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    owned = F._owned_live_counts(projects, [], [])
+    aggregated = F._aggregate_controller_rows(rows, owned)
+    assert_true("owned counts key by owner label only", owned == {"webui": 3})
+    assert_true("one controller row per owner label across repos", len(aggregated) == 1)
+    assert_true("owned live workers count wherever they run", aggregated[0]["owned_live"] == 3)
+    assert_true("controller key is the owner label, not a parent:label pair", aggregated[0]["controller_key"] == "webui")
+    legacy = parent_keyed_counts(projects, [], [])
+    assert_true(
+        "parent-keyed mutation splits the same workers across two repos",
+        legacy == {("clone-a", "webui"): 1, ("clone-b", "webui"): 1, ("kiln", "webui"): 1},
+    )
+    assert_true("label-keyed counts are not the parent-keyed mutation", owned != legacy)
+
+
 def main() -> None:
     fleet_payload = test_fleet_consumes_status_once_before_project_grouping()
     test_global_history_count_excludes_unreachable_remote_terminals_mutation_pair()
@@ -2540,6 +2946,10 @@ def main() -> None:
     test_controller_in_flight_null_owner_counts_for_every_controller()
     test_controller_state_unknown_when_waiter_directory_is_unreadable()
     test_controller_fields_without_session_identity_are_unknown()
+    test_controller_panel_lists_live_first_and_shows_retire_command()
+    test_controller_panel_aggregates_owned_workers_across_worktrees()
+    test_fast_plane_carries_cached_repo_identity_without_guessing_mutation_pair()
+    test_controllers_aggregate_by_owner_label_across_repos_mutation_pair()
     test_long_controller_nonces_remain_distinct_context_keys()
     test_journal_in_flight_count_follows_canonical_attempt_lifecycle_states()
     test_journal_in_flight_count_ignores_forged_mail_and_cursor_advances()

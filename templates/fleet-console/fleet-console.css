@@ -192,6 +192,7 @@
     padding:0 4px; font-size:9px; line-height:1.45;
   }
   .task-chip:hover, .task-chip:focus-visible { background:var(--cyan-wash); outline:none; }
+  .task-chip.active { background:var(--cyan-wash); color:var(--ink); font-weight:650; }
   .prompt-body {
     grid-column:1/-1; margin:2px 0 4px 21px; padding:9px 10px;
     border:1px solid var(--edge); background:var(--ground-2); color:var(--ink-2);
@@ -221,6 +222,30 @@
   .controller-health.waiting-on-user { color:var(--cyan); }
   .controller-health.dead { color:var(--clay); text-decoration:line-through; }
   .controller-health.unknown { color:var(--clay); border-bottom:1px dashed currentColor; }
+  .controllers-panel { margin-bottom:14px; }
+  .controller-row {
+    display:grid;
+    grid-template-columns:minmax(120px,.9fr) minmax(88px,.7fr) minmax(110px,.7fr) minmax(56px,.4fr) minmax(56px,.4fr) minmax(72px,.5fr) minmax(180px,1.4fr);
+    gap:10px; align-items:center; padding:8px 12px; border-top:1px solid var(--edge-soft);
+    font-size:11px;
+  }
+  .controller-row.dead { background:var(--ground-2); }
+  .controller-label { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .controller-row.dead .controller-label { text-decoration:line-through; color:var(--ink-3); }
+  .controller-project, .controller-pool, .controller-inflight, .controller-seen { color:var(--ink-2); }
+  .controller-action { font-size:10px; color:var(--amber); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .dead-controllers-toggle {
+    display:block; width:100%; text-align:left; padding:7px 12px;
+    border-top:1px solid var(--edge-soft); background:var(--ground-2);
+  }
+  .controller-owned { padding:4px 12px 10px 28px; }
+  .owned-group { margin:4px 0 8px; }
+  .owned-title { font-size:10px; letter-spacing:.08em; text-transform:uppercase; color:var(--ink-3); }
+  .owned-dispatch { font-size:11px; color:var(--ink-2); }
+  .repo-worktrees, .repo-checkouts { display:flex; flex-direction:column; gap:8px; padding:0 8px 10px; }
+  .repo-worktrees .panel.band, .repo-checkouts .panel.band { box-shadow:none; }
+  .repo-collapsed-checkouts { display:flex; flex-direction:column; gap:8px; }
+  .collapsed-checkouts-toggle { text-align:left; }
   .state-txt { font-size:11px; }
   .host { font-size:11px; color:var(--ink-3); }
 

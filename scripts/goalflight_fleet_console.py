@@ -20,6 +20,7 @@ import math
 import os
 import re
 import shlex
+import sqlite3
 import sys
 import uuid
 from pathlib import Path
@@ -211,6 +212,10 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             "last_seen": None,
             "skill_version": None,
             "history_excluded": None,
+            "parent_project_id": None,
+            "parent_name": None,
+            "worktree_name": None,
+            "repo_identity": None,
             "queue": {
                 "depth": None,
                 "lanes": [{"agent": None, "count": None}],
@@ -268,6 +273,24 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
                     "prompt_file": None,
                 }
             ],
+        }
+    ],
+    "controllers": [
+        {
+            "controller_key": None,
+            "label": None,
+            "project_id": None,
+            "project_name": None,
+            "parent_project_id": None,
+            "parent_name": None,
+            "controller_liveness_state": None,
+            "listener_live": None,
+            "listener_target": None,
+            "in_flight_count": None,
+            "owned_live": None,
+            "last_seen": None,
+            "generation": None,
+            "retire_command": None,
         }
     ],
     "unassigned_workers": [
@@ -525,6 +548,16 @@ def _display(value: object, *, limit: int = 96) -> str | None:
     text = goalflight_messages.sanitize_display(value, limit=limit)
     text = _ABSOLUTE_PATH.sub(lambda match: f"{match.group(1) or match.group(2) or ''}[path]", text)
     return text or None
+
+
+def _repo_identity_scalar(value: object) -> str | None:
+    """Cached registry identity only. Missing or blank is unknown, never guessed."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    return _display(text, limit=160)
 
 
 def _safe_error(source: str, exc: BaseException) -> str:
@@ -1007,6 +1040,256 @@ def classify_controller(
     return "WAITING-ON-USER"
 
 
+_MAIN_CHECKOUT_CACHE: dict[str, str] = {}
+_LIVENESS_RANK = {
+    "ALIVE": 0,
+    "HUNG": 1,
+    "WAITING-ON-USER": 2,
+    "UNKNOWN": 3,
+    "DEAD": 4,
+}
+
+
+def _git_main_checkout(project_root: str) -> str:
+    """Return the main checkout for a worktree without shelling out.
+
+    A linked worktree stores ``gitdir:`` in ``.git``; ``commondir`` then
+    names the shared ``.git`` directory of the parent checkout. Results are
+    cached per root so the fast plane pays one small-file read, not one
+    ``git`` per row.
+    """
+    cached = _MAIN_CHECKOUT_CACHE.get(project_root)
+    if cached is not None:
+        return cached
+    root = Path(project_root)
+    main = project_root
+    git = root / ".git"
+    try:
+        if git.is_file():
+            first = git.read_text(encoding="utf-8").splitlines()[0].strip()
+            if first.lower().startswith("gitdir:"):
+                gitdir = Path(first.split(":", 1)[1].strip())
+                if not gitdir.is_absolute():
+                    gitdir = root / gitdir
+                gitdir = gitdir.resolve(strict=False)
+                commondir = gitdir / "commondir"
+                if commondir.is_file():
+                    rel = commondir.read_text(encoding="utf-8").strip()
+                    common_git = (gitdir / rel).resolve(strict=False)
+                    if common_git.name == ".git":
+                        main = str(common_git.parent)
+                elif (
+                    gitdir.parent.name == "worktrees"
+                    and gitdir.parent.parent.name == ".git"
+                ):
+                    main = str(gitdir.parent.parent.parent)
+        elif git.is_dir():
+            main = project_root
+    except (OSError, UnicodeError, IndexError, ValueError):
+        main = project_root
+    _MAIN_CHECKOUT_CACHE[project_root] = main
+    return main
+
+
+def _parent_fields(project_root: str) -> dict[str, Any]:
+    main = _git_main_checkout(project_root)
+    is_worktree = os.path.abspath(main) != os.path.abspath(project_root)
+    return {
+        "parent_project_id": _project_id(main),
+        "parent_name": _display(Path(main).name or "project", limit=64),
+        "worktree_name": (
+            _display(Path(project_root).name or "worktree", limit=64)
+            if is_worktree
+            else None
+        ),
+    }
+
+
+def _controller_retire_command(label: str) -> str:
+    """Exact session-status retire invocation; relative so the plane stays path-free."""
+    return "python3 scripts/goalflight_session_status.py --retire " + shlex.quote(label)
+
+
+def _journals_dir() -> Path | None:
+    override = os.environ.get("GOALFLIGHT_JOURNAL_DIR", "").strip()
+    if override:
+        return Path(override).expanduser() / "journals"
+    # Isolated console tests must never walk the operator's default state dir.
+    if os.environ.get("GOALFLIGHT_TEST_MODE") == "1":
+        return None
+    return goalflight_task.resolve_state_base_dir() / "journals"
+
+
+def _active_controller_roots_from_journals() -> set[str]:
+    """Project roots that still have an ACTIVE lease row.
+
+    One directory listing plus a DISTINCT on the lease table — not a
+    per-controller history walk and not a pass over the 1,400-root registry.
+    """
+    roots: set[str] = set()
+    base = _journals_dir()
+    if base is None:
+        return roots
+    try:
+        paths = list(base.glob(f"*/{goalflight_journal.JOURNAL_FILE_NAME}"))
+    except OSError:
+        return roots
+    for path in paths:
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        except sqlite3.Error:
+            continue
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT project_root FROM controller_leases WHERE state = 'ACTIVE'"
+            )
+            for row in rows:
+                supplied = row[0] if row else None
+                if isinstance(supplied, str) and supplied:
+                    roots.add(supplied)
+        except sqlite3.Error:
+            continue
+        finally:
+            conn.close()
+    return roots
+
+
+def _empty_controller_context() -> dict[str, object | None]:
+    return {
+        "label": None,
+        "generation": None,
+        "liveness_state": "UNKNOWN",
+        "listener_live": None,
+        "listener_target": None,
+        "in_flight_count": 0,
+        "last_seen": None,
+    }
+
+
+def _controller_panel_row(
+    project_root: str,
+    context: dict[str, object | None],
+) -> dict[str, Any]:
+    raw_label = context.get("label")
+    label = raw_label if isinstance(raw_label, str) and raw_label else None
+    state = str(context.get("liveness_state") or "UNKNOWN")
+    if state not in CONTROLLER_LIVENESS_STATES:
+        state = "UNKNOWN"
+    generation = context.get("generation")
+    in_flight = context.get("in_flight_count")
+    listener_live = context.get("listener_live")
+    listener_target = context.get("listener_target")
+    retire = (
+        _controller_retire_command(label)
+        if state == "DEAD" and label
+        else None
+    )
+    parent = _parent_fields(project_root)
+    return {
+        "controller_key": _display(
+            f"{parent['parent_project_id']}:{label or 'unknown'}",
+            limit=128,
+        ),
+        "label": _display(label, limit=64),
+        "project_id": _project_id(project_root),
+        "project_name": _display(Path(project_root).name or "project", limit=64),
+        "parent_project_id": parent["parent_project_id"],
+        "parent_name": parent["parent_name"],
+        "controller_liveness_state": state,
+        "listener_live": listener_live if isinstance(listener_live, int) and not isinstance(listener_live, bool) else None,
+        "listener_target": listener_target if isinstance(listener_target, int) and not isinstance(listener_target, bool) else None,
+        "in_flight_count": in_flight if isinstance(in_flight, int) and not isinstance(in_flight, bool) and in_flight >= 0 else 0,
+        "owned_live": 0,
+        "last_seen": _iso_timestamp(context.get("last_seen")),
+        "generation": generation if isinstance(generation, int) and not isinstance(generation, bool) else None,
+        "retire_command": _display(retire, limit=160) if retire else None,
+    }
+
+
+def _controller_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    state = str(row.get("controller_liveness_state") or "UNKNOWN")
+    rank = _LIVENESS_RANK.get(state, 3)
+    return (
+        1 if state == "DEAD" else 0,
+        rank,
+        str(row.get("label") or ""),
+        str(row.get("parent_name") or row.get("project_name") or ""),
+        str(row.get("controller_key") or ""),
+    )
+
+
+def _owned_live_counts(
+    projects: list[dict[str, Any]],
+    unassigned: list[dict[str, Any]],
+    remote_workers: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Count live workers per owner label wherever those workers run."""
+    counts: dict[str, int] = {}
+
+    def add(workers: list[dict[str, Any]]) -> None:
+        for worker in workers:
+            label = worker.get("controller_label")
+            if not isinstance(label, str) or not label:
+                continue
+            if worker.get("is_terminal") is True:
+                continue
+            counts[label] = counts.get(label, 0) + 1
+
+    for project in projects:
+        add(project.get("workers") or [])
+    add(unassigned)
+    add(remote_workers)
+    return counts
+
+
+def _aggregate_controller_rows(
+    rows: list[dict[str, Any]],
+    owned: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Collapse leftover per-journal rows to one owner-label row across repos."""
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        label = row.get("label")
+        if not isinstance(label, str) or not label:
+            continue
+        current = grouped.get(label)
+        if current is None:
+            grouped[label] = dict(row)
+            continue
+        current_rank = _LIVENESS_RANK.get(
+            str(current.get("controller_liveness_state") or "UNKNOWN"), 3
+        )
+        new_rank = _LIVENESS_RANK.get(
+            str(row.get("controller_liveness_state") or "UNKNOWN"), 3
+        )
+        if new_rank < current_rank:
+            current["controller_liveness_state"] = row.get("controller_liveness_state")
+            current["listener_live"] = row.get("listener_live")
+            current["listener_target"] = row.get("listener_target")
+            current["generation"] = row.get("generation")
+            current["retire_command"] = row.get("retire_command")
+        current_flight = current.get("in_flight_count")
+        new_flight = row.get("in_flight_count")
+        if isinstance(current_flight, int) and isinstance(new_flight, int):
+            current["in_flight_count"] = max(current_flight, new_flight)
+        elif isinstance(new_flight, int):
+            current["in_flight_count"] = new_flight
+        current_seen = current.get("last_seen") or ""
+        new_seen = row.get("last_seen") or ""
+        if new_seen > current_seen:
+            current["last_seen"] = row.get("last_seen")
+    for label, row in grouped.items():
+        row["owned_live"] = owned.get(label, 0)
+        row["controller_key"] = _display(label, limit=128)
+        if row.get("controller_liveness_state") != "DEAD":
+            row["retire_command"] = None
+        elif row.get("label"):
+            row["retire_command"] = _display(
+                _controller_retire_command(str(row["label"])), limit=160
+            )
+    return sorted(grouped.values(), key=_controller_sort_key)
+
+
 def _raw_controller_session_id(value: object) -> str | None:
     """Return an ownership identity unchanged; presentation is a later step."""
     return value if isinstance(value, str) and value else None
@@ -1088,7 +1371,7 @@ def _controller_contexts_by_session(
             authority = goalflight_journal.Journal.open_reader(project_root)
         if authority is None:
             return {
-                session_id: {"label": None, "liveness_state": "UNKNOWN"}
+                session_id: _empty_controller_context()
                 for session_id in (requested or set())
             }
         lease_rows = authority.lease_records(
@@ -1096,7 +1379,7 @@ def _controller_contexts_by_session(
         )
     except (goalflight_journal.JournalError, OSError, ValueError):
         return {
-            session_id: {"label": None, "liveness_state": "UNKNOWN"}
+            session_id: _empty_controller_context()
             for session_id in (requested or set())
         }
 
@@ -1193,6 +1476,7 @@ def _controller_contexts_by_session(
         matches = active_rows.get(session_id, []) or locked_ended_rows.get(
             session_id, []
         )
+        listener_records: list[Any] | None = []
         if not matches:
             holder_lock: bool | None = False
             live_waiter_count = 0
@@ -1214,12 +1498,16 @@ def _controller_contexts_by_session(
                     controller_label=label,
                     prune_dead=False,
                 )
-                live_waiter_count = (
-                    None if live_waiters is None else len(live_waiters)
-                )
+                if live_waiters is None:
+                    live_waiter_count = None
+                    listener_records = None
+                else:
+                    live_waiter_count = len(live_waiters)
+                    listener_records = list(live_waiters)
             except (OSError, RuntimeError, ValueError):
                 holder_lock = None
                 live_waiter_count = None
+                listener_records = None
         in_flight_count = _journal_in_flight_count(
             authority,
             controller_label=label or "",
@@ -1231,6 +1519,21 @@ def _controller_contexts_by_session(
             and isinstance(generation_rows[0].get("generation"), int)
             else None
         )
+        last_seen = None
+        if generation_rows:
+            last_seen = generation_rows[0].get("renewed_at") or generation_rows[0].get(
+                "claimed_at"
+            )
+        try:
+            listener_target: int | None = goalflight_wake.listener_slot_count()
+        except ValueError:
+            listener_target = None
+        if listener_records is None:
+            listener_live: int | None = None
+        else:
+            listener_live = sum(
+                1 for waiter in listener_records if getattr(waiter, "kind", None) == "listener"
+            )
         contexts[session_id] = {
             "label": label,
             "generation": generation,
@@ -1239,6 +1542,10 @@ def _controller_contexts_by_session(
                 live_waiter_count,
                 in_flight_count,
             ),
+            "listener_live": listener_live,
+            "listener_target": listener_target,
+            "in_flight_count": in_flight_count,
+            "last_seen": last_seen,
         }
     return contexts
 
@@ -1895,6 +2202,7 @@ def _registered_projects(
                 "root": root,
                 "last_seen": _iso_timestamp(row.get("last_seen")),
                 "skill_version": _display(row.get("skill_version"), limit=32),
+                "repo_identity": _repo_identity_scalar(row.get("repo_identity")),
             }
         )
     total = len(seen_total)
@@ -1921,11 +2229,12 @@ def _project_rows(
     all_registered_roots: set[str] | None = None,
     sampled_at: dt.datetime | None = None,
     visible_roots: set[str] | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, list[dict[str, Any]]]:
     """Rows only for projects with mutable work or an ACTIVE capacity lease.
 
     Historical terminal-only roots are counted for the slow blob without path
     resolution, journal opens, status-sidecar reads, or project-row projection.
+    Controller panel rows reuse the same ACTIVE lease pass.
     """
     dispatch = machine_status.get("dispatch")
     dispatch = dispatch if isinstance(dispatch, dict) else {}
@@ -1966,10 +2275,16 @@ def _project_rows(
     for root in active_roots:
         by_root.setdefault(
             root,
-            {"root": root, "last_seen": None, "skill_version": None},
+            {
+                "root": root,
+                "last_seen": None,
+                "skill_version": None,
+                "repo_identity": None,
+            },
         )
 
     projects = []
+    controllers: list[dict[str, Any]] = []
     # Deep-sample membership: who gets session/milestone calls this tick.
     sampled_roots = {item["root"] for item in registered_projects}
     # Registry membership: a fact about the project, independent of sampling.
@@ -1980,8 +2295,12 @@ def _project_rows(
         probe_records = [
             record for record in scoped_records if not _record_is_terminal(record)
         ]
-        journal_reader = (
-            _project_journal_reader(Path(root)) if probe_records else None
+        journal_reader = _project_journal_reader(Path(root))
+        lease_root = _git_main_checkout(root)
+        lease_reader = (
+            journal_reader
+            if lease_root == root
+            else _project_journal_reader(Path(lease_root))
         )
         all_journal_authority = _journal_authority_by_dispatch(
             Path(root),
@@ -1996,10 +2315,16 @@ def _project_rows(
         )
 
         controller_contexts = _controller_contexts_by_session(
-            Path(root),
+            Path(lease_root),
             [record for record in fast_records if not _record_is_terminal(record)],
-            authority=journal_reader,
+            include_all=True,
+            authority=lease_reader or journal_reader,
             open_if_missing=False,
+        )
+        controllers.extend(
+            _controller_panel_row(lease_root, context)
+            for context in controller_contexts.values()
+            if context.get("label")
         )
         controller_labels = {
             session_id: str(context["label"])
@@ -2025,6 +2350,7 @@ def _project_rows(
                 for record in fast_records
             ]
         )
+        parent = _parent_fields(root)
         projects.append(
             {
                 "project_id": _project_id(root),
@@ -2033,6 +2359,10 @@ def _project_rows(
                 "last_seen": metadata.get("last_seen"),
                 "skill_version": metadata.get("skill_version"),
                 "history_excluded": history_excluded,
+                "parent_project_id": parent["parent_project_id"],
+                "parent_name": parent["parent_name"],
+                "worktree_name": parent["worktree_name"],
+                "repo_identity": _repo_identity_scalar(metadata.get("repo_identity")),
                 # Queue/store/milestone history changes far more slowly than
                 # worker liveness. Keep deep repository claims unknown while
                 # publishing the machine sample's exact active-lease count.
@@ -2063,7 +2393,7 @@ def _project_rows(
             str(project.get("project_id") or ""),
         )
     )
-    return projects, unassigned, hidden_history_excluded
+    return projects, unassigned, hidden_history_excluded, controllers
 
 
 def build_fleet_plane(
@@ -2144,7 +2474,7 @@ def build_fleet_plane(
         only_roots=fast_roots,
         limit=None,
     )
-    projects, unassigned, hidden_history_excluded = _project_rows(
+    projects, unassigned, hidden_history_excluded, controllers = _project_rows(
         machine_status if isinstance(machine_status, dict) else {},
         sampled_projects,
         errors,
@@ -2152,11 +2482,38 @@ def build_fleet_plane(
         sampled_at=sampled_at,
         visible_roots=fast_roots,
     )
+    seen_roots = set(fast_roots)
+    for supplied in _active_controller_roots_from_journals():
+        root = _canonical_root(supplied)
+        if root is None or root in seen_roots:
+            continue
+        seen_roots.add(root)
+        journal_reader = _project_journal_reader(Path(root))
+        extra_contexts = _controller_contexts_by_session(
+            Path(root),
+            None,
+            include_all=True,
+            authority=journal_reader,
+            open_if_missing=False,
+        )
+        controllers.extend(
+            _controller_panel_row(root, context)
+            for context in extra_contexts.values()
+            if context.get("label")
+        )
+    remote = _remote_row(remote_status, sampled_at=sampled_at)
+    controllers = _aggregate_controller_rows(
+        controllers,
+        _owned_live_counts(
+            projects,
+            unassigned,
+            list((remote.get("workers") or [])),
+        ),
+    )
     # Attach queue depth by the project's own root. Every row gets the key --
     # the allowlist requires it, and an absent queue must read as depth 0, not
     # as a missing field a renderer has to guess about.
     _attach_queue_rows(projects, queue_by_root)
-    remote = _remote_row(remote_status, sampled_at=sampled_at)
     # Only project history has a disclosure/fetch path in the renderer. Remote
     # and unassigned retention remains bounded, but its omitted rows must not
     # inflate the global '+N in history' claim into unreachable inventory.
@@ -2191,6 +2548,7 @@ def build_fleet_plane(
         "vendors": _vendor_rows(usage_rows),
         "remote": remote,
         "projects": projects,
+        "controllers": controllers,
         "unassigned_workers": unassigned,
     }
     validate_projection(payload, "fleet")
@@ -2476,6 +2834,7 @@ def build_degraded_plane(
             "vendors": [],
             "remote": _remote_row({}),
             "projects": [],
+            "controllers": [],
             "unassigned_workers": [],
         }
     validate_projection(payload, plane)

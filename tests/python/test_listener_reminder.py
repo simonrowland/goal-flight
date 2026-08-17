@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 from pathlib import Path
 import sys
@@ -66,8 +67,14 @@ def test_reminder_uses_held_waiter_lock_not_journal_row(
         )
         assert reserve_line is not None
         assert reserve_line.startswith(f"listener pool n=1/{wake.DEFAULT_LISTENER_SLOTS} — reserve down; re-arm: ")
-        assert "--report-pending" in reserve_line
-        with wake.register_waiter(root, controller_label="bugs", kind="listener"):
+        assert reserve_line.count("--report-pending") == wake.DEFAULT_LISTENER_SLOTS - 1
+        # Silence requires a FULL pool: fill the remaining slots (one is
+        # already held above) and only then does the reminder go quiet.
+        with contextlib.ExitStack() as rest:
+            for _slot in range(wake.DEFAULT_LISTENER_SLOTS - 1):
+                rest.enter_context(
+                    wake.register_waiter(root, controller_label="bugs", kind="listener")
+                )
             stream = io.StringIO()
             assert msgs.emit_listener_reminder(
                 project_root=root,
@@ -134,6 +141,6 @@ def test_controller_mail_exit_code_actions_and_skill_pool_instruction() -> None:
     controller_entry = next(
         line for line in skill.splitlines() if line.startswith("Controller entry auto-claims")
     )
-    assert "pool of two" in controller_entry
+    assert "pool of four" in controller_entry
     assert "--report-pending" in controller_entry
-    assert "restore depth two" in controller_entry
+    assert "restore depth four" in controller_entry
