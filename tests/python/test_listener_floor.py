@@ -136,11 +136,12 @@ def test_depth_plan_is_idempotent_at_target() -> None:
         4, 4, "CMD", work_in_flight=True
     )
     assert plan["missing"] == 0
-    assert plan["commands"] == []
-    assert plan["hint"] == ""
+    assert plan["command"] == "CMD"
+    assert "commands" not in plan
+    assert "hint" not in plan
     short = wake.listener_depth_plan(0, 4, "CMD", work_in_flight=True)
     assert short["missing"] == 4
-    assert short["commands"] == ["CMD", "CMD", "CMD", "CMD"]
+    assert short["command"] == "CMD"
 
 
 def test_controller_attention_is_quiet_and_addressed_to_source(
@@ -305,7 +306,8 @@ def test_consumed_slot_with_work_in_flight_emits_floor_and_following_it_restores
             assert rearm["work_in_flight"] is True
             assert rearm["live"] == 0
             assert rearm["missing"] == wake.DEFAULT_LISTENER_SLOTS
-            assert len(rearm["commands"]) == wake.DEFAULT_LISTENER_SLOTS
+            assert rearm["command"]
+            assert "commands" not in rearm
             assert wake.SEPARATE_TRACKED_ARM_RULE in rearm["hint"]
             assert "1. " in rearm["hint"]
             assert proc.poll() is not None
@@ -418,8 +420,10 @@ def test_arming_at_target_does_not_overshoot(
             command,
             work_in_flight=True,
         )
-        assert plan["commands"] == []
-        assert plan["hint"] == ""
+        assert plan["missing"] == 0
+        assert plan["command"] == command
+        assert "commands" not in plan
+        assert "hint" not in plan
         refused = subprocess.run(
             _listen_cmd(project, label="floor-ctl", nonce=lease.nonce, timeout_s=2),
             cwd=project,
@@ -458,9 +462,9 @@ def test_lease_claim_emits_remaining_depth_when_work_is_in_flight(
     assert depth["work_in_flight"] is True
     assert depth["live"] == 0
     assert depth["missing"] == wake.DEFAULT_LISTENER_SLOTS
-    assert len(depth["commands"]) == wake.DEFAULT_LISTENER_SLOTS
-    assert wake.SEPARATE_TRACKED_ARM_RULE in depth["hint"]
-    assert depth["hint"].startswith("listener floor:")
+    assert isinstance(depth["command"], str) and depth["command"]
+    assert "commands" not in depth
+    assert "hint" not in depth
 
 
 def test_lease_claim_stays_silent_without_in_flight_work(
@@ -479,5 +483,6 @@ def test_lease_claim_stays_silent_without_in_flight_work(
     assert result["claimed"] is True
     depth = result["listener_depth"]
     assert depth["work_in_flight"] is False
-    assert depth["commands"] == []
-    assert depth["hint"] == ""
+    assert isinstance(depth["command"], str) and depth["command"]
+    assert "commands" not in depth
+    assert "hint" not in depth

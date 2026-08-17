@@ -37,6 +37,7 @@ _FILE_VERSION = "v2"
 _GENERATION_FILE_VERSION = "generation-v1"
 _LISTENER_SLOT_FILE_VERSION = "listener-slot-v1"
 _RING_STAMP_FILE_VERSION = "ring-stamp-v1"
+_PENDING_REPORT_FILE_VERSION = "pending-report-v1"
 _LEASE_EVENT_SCHEMA = "goalflight.lease-generation-event.v1"
 # Depth is resilience, not efficiency: one event wakes exactly one slot, so
 # the remaining slots are the margin for a controller that forgets to re-arm.
@@ -289,6 +290,55 @@ def _ring_stamp_path(project_root: Path | str, *, controller_label: str) -> Path
     return ledger_dir(project_root) / (
         f"{_RING_STAMP_FILE_VERSION}.{_label_hash(controller_label)}.cursor"
     )
+
+
+def _pending_report_path(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> Path:
+    return ledger_dir(project_root) / (
+        f"{_PENDING_REPORT_FILE_VERSION}.{_label_hash(controller_label)}."
+        f"{_label_hash(lease_nonce)}.claimed"
+    )
+
+
+def claim_pending_report(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> bool:
+    """First --report-pending arm in this lease generation emits the backlog.
+
+    Later arms keep waiting without reprinting. Two arms racing: exclusive
+    create, exactly one wins. The loser still raises its local high-water
+    from its own peek so the same backlog does not pop every slot. Peek
+    skew (mail arriving between the two peeks) is handled by the earlier
+    listener, whose high-water is older and will still ring.
+    """
+    label = str(controller_label or "").strip()
+    nonce = str(lease_nonce or "").strip()
+    if not label or not nonce:
+        raise ValueError("controller label and lease nonce are required")
+    path = _pending_report_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, _open_flags(create_exclusive=True), 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    try:
+        os.write(fd, b"claimed\n")
+    finally:
+        os.close(fd)
+    return True
 
 
 def _ring_stamp_lock_path(project_root: Path | str, *, controller_label: str) -> Path:
@@ -563,29 +613,23 @@ def listener_depth_plan(
     *,
     work_in_flight: bool,
 ) -> dict[str, object]:
-    """Remaining-depth plan after a listen exit or a lease claim.
+    """Remaining-depth machine plan after a listen exit or a lease claim.
 
     Entry nagging stays in ``listener_reserve_hint`` (silent above
-    low-water). This plan always speaks when work is in flight and the
-    pool is short, because that is the moment a forgotten re-arm leaves
-    the controller deaf.
+    low-water). The numbered human list lives in ``listener_floor_hint``
+    and is rendered only on the listen-exit surface. This plan carries
+    the single command template: repeating it ``missing`` times is
+    something a count already says.
     """
     target = int(target_waiters)
     live = 0 if live_waiters is None else int(live_waiters)
     missing = max(0, target - live)
-    commands = [command] * missing if work_in_flight and missing else []
     return {
         "live": live,
         "target": target,
         "missing": missing,
         "work_in_flight": bool(work_in_flight),
-        "commands": commands,
-        "hint": listener_floor_hint(
-            live,
-            target,
-            command,
-            work_in_flight=work_in_flight,
-        ),
+        "command": command,
         "separate_tracked_tasks": True,
     }
 

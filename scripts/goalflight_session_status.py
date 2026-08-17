@@ -2438,12 +2438,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         if result.get("claimed"):
             _index_controller_project(project_root)
-            hint = ""
-            depth = result.get("listener_depth")
-            if isinstance(depth, dict):
-                hint = str(depth.get("hint") or "")
-            if hint:
-                print(hint, file=sys.stderr)
         print(json.dumps(result))
         return 0
 

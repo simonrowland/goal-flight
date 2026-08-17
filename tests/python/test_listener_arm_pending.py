@@ -242,10 +242,10 @@ def test_report_pending_json_is_jsonl_through_ring(
         json.loads(line) for line in timeout_result.stdout.splitlines() if line.strip()
     ]
     assert timeout_result.returncode == 1, timeout_result.stderr
-    assert [payload["kind"] for payload in timeout_payloads] == [
-        "pending-at-arm",
-        "exit",
-    ]
+    # Same lease generation already emitted the backlog. A later arm stays
+    # silent and only JSONL-exits on timeout; reprinting would spend the
+    # report (and, in a pool, the other doorbells) on mail already seen.
+    assert [payload["kind"] for payload in timeout_payloads] == ["exit"]
     assert timeout_payloads[-1]["reason"] == "timeout"
 
 
