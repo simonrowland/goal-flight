@@ -23,6 +23,18 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/hooks/goalflight-context-meter.sh",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
