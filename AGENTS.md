@@ -84,7 +84,15 @@ The repo-wide gate. Run it under env isolation so a test run cannot touch live
 state — point `GOALFLIGHT_JOURNAL_DIR`, `GOALFLIGHT_STATE_DIR`,
 `GOALFLIGHT_WAKE_LEDGER`, `GOALFLIGHT_MESSAGES_DIR`, `GOALFLIGHT_TASK_STORE` and
 `GOALFLIGHT_PIDFILE_DIR` at a temp root and set
-`GOALFLIGHT_CAPACITY_CONF=/dev/null`.
+`GOALFLIGHT_CAPACITY_CONF=/dev/null`. Tests that exercise the dispatch launch
+path must also set `GOALFLIGHT_DISPATCH_DIR` themselves (via `tmp_path` /
+`mktemp`); the default is still `<state_dir>/dispatch`, so a launch that
+forgets both that override and `GOALFLIGHT_STATE_DIR` writes status into the
+live uid-keyed directory. Do not set `GOALFLIGHT_DISPATCH_DIR` globally in the
+gate — that would steal writes from tests that assert under
+`$GOALFLIGHT_STATE_DIR/dispatch`. Journal/mail isolation stays on
+`GOALFLIGHT_JOURNAL_DIR` / `GOALFLIGHT_MESSAGES_DIR`; the dispatch-dir
+override does not cover those.
 
 Never run the gate while a dispatched worker holds the tree: concurrent edits
 produce phantom failures that belong to neither change. Workers run only their

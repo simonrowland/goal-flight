@@ -16,7 +16,17 @@ def state_dir(configured: Path | str | None = None) -> Path:
 
 
 def dispatch_base_dir(configured_state_dir: Path | str | None = None) -> Path:
-    return state_dir(configured_state_dir) / "dispatch"
+    """Status/tail/steer directory, overridable via ``$GOALFLIGHT_DISPATCH_DIR``.
+
+    Default remains ``<state_dir>/dispatch``. Tests that exercise the launch
+    path must set the override themselves so isolation does not depend on the
+    invoker remembering ``$GOALFLIGHT_STATE_DIR``. Blank/whitespace falls back,
+    matching the other ``GOALFLIGHT_*`` path resolvers.
+    """
+    return goalflight_compat.resolve_env_path(
+        "GOALFLIGHT_DISPATCH_DIR",
+        state_dir(configured_state_dir) / "dispatch",
+    )
 
 
 def dispatch_queue_dir(configured_state_dir: Path | str | None = None) -> Path:
