@@ -19,7 +19,6 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_codex_sessions as S  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
-import goalflight_journal as J  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
 import goalflight_watch as W  # noqa: E402
 
@@ -31,21 +30,6 @@ pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
     reason="Codex rollout resume is local POSIX-only",
 )
-
-
-def _claim_fake_worker(argv: list[str], pid: int) -> None:
-    """Model the real pre-exec launcher's journal ownership transition."""
-    project_root = argv[argv.index("--project-root") + 1]
-    attempt_id = argv[argv.index("--attempt-id") + 1]
-    launch_token = argv[argv.index("--launch-token") + 1]
-    launch_epoch = int(argv[argv.index("--launch-epoch") + 1])
-    claimed = J.Journal(project_root).mark_attempt_running(
-        attempt_id,
-        launch_token,
-        launch_epoch=launch_epoch,
-        worker_instance={"pid": pid, "source": "resume-test-spawn"},
-    )
-    assert claimed.committed, claimed
 
 
 @pytest.fixture(autouse=True)
@@ -177,8 +161,6 @@ def _stub_detached_runtime(
             }
         )
         pid = 42000 + len(spawn_calls)
-        if kwargs["label"] == "worker":
-            _claim_fake_worker(argv, pid)
         return pid
 
     monkeypatch.setattr(D, "_spawn_daemonized_process", spawn)
@@ -211,8 +193,6 @@ def _stub_forked_runtime(
             encoding="utf-8",
         )
         pid = 500_000 + (os.getpid() % 10_000) + len(list(markers.iterdir()))
-        if label == "worker":
-            _claim_fake_worker(argv, pid)
         return pid
 
     monkeypatch.setattr(D, "_acquire_capacity", acquire)

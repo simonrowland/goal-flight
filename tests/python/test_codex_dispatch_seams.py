@@ -164,18 +164,6 @@ def _stub_bash_launch(
             }
         )
         pid = 41000 + len(spawn_calls)
-        if kwargs.get("label") == "worker" and "--attempt-id" in argv:
-            project_root = argv[argv.index("--project-root") + 1]
-            attempt_id = argv[argv.index("--attempt-id") + 1]
-            launch_token = argv[argv.index("--launch-token") + 1]
-            launch_epoch = int(argv[argv.index("--launch-epoch") + 1])
-            claimed = D.goalflight_journal.Journal(project_root).mark_attempt_running(
-                attempt_id,
-                launch_token,
-                launch_epoch=launch_epoch,
-                worker_instance={"pid": pid, "source": "dispatch-seam-test-spawn"},
-            )
-            assert claimed.committed, claimed
         return pid
 
     monkeypatch.setattr(D, "_spawn_daemonized_process", fake_spawn)
@@ -315,8 +303,7 @@ def test_bash_ext_absent_preserves_spawn_and_stays_quiet(
         api_missing=True,
     )
     worker_argv = worker_spawn["argv"]
-    assert Path(worker_argv[1]).name == "goalflight_launch_worker.py"
-    assert worker_argv[-3:] == [sys.executable, "-c", "pass"]
+    assert worker_argv == [sys.executable, "-c", "pass"]
     assert "CODEX_HOME" not in worker_spawn["env"]
     assert all(call.get("effective_account") is None for call in ledger_calls)
     assert "per-dispatch home" not in capsys.readouterr().err

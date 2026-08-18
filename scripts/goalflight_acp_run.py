@@ -3450,6 +3450,17 @@ async def _run_acp_dispatch_impl(
         pgid = process_group_id(p.pid) or p.pid
         with contextlib.suppress(Exception):
             attach_worker_to_lease(p.pid)
+        try:
+            await asyncio.to_thread(
+                goalflight_ledger.claim_attempt_running,
+                project_root,
+                dispatch_id,
+                p.pid,
+            )
+        except Exception:
+            with contextlib.suppress(Exception):
+                p.kill()
+            raise
         updates: dict[str, object] = dict(
             worker_pid=p.pid, pgid=pgid, worker_alive=True, state="handshaking"
         )
@@ -3546,21 +3557,6 @@ async def _run_acp_dispatch_impl(
                 raise RuntimeError(
                     f"prepared attempt identity missing for {dispatch_id}: {required_key}"
                 )
-        acp_args = [
-            str(SCRIPT_DIR / "goalflight_launch_worker.py"),
-            "--project-root",
-            str(project_root),
-            "--attempt-id",
-            str(attempt_record["attempt_id"]),
-            "--launch-token",
-            str(attempt_record["launch_token"]),
-            "--launch-epoch",
-            str(attempt_record["launch_epoch"]),
-            "--",
-            command,
-            *acp_args,
-        ]
-        command = sys.executable
         # Spawn + handshake, retrying once on AcpError (the intermittent
         # codex-acp wedge). The helper kills a wedged worker before respawning,
         # so no identity-matched PID is ever left alive. Status progresses
@@ -3682,9 +3678,10 @@ async def _run_acp_dispatch_impl(
         if test_delay_s > 0:
             await asyncio.sleep(test_delay_s)
         await asyncio.to_thread(
-            goalflight_ledger.wait_attempt_running,
+            goalflight_ledger.claim_attempt_running,
             project_root,
             dispatch_id,
+            proc.pid,
         )
         record_ledger_state(worker_pid=proc.pid, state="running")
         activity.reset_progress_clock(active_monotonic())

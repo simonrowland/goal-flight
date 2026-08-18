@@ -3584,23 +3584,9 @@ def _attempt_claiming_worker_argv(
         raise RuntimeError(
             f"prepared attempt {attempt.attempt_id} is {attempt.lifecycle_state}, expected STARTING"
         )
-    return (
-        [
-            sys.executable,
-            str(SCRIPT_DIR / "goalflight_launch_worker.py"),
-            "--project-root",
-            str(project_root),
-            "--attempt-id",
-            attempt.attempt_id,
-            "--launch-token",
-            attempt.launch_token,
-            "--launch-epoch",
-            str(attempt.launch_epoch),
-            "--",
-            *worker_argv,
-        ],
-        True,
-    )
+    # The unsandboxed watcher claims RUNNING after spawn. Do not wrap the
+    # worker in launch_worker — that CAS was the only in-sandbox journal write.
+    return worker_argv, True
 
 
 def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | None, status_json: Path, tail: Path) -> None:
@@ -10458,9 +10444,10 @@ def main(argv: list[str] | None = None) -> int:
             pidfile = None
         try:
             if wait_for_worker_claim:
-                goalflight_ledger.wait_attempt_running(
+                goalflight_ledger.claim_attempt_running(
                     project_root,
                     str(args.dispatch_id),
+                    worker_pid,
                 )
             _record_ledger(
                 args,

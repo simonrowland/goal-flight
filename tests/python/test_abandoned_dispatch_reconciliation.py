@@ -19,7 +19,6 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_capacity as C  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
-import goalflight_journal as J  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
 
 
@@ -174,20 +173,6 @@ def _stub_resume_runtime(
         spawn_calls.append({"argv": list(argv), "label": kwargs.get("label"), "pid": pid})
         if kwargs.get("label") == "worker":
             worker_pids.append(pid)
-            # The real pre-exec launcher owns STARTING -> RUNNING. This fake
-            # spawn must model that claim before the parent publishes its
-            # compatibility ledger projection.
-            project_root = argv[argv.index("--project-root") + 1]
-            attempt_id = argv[argv.index("--attempt-id") + 1]
-            launch_token = argv[argv.index("--launch-token") + 1]
-            launch_epoch = int(argv[argv.index("--launch-epoch") + 1])
-            claimed = J.Journal(project_root).mark_attempt_running(
-                attempt_id,
-                launch_token,
-                launch_epoch=launch_epoch,
-                worker_instance={"pid": pid, "source": "resume-test-spawn"},
-            )
-            assert claimed.committed, claimed
         return pid
 
     monkeypatch.setattr(D, "_spawn_daemonized_process", spawn)

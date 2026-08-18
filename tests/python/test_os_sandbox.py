@@ -590,88 +590,34 @@ def _sandboxed_journal_open(workspace: Path, journal_path: Path):
     return prepared, result
 
 
-def case_journal_dir_is_a_write_root() -> None:
-    """Grant is the journal's parent, resolved through the writer, not a guess."""
+def case_journal_dir_is_not_a_write_root() -> None:
+    """Watcher owns the RUNNING claim; the seatbelt must not grant the journal."""
     with _isolated_journal_workspace() as (workspace, journal_path):
         roots = goalflight_os_sandbox_mod.macos_write_roots(
             str(workspace), OS_SANDBOX_WORKSPACE_WRITE
         )
         journal_dir = str(journal_path.parent.resolve())
-        assert any(
-            Path(root).resolve() == Path(journal_dir)
-            for root in roots
-        ), (journal_dir, roots)
-        # Narrow: sibling journals and the state base stay off the list.
         journals_parent = str(Path(journal_dir).parent.resolve())
-        assert all(
-            Path(root).resolve() != Path(journals_parent)
-            for root in roots
-        ), roots
+        resolved_roots = [Path(root).resolve() for root in roots]
+        assert Path(journal_dir) not in resolved_roots, (journal_dir, roots)
+        assert Path(journals_parent) not in resolved_roots, roots
 
 
-def case_missing_journal_grant_reproduces_permission_error() -> None:
-    """The fleet death: lock is outside workspace, so workspace-write denies it."""
-    if _skip_unless_sandbox_exec_case("case_missing_journal_grant_reproduces_permission_error"):
+def case_sandboxed_journal_open_is_denied() -> None:
+    """Journal lock sits outside the workspace; workspace-write must deny it."""
+    if _skip_unless_sandbox_exec_case("case_sandboxed_journal_open_is_denied"):
         return
     with _isolated_journal_workspace() as (workspace, journal_path):
-        real_grant = goalflight_os_sandbox_mod.goalflight_journal_write_root
-
-        def _miss(_cwd: str) -> str:
-            return str(workspace / ".not-the-journal")
-
-        goalflight_os_sandbox_mod.goalflight_journal_write_root = _miss
-        try:
-            _prepared, result = _sandboxed_journal_open(workspace, journal_path)
-        finally:
-            goalflight_os_sandbox_mod.goalflight_journal_write_root = real_grant
+        _prepared, result = _sandboxed_journal_open(workspace, journal_path)
         assert result.returncode != 0, result
         combined = result.stdout + result.stderr
         assert "journal-ok" not in result.stdout, result
         assert "PermissionError" in combined or "Operation not permitted" in combined, result
 
 
-def case_sandboxed_journal_open_succeeds() -> None:
-    if _skip_unless_sandbox_exec_case("case_sandboxed_journal_open_succeeds"):
-        return
-    with _isolated_journal_workspace() as (workspace, journal_path):
-        outside = workspace.parent / "outside.txt"
-        if outside.exists():
-            outside.unlink()
-        prepared, result = _sandboxed_journal_open(workspace, journal_path)
-        try:
-            assert result.returncode == 0, result
-            assert "journal-ok" in result.stdout, result
-            assert str(journal_path) in result.stdout, result
-            # Safety: grant is not a general home/state write.
-            deny = (
-                "from pathlib import Path; "
-                f"Path(r'{outside}').write_text('outside'); "
-                "print('outside-ok')"
-            )
-            denied = prepare_os_sandbox_command(
-                sys.executable,
-                ["-c", deny],
-                cwd=str(workspace),
-                os_sandbox=OS_SANDBOX_WORKSPACE_WRITE,
-            )
-            denied_result = subprocess.run(
-                [denied.command, *denied.args],
-                cwd=str(workspace),
-                text=True,
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-            assert denied_result.returncode != 0, denied_result
-            assert not outside.exists(), "sandbox allowed write outside workspace and journal dir"
-        finally:
-            if outside.exists():
-                outside.unlink()
-
-
-def case_sandboxed_launch_worker_gets_past_journal_lock() -> None:
-    """launch_worker is the sandboxed process; Journal() is its first act."""
-    if _skip_unless_sandbox_exec_case("case_sandboxed_launch_worker_gets_past_journal_lock"):
+def case_sandboxed_launch_worker_cannot_lock_journal() -> None:
+    """In-sandbox launch_worker is no longer a journal writer; the lock is denied."""
+    if _skip_unless_sandbox_exec_case("case_sandboxed_launch_worker_cannot_lock_journal"):
         return
     launcher = ROOT / "scripts" / "goalflight_launch_worker.py"
     with _isolated_journal_workspace() as (workspace, _journal_path):
@@ -707,12 +653,9 @@ def case_sandboxed_launch_worker_gets_past_journal_lock() -> None:
             env=env,
         )
         combined = result.stdout + result.stderr
-        assert "PermissionError" not in combined, result
-        assert "Operation not permitted" not in combined, result
-        # No such attempt: claim fails *after* Journal() opened. That is the
-        # handshake-death boundary: lock success, then exec or a claim error.
-        assert result.returncode in {73, 75}, result
-        assert "launch refused" in result.stderr, result
+        assert result.returncode != 0, result
+        assert "journal-ok" not in result.stdout, result
+        assert "PermissionError" in combined or "Operation not permitted" in combined, result
 
 
 def case_dispatch_help_exposes_title_allow_pattern() -> None:
@@ -1427,10 +1370,9 @@ def main() -> None:
     case_rejects_cwd_under_temp_root()
     case_agent_state_roots_are_explicit_exception()
     case_rejects_cwd_under_agent_state_root()
-    case_journal_dir_is_a_write_root()
-    case_missing_journal_grant_reproduces_permission_error()
-    case_sandboxed_journal_open_succeeds()
-    case_sandboxed_launch_worker_gets_past_journal_lock()
+    case_journal_dir_is_not_a_write_root()
+    case_sandboxed_journal_open_is_denied()
+    case_sandboxed_launch_worker_cannot_lock_journal()
     case_sandboxed_acp_handshake_with_isolated_journal()
     case_dispatch_help_exposes_title_allow_pattern()
     case_dispatch_forwards_title_allow_pattern_to_acp_cfg()

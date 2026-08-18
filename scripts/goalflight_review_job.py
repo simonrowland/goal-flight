@@ -811,20 +811,11 @@ def main(argv: list[str] | None = None) -> int:
             attempt_record = json.loads(
                 goalflight_ledger.record_path(dispatch_id).read_text(encoding="utf-8")
             )
-            cmd = [
-                sys.executable,
-                str(Path(__file__).resolve().parent / "goalflight_launch_worker.py"),
-                "--project-root",
-                str(args.repo),
-                "--attempt-id",
-                str(attempt_record["attempt_id"]),
-                "--launch-token",
-                str(attempt_record["launch_token"]),
-                "--launch-epoch",
-                str(attempt_record["launch_epoch"]),
-                "--",
-                *cmd,
-            ]
+            for required_key in ("attempt_id", "launch_token", "launch_epoch"):
+                if attempt_record.get(required_key) in (None, ""):
+                    raise RuntimeError(
+                        f"prepared attempt identity missing for {dispatch_id}: {required_key}"
+                    )
             proc = subprocess.Popen(
                 cmd,
                 cwd=args.repo,
@@ -864,7 +855,7 @@ def main(argv: list[str] | None = None) -> int:
                     goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state="failed", reason=payload["error"], keep=True))
             print(json.dumps(payload, sort_keys=True) if args.json else f"{args.name}: failed status={status_path}")
             return 1
-        goalflight_ledger.wait_attempt_running(args.repo, dispatch_id)
+        goalflight_ledger.claim_attempt_running(args.repo, dispatch_id, proc.pid)
         record_review_state("running", proc.pid)
         payload = {
             "schema": "goalflight.review-job.v1",

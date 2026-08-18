@@ -905,15 +905,8 @@ def _install_fake_acp_after_capacity():
     old_validate = goalflight_acp_run.validate_acp_dispatch_readiness
 
     async def fake_spawn(command, command_args, **kwargs):
-        wrapped = list(command_args)
-        separator = wrapped.index("--")
-        wrapped = wrapped[: separator + 1] + [
-            sys.executable,
-            "-c",
-            "import time; time.sleep(60)",
-        ]
         proc = subprocess.Popen(
-            [command, *wrapped],
+            [sys.executable, "-c", "import time; time.sleep(60)"],
             cwd=kwargs.get("cwd"),
             env=kwargs.get("env"),
         )

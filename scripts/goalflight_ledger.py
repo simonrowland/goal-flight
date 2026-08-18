@@ -580,6 +580,44 @@ def commit_terminal_authority(
     )
 
 
+def claim_attempt_running(
+    project_root: Path | str,
+    dispatch_id: str,
+    worker_pid: int,
+) -> goalflight_journal.AttemptIdentity:
+    """Mark STARTING -> RUNNING from the unsandboxed watcher after spawn.
+
+    Spawn return is the RUNNING moment: the OS has already created the
+    process. This does not infer liveness from later I/O. If the worker
+    died between spawn and this call, stamp ``{"pid": worker_pid}`` so
+    reconciler classifies worker_dead instead of abandoning a launch
+    that did start. A second call on an already-RUNNING attempt is a
+    no-op so handshake retries and mocked spawn paths can share one
+    owner.
+    """
+    if not isinstance(worker_pid, int) or worker_pid <= 0:
+        raise ValueError("worker_pid must be a positive int")
+    authority = goalflight_journal.Journal(project_root)
+    attempt = authority.attempt_for_dispatch(dispatch_id)
+    if attempt is None:
+        raise RuntimeError(f"prepared attempt missing for {dispatch_id}")
+    if attempt.lifecycle_state == goalflight_journal.ATTEMPT_RUNNING:
+        return attempt
+    if attempt.lifecycle_state != goalflight_journal.ATTEMPT_STARTING:
+        raise RuntimeError(
+            f"attempt {attempt.attempt_id} entered {attempt.lifecycle_state} before RUNNING"
+        )
+    result = authority.mark_attempt_running(
+        attempt.attempt_id,
+        attempt.launch_token,
+        launch_epoch=attempt.launch_epoch,
+        worker_instance=process_identity(worker_pid) or {"pid": worker_pid},
+    )
+    if not result.committed or result.value is None:
+        raise RuntimeError(f"RUNNING claim lost for {dispatch_id}: {result.reason}")
+    return result.value
+
+
 def wait_attempt_running(
     project_root: Path | str,
     dispatch_id: str,
