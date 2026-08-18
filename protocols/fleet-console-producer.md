@@ -42,7 +42,7 @@ Each payload stamps its producer cadence. The renderer declares a plane stale
 at two missed stamped intervals; its own reload timer is transport, never
 freshness authority. Every degraded `last_error` and stale banner names the
 plane launchd log plus `scripts/install-fleet-console.sh --status --plane
-<plane>`. HUNG controller attention carries the exact `listen-auto` command
+<plane>`. HUNG controller attention carries the exact `listen` command
 rendered by the wake layer.
 
 ## Tick behavior

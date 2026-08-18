@@ -1215,7 +1215,7 @@ def listener_start_command(
     argv = [
         "python3",
         str(messages_script),
-        "listen-auto",
+        "listen",
         "--project-root",
         str(Path(project_root).expanduser().resolve(strict=False)),
     ]

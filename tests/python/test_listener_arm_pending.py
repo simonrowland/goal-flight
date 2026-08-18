@@ -75,7 +75,7 @@ def test_arm_reports_backlog_stays_armed_and_rings_on_new(
                         "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce}
         proc = subprocess.Popen(
             [sys.executable, str(SCRIPTS / "goalflight_messages.py"),
-             "listen-auto", "--project-root", str(project),
+             "listen", "--project-root", str(project),
              "--controller-label", "armtest", "--report-pending"],
             env=listener_env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True,
@@ -135,7 +135,7 @@ def test_default_arm_over_backlog_exits_promptly(
             [
                 sys.executable,
                 str(SCRIPTS / "goalflight_messages.py"),
-                "listen-auto",
+                "listen",
                 "--project-root",
                 str(project),
                 "--controller-label",
@@ -181,7 +181,7 @@ def test_report_pending_json_is_jsonl_through_ring(
             [
                 sys.executable,
                 str(SCRIPTS / "goalflight_messages.py"),
-                "listen-auto",
+                "listen",
                 "--project-root",
                 str(project),
                 "--controller-label",
@@ -216,6 +216,8 @@ def test_report_pending_json_is_jsonl_through_ring(
                 proc.kill()
                 proc.wait()
 
+        # Deliberate listen-auto invocation: deployed controllers still arm
+        # with the alias; this locks back-compat rather than leaving it accidental.
         timeout_result = subprocess.run(
             [
                 sys.executable,

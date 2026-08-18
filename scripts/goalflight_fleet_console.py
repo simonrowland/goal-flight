@@ -444,7 +444,7 @@ def _is_listener_start_action(value: str) -> bool:
         argv[0] == "python3"
         and Path(argv[1]).resolve()
         == Path(str(goalflight_messages.__file__)).resolve()
-        and argv[2:4] == ["listen-auto", "--project-root"]
+        and argv[2:4] == ["listen", "--project-root"]
         and Path(argv[4]).is_absolute()
     ):
         return False

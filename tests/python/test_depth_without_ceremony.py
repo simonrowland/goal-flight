@@ -1,7 +1,7 @@
 """t-249 + t-267 residual: restore listener depth without ceremony.
 
 A live controller must reach target depth without remembering to re-arm.
-listen-auto resolves the journal lease (env is one input, not the only one).
+listen resolves the journal lease (env is one input, not the only one).
 relay / status / next emit a one-line depth cue once per transition.
 The numbered listen-exit list is frozen and is not repeated on those surfaces.
 """
@@ -125,7 +125,7 @@ def _listen_cmd(
     *,
     label: str,
     nonce: str | None = None,
-    command: str = "listen-auto",
+    command: str = "listen",
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -147,6 +147,7 @@ def _listen_cmd(
 
 
 def _listen_auto_cmd(project: Path, *, label: str, nonce: str | None = None) -> list[str]:
+    # Alias lock: deployed controllers still paste listen-auto.
     return _listen_cmd(project, label=label, nonce=nonce, command="listen-auto")
 
 
@@ -211,7 +212,7 @@ def test_listen_exit_numbered_hint_is_frozen() -> None:
 
 
 def test_activity_hint_is_one_line_and_silent_when_done() -> None:
-    command = "python3 scripts/goalflight_messages.py listen-auto --report-pending"
+    command = "python3 scripts/goalflight_messages.py listen --report-pending"
     hint = wake.listener_activity_hint(0, 4, command, work_in_flight=True)
     assert hint == f"listener depth 0/4 — 4 missing; {command}"
     assert "\n" not in hint

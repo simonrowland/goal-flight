@@ -77,11 +77,10 @@ def main() -> int:
     import goalflight_fleet_console as console
 
     label = "smoke"
-    # listen-auto is what production controllers arm; the bare `listen`
-    # blocks on the journal cursor alone and misses carrier-projected
-    # worker terminals until an ingesting entry runs.
+    # Hints emit plain `listen` (self-resolves the ACTIVE lease). listen-auto
+    # remains accepted so deployed controllers mid-flight keep arming.
     listener_cmd = [
-        sys.executable, str(SCRIPTS / "goalflight_messages.py"), "listen-auto",
+        sys.executable, str(SCRIPTS / "goalflight_messages.py"), "listen",
         "--project-root", str(project_root), "--controller-label", label,
     ]
 

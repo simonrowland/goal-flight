@@ -433,7 +433,7 @@ def test_allowlist_rejects_unknown_and_unsafe_fields(
 
     hostile_action = json.loads(json.dumps(attention_payload))
     hostile_action["items"][0]["action"] = (
-        "python3 /tmp/goalflight_messages.py listen-auto --project-root /tmp/project"
+        "python3 /tmp/goalflight_messages.py listen --project-root /tmp/project"
     )
     try:
         F.validate_projection(hostile_action, "attention")

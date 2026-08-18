@@ -116,7 +116,7 @@ def _post(env: dict[str, str], project: Path, label: str, text: str) -> None:
 
 
 def test_floor_hint_names_missing_slots_as_separate_tracked_calls() -> None:
-    command = "python3 scripts/goalflight_messages.py listen-auto --report-pending"
+    command = "python3 scripts/goalflight_messages.py listen --report-pending"
     hint = wake.listener_floor_hint(0, 4, command, work_in_flight=True)
     assert "live=0/4" in hint
     assert "4 slots missing" in hint
