@@ -39,6 +39,21 @@ def _write_reader(directory: Path, filename: str, body: str) -> None:
     (directory / filename).write_text(body, encoding="utf-8")
 
 
+def _kimi_usage_row(usage_obj: dict) -> dict:
+    spec = usage.ReaderSpec("kimi", "moonshot", "kimi_usage.py")
+    return usage.normalize_payload(
+        spec,
+        [
+            {
+                "label": "kimi-code",
+                "source": "kimi_code_usages",
+                "ok": True,
+                "usage": usage_obj,
+            }
+        ],
+    )[0]
+
+
 def test_normalizes_codex_epoch_and_walled_state():
     spec = usage.ReaderSpec("codex", "codex", "codex_usage.py")
     rows = usage.normalize_payload(
@@ -99,6 +114,199 @@ def test_normalizes_kimi_nested_usage_and_iso_reset():
         reset_iso.replace("Z", "+00:00")
     ).timestamp()
     assert row["flags"] == []
+
+
+def test_exhausted_rate_window_is_the_binding_reading(new_york_tz):
+    """Cycle headroom must not hide a spent rate window (live 2026-08-18).
+
+    The cycle still had 65/100; the 5h window was 0/100. The window is what
+    the API enforces, so the row must read as walled on the window's reset.
+    """
+    cycle_reset = "2026-08-19T04:47:00Z"
+    window_reset = "2026-08-18T16:47:56Z"
+    row = _kimi_usage_row(
+        {
+            "remaining": 65,
+            "limit": 100,
+            "resetTime": cycle_reset,
+            "windows": [
+                {
+                    "duration": 300,
+                    "timeUnit": "TIME_UNIT_MINUTE",
+                    "remaining": 0,
+                    "limit": 100,
+                    "resetTime": window_reset,
+                }
+            ],
+        }
+    )
+
+    window_ts = datetime.fromisoformat("2026-08-18T16:47:56+00:00").timestamp()
+    assert row["remaining"].startswith("0/100")
+    assert "5h window" in row["remaining"]
+    assert "12:47" in row["remaining"]
+    assert "65/100" not in row["remaining"]
+    assert row["reset_at"] == window_ts
+    assert row["flags"] == ["walled"]
+
+    now = datetime.fromisoformat("2026-08-18T16:29:00+00:00").timestamp()
+    rendered = usage.render_table([row], now=now)
+    assert "0/100" in rendered
+    assert "5h window" in rendered
+    assert "12:47" in rendered
+    assert "⛔wall" in rendered
+    assert "Aug 19" not in rendered
+
+
+def test_exhausted_cycle_still_walls_when_window_is_fresh():
+    cycle_reset = "2026-08-19T04:47:00Z"
+    window_reset = "2026-08-18T16:47:56Z"
+    row = _kimi_usage_row(
+        {
+            "remaining": 0,
+            "limit": 100,
+            "resetTime": cycle_reset,
+            "windows": [
+                {
+                    "duration": 300,
+                    "timeUnit": "TIME_UNIT_MINUTE",
+                    "remaining": 80,
+                    "limit": 100,
+                    "resetTime": window_reset,
+                }
+            ],
+        }
+    )
+
+    cycle_ts = datetime.fromisoformat("2026-08-19T04:47:00+00:00").timestamp()
+    assert row["remaining"] == "0/100"
+    assert "window" not in row["remaining"]
+    assert row["reset_at"] == cycle_ts
+    assert row["flags"] == ["walled"]
+
+
+def test_neither_exhausted_uses_tighter_constraint_and_its_reset():
+    later = "2026-08-19T04:47:00Z"
+    sooner = "2026-08-18T16:47:56Z"
+    later_ts = datetime.fromisoformat("2026-08-19T04:47:00+00:00").timestamp()
+    sooner_ts = datetime.fromisoformat("2026-08-18T16:47:56+00:00").timestamp()
+
+    cycle_tighter = _kimi_usage_row(
+        {
+            "remaining": 50,
+            "limit": 100,
+            "resetTime": later,
+            "windows": [
+                {
+                    "duration": 300,
+                    "timeUnit": "TIME_UNIT_MINUTE",
+                    "remaining": 80,
+                    "limit": 100,
+                    "resetTime": sooner,
+                }
+            ],
+        }
+    )
+    assert cycle_tighter["remaining"] == "50/100"
+    assert cycle_tighter["reset_at"] == later_ts
+    assert cycle_tighter["flags"] == []
+
+    window_tighter = _kimi_usage_row(
+        {
+            "remaining": 80,
+            "limit": 100,
+            "resetTime": later,
+            "windows": [
+                {
+                    "duration": 300,
+                    "timeUnit": "TIME_UNIT_MINUTE",
+                    "remaining": 50,
+                    "limit": 100,
+                    "resetTime": sooner,
+                }
+            ],
+        }
+    )
+    assert window_tighter["remaining"].startswith("50/100")
+    assert "5h window" in window_tighter["remaining"]
+    assert window_tighter["reset_at"] == sooner_ts
+    assert window_tighter["flags"] == []
+
+
+def test_binding_constraint_is_the_minimum_across_every_window():
+    row = _kimi_usage_row(
+        {
+            "remaining": 40,
+            "limit": 100,
+            "resetTime": "2026-08-19T04:47:00Z",
+            "windows": [
+                {
+                    "duration": 5,
+                    "timeUnit": "TIME_UNIT_MINUTE",
+                    "remaining": 20,
+                    "limit": 100,
+                    "resetTime": "2026-08-18T16:10:00Z",
+                },
+                {
+                    "duration": 300,
+                    "timeUnit": "TIME_UNIT_MINUTE",
+                    "remaining": 5,
+                    "limit": 100,
+                    "resetTime": "2026-08-18T16:47:56Z",
+                },
+            ],
+        }
+    )
+    assert row["remaining"].startswith("5/100")
+    assert "5h window" in row["remaining"]
+    assert row["reset_at"] == datetime.fromisoformat(
+        "2026-08-18T16:47:56+00:00"
+    ).timestamp()
+    assert row["flags"] == []
+
+
+def test_engines_without_windows_keep_the_cycle_reading():
+    """No windows list, or an empty one, must match the pre-binding renderer."""
+    reset_iso = "2033-05-18T03:33:20Z"
+    expected_reset = datetime.fromisoformat(
+        reset_iso.replace("Z", "+00:00")
+    ).timestamp()
+    for windows in (None, [], "not-a-list"):
+        usage_obj = {
+            "remaining": 66,
+            "limit": 100,
+            "resetTime": reset_iso,
+        }
+        if windows is not None:
+            usage_obj["windows"] = windows
+        row = _kimi_usage_row(usage_obj)
+        assert row["remaining"] == "66/100"
+        assert row["reset_at"] == expected_reset
+        assert row["flags"] == []
+
+
+def test_remaining_column_header_names_the_direction():
+    """The column shows leftover headroom; the header has to say so.
+
+    `2%` is 2% left, not 2% consumed. An unlabelled PROBE READING is read
+    backwards on the exact decision the table exists to inform.
+    """
+    rendered = usage.render_table(
+        [
+            {
+                "provider": "codex",
+                "account": "25ca6b",
+                "remaining": "2%",
+                "reset_at": None,
+                "flags": [],
+            }
+        ],
+        now=2_000_000_000,
+    )
+    header = rendered.splitlines()[0]
+    assert "REMAINING" in header
+    assert "PROBE READING" not in rendered
+    assert "2%" in rendered
 
 
 def test_normalizes_cursor_ui_only_shape():
@@ -936,7 +1144,7 @@ def test_non_grok_prepaid_balance_uses_generic_wall_and_display_path() -> None:
 
 
 def test_probe_reading_shows_the_deciding_balance_and_omits_spend_attribution() -> None:
-    """reader record -> normalized remaining -> existing PROBE READING column.
+    """reader record -> normalized remaining -> REMAINING column.
 
     Only the balance earns a place in the row. `product_usage` percentages are
     shares of one already-spent budget and sum to 100 (measured: GrokBuild 95,
@@ -974,7 +1182,7 @@ def test_probe_reading_shows_the_deciding_balance_and_omits_spend_attribution() 
     assert "⛔wall" in rendered, "a zero balance must not clear the wall"
     for omitted in ("components", "GrokBuild", "GrokVoice", "GrokChat", "on_demand"):
         assert omitted not in rendered, f"{omitted} must not reach the row"
-    assert "PROVIDER/ACCOUNT  PROBE READING" in rendered
+    assert "PROVIDER/ACCOUNT  REMAINING" in rendered
 
 
 def test_grok_rows_are_per_account_and_host_stays_unlabelled():

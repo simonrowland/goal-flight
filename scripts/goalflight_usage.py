@@ -172,6 +172,164 @@ def _window_reset(usage: Mapping[str, Any]) -> float | None:
     return min(candidates) if candidates else None
 
 
+_WINDOW_UNIT_SECONDS = {
+    "SECOND": 1.0,
+    "SECONDS": 1.0,
+    "SEC": 1.0,
+    "MINUTE": 60.0,
+    "MINUTES": 60.0,
+    "MIN": 60.0,
+    "HOUR": 3600.0,
+    "HOURS": 3600.0,
+    "HR": 3600.0,
+    "DAY": 86400.0,
+    "DAYS": 86400.0,
+}
+
+
+def _window_span_seconds(window: Mapping[str, Any]) -> float | None:
+    duration = _number(window.get("duration"))
+    if duration is None or duration <= 0:
+        return None
+    raw_unit = window.get("timeUnit") or window.get("time_unit")
+    if not isinstance(raw_unit, str):
+        return None
+    unit = raw_unit.strip().upper()
+    if unit.startswith("TIME_UNIT_"):
+        unit = unit[len("TIME_UNIT_") :]
+    multiplier = _WINDOW_UNIT_SECONDS.get(unit)
+    if multiplier is None:
+        return None
+    return duration * multiplier
+
+
+def _format_window_span(seconds: float) -> str:
+    if seconds < 90 * 60:
+        return f"{_format_number(seconds / 60)}m"
+    hours = seconds / 3600
+    if hours < 48:
+        return f"{_format_number(hours)}h"
+    return f"{_format_number(hours / 24)}d"
+
+
+def _local_hhmm(reset_at: float) -> str:
+    try:
+        return datetime.fromtimestamp(reset_at).astimezone().strftime("%H:%M")
+    except (OSError, OverflowError, ValueError):
+        return "—"
+
+
+def _constraint_from_mapping(
+    mapping: Mapping[str, Any], *, is_window: bool
+) -> dict[str, Any]:
+    return {
+        "remaining": _number(mapping.get("remaining")),
+        "limit": _number(mapping.get("limit")),
+        "remaining_percent": _number(mapping.get("remaining_percent")),
+        "used_percent": _number(mapping.get("used_percent")),
+        "unit": _label(mapping.get("unit")),
+        "resets": _reset_candidates(mapping),
+        "is_window": is_window,
+        "window_seconds": _window_span_seconds(mapping) if is_window else None,
+    }
+
+
+def _constraint_tightness(constraint: Mapping[str, Any]) -> float | None:
+    remaining = _number(constraint.get("remaining"))
+    limit = _number(constraint.get("limit"))
+    remaining_percent = _number(constraint.get("remaining_percent"))
+    used_percent = _number(constraint.get("used_percent"))
+    if remaining is not None and limit is not None and limit > 0:
+        return remaining / limit
+    if remaining_percent is not None:
+        return remaining_percent / 100.0
+    if used_percent is not None:
+        return _percent_remaining(used_percent) / 100.0
+    if remaining is not None:
+        return remaining
+    return None
+
+
+def _pick_binding(usage: Mapping[str, Any]) -> dict[str, Any]:
+    """The tightest of the cycle budget and every rate window.
+
+    A spent window with leftover cycle budget is still a wall. Displaying the
+    cycle number is the dangerous direction: it looks like headroom exists.
+    """
+    cycle = _constraint_from_mapping(usage, is_window=False)
+    candidates = [cycle]
+    windows = usage.get("windows")
+    if isinstance(windows, list):
+        for window in windows:
+            if isinstance(window, Mapping):
+                candidates.append(_constraint_from_mapping(window, is_window=True))
+    scored: list[tuple[float, float, dict[str, Any]]] = []
+    for constraint in candidates:
+        tightness = _constraint_tightness(constraint)
+        if tightness is None:
+            continue
+        resets = constraint.get("resets") or []
+        reset_at = min(resets) if resets else float("inf")
+        scored.append((tightness, reset_at, constraint))
+    if not scored:
+        return cycle
+    scored.sort(key=lambda item: (item[0], item[1]))
+    return scored[0][2]
+
+
+def _usage_binding_reset(usage: Mapping[str, Any]) -> float | None:
+    windows = usage.get("windows")
+    if isinstance(windows, list) and windows:
+        resets = _pick_binding(usage).get("resets") or []
+        if resets:
+            return min(resets)
+    resets = _reset_candidates(usage)
+    if resets:
+        return min(resets)
+    return _window_reset(usage)
+
+
+def _fields_remaining(
+    constraint: Mapping[str, Any],
+) -> tuple[str | None, float | None, float | None]:
+    remaining = _number(constraint.get("remaining"))
+    limit = _number(constraint.get("limit"))
+    remaining_percent = _number(constraint.get("remaining_percent"))
+    used_percent = _number(constraint.get("used_percent"))
+    unit = constraint.get("unit")
+    if not isinstance(unit, str):
+        unit = None
+
+    if remaining is not None and limit is not None:
+        return (
+            f"{_format_number(remaining)}/{_format_number(limit)}",
+            remaining,
+            used_percent,
+        )
+    if remaining_percent is not None:
+        return f"{_format_number(remaining_percent)}%", remaining_percent, used_percent
+    if used_percent is not None:
+        computed = _percent_remaining(used_percent)
+        return f"{_format_number(computed)}%", computed, used_percent
+    if remaining is not None and unit:
+        return f"{_format_number(remaining)} {unit}", remaining, used_percent
+    if remaining is not None:
+        return _format_number(remaining), remaining, used_percent
+    return None, None, used_percent
+
+
+def _with_window_annotation(text: str, binding: Mapping[str, Any]) -> str:
+    seconds = binding.get("window_seconds")
+    if isinstance(seconds, (int, float)) and seconds > 0:
+        label = f"{_format_window_span(float(seconds))} window"
+    else:
+        label = "window"
+    resets = binding.get("resets") or []
+    if resets:
+        label = f"{label}, resets {_local_hhmm(min(resets))}"
+    return f"{text} ({label})"
+
+
 def _row(
     provider: str,
     *,
@@ -236,34 +394,27 @@ def _percent_remaining(used_percent: float) -> float:
 def _usage_remaining(
     usage: object,
 ) -> tuple[str | None, float | None, float | None]:
-    """Return display text, numeric remaining, and numeric used percent."""
+    """Return display text, numeric remaining, and numeric used percent.
+
+    When ``usage.windows`` is present, the displayed reading is the binding
+    constraint — the tightest remaining/limit ratio across the cycle budget
+    and every rate window. Engines that report no windows keep the
+    cycle-only reading unchanged.
+    """
     if isinstance(usage, str):
         return _label(usage), None, None
     if not isinstance(usage, Mapping):
         return None, None, None
 
-    remaining = _number(usage.get("remaining"))
-    limit = _number(usage.get("limit"))
-    remaining_percent = _number(usage.get("remaining_percent"))
-    used_percent = _number(usage.get("used_percent"))
-    unit = _label(usage.get("unit"))
+    windows = usage.get("windows")
+    if isinstance(windows, list) and windows:
+        binding = _pick_binding(usage)
+        text, remaining_value, used = _fields_remaining(binding)
+        if text and binding.get("is_window"):
+            text = _with_window_annotation(text, binding)
+        return text, remaining_value, used
 
-    if remaining is not None and limit is not None:
-        return (
-            f"{_format_number(remaining)}/{_format_number(limit)}",
-            remaining,
-            used_percent,
-        )
-    if remaining_percent is not None:
-        return f"{_format_number(remaining_percent)}%", remaining_percent, used_percent
-    if used_percent is not None:
-        computed = _percent_remaining(used_percent)
-        return f"{_format_number(computed)}%", computed, used_percent
-    if remaining is not None and unit:
-        return f"{_format_number(remaining)} {unit}", remaining, used_percent
-    if remaining is not None:
-        return _format_number(remaining), remaining, used_percent
-    return None, None, used_percent
+    return _fields_remaining(_constraint_from_mapping(usage, is_window=False))
 
 
 def _apply_reported_headroom(
@@ -380,10 +531,9 @@ def _normalize_kimi(record: Mapping[str, Any], now: float) -> dict[str, object]:
 
     usage = record.get("usage")
     usage_mapping = usage if isinstance(usage, Mapping) else None
-    reset_at = None
-    if usage_mapping is not None:
-        resets = _reset_candidates(usage_mapping)
-        reset_at = min(resets) if resets else _window_reset(usage_mapping)
+    reset_at = (
+        _usage_binding_reset(usage_mapping) if usage_mapping is not None else None
+    )
     if reset_at is None:
         resets = _reset_candidates(record)
         reset_at = min(resets) if resets else None
@@ -939,7 +1089,7 @@ def render_table(
     current_time = time.time() if now is None else now
     headers = (
         "PROVIDER/ACCOUNT",
-        "PROBE READING",
+        "REMAINING",
         "RESETS (local HH:MM)",
         "EVIDENCE",
     )
