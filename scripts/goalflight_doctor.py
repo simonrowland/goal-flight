@@ -1469,11 +1469,26 @@ def check_opencode_context_mode(skill_root: Path, project_root: Path) -> dict:
     return out
 
 
+def check_grok_permission_modes(
+    accounts: list[tuple[str | None, Path]] | None = None,
+) -> list[dict]:
+    """permission_mode rows for configured grok homes. Never reads auth.json."""
+    try:
+        import grok_permission_mode
+    except Exception:
+        return []
+    try:
+        return grok_permission_mode.inspect_configured_homes(accounts)
+    except Exception:
+        return []
+
+
 def check_grok() -> dict:
+    permission_modes = check_grok_permission_modes()
     path = shutil.which("grok") or str(Path.home() / ".grok/bin/grok")
     p = Path(path) if path else None
     if not p or not p.exists():
-        return {"present": False}
+        return {"present": False, "permission_modes": permission_modes}
     help_result = run([str(p), "--help"], timeout=4)
     version_result = run([str(p), "--version"], timeout=4)
     text = help_result["stdout"] + help_result["stderr"]
@@ -1483,6 +1498,7 @@ def check_grok() -> dict:
         "version": first_line(version_result["stdout"] or version_result["stderr"]),
         "grok_build": "Grok Build" in text,
         "headless_flags": "--prompt-file" in text and "--cwd" in text,
+        "permission_modes": permission_modes,
     }
 
 
@@ -3227,6 +3243,23 @@ def collect_human_lines(payload: dict) -> list[str]:
         status_line(payload["opencode"].get("present"), "opencode ACP", payload["opencode"].get("version")),
         status_line(payload["grok"].get("present"), "Grok Build binary", payload["grok"].get("version")),
         status_line(payload["grok"].get("headless_flags"), "Grok headless flags", None),
+    ]
+    for row in (payload.get("grok") or {}).get("permission_modes") or []:
+        config = row.get("config") or "config.toml"
+        if row.get("status") == "present":
+            lines.append(
+                status_line(
+                    True,
+                    "Grok permission_mode",
+                    f"{config}: {row.get('permission_mode')}",
+                )
+            )
+        else:
+            detail = row.get("detail") or row.get("status") or "not set"
+            lines.append(
+                status_line(False, "Grok permission_mode missing", f"{config}: {detail}")
+            )
+    lines += [
         status_line(
             (payload.get("claude_acp_stopgap") or {}).get("ok"),
             "Claude ACP pinned TUI-submit fix",

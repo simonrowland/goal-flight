@@ -77,6 +77,9 @@ package repository; for normal target projects it is skipped as INFO.
     - `--prompt-file`
     - `--permission-mode`
     - `--os-sandbox`
+    - Each configured seat home must have `permission_mode` in that home's
+      `.grok/config.toml`. Doctor warns and dispatch refuses when the key is
+      absent; do not add a grok CLI `--permission-mode` flag to compensate.
   - Claude compatibility path: CLI/plugin checks pass before Claude-specific
     compatibility examples are used. NOTE: presence/PATH only — a green doctor
     does NOT confirm the **remote** claude-acp credential. Headless subscription

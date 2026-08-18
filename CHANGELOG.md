@@ -6,6 +6,14 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- A grok dispatch into a seat home whose `config.toml` has no
+  `permission_mode` is refused before launch. Fresh homes omit the key, and
+  the worker then died after one turn with no terminal marker. The refusal
+  names the file and the verified fix; a present value is left alone and the
+  grok CLI flag is still omitted.
+
 ## [1.5.0] - 2026-08-18
 
 ### Added

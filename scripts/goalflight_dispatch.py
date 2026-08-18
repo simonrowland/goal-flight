@@ -93,6 +93,7 @@ from goalflight_watch import (
     _marker_state as _marker_state_for_terminal,
     _terminal_marker_matches_dispatch,
 )
+import grok_permission_mode
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WATCH_PY = SCRIPT_DIR / "goalflight_watch.py"
@@ -3183,6 +3184,37 @@ def _resolve_account_env(args) -> dict[str, str]:
             )
         return {key: env[key] for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME")}
     raise DispatchUsageError(f"--account unsupported for engine {engine!r}")
+
+
+def _guard_grok_seat_permission_mode(
+    args,
+    account_env: dict[str, str],
+    *,
+    default_home: Path | None = None,
+) -> str | None:
+    """Refuse a grok launch whose selected home has no permission_mode.
+
+    Only absence is a hard stop: a present value is returned and otherwise
+    ignored. This does not add ``--permission-mode`` to argv and does not
+    rewrite the operator's config.toml.
+    """
+    if _account_engine(getattr(args, "agent", None) or "") != "grok":
+        return None
+    home = grok_permission_mode.home_from_account_env(
+        account_env,
+        default_home=default_home,
+    )
+    inspection = grok_permission_mode.inspect_home(home)
+    if inspection.status == "present":
+        return inspection.mode
+    raise DispatchUsageError(grok_permission_mode.refusal_message(inspection))
+
+
+def _resolve_launch_account_env(args) -> dict[str, str]:
+    """Resolve the seat HOME, then refuse a grok home with no permission_mode."""
+    account_env = _resolve_account_env(args)
+    _guard_grok_seat_permission_mode(args, account_env)
+    return account_env
 
 
 _CODEX_SEAT_API_UNSET = object()
@@ -10085,7 +10117,9 @@ def main(argv: list[str] | None = None) -> int:
                 allow_queued=args.from_queue or args.submit,
             )
             _mark_queue_claim_launch_started(args)
-            account_env = {} if goalflight_compat.is_windows() else _resolve_account_env(args)
+            account_env = (
+                {} if goalflight_compat.is_windows() else _resolve_launch_account_env(args)
+            )
             if args.submit:
                 return _submit_dispatch(args, raw, base=base)
             if (
@@ -10110,7 +10144,7 @@ def main(argv: list[str] | None = None) -> int:
         _apply_max_idle_default(args)
         _validate_before_side_effects(args, raw)
         dispatch_warnings = _dispatch_warnings(args, raw)
-        account_env = _resolve_account_env(args)
+        account_env = _resolve_launch_account_env(args)
     except UnsupportedAgentSandboxRequest as e:
         try:
             return _record_unsupported_sandbox_rejection(args, e)
