@@ -200,21 +200,25 @@ ledger/queue are shared across projects (identify origin by `project_root`).
 
 ## Review layers
 
-Review layers: executor self-review, chunk review, milestone review.
+Reviews are cut by SUBJECT; `protocols/review-types.md` is operative (two waves
++ 3-cluster pilot). Distinct review layers: executor self-review, Type-1 chunk
+review, Type-2 milestone review; Type 3 sweeps class predicates.
 
-| Layer | Gate | Default |
+| Layer / Type | Gate | Default |
 |---|---|---|
-| Executor self-review | In-worker prompt before handoff | Executor self-review covers seven categories before handing off a chunk; every worker states concrete failure conditions and verifies defensively with evidence that they are absent; non-trivial adds ≥2 concern-diverse lenses as floor, not target |
-| Chunk review | Every commit-worthy chunk | mandatory controller review; default gstack `/review`; `./scripts/autoreview.sh` as a complementary parallel option |
-| Milestone review | 5 committed chunks since last clean sweep, `[milestone]` chunks, or before push | `protocols/milestone-review.md`, gstack `/review` + concern-diverse sweep |
+| Executor self-review (floor) | Before handoff; self-refutation DRY | seven categories + null hypothesis; every worker states concrete failure conditions and verifies defensively with evidence they are absent; non-trivial: ≥2 concern-diverse lenses as floor, not target. Never replaces Type-1 FIND (field: 9 P1s) |
+| Type 1 — patch multi-review | Every commit-worthy chunk | `protocols/review-types.md`: N FIND reviewers → one non-finder FIX executor; pinned findings, per-hunk attribution, fix null hypotheses (`protocols/review-fix-report.md`); controller samples. Default gstack `/review`; `./scripts/autoreview.sh` as a complementary parallel option |
+| Type 2 — milestone review | 5 chunks, `[milestone]`, or pre-push | `protocols/milestone-review.md`; milestone/QA bug sweep; adversarial verify; disjoint fix groups |
+| Type 3 — dictionary deep-sweep | Each class mint; under-searched predicates | predicate bug sweep; exit at marginal_real_yield ≈ 0 |
 
-On chunk completion, dispatch gstack `/review` before committing; controller reviews EACH returning chunk with ≥2 concern-diverse lenses as floor, not target, re-takes the null stance, and scales above the floor by complexity before commit.
-Reviews go through gstack `/review` and `/challenge`; do not hand-roll review prompts.
+On chunk completion, dispatch gstack `/review` before committing; use
+`/challenge` as the canonical adversarial frame; never hand-roll review prompts.
+Controller re-takes the null stance with ≥2 concern-diverse lenses, scaling by complexity. Review routing follows `protocols/review-types.md`; non-code flights use `prompts/gstack-*.md`. [RT-005]
 Reviewer misses become regression tests, not trust exemptions. Write review rubrics before first wave dispatch.
-Review results are saved durably (`docs-private/reviews/` or the chunk's research dir) — never /tmp-only; tails die at reboot and unsaved verdicts cannot be mined.
-Every NEW bug class triggers the MINT-generalize loop (`protocols/review-mining.md`): mint the class predicate, sweep BACKWARDS over code + the saved review archive for more instances, record the sweep (no-hit included), encode the class as a forward review lens. One catch, one class, one sweep.
-Reviews are one-shot; fixes loop to green and re-review; substantive fix closures get a refutation-stance closing pass that attacks the resolutions.
-Diversify reviewer concern, not just model: perspectives are the floor, not target; complicated work scales above two, while engine diversity escalates by stakes when abundant. Use consolidation review for cross-slice contradictions.
+Review results are saved durably under `docs-private/reviews/` or the chunk research dir; /tmp-only verdicts cannot be mined.
+Each NEW bug class triggers MINT-generalize (`protocols/review-mining.md`): mint, sweep backwards over code + saved reviews, record no-hits, encode the lens. One catch, one class, one sweep.
+Reviews are one-shot; fixes loop to green and re-review; substantive closures get a refutation pass.
+Diversify reviewer concern, not just model; scale perspectives by complexity/stakes. Use consolidation review for cross-slice contradictions.
 Milestone review is a separate gate from chunk review; status prints chunks since last sweep; skipped due sweep = open liability.
 
 ## Nested Review Invocation
@@ -393,7 +397,7 @@ Default routing by task:
 |---|---|---|---|
 | Code-writing chunks | `goalflight_dispatch.py` codex worker | Alternate marker-reliable CLI worker (`grok-code` or `moonshot`) with passing write-file probe | Host Agent — LAST RESORT only ‡ |
 | Research / web search | `goalflight_dispatch.py` `--agent grok-research` (read-only) | controller-direct | - |
-| Reviewer dispatches | gstack `/review` via review worker + concern-diverse sweep | any one alone | Claude Agent only when others unreachable |
+| Reviewer dispatches | per `protocols/review-types.md` (Type-1 find/fix; Types 2/3 via bug-sweep) | stakes carve-down: single concern-diverse reviewer for trivial chunks ONLY [RT-004] | Claude Agent only when others unreachable |
 | Planning / decompose | code/planning worker | controller-direct | Claude Agent |
 | Anticipatory questions | strongest interactive planner | controller-direct | - |
 | Analysis / reflection | controller-direct | - | - |
@@ -440,7 +444,7 @@ Bash-tail recipes live in `protocols/legacy/bash-tail.md`; forking lives in
 
 ## Verification and test gates
 
-Before each chunk commit: focused tests green. Background tests are pending until results are read. `./tests/run.sh` is the repo-wide gate when chunk scope or release risk justifies it. GOALFLIGHT_AUTOREVIEW=1 is an optional maintainer tier, not a default review path.
+Before each chunk commit: focused tests green. Background tests are pending until results are read. `./tests/run.sh` is the repo-wide gate when scope or risk justifies it. `./scripts/autoreview.sh` is a complementary parallel option, never the default; gstack `/review` remains default. GOALFLIGHT_AUTOREVIEW=1 is an optional maintainer tier, not a default review path.
 
 For each Golden Master entry, SKILL.md contains the entry's compressed-form text. Wave 2 scenarios: draft-goal-office-hours, vague-goal-premise-backlog, context-load-order. Build corpus eagerly; it audits source truth. Use primary sources, not precis, for corpus slices. Specialize self-review bullets to project nouns. Check source-truth contradictions before corpus build. Preflight noninteractive workers for MCP approval stalls. No remote dispatch before phase gate is green.
 
