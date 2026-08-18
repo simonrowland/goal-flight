@@ -1327,10 +1327,35 @@ def _harvest_file_status_token(value: str | None) -> str | None:
     text = _clean_markdown_title(value)
     if re.match(r"^in[\s_-]+progress\b", text, flags=re.IGNORECASE):
         return "IN_PROGRESS"
-    match = re.match(r"^([A-Za-z]+(?:_[A-Za-z]+)*)\b", text)
+    match = re.match(r"^([A-Za-z]+(?:[-_][A-Za-z]+)*)\b", text)
     if not match:
         return None
     return match.group(1).upper().replace("-", "_")
+
+
+def _harvest_status_vocabulary(value: str | None, default: set[str]) -> set[str]:
+    if value is None:
+        return set(default)
+    tokens = {_harvest_file_status_token(part.strip()) for part in value.split(",")}
+    return {token for token in tokens if token}
+
+
+def _harvest_flat_frontmatter(lines: list[str]) -> tuple[dict[str, str] | None, int, bool]:
+    """Parse the flat key: value frontmatter used by registry source files (not general YAML)."""
+    if not lines or lines[0].strip() != "---":
+        return None, 0, False
+    closing = next((index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"), None)
+    if closing is None:
+        return None, 0, True
+    values: dict[str, str] = {}
+    for line in lines[1:closing]:
+        match = re.match(r"^\s*([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*$", line)
+        if match:
+            value = match.group(2).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            values[match.group(1).lower().replace("-", "_")] = _strip_markdown_wrappers(value)
+    return values, closing + 1, False
 
 
 def _harvest_priority_tag(value: str | None) -> str | None:
@@ -3090,21 +3115,47 @@ def _harvest_file_task_candidate(
     default_kind: str,
     source_type: str,
     lane: str | None = None,
+    open_statuses: set[str] | None = None,
+    closed_statuses: set[str] | None = None,
+    status_key: str = "status",
 ) -> tuple[dict[str, Any] | None, str]:
     lines = text.splitlines()
-    first_h1 = _harvest_first_h1(lines)
+    frontmatter, body_start, malformed_frontmatter = _harvest_flat_frontmatter(lines)
+    title_from_frontmatter = (frontmatter or {}).get("title")
+    def outcome(value: str) -> str:
+        return f"malformed_frontmatter+{value}" if malformed_frontmatter else value
+
+    first_h1 = _harvest_first_h1(lines[body_start:])
+    if first_h1 is not None:
+        first_h1 = (first_h1[0] + body_start, first_h1[1])
+    if title_from_frontmatter:
+        first_h1 = (1, title_from_frontmatter)
     if first_h1 is None:
-        return None, "no_header_skipped"
+        return None, outcome("no_header_skipped")
     h1_lineno, raw_title = first_h1
     title = _harvest_file_task_title(raw_title)
     if not title:
-        return None, "no_header_skipped"
+        return None, outcome("no_header_skipped")
 
-    status_token = _harvest_file_status_token(_harvest_file_metadata_value(lines, "status"))
-    if status_token in HARVEST_FILE_CLOSED_STATUSES:
-        return None, "closed_skipped"
-    if status_token is not None and status_token not in HARVEST_FILE_OPEN_STATUSES:
-        status_token = None
+    normalized_status_key = status_key.lower().replace("-", "_")
+    selected_status_missing = (
+        normalized_status_key != "status"
+        and frontmatter is not None
+        and normalized_status_key not in frontmatter
+    )
+    status_value = (frontmatter or {}).get(normalized_status_key)
+    if normalized_status_key == "status" or selected_status_missing:
+        status_value = status_value or (frontmatter or {}).get("status") or (frontmatter or {}).get("disclosure_status")
+    if frontmatter is None:
+        status_value = _harvest_file_metadata_value(lines, "status")
+        selected_status_missing = normalized_status_key != "status"
+    status_token = _harvest_file_status_token(status_value)
+    effective_open = open_statuses if open_statuses is not None else HARVEST_FILE_OPEN_STATUSES
+    effective_closed = closed_statuses if closed_statuses is not None else HARVEST_FILE_CLOSED_STATUSES
+    if status_token in effective_closed:
+        closed_outcome = "closed_skipped+unknown_status" if selected_status_missing else "closed_skipped"
+        return None, outcome(closed_outcome)
+    unknown_status = selected_status_missing or (status_token is not None and status_token not in effective_open)
 
     candidate = _harvest_candidate(
         store,
@@ -3117,20 +3168,30 @@ def _harvest_file_task_candidate(
         key_scope_only=True,
     )
     if candidate is None:
-        return None, "no_header_skipped"
+        return None, outcome("no_header_skipped")
     if lane is not None:
         candidate["lane"] = lane
     tags = [*LIST_TYPE(candidate.get("tags") or []), "file-task"]
     if status_token == "IN_PROGRESS":
         tags.append("wip")
-    priority_tag = _harvest_priority_tag(_harvest_file_metadata_value(lines, "priority"))
+    if frontmatter and frontmatter.get("id"):
+        tags.append(f"src-id:{frontmatter['id']}")
+    priority_value = (frontmatter or {}).get("priority") if frontmatter is not None else _harvest_file_metadata_value(lines, "priority")
+    priority_tag = _harvest_priority_tag(priority_value)
     if priority_tag:
         tags.append(priority_tag)
+    if frontmatter and frontmatter.get("novelty"):
+        novelty = re.sub(r"\s+", "-", _clean_markdown_title(frontmatter["novelty"]).lower()).strip("-")
+        if novelty:
+            tags.append(f"novelty:{novelty}")
     candidate["tags"] = _dedupe_strs(tags)
-    prompt = _harvest_heading_prompt(lines[h1_lineno:])
+    prompt_lines = lines[body_start:] if title_from_frontmatter else lines[h1_lineno:]
+    prompt = _harvest_heading_prompt(prompt_lines)
     if prompt:
         candidate["prompt"] = prompt
-    return candidate, "imported"
+    if unknown_status:
+        return candidate, outcome("unknown_status")
+    return candidate, outcome("imported")
 
 
 def _harvest_review_candidates(store: TaskStore) -> list[dict[str, Any]]:
@@ -3297,6 +3358,9 @@ def _collect_harvest_candidates(
     no_implicit_resume: bool = False,
     headings_as_tasks: bool = False,
     file_as_task: bool = False,
+    open_statuses: set[str] | None = None,
+    closed_statuses: set[str] | None = None,
+    status_key: str = "status",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     candidates: list[dict[str, Any]] = []
     source_matches: list[dict[str, Any]] = []
@@ -3326,6 +3390,8 @@ def _collect_harvest_candidates(
             summary["imported"] = 0
             summary["closed_skipped"] = 0
             summary["no_header_skipped"] = 0
+            summary["unknown_status"] = 0
+            summary["malformed_frontmatter"] = 0
         for path in paths:
             text = path.read_text(encoding="utf-8", errors="replace")
             skip_reason = _harvest_source_skip_reason(path, text, manual_source=True)
@@ -3343,16 +3409,29 @@ def _collect_harvest_candidates(
                     default_kind=source_kind,
                     source_type="manual-source",
                     lane=source_lane,
+                    open_statuses=open_statuses,
+                    closed_statuses=closed_statuses,
+                    status_key=status_key,
                 )
-                if outcome == "imported":
+                if outcome.endswith("imported") or "unknown_status" in outcome:
                     prior_count = len(candidates)
                     _append_candidate(candidates, candidate)
                     if len(candidates) > prior_count:
                         summary["imported"] = int(summary["imported"]) + 1
-                elif outcome == "closed_skipped":
+                    if "unknown_status" in outcome:
+                        summary["unknown_status"] = int(summary["unknown_status"]) + 1
+                    if "malformed_frontmatter" in outcome:
+                        summary["malformed_frontmatter"] = int(summary["malformed_frontmatter"]) + 1
+                elif "closed_skipped" in outcome:
                     summary["closed_skipped"] = int(summary["closed_skipped"]) + 1
-                elif outcome == "no_header_skipped":
+                    if "unknown_status" in outcome:
+                        summary["unknown_status"] = int(summary["unknown_status"]) + 1
+                    if "malformed_frontmatter" in outcome:
+                        summary["malformed_frontmatter"] = int(summary["malformed_frontmatter"]) + 1
+                elif "no_header_skipped" in outcome:
                     summary["no_header_skipped"] = int(summary["no_header_skipped"]) + 1
+                    if "malformed_frontmatter" in outcome:
+                        summary["malformed_frontmatter"] = int(summary["malformed_frontmatter"]) + 1
                 continue
             candidates.extend(
                 _harvest_heading_blocks(
@@ -3586,6 +3665,310 @@ def _cmd_capture(store: TaskStore, args: argparse.Namespace) -> int:
         f"captured {created} ({args.lane}). promote: python3 goalflight_task.py lane {created} <name>",
         file=sys.stderr,
     )
+    return 0
+
+
+def _import_content_key(kind: str, title: str) -> str:
+    return f"import:{_short_hash([kind, _norm_key(title)])}"
+
+
+def _import_content_signature(record: dict[str, Any], blocker_keys: dict[str, str]) -> tuple[Any, ...]:
+    # Agent-authored sidecars may re-emit set-like fields in nondeterministic
+    # order; treating that order as content would duplicate records on re-import.
+    return (
+        str(record.get("lane", "deferred")),
+        tuple(sorted(_dedupe_strs(record.get("tags", [])))),
+        tuple(sorted(blocker_keys.get(ref, ref) for ref in _dedupe_strs(record.get("blocked_by", [])))),
+        tuple(sorted(_dedupe_strs(record.get("links", [])))),
+    )
+
+
+def _read_import_records(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    records: list[dict[str, Any]] = []
+    errors: list[str] = []
+    seen_drafts: dict[str, int] = {}
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not raw.strip():
+            continue
+        try:
+            record = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            errors.append(f"line {lineno}: invalid JSON: {exc.msg}")
+            continue
+        if not isinstance(record, dict):
+            errors.append(f"line {lineno}: expected a JSON object")
+            continue
+        prefix = f"line {lineno}"
+        draft_id = record.get("id")
+        if not isinstance(draft_id, str) or not draft_id.startswith("draft-") or draft_id == "draft-":
+            if isinstance(draft_id, str) and ITEM_ID_RE.fullmatch(draft_id):
+                errors.append(f"{prefix}: id {draft_id!r} looks like a real store id; expected draft-<anything>")
+            else:
+                errors.append(f"{prefix}: id must be draft-<anything>")
+        elif draft_id in seen_drafts:
+            errors.append(f"{prefix}: duplicate draft id {draft_id!r} (first seen on line {seen_drafts[draft_id]})")
+        else:
+            seen_drafts[draft_id] = lineno
+        if record.get("schema_version") != 1:
+            errors.append(f"{prefix}: schema_version must be 1")
+        kind = record.get("kind")
+        if kind not in FAMILY_PREFIX_BY_KIND:
+            errors.append(f"{prefix}: kind must be task, bug, or decision")
+        title = record.get("title")
+        if not isinstance(title, str) or not title.strip():
+            errors.append(f"{prefix}: title must be a non-empty string")
+        lane = record.get("lane", "deferred")
+        if not isinstance(lane, str) or not lane.strip():
+            errors.append(f"{prefix}: lane must be a non-empty string")
+        for field in ("blocked_by", "links", "tags"):
+            value = record.get(field, [])
+            if not isinstance(value, LIST_TYPE) or any(not isinstance(entry, str) for entry in value):
+                errors.append(f"{prefix}: {field} must be an array of strings")
+        if isinstance(draft_id, str) and draft_id.startswith("draft-") and isinstance(kind, str) and isinstance(title, str):
+            normalized = dict(record)
+            normalized["title"] = title.strip()
+            normalized["lane"] = lane
+            for field in ("blocked_by", "links", "tags"):
+                value = normalized.get(field, [])
+                normalized[field] = value if isinstance(value, LIST_TYPE) and all(isinstance(entry, str) for entry in value) else []
+            normalized["_line"] = lineno
+            normalized["import_key"] = _import_content_key(kind, title)
+            records.append(normalized)
+    return records, errors
+
+
+def _preview_import_ids(store: TaskStore, families: list[str]) -> list[str]:
+    seq = store._read_seq()
+    current = {family: max(int(seq.get(family, 0)), store._max_existing_sequence(family)) for family in set(families)}
+    out: list[str] = []
+    for family in families:
+        current[family] += 1
+        out.append(f"{family}-{current[family]:03d}")
+    return out
+
+
+def _cmd_import(store: TaskStore, args: argparse.Namespace) -> int:
+    source = Path(args.sidecar)
+    if not source.is_absolute():
+        source = (Path.cwd() / source).resolve(strict=False)
+    require_regular_file(source)
+    records, errors = _read_import_records(source)
+    existing_items = store.load_items()
+    existing_by_id = {str(item["id"]): item for item in existing_items}
+    draft_ids = {str(record["id"]) for record in records}
+    unknown_refs = sorted({
+        ref
+        for record in records
+        for ref in record.get("blocked_by", [])
+        if ref not in draft_ids and ref not in existing_by_id
+    })
+    if unknown_refs:
+        errors.append(f"unknown blocked_by reference(s): {', '.join(unknown_refs)}")
+    draft_key_by_id = {str(record["id"]): str(record["import_key"]) for record in records}
+    existing_key_by_id = {
+        str(item["id"]): str(item["import_key"])
+        for item in existing_items
+        if isinstance(item.get("import_key"), str) and item.get("import_key")
+    }
+    blocker_keys = {**existing_key_by_id, **draft_key_by_id}
+    self_refs = sorted({
+        str(record["id"])
+        for record in records
+        if any(blocker_keys.get(ref, ref) == str(record["import_key"]) for ref in record.get("blocked_by", []))
+    })
+    if self_refs:
+        errors.append(f"self blocked_by reference(s): {', '.join(self_refs)}")
+    draft_edges = {
+        str(record["id"]): [
+            ref for ref in record.get("blocked_by", [])
+            if ref in draft_ids and ref != str(record["id"])
+        ]
+        for record in records
+    }
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    path: list[str] = []
+    cycle: list[str] | None = None
+
+    def find_cycle(draft_id: str) -> None:
+        nonlocal cycle
+        if cycle is not None or draft_id in visited:
+            return
+        if draft_id in visiting:
+            start = path.index(draft_id)
+            cycle = path[start:] + [draft_id]
+            return
+        visiting.add(draft_id)
+        path.append(draft_id)
+        for blocker in draft_edges[draft_id]:
+            find_cycle(blocker)
+            if cycle is not None:
+                break
+        path.pop()
+        visiting.remove(draft_id)
+        visited.add(draft_id)
+
+    for draft_id in draft_edges:
+        find_cycle(draft_id)
+        if cycle is not None:
+            errors.append(f"dependency cycle among draft ids: {' -> '.join(cycle)}")
+            break
+    records_by_key: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        records_by_key.setdefault(str(record["import_key"]), []).append(record)
+    for key_records in records_by_key.values():
+        first = key_records[0]
+        first_signature = _import_content_signature(first, blocker_keys)
+        for other in key_records[1:]:
+            if _import_content_signature(other, blocker_keys) != first_signature:
+                errors.append(
+                    "import content collision: "
+                    f"{first['id']} (line {first['_line']}) and {other['id']} (line {other['_line']}) "
+                    "share kind/title but differ in lane, tags, blocked_by, or links"
+                )
+    existing_by_key = {
+        str(item["import_key"]): item
+        for item in existing_items
+        if isinstance(item.get("import_key"), str) and item.get("import_key")
+    }
+    for record in records:
+        existing = existing_by_key.get(str(record["import_key"]))
+        if existing is not None and _import_content_signature(record, blocker_keys) != _import_content_signature(existing, blocker_keys):
+            errors.append(
+                "import content collision: "
+                f"{record['id']} (line {record['_line']}) and existing item {existing['id']} "
+                "share kind/title but differ in lane, tags, blocked_by, or links"
+            )
+    if errors:
+        summary = {"imported": 0, "skipped_duplicates": 0, "errors": len(errors), "error_messages": errors}
+        if args.json:
+            print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+        else:
+            for error in errors:
+                print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+
+    existing_keys = {
+        str(item["import_key"]): str(item["id"])
+        for item in existing_items
+        if isinstance(item.get("import_key"), str) and item.get("import_key")
+    }
+    new_keys: list[str] = []
+    key_to_record: dict[str, dict[str, Any]] = {}
+    for record in records:
+        key = str(record["import_key"])
+        if key not in existing_keys and key not in key_to_record:
+            new_keys.append(key)
+            key_to_record[key] = record
+    families = [FAMILY_PREFIX_BY_KIND[str(key_to_record[key]["kind"])] for key in new_keys]
+
+    if args.dry_run:
+        allocated = _preview_import_ids(store, families)
+        key_to_id = {**existing_keys, **dict(zip(new_keys, allocated))}
+        mapping = {str(record["id"]): key_to_id[str(record["import_key"])] for record in records}
+        summary = {
+            "imported": len(new_keys),
+            "skipped_duplicates": len(records) - len(new_keys),
+            "errors": 0,
+            "id_mapping": mapping,
+        }
+    else:
+        actor = _actor(args)
+        reserved_families: list[str] = []
+
+        def update(items: list[dict[str, Any]]) -> dict[str, Any]:
+            live_keys = {
+                str(item["import_key"]): str(item["id"])
+                for item in items
+                if isinstance(item.get("import_key"), str) and item.get("import_key")
+            }
+            live_by_key = {
+                str(item["import_key"]): item
+                for item in items
+                if isinstance(item.get("import_key"), str) and item.get("import_key")
+            }
+            live_key_by_id = {str(item["id"]): key for key, item in live_by_key.items()}
+            live_blocker_keys = {**live_key_by_id, **draft_key_by_id}
+            for record in records:
+                existing = live_by_key.get(str(record["import_key"]))
+                if existing is not None and _import_content_signature(record, live_blocker_keys) != _import_content_signature(existing, live_blocker_keys):
+                    raise TaskError(
+                        "import content collision: "
+                        f"{record['id']} (line {record['_line']}) and existing item {existing['id']} "
+                        "share kind/title but differ in lane, tags, blocked_by, or links"
+                    )
+            key_to_id = dict(live_keys)
+            created_records: list[dict[str, Any]] = []
+            missing_records: list[dict[str, Any]] = []
+            missing_keys: set[str] = set()
+            for record in records:
+                key = str(record["import_key"])
+                if key not in key_to_id and key not in missing_keys:
+                    missing_keys.add(key)
+                    missing_records.append(record)
+            reserved_families[:] = [FAMILY_PREFIX_BY_KIND[str(record["kind"])] for record in missing_records]
+            allocated = _preview_import_ids(store, reserved_families)
+            allocated_iter = iter(allocated)
+            for record in records:
+                key = str(record["import_key"])
+                if key in key_to_id:
+                    continue
+                item_id = next(allocated_iter)
+                key_to_id[key] = item_id
+                created_records.append(record)
+            mapping = {str(record["id"]): key_to_id[str(record["import_key"])] for record in records}
+            for record in created_records:
+                item_id = key_to_id[str(record["import_key"])]
+                blockers = [mapping.get(ref, ref) for ref in record.get("blocked_by", [])]
+                item = _make_item(
+                    item_id,
+                    kind=str(record["kind"]),
+                    title=str(record["title"]),
+                    actor=actor,
+                    blocked_by=blockers,
+                    links=[],
+                    tags=[],
+                    lane=str(record["lane"]),
+                    audit_action="import",
+                )
+                item["links"] = LIST_TYPE(record.get("links", []))
+                item["tags"] = LIST_TYPE(record.get("tags", []))
+                item["import_key"] = str(record["import_key"])
+                item["import_source"] = str(source)
+                item["import_draft_id"] = str(record["id"])
+                item["original_draft_id"] = str(record["id"])
+                items.append(item)
+            return {
+                "imported": len(created_records),
+                "skipped_duplicates": len(records) - len(created_records),
+                "errors": 0,
+                "id_mapping": mapping,
+            }
+
+        store._ensure_store_ready()
+        with store.store_lock():
+            store._recover_interrupted_publish_locked()
+            store._snapshot_last_good(require_valid=True)
+            items = store.load_items(recover_publish=False)
+            with FileLock(store.seq_lock_path):
+                summary = update(items)
+                # save_items_atomic performs the complete store validation and
+                # publish before counters advance. A crash after publish but
+                # before this counter write is recovered by max-existing-id.
+                store.save_items_atomic(items)
+                seq = store._read_seq()
+                for family in set(reserved_families):
+                    seq[family] = max(int(seq.get(family, 0)), store._max_existing_sequence(family))
+                if reserved_families:
+                    _atomic_write_text(store.seq_path, json.dumps(seq, indent=2, sort_keys=True) + "\n", prefix=".task-seq-")
+
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    else:
+        mode = "would import" if args.dry_run else "imported"
+        print(f"{mode} {summary['imported']}; skipped duplicates {summary['skipped_duplicates']}; errors 0")
+        for draft_id, item_id in summary["id_mapping"].items():
+            print(f"{draft_id} -> {item_id}")
     return 0
 
 
@@ -3925,6 +4308,12 @@ def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
     _validate_lane_arg(args.lane)
     if getattr(args, "file_as_task", False) and not args.sources:
         raise TaskError("--file-as-task requires at least one --source <glob>")
+    if (getattr(args, "open_status", None) is not None or getattr(args, "closed_status", None) is not None or getattr(args, "status_key", None) is not None) and not getattr(args, "file_as_task", False):
+        raise TaskError("--status-key, --open-status, and --closed-status require --file-as-task")
+    open_statuses = _harvest_status_vocabulary(getattr(args, "open_status", None), HARVEST_FILE_OPEN_STATUSES)
+    closed_statuses = _harvest_status_vocabulary(getattr(args, "closed_status", None), HARVEST_FILE_CLOSED_STATUSES)
+    if open_statuses & closed_statuses:
+        raise TaskError("--open-status and --closed-status must not overlap")
     candidates, source_matches = _collect_harvest_candidates(
         store,
         source_patterns=args.sources,
@@ -3935,6 +4324,9 @@ def _cmd_harvest(store: TaskStore, args: argparse.Namespace) -> int:
         no_implicit_resume=getattr(args, "no_implicit_resume", False),
         headings_as_tasks=getattr(args, "headings_as_tasks", False),
         file_as_task=getattr(args, "file_as_task", False),
+        open_statuses=open_statuses,
+        closed_statuses=closed_statuses,
+        status_key=getattr(args, "status_key", None) or "status",
     )
     if args.dry_run:
         payload = {
@@ -3985,6 +4377,9 @@ def _run_harvest_json(store: TaskStore, args: argparse.Namespace, *, dry_run: bo
         no_implicit_resume=getattr(args, "no_implicit_resume", False),
         headings_as_tasks=getattr(args, "headings_as_tasks", False),
         file_as_task=getattr(args, "file_as_task", False),
+        open_status=getattr(args, "open_status", None),
+        closed_status=getattr(args, "closed_status", None),
+        status_key=getattr(args, "status_key", None),
     )
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -4019,7 +4414,9 @@ def _source_match_text_lines(source_matches: list[dict[str, Any]]) -> list[str]:
                 f"file-as-task for {pattern}: {int(summary.get('files_matched') or 0)} matched, "
                 f"{int(summary.get('imported') or 0)} imported, "
                 f"{int(summary.get('closed_skipped') or 0)} closed_skipped, "
-                f"{int(summary.get('no_header_skipped') or 0)} no_header_skipped"
+                f"{int(summary.get('no_header_skipped') or 0)} no_header_skipped, "
+                f"{int(summary.get('unknown_status') or 0)} unknown_status, "
+                f"{int(summary.get('malformed_frontmatter') or 0)} malformed_frontmatter"
             )
         skipped = LIST_TYPE(summary.get("skipped_sources") or [])
         if skipped:
@@ -4690,6 +5087,18 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--json", action="store_true")
     capture.set_defaults(func=_cmd_capture)
 
+    import_cmd = sub.add_parser(
+        "import",
+        help="Import agent-authored draft records from a JSONL sidecar.",
+        epilog="example: goalflight_task.py import drafts.jsonl --dry-run --json",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    import_cmd.add_argument("--by", help=argparse.SUPPRESS)
+    import_cmd.add_argument("sidecar")
+    import_cmd.add_argument("--dry-run", action="store_true", help="Preview allocations and draft-id mapping without writing.")
+    import_cmd.add_argument("--json", action="store_true", help="Print an import summary as JSON.")
+    import_cmd.set_defaults(func=_cmd_import)
+
     show = sub.add_parser(
         "show",
         help="READ-ONLY (safe, free): read one item by id.",
@@ -4839,6 +5248,9 @@ def build_parser() -> argparse.ArgumentParser:
     harvest.add_argument("--all-bullets", action="store_true", help="Harvest bullets from any section in --source files instead of only task/backlog/action/TODO/open/next sections.")
     harvest.add_argument("--headings-as-tasks", action="store_true", help="Also harvest guarded work-item headings from --source files; off by default to avoid prose-heading noise.")
     harvest.add_argument("--file-as-task", action="store_true", help="Import each matched --source file as one draft item, using its first H1 as the title.")
+    harvest.add_argument("--status-key", metavar="<name>", help="Frontmatter status key for --file-as-task (default: status; default key falls back to disclosure_status).")
+    harvest.add_argument("--open-status", metavar="<csv>", help="Comma-separated open status vocabulary for --file-as-task.")
+    harvest.add_argument("--closed-status", metavar="<csv>", help="Comma-separated closed status vocabulary for --file-as-task.")
     harvest.add_argument("--no-implicit-resume", action="store_true", help="Skip implicit RESUME-NOTES candidates during built-in harvest.")
     harvest.add_argument("--json", action="store_true")
     harvest.set_defaults(func=_cmd_harvest)
