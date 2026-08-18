@@ -6,6 +6,45 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-08-18
+
+### Added
+
+- Dispatch rotates to a worker pool that can actually serve. A pool whose
+  health check fails recoverably now gets a retry before any verdict is
+  recorded, and a pool that a finished dispatch proves unavailable is skipped
+  on the next selection instead of after the cache interval. Previously a
+  transient check failure benched a healthy pool for the whole interval, and
+  with the alternative already spent every dispatch failed outright.
+- A three-type review taxonomy: patch multi-review with a find/fix split and
+  pinned findings, milestone review, and dictionary deep-sweep over class
+  predicates, above the executor self-review floor. Ships the protocols, a
+  report template, and deterministic protocol checks.
+- Harvesting a file as a task understands a frontmatter header, with a
+  selectable status key and configurable open/closed vocabulary that counts
+  unknown statuses rather than discarding them.
+
+### Changed
+
+- The capacity table reports the tightest limit rather than the roomiest. A
+  pool with budget left for the period but a spent short-interval allowance
+  was rendered with the period number, so a pool that could not serve a single
+  request read as having room — and the reset shown was hours away when the
+  real block cleared in minutes. The column is also labelled, because it counts
+  what is LEFT and was being read as what had been used.
+- Generated hints name the plain wake command. The longer alias they printed
+  no longer does anything extra, but it was what operators saw and pasted. The
+  alias stays accepted and is locked by test, so installs elsewhere on a
+  machine keep working until they update.
+
+### Fixed
+
+- Pool listeners no longer die during a test's own waits: the arbitration
+  fixture's deadline equalled the sum of the windows it waited through, so
+  expiring listeners were counted as extra exits under load.
+- The task audit records the previous lane when an item is re-laned.
+
+
 ### Added
 
 - A repo is one repo however it reaches the disk. Project records now carry a
