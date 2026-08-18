@@ -147,6 +147,24 @@ def test_lane_cli_and_reserved_backlog_view() -> None:
         assert_true("tasks-data.js has no status key", all("status" not in item for item in data_items))
 
 
+def test_lane_cli_audit_captures_previous_lane_when_relaned() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+
+        proc = run_task(project, "new", "Re-lane task", "--lane", "ui", "--by", "tester")
+        assert_true(f"new --lane ui exits 0: {proc.stderr}", proc.returncode == 0)
+        item_id = proc.stdout.strip()
+
+        proc = run_task(project, "lane", item_id, "release", "--by", "tester")
+        assert_true(f"re-lane ui to release exits 0: {proc.stderr}", proc.returncode == 0)
+
+        item = read_items(project)[0]
+        lane_audit = item["audit"][-1]
+        assert_true("re-lane audit action", lane_audit.get("action") == "lane")
+        assert_true("re-lane audit captures old lane ui", lane_audit.get("old_lane") == "ui")
+        assert_true("re-lane audit captures new lane release", lane_audit.get("lane") == "release")
+
+
 def test_lane_rejects_reserved_near_miss_but_allows_distinct_free_text() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td)
@@ -199,6 +217,7 @@ def main() -> None:
         return
     test_lane_validates_as_string()
     test_lane_cli_and_reserved_backlog_view()
+    test_lane_cli_audit_captures_previous_lane_when_relaned()
     test_lane_rejects_reserved_near_miss_but_allows_distinct_free_text()
     test_list_lane_rejects_reserved_near_miss()
     print("OK: lane field tests pass")
