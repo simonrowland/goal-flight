@@ -7,10 +7,13 @@ from support import note_skip, skip_case_posix_on_native_windows
 
 import argparse
 import asyncio
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -24,8 +27,13 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import goalflight_acp_run  # noqa: E402
 import goalflight_adapter_readiness  # noqa: E402
 import goalflight_dispatch  # noqa: E402
+import goalflight_journal  # noqa: E402
 import goalflight_os_sandbox as goalflight_os_sandbox_mod  # noqa: E402
-from goalflight_acp_client import AcpError, AcpProcessPool  # noqa: E402
+from goalflight_acp_client import (  # noqa: E402
+    AcpError,
+    AcpProcessPool,
+    permission_policy_for_dispatch,
+)
 from goalflight_os_sandbox import (  # noqa: E402
     OS_SANDBOX_OFF,
     OS_SANDBOX_READ_ONLY,
@@ -529,6 +537,433 @@ def case_rejects_cwd_under_agent_state_root() -> None:
         shutil.rmtree(base, ignore_errors=True)
 
 
+@contextlib.contextmanager
+def _isolated_journal_workspace():
+    """Journal dir outside the sandboxed cwd and outside /tmp (already granted)."""
+    base = ROOT / f".goalflight-os-sandbox-journal-{os.getpid()}"
+    workspace = base / "workspace"
+    journal_state = base / "journal-state"
+    shutil.rmtree(base, ignore_errors=True)
+    workspace.mkdir(parents=True)
+    old = os.environ.get("GOALFLIGHT_JOURNAL_DIR")
+    os.environ["GOALFLIGHT_JOURNAL_DIR"] = str(journal_state)
+    try:
+        opened = goalflight_journal.Journal.create(str(workspace))
+        yield workspace, opened.path
+    finally:
+        if old is None:
+            os.environ.pop("GOALFLIGHT_JOURNAL_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_JOURNAL_DIR"] = old
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def _sandboxed_journal_open(workspace: Path, journal_path: Path):
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, r'{ROOT / 'scripts'}'); "
+        f"sys.path.insert(0, r'{ROOT}'); "
+        "import goalflight_journal as gj; "
+        f"opened = gj.Journal(r'{workspace}'); "
+        "print('journal-ok'); "
+        f"print(opened.path)"
+    )
+    prepared = prepare_os_sandbox_command(
+        sys.executable,
+        ["-c", code],
+        cwd=str(workspace),
+        os_sandbox=OS_SANDBOX_WORKSPACE_WRITE,
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(ROOT / "scripts"), str(ROOT), env.get("PYTHONPATH", "")]
+    )
+    result = subprocess.run(
+        [prepared.command, *prepared.args],
+        cwd=str(workspace),
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+        env=env,
+    )
+    return prepared, result
+
+
+def case_journal_dir_is_a_write_root() -> None:
+    """Grant is the journal's parent, resolved through the writer, not a guess."""
+    with _isolated_journal_workspace() as (workspace, journal_path):
+        roots = goalflight_os_sandbox_mod.macos_write_roots(
+            str(workspace), OS_SANDBOX_WORKSPACE_WRITE
+        )
+        journal_dir = str(journal_path.parent.resolve())
+        assert any(
+            Path(root).resolve() == Path(journal_dir)
+            for root in roots
+        ), (journal_dir, roots)
+        # Narrow: sibling journals and the state base stay off the list.
+        journals_parent = str(Path(journal_dir).parent.resolve())
+        assert all(
+            Path(root).resolve() != Path(journals_parent)
+            for root in roots
+        ), roots
+
+
+def case_missing_journal_grant_reproduces_permission_error() -> None:
+    """The fleet death: lock is outside workspace, so workspace-write denies it."""
+    if _skip_unless_sandbox_exec_case("case_missing_journal_grant_reproduces_permission_error"):
+        return
+    with _isolated_journal_workspace() as (workspace, journal_path):
+        real_grant = goalflight_os_sandbox_mod.goalflight_journal_write_root
+
+        def _miss(_cwd: str) -> str:
+            return str(workspace / ".not-the-journal")
+
+        goalflight_os_sandbox_mod.goalflight_journal_write_root = _miss
+        try:
+            _prepared, result = _sandboxed_journal_open(workspace, journal_path)
+        finally:
+            goalflight_os_sandbox_mod.goalflight_journal_write_root = real_grant
+        assert result.returncode != 0, result
+        combined = result.stdout + result.stderr
+        assert "journal-ok" not in result.stdout, result
+        assert "PermissionError" in combined or "Operation not permitted" in combined, result
+
+
+def case_sandboxed_journal_open_succeeds() -> None:
+    if _skip_unless_sandbox_exec_case("case_sandboxed_journal_open_succeeds"):
+        return
+    with _isolated_journal_workspace() as (workspace, journal_path):
+        outside = workspace.parent / "outside.txt"
+        if outside.exists():
+            outside.unlink()
+        prepared, result = _sandboxed_journal_open(workspace, journal_path)
+        try:
+            assert result.returncode == 0, result
+            assert "journal-ok" in result.stdout, result
+            assert str(journal_path) in result.stdout, result
+            # Safety: grant is not a general home/state write.
+            deny = (
+                "from pathlib import Path; "
+                f"Path(r'{outside}').write_text('outside'); "
+                "print('outside-ok')"
+            )
+            denied = prepare_os_sandbox_command(
+                sys.executable,
+                ["-c", deny],
+                cwd=str(workspace),
+                os_sandbox=OS_SANDBOX_WORKSPACE_WRITE,
+            )
+            denied_result = subprocess.run(
+                [denied.command, *denied.args],
+                cwd=str(workspace),
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            assert denied_result.returncode != 0, denied_result
+            assert not outside.exists(), "sandbox allowed write outside workspace and journal dir"
+        finally:
+            if outside.exists():
+                outside.unlink()
+
+
+def case_sandboxed_launch_worker_gets_past_journal_lock() -> None:
+    """launch_worker is the sandboxed process; Journal() is its first act."""
+    if _skip_unless_sandbox_exec_case("case_sandboxed_launch_worker_gets_past_journal_lock"):
+        return
+    launcher = ROOT / "scripts" / "goalflight_launch_worker.py"
+    with _isolated_journal_workspace() as (workspace, _journal_path):
+        prepared = prepare_os_sandbox_command(
+            sys.executable,
+            [
+                str(launcher),
+                "--project-root",
+                str(workspace),
+                "--attempt-id",
+                "00000000-0000-4000-8000-000000000001",
+                "--launch-token",
+                "00000000-0000-4000-8000-000000000002",
+                "--launch-epoch",
+                "1",
+                "--",
+                "/usr/bin/true",
+            ],
+            cwd=str(workspace),
+            os_sandbox=OS_SANDBOX_WORKSPACE_WRITE,
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(ROOT / "scripts"), str(ROOT), env.get("PYTHONPATH", "")]
+        )
+        result = subprocess.run(
+            [prepared.command, *prepared.args],
+            cwd=str(workspace),
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+            env=env,
+        )
+        combined = result.stdout + result.stderr
+        assert "PermissionError" not in combined, result
+        assert "Operation not permitted" not in combined, result
+        # No such attempt: claim fails *after* Journal() opened. That is the
+        # handshake-death boundary: lock success, then exec or a claim error.
+        assert result.returncode in {73, 75}, result
+        assert "launch refused" in result.stderr, result
+
+
+def case_dispatch_help_exposes_title_allow_pattern() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "goalflight_dispatch.py"), "--help"],
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--permission-allow-tool-title-pattern" in result.stdout, result.stdout
+
+
+def case_dispatch_forwards_title_allow_pattern_to_acp_cfg() -> None:
+    pattern = r"^\./tests/run\.sh$"
+    old_state = os.environ.get("GOALFLIGHT_STATE_DIR")
+    with tempfile.TemporaryDirectory(prefix="gf-title-allow-dispatch-") as tmp:
+        tmp_path = Path(tmp)
+        os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+        args = argparse.Namespace(
+            agent="cursor",
+            cwd=str(ROOT),
+            prompt_file=None,
+            prompt="probe",
+            dispatch_id="title-allow-forward",
+            read_only=False,
+            os_sandbox="workspace-write",
+            permission_mode="auto",
+            permission_dir=None,
+            permission_inline_timeout_s=None,
+            permission_user_timeout_s=None,
+            permission_allow_tool_title_pattern=[pattern],
+            max_idle_secs=30.0,
+            poll_secs=0.2,
+        )
+        try:
+            cfg = goalflight_dispatch._build_acp_cfg(
+                args, status_json=tmp_path / "status.json", base=tmp_path / "dispatch"
+            )
+            assert cfg.permission_allow_tool_title_pattern == [pattern], cfg
+            empty = argparse.Namespace(**{**vars(args), "permission_allow_tool_title_pattern": []})
+            empty_cfg = goalflight_dispatch._build_acp_cfg(
+                empty, status_json=tmp_path / "empty.status.json", base=tmp_path / "dispatch"
+            )
+            assert empty_cfg.permission_allow_tool_title_pattern == [], empty_cfg
+        finally:
+            if old_state is None:
+                os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+            else:
+                os.environ["GOALFLIGHT_STATE_DIR"] = old_state
+
+
+def case_dispatch_replay_keeps_title_allow_pattern() -> None:
+    pattern = r"^\./tests/run\.sh$"
+    args = argparse.Namespace(
+        agent="cursor",
+        dispatch_id="title-allow-replay",
+        cwd=str(ROOT),
+        shape="acp",
+        priority="normal",
+        billing="sub",
+        poll_secs=2.0,
+        max_idle_secs=600.0,
+        prompt_file=None,
+        prompt="hi",
+        task_ids=[],
+        model=None,
+        os_sandbox="workspace-write",
+        read_only=False,
+        web_research_ok=False,
+        web_qa=False,
+        ignore_git_warn=False,
+        no_orientation=False,
+        capacity_wait_s=None,
+        account=None,
+        interactive=False,
+        permission_mode="auto",
+        permission_dir=None,
+        permission_inline_timeout_s=None,
+        permission_user_timeout_s=None,
+        permission_allow_tool_title_pattern=[pattern],
+        controller_pid=None,
+        fast=False,
+    )
+    argv = goalflight_dispatch._canonical_replay_argv(
+        args, [], tail=Path("/tmp/t"), status_json=Path("/tmp/s")
+    )
+    assert "--permission-allow-tool-title-pattern" in argv, argv
+    assert pattern in argv, argv
+    # No default pattern when the caller omitted the flag.
+    omitted = argparse.Namespace(**{**vars(args), "permission_allow_tool_title_pattern": []})
+    omitted_argv = goalflight_dispatch._canonical_replay_argv(
+        omitted, [], tail=Path("/tmp/t"), status_json=Path("/tmp/s")
+    )
+    assert "--permission-allow-tool-title-pattern" not in omitted_argv, omitted_argv
+
+
+def case_title_allow_from_dispatch_still_hard_gates() -> None:
+    """Matching titles fast-path; execute/outside-cwd still escalate without sandbox."""
+    pattern = re.compile(r"^\./tests/run\.sh$")
+    off = goalflight_acp_run.make_title_allow_policy(
+        [pattern], base=permission_policy_for_dispatch("off")
+    )
+    on = goalflight_acp_run.make_title_allow_policy(
+        [pattern], base=permission_policy_for_dispatch("workspace-write")
+    )
+    cwd = str(ROOT)
+    matching_execute = {
+        "title": "./tests/run.sh",
+        "kind": "execute",
+        "locations": [],
+    }
+    matching_read = {
+        "title": "./tests/run.sh",
+        "kind": "read",
+        "locations": [{"path": str(ROOT / "tests" / "run.sh")}],
+    }
+    outside = {
+        "title": "./tests/run.sh",
+        "kind": "edit",
+        "locations": [{"path": "/etc/passwd"}],
+    }
+    assert off(matching_read, [], cwd) == "allow"
+    assert off(matching_execute, [], cwd) == "escalate"
+    assert off(outside, [], cwd) == "escalate"
+    # Sandbox-aware base allows in-cwd execute after the hard-gate handoff.
+    assert on(matching_execute, [], cwd) == "allow"
+    assert on(outside, [], cwd) == "escalate"
+
+
+def case_sandboxed_acp_handshake_with_isolated_journal() -> None:
+    """ACP spawn under workspace-write must complete handshake when journal is off-tmp."""
+    if _skip_unless_sandbox_exec_case("case_sandboxed_acp_handshake_with_isolated_journal"):
+        return
+    old_journal = os.environ.get("GOALFLIGHT_JOURNAL_DIR")
+    old_steer = os.environ.pop("GOALFLIGHT_STEER_FILE", None)
+    journal_state = ROOT / f".goalflight-os-sandbox-hs-journal-{os.getpid()}"
+    shutil.rmtree(journal_state, ignore_errors=True)
+    try:
+        os.environ["GOALFLIGHT_JOURNAL_DIR"] = str(journal_state)
+        goalflight_journal.Journal.create(str(ROOT))
+        payload = asyncio.run(_run_sandbox_probe(OS_SANDBOX_WORKSPACE_WRITE))
+        assert payload["state"] == "complete", payload
+        assert payload.get("ok") is True, payload
+        assert payload["os_sandbox"]["profile"] == OS_SANDBOX_WORKSPACE_WRITE
+    finally:
+        if old_journal is None:
+            os.environ.pop("GOALFLIGHT_JOURNAL_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_JOURNAL_DIR"] = old_journal
+        if old_steer is None:
+            os.environ.pop("GOALFLIGHT_STEER_FILE", None)
+        else:
+            os.environ["GOALFLIGHT_STEER_FILE"] = old_steer
+        shutil.rmtree(journal_state, ignore_errors=True)
+
+
+def case_broad_pattern_sandbox_off_warning_still_fires() -> None:
+    """Startup warning must still fire; plumbing must not swallow it."""
+    old_agent_command = goalflight_acp_run.agent_command
+    old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    old_scenario = os.environ.get("GOALFLIGHT_FAKE_ACP_SCENARIO")
+    old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+    old_journal = os.environ.get("GOALFLIGHT_JOURNAL_DIR")
+    old_steer = os.environ.pop("GOALFLIGHT_STEER_FILE", None)
+    os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "echo"
+    goalflight_acp_run.agent_command = (
+        lambda agent, model=None, fast=False: (sys.executable, [str(FAKE)])
+    )
+    workspace = ROOT / f".goalflight-os-sandbox-warn-{os.getpid()}"
+    shutil.rmtree(workspace, ignore_errors=True)
+    workspace.mkdir()
+    try:
+        with tempfile.TemporaryDirectory(prefix="gf-os-sandbox-warn-") as tmp:
+            tmp_path = Path(tmp)
+            # Journal must sit outside /tmp so this is not accidentally
+            # granted by the temp-root rule; create it next to the workspace.
+            journal_state = workspace.parent / f".goalflight-os-sandbox-warn-journal-{os.getpid()}"
+            shutil.rmtree(journal_state, ignore_errors=True)
+            os.environ["GOALFLIGHT_JOURNAL_DIR"] = str(journal_state)
+            goalflight_journal.Journal.create(str(workspace))
+            goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+            _write_supported_adapter_manifest(tmp_path, "fake-sandbox")
+            status_path = tmp_path / "status.json"
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                payload = asyncio.run(
+                    goalflight_acp_run.run(
+                        argparse.Namespace(
+                            agent="fake-sandbox",
+                            cwd=str(workspace),
+                            session_id="title-allow-warn-session",
+                            dispatch_id=f"test-title-allow-warn-{os.getpid()}",
+                            prompt_id=None,
+                            prompt=None,
+                            prompt_text="COMPLETE: warn probe",
+                            mode="one-shot",
+                            status_json=str(status_path),
+                            idle_timeout=5.0,
+                            heartbeat_interval=0.2,
+                            wedge_samples=100,
+                            max_tool_s=60.0,
+                            max_quiet_s=60.0,
+                            progress_stall_s=60.0,
+                            liveness_profile="local_compute",
+                            remote_turn_silence_s=None,
+                            remote_turn_cancel_grace_s=0.0,
+                            cpu_epsilon=0.1,
+                            context_mode="disabled",
+                            permission_mode="auto",
+                            permission_dir=None,
+                            permission_inline_timeout_s=None,
+                            permission_user_timeout_s=None,
+                            permission_allow_tool_title_pattern=[".*"],
+                            os_sandbox=OS_SANDBOX_OFF,
+                            json=True,
+                        )
+                    )
+                )
+            text = stderr.getvalue()
+            assert "WARNING — broad title-allow pattern" in text, text
+            assert payload.get("state") in {"complete", "failed", "blocked_os_sandbox", "blocked_adapter_gate"}, payload
+    finally:
+        goalflight_acp_run.agent_command = old_agent_command
+        goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+        if old_scenario is None:
+            os.environ.pop("GOALFLIGHT_FAKE_ACP_SCENARIO", None)
+        else:
+            os.environ["GOALFLIGHT_FAKE_ACP_SCENARIO"] = old_scenario
+        if old_state_dir is None:
+            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+        if old_journal is None:
+            os.environ.pop("GOALFLIGHT_JOURNAL_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_JOURNAL_DIR"] = old_journal
+        if old_steer is None:
+            os.environ.pop("GOALFLIGHT_STEER_FILE", None)
+        else:
+            os.environ["GOALFLIGHT_STEER_FILE"] = old_steer
+        shutil.rmtree(workspace, ignore_errors=True)
+        shutil.rmtree(
+            ROOT / f".goalflight-os-sandbox-warn-journal-{os.getpid()}",
+            ignore_errors=True,
+        )
+
+
 async def _run_sandbox_probe(profile: str) -> dict:
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
@@ -992,6 +1427,16 @@ def main() -> None:
     case_rejects_cwd_under_temp_root()
     case_agent_state_roots_are_explicit_exception()
     case_rejects_cwd_under_agent_state_root()
+    case_journal_dir_is_a_write_root()
+    case_missing_journal_grant_reproduces_permission_error()
+    case_sandboxed_journal_open_succeeds()
+    case_sandboxed_launch_worker_gets_past_journal_lock()
+    case_sandboxed_acp_handshake_with_isolated_journal()
+    case_dispatch_help_exposes_title_allow_pattern()
+    case_dispatch_forwards_title_allow_pattern_to_acp_cfg()
+    case_dispatch_replay_keeps_title_allow_pattern()
+    case_title_allow_from_dispatch_still_hard_gates()
+    case_broad_pattern_sandbox_off_warning_still_fires()
     case_runner_workspace_write_blocks_home_write()
     case_runner_read_only_blocks_workspace_write()
     case_runner_blocks_undeclared_os_sandbox_before_capacity()

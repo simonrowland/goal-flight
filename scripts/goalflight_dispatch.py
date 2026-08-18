@@ -3822,6 +3822,8 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv += ["--permission-inline-timeout-s", str(args.permission_inline_timeout_s)]
     if args.permission_user_timeout_s is not None:
         argv += ["--permission-user-timeout-s", str(args.permission_user_timeout_s)]
+    for pattern in getattr(args, "permission_allow_tool_title_pattern", None) or []:
+        argv += ["--permission-allow-tool-title-pattern", str(pattern)]
     # Replay presents the controller capability plus its measured beacon
     # identity.  The child process's own PID never becomes the lease principal.
     controller_label = _controller_label(args)
@@ -9185,7 +9187,9 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         permission_user_timeout_s=getattr(args, "permission_user_timeout_s", None),
         read_only=_effective_read_only(args),
         interactive=bool(getattr(args, "interactive", False)),
-        permission_allow_tool_title_pattern=[],
+        permission_allow_tool_title_pattern=list(
+            getattr(args, "permission_allow_tool_title_pattern", None) or []
+        ),
         heartbeat_interval=max(float(args.poll_secs or 0.0), 0.1),
         wedge_samples=4,
         max_tool_s=DEFAULT_MAX_TOOL_S,
@@ -9889,6 +9893,22 @@ def main(argv: list[str] | None = None) -> int:
                         help="Inline controller-responsiveness timeout before worker fallback auto-decline.")
     parser.add_argument("--permission-user-timeout-s", type=float,
                         help="Inline post-ack user-decision timeout before worker fallback auto-decline.")
+    parser.add_argument(
+        "--permission-allow-tool-title-pattern",
+        action="append",
+        default=[],
+        metavar="REGEX",
+        help="Controller-discretion auto-allow shortcut (R26). Regex pattern (Python "
+             "re.search semantics) matched against the request_permission tool-call "
+             "title. When the title matches any provided pattern, the runner "
+             "auto-approves the request before falling through to the default "
+             "scope-aware policy. Repeatable: pass multiple --permission-allow-tool-"
+             "title-pattern flags to add patterns. Use to pre-authorize the worker's "
+             "in-scope tool uses (e.g., a chunk authorized to run "
+             "'./tests/run.sh' can pass '^./tests/run\\.sh$'). Does NOT bypass the "
+             "destructive-op fail-closed checks in the base policy when patterns "
+             "don't match — those still escalate to USER-CONFIRM.",
+    )
     parser.add_argument("--tail", help="Worker output sink (auto: <state>/dispatch/<id>.tail)")
     parser.add_argument("--status-json", help="Watcher status file (auto: <state>/dispatch/<id>.status.json)")
     parser.add_argument("--dispatch-id", help="Slug for auto paths (auto-generated if omitted)")

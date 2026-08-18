@@ -162,14 +162,36 @@ def goalflight_worker_channel_roots() -> list[str]:
     following it. Only ``task-stores/`` is granted -- the state base above it
     holds the cross-project index and setup backups, which stay denied.
 
-    Scope is deliberately those two. The fleet directory holds the registry and
-    the derived aggregate -- state a worker consumes but must never author --
+    Scope is deliberately those two. The journal grant lives in
+    ``goalflight_journal_write_root`` so it follows the journal resolver, not
+    this mail/store pair. The fleet directory holds the registry and the
+    derived aggregate -- state a worker consumes but must never author --
     and stays denied.
     """
     return [
         str(Path.home() / ".goal-flight" / "messages"),
         str(worker_task_store_root()),
     ]
+
+
+def goalflight_journal_write_root(cwd: str) -> str:
+    """Directory of this project's journal and its write lock.
+
+    ``goalflight_launch_worker`` is the process the seatbelt wraps, and its
+    first act is ``Journal(project_root)``. Journal takes a FileLock on
+    ``.<journal-name>.write.lock`` next to the sqlite file. That directory
+    lives under the XDG state home (or ``$GOALFLIGHT_JOURNAL_DIR``), outside
+    any workspace, so workspace-write alone kills the ACP handshake with
+    PermissionError.
+
+    Grant is the journal's parent directory only -- not ``journals/`` (other
+    projects) and not the state base (cross-project index, setup backups).
+    Resolved through the same helper the writer uses so an override cannot
+    point the grant at a directory nobody writes.
+    """
+    import goalflight_journal
+
+    return str(goalflight_journal.resolve_journal_path(cwd).parent)
 
 
 def _agent_state_roots(agent: str | None, command: str) -> list[str]:
@@ -253,16 +275,18 @@ def macos_write_roots(cwd: str, profile: str, *, agent: str | None = None, comma
                 f"inside allowed temp root {root!r}; move the worktree or use off"
             )
     roots.extend(temp_roots)
-    agent_roots = _unique_real_paths(
-        _agent_state_roots(agent, command) + goalflight_worker_channel_roots()
+    extra_roots = _unique_real_paths(
+        _agent_state_roots(agent, command)
+        + goalflight_worker_channel_roots()
+        + [goalflight_journal_write_root(cwd)]
     )
-    for root in agent_roots:
+    for root in extra_roots:
         if _path_contains(root, cwd):
             raise OsSandboxError(
                 "os sandbox cannot enforce workspace boundaries when cwd is "
                 f"inside allowed agent state root {root!r}; move the worktree or use off"
             )
-    roots.extend(agent_roots)
+    roots.extend(extra_roots)
     return _unique_real_paths(roots)
 
 
