@@ -213,12 +213,24 @@ def _assert_arbitration_pool_legal(slots: int) -> int:
     return slots
 
 
+# Arbitration fixtures wait up to EXIT + LIVE + EXIT seconds before the
+# "N of M exited" check. A listener --timeout-s equal to that sum expires
+# during the second exit-wait under load and is counted as a surplus exit
+# (the t-282 3-where-2 flake). The fixture must outlive the wait budget.
+_ARBITRATION_EXIT_WAIT_S = 5.0
+_ARBITRATION_LIVE_WAIT_S = 5.0
+_ARBITRATION_LISTENER_TIMEOUT_S = 60.0
+assert _ARBITRATION_LISTENER_TIMEOUT_S > (
+    2 * _ARBITRATION_EXIT_WAIT_S + _ARBITRATION_LIVE_WAIT_S
+)
+
+
 def _wait_for_listener_count(
     root: Path,
     *,
     label: str,
     count: int,
-    timeout_s: float = 5,
+    timeout_s: float = _ARBITRATION_LIVE_WAIT_S,
 ) -> list[wake.WaiterRecord]:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -255,7 +267,7 @@ def _wait_for_exited_count(
     processes: list[subprocess.Popen[str]],
     count: int,
     *,
-    timeout_s: float = 5,
+    timeout_s: float = _ARBITRATION_EXIT_WAIT_S,
 ) -> list[subprocess.Popen[str]]:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -266,6 +278,10 @@ def _wait_for_exited_count(
             break
         time.sleep(0.02)
     return [process for process in processes if process.poll() is not None]
+
+
+def _pool_exit_codes(processes: list[subprocess.Popen[str]]) -> list[int | None]:
+    return [process.poll() for process in processes]
 
 
 def _advance_all(
@@ -590,7 +606,7 @@ def test_listener_pool_one_event_pops_exactly_one_real_process(
                 label="wake-test",
                 nonce=claimed.value.nonce,
                 slots=arbitration_slots,
-                timeout_s=15,
+                timeout_s=_ARBITRATION_LISTENER_TIMEOUT_S,
             ),
             cwd=root,
             env=env,
@@ -891,7 +907,7 @@ def test_cursor_advance_with_leftovers_pops_one_more_pool_member(
                 label="wake-test",
                 nonce=claimed.value.nonce,
                 slots=arbitration_slots,
-                timeout_s=15,
+                timeout_s=_ARBITRATION_LISTENER_TIMEOUT_S,
             ),
             cwd=root,
             env=env,
@@ -903,7 +919,8 @@ def test_cursor_advance_with_leftovers_pops_one_more_pool_member(
     ]
     try:
         exited = _wait_for_exited_count(processes, 1)
-        assert len(exited) == 1
+        assert len(exited) == 1, _pool_exit_codes(processes)
+        assert exited[0].returncode == 0, _pool_exit_codes(processes)
         _wait_for_listener_count(
             root, label="wake-test", count=arbitration_slots - 1
         )
@@ -930,7 +947,10 @@ def test_cursor_advance_with_leftovers_pops_one_more_pool_member(
         assert len(authority.cursor_peek("wake-test", nonce=claimed.value.nonce).items) == 1
 
         exited = _wait_for_exited_count(processes, 2)
-        assert len(exited) == 2
+        assert len(exited) == 2, _pool_exit_codes(processes)
+        assert all(process.returncode == 0 for process in exited), _pool_exit_codes(
+            processes
+        )
         assert sum(process.poll() is None for process in processes) == 1
         assert len(_wait_for_listener_count(root, label="wake-test", count=1)) == 1
     finally:
@@ -1044,7 +1064,7 @@ def test_self_post_does_not_ring_pool_foreign_post_does(
                 label="wake-test",
                 nonce=claimed.value.nonce,
                 slots=arbitration_slots,
-                timeout_s=15,
+                timeout_s=_ARBITRATION_LISTENER_TIMEOUT_S,
             ),
             cwd=root,
             env=env,
