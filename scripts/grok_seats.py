@@ -13,7 +13,7 @@ State is cached in ``grok-seat-states.json`` and refreshed inline when stale, so
 the common path is a file read and a stale cache costs one probe round rather
 than a background service.
 
-Two rules carry the design:
+Three rules carry the design:
 
 * **A selection failure must never fail a dispatch.** Every error path returns
   None, which means "no opinion, use the host default" -- exactly what happened
@@ -24,6 +24,11 @@ Two rules carry the design:
   be genuinely unmeasurable. Such a seat stays ELIGIBLE (there is no evidence it
   is starved) but ranks behind any seat measured to have headroom, because a
   measured number is better evidence than an absence.
+* **A 401 is not a dead credential.** An optional local rotator (loaded from
+  ``ext`` if present, otherwise a no-op) may recover a failed probe before this
+  module records the seat dead, and may mark a seat exhausted the moment a
+  dispatch proves it. Most installs have no rotator; a missing one must never
+  change or fail a dispatch.
 """
 
 from __future__ import annotations
@@ -49,9 +54,111 @@ STATE_TTL_S = 600.0
 PROBE_TIMEOUT_S = 10.0
 HOST_KEY = ""  # the host ~/.grok login, which has no seat label
 
+# Sentinels so a test can pass recover=None to disable the optional rotator
+# without being confused with "use the default loader".
+_UNSET = object()
+_RECOVER_CACHE = _UNSET
+_MARK_CACHE = _UNSET
+
 
 def _now() -> float:
     return time.time()
+
+
+def _optional_recover():
+    """Return the local 401-recovery hook, or None when the rotator is absent."""
+    global _RECOVER_CACHE
+    if _RECOVER_CACHE is not _UNSET:
+        return _RECOVER_CACHE
+    try:
+        from ext import grok_rotate
+
+        hook = getattr(grok_rotate, "recover_probe", None)
+    except BaseException:
+        hook = None
+    _RECOVER_CACHE = hook if callable(hook) else None
+    return _RECOVER_CACHE
+
+
+def _optional_mark_exhausted():
+    """Return the local exhaustion-marker hook, or None when the rotator is absent."""
+    global _MARK_CACHE
+    if _MARK_CACHE is not _UNSET:
+        return _MARK_CACHE
+    try:
+        from ext import grok_rotate
+
+        hook = getattr(grok_rotate, "mark_exhausted", None)
+    except BaseException:
+        hook = None
+    _MARK_CACHE = hook if callable(hook) else None
+    return _MARK_CACHE
+
+
+def _record_is_grok(record: dict) -> bool:
+    """True when a ledger-shaped record billed a grok engine.
+
+    Matches ``grok`` and the dispatch handles that share that engine
+    (``grok-code``, ``grok-research``, ``grok-acp``) without importing the
+    dispatcher -- this module must stay safe to load from a watcher.
+    """
+    for key in ("engine", "agent"):
+        value = record.get(key)
+        if isinstance(value, str) and value.split("-", 1)[0] == "grok":
+            return True
+    return False
+
+
+def note_exhausted(
+    seat: str,
+    *,
+    path: Path | None = None,
+    marker=None,
+) -> bool:
+    """Tell the optional rotator this seat is starved. Never raises.
+
+    Returns True only if a rotator accepted the mark. A missing rotator is
+    the common case and must be indistinguishable from a no-op.
+    """
+    if not isinstance(seat, str) or not seat.strip():
+        return False
+    mark = _optional_mark_exhausted() if marker is None else marker
+    if not callable(mark):
+        return False
+    try:
+        if path is not None:
+            mark(seat.strip(), path=path)
+        else:
+            mark(seat.strip())
+        return True
+    except BaseException:
+        return False
+
+
+def note_exhausted_if_proven(
+    record: dict | None,
+    *,
+    state: str | None = None,
+    path: Path | None = None,
+    marker=None,
+) -> bool:
+    """Mark a grok seat exhausted only when a dispatch just proved it.
+
+    Requires a terminal ``quota_exhausted`` outcome AND a non-empty
+    ``effective_account`` on a grok record. Anything else -- another engine,
+    an unpinned host default, a different failure -- is a no-op.
+    """
+    if not isinstance(record, dict):
+        return False
+    outcome = state or record.get("state") or record.get("terminal_state")
+    if outcome != "quota_exhausted":
+        return False
+    if not _record_is_grok(record):
+        return False
+    seat = record.get("effective_account")
+    if not isinstance(seat, str) or not seat.strip():
+        return False
+    return note_exhausted(seat, path=path, marker=marker)
 
 
 class TrustRefused(ValueError):
@@ -163,14 +270,18 @@ def refresh_states(
     timeout_s: float = PROBE_TIMEOUT_S,
     now: float | None = None,
     reader=None,
+    recover=_UNSET,
 ) -> dict:
     """Probe every configured grok login and cache the result.
 
     ``reader`` is the seam tests inject; by default this calls the bundled grok
-    usage reader once per account.
+    usage reader once per account. ``recover`` is the optional 401-recovery
+    hook: omit it to load the local rotator if present, pass ``None`` to
+    disable, or pass a callable to inject one.
     """
     current = _now() if now is None else now
     read_usage = grok_usage.read_usage if reader is None else reader
+    recover_fn = _optional_recover() if recover is _UNSET else recover
     seats: dict[str, dict] = {}
     for label, auth_path in grok_usage.accounts():
         try:
@@ -181,6 +292,28 @@ def refresh_states(
             # A reader that raises is a reader we cannot use; record it as
             # unmeasurable rather than dropping the account silently.
             record = {"ok": False, "error": "reader raised"}
+        # A 401 is the kimi-style "lapsed, auto-heals" case: the login still
+        # exists, the access token just expired. Recording it dead benches a
+        # live seat until the next TTL and can starve the whole fleet. Only
+        # a 401 is offered to the rotator; a 403/5xx/malformed body is left
+        # as-is so we do not launch a recovery process per broken seat.
+        if (
+            recover_fn is not None
+            and not record.get("ok")
+            and "401" in str(record.get("error") or "")
+        ):
+            try:
+                recovered = recover_fn(
+                    label=label,
+                    auth_path=auth_path,
+                    probe=record,
+                    reader=read_usage,
+                    timeout_s=timeout_s,
+                )
+                if isinstance(recovered, dict):
+                    record = recovered
+            except BaseException:
+                pass
         seats[label or HOST_KEY] = {
             "ok": bool(record.get("ok")),
             "used_percent": record.get("used_percent"),

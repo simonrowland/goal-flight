@@ -3189,6 +3189,41 @@ _CODEX_SEAT_API_UNSET = object()
 _CODEX_SEAT_API_CACHE = _CODEX_SEAT_API_UNSET
 
 
+def _maybe_mark_grok_quota_exhausted(
+    dispatch_id: str | None = None,
+    state: str | None = None,
+    record: dict | None = None,
+) -> None:
+    """If this finish just proved a grok seat empty, tell the optional rotator.
+
+    Without this, the next dispatch re-reads a cache that still calls the
+    dead seat healthy for up to the probe TTL. A missing rotator is a
+    no-op; this must never fail the dispatch.
+    """
+    try:
+        if (
+            state not in (None, "quota_exhausted")
+            and (
+                record is None
+                or (
+                    record.get("state") != "quota_exhausted"
+                    and record.get("terminal_state") != "quota_exhausted"
+                )
+            )
+        ):
+            return
+        import grok_seats
+
+        if record is None:
+            if not dispatch_id:
+                return
+            path = goalflight_ledger.record_path(dispatch_id, create=False)
+            record = json.loads(path.read_text(encoding="utf-8"))
+        grok_seats.note_exhausted_if_proven(record, state=state)
+    except BaseException:
+        return
+
+
 def _codex_seat_api():
     """Return the optional local launch library, or None on any import failure."""
     global _CODEX_SEAT_API_CACHE
@@ -5018,6 +5053,7 @@ def _finish_ledger(
         )
     if code != 0:
         raise RuntimeError(f"journal terminal emitter exited {code} for {dispatch_id}")
+    _maybe_mark_grok_quota_exhausted(dispatch_id, state)
 
 
 def _release_capacity(lease_id: str | None, state: str, reason: str | None) -> None:
@@ -5442,6 +5478,7 @@ def _commit_abandoned_dispatch(
     if elapsed_s is not None:
         record["elapsed_s"] = elapsed_s
     goalflight_ledger.write_record(record)
+    _maybe_mark_grok_quota_exhausted(record=record, state=state)
 
 
 def _abandoned_status_entry(record: dict) -> dict:
@@ -8035,9 +8072,11 @@ def commit_reconciled_terminal(
             goalflight_ledger.write_record(record)
         except Exception:
             return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+        existing_state = str(record.get("state") or existing_terminal)
+        _maybe_mark_grok_quota_exhausted(record=record, state=existing_state)
         return TerminalCommitResult(
             TerminalCommitKind.EXISTING_TERMINAL,
-            str(record.get("state") or existing_terminal),
+            existing_state,
             True,
         )
 
@@ -8101,6 +8140,7 @@ def commit_reconciled_terminal(
         goalflight_ledger.write_record(record)
     except Exception:
         return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
+    _maybe_mark_grok_quota_exhausted(record=record, state=state)
     return TerminalCommitResult(
         TerminalCommitKind.CREATED_TERMINAL if created else TerminalCommitKind.UPDATED_TERMINAL,
         state,

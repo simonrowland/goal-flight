@@ -498,6 +498,22 @@ def _cleanup_codex_dispatch_home(
         )
 
 
+def _maybe_note_grok_quota(dispatch_id: object, state: object) -> None:
+    """Best-effort: a grok 402 should flip the seat cache now, not after the TTL."""
+    if state != "quota_exhausted":
+        return
+    try:
+        import grok_seats
+
+        path = goalflight_ledger.record_path(str(dispatch_id), create=False)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        grok_seats.note_exhausted_if_proven(
+            record, state=str(state) if state is not None else None
+        )
+    except BaseException:
+        return
+
+
 def _finish_existing_ledger(
     dispatch_id: str,
     state: object,
@@ -566,6 +582,7 @@ def _finish_existing_ledger(
                         )
                     )
                 if code == 0:
+                    _maybe_note_grok_quota(dispatch_id, state)
                     return None
                 last_error = {
                     "type": "TerminalCommitRefused",

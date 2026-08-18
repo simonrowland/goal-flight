@@ -164,6 +164,322 @@ def test_refresh_records_every_account_including_unreachable_ones(
     assert json.loads(path.read_text())["seats"]["seat"]["ok"] is False
 
 
+def test_refresh_default_path_loads_the_optional_recover_hook(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Omitting recover= must consult the optional loader, not silently disable it."""
+    monkeypatch.setattr(
+        seats.grok_usage,
+        "accounts",
+        lambda: [("seat", Path("/seat/auth.json"))],
+    )
+    probes = iter(
+        [
+            {"ok": False, "error": "billing endpoint returned HTTP 401"},
+            {"ok": True, "used_percent": 4.0, "error": None},
+        ]
+    )
+    called: list[str] = []
+
+    def reader(*, auth_path, timeout_s, account):
+        return next(probes)
+
+    def hook(**kwargs):
+        called.append("recovered")
+        return kwargs["reader"](
+            auth_path=kwargs["auth_path"],
+            timeout_s=kwargs["timeout_s"],
+            account=kwargs["label"],
+        )
+
+    monkeypatch.setattr(seats, "_optional_recover", lambda: hook)
+    path = tmp_path / "s.json"
+    document = seats.refresh_states(path=path, now=NOW, reader=reader)
+    assert called == ["recovered"]
+    assert document["seats"]["seat"]["ok"] is True
+
+
+def test_refresh_recovers_a_401_via_optional_hook_before_recording_dead(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A lapsed token must be offered to the rotator, then re-recorded healthy.
+
+    This is the b-162 wire: without it the TTL refresh benches a live seat
+    until a human notices. The hook is injected so this test does not depend
+    on the untracked rotator being present.
+    """
+    monkeypatch.setattr(
+        seats.grok_usage,
+        "accounts",
+        lambda: [("seat", Path("/seat/auth.json"))],
+    )
+    probes = iter(
+        [
+            {"ok": False, "error": "billing endpoint returned HTTP 401"},
+            {"ok": True, "used_percent": 12.0, "error": None},
+        ]
+    )
+    recover_calls: list[dict] = []
+
+    def reader(*, auth_path, timeout_s, account):
+        return next(probes)
+
+    def recover(**kwargs):
+        recover_calls.append(kwargs)
+        return kwargs["reader"](
+            auth_path=kwargs["auth_path"],
+            timeout_s=kwargs["timeout_s"],
+            account=kwargs["label"],
+        )
+
+    path = tmp_path / "s.json"
+    document = seats.refresh_states(
+        path=path, now=NOW, reader=reader, recover=recover
+    )
+    assert recover_calls, "a 401 must be offered to the optional recover hook"
+    assert document["seats"]["seat"]["ok"] is True, document
+    assert document["seats"]["seat"]["used_percent"] == 12.0
+    assert seats._rank(document["seats"]["seat"]) is not None
+    persisted = json.loads(path.read_text())
+    assert persisted["seats"]["seat"]["ok"] is True
+
+
+def test_refresh_does_not_offer_a_non_401_failure_to_the_rotator(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Only a 401 is recoverable. A 503 must be recorded dead without a nudge."""
+    monkeypatch.setattr(
+        seats.grok_usage,
+        "accounts",
+        lambda: [("seat", Path("/seat/auth.json"))],
+    )
+    recover_calls: list[dict] = []
+
+    def reader(*, auth_path, timeout_s, account):
+        return {"ok": False, "error": "billing endpoint returned HTTP 503"}
+
+    def recover(**kwargs):
+        recover_calls.append(kwargs)
+        return {"ok": True, "used_percent": 1.0}
+
+    path = tmp_path / "s.json"
+    document = seats.refresh_states(
+        path=path, now=NOW, reader=reader, recover=recover
+    )
+    assert recover_calls == [], "a 503 must not be offered to the recover hook"
+    assert document["seats"]["seat"]["ok"] is False, document
+    assert seats._rank(document["seats"]["seat"]) is None
+
+
+def test_refresh_records_dead_when_401_survives_recovery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        seats.grok_usage,
+        "accounts",
+        lambda: [("seat", Path("/seat/auth.json"))],
+    )
+
+    def reader(*, auth_path, timeout_s, account):
+        return {"ok": False, "error": "billing endpoint returned HTTP 401"}
+
+    def recover(**kwargs):
+        return dict(kwargs["probe"])
+
+    path = tmp_path / "s.json"
+    document = seats.refresh_states(
+        path=path, now=NOW, reader=reader, recover=recover
+    )
+    assert document["seats"]["seat"]["ok"] is False
+    assert seats._rank(document["seats"]["seat"]) is None
+
+
+def test_refresh_without_recover_hook_records_401_as_dead(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Most installs have no rotator; a 401 then stays a failed probe."""
+    monkeypatch.setattr(
+        seats.grok_usage,
+        "accounts",
+        lambda: [("seat", Path("/seat/auth.json"))],
+    )
+
+    def reader(*, auth_path, timeout_s, account):
+        return {"ok": False, "error": "billing endpoint returned HTTP 401"}
+
+    path = tmp_path / "s.json"
+    document = seats.refresh_states(
+        path=path, now=NOW, reader=reader, recover=None
+    )
+    assert document["seats"]["seat"]["ok"] is False
+    assert json.loads(path.read_text())["seats"]["seat"]["ok"] is False
+
+
+def test_refresh_swallows_a_recover_hook_that_raises(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        seats.grok_usage,
+        "accounts",
+        lambda: [("seat", Path("/seat/auth.json"))],
+    )
+
+    def reader(*, auth_path, timeout_s, account):
+        return {"ok": False, "error": "billing endpoint returned HTTP 401"}
+
+    def recover(**kwargs):
+        raise RuntimeError("rotator exploded")
+
+    path = tmp_path / "s.json"
+    document = seats.refresh_states(
+        path=path, now=NOW, reader=reader, recover=recover
+    )
+    assert document["seats"]["seat"]["ok"] is False
+
+
+def test_missing_rotator_module_is_a_noop_on_refresh(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A checkout without scripts/ext must not fail a refresh or change the verdict."""
+    import builtins
+
+    monkeypatch.setattr(
+        seats.grok_usage,
+        "accounts",
+        lambda: [("seat", Path("/seat/auth.json"))],
+    )
+    seats._RECOVER_CACHE = seats._UNSET
+    original_import = builtins.__import__
+
+    def failing_import(name, *args, **kwargs):
+        if name == "ext" or (isinstance(name, str) and name.startswith("ext.")):
+            raise ModuleNotFoundError("optional rotator absent")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", failing_import)
+    assert seats._optional_recover() is None
+
+    def reader(*, auth_path, timeout_s, account):
+        return {"ok": False, "error": "billing endpoint returned HTTP 401"}
+
+    path = tmp_path / "s.json"
+    document = seats.refresh_states(path=path, now=NOW, reader=reader)
+    assert document["seats"]["seat"]["ok"] is False
+    seats._RECOVER_CACHE = seats._UNSET
+
+
+def test_note_exhausted_if_proven_routes_selection_away_immediately(
+    tmp_path: Path,
+) -> None:
+    """A live 402 must take effect on the next select_seat, not after the TTL."""
+    path = _states(
+        tmp_path / "s.json",
+        {"": _entry(100.0), "seat": _entry(3.0)},
+    )
+    assert seats.select_seat(path=path, now=NOW, allow_refresh=False) == "seat"
+
+    marked = []
+
+    def marker(seat, **kwargs):
+        marked.append((seat, kwargs))
+        document = json.loads(path.read_text())
+        document["seats"][seat] = {
+            "ok": True,
+            "used_percent": seats.EXHAUSTED_AT_PERCENT,
+            "error": "quota_exhausted (observed)",
+        }
+        path.write_text(json.dumps(document))
+
+    record = {
+        "engine": "grok",
+        "agent": "grok-code",
+        "state": "quota_exhausted",
+        "effective_account": "seat",
+    }
+    assert seats.note_exhausted_if_proven(record, path=path, marker=marker) is True
+    assert marked and marked[0][0] == "seat"
+    assert seats.select_seat(path=path, now=NOW, allow_refresh=False) is None
+
+
+@pytest.mark.parametrize(
+    ("record", "state"),
+    [
+        (
+            {
+                "engine": "codex",
+                "agent": "codex",
+                "state": "quota_exhausted",
+                "effective_account": "seat",
+            },
+            None,
+        ),
+        (
+            {
+                "engine": "grok",
+                "agent": "grok-code",
+                "state": "complete",
+                "effective_account": "seat",
+            },
+            None,
+        ),
+        (
+            {
+                "engine": "grok",
+                "agent": "grok-code",
+                "state": "quota_exhausted",
+                "effective_account": "",
+            },
+            None,
+        ),
+        (
+            {
+                "engine": "grok",
+                "agent": "grok-code",
+                "state": "quota_exhausted",
+            },
+            None,
+        ),
+        (
+            {
+                "engine": "grok",
+                "agent": "grok-code",
+                "state": "failed",
+                "effective_account": "seat",
+            },
+            "failed",
+        ),
+    ],
+)
+def test_note_exhausted_if_proven_ignores_records_that_did_not_prove_it(
+    record, state
+) -> None:
+    marked = []
+    assert (
+        seats.note_exhausted_if_proven(
+            record, state=state, marker=lambda seat, **k: marked.append(seat)
+        )
+        is False
+    )
+    assert marked == []
+
+
+def test_note_exhausted_is_noop_when_rotator_is_absent(monkeypatch) -> None:
+    import builtins
+
+    seats._MARK_CACHE = seats._UNSET
+    original_import = builtins.__import__
+
+    def failing_import(name, *args, **kwargs):
+        if name == "ext" or (isinstance(name, str) and name.startswith("ext.")):
+            raise ModuleNotFoundError("optional rotator absent")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", failing_import)
+    assert seats._optional_mark_exhausted() is None
+    assert seats.note_exhausted("seat") is False
+    seats._MARK_CACHE = seats._UNSET
+
+
 # --- folder trust -------------------------------------------------------
 
 def test_trust_guard_refuses_paths_that_are_too_broad(tmp_path: Path) -> None:
