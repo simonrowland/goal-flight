@@ -13,6 +13,9 @@ incremented when meaningful skill behaviour changes.
   the worker then died after one turn with no terminal marker. The refusal
   names the file and the verified fix; a present value is left alone and the
   grok CLI flag is still omitted.
+- `goalflight_task.py new --kind decision` mints `d-NNN` instead of `q-NNN`,
+  so pending store decisions cannot collide with a project's ratified
+  decision-lock q-series. Existing `q-*` rows keep working.
 
 ## [1.5.0] - 2026-08-18
 

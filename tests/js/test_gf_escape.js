@@ -311,6 +311,8 @@ assert("autolink escapes script terminator", !/<\/script/i.test(linked));
 assert("autolink escapes raw img tag", !/<img/i.test(linked));
 assert("autolink preserves escaped text", linked.includes("&lt;/script&gt;&lt;img"));
 assert("autolink emits item id link", linked.includes('href="ticket.html?id=t-001"'));
+assert("autolink emits decision d- id link", GF.autolink("see d-001 now").includes('href="ticket.html?id=d-001"'));
+assert("autolink still emits legacy q- id link", GF.autolink("see q-001 now").includes('href="ticket.html?id=q-001"'));
 assert("autolink emits allowlisted path link", linked.includes('href="../docs-private/proof.md"'));
 const mentionPath = GF.renderMention("docs-private/proof.md:42");
 assert("renderMention strips line suffix from href", mentionPath.includes('href="../docs-private/proof.md"'));

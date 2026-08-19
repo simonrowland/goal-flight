@@ -62,7 +62,7 @@ def test_happy_path_forward_blocker_remap_and_preservation() -> None:
         assert proc.returncode == 0, proc.stderr
         payload = json.loads(proc.stdout)
         assert payload["imported"] == 3 and payload["errors"] == 0
-        assert payload["id_mapping"] == {"draft-first": "t-001", "draft-later": "b-001", "draft-choice": "q-001"}
+        assert payload["id_mapping"] == {"draft-first": "t-001", "draft-later": "b-001", "draft-choice": "d-001"}
         by_id = {item["id"]: item for item in read_items(project)}
         assert by_id["t-001"]["blocked_by"] == ["b-001"]
         assert by_id["t-001"]["links"] == ["doc.md", "doc.md"]

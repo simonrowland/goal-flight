@@ -9,7 +9,7 @@
  *   - REFRESH: manual Refresh button + page reload on visibilitychange/focus
  *     so file:// views pick up a changed tasks-data.js.
  *   - RENDER: sectioned status board, kind/status/search filters, sort, counts.
- *   - AUTOLINK: \b[tbq]-\d+\b ids -> ticket.html?id=...
+ *   - AUTOLINK: \b[tbqd]-\d+\b ids -> ticket.html?id=...
  *   - MENTIONS: single ids/path mentions -> safe links, everything else code.
  *
  * Public surface: window.GF = { load, items, status, autolink, ... }.
@@ -188,11 +188,11 @@
 
   /* ----------------------------------------------------------- autolink */
 
-  // Match every linkable item-id family actually used as an id: t-/b-/q- plus
+  // Match every linkable item-id family actually used as an id: t-/b-/d-/q- plus
   // ADR-/bp- (case-insensitive, to match idLink/linkList which already accept
   // ADR-/bp- and Q-). The captured id is emitted verbatim so casing is preserved.
-  var ID_RE = /\b((?:ADR|bp|[tbq])-\d+)\b/gi;
-  var ID_EXACT_RE = /^(?:ADR|bp|[tbq])-\d+$/i;
+  var ID_RE = /\b((?:ADR|bp|[tbqd])-\d+)\b/gi;
+  var ID_EXACT_RE = /^(?:ADR|bp|[tbqd])-\d+$/i;
 
   // Allowlisted repo-root-relative directory prefixes for file-path autolinking
   // (ADR-012 / progress-dashboard.md "Autolinking"). Configurable: a deployment
@@ -578,7 +578,7 @@
     });
     if (!holds.length && it.links) {
       holds = it.links.filter(function (l) {
-        return /^[tbq]-\d+$/.test(l);
+        return /^[tbqd]-\d+$/.test(l);
       });
     }
     return holds;

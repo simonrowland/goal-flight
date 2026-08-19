@@ -16,12 +16,13 @@ atomic whole-file rewrite, with append-only per-item `audit[]` and `dispatches[]
 arrays. **One store, not two: a bug is an item with `kind: bug`.** Record:
 `{ id, kind, title, blocked_by, links, done, tags, created_at, created_by, closed_at?, closed_by?, resolution?, audit?, prompt?, prompt_path?, acceptance?, pattern?, severity?, source?, dispatches? }`
 — `kind: task | bug | decision`; `acceptance` for tasks; `pattern`/`severity`/
-`source` (`review|controller|sweep`) for bugs. Decision items (`q-NNN` open
-questions, `ADR-NNN` decided records) flow `decision → done` only — they have no
-dispatch lifecycle — and may be referenced from any item's `blocked_by` (a task
-blocked by an open `q-NNN` surfaces under Waiting / Decisions needed; see line 62
-and the Decisions-needed section below). Ids `t-NNN` / `b-NNN` / `q-NNN` /
-`ADR-NNN`, one allocator per family.
+`source` (`review|controller|sweep`) for bugs. Decision items (`d-NNN` open
+questions, `ADR-NNN` decided records; legacy `q-NNN` rows remain valid) flow
+`decision → done` only — they have no dispatch lifecycle — and may be
+referenced from any item's `blocked_by` (a task blocked by an open `d-NNN`
+surfaces under Waiting / Decisions needed; see line 62 and the
+Decisions-needed section below). Ids `t-NNN` / `b-NNN` / `d-NNN` / `ADR-NNN`
+(plus legacy `q-NNN`), one allocator per family.
 
 The HTML views are self-contained **HTML+JS** filter-views that read the data
 client-side from `tasks-data.js` (a mirror of this file) — no Python page
@@ -166,7 +167,7 @@ breadcrumb is the durable fallback.
 ## Blockers + links (first-class, cross-kind)
 
 `blocked_by` holds a list of ANY item ids — task `t-NNN`, bug `b-NNN`, or a
-decision `q-NNN` — so "task blocked by a bug" / "bug blocked by a decision" needs
+decision `d-NNN` (legacy `q-NNN`) — so "task blocked by a bug" / "bug blocked by a decision" needs
 no join (one store). `links` holds free pointers (other items, files,
 `reviews/<slug>`, `#anchors`) the generator renders inline. The **Waiting** view
 is any item with an unresolved `blocked_by`, linked to its blocker.

@@ -110,7 +110,7 @@ footer{max-width:46rem;margin:0 auto;padding:1.5rem 1.25rem 2rem;color:var(--mut
     if(!links || !links.length) return "<span style='color:var(--muted)'>none</span>";
     return "<ul>"+links.map(function(l){
       var text = String(l == null ? "" : l).trim();
-      if(/^(?:ADR|bp|[tbq])-\d+$/i.test(text)){
+      if(/^(?:ADR|bp|[tbqd])-\d+$/i.test(text)){
         // Flag a link to an id that has no item, so a dangling cross-reference
         // doesn't masquerade as a live ticket (matches blockerList's guard).
         var known = GF.store.byId[text];

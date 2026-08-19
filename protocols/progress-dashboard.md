@@ -33,7 +33,7 @@ Mechanics (offline, no server):
   a `fetch`, so no CORS block, no local server). `fetch('tasks.jsonl')` would be
   blocked on `file://` — that's why the data is a `.js`.
 - A shared **`gf.js`** renders list/details + **autolinks** every `t-NNN` /
-  `b-NNN` / `q-NNN` id it finds (incl. in the recap) to the ticket views.
+  `b-NNN` / `d-NNN` / `q-NNN` id it finds (incl. in the recap) to the ticket views.
 - Pages are static, vendored once (no per-change build); they always show current
   data because they read it live — **no staleness, no generator-must-run hazard.**
 - LIFO / grey-done / sort / filter are JS here; CSS + JS inlined or vendored
@@ -60,7 +60,7 @@ covers that, so it isn't worth a dependency.
 
 `gf.js`'s linkify pass (HTML-escape → wrap matches) turns two things into links:
 
-- **Item ids** `t-NNN` / `b-NNN` / `q-NNN` → `ticket.html?id=…`.
+- **Item ids** `t-NNN` / `b-NNN` / `d-NNN` / `q-NNN` → `ticket.html?id=…`.
 - **File-path mentions:**
   - *opinionated-dir, repo-root-relative* — path whose repo-root-relative form
     starts with an allowlisted prefix (`docs-private/`, `specs/`, … — configurable)

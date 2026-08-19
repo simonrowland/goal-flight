@@ -50,10 +50,12 @@ PROJECT_REGISTRY_INDEX_SCHEMA = "goalflight.projects-index.v1"
 PROJECT_STORE_META_SCHEMA = "goalflight.project-store-meta.v1"
 VIEW_MANIFEST_SCHEMA = "goalflight.view-manifest.v1"
 PROJECT_REGISTRY_THROTTLE_S = 3600
-FAMILY_PREFIX_BY_KIND = {"task": "t", "bug": "b", "decision": "q"}
-VALID_FAMILIES = {"t", "b", "q", "ADR"}
+# Decisions mint d-NNN so they cannot collide with a project's ratified q-series.
+# VALID_FAMILIES keeps q for legacy rows that already used that prefix.
+FAMILY_PREFIX_BY_KIND = {"task": "t", "bug": "b", "decision": "d"}
+VALID_FAMILIES = {"t", "b", "d", "q", "ADR"}
 TASK_DISPATCH_STATES = {"working", "worker-finished", "worker-failed"}
-ITEM_ID_RE = re.compile(r"\b((?:ADR|bp|[tbq])-\d+)\b", re.IGNORECASE)
+ITEM_ID_RE = re.compile(r"\b((?:ADR|bp|[tbqd])-\d+)\b", re.IGNORECASE)
 RESUME_NOTES_RE = re.compile(r"^RESUME-NOTES-(\d{4}-\d{2}-\d{2})(?:-rev(\d+))?\.md$", re.IGNORECASE)
 REVIEW_SEVERITY = {"P0": "critical", "P1": "high", "P2": "medium", "P3": "low"}
 HARVEST_DRAFT_TAGS = ("draft", "harvest")
@@ -2840,7 +2842,7 @@ def _kind_from_reference(value: str, default: str) -> str:
     lower = value.lower()
     if lower.startswith(("b-", "bp-")):
         return "bug"
-    if lower.startswith(("q-", "adr-")):
+    if lower.startswith(("d-", "q-", "adr-")):
         return "decision"
     if lower.startswith("t-"):
         return "task"
@@ -3022,7 +3024,7 @@ def _harvest_heading_blocks(
             current_heading_position = f"heading:{lineno}:{_harvest_title_key(heading_text)}"
             if headings_as_tasks and (parent_task_context or _heading_allows_harvest_context(heading_text)):
                 heading_title = _harvest_position_title(heading_text)
-                id_like = re.match(r"^(?:ADR|bp|[tbq])-\d+\b", heading_title, re.IGNORECASE)
+                id_like = re.match(r"^(?:ADR|bp|[tbqd])-\d+\b", heading_title, re.IGNORECASE)
                 numbered = re.match(r"^\d+[.)]\s+", _clean_markdown_title(heading_text)) is not None
                 if heading_title and not id_like and not _is_generic_harvest_heading(heading_title):
                     if parent_task_context or numbered:
@@ -3042,7 +3044,7 @@ def _harvest_heading_blocks(
                             flush()
                             promoted_section = {"level": level, "candidate": candidate, "body_lines": []}
                             continue
-        heading = re.match(r"^#{2,6}\s+((?:ADR|bp|[tbq])-\d+)\b(?:\s+(.+))?", line, re.IGNORECASE)
+        heading = re.match(r"^#{2,6}\s+((?:ADR|bp|[tbqd])-\d+)\b(?:\s+(.+))?", line, re.IGNORECASE)
         if heading:
             flush()
             current = (
