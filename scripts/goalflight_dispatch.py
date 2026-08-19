@@ -76,6 +76,7 @@ import goalflight_capacity
 import goalflight_codex_sessions
 import goalflight_dispatch_paths
 import goalflight_dispatch_states
+import goalflight_engine_sessions
 import goalflight_steer_mailbox
 import goalflight_ledger
 import goalflight_journal
@@ -112,15 +113,47 @@ PRELAUNCH_CANDIDATE_STATES = frozenset(
 )
 QUEUE_PRIORITY_RANK = {lane: rank for rank, lane in enumerate(goalflight_capacity.PRIORITY_LANES)}
 QUEUE_DEFAULT_PRIORITY = "normal"
-PRESET_AGENTS = {"codex", "grok-code", "grok-research", "moonshot"}
-STDIN_PROMPT_AGENTS = {"codex", "grok-code", "grok-research", "moonshot"}
-DEFAULT_MAX_IDLE_SECS = 180.0
+PRESET_AGENTS = {
+    "codex",
+    "grok-code",
+    "grok-research",
+    "moonshot",
+    "cursor",
+    "cursor-agent",
+    "claude",
+}
+STDIN_PROMPT_AGENTS = {
+    "codex",
+    "grok-code",
+    "grok-research",
+    "moonshot",
+    "cursor",
+    "cursor-agent",
+    "claude",
+}
+# Quiet is not death, and this threshold is a BACKSTOP, not a liveness test.
+# Reaching it does not kill the worker -- the watcher records the verdict and
+# exits while the process keeps running, which is how a fleet accumulates
+# orphans that burn tokens with nobody listening. An abandoned live worker is
+# strictly worse than a killed one, so the threshold must be generous.
+#
+# It can afford to be. Controllers are woken by delivered events, not by this
+# expiring, so a long backstop costs latency nowhere: the only thing a short
+# value buys is a false terminal verdict on a worker that was still thinking.
+# Measured 2026-08-19: 21 live workers orphaned in one day at the old values,
+# with ordinary deep-reading quiet periods exceeding ten minutes on a box
+# running 20+ concurrent workers.
+DEFAULT_MAX_IDLE_SECS = 900.0
 _DASHBOARD_REFRESH_SUBCOMMAND = "dashboard-refresh"
 _DASHBOARD_REFRESH_MARKER = "goalflight-dashboard-refresh-v1"
 _DASHBOARD_REFRESH_QUEUED_GRACE_S = 60 * 60
 _DASHBOARD_REFRESH_MAX_LIFETIME_S = 4 * 60 * 60
 _DASHBOARD_REFRESH_CLAIM_STALE_S = 30.0
-CODE_WRITER_MAX_IDLE_SECS = 600.0
+# Code writers read a corpus before their first edit, so their quiet periods are
+# the longest in the fleet and the most often mistaken for death. One hour is a
+# backstop for a genuinely wedged process, not a guess at how long thinking
+# takes.
+CODE_WRITER_MAX_IDLE_SECS = 3600.0
 CODE_WRITER_AGENTS = {"codex", "codex-acp", "grok-code", "grok-acp", "moonshot", "cursor", "cursor-agent"}
 
 
@@ -2170,7 +2203,7 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     if args.agent not in PRESET_AGENTS:
         raise DispatchUsageError(
             "no worker preset for --agent "
-            f"{args.agent!r} — use --agent codex|grok-code|grok-research|moonshot with "
+            f"{args.agent!r} — use --agent codex|grok-code|grok-research|moonshot|cursor|claude with "
             "--prompt/--prompt-file, or pass a raw worker after `-- <cmd...>`"
         )
     if args.agent in STDIN_PROMPT_AGENTS and not _prompt_requested(args):
@@ -2466,7 +2499,7 @@ def _assert_codex_resume_source_not_live(record: dict, dispatch_id: str) -> None
         )
     if identity_state == "indeterminate":
         raise DispatchUsageError(
-            f"dispatch {dispatch_id} liveness is indeterminate; refusing codex resume"
+            f"dispatch {dispatch_id} liveness is indeterminate; refusing resume"
         )
     if identity_state == "dead":
         return
@@ -2477,7 +2510,7 @@ def _assert_codex_resume_source_not_live(record: dict, dispatch_id: str) -> None
         goalflight_ledger.terminal_state_for(source_state, source_reason) == "unknown"
     ):
         raise DispatchUsageError(
-            f"dispatch {dispatch_id} liveness is indeterminate; refusing codex resume"
+            f"dispatch {dispatch_id} liveness is indeterminate; refusing resume"
         )
 
 
@@ -2497,7 +2530,7 @@ def _assert_no_nonterminal_codex_resume_child(
         ):
             continue
         if (
-            goalflight_ledger.infer_engine(
+            goalflight_engine_sessions.resume_engine(
                 candidate.get("engine") or candidate.get("agent")
             )
             != "codex"
@@ -2566,6 +2599,161 @@ def _recorded_codex_session_id(record: dict, dispatch_id: str) -> str | None:
     return next(iter(recorded), None)
 
 
+def _recorded_engine_session_id(record: dict, dispatch_id: str) -> str | None:
+    engine = goalflight_engine_sessions.resume_engine(
+        record.get("engine") or record.get("agent")
+    )
+    if engine == "codex":
+        return _recorded_codex_session_id(record, dispatch_id)
+    candidates = [record.get("engine_session_id"), record.get("codex_session_id")]
+    status = _codex_resume_status(record, dispatch_id)
+    if status is not None:
+        candidates.append(status.get("engine_session_id"))
+        candidates.append(status.get("codex_session_id"))
+    recorded: set[str] = set()
+    for candidate in candidates:
+        session_id = goalflight_engine_sessions.valid_session_id(engine, candidate)
+        if session_id is not None:
+            recorded.add(session_id)
+    if len(recorded) > 1:
+        raise DispatchUsageError(
+            f"dispatch {dispatch_id} has conflicting recorded {engine} session handles"
+        )
+    return next(iter(recorded), None)
+
+
+def _assert_no_nonterminal_resume_child(
+    *,
+    dispatch_id: str,
+    engine: str,
+    session_id: str,
+    exclude_dispatch_id: str | None = None,
+    reconcile_dead_preclaim: bool = False,
+) -> None:
+    """Refuse a second live launch against the same engine session."""
+    if engine == "codex":
+        return
+    for candidate in goalflight_ledger.read_records():
+        candidate_id = candidate.get("dispatch_id")
+        if (
+            candidate_id in {dispatch_id, exclude_dispatch_id}
+            or not candidate.get("parent_dispatch_id")
+        ):
+            continue
+        if (
+            goalflight_engine_sessions.resume_engine(
+                candidate.get("engine") or candidate.get("agent")
+            )
+            != engine
+        ):
+            continue
+        if (
+            goalflight_ledger.terminal_state_for(
+                candidate.get("state"),
+                candidate.get("reason") or candidate.get("error"),
+            )
+            != "unknown"
+        ):
+            continue
+        candidate_session_id = goalflight_engine_sessions.valid_session_id(
+            engine,
+            candidate.get("engine_session_id") or candidate.get("codex_session_id"),
+        )
+        if candidate_session_id != session_id:
+            continue
+        identity_matches, identity_reason = goalflight_ledger.identity_matches(
+            candidate
+        )
+        confirmed_dead_preclaim = (
+            candidate.get("state") == "waiting_capacity"
+            and not candidate.get("worker_pid")
+            and not identity_matches
+            and (
+                identity_reason == "dead"
+                or str(identity_reason).startswith("pid_reused_")
+            )
+            and isinstance(candidate_id, str)
+            and bool(candidate_id)
+        )
+        if confirmed_dead_preclaim:
+            if reconcile_dead_preclaim:
+                _finish_ledger(
+                    candidate_id,
+                    "failed",
+                    f"stale_resume_preclaim:{identity_reason}",
+                    worker_still_alive=False,
+                )
+            continue
+        raise DispatchUsageError(
+            f"dispatch {dispatch_id} already has non-terminal resume child "
+            f"{candidate_id} for session {session_id}"
+        )
+
+
+def _validate_resume_source(
+    dispatch_id: str,
+    *,
+    exclude_dispatch_id: str | None = None,
+    reconcile_dead_preclaim: bool = False,
+) -> dict:
+    """Validate a resume source for any wired worker CLI.
+
+    Codex still needs its per-dispatch home and rollout. Other engines need a
+    recorded native handle. Pre-capture dispatches refuse instead of starting
+    a silent fresh session.
+    """
+    record = _find_dispatch_record(dispatch_id)
+    if record is None:
+        raise DispatchUsageError(f"no ledger record for dispatch {dispatch_id}")
+    engine = goalflight_engine_sessions.resume_engine(
+        record.get("engine") or record.get("agent")
+    )
+    if engine is None:
+        label = record.get("engine") or record.get("agent") or "unknown"
+        raise DispatchUsageError(
+            f"dispatch {dispatch_id} engine {label!r} is not a resumable worker CLI"
+        )
+    _assert_codex_resume_source_not_live(record, dispatch_id)
+    if engine == "codex":
+        _record, home, session_id, home_owner_dispatch_id = (
+            _validate_codex_resume_source(
+                dispatch_id,
+                exclude_dispatch_id=exclude_dispatch_id,
+                reconcile_dead_preclaim=reconcile_dead_preclaim,
+            )
+        )
+        return {
+            "record": _record,
+            "engine": engine,
+            "agent": str(_record.get("agent") or "codex"),
+            "shape": goalflight_ledger.infer_shape(_record),
+            "session_id": session_id,
+            "codex_home": home,
+            "codex_home_owner_dispatch_id": home_owner_dispatch_id,
+        }
+    session_id = _recorded_engine_session_id(record, dispatch_id)
+    if session_id is None:
+        raise DispatchUsageError(
+            f"dispatch {dispatch_id} has no recorded {engine} session handle"
+        )
+    _assert_no_nonterminal_resume_child(
+        dispatch_id=dispatch_id,
+        engine=engine,
+        session_id=session_id,
+        exclude_dispatch_id=exclude_dispatch_id,
+        reconcile_dead_preclaim=reconcile_dead_preclaim,
+    )
+    return {
+        "record": record,
+        "engine": engine,
+        "agent": str(record.get("agent") or engine),
+        "shape": goalflight_ledger.infer_shape(record),
+        "session_id": session_id,
+        "codex_home": None,
+        "codex_home_owner_dispatch_id": None,
+    }
+
+
 def _validate_codex_resume_source(
     dispatch_id: str,
     *,
@@ -2629,6 +2817,55 @@ def _codex_resume_lock(home: Path, session_id: str):
             yield
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _engine_resume_lock_path(engine: str, session_id: str) -> Path:
+    key = hashlib.sha256(f"{engine}\0{session_id}".encode("utf-8")).hexdigest()
+    return _codex_dispatch_homes_dir() / ".resume-locks" / f"{key}.lock"
+
+
+@contextlib.contextmanager
+def _engine_resume_lock(engine: str, session_id: str):
+    """Serialize claims for one recorded non-Codex engine session."""
+    if fcntl is None:  # pragma: no cover - resume is refused on native Windows
+        raise DispatchUsageError("resume requires local file locking")
+    lock_path = _engine_resume_lock_path(engine, session_id)
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _revalidate_resume_claim(
+    *,
+    parent_dispatch_id: str,
+    expected_engine: str,
+    expected_session_id: str,
+    exclude_dispatch_id: str | None = None,
+) -> None:
+    source = _validate_resume_source(
+        parent_dispatch_id,
+        exclude_dispatch_id=exclude_dispatch_id,
+        reconcile_dead_preclaim=True,
+    )
+    if (
+        source["engine"] != expected_engine
+        or source["session_id"] != expected_session_id
+    ):
+        raise DispatchUsageError(
+            f"dispatch {parent_dispatch_id} resume lineage changed while claiming"
+        )
+    _assert_no_nonterminal_resume_child(
+        dispatch_id=parent_dispatch_id,
+        engine=expected_engine,
+        session_id=expected_session_id,
+        exclude_dispatch_id=exclude_dispatch_id,
+        reconcile_dead_preclaim=True,
+    )
 
 
 def _revalidate_codex_resume_claim(
@@ -2737,7 +2974,7 @@ def _rebuild_codex_resume_home(
 def _cmd_resume(argv: list[str]) -> int:
     parser = _TerseArgumentParser(
         prog=f"{Path(sys.argv[0]).name} resume",
-        description="Resume a recorded Codex rollout as a tracked dispatch.",
+        description="Resume a recorded worker-CLI session as a tracked dispatch.",
         usage_hint="try resume <dispatch-id> --prompt-file <path>",
     )
     parser.add_argument("dispatch_id")
@@ -2752,24 +2989,24 @@ def _cmd_resume(argv: list[str]) -> int:
         )
         return 64
     try:
-        record, home, session_id, home_owner_dispatch_id = (
-            _validate_codex_resume_source(args.dispatch_id)
-        )
+        source = _validate_resume_source(args.dispatch_id)
         child_dispatch_id = _reserve_auto_dispatch_id(
-            "codex-resume", _dispatch_base_dir()
+            f"{source['engine']}-resume", _dispatch_base_dir()
         )
     except DispatchUsageError as exc:
         print(f"goalflight_dispatch: {exc}", file=sys.stderr)
         return 64
 
+    record = source["record"]
     project_root = Path(
         str(record.get("project_root") or Path.cwd())
     ).expanduser().resolve(strict=False)
+    shape = source["shape"] if source["shape"] in {"bash", "acp"} else "bash"
     launch_argv = [
         "--agent",
-        "codex",
+        source["agent"],
         "--shape",
-        "bash",
+        shape,
         "--dispatch-id",
         child_dispatch_id,
         "--cwd",
@@ -2778,13 +3015,24 @@ def _cmd_resume(argv: list[str]) -> int:
         str(prompt_path),
         "--parent-dispatch-id",
         args.dispatch_id,
-        "--codex-session-id",
-        session_id,
-        "--codex-resume-home",
-        str(home),
-        "--codex-home-owner-dispatch-id",
-        home_owner_dispatch_id,
+        "--engine-session-id",
+        source["session_id"],
     ]
+    if source["engine"] == "codex":
+        launch_argv += [
+            "--codex-session-id",
+            source["session_id"],
+            "--codex-resume-home",
+            str(source["codex_home"]),
+            "--codex-home-owner-dispatch-id",
+            source["codex_home_owner_dispatch_id"],
+        ]
+    else:
+        # Stay on the seat that owns the session files. Codex rebuilds a
+        # per-dispatch home; grok/cursor/claude sessions live in the seat HOME.
+        account = record.get("effective_account") or record.get("account")
+        if isinstance(account, str) and account and account != "default":
+            launch_argv += ["--account", account]
     task_ids = record.get("task_ids")
     if isinstance(task_ids, list):
         for task_id in task_ids:
@@ -3369,6 +3617,39 @@ def _capacity_wait_seconds(args) -> float:
     )
 
 
+def _resolved_engine_session_id(args) -> str | None:
+    engine = goalflight_engine_sessions.resume_engine(getattr(args, "agent", None))
+    for raw in (
+        getattr(args, "engine_session_id", None),
+        getattr(args, "codex_session_id", None),
+    ):
+        handle = goalflight_engine_sessions.valid_session_id(engine, raw)
+        if handle is not None:
+            return handle
+    return None
+
+
+def _ensure_assigned_engine_session(args) -> str | None:
+    """Name a new grok/claude session before spawn so resume has a handle.
+
+    Resume launches already carry the recorded handle. Engines that cannot
+    assign (kimi, cursor) stay blank until harvest; a blank handle refuses
+    resume instead of starting fresh.
+    """
+    existing = _resolved_engine_session_id(args)
+    if existing is not None:
+        args.engine_session_id = existing
+        return existing
+    if getattr(args, "parent_dispatch_id", None):
+        return None
+    engine = goalflight_engine_sessions.resume_engine(getattr(args, "agent", None))
+    if not goalflight_engine_sessions.can_assign_at_launch(engine):
+        return None
+    assigned = goalflight_engine_sessions.new_session_id(engine)
+    args.engine_session_id = assigned
+    return assigned
+
+
 def _codex_home_owner_dispatch_id(args) -> str | None:
     recorded = getattr(args, "codex_home_owner_dispatch_id", None)
     if isinstance(recorded, str) and recorded:
@@ -3404,12 +3685,15 @@ def _prelaunch_status_metadata(
         metadata["parent_dispatch_id"] = parent_dispatch_id
     resolved_session_id = (
         codex_session_id
+        or _resolved_engine_session_id(args)
         or goalflight_codex_sessions.valid_session_id(
             getattr(args, "codex_session_id", None)
         )
     )
     if resolved_session_id:
-        metadata["codex_session_id"] = resolved_session_id
+        metadata["engine_session_id"] = resolved_session_id
+        if goalflight_engine_sessions.resume_engine(getattr(args, "agent", None)) == "codex":
+            metadata["codex_session_id"] = resolved_session_id
     resolved_home = codex_home or getattr(args, "codex_resume_home", None)
     if resolved_home:
         metadata["codex_home"] = str(resolved_home)
@@ -3420,7 +3704,21 @@ def _prelaunch_status_metadata(
 
 
 def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | None:
-    lease_ttl_s = max(int(args.max_idle_secs or 300) * 4, 3600)
+    # Lease TTL answers a DIFFERENT question from the idle backstop: idle asks
+    # "how long may a worker be quiet", TTL asks "how long may a dead worker keep
+    # holding capacity". Deriving one from the other couples them, so raising the
+    # idle backstop silently multiplied capacity holding.
+    #
+    # Bounds, both load-bearing:
+    #   lower  TTL > idle, or a legitimately quiet-but-alive worker loses its
+    #          lease while still working — the opposite of the bug we are fixing.
+    #   upper  capped, or a dead code writer would hold a lease for
+    #          3600*4 = 14400s (4h). With ~127 leases live on this box that
+    #          starves the pool.
+    # 7200s satisfies both: 2x the 3600s code-writer backstop (a worker quiet a
+    # full hour keeps its lease) while halving the dead-worker hold from 4h.
+    # Sanity: default agent 900s -> max(3600,3600)=3600 -> unchanged at 1h.
+    lease_ttl_s = min(max(int(args.max_idle_secs or 300) * 4, 3600), 7200)
     acquire_args = argparse.Namespace(
         agent=args.agent,
         dispatch_id=args.dispatch_id,
@@ -3598,6 +3896,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 worker_pid=worker_pid,
                 acp_session_id=None,
                 logical_session_id=args.dispatch_id,
+                engine_session_id=_resolved_engine_session_id(args),
                 codex_session_id=getattr(args, "codex_session_id", None),
                 codex_home=codex_home or getattr(args, "codex_resume_home", None),
                 codex_home_owner_dispatch_id=_codex_home_owner_dispatch_id(args),
@@ -3888,6 +4187,11 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv += ["--controller-beacon-pid", str(controller_beacon_pid)]
     if controller_session_id is not None:
         argv += ["--controller-session-id", controller_session_id]
+    engine_session_id = _resolved_engine_session_id(args)
+    if engine_session_id is not None:
+        argv += ["--engine-session-id", engine_session_id]
+    if getattr(args, "parent_dispatch_id", None):
+        argv += ["--parent-dispatch-id", str(args.parent_dispatch_id)]
     if raw_argv:
         argv += ["--", *raw_argv]
     return argv
@@ -4859,6 +5163,7 @@ def _watcher_spawn_argv(
     launch_detached: bool = False,
     codex_dispatch_home: str | None = None,
     codex_session_id: str | None = None,
+    engine_session_id: str | None = None,
     parent_dispatch_id: str | None = None,
     codex_home_owner_dispatch_id: str | None = None,
     controller_pid: int | None = None,
@@ -4892,12 +5197,12 @@ def _watcher_spawn_argv(
         str(pgid),
         "--stay-after-terminal",
     ]
+    if project_root is not None:
+        watch_cmd += ["--project-root", str(project_root)]
     if task_ids:
         if project_root is None:
             raise ValueError("project_root is required when task_ids are present")
         watch_cmd += [
-            "--project-root",
-            str(project_root),
             "--task-ids",
             ",".join(task_ids),
         ]
@@ -4917,6 +5222,8 @@ def _watcher_spawn_argv(
         ]
     if codex_session_id is not None:
         watch_cmd += ["--codex-session-id", codex_session_id]
+    if engine_session_id is not None:
+        watch_cmd += ["--engine-session-id", engine_session_id]
     if parent_dispatch_id is not None:
         watch_cmd += ["--parent-dispatch-id", parent_dispatch_id]
     if codex_home_owner_dispatch_id is not None:
@@ -9223,7 +9530,13 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         account=getattr(args, "account", None),
         cwd=str(project_root),
         worktree="off",
-        session_id=None,
+        session_id=_resolved_engine_session_id(args),
+        resume_session_id=(
+            _resolved_engine_session_id(args)
+            if getattr(args, "parent_dispatch_id", None)
+            else None
+        ),
+        parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
         dispatch_id=args.dispatch_id,
         task_ids=list(getattr(args, "task_ids", []) or []),
         priority=getattr(args, "priority", "normal"),
@@ -9795,6 +10108,14 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
             argv += ["--model", selected_model]
         if args.cwd:
             argv += ["--cwd", args.cwd]
+        grok_session_id = _resolved_engine_session_id(args)
+        if grok_session_id:
+            # RESUME_FORK_POLICY = reuse. Never --fork-session (t-288 steer 1).
+            argv += goalflight_engine_sessions.session_argv(
+                "grok",
+                grok_session_id,
+                resume=bool(getattr(args, "parent_dispatch_id", None)),
+            )
         return argv, None
     if args.agent == "moonshot":
         # kimi has no --cwd, is off-PATH, takes the prompt as an argv value, and -p auto-runs
@@ -9807,8 +10128,49 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         resolved_cwd = os.path.abspath(args.cwd or ".")
         extra = (["--model", args.model] if getattr(args, "model", None) else []) \
                 + ["--add-dir", resolved_cwd]
+        kimi_session_id = _resolved_engine_session_id(args)
+        if kimi_session_id and getattr(args, "parent_dispatch_id", None):
+            extra += goalflight_engine_sessions.session_argv(
+                "moonshot", kimi_session_id, resume=True
+            )
         argv = ["/bin/sh", "-lc", script, resolved_cwd, prompt_text, *extra]
         return argv, None
+    if args.agent in CURSOR_AGENTS:
+        if not prompt_path:
+            raise DispatchUsageError("cursor resume/launch requires a prompt file")
+        argv = [
+            "cursor-agent",
+            "-p",
+            "--force",
+            "--trust",
+            "--output-format",
+            "text",
+        ]
+        cursor_session_id = _resolved_engine_session_id(args)
+        if cursor_session_id and getattr(args, "parent_dispatch_id", None):
+            argv += goalflight_engine_sessions.session_argv(
+                "cursor", cursor_session_id, resume=True
+            )
+        if args.cwd:
+            argv += ["--workspace", os.path.abspath(args.cwd)]
+        if model:
+            argv += ["--model", str(model)]
+        # Prompt via stdin: the file can be 5-20KB and argv would truncate.
+        return argv, prompt_path
+    if args.agent == "claude":
+        if not prompt_path:
+            raise DispatchUsageError("claude resume/launch requires a prompt file")
+        argv = ["claude", "-p", "--output-format", "text"]
+        claude_session_id = _resolved_engine_session_id(args)
+        if claude_session_id:
+            argv += goalflight_engine_sessions.session_argv(
+                "claude",
+                claude_session_id,
+                resume=bool(getattr(args, "parent_dispatch_id", None)),
+            )
+        if model:
+            argv += ["--model", str(model)]
+        return argv, prompt_path
     return None, None  # unknown preset + no raw command
 
 
@@ -10013,6 +10375,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--launch-detached", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--acp-detached-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--parent-dispatch-id", help=argparse.SUPPRESS)
+    parser.add_argument("--engine-session-id", help=argparse.SUPPRESS)
     parser.add_argument("--codex-session-id", help=argparse.SUPPRESS)
     parser.add_argument("--codex-resume-home", help=argparse.SUPPRESS)
     parser.add_argument("--codex-home-owner-dispatch-id", help=argparse.SUPPRESS)
@@ -10063,17 +10426,18 @@ def main(argv: list[str] | None = None) -> int:
     if shape == "auto":
         shape = "acp" if args.agent in ("cursor", "claude-acp", "claude") else "bash"
     args.shape = shape
+    _ensure_assigned_engine_session(args)
     if (
-        shape == "bash"
-        and args.agent == "codex"
-        and getattr(args, "parent_dispatch_id", None)
+        getattr(args, "parent_dispatch_id", None)
+        and _resolved_engine_session_id(args) is None
         and goalflight_codex_sessions.valid_session_id(
             getattr(args, "codex_session_id", None)
         )
         is None
     ):
+        engine = goalflight_engine_sessions.resume_engine(args.agent) or args.agent
         print(
-            "goalflight_dispatch: codex resume launch requires a recorded session handle",
+            f"goalflight_dispatch: {engine} resume launch requires a recorded session handle",
             file=sys.stderr,
         )
         return 64
@@ -10215,8 +10579,14 @@ def main(argv: list[str] | None = None) -> int:
     ledger_recorded = False
     detached_launched = False
     codex_dispatch_home = None
+    engine_session_id = _resolved_engine_session_id(args)
+    resume_engine = goalflight_engine_sessions.resume_engine(args.agent)
     codex_session_id = goalflight_codex_sessions.valid_session_id(
         getattr(args, "codex_session_id", None)
+    ) or (
+        engine_session_id
+        if resume_engine == "codex"
+        else None
     )
     effective_account = None
     request_envelope = None
@@ -10244,6 +10614,8 @@ def main(argv: list[str] | None = None) -> int:
         summary_head["task_ids"] = list(args.task_ids)
     if getattr(args, "parent_dispatch_id", None):
         summary_head["parent_dispatch_id"] = args.parent_dispatch_id
+    if engine_session_id is not None:
+        summary_head["engine_session_id"] = engine_session_id
     if codex_session_id is not None:
         summary_head["codex_session_id"] = codex_session_id
     codex_home_owner_dispatch_id = _codex_home_owner_dispatch_id(args)
@@ -10261,7 +10633,7 @@ def main(argv: list[str] | None = None) -> int:
         # Back-compat: ledger consumers now see one extra pre-spawn row per
         # dispatch; the existing running row is still written after capacity
         # is acquired and the worker is spawned.
-        if getattr(args, "parent_dispatch_id", None):
+        if getattr(args, "parent_dispatch_id", None) and resume_engine == "codex":
             resume_home = Path(args.codex_resume_home).expanduser().resolve(
                 strict=False
             )
@@ -10294,6 +10666,23 @@ def main(argv: list[str] | None = None) -> int:
                         args.codex_session_id,
                         args.dispatch_id,
                     )
+        elif getattr(args, "parent_dispatch_id", None) and resume_engine and engine_session_id:
+            with _engine_resume_lock(resume_engine, engine_session_id):
+                _revalidate_resume_claim(
+                    parent_dispatch_id=args.parent_dispatch_id,
+                    expected_engine=resume_engine,
+                    expected_session_id=engine_session_id,
+                )
+                _record_ledger(
+                    args,
+                    project_root=project_root,
+                    prompt_path=prompt_path,
+                    status_json=status_json,
+                    tail=tail,
+                    lease_id=None,
+                    worker_pid=None,
+                    state="waiting_capacity",
+                )
         else:
             _record_ledger(
                 args,
@@ -10326,6 +10715,18 @@ def main(argv: list[str] | None = None) -> int:
             # ledger records "default" (nothing pinned), while effective_account
             # names the seat this dispatch actually billed.
             effective_account = grok_selected_account(args)
+        if (
+            getattr(args, "parent_dispatch_id", None)
+            and resume_engine not in {None, "codex"}
+            and engine_session_id
+        ):
+            with _engine_resume_lock(resume_engine, engine_session_id):
+                _revalidate_resume_claim(
+                    parent_dispatch_id=args.parent_dispatch_id,
+                    expected_engine=resume_engine,
+                    expected_session_id=engine_session_id,
+                    exclude_dispatch_id=args.dispatch_id,
+                )
         if (
             _account_engine(args.agent) == "codex"
             and not goalflight_compat.is_windows()
@@ -10588,6 +10989,7 @@ def main(argv: list[str] | None = None) -> int:
             launch_detached=bool(args.launch_detached),
             codex_dispatch_home=codex_dispatch_home,
             codex_session_id=codex_session_id,
+            engine_session_id=engine_session_id,
             parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
             codex_home_owner_dispatch_id=codex_home_owner_dispatch_id,
             controller_pid=controller_pid,

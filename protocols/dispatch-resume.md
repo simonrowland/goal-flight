@@ -38,16 +38,49 @@ you want to keep, not by what killed the worker.
 
 ## Mechanics
 
-- `goalflight_dispatch.py resume <dispatch-id>` recovers the recorded session
-  (codex-resume family) and continues under the SAME dispatch id, so ledger
-  and journal history stay one story.
+- `goalflight_dispatch.py resume <dispatch-id>` recovers the recorded
+  **engine** session and continues it as a tracked child launch under the
+  SAME engine session id. The child keeps `parent_dispatch_id` so ledger and
+  journal stay one story. The Goal Flight launch id is new because each
+  spawn is a new process, lease, and status file; the conversation handle is
+  not.
+- Every wired worker CLI is resumable: Codex (`codex exec resume`), Grok
+  (`--resume <id>`), cursor-agent (`--resume <chatId>`), Claude
+  (`--resume <id>`), and Moonshot/Kimi (`-S <id>`). ACP dispatches resume
+  via `session/load` when the handle was recorded.
+- **Reuse, never fork.** Grok and Claude expose `--fork-session`. Resume
+  does not pass it. Fork would mint a sibling session and look like a
+  silent fresh start. The live-source guard is what prevents attaching to a
+  running worker.
 - A resume still needs the brief on disk: the worker re-reads
   `$GOALFLIGHT_PROMPT_FILE`, which is authoritative over its summarized
   memory. Update that file BEFORE resuming if the plan changed.
 - Ownership is recorded at dispatch time; a resumed dispatch keeps its
   original owner, so wakes still route to the controller that started it.
-- Never resume into a tree another worker now owns. Check for in-flight
-  dispatches on the same files first.
+- Never resume a source that is still live or whose liveness is
+  indeterminate.
+- Never resume into a session another non-terminal child already holds.
+- Resume refuses honestly when it cannot attach:
+  - no recorded engine session handle (typical of dispatches that predate
+    capture — Grok/Claude now assign at launch; Kimi/cursor harvest after
+    the CLI creates the session)
+  - missing Codex home/rollout
+  - unsupported CLI / unknown engine
+  It must not appear to resume and silently start fresh.
+
+## Capture
+
+Ledger `session_id` is the Goal Flight dispatch id, not the engine handle.
+
+| engine | handle field | captured |
+|---|---|---|
+| codex | `codex_session_id` / `engine_session_id` | watcher harvests the rollout UUID |
+| grok | `engine_session_id` | assigned at launch (`--session-id`) |
+| claude | `engine_session_id` | assigned at launch (`--session-id`) |
+| cursor | `engine_session_id` | harvest / ACP `session/new` return |
+| moonshot | `engine_session_id` | harvest from `session_index.jsonl` or resume footer |
+
+A dispatch with no recorded handle cannot be resumed. Say so.
 
 ## The honest default
 

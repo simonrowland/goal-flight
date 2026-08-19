@@ -406,20 +406,28 @@ def write_record(record: dict) -> Path:
     return path
 
 
-def record_codex_session_id(dispatch_id: str, session_id: str) -> Path:
-    """Attach a harvested Codex rollout UUID without replacing launch metadata."""
+def record_engine_session_id(dispatch_id: str, session_id: str) -> Path:
+    """Attach a harvested engine session handle without replacing launch metadata."""
     with StateLock():
         path = record_path(dispatch_id)
         if not path.exists():
             raise FileNotFoundError(f"missing dispatch ledger record: {dispatch_id}")
         record = json.loads(path.read_text(encoding="utf-8"))
-        existing = record.get("codex_session_id")
+        existing = record.get("engine_session_id") or record.get("codex_session_id")
         if existing not in (None, "", session_id):
             raise ValueError(
-                f"dispatch {dispatch_id} already records codex session {existing}"
+                f"dispatch {dispatch_id} already records engine session {existing}"
             )
-        record["codex_session_id"] = session_id
+        record["engine_session_id"] = session_id
+        engine = infer_engine(record.get("engine") or record.get("agent"))
+        if engine == "codex":
+            record["codex_session_id"] = session_id
         return write_record(record)
+
+
+def record_codex_session_id(dispatch_id: str, session_id: str) -> Path:
+    """Attach a harvested Codex rollout UUID without replacing launch metadata."""
+    return record_engine_session_id(dispatch_id, session_id)
 
 
 def read_records() -> list[dict]:
@@ -749,6 +757,7 @@ def cmd_record(args: argparse.Namespace) -> int:
     if effective_account:
         record["effective_account"] = effective_account
     for key in (
+        "engine_session_id",
         "codex_session_id",
         "codex_home",
         "codex_home_owner_dispatch_id",
@@ -757,6 +766,8 @@ def cmd_record(args: argparse.Namespace) -> int:
         value = getattr(args, key, None)
         if value:
             record[key] = value
+    if record.get("codex_session_id") and not record.get("engine_session_id"):
+        record["engine_session_id"] = record["codex_session_id"]
     request_envelope_json = getattr(args, "request_envelope_json", None)
     if request_envelope_json:
         try:
@@ -869,6 +880,7 @@ def cmd_record(args: argparse.Namespace) -> int:
                 record["claimant_pid"] = existing["claimant_pid"]
                 record["claimant_identity"] = existing.get("claimant_identity")
             for key in (
+                "engine_session_id",
                 "codex_session_id",
                 "codex_home",
                 "codex_home_owner_dispatch_id",
@@ -876,6 +888,8 @@ def cmd_record(args: argparse.Namespace) -> int:
             ):
                 if key not in record and existing.get(key):
                     record[key] = existing[key]
+            if record.get("codex_session_id") and not record.get("engine_session_id"):
+                record["engine_session_id"] = record["codex_session_id"]
         path = write_record(record)
     try:
         # Prompt mirrors are immutable and write-once. This derived projection

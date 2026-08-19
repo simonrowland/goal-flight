@@ -2758,6 +2758,34 @@ class GoalflightAcpConnection:
         self.acp_session_id = response.session_id
         return self.acp_session_id
 
+    async def load_session(
+        self, session_id: str, cwd: str, timeout: float = 60.0
+    ) -> str:
+        """Resume an existing ACP session. Reuses the recorded id; never forks."""
+        require_acp_sdk()
+        self.cwd = cwd
+        loader = getattr(self.conn, "load_session", None)
+        if loader is None:
+            raise AcpError(
+                "ACP SDK has no load_session; cannot resume this ACP dispatch"
+            )
+        try:
+            response = await asyncio.wait_for(
+                loader(session_id=session_id, cwd=cwd, mcp_servers=[]),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError as e:
+            raise AcpError(
+                f"session/load: no response within {timeout:.0f}s -- worker likely wedged in handshake"
+            ) from e
+        except AcpError:
+            raise
+        except Exception as e:
+            raise AcpError(f"session/load failed: {e}") from e
+        loaded = getattr(response, "session_id", None) or session_id
+        self.acp_session_id = loaded
+        return self.acp_session_id
+
     async def session_new(self, cwd: str, timeout: float = 60.0) -> str:
         return await self.new_session(cwd, timeout=timeout)
 

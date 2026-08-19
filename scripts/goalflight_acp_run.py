@@ -1801,6 +1801,7 @@ async def spawn_and_handshake_with_retry(
     session_model: str | None = None,
     env: dict[str, str] | None = None,
     stderr_capture: AgentStderrCapture | None = None,
+    resume_session_id: str | None = None,
 ) -> tuple[asyncio.subprocess.Process, AcpConnection]:
     """Spawn the worker and run the ACP handshake, retrying once on AcpError.
 
@@ -1847,7 +1848,12 @@ async def spawn_and_handshake_with_retry(
                 await maybe
         try:
             await conn.initialize(timeout=handshake_timeout)
-            await conn.new_session(cwd, timeout=handshake_timeout)
+            if resume_session_id:
+                await conn.load_session(
+                    resume_session_id, cwd, timeout=handshake_timeout
+                )
+            else:
+                await conn.new_session(cwd, timeout=handshake_timeout)
             if session_model and _uses_session_model(agent):
                 try:
                     await conn.set_session_model(str(session_model), timeout=handshake_timeout)
@@ -2446,6 +2452,8 @@ async def _run_acp_dispatch_impl(
                     worker_pid=worker_pid,
                     acp_session_id=cfg.session_id,
                     logical_session_id=cfg.session_id,
+                    engine_session_id=getattr(cfg, "engine_session_id", None)
+                    or cfg.session_id,
                     lease_id=lease_id,
                     stdout_path=None,
                     stderr_path=None,
@@ -3655,7 +3663,14 @@ async def _run_acp_dispatch_impl(
                 session_model=getattr(cfg, "model", None),
                 env=spawn_env,
                 stderr_capture=agent_stderr_capture,
+                resume_session_id=getattr(cfg, "resume_session_id", None),
             )
+        native_session = getattr(conn, "acp_session_id", None)
+        if native_session:
+            cfg.session_id = native_session
+            cfg.engine_session_id = native_session
+            payload["session_id"] = native_session
+            payload["engine_session_id"] = native_session
         refresh_user_confirm_guard()
         await update_status(os_sandbox=getattr(conn, "os_sandbox_metadata", None) or payload["os_sandbox"])
         test_marker = goalflight_compat.allowed_env_override(

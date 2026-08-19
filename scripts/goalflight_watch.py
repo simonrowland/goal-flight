@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 import goalflight_compat
 import goalflight_codex_sessions
 import goalflight_dispatch_states
+import goalflight_engine_sessions
 import goalflight_ledger
 import goalflight_quota_stuck
 import goalflight_task
@@ -616,6 +617,7 @@ def _status_snapshot(payload: dict) -> dict:
         "shape",
         "effective_account",
         "codex_session_id",
+        "engine_session_id",
         "codex_home",
         "codex_home_owner_dispatch_id",
         "parent_dispatch_id",
@@ -1954,7 +1956,18 @@ def main() -> int:
     parser.add_argument("--task-ids")
     parser.add_argument("--agent", default="unknown")
     parser.add_argument("--poll-secs", type=float, default=2.0)
-    parser.add_argument("--max-idle-secs", type=float, default=180.0)
+    parser.add_argument(
+        "--max-idle-secs",
+        type=float,
+        default=900.0,
+        help=(
+            "Backstop for a wedged worker, NOT a liveness test. Reaching it does "
+            "not kill the worker: this records the verdict and exits while the "
+            "process keeps running, so a short value abandons live workers rather "
+            "than ending them. Controllers wake on delivered events, so a generous "
+            "value costs no latency."
+        ),
+    )
     parser.add_argument("--cpu-epsilon", type=float, default=0.1)
     parser.add_argument(
         "--trace-long-running-secs",
@@ -1981,6 +1994,7 @@ def main() -> int:
     )
     parser.add_argument("--codex-dispatch-home", help=argparse.SUPPRESS)
     parser.add_argument("--codex-session-id", help=argparse.SUPPRESS)
+    parser.add_argument("--engine-session-id", help=argparse.SUPPRESS)
     parser.add_argument("--codex-home-owner-dispatch-id", help=argparse.SUPPRESS)
     parser.add_argument("--parent-dispatch-id", help=argparse.SUPPRESS)
     parser.add_argument("--worker-identity-json",
@@ -2043,9 +2057,18 @@ def main() -> int:
         if args.codex_dispatch_home
         else None
     )
+    resume_engine = goalflight_engine_sessions.resume_engine(args.agent)
+    engine_session_id = goalflight_engine_sessions.valid_session_id(
+        resume_engine, getattr(args, "engine_session_id", None)
+    )
     codex_session_id = goalflight_codex_sessions.valid_session_id(
         args.codex_session_id
     )
+    if resume_engine == "codex" and engine_session_id and not codex_session_id:
+        codex_session_id = engine_session_id
+    if engine_session_id is None and codex_session_id is not None:
+        engine_session_id = codex_session_id
+    engine_session_recorded = engine_session_id is not None
     codex_session_recorded = False
     if goalflight_compat.is_windows():
         payload = {
@@ -2070,6 +2093,8 @@ def main() -> int:
             )
         if args.parent_dispatch_id:
             payload["parent_dispatch_id"] = args.parent_dispatch_id
+        if engine_session_id is not None:
+            payload["engine_session_id"] = engine_session_id
         if codex_session_id is not None:
             payload["codex_session_id"] = codex_session_id
         if codex_home is not None:
@@ -2153,6 +2178,7 @@ def main() -> int:
 
     def write_payload(payload: dict, *, reason: str | None = None, terminal_write: bool = False) -> dict | None:
         nonlocal codex_session_id, codex_session_recorded
+        nonlocal engine_session_id, engine_session_recorded
         nonlocal last_payload, final_status_written, working_breadcrumb_written
         nonlocal dispatch_retired
         if not status_write_allowed():
@@ -2172,14 +2198,65 @@ def main() -> int:
                 )
         if codex_session_id is not None:
             payload["codex_session_id"] = codex_session_id
+            if engine_session_id is None:
+                engine_session_id = codex_session_id
             if not codex_session_recorded and args.dispatch_id:
                 try:
                     goalflight_ledger.record_codex_session_id(
                         args.dispatch_id, codex_session_id
                     )
                     codex_session_recorded = True
+                    engine_session_recorded = True
                 except Exception as exc:
                     payload["codex_session_record_error"] = {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    }
+        if engine_session_id is None and resume_engine in {"moonshot", "grok"}:
+            work_dir = (
+                Path(args.project_root)
+                if getattr(args, "project_root", None)
+                else Path.cwd()
+            )
+            if resume_engine == "moonshot":
+                engine_session_id = (
+                    goalflight_engine_sessions.harvest_kimi_session_id(
+                        Path.home(), work_dir
+                    )
+                )
+                if engine_session_id is None:
+                    try:
+                        for line in Path(tail).read_text(
+                            encoding="utf-8", errors="replace"
+                        ).splitlines()[-80:]:
+                            raw = goalflight_engine_sessions.parse_resume_footer_handle(
+                                line
+                            )
+                            engine_session_id = (
+                                goalflight_engine_sessions.valid_session_id(
+                                    "moonshot", raw
+                                )
+                            )
+                            if engine_session_id is not None:
+                                break
+                    except OSError:
+                        pass
+            elif resume_engine == "grok":
+                engine_session_id = (
+                    goalflight_engine_sessions.harvest_grok_session_id(
+                        Path.home(), work_dir
+                    )
+                )
+        if engine_session_id is not None:
+            payload["engine_session_id"] = engine_session_id
+            if not engine_session_recorded and args.dispatch_id:
+                try:
+                    goalflight_ledger.record_engine_session_id(
+                        args.dispatch_id, engine_session_id
+                    )
+                    engine_session_recorded = True
+                except Exception as exc:
+                    payload["engine_session_record_error"] = {
                         "type": type(exc).__name__,
                         "message": str(exc),
                     }

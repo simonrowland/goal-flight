@@ -66,29 +66,36 @@ def _make_git_repo(root: Path) -> str:
 
 
 def test_default_idle_windows() -> None:
-    args = _args(agent="codex")
-    D._apply_max_idle_default(args)
-    check("codex write default idle is 600s", args.max_idle_secs == 600.0)
-
-    args = _args(agent="grok-code")
-    D._apply_max_idle_default(args)
-    check("grok-code write default idle is 600s", args.max_idle_secs == 600.0)
-
-    args = _args(agent="moonshot")
-    D._apply_max_idle_default(args)
-    check("moonshot write default idle is 600s", args.max_idle_secs == 600.0)
+    # Raised 2026-08-19 by operator directive (600 -> 3600 for writers, 180 ->
+    # 900 otherwise). Reaching this threshold never killed a worker: the watcher
+    # records the verdict and exits while the process keeps running, so a short
+    # value ABANDONS live workers rather than ending them -- measured at 21
+    # orphans in one day. Controllers wake on delivered events, so a generous
+    # backstop costs no latency.
+    for agent in ("codex", "grok-code", "moonshot"):
+        args = _args(agent=agent)
+        D._apply_max_idle_default(args)
+        check(f"{agent} write default idle is 3600s", args.max_idle_secs == 3600.0)
 
     args = _args(agent="codex", read_only=True)
     D._apply_max_idle_default(args)
-    check("read-only keeps quick idle default", args.max_idle_secs == 180.0)
+    check("read-only keeps quick idle default", args.max_idle_secs == 900.0)
 
     args = _args(agent="grok-research")
     D._apply_max_idle_default(args)
-    check("research keeps quick idle default", args.max_idle_secs == 180.0)
+    check("research keeps quick idle default", args.max_idle_secs == 900.0)
 
     args = _args(agent="codex", max_idle_secs=42.0)
     D._apply_max_idle_default(args)
     check("explicit idle value is preserved", args.max_idle_secs == 42.0)
+
+    # The RELATIONSHIP is what the tiers mean, and it must survive any future
+    # retune of the numbers above: a code writer reads a corpus before its first
+    # edit, so its quiet periods are the longest in the fleet.
+    check(
+        "code writers get a longer window than read-only/research",
+        D.CODE_WRITER_MAX_IDLE_SECS > D.DEFAULT_MAX_IDLE_SECS,
+    )
 
 
 def test_read_only_review_artifact_guard() -> None:

@@ -429,6 +429,7 @@ def test_resume_verb_passes_lineage_and_tasks_to_normal_dispatch(
     assert launch[launch.index("--dispatch-id") + 1] == "codex-resume-child"
     assert launch[launch.index("--parent-dispatch-id") + 1] == parent_id
     assert launch[launch.index("--codex-session-id") + 1] == SESSION_ID
+    assert launch[launch.index("--engine-session-id") + 1] == SESSION_ID
     assert launch[launch.index("--codex-resume-home") + 1] == str(home)
     assert (
         launch[launch.index("--codex-home-owner-dispatch-id") + 1]
@@ -812,7 +813,7 @@ def test_resume_fails_honestly_without_fresh_dispatch(
         (
             (True, "identity_indeterminate"),
             "goalflight_dispatch: dispatch live-parent liveness is indeterminate; "
-            "refusing codex resume\n",
+            "refusing resume\n",
         ),
     ],
 )
