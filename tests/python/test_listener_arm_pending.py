@@ -216,6 +216,99 @@ def test_report_pending_json_is_jsonl_through_ring(
                 proc.kill()
                 proc.wait()
 
+
+def test_replacement_arm_rings_events_arriving_after_first_report(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    """A superseded re-arm must not swallow mail that arrived after the report.
+
+    --report-pending raises a high-water so the same backlog cannot pop the
+    whole pool. That water is the *reported* positions. A replacement arm
+    that peeks later must not raise it to the current backlog.
+    """
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "arm-replace-test"}
+    ).value
+    assert lease is not None
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        _post(env, project, "reported backlog")
+        listener_env = {
+            **env,
+            "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+            "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+        }
+        first = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPTS / "goalflight_messages.py"),
+                "listen",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                "armtest",
+                "--report-pending",
+                "--json",
+                "--poll-secs",
+                "0.01",
+            ],
+            env=listener_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            assert first.stdout is not None
+            arm_line = first.stdout.readline()
+            arm_payload = json.loads(arm_line)
+            assert arm_payload["kind"] == "pending-at-arm"
+            first.kill()
+            first.wait(timeout=5)
+
+            _post(env, project, "arrived after report")
+            replacement = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "goalflight_messages.py"),
+                    "listen",
+                    "--project-root",
+                    str(project),
+                    "--controller-label",
+                    "armtest",
+                    "--report-pending",
+                    "--json",
+                    "--poll-secs",
+                    "0.01",
+                    "--timeout-s",
+                    "8",
+                ],
+                env=listener_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                stdout, stderr = replacement.communicate(timeout=15)
+            finally:
+                if replacement.poll() is None:
+                    replacement.kill()
+                    replacement.wait()
+            assert replacement.returncode == 0, stderr
+            payloads = [
+                json.loads(line) for line in stdout.splitlines() if line.strip()
+            ]
+            assert payloads, stdout
+            assert payloads[-1]["kind"] == "ring", payloads
+            assert payloads[-1]["reason"] == "event"
+            assert all(payload.get("kind") != "pending-at-arm" for payload in payloads)
+        finally:
+            if first.poll() is None:
+                first.kill()
+                first.wait()
+
         # Deliberate listen-auto invocation: deployed controllers still arm
         # with the alias; this locks back-compat rather than leaving it accidental.
         timeout_result = subprocess.run(

@@ -314,21 +314,39 @@ def test_claim_pending_report_first_writer_wins(
     project, _env = isolated
     assert (
         wake.claim_pending_report(
-            project, controller_label="terse-ctl", lease_nonce="nonce-a"
+            project,
+            controller_label="terse-ctl",
+            lease_nonce="nonce-a",
+            positions={"arm-backlog": 2},
         )
         is True
     )
+    assert wake.pending_report_high_water(
+        project, controller_label="terse-ctl", lease_nonce="nonce-a"
+    ) == {"arm-backlog": 2}
     assert (
         wake.claim_pending_report(
-            project, controller_label="terse-ctl", lease_nonce="nonce-a"
+            project,
+            controller_label="terse-ctl",
+            lease_nonce="nonce-a",
+            positions={"arm-backlog": 99},
         )
         is False
     )
+    assert wake.pending_report_high_water(
+        project, controller_label="terse-ctl", lease_nonce="nonce-a"
+    ) == {"arm-backlog": 2}
     assert (
         wake.claim_pending_report(
             project, controller_label="terse-ctl", lease_nonce="nonce-b"
         )
         is True
+    )
+    assert (
+        wake.pending_report_high_water(
+            project, controller_label="terse-ctl", lease_nonce="nonce-b"
+        )
+        == {}
     )
 
 

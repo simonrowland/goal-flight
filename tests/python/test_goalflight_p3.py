@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor
+import inspect
 import json
 import os
 from pathlib import Path
@@ -46,8 +47,12 @@ def _set_state_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str,
     }
     for key, value in values.items():
         monkeypatch.setenv(key, value)
+    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
+    monkeypatch.delenv("GOALFLIGHT_PROCESS_ROLE", raising=False)
     env = os.environ.copy()
     env.update(values)
+    env.pop("GOALFLIGHT_DISPATCH_ID", None)
+    env.pop("GOALFLIGHT_PROCESS_ROLE", None)
     env["PYTHONPATH"] = os.pathsep.join(
         [str(SCRIPTS), str(ROOT), env.get("PYTHONPATH", "")]
     )
@@ -1865,6 +1870,81 @@ def test_terminal_outbox_without_ledger_completes_journal_delivery(
     for label, lease in leases.items():
         pending = authority.cursor_peek(label, nonce=lease.nonce)
         assert [str(row["stream_id"]) for row in pending.items] == [dispatch_id]
+
+
+def test_produce_path_invalidate_cannot_consume_cursor() -> None:
+    """Mutation guard: produce-path snapshot invalidation is not a drain."""
+    src = inspect.getsource(journal.Journal._invalidate_delivery_cursor_snapshots)
+    assert "INSERT INTO controller_stream_cursors" not in src, (
+        "produce path advanced a stream cursor without a consumer"
+    )
+    assert "advanced_by =" not in src, (
+        "produce path stamped advanced_by; only a drain may record a consumer"
+    )
+    assert "backlog_pending = 0" not in src, (
+        "produce path forced backlog_pending=0 and retired unread mail"
+    )
+
+
+def test_terminal_event_leaves_backlog_pending_until_drain(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A live recipient's terminal event stays unconsumed until a named drain."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    lease = _claim(authority, "inbox")
+    before = authority.cursor_status("inbox")
+    assert before is not None
+    assert before["backlog_pending"] == 0
+    assert before["positions"] == {}
+    assert before["advanced_by"] is None
+
+    dispatch_id = "silent-consumption-terminal"
+    prepared = authority.prepare_attempt(dispatch_id)
+    assert prepared.committed and prepared.value is not None
+    committed = authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="complete",
+        observation={"state": "complete", "outcome": {}},
+    )
+    assert committed.committed
+    assert len(authority.project_terminal_outbox(messages_dir=tmp_path / "messages")) == 1
+
+    after_produce = authority.cursor_status("inbox")
+    assert after_produce is not None
+    assert after_produce["backlog_pending"] == 1, (
+        "produce path retired the terminal event before a consumer acted"
+    )
+    assert after_produce["positions"] == {}, (
+        "produce path advanced a stream cursor without a consumer"
+    )
+    assert after_produce["advanced_by"] is None, (
+        "produce path stamped a consumer that did not act"
+    )
+    assert after_produce["advanced_at"] is None
+    peek = authority.cursor_peek("inbox", nonce=lease.nonce)
+    assert [str(row["stream_id"]) for row in peek.items] == [dispatch_id]
+
+    actor = "controller:168:relay-drain"
+    advanced = authority.advance_cursor(
+        "inbox",
+        nonce=lease.nonce,
+        expected_cursor_version=peek.cursor_version,
+        expected_stream_snapshots=peek.stream_snapshots,
+        advances={dispatch_id: 1},
+        actor=actor,
+    )
+    assert advanced.committed
+    after_drain = authority.cursor_status("inbox")
+    assert after_drain is not None
+    assert after_drain["backlog_pending"] == 0
+    assert after_drain["advanced_by"] == actor
+    assert after_drain["advanced_at"]
+    assert after_drain["positions"] == {dispatch_id: 1}
+    drained = authority.cursor_peek("inbox", nonce=lease.nonce)
+    assert drained.items == ()
 
 
 def test_terminal_outbox_retry_heals_partial_recipient_fanout(

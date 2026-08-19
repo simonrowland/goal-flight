@@ -18,7 +18,7 @@ import sys
 import time
 import tempfile
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 
 try:
     import fcntl
@@ -309,15 +309,63 @@ def claim_pending_report(
     *,
     controller_label: str,
     lease_nonce: str,
+    positions: Mapping[str, int] | None = None,
 ) -> bool:
     """First --report-pending arm in this lease generation emits the backlog.
 
-    Later arms keep waiting without reprinting. Two arms racing: exclusive
-    create, exactly one wins. The loser still raises its local high-water
-    from its own peek so the same backlog does not pop every slot. Peek
-    skew (mail arriving between the two peeks) is handled by the earlier
-    listener, whose high-water is older and will still ring.
+    Later arms keep waiting without reprinting. The winner persists the
+    reported high-water so a replacement arm after a superseded exit does
+    not raise the water to its own later peek and swallow events that
+    arrived after the report. Peek skew is then visible to every later
+    arm: they wait beyond the *reported* positions, not beyond whatever
+    happens to be pending at the moment they start.
     """
+    label = str(controller_label or "").strip()
+    nonce = str(lease_nonce or "").strip()
+    if not label or not nonce:
+        raise ValueError("controller label and lease nonce are required")
+    normalized: dict[str, int] = {}
+    for stream, position in dict(positions or {}).items():
+        stream_id = str(stream or "").strip()
+        if not stream_id:
+            continue
+        if not isinstance(position, int) or isinstance(position, bool) or position < 1:
+            raise ValueError("pending-report position is invalid")
+        normalized[stream_id] = position
+    path = _pending_report_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    payload = (json.dumps({"positions": normalized}, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, _open_flags(create_exclusive=True), 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    try:
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:
+                raise OSError(errno.EIO, "short pending-report stamp write")
+            remaining = remaining[written:]
+    finally:
+        os.close(fd)
+    return True
+
+
+def pending_report_high_water(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> dict[str, int] | None:
+    """Return the first-arm reported high-water, or None if none claimed yet."""
     label = str(controller_label or "").strip()
     nonce = str(lease_nonce or "").strip()
     if not label or not nonce:
@@ -328,17 +376,38 @@ def claim_pending_report(
         lease_nonce=nonce,
     )
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, _open_flags(create_exclusive=True), 0o600)
-    except FileExistsError:
-        return False
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
     except OSError:
-        return False
+        return None
+    text = raw.strip()
+    if not text or text == "claimed":
+        # Pre-persistence stamps exist but carry no positions; treat as
+        # unknown so the caller can fall back to its own peek.
+        return None
     try:
-        os.write(fd, b"claimed\n")
-    finally:
-        os.close(fd)
-    return True
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    positions = payload.get("positions")
+    if not isinstance(positions, dict):
+        return None
+    normalized: dict[str, int] = {}
+    for stream, position in positions.items():
+        stream_id = str(stream or "").strip()
+        if not stream_id:
+            continue
+        try:
+            value = int(position)
+        except (TypeError, ValueError):
+            continue
+        if value < 1:
+            continue
+        normalized[stream_id] = value
+    return normalized
 
 
 def _ring_stamp_lock_path(project_root: Path | str, *, controller_label: str) -> Path:

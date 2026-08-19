@@ -2458,6 +2458,26 @@ class Journal:
                     """,
                     (project_root, resolved_label, generation, now),
                 )
+            # A new generation has not consumed anything, but unread mail
+            # already in the journal must stay pending until a drain acts.
+            connection.execute(
+                """
+                UPDATE controller_cursors
+                SET backlog_pending = ?
+                WHERE project_root = ? AND label = ?
+                """,
+                (
+                    1
+                    if self._label_has_unread_delivery(
+                        connection,
+                        project_root=project_root,
+                        label=resolved_label,
+                    )
+                    else 0,
+                    project_root,
+                    resolved_label,
+                ),
+            )
             row = connection.execute(
                 """SELECT * FROM controller_leases
                    WHERE project_root = ? AND label = ? AND generation = ?""",
@@ -2749,7 +2769,61 @@ class Journal:
         return self._domain_write(action)
 
     @staticmethod
+    def _label_has_unread_delivery(
+        connection: sqlite3.Connection,
+        *,
+        project_root: str,
+        label: str,
+    ) -> bool:
+        """True when peek-visible projected mail sits beyond this label's stream cursor."""
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM delivery_events AS e
+            LEFT JOIN controller_stream_cursors AS c
+              ON c.project_root = e.project_root
+             AND c.label = ?
+             AND c.stream_id = e.stream_id
+            WHERE e.project_root = ?
+              AND e.recipient_label IN (?, '*')
+              AND e.projected_at IS NOT NULL
+              AND e.withdrawn_at IS NULL
+              AND e.stream_seq > COALESCE(c.position, 0)
+            LIMIT 1
+            """,
+            (label, project_root, label),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _cursor_labels_for_delivery_invalidation(
+        connection: sqlite3.Connection,
+        *,
+        project_root: str,
+        recipient_label: str,
+        exclude_label: str | None = None,
+    ) -> tuple[str, ...]:
+        if recipient_label == "*":
+            sql = "SELECT label FROM controller_cursors WHERE project_root = ?"
+            parameters: list[object] = [project_root]
+            if exclude_label is not None:
+                sql += " AND label != ?"
+                parameters.append(exclude_label)
+            return tuple(str(row[0]) for row in connection.execute(sql, parameters))
+        if exclude_label is not None and recipient_label == exclude_label:
+            return ()
+        exists = connection.execute(
+            """
+            SELECT 1 FROM controller_cursors
+            WHERE project_root = ? AND label = ?
+            """,
+            (project_root, recipient_label),
+        ).fetchone()
+        return (recipient_label,) if exists is not None else ()
+
+    @classmethod
     def _invalidate_delivery_cursor_snapshots(
+        cls,
         connection: sqlite3.Connection,
         *,
         project_root: str,
@@ -2757,24 +2831,41 @@ class Journal:
         updated_at: str,
         exclude_label: str | None = None,
     ) -> int:
-        """Bump every cursor whose pending view can change for a delivery row."""
-        predicates = ["project_root = ?"]
-        parameters: list[object] = [updated_at, project_root]
-        if recipient_label != "*":
-            predicates.append("label = ?")
-            parameters.append(recipient_label)
-        if exclude_label is not None:
-            predicates.append("label != ?")
-            parameters.append(exclude_label)
-        updated = connection.execute(
-            """
-            UPDATE controller_cursors
-            SET cursor_version = cursor_version + 1, updated_at = ?
-            WHERE """
-            + " AND ".join(predicates),
-            parameters,
+        """Bump snapshot tokens whose pending view can change for a delivery row.
+
+        This is not consumption. Stream positions and ``advanced_by`` stay
+        untouched; ``backlog_pending`` is refreshed from unread projected
+        mail so a produce-path write cannot look like a drain.
+        """
+        labels = cls._cursor_labels_for_delivery_invalidation(
+            connection,
+            project_root=project_root,
+            recipient_label=recipient_label,
+            exclude_label=exclude_label,
         )
-        return int(updated.rowcount)
+        updated = 0
+        for label in labels:
+            pending = (
+                1
+                if cls._label_has_unread_delivery(
+                    connection,
+                    project_root=project_root,
+                    label=label,
+                )
+                else 0
+            )
+            changed = connection.execute(
+                """
+                UPDATE controller_cursors
+                SET cursor_version = cursor_version + 1,
+                    updated_at = ?,
+                    backlog_pending = ?
+                WHERE project_root = ? AND label = ?
+                """,
+                (updated_at, pending, project_root, label),
+            )
+            updated += int(changed.rowcount)
+        return updated
 
     def mark_delivery_projected(
         self,
@@ -3314,27 +3405,6 @@ class Journal:
                     updated_at=now,
                     exclude_label=resolved_label,
                 )
-            updated = connection.execute(
-                """
-                UPDATE controller_cursors
-                SET cursor_version = cursor_version + 1, updated_at = ?,
-                    backlog_pending = 0, advanced_at = ?, advanced_by = ?
-                WHERE project_root = ? AND label = ?
-                  AND registry_generation = ?
-                """,
-                (
-                    now,
-                    now,
-                    actor_value,
-                    project_root,
-                    resolved_label,
-                    generation,
-                ),
-            )
-            if updated.rowcount != 1:
-                raise CASMismatch(
-                    "cursor CAS lost: registry generation changed"
-                )
             for stream, position in normalized_advances.items():
                 connection.execute(
                     """
@@ -3346,6 +3416,48 @@ class Journal:
                         updated_at = excluded.updated_at
                     """,
                     (project_root, resolved_label, stream, position, now),
+                )
+            pending = (
+                1
+                if self._label_has_unread_delivery(
+                    connection,
+                    project_root=project_root,
+                    label=resolved_label,
+                )
+                else 0
+            )
+            updated = connection.execute(
+                """
+                UPDATE controller_cursors
+                SET cursor_version = cursor_version + 1, updated_at = ?,
+                    backlog_pending = ?, advanced_at = ?, advanced_by = ?
+                WHERE project_root = ? AND label = ?
+                  AND registry_generation = ?
+                """,
+                (
+                    now,
+                    pending,
+                    now,
+                    actor_value,
+                    project_root,
+                    resolved_label,
+                    generation,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CASMismatch(
+                    "cursor CAS lost: registry generation changed"
+                )
+            attributed = connection.execute(
+                """
+                SELECT advanced_by FROM controller_cursors
+                WHERE project_root = ? AND label = ?
+                """,
+                (project_root, resolved_label),
+            ).fetchone()
+            if attributed is None or not str(attributed["advanced_by"] or "").strip():
+                raise JournalIntegrityError(
+                    "cursor consume-path write left advanced_by NULL"
                 )
             return {
                 "label": resolved_label,

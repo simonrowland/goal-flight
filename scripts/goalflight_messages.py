@@ -4413,51 +4413,73 @@ def cmd_listen(args) -> int:
             arm_snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
         except goalflight_journal.JournalError:
             arm_snapshot = None
-    if arm_snapshot is not None and arm_snapshot.items:
-        arm_high = _cursor_positions(arm_snapshot.items)
-        # First arm in this lease generation converts the backlog into one
-        # report. Later arms raise the same high-water and stay silent so
-        # pending mail cannot spend the whole pool. Two arms racing: the
-        # exclusive claim decides the reporter; both keep waiting.
-        should_report = goalflight_wake.claim_pending_report(
+        persisted_high = goalflight_wake.pending_report_high_water(
             project_root,
             controller_label=label,
             lease_nonce=nonce,
         )
-        if should_report:
-            # The arm doubles as the peek: emit the same machine-readable
-            # snapshot relay --new --json would, advance command included,
-            # so the awake controller drains the backlog straight from this
-            # output without a second CLI round-trip.
-            arm_advance = _cursor_advance_command(
-                project_root=project_root,
+        if persisted_high is not None:
+            # A prior arm in this generation already reported. Use that
+            # high-water, not this process's later peek — otherwise a
+            # superseded re-arm silently swallows events that arrived after
+            # the report.
+            arm_high = persisted_high
+        elif arm_snapshot is not None and arm_snapshot.items:
+            arm_high = _cursor_positions(arm_snapshot.items)
+            # First arm in this lease generation converts the backlog into one
+            # report. Later arms stay silent so pending mail cannot spend the
+            # whole pool. Two arms racing: the exclusive claim decides the
+            # reporter; both wait beyond the *reported* positions.
+            should_report = goalflight_wake.claim_pending_report(
+                project_root,
                 controller_label=label,
                 lease_nonce=nonce,
-                cursor_version=arm_snapshot.cursor_version,
-                positions=_cursor_positions(arm_snapshot.items),
-                stream_snapshots=arm_snapshot.stream_snapshots,
+                positions=arm_high,
             )
-            arm_payload = {
-                "kind": "pending-at-arm",
-                "items": arm_snapshot.items,
-                "cursor_version": arm_snapshot.cursor_version,
-                "advance_command": arm_advance,
-            }
-            if args.json:
-                print(
-                    json.dumps(arm_payload, sort_keys=True, default=str),
-                    flush=True,
-                )
-            else:
-                arm_items = _envelopes_with_rows(authority, list(arm_snapshot.items))
-                visible_arm_items = _foreign_controller_items(
-                    arm_items,
+            if not should_report:
+                winner_high = goalflight_wake.pending_report_high_water(
+                    project_root,
                     controller_label=label,
                     lease_nonce=nonce,
                 )
-                for row, envelope in visible_arm_items:
-                    print(format_receipt_headline(row, envelope), flush=True)
-                print(f"advance: {arm_advance}", flush=True)
+                if winner_high is not None:
+                    arm_high = winner_high
+            else:
+                # The arm doubles as the peek: emit the same machine-readable
+                # snapshot relay --new --json would, advance command included,
+                # so the awake controller drains the backlog straight from this
+                # output without a second CLI round-trip.
+                arm_advance = _cursor_advance_command(
+                    project_root=project_root,
+                    controller_label=label,
+                    lease_nonce=nonce,
+                    cursor_version=arm_snapshot.cursor_version,
+                    positions=_cursor_positions(arm_snapshot.items),
+                    stream_snapshots=arm_snapshot.stream_snapshots,
+                )
+                arm_payload = {
+                    "kind": "pending-at-arm",
+                    "items": arm_snapshot.items,
+                    "cursor_version": arm_snapshot.cursor_version,
+                    "advance_command": arm_advance,
+                }
+                if args.json:
+                    print(
+                        json.dumps(arm_payload, sort_keys=True, default=str),
+                        flush=True,
+                    )
+                else:
+                    arm_items = _envelopes_with_rows(
+                        authority, list(arm_snapshot.items)
+                    )
+                    visible_arm_items = _foreign_controller_items(
+                        arm_items,
+                        controller_label=label,
+                        lease_nonce=nonce,
+                    )
+                    for row, envelope in visible_arm_items:
+                        print(format_receipt_headline(row, envelope), flush=True)
+                    print(f"advance: {arm_advance}", flush=True)
 
     while True:
         parent_result = parent_exit()
