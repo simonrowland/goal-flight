@@ -3774,6 +3774,54 @@ def _cursor_advance_command(
     return shlex.join(argv)
 
 
+def _active_controller_labels(authority) -> list[str]:
+    """ACTIVE lease labels for this project, in journal roster order."""
+    labels: list[str] = []
+    seen: set[str] = set()
+    for row in authority.lease_records():
+        label = str(row.get("label") or "").strip()
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+    return labels
+
+
+def _explicit_controller_label() -> str | None:
+    """Return only an operator-declared label, never a repo-name guess."""
+    label = str(os.environ.get("GOALFLIGHT_CONTROLLER_LABEL") or "").strip()
+    return label[:64] or None
+
+
+def _require_relay_controller_label(authority) -> str:
+    """Return the unique mailbox relay may inspect.
+
+    ``GOALFLIGHT_CONTROLLER_LABEL`` is explicit identity. A unique ACTIVE
+    lease is the bash-tool fallback (those calls drop the session label).
+    Zero or several ACTIVE leases without an explicit match are a
+    refusal: drain must never report empty without looking.
+    """
+    explicit = _explicit_controller_label()
+    labels = _active_controller_labels(authority)
+    roster = ", ".join(labels) if labels else "(none)"
+    if explicit:
+        if explicit in labels:
+            return explicit
+        raise MessageError(
+            f"controller label {explicit!r} is not among ACTIVE leases: {roster}"
+        )
+    if len(labels) == 1:
+        return labels[0]
+    if not labels:
+        raise MessageError(
+            "no ACTIVE controller lease; set GOALFLIGHT_CONTROLLER_LABEL"
+        )
+    raise MessageError(
+        f"ambiguous ACTIVE controller leases: {roster}; "
+        "set GOALFLIGHT_CONTROLLER_LABEL"
+    )
+
+
 def cmd_relay(args: argparse.Namespace) -> int:
     """Peek at journal-pending assignments, optionally draining that snapshot."""
     drain = bool(getattr(args, "drain", False))
@@ -3783,30 +3831,11 @@ def cmd_relay(args: argparse.Namespace) -> int:
         return 2
     try:
         import goalflight_journal  # type: ignore
-        import goalflight_session_status as sessions  # type: ignore
         import goalflight_task  # type: ignore
 
         root = goalflight_task.resolve_project_root(str(project_root))
         authority = goalflight_journal.Journal(root)
-        controller_label = sessions.resolve_controller_label(project_root=root)
-        if controller_label is None:
-            active = authority.lease_records()
-            controller_label = str(active[0]["label"]) if len(active) == 1 else None
-        if controller_label is None:
-            if drain:
-                if getattr(args, "json", False):
-                    print(
-                        json.dumps(
-                            {"drained": 0, "items": [], "status": "no_mail"},
-                            sort_keys=True,
-                        )
-                    )
-                else:
-                    print("no mail")
-            else:
-                print("no pending journal events")
-            emit_listener_activity_signal(project_root=root)
-            return 0
+        controller_label = _require_relay_controller_label(authority)
         lease = authority.active_lease(controller_label)
         if lease is None:
             raise MessageError("active controller lease is unavailable")

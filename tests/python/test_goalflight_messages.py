@@ -319,6 +319,212 @@ def test_relay_drain_backlog_none_and_json_mutation_pair() -> None:
             assert_true("drain bypasses wake-entry notices", wake_notice.call_count == 0)
 
 
+def test_relay_drain_ambiguous_identity_refuses_instead_of_no_mail() -> None:
+    """Drain may print 'no mail' only after looking at a uniquely resolved mailbox."""
+    import goalflight_journal
+
+    argv = ["relay", "--drain"]
+
+    def run_drain(
+        project: Path,
+        env: dict[str, str],
+        extra_env: dict[str, str] | None = None,
+        extra_argv: list[str] | None = None,
+    ) -> tuple[int, str, str]:
+        merged = dict(env)
+        if extra_env:
+            merged.update(extra_env)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, merged, clear=False),
+            mock.patch.object(
+                _carrier_messages,
+                "_current_project_root",
+                return_value=project,
+            ),
+            mock.patch.object(
+                _carrier_messages,
+                "emit_wake_entry_notice",
+                side_effect=AssertionError("drain must not emit a wake-entry notice"),
+            ),
+        ):
+            os.environ.pop("GOALFLIGHT_DISPATCH_ID", None)
+            if "GOALFLIGHT_CONTROLLER_LABEL" not in (extra_env or {}):
+                os.environ.pop("GOALFLIGHT_CONTROLLER_LABEL", None)
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = _carrier_messages.main([*argv, *(extra_argv or [])])
+        return rc, stdout.getvalue(), stderr.getvalue()
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        with mock.patch.dict(os.environ, env, clear=False):
+            os.environ.pop("GOALFLIGHT_CONTROLLER_LABEL", None)
+            authority = goalflight_journal.open_or_create_journal(project)
+            for label in ("ghard", "pm2", "pm2-main"):
+                claimed = authority.claim_or_renew_lease(
+                    label,
+                    principal={"principal_id": f"{label}-principal"},
+                )
+                assert_true(f"{label} lease claimed", claimed.committed)
+            _post_journal_controller_mail(
+                project=project,
+                messages_dir=messages_dir,
+                label="pm2",
+                dispatch_id="stranded-pm2",
+            )
+            lease = authority.active_lease("pm2")
+            assert_true("pm2 lease readable", lease is not None)
+            before = authority.cursor_peek("pm2", nonce=lease.nonce, limit=1000)
+            assert_true("event is peekable for pm2", len(list(before.items)) == 1)
+
+        rc, stdout, stderr = run_drain(project, env)
+        after_refuse = authority.cursor_peek("pm2", nonce=lease.nonce, limit=1000)
+        assert_true("ambiguous drain exits 2", rc == 2)
+        assert_true("ambiguous drain writes no stdout", stdout == "")
+        assert_true(
+            "ambiguous drain does not print no mail",
+            "no mail" not in stdout and "no mail" not in stderr,
+        )
+        assert_true(
+            "ambiguous drain names the ambiguity",
+            "ambiguous ACTIVE controller leases:" in stderr,
+        )
+        assert_true(
+            "ambiguous drain lists every ACTIVE label",
+            "ghard, pm2, pm2-main" in stderr,
+        )
+        assert_true(
+            "ambiguous drain names the identity knob",
+            "GOALFLIGHT_CONTROLLER_LABEL" in stderr,
+        )
+        assert_true(
+            "peekable event survives the refusal",
+            len(list(after_refuse.items)) == 1,
+        )
+
+        json_rc, json_out, json_err = run_drain(project, env, extra_argv=["--json"])
+        assert_true("ambiguous JSON drain exits 2", json_rc == 2)
+        assert_true("ambiguous JSON drain writes no stdout", json_out == "")
+        assert_true(
+            "ambiguous JSON drain does not emit no_mail status",
+            "no_mail" not in json_out and "no mail" not in json_err,
+        )
+        assert_true(
+            "ambiguous JSON drain still names the ambiguity",
+            "ambiguous ACTIVE controller leases:" in json_err,
+        )
+
+        rc, stdout, stderr = run_drain(
+            project, env, extra_env={"GOALFLIGHT_CONTROLLER_LABEL": "pm2"}
+        )
+        after_drain = authority.cursor_peek("pm2", nonce=lease.nonce, limit=1000)
+        assert_true("unambiguous drain succeeds", rc == 0)
+        assert_true("unambiguous drain writes no stderr", stderr == "")
+        assert_true("unambiguous drain receipts the peekable item", "stranded-pm2" in stdout)
+        assert_true("unambiguous drain empties that mailbox", len(list(after_drain.items)) == 0)
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "pm2"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        with mock.patch.dict(os.environ, env, clear=False):
+            os.environ.pop("GOALFLIGHT_CONTROLLER_LABEL", None)
+            authority = goalflight_journal.open_or_create_journal(project)
+            for label in ("ghard", "pm2", "pm2-main"):
+                claimed = authority.claim_or_renew_lease(
+                    label,
+                    principal={"principal_id": f"{label}-principal"},
+                )
+                assert_true(f"{label} lease claimed in pm2-named project", claimed.committed)
+            _post_journal_controller_mail(
+                project=project,
+                messages_dir=messages_dir,
+                label="pm2-main",
+                dispatch_id="stranded-pm2-main",
+            )
+            lease = authority.active_lease("pm2-main")
+            assert_true("pm2-main lease readable", lease is not None)
+            peekable = authority.cursor_peek("pm2-main", nonce=lease.nonce, limit=1000)
+            assert_true(
+                "event is peekable for pm2-main",
+                len(list(peekable.items)) == 1,
+            )
+
+        rc, stdout, stderr = run_drain(project, env)
+        still = authority.cursor_peek("pm2-main", nonce=lease.nonce, limit=1000)
+        assert_true("repo-name collision still exits 2", rc == 2)
+        assert_true(
+            "repo-name collision does not print no mail",
+            "no mail" not in stdout and "no mail" not in stderr,
+        )
+        assert_true(
+            "repo-name collision names the ambiguity",
+            "ambiguous ACTIVE controller leases:" in stderr,
+        )
+        assert_true(
+            "pm2-main mail remains peekable after the repo-name guess is refused",
+            len(list(still.items)) == 1,
+        )
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        with mock.patch.dict(os.environ, env, clear=False):
+            os.environ.pop("GOALFLIGHT_CONTROLLER_LABEL", None)
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                "only-ctl",
+                principal={"principal_id": "only-principal"},
+            )
+            assert_true("unique lease claimed", claimed.committed)
+            _post_journal_controller_mail(
+                project=project,
+                messages_dir=messages_dir,
+                label="only-ctl",
+                dispatch_id="unique-mail",
+            )
+            lease = authority.active_lease("only-ctl")
+            assert_true("unique lease readable", lease is not None)
+
+        rc, stdout, stderr = run_drain(project, env)
+        after = authority.cursor_peek("only-ctl", nonce=lease.nonce, limit=1000)
+        assert_true("unique-lease drain succeeds without env label", rc == 0)
+        assert_true("unique-lease drain receipts the item", "unique-mail" in stdout)
+        assert_true("unique-lease drain writes no stderr", stderr == "")
+        assert_true("unique-lease drain empties the mailbox", len(list(after.items)) == 0)
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        env = _journal_test_env(base)
+        with mock.patch.dict(os.environ, env, clear=False):
+            os.environ.pop("GOALFLIGHT_CONTROLLER_LABEL", None)
+            goalflight_journal.open_or_create_journal(project)
+
+        rc, stdout, stderr = run_drain(project, env)
+        assert_true("empty-roster drain exits 2", rc == 2)
+        assert_true("empty-roster drain writes no stdout", stdout == "")
+        assert_true(
+            "empty-roster drain does not print no mail",
+            "no mail" not in stdout and "no mail" not in stderr,
+        )
+        assert_true(
+            "empty-roster drain names the missing lease",
+            "no ACTIVE controller lease" in stderr,
+        )
+
+
 def test_relay_skips_self_peek_but_drain_receipts_self_and_foreign_mutation_pair() -> None:
     import goalflight_journal
 
