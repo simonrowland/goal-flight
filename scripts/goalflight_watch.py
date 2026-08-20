@@ -526,23 +526,37 @@ def _finish_existing_ledger(
     codex_dispatch_home_resolved: bool = False,
     codex_session_id: str | None = None,
     terminal_marker: dict | None = None,
+    headline: str | None = None,
 ) -> dict | None:
     if not dispatch_id or not state:
         return None
     if state == "watcher_stopped" and worker_still_alive is True:
         return None
     emitter_reason: object = reason
+    headline_text = headline.strip() if isinstance(headline, str) else ""
     if (
         isinstance(terminal_marker, dict)
         and terminal_marker.get("kind") in WORKER_MAIL_MARKER_KINDS
     ):
+        marker_text = _strip_marker_decoration(
+            str(terminal_marker.get("text") or "")
+        ).strip()
         emitter_reason = {
             "reason": reason,
             "marker_kind": terminal_marker.get("kind"),
-            "text": _strip_marker_decoration(
-                str(terminal_marker.get("text") or "")
-            ).strip(),
+            "text": marker_text,
         }
+        if not headline_text:
+            headline_text = marker_text
+    elif (
+        not headline_text
+        and isinstance(terminal_marker, dict)
+        and terminal_marker.get("kind") in HEADLINE_MAIL_MARKER_KINDS
+    ):
+        headline_text = _strip_marker_decoration(
+            str(terminal_marker.get("text") or "")
+        ).strip()
+    headline_text = headline_text or None
     try:
         path = goalflight_ledger.record_path(dispatch_id, create=False)
         if not path.exists():
@@ -556,6 +570,7 @@ def _finish_existing_ledger(
                 worker_still_alive=(
                     worker_still_alive if isinstance(worker_still_alive, bool) else None
                 ),
+                headline=headline_text,
             )
             if committed.committed:
                 return None
@@ -580,6 +595,7 @@ def _finish_existing_ledger(
                             terminal_state=None,
                             elapsed_s=None,
                             worker_still_alive=worker_still_alive,
+                            headline=headline_text,
                         )
                     )
                 if code == 0:
@@ -1463,6 +1479,12 @@ def extract_markers(path: Path, max_bytes: int = 10 * 1024 * 1024,
 # status check. (They are also terminal markers — the worker stops and waits — so
 # each is normally emitted once.)
 WORKER_MAIL_MARKER_KINDS = frozenset({"USER-NEED", "USER-CONFIRM", "BLOCKED"})
+# Headline kinds whose text becomes the terminal outbox line even when the
+# live verdict was idle_timeout (or another liveness miss). COMPLETE belongs
+# here: a finished worker whose watcher called idle first still delivered work.
+HEADLINE_MAIL_MARKER_KINDS = (
+    SUCCESS_TERMINAL_MARKERS | BLOCKING_TERMINAL_MARKERS | WORKER_MAIL_MARKER_KINDS
+)
 
 # Sentinel parked in the dedup set after any mail-layer failure: the bridge then
 # no-ops for the rest of the watcher run. A real (type, text) key can never equal
@@ -1552,6 +1574,47 @@ def _last_line_is_terminal_marker(
     ):
         return None
     return marker
+
+
+def _is_headline_kind(marker: object) -> bool:
+    return isinstance(marker, dict) and marker.get("kind") in HEADLINE_MAIL_MARKER_KINDS
+
+
+def harvest_headline_marker(
+    payload: dict,
+    tail: Path,
+    *,
+    ignore_prefix_lines: list[str] | None = None,
+    kimi_output: bool = False,
+    expected_dispatch_id: str | None = None,
+) -> dict | None:
+    """Return COMPLETE/BLOCKED/… even when the live verdict skipped harvesting.
+
+    Live detection is last-line-only and idle_timeout used to stop without a
+    final scan, so a worker that signed off and then went quiet arrived with
+    ``last_marker is None``. Terminal writes rescan the tail; the verdict is
+    not rewritten.
+    """
+    for candidate in (payload.get("terminal_marker"), payload.get("last_marker")):
+        if _is_headline_kind(candidate):
+            return candidate  # type: ignore[return-value]
+    for marker in reversed(list(payload.get("markers") or [])):
+        if _is_headline_kind(marker):
+            return marker
+    harvested = _final_terminal_marker(
+        tail,
+        ignore_prefix_lines=ignore_prefix_lines,
+        kimi_output=kimi_output,
+        expected_dispatch_id=expected_dispatch_id,
+        full_file_fallback=True,
+    )
+    if _is_headline_kind(harvested):
+        return harvested
+    markers, _size = extract_markers(tail, ignore_prefix_lines=ignore_prefix_lines)
+    for marker in reversed(markers):
+        if _is_headline_kind(marker):
+            return marker
+    return None
 
 
 def _recorded_terminal_success_marker(
@@ -2268,7 +2331,21 @@ def main() -> int:
             )
         if reason:
             payload["reason"] = reason
+        mail_marker: dict | None = None
+        terminal_marker: dict | object | None = None
         if terminal_write:
+            harvested_headline = harvest_headline_marker(
+                payload,
+                tail,
+                ignore_prefix_lines=ignore_prefix_lines,
+                kimi_output=moonshot_family(args.agent),
+                expected_dispatch_id=args.dispatch_id,
+            )
+            if harvested_headline is not None and not _is_headline_kind(
+                payload.get("last_marker")
+            ):
+                payload["last_marker"] = harvested_headline
+            mail_marker = harvested_headline
             terminal_marker = payload.get("terminal_marker") or terminal_seen
             final_state, final_reason, _limit_reached = goalflight_terminal.terminal_rate_limit_outcome(
                 payload.get("state"),
@@ -2345,6 +2422,22 @@ def main() -> int:
             payload["liveness_state"] = goalflight_terminal.terminal_liveness_state(payload.get("state"))
         ledger_error = None
         if terminal_write:
+            blocking_marker = (
+                terminal_marker
+                if isinstance(terminal_marker, dict)
+                and terminal_marker.get("kind") in WORKER_MAIL_MARKER_KINDS
+                else None
+            )
+            headline_marker = (
+                mail_marker
+                if isinstance(mail_marker, dict)
+                else blocking_marker
+            )
+            headline_text = None
+            if isinstance(headline_marker, dict):
+                headline_text = _strip_marker_decoration(
+                    str(headline_marker.get("text") or "")
+                ).strip() or None
             ledger_error = _finish_existing_ledger(
                 args.dispatch_id,
                 payload.get("state"),
@@ -2356,9 +2449,8 @@ def main() -> int:
                     args.codex_dispatch_home_resolved
                 ),
                 codex_session_id=codex_session_id,
-                terminal_marker=(
-                    terminal_marker if isinstance(terminal_marker, dict) else None
-                ),
+                terminal_marker=blocking_marker,
+                headline=headline_text,
             )
             if ledger_error:
                 payload["terminal_pending_state"] = payload.get("state")

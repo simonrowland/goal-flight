@@ -244,6 +244,16 @@ CONTROLLER_CHANNEL_TYPES = frozenset(
         "notice",
     }
 )
+# Typed aliases that may carry a controller addressee without joining the
+# controller-channel aggregate. This is how a side controller lands a patch on
+# main without pushing to the remote.
+CONTROLLER_ADDRESSEE_TYPES = CONTROLLER_CHANNEL_TYPES | frozenset(
+    {
+        "merge-request",
+        "patch",
+        "finding",
+    }
+)
 CONTROLLER_LISTENER_ESCALATION_TYPES = frozenset({"user_need", "user_confirm", "blocked"})
 TASK_STORE_STATUS_NUDGE_KINDS = frozenset({"parallel-ready", "resume-ready", "done-suggest"})
 NON_ERROR_UNDELIVERED_STATUSES = frozenset({"terminal_recorded_only", "worker_view_queued"})
@@ -651,9 +661,14 @@ def validate_envelope(
             raise MessageError(
                 f"{path}.addressee.project_root: expected canonical root {canonical_root!r}"
             )
-        if canonical_event_type(str(envelope.get("type") or "")) not in CONTROLLER_CHANNEL_TYPES:
+        raw_type = str(envelope.get("type") or "")
+        if (
+            canonical_event_type(raw_type) not in CONTROLLER_CHANNEL_TYPES
+            and raw_type not in CONTROLLER_ADDRESSEE_TYPES
+        ):
             raise MessageError(
-                f"{path}.addressee: controller addressing is only valid for controller-channel types"
+                f"{path}.addressee: controller addressing is only valid for "
+                "controller-channel types or merge-request/patch/finding"
             )
     return _canonical_json_text(envelope, path=path, byte_limit=MAX_ENVELOPE_JSON_BYTES)
 
@@ -3595,6 +3610,19 @@ def split_fresh_and_stale(
 
 HEADLINE_MAX = 96
 DRAIN_HEADLINE_MAX = 100
+# Drain leads with mail a controller must act on. Aliases are matched on the
+# stored type (merge-request stays merge-request, not advisory).
+DRAIN_SIGNAL_TYPES = frozenset(
+    {
+        "merge-request",
+        "patch",
+        "finding",
+        "controller-question",
+        "user_need",
+        "blocked",
+    }
+)
+DRAIN_PATCH_TYPES = frozenset({"merge-request", "patch"})
 
 
 def sanitize_display(value: object, *, limit: int | None = None) -> str:
@@ -3676,6 +3704,77 @@ def envelope_authored_by_controller(
     )
 
 
+def is_drain_chatter(envelope: dict) -> bool:
+    """True for a worker-terminal notice whose only content is a state change."""
+    if not isinstance(envelope, dict):
+        return False
+    payload = envelope.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    text = payload.get("text") if isinstance(payload.get("text"), str) else ""
+    text = text.strip()
+    terminal_state = payload.get("terminal_state")
+    source = envelope.get("source")
+    source = source if isinstance(source, dict) else {}
+    from_worker_terminal = (
+        source.get("adapter") == "journal-outbox"
+        or source.get("transport") == "journal"
+        or "terminal_state" in payload
+    )
+    if not from_worker_terminal:
+        return False
+    if not text:
+        return True
+    if text.startswith("dispatch terminal:"):
+        return True
+    if terminal_state not in (None, "") and text == str(terminal_state):
+        return True
+    return False
+
+
+def drain_rank(envelope: dict) -> int:
+    """0 = signal, 1 = other, 2 = worker-terminal state-change chatter."""
+    if is_drain_chatter(envelope):
+        return 2
+    raw_type = str(envelope.get("type") or "")
+    if raw_type in DRAIN_SIGNAL_TYPES:
+        return 0
+    return 1
+
+
+def order_drain_items(
+    items: list[tuple[dict, dict]],
+) -> list[tuple[dict, dict]]:
+    """Stable sort: signal, then other, then chatter. Nothing is dropped."""
+    return sorted(
+        items,
+        key=lambda pair: drain_rank(pair[1] if isinstance(pair[1], dict) else {}),
+    )
+
+
+def _patch_next_action(payload: dict) -> str:
+    if payload.get("patch") or payload.get("diff"):
+        return "git apply"
+    text = payload.get("text") if isinstance(payload.get("text"), str) else ""
+    stripped = text.lstrip()
+    if stripped.startswith("From ") or stripped.startswith("From:"):
+        return "git am"
+    return "git apply"
+
+
+def format_patch_drain_head(envelope: dict) -> str:
+    """One line: what it carries, from whom, what to run next."""
+    payload = envelope.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    who = envelope_from(envelope)
+    action = _patch_next_action(payload)
+    suffix = f" from {who} · next: {action}"
+    carries = envelope_headline(envelope)
+    room = DRAIN_HEADLINE_MAX - len(suffix)
+    if room > 8:
+        return sanitize_display(carries, limit=room) + suffix
+    return sanitize_display(f"{carries}{suffix}", limit=DRAIN_HEADLINE_MAX)
+
+
 def format_receipt_headline(row: dict, envelope: dict) -> str:
     """The terse item line shared by arm reports and drain receipts."""
     kind = sanitize_display(
@@ -3684,7 +3783,11 @@ def format_receipt_headline(row: dict, envelope: dict) -> str:
     )
     stream = sanitize_display(row.get("stream_id") or envelope.get("dispatch_id") or "?", limit=80)
     seq = sanitize_display(row.get("stream_seq") or envelope.get("seq") or "?", limit=20)
-    payload_head = sanitize_display(envelope_headline(envelope), limit=DRAIN_HEADLINE_MAX)
+    raw_type = str(envelope.get("type") or row.get("event_type") or "")
+    if raw_type in DRAIN_PATCH_TYPES:
+        payload_head = format_patch_drain_head(envelope)
+    else:
+        payload_head = sanitize_display(envelope_headline(envelope), limit=DRAIN_HEADLINE_MAX)
     return f"[{kind}] {stream} seq={seq} — {payload_head}"
 
 
@@ -3842,6 +3945,8 @@ def cmd_relay(args: argparse.Namespace) -> int:
         peek = authority.cursor_peek(controller_label, nonce=lease.nonce, limit=1000)
         rows = list(peek.items)
         items_with_rows = _envelopes_with_rows(authority, rows)
+        if drain:
+            items_with_rows = order_drain_items(items_with_rows)
         envelopes = [envelope for _row, envelope in items_with_rows]
         visible_items = _foreign_controller_items(
             items_with_rows,

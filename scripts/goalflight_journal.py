@@ -135,6 +135,64 @@ ATTEMPT_ABANDONED = "ABANDONED"
 ATTEMPT_LIVE_STATES = (ATTEMPT_PREPARED, ATTEMPT_STARTING, ATTEMPT_RUNNING)
 ATTEMPT_FINAL_STATES = (ATTEMPT_TERMINAL, ATTEMPT_ABANDONED)
 TERMINAL_EVENT_TYPES = frozenset({"result", "blocked", "user_need", "user_confirm"})
+# Worker marker kinds whose payload is the human-facing outbox line. The
+# machine-readable terminal_state stays on the envelope; only `text` changes.
+OUTBOX_HEADLINE_MARKER_KINDS = frozenset(
+    {
+        "COMPLETE",
+        "READY",
+        "RESULT",
+        "BLOCKED",
+        "FAILED",
+        "USER-NEED",
+        "USER-CONFIRM",
+    }
+)
+
+
+def outbox_headline_text(terminal_state: str, observation: object) -> str:
+    """Human-facing outbox line: worker marker text, else the state string.
+
+    Controllers drain this field. A completed worker's own COMPLETE/BLOCKED
+    headline is the work; ``dispatch terminal: <state>`` is only the fallback
+    when no marker was harvested. ``terminal_state`` on the same payload is
+    unchanged. Completions travel on ``headline``, not ``outcome.error``.
+    """
+    fallback = f"dispatch terminal: {terminal_state}"
+    if not isinstance(observation, dict):
+        return fallback
+    headline = observation.get("headline")
+    if isinstance(headline, str) and headline.strip():
+        return headline.strip()
+    for key in ("last_marker", "terminal_marker"):
+        marker = observation.get(key)
+        if not isinstance(marker, dict):
+            continue
+        kind = marker.get("kind")
+        text = marker.get("text")
+        if (
+            kind in OUTBOX_HEADLINE_MARKER_KINDS
+            and isinstance(text, str)
+            and text.strip()
+        ):
+            return text.strip()
+        for marker_kind, marker_text in marker.items():
+            if (
+                marker_kind in OUTBOX_HEADLINE_MARKER_KINDS
+                and isinstance(marker_text, str)
+                and marker_text.strip()
+            ):
+                return marker_text.strip()
+    # Pre-headline records stored the worker line on the error channel.
+    outcome = observation.get("outcome")
+    error = outcome.get("error") if isinstance(outcome, dict) else None
+    if isinstance(error, dict):
+        text = error.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return fallback
+
+
 START_CLAIM_DEADLINE_S = 300.0
 # Compatibility horizon for the legacy schema/API.  The derived deadline is
 # telemetry only; held kernel locks are the sole lease-liveness authority.
@@ -3938,20 +3996,13 @@ class Journal:
                 ATTEMPT_ABANDONED if terminal == "abandoned" else ATTEMPT_TERMINAL
             )
             observation_value = json.loads(observation_json)
-            outcome = (
-                observation_value.get("outcome")
-                if isinstance(observation_value, dict)
-                else None
-            )
-            error = outcome.get("error") if isinstance(outcome, dict) else None
-            marker_text = error.get("text") if isinstance(error, dict) else None
             payload = {
                 "attempt_id": attempt,
                 "transition_id": transition_id,
                 "dispatch_id": str(existing["dispatch_id"]),
                 "terminal_state": terminal,
                 "complete": resolved_event_type == "result",
-                "text": str(marker_text or f"dispatch terminal: {terminal}"),
+                "text": outbox_headline_text(terminal, observation_value),
                 "observation": observation_value,
             }
             payload_json = self._json_object(payload, label="outbox_payload")

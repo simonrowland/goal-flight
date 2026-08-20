@@ -43,10 +43,18 @@ surfaces do not exist. The journal cursor is the sole delivery position.
 
 `relay --drain` is the explicit composed read-receipt path. It prints one bounded
 `[type] stream seq=N — payload head` line for every item before the terse cursor
-receipt; `--json` carries those same receipted envelopes in `items`. Use it only
-when reading those headlines settles the work. If an item needs its body or any
-other processing, peek first and run the emitted exact `advance` command only after
+receipt; `--json` carries those same receipted envelopes in `items`. Signal
+(`merge-request`, `patch`, `finding`, `controller-question`, `user_need`,
+`blocked`) sorts first; worker-terminal notices whose only content is a state
+change sort last. Nothing that arrived is hidden, and the drained count still
+matches the snapshot. Use it only when reading those headlines settles the work.
+If an item needs its body or any other processing, peek first (`relay --new`
+keeps arrival order) and run the emitted exact `advance` command only after
 that processing finishes. Receipt means settled, not merely observed.
+
+A worker-terminal item's headline is the worker's own `COMPLETE` / `BLOCKED`
+marker text when one was harvested — including when the watcher called the run
+`idle_timeout`. The state string is the fallback, not the default.
 
 ## Send
 
@@ -61,6 +69,27 @@ python3 <skill-root>/scripts/goalflight_messages.py post \
 current canonical git project and is needed only for explicit cross-project mail.
 Producers record the journal assignment before projecting the JSONL carrier; retry
 heals an unprojected assignment rather than creating a second store.
+
+## Patch flow — mail is how work leaves a controller
+
+Do not push to the remote to land a branch. Post typed mail; the receiving
+controller applies it.
+
+```bash
+python3 <skill-root>/scripts/goalflight_messages.py post \
+  --dispatch-id <topic-slug> --type merge-request \
+  --to-controller <label> --subject '<what the patch does>' \
+  --text "$(git format-patch --stdout origin/main)"
+```
+
+`patch` is the same apply path with a unified diff. Findings and questions use
+the same `post` command with `--type finding` or `--type controller-question`.
+
+`relay --drain` leads with those types. A merge-request/patch line is one line:
+what it carries, who sent it, and the next command (`git am` for an mbox
+patch, `git apply` otherwise). The body is in the receipted envelope
+(`relay --drain --json`, or `read --dispatch-id <id> --last 1`). Worker-terminal
+state-change notices still appear; they sort after signal.
 
 ## Pop-one listener pool
 

@@ -6,6 +6,18 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Changed
+
+- Terminal mail carries the worker's own COMPLETE/BLOCKED headline instead of
+  `dispatch terminal: <state>`. The headline travels on a dedicated observation
+  field, not the error channel, so a clean completion still has top-level
+  `reason` and no `error`. The watcher still harvests that marker when it
+  rules `idle_timeout` first. `relay --drain` leads with actionable types
+  (`merge-request`, `patch`, `finding`, `controller-question`, `user_need`,
+  `blocked`) and demotes worker-terminal state-change chatter without hiding
+  it; merge-request/patch lines name the patch, the sender, and `git am` /
+  `git apply`.
+
 ### Fixed
 
 - A grok dispatch into a seat home whose `config.toml` has no
