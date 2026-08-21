@@ -69,12 +69,20 @@ def test_epoch_fence_names_resume_before_arithmetic(
     _set_state_env(monkeypatch, tmp_path)
     project = _project(tmp_path)
     authority = journal.Journal.create(project)
+    # Derive the journal's epoch from the client's rather than pinning a
+    # literal. This test needs a journal exactly one epoch AHEAD of the
+    # client; a hard-coded number silently becomes "equal" the moment the
+    # client is bumped, and an equal epoch raises nothing, so the test fails
+    # claiming the fence is broken when only the fixture went stale. That is
+    # what happened when the seat-attribution columns moved the client 5 -> 6.
+    ahead = journal.CURRENT_SCHEMA_EPOCH + 1
     with sqlite3.connect(authority.path) as connection:
         connection.execute(
             """UPDATE journal_epochs
-               SET schema_epoch = 6, protocol_epoch = 6, registry_epoch = 6,
-                   minimum_reader_epoch = 6, minimum_writer_epoch = 6
-               WHERE singleton = 1"""
+               SET schema_epoch = ?, protocol_epoch = ?, registry_epoch = ?,
+                   minimum_reader_epoch = ?, minimum_writer_epoch = ?
+               WHERE singleton = 1""",
+            (ahead, ahead, ahead, ahead, ahead),
         )
 
     with pytest.raises(journal.JournalUpgradeRequired) as captured:
@@ -85,7 +93,7 @@ def test_epoch_fence_names_resume_before_arithmetic(
         "UPGRADE_REQUIRED: restart this session onto the deployed skill: "
         "/goal-flight resume;"
     )
-    assert "schema client=5 journal=6" in message
+    assert f"schema client={journal.CURRENT_SCHEMA_EPOCH} journal={ahead}" in message
     assert message.count("\n") == 0
     assert not isinstance(captured.value, journal.JournalIntegrityError)
     assert journal.main(["--project-root", str(project), "inspect"]) == 2

@@ -11105,6 +11105,7 @@ def main(argv: list[str] | None = None) -> int:
     summary_head = {
         "dispatch_id": args.dispatch_id,
         "agent": args.agent,
+        "engine": _account_engine(args.agent) or args.agent,
         "worker_pid": None,
         "tail": str(tail),
         "status_json": str(status_json),
@@ -11445,6 +11446,8 @@ def main(argv: list[str] | None = None) -> int:
             registration_errors.append(_registration_error("record_ledger_running", e))
 
         summary_head.update({"worker_pid": worker_pid, "worker_identity": worker_identity_token})
+        if effective_account:
+            summary_head["effective_account"] = effective_account
         if registration_errors:
             summary_head["registration_errors"] = registration_errors
             with contextlib.suppress(Exception):

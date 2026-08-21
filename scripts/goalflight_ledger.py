@@ -797,6 +797,8 @@ def cmd_record(args: argparse.Namespace) -> int:
             owner_session_nonce=(
                 controller_session_id if owner_controller_label is not None else None
             ),
+            effective_account=effective_account,
+            engine=engine,
         )
         if not prepared.committed or prepared.value is None:
             print(

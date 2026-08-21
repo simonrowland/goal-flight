@@ -39,6 +39,8 @@ def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journals"))
+    monkeypatch.setenv("GOALFLIGHT_MESSAGES_DIR", str(tmp_path / "messages"))
     monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
     monkeypatch.setenv("GOALFLIGHT_CODEX_STATE_DIR", str(tmp_path / "codex-state"))
     monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", "/dev/null")
@@ -205,7 +207,9 @@ def _stub_bash_launch(
 
 
 def test_bash_pin_is_applied_after_capacity_and_reaches_spawn(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     home = tmp_path / "dispatch-home"
     home.mkdir()
@@ -221,6 +225,20 @@ def test_bash_pin_is_applied_after_capacity_and_reaches_spawn(
         for call in ledger_calls
         if call["state"] in {"starting", "running"}
     ] == ["seat-a", "seat-a"]
+    dispatch_start = next(
+        json.loads(line.removeprefix("DISPATCH-START "))
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("DISPATCH-START ")
+    )
+    row = D.goalflight_journal.Journal(tmp_path).read_all(
+        """SELECT effective_account, engine
+           FROM dispatch_attempts WHERE dispatch_id = ?""",
+        ("bash-seat-seam",),
+    )[0]
+    assert dispatch_start["effective_account"] == "seat-a"
+    assert row["effective_account"] == dispatch_start["effective_account"]
+    assert row["effective_account"] != "explicit-seat"
+    assert row["engine"] == dispatch_start["engine"] == "codex"
 
 
 def test_bash_launch_survives_missing_starting_ledger_projection(
@@ -290,6 +308,13 @@ def test_bash_resolve_none_preserves_inherited_environment(
     )
     assert "CODEX_HOME" not in worker_spawn["env"]
     assert all(call.get("effective_account") is None for call in ledger_calls)
+    row = D.goalflight_journal.Journal(tmp_path).read_all(
+        """SELECT effective_account, engine
+           FROM dispatch_attempts WHERE dispatch_id = ?""",
+        ("bash-seat-seam",),
+    )[0]
+    assert row["effective_account"] is None
+    assert row["engine"] == "codex"
 
 
 def test_bash_ext_absent_preserves_spawn_and_stays_quiet(
@@ -396,6 +421,7 @@ def _ledger_args(dispatch_id: str) -> argparse.Namespace:
 
 def test_ledger_persists_and_surfaces_effective_account_only_when_pinned(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(D, "_export_dashboard_status_for_project", lambda *_args: None)
     monkeypatch.setattr(D, "_upsert_project_registry_for_dispatch", lambda *_args: None)
@@ -405,7 +431,7 @@ def test_ledger_persists_and_surfaces_effective_account_only_when_pinned(
         task_ids=[],
         agent="codex",
         shape="bash",
-        account=None,
+        account="requested-seat",
         read_only=False,
         os_sandbox=None,
         controller_pid=None,
@@ -414,7 +440,7 @@ def test_ledger_persists_and_surfaces_effective_account_only_when_pinned(
     )
     D._record_ledger(
         args,
-        project_root=ROOT,
+        project_root=tmp_path,
         prompt_path=None,
         status_json=Path("/dev/null"),
         tail=Path("/dev/null"),
@@ -430,15 +456,32 @@ def test_ledger_persists_and_surfaces_effective_account_only_when_pinned(
         for row in L.status_payload()["records"]
         if row["dispatch_id"] == args.dispatch_id
     )
-    assert row["account"] == "default"
+    assert row["account"] == "requested-seat"
     assert row["effective_account"] == "seat-b"
+    journal_row = D.goalflight_journal.Journal(tmp_path).read_all(
+        """SELECT effective_account, engine
+           FROM dispatch_attempts WHERE dispatch_id = ?""",
+        (args.dispatch_id,),
+    )[0]
+    assert journal_row["effective_account"] == "seat-b"
+    assert journal_row["engine"] == "codex"
 
     unpinned_args = _ledger_args("ledger-unpinned")
+    unpinned_args.project_root = str(tmp_path)
+    unpinned_args.agent = "worker"
+    unpinned_args.engine = "worker"
     L.cmd_record(unpinned_args)
     unpinned = json.loads(
         L.record_path(unpinned_args.dispatch_id).read_text(encoding="utf-8")
     )
     assert "effective_account" not in unpinned
+    unpinned_row = D.goalflight_journal.Journal(tmp_path).read_all(
+        """SELECT effective_account, engine
+           FROM dispatch_attempts WHERE dispatch_id = ?""",
+        (unpinned_args.dispatch_id,),
+    )[0]
+    assert unpinned_row["effective_account"] is None
+    assert unpinned_row["engine"] == "worker"
 
 
 def _acp_cfg(

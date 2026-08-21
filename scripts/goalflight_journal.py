@@ -56,11 +56,11 @@ import goalflight_task  # noqa: E402
 import goalflight_wake  # noqa: E402
 
 
-CURRENT_SCHEMA_EPOCH = 5
-CURRENT_PROTOCOL_EPOCH = 5
-CURRENT_REGISTRY_EPOCH = 5
-CURRENT_READER_EPOCH = 5
-CURRENT_WRITER_EPOCH = 5
+CURRENT_SCHEMA_EPOCH = 6
+CURRENT_PROTOCOL_EPOCH = 6
+CURRENT_REGISTRY_EPOCH = 6
+CURRENT_READER_EPOCH = 6
+CURRENT_WRITER_EPOCH = 6
 CURRENT_SCHEMA_COLUMNS = {
     "journal_migrations": ("migration_id", "applied_at"),
     "dispatch_attempts": (
@@ -69,6 +69,7 @@ CURRENT_SCHEMA_COLUMNS = {
         "state_updated_at", "start_deadline_at", "terminal_transition_id",
         "terminal_state", "terminal_outcome_json", "terminal_at",
         "owner_controller_label", "owner_session_digest",
+        "effective_account", "engine",
     ),
     "dispatch_transitions": (
         "attempt_id", "transition_id", "from_state", "to_state",
@@ -112,7 +113,8 @@ CURRENT_SCHEMA_COLUMNS = {
         "payload_json", "wake_class", "created_at", "resolved_at",
     ),
 }
-_LEGACY_DISPATCH_ATTEMPTS_COLUMNS = CURRENT_SCHEMA_COLUMNS["dispatch_attempts"][:-2]
+_LEGACY_DISPATCH_ATTEMPTS_COLUMNS = CURRENT_SCHEMA_COLUMNS["dispatch_attempts"][:-4]
+_EPOCH_FIVE_DISPATCH_ATTEMPTS_COLUMNS = CURRENT_SCHEMA_COLUMNS["dispatch_attempts"][:-2]
 _LEGACY_TERMINAL_OUTBOX_COLUMNS = CURRENT_SCHEMA_COLUMNS["terminal_outbox"][:-2]
 JOURNAL_FILE_NAME = "state-journal.sqlite3"
 JOURNAL_IDENTITY_KEY = "journal_identity"
@@ -1230,25 +1232,39 @@ class Journal:
                 for column in connection.execute("PRAGMA table_info(terminal_outbox)")
             )
             legacy_outbox = outbox_columns == _LEGACY_TERMINAL_OUTBOX_COLUMNS
+            attempt_columns = tuple(
+                str(column[1])
+                for column in connection.execute("PRAGMA table_info(dispatch_attempts)")
+            )
+            legacy_attempt_seat = (
+                attempt_columns == _EPOCH_FIVE_DISPATCH_ATTEMPTS_COLUMNS
+            )
             nonrepairable_malformed = sorted(
-                set(malformed_before) - ({"terminal_outbox"} if legacy_outbox else set())
+                set(malformed_before)
+                - ({"terminal_outbox"} if legacy_outbox else set())
+                - ({"dispatch_attempts"} if legacy_attempt_seat else set())
             )
             if nonrepairable_malformed:
                 self._raise_integrity_failure(
-                    "epoch-5 journal has structurally invalid tables: "
+                    "epoch-6 journal has structurally invalid tables: "
                     + ", ".join(nonrepairable_malformed)
                 )
-            repairable_shape = bool(missing_before) or legacy_outbox
+            repairable_shape = (
+                bool(missing_before) or legacy_outbox or legacy_attempt_seat
+            )
             if repairable_shape and not self.allow_migration:
                 self._raise_migration_required(stored)
             retry_columns_migrated = self._install_outbox_retry_columns(connection)
+            seat_columns_migrated = self._install_attempt_seat_columns(connection)
             missing, malformed = self._current_schema_issues(connection)
             if malformed:
                 self._raise_integrity_failure(
-                    "epoch-5 journal has structurally invalid tables: "
+                    "epoch-6 journal has structurally invalid tables: "
                     + ", ".join(malformed)
                 )
-            repaired = retry_columns_migrated or bool(missing)
+            repaired = (
+                retry_columns_migrated or seat_columns_migrated or bool(missing)
+            )
             if repaired:
                 # In-progress P3 builds could stamp epoch 3 before every final
                 # P3 table existed.  The installer is idempotent and is the
@@ -1263,7 +1279,7 @@ class Journal:
                 if malformed:
                     details.append("structurally invalid tables: " + ", ".join(malformed))
                 self._raise_integrity_failure(
-                    "epoch-5 journal has incomplete schema after the idempotent installer; "
+                    "epoch-6 journal has incomplete schema after the idempotent installer; "
                     + "; ".join(details)
                 )
             return repaired
@@ -1272,6 +1288,7 @@ class Journal:
             (2, 2, 2, 2, 2),
             (3, 3, 3, 3, 3),
             (4, 4, 4, 4, 4),
+            (5, 5, 5, 5, 5),
         }:
             return False
         if not self.allow_migration:
@@ -1290,6 +1307,7 @@ class Journal:
         self._install_p3_schema(connection)
         self._install_p4_schema(connection)
         self._install_attempt_owner_columns(connection)
+        self._install_attempt_seat_columns(connection)
         self._install_outbox_retry_columns(connection)
         now = utc_now()
         connection.execute(
@@ -1338,6 +1356,13 @@ class Journal:
             """,
             (now,),
         )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO journal_migrations (migration_id, applied_at)
+            VALUES ('dispatch-attempt-seat-attribution-v1', ?)
+            """,
+            (now,),
+        )
         return True
 
     def _raise_migration_required(self, stored: tuple[int, ...]) -> None:
@@ -1381,6 +1406,34 @@ class Journal:
         if columns == _LEGACY_DISPATCH_ATTEMPTS_COLUMNS + ("owner_controller_label",):
             connection.execute(
                 "ALTER TABLE dispatch_attempts ADD COLUMN owner_session_digest TEXT NULL"
+            )
+            migrated = True
+        return migrated
+
+    @staticmethod
+    def _install_attempt_seat_columns(connection: sqlite3.Connection) -> bool:
+        """Install nullable effective-seat attribution for the epoch-6 schema."""
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "dispatch_attempts" not in tables:
+            return False
+        columns = tuple(
+            str(row[1]) for row in connection.execute("PRAGMA table_info(dispatch_attempts)")
+        )
+        migrated = False
+        if columns == _EPOCH_FIVE_DISPATCH_ATTEMPTS_COLUMNS:
+            connection.execute(
+                "ALTER TABLE dispatch_attempts ADD COLUMN effective_account TEXT NULL"
+            )
+            columns += ("effective_account",)
+            migrated = True
+        if columns == _EPOCH_FIVE_DISPATCH_ATTEMPTS_COLUMNS + ("effective_account",):
+            connection.execute(
+                "ALTER TABLE dispatch_attempts ADD COLUMN engine TEXT NULL"
             )
             migrated = True
         return migrated
@@ -1463,6 +1516,8 @@ class Journal:
                 terminal_at TEXT,
                 owner_controller_label TEXT NULL,
                 owner_session_digest TEXT NULL,
+                effective_account TEXT NULL,
+                engine TEXT NULL,
                 CHECK (
                     (lifecycle_state IN ('TERMINAL', 'ABANDONED')
                      AND terminal_transition_id IS NOT NULL
@@ -3719,6 +3774,8 @@ class Journal:
         defer_start_deadline: bool = False,
         owner_controller_label: str | None = None,
         owner_session_nonce: str | None = None,
+        effective_account: str | None = None,
+        engine: str | None = None,
     ) -> WriteResult[AttemptIdentity]:
         dispatch = self._identity_token(dispatch_id, label="dispatch_id")
         if defer_start_deadline and start_deadline_at is not None:
@@ -3746,12 +3803,28 @@ class Journal:
         owner_session_digest = goalflight_wake.controller_session_digest(
             owner_session_nonce
         )
+        # Seat attribution is reporting evidence, not a launch gate. Empty or
+        # malformed values stay NULL, and a seat without an engine is too
+        # ambiguous to assert because account ids are provider-local.
+        asserted_engine = (
+            engine if isinstance(engine, str) and engine.strip() else None
+        )
+        asserted_effective_account = (
+            effective_account
+            if (
+                asserted_engine is not None
+                and isinstance(effective_account, str)
+                and effective_account.strip()
+            )
+            else None
+        )
 
         def action(connection: sqlite3.Connection) -> AttemptIdentity:
             existing = connection.execute(
                 """
                 SELECT attempt_id, dispatch_id, launch_token, launch_epoch, lifecycle_state,
-                       owner_controller_label, owner_session_digest
+                       owner_controller_label, owner_session_digest,
+                       effective_account, engine
                 FROM dispatch_attempts WHERE dispatch_id = ?
                 """,
                 (dispatch,),
@@ -3775,6 +3848,44 @@ class Journal:
                     raise CASMismatch(
                         "dispatch already belongs to a different owner capability"
                     )
+                if asserted_effective_account is not None and (
+                    existing["effective_account"] is not None
+                    and existing["effective_account"] != asserted_effective_account
+                ):
+                    raise CASMismatch(
+                        "dispatch already belongs to a different effective account"
+                    )
+                if asserted_engine is not None and (
+                    existing["engine"] is not None
+                    and existing["engine"] != asserted_engine
+                ):
+                    raise CASMismatch("dispatch already belongs to a different engine")
+                if (
+                    existing["lifecycle_state"] == ATTEMPT_PREPARED
+                    and (
+                        (
+                            existing["effective_account"] is None
+                            and asserted_effective_account is not None
+                        )
+                        or (
+                            existing["engine"] is None
+                            and asserted_engine is not None
+                        )
+                    )
+                ):
+                    connection.execute(
+                        """
+                        UPDATE dispatch_attempts
+                        SET effective_account = COALESCE(effective_account, ?),
+                            engine = COALESCE(engine, ?)
+                        WHERE attempt_id = ? AND lifecycle_state = 'PREPARED'
+                        """,
+                        (
+                            asserted_effective_account,
+                            asserted_engine,
+                            identity.attempt_id,
+                        ),
+                    )
                 return identity
             allocated_attempt = supplied_attempt or str(uuid.uuid4())
             allocated_token = supplied_token or uuid.uuid4().hex
@@ -3793,8 +3904,9 @@ class Journal:
                 INSERT INTO dispatch_attempts (
                     attempt_id, dispatch_id, project_root, lifecycle_state,
                     launch_epoch, launch_token, prepared_at, state_updated_at,
-                    start_deadline_at, owner_controller_label, owner_session_digest
-                ) VALUES (?, ?, ?, 'PREPARED', 0, ?, ?, ?, ?, ?, ?)
+                    start_deadline_at, owner_controller_label, owner_session_digest,
+                    effective_account, engine
+                ) VALUES (?, ?, ?, 'PREPARED', 0, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     allocated_attempt,
@@ -3806,6 +3918,8 @@ class Journal:
                     resolved_start_deadline,
                     owner_controller_label,
                     owner_session_digest,
+                    asserted_effective_account,
+                    asserted_engine,
                 ),
             )
             return AttemptIdentity(

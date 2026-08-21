@@ -86,6 +86,8 @@ def test_epoch_four_migration_is_race_safe_idempotent_and_corruption_fails_close
     env[journal.ALLOW_MIGRATION_ENV] = "1"
     project = _project(tmp_path)
     authority = journal.open_or_create_journal(project)
+    historical = authority.prepare_attempt("historical-unattributed-seat")
+    assert historical.committed
     with sqlite3.connect(authority.path) as connection:
         epochs = tuple(
             connection.execute(
@@ -94,7 +96,7 @@ def test_epoch_four_migration_is_race_safe_idempotent_and_corruption_fails_close
                    FROM journal_epochs WHERE singleton = 1"""
             ).fetchone()
         )
-        assert epochs == (5, 5, 5, 5, 5)
+        assert epochs == (6, 6, 6, 6, 6)
         connection.execute(
             """UPDATE journal_epochs
                SET schema_epoch = 4, protocol_epoch = 4, registry_epoch = 4,
@@ -103,6 +105,12 @@ def test_epoch_four_migration_is_race_safe_idempotent_and_corruption_fails_close
         )
         connection.execute("DROP TABLE listener_coverage")
         connection.execute("DROP TABLE system_attention_items")
+        connection.execute(
+            "ALTER TABLE dispatch_attempts DROP COLUMN engine"
+        )
+        connection.execute(
+            "ALTER TABLE dispatch_attempts DROP COLUMN effective_account"
+        )
         connection.execute(
             "ALTER TABLE dispatch_attempts DROP COLUMN owner_session_digest"
         )
@@ -157,9 +165,19 @@ def test_epoch_four_migration_is_race_safe_idempotent_and_corruption_fails_close
         str(row["name"])
         for row in reopened.read_all("PRAGMA table_info(dispatch_attempts)")
     ) == journal.CURRENT_SCHEMA_COLUMNS["dispatch_attempts"]
+    historical_row = reopened.read_all(
+        """SELECT effective_account, engine FROM dispatch_attempts
+           WHERE dispatch_id = 'historical-unattributed-seat'"""
+    )[0]
+    assert historical_row["effective_account"] is None
+    assert historical_row["engine"] is None
     assert reopened.read_all(
         """SELECT COUNT(*) AS marker_count FROM journal_migrations
            WHERE migration_id = 'dispatch-attempt-owner-v1'"""
+    )[0]["marker_count"] == 1
+    assert reopened.read_all(
+        """SELECT COUNT(*) AS marker_count FROM journal_migrations
+           WHERE migration_id = 'dispatch-attempt-seat-attribution-v1'"""
     )[0]["marker_count"] == 1
     assert tuple(
         reopened.read_all(
@@ -167,7 +185,7 @@ def test_epoch_four_migration_is_race_safe_idempotent_and_corruption_fails_close
                       minimum_reader_epoch, minimum_writer_epoch
                FROM journal_epochs WHERE singleton = 1"""
         )[0]
-    ) == (5, 5, 5, 5, 5)
+    ) == (6, 6, 6, 6, 6)
 
     corrupt_project = tmp_path / "corrupt-project"
     corrupt_project.mkdir()
@@ -221,7 +239,7 @@ def test_older_journal_requires_explicit_migration_without_mutating(
     assert authority.path.stat().st_mtime_ns == before_mtime
     assert authority.path.read_bytes() == before_bytes
     assert journal.main(["--project-root", str(project), "migrate"]) == 0
-    assert journal.Journal(project).epochs() == journal.JournalEpochs(5, 5, 5, 5, 5)
+    assert journal.Journal(project).epochs() == journal.JournalEpochs(6, 6, 6, 6, 6)
 
 
 def test_explicit_migration_runs_once_and_status_mixed_epoch_walk_is_read_only(
@@ -250,7 +268,7 @@ def test_explicit_migration_runs_once_and_status_mixed_epoch_walk_is_read_only(
         )
 
     migrated = journal.Journal(old_project, allow_migration=True)
-    assert migrated.epochs() == journal.JournalEpochs(5, 5, 5, 5, 5)
+    assert migrated.epochs() == journal.JournalEpochs(6, 6, 6, 6, 6)
     first_markers = migrated.read_all(
         """SELECT migration_id, COUNT(*) AS count
            FROM journal_migrations GROUP BY migration_id ORDER BY migration_id"""
@@ -317,7 +335,7 @@ def test_explicit_migration_runs_once_and_status_mixed_epoch_walk_is_read_only(
         assert (path.stat().st_mtime_ns, path.read_bytes(), epochs) == fingerprint
 
 
-def test_epoch_five_fences_epoch_four_reader_writer_before_schema_validation(
+def test_epoch_six_fences_epoch_five_reader_writer_before_schema_validation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -326,45 +344,45 @@ def test_epoch_five_fences_epoch_four_reader_writer_before_schema_validation(
     authority = journal.open_or_create_journal(project)
     with sqlite3.connect(authority.path) as connection:
         connection.execute(
-            "ALTER TABLE dispatch_attempts DROP COLUMN owner_session_digest"
+            "ALTER TABLE dispatch_attempts DROP COLUMN engine"
         )
         connection.execute(
-            "ALTER TABLE dispatch_attempts DROP COLUMN owner_controller_label"
+            "ALTER TABLE dispatch_attempts DROP COLUMN effective_account"
         )
 
-    epoch_four_client = journal.ClientEpochs(
-        schema=4,
-        protocol=4,
-        registry=4,
-        reader=4,
-        writer=4,
+    epoch_five_client = journal.ClientEpochs(
+        schema=5,
+        protocol=5,
+        registry=5,
+        reader=5,
+        writer=5,
     )
-    fence_match = r"UPGRADE_REQUIRED:.*schema client=4 journal=5"
+    fence_match = r"UPGRADE_REQUIRED:.*schema client=5 journal=6"
     with pytest.raises(
         journal.JournalUpgradeRequired,
         match=fence_match,
     ) as direct_refusal:
-        journal.Journal(project, client_epochs=epoch_four_client)
+        journal.Journal(project, client_epochs=epoch_five_client)
     assert not isinstance(direct_refusal.value, journal.JournalIntegrityError)
 
     with sqlite3.connect(authority.path) as connection:
         connection.execute(
             """UPDATE journal_epochs
-               SET schema_epoch = 4, protocol_epoch = 4, registry_epoch = 4,
-                   minimum_reader_epoch = 4, minimum_writer_epoch = 4
+               SET schema_epoch = 5, protocol_epoch = 5, registry_epoch = 5,
+                   minimum_reader_epoch = 5, minimum_writer_epoch = 5
                WHERE singleton = 1"""
         )
 
     old_client = journal.Journal(
         project,
-        client_epochs=epoch_four_client,
+        client_epochs=epoch_five_client,
         allow_migration=True,
     )
     migrated = journal.Journal(project, allow_migration=True)
-    assert migrated.epochs() == journal.JournalEpochs(5, 5, 5, 5, 5)
+    assert migrated.epochs() == journal.JournalEpochs(6, 6, 6, 6, 6)
 
     with pytest.raises(journal.JournalUpgradeRequired, match=fence_match):
-        journal.Journal(project, client_epochs=epoch_four_client)
+        journal.Journal(project, client_epochs=epoch_five_client)
     with pytest.raises(journal.JournalUpgradeRequired, match=fence_match):
         old_client.read_all("SELECT attempt_id FROM dispatch_attempts")
     with pytest.raises(journal.JournalUpgradeRequired, match=fence_match):
@@ -413,6 +431,75 @@ def test_prepare_attempt_records_immutable_digested_owner_capability(
         owner_session_nonce="different-capability",
     )
     assert conflicting.cas_lost
+
+
+def test_prepare_attempt_records_effective_seat_without_defaulting_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    authority = journal.open_or_create_journal(_project(tmp_path))
+    waiting = authority.prepare_attempt(
+        "seat-at-prepare",
+        defer_start_deadline=True,
+        engine="codex",
+    )
+    assert waiting.committed and waiting.value is not None
+    waiting_row = authority.read_all(
+        """SELECT effective_account, engine FROM dispatch_attempts
+           WHERE dispatch_id = ?""",
+        ("seat-at-prepare",),
+    )[0]
+    assert waiting_row["effective_account"] is None
+    assert waiting_row["engine"] == "codex"
+
+    resolved = authority.prepare_attempt(
+        "seat-at-prepare",
+        effective_account="served-seat",
+        engine="codex",
+    )
+    assert resolved.committed and resolved.value == waiting.value
+    resolved_row = authority.read_all(
+        """SELECT effective_account, engine FROM dispatch_attempts
+           WHERE dispatch_id = ?""",
+        ("seat-at-prepare",),
+    )[0]
+    assert resolved_row["effective_account"] == "served-seat"
+    assert resolved_row["engine"] == "codex"
+
+    conflict = authority.prepare_attempt(
+        "seat-at-prepare",
+        effective_account="different-seat",
+        engine="codex",
+    )
+    assert conflict.cas_lost
+
+    unattributed = authority.prepare_attempt(
+        "seat-not-determined",
+        effective_account="",
+        engine="worker",
+    )
+    assert unattributed.committed
+    unattributed_row = authority.read_all(
+        """SELECT effective_account, engine FROM dispatch_attempts
+           WHERE dispatch_id = ?""",
+        ("seat-not-determined",),
+    )[0]
+    assert unattributed_row["effective_account"] is None
+    assert unattributed_row["engine"] == "worker"
+
+    missing_engine = authority.prepare_attempt(
+        "seat-without-engine",
+        effective_account="ambiguous-seat",
+    )
+    assert missing_engine.committed
+    missing_engine_row = authority.read_all(
+        """SELECT effective_account, engine FROM dispatch_attempts
+           WHERE dispatch_id = ?""",
+        ("seat-without-engine",),
+    )[0]
+    assert missing_engine_row["effective_account"] is None
+    assert missing_engine_row["engine"] is None
 
 
 def test_current_epoch_structurally_wrong_table_stays_fail_closed(
@@ -3086,6 +3173,8 @@ def test_hidden_consumers_use_journal_and_relay_is_peek_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     env = _set_state_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("GOALFLIGHT_ROOT", str(ROOT))
+    env["GOALFLIGHT_ROOT"] = str(ROOT)
     env["GOALFLIGHT_TEST_LISTENER_START_TOKEN"] = "drain-loop-listener-token"
     project = _project(tmp_path)
     monkeypatch.chdir(project)
