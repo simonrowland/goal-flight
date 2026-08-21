@@ -323,8 +323,19 @@ def test_doctor_json_shape() -> None:
     ss = payload["session_status"]
     assert_true("session_status.ok present", "ok" in ss)
     if ss.get("ok"):
-        for key in ("active", "queue_file", "active_leases_in_project"):
+        for key in ("active", "queue_file", "active_capacity_leases_in_project"):
             assert_true(f"session_status.{key} present when ok", key in ss)
+    assert_true(
+        "controller_lease_liveness section",
+        "controller_lease_liveness" in payload,
+    )
+    cls = payload["controller_lease_liveness"]
+    for key in (
+        "active_controller_leases_in_project",
+        "active_but_dead_controller_leases_in_project",
+        "leases",
+    ):
+        assert_true(f"controller_lease_liveness.{key} present", key in cls)
     assert_true("resume_notes_pattern section", "resume_notes_pattern" in payload)
     rnp = payload["resume_notes_pattern"]
     for key in ("present", "count", "pattern_violations", "ok"):

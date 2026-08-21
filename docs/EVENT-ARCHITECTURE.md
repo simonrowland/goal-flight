@@ -203,9 +203,6 @@ system disagree, prefer the live check and record the disagreement.
   columns in `dispatch_attempts`; the only pointer is `/tmp`. Store path **and
   content hash** durably.
 - **b-174** — ownership discarded → universal fanout (§3).
-- **b-175** — doctor never inspects lease liveness (zero references to
-  `controller_leases` / `classify_controller` / `holder_lock`) and reported
-  `active_leases_in_project: 0, ok: true` while a lease was demonstrably live.
 - **t-293** — teach at dispatch time when ownership will not resolve.
 - **b-176** — listeners die silently at exit 144; cause is the host's task
   reaper, so the fix is legibility, not survival.

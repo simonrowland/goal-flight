@@ -643,7 +643,10 @@ def hold_controller_lock(
     validated_generation: int | None = None
     validated_stamp: tuple[int, int, int] | None = None
     try:
-        while _controller_process_identity(pid) == expected_identity:
+        while True:
+            holder_matches = goalflight_compat.process_identity_matches(pid, start_token)
+            if holder_matches is False:
+                return 0
             try:
                 candidate_stamp = goalflight_wake.lease_generation_event_stamp(
                     project_root,
@@ -691,7 +694,6 @@ def hold_controller_lock(
             if not matched_generation and time.monotonic() >= startup_deadline:
                 return 2
             time.sleep(CONTROLLER_LOCK_POLL_S)
-        return 0
     finally:
         registration.close()
 
@@ -1748,8 +1750,10 @@ def aggregate_status(project_root: Path, *, ttl_days: int = 7) -> dict:
         "queue_slug": queue_front.get("slug"),
         "queue_last_touched": queue_front.get("last-touched") or queue_front.get("last_touched"),
         "queue_current_session": queue_front.get("current_session"),
-        "active_leases_in_project": len(leases_for_project),
-        "active_lease_dispatch_ids": [l.get("dispatch_id") for l in leases_for_project],
+        "active_capacity_leases_in_project": len(leases_for_project),
+        "active_capacity_lease_dispatch_ids": [
+            lease.get("dispatch_id") for lease in leases_for_project
+        ],
         "newest_resume_notes": str(newest_notes.relative_to(project_root)) if newest_notes else None,
         "resume_notes_active": notes_active,
         "resume_notes_reason": notes_reason,
@@ -1958,7 +1962,7 @@ def to_text(status: dict) -> str:
     pieces = [
         f"active goal-flight session ({status['queue_slug'] or 'unnamed'})",
         f"queue={status['queue_file']}",
-        f"leases={status['active_leases_in_project']}",
+        f"capacity_leases={status['active_capacity_leases_in_project']}",
     ]
     if status["queue_last_touched"]:
         pieces.append(f"last-touched={status['queue_last_touched']}")

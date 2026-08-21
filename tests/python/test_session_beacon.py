@@ -16,6 +16,7 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SCRIPTS))
 
+import goalflight_compat as compat  # noqa: E402
 import goalflight_journal as journal  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
@@ -137,6 +138,7 @@ def test_lock_holder_cheap_ticks_revalidate_only_on_generation_event(
         "_controller_process_identity",
         lambda pid: {"pid": pid, "start_token": "cheap-tick"},
     )
+    monkeypatch.setattr(compat, "process_identity_matches", lambda *_args: True)
 
     def reject_write_locking_constructor(*_args, **_kwargs):
         raise AssertionError("beacon tick constructed the write-locking Journal client")
@@ -179,6 +181,60 @@ def test_lock_holder_cheap_ticks_revalidate_only_on_generation_event(
     assert sleeps["count"] == 2
     assert len(open_calls) == 2
     assert registration.closed is True
+
+
+def test_lock_holder_keeps_witness_after_inconclusive_identity_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    identity = compat.process_start_identity(os.getpid())
+    assert identity is not None
+    expected = {
+        "pid": os.getpid(),
+        "start_token": str(identity["start_token"]),
+    }
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "controller",
+        principal=expected,
+    )
+    assert claimed.committed and claimed.value is not None
+    lease = claimed.value
+    wake.publish_lease_generation_event(
+        root,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        generation=lease.generation,
+        state=lease.state,
+    )
+
+    monkeypatch.setattr(sessions, "_controller_process_identity", lambda _pid: expected)
+    probe_results = iter((None, False))
+    monkeypatch.setattr(
+        compat,
+        "process_identity_matches",
+        lambda *_args: next(probe_results),
+    )
+    event_reads = 0
+    original_read_event = wake.read_lease_generation_event
+
+    def read_event(*args, **kwargs):
+        nonlocal event_reads
+        event_reads += 1
+        return original_read_event(*args, **kwargs)
+
+    monkeypatch.setattr(wake, "read_lease_generation_event", read_event)
+    monkeypatch.setattr(sessions.time, "sleep", lambda _seconds: None)
+
+    assert sessions.hold_controller_lock(
+        root,
+        label=lease.label,
+        nonce=lease.nonce,
+        pid=expected["pid"],
+        start_token=expected["start_token"],
+    ) == 0
+    assert event_reads == 1
 
 
 def test_same_measured_process_generation_renews_idempotently(

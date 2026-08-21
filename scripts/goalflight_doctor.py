@@ -26,6 +26,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from goalflight_watch import SUCCESS_TERMINAL_MARKERS
+import goalflight_journal
+import goalflight_wake
 
 try:
     import goalflight_capacity
@@ -554,9 +556,80 @@ def check_session_status(skill_root: Path, project_root: Path) -> dict:
         "queue_file": payload.get("queue_file"),
         "queue_state": payload.get("queue_state"),
         "queue_reason": payload.get("queue_reason"),
-        "active_leases_in_project": payload.get("active_leases_in_project", 0),
+        "active_capacity_leases_in_project": payload.get(
+            "active_capacity_leases_in_project", 0
+        ),
         "newest_resume_notes": payload.get("newest_resume_notes"),
         "resume_notes_active": payload.get("resume_notes_active"),
+    }
+
+
+def check_controller_lease_liveness(project_root: Path) -> dict:
+    """Report ACTIVE journal leases against their sole kernel liveness witness."""
+    resolved_root = project_root.resolve()
+    try:
+        records = goalflight_journal.Journal.open_reader(resolved_root).lease_records()
+    except goalflight_journal.JournalUnavailable:
+        return {
+            "ok": True,
+            "present": False,
+            "project_root": str(resolved_root),
+            "active_controller_leases_in_project": 0,
+            "active_but_dead_controller_leases_in_project": 0,
+            "unknown_controller_lease_holders_in_project": 0,
+            "leases": [],
+        }
+    except (goalflight_journal.JournalError, OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "present": True,
+            "project_root": str(resolved_root),
+            "error": f"{type(exc).__name__}: {exc}",
+            "active_controller_leases_in_project": 0,
+            "active_but_dead_controller_leases_in_project": 0,
+            "unknown_controller_lease_holders_in_project": 0,
+            "leases": [],
+        }
+
+    leases: list[dict[str, object]] = []
+    for record in records:
+        label = str(record.get("label") or "").strip()
+        nonce = str(record.get("nonce") or "").strip()
+        holder_live = (
+            goalflight_wake.lease_holder_alive(
+                resolved_root,
+                controller_label=label,
+                lease_nonce=nonce,
+                prune_dead=False,
+            )
+            if label and nonce
+            else None
+        )
+        leases.append(
+            {
+                "label": label,
+                "generation": int(record.get("generation") or 0),
+                "sql_state": str(record.get("state") or ""),
+                "holder_live": holder_live,
+                "holder_state": (
+                    "live"
+                    if holder_live is True
+                    else "dead"
+                    if holder_live is False
+                    else "unknown"
+                ),
+            }
+        )
+    dead_count = sum(row["holder_live"] is False for row in leases)
+    unknown_count = sum(row["holder_live"] is None for row in leases)
+    return {
+        "ok": dead_count == 0 and unknown_count == 0,
+        "present": True,
+        "project_root": str(resolved_root),
+        "active_controller_leases_in_project": len(leases),
+        "active_but_dead_controller_leases_in_project": dead_count,
+        "unknown_controller_lease_holders_in_project": unknown_count,
+        "leases": leases,
     }
 
 
@@ -2957,6 +3030,7 @@ def doctor(
         "autoreview": check_autoreview(skill_root),
         "agents_md_state": check_agents_md_state(repo),
         "session_status": check_session_status(skill_root, repo),
+        "controller_lease_liveness": check_controller_lease_liveness(repo),
         "resume_notes_pattern": check_resume_notes_pattern(repo),
         "cursor": {
             "desktop_present": cursor_desktop,
@@ -3187,6 +3261,7 @@ def print_human(payload: dict, *, verbose: bool = False) -> None:
 
 def collect_human_lines(payload: dict) -> list[str]:
     plugin = payload["plugin"]
+    controller_leases = payload.get("controller_lease_liveness") or {}
     lines = [
         status_line(
             None if plugin.get("skipped") else plugin.get("manifest_exists"),
@@ -3243,7 +3318,24 @@ def collect_human_lines(payload: dict) -> list[str]:
         status_line(payload["opencode"].get("present"), "opencode ACP", payload["opencode"].get("version")),
         status_line(payload["grok"].get("present"), "Grok Build binary", payload["grok"].get("version")),
         status_line(payload["grok"].get("headless_flags"), "Grok headless flags", None),
+        status_line(
+            controller_leases.get("ok"),
+            "controller lease holder liveness",
+            (
+                f"active={controller_leases.get('active_controller_leases_in_project', 0)} "
+                f"ACTIVE-but-dead={controller_leases.get('active_but_dead_controller_leases_in_project', 0)} "
+                f"unknown={controller_leases.get('unknown_controller_lease_holders_in_project', 0)}"
+            ),
+        ),
     ]
+    for lease in controller_leases.get("leases") or []:
+        lines.append(
+            status_line(
+                lease.get("holder_live"),
+                f"controller lease {lease.get('label')}",
+                f"generation={lease.get('generation')} holder={lease.get('holder_state')}",
+            )
+        )
     for row in (payload.get("grok") or {}).get("permission_modes") or []:
         config = row.get("config") or "config.toml"
         if row.get("status") == "present":

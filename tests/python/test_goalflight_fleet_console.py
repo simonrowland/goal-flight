@@ -191,7 +191,7 @@ def test_fleet_consumes_status_once_before_project_grouping() -> dict:
                 "active": True,
                 "queue_state": "active",
                 "queue_last_touched": "2026-08-02T09:30:00+00:00",
-                "active_leases_in_project": 1,
+                "active_capacity_leases_in_project": 1,
                 "queue_file": "docs-private/private-queue.md",
                 "queue_current_session": {"pid": 123, "hostname": "secret-host"},
             }

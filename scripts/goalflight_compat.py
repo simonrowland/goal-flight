@@ -67,6 +67,7 @@ __all__ = [
     "flock",
     "pid_alive",
     "pid_is_zombie",
+    "process_identity_matches",
     "windows_process_identity",
     "kill_pid",
     "default_state_dir",
@@ -1232,6 +1233,51 @@ def process_start_identity(pid: int, *, include_ancestry: bool = False) -> dict 
         except (IndexError, OSError, ValueError):
             return None
 
+    return None
+
+
+def process_identity_matches(pid: int, start_token: str) -> bool | None:
+    """Compare one process generation, returning UNKNOWN on probe failure.
+
+    ``False`` is reserved for proof that the PID is absent or now names a
+    different generation. A witness loop can therefore retain its lock on
+    ``None`` without mistaking an unavailable identity probe for a dead host.
+    """
+    if (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or pid <= 0
+        or not isinstance(start_token, str)
+        or not start_token
+    ):
+        return None
+    try:
+        current = process_start_identity(pid)
+    except Exception:
+        return None
+    if isinstance(current, dict) and current.get("start_token"):
+        return bool(
+            current.get("pid") == pid
+            and current.get("start_token") == start_token
+        )
+
+    if is_windows():
+        # OpenProcess failures do not expose enough information here to reserve
+        # False for proven absence. Keep the delivery-safe UNKNOWN default.
+        return None  # pragma: no cover - Windows only
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        return None
+    except Exception:
+        return None
     return None
 
 

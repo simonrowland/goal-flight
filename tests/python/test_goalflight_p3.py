@@ -1248,6 +1248,100 @@ def test_continuous_delivery_cannot_starve_stream_advance(
     assert authority.cursor_status("controller")["positions"] == {"continuous-stream": 1}
 
 
+def test_delivery_planner_keeps_b7d1b03_recipient_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    first_primary = _claim(authority, "primary")
+    replacement = authority.claim_or_renew_lease(
+        "primary",
+        principal=_principal(41002, "start-b"),
+        takeover=True,
+    )
+    assert replacement.committed and replacement.value is not None
+    assert replacement.value.generation == first_primary.generation + 1
+    _claim(authority, "secondary")
+
+    def write_dispatch(dispatch_id: str, owner: str | None) -> None:
+        record = {
+            "dispatch_id": dispatch_id,
+            "project_root": str(project),
+            "state": "running",
+        }
+        if owner is not None:
+            record["controller_label"] = owner
+        path = ledger.record_path(dispatch_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record), encoding="utf-8")
+
+    def post(
+        dispatch_id: str,
+        *,
+        msg_type: str = "result",
+        payload: dict[str, object] | None = None,
+        addressee: dict[str, object] | None = None,
+    ) -> None:
+        messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type=msg_type,
+            payload=payload or {"summary": dispatch_id},
+            messages_dir=tmp_path / "messages",
+            source={"node": "test", "adapter": "test", "transport": "controller"},
+            addressee=addressee,
+        )
+
+    write_dispatch("planner-owned", "primary")
+    post("planner-owned")
+    write_dispatch("planner-unowned", None)
+    post("planner-unowned")
+    post(
+        "planner-addressed",
+        msg_type="controller-notice",
+        addressee=messages.controller_addressee("secondary", project_root=project),
+    )
+    post(
+        "planner-star",
+        msg_type="controller-notice",
+        addressee=messages.controller_addressee("*", project_root=project),
+    )
+    post(
+        "planner-project-broadcast",
+        msg_type="controller-notice",
+        payload={"project_root": str(project), "text": "broadcast"},
+    )
+
+    recipients = {
+        str(stream_id): [str(row["recipient_label"]) for row in authority.read_all(
+            """SELECT recipient_label FROM delivery_events
+               WHERE stream_id = ? ORDER BY recipient_label""",
+            (stream_id,),
+        )]
+        for stream_id in (
+            "planner-owned",
+            "planner-unowned",
+            "planner-addressed",
+            "planner-star",
+            "planner-project-broadcast",
+        )
+    }
+    assert recipients == {
+        "planner-owned": ["primary"],
+        "planner-unowned": ["primary", "secondary"],
+        "planner-addressed": ["secondary"],
+        "planner-star": ["*"],
+        "planner-project-broadcast": ["*"],
+    }
+    primary_states = [
+        str(row["state"])
+        for row in authority.lease_records(include_ended=True)
+        if row["label"] == "primary"
+    ]
+    assert primary_states == ["SUPERSEDED", "ACTIVE"]
+
+
 def test_terminal_projection_targets_owned_exactly_and_unowned_by_fanout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

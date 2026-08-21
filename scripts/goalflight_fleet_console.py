@@ -2115,7 +2115,7 @@ def _session_row(payload: object) -> dict[str, Any]:
         "active": data.get("active") if isinstance(data.get("active"), bool) else None,
         "queue_state": _display(data.get("queue_state"), limit=32),
         "queue_last_touched": _iso_timestamp(data.get("queue_last_touched")),
-        "active_leases": _number(data.get("active_leases_in_project")),
+        "active_leases": _number(data.get("active_capacity_leases_in_project")),
     }
 
 
