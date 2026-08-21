@@ -187,22 +187,31 @@ repo over the existing SSH alias. It should be cleaned up after collect.
 Remote worktree layout:
 
 ```text
-~/.goal-flight/worktrees/<dispatch-id>
+~/.goal-flight/worktrees/wt-1 .. wt-N
 ```
 
-Remote branch:
+The node creates seats lazily, leases them with kernel locks, quarantines dirty
+abandoned work to visible branches, and acquire-resets before reuse. The
+`GOALFLIGHT_WORKTREE_SEATS` range is a hard ceiling; dispatch ids never become
+worktree directory names.
+
+Abandoned-work quarantine branch:
 
 ```text
-gf/worker/<dispatch-id>
+goalflight/quarantine/wt-<N>-<UTC-time>
 ```
 
 Remote command shape:
 
 ```text
 git -C <repo_root> fetch --quiet origin
-git -C <repo_root> worktree add -b gf/worker/<dispatch-id> <worktree_path> <base_ref>
+python3 <repo_root>/scripts/goalflight_fleet_launch_detached.py launch ... --base-sha <base_ref>
 python3 <repo_root>/scripts/goalflight_acp_run.py ... --cwd <worktree_path>
 ```
+
+The launch helper is the single allocator: it acquires a kernel-locked seat,
+quarantines abandoned dirty state when necessary, resets to the requested base,
+and passes the lock descriptor through to the detached worker.
 
 ### Worker Completion
 
@@ -670,9 +679,9 @@ and must emit the exact remote/ref before executing.
 
 ### Unit Tests
 
-- dispatch preview includes fetch before worktree add
+- dispatch preview includes fetch and exact-base verification before remote seat acquire
 - dispatch preview uses configurable `base_ref`
-- worktree add creates `gf/worker/<dispatch-id>`
+- remote seat acquire stays within `wt-1` … `wt-N`
 - worker terminal status validates required git fields
 - collect fetches remote branch into `refs/remotes/fleet/...`
 - collect uses immutable `/sha/<head-sha>` refs and refuses `/current` ref
@@ -685,7 +694,7 @@ and must emit the exact remote/ref before executing.
 - review-accept records reviewed ref and review result
 - land refuses without review-accept for the same immutable ref
 - land refuses dirty controller worktrees
-- setup failure after worktree add records cleanup-safe state
+- setup failure after seat acquire releases by process exit without removing the seat
 - failed worker can create recovery artifact and transition to `artifacted`
 - dirty complete worker can create recovery artifact and transition to
   `artifacted`
@@ -711,7 +720,7 @@ and must emit the exact remote/ref before executing.
 - stub remote: dirty worker -> patch artifact
 - stub remote: dirty worker with untracked file -> patch artifact includes it
 - stub remote: direct fetch failure -> bundle fallback
-- stub remote: worktree add succeeds, ACP spawn fails -> setup_failed cleanup
+- stub remote: seat acquire succeeds, ACP spawn fails -> kernel lease releases and seat persists
 - stub remote: collected ref exists at different SHA -> recollect refused
 - stub remote: land before review-accept -> refused
 - live Mac Studio smoke: dispatch, remote clean commit, collect fetch-only,

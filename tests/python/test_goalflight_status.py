@@ -91,8 +91,8 @@ def test_scope() -> None:
 
 
 def worktree_payload(repo_root: str, worktree_dir: str) -> dict:
-    """A worktree-style ACP dispatch: the worker runs inside a per-dispatch
-    worktree (``worker_cwd``/``worktree_path`` = worktree dir) but the ledger
+    """A worktree-style ACP dispatch: the worker runs inside a leased pool seat
+    (``worker_cwd``/``worktree_path`` = worktree dir) but the ledger
     record's ``project_root`` MUST be the main repo toplevel so the record stays
     in-scope. This is the exact data shape of the e21cda2 regression: if
     goalflight_acp_run recorded ``project_root=worker_cwd`` (the worktree dir)

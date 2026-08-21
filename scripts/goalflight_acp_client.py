@@ -3014,6 +3014,7 @@ async def spawn_acp_connection(
     context_mode: bool = True,
     os_sandbox: str = OS_SANDBOX_OFF,
     env: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> GoalflightAcpConnection:
     if goalflight_compat.is_windows():
         raise AcpError(goalflight_compat.windows_dispatch_refusal())
@@ -3048,6 +3049,7 @@ async def spawn_acp_connection(
         start_new_session=True,
         limit=limit,
         env=child_env,
+        pass_fds=pass_fds,
     )
     if proc.stdin is None or proc.stdout is None:
         with contextlib.suppress(ProcessLookupError):

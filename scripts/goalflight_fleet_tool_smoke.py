@@ -472,9 +472,9 @@ def preview_tool_smoke_canary(
         model_version=model_version,
     )
     dispatch_id = f"tool-smoke-{_safe_part(agent)}-{cache_key_for_identity(identity)[:12]}"
-    worktree_path = _remote_path(state_dir, "worktrees", dispatch_id)
     status_path = _remote_path(state_dir, "dispatches", dispatch_id, "status.json")
-    expected_absolute_path = f"{worktree_path.rstrip('/')}/README.md"
+    worktree_path = None
+    expected_absolute_path = "{{GOALFLIGHT_WORKTREE_PATH}}/README.md"
     return {
         "schema": TOOL_SMOKE_SCHEMA,
         "dry_run": True,
@@ -484,7 +484,7 @@ def preview_tool_smoke_canary(
         "worktree_path": worktree_path,
         "status_path": status_path,
         "expected_absolute_path": expected_absolute_path,
-        "prompt": build_tool_smoke_prompt(worktree_path=worktree_path),
+        "prompt": build_tool_smoke_prompt(worktree_path="{{GOALFLIGHT_WORKTREE_PATH}}"),
         "ttl_s": int(ttl_s),
     }
 
@@ -515,24 +515,12 @@ def run_tool_smoke_canary(
     )
     identity = dict(preview["identity"])
     dispatch_id = str(preview["dispatch_id"])
-    worktree_path = str(preview["worktree_path"])
     status_path = str(preview["status_path"])
-    expected_absolute_path = str(preview["expected_absolute_path"])
     prompt = str(preview["prompt"])
 
-    # Deterministic smoke worktree. Remove a stale prior copy first; ignore
-    # absence/non-removable paths and let worktree add produce the real verdict.
-    _ssh_result(
-        node_id,
-        node,
-        "git_worktree_remove",
-        runner=runner,
-        worktree_path=worktree_path,
-    )
     preflight_steps = [
         ("git_fetch", {}),
         ("git_verify_commit", {"sha": base_sha}),
-        ("git_worktree_add", {"worktree_path": worktree_path, "ref": base_sha, "detach": True}),
     ]
     for command_class, params in preflight_steps:
         result = _ssh_result(node_id, node, command_class, runner=runner, **params)
@@ -563,8 +551,11 @@ def run_tool_smoke_canary(
         agent=agent,
         model=identity.get("model_version"),
         prompt=prompt,
-        cwd=worktree_path,
+        cwd=str(node.get("repo_root") or ""),
         status_json=status_path,
+        worktree=True,
+        worktree_root=_remote_path(state_dir, "worktrees"),
+        worktree_base=base_sha,
         mode="one-shot",
         os_sandbox=sandbox,
         max_consecutive_tool_errors=1,
@@ -585,6 +576,10 @@ def run_tool_smoke_canary(
         status_payload = _json_from_stdout(str(status_read.get("stdout") or ""))
     if status_payload is None:
         status_payload = _json_from_stdout(str(acp.get("stdout") or ""))
+    worktree_path = str((status_payload or {}).get("worktree_path") or "")
+    expected_absolute_path = (
+        f"{worktree_path.rstrip('/')}/README.md" if worktree_path else None
+    )
     record = build_result_record(
         identity=identity,
         ttl_s=ttl_s,

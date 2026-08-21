@@ -8,6 +8,7 @@ hand-running a long environment probe sequence into the context window.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -28,6 +29,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from goalflight_watch import SUCCESS_TERMINAL_MARKERS
 import goalflight_journal
 import goalflight_wake
+import goalflight_worktree_pool
 
 try:
     import goalflight_capacity
@@ -1730,9 +1732,8 @@ def worker_linked_worktree_commit_probe(
         }
 
     nonce = f"{os.getpid()}-{time.time_ns()}"
-    branch = f"goalflight-doctor-{nonce}"
     temp_root = Path(tempfile.mkdtemp(prefix="goalflight-worktree-commit-probe-"))
-    worktree = temp_root / "worktree"
+    worktree = temp_root / "unacquired-worktree"
     state_dir = temp_root / "state"
     state_dir.mkdir()
     dispatch_id = f"doctor-worktree-commit-{nonce}"
@@ -1745,9 +1746,8 @@ def worker_linked_worktree_commit_probe(
     proc: subprocess.CompletedProcess[str] | None = None
     head_sha = ""
     committed_text = ""
-    cleanup_errors: list[str] = []
     result: dict | None = None
-    worktree_add_attempted = False
+    worktree_lease: goalflight_worktree_pool.WorktreeSeatLease | None = None
     try:
         base = run(["git", "-C", str(repo), "rev-parse", "HEAD"], timeout=10)
         if not base["ok"]:
@@ -1761,22 +1761,23 @@ def worker_linked_worktree_commit_probe(
             }
             return result
         base_sha = base["stdout"].strip()
-        worktree_add_attempted = True
-        added = run(
-            ["git", "-C", str(repo), "worktree", "add", "-b", branch, str(worktree), "HEAD"],
-            timeout=30,
-        )
-        if not added["ok"]:
-            detail = added["stderr"].strip().splitlines()
+        try:
+            worktree_lease = goalflight_worktree_pool.acquire_worktree_seat(
+                repo,
+                dispatch_id,
+                base=base_sha,
+            )
+        except goalflight_worktree_pool.WorktreeSeatError as exc:
             result = {
                 "enabled": True,
                 "kind": "linked-worktree-commit",
                 "agent": agent,
                 "ok": False,
                 "state": "blocked",
-                "detail": f"git worktree add failed: {detail[-1] if detail else 'unknown error'}",
+                "detail": f"worktree seat acquire failed: {exc}",
             }
             return result
+        worktree = worktree_lease.path
         prompt.write_text(
             "\n".join(
                 [
@@ -1820,6 +1821,7 @@ def worker_linked_worktree_commit_probe(
             GIT_AUTHOR_EMAIL="goal-flight-doctor@example.invalid",
             GIT_COMMITTER_NAME="Goal Flight Doctor",
             GIT_COMMITTER_EMAIL="goal-flight-doctor@example.invalid",
+            GOALFLIGHT_WORKTREE_LOCK_FD=str(worktree_lease.fileno()),
         )
         proc = subprocess.run(
             cmd,
@@ -1828,6 +1830,7 @@ def worker_linked_worktree_commit_probe(
             capture_output=True,
             text=True,
             timeout=max(timeout_s + 30.0, 60.0),
+            pass_fds=(worktree_lease.fileno(),),
         )
         head = run(["git", "-C", str(worktree), "rev-parse", "HEAD"], timeout=10)
         if head["ok"]:
@@ -1871,26 +1874,9 @@ def worker_linked_worktree_commit_probe(
         }
         return result
     finally:
-        if worktree.exists():
-            removed = run(
-                ["git", "-C", str(repo), "worktree", "remove", "--force", str(worktree)],
-                timeout=30,
-            )
-            if not removed["ok"]:
-                cleanup_errors.append(first_line(removed["stderr"]) or "worktree remove failed")
-        if worktree_add_attempted:
-            deleted = run(["git", "-C", str(repo), "branch", "-D", branch], timeout=10)
-            if not deleted["ok"] and "not found" not in deleted["stderr"].lower():
-                cleanup_errors.append(first_line(deleted["stderr"]) or "branch delete failed")
+        if worktree_lease is not None:
+            worktree_lease.release()
         shutil.rmtree(temp_root, ignore_errors=True)
-        if cleanup_errors and result is not None:
-            result["ok"] = False
-            result["state"] = "cleanup_failed"
-            result["cleanup_errors"] = cleanup_errors
-            result["detail"] = (
-                f"{result.get('detail', '')} "
-                f"cleanup_failed={' | '.join(cleanup_errors)}"
-            ).strip()
 
 
 def _npm_registry_version(pkg: str, timeout: float = 6.0) -> str | None:
@@ -2639,10 +2625,10 @@ def _active_capacity_dispatches() -> tuple[set[tuple[str, str]], str | None]:
 
 
 def check_worktrees(project_root: Path) -> dict:
-    """Report managed per-dispatch worktrees and stale completed ones.
+    """Report reusable pool seats plus legacy per-dispatch worktrees.
 
-    Only paths under ``<project_root>/worktrees/<dispatch-id>`` are managed by
-    local ACP dispatch. Other git worktrees belong to operators or other tools.
+    Pool ownership comes only from each seat's kernel lock. Capacity records
+    remain a compatibility signal for legacy task-named worktrees.
     """
     result = run(["git", "worktree", "list", "--porcelain"], cwd=project_root, timeout=8)
     if not result.get("ok"):
@@ -2671,7 +2657,7 @@ def check_worktrees(project_root: Path) -> dict:
     except OSError:
         managed_root = managed_root_path.absolute()
     paths: list[str] = []
-    dispatch_by_path: dict[str, str] = {}
+    legacy_dispatch_by_path: dict[str, str] = {}
     details: list[dict] = []
     escaped: list[str] = []
     for record in _parse_git_worktree_porcelain(result.get("stdout") or ""):
@@ -2704,22 +2690,52 @@ def check_worktrees(project_root: Path) -> dict:
         except (ValueError, OSError):
             escaped.append(str(path))
             continue
-        dispatch_id = rel.parts[0]
+        leaf_name = rel.parts[0]
         path_text = str(resolved_path)
         paths.append(path_text)
-        dispatch_by_path[path_text] = dispatch_id
         status = run(["git", "status", "--short"], cwd=resolved_path, timeout=4)
         head = run(["git", "rev-parse", "--short", "HEAD"], cwd=resolved_path, timeout=4)
         branch = run(["git", "branch", "--show-current"], cwd=resolved_path, timeout=4)
-        details.append(
-            {
-                "path": path_text,
-                "dispatch_id": dispatch_id,
-                "dirty": bool(status.get("stdout")),
-                "head": head.get("stdout") or None,
-                "branch": branch.get("stdout") or None,
-            }
-        )
+        detail = {
+            "path": path_text,
+            "dispatch_id": leaf_name,
+            "dirty": bool(status.get("stdout")),
+            "head": head.get("stdout") or None,
+            "branch": branch.get("stdout") or None,
+        }
+        if re.fullmatch(r"wt-[1-9][0-9]*", leaf_name):
+            detail["seat"] = leaf_name
+            lock_path = goalflight_worktree_pool.worktree_seat_lock_path(
+                project_root, leaf_name
+            )
+            lock_file = None
+            try:
+                lock_file = lock_path.open("r+", encoding="utf-8")
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except FileNotFoundError:
+                detail["seat_state"] = "free"
+                detail["occupant_dispatch_id"] = None
+            except BlockingIOError:
+                detail["seat_state"] = "held"
+                try:
+                    lock_file.seek(0)
+                    occupant = json.load(lock_file)
+                except (OSError, ValueError, TypeError):
+                    occupant = {}
+                detail["occupant_dispatch_id"] = occupant.get("dispatch_id")
+                detail["occupant_pid"] = occupant.get("pid")
+            except OSError as exc:
+                detail["seat_state"] = "unknown"
+                detail["seat_error"] = f"{type(exc).__name__}: {exc}"
+            else:
+                detail["seat_state"] = "free"
+                detail["occupant_dispatch_id"] = None
+            finally:
+                if lock_file is not None:
+                    lock_file.close()
+        else:
+            legacy_dispatch_by_path[path_text] = leaf_name
+        details.append(detail)
 
     blocking_paths: list[str] = []
     if managed_root_path.is_dir():
@@ -2735,13 +2751,16 @@ def check_worktrees(project_root: Path) -> dict:
             if child_abs not in registered and child_resolved not in registered_resolved:
                 blocking_paths.append(child_abs)
 
-    active_dispatches, capacity_error = _active_capacity_dispatches()
+    active_dispatches: set[tuple[str, str]] = set()
+    capacity_error = None
+    if legacy_dispatch_by_path:
+        active_dispatches, capacity_error = _active_capacity_dispatches()
     project_root_key = str(project_root.resolve())
     stale = []
     if capacity_error is None:
         stale = [
             path
-            for path, dispatch_id in sorted(dispatch_by_path.items())
+            for path, dispatch_id in sorted(legacy_dispatch_by_path.items())
             if (dispatch_id, path) not in active_dispatches
             and (dispatch_id, project_root_key) not in active_dispatches
         ]

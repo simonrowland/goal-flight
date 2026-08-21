@@ -212,6 +212,7 @@ def _receipt_runner(captured: list[list[str]]):
                 "launcher_log_path": f"/tmp/goal-flight-remote-drain-test/dispatches/{dispatch_id}/dispatcher.log",
                 "started_at": "2026-06-21T12:00:00+00:00",
                 "worktree_base_sha": base_sha,
+                "worktree_path": "/tmp/goal-flight-remote-drain-test/worktrees/wt-1",
             },
             sort_keys=True,
         ), ""

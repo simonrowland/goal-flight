@@ -276,51 +276,77 @@ def case_non_linked_and_non_write_profiles_are_unchanged() -> None:
         assert not any("writable_roots=" in part for part in grok_argv), grok_argv
 
 
-def case_doctor_reports_cleanup_failure() -> None:
+def case_doctor_releases_worktree_seat() -> None:
     original_run = doctor.run
     original_subprocess_run = doctor.subprocess.run
+    original_acquire = doctor.goalflight_worktree_pool.acquire_worktree_seat
+    lease_root = Path(tempfile.mkdtemp(prefix="goalflight-doctor-seat-test-"))
+    worktree = lease_root / "wt-1"
+    worktree.mkdir()
+    expected_text = ""
+    calls: list[list[str]] = []
+
+    class FakeLease:
+        path = worktree
+        released = False
+
+        @staticmethod
+        def fileno() -> int:
+            return 42
+
+        def release(self) -> None:
+            self.released = True
+
+    lease = FakeLease()
 
     def result(*, ok: bool, stdout: str = "", stderr: str = "") -> dict:
         return {"ok": ok, "returncode": 0 if ok else 1, "stdout": stdout, "stderr": stderr}
 
     def fake_run(argv: list[str], timeout: float) -> dict:
-        if "worktree" in argv and "add" in argv:
-            Path(argv[-2]).mkdir(parents=True)
-            return result(ok=True)
-        if "worktree" in argv and "remove" in argv:
-            return result(ok=False, stderr="cleanup denied")
-        if "branch" in argv and "-D" in argv:
-            return result(ok=True)
+        calls.append(argv)
         if "rev-parse" in argv:
             cwd = Path(argv[argv.index("-C") + 1])
-            return result(ok=True, stdout=("b" if cwd.name == "worktree" else "a") * 40 + "\n")
+            return result(ok=True, stdout=("b" if cwd == worktree else "a") * 40 + "\n")
         if "show" in argv:
-            cwd = Path(argv[argv.index("-C") + 1])
-            prompt_text = (cwd.parent / "prompt.md").read_text(encoding="utf-8")
-            match = re.search(r"`(goalflight-doctor-worktree-commit:[^`]+)`", prompt_text)
-            assert match
-            return result(ok=True, stdout=match.group(1) + "\n")
+            return result(ok=True, stdout=expected_text + "\n")
         raise AssertionError(argv)
 
     def fake_subprocess_run(*args, **kwargs):
+        nonlocal expected_text
+        command = args[0]
+        prompt_path = Path(command[command.index("--prompt-file") + 1])
+        prompt_text = prompt_path.read_text(encoding="utf-8")
+        match = re.search(r"`(goalflight-doctor-worktree-commit:[^`]+)`", prompt_text)
+        assert match
+        expected_text = match.group(1)
         return subprocess.CompletedProcess(args[0], 0, "", "")
+
+    def fake_acquire(repo: Path, dispatch_id: str, *, base: str):
+        assert repo == REPO_ROOT
+        assert dispatch_id.startswith("doctor-worktree-commit-")
+        assert base == "a" * 40
+        return lease
 
     doctor.run = fake_run
     doctor.subprocess.run = fake_subprocess_run
+    doctor.goalflight_worktree_pool.acquire_worktree_seat = fake_acquire
     try:
         payload = doctor.worker_linked_worktree_commit_probe(REPO_ROOT, enabled=True)
     finally:
         doctor.run = original_run
         doctor.subprocess.run = original_subprocess_run
-    assert payload["ok"] is False, payload
-    assert payload["state"] == "cleanup_failed", payload
-    assert payload["cleanup_errors"] == ["cleanup denied"], payload
+        doctor.goalflight_worktree_pool.acquire_worktree_seat = original_acquire
+        shutil.rmtree(lease_root)
+    assert payload["ok"] is True, payload
+    assert payload["state"] == "complete", payload
+    assert lease.released is True
+    assert not any("worktree" in argv and ("add" in argv or "remove" in argv) for argv in calls)
 
 
 def main() -> None:
     case_linked_worktree_argv_is_narrow()
     case_non_linked_and_non_write_profiles_are_unchanged()
-    case_doctor_reports_cleanup_failure()
+    case_doctor_releases_worktree_seat()
     print("test_linked_worktree_codex_sandbox: all cases passed")
 
 

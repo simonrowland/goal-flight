@@ -97,8 +97,6 @@ ALLOWED_COMMAND_CLASSES = frozenset(
         "git_status_porcelain",
         "git_verify_commit",
         "git_checkout",
-        "git_worktree_add",
-        "git_worktree_remove",
         "read_status_file",
         "read_lease_file",
         "pid_identity",
@@ -387,6 +385,23 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
             prompt_b64,
             "--json",
         ]
+        if bool(params.get("worktree")):
+            worktree_root = _validate_declared_remote_path(
+                str(params.get("worktree_root") or f"{state_dir}/worktrees"),
+                [state_dir],
+                field="acp_run worktree_root",
+            )
+            worktree_base = str(params.get("worktree_base") or "HEAD")
+            argv.extend(
+                [
+                    "--worktree",
+                    "create",
+                    "--worktree-root",
+                    worktree_root,
+                    "--worktree-base",
+                    worktree_base,
+                ]
+            )
         model = str(params.get("model") or "").strip()
         if model:
             argv.extend(["--model", model])
@@ -419,7 +434,6 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         dispatch_id = _require_dispatch_id(str(params.get("dispatch_id") or ""))
         agent = str(params.get("agent") or "")
         prompt = str(params.get("prompt") or "")
-        cwd = str(params.get("cwd") or repo_root)
         node_id = str(params.get("node_id") or "")
         state_dir = _validate_state_dir(
             str(params.get("state_dir") or "~/.goal-flight"),
@@ -431,13 +445,6 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
             raise SshAllowlistError("launch_detached requires dispatch_id, node_id, agent, and status_json")
         if not base_sha:
             raise SshAllowlistError("launch_detached requires base_sha")
-        cwd = _validate_scoped_remote_path(
-            cwd,
-            repo_root=repo_root,
-            state_dir=state_dir,
-            allowed_roots=list(params.get("allowed_roots") or []),
-            field="launch_detached cwd",
-        )
         status_json = _validate_declared_remote_path(
             status_json,
             [f"{state_dir}/dispatches"],
@@ -464,8 +471,6 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
             agent,
             "--prompt-b64",
             prompt_b64,
-            "--cwd",
-            cwd,
             "--state-dir",
             state_dir,
             "--status-json",
@@ -532,44 +537,6 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
     elif command_class == "git_checkout":
         ref = str(params.get("ref") or "HEAD")
         argv = ["git", "-C", repo_root, "checkout", ref]
-    elif command_class == "git_worktree_add":
-        path = str(params.get("worktree_path") or "")
-        ref = str(params.get("ref") or "HEAD")
-        if not path:
-            raise SshAllowlistError("git_worktree_add requires worktree_path")
-        state_dir_param = str(params.get("state_dir") or "").rstrip("/")
-        state_dir = _validate_state_dir(
-            state_dir_param,
-            field="git_worktree_add state_dir",
-        ) if state_dir_param else None
-        path = _validate_scoped_remote_path(
-            path,
-            repo_root=repo_root,
-            state_dir=state_dir,
-            allowed_roots=list(params.get("allowed_roots") or []),
-            field="git_worktree_add worktree_path",
-        )
-        argv = ["git", "-C", repo_root, "worktree", "add"]
-        if bool(params.get("detach")):
-            argv.append("--detach")
-        argv.extend([path, ref])
-    elif command_class == "git_worktree_remove":
-        path = str(params.get("worktree_path") or "")
-        if not path:
-            raise SshAllowlistError("git_worktree_remove requires worktree_path")
-        state_dir_param = str(params.get("state_dir") or "").rstrip("/")
-        state_dir = _validate_state_dir(
-            state_dir_param,
-            field="git_worktree_remove state_dir",
-        ) if state_dir_param else None
-        path = _validate_scoped_remote_path(
-            path,
-            repo_root=repo_root,
-            state_dir=state_dir,
-            allowed_roots=list(params.get("allowed_roots") or []),
-            field="git_worktree_remove worktree_path",
-        )
-        argv = ["git", "-C", repo_root, "worktree", "remove", path]
     elif command_class == "read_status_file":
         status_path = str(params.get("status_path") or "")
         if not status_path:

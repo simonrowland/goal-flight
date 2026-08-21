@@ -38,12 +38,30 @@ class FakeProc:
         return self.returncode
 
 
+class FakeSeatLease:
+    path = ROOT
+    seat_name = "wt-1"
+    quarantine_branch = None
+
+    def __init__(self) -> None:
+        self._fd = os.open(os.devnull, os.O_RDONLY)
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def release(self) -> None:
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
+
+
 @contextmanager
 def patched_spawn(returncode: int | None = None):
     calls: list[dict[str, Any]] = []
     old_popen = fleet_launch.subprocess.Popen
     old_identity = fleet_launch._process_identity_after_spawn
     old_which = fleet_launch.shutil.which
+    old_acquire = fleet_launch.goalflight_worktree_pool.acquire_worktree_seat
 
     def fake_popen(argv: list[str], **kwargs: Any) -> FakeProc:
         if argv and Path(str(argv[0])).name == "ps":
@@ -58,12 +76,14 @@ def patched_spawn(returncode: int | None = None):
         "comm": "python3",
     }
     fleet_launch.shutil.which = lambda _name: None
+    fleet_launch.goalflight_worktree_pool.acquire_worktree_seat = lambda *_a, **_k: FakeSeatLease()
     try:
         yield calls
     finally:
         fleet_launch.subprocess.Popen = old_popen
         fleet_launch._process_identity_after_spawn = old_identity
         fleet_launch.shutil.which = old_which
+        fleet_launch.goalflight_worktree_pool.acquire_worktree_seat = old_acquire
 
 
 @contextmanager
@@ -146,8 +166,18 @@ def test_clean_first_launch_creates_marker_and_spawns() -> None:
         assert_true("prompt written", (dispatch_dir / "prompt.md").read_text(encoding="utf-8") == prompt_text)
         assert_true("receipt written", (dispatch_dir / "launch_receipt.json").exists())
         assert_true("stdout receipt", receipt.get("remote_pid") == 4242)
+        assert_true("receipt names pooled seat", receipt.get("worktree_seat") == "wt-1")
+        assert_true("receipt carries seat path", receipt.get("worktree_path") == str(ROOT))
         assert_true("marker receipted", marker.get("state") == "receipted")
         assert_true("marker pid", marker.get("remote_pid") == 4242)
+        spawn_kwargs = calls[0]["kwargs"]
+        inherited_fds = spawn_kwargs.get("pass_fds") or ()
+        assert_true("detached worker inherits one seat fd", len(inherited_fds) == 1)
+        assert_true(
+            "seat fd is identified in child env",
+            spawn_kwargs["env"].get(fleet_launch.goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV)
+            == str(inherited_fds[0]),
+        )
 
 
 def test_duplicate_marker_recovery_without_no_worker_proof_refuses() -> None:
@@ -557,6 +587,7 @@ def test_recover_unconfirmed_dead_status_resets_lineage_before_spawn() -> None:
         old_identity = fleet_launch._process_identity
         old_after_spawn = fleet_launch._process_identity_after_spawn
         old_which = fleet_launch.shutil.which
+        old_acquire = fleet_launch.goalflight_worktree_pool.acquire_worktree_seat
 
         def track_reset(path: Path) -> bool:
             reset_calls.append(path)
@@ -577,6 +608,7 @@ def test_recover_unconfirmed_dead_status_resets_lineage_before_spawn() -> None:
         fleet_launch._process_identity = fake_identity
         fleet_launch._process_identity_after_spawn = lambda pid: fake_identity(pid)
         fleet_launch.shutil.which = lambda _name: None
+        fleet_launch.goalflight_worktree_pool.acquire_worktree_seat = lambda *_a, **_k: FakeSeatLease()
         try:
             stdout = io.StringIO()
             with redirect_stdout(stdout):
@@ -588,6 +620,7 @@ def test_recover_unconfirmed_dead_status_resets_lineage_before_spawn() -> None:
             fleet_launch._process_identity = old_identity
             fleet_launch._process_identity_after_spawn = old_after_spawn
             fleet_launch.shutil.which = old_which
+            fleet_launch.goalflight_worktree_pool.acquire_worktree_seat = old_acquire
         receipt = json.loads(stdout.getvalue())
         marker = json.loads((dispatch_dir / "launch_marker.json").read_text(encoding="utf-8"))
         assert_true("launch ok", code == 0)

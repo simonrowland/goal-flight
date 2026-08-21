@@ -76,6 +76,7 @@ def launch_receipt_for_argv(argv: list[str]) -> str:
             "launcher_log_path": f"/tmp/goal-flight-dispatch-test/dispatches/{dispatch_id}/dispatcher.log",
             "started_at": "2026-06-11T12:00:00+00:00",
             "worktree_base_sha": base_sha,
+            "worktree_path": "/tmp/goal-flight-dispatch-test/worktrees/wt-1",
         },
         sort_keys=True,
     )
@@ -149,28 +150,22 @@ def test_explicit_dry_run_preview() -> None:
         assert_true("node", payload["node"] == "localhost")
         assert_true("agent", payload["agent"] == "codex-acp")
         assert_true("billing", payload["billing_account"] == "openai/default")
-        assert_true("worktree", "worktrees/acp-dispatch-explicit" in payload["worktree_path"])
+        assert_true("seat selected remotely", payload["worktree_path"] is None)
         assert_true("remote cmds", len(payload["remote_commands"]) >= 2)
         classes = [c["command_class"] for c in payload["remote_commands"]]
         assert_true("cleanup refs", "git_prune_claude_refs" in classes)
         assert_true("git fetch", "git_fetch" in classes)
         assert_true("verify commit", "git_verify_commit" in classes)
-        assert_true("worktree add", "git_worktree_add" in classes)
+        assert_true("no task-named worktree add", "git_worktree_add" not in classes)
         assert_true(
             "cleanup before fetch",
             classes.index("git_prune_claude_refs") < classes.index("git_fetch"),
         )
         assert_true("fetch before verify", classes.index("git_fetch") < classes.index("git_verify_commit"))
-        assert_true("verify before worktree", classes.index("git_verify_commit") < classes.index("git_worktree_add"))
-        assert_true("fetch before worktree", classes.index("git_fetch") < classes.index("git_worktree_add"))
         verify = next(c for c in payload["remote_commands"] if c["command_class"] == "git_verify_commit")
         assert_true("verify exact base", f"{BASE_SHA}^{{commit}}" in verify["argv"])
-        worktree_add = next(c for c in payload["remote_commands"] if c["command_class"] == "git_worktree_add")
-        assert_true("worktree add uses base sha", worktree_add["argv"][-1] == BASE_SHA)
-        assert_true("worktree add detached", "--detach" in worktree_add["argv"])
-        assert_true("worktree add avoids local HEAD", "HEAD" not in worktree_add["argv"])
         launch = next(c for c in payload["remote_commands"] if c["command_class"] == "launch_detached")
-        assert_true("launch cwd worktree", payload["worktree_path"] in launch["argv"])
+        assert_true("launch has no preselected cwd", "--cwd" not in launch["argv"])
         assert_true("launch base sha", launch["argv"][launch["argv"].index("--base-sha") + 1] == BASE_SHA)
         assert_true(
             "launch status json",
@@ -359,7 +354,7 @@ def test_thin_defaults_shows_billing_banner() -> None:
         assert_true("billing visible", preview.billing_account)
 
 
-def test_lock_chain_rollback_on_worktree_failure() -> None:
+def test_lock_chain_rollback_before_remote_capacity() -> None:
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
         _fixture_fleet(fleet_dir)
@@ -377,7 +372,7 @@ def test_lock_chain_rollback_on_worktree_failure() -> None:
                 fleet_dir,
                 preview,
                 runner=lambda _a: (1, "", "fail"),
-                stop_after="worktree",
+                stop_after="remote_capacity",
             )
             assert_true("should raise", False)
         except fleet_dispatch.DispatchError:
@@ -1109,10 +1104,9 @@ def test_git_verify_commit_failure_hints_unpushed_base() -> None:
     assert_true("hint scoped to git_verify_commit only", "push the controller commit" not in other)
 
 
-def test_lock_chain_removes_worktree_on_midchain_failure() -> None:
-    # git_worktree_add succeeds, then launch_detached hard-fails (confirmed
-    # refusal): rollback must remove the worktree this dispatch created, not just
-    # release the account lock — otherwise detached worktrees accumulate on the node.
+def test_lock_chain_never_removes_pooled_seat_on_midchain_failure() -> None:
+    # Seat acquire/reset and ownership live inside the remote launch process.
+    # Controller rollback releases its account lock but never removes a pool seat.
     calls: list[list[str]] = []
 
     def runner(argv: list[str]) -> tuple[int, str, str]:
@@ -1138,10 +1132,8 @@ def test_lock_chain_removes_worktree_on_midchain_failure() -> None:
             assert_true("should raise", False)
         except fleet_dispatch.DispatchError:
             pass
-        removed = any(
-            "worktree" in " ".join(call) and "remove" in " ".join(call) for call in calls
-        )
-        assert_true("rollback issued git_worktree_remove", removed)
+        removed = any("worktree" in " ".join(call) and "remove" in " ".join(call) for call in calls)
+        assert_true("rollback does not remove pooled seat", not removed)
         lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, "openai/default"))
         assert_true("account lock released too", lock is None or lock.get("state") == "released")
 
@@ -1154,7 +1146,7 @@ def main() -> None:
     test_exec_with_live_ssh_env_uses_runner()
     test_preview_ignores_live_ssh_env()
     test_thin_defaults_shows_billing_banner()
-    test_lock_chain_rollback_on_worktree_failure()
+    test_lock_chain_rollback_before_remote_capacity()
     test_remote_failure_surfaces_ssh_details()
     test_redact_argv_masks_prompt_values_everywhere()
     test_pending_row_written_before_remote_mutation()
@@ -1175,7 +1167,7 @@ def main() -> None:
     test_ledger_launch_receipt_roundtrip()
     test_tool_smoke_skip_is_authoritative_even_in_goal_mode()
     test_git_verify_commit_failure_hints_unpushed_base()
-    test_lock_chain_removes_worktree_on_midchain_failure()
+    test_lock_chain_never_removes_pooled_seat_on_midchain_failure()
     print("OK: fleet dispatch tests pass")
 
 

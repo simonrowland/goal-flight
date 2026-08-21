@@ -180,9 +180,12 @@ python3 <skill-root>/scripts/goalflight_dispatch.py --agent <ready-agent> --prom
 ```
 
 For `--parallel N` where `N >= 2`, ACP code-writing dispatches must pass
-`--worktree create`; the runner creates `worktrees/<dispatch-id>/` from `HEAD`
-and routes the worker `--cwd` there. Sequential dispatch (`--parallel 1` or no
-flag) stays in the project root.
+`--worktree create`; the runner leases one lazy, reusable seat from
+`worktrees/wt-1` … `worktrees/wt-N` and routes the worker `--cwd` there.
+`GOALFLIGHT_WORKTREE_SEATS` sets the deliberate per-repository hard ceiling
+(default 4). A full pool fails with occupant dispatch ids instead of creating
+another checkout. Sequential dispatch (`--parallel 1` or no flag) stays in the
+project root.
 
 Parallel worktrees start from committed `HEAD`; they do not include uncommitted
 controller-root edits. Preserve unrelated WIP. Dispatch from committed `HEAD`

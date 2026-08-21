@@ -28,6 +28,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import goalflight_dispatch_states as dispatch_states
 import goalflight_ledger
+import goalflight_worktree_pool
 from goalflight_liveness import reset_status_lineage
 
 ENV_ALLOW_EXACT = frozenset(
@@ -553,6 +554,7 @@ def _receipt_from_status(args: argparse.Namespace, status_json: Path, state_dir:
         "launcher_log_path": str(_dispatch_dir(state_dir, args.dispatch_id) / "dispatcher.log"),
         "started_at": str(payload.get("updated_at") or _utc_now()),
         "worktree_base_sha": getattr(args, "base_sha", ""),
+        "worktree_path": payload.get("worktree_path") or payload.get("worker_cwd"),
         "reused": True,
         "reuse_source": "status_json",
     }
@@ -683,6 +685,45 @@ def _launch(args: argparse.Namespace) -> int:
         )
         return 1
 
+    try:
+        worktree_seat = goalflight_worktree_pool.acquire_worktree_seat(
+            repo_root,
+            args.dispatch_id,
+            base=args.base_sha,
+            managed_root=state_dir / "worktrees",
+        )
+    except goalflight_worktree_pool.WorktreeSeatError as exc:
+        _update_launch_marker(
+            marker_path,
+            {
+                "state": "worktree_acquire_failed",
+                "error": str(exc),
+            },
+        )
+        if recovery_lock_acquired:
+            _remove_file(recovery_lock_path)
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "dispatch_id": args.dispatch_id,
+                    "node_id": args.node_id,
+                    "error": str(exc),
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+    _update_launch_marker(
+        marker_path,
+        {
+            "worktree_path": str(worktree_seat.path),
+            "worktree_seat": worktree_seat.seat_name,
+            "quarantine_branch": worktree_seat.quarantine_branch,
+        },
+    )
+
     dispatch_py = repo_root / "scripts" / "goalflight_dispatch.py"
     cmd = [
         sys.executable,
@@ -694,7 +735,7 @@ def _launch(args: argparse.Namespace) -> int:
         "--prompt-file",
         str(prompt_path),
         "--cwd",
-        args.cwd,
+        str(worktree_seat.path),
         "--dispatch-id",
         args.dispatch_id,
         "--status-json",
@@ -706,6 +747,7 @@ def _launch(args: argparse.Namespace) -> int:
     env = _sanitized_env(os.environ)
     env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
     env["GOALFLIGHT_FLEET_NODE_ID"] = args.node_id
+    env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(worktree_seat.fileno())
     _ensure_local_bin_on_path(env)
 
     popen_cmd = cmd
@@ -725,8 +767,10 @@ def _launch(args: argparse.Namespace) -> int:
                 cwd=str(repo_root),
                 start_new_session=(os.name != "nt"),
                 close_fds=True,
+                pass_fds=(worktree_seat.fileno(),),
             )
     except OSError as exc:
+        worktree_seat.release()
         _update_launch_marker(
             marker_path,
             {
@@ -763,6 +807,7 @@ def _launch(args: argparse.Namespace) -> int:
         },
     )
     if proc.poll() is not None:
+        worktree_seat.release()
         _update_launch_marker(
             marker_path,
             {
@@ -788,6 +833,8 @@ def _launch(args: argparse.Namespace) -> int:
         )
         return 1
 
+    worktree_seat.release()
+
     receipt = {
         "schema": "goalflight.fleet.launch_receipt.v1",
         "dispatch_id": args.dispatch_id,
@@ -801,6 +848,9 @@ def _launch(args: argparse.Namespace) -> int:
         "launcher_log_path": str(log_path),
         "started_at": _utc_now(),
         "worktree_base_sha": getattr(args, "base_sha", ""),
+        "worktree_path": str(worktree_seat.path),
+        "worktree_seat": worktree_seat.seat_name,
+        "quarantine_branch": worktree_seat.quarantine_branch,
     }
     receipt_file = _receipt_path(state_dir, args.dispatch_id)
     receipt_file.write_text(json.dumps(receipt, sort_keys=True) + "\n")
@@ -869,7 +919,6 @@ def main(argv: list[str] | None = None) -> int:
     launch.add_argument("--dispatch-id", required=True)
     launch.add_argument("--agent", required=True)
     launch.add_argument("--prompt-b64", required=True)
-    launch.add_argument("--cwd", required=True)
     launch.add_argument("--state-dir", required=True)
     launch.add_argument("--status-json", required=True)
     launch.add_argument("--read-only", action="store_true")

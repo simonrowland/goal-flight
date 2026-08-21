@@ -158,8 +158,11 @@ def test_acp_run_uses_prompt_b64_and_acp_python() -> None:
         dispatch_id="acp-test",
         agent="codex-acp",
         prompt=prompt,
-        cwd="/Users/dev/.goal-flight/worktrees/acp-test",
+        cwd="/srv/goal-flight",
         status_json="/Users/dev/.goal-flight/dispatches/acp-test/status.json",
+        worktree=True,
+        worktree_root="/Users/dev/.goal-flight/worktrees",
+        worktree_base=BASE_SHA,
         model="grok-composer-2.5-fast",
         mode="one-shot",
         os_sandbox="read-only",
@@ -182,6 +185,12 @@ def test_acp_run_uses_prompt_b64_and_acp_python() -> None:
     assert_true("sandbox passed", argv[argv.index("--os-sandbox") + 1] == "read-only")
     assert_true("tool cap passed", argv[argv.index("--max-consecutive-tool-errors") + 1] == "1")
     assert_true("event cap passed", argv[argv.index("--max-acp-events") + 1] == "120")
+    assert_true("pooled worktree enabled", argv[argv.index("--worktree") + 1] == "create")
+    assert_true(
+        "pool root passed",
+        argv[argv.index("--worktree-root") + 1] == "/Users/dev/.goal-flight/worktrees",
+    )
+    assert_true("pool base passed", argv[argv.index("--worktree-base") + 1] == BASE_SHA)
     assert_true("live matrix opt-in only", "GOALFLIGHT_ACP_LIVE_MATRIX=1" not in argv)
 
 

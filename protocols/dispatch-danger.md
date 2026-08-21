@@ -25,8 +25,8 @@ Safe to run anytime, as often as you like.
     `execute`, which renders `prompts/dispatch-wrapper.md`). They run without the
     project's north-star frame — a correctness risk, not just hygiene.
 - **`/goal-flight execute [--parallel N]`** — dispatches queued chunks with the full
-  `prompts/dispatch-wrapper.md` mandate. `--parallel N≥2` isolates each worker in its
-  own git worktree (`scripts/goalflight_acp_run.py --worktree create`); sequential
+  `prompts/dispatch-wrapper.md` mandate. `--parallel N≥2` isolates each worker in a
+  leased pooled seat (`scripts/goalflight_acp_run.py --worktree create`); sequential
   dispatch stays in the project root.
 - **Dispatcher CLI (`scripts/goalflight_dispatch.py`)** — without `--submit`, launches
   one worker in default detached mode. With `--submit`, writes a durable queue entry

@@ -2,8 +2,8 @@
 """Fleet remote dispatch MVP (Track A goals 11a–11f).
 
 Explicit dispatch CLI with preview-first flow, thin defaults from steering,
-lock-order enforcement, allowlisted remote worktree + detached launch receipt,
-and auth/quarantine gates.
+lock-order enforcement, allowlisted remote pooled-seat launch receipts, and
+auth/quarantine gates.
 """
 
 from __future__ import annotations
@@ -130,7 +130,7 @@ class DispatchPreview:
     agent: str
     billing_account: str
     prompt: str
-    worktree_path: str
+    worktree_path: str | None
     base_sha: str
     lock_steps: list[LockStep] = field(default_factory=list)
     thin_defaults: bool = False
@@ -193,15 +193,8 @@ def resolve_thin_defaults(
     return resolved_agent, str(resolved_billing), used_thin
 
 
-def worktree_path_for_dispatch(node_entry: dict[str, Any], dispatch_id: str) -> str:
-    state_dir = str(node_entry.get("state_dir") or "~/.goal-flight").rstrip("/")
-    if state_dir.startswith("~"):
-        state_dir = str(Path(state_dir).expanduser())
-    return f"{state_dir}/worktrees/{dispatch_id}"
-
-
 def build_lock_steps(*, acquired: list[str] | None = None) -> list[LockStep]:
-    order = ["registry", "account", "worktree", "remote_capacity", "spawn"]
+    order = ["registry", "account", "remote_capacity", "spawn"]
     acquired_set = set(acquired or [])
     steps: list[LockStep] = []
     for name in order:
@@ -302,7 +295,6 @@ def build_remote_command_plan(
     dispatch_id: str,
     agent: str,
     prompt: str,
-    worktree_path: str,
     base_sha: str,
     recover_unconfirmed: bool = False,
 ) -> list[dict[str, Any]]:
@@ -316,7 +308,6 @@ def build_remote_command_plan(
         ("git_prune_claude_refs", {"python": str(node_entry.get("python") or "python3")}),
         ("git_fetch", {}),
         ("git_verify_commit", {"sha": base_sha}),
-        ("git_worktree_add", {"state_dir": state_dir, "worktree_path": worktree_path, "ref": base_sha, "detach": True}),
         (
             "launch_detached",
             {
@@ -324,7 +315,6 @@ def build_remote_command_plan(
                 "node_id": str(node_entry.get("node_id") or ""),
                 "agent": agent,
                 "prompt": prompt,
-                "cwd": worktree_path,
                 "state_dir": state_dir,
                 "status_json": status_json,
                 "python": str(node_entry.get("python") or "python3"),
@@ -380,7 +370,6 @@ def preview_dispatch(
 
     dispatch_id = dispatch_id or default_dispatch_id()
     resolved_base_sha = normalize_base_sha(base_sha)
-    worktree = worktree_path_for_dispatch(node_entry, dispatch_id)
     banner = None
     if used_thin or thin_mode:
         banner = "MVP still requires explicit confirmation of billing account before --exec"
@@ -391,7 +380,7 @@ def preview_dispatch(
         agent=resolved_agent,
         billing_account=resolved_billing,
         prompt=prompt,
-        worktree_path=worktree,
+        worktree_path=None,
         base_sha=resolved_base_sha,
         lock_steps=build_lock_steps(),
         thin_defaults=used_thin or thin_mode,
@@ -401,7 +390,6 @@ def preview_dispatch(
             dispatch_id=dispatch_id,
             agent=resolved_agent,
             prompt=prompt,
-            worktree_path=worktree,
             base_sha=resolved_base_sha,
             recover_unconfirmed=recover_unconfirmed,
         ),
@@ -482,6 +470,8 @@ def _parse_launch_receipt(
         raise DispatchError("launch_detached receipt missing remote_pid")
     if not payload.get("remote_status_path"):
         raise DispatchError("launch_detached receipt missing remote_status_path")
+    if not payload.get("worktree_path"):
+        raise DispatchError("launch_detached receipt missing worktree_path")
     if base_sha and payload.get("worktree_base_sha") != base_sha:
         raise DispatchError("launch_detached receipt base_sha mismatch")
     return payload
@@ -505,7 +495,6 @@ def acquire_lock_chain(
 
     result = LockChainResult(account_key=preview.billing_account)
     acquired: list[str] = []
-    worktree_created = False
     node_entry: dict[str, Any] = {}
     try:
         existing_lock = fleet.load_account_lock(fleet.account_lock_path(fleet_dir, preview.billing_account))
@@ -535,10 +524,6 @@ def acquire_lock_chain(
         persist_dispatch_account_lock_link(fleet_dir, preview, lock_doc)
         if stop_after == "account":
             raise DispatchError("stop_after account")
-
-        acquired.append("worktree")
-        if stop_after == "worktree":
-            raise DispatchError("stop_after worktree")
 
         if stop_after == "remote_capacity":
             raise DispatchError("stop_after remote_capacity")
@@ -587,13 +572,6 @@ def acquire_lock_chain(
                         result.acquired = acquired
                         return result
                     raise DispatchError(failure)
-                if cmd["command_class"] == "git_worktree_add":
-                    # Real creation confirmed (code == 0). Track it so a later
-                    # mid-chain failure can roll the worktree back, not just the
-                    # account lock. Only OUR successful add sets this — a failed
-                    # add (e.g. path already exists for a duplicate dispatch) leaves
-                    # it False so we never remove a worktree we did not create.
-                    worktree_created = True
                 if cmd["command_class"] == "launch_detached":
                     try:
                         result.launch_receipt = _parse_launch_receipt(
@@ -614,8 +592,6 @@ def acquire_lock_chain(
         result.acquired = acquired
         return result
     except Exception:
-        if worktree_created and runner is not None:
-            _best_effort_remove_worktree(preview, node_entry, runner=runner, fleet_dir=fleet_dir)
         release_lock_chain(fleet_dir, preview, acquired=acquired, fencing_token=result.fencing_token)
         raise
 
@@ -640,40 +616,6 @@ def release_lock_chain(
                 )
             except fleet.AccountLockError:
                 pass
-
-
-def _best_effort_remove_worktree(
-    preview: DispatchPreview,
-    node_entry: dict[str, Any],
-    *,
-    runner: Callable[[list[str]], tuple[int, str, str]],
-    fleet_dir: Path,
-) -> None:
-    """Remove a remote worktree this dispatch created before it failed mid-chain.
-
-    A `git_worktree_add` that succeeded followed by a later command failure (e.g. a
-    confirmed launch refusal) would otherwise strand a detached worktree on the
-    node, accumulating until `git worktree prune`/salvage. The freshly-added
-    detached worktree is clean (the worker never ran), so a plain remove suffices.
-    Best-effort and never raises: rollback cleanup must not mask the original
-    dispatch error, and the account-lock release below must still run.
-    """
-    try:
-        import goalflight_fleet_ssh as fleet_ssh
-
-        repo_root = str(node_entry.get("repo_root") or "")
-        argv = fleet_ssh.build_remote_command(
-            "git_worktree_remove",
-            repo_root=repo_root,
-            state_dir=str(node_entry.get("state_dir") or "~/.goal-flight"),
-            worktree_path=preview.worktree_path,
-        )
-        host = fleet_ssh.host_from_node_entry(preview.node_id, node_entry)
-        ssh_argv = fleet_ssh.build_ssh_command(host, argv, command_class="git_worktree_remove")
-        with fleet_ssh.node_ssh_lock(preview.node_id, fleet_dir=fleet_dir):
-            runner(ssh_argv)
-    except Exception:
-        pass
 
 
 def register_dispatch_meta(
@@ -717,7 +659,10 @@ def register_dispatch_meta(
         "remote_status_path": remote_status_path,
         "remote_lease_id_superseded_by": "launch_receipt",
         "launch_unconfirmed": launch_unconfirmed,
-        "worktree_path": preview.worktree_path,
+        "worktree_path": (
+            (launch_receipt or {}).get("worktree_path")
+            or preview.worktree_path
+        ),
         "base_sha": preview.base_sha,
         "worktree_base_sha": preview.base_sha,
     }
@@ -875,6 +820,7 @@ def resolve_dispatch_runner(args) -> Callable[[list[str]], tuple[int, str, str]]
                     "launcher_log_path": "/tmp/goal-flight-stub/dispatcher.log",
                     "started_at": "2026-06-11T12:00:00+00:00",
                     "worktree_base_sha": base_sha,
+                    "worktree_path": "/tmp/goal-flight-stub/worktrees/wt-1",
                 },
                 sort_keys=True,
             ), ""

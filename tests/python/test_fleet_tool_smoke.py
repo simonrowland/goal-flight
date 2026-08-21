@@ -96,7 +96,8 @@ def _runner_with_acp_status(*, red_read_error: bool = False, include_tool_calls:
                         return 0, path.read_text(), ""
             return 0, "{}", ""
         status_path = Path(_extract_wrapped_flag(argv, "--status-json"))
-        cwd = _extract_wrapped_flag(argv, "--cwd", "/tmp/goal-flight/worktree")
+        pool_root = _extract_wrapped_flag(argv, "--worktree-root", "/tmp/goal-flight/worktrees")
+        cwd = f"{pool_root.rstrip('/')}/wt-1"
         status_path.parent.mkdir(parents=True, exist_ok=True)
         stderr_path = status_path.with_suffix(".stderr.log")
         result_text = (
@@ -114,6 +115,8 @@ def _runner_with_acp_status(*, red_read_error: bool = False, include_tool_calls:
             "text_excerpt": result_text,
             "status_path": str(status_path),
             "agent_stderr_path": str(stderr_path),
+            "worker_cwd": cwd,
+            "worktree_path": cwd,
         }
         if include_tool_calls:
             payload["tool_calls"] = _read_tool_calls(f"{cwd.rstrip('/')}/README.md")

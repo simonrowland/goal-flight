@@ -85,6 +85,7 @@ import goalflight_quota_stuck
 import goalflight_session_status
 import goalflight_task
 import goalflight_terminal
+import goalflight_worktree_pool
 from goalflight_agent_limits import moonshot_family
 from goalflight_codex_sandbox import codex_workspace_write_args
 from goalflight_liveness import active_monotonic, process_group_id, write_status
@@ -795,6 +796,7 @@ def _cmd_spawn_daemon() -> int:
                 stderr=stderr_f,
                 start_new_session=True,
                 close_fds=True,
+                pass_fds=goalflight_worktree_pool.inherited_worktree_lock_fds(),
             )
         print(json.dumps({"pid": child.pid}, sort_keys=True), flush=True)
         return 0
@@ -823,6 +825,7 @@ def _spawn_daemonized_process(
         "stderr": stderr,
         "serialize_stdout": bool(stdout_path and serialize_stdout),
     }
+    inherited_lock_fds = goalflight_worktree_pool.inherited_worktree_lock_fds()
     helper = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), DAEMON_SPAWN_ARG],
         input=json.dumps(spec, sort_keys=True),
@@ -832,6 +835,7 @@ def _spawn_daemonized_process(
         errors="replace",
         env=env,
         timeout=30,
+        pass_fds=inherited_lock_fds,
         **_detached_popen_kwargs(),
     )
     if helper.returncode != 0:

@@ -46,6 +46,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import goalflight_compat  # noqa: E402
 import goalflight_dispatch_paths  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
+import goalflight_worktree_pool  # noqa: E402
 from goalflight_watch import (  # noqa: E402
     BLOCKING_TERMINAL_MARKERS,
     SUCCESS_TERMINAL_MARKERS,
@@ -1476,80 +1477,25 @@ def _now() -> int:
     return int(time.time())
 
 
-def worktree_path_for_dispatch(project_root: Path, dispatch_id: str) -> Path:
-    """Return the managed local worktree path for a dispatch id.
-
-    Dispatch ids become path segments under ``worktrees/``. Reject separators
-    and traversal up front so a caller cannot route writes outside the project.
-    """
-    if not dispatch_id or dispatch_id in {".", ".."} or dispatch_id.startswith("."):
-        raise ValueError("dispatch_id must be a non-empty path segment")
-    if "/" in dispatch_id or "\\" in dispatch_id or ".." in Path(dispatch_id).parts:
-        raise ValueError(f"dispatch_id is not a safe path segment: {dispatch_id!r}")
-    if not _re.fullmatch(r"[A-Za-z0-9._-]+", dispatch_id):
-        raise ValueError(f"dispatch_id contains unsupported characters: {dispatch_id!r}")
-    return project_root / "worktrees" / dispatch_id
-
-
 def status_filename_segment(dispatch_id: str) -> str:
     """Return a filesystem-safe status filename segment for a dispatch id."""
     segment = _re.sub(r"[^A-Za-z0-9._-]+", "_", dispatch_id).strip("._-")
     return segment or "invalid-dispatch"
 
 
-def create_dispatch_worktree(project_root: Path, dispatch_id: str) -> Path:
-    """Create and return the per-dispatch git worktree path."""
-    project_root = project_root.resolve()
-    worktree_path = worktree_path_for_dispatch(project_root, dispatch_id)
-    top = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=str(project_root),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+def create_and_route_dispatch_worktree(
+    cfg: argparse.Namespace,
+    project_root: Path,
+    dispatch_id: str,
+) -> goalflight_worktree_pool.WorktreeSeatLease:
+    """Acquire and prepare one reusable worktree seat for a dispatch."""
+    configured_root = getattr(cfg, "worktree_root", None)
+    return goalflight_worktree_pool.acquire_worktree_seat(
+        project_root,
+        dispatch_id,
+        base=str(getattr(cfg, "worktree_base", None) or "HEAD"),
+        managed_root=Path(configured_root) if configured_root else None,
     )
-    if top.returncode != 0:
-        detail = (top.stderr or top.stdout or "").strip()
-        raise RuntimeError(f"--cwd is not a git repository root: {project_root}: {detail}")
-    if Path(top.stdout.strip()).resolve() != project_root:
-        raise RuntimeError(f"--cwd must be the git repository root: {project_root}")
-    managed_root = worktree_path.parent
-    if managed_root.is_symlink():
-        raise ValueError(f"managed worktree root must not be a symlink: {managed_root}")
-    if managed_root.exists() and not managed_root.is_dir():
-        raise ValueError(f"managed worktree root is not a directory: {managed_root}")
-    managed_root.mkdir(parents=True, exist_ok=True)
-    if worktree_path.exists() or worktree_path.is_symlink():
-        raise ValueError(f"dispatch worktree path already exists: {worktree_path}")
-    result = subprocess.run(
-        ["git", "worktree", "add", str(worktree_path), "HEAD"],
-        cwd=str(project_root),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"git worktree add failed for {worktree_path}: {detail}")
-    if worktree_path.is_symlink():
-        raise RuntimeError(f"dispatch worktree path became a symlink: {worktree_path}")
-    try:
-        worktree_path.resolve().relative_to(managed_root.resolve())
-    except ValueError as exc:
-        raise RuntimeError(f"dispatch worktree escaped managed root: {worktree_path}") from exc
-    return worktree_path
-
-
-def create_and_route_dispatch_worktree(_cfg: argparse.Namespace, project_root: Path, dispatch_id: str) -> Path:
-    """Create a dispatch worktree; caller routes worker cwd with a local value."""
-    created = create_dispatch_worktree(project_root, dispatch_id)
-    return created
 
 
 def _event_kind(event: dict) -> str:
@@ -1802,6 +1748,7 @@ async def spawn_and_handshake_with_retry(
     env: dict[str, str] | None = None,
     stderr_capture: AgentStderrCapture | None = None,
     resume_session_id: str | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> tuple[asyncio.subprocess.Process, AcpConnection]:
     """Spawn the worker and run the ACP handshake, retrying once on AcpError.
 
@@ -1838,6 +1785,7 @@ async def spawn_and_handshake_with_retry(
             permission_policy=permission_policy,
             os_sandbox=os_sandbox,
             env=env,
+            pass_fds=pass_fds,
         )
         if stderr_capture is not None:
             await stderr_capture.attach(conn)
@@ -2065,13 +2013,6 @@ async def _run_acp_dispatch_impl(
         else:
             resolved_permission_dir_source = "default"
     worktree_mode = getattr(cfg, "worktree", "off")
-    worktree_path: Path | None = None
-    worktree_error: str | None = None
-    if worktree_mode == "create":
-        try:
-            worktree_path = worktree_path_for_dispatch(project_root, dispatch_id)
-        except Exception as e:
-            worktree_error = f"{type(e).__name__}: {e}"
     status_path = _resolve_status_json_path(getattr(cfg, "status_json", None), dispatch_id)
     cfg.status_json = str(status_path)
     agent_stderr_path = _agent_stderr_log_path(status_path)
@@ -2115,7 +2056,7 @@ async def _run_acp_dispatch_impl(
         "project_root": str(project_root),
         "worker_cwd": worker_cwd,
         "worktree_mode": worktree_mode,
-        "planned_worktree_path": str(worktree_path) if worktree_path is not None else None,
+        "planned_worktree_path": None,
         "worktree_path": None,
         "status_path": str(status_path),
         "agent_stderr_path": str(agent_stderr_path),
@@ -2199,16 +2140,6 @@ async def _run_acp_dispatch_impl(
         print(f"goalflight_acp_run: {registration_warning}", file=sys.stderr)
     if boundary_warning:
         print(f"goalflight_acp_run: WARNING: {boundary_warning}", file=sys.stderr)
-    if worktree_error is not None:
-        payload.update(
-            state="failed_worktree",
-            ok=False,
-            error=worktree_error,
-            updated_at=_now(),
-        )
-        _commit_prelaunch_terminal(payload, project_root=project_root)
-        write_status(status_path, payload)
-        return payload
     try:
         if cfg.prompt:
             prompt = Path(original_prompt_file or cfg.prompt).read_text()
@@ -2292,8 +2223,8 @@ async def _run_acp_dispatch_impl(
         dispatch_id=dispatch_id,
         prompt_id=cfg.prompt_id,
         project_root=str(project_root),
-        worktree_path=str(worktree_path) if worktree_path is not None else None,
-        worker_cwd=str(worktree_path) if worktree_path is not None else worker_cwd,
+        worktree_path=None,
+        worker_cwd=worker_cwd,
         controller_pid=controller_pid,
         worker_pid=None,
         lease_id=None,
@@ -2384,6 +2315,7 @@ async def _run_acp_dispatch_impl(
 
     proc: asyncio.subprocess.Process | None = None
     conn: AcpConnection | None = None
+    worktree_seat: goalflight_worktree_pool.WorktreeSeatLease | None = None
     heartbeat_task: asyncio.Task | None = None
     ledger_recorded = False
     state = "failed"
@@ -2470,9 +2402,9 @@ async def _run_acp_dispatch_impl(
                     ),
                     transport="acp",
                     # project_root MUST be the original --cwd (main repo
-                    # toplevel), NOT worker_cwd. For a worktree dispatch
-                    # worker_cwd is reassigned to the per-dispatch worktree dir
-                    # (line ~1770), but goalflight_status.scope_payload() filters
+                    # toplevel), NOT worker_cwd. For a worktree dispatch,
+                    # worker_cwd is reassigned to the leased pool seat, but
+                    # goalflight_status.scope_payload() filters
                     # records by exact project_root == this-repo toplevel. If we
                     # recorded the worktree path here the record would be scoped
                     # OUT of `status --done/--dispatch/--json` for its whole
@@ -2512,6 +2444,17 @@ async def _run_acp_dispatch_impl(
             lease = data.get("leases", {}).get(lease_id)
             if lease:
                 lease["worker_pid"] = worker_pid
+                goalflight_capacity.save_state(data)
+
+    def attach_worktree_to_lease(path: Path) -> None:
+        if not lease_id:
+            return
+        with goalflight_capacity.StateLock():
+            data = goalflight_capacity.load_state()
+            lease = data.get("leases", {}).get(lease_id)
+            if lease:
+                lease["worker_cwd"] = str(path)
+                lease["worktree_path"] = str(path)
                 goalflight_capacity.save_state(data)
 
     def detach_lease_to_worker(worker_pid: int, reason: object) -> None:
@@ -3557,9 +3500,11 @@ async def _run_acp_dispatch_impl(
     record_ledger_state(worker_pid=None, state="starting")
     ledger_recorded = True
     try:
-        if worktree_path is not None:
+        if worktree_mode == "create":
             try:
-                created = create_and_route_dispatch_worktree(cfg, project_root, dispatch_id)
+                worktree_seat = create_and_route_dispatch_worktree(
+                    cfg, project_root, dispatch_id
+                )
             except Exception as e:
                 await update_status(
                     state="failed_worktree",
@@ -3567,7 +3512,9 @@ async def _run_acp_dispatch_impl(
                     error=f"{type(e).__name__}: {e}",
                 )
                 return payload
-            worker_cwd = str(created)
+            worker_cwd = str(worktree_seat.path)
+            prompt = prompt.replace("{{GOALFLIGHT_WORKTREE_PATH}}", worker_cwd)
+            attach_worktree_to_lease(worktree_seat.path)
             command, acp_args = agent_command(
                 cfg.agent,
                 model=getattr(cfg, "model", None),
@@ -3578,7 +3525,9 @@ async def _run_acp_dispatch_impl(
             await update_status(
                 state="worktree_created",
                 worker_cwd=worker_cwd,
-                worktree_path=str(created),
+                worktree_path=str(worktree_seat.path),
+                worktree_seat=worktree_seat.seat_name,
+                quarantine_branch=worktree_seat.quarantine_branch,
             )
         try:
             if os_sandbox_profile != OS_SANDBOX_OFF:
@@ -3699,6 +3648,14 @@ async def _run_acp_dispatch_impl(
                 env=spawn_env,
                 stderr_capture=agent_stderr_capture,
                 resume_session_id=getattr(cfg, "resume_session_id", None),
+                pass_fds=tuple(
+                    dict.fromkeys(
+                        (
+                            *goalflight_worktree_pool.inherited_worktree_lock_fds(),
+                            *((worktree_seat.fileno(),) if worktree_seat is not None else ()),
+                        )
+                    )
+                ),
             )
         native_session = getattr(conn, "acp_session_id", None)
         if native_session:
@@ -4339,6 +4296,8 @@ async def _run_acp_dispatch_impl(
         elif lease_id:
             with contextlib.redirect_stdout(io.StringIO()):
                 goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=payload.get("state", state), reason=payload.get("error"), keep=True))
+        if worktree_seat is not None:
+            worktree_seat.release()
     _attach_agent_stderr_tail(payload, agent_stderr_capture)
     write_status(status_path, payload)
     return payload
@@ -4442,10 +4401,18 @@ def main(argv: list[str] | None = None) -> int:
         "--worktree",
         choices=["off", "create"],
         default="off",
-        help="Dispatch worktree mode. 'create' runs `git worktree add "
-             "worktrees/<dispatch-id>/ HEAD` from the original --cwd and "
-             "routes the worker --cwd to that per-dispatch worktree. The "
-             "worktree is intentionally left on exit for operator inspection.",
+        help="Dispatch worktree mode. 'create' leases and acquire-resets one "
+             "lazy seat from the configured wt-1..wt-N pool.",
+    )
+    parser.add_argument(
+        "--worktree-root",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--worktree-base",
+        default="HEAD",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--dispatch-id")

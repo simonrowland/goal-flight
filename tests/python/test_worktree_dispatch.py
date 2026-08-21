@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for per-dispatch local worktree routing."""
+"""Tests for local worktree seat routing."""
 
 from __future__ import annotations
 
@@ -9,8 +9,7 @@ skip_posix_on_native_windows("worktree dispatch tests use POSIX symlink semantic
 
 import argparse
 import asyncio
-import contextlib
-import io
+from contextlib import contextmanager
 import json
 import os
 import subprocess
@@ -35,6 +34,7 @@ os.environ.pop("GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE", None)
 import goalflight_acp_run
 import goalflight_capacity
 import goalflight_doctor
+import goalflight_worktree_pool
 
 OS_SANDBOX_OFF = goalflight_acp_run.OS_SANDBOX_OFF
 
@@ -70,50 +70,45 @@ def make_repo(root: Path) -> Path:
     return repo
 
 
-def acquire_active_dispatch(dispatch_id: str, project_root: Path) -> None:
-    args = argparse.Namespace(
-        agent="codex",
-        dispatch_id=dispatch_id,
-        prompt_id=None,
-        project_root=str(project_root),
-        controller_pid=os.getpid(),
-        worker_pid=None,
-        lease_id=f"lease-{dispatch_id}",
-        mem_mb=1,
-        agent_cap=None,
-        ttl_s=3600,
-        ram_mb=65536,
-        reserve_mb=goalflight_capacity.DEFAULT_RESERVE_MB,
-        worst_worker_mb=goalflight_capacity.DEFAULT_WORST_WORKER_MB,
-        hard_cap=goalflight_capacity.DEFAULT_HARD_CAP,
-        max_total=10,
-    )
-    with contextlib.redirect_stdout(io.StringIO()):
-        rc = goalflight_capacity.cmd_acquire(args)
-    assert_true("capacity acquire", rc == 0)
+@contextmanager
+def seat_limit(limit: int):
+    name = goalflight_worktree_pool.WORKTREE_SEATS_ENV
+    prior = os.environ.get(name)
+    os.environ[name] = str(limit)
+    try:
+        yield
+    finally:
+        if prior is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = prior
 
 
 def test_worktree_create_routes_distinct_cwds_and_stale_probe() -> None:
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+    old_seats = os.environ.get(goalflight_worktree_pool.WORKTREE_SEATS_ENV)
     try:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             os.environ["GOALFLIGHT_STATE_DIR"] = str(root / "state")
             os.environ["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
+            os.environ[goalflight_worktree_pool.WORKTREE_SEATS_ENV] = "2"
             repo = make_repo(root)
 
             args_one = argparse.Namespace(cwd=str(repo))
             args_two = argparse.Namespace(cwd=str(repo))
-            wt_one = goalflight_acp_run.create_and_route_dispatch_worktree(
+            lease_one = goalflight_acp_run.create_and_route_dispatch_worktree(
                 args_one,
                 repo,
                 "acp-test-one",
             )
-            wt_two = goalflight_acp_run.create_and_route_dispatch_worktree(
+            lease_two = goalflight_acp_run.create_and_route_dispatch_worktree(
                 args_two,
                 repo,
                 "acp-test-two",
             )
+            wt_one = lease_one.path
+            wt_two = lease_two.path
 
             # macOS resolves /var/folders → /private/var/folders; goalflight_acp_run
             # calls project_root.resolve() before building the worktree path. Resolve
@@ -133,34 +128,20 @@ def test_worktree_create_routes_distinct_cwds_and_stale_probe() -> None:
             assert_true("first status modified", " M tracked.txt" in git(wt_one, "status", "--short"))
             assert_true("second status modified", " M tracked.txt" in git(wt_two, "status", "--short"))
 
-            acquire_active_dispatch("acp-test-one", wt_one)
             probe = goalflight_doctor.check_worktrees(repo)
             assert_true("doctor count", probe["count"] == 2)
             assert_true("doctor paths", str(wt_one) in probe["paths"] and str(wt_two) in probe["paths"])
             by_path = {item["path"]: item for item in probe["details"]}
             assert_true("doctor detail head", by_path[str(wt_one)]["head"] is not None)
             assert_true("doctor detail dirty", by_path[str(wt_two)]["dirty"] is True)
-            assert_true("active worktree not stale", str(wt_one) not in probe["stale"])
-            assert_true("inactive worktree stale", str(wt_two) in probe["stale"])
-            assert_true("stale makes probe warn", probe["ok"] is False)
-
-            other = root / "other-project"
-            other.mkdir()
-            acquire_active_dispatch("acp-test-two", other)
-            cross_repo_probe = goalflight_doctor.check_worktrees(repo)
-            assert_true(
-                "same dispatch id in another repo stays stale",
-                str(wt_two) in cross_repo_probe["stale"],
-            )
-            acquire_active_dispatch("acp-test-two", repo)
-            same_repo_probe = goalflight_doctor.check_worktrees(repo)
-            assert_true(
-                "same dispatch id in same repo is active",
-                str(wt_two) not in same_repo_probe["stale"],
-            )
+            assert_true("first seat held", by_path[str(wt_one)]["seat_state"] == "held")
+            assert_true("second occupant named", by_path[str(wt_two)]["occupant_dispatch_id"] == "acp-test-two")
+            assert_true("pooled seats are never stale", probe["stale"] == [])
 
             git(wt_one, "reset", "--hard")
             git(wt_two, "reset", "--hard")
+            lease_one.release()
+            lease_two.release()
             git(repo, "worktree", "remove", "--force", str(wt_one))
             git(repo, "worktree", "remove", "--force", str(wt_two))
             git(repo, "worktree", "prune")
@@ -170,10 +151,14 @@ def test_worktree_create_routes_distinct_cwds_and_stale_probe() -> None:
             os.environ.pop("GOALFLIGHT_STATE_DIR", None)
         else:
             os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+        if old_seats is None:
+            os.environ.pop(goalflight_worktree_pool.WORKTREE_SEATS_ENV, None)
+        else:
+            os.environ[goalflight_worktree_pool.WORKTREE_SEATS_ENV] = old_seats
 
 
 def test_worktree_root_symlink_is_rejected() -> None:
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory() as td, seat_limit(1):
         root = Path(td)
         repo = make_repo(root)
         outside = root / "outside"
@@ -181,8 +166,8 @@ def test_worktree_root_symlink_is_rejected() -> None:
         (repo / "worktrees").symlink_to(outside, target_is_directory=True)
 
         try:
-            goalflight_acp_run.create_dispatch_worktree(repo, "acp-test-symlink")
-        except ValueError as exc:
+            goalflight_worktree_pool.acquire_worktree_seat(repo, "acp-test-symlink")
+        except goalflight_worktree_pool.WorktreeSeatError as exc:
             assert_true("symlink error", "symlink" in str(exc))
         else:
             raise AssertionError("symlinked worktrees root was accepted")
@@ -199,32 +184,21 @@ def test_worktree_root_symlink_is_rejected() -> None:
 
 
 def test_worktree_leaf_symlink_is_rejected() -> None:
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory() as td, seat_limit(1):
         root = Path(td)
         repo = make_repo(root)
         outside = root / "outside"
         outside.mkdir()
         managed = repo / "worktrees"
         managed.mkdir()
-        (managed / "acp-test-leaf").symlink_to(outside, target_is_directory=True)
+        (managed / "wt-1").symlink_to(outside, target_is_directory=True)
 
         try:
-            goalflight_acp_run.create_dispatch_worktree(repo, "acp-test-leaf")
-        except ValueError as exc:
-            assert_true("leaf exists error", "already exists" in str(exc))
+            goalflight_worktree_pool.acquire_worktree_seat(repo, "acp-test-leaf")
+        except goalflight_worktree_pool.WorktreeSeatError as exc:
+            assert_true("leaf symlink error", "symlink" in str(exc))
         else:
             raise AssertionError("symlinked worktree leaf was accepted")
-
-
-def test_hidden_dispatch_id_is_rejected() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        repo = make_repo(Path(td))
-        try:
-            goalflight_acp_run.create_dispatch_worktree(repo, ".hidden")
-        except ValueError as exc:
-            assert_true("hidden dispatch id rejected", "path segment" in str(exc))
-        else:
-            raise AssertionError("hidden dispatch id was accepted")
 
 
 def test_doctor_capacity_unknown_does_not_mark_stale() -> None:
@@ -233,7 +207,9 @@ def test_doctor_capacity_unknown_does_not_mark_stale() -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             repo = make_repo(root)
-            wt = goalflight_acp_run.create_dispatch_worktree(repo, "acp-test-unknown")
+            wt = repo.resolve() / "worktrees" / "acp-test-unknown"
+            wt.parent.mkdir()
+            git(repo, "worktree", "add", "--detach", str(wt), "HEAD")
 
             goalflight_doctor.goalflight_capacity = None
             probe = goalflight_doctor.check_worktrees(repo)
@@ -286,6 +262,7 @@ def test_doctor_flags_orphaned_blocking_path() -> None:
 
 def test_execute_parallel_docs_require_worktree_create() -> None:
     text = (ROOT / "commands" / "execute.md").read_text()
+    protocol = (ROOT / "protocols" / "worktrees-parallel.md").read_text()
     assert_true("parallel uses worktree create", "`--worktree create`" in text)
     assert_true("parallel threshold documented", "`--parallel N` where `N >= 2`" in text)
     assert_true("sequential stays root", "Sequential dispatch" in text and "project root" in text)
@@ -295,6 +272,10 @@ def test_execute_parallel_docs_require_worktree_create() -> None:
         "never move another owner's WIP",
         "Never stash, move, or discard another owner's WIP" in text,
     )
+    assert_true("slot range documented", "`worktrees/wt-1`" in text)
+    assert_true("hard ceiling documented", "hard ceiling" in text)
+    assert_true("index exclude documented", "`worktrees/wt-*`" in protocol)
+    assert_true("codedb ignore location documented", "`.codedbignore`" in protocol)
 
 
 class FakeProc:
@@ -363,6 +344,7 @@ def runner_args(repo: Path, dispatch_id: str, status_path: Path) -> argparse.Nam
 
 def test_runner_worktree_status_and_capacity_contract() -> None:
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+    old_seats = os.environ.get(goalflight_worktree_pool.WORKTREE_SEATS_ENV)
     patches = {
         "agent_command": goalflight_acp_run.agent_command,
         "validate_acp_dispatch_readiness": goalflight_acp_run.validate_acp_dispatch_readiness,
@@ -377,6 +359,7 @@ def test_runner_worktree_status_and_capacity_contract() -> None:
             root = Path(td)
             os.environ["GOALFLIGHT_STATE_DIR"] = str(root / "state")
             os.environ["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
+            os.environ[goalflight_worktree_pool.WORKTREE_SEATS_ENV] = "1"
             repo = make_repo(root)
             status_path = repo / "status.json"
             args = runner_args(repo, "acp-run-contract", status_path)
@@ -399,13 +382,15 @@ def test_runner_worktree_status_and_capacity_contract() -> None:
             # Worktree path is built from repo.resolve() in the runner (macOS
             # /var/folders → /private/var/folders resolution); compare against
             # the same.
-            worktree_path = repo.resolve() / "worktrees" / "acp-run-contract"
+            worktree_path = repo.resolve() / "worktrees" / "wt-1"
             assert_true("runner complete", payload["state"] == "complete")
             assert_true("status worktree path", status["worktree_path"] == str(worktree_path))
             assert_true("status worker cwd", status["worker_cwd"] == str(worktree_path))
             assert_true("status project root", status["project_root"] == str(repo.resolve()))
             assert_true("worktree left on disk", worktree_path.is_dir())
             assert_true("worker spawned in worktree", spawn_calls[0]["cwd"] == str(worktree_path))
+            inherited_fds = spawn_calls[0]["pass_fds"]
+            assert_true("worker inherits seat lock", len(inherited_fds) == 1)
 
             state = goalflight_capacity.load_state()
             leases = list(state.get("leases", {}).values())
@@ -420,6 +405,10 @@ def test_runner_worktree_status_and_capacity_contract() -> None:
             os.environ.pop("GOALFLIGHT_STATE_DIR", None)
         else:
             os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+        if old_seats is None:
+            os.environ.pop(goalflight_worktree_pool.WORKTREE_SEATS_ENV, None)
+        else:
+            os.environ[goalflight_worktree_pool.WORKTREE_SEATS_ENV] = old_seats
 
 
 def test_capacity_denied_does_not_create_worktree() -> None:
@@ -451,7 +440,7 @@ def test_capacity_denied_does_not_create_worktree() -> None:
             assert_true("capacity blocked", payload["state"] == "blocked_capacity")
             assert_true(
                 "worktree not created on capacity block",
-                not (repo / "worktrees" / "acp-capacity-denied").exists(),
+                not (repo / "worktrees").exists(),
             )
     finally:
         goalflight_acp_run.agent_command = old_agent_command
@@ -466,6 +455,7 @@ def test_capacity_denied_does_not_create_worktree() -> None:
 
 def test_runner_worktree_create_failure_writes_failed_status() -> None:
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+    old_seats = os.environ.get(goalflight_worktree_pool.WORKTREE_SEATS_ENV)
     old_agent_command = goalflight_acp_run.agent_command
     old_readiness = goalflight_acp_run.validate_acp_dispatch_readiness
     old_sandbox = goalflight_acp_run.validate_os_sandbox_request
@@ -476,8 +466,9 @@ def test_runner_worktree_create_failure_writes_failed_status() -> None:
             root = Path(td)
             os.environ["GOALFLIGHT_STATE_DIR"] = str(root / "state")
             os.environ["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
+            os.environ[goalflight_worktree_pool.WORKTREE_SEATS_ENV] = "1"
             repo = make_repo(root)
-            existing = repo / "worktrees" / "acp-existing"
+            existing = repo / "worktrees" / "wt-1"
             existing.mkdir(parents=True)
             status_path = repo / "existing-status.json"
             args = runner_args(repo, "acp-existing", status_path)
@@ -511,6 +502,10 @@ def test_runner_worktree_create_failure_writes_failed_status() -> None:
             os.environ.pop("GOALFLIGHT_STATE_DIR", None)
         else:
             os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+        if old_seats is None:
+            os.environ.pop(goalflight_worktree_pool.WORKTREE_SEATS_ENV, None)
+        else:
+            os.environ[goalflight_worktree_pool.WORKTREE_SEATS_ENV] = old_seats
 
 
 def main() -> None:
@@ -518,7 +513,6 @@ def main() -> None:
         test_worktree_create_routes_distinct_cwds_and_stale_probe,
         test_worktree_root_symlink_is_rejected,
         test_worktree_leaf_symlink_is_rejected,
-        test_hidden_dispatch_id_is_rejected,
         test_doctor_capacity_unknown_does_not_mark_stale,
         test_doctor_flags_registered_leaf_escape,
         test_doctor_flags_orphaned_blocking_path,
