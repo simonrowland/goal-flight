@@ -1310,8 +1310,8 @@ def post_message(
                 if project_journal_delivery
                 else ()
             )
-            _mark_journal_delivery(assignment)
-            return {
+            controller_deliveries = _mark_journal_delivery(assignment)
+            result = {
                 "envelope": same_identity,
                 "line": serialize_envelope_line(same_identity),
                 "path": str(path),
@@ -1324,6 +1324,12 @@ def post_message(
                     "detail": "matching event identity already exists",
                 },
             }
+            if not deliver_to_worker:
+                result["controller_delivery"] = _controller_delivery_report(
+                    controller_deliveries,
+                    envelope=same_identity,
+                )
+            return result
         if skip_if is not None:
             duplicate = next((item for item in existing if skip_if(item)), None)
             if duplicate is not None:
@@ -1332,8 +1338,8 @@ def post_message(
                     if project_journal_delivery
                     else ()
                 )
-                _mark_journal_delivery(assignment)
-                return {
+                controller_deliveries = _mark_journal_delivery(assignment)
+                result = {
                     "envelope": duplicate,
                     "line": serialize_envelope_line(duplicate),
                     "path": str(path),
@@ -1346,6 +1352,12 @@ def post_message(
                         "detail": "matching carrier record already exists",
                     },
                 }
+                if not deliver_to_worker:
+                    result["controller_delivery"] = _controller_delivery_report(
+                        controller_deliveries,
+                        envelope=duplicate,
+                    )
+                return result
         resolved_seq = require_positive_int_seq(
             _admit_stream_seq(provided_seq=provided_seq, envelopes=existing),
             path="seq",
@@ -1374,7 +1386,7 @@ def post_message(
             )
         else:
             _carrier_append_locked(transaction, envelope)
-        _mark_journal_delivery(assignment)
+        controller_deliveries = _mark_journal_delivery(assignment)
         # The messages lock orders both the canonical record and its materialized
         # worker view. Releasing it between the two writes lets concurrent posts
         # assign message seq 1/2 but append steer entries in the order 2/1.
@@ -1395,13 +1407,19 @@ def post_message(
         )
     if update_aggregate and fleet_dir is not None:
         refresh_aggregate(fleet_dir, messages_dir=messages_dir)
-    return {
+    result = {
         "envelope": envelope,
         "line": line,
         "path": str(path),
         "recorded": True,
         "delivery": delivery,
     }
+    if not deliver_to_worker:
+        result["controller_delivery"] = _controller_delivery_report(
+            controller_deliveries,
+            envelope=envelope,
+        )
+    return result
 
 
 def _dispatch_record(dispatch_id: str) -> tuple[dict | None, str | None]:
@@ -1582,7 +1600,10 @@ def _prepare_journal_delivery(
         raise MessageError(f"journal delivery assignment failed: {type(exc).__name__}: {exc}") from exc
 
 
-def _mark_journal_delivery(assignments: Iterable[dict[str, object]]) -> None:
+def _mark_journal_delivery(
+    assignments: Iterable[dict[str, object]],
+) -> tuple[dict[str, object], ...]:
+    deliveries: list[dict[str, object]] = []
     for assignment in assignments:
         authority = assignment["authority"]
         result = authority.mark_delivery_projected(
@@ -1595,6 +1616,82 @@ def _mark_journal_delivery(assignments: Iterable[dict[str, object]]) -> None:
                 "journal delivery projection was not committed: "
                 + str(result.reason or result.disposition.value)
             )
+        value = result.value or {}
+        deliveries.append(
+            {
+                "project_root": str(value.get("project_root") or authority.project_root),
+                "recipient_label": str(
+                    value.get("recipient_label") or assignment["recipient_label"]
+                ),
+                "event_uuid": str(value.get("event_uuid") or assignment["event_uuid"]),
+                "cursors": list(value.get("recipient_cursors") or ()),
+            }
+        )
+    return tuple(deliveries)
+
+
+def _controller_delivery_report(
+    deliveries: Iterable[dict[str, object]],
+    *,
+    envelope: dict,
+) -> dict[str, object]:
+    delivery_items: list[dict[str, object]] = []
+    for delivery in deliveries:
+        cursors = [
+            dict(cursor)
+            for cursor in delivery.get("cursors", ())
+            if isinstance(cursor, dict)
+        ]
+        item: dict[str, object] = {
+            "delivered": bool(cursors),
+            "project_root": str(delivery["project_root"]),
+            "recipient_label": str(delivery["recipient_label"]),
+            "event_uuid": str(delivery["event_uuid"]),
+        }
+        if len(cursors) == 1:
+            item["cursor"] = cursors[0]
+        elif cursors:
+            item["cursors"] = cursors
+        delivery_items.append(item)
+
+    addressee_label = controller_addressee_label(envelope)
+    delivered_count = sum(bool(item["delivered"]) for item in delivery_items)
+    requested = bool(delivery_items) or addressee_label is not None
+    if delivery_items and delivered_count == len(delivery_items):
+        labels = ", ".join(str(item["recipient_label"]) for item in delivery_items)
+        status = (
+            "delivered_to_controller"
+            if len(delivery_items) == 1
+            else "delivered_to_controllers"
+        )
+        detail = f"message delivered to controller {labels}"
+    elif delivered_count:
+        status = "partially_delivered_to_controllers"
+        detail = (
+            f"message delivered to {delivered_count} of {len(delivery_items)} "
+            "controller recipients"
+        )
+    elif addressee_label is not None:
+        status = "controller_addressee_unresolved"
+        detail = (
+            f"message recorded for controller {addressee_label}, but no active "
+            "controller cursor resolved; reached nobody"
+        )
+    else:
+        status = "recorded_reached_nobody"
+        detail = "message recorded with no controller recipient or worker delivery; reached nobody"
+
+    report: dict[str, object] = {
+        "requested": requested,
+        "delivered": bool(delivered_count),
+        "status": status,
+        "detail": detail,
+    }
+    if len(delivery_items) == 1:
+        report.update(delivery_items[0])
+    elif delivery_items:
+        report["deliveries"] = delivery_items
+    return report
 
 
 def _withdraw_journal_delivery(envelope: dict, path: Path) -> None:
@@ -1795,11 +1892,18 @@ def _controller_sender_session_id(dispatch_id: str) -> str | None:
 
 def post_result_is_error(result: dict) -> bool:
     delivery = result["delivery"]
-    return bool(
+    worker_error = bool(
         delivery["requested"]
         and not delivery["delivered"]
         and delivery["status"] not in NON_ERROR_UNDELIVERED_STATUSES
     )
+    controller_delivery = result.get("controller_delivery")
+    controller_error = bool(
+        isinstance(controller_delivery, dict)
+        and controller_delivery.get("requested")
+        and not controller_delivery.get("delivered")
+    )
+    return worker_error or controller_error
 
 
 def post_controller_steer(dispatch_id: str, text: str) -> dict:
@@ -2307,7 +2411,15 @@ def cmd_post(args: argparse.Namespace) -> int:
     print(json.dumps(result, indent=2 if args.json else None))
     delivery = result["delivery"]
     if post_result_is_error(result):
-        print(delivery["detail"], file=sys.stderr)
+        controller_delivery = result.get("controller_delivery")
+        failed_delivery = (
+            controller_delivery
+            if isinstance(controller_delivery, dict)
+            and controller_delivery.get("requested")
+            and not controller_delivery.get("delivered")
+            else delivery
+        )
+        print(failed_delivery["detail"], file=sys.stderr)
         return 1
     return 0
 

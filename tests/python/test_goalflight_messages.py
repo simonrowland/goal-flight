@@ -48,9 +48,12 @@ def run_messages_cli(
         {
             "GOALFLIGHT_MESSAGES_DIR": str(messages_dir),
             "GOALFLIGHT_FLEET_DIR": str(fleet_dir),
+            "GOALFLIGHT_JOURNAL_DIR": str(messages_dir.parent / "journals"),
             "GOALFLIGHT_STATE_DIR": str(messages_dir.parent / "state"),
+            "GOALFLIGHT_WAKE_LEDGER_DIR": str(messages_dir.parent / "wake-ledger"),
             "GOAL_FLIGHT_PIDFILE_DIR": str(messages_dir.parent / "pids"),
             "GOALFLIGHT_TASK_STORE_DIR": str(messages_dir.parent / "task-store"),
+            "GOALFLIGHT_CAPACITY_CONF": os.devnull,
         }
     )
     return subprocess.run(
@@ -1356,6 +1359,240 @@ def test_controller_post_reaches_worker_steer_read_path() -> None:
         envelope = delivered["context"]["message_envelope"]
         assert_true("typed envelope survives projection", envelope["type"] == "controller-notice")
         assert_true("message sequence remains canonical", envelope["seq"] == 1)
+
+
+def test_resolved_controller_post_reports_projected_journal_delivery() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        label = "report-controller"
+        env = _journal_test_env(base)
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "post-report-test"},
+            )
+            assert_true("report controller lease claimed", claimed.committed)
+
+            posted = run_messages_cli(
+                messages_dir,
+                fleet_dir,
+                [
+                    "post",
+                    "--dispatch-id",
+                    "controller-report",
+                    "--type",
+                    "controller-answer",
+                    "--text",
+                    "delivery is visible",
+                    "--to-controller",
+                    label,
+                    "--controller-project-root",
+                    str(project),
+                ],
+            )
+
+            assert_true(f"resolved controller post succeeds: {posted.stderr}", posted.returncode == 0)
+            result = json.loads(posted.stdout)
+            delivery = result["controller_delivery"]
+            assert_true("controller channel requested", delivery["requested"] is True)
+            assert_true("controller channel delivered", delivery["delivered"] is True)
+            assert_true("controller delivery status is explicit", delivery["status"] == "delivered_to_controller")
+            assert_true("controller recipient is reported", delivery["recipient_label"] == label)
+            assert_true("controller cursor backlog is reported", delivery["cursor"]["backlog_pending"] == 1)
+            rows = authority.read_all(
+                """SELECT recipient_label, event_uuid, projected_at
+                   FROM delivery_events WHERE event_uuid = ?""",
+                (delivery["event_uuid"],),
+            )
+            assert_true("reported delivery event exists in journal", len(rows) == 1)
+            assert_true("journal recipient matches report", rows[0]["recipient_label"] == label)
+            assert_true("journal event UUID matches report", rows[0]["event_uuid"] == delivery["event_uuid"])
+            assert_true("journal delivery is projected", rows[0]["projected_at"] is not None)
+
+
+def test_unresolved_controller_post_reports_reaching_nobody() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        missing_label = "missing-controller"
+        env = _journal_test_env(base)
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            posted = run_messages_cli(
+                messages_dir,
+                fleet_dir,
+                [
+                    "post",
+                    "--dispatch-id",
+                    "controller-unresolved",
+                    "--type",
+                    "controller-answer",
+                    "--text",
+                    "nobody can receive this",
+                    "--to-controller",
+                    missing_label,
+                    "--controller-project-root",
+                    str(project),
+                ],
+            )
+
+            result = json.loads(posted.stdout)
+            delivery = result["controller_delivery"]
+            assert_true("unresolved controller post exits nonzero", posted.returncode != 0)
+            assert_true("unresolved controller channel was requested", delivery["requested"] is True)
+            assert_true("unresolved controller is not claimed delivered", delivery["delivered"] is False)
+            assert_true(
+                "unresolved status is machine-distinct",
+                delivery["status"] == "controller_addressee_unresolved",
+            )
+            assert_true("unresolved label is reported", delivery["recipient_label"] == missing_label)
+            assert_true("unresolved report says it reached nobody", "reached nobody" in delivery["detail"])
+            assert_true("unresolved stderr reports controller failure", "reached nobody" in posted.stderr)
+            rows = authority.read_all(
+                "SELECT event_uuid FROM delivery_events WHERE event_uuid = ?",
+                (delivery["event_uuid"],),
+            )
+            assert_true("unresolved post remains recorded in journal", len(rows) == 1)
+
+
+def test_post_without_any_delivery_target_reports_reaching_nobody() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        posted = run_messages_cli(
+            base / "messages",
+            base / "fleet",
+            [
+                "post",
+                "--dispatch-id",
+                "record-only-no-target",
+                "--type",
+                "status",
+                "--text",
+                "record without a recipient",
+            ],
+        )
+
+        assert_true(f"record-only post succeeds: {posted.stderr}", posted.returncode == 0)
+        result = json.loads(posted.stdout)
+        delivery = result["controller_delivery"]
+        assert_true("controller channel is not requested", delivery["requested"] is False)
+        assert_true("record-only post is not delivered", delivery["delivered"] is False)
+        assert_true("record-only status names nobody", delivery["status"] == "recorded_reached_nobody")
+        assert_true("record-only detail names nobody", "reached nobody" in delivery["detail"])
+
+
+def test_worker_delivery_post_report_shape_is_unchanged() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "worker-report-shape"
+        write_ledger_record(base, dispatch_id, base / "project", state="running", worker_pid=os.getpid())
+
+        posted = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            [
+                "post",
+                "--dispatch-id",
+                dispatch_id,
+                "--type",
+                "controller-notice",
+                "--text",
+                "worker channel only",
+            ],
+        )
+
+        assert_true(f"worker delivery succeeds: {posted.stderr}", posted.returncode == 0)
+        result = json.loads(posted.stdout)
+        assert_true(
+            "worker post top-level report shape is unchanged",
+            set(result) == {"envelope", "line", "path", "recorded", "delivery"},
+        )
+        assert_true(
+            "worker delivery report fields are unchanged",
+            set(result["delivery"])
+            == {
+                "requested",
+                "delivered",
+                "worker_view_written",
+                "status",
+                "dispatch_classification",
+                "steer_path",
+                "steer_seq",
+                "steer_entry",
+                "detail",
+            },
+        )
+        assert_true("worker delivery remains reported", result["delivery"]["status"] == "worker_view_written")
+
+
+def test_cross_project_controller_post_reports_recipient_journal_delivery() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        sender_project = base / "sender"
+        recipient_project = base / "recipient"
+        init_git_project(sender_project)
+        init_git_project(recipient_project)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        label = "cross-project-controller"
+        env = _journal_test_env(base)
+        with mock.patch.dict(os.environ, env, clear=False):
+            recipient_authority = goalflight_journal.open_or_create_journal(recipient_project)
+            claimed = recipient_authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "cross-project-report-test"},
+            )
+            assert_true("cross-project controller lease claimed", claimed.committed)
+
+            posted = run_messages_cli(
+                messages_dir,
+                fleet_dir,
+                [
+                    "post",
+                    "--dispatch-id",
+                    "cross-project-report",
+                    "--type",
+                    "controller-answer",
+                    "--text",
+                    "recipient project owns this",
+                    "--to-controller",
+                    label,
+                    "--controller-project-root",
+                    str(recipient_project),
+                ],
+                cwd=sender_project,
+            )
+
+            assert_true(f"cross-project post succeeds: {posted.stderr}", posted.returncode == 0)
+            result = json.loads(posted.stdout)
+            delivery = result["controller_delivery"]
+            assert_true("cross-project controller delivery is reported", delivery["delivered"] is True)
+            assert_true("cross-project recipient is reported", delivery["recipient_label"] == label)
+            assert_true(
+                "cross-project recipient root is reported",
+                delivery["project_root"] == str(recipient_project.resolve()),
+            )
+            rows = recipient_authority.read_all(
+                "SELECT event_uuid FROM delivery_events WHERE event_uuid = ?",
+                (delivery["event_uuid"],),
+            )
+            assert_true("reported event is in recipient journal", len(rows) == 1)
 
 
 def test_worker_sideband_type_does_not_echo_to_worker_from_controller_context() -> None:

@@ -2988,8 +2988,27 @@ class Journal:
                     recipient_label=effective_recipient,
                     updated_at=projected_at,
                 )
+            cursor_rows = connection.execute(
+                """
+                SELECT c.label, c.registry_generation, c.cursor_version,
+                       c.backlog_pending, c.updated_at
+                FROM controller_leases AS l
+                JOIN controller_cursors AS c
+                  ON c.project_root = l.project_root
+                 AND c.label = l.label
+                 AND c.registry_generation = l.generation
+                WHERE l.project_root = ? AND l.state = 'ACTIVE'
+                  AND (? = '*' OR l.label = ?)
+                ORDER BY c.label
+                """,
+                (project_root, effective_recipient, effective_recipient),
+            ).fetchall()
             result = dict(row)
             result["projected_at"] = projected_at
+            # Return the cursor state observed by the same transaction that
+            # projected the event. Post reporting must not re-query after the
+            # commit and accidentally describe a later delivery or drain.
+            result["recipient_cursors"] = [dict(cursor) for cursor in cursor_rows]
             return result
 
         return self._domain_write(action)
