@@ -97,6 +97,11 @@ def isolated(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, str]]:
     for value in env.values():
         if value != os.devnull:
             Path(value).mkdir(parents=True, exist_ok=True)
+    # Hints name the ADVERTISED install, not the copy that generated them. Pin
+    # the advertised root to the code under test so these expectations do not
+    # depend on whether the host has ~/.goal-flight/skill installed. Set after
+    # the mkdir loop above: this root already exists and must not be created.
+    env["GOALFLIGHT_ROOT"] = str(SCRIPTS.parent)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LABEL", raising=False)

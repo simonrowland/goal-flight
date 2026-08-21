@@ -1280,7 +1280,10 @@ def listener_start_command(
     *,
     controller_label: str | None,
 ) -> str:
-    messages_script = Path(__file__).resolve().with_name("goalflight_messages.py")
+    messages_script = goalflight_compat.advertised_script(
+        "goalflight_messages.py",
+        running_file=__file__,
+    )
     argv = [
         "python3",
         str(messages_script),

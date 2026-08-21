@@ -74,6 +74,9 @@ __all__ = [
     "nearest_existing_path",
     "safe_dispatch_filename",
     "tokenize_args",
+    "installed_skill_root",
+    "advertised_skill_root",
+    "advertised_script",
 ]
 
 
@@ -816,6 +819,86 @@ def resolve_env_path(var: str, default) -> Path:
     if raw:
         return Path(raw).expanduser()
     return Path(default).expanduser()
+
+
+def _absolute_unfollowed(value: Path | str) -> Path:
+    """Expand ``~`` and make absolute without following the final symlink.
+
+    ``Path.resolve()`` would turn a pin symlink into a development checkout.
+    Copy-paste hints must name the install location, not its target.
+    """
+    return Path(os.path.abspath(os.path.expanduser(str(value))))
+
+
+def _looks_like_skill_root(root: Path) -> bool:
+    return (root / "scripts" / "goalflight_messages.py").is_file()
+
+
+def _candidate_skill_root(value: Path | str) -> Path | None:
+    expanded = Path(os.path.expanduser(str(value)))
+    if not expanded.is_absolute():
+        return None
+    root = _absolute_unfollowed(expanded)
+    if not _looks_like_skill_root(root):
+        return None
+    return root
+
+
+def installed_skill_root() -> Path | None:
+    """Skill root a non-maintainer controller should run tooling from.
+
+    Precedence matches the rest of the codebase: ``$GOALFLIGHT_ROOT`` is the
+    override and ``~/.goal-flight/skill`` is the default. That is the shell
+    semantics of the pin literal `goalflight_setup` writes into AGENTS.md
+    (``${GOALFLIGHT_ROOT:-~/.goal-flight/skill}``) and the order
+    `goalflight_doctor._goalflight_skill_root` probes. Advertising a different
+    root than doctor probes would re-create the split-install problem this
+    function exists to close.
+
+    An ABSOLUTE override is honoured even when it does not exist or does not
+    look like a skill, because doctor honours it too. Second-guessing the
+    override here would put the advertiser and doctor on different roots, which
+    is the split this function exists to close: probing
+    ``GOALFLIGHT_ROOT=/definitely/missing`` made an earlier draft advertise
+    ``~/.goal-flight/skill`` while doctor named ``/definitely/missing``.
+
+    A RELATIVE override is the one case we decline, and not out of judgement
+    about usability: a relative path's meaning depends on the reader's cwd, and
+    resolving it against the *emitter's* cwd is exactly how six live listeners
+    ended up running ``scripts/...``. Falling back to the pin yields a path that
+    means the same thing in every shell. Returns None when the pin is absent too.
+    """
+    raw = os.environ.get("GOALFLIGHT_ROOT", "").strip()
+    if raw:
+        expanded = Path(os.path.expanduser(raw))
+        if expanded.is_absolute():
+            return _absolute_unfollowed(expanded)
+    return _candidate_skill_root(Path.home() / ".goal-flight" / "skill")
+
+
+def running_skill_root(running_file: Path | str | None = None) -> Path:
+    """Skill root of the copy that is executing, always absolute."""
+    raw = Path(running_file or __file__).expanduser()
+    try:
+        path = raw.resolve()
+    except OSError:
+        path = _absolute_unfollowed(raw)
+    if path.parent.name == "scripts":
+        return path.parent.parent
+    return path.parent
+
+
+def advertised_skill_root(*, running_file: Path | str | None = None) -> Path:
+    """Install path for copy-paste hints; running copy only when none exists."""
+    installed = installed_skill_root()
+    if installed is not None:
+        return installed
+    return running_skill_root(running_file)
+
+
+def advertised_script(name: str, *, running_file: Path | str | None = None) -> Path:
+    """Absolute, tilde-free script path a peer controller should run."""
+    return advertised_skill_root(running_file=running_file) / "scripts" / name
 
 
 def gstack_browse_bin_candidates() -> list[Path]:

@@ -3398,13 +3398,24 @@ def emit_listener_reminder(
         root = _canonical_project_root(Path(project_root))
         label = str(controller_label or "").strip()
         if not label:
+            register_cmd = shlex.join(
+                [
+                    "python3",
+                    str(
+                        goalflight_compat.advertised_script(
+                            "goalflight_session_status.py",
+                            running_file=__file__,
+                        )
+                    ),
+                    "--controller-startup",
+                    "--controller-pid-from-ancestry",
+                ]
+            )
             line = (
                 "this controller is not registered for "
                 f"{root}: peers cannot discover it, its dispatches are recorded "
                 "with no owner, and no mail listener can be attributed to it. "
-                "register with: python3 "
-                f"{Path(__file__).resolve().parent / 'goalflight_session_status.py'} "
-                "--controller-startup --controller-pid-from-ancestry"
+                f"register with: {register_cmd}"
             )
         else:
             coverage = listener_coverage_status(
@@ -3860,7 +3871,12 @@ def _cursor_advance_command(
         raise ValueError("cursor positions and stream snapshots must name the same streams")
     argv = [
         sys.executable,
-        str(Path(__file__).resolve()),
+        str(
+            goalflight_compat.advertised_script(
+                "goalflight_messages.py",
+                running_file=__file__,
+            )
+        ),
         "advance",
         "--project-root",
         str(project_root),
@@ -4426,7 +4442,16 @@ def _listener_startup_grace_s() -> float:
 
 
 def _exact_listener_command() -> str:
-    argv = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+    # The re-arm hint is the most-copied string this tool emits: every doorbell
+    # prints one as it exits, and controllers paste it verbatim to restore
+    # depth. Deriving it from __file__ therefore propagates whichever copy is
+    # running -- which is how the fleet ended up split across four installs,
+    # with a development checkout re-seeding itself on every wake. Name the
+    # advertised install instead; the running copy stays the honest fallback.
+    script = goalflight_compat.advertised_script(
+        "goalflight_messages.py", running_file=__file__
+    )
+    argv = [sys.executable, str(script), *sys.argv[1:]]
     if "--report-pending" not in argv:
         argv.append("--report-pending")
     return shlex.join(argv)

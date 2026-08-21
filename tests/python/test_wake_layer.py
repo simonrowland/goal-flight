@@ -1189,6 +1189,13 @@ def test_shell_detached_listener_is_reaped_after_startup_grace_real_process(
     assert claimed.committed and claimed.value is not None
     env = dict(env)
     env["GOALFLIGHT_LISTENER_STARTUP_GRACE_S"] = "0.2"
+    # The re-arm hint now names the ADVERTISED install rather than the running
+    # copy, so that a listener started from a development checkout does not tell
+    # its reader to re-arm that checkout. Pin the advertised root to the code
+    # under test: without this the expectation below silently depends on whether
+    # the host happens to have ~/.goal-flight/skill installed -- it would pass on
+    # a bare box (no pin, fallback to the running copy) and fail on a real one.
+    env["GOALFLIGHT_ROOT"] = str(ROOT)
     command = _listener_command(
         root,
         tmp_path,

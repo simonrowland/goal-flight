@@ -2327,8 +2327,12 @@ def _wait_for_dispatches_registered(
                     else:
                         print(f"wait woken by mail: {len(fresh)} new; "
                               f"{sum(1 for r in rows if r['terminal'])}/{len(rows)} terminal")
+                    status_py = goalflight_compat.advertised_script(
+                        "goalflight_status.py",
+                        running_file=__file__,
+                    )
                     print(
-                        f"new mail: python3 {Path(__file__).resolve()} --wait "
+                        f"new mail: python3 {shlex.quote(str(status_py))} --wait "
                         f"{','.join(pending)}  # re-arm after reading",
                         file=sys.stderr,
                     )

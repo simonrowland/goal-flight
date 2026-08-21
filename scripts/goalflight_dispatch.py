@@ -62,6 +62,7 @@ import io
 import json
 import os
 import re
+import shlex
 import signal
 import shutil
 import socket
@@ -98,7 +99,10 @@ import grok_permission_mode
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WATCH_PY = SCRIPT_DIR / "goalflight_watch.py"
-WATCH_TAIL_SH = SCRIPT_DIR / "watch-dispatch-tail.sh"
+# NOTE: no module-level watch-dispatch-tail.sh constant. It would name the
+# GENERATING copy, and its only consumer now builds the path from the
+# advertised skill root instead (see _status_reminder_lines). Re-adding a
+# SCRIPT_DIR-derived constant here would quietly re-open that regression.
 DAEMON_SPAWN_ARG = "__goalflight_spawn_daemon"
 DISPATCH_QUEUE_SCHEMA = "goalflight.dispatch-queue.v1"
 QUEUE_CLAIM_STALE_S = 300.0
@@ -1858,7 +1862,7 @@ def resolve_reconciliation_mode(
 
 
 def _skill_root() -> Path:
-    return SCRIPT_DIR.parent
+    return goalflight_compat.advertised_skill_root(running_file=__file__)
 
 
 def _status_reminder_lines(
@@ -1889,16 +1893,21 @@ def _status_reminder_lines(
     status_path = Path(status_json).resolve()
     if not hints:
         return [f"[goal-flight] dispatched {dispatch_id}  status={status_path}"]
-    root = (skill_root or _skill_root()).resolve()
+    root = Path(os.path.abspath(os.path.expanduser(str(skill_root or _skill_root()))))
     tail = Path(tail_path).resolve()
     status_py = root / "scripts" / "goalflight_status.py"
     watch_py = root / "scripts" / "goalflight_watch.py"
     messages_py = root / "scripts" / "goalflight_messages.py"
+    # Every path below is shell-quoted: these lines are pasted verbatim into
+    # someone else's shell, and an install path containing a space silently
+    # tokenizes into two arguments (`/tmp/skill root/...` -> `/tmp/skill` +
+    # `root/...`), producing a command that fails on a machine we never see.
+    q = shlex.quote
     lines = [
         f"[goal-flight] dispatched {dispatch_id} ({shape}). Check status with the python "
         "tooling — do NOT hand-roll ps/tail -f/backgrounded watchers (they race the worker "
         "and exit early):",
-        f"  status: python3 {status_py} --dispatch {dispatch_id}",
+        f"  status: python3 {q(str(status_py))} --dispatch {dispatch_id}",
         # The wait is shown in its BACKGROUNDED form on purpose. Printed as a
         # plain foreground command it reads as "block here for however long the
         # worker takes", which the >10s foreground rule forbids -- so controllers
@@ -1906,13 +1915,13 @@ def _status_reminder_lines(
         # polling on a timer instead. A timer cannot know when the work finished;
         # it only knows when the clock did. Backgrounding the wait keeps the
         # event as the wake signal AND keeps the turn free.
-        f"  wait:   python3 {status_py} --wait {dispatch_id}"
+        f"  wait:   python3 {q(str(status_py))} --wait {dispatch_id}"
         "   # run this in the BACKGROUND; its completion wakes you on the",
         "          #   real event. Do not block the turn on it, and do not"
         "  replace it with a timer -- a timer wakes on the clock, not the work.",
-        f"  done?:  python3 {status_py} --done {dispatch_id}   "
+        f"  done?:  python3 {q(str(status_py))} --done {dispatch_id}   "
         "# exit 0=terminal, 1=running, 2=ambiguous",
-        f"  mail:   python3 {messages_py} relay   # current project, open + unread",
+        f"  mail:   python3 {q(str(messages_py))} relay   # current project, open + unread",
     ]
     if shape == "acp":
         watch_parts = [
@@ -1927,7 +1936,7 @@ def _status_reminder_lines(
         ]
         if prompt_path is not None:
             watch_parts += ["--ignore-prompt-file", str(Path(prompt_path).resolve())]
-        lines.append("  watch:  " + " ".join(watch_parts))
+        lines.append("  watch:  " + shlex.join(watch_parts))
     else:
         # Moonshot (kimi CLI) renderer normalization keys off the production
         # preset label; synthetic -bash-tail aliases are not first-class dispatch agents.
@@ -1938,7 +1947,7 @@ def _status_reminder_lines(
         )
         watch_parts = [
             "bash",
-            str(WATCH_TAIL_SH.resolve()),
+            str(root / "scripts" / "watch-dispatch-tail.sh"),
             "--pid",
             str(worker_pid),
             "--tail",
@@ -1958,7 +1967,7 @@ def _status_reminder_lines(
             watch_parts += ["--max-idle-secs", str(max_idle_secs)]
         if prompt_path is not None:
             watch_parts += ["--ignore-prompt-file", str(Path(prompt_path).resolve())]
-        lines.append("  watch:  " + " ".join(watch_parts))
+        lines.append("  watch:  " + shlex.join(watch_parts))
     return lines
 
 
@@ -4354,12 +4363,15 @@ def _warn_if_stranded_without_drainer(queue_path: Path) -> None:
             return  # a drainer exists; it will pick this up on its next pass
     except Exception:
         return  # never let an advisory check break a dispatch
+    root = _skill_root()
+    dispatch_py = root / "scripts" / "goalflight_dispatch.py"
+    drainer_sh = root / "scripts" / "install-drainer.sh"
     print(
         "goalflight_dispatch: WARNING — request is STILL QUEUED after the "
         "drain-on-submit pass and no live drainer was detected, so nothing will "
         "launch it. (A peer drainer may still claim it momentarily.) Remedy:\n"
-        "  python3 <skill-root>/scripts/goalflight_dispatch.py drain --json   # launch it now\n"
-        "  bash <skill-root>/scripts/install-drainer.sh                       # restore the standing drainer",
+        f"  python3 {shlex.quote(str(dispatch_py))} drain --json   # launch it now\n"
+        f"  bash {shlex.quote(str(drainer_sh))}                       # restore the standing drainer",
         file=sys.stderr,
     )
 

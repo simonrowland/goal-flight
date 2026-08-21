@@ -31,6 +31,7 @@ ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(ROOT))
 
+import goalflight_compat
 import goalflight_dispatch_states
 import goalflight_fleet_console_history
 import goalflight_fleet_status_cli
@@ -440,10 +441,14 @@ def _is_listener_start_action(value: str) -> bool:
         argv = argv[:-1]
     if len(argv) not in {5, 7}:
         return False
+    advertised = goalflight_compat.advertised_script(
+        "goalflight_messages.py",
+        running_file=goalflight_wake.__file__,
+    )
     if not (
         argv[0] == "python3"
-        and Path(argv[1]).resolve()
-        == Path(str(goalflight_messages.__file__)).resolve()
+        and Path(argv[1]).is_absolute()
+        and Path(os.path.abspath(argv[1])) == advertised
         and argv[2:4] == ["listen", "--project-root"]
         and Path(argv[4]).is_absolute()
     ):
