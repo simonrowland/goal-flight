@@ -41,9 +41,10 @@ METER_ENV = (
 
 
 @pytest.fixture(autouse=True)
-def _isolate_meter_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_meter_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in METER_ENV:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
 
 
 def _usage_record(

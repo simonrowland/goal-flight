@@ -41,13 +41,27 @@ import goalflight_watch  # noqa: E402
 
 
 def _isolate_state_env(env: dict[str, str], base: Path) -> None:
+    for key in (
+        "GOALFLIGHT_DISPATCH_ID",
+        "GOALFLIGHT_PROJECT_ROOT",
+        "GOALFLIGHT_PROMPT_FILE",
+        "GOALFLIGHT_STEER_FILE",
+        "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE",
+        "GOALFLIGHT_CONTROLLER_SESSION_ID",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+        "GOALFLIGHT_CONTROLLER_PID",
+    ):
+        env.pop(key, None)
     env["GOALFLIGHT_STATE_DIR"] = str(base / "state")
+    env["GOALFLIGHT_DISPATCH_DIR"] = str(base / "state" / "dispatch")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(base / "task-store")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(base / "journal")
     env["GOALFLIGHT_MESSAGES_DIR"] = str(base / "messages")
+    env["GOALFLIGHT_FLEET_DIR"] = str(base / "fleet")
     env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(base / "wake-ledger")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(base / "pids")
     env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
+    env["GOALFLIGHT_ROOT"] = str(ROOT)
 
 
 def _wait_for(predicate, timeout: float = 8.0, interval: float = 0.1) -> bool:

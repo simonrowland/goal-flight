@@ -93,11 +93,27 @@ def _write_fake_codex_acp_manifest(
 
 def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
+    for key in (
+        "GOALFLIGHT_DISPATCH_ID",
+        "GOALFLIGHT_PROJECT_ROOT",
+        "GOALFLIGHT_PROMPT_FILE",
+        "GOALFLIGHT_STEER_FILE",
+        "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE",
+        "GOALFLIGHT_CONTROLLER_SESSION_ID",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+        "GOALFLIGHT_CONTROLLER_PID",
+    ):
+        env.pop(key, None)
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+    env["GOALFLIGHT_DISPATCH_DIR"] = str(tmp / "state" / "dispatch")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
+    env["GOALFLIGHT_FLEET_DIR"] = str(tmp / "fleet")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
+    env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
+    env["GOALFLIGHT_ROOT"] = str(ROOT)
     env["GOALFLIGHT_ADAPTERS_DIR"] = str(tmp / "adapters")
     env["GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE"] = "1"
     env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "steer_multiturn"

@@ -38,6 +38,10 @@ def isolated_env(tmp_path: Path, *, label: str = "wake-test") -> dict[str, str]:
     env = dict(os.environ)
     for key in (
         "GOALFLIGHT_DISPATCH_ID",
+        "GOALFLIGHT_PROJECT_ROOT",
+        "GOALFLIGHT_PROMPT_FILE",
+        "GOALFLIGHT_STEER_FILE",
+        "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE",
         "GOALFLIGHT_CONTROLLER_SESSION_ID",
         "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
         "GOALFLIGHT_CONTROLLER_PID",
@@ -50,9 +54,11 @@ def isolated_env(tmp_path: Path, *, label: str = "wake-test") -> dict[str, str]:
             "GOALFLIGHT_JOURNAL_DIR": str(tmp_path / "journals"),
             "GOALFLIGHT_TASK_STORE_DIR": str(tmp_path / "task-store"),
             "GOALFLIGHT_STATE_DIR": str(tmp_path / "state"),
+            "GOALFLIGHT_DISPATCH_DIR": str(tmp_path / "state" / "dispatch"),
             "GOALFLIGHT_WAKE_LEDGER_DIR": str(tmp_path / "wake-ledger"),
             "GOAL_FLIGHT_PIDFILE_DIR": str(tmp_path / "pids"),
             "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
+            "GOALFLIGHT_ROOT": str(ROOT),
             "GOALFLIGHT_CONTROLLER_LABEL": label,
             "GOALFLIGHT_PROCESS_ROLE": "controller",
             "GOALFLIGHT_TEST_MODE": "1",
@@ -408,21 +414,22 @@ def test_owned_worker_finish_wakes_armed_doorbell_three_runs(
                 stderr=subprocess.PIPE,
                 text=True,
             )
+            completed: subprocess.Popen[str] | None = None
             try:
                 _wait_for_listener(authority, "wake-test", listener)
                 started = time.monotonic()
-                completed = subprocess.run(
+                completed = subprocess.Popen(
                     _completion_dispatch_command(root, tmp_path, dispatch_id),
                     cwd=root,
                     env=env,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    check=False,
-                    timeout=20,
                 )
                 listener_stdout, listener_stderr = listener.communicate(timeout=6)
                 elapsed = time.monotonic() - started
-                assert completed.returncode == 0, (completed.stdout, completed.stderr)
+                completed_stdout, completed_stderr = completed.communicate(timeout=20)
+                assert completed.returncode == 0, (completed_stdout, completed_stderr)
                 assert listener.returncode == 0, listener_stderr
                 assert json.loads(listener_stdout)["reason"] == "event"
                 assert elapsed < 5.0
@@ -430,8 +437,8 @@ def test_owned_worker_finish_wakes_armed_doorbell_three_runs(
                 record = json.loads(ledger.record_path(dispatch_id, create=False).read_text())
                 assert record["controller_label"] == "wake-test", (
                     record,
-                    completed.stdout,
-                    completed.stderr,
+                    completed_stdout,
+                    completed_stderr,
                 )
                 assert record["controller_session_id"] == lease.nonce
                 attempt_owner = authority.read_all(
@@ -456,6 +463,9 @@ def test_owned_worker_finish_wakes_armed_doorbell_three_runs(
                 if listener.poll() is None:
                     listener.kill()
                     listener.communicate(timeout=3)
+                if completed is not None and completed.poll() is None:
+                    completed.kill()
+                    completed.communicate(timeout=3)
     assert len(measurements) == 3
 
 
@@ -498,10 +508,11 @@ def test_unowned_worker_finish_fans_out_and_wakes_registered_controller(
         stderr=subprocess.PIPE,
         text=True,
     )
+    completed: subprocess.Popen[str] | None = None
     try:
         _wait_for_listener(authority, "wake-test", listener)
         started = time.monotonic()
-        completed = subprocess.run(
+        completed = subprocess.Popen(
             _completion_dispatch_command(
                 root,
                 tmp_path,
@@ -510,14 +521,14 @@ def test_unowned_worker_finish_fans_out_and_wakes_registered_controller(
             ),
             cwd=root,
             env=dispatch_env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
-            timeout=20,
         )
         listener_stdout, listener_stderr = listener.communicate(timeout=6)
         elapsed = time.monotonic() - started
-        assert completed.returncode == 0, (completed.stdout, completed.stderr)
+        completed_stdout, completed_stderr = completed.communicate(timeout=20)
+        assert completed.returncode == 0, (completed_stdout, completed_stderr)
         assert listener.returncode == 0, listener_stderr
         assert json.loads(listener_stdout)["reason"] == "event"
         assert elapsed < 5.0
@@ -541,6 +552,9 @@ def test_unowned_worker_finish_fans_out_and_wakes_registered_controller(
         if listener.poll() is None:
             listener.kill()
             listener.communicate(timeout=3)
+        if completed is not None and completed.poll() is None:
+            completed.kill()
+            completed.communicate(timeout=3)
 
 
 def test_unowned_terminal_replacement_withdraws_every_fanout_recipient(
