@@ -2677,6 +2677,11 @@ def main() -> int:
             "last_marker": markers[-1] if markers else None,
             "terminal_marker": terminal,
             "state": "running_quiet" if liveness_state == "running_quiet" else "running",
+            # b-054: record the EFFECTIVE idle budget.  The launcher's initial
+            # status may say None (its record predates default resolution), and
+            # a budget that cannot be audited from status.json reads as
+            # unhonored -- the flag was honored all along, but the record lied.
+            "max_idle_secs": args.max_idle_secs,
             "updated_at": int(now),
         }
         if ignore_prompt_signature is not None:
