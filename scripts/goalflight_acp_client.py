@@ -1584,12 +1584,7 @@ class AcpLivenessActivity:
     def has_inline_holds(self) -> bool:
         return bool(self.inline_held_permissions)
 
-    def _prune_permissions(self, now: float) -> None:
-        if self.permission_timeout_s <= 0:
-            self.pending_permissions.clear()
-            return
-        for key, _ in self._expired_permissions(now):
-            self.pending_permissions.pop(key, None)
+    # Removed _prune_permissions: timed_out now expires and reports permissions; silent pruning hid timeouts.
 
     def _expired_permissions(self, now: float) -> list[tuple[str, float]]:
         if self.permission_timeout_s <= 0:

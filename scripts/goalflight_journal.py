@@ -2602,14 +2602,7 @@ class Journal:
 
         return self._domain_write(action)
 
-    def expire_stale_leases(self, *, observed_at: str | None = None) -> WriteResult[list[dict[str, object]]]:
-        del observed_at
-        return WriteResult(
-            WriteDisposition.COMMITTED,
-            [],
-            attempts=0,
-            reason="lease deadlines are telemetry-only; kernel locks decide liveness",
-        )
+    # Removed expire_stale_leases: its silent no-op hid that t-297 needs explicit holder-death expiry.
 
     def release_lease(
         self,

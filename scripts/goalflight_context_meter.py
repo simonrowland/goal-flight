@@ -318,9 +318,7 @@ def newest_assistant_in_bytes(
             return usage, _model_in_record(buf, pos)
 
 
-def newest_usage_in_bytes(buf: bytes) -> dict[str, Any] | None:
-    found = newest_assistant_in_bytes(buf)
-    return None if found is None else found[0]
+# Removed newest_usage_in_bytes: its model-blind result could mis-size the active context window.
 
 
 def _read_tail(path: Path, nbytes: int) -> bytes:

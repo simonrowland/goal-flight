@@ -30,7 +30,7 @@ from typing import TypeVar
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-DEFAULT_CONTRACT = REPO_ROOT / "docs-private" / "architecture" / "contracts" / "goalflight.message.v1.json"
+# Removed DEFAULT_CONTRACT: its private generating-copy JSON path was superseded by EVENT_TYPE_REGISTRY.
 AGGREGATE_SCHEMA = "goalflight.fleet.register.aggregate.v1"
 INGESTION_ORDER_FILE = ".ingestion-order"
 INGESTION_IDENTITY_FILE = ".ingestion-identities.json"
@@ -256,7 +256,7 @@ CONTROLLER_ADDRESSEE_TYPES = CONTROLLER_CHANNEL_TYPES | frozenset(
         "finding",
     }
 )
-CONTROLLER_LISTENER_ESCALATION_TYPES = frozenset({"user_need", "user_confirm", "blocked"})
+# Removed CONTROLLER_LISTENER_ESCALATION_TYPES: its partial set was superseded by registry wake classes.
 TASK_STORE_STATUS_NUDGE_KINDS = frozenset({"parallel-ready", "resume-ready", "done-suggest"})
 NON_ERROR_UNDELIVERED_STATUSES = frozenset({"terminal_recorded_only", "worker_view_queued"})
 CONTROLLER_ADDRESSEE_KIND = "controller"

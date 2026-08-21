@@ -13,8 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-# Non-interactive SSH often omits Homebrew and user-local agent installs.
-SYSTEM_PATH_PREFIX = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# Removed SYSTEM_PATH_PREFIX: it omitted user-local agent bins; REMOTE_PATH_PREFIX is the remote authority.
 # OpenSSH forced-command exec often omits HOME; bootstrap before user-local bins.
 REMOTE_PATH_PREFIX = (
     "$HOME/.local/bin:$HOME/.grok/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"

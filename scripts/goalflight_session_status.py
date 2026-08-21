@@ -431,15 +431,7 @@ def _resolve_optional_incarnation(
     return resolution, None
 
 
-def _same_controller_process(record: dict, current: dict | None) -> bool:
-    expected = record.get("process_identity")
-    if not isinstance(expected, dict) or not isinstance(current, dict):
-        return False
-    return bool(
-        expected.get("pid") == current.get("pid")
-        and expected.get("start_token")
-        and expected.get("start_token") == current.get("start_token")
-    )
+# Removed _same_controller_process: PID/start-token inference was superseded by held kernel-lock liveness.
 
 
 def _lease_holder_liveness(

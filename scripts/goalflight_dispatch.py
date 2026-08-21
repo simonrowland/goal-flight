@@ -4792,14 +4792,7 @@ def _queue_claim_worker_spawn_intent(entry: dict) -> bool:
     return bool(entry.get("queue_worker_spawn_intent") or entry.get("queue_worker_spawn_intent_at"))
 
 
-def _queue_claim_launcher_alive(entry: dict) -> bool:
-    status, _reason = _queue_claim_identity_status(
-        entry.get("queue_launcher_pid"),
-        entry.get("queue_launcher_identity"),
-    )
-    # identity_indeterminate returns ok=True from identity_matches; treat as
-    # alive for "still launching" protection so we never kill a maybe-live process.
-    return status in {"live", "indeterminate"}
+# Removed _queue_claim_launcher_alive: boolean liveness hid tri-state identity evidence required by reconciliation.
 
 
 def _queue_claim_identity_status(
@@ -4840,12 +4833,7 @@ def _queue_claim_identity_status(
     return "indeterminate", reason or "identity_unknown"
 
 
-def _queue_claim_worker_alive(entry: dict) -> bool:
-    status, _reason = _queue_claim_identity_status(
-        entry.get("queue_worker_pid"),
-        entry.get("queue_worker_identity"),
-    )
-    return status == "live"
+# Removed _queue_claim_worker_alive: boolean liveness treated indeterminate identity as dead instead of evidence.
 
 
 def _queue_claim_worker_status(entry: dict) -> tuple[str, str]:
@@ -6909,20 +6897,7 @@ def _completion_decision_is_deferred(decision: dict | None) -> bool:
     return isinstance(decision, dict) and decision.get("state") == "deferred"
 
 
-@contextlib.contextmanager
-def _task_store_mutation_lock(entry: dict, record: dict | None = None):
-    """Freeze linked task truth while a completion decision is persisted."""
-    if not _entry_task_ids(entry, record):
-        yield
-        return
-    root = SCRIPT_DIR.parent
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-    import goalflight_task  # type: ignore
-
-    store = goalflight_task.TaskStore(_project_root_for_entry(entry, record))
-    with store.store_lock():
-        yield
+# Removed _task_store_mutation_lock: the bounded Q→S→L transaction now owns reconciliation lock ordering.
 
 
 def try_acquire_task_store_lock(
@@ -7105,42 +7080,7 @@ def _reconcile_transaction_still_valid(
     return True
 
 
-def _apply_completion_authority(
-    entry: dict,
-    decision: dict,
-    *,
-    claim: Path | None = None,
-) -> str:
-    """Compatibility entry routed through the single transaction owner."""
-    if claim is not None:
-        return _reconcile_claim_transaction(
-            claim,
-            entry,
-            queue_dir=claim.parent,
-            reason=str(decision.get("reason") or "completion_authority"),
-            stale_s=0.0,
-        )
-    state = str(decision.get("state") or "complete")
-    reason = decision.get("reason") or "completion_authority"
-    if state in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES or state in {
-        "complete",
-        "superseded",
-        "worker_dead",
-    }:
-        # Reuse terminalize path (scans again + first-terminal-wins). For
-        # superseded/complete we still go through _mark_claim_worker_dead which
-        # re-reads the tail; override via reason + finish lock recheck.
-        persisted = _mark_claim_worker_dead(
-            entry,
-            reason=str(reason),
-            force_state=state if state in {"complete", "superseded"} else None,
-            salvage_required=bool(decision.get("salvage_required")),
-            resolution_source=decision.get("resolution_source"),
-            claim=claim,
-        )
-        if not persisted:
-            return "pending"
-    return "cleared"
+# Removed _apply_completion_authority: its split compatibility path bypassed the single transaction owner.
 
 
 def _entry_pre_spawn(entry: dict) -> bool:

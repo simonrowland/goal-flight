@@ -47,12 +47,7 @@ def queue_entry_path(
     return base / f"{safe_dispatch_filename(dispatch_id)}.json"
 
 
-def status_path_for(
-    dispatch_id: str,
-    configured: str | Path | None = None,
-    state_dir: Path | str | None = None,
-) -> Path:
-    return Path(configured).expanduser() if configured else dispatch_base_dir(state_dir) / f"{dispatch_id}.status.json"
+# Removed status_path_for: raw dispatch IDs bypassed the canonical status filename sanitization.
 
 
 def steer_file(dispatch_id: str, state_dir: Path | str | None = None) -> Path:

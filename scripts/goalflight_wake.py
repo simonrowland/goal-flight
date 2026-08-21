@@ -1114,9 +1114,7 @@ class LeaseHolderRegistration:
         self.close()
 
 
-def _probe_locked_once(path: Path) -> bool:
-    """Take one kernel-lock sample; file existence/content proves nothing."""
-    return _probe_locked_state(path) is True
+# Removed _probe_locked_once: one-sample waiter liveness could revive the inherited-fd race stable probing fixed.
 
 
 def _probe_locked_state_at(directory_fd: int, name: str) -> bool | None:
