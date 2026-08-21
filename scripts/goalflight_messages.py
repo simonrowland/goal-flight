@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import datetime as dt
 from enum import Enum
 import functools
@@ -15,7 +15,9 @@ import json
 import math
 import os
 import re
+import select
 import shlex
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -4296,7 +4298,122 @@ def merge_remote_register(
     }
 
 
+# Tracked-task refusal. Distinct from POSIX 128+signal: 144 is SIGURG on
+# macOS, not this code. Historical bulk-144 reports were not detached exits.
 DETACHED_LISTENER_EXIT_CODE = 4
+LISTENER_POSIX_SIGNAL_EXIT_BASE = 128
+_LISTENER_FATAL_SIGNAL_NAMES = ("SIGTERM", "SIGHUP", "SIGINT", "SIGQUIT")
+_LISTENER_NOISY_IGNORED_SIGNAL_NAMES = ("SIGURG", "SIGIO")
+
+
+def listener_posix_signal_exit_code(signum: int) -> int:
+    """Shell-visible status for a caught terminating signal: 128 + signo."""
+    return LISTENER_POSIX_SIGNAL_EXIT_BASE + int(signum)
+
+
+def _listener_signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except (ValueError, SystemError):
+        return f"signal-{signum}"
+
+
+def _pid_command_line(pid: int) -> str:
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            text=True,
+            timeout=1,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return " ".join(out.split())[:200]
+
+
+def _listener_signal_context() -> str:
+    pid = os.getpid()
+    parent = os.getppid()
+    parent_cmd = _pid_command_line(parent)
+    extra = f" parent={parent_cmd!r}" if parent_cmd else ""
+    return f"pid={pid} ppid={parent}{extra}"
+
+
+def _stdio_peer_gone(stream: object) -> bool:
+    """True when the harness has closed the tracked-task output pipe."""
+    try:
+        fileno = getattr(stream, "fileno", None)
+        if fileno is None:
+            return False
+        fd = fileno()
+        mode = os.fstat(fd).st_mode
+    except (AttributeError, OSError, ValueError):
+        return False
+    if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)):
+        return False
+    try:
+        poller = select.poll()
+        poller.register(fd, select.POLLERR | select.POLLHUP | select.POLLNVAL)
+        return bool(poller.poll(0))
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+@dataclass
+class _ListenerDeathWatch:
+    """Catch silent harness/OS kills so a doorbell can die loudly or stay alive.
+
+    SIGURG's kernel default on macOS/BSD is discard. A wrapper that reports
+    exit 144 (128+16) after sending SIGURG is not this process dying unless a
+    handler made SIGURG fatal. We log SIGURG and keep waiting. Terminating
+    signals print who/why, release the slot, and exit 128+signo.
+    """
+
+    fatal_signum: int | None = None
+    notices: list[int] = field(default_factory=list)
+    _prior: list[tuple[int, object]] = field(default_factory=list)
+
+    def install(self) -> None:
+        def _fatal(signum: int, _frame: object) -> None:
+            self.fatal_signum = signum
+            name = _listener_signal_name(signum)
+            line = (
+                f"listen: killed by {name} ({signum}); releasing slot "
+                f"pid={os.getpid()} ppid={os.getppid()}\n"
+            )
+            with contextlib.suppress(OSError):
+                os.write(2, line.encode("utf-8", "replace"))
+
+        def _notice(signum: int, _frame: object) -> None:
+            if signum in self.notices:
+                return
+            self.notices.append(signum)
+            name = _listener_signal_name(signum)
+            line = (
+                f"listen: received {name} ({signum}); kernel default is "
+                f"discard so staying alive pid={os.getpid()} ppid={os.getppid()}\n"
+            )
+            with contextlib.suppress(OSError):
+                os.write(2, line.encode("utf-8", "replace"))
+
+        for names, handler in (
+            (_LISTENER_FATAL_SIGNAL_NAMES, _fatal),
+            (_LISTENER_NOISY_IGNORED_SIGNAL_NAMES, _notice),
+        ):
+            for name in names:
+                sig = getattr(signal, name, None)
+                if sig is None:
+                    continue
+                try:
+                    old = signal.signal(sig, handler)
+                except (OSError, ValueError):
+                    continue
+                self._prior.append((sig, old))
+
+    def restore(self) -> None:
+        while self._prior:
+            sig, old = self._prior.pop()
+            with contextlib.suppress(OSError, ValueError):
+                signal.signal(sig, old)
 
 
 def _listener_startup_grace_s() -> float:
@@ -4439,6 +4556,8 @@ def cmd_listen(args) -> int:
     listener_started = time.monotonic()
     detached_grace = _listener_startup_grace_s()
     rearm_command = _exact_listener_command()
+    death_watch = _ListenerDeathWatch()
+    death_watch.install()
 
     def rearm_plan_after_release() -> dict[str, object] | None:
         try:
@@ -4503,6 +4622,7 @@ def cmd_listen(args) -> int:
         finally:
             if waiter is not None:
                 waiter.close()
+            death_watch.restore()
         emit_payload(payload, detail=None if args.json else payload.get("detail"))
         return code
 
@@ -4512,6 +4632,7 @@ def cmd_listen(args) -> int:
         with contextlib.suppress(Exception):
             authority.exit_listener(coverage_id, reason="orphaned")
         waiter.close()
+        death_watch.restore()
         print(
             "DETACHED LISTENER: my exit wakes nobody; kill me "
             f"(pid {os.getpid()}) and re-arm as a tracked background task: "
@@ -4528,6 +4649,36 @@ def cmd_listen(args) -> int:
             return None
         if current_parent != parent_pid:
             return finish("orphaned", code=3, detail="listener parent changed")
+        return None
+
+    def signal_or_stdio_exit() -> int | None:
+        fatal = death_watch.fatal_signum
+        if fatal is not None:
+            name = _listener_signal_name(fatal)
+            return finish(
+                "signal",
+                code=listener_posix_signal_exit_code(fatal),
+                detail=(
+                    f"killed by {name} ({fatal}); "
+                    f"{_listener_signal_context()}"
+                ),
+            )
+        if _stdio_peer_gone(sys.stdout):
+            noticed = death_watch.notices[-1] if death_watch.notices else None
+            extra = (
+                f"; last received {_listener_signal_name(noticed)} ({noticed})"
+                if noticed is not None
+                else ""
+            )
+            return finish(
+                "orphaned",
+                code=3,
+                detail=(
+                    "controlling stdout closed; tracked task is gone"
+                    + extra
+                    + f"; {_listener_signal_context()}"
+                ),
+            )
         return None
 
     emit_wake_entry_notice(
@@ -4619,6 +4770,9 @@ def cmd_listen(args) -> int:
         parent_result = parent_exit()
         if parent_result is not None:
             return parent_result
+        signal_result = signal_or_stdio_exit()
+        if signal_result is not None:
+            return signal_result
         # A shell-detached listener can already have PPID 1 at process start.
         # Give launch/track plumbing a bounded grace, but never let that
         # untracked process consume the ring during the grace window.
@@ -4735,12 +4889,16 @@ def cmd_listen(args) -> int:
                     f"advance after processing: {advance_command}"
                 )
             emit_payload(payload)
+            death_watch.restore()
             return 0
         sleep_until = time.monotonic() + poll
         while time.monotonic() < sleep_until:
             parent_result = parent_exit()
             if parent_result is not None:
                 return parent_result
+            signal_result = signal_or_stdio_exit()
+            if signal_result is not None:
+                return signal_result
             if deadline is not None and time.monotonic() >= deadline:
                 return finish("timeout", code=1, detail="no waking event before timeout")
             time.sleep(min(0.25, max(0.0, sleep_until - time.monotonic())))

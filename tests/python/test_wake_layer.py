@@ -1157,11 +1157,16 @@ def test_detached_listener_refuses_ppid_one_with_distinct_code_and_one_line(
         report_pending=False,
     )
 
+    prior_term = signal.getsignal(signal.SIGTERM)
     code = messages.cmd_listen(args)
     captured = capsys.readouterr()
+    assert signal.getsignal(signal.SIGTERM) == prior_term
 
     assert code == messages.DETACHED_LISTENER_EXIT_CODE
     assert code not in {0, 1, 2, 3}
+    # 144 is POSIX 128+SIGURG on macOS, not the detached refusal.
+    assert code != 144
+    assert messages.DETACHED_LISTENER_EXIT_CODE != 128 + int(signal.SIGURG)
     assert captured.out == ""
     lines = captured.err.splitlines()
     assert len(lines) == 1

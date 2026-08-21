@@ -164,8 +164,10 @@ and none was re-armed, entry hints report `n=0`; if the default pool is short, t
 report `n=1/4` and the exact `--report-pending` re-arm command once per missing slot. A listener
 reparented to PID 1 waits through a short startup grace, then refuses with one exact
 re-arm command: its exit cannot wake an untracked parent. Superseded, orphaned,
-stale-lease, corrupt, upgrade-required, and journal-unavailable exits remain durable
-audit rows. A listener never renews the controller lease.
+signal, stale-lease, corrupt, upgrade-required, and journal-unavailable exits remain durable
+audit rows. A listener never renews the controller lease. Exit 4 is the detached
+refusal; it is not POSIX 128+signal. Bulk exit-144 reports (128+16, SIGURG on
+macOS) are not detached-listener deaths — detached exits 4.
 
 Supervisors must branch on the listener's exit code instead of blindly restarting:
 
@@ -176,6 +178,7 @@ Supervisors must branch on the listener's exit code instead of blindly restartin
 | 2 | Infrastructure or corruption failure. | Preserve the one-line diagnostic, repair or escalate the journal/wake substrate, and avoid a restart loop until the fault is cleared. |
 | 3 | Contention, supersession, orphaning, or stale lease. | Reconcile the active lease and held slot PIDs; do not kill by pattern, and re-arm only under the current lease. |
 | 4 | Detached-listener refusal: its exit cannot wake a tracked controller. | Use the emitted command to launch a tracked background listener; do not detach it again. |
+| 128+N | POSIX signal N. On macOS 144 is SIGURG (16). | SIGURG is logged and the listener stays alive (kernel default is discard). A terminating signal prints who/why, releases the slot, and exits 128+N. Empty 144 is a harness report, not this refusal. |
 
 The held-lock ledger, not coverage rows or `ps` output, drives the missing-listener
 reminder. Coverage rows retain audit and supersession history only.
