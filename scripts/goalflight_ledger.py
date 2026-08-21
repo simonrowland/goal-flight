@@ -543,6 +543,7 @@ def commit_terminal_authority(
     reason: object,
     terminal_state: str | None = None,
     worker_still_alive: bool | None = None,
+    headline: str | None = None,
 ) -> goalflight_journal.WriteResult[goalflight_journal.TerminalCommit]:
     """Sole journal emitter used by every terminal classifier."""
     dispatch_id = str(record.get("dispatch_id") or "")
@@ -575,15 +576,18 @@ def commit_terminal_authority(
         if resolved_terminal == "complete"
         else "blocked"
     )
+    observation: dict[str, object] = {
+        "state": state,
+        "terminal_state": resolved_terminal,
+        "outcome": failure_envelope(reason) or {},
+        "worker_still_alive": worker_still_alive,
+    }
+    if isinstance(headline, str) and headline.strip():
+        observation["headline"] = headline.strip()
     return authority.commit_terminal(
         attempt.attempt_id,
         terminal_state=resolved_terminal,
-        observation={
-            "state": state,
-            "terminal_state": resolved_terminal,
-            "outcome": failure_envelope(reason) or {},
-            "worker_still_alive": worker_still_alive,
-        },
+        observation=observation,
         event_type=event_type,
     )
 
@@ -916,6 +920,7 @@ def cmd_finish(args: argparse.Namespace) -> int:
         reason=args.reason,
         terminal_state=terminal_state,
         worker_still_alive=getattr(args, "worker_still_alive", None),
+        headline=getattr(args, "headline", None),
     )
     if not committed.committed or committed.value is None:
         print(json.dumps({
@@ -954,6 +959,9 @@ def cmd_finish(args: argparse.Namespace) -> int:
         if envelope:
             record.update(envelope)
             record["outcome"].update(envelope)
+        headline = winner.observation.get("headline")
+        if isinstance(headline, str) and headline.strip():
+            record["headline"] = headline.strip()
         winner_reason = None
         if isinstance(envelope, dict):
             winner_reason = envelope.get("error") or envelope.get("reason")
