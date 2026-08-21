@@ -290,3 +290,100 @@ system already struggles with (see b-165: reads bounce rather than wait).
 **Constraint on any fix:** deliberate broadcast must survive. A shared sweep
 worker may legitimately address everyone — the goal is that *unintended* fanout
 stops, not that fanout becomes impossible.
+
+---
+
+## 9. Decided direction: one persistent listener, and the heartbeat that proves it
+
+**Operator, 2026-08-21:** *"one persistent line-break-wakeup listener is the
+way."*
+
+Everything in §2.2 describes a wake layer built around **exit-as-wake**, and
+almost every open defect in §6 is downstream of that one choice. This section
+records the replacement.
+
+### The shape
+
+A single long-lived listener writes lines to stdout; the host surfaces each line
+as a wake. Three line kinds, structurally distinguishable:
+
+| line | meaning | wakes with |
+|---|---|---|
+| **event** | mail arrived | the payload |
+| **heartbeat** | nothing arrived | proof the channel is open |
+| **frontier** | periodic | the store's `next` — so a wake arrives with work in hand |
+
+### What it deletes
+
+Exit-as-wake forces every doorbell to be one-shot, which forces a **pool**,
+which forces depth accounting, re-arming every turn, and a separate liveness
+probe. None of those are requirements — they are consequences. A persistent
+wake removes all four. **The cap was never the problem; the pool was.** Raising
+`--listener-slots` tunes a symptom.
+
+It also subsumes the `/loop` idle timer. A timer wakes on the clock; a heartbeat
+wakes on the clock *and* proves the channel is open while doing it.
+
+### Bidirectional liveness — the load-bearing idea
+
+The same write proves liveness in both directions:
+
+- heartbeat **arrives** → the listener is alive, proven to the controller
+- heartbeat **write succeeds** → the controller is alive, proven to the listener
+- write fails `EPIPE` → the controller is gone; the listener exits and releases
+  its slot rather than lingering
+- heartbeats **stop arriving** → the listener is gone; the controller re-arms
+
+**This dissolves b-176 rather than fixing it.** That defect is that the
+dropped-pipe → `orphaned` path may fire on *quiet* instead of a genuinely closed
+fd. Its root cause is that a listener with no mail never writes, so it has
+nothing to discover a closed pipe *with* — quiet and dead are indistinguishable.
+A heartbeat means there is no such thing as a legitimately quiet listener:
+every interval produces a write, so `EPIPE` becomes evidence rather than an
+inference from silence. **measured**: this is the same mechanism the operator
+identified as *"controller is running vs claude app crashed"*.
+
+It likewise removes b-167 (a uniform timeout blanking a whole pool at once) —
+with one listener there is no pool to blank — and supplies the orphan reaper
+(b-020/b-173) its missing second fact, since a listener that self-exits on
+`EPIPE` stops being an orphan at the source.
+
+### The case neither side can catch alone
+
+If compaction leaves the process running but the host stops **surfacing** its
+lines, the write still succeeds while nobody is semantically listening. The
+listener cannot detect this — its pipe is fine. It collapses into the
+controller's side: heartbeats stop arriving, and missing heartbeats read as
+death. **The controller-side timeout therefore stays load-bearing** and must not
+be dropped merely because the listener has `EPIPE` detection.
+
+### Invariants this must satisfy
+
+- **A missing heartbeat reads as death, loudly.** The entire value is that
+  silence stops being ambiguous. A stream that dies quietly is strictly worse
+  than a doorbell that dies, because a doorbell's exit is itself a signal.
+- **Heartbeat and frontier lines are structurally tagged**, never distinguished
+  by parsing prose. A controller that mistakes a heartbeat for work burns a turn
+  on nothing — the "are you still there?" anti-pattern, self-inflicted.
+- **The frontier line is information, not instruction.** A controller mid-chunk
+  must not pivot because a heartbeat named a different `next`; an explicit
+  user-directed mission already outranks the store frontier.
+- **Do not repeat an unchanged frontier every beat.** Noise trains controllers
+  to ignore the channel — the same way a false `MAIL-ERROR` (b-184) trains them
+  to ignore real delivery failures.
+- **Cadence is derived, not guessed.** Death is detected within roughly one
+  interval, so choose the interval from how long a controller may acceptably be
+  deaf without knowing it, and record the reasoning.
+
+### What stays
+
+Doorbells remain the portable path for hosts with no persistent monitor
+(codex, grok, cursor, opencode). Both paths share the journal as durable truth,
+so a missed wake costs **latency, not events** — which is what makes running two
+mechanisms safe rather than merely redundant.
+
+**Persistent is not immortal.** A streaming listener is a tracked background
+task, and this host reaps those — 149 exit-144 events since 2026-06-13 across
+many task kinds. The stream is cheaper per event than a pool; it is not more
+durable than one. That is an argument for keeping one backup doorbell, not
+against the design.
