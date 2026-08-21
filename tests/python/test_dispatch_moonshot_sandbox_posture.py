@@ -47,6 +47,7 @@ def _run(dispatch_id: str, project: Path, *, read_only: bool) -> tuple[int, str,
     argv = [
         "--agent",
         "moonshot",
+        "--unregistered-forced",
         "--dispatch-id",
         dispatch_id,
         "--cwd",

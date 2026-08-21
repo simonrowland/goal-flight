@@ -849,6 +849,7 @@ def case_broad_pattern_sandbox_off_warning_still_fires() -> None:
                     goalflight_acp_run.run(
                         argparse.Namespace(
                             agent="fake-sandbox",
+                            unregistered_forced=True,
                             cwd=str(workspace),
                             session_id="title-allow-warn-session",
                             dispatch_id=f"test-title-allow-warn-{os.getpid()}",
@@ -928,6 +929,7 @@ async def _run_sandbox_probe(profile: str) -> dict:
             return await goalflight_acp_run.run(
                 argparse.Namespace(
                     agent="fake-sandbox",
+                    unregistered_forced=True,
                     cwd=str(workspace),
                     session_id=f"{dispatch_id}-session",
                     dispatch_id=dispatch_id,
@@ -1011,6 +1013,7 @@ def case_runner_blocks_undeclared_os_sandbox_before_capacity() -> None:
             payload = asyncio.run(goalflight_acp_run.run(
                 argparse.Namespace(
                     agent="fake-no-sandbox",
+                    unregistered_forced=True,
                     cwd=str(ROOT),
                     session_id="unsupported-os-sandbox",
                     dispatch_id=f"test-unsupported-os-sandbox-{os.getpid()}",
@@ -1090,6 +1093,7 @@ def case_runner_translates_claude_read_only_to_acp_permissions() -> None:
                 goalflight_acp_run.run(
                     argparse.Namespace(
                         agent="claude",
+                        unregistered_forced=True,
                         cwd=str(ROOT),
                         session_id="claude-read-only-fallback",
                         dispatch_id=f"test-claude-read-only-fallback-{os.getpid()}",
@@ -1142,6 +1146,7 @@ def case_runner_translates_claude_read_only_to_acp_permissions() -> None:
                 goalflight_acp_run.run(
                     argparse.Namespace(
                         agent="claude",
+                        unregistered_forced=True,
                         cwd=str(ROOT),
                         session_id="claude-no-sandbox-request",
                         dispatch_id=f"test-claude-no-sandbox-request-{os.getpid()}",
@@ -1213,6 +1218,7 @@ def case_runner_blocks_temp_cwd_before_capacity() -> None:
                 payload = asyncio.run(goalflight_acp_run.run(
                     argparse.Namespace(
                         agent="fake-sandbox",
+                        unregistered_forced=True,
                         cwd=cwd,
                         session_id="temp-cwd-os-sandbox",
                         dispatch_id=f"test-temp-cwd-os-sandbox-{os.getpid()}",

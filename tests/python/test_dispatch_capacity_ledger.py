@@ -164,6 +164,7 @@ def _dispatch_command(
     cmd = [
         sys.executable,
         str(DISPATCH),
+        "--unregistered-forced",
         "--agent",
         agent,
         "--dispatch-id",
@@ -318,6 +319,7 @@ def case_status_sees_dispatch_and_lease_releases() -> None:
             [
                 sys.executable,
                 str(DISPATCH),
+                "--unregistered-forced",
                 "--agent",
                 "test-dispatch",
                 "--dispatch-id",
@@ -780,6 +782,7 @@ def case_submit_foreground_rejected() -> None:
             [
                 sys.executable,
                 str(DISPATCH),
+                "--unregistered-forced",
                 "--submit",
                 "--foreground",
                 "--agent",
@@ -833,6 +836,7 @@ def case_capacity_block_does_not_spawn() -> None:
             [
                 sys.executable,
                 str(DISPATCH),
+                "--unregistered-forced",
                 "--agent",
                 "test-dispatch",
                 "--dispatch-id",
@@ -892,7 +896,7 @@ def case_capacity_wait_queues_until_slot_frees() -> None:
         )
         proc = subprocess.Popen(
             [
-                sys.executable, str(DISPATCH),
+                sys.executable, str(DISPATCH), "--unregistered-forced",
                 "--agent", "test-dispatch", "--dispatch-id", "queued-dispatch",
                 "--capacity-wait-s", "60",
                 "--poll-secs", "0.2", "--max-idle-secs", "20",
@@ -932,7 +936,7 @@ def case_capacity_wait_queues_until_slot_frees() -> None:
         # (the reused-id guard sees the non-terminal waiting_capacity record).
         reuse = subprocess.run(
             [
-                sys.executable, str(DISPATCH),
+                sys.executable, str(DISPATCH), "--unregistered-forced",
                 "--agent", "test-dispatch", "--dispatch-id", "queued-dispatch",
                 "--capacity-wait-s", "0",
                 "--tail", str(tmp / "reuse.tail"),
@@ -982,7 +986,7 @@ def case_capacity_wait_interrupt_writes_terminal_status() -> None:
         status_path = tmp / "interrupted.status.json"
         proc = subprocess.Popen(
             [
-                sys.executable, str(DISPATCH),
+                sys.executable, str(DISPATCH), "--unregistered-forced",
                 "--agent", "test-dispatch", "--dispatch-id", "interrupted-dispatch",
                 "--capacity-wait-s", "120",
                 "--tail", str(tmp / "interrupted.tail"),
@@ -1017,6 +1021,7 @@ def case_require_prompt_before_side_effects() -> None:
             [
                 sys.executable,
                 str(DISPATCH),
+                "--unregistered-forced",
                 "--agent",
                 "codex",
                 "--cwd",
@@ -1042,6 +1047,7 @@ def case_account_guard_before_prompt_materialization() -> None:
             [
                 sys.executable,
                 str(DISPATCH),
+                "--unregistered-forced",
                 "--agent",
                 "codex",
                 "--account",
@@ -1074,6 +1080,7 @@ def case_codex_routed_subscription_strips_openai_api_key() -> None:
                 [
                     sys.executable,
                     str(DISPATCH),
+                    "--unregistered-forced",
                     "--agent",
                     agent,
                     "--dispatch-id",
@@ -1120,6 +1127,7 @@ def case_state_dir_auto_paths() -> None:
             [
                 sys.executable,
                 str(DISPATCH),
+                "--unregistered-forced",
                 "--agent",
                 "test-dispatch",
                 "--poll-secs",
@@ -1197,6 +1205,7 @@ def case_dispatch_id_collision_suffix() -> None:
                 [
                     sys.executable,
                     str(DISPATCH),
+                    "--unregistered-forced",
                     "--agent",
                     "test-dispatch",
                     "--poll-secs",
@@ -1608,6 +1617,7 @@ def case_dispatch_stats_window_and_legacy_records() -> None:
             [
                 sys.executable,
                 str(DISPATCH),
+                "--unregistered-forced",
                 "--agent",
                 "test-dispatch",
                 "--prompt",

@@ -328,6 +328,7 @@ async def fake_run_prompt(*_args, **_kwargs):
 def runner_args(repo: Path, dispatch_id: str, status_path: Path) -> argparse.Namespace:
     return argparse.Namespace(
         agent="codex",
+        unregistered_forced=True,
         install_slot=None,
         cwd=str(repo),
         worktree="create",

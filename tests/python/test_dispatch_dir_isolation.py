@@ -236,6 +236,7 @@ def test_isolated_launch_does_not_touch_live_dispatch_or_mail() -> None:
             [
                 sys.executable,
                 str(DISPATCH),
+                "--unregistered-forced",
                 "--cwd",
                 str(tmp),
                 "--agent",

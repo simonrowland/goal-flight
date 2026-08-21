@@ -96,7 +96,7 @@ def _run(
         t0 = time.time()
         proc = subprocess.run(
             [
-                sys.executable, str(DISPATCH),
+                sys.executable, str(DISPATCH), "--unregistered-forced",
                 "--cwd", tmp,
                 "--agent", "test", "--tail", str(tail), "--status-json", str(status),
                 "--dispatch-id", "crash-safe-run",
@@ -140,7 +140,7 @@ def _run_dispatch_with_state(dispatch_id: str, worker_code: str, *, max_idle: st
         env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
         proc = subprocess.run(
             [
-                sys.executable, str(DISPATCH),
+                sys.executable, str(DISPATCH), "--unregistered-forced",
                 "--cwd", str(tmp_path),
                 "--agent", "codex",
                 "--dispatch-id", dispatch_id,
@@ -899,7 +899,7 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
         )
         proc = subprocess.Popen(
             [
-                sys.executable, str(DISPATCH),
+                sys.executable, str(DISPATCH), "--unregistered-forced",
                 "--cwd", str(tmp_path),
                 "--agent", "test", "--tail", str(tail), "--status-json", str(status),
                 "--dispatch-id", "launcher-pgroup",
@@ -968,7 +968,7 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
         )
         proc = subprocess.Popen(
             [
-                sys.executable, str(DISPATCH),
+                sys.executable, str(DISPATCH), "--unregistered-forced",
                 # Pin the project root to the sandbox: the controller registry
                 # is per-project, so inheriting this repo as cwd would let a
                 # registered local controller be inferred as this dispatch's

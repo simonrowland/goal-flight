@@ -2994,6 +2994,24 @@ def _cmd_resume(argv: list[str]) -> int:
     )
     parser.add_argument("dispatch_id")
     parser.add_argument("--prompt-file", required=True)
+    parser.add_argument(
+        "--controller-label",
+        help="Controller label used to select a kernel-live project lease.",
+    )
+    parser.add_argument(
+        "--controller-pid",
+        type=int,
+        help="Controller pid used to select a kernel-live project lease.",
+    )
+    parser.add_argument(
+        "--controller-session-id",
+        help="Controller lease nonce used to verify dispatch ownership.",
+    )
+    parser.add_argument(
+        "--unregistered-forced",
+        action="store_true",
+        help="Resume without a registered controller and keep NULL ownership.",
+    )
     args = parser.parse_args(argv)
 
     prompt_path = Path(args.prompt_file).expanduser()
@@ -3033,6 +3051,15 @@ def _cmd_resume(argv: list[str]) -> int:
         "--engine-session-id",
         source["session_id"],
     ]
+    if args.unregistered_forced:
+        launch_argv.append("--unregistered-forced")
+    for flag, value in (
+        ("--controller-label", args.controller_label),
+        ("--controller-pid", args.controller_pid),
+        ("--controller-session-id", args.controller_session_id),
+    ):
+        if value is not None:
+            launch_argv.extend([flag, str(value)])
     if source["engine"] == "codex":
         launch_argv += [
             "--codex-session-id",
@@ -3191,6 +3218,105 @@ def _reserve_auto_dispatch_id(agent: str, base: Path) -> str:
     raise DispatchUsageError(f"could not reserve a dispatch id for stem {stem!r}")
 
 
+def _kernel_live_controller_sessions(project_root: Path) -> list[dict]:
+    """Return controller leases whose kernel slot lock is held now."""
+    root = goalflight_task.resolve_project_root(str(project_root))
+    try:
+        authority = goalflight_journal.Journal(root)
+    except goalflight_journal.JournalUnavailable:
+        return []
+    sessions: list[dict] = []
+    seen: set[tuple[str, int, str]] = set()
+    for row in authority.lease_records():
+        label = str(row.get("label") or "")
+        nonce = str(row.get("nonce") or "")
+        try:
+            pid = int(row.get("pid"))
+        except (TypeError, ValueError):
+            continue
+        if not label or not nonce:
+            continue
+        session = goalflight_session_status.live_session(
+            root,
+            label=label,
+            pid=pid,
+        )
+        if not isinstance(session, dict) or str(session.get("id") or "") != nonce:
+            continue
+        key = (label, pid, nonce)
+        if key in seen:
+            continue
+        seen.add(key)
+        sessions.append(dict(session))
+    return sorted(
+        sessions,
+        key=lambda session: (
+            str(session.get("label") or ""),
+            int(session.get("pid") or 0),
+        ),
+    )
+
+
+def _requested_controller_pid(args) -> int | None:
+    for value in (
+        getattr(args, "controller_pid", None),
+        getattr(args, "controller_beacon_pid", None),
+        os.environ.get("GOALFLIGHT_CONTROLLER_PID"),
+    ):
+        try:
+            if value is not None and str(value).strip():
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _declared_controller_label(args, project_root: Path) -> str | None:
+    value = getattr(args, "controller_label", None)
+    if value is None:
+        value = os.environ.get("GOALFLIGHT_CONTROLLER_LABEL")
+    if not str(value or "").strip():
+        return None
+    return goalflight_session_status.resolve_controller_label(
+        str(value),
+        project_root=project_root,
+    )
+
+
+def _controller_session_is_in_ancestry(session: dict) -> bool:
+    expected = session.get("process_identity")
+    if not isinstance(expected, dict):
+        return False
+    expected_pid = expected.get("pid")
+    expected_start = expected.get("start_token")
+    if not isinstance(expected_pid, int) or not expected_start:
+        return False
+    ancestry = goalflight_session_status._controller_process_ancestry()
+    return any(
+        process.get("pid") == expected_pid
+        and process.get("start_token") == expected_start
+        for process in ancestry
+    )
+
+
+def _self_resolved_controller_session(
+    args,
+    project_root: Path,
+) -> dict | None:
+    """Resolve one ancestry-proven live holder matching declared identity."""
+    label = _declared_controller_label(args, project_root)
+    pid = _requested_controller_pid(args)
+    sessions = _kernel_live_controller_sessions(project_root)
+    matches = [
+        session
+        for session in sessions
+        if (label is None or str(session.get("label") or "") == label)
+        and (pid is None or int(session.get("pid") or 0) == pid)
+        and _controller_session_is_in_ancestry(session)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
     """Auto-claim a controller entry, or verify child ownership without renewal."""
     root = goalflight_task.resolve_project_root(str(project_root))
@@ -3206,6 +3332,12 @@ def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
     requested_session_id = goalflight_session_status.resolve_controller_session_id(
         getattr(args, "controller_session_id", None)
     )
+    explicit_session_id = str(
+        getattr(args, "controller_session_id", None) or ""
+    ).strip() or None
+    args._requested_controller_label = _declared_controller_label(args, root)
+    args._requested_controller_pid = _requested_controller_pid(args)
+    args._requested_controller_session_id = requested_session_id
     ambient_lease_nonce = str(
         os.environ.get("GOALFLIGHT_CONTROLLER_LEASE_NONCE") or ""
     ).strip() or None
@@ -3230,21 +3362,49 @@ def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
     )
     session: dict | None = None
     claim_result: dict[str, object]
-    if requested_label and ambient_lease_nonce is not None:
+    self_resolved = (
+        _self_resolved_controller_session(args, root)
+        if requested_session_id is None and not child_role
+        else None
+    )
+    if isinstance(self_resolved, dict):
+        session = self_resolved
+        claim_result = {
+            "claimed": False,
+            "reason": "resolved_kernel_live_controller",
+            "inherited": True,
+        }
+    elif requested_label and (
+        ambient_lease_nonce is not None
+        or (
+            explicit_session_id is not None
+            and not child_role
+            and declared_owner_pid is None
+        )
+    ):
+        verification_pid = (
+            getattr(args, "_requested_controller_pid", None)
+            if explicit_session_id is not None and ambient_lease_nonce is None
+            else requested_pid
+        )
         candidate = (
             goalflight_session_status.live_session(
                 root,
                 label=requested_label,
-                pid=requested_pid,
+                pid=verification_pid,
             )
-            if requested_pid is not None
+            if verification_pid is not None
             else goalflight_session_status.live_session(root, label=requested_label)
         )
         if isinstance(candidate, dict) and candidate.get("id") == requested_session_id:
             session = candidate
             claim_result = {
                 "claimed": False,
-                "reason": "inherited_controller_capability",
+                "reason": (
+                    "inherited_controller_capability"
+                    if ambient_lease_nonce is not None
+                    else "verified_controller_capability"
+                ),
                 "inherited": True,
             }
         else:
@@ -3316,6 +3476,7 @@ def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
     args.controller_label = str(session_label) if session_label is not None else None
     return claim_result
 
+
 def _controller_pid(args) -> int | None:
     session_id = getattr(args, "controller_session_id", None)
     pid = getattr(args, "_controller_beacon_pid", None)
@@ -3330,6 +3491,227 @@ def _controller_session_id(args) -> str | None:
 def _controller_label(args) -> str | None:
     value = getattr(args, "controller_label", None)
     return str(value) if value and _controller_session_id(args) is not None else None
+
+
+def _resolve_controller_dispatch_owner(
+    args,
+    project_root: Path,
+) -> tuple[str, int, str] | None:
+    """Return the kernel-live nonce + pid + label owner triple, if exact."""
+    nonce = _controller_session_id(args)
+    pid = _controller_pid(args)
+    label = _controller_label(args)
+    if nonce is None or pid is None or label is None:
+        return None
+    session = goalflight_session_status.live_session(
+        project_root,
+        label=label,
+        pid=pid,
+    )
+    if not isinstance(session, dict):
+        return None
+    try:
+        session_pid = int(session.get("pid"))
+    except (TypeError, ValueError):
+        return None
+    if (
+        str(session.get("id") or "") != nonce
+        or session_pid != pid
+        or str(session.get("label") or "") != label
+    ):
+        return None
+    return nonce, pid, label
+
+
+def _unregistered_controller_warning() -> str:
+    reseat = shlex.join(
+        [
+            "python3",
+            str(goalflight_compat.advertised_script("goalflight_session_status.py")),
+            "--controller-startup",
+            "--controller-pid-from-ancestry",
+        ]
+    )
+    return "\n".join(
+        [
+            "controller is not registered; the default path refuses before record or "
+            "launch, while an --unregistered-forced dispatch is recorded with no "
+            "owner and its terminal event will wake every controller in the project.",
+            reseat,
+            "Use --unregistered-forced to override and launch without a recorded owner.",
+        ]
+    )
+
+
+def _remove_option_before_worker_remainder(argv: list[str], flag: str) -> list[str]:
+    try:
+        split = argv.index("--")
+    except ValueError:
+        split = len(argv)
+    head = argv[:split]
+    tail = argv[split:]
+    out: list[str] = []
+    index = 0
+    while index < len(head):
+        if head[index] == flag:
+            index += 2
+            continue
+        out.append(head[index])
+        index += 1
+    return out + tail
+
+
+def _registered_dispatch_command(args, session: dict) -> str:
+    argv = list(getattr(args, "_original_argv", []) or [])
+    argv = _remove_flag_before_worker_remainder(argv, "--unregistered-forced")
+    argv = _remove_option_before_worker_remainder(argv, "--controller-beacon-pid")
+    for flag, value in (
+        ("--controller-label", session.get("label")),
+        ("--controller-pid", session.get("pid")),
+        ("--controller-session-id", session.get("id")),
+    ):
+        argv = _set_option_before_worker_remainder(argv, flag, str(value))
+    return shlex.join(
+        [
+            "python3",
+            str(
+                goalflight_compat.advertised_script(
+                    str(
+                        getattr(
+                            args,
+                            "_controller_registration_script",
+                            "goalflight_dispatch.py",
+                        )
+                    )
+                )
+            ),
+            *argv,
+        ]
+    )
+
+
+def _controller_not_in_ancestry_warning(session: dict) -> str:
+    return "\n".join(
+        [
+            "controller "
+            f"{session.get('label')} is kernel-live under pid {session.get('pid')}, "
+            "but that holder is not in this invocation's process ancestry; refusing "
+            "to attribute this dispatch to the incumbent.",
+            "Use --unregistered-forced to override and launch without a recorded "
+            "owner.",
+        ]
+    )
+
+
+def _controller_registration_warning(args, project_root: Path) -> str:
+    sessions = _kernel_live_controller_sessions(project_root)
+    if not sessions:
+        return _unregistered_controller_warning()
+
+    requested_label = getattr(args, "_requested_controller_label", None)
+    requested_pid = getattr(args, "_requested_controller_pid", None)
+    same_label = [
+        session
+        for session in sessions
+        if requested_label is not None
+        and str(session.get("label") or "") == str(requested_label)
+    ]
+    if len(sessions) == 1:
+        session = sessions[0]
+        if requested_pid is not None and int(session.get("pid") or 0) != int(
+            requested_pid
+        ):
+            return "\n".join(
+                [
+                    "controller "
+                    f"{session.get('label')} is kernel-live under pid "
+                    f"{session.get('pid')}, not requested pid {requested_pid}; "
+                    "refusing to adopt or displace the incumbent.",
+                    "Use --unregistered-forced to override and launch without a "
+                    "recorded owner.",
+                ]
+            )
+        if not _controller_session_is_in_ancestry(session):
+            return _controller_not_in_ancestry_warning(session)
+        return "\n".join(
+            [
+                "a kernel-live controller exists, but this dispatch invocation did "
+                "not identify it; live controller label: "
+                f"{session.get('label')}.",
+                _registered_dispatch_command(args, session),
+                "Use --unregistered-forced to override and launch without a "
+                "recorded owner.",
+            ]
+        )
+
+    if requested_pid is not None:
+        incumbent = next(
+            (
+                session
+                for session in same_label or sessions
+                if int(session.get("pid") or 0) != int(requested_pid)
+            ),
+            None,
+        )
+        if incumbent is not None and (same_label or len(sessions) == 1):
+            return "\n".join(
+                [
+                    "controller "
+                    f"{incumbent.get('label')} is kernel-live under pid "
+                    f"{incumbent.get('pid')}, not requested pid {requested_pid}; "
+                    "refusing to adopt or displace the incumbent.",
+                    "Use --unregistered-forced to override and launch without a "
+                    "recorded owner.",
+                ]
+            )
+
+    exact = [
+        session
+        for session in sessions
+        if (requested_label is None or str(session.get("label")) == str(requested_label))
+        and (requested_pid is None or int(session.get("pid") or 0) == int(requested_pid))
+    ]
+    if len(exact) == 1:
+        session = exact[0]
+        if not _controller_session_is_in_ancestry(session):
+            return _controller_not_in_ancestry_warning(session)
+        return "\n".join(
+            [
+                "a kernel-live controller exists, but this dispatch invocation did "
+                "not identify it; live controller label: "
+                f"{session.get('label')}.",
+                _registered_dispatch_command(args, session),
+                "Use --unregistered-forced to override and launch without a "
+                "recorded owner.",
+            ]
+        )
+
+    incumbents = ", ".join(
+        f"{session.get('label')} (pid {session.get('pid')})" for session in sessions
+    )
+    return "\n".join(
+        [
+            "controller identity is ambiguous; multiple kernel-live controllers "
+            f"exist for this project: {incumbents}.",
+            "Refusing to guess an owner; identify one with --controller-label, "
+            "--controller-pid, and --controller-session-id.",
+            "Use --unregistered-forced to override and launch without a recorded "
+            "owner.",
+        ]
+    )
+
+
+def _prepare_attempt_controller_registration(
+    args,
+    project_root: Path,
+) -> str | None:
+    """Refuse an unowned attempt, or return the forced-path warning to emit."""
+    if _resolve_controller_dispatch_owner(args, project_root) is not None:
+        return None
+    warning = _controller_registration_warning(args, project_root)
+    if getattr(args, "unregistered_forced", False):
+        return warning
+    raise DispatchUsageError(warning)
 
 
 def _account_engine(agent: str) -> str | None:
@@ -3885,6 +4267,11 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                    effective_account: str | None = None,
                    codex_home: str | None = None,
                    request_envelope: dict | None = None) -> None:
+    if state == "waiting_capacity":
+        # This is the dispatch attempt's prepare boundary. Re-resolve here so
+        # argument parsing, prompt materialization, and account setup cannot
+        # turn a stale controller capability into an owned journal attempt.
+        _prepare_attempt_controller_registration(args, project_root)
     with contextlib.redirect_stdout(io.StringIO()):
         record_code = goalflight_ledger.cmd_record(
             argparse.Namespace(
@@ -4202,6 +4589,8 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv += ["--controller-beacon-pid", str(controller_beacon_pid)]
     if controller_session_id is not None:
         argv += ["--controller-session-id", controller_session_id]
+    if getattr(args, "unregistered_forced", False):
+        argv.append("--unregistered-forced")
     engine_session_id = _resolved_engine_session_id(args)
     if engine_session_id is not None:
         argv += ["--engine-session-id", engine_session_id]
@@ -5052,6 +5441,9 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
             "no_orientation": bool(getattr(args, "no_orientation", False)),
             "controller_label": _controller_label(args),
             "controller_beacon_pid": _controller_pid(args),
+            "unregistered_forced": bool(
+                getattr(args, "unregistered_forced", False)
+            ),
             "raw_worker": raw_argv,
         },
     }
@@ -9255,6 +9647,44 @@ def _drain_queue_once(args) -> dict:
                 launched += 1
                 details.append({"dispatch_id": dispatch_id, "state": "launched", "reason": "worker_record_present"})
             continue
+        try:
+            observed_claim = json.loads(claim.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            observed_claim = None
+        if (
+            proc.returncode != 0
+            and isinstance(observed_claim, dict)
+            and observed_claim.get("queue_launch_token") == launch_token
+            and _entry_pre_spawn(observed_claim)
+        ):
+            restored, decision = _restore_claim_if_incomplete(
+                claim,
+                entry,
+                queue_dir,
+                stale_s=args.claim_stale_s,
+            )
+            if decision is not None:
+                details.append(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": str(decision.get("state") or "complete"),
+                        "reason": str(
+                            decision.get("reason") or "completion_authority"
+                        ),
+                    }
+                )
+                continue
+            if restored is not None:
+                _restore_queued_record_from_entry(entry, restored)
+                left_queued += 1
+                details.append(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": "queued",
+                        "reason": f"launch_refused_pre_spawn:{proc.returncode}",
+                    }
+                )
+                continue
         pending_claims += 1
         failed += 1
         details.append(
@@ -9593,6 +10023,8 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         controller_session_id=_controller_session_id(args),
         controller_pid=_controller_pid(args),
         controller_label=_controller_label(args),
+        unregistered_forced=bool(getattr(args, "unregistered_forced", False)),
+        _controller_registration_script="goalflight_acp_run.py",
         cpu_epsilon=0.1,
         json=False,
     )
@@ -9752,6 +10184,18 @@ def _run_test_acp_shape_if_requested(args, *, base: Path, status_json: Path, tai
 def _acp_detached_child_argv(args) -> list[str]:
     argv = list(getattr(args, "_original_argv", []) or sys.argv[1:])
     argv = _remove_flag_before_worker_remainder(argv, "--launch-detached")
+    for flag, value in (
+        ("--controller-label", _controller_label(args)),
+        ("--controller-beacon-pid", _controller_pid(args)),
+        ("--controller-session-id", _controller_session_id(args)),
+    ):
+        if value is not None:
+            argv = _set_option_before_worker_remainder(argv, flag, str(value))
+    if (
+        getattr(args, "unregistered_forced", False)
+        and "--unregistered-forced" not in argv
+    ):
+        argv = _insert_before_worker_remainder(argv, ["--unregistered-forced"])
     if "--acp-detached-child" not in argv:
         argv = _insert_before_worker_remainder(argv, ["--acp-detached-child"])
     return argv
@@ -10364,8 +10808,9 @@ def main(argv: list[str] | None = None) -> int:
         "--controller-pid",
         type=int,
         help=(
-            "Legacy compatibility input. Controller ownership and the watcher "
-            "orphan guard are derived from the live project beacon."
+            "Controller pid used to select a kernel-live project lease. The "
+            "matching nonce is resolved automatically when ancestry proves the "
+            "holder."
         ),
     )
     parser.add_argument(
@@ -10378,6 +10823,15 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--unregistered-forced",
+        action="store_true",
+        help=(
+            "Override the registered-controller launch refusal. The dispatch is "
+            "recorded with no owner, so its terminal event wakes every controller "
+            "in the project."
+        ),
+    )
+    parser.add_argument(
         "--takeover",
         action="store_true",
         help=(
@@ -10386,7 +10840,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--controller-beacon-pid", type=int, help=argparse.SUPPRESS)
-    parser.add_argument("--controller-session-id", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--controller-session-id",
+        help="Controller lease nonce used to verify dispatch ownership.",
+    )
     parser.add_argument("--from-queue", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--queue-launch-token", help=argparse.SUPPRESS)
     parser.add_argument("--queue-claim-path", help=argparse.SUPPRESS)
@@ -10498,7 +10955,6 @@ def main(argv: list[str] | None = None) -> int:
                 args.dispatch_id,
                 allow_queued=args.from_queue or args.submit,
             )
-            _mark_queue_claim_launch_started(args)
             account_env = (
                 {} if goalflight_compat.is_windows() else _resolve_launch_account_env(args)
             )
@@ -10514,6 +10970,16 @@ def main(argv: list[str] | None = None) -> int:
                 args.background_default_notice = True
             if goalflight_compat.is_windows():
                 return _run_acp_shape(args, base=base, account_env={})
+            registration_warning = _prepare_attempt_controller_registration(
+                args,
+                _project_root(args),
+            )
+            if registration_warning is not None:
+                args.dispatch_warnings = [
+                    *getattr(args, "dispatch_warnings", []),
+                    registration_warning,
+                ]
+            _mark_queue_claim_launch_started(args)
             return _run_acp_shape(args, base=base, account_env=account_env)
         except DispatchUsageError as e:
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
@@ -10550,7 +11016,6 @@ def main(argv: list[str] | None = None) -> int:
             args.dispatch_id,
             allow_queued=args.from_queue or args.submit,
         )
-        _mark_queue_claim_launch_started(args)
     except DispatchUsageError as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64
@@ -10584,10 +11049,26 @@ def main(argv: list[str] | None = None) -> int:
               "or `-- <cmd...>`", file=sys.stderr)
         return 64
 
+    project_root = _project_root(args)
+    try:
+        registration_warning = _prepare_attempt_controller_registration(
+            args,
+            project_root,
+        )
+    except DispatchUsageError as e:
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        return 64
+    if registration_warning is not None:
+        dispatch_warnings = [*dispatch_warnings, registration_warning]
+    try:
+        _mark_queue_claim_launch_started(args)
+    except DispatchUsageError as e:
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        return 64
+
     tail.parent.mkdir(parents=True, exist_ok=True)
     _emit_dispatch_warnings(dispatch_warnings, tail_path=tail, reset_tail=True)
     worker_stdout_mode = "ab" if dispatch_warnings else "wb"
-    project_root = _project_root(args)
     _reap_quota_stuck_before_bash_launch()
     worker_pid = None
     watcher_pid = None

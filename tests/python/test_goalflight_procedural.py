@@ -845,6 +845,7 @@ def test_runners_write_status_on_capacity_and_spawn_failure() -> None:
             [
                 "python3",
                 "scripts/goalflight_acp_run.py",
+                "--unregistered-forced",
                 "--agent",
                 "codex-acp",
                 "--cwd",
@@ -902,6 +903,7 @@ def test_runners_write_status_on_capacity_and_spawn_failure() -> None:
             [
                 "python3",
                 "scripts/goalflight_acp_run.py",
+                "--unregistered-forced",
                 "--agent",
                 "codex-acp",
                 "--cwd",

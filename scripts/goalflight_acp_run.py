@@ -2002,16 +2002,37 @@ async def _run_acp_dispatch_impl(
     original_prompt_file = _resolve_original_prompt_file(cfg)
     run_started = time.time()
     project_root = Path(cfg.cwd).resolve()
-    controller_session_id = getattr(cfg, "controller_session_id", None)
-    controller_pid = getattr(cfg, "controller_pid", None)
-    controller_label = getattr(cfg, "controller_label", None)
-    if not controller_session_id or controller_pid is None:
+    cfg._controller_registration_script = "goalflight_acp_run.py"
+    registration_error: str | None = None
+    registration_warning: str | None = None
+    try:
+        import goalflight_dispatch as controller_dispatch
+
+        controller_claim = controller_dispatch._stamp_controller_session(
+            cfg,
+            project_root,
+        )
+        if controller_claim.get("reason") == "label_in_use":
+            raise controller_dispatch.DispatchUsageError(
+                str(
+                    controller_claim.get("message")
+                    or "controller label is held by another live process"
+                )
+            )
+        registration_warning = (
+            controller_dispatch._prepare_attempt_controller_registration(
+                cfg,
+                project_root,
+            )
+        )
+        controller_session_id = controller_dispatch._controller_session_id(cfg)
+        controller_pid = controller_dispatch._controller_pid(cfg)
+        controller_label = controller_dispatch._controller_label(cfg)
+    except Exception as exc:
+        registration_error = str(exc) or type(exc).__name__
         controller_session_id = None
         controller_pid = None
         controller_label = None
-    else:
-        controller_session_id = str(controller_session_id)
-        controller_label = str(controller_label)[:64] if controller_label else None
     permission_mode = str(getattr(cfg, "permission_mode", "auto") or "auto")
     try:
         user_confirm_timeout_s = float(
@@ -2162,6 +2183,20 @@ async def _run_acp_dispatch_impl(
             write_status(status_path, payload)
 
     write_status(status_path, payload)
+    if registration_error is not None:
+        payload.update(
+            state="blocked_controller_registration",
+            ok=False,
+            error=registration_error,
+            updated_at=_now(),
+        )
+        write_status(status_path, payload)
+        print(f"goalflight_acp_run: {registration_error}", file=sys.stderr)
+        return payload
+    if registration_warning is not None:
+        payload["controller_registration_warning"] = registration_warning
+        write_status(status_path, payload)
+        print(f"goalflight_acp_run: {registration_warning}", file=sys.stderr)
     if boundary_warning:
         print(f"goalflight_acp_run: WARNING: {boundary_warning}", file=sys.stderr)
     if worktree_error is not None:
@@ -4390,6 +4425,7 @@ def write_windows_refusal_status(args: argparse.Namespace) -> tuple[dict, Path]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="goal-flight ACP runner")
     parser.add_argument("--agent", required=True)
     parser.add_argument("--model", default=None,
@@ -4452,6 +4488,26 @@ def main(argv: list[str] | None = None) -> int:
              "(rely on PID liveness + the worker's terminal marker instead).",
     )
     parser.add_argument("--status-json")
+    parser.add_argument(
+        "--controller-label",
+        help="Controller label used to select a kernel-live project lease.",
+    )
+    parser.add_argument(
+        "--controller-pid",
+        type=int,
+        help="Controller pid used to select a kernel-live project lease.",
+    )
+    parser.add_argument(
+        "--controller-session-id",
+        help="Controller lease nonce used to verify dispatch ownership.",
+    )
+    parser.add_argument(
+        "--unregistered-forced",
+        action="store_true",
+        help=(
+            "Override the registered-controller refusal and keep NULL ownership."
+        ),
+    )
     parser.add_argument(
         "--steer-file",
         default=None,
@@ -4644,6 +4700,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    args._original_argv = list(argv)
+    args._controller_registration_script = "goalflight_acp_run.py"
     # Derive idle-timeout from mode when not explicitly set. Goal-mode loops
     # run multi-hour and can go silent for long stretches between events; a
     # 5-minute idle ceiling would kill a healthy worker mid-test. 10h is a

@@ -247,11 +247,14 @@ def test_resume_verb_passes_grok_lineage(
         "main",
         lambda argv=None: captured.append(list(argv or [])) or 0,
     )
-    assert D._cmd_resume([parent_id, "--prompt-file", str(prompt)]) == 0
+    assert D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 0
     launch = captured[0]
     assert launch[launch.index("--agent") + 1] == "grok-code"
     assert launch[launch.index("--parent-dispatch-id") + 1] == parent_id
     assert launch[launch.index("--engine-session-id") + 1] == GROK_SESSION
+    assert "--unregistered-forced" in launch
     assert "--fork-session" not in launch
     assert "--codex-resume-home" not in launch
 
@@ -445,6 +448,7 @@ def test_grok_launch_then_resume_reuses_assigned_handle(tmp_path: Path) -> None:
             str(DISPATCH_PY),
             "--agent",
             "grok-code",
+            "--unregistered-forced",
             "--account",
             "seat",
             "--prompt-file",
@@ -489,6 +493,7 @@ def test_grok_launch_then_resume_reuses_assigned_handle(tmp_path: Path) -> None:
             "grok-first",
             "--prompt-file",
             str(resume_prompt),
+            "--unregistered-forced",
         ],
         cwd=str(tmp_path),
         env=env,

@@ -77,6 +77,7 @@ def case_dispatch_task_ids_update_ledger_and_breadcrumbs() -> None:
             [
                 sys.executable,
                 str(DISPATCH),
+                "--unregistered-forced",
                 "--agent",
                 "test-dispatch",
                 "--dispatch-id",

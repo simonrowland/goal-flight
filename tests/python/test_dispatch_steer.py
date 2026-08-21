@@ -321,6 +321,7 @@ def case_spawn_exports_steer_env() -> None:
             [
                 sys.executable,
                 str(DISPATCH),
+                "--unregistered-forced",
                 "--agent",
                 "env-check",
                 "--dispatch-id",
@@ -373,6 +374,7 @@ def _run_prompt_env_case(tmp: Path, dispatch_id: str, prompt_args: list[str], se
                     [
                         "--agent",
                         "codex",
+                        "--unregistered-forced",
                         "--dispatch-id",
                         dispatch_id,
                         "--tail",

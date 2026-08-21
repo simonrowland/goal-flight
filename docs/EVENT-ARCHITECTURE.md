@@ -110,38 +110,41 @@ provides one.
 
 ---
 
-## 3. Identity and ownership — **currently broken**
+## 3. Identity and ownership — **persist or refuse**
 
-This is the weakest part of the system and the source of most cross-controller
-noise.
+**Inferred implementation invariant:** dispatch ownership is the exact **nonce +
+PID + label** of a kernel-lock-live controller lease. The dispatcher re-resolves
+that triple at attempt preparation; `--controller-label` alone is not ownership.
 
-**Measured, 2026-08-21:** `--controller-label` is accepted and **silently
-discarded**. Five dispatches launched with the flag explicitly set all recorded
-`controller_label=None`, `controller_pid=None`, and NULL
-`owner_controller_label` / `owner_session_digest` in the ledger. No error was
-raised. `project_root` and `worker_cwd` are also `None`.
+**Inferred implementation invariant:** a plain dispatch or resume needs no new
+ownership flags when exactly one kernel-live project controller is proven to be
+in the invocation's PID-and-start-token ancestry. The dispatcher reads that
+lease's nonce and records its full owner triple. An explicit
+`--controller-label` plus `--controller-pid` likewise resolves the matching live
+nonce only when the holder is in that ancestry. Zero matches, several matches,
+or a sole unrelated live holder refuse rather than guessing by proximity.
 
-Consequences, all measured:
+**Inferred implementation invariant:** an unresolved controller now refuses
+before worker launch or capacity leasing. With no kernel-live controller, the
+refusal prints the advertised-install registration command:
 
-- **Every dispatch is unowned**, so terminal events fan out to *every*
-  controller in the project — one dispatch reached four controllers, another
-  three, one broadcast to `*`. Each foreign event costs a one-shot doorbell.
-- **An unowned controller cannot be messaged.** Posting to an unresolvable label
-  returns `recorded_only_no_dispatch`: recorded, never delivered. So "notify the
-  affected controllers" is not merely blocked — it is undefined.
-- **An unowned dispatch cannot be attributed**, so we cannot even identify whose
-  it is.
+```shell
+python3 <advertised-skill>/scripts/goalflight_session_status.py --controller-startup --controller-pid-from-ancestry
+```
 
-**Ambient identity is available and unused.** Where the dispatcher runs, the git
-toplevel and origin URL both resolve; `GOALFLIGHT_CONTROLLER_LABEL` and
-`GOALFLIGHT_CONTROLLER_LEASE_NONCE` are the env vars other controllers already
-export. Yet `dispatch` reads the label env var once, never reads a controller
-pid, and records no project root. **measured**
+**Inferred implementation invariant:** `--unregistered-forced` is the deliberate
+escape hatch. It launches with the same NULL owner used by the legacy path and
+prints the warning to stderr (and the dispatch tail where one exists), making
+the resulting project-wide terminal-event fanout visible. Deliberate broadcast
+remains a separate supported operation.
 
-**Design question for the next iteration (open):** should ownership be keyed on
-the *label* — a human string that already collided (`pm2` vs `pm2-main`) — or on
-the **lease identity**, which has kernel-lock liveness behind it? A label is a
-hint; a lease is a fact.
+**Measured:** 421 of 1,704 observed dispatch rows were owned, and an owned
+dispatch's terminal event fanned out to exactly one recipient. **Inferred from
+code and journal rows:** the legacy failure was silent NULL ownership: when the
+write path could not resolve the controller triple, the read path treated NULL
+as "wake every SQL-ACTIVE controller label in this project." One ownerless
+dispatch therefore spent a one-shot doorbell for every recipient, including
+stale SQL lease rows.
 
 **Invariants any fix must satisfy**
 
@@ -186,7 +189,7 @@ The dominant defect class this week was not missing functionality. It was
 | `idle_timeout` | worker exited | worker still running |
 | `backlog_pending: 0` | mail consumed | default, never written |
 | terminal verdict | work lost | work complete, marker unharvested |
-| `--controller-label` accepted | ownership recorded | silently discarded |
+| unresolved controller (legacy) | ownership recorded | silently NULL and fanned out |
 
 **Design rule:** a field must be able to distinguish *unset* from *asserted*,
 and a verdict must name the evidence it rests on. When a record and the live
@@ -224,7 +227,8 @@ Named because their absence shapes the priority order:
   ordering is wrong.
 - Whether non-Claude hosts suffer the tracked-task reap. Detached processes
   survived the wipes, which suggests not — one observation, not a proof.
-- How long ownership has been NULL, and whether it was ever populated.
+- How ownership rates changed over time before the measured 421-of-1,704
+  snapshot. Ownership was populated; its historical trend remains unmeasured.
 
 ---
 

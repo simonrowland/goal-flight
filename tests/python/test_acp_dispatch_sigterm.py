@@ -174,6 +174,7 @@ def case_dispatch_acp_single_finalize() -> None:
                 [
                     "--shape",
                     "acp",
+                    "--unregistered-forced",
                     "--agent",
                     "codex-acp",
                     "--dispatch-id",
@@ -230,6 +231,7 @@ def case_dispatch_interactive_sugar_routes_codex_acp_inline() -> None:
             rc = goalflight_dispatch.main(
                 [
                     "--interactive",
+                    "--unregistered-forced",
                     "--dispatch-id",
                     "acp-interactive-sugar",
                     "--cwd",
@@ -306,6 +308,7 @@ def case_dispatch_inline_permission_relay_writes_decision_and_worker_proceeds() 
                 rc = goalflight_dispatch.main(
                     [
                         "--interactive",
+                        "--unregistered-forced",
                         "--dispatch-id",
                         "acp-inline-relay",
                         "--cwd",
@@ -362,6 +365,7 @@ def case_dispatch_acp_sigterm_finalizes_and_reaps() -> None:
                 str(DISPATCH),
                 "--shape",
                 "acp",
+                "--unregistered-forced",
                 "--agent",
                 "codex-acp",
                 "--dispatch-id",
@@ -454,6 +458,7 @@ def case_dispatch_acp_sigterm_before_pid_update_keeps_ledger_row() -> None:
                 str(DISPATCH),
                 "--shape",
                 "acp",
+                "--unregistered-forced",
                 "--agent",
                 "codex-acp",
                 "--dispatch-id",

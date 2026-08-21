@@ -624,7 +624,9 @@ def test_inferred_abandonment_is_resumable_and_fresh_child_stays_live(
 
     monkeypatch.setattr(D.goalflight_ledger, "identity_matches", identity_matches)
 
-    assert D._cmd_resume([parent_id, "--prompt-file", str(prompt)]) == 0
+    assert D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 0
     resumed = _read(fresh_child_id)
     reopened_parent = _read(parent_id)
     assert [call["label"] for call in spawn_calls] == ["worker", "watcher"]

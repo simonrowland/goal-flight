@@ -19,7 +19,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_codex_sessions as S  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
+import goalflight_journal as J  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
+import goalflight_wake as wake  # noqa: E402
 import goalflight_watch as W  # noqa: E402
 
 
@@ -41,11 +43,22 @@ def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(state))
     monkeypatch.setenv("GOALFLIGHT_CODEX_STATE_DIR", str(state))
     monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
+    monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("GOALFLIGHT_MESSAGES_DIR", str(tmp_path / "messages"))
+    monkeypatch.setenv("GOALFLIGHT_WAKE_LEDGER_DIR", str(tmp_path / "wake-ledger"))
+    monkeypatch.setenv("GOALFLIGHT_PIDFILE_DIR", str(tmp_path / "pidfiles"))
     monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", "/dev/null")
     monkeypatch.setenv("GOALFLIGHT_CAPACITY_WAIT_S", "0")
     monkeypatch.setenv("GOALFLIGHT_DISABLE_NUDGES", "1")
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("GOALFLIGHT_CODEX_CONTEXT_MODE", raising=False)
+    for key in (
+        "GOALFLIGHT_CONTROLLER_LABEL",
+        "GOALFLIGHT_CONTROLLER_PID",
+        "GOALFLIGHT_CONTROLLER_SESSION_ID",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
 
 def _dispatch_home(tmp_path: Path, dispatch_id: str) -> Path:
@@ -423,7 +436,20 @@ def test_resume_verb_passes_lineage_and_tasks_to_normal_dispatch(
         lambda argv=None: captured.append(list(argv or [])) or 0,
     )
 
-    assert D._cmd_resume([parent_id, "--prompt-file", str(prompt)]) == 0
+    assert D._cmd_resume(
+        [
+            parent_id,
+            "--prompt-file",
+            str(prompt),
+            "--unregistered-forced",
+            "--controller-label",
+            "resume-test",
+            "--controller-pid",
+            "12345",
+            "--controller-session-id",
+            "resume-test-nonce",
+        ]
+    ) == 0
 
     launch = captured[0]
     assert launch[launch.index("--dispatch-id") + 1] == "codex-resume-child"
@@ -436,7 +462,65 @@ def test_resume_verb_passes_lineage_and_tasks_to_normal_dispatch(
         == parent_id
     )
     assert launch[launch.index("--task") + 1] == "t-123"
+    assert "--unregistered-forced" in launch
+    assert launch[launch.index("--controller-label") + 1] == "resume-test"
+    assert launch[launch.index("--controller-pid") + 1] == "12345"
+    assert launch[launch.index("--controller-session-id") + 1] == (
+        "resume-test-nonce"
+    )
     assert "--account" not in launch
+
+
+def test_resume_by_single_registered_controller_records_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "owned-resume-parent"
+    child_id = "owned-resume-child"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    prompt = tmp_path / "owned-resume.md"
+    prompt.write_text("Continue the registered turn.", encoding="utf-8")
+    authority = J.open_or_create_journal(tmp_path)
+    principal = L.process_identity(os.getpid())
+    assert principal is not None
+    claimed = authority.claim_or_renew_lease(
+        "resume-controller",
+        principal=principal,
+    )
+    assert claimed.committed and claimed.value is not None
+    holder = wake.register_lease_holder(
+        tmp_path,
+        controller_label="resume-controller",
+        lease_nonce=claimed.value.nonce,
+    )
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda _agent, _base: child_id,
+    )
+    _spawn_calls, leases = _stub_detached_runtime(monkeypatch)
+
+    try:
+        rc = D._cmd_resume([parent_id, "--prompt-file", str(prompt)])
+    finally:
+        holder.close()
+
+    assert rc == 0
+    assert leases == ["lease-resume"]
+    record = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
+    assert record["controller_label"] == "resume-controller"
+    assert record["controller_session_id"] == claimed.value.nonce
+    owner = authority.read_all(
+        """SELECT owner_controller_label, owner_session_digest
+           FROM dispatch_attempts WHERE dispatch_id = ?""",
+        (child_id,),
+    )[0]
+    assert owner["owner_controller_label"] == "resume-controller"
+    assert owner["owner_session_digest"] == wake.controller_session_digest(
+        claimed.value.nonce
+    )
 
 
 def test_resumed_turn_uses_normal_tracking_surfaces(
@@ -458,6 +542,7 @@ def test_resumed_turn_uses_normal_tracking_surfaces(
         [
             "--agent",
             "codex",
+            "--unregistered-forced",
             "--shape",
             "bash",
             "--dispatch-id",
@@ -582,7 +667,14 @@ def test_concurrent_resumes_claim_before_capacity_and_only_one_launches(
         results.put(
             (
                 os.getpid(),
-                D._cmd_resume([parent_id, "--prompt-file", str(prompt)]),
+                D._cmd_resume(
+                    [
+                        parent_id,
+                        "--prompt-file",
+                        str(prompt),
+                        "--unregistered-forced",
+                    ]
+                ),
             )
         )
 
@@ -672,7 +764,12 @@ def test_dead_preclaim_is_reconciled_before_retry(
 
     claimant = ctx.Process(
         target=lambda: D._cmd_resume(
-            [parent_id, "--prompt-file", str(prompt)]
+            [
+                parent_id,
+                "--prompt-file",
+                str(prompt),
+                "--unregistered-forced",
+            ]
         )
     )
     claimant.start()
@@ -684,7 +781,9 @@ def test_dead_preclaim_is_reconciled_before_retry(
     assert not claimant.is_alive()
 
     monkeypatch.setattr(D, "_CODEX_RESUME_DURABLE_CLAIM_HOOK", None)
-    assert D._cmd_resume([parent_id, "--prompt-file", str(prompt)]) == 0
+    assert D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 0
 
     stale = json.loads(L.record_path(stale_id).read_text(encoding="utf-8"))
     assert stale["state"] == "failed"
@@ -720,7 +819,9 @@ def test_parent_child_grandchild_resume_preserves_original_home_owner(
     )
     monkeypatch.setattr(D, "_dispatch_base_dir", lambda: dispatch_base)
 
-    assert D._cmd_resume([parent_id, "--prompt-file", str(prompt)]) == 0
+    assert D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 0
     child = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
     assert child["parent_dispatch_id"] == parent_id
     assert child["codex_home"] == str(home)
@@ -736,7 +837,9 @@ def test_parent_child_grandchild_resume_preserves_original_home_owner(
     )
     L.write_record(child)
 
-    assert D._cmd_resume([child_id, "--prompt-file", str(prompt)]) == 0
+    assert D._cmd_resume(
+        [child_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 0
     grandchild = json.loads(
         L.record_path(grandchild_id).read_text(encoding="utf-8")
     )
@@ -916,6 +1019,7 @@ def test_main_reports_resume_build_usage_error_without_traceback(
         [
             "--agent",
             "codex",
+            "--unregistered-forced",
             "--shape",
             "bash",
             "--dispatch-id",
@@ -958,6 +1062,7 @@ def test_main_reports_resume_rebuild_usage_error_without_traceback(
         [
             "--agent",
             "codex",
+            "--unregistered-forced",
             "--shape",
             "bash",
             "--dispatch-id",
@@ -979,7 +1084,10 @@ def test_main_reports_resume_rebuild_usage_error_without_traceback(
     )
 
     assert rc == 64
-    assert capsys.readouterr().err == (
+    error = capsys.readouterr().err
+    assert "controller is not registered" in error
+    assert "--unregistered-forced" in error
+    assert error.endswith(
         "goalflight_dispatch: resume home rebuild refused\n"
     )
 

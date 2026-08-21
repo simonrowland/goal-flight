@@ -488,6 +488,7 @@ def test_foreground_dispatch_refreshes_dashboard_status_data() -> None:
                     str(DISPATCH),
                     "--agent",
                     "test-dispatch",
+                    "--unregistered-forced",
                     "--dispatch-id",
                     "dashboard-watch",
                     "--cwd",

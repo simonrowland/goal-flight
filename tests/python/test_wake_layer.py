@@ -128,8 +128,10 @@ def _completion_dispatch_command(
     root: Path,
     tmp_path: Path,
     dispatch_id: str,
+    *,
+    forced: bool = False,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(SCRIPTS / "goalflight_dispatch.py"),
         "--agent",
@@ -147,6 +149,11 @@ def _completion_dispatch_command(
         "--max-idle-secs",
         "20",
         "--foreground",
+    ]
+    if forced:
+        command.append("--unregistered-forced")
+    return [
+        *command,
         "--",
         sys.executable,
         "-c",
@@ -495,7 +502,12 @@ def test_unowned_worker_finish_fans_out_and_wakes_registered_controller(
         _wait_for_listener(authority, "wake-test", listener)
         started = time.monotonic()
         completed = subprocess.run(
-            _completion_dispatch_command(root, tmp_path, dispatch_id),
+            _completion_dispatch_command(
+                root,
+                tmp_path,
+                dispatch_id,
+                forced=True,
+            ),
             cwd=root,
             env=dispatch_env,
             capture_output=True,

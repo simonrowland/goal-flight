@@ -122,6 +122,7 @@ async def _run_blocked_startup(
                     payload = await goalflight_acp_run.run(
                         argparse.Namespace(
                             agent=agent,
+                            unregistered_forced=True,
                             install_slot=None,
                             cwd=str(ROOT),
                             worktree="off",

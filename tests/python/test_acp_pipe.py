@@ -384,6 +384,7 @@ async def case_runner_overlimit_response_status_counts_drop() -> None:
             payload = await goalflight_acp_run.run(
                 argparse.Namespace(
                     agent="fake-runner",
+                    unregistered_forced=True,
                     cwd=str(ROOT),
                     session_id=f"{dispatch_id}-session",
                     dispatch_id=dispatch_id,
@@ -454,6 +455,7 @@ async def _run_fake_runner_scenario(
             payload = await goalflight_acp_run.run(
                 argparse.Namespace(
                     agent="fake-runner",
+                    unregistered_forced=True,
                     cwd=str(ROOT),
                     session_id=f"{dispatch_id}-session",
                     dispatch_id=dispatch_id,
@@ -648,6 +650,7 @@ async def case_runner_many_events_completes_under_cap() -> None:
 def _stderr_error_runner_args(dispatch_id: str, status_path: Path) -> argparse.Namespace:
     return argparse.Namespace(
         agent="stderr-runner",
+        unregistered_forced=True,
         cwd=str(ROOT),
         session_id=f"{dispatch_id}-session",
         dispatch_id=dispatch_id,
@@ -799,6 +802,7 @@ async def case_runner_blocks_probe_required_adapter() -> None:
             status_path = tmp_path / "status.json"
             payload = await goalflight_acp_run.run(argparse.Namespace(
                 agent="blocked-runner",
+                unregistered_forced=True,
                 cwd=str(ROOT),
                 session_id=f"blocked-{os.getpid()}",
                 dispatch_id=f"blocked-{os.getpid()}",
@@ -839,6 +843,7 @@ async def case_runner_blocks_invalid_adapter_manifest() -> None:
             status_path = tmp_path / "status.json"
             payload = await goalflight_acp_run.run(argparse.Namespace(
                 agent="invalid-runner",
+                unregistered_forced=True,
                 cwd=str(ROOT),
                 session_id=f"invalid-{os.getpid()}",
                 dispatch_id=f"invalid-{os.getpid()}",
@@ -877,6 +882,7 @@ async def case_runner_blocks_missing_adapter_manifest() -> None:
             status_path = tmp_path / "status.json"
             payload = await goalflight_acp_run.run(argparse.Namespace(
                 agent="missing-runner",
+                unregistered_forced=True,
                 cwd=str(ROOT),
                 session_id=f"missing-{os.getpid()}",
                 dispatch_id=f"missing-{os.getpid()}",
@@ -927,6 +933,7 @@ def case_direct_default_status_uses_dispatch_state_dir() -> None:
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
                 rc = goalflight_acp_run.main([
+                    "--unregistered-forced",
                     "--agent", "missing-runner",
                     "--cwd", str(worker_cwd),
                     "--session-id", f"{dispatch_id}-session",
@@ -979,6 +986,7 @@ def case_direct_explicit_status_json_wins() -> None:
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
                 rc = goalflight_acp_run.main([
+                    "--unregistered-forced",
                     "--agent", "missing-runner",
                     "--cwd", str(worker_cwd),
                     "--session-id", f"{dispatch_id}-session",

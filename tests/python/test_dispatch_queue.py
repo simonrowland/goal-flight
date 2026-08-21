@@ -28,6 +28,9 @@ FAKE_ACP_AGENT = ROOT / "tests" / "fixtures" / "acp_fake_agent.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_dispatch as D  # noqa: E402
+import goalflight_journal as journal  # noqa: E402
+import goalflight_ledger as ledger  # noqa: E402
+import goalflight_wake as wake  # noqa: E402
 
 
 def _env(tmp: Path) -> dict[str, str]:
@@ -372,6 +375,7 @@ def test_submit_records_replayable_request_without_capacity_acquire() -> None:
                     "--agent",
                     "test-dispatch",
                     "--submit",
+                    "--unregistered-forced",
                     "--no-drain-on-submit",
                     "--dispatch-id",
                     "submit-fast",
@@ -434,6 +438,7 @@ def test_submit_default_runs_one_drain_pass_after_queue_write() -> None:
                     "--agent",
                     "test-dispatch",
                     "--submit",
+                    "--unregistered-forced",
                     "--dispatch-id",
                     "submit-drain-default",
                     "--tail",
@@ -481,6 +486,7 @@ def test_submit_drain_on_submit_error_does_not_fail_submit() -> None:
                         "--agent",
                         "test-dispatch",
                         "--submit",
+                        "--unregistered-forced",
                         "--dispatch-id",
                         "submit-drain-fails",
                         "--tail",
@@ -527,6 +533,7 @@ def test_submit_default_drain_launches_once_and_duplicate_submit_does_not_double
             "--agent",
             "test-dispatch",
             "--submit",
+            "--unregistered-forced",
             "--dispatch-id",
             "submit-default-launch",
             "--tail",
@@ -571,6 +578,7 @@ def test_submit_is_idempotent_for_matching_args_and_rejects_collisions() -> None
             "--agent",
             "test-dispatch",
             "--submit",
+            "--unregistered-forced",
             "--no-drain-on-submit",
             "--dispatch-id",
             "submit-idempotent",
@@ -608,6 +616,7 @@ def test_submit_ignores_matching_failed_claim_tombstone_for_requeue() -> None:
             "--agent",
             "test-dispatch",
             "--submit",
+            "--unregistered-forced",
             "--no-drain-on-submit",
             "--dispatch-id",
             "submit-after-failed-tombstone",
@@ -653,6 +662,7 @@ def test_duplicate_submit_runs_opportunistic_drain() -> None:
                     "--agent",
                     "test-dispatch",
                     "--submit",
+                    "--unregistered-forced",
                     "--no-drain-on-submit",
                     "--dispatch-id",
                     "duplicate-drain-nudge",
@@ -690,6 +700,7 @@ def test_duplicate_submit_runs_opportunistic_drain() -> None:
                     "--agent",
                     "test-dispatch",
                     "--submit",
+                    "--unregistered-forced",
                     "--dispatch-id",
                     "duplicate-drain-nudge",
                     "--tail",
@@ -722,6 +733,7 @@ def test_concurrent_submit_same_id_is_idempotent() -> None:
             "--agent",
             "test-dispatch",
             "--submit",
+            "--unregistered-forced",
             "--no-drain-on-submit",
             "--dispatch-id",
             "submit-race",
@@ -775,6 +787,7 @@ def test_submit_write_error_is_clean() -> None:
                     "--agent",
                     "test-dispatch",
                     "--submit",
+                    "--unregistered-forced",
                     "--no-drain-on-submit",
                     "--dispatch-id",
                     "submit-readonly",
@@ -816,6 +829,7 @@ def test_submit_status_write_error_removes_queue_entry() -> None:
                     "--agent",
                     "test-dispatch",
                     "--submit",
+                    "--unregistered-forced",
                     "--no-drain-on-submit",
                     "--dispatch-id",
                     "submit-status-fails",
@@ -876,6 +890,7 @@ def test_submit_rejects_active_waiting_capacity_ledger() -> None:
                 "--agent",
                 "test-dispatch",
                 "--submit",
+                "--unregistered-forced",
                 "--no-drain-on-submit",
                 "--dispatch-id",
                 "dup-wait",
@@ -915,6 +930,7 @@ def test_drain_launches_queued_request_once_and_exits() -> None:
                 "--agent",
                 "test-dispatch",
                 "--submit",
+                "--unregistered-forced",
                 "--no-drain-on-submit",
                 "--dispatch-id",
                 "drain-launch",
@@ -948,6 +964,92 @@ def test_drain_launches_queued_request_once_and_exits() -> None:
         assert marker.read_text() == "x", "second drain double-launched the request"
 
 
+def test_registered_queue_refusal_after_controller_exit_restores_runnable_entry() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        marker = tmp / "expired-controller-worker-ran"
+        dispatch_id = "expired-controller-queue"
+        queue_path = tmp / "state" / "dispatch-queue" / f"{dispatch_id}.json"
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            authority = journal.open_or_create_journal(tmp)
+            principal = ledger.process_identity(os.getpid())
+            assert principal is not None
+            claimed = authority.claim_or_renew_lease(
+                "queue-controller",
+                principal=principal,
+            )
+            assert claimed.committed and claimed.value is not None
+            holder = wake.register_lease_holder(
+                tmp,
+                controller_label="queue-controller",
+                lease_nonce=claimed.value.nonce,
+            )
+            try:
+                submit = _run(
+                    [
+                        sys.executable,
+                        str(DISPATCH),
+                        "--agent",
+                        "test-dispatch",
+                        "--submit",
+                        "--no-drain-on-submit",
+                        "--dispatch-id",
+                        dispatch_id,
+                        "--cwd",
+                        str(tmp),
+                        "--",
+                        sys.executable,
+                        "-c",
+                        (
+                            "from pathlib import Path; "
+                            f"Path({str(marker)!r}).write_text('ran'); "
+                            f"print('COMPLETE: {dispatch_id} — ran')"
+                        ),
+                    ],
+                    env,
+                )
+            finally:
+                holder.close()
+
+            assert submit.returncode == 0, (submit.stdout, submit.stderr)
+            assert queue_path.is_file()
+            drain = _run(
+                [
+                    sys.executable,
+                    str(DISPATCH),
+                    "drain",
+                    "--capacity-wait-s",
+                    "0",
+                    "--json",
+                ],
+                env,
+            )
+            payload = json.loads(drain.stdout)
+            assert drain.returncode == 0, (drain.stdout, drain.stderr)
+            assert payload["launched"] == 0, payload
+            assert payload["left_queued"] == 1, payload
+            assert payload["pending_claims"] == 0, payload
+            assert payload["details"] == [
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "queued",
+                    "reason": "launch_refused_pre_spawn:64",
+                }
+            ]
+            assert queue_path.is_file(), "refusal removed the runnable queue entry"
+            assert list(queue_path.parent.glob(f"{dispatch_id}.json.claimed-*")) == []
+            assert not marker.exists(), "refused queued worker still launched"
+            record = json.loads(ledger.record_path(dispatch_id).read_text(encoding="utf-8"))
+            assert record["state"] == "queued", record
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+
 def test_drain_waits_for_submit_status_recording() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -974,6 +1076,7 @@ def test_drain_waits_for_submit_status_recording() -> None:
                 "--agent",
                 "test-dispatch",
                 "--submit",
+                "--unregistered-forced",
                 "--no-drain-on-submit",
                 "--dispatch-id",
                 "submit-drain-race",
@@ -1077,6 +1180,7 @@ def test_acp_submit_then_drain_replays_from_queue() -> None:
                 "--shape",
                 "acp",
                 "--submit",
+                "--unregistered-forced",
                 "--no-drain-on-submit",
                 "--dispatch-id",
                 "acp-drain",
@@ -1176,6 +1280,7 @@ def test_drain_leaves_request_queued_when_capacity_full() -> None:
                 "--agent",
                 "test-dispatch",
                 "--submit",
+                "--unregistered-forced",
                 "--no-drain-on-submit",
                 "--dispatch-id",
                 "drain-no-capacity",
@@ -2351,6 +2456,7 @@ def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
             [
                 sys.executable,
                 str(DISPATCH),
+                "--unregistered-forced",
                 "--agent",
                 "codex",
                 "--dispatch-id",
@@ -4528,6 +4634,7 @@ def main() -> None:
     test_submit_status_write_error_removes_queue_entry()
     test_submit_rejects_active_waiting_capacity_ledger()
     test_drain_launches_queued_request_once_and_exits()
+    test_registered_queue_refusal_after_controller_exit_restores_runnable_entry()
     test_drain_waits_for_submit_status_recording()
     test_drain_write_error_is_json_error_without_traceback()
     test_acp_submit_then_drain_replays_from_queue()

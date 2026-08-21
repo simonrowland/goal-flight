@@ -170,6 +170,7 @@ def _stub_bash_launch(
     argv = [
         "--agent",
         "codex",
+        "--unregistered-forced",
         "--dispatch-id",
         "bash-seat-seam",
         "--cwd",
@@ -489,6 +490,7 @@ def _acp_cfg(
             remote_turn_silence_s=None,
             remote_turn_cancel_grace_s=1.0,
             cpu_epsilon=0.1,
+            unregistered_forced=True,
             json=True,
         )
     )
@@ -571,6 +573,12 @@ def _run_acp_to_spawn_failure(
     cfg = _acp_cfg(tmp_path, account=account, agent=agent)
     cfg.request_envelope = request_envelope
     payload = asyncio.run(A.run_acp_dispatch(cfg))
+    if block_dispatch_import:
+        assert payload["state"] == "blocked_controller_registration"
+        assert ordering == []
+        assert captured == {}
+        assert resolve_accounts == []
+        return cfg, captured, cleanups
     assert payload["state"] == "failed"
     expect_resolve = (
         L.infer_engine(agent) == "codex" and not block_dispatch_import
@@ -631,7 +639,7 @@ def test_acp_resolve_none_does_not_override_or_write_effective_account(
     assert cfg.context_mode == "enabled"
 
 
-def test_acp_dispatcher_import_failure_keeps_context_guard_closed(
+def test_acp_dispatcher_import_failure_refuses_before_capacity_or_spawn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -648,13 +656,13 @@ def test_acp_dispatcher_import_failure_keeps_context_guard_closed(
         spawn_base_env={"BASE": "captured", "CODEX_HOME": str(bare)},
         dispatch_import_attempts=import_attempts,
     )
-    assert captured["CODEX_HOME"] == str(bare)
-    assert cfg.context_mode == "enabled"
+    assert captured == {}
+    assert cfg.context_mode == "disabled"
     assert cleanups == []
     assert import_attempts == ["goalflight_dispatch"]
 
 
-def test_non_codex_acp_skips_dispatcher_integration(
+def test_non_codex_acp_requires_dispatcher_integration_for_registration_gate(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -668,10 +676,10 @@ def test_non_codex_acp_skips_dispatcher_integration(
         block_dispatch_import=True,
         dispatch_import_attempts=import_attempts,
     )
-    assert captured == {"BASE": "captured"}
+    assert captured == {}
     assert cfg.context_mode == "disabled"
     assert cleanups == []
-    assert import_attempts == []
+    assert import_attempts == ["goalflight_dispatch"]
 
 
 def test_context_mode_disable_requires_effective_home_table(tmp_path: Path) -> None:
@@ -881,6 +889,7 @@ def test_queued_terminal_reconcile_requeues_exactly_once_end_to_end(
         [
             "--agent",
             "codex",
+            "--unregistered-forced",
             "--shape",
             "bash",
             "--dispatch-id",

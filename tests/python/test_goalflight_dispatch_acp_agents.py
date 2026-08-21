@@ -871,6 +871,7 @@ def _acp_cfg(tmp: Path, *, dispatch_id: str, status_json: Path, capacity_wait_s:
             remote_turn_silence_s=None,
             remote_turn_cancel_grace_s=1.0,
             cpu_epsilon=0.1,
+            unregistered_forced=True,
             json=False,
         )
     )
@@ -1070,6 +1071,7 @@ def _main_capture_for(agent: str) -> tuple[int, dict[str, object]]:
                 "goalflight_dispatch.py",
                 "--agent",
                 agent,
+                "--unregistered-forced",
                 "--prompt",
                 "COMPLETE: no-op",
                 "--cwd",

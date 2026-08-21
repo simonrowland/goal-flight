@@ -218,6 +218,31 @@ def test_owning_controller_child_renews_with_nonce_and_measured_beacon(
     )
     assert replay[replay.index("--controller-session-id") + 1] == incumbent.value.nonce
     assert replay[replay.index("--controller-beacon-pid") + 1] == "62001"
+    replay_args.unregistered_forced = True
+    forced_replay = dispatch._canonical_replay_argv(
+        replay_args,
+        [],
+        tail=tmp_path / "owner-child-forced.tail",
+        status_json=tmp_path / "owner-child-forced.status.json",
+    )
+    assert "--unregistered-forced" in forced_replay
+
+    replay_args._original_argv = [
+        "--agent",
+        "codex-acp",
+        "--shape",
+        "acp",
+        "--prompt",
+        "owned child",
+    ]
+    detached = dispatch._acp_detached_child_argv(replay_args)
+    assert detached[detached.index("--controller-label") + 1] == "owner"
+    assert detached[detached.index("--controller-session-id") + 1] == (
+        incumbent.value.nonce
+    )
+    assert detached[detached.index("--controller-beacon-pid") + 1] == "62001"
+    assert "--acp-detached-child" in detached
+    assert "--unregistered-forced" in detached
 
 
 def test_ambient_lease_capability_inherits_owner_without_claiming(

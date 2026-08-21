@@ -444,6 +444,7 @@ def _run_fake_runner(
         args = [
             sys.executable,
             "scripts/goalflight_acp_run.py",
+            "--unregistered-forced",
             "--agent",
             str(wrapper),
             "--cwd",
@@ -718,7 +719,7 @@ def case_runner_preserves_live_controller_beacon_pair() -> None:
             task_ids=[],
             launch_detached=False,
             queue_launch_token=None,
-            cwd=None,
+            cwd=str(project_root),
             prompt="ownership test",
             prompt_file=None,
             no_orientation=True,
@@ -1682,6 +1683,7 @@ def case_user_confirm_wait_is_not_remote_silence_reaped() -> None:
             [
                 sys.executable,
                 "scripts/goalflight_acp_run.py",
+                "--unregistered-forced",
                 "--agent",
                 str(wrapper),
                 "--cwd",
@@ -2246,6 +2248,7 @@ def case_acp_missing_prompt_commits_terminal_outbox() -> None:
             [
                 sys.executable,
                 str(ROOT / "scripts/goalflight_acp_run.py"),
+                "--unregistered-forced",
                 "--agent",
                 str(wrapper),
                 "--dispatch-id",
