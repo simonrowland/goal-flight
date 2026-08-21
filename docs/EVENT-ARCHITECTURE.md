@@ -225,3 +225,67 @@ Named because their absence shapes the priority order:
 - Whether non-Claude hosts suffer the tracked-task reap. Detached processes
   survived the wipes, which suggests not — one observation, not a proof.
 - How long ownership has been NULL, and whether it was ever populated.
+
+---
+
+## 8. Open design decision: mail is fleet-scoped, dispatch state is not
+
+**Operator, 2026-08-21:** *"the mail queue should be centralized not between a
+million worktrees."*
+
+The current design is **inconsistent with itself**, and the numbers show it:
+
+| artefact | scope | count |
+|---|---|---|
+| message envelopes (`~/.goal-flight/messages/*.jsonl`) | **fleet-global** | 3,773 files |
+| delivery events (the wake path) | **per project journal** | 4,582 rows across **37** journals |
+
+Message *content* is already centralized. Only the *wake path* is fragmented.
+Mail did not choose project scoping — it inherited it by living in a journal
+built for dispatch state. That is an accident of colocation.
+
+**Why it hurts, all measured:**
+
+- A worktree mints a new journal, so it mints a new mail universe.
+  `bt-pins` is a live example: one delivery event, one controller, invisible to
+  the four controllers in the parent project's journal.
+- Cross-project mail lands in the **sender's** journal. Two replies from
+  `goal-flight` to `kiln-main` are sitting undelivered right now, including a
+  correction kiln is currently acting against.
+- `--project-root` resolves from CWD, so **where a controller happens to stand
+  decides which mail universe it lives in.**
+- One journal has no `controller_leases` table at all — an older-schema island
+  that cannot participate.
+
+**The distinction that resolves it:**
+
+- **Fleet-scoped** — who exists, who is live, and messages *between* controllers.
+  These are inter-controller concerns and must not be partitioned by directory.
+- **Project-scoped** — dispatch attempts, capacity leases, cursors, listener
+  coverage. These are genuinely per-project and should stay put.
+
+**Direction (operator-decided 2026-08-21):** the mail queue belongs in the
+**local install folder** — `~/.goal-flight/` — not in any project journal and
+never in a worktree. The envelopes are already there
+(`~/.goal-flight/messages/`); the delivery/wake state should sit beside them,
+fleet-scoped and install-local.
+
+That gives a clean split of homes:
+
+| state | home | scope |
+|---|---|---|
+| envelopes, delivery/wake, controller registry | `~/.goal-flight/` | **fleet** |
+| dispatch attempts, capacity leases, cursors, listener coverage | `~/.local/state/goal-flight/journals/<project>/` | **project** |
+
+The invariant this buys: **a message reaches the recipient's wake path
+regardless of where either party is standing** — no cwd, worktree, clone, or
+choice of tooling install can partition it. Routing is by **recipient**, which
+the envelope already records.
+
+**Do not centralize the whole journal.** Dispatch state is legitimately
+per-project, and a single global SQLite would concentrate the contention this
+system already struggles with (see b-165: reads bounce rather than wait).
+
+**Constraint on any fix:** deliberate broadcast must survive. A shared sweep
+worker may legitimately address everyone — the goal is that *unintended* fanout
+stops, not that fanout becomes impossible.
