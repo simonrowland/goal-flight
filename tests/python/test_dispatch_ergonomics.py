@@ -243,6 +243,41 @@ def test_git_pin_warning() -> None:
             _args(cwd=str(repo), prompt=f"Verify HEAD is {short_head} and compare {mismatch_pin} before edits")
         )
         check("mixed fresh and stale pins warn", mixed is not None and "GIT BASE PIN MISMATCH" in mixed)
+
+        # b-052: the check must measure --cwd (the tree the worker runs in),
+        # not the launching shell's tree.  Build a WORKTREE of the same repo,
+        # advance it one commit, and pin the prompt to the worktree's HEAD:
+        # the worktree pin is correct and must be silent even though it does
+        # not match the primary checkout's HEAD.
+        worktree = Path(td) / "wt"
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "add", "-b", "b052", str(worktree)],
+            check=True, capture_output=True,
+        )
+        (worktree / "extra.txt").write_text("advance\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worktree), "add", "extra.txt"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(worktree), "commit", "-q", "-m", "advance worktree"],
+            check=True, capture_output=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+        )
+        wt_head = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        assert wt_head != head, "worktree did not advance"
+        wt_pin_ok = D._git_pin_warning(
+            _args(cwd=str(worktree), prompt=f"Verify HEAD is {wt_head[:7]} before edits.")
+        )
+        check("correct worktree pin is silent (measures --cwd, not project root)", wt_pin_ok is None)
+        wt_pin_stale = D._git_pin_warning(
+            _args(cwd=str(worktree), prompt=f"Verify HEAD is {head[:7]} before edits.")
+        )
+        check(
+            "primary-checkout pin against advanced worktree still warns",
+            wt_pin_stale is not None and "GIT BASE PIN MISMATCH" in wt_pin_stale,
+        )
         check("mixed warning names stale pin", mixed is not None and mismatch_pin in mixed)
 
         ignored_no_pin = D._git_pin_warning(_args(cwd=str(repo), prompt="Implement.", ignore_git_warn=True))

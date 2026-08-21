@@ -2059,7 +2059,13 @@ def _valid_lower_base_sha(value: object) -> str | None:
 def _git_pin_warning(args) -> str | None:
     if getattr(args, "ignore_git_warn", False) or not _prompt_requested(args):
         return None
-    head = _git_head_for_cwd(_project_root(args))
+    # b-052: measure the tree the worker will actually run in (--cwd), not the
+    # canonical project root.  resolve_project_root deliberately collapses a
+    # worktree back to the registered root (so worktrees share one task store),
+    # which made a CORRECT worktree pin warn against the main checkout's HEAD --
+    # a warning that measures the wrong tree trains operators to ignore it.
+    worker_tree = Path(args.cwd) if getattr(args, "cwd", None) else _project_root(args)
+    head = _git_head_for_cwd(worker_tree)
     if not head:
         return None
     text = _read_prompt_for_guard(args)
