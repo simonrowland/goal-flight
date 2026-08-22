@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -357,6 +358,76 @@ def test_self_resolution_uses_active_generation_when_env_is_absent(
                 if proc.poll() is None:
                     proc.send_signal(signal.SIGTERM)
                     proc.wait(timeout=5)
+
+
+def test_listen_auto_propagates_journal_epoch_fence(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    lease = _claim(project)
+    authority = journal.Journal.open_reader(project)
+    ahead = journal.CURRENT_SCHEMA_EPOCH + 1
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute(
+            """UPDATE journal_epochs
+               SET schema_epoch = ?, protocol_epoch = ?, registry_epoch = ?,
+                   minimum_reader_epoch = ?, minimum_writer_epoch = ?
+               WHERE singleton = 1""",
+            (ahead, ahead, ahead, ahead, ahead),
+        )
+
+    fence_match = (
+        rf"UPGRADE_REQUIRED:.*schema client={journal.CURRENT_SCHEMA_EPOCH} "
+        rf"journal={ahead}"
+    )
+    with pytest.raises(journal.JournalUpgradeRequired, match=fence_match):
+        messages._resolve_listen_auto_lease(
+            project,
+            controller_label="depth-ctl",
+            explicit_nonce=lease.nonce,
+        )
+
+    refused = _run(
+        project,
+        env,
+        _listen_auto_cmd(project, label="depth-ctl", nonce=lease.nonce),
+    )
+    assert refused.returncode == 1, refused.stderr
+    assert "JournalUpgradeRequired" in refused.stderr
+    assert "UPGRADE_REQUIRED:" in refused.stderr
+    assert (
+        f"schema client={journal.CURRENT_SCHEMA_EPOCH} journal={ahead}"
+        in refused.stderr
+    )
+    assert "lease-nonce-not-live" not in refused.stderr
+
+
+def test_listen_auto_genuinely_stale_nonce_remains_distinct(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    _claim(project)
+    stale_nonce = "genuinely-stale-listener-nonce"
+
+    resolved = messages._resolve_listen_auto_lease(
+        project,
+        controller_label="depth-ctl",
+        explicit_nonce=stale_nonce,
+    )
+    assert resolved == {
+        "claimed": False,
+        "reason": "lease-nonce-not-live",
+        "label": "depth-ctl",
+    }
+
+    refused = _run(
+        project,
+        env,
+        _listen_auto_cmd(project, label="depth-ctl", nonce=stale_nonce),
+    )
+    assert refused.returncode == 2, refused.stderr
+    assert "lease-nonce-not-live" in refused.stderr
+    assert "UPGRADE_REQUIRED:" not in refused.stderr
 
 
 def _activity_env(env: dict[str, str], *, label: str = "depth-ctl") -> dict[str, str]:

@@ -320,9 +320,8 @@ def test_explicit_migration_runs_once_and_status_mixed_epoch_walk_is_read_only(
     )
     assert rows["old-epoch-dispatch"] == {"_wait_journal_error": True}
     assert rows["current-epoch-dispatch"]["lifecycle_state"] == "PREPARED"
-    assert messages.controller_mail_summary(
-        task_store_project_root=old_project
-    ) == {}
+    with pytest.raises(journal.JournalUpgradeRequired, match="UPGRADE_REQUIRED"):
+        messages.controller_mail_summary(task_store_project_root=old_project)
     for path, fingerprint in before.items():
         with sqlite3.connect(path) as connection:
             epochs = tuple(

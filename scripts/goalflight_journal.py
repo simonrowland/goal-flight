@@ -635,6 +635,15 @@ def _parse_utc(value: object) -> dt.datetime | None:
     return parsed.astimezone(dt.timezone.utc)
 
 
+def _next_lease_renewed_at(previous: object) -> str:
+    """Return a timestamp that changes on every renewal, even within one second."""
+    current = dt.datetime.now(dt.timezone.utc)
+    parsed = _parse_utc(previous)
+    if parsed is not None and current <= parsed:
+        current = parsed + dt.timedelta(microseconds=1)
+    return current.isoformat(timespec="microseconds")
+
+
 def listener_exit_reason(
     coverage: Mapping[str, object] | None,
     lease: Mapping[str, object] | None,
@@ -2374,6 +2383,104 @@ class Journal:
         sql += " ORDER BY label, generation"
         return [dict(row) for row in self.read_all(sql, parameters)]
 
+    def _expire_active_lease(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        label: str,
+        generation: int,
+        nonce: str,
+        expected_renewed_at: str,
+        ended_at: str,
+    ) -> sqlite3.Row | None:
+        cursor = connection.execute(
+            """
+            UPDATE controller_leases
+            SET state = 'EXPIRED', ended_at = ?, ended_reason = 'holder-dead'
+            WHERE project_root = ? AND label = ? AND generation = ?
+              AND nonce = ? AND renewed_at = ? AND state = 'ACTIVE'
+            """,
+            (
+                ended_at,
+                str(self.project_root),
+                label,
+                generation,
+                nonce,
+                expected_renewed_at,
+            ),
+        )
+        if cursor.rowcount == 0:
+            return None
+        connection.execute(
+            """
+            UPDATE listener_coverage
+            SET state = 'EXITED', exited_at = ?, exit_reason = 'orphaned'
+            WHERE project_root = ? AND label = ? AND lease_generation = ?
+              AND state = 'ARMED'
+            """,
+            (ended_at, str(self.project_root), label, generation),
+        )
+        # ``horizon`` is the shipped schema's journal-side bucket; the
+        # precise kernel cause is carried in ``reason``.
+        self._materialize_attention(
+            connection,
+            project_root=str(self.project_root),
+            label=label,
+            generation=generation,
+            trigger_side="horizon",
+            reason="holder-dead",
+        )
+        return connection.execute(
+            """SELECT * FROM controller_leases
+               WHERE project_root = ? AND label = ? AND generation = ?""",
+            (str(self.project_root), label, generation),
+        ).fetchone()
+
+    # Mechanism choice: sweep on claim/renew instead of mutating lease reads.
+    # Claims already need a writable journal, active projects sweep naturally,
+    # and exact generation+nonce+renewal CAS leaves concurrent claims untouched.
+    def expire_stale_leases(self) -> WriteResult[list[dict[str, object]]]:
+        proven_dead: list[tuple[str, int, str, str]] = []
+        for row in self.lease_records():
+            label = str(row["label"])
+            nonce = str(row["nonce"])
+            try:
+                alive = goalflight_wake.lease_holder_alive(
+                    self.project_root,
+                    controller_label=label,
+                    lease_nonce=nonce,
+                    prune_dead=False,
+                )
+            except (OSError, RuntimeError, ValueError):
+                # Probe failure is indeterminate. Keeping routing state is the
+                # recoverable, fail-closed outcome.
+                continue
+            if alive is False:
+                proven_dead.append(
+                    (label, int(row["generation"]), nonce, str(row["renewed_at"]))
+                )
+
+        if not proven_dead:
+            return WriteResult(WriteDisposition.COMMITTED, [], attempts=0)
+
+        def action(connection: sqlite3.Connection) -> list[dict[str, object]]:
+            ended_at = utc_now()
+            expired: list[dict[str, object]] = []
+            for label, generation, nonce, renewed_at in proven_dead:
+                row = self._expire_active_lease(
+                    connection,
+                    label=label,
+                    generation=generation,
+                    nonce=nonce,
+                    expected_renewed_at=renewed_at,
+                    ended_at=ended_at,
+                )
+                if row is not None:
+                    expired.append(dict(row))
+            return expired
+
+        return self._domain_write(action)
+
     def claim_or_renew_lease(
         self,
         label: str,
@@ -2400,6 +2507,13 @@ class Journal:
             self._identity_token(nonce, label="lease nonce") if nonce is not None else None
         )
         project_root = str(self.project_root)
+        expiry = self.expire_stale_leases()
+        if not expiry.committed:
+            return WriteResult(
+                expiry.disposition,
+                attempts=expiry.attempts,
+                reason=f"lease expiry sweep failed before claim: {expiry.reason}",
+            )
 
         def action(connection: sqlite3.Connection) -> LeaseIdentity:
             now = utc_now()
@@ -2426,6 +2540,7 @@ class Journal:
                 # requirement: claim-or-renew must also work when a fresh helper
                 # can re-measure its controller but cannot carry the nonce.
                 if same_principal:
+                    renewed_at = _next_lease_renewed_at(active["renewed_at"])
                     connection.execute(
                         """
                         UPDATE controller_leases
@@ -2435,7 +2550,7 @@ class Journal:
                           AND nonce = ? AND state = 'ACTIVE'
                         """,
                         (
-                            now,
+                            renewed_at,
                             deadline,
                             principal_json,
                             pid,
@@ -2460,34 +2575,15 @@ class Journal:
                     and incumbent_liveness.nonce == str(active["nonce"])
                 )
                 if incumbent_proven_dead:
-                    connection.execute(
-                        """
-                        UPDATE controller_leases
-                        SET state = 'EXPIRED', ended_at = ?, ended_reason = 'holder-dead'
-                        WHERE project_root = ? AND label = ? AND generation = ?
-                          AND state = 'ACTIVE'
-                        """,
-                        (now, project_root, resolved_label, int(active["generation"])),
-                    )
-                    connection.execute(
-                        """
-                        UPDATE listener_coverage
-                        SET state = 'EXITED', exited_at = ?, exit_reason = 'orphaned'
-                        WHERE project_root = ? AND label = ? AND lease_generation = ?
-                          AND state = 'ARMED'
-                        """,
-                        (now, project_root, resolved_label, int(active["generation"])),
-                    )
-                    # ``horizon`` is the shipped schema's journal-side bucket;
-                    # the precise kernel cause is carried in ``reason``.
-                    self._materialize_attention(
+                    expired = self._expire_active_lease(
                         connection,
-                        project_root=project_root,
                         label=resolved_label,
                         generation=int(active["generation"]),
-                        trigger_side="horizon",
-                        reason="holder-dead",
+                        nonce=str(active["nonce"]),
+                        expected_renewed_at=str(active["renewed_at"]),
+                        ended_at=now,
                     )
+                    assert expired is not None
                     replaced_nonce = str(active["nonce"])
                     active = None
                     replacing_generation = True

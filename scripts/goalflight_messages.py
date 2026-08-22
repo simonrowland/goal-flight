@@ -53,15 +53,15 @@ import goalflight_steer_mailbox  # noqa: E402
 import goalflight_wake  # noqa: E402
 from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS  # noqa: E402
 
-_EXPECTED_OPTIONAL_ERRORS = (
+_EXPECTED_OPTIONAL_NON_RUNTIME_ERRORS = (
     ImportError,
     OSError,
-    RuntimeError,
     TypeError,
     ValueError,
     sqlite3.DatabaseError,
     subprocess.SubprocessError,
 )
+_EXPECTED_OPTIONAL_ERRORS = _EXPECTED_OPTIONAL_NON_RUNTIME_ERRORS + (RuntimeError,)
 
 
 @dataclass(frozen=True)
@@ -1481,7 +1481,7 @@ def _journal_delivery_targets(envelope: dict) -> tuple[tuple[Path, str, bool], .
                     for row in goalflight_journal.Journal.open_reader(root).lease_records()
                     if str(row.get("label") or "").strip()
                 )
-            except _EXPECTED_OPTIONAL_ERRORS as exc:
+            except _EXPECTED_OPTIONAL_NON_RUNTIME_ERRORS as exc:
                 raise MessageError(
                     f"cannot resolve unowned terminal recipients: {exc}"
                 ) from exc
@@ -1597,7 +1597,7 @@ def _prepare_journal_delivery(
         return tuple(assignments)
     except MessageError:
         raise
-    except _EXPECTED_OPTIONAL_ERRORS as exc:
+    except _EXPECTED_OPTIONAL_NON_RUNTIME_ERRORS as exc:
         raise MessageError(f"journal delivery assignment failed: {type(exc).__name__}: {exc}") from exc
 
 
@@ -2832,7 +2832,7 @@ def controller_pending_events(
             stream_ids=dispatch_ids,
             limit=limit,
         )
-    except goalflight_journal.JournalError:
+    except goalflight_journal.JournalUnavailable:
         return []
 
 
@@ -3147,7 +3147,7 @@ def controller_mail_summary(
         if label is None:
             return {}
         rows = authority.pending_delivery_events(label, waking_only=True, limit=1000)
-    except (goalflight_journal.JournalError, ValueError):
+    except (goalflight_journal.JournalUnavailable, ValueError):
         return {}
 
     items: list[dict[str, object]] = []
@@ -3207,7 +3207,7 @@ def listener_coverage_status(
 
             lease = goalflight_journal.Journal.open_reader(root).active_lease(label)
             nonce = lease.nonce if lease is not None else None
-        except goalflight_journal.JournalError:
+        except goalflight_journal.JournalUnavailable:
             nonce = None
     status = goalflight_wake.coverage_status(
         root,
@@ -3275,7 +3275,7 @@ def _ambient_claimed_controller(
     try:
         authority = goalflight_journal.Journal.open_reader(project_root)
         lease = authority.active_lease(label)
-    except goalflight_journal.JournalError:
+    except goalflight_journal.JournalUnavailable:
         return {"claimed": False, "reason": "journal-unavailable", "label": label}
     if lease is None:
         return {"claimed": False, "reason": "no-active-controller-lease", "label": label}
@@ -3311,10 +3311,7 @@ def _listen_auto_live_generations(
     """ACTIVE lease plus same-label generations whose holder lock is still live."""
     found: list[dict[str, object]] = []
     seen: set[str] = set()
-    try:
-        records = authority.lease_records(include_ended=True)
-    except Exception:
-        records = []
+    records = authority.lease_records(include_ended=True)
     for rec in records:
         if str(rec.get("label") or "") != label:
             continue
@@ -3368,7 +3365,7 @@ def _resolve_listen_auto_lease(
 
     try:
         authority = goalflight_journal.Journal.open_reader(project_root)
-    except goalflight_journal.JournalError:
+    except goalflight_journal.JournalUnavailable:
         return {
             "claimed": False,
             "reason": "journal-unavailable",
@@ -3575,7 +3572,7 @@ def emit_listener_reminder(
             line = goalflight_wake.coverage_rearm_hint(plan)
         print(line, file=sys.stderr if stream is None else stream)
         return line
-    except _EXPECTED_OPTIONAL_ERRORS:
+    except _EXPECTED_OPTIONAL_NON_RUNTIME_ERRORS:
         return None
 
 
@@ -3615,7 +3612,7 @@ def emit_controller_mail_notice(
         # advice; stdout is data.
         print(notice, file=sys.stderr if stream is None else stream)
         return notice
-    except _EXPECTED_OPTIONAL_ERRORS:
+    except _EXPECTED_OPTIONAL_NON_RUNTIME_ERRORS:
         return None
 
 
@@ -3630,10 +3627,13 @@ def emit_listener_activity_signal(
     Stderr by default: those surfaces' stdout is a data contract. The
     numbered listen-exit list is not emitted here.
     """
+    if project_root is None:
+        return ""
     try:
-        if project_root is None:
-            return ""
         import goalflight_journal  # type: ignore
+    except ImportError:
+        return ""
+    try:
         import goalflight_session_status as sessions  # type: ignore
         import goalflight_task  # type: ignore
 
@@ -3677,7 +3677,9 @@ def emit_listener_activity_signal(
         if hint:
             print(hint, file=sys.stderr if stream is None else stream)
         return hint
-    except Exception:
+    except goalflight_journal.JournalUnavailable:
+        return ""
+    except (ImportError, OSError, TypeError, ValueError, sqlite3.DatabaseError):
         return ""
 
 
@@ -4156,9 +4158,13 @@ def cmd_relay(args: argparse.Namespace) -> int:
         except goalflight_journal.CASMismatch as exc:
             advanced = None
             conflict_reason = str(exc)
-        except goalflight_journal.JournalError as exc:
+        except goalflight_journal.JournalUpgradeRequired:
+            raise
+        except goalflight_journal.JournalUnavailable as exc:
             print(f"relay: {exc}", file=sys.stderr)
             return 2
+        except goalflight_journal.JournalError:
+            raise
         else:
             conflict_reason = advanced.reason if not advanced.committed else None
         if advanced is None or not advanced.committed or advanced.value is None:
@@ -4323,7 +4329,14 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
             advances=advances,
             actor=f"controller:{os.getpid()}",
         )
-    except (ValueError, goalflight_journal.JournalError) as exc:
+    except goalflight_journal.JournalUpgradeRequired:
+        raise
+    except goalflight_journal.JournalUnavailable as exc:
+        print(f"advance: {exc}", file=sys.stderr)
+        return 2
+    except goalflight_journal.JournalError:
+        raise
+    except ValueError as exc:
         print(f"advance: {exc}", file=sys.stderr)
         return 2
     if not result.committed or result.value is None:
@@ -5148,7 +5161,13 @@ def cmd_follow(args) -> int:
             file=sys.stderr,
         )
         return 3
-    except (goalflight_journal.JournalError, OSError, RuntimeError, ValueError) as exc:
+    except goalflight_journal.JournalUpgradeRequired as exc:
+        return startup_fail("journal-upgrade-required", exc)
+    except goalflight_journal.JournalUnavailable as exc:
+        return startup_fail("journal-unavailable", exc)
+    except goalflight_journal.JournalError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
         return startup_fail("startup-failed", exc)
     try:
         goalflight_wake.activate_monitor_state(
@@ -5279,7 +5298,11 @@ def cmd_follow(args) -> int:
                 return fail("lease-cursor-mismatch", exc, code=3)
             except goalflight_journal.JournalUpgradeRequired as exc:
                 return fail("journal-upgrade-required", exc, code=2)
-            except (goalflight_journal.JournalError, ValueError) as exc:
+            except goalflight_journal.JournalUnavailable as exc:
+                return fail("journal-unavailable", exc, code=2)
+            except goalflight_journal.JournalError:
+                raise
+            except ValueError as exc:
                 return fail("journal-unavailable", exc, code=2)
 
             try:
@@ -5319,6 +5342,12 @@ def cmd_follow(args) -> int:
         return fail("stdout-backpressure", exc, code=2, write_stdout=False)
     except FollowStateError as exc:
         return fail("state-unavailable", exc, code=2)
+    except goalflight_journal.JournalUpgradeRequired as exc:
+        return fail("journal-upgrade-required", exc, code=2)
+    except goalflight_journal.JournalUnavailable as exc:
+        return fail("journal-unavailable", exc, code=2)
+    except goalflight_journal.JournalError:
+        raise
     except (OSError, RuntimeError, ValueError) as exc:
         return fail("stream-runtime", exc, code=2)
     finally:
@@ -5372,7 +5401,14 @@ def _cmd_watch_follow(
             file=sys.stderr,
         )
         return 3
-    except (goalflight_journal.JournalError, OSError, RuntimeError, ValueError) as exc:
+    except goalflight_journal.JournalUpgradeRequired:
+        raise
+    except goalflight_journal.JournalUnavailable as exc:
+        print(f"listen: watchdog registration failed: {exc}", file=sys.stderr)
+        return 2
+    except goalflight_journal.JournalError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
         print(f"listen: watchdog registration failed: {exc}", file=sys.stderr)
         return 2
 
@@ -5480,9 +5516,15 @@ def _cmd_watch_follow(
                     _silence_broken_stdout(sys.stdout)
                 return 0
             time.sleep(poll)
+    except goalflight_journal.JournalUpgradeRequired:
+        raise
+    except goalflight_journal.JournalUnavailable as exc:
+        print(f"listen: watchdog runtime failed: {exc}", file=sys.stderr)
+        return 2
+    except goalflight_journal.JournalError:
+        raise
     except (
         FollowWriteStalled,
-        goalflight_journal.JournalError,
         OSError,
         RuntimeError,
         ValueError,
@@ -5568,7 +5610,14 @@ def cmd_listen(args) -> int:
         if not isinstance(identity, dict) or not identity.get("start_token"):
             raise MessageError("listener process identity is unavailable")
         parent_pid = os.getppid()
-    except (MessageError, goalflight_journal.JournalError, ValueError) as exc:
+    except goalflight_journal.JournalUpgradeRequired:
+        raise
+    except goalflight_journal.JournalUnavailable as exc:
+        print(f"listen: {exc}", file=sys.stderr)
+        return 2
+    except goalflight_journal.JournalError:
+        raise
+    except (MessageError, ValueError) as exc:
         print(f"listen: {exc}", file=sys.stderr)
         return 2
 
@@ -5613,7 +5662,17 @@ def cmd_listen(args) -> int:
         if not armed.committed or not armed.value:
             raise MessageError(armed.reason or "listener coverage arm lost")
         coverage = dict(armed.value)
-    except (MessageError, goalflight_journal.JournalError, ValueError) as exc:
+    except goalflight_journal.JournalUpgradeRequired:
+        waiter.close()
+        raise
+    except goalflight_journal.JournalUnavailable as exc:
+        waiter.close()
+        print(f"listen: {exc}", file=sys.stderr)
+        return 2
+    except goalflight_journal.JournalError:
+        waiter.close()
+        raise
+    except (MessageError, ValueError) as exc:
         waiter.close()
         print(f"listen: {exc}", file=sys.stderr)
         return 2
@@ -5650,6 +5709,10 @@ def cmd_listen(args) -> int:
                 rearm_command,
                 work_in_flight=authority.care_work_exists(label),
             )
+        except goalflight_journal.JournalUpgradeRequired:
+            raise
+        except goalflight_journal.JournalError:
+            raise
         except Exception:
             return None
 
@@ -5705,7 +5768,7 @@ def cmd_listen(args) -> int:
     def finish_detached() -> int:
         # Best-effort journal audit must never turn the refusal into multiple
         # lines; the one diagnostic is deliberately copy/paste actionable.
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(goalflight_journal.JournalUnavailable):
             authority.exit_listener(coverage_id, reason="orphaned")
         waiter.close()
         death_watch.restore()
@@ -5723,7 +5786,7 @@ def cmd_listen(args) -> int:
         # lone watchdog death loud without a new task, daemon, or delivery
         # slot. It cannot witness its own death, and no controller-scoped task
         # survives the correlated case where the host reaps every tracked task.
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(goalflight_journal.JournalUnavailable):
             authority.exit_listener(coverage_id, reason="watchdog-dead")
         waiter.close()
         death_watch.restore()
@@ -5803,7 +5866,7 @@ def cmd_listen(args) -> int:
     if getattr(args, "report_pending", False):
         try:
             arm_snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
-        except goalflight_journal.JournalError:
+        except goalflight_journal.JournalUnavailable:
             arm_snapshot = None
         persisted_high = goalflight_wake.pending_report_high_water(
             project_root,
@@ -5965,7 +6028,9 @@ def cmd_listen(args) -> int:
             return finish("upgrade-required", code=2, detail=str(exc))
         except goalflight_journal.JournalUnavailable as exc:
             return finish("journal-unavailable", code=2, detail=str(exc))
-        except (goalflight_journal.JournalError, ValueError) as exc:
+        except goalflight_journal.JournalError:
+            raise
+        except ValueError as exc:
             return finish("corrupt", code=2, detail=str(exc))
         if wakeable_items:
             snapshot = peek
@@ -6001,7 +6066,7 @@ def cmd_listen(args) -> int:
                 )
             # The cursor-version stamp, not the single audit row, arbitrates a
             # pool ring. A sibling may already have superseded this row.
-            with contextlib.suppress(goalflight_journal.JournalError, ValueError):
+            with contextlib.suppress(goalflight_journal.JournalUnavailable, ValueError):
                 authority.exit_listener(coverage_id, reason="event")
             payload = {
                 "kind": "ring",

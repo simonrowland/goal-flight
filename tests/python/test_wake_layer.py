@@ -1571,6 +1571,187 @@ def test_deleted_live_lease_address_is_unknown_not_dead(
             child.wait(timeout=3)
 
 
+def test_claim_expires_dead_recipients_but_keeps_live_and_unknown_holders(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _env = isolated
+    authority = journal.open_or_create_journal(root)
+    dead = authority.claim_or_renew_lease(
+        "dead", principal={"principal_id": "dead-controller"}
+    )
+    assert dead.committed and dead.value is not None
+    dead_holder = wake.register_lease_holder(
+        root,
+        controller_label="dead",
+        lease_nonce=dead.value.nonce,
+    )
+    live = authority.claim_or_renew_lease(
+        "live", principal={"principal_id": "live-controller"}
+    )
+    assert live.committed and live.value is not None
+    live_holder = wake.register_lease_holder(
+        root,
+        controller_label="live",
+        lease_nonce=live.value.nonce,
+    )
+    unknown = authority.claim_or_renew_lease(
+        "unknown", principal={"principal_id": "unknown-controller"}
+    )
+    assert unknown.committed and unknown.value is not None
+    dead_holder.close()
+
+    real_liveness = journal.goalflight_wake.lease_holder_alive
+    observations: list[tuple[str, bool]] = []
+
+    def observe_liveness(
+        project_root: Path | str,
+        *,
+        controller_label: str,
+        lease_nonce: str,
+        prune_dead: bool = True,
+    ) -> bool | None:
+        observations.append((controller_label, prune_dead))
+        return real_liveness(
+            project_root,
+            controller_label=controller_label,
+            lease_nonce=lease_nonce,
+            prune_dead=prune_dead,
+        )
+
+    monkeypatch.setattr(
+        journal.goalflight_wake,
+        "lease_holder_alive",
+        observe_liveness,
+    )
+    try:
+        swept = authority.claim_or_renew_lease(
+            "sweeper", principal={"principal_id": "active-controller"}
+        )
+        assert swept.committed and swept.value is not None
+
+        active_recipients = messages._active_controller_labels(authority)
+        assert "dead" not in active_recipients
+        assert {"live", "unknown", "sweeper"}.issubset(active_recipients)
+        assert observations
+        assert all(prune_dead is False for _label, prune_dead in observations)
+
+        dead_row = next(
+            row
+            for row in authority.lease_records(include_ended=True)
+            if row["label"] == "dead"
+        )
+        assert dead_row["state"] == "EXPIRED"
+        assert dead_row["ended_reason"] == "holder-dead"
+        assert authority.active_lease("live") == live.value
+        assert authority.active_lease("unknown") == unknown.value
+    finally:
+        live_holder.close()
+
+
+def test_expire_stale_leases_is_idempotent(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    root, _env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "dead", principal={"principal_id": "dead-controller"}
+    )
+    assert claimed.committed and claimed.value is not None
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="dead",
+        lease_nonce=claimed.value.nonce,
+    )
+    holder.close()
+
+    first = authority.expire_stale_leases()
+    second = authority.expire_stale_leases()
+
+    assert first.committed and first.value is not None
+    assert [row["label"] for row in first.value] == ["dead"]
+    assert second.committed and second.value == []
+    assert authority.active_lease("dead") is None
+    ended = [
+        row
+        for row in authority.lease_records(include_ended=True)
+        if row["label"] == "dead" and row["state"] == "EXPIRED"
+    ]
+    assert len(ended) == 1
+
+
+def test_stale_expiry_snapshot_cannot_expire_a_concurrent_renewal(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _env = isolated
+    authority = journal.open_or_create_journal(root)
+    incumbent = authority.claim_or_renew_lease(
+        "owner", principal={"principal_id": "dead-controller"}
+    )
+    assert incumbent.committed and incumbent.value is not None
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="owner",
+        lease_nonce=incumbent.value.nonce,
+    )
+    holder.close()
+
+    observed_dead = threading.Event()
+    release_expiry = threading.Event()
+    real_liveness = journal.goalflight_wake.lease_holder_alive
+
+    def delayed_liveness(
+        project_root: Path | str,
+        *,
+        controller_label: str,
+        lease_nonce: str,
+        prune_dead: bool = True,
+    ) -> bool | None:
+        if threading.current_thread().name != "stale-expiry":
+            return None
+        alive = real_liveness(
+            project_root,
+            controller_label=controller_label,
+            lease_nonce=lease_nonce,
+            prune_dead=prune_dead,
+        )
+        observed_dead.set()
+        assert release_expiry.wait(timeout=3)
+        return alive
+
+    monkeypatch.setattr(
+        journal.goalflight_wake,
+        "lease_holder_alive",
+        delayed_liveness,
+    )
+    expiry_result: dict[str, object] = {}
+
+    def expire() -> None:
+        expiry_result["result"] = journal.Journal(root).expire_stale_leases()
+
+    thread = threading.Thread(target=expire, name="stale-expiry")
+    thread.start()
+    try:
+        assert observed_dead.wait(timeout=3)
+        renewal = authority.claim_or_renew_lease(
+            "owner",
+            principal={"principal_id": "dead-controller"},
+        )
+        assert renewal.committed and renewal.value is not None
+    finally:
+        release_expiry.set()
+        thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    result = expiry_result["result"]
+    assert isinstance(result, journal.WriteResult)
+    assert result.committed and result.value == []
+    assert renewal.value.generation == incumbent.value.generation
+    assert renewal.value.renewed_at != incumbent.value.renewed_at
+    assert authority.active_lease("owner") == renewal.value
+
+
 def test_second_generation_holder_loses_well_known_lock(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
