@@ -135,7 +135,7 @@ cadences below 60 or above 300 seconds. Measurements on a box carrying
 six-plus concurrent workers showed that a 30-second grace sits inside ordinary
 scheduling jitter, so death requires three full missed heartbeat intervals (360
 seconds at the default cadence). Every successful stdout record updates generation-
-bound durable liveness state. The separately tracked backup below reads that state on
+bound durable liveness state. The separately tracked watchdog below reads that state on
 each poll; stale, faulted, missing, or invalid state makes it emit a structural
 `event`/`listener-dead` record on stdout and exit, so the tracked task wakes the
 controller with the exact persistent re-arm command. Any event is also liveness
@@ -145,7 +145,11 @@ emits on the next idle beat.
 
 The monitor is tracked, not immortal. The host may reap it; stopped heartbeats make
 that failure detectable. Keep **one** portable backup doorbell as a separate tracked
-task:
+task. During its existing bounded mail wait, that doorbell also checks the
+generation-scoped watchdog lock. Once it has observed the watchdog, or after the same
+15-second startup grace used for persistent state, a missing watchdog lock makes the
+doorbell release its own lock, flush a structural `event`/`watchdog-dead` record with
+the exact watchdog re-arm command, and exit:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py listen \
@@ -175,6 +179,15 @@ backup command. Persistent coverage is three required components: one live, heal
 monitor stream, one backup doorbell, and one watchdog. Status, entry hints, and fleet
 output use that shared `live/3` predicate; after stream loss the surviving backup and
 watchdog report persistent coverage `2/3`, never a portable `1/4` pool.
+
+This is a bounded witness chain, not complete failure coverage. A lone watchdog death
+is loud, and correlated stream-plus-watchdog death is still loud while the backup
+survives. The backup cannot witness its own hard death. If the host reaps every
+tracked task, no controller-session process remains to emit a line; if the machine is
+suspended, no line can be emitted until a tracked process runs again. Full coverage
+would require an external supervisor, which this design deliberately forbids. The
+doorbell witness therefore shrinks the silent window and moves the last unwitnessed
+link one hop; it does not make persistent coverage reap-proof.
 
 An `EPIPE` is the only proof that the controller side is gone; the stream exits and
 releases its monitor slot. A cursor-ring reservation is rolled back if delivery did

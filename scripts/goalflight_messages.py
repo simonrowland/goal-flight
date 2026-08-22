@@ -4950,6 +4950,29 @@ def _follow_dead_record(
     return _fit_follow_record(record, shrink_fields=("reason", "rearm_command"))
 
 
+def _watchdog_dead_record(
+    status: dict[str, object],
+    *,
+    rearm_command: str,
+) -> dict[str, object]:
+    """Describe coverage after the dead watchdog's witness releases its lock."""
+    record: dict[str, object] = {
+        "kind": "event",
+        "payload": {
+            "type": "watchdog-dead",
+            "reason": "missing-lock",
+            "live": status.get("live_waiters"),
+            "target": status.get("target_waiters"),
+            "missing_components": list(status.get("missing_components") or []),
+            "rearm_command": rearm_command,
+        },
+    }
+    return _fit_follow_record(
+        record,
+        shrink_fields=("rearm_command",),
+    )
+
+
 def _silence_broken_stdout(stream: object) -> None:
     """Prevent Python's shutdown flush from turning handled EPIPE into exit 120."""
     try:
@@ -5598,6 +5621,12 @@ def cmd_listen(args) -> int:
     coverage_id = str(coverage["coverage_id"])
     listener_started = time.monotonic()
     detached_grace = _listener_startup_grace_s()
+    watchdog_start_grace = (
+        0.1
+        if test_mode
+        else FOLLOW_STATE_START_GRACE_SECS
+    )
+    watchdog_observed_live = False
     rearm_command = _exact_listener_command()
     death_watch = _ListenerDeathWatch()
     death_watch.install()
@@ -5687,6 +5716,37 @@ def cmd_listen(args) -> int:
             file=sys.stderr,
         )
         return DETACHED_LISTENER_EXIT_CODE
+
+    def finish_watchdog_dead() -> int:
+        # Witness design: the existing backup doorbell checks the watchdog's
+        # generation lock during its normal bounded mail wait. This makes a
+        # lone watchdog death loud without a new task, daemon, or delivery
+        # slot. It cannot witness its own death, and no controller-scoped task
+        # survives the correlated case where the host reaps every tracked task.
+        with contextlib.suppress(Exception):
+            authority.exit_listener(coverage_id, reason="watchdog-dead")
+        waiter.close()
+        death_watch.restore()
+        status = goalflight_wake.coverage_status(
+            project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+        )
+        payload = _watchdog_dead_record(
+            status,
+            rearm_command=goalflight_wake.follow_watchdog_start_command(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+            ),
+        )
+        try:
+            alive = _write_follow_record(payload, stream=sys.stdout)
+            if not alive:
+                _silence_broken_stdout(sys.stdout)
+        except (FollowWriteStalled, OSError):
+            pass
+        return 0
 
     def parent_exit() -> int | None:
         current_parent = os.getppid()
@@ -5851,6 +5911,28 @@ def cmd_listen(args) -> int:
             )
             if reason:
                 return finish(reason, code=3, detail="listener self-check failed")
+            witness_status = goalflight_wake.coverage_status(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+            )
+            watchdog_status = witness_status.get("watchdog")
+            watchdog_state = (
+                str(watchdog_status.get("state") or "")
+                if isinstance(watchdog_status, dict)
+                else ""
+            )
+            if watchdog_state == "live":
+                watchdog_observed_live = True
+            elif (
+                witness_status.get("wake_mode") == "persistent"
+                and watchdog_state == "missing"
+                and (
+                    watchdog_observed_live
+                    or time.monotonic() - listener_started >= watchdog_start_grace
+                )
+            ):
+                return finish_watchdog_dead()
             # With an arm-time backlog the cheap limit-1 peek would forever
             # see the oldest (already-reported) item; peek wide and ring only
             # for events beyond the arm-time high-water.

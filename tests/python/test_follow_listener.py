@@ -500,6 +500,17 @@ def test_every_record_is_structural_and_below_pipe_buf_with_long_frontier() -> N
             {"state": "stale", "age_s": 999, "dead_after_s": 360},
             rearm_command="python3 goalflight_messages.py follow " + "x" * 10_000,
         ),
+        messages._watchdog_dead_record(
+            {
+                "live_waiters": 0,
+                "target_waiters": 3,
+                "missing_components": ["stream", "backup", "watchdog"],
+            },
+            rearm_command=(
+                "python3 goalflight_messages.py listen --watch-follow "
+                + "x" * 10_000
+            ),
+        ),
     ]
     assert {record["kind"] for record in records} == {
         "event",
@@ -932,6 +943,162 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
             if proc.poll() is None:
                 proc.terminate()
         for proc in processes:
+            if proc.poll() is None:
+                proc.wait(timeout=3)
+
+
+def test_backup_wakes_when_watchdog_is_sigkilled_with_stream_alive(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    follow = _spawn_follow(project, env, lease, heartbeat_s=0.3, poll_s=0.25)
+    assert follow.stdout is not None
+    follow_reader = _JsonLineReader(follow.stdout)
+    assert follow_reader.read()[1]["kind"] == "heartbeat"
+    assert follow_reader.read()[1]["kind"] == "frontier"
+    backup = subprocess.Popen(
+        _backup_command(project, lease),
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    watchdog = subprocess.Popen(
+        _watch_command(project, lease),
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert backup.stdout is not None
+    backup_reader = _JsonLineReader(backup.stdout)
+    try:
+        _wait_for_waiter_kind(project, lease.label, wake.MONITOR_KIND, follow.pid)
+        _wait_for_waiter_kind(project, lease.label, "listener", backup.pid)
+        _wait_for_waiter_kind(project, lease.label, wake.WATCHDOG_KIND, watchdog.pid)
+
+        os.kill(watchdog.pid, signal.SIGKILL)
+        assert watchdog.wait(timeout=2) == -signal.SIGKILL
+        status = wake.coverage_status(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        )
+        assert status["watchdog"]["state"] == "missing"
+        assert all(
+            row["kind"] != wake.WATCHDOG_KIND for row in status["waiters"]
+        )
+
+        _raw, dead = backup_reader.read(timeout_s=2)
+        assert dead["kind"] == "event"
+        assert dead["payload"]["type"] == "watchdog-dead"
+        assert dead["payload"]["reason"] == "missing-lock"
+        assert dead["payload"]["live"] == 1
+        assert dead["payload"]["target"] == 3
+        assert dead["payload"]["missing_components"] == ["backup", "watchdog"]
+        assert dead["payload"]["rearm_command"] == (
+            wake.follow_watchdog_start_command(
+                project,
+                controller_label=lease.label,
+                lease_nonce=lease.nonce,
+            )
+        )
+        assert follow.poll() is None
+        assert backup.wait(timeout=2) == 0
+    finally:
+        for proc in (backup, watchdog, follow):
+            if proc.poll() is None:
+                proc.terminate()
+        for proc in (backup, watchdog, follow):
+            if proc.poll() is None:
+                proc.wait(timeout=3)
+
+
+def test_backup_wakes_when_watchdog_never_arms_after_grace(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    follow = _spawn_follow(project, env, lease, heartbeat_s=0.3, poll_s=0.25)
+    assert follow.stdout is not None
+    follow_reader = _JsonLineReader(follow.stdout)
+    assert follow_reader.read()[1]["kind"] == "heartbeat"
+    assert follow_reader.read()[1]["kind"] == "frontier"
+    backup = subprocess.Popen(
+        _backup_command(project, lease),
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert backup.stdout is not None
+    backup_reader = _JsonLineReader(backup.stdout)
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", backup.pid)
+        _raw, dead = backup_reader.read(timeout_s=2)
+        assert dead["kind"] == "event"
+        assert dead["payload"]["type"] == "watchdog-dead"
+        assert dead["payload"]["missing_components"] == ["backup", "watchdog"]
+        assert follow.poll() is None
+        assert backup.wait(timeout=2) == 0
+    finally:
+        for proc in (backup, follow):
+            if proc.poll() is None:
+                proc.terminate()
+        for proc in (backup, follow):
+            if proc.poll() is None:
+                proc.wait(timeout=3)
+
+
+def test_backup_witnesses_correlated_stream_and_watchdog_death(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    follow = _spawn_follow(project, env, lease, heartbeat_s=0.3, poll_s=0.25)
+    assert follow.stdout is not None
+    follow_reader = _JsonLineReader(follow.stdout)
+    assert follow_reader.read()[1]["kind"] == "heartbeat"
+    assert follow_reader.read()[1]["kind"] == "frontier"
+    backup = subprocess.Popen(
+        _backup_command(project, lease),
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    watchdog = subprocess.Popen(
+        _watch_command(project, lease),
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert backup.stdout is not None
+    backup_reader = _JsonLineReader(backup.stdout)
+    try:
+        _wait_for_waiter_kind(project, lease.label, wake.MONITOR_KIND, follow.pid)
+        _wait_for_waiter_kind(project, lease.label, "listener", backup.pid)
+        _wait_for_waiter_kind(project, lease.label, wake.WATCHDOG_KIND, watchdog.pid)
+
+        os.kill(follow.pid, signal.SIGKILL)
+        os.kill(watchdog.pid, signal.SIGKILL)
+        assert follow.wait(timeout=2) == -signal.SIGKILL
+        assert watchdog.wait(timeout=2) == -signal.SIGKILL
+
+        _raw, dead = backup_reader.read(timeout_s=2)
+        assert dead["kind"] == "event"
+        assert dead["payload"]["type"] == "watchdog-dead"
+        assert dead["payload"]["live"] == 0
+        assert dead["payload"]["missing_components"] == [
+            "stream",
+            "backup",
+            "watchdog",
+        ]
+        assert backup.wait(timeout=2) == 0
+    finally:
+        for proc in (backup, watchdog, follow):
+            if proc.poll() is None:
+                proc.terminate()
+        for proc in (backup, watchdog, follow):
             if proc.poll() is None:
                 proc.wait(timeout=3)
 
