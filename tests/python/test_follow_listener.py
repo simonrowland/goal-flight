@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import select
+import signal
 import subprocess
 import sys
 import time
@@ -82,6 +83,7 @@ def _follow_command(
     lease: journal.LeaseIdentity,
     *,
     heartbeat_s: float,
+    poll_s: float = 0.01,
 ) -> list[str]:
     return [
         sys.executable,
@@ -94,7 +96,7 @@ def _follow_command(
         "--lease-nonce",
         lease.nonce,
         "--poll-secs",
-        "0.01",
+        str(poll_s),
         "--heartbeat-secs",
         str(heartbeat_s),
         "--frontier-floor-secs",
@@ -130,9 +132,15 @@ def _spawn_follow(
     lease: journal.LeaseIdentity,
     *,
     heartbeat_s: float,
+    poll_s: float = 0.01,
 ) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
-        _follow_command(project, lease, heartbeat_s=heartbeat_s),
+        _follow_command(
+            project,
+            lease,
+            heartbeat_s=heartbeat_s,
+            poll_s=poll_s,
+        ),
         cwd=project,
         env=env,
         stdout=subprocess.PIPE,
@@ -151,30 +159,58 @@ def _watch_command(project: Path, lease: journal.LeaseIdentity) -> list[str]:
         lease.label,
         "--lease-nonce",
         lease.nonce,
-        "--listener-slots",
-        "1",
-        "--report-pending",
         "--watch-follow",
         "--json",
         "--poll-secs",
         "0.01",
         "--timeout-s",
-        "1",
+        "3",
     ]
 
 
-def _wait_for_monitor_slot(project: Path, label: str, pid: int) -> None:
+def _backup_command(project: Path, lease: journal.LeaseIdentity) -> list[str]:
+    return [
+        sys.executable,
+        str(SCRIPTS / "goalflight_messages.py"),
+        "listen",
+        "--project-root",
+        str(project),
+        "--controller-label",
+        lease.label,
+        "--lease-nonce",
+        lease.nonce,
+        "--listener-slots",
+        "1",
+        "--report-pending",
+        "--json",
+        "--poll-secs",
+        "0.01",
+        "--timeout-s",
+        "4",
+    ]
+
+
+def _wait_for_waiter_kind(
+    project: Path,
+    label: str,
+    kind: str,
+    pid: int,
+) -> None:
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
         waiters = wake.live_waiters(
             project,
             controller_label=label,
-            kinds={wake.MONITOR_KIND},
+            kinds={kind},
         ) or []
         if [row.pid for row in waiters] == [pid]:
             return
         time.sleep(0.01)
-    raise AssertionError(f"persistent monitor slot for pid={pid} never appeared")
+    raise AssertionError(f"{kind} waiter for pid={pid} never appeared")
+
+
+def _wait_for_monitor_slot(project: Path, label: str, pid: int) -> None:
+    _wait_for_waiter_kind(project, label, wake.MONITOR_KIND, pid)
 
 
 def test_live_lines_flush_before_exit_and_heartbeat_cadence_carries_mail(
@@ -556,8 +592,8 @@ def test_persistent_monitor_suppresses_pool_shortage_but_keeps_backup_depth(
         )
         assert stream_only["wake_mode"] == "persistent"
         assert stream_only["live_waiters"] == 1
-        assert stream_only["target_waiters"] == 2
-        assert stream_only["missing_components"] == ["backup"]
+        assert stream_only["target_waiters"] == 3
+        assert stream_only["missing_components"] == ["backup", "watchdog"]
         assert stream_only["portable_live_waiters"] == 0
         assert stream_only["portable_target_waiters"] == 1
         claim_depth = sessions._listener_depth_after_claim(
@@ -567,10 +603,11 @@ def test_persistent_monitor_suppresses_pool_shortage_but_keeps_backup_depth(
         )
         assert claim_depth is not None
         assert claim_depth["live"] == 1
-        assert claim_depth["target"] == 2
-        assert claim_depth["missing"] == 1
-        assert claim_depth["missing_components"] == ["backup"]
-        assert "--watch-follow" in claim_depth["commands"][0]
+        assert claim_depth["target"] == 3
+        assert claim_depth["missing"] == 2
+        assert claim_depth["missing_components"] == ["backup", "watchdog"]
+        assert "--watch-follow" not in claim_depth["commands"][0]
+        assert "--watch-follow" in claim_depth["commands"][1]
         claim_hint_plan = {**claim_depth, "work_in_flight": True}
         assert "own tracked background task" in wake.coverage_rearm_hint(
             claim_hint_plan
@@ -587,8 +624,23 @@ def test_persistent_monitor_suppresses_pool_shortage_but_keeps_backup_depth(
                 controller_label=lease.label,
                 lease_nonce=lease.nonce,
             )
-            assert with_backup["live_waiters"] == with_backup["target_waiters"] == 2
+            assert with_backup["live_waiters"] == 2
+            assert with_backup["target_waiters"] == 3
+            assert with_backup["missing_components"] == ["watchdog"]
             assert with_backup["portable_live_waiters"] == 1
+            with wake.register_watchdog_waiter(
+                project,
+                controller_label=lease.label,
+                generation_key=lease.nonce,
+            ):
+                complete = wake.coverage_status(
+                    project,
+                    controller_label=lease.label,
+                    lease_nonce=lease.nonce,
+                )
+                assert complete["covered"] is True
+                assert complete["live_waiters"] == complete["target_waiters"] == 3
+                assert complete["missing_components"] == []
 
     with wake.register_listener_waiter(
         project,
@@ -603,8 +655,8 @@ def test_persistent_monitor_suppresses_pool_shortage_but_keeps_backup_depth(
         )
         assert stream_gone["wake_mode"] == "persistent"
         assert stream_gone["live_waiters"] == 1
-        assert stream_gone["target_waiters"] == 2
-        assert stream_gone["missing_components"] == ["stream"]
+        assert stream_gone["target_waiters"] == 3
+        assert stream_gone["missing_components"] == ["stream", "watchdog"]
         stream_plan = wake.coverage_rearm_plan(
             stream_gone,
             project,
@@ -615,6 +667,46 @@ def test_persistent_monitor_suppresses_pool_shortage_but_keeps_backup_depth(
         assert "host persistent stdout monitor" in wake.coverage_rearm_hint(
             stream_plan
         )
+
+
+def test_watchdog_generation_lock_is_independent_of_listener_slot(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, _env, lease = isolated
+    with wake.register_listener_waiter(
+        project,
+        controller_label=lease.label,
+        generation_key=lease.nonce,
+        slots=1,
+    ):
+        with wake.register_watchdog_waiter(
+            project,
+            controller_label=lease.label,
+            generation_key=lease.nonce,
+        ):
+            kinds = {
+                row.kind
+                for row in wake.live_waiters(
+                    project,
+                    controller_label=lease.label,
+                    kinds={"listener", "watchdog"},
+                )
+                or []
+            }
+            assert kinds == {"listener", "watchdog"}
+            with pytest.raises(wake.ListenerSlotsFull):
+                wake.register_listener_waiter(
+                    project,
+                    controller_label=lease.label,
+                    generation_key=lease.nonce,
+                    slots=1,
+                )
+            with pytest.raises(wake.ListenerSlotsFull):
+                wake.register_watchdog_waiter(
+                    project,
+                    controller_label=lease.label,
+                    generation_key=lease.nonce,
+                )
 
 
 def test_fleet_console_uses_shared_persistent_coverage_predicate(
@@ -645,7 +737,115 @@ def test_fleet_console_uses_shared_persistent_coverage_predicate(
     context = contexts[lease.nonce]
     assert context["wake_mode"] == "persistent"
     assert context["listener_live"] == 1
-    assert context["listener_target"] == 2
+    assert context["listener_target"] == 3
+
+
+def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    follow = _spawn_follow(project, env, lease, heartbeat_s=0.3, poll_s=0.25)
+    assert follow.stdout is not None
+    follow_reader = _JsonLineReader(follow.stdout)
+    assert follow_reader.read()[1]["kind"] == "heartbeat"
+    assert follow_reader.read()[1]["kind"] == "frontier"
+    backup = subprocess.Popen(
+        _backup_command(project, lease),
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    watchdog = subprocess.Popen(
+        _watch_command(project, lease),
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert watchdog.stdout is not None
+    watchdog_reader = _JsonLineReader(watchdog.stdout)
+    replacement_backup: subprocess.Popen[bytes] | None = None
+    try:
+        _wait_for_waiter_kind(project, lease.label, wake.MONITOR_KIND, follow.pid)
+        _wait_for_waiter_kind(project, lease.label, "listener", backup.pid)
+        _wait_for_waiter_kind(project, lease.label, "watchdog", watchdog.pid)
+
+        listener_pids = [
+            row.pid
+            for row in wake.live_waiters(
+                project,
+                controller_label=lease.label,
+                kinds={"listener"},
+            )
+            or []
+        ]
+        assert listener_pids == [backup.pid]
+        assert backup.poll() is None, "arming the watchdog displaced the backup"
+        refused = subprocess.run(
+            _backup_command(project, lease),
+            cwd=project,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        assert refused.returncode == 3
+        assert "listener slots hold live doorbells" in refused.stderr
+        assert "likely your own tracked tasks" in refused.stderr
+        assert "do NOT kill by pattern" in refused.stderr
+        assert backup.poll() is None, "a refused contender displaced the live backup"
+
+        messages.post_message(
+            dispatch_id="backup-rings-with-watchdog",
+            msg_type="controller-notice",
+            payload={"text": "the backup must still deliver"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(
+                lease.label,
+                project_root=project,
+            ),
+        )
+        backup_stdout, backup_stderr = backup.communicate(timeout=2)
+        assert backup.returncode == 0, backup_stderr.decode()
+        backup_lines = [
+            json.loads(line) for line in backup_stdout.splitlines() if line
+        ]
+        assert backup_lines[-1]["kind"] == "ring"
+        assert backup_lines[-1]["reason"] == "event"
+
+        replacement_backup = subprocess.Popen(
+            _backup_command(project, lease),
+            cwd=project,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        _wait_for_waiter_kind(
+            project,
+            lease.label,
+            "listener",
+            replacement_backup.pid,
+        )
+        os.kill(follow.pid, signal.SIGKILL)
+        assert follow.wait(timeout=2) == -signal.SIGKILL
+        _raw, dead = watchdog_reader.read(timeout_s=3)
+        assert dead["kind"] == "event"
+        assert dead["payload"]["type"] == "listener-dead"
+        assert dead["payload"]["reason"] == "stale"
+        assert replacement_backup.poll() is None
+        assert watchdog.wait(timeout=2) == 0
+    finally:
+        processes = [backup, watchdog, follow]
+        if replacement_backup is not None:
+            processes.append(replacement_backup)
+        for proc in processes:
+            if proc.poll() is None:
+                proc.terminate()
+        for proc in processes:
+            if proc.poll() is None:
+                proc.wait(timeout=3)
 
 
 def test_watchdog_reads_durable_age_and_wakes_with_exact_rearm(
@@ -682,7 +882,7 @@ def test_watchdog_reads_durable_age_and_wakes_with_exact_rearm(
     assert wake.live_waiters(
         project,
         controller_label=lease.label,
-        kinds={"listener"},
+        kinds={"listener", "watchdog"},
     ) == []
 
 

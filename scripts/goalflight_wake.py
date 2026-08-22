@@ -30,7 +30,8 @@ import goalflight_compat
 
 
 MONITOR_KIND = "monitor"
-WAITER_KINDS = frozenset({"listener", "wait", MONITOR_KIND})
+WATCHDOG_KIND = "watchdog"
+WAITER_KINDS = frozenset({"listener", "wait", MONITOR_KIND, WATCHDOG_KIND})
 LEASE_KIND = "lease"
 LOCK_KINDS = WAITER_KINDS | {LEASE_KIND}
 ENTRY_POLL_WINDOW_S = 1.0
@@ -42,7 +43,7 @@ _RING_STAMP_FILE_VERSION = "ring-stamp-v1"
 _PENDING_REPORT_FILE_VERSION = "pending-report-v1"
 _MONITOR_STATE_FILE_VERSION = "monitor-state-v1"
 MONITOR_STATE_SCHEMA = "goalflight.monitor-state.v1"
-PERSISTENT_WAKE_TARGET = 2
+PERSISTENT_WAKE_TARGET = 3
 _OBSERVED_WAITERS_UNSET = object()
 _LEASE_EVENT_SCHEMA = "goalflight.lease-generation-event.v1"
 # Depth is resilience, not efficiency: one event wakes exactly one slot, so
@@ -1122,6 +1123,21 @@ def register_listener_waiter(
     )
 
 
+def register_watchdog_waiter(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    generation_key: str,
+) -> WaiterRegistration:
+    """Hold the one watchdog lock for a lease generation, outside the doorbell pool."""
+    return register_waiter(
+        project_root,
+        controller_label=controller_label,
+        kind=WATCHDOG_KIND,
+        generation_key=generation_key,
+    )
+
+
 def listener_slot_holder_pids(
     project_root: Path | str,
     *,
@@ -1540,7 +1556,7 @@ def coverage_status(
         live_waiters(
             project_root,
             controller_label=controller_label,
-            kinds={"listener", MONITOR_KIND},
+            kinds={"listener", MONITOR_KIND, WATCHDOG_KIND},
         )
         if observed_waiters is _OBSERVED_WAITERS_UNSET
         else observed_waiters
@@ -1570,7 +1586,12 @@ def coverage_status(
         }
     monitor_waiters = [row for row in waiters if row.kind == MONITOR_KIND]
     portable_waiters = [row for row in waiters if row.kind == "listener"]
-    persistent = bool(monitor_waiters) or durable_monitor is not None
+    watchdog_waiters = [row for row in waiters if row.kind == WATCHDOG_KIND]
+    persistent = (
+        bool(monitor_waiters)
+        or bool(watchdog_waiters)
+        or durable_monitor is not None
+    )
     serialized_waiters = [
         {
             "kind": row.kind,
@@ -1592,6 +1613,7 @@ def coverage_status(
             "stale",
         }
         backup_live = bool(portable_waiters)
+        watchdog_live = bool(watchdog_waiters)
         monitor_state = (
             durable_state
             if durable_state in {"fault", "stale"}
@@ -1604,6 +1626,8 @@ def coverage_status(
             missing_components.append("stream")
         if not backup_live:
             missing_components.append("backup")
+        if not watchdog_live:
+            missing_components.append("watchdog")
         if monitor_state == "fault":
             reason = "persistent-monitor-fault"
         elif monitor_state == "stale":
@@ -1612,12 +1636,16 @@ def coverage_status(
             reason = "persistent-monitor-missing"
         elif not backup_live:
             reason = "persistent-backup-missing"
+        elif not watchdog_live:
+            reason = "persistent-watchdog-missing"
         else:
             reason = "persistent-covered"
         return {
-            "covered": monitor_healthy and backup_live,
+            "covered": monitor_healthy and backup_live and watchdog_live,
             "reason": reason,
-            "live_waiters": int(monitor_healthy) + int(backup_live),
+            "live_waiters": (
+                int(monitor_healthy) + int(backup_live) + int(watchdog_live)
+            ),
             "target_waiters": PERSISTENT_WAKE_TARGET,
             "waiters": serialized_waiters,
             "monitor": {
@@ -1640,6 +1668,11 @@ def coverage_status(
                 "required": True,
                 "state": "live" if backup_live else "missing",
                 "observed": len(portable_waiters),
+            },
+            "watchdog": {
+                "required": True,
+                "state": "live" if watchdog_live else "missing",
+                "observed": len(watchdog_waiters),
             },
             "wake_mode": "persistent",
             "portable_live_waiters": len(portable_waiters),
@@ -1708,6 +1741,31 @@ def persistent_backup_start_command(
             "--listener-slots",
             "1",
             "--report-pending",
+        ]
+    )
+
+
+def follow_watchdog_start_command(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> str:
+    messages_script = goalflight_compat.advertised_script(
+        "goalflight_messages.py",
+        running_file=__file__,
+    )
+    return shlex.join(
+        [
+            "python3",
+            str(messages_script),
+            "listen",
+            "--project-root",
+            str(Path(project_root).expanduser().resolve(strict=False)),
+            "--controller-label",
+            controller_label,
+            "--lease-nonce",
+            lease_nonce,
             "--watch-follow",
         ]
     )
@@ -1747,6 +1805,14 @@ def coverage_rearm_commands(
         elif component == "backup":
             commands.append(
                 persistent_backup_start_command(
+                    project_root,
+                    controller_label=controller_label,
+                    lease_nonce=nonce,
+                )
+            )
+        elif component == "watchdog":
+            commands.append(
+                follow_watchdog_start_command(
                     project_root,
                     controller_label=controller_label,
                     lease_nonce=nonce,

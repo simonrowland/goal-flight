@@ -1847,7 +1847,7 @@ async function testInteractiveHistoryAndKeyedRows() {
           label: "stream-controller",
           wake_mode: "persistent",
           listener_live: 1,
-          listener_target: 2,
+          listener_target: 3,
         })],
       }),
       attentionPayload({ items: [] })
@@ -1856,7 +1856,7 @@ async function testInteractiveHistoryAndKeyedRows() {
     assert("persistent controller shows the required backup shortage", [
       streamController != null,
       descendants(streamController).some((node) =>
-        node.className === "controller-pool" && node.textContent === "1/2"
+        node.className === "controller-pool" && node.textContent === "1/3"
       ),
       !streamController.textContent.includes("1/4"),
     ].every(Boolean));

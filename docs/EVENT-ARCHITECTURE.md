@@ -407,12 +407,14 @@ indefinite deafness into a bounded failure. Production values are rejected outsi
 the 60-to-300-second range. On a box carrying six-plus concurrent
 workers, a 30-second grace fell inside normal scheduling jitter. The detector now
 requires three complete missed beats: 360 seconds at the default cadence. The
-stream durably records every successful stdout record; one separately tracked
-`listen --listener-slots 1 --report-pending --watch-follow` backup polls that
-generation-bound state and emits `event`/`listener-dead` plus the persistent re-arm
-command when state is stale, faulted, missing, or invalid. This makes persistent
-coverage a shared two-component `live/2` fact. It stays persistent after stream
-death, so the surviving backup reports `1/2`, not portable `1/4`.
+stream durably records every successful stdout record. One separately tracked
+`listen --listener-slots 1 --report-pending` backup delivers mail, while an
+independently locked `listen --watch-follow` watchdog polls generation-bound state
+and emits `event`/`listener-dead` plus the persistent re-arm command when state is
+stale, faulted, missing, or invalid. The watchdog never claims a delivery slot or
+reads the mail cursor. This makes persistent coverage a shared three-component
+`live/3` fact. It stays persistent after stream death, so the surviving backup and
+watchdog report `2/3`, not portable `1/4`.
 Unchanged frontiers have a 15-minute floor and changed frontiers emit on the next
 idle beat. The host may batch lines produced within 200 ms, so every line is an
 independently parseable JSON object and consumers enumerate all records in a batch.

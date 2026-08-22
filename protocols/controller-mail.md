@@ -153,16 +153,28 @@ python3 <skill-root>/scripts/goalflight_messages.py listen \
   --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
   --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE" \
   --listener-slots 1 \
-  --report-pending \
+  --report-pending
+```
+
+Arm the watchdog as a third tracked task. It holds its own generation lock and never
+claims a doorbell slot or reads the mail cursor:
+
+```bash
+python3 <skill-root>/scripts/goalflight_messages.py listen \
+  --project-root "$PWD" \
+  --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
+  --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE" \
   --watch-follow
 ```
 
-Arm the stream first, then this watchdog/doorbell. `--watch-follow` allows 15 seconds
+Arm the stream first, then the backup and watchdog. `--watch-follow` allows 15 seconds
 for the stream's durable state to appear, preventing an invalid or missing state file
-from becoming silent death. Persistent coverage is two required components: one live,
-healthy monitor stream and this one backup. Status, entry hints, and fleet output all
-use that shared `live/2` predicate; after stream loss the backup remains persistent
-coverage `1/2`, never a portable `1/4` pool.
+from becoming silent death. It is observer-only: `--listener-slots` and
+`--report-pending` are ignored with a warning, and the diagnostic prints the separate
+backup command. Persistent coverage is three required components: one live, healthy
+monitor stream, one backup doorbell, and one watchdog. Status, entry hints, and fleet
+output use that shared `live/3` predicate; after stream loss the surviving backup and
+watchdog report persistent coverage `2/3`, never a portable `1/4` pool.
 
 An `EPIPE` is the only proof that the controller side is gone; the stream exits and
 releases its monitor slot. A cursor-ring reservation is rolled back if delivery did

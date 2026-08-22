@@ -5303,6 +5303,152 @@ def cmd_follow(args) -> int:
         death_watch.restore()
 
 
+def _cmd_watch_follow(
+    args,
+    *,
+    project_root: Path,
+    label: str,
+    nonce: str,
+    poll: float,
+) -> int:
+    """Observe durable follow age without joining the doorbell delivery pool."""
+    import goalflight_journal  # type: ignore
+
+    stdout_refusal = _follow_stdout_refusal(sys.stdout)
+    if stdout_refusal:
+        print(f"listen: refused: {stdout_refusal}", file=sys.stderr)
+        return 2
+    ignored = []
+    if getattr(args, "listener_slots", None) is not None:
+        ignored.append("--listener-slots")
+    if getattr(args, "report_pending", False):
+        ignored.append("--report-pending")
+    if ignored:
+        backup_command = goalflight_wake.persistent_backup_start_command(
+            project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+        )
+        print(
+            "listen: --watch-follow is watchdog-only and does not deliver mail; "
+            f"ignoring {', '.join(ignored)}; arm the backup separately: "
+            f"{backup_command}",
+            file=sys.stderr,
+        )
+
+    try:
+        authority = goalflight_journal.Journal(project_root)
+        waiter = goalflight_wake.register_watchdog_waiter(
+            project_root,
+            controller_label=label,
+            generation_key=nonce,
+        )
+    except goalflight_wake.ListenerSlotsFull:
+        print(
+            "listen: this controller generation already has a live follow watchdog",
+            file=sys.stderr,
+        )
+        return 3
+    except (goalflight_journal.JournalError, OSError, RuntimeError, ValueError) as exc:
+        print(f"listen: watchdog registration failed: {exc}", file=sys.stderr)
+        return 2
+
+    started = time.monotonic()
+    state_grace = (
+        0.1
+        if os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
+        else FOLLOW_STATE_START_GRACE_SECS
+    )
+    detached_grace = _listener_startup_grace_s()
+    parent_pid = os.getppid()
+    deadline = (
+        started + float(args.timeout_s)
+        if args.timeout_s and float(args.timeout_s) > 0
+        else None
+    )
+    try:
+        while True:
+            current_parent = os.getppid()
+            if current_parent == 1:
+                if time.monotonic() - started >= detached_grace:
+                    command = goalflight_wake.follow_watchdog_start_command(
+                        project_root,
+                        controller_label=label,
+                        lease_nonce=nonce,
+                    )
+                    print(
+                        "DETACHED WATCHDOG: my exit wakes nobody; re-arm as a "
+                        f"tracked background task: {command}",
+                        file=sys.stderr,
+                    )
+                    return DETACHED_LISTENER_EXIT_CODE
+            elif current_parent != parent_pid:
+                print(
+                    "listen: orphaned: watchdog parent changed",
+                    file=sys.stderr,
+                )
+                return 3
+            if _stdio_peer_gone(sys.stdout):
+                print(
+                    "listen: orphaned: controlling stdout closed; tracked task is gone",
+                    file=sys.stderr,
+                )
+                return 3
+            if deadline is not None and time.monotonic() >= deadline:
+                return 1
+
+            lease = authority.active_lease(label)
+            if lease is None or lease.nonce != nonce:
+                print(
+                    "listen: stale-lease: watchdog generation is no longer active",
+                    file=sys.stderr,
+                )
+                return 3
+            follow_status = goalflight_wake.monitor_status(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+            )
+            if follow_status is None and time.monotonic() - started >= state_grace:
+                follow_status = {
+                    "state": "fault",
+                    "age_s": time.monotonic() - started,
+                    "dead_after_s": state_grace,
+                    "fault": {
+                        "reason": "state-unavailable",
+                        "detail": "durable follow state is missing or invalid",
+                    },
+                }
+            if follow_status is not None and follow_status.get("state") in {
+                "fault",
+                "stale",
+            }:
+                payload = _follow_dead_record(
+                    follow_status,
+                    rearm_command=goalflight_wake.follow_start_command(
+                        project_root,
+                        controller_label=label,
+                        lease_nonce=nonce,
+                    ),
+                )
+                alive = _write_follow_record(payload, stream=sys.stdout)
+                if not alive:
+                    _silence_broken_stdout(sys.stdout)
+                return 0
+            time.sleep(poll)
+    except (
+        FollowWriteStalled,
+        goalflight_journal.JournalError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
+        print(f"listen: watchdog runtime failed: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        waiter.close()
+
+
 def cmd_listen(args) -> int:
     """One-shot journal cursor listener; its exit is the wake.
 
@@ -5342,6 +5488,15 @@ def cmd_listen(args) -> int:
     args.lease_nonce = nonce
     test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
     poll = max(0.01 if test_mode else 0.5, float(args.poll_secs or 5.0))
+    watch_follow = bool(getattr(args, "watch_follow", False))
+    if watch_follow:
+        return _cmd_watch_follow(
+            args,
+            project_root=project_root,
+            label=label,
+            nonce=nonce,
+            poll=poll,
+        )
     try:
         listener_slots = goalflight_wake.listener_slot_count(
             getattr(args, "listener_slots", None)
@@ -5349,15 +5504,6 @@ def cmd_listen(args) -> int:
     except ValueError as exc:
         print(f"listen: {exc}", file=sys.stderr)
         return 2
-    watch_follow = bool(getattr(args, "watch_follow", False))
-    if watch_follow and listener_slots != 1:
-        print("listen: --watch-follow requires --listener-slots 1", file=sys.stderr)
-        return 2
-    if watch_follow:
-        stdout_refusal = _follow_stdout_refusal(sys.stdout)
-        if stdout_refusal:
-            print(f"listen: refused: {stdout_refusal}", file=sys.stderr)
-            return 2
     deadline = (
         time.monotonic() + float(args.timeout_s)
         if args.timeout_s and float(args.timeout_s) > 0
@@ -5430,10 +5576,6 @@ def cmd_listen(args) -> int:
 
     coverage_id = str(coverage["coverage_id"])
     listener_started = time.monotonic()
-    watch_started = listener_started
-    watch_state_grace = (
-        0.1 if test_mode else FOLLOW_STATE_START_GRACE_SECS
-    )
     detached_grace = _listener_startup_grace_s()
     rearm_command = _exact_listener_command()
     death_watch = _ListenerDeathWatch()
@@ -5524,32 +5666,6 @@ def cmd_listen(args) -> int:
             file=sys.stderr,
         )
         return DETACHED_LISTENER_EXIT_CODE
-
-    def finish_follow_dead(status: dict[str, object]) -> int:
-        payload = _follow_dead_record(
-            status,
-            rearm_command=goalflight_wake.follow_start_command(
-                project_root,
-                controller_label=label,
-                lease_nonce=nonce,
-            ),
-        )
-        try:
-            with contextlib.suppress(
-                goalflight_journal.JournalError,
-                ValueError,
-            ):
-                authority.exit_listener(coverage_id, reason="follow-dead")
-            alive = _write_follow_record(payload, stream=sys.stdout)
-            if not alive:
-                _silence_broken_stdout(sys.stdout)
-        except FollowWriteStalled as exc:
-            print(f"listen: watchdog stdout backpressure: {exc}", file=sys.stderr)
-            return 2
-        finally:
-            waiter.close()
-            death_watch.restore()
-        return 0
 
     def parent_exit() -> int | None:
         current_parent = os.getppid()
@@ -5691,30 +5807,6 @@ def cmd_listen(args) -> int:
             continue
         if deadline is not None and time.monotonic() >= deadline:
             return finish("timeout", code=1, detail="no waking event before timeout")
-        if watch_follow:
-            follow_status = goalflight_wake.monitor_status(
-                project_root,
-                controller_label=label,
-                lease_nonce=nonce,
-            )
-            if (
-                follow_status is None
-                and time.monotonic() - watch_started >= watch_state_grace
-            ):
-                follow_status = {
-                    "state": "fault",
-                    "age_s": time.monotonic() - watch_started,
-                    "dead_after_s": watch_state_grace,
-                    "fault": {
-                        "reason": "state-unavailable",
-                        "detail": "durable follow state is missing or invalid",
-                    },
-                }
-            if follow_status is not None and follow_status.get("state") in {
-                "fault",
-                "stale",
-            }:
-                return finish_follow_dead(follow_status)
         try:
             lease = authority.active_lease(label)
             measured = (
@@ -6003,8 +6095,8 @@ def _run_cli(argv: list[str] | None = None) -> int:
             "--watch-follow",
             action="store_true",
             help=(
-                "persistent-host backup: wake with listener-dead when durable "
-                "follow records stop"
+                "watchdog-only mode: wake with listener-dead when durable "
+                "follow records stop; does not deliver mail or consume a listener slot"
             ),
         )
 
