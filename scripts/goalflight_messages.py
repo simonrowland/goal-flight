@@ -8,6 +8,7 @@ from collections.abc import Callable
 import contextlib
 from dataclasses import dataclass, field
 import datetime as dt
+import errno
 from enum import Enum
 import functools
 import hashlib
@@ -3190,6 +3191,7 @@ def listener_coverage_status(
     project_root: Path | str,
     controller_label: str,
     *,
+    lease_nonce: str | None = None,
     identity_probe: Callable[[int], dict | None] | None = None,
 ) -> dict[str, object]:
     """Return live wake coverage from the kernel-held waiter ledger."""
@@ -3198,7 +3200,23 @@ def listener_coverage_status(
     root = goalflight_task.resolve_project_root(str(project_root))
     label = str(controller_label or "").strip()
     del identity_probe  # compatibility-only; lock state replaces process probing.
-    return goalflight_wake.coverage_status(root, controller_label=label or None)
+    nonce = str(lease_nonce or "").strip() or None
+    if label and nonce is None:
+        try:
+            import goalflight_journal  # type: ignore
+
+            lease = goalflight_journal.Journal.open_reader(root).active_lease(label)
+            nonce = lease.nonce if lease is not None else None
+        except goalflight_journal.JournalError:
+            nonce = None
+    status = goalflight_wake.coverage_status(
+        root,
+        controller_label=label or None,
+        lease_nonce=nonce,
+    )
+    if nonce:
+        status["lease_nonce"] = nonce
+    return status
 
 
 def listener_reminder_line(project_root: Path | str, controller_label: str) -> str:
@@ -3280,6 +3298,7 @@ def _ambient_claimed_controller(
         "reason": "ambient-controller-lease",
         "label": label,
         "lease_generation": lease.generation,
+        "lease_nonce": lease.nonce,
         "holder_alive": holder_alive,
     }
 
@@ -3468,6 +3487,9 @@ def emit_wake_entry_notice(
     return goalflight_wake.check_tool_entry(
         root,
         controller_label=label,
+        controller_lease_nonce=(
+            str(ambient.get("lease_nonce") or "").strip() or None
+        ),
         controller_claimed=ambient.get("claimed") is True,
         mail_bearing=mail_bearing,
         pending_probe=pending_probe,
@@ -3542,18 +3564,15 @@ def emit_listener_reminder(
             )
             if isinstance(live_waiters, int) and live_waiters >= target_waiters:
                 return None
-            command = goalflight_wake.listener_start_command(
+            nonce = str(coverage.get("lease_nonce") or "").strip() or None
+            plan = goalflight_wake.coverage_rearm_plan(
+                coverage,
                 root,
                 controller_label=label,
+                lease_nonce=nonce,
+                work_in_flight=True,
             )
-            if not isinstance(live_waiters, int) or live_waiters == 0:
-                line = listener_reminder_line(root, label)
-            else:
-                line = goalflight_wake.listener_reserve_hint(
-                    live_waiters,
-                    target_waiters,
-                    command,
-                )
+            line = goalflight_wake.coverage_rearm_hint(plan)
         print(line, file=sys.stderr if stream is None else stream)
         return line
     except _EXPECTED_OPTIONAL_ERRORS:
@@ -3637,18 +3656,21 @@ def emit_listener_activity_signal(
             label = str(active[0]["label"])
         else:
             return ""
-        coverage = goalflight_wake.coverage_status(root, controller_label=label)
-        live = coverage.get("live_waiters")
-        target = int(
-            coverage.get("target_waiters") or goalflight_wake.listener_slot_count()
+        active_nonce = (
+            str(matching[0].get("nonce") or "").strip()
+            if matching
+            else str(active[0].get("nonce") or "").strip()
         )
-        command = goalflight_wake.listener_start_command(
-            root, controller_label=label
+        coverage = goalflight_wake.coverage_status(
+            root,
+            controller_label=label,
+            lease_nonce=active_nonce or None,
         )
-        plan = goalflight_wake.listener_depth_plan(
-            live if isinstance(live, int) else 0,
-            target,
-            command,
+        plan = goalflight_wake.coverage_rearm_plan(
+            coverage,
+            root,
+            controller_label=label,
+            lease_nonce=active_nonce or None,
             work_in_flight=authority.care_work_exists(label),
         )
         hint = goalflight_wake.consume_listener_activity_signal(root, label, plan)
@@ -4573,6 +4595,714 @@ def _listen_cli_name() -> str:
     return "listen-auto" if sys.argv[1:2] == ["listen-auto"] else "listen"
 
 
+# The persistent-monitor host auto-stops noisy streams, while a slow beat delays
+# detection of a reaped listener. Controllers already work on minute-scale
+# turns, so a two-minute beat avoids seconds-scale volume. The former 30-second
+# death grace sat inside ordinary scheduling jitter on a box carrying six-plus
+# concurrent workers. Require three whole missed beats instead: one delayed
+# turn cannot false-kill the primary channel, while death is still loud within
+# six minutes. Production configuration stays between one and five minutes:
+# below that risks host volume limiting, above that permits fifteen minutes of
+# unannounced deafness. The 15-minute unchanged-frontier floor adds at most four
+# informational lines per hour.
+FOLLOW_HEARTBEAT_SECS = 120.0
+FOLLOW_HEARTBEAT_MIN_SECS = 60.0
+FOLLOW_HEARTBEAT_MAX_SECS = 300.0
+FOLLOW_DEAD_AFTER_INTERVALS = 3
+FOLLOW_DEAD_AFTER_SECS = FOLLOW_HEARTBEAT_SECS * FOLLOW_DEAD_AFTER_INTERVALS
+FOLLOW_FRONTIER_FLOOR_SECS = 15.0 * 60.0
+FOLLOW_FRONTIER_STALE_SECS = 60.0 * 60.0
+FOLLOW_WRITE_RETRY_SECS = 1.0
+FOLLOW_WRITE_STALL_SECS = 60.0
+FOLLOW_STATE_START_GRACE_SECS = 15.0
+STREAM_PIPE_BUF_BYTES = 512
+# Include the newline and stay strictly below the measured 512-byte PIPE_BUF.
+STREAM_LINE_MAX_BYTES = STREAM_PIPE_BUF_BYTES - 1
+
+
+class FollowWriteStalled(MessageError):
+    """Persistent stdout stayed backpressured beyond its swapping grace."""
+
+
+class FollowStateError(MessageError):
+    """Durable liveness state could not follow a successful stdout record."""
+
+
+def _truncate_utf8(value: object, max_bytes: int) -> str:
+    text = sanitize_display(value)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    if max_bytes <= 0:
+        return ""
+    suffix = "…"
+    suffix_bytes = suffix.encode("utf-8")
+    if max_bytes < len(suffix_bytes):
+        return encoded[:max_bytes].decode("utf-8", "ignore")
+    return (
+        encoded[: max_bytes - len(suffix_bytes)].decode("utf-8", "ignore")
+        + suffix
+    )
+
+
+def _follow_line_bytes(record: dict[str, object]) -> bytes:
+    if record.get("kind") not in {"event", "heartbeat", "frontier"}:
+        raise MessageError("follow record kind must be event, heartbeat, or frontier")
+    line = json.dumps(
+        record,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8") + b"\n"
+    if len(line) > STREAM_LINE_MAX_BYTES:
+        raise MessageError(
+            f"follow line is {len(line)} bytes; maximum is {STREAM_LINE_MAX_BYTES}"
+        )
+    return line
+
+
+def _fit_follow_record(
+    record: dict[str, object],
+    *,
+    shrink_fields: tuple[str, ...],
+) -> dict[str, object]:
+    """Shrink selected payload strings until one atomic JSON line fits."""
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        raise MessageError("follow record payload must be an object")
+    try:
+        _follow_line_bytes(record)
+        return record
+    except MessageError:
+        payload["truncated"] = True
+    for field in shrink_fields:
+        value = payload.get(field)
+        if not isinstance(value, str) or not value:
+            continue
+        while value:
+            try:
+                _follow_line_bytes(record)
+                return record
+            except MessageError:
+                current_bytes = len(value.encode("utf-8"))
+                serialized_bytes = len(
+                    json.dumps(
+                        record,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                        default=str,
+                    ).encode("utf-8")
+                ) + 1
+                overshoot = max(0, serialized_bytes - STREAM_LINE_MAX_BYTES)
+                value = _truncate_utf8(
+                    value,
+                    max(0, current_bytes - max(32, overshoot + 4)),
+                )
+                payload[field] = value
+    _follow_line_bytes(record)
+    return record
+
+
+def _follow_heartbeat_record(seq: int, interval_s: float) -> dict[str, object]:
+    return {
+        "kind": "heartbeat",
+        "payload": {
+            "seq": seq,
+            "at": utc_now(),
+            "interval_s": interval_s,
+        },
+    }
+
+
+def _follow_event_record(row: dict[str, object], envelope: dict) -> dict[str, object]:
+    raw_payload = envelope.get("payload")
+    payload_data = raw_payload if isinstance(raw_payload, dict) else {}
+    record: dict[str, object] = {
+        "kind": "event",
+        "payload": {
+            "stream_id": _truncate_utf8(row.get("stream_id"), 72),
+            "stream_seq": int(row.get("stream_seq") or 0),
+            "dispatch_id": _truncate_utf8(envelope.get("dispatch_id"), 72),
+            "type": _truncate_utf8(envelope.get("type"), 40),
+            "data": payload_data,
+        },
+    }
+    try:
+        _follow_line_bytes(record)
+        return record
+    except MessageError:
+        summary = json.dumps(
+            payload_data,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            default=str,
+        )
+        event_payload = record["payload"]
+        assert isinstance(event_payload, dict)
+        event_payload["data"] = None
+        event_payload["summary"] = summary
+        return _fit_follow_record(
+            record,
+            shrink_fields=("summary", "dispatch_id", "stream_id", "type"),
+        )
+
+
+def _follow_frontier_record(row: dict[str, object] | None) -> dict[str, object]:
+    if row is None:
+        return {
+            "kind": "frontier",
+            "payload": {
+                "state": "empty",
+                "advisory": "information-only",
+            },
+        }
+    derived = str(row.get("derived_status") or "pending")
+    state = derived if derived in {"blocked", "stale"} else "ready"
+    record: dict[str, object] = {
+        "kind": "frontier",
+        "payload": {
+            "state": state,
+            "id": _truncate_utf8(row.get("id"), 72),
+            "title": sanitize_display(row.get("title") or ""),
+            "advisory": "information-only",
+        },
+    }
+    return _fit_follow_record(record, shrink_fields=("title", "id"))
+
+
+def _follow_frontier_snapshot(task_store) -> dict[str, object]:
+    """Read the generated task projection without entering the store API.
+
+    ``TaskStore.next_frontier()`` derives against the global dispatch ledger and
+    can repair interrupted publishes. A heartbeat must not take that lock or
+    mutate the store, so the stream consumes the already-materialized JS view.
+    """
+    import goalflight_task  # type: ignore
+
+    try:
+        projection_candidates = (
+            task_store.data_js_path,
+            task_store.export_dashboard_dir / "tasks-data.js",
+        )
+        projection_path = next(path for path in projection_candidates if path.is_file())
+        projection_stat = projection_path.stat()
+        text = projection_path.read_text(encoding="utf-8")
+        marker = "window.GF_ITEMS = "
+        offset = text.index(marker) + len(marker)
+        rows, _end = json.JSONDecoder().raw_decode(text[offset:])
+        if not isinstance(rows, list):
+            raise ValueError("materialized task projection is not an array")
+        rows = [
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and row.get("kind", "task") in {"task", "bug"}
+            and row.get("derived_status") == "pending"
+            and row.get("lane") not in goalflight_task.RESERVED_LANES
+            and goalflight_task._latest_dispatch_breadcrumb(row) is None
+        ]
+    except Exception as exc:
+        record: dict[str, object] = {
+            "kind": "frontier",
+            "payload": {
+                "state": "unavailable",
+                "detail": sanitize_display(str(exc), limit=180),
+                "advisory": "information-only",
+            },
+        }
+        return _fit_follow_record(record, shrink_fields=("detail",))
+    record = _follow_frontier_record(rows[0] if rows else None)
+    payload = record.get("payload")
+    assert isinstance(payload, dict)
+    payload["source"] = "materialized-projection"
+    if payload.get("state") == "ready":
+        # Dispatch-ledger changes can outpace this generated view without
+        # touching tasks.jsonl. Never present a projection as authoritative.
+        payload["state"] = "projected"
+    projection_age_s = max(0.0, time.time() - projection_stat.st_mtime)
+    payload["age_s"] = round(projection_age_s, 1)
+    canonical_path = task_store.tasks_path
+    try:
+        canonical_newer = (
+            canonical_path.is_file()
+            and canonical_path.stat().st_mtime_ns > projection_stat.st_mtime_ns
+        )
+    except OSError:
+        canonical_newer = True
+    if canonical_newer:
+        payload["state"] = "stale"
+        payload["stale_reason"] = "canonical-newer"
+    elif projection_age_s >= FOLLOW_FRONTIER_STALE_SECS:
+        payload["state"] = "stale"
+        payload["stale_reason"] = "projection-age"
+    return _fit_follow_record(record, shrink_fields=("title", "id"))
+
+
+def _follow_frontier_signature(record: dict[str, object]) -> str:
+    payload = record.get("payload")
+    stable_payload = dict(payload) if isinstance(payload, dict) else payload
+    if isinstance(stable_payload, dict):
+        stable_payload.pop("age_s", None)
+    return json.dumps(
+        {"kind": record.get("kind"), "payload": stable_payload},
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _wait_follow_stdout_writable(stream: object, wait_s: float) -> None:
+    try:
+        fd = stream.fileno()  # type: ignore[attr-defined]
+        select.select([], [fd], [], wait_s)
+    except (AttributeError, OSError, TypeError, ValueError):
+        time.sleep(wait_s)
+
+
+def _write_follow_record(
+    record: dict[str, object],
+    *,
+    stream=None,
+    retry_s: float = FOLLOW_WRITE_RETRY_SECS,
+    stall_s: float = FOLLOW_WRITE_STALL_SECS,
+    wait_writable: Callable[[object, float], None] = _wait_follow_stdout_writable,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Write and flush one atomic line; False means the stdout reader is gone."""
+    target = stream if stream is not None else sys.stdout
+    text = _follow_line_bytes(record).decode("utf-8")
+    wrote = False
+    stall_deadline = clock() + max(0.01, float(stall_s))
+    while True:
+        try:
+            if not wrote:
+                target.write(text)
+                wrote = True
+            # Host monitors consume live stdout, not process-exit buffers.  This
+            # flush is the wake boundary and is intentionally test-locked.
+            target.flush()
+            return True
+        except OSError as exc:
+            if exc.errno == errno.EPIPE:
+                return False
+            if exc.errno == errno.EINTR:
+                continue
+            if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                remaining = stall_deadline - clock()
+                if remaining <= 0:
+                    raise FollowWriteStalled(
+                        f"stdout stayed backpressured for {stall_s:g}s"
+                    ) from exc
+                wait_writable(target, min(max(0.01, retry_s), remaining))
+                continue
+            raise
+
+
+def _follow_stdout_refusal(stream: object) -> str | None:
+    try:
+        mode = os.fstat(stream.fileno()).st_mode  # type: ignore[attr-defined]
+    except (AttributeError, OSError, TypeError, ValueError):
+        return "stdout has no inspectable file descriptor"
+    if stat.S_ISREG(mode):
+        return (
+            "stdout is a regular file; only a host-monitored pipe/socket can "
+            "turn live records into controller wakes"
+        )
+    return None
+
+
+def _follow_fault_record(reason: str, detail: object = "") -> dict[str, object]:
+    record: dict[str, object] = {
+        "kind": "event",
+        "payload": {
+            "type": "listener-fault",
+            "reason": _truncate_utf8(reason, 72),
+            "detail": sanitize_display(detail, limit=180),
+        },
+    }
+    return _fit_follow_record(record, shrink_fields=("detail", "reason"))
+
+
+def _follow_dead_record(
+    status: dict[str, object],
+    *,
+    rearm_command: str,
+) -> dict[str, object]:
+    fault = status.get("fault")
+    reason = (
+        str(fault.get("reason") or "fault")
+        if isinstance(fault, dict)
+        else str(status.get("state") or "stale")
+    )
+    record: dict[str, object] = {
+        "kind": "event",
+        "payload": {
+            "type": "listener-dead",
+            "reason": _truncate_utf8(reason, 72),
+            "age_s": round(float(status.get("age_s") or 0.0), 1),
+            "dead_after_s": float(status.get("dead_after_s") or 0.0),
+            "rearm_command": rearm_command,
+            "backup_required": True,
+        },
+    }
+    return _fit_follow_record(record, shrink_fields=("reason", "rearm_command"))
+
+
+def _silence_broken_stdout(stream: object) -> None:
+    """Prevent Python's shutdown flush from turning handled EPIPE into exit 120."""
+    try:
+        fd = stream.fileno()  # type: ignore[attr-defined]
+        replacement = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(replacement, fd)
+        finally:
+            os.close(replacement)
+        with contextlib.suppress(OSError):
+            stream.flush()  # type: ignore[attr-defined]
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+def _follow_inert_knob_warnings() -> list[str]:
+    warnings = []
+    for name in ("GOALFLIGHT_LISTENER_SLOTS", "GOALFLIGHT_LISTENER_LOW_WATER"):
+        if name in os.environ:
+            warnings.append(
+                f"follow: {name} affects only portable one-shot listen; "
+                "it has no effect on the persistent stream"
+            )
+    return warnings
+
+
+def _emit_claimed_follow_events(
+    project_root: Path,
+    *,
+    controller_label: str,
+    cursor_version: int,
+    visible: list[tuple[dict, dict]],
+    emit: Callable[[dict[str, object]], bool],
+) -> tuple[bool, bool]:
+    """Reserve one cursor ring and roll it back unless every event was written."""
+    if not visible:
+        return True, False
+    ring_claimed = goalflight_wake.claim_ring(
+        project_root,
+        controller_label=controller_label,
+        cursor_version=cursor_version,
+    )
+    if not ring_claimed:
+        return True, False
+    try:
+        for row, envelope in visible:
+            if not emit(_follow_event_record(row, envelope)):
+                released = goalflight_wake.release_ring_claim(
+                    project_root,
+                    controller_label=controller_label,
+                    cursor_version=cursor_version,
+                )
+                if not released:
+                    raise FollowStateError(
+                        "failed delivery could not release its cursor ring"
+                    )
+                return False, False
+    except BaseException:
+        goalflight_wake.release_ring_claim(
+            project_root,
+            controller_label=controller_label,
+            cursor_version=cursor_version,
+        )
+        raise
+    return True, True
+
+
+def cmd_follow(args) -> int:
+    """Persistent newline-delimited wake stream for a host monitor."""
+    import goalflight_journal  # type: ignore
+    import goalflight_session_status as sessions  # type: ignore
+    import goalflight_task  # type: ignore
+
+    project_root = goalflight_task.resolve_project_root(
+        args.project_root or str(Path.cwd())
+    )
+    label = sessions.resolve_controller_label(
+        args.controller_label,
+        project_root=project_root,
+    )
+    if not label:
+        print("follow: controller label is unavailable", file=sys.stderr)
+        return 2
+    resolved = _resolve_listen_auto_lease(
+        project_root,
+        controller_label=label,
+        explicit_nonce=str(args.lease_nonce or "").strip() or None,
+    )
+    if not resolved.get("claimed"):
+        print(
+            "follow: " + str(resolved.get("reason") or "ambient lease unavailable"),
+            file=sys.stderr,
+        )
+        return 2
+    nonce = str(resolved.get("nonce") or "").strip()
+    if not nonce:
+        print("follow: active controller lease is unavailable", file=sys.stderr)
+        return 2
+
+    test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
+    minimum = 0.01 if test_mode else 1.0
+    configured = {
+        "poll-secs": float(args.poll_secs),
+        "heartbeat-secs": float(args.heartbeat_secs),
+        "frontier-floor-secs": float(args.frontier_floor_secs),
+    }
+    invalid = [
+        name
+        for name, value in configured.items()
+        if not math.isfinite(value) or value <= 0
+    ]
+    if invalid:
+        print(
+            "follow: positive finite timing required for " + ", ".join(invalid),
+            file=sys.stderr,
+        )
+        return 2
+    if not test_mode and not (
+        FOLLOW_HEARTBEAT_MIN_SECS
+        <= configured["heartbeat-secs"]
+        <= FOLLOW_HEARTBEAT_MAX_SECS
+    ):
+        print(
+            "follow: heartbeat-secs must stay between "
+            f"{FOLLOW_HEARTBEAT_MIN_SECS:g} and "
+            f"{FOLLOW_HEARTBEAT_MAX_SECS:g} seconds; faster risks host "
+            "volume limiting and slower hides deafness too long",
+            file=sys.stderr,
+        )
+        return 2
+    poll_s = max(minimum, configured["poll-secs"])
+    heartbeat_s = max(minimum, configured["heartbeat-secs"])
+    dead_after_s = heartbeat_s * FOLLOW_DEAD_AFTER_INTERVALS
+    frontier_floor_s = max(heartbeat_s, configured["frontier-floor-secs"])
+    stdout_refusal = _follow_stdout_refusal(sys.stdout)
+    if stdout_refusal:
+        print(f"follow: refused: {stdout_refusal}", file=sys.stderr)
+        return 2
+    for warning in _follow_inert_knob_warnings():
+        print(warning, file=sys.stderr)
+    print(
+        "follow: stdout must be owned by the host persistent monitor; "
+        "ordinary shell backgrounding produces no controller wakes",
+        file=sys.stderr,
+    )
+
+    def startup_fail(reason: str, detail: object) -> int:
+        stdout_alive = True
+        try:
+            stdout_alive = _write_follow_record(
+                _follow_fault_record(reason, detail),
+                stream=sys.stdout,
+            )
+            if not stdout_alive:
+                _silence_broken_stdout(sys.stdout)
+        except (FollowWriteStalled, OSError):
+            pass
+        print(f"follow: {reason}: {detail}", file=sys.stderr)
+        return 2 if stdout_alive else 0
+
+    try:
+        authority = goalflight_journal.Journal(project_root)
+        waiter = goalflight_wake.register_waiter(
+            project_root,
+            controller_label=label,
+            kind=goalflight_wake.MONITOR_KIND,
+            generation_key=nonce,
+        )
+        task_store = goalflight_task.TaskStore(project_root)
+    except goalflight_wake.ListenerSlotsFull:
+        print(
+            "follow: this controller lease already has a persistent stream",
+            file=sys.stderr,
+        )
+        return 3
+    except (goalflight_journal.JournalError, OSError, RuntimeError, ValueError) as exc:
+        return startup_fail("startup-failed", exc)
+    try:
+        goalflight_wake.activate_monitor_state(
+            project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+            heartbeat_s=heartbeat_s,
+            dead_after_s=dead_after_s,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        waiter.close()
+        stdout_alive = True
+        try:
+            stdout_alive = _write_follow_record(
+                _follow_fault_record("state-unavailable", exc),
+                stream=sys.stdout,
+            )
+            if not stdout_alive:
+                _silence_broken_stdout(sys.stdout)
+        except (FollowWriteStalled, OSError):
+            pass
+        print(f"follow: durable monitor state unavailable: {exc}", file=sys.stderr)
+        return 2 if stdout_alive else 0
+
+    death_watch = _ListenerDeathWatch()
+    death_watch.install()
+    heartbeat_seq = 0
+    next_heartbeat = time.monotonic()
+    last_frontier_signature: str | None = None
+    last_frontier_at = float("-inf")
+    arm_high = goalflight_wake.pending_report_high_water(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    ) or {}
+
+    def emit(record: dict[str, object]) -> bool:
+        alive = _write_follow_record(record, stream=sys.stdout)
+        if not alive:
+            _silence_broken_stdout(sys.stdout)
+            return False
+        try:
+            goalflight_wake.record_monitor_emit(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+                record_kind=str(record.get("kind") or "unknown"),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise FollowStateError(str(exc)) from exc
+        return alive
+
+    def fail(
+        reason: str,
+        detail: object,
+        *,
+        code: int,
+        write_stdout: bool = True,
+    ) -> int:
+        # Release the generation lock before publishing fault state. A watcher
+        # may wake and run the supplied re-arm command immediately; observing
+        # the fault must never race a holder that has already decided to exit.
+        waiter.close()
+        with contextlib.suppress(OSError, RuntimeError, ValueError):
+            goalflight_wake.record_monitor_fault(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+                reason=reason,
+                detail=str(detail),
+            )
+        stdout_alive = True
+        if write_stdout:
+            try:
+                stdout_alive = _write_follow_record(
+                    _follow_fault_record(reason, detail),
+                    stream=sys.stdout,
+                )
+                if not stdout_alive:
+                    _silence_broken_stdout(sys.stdout)
+            except (FollowWriteStalled, OSError):
+                pass
+        print(f"follow: {reason}: {detail}", file=sys.stderr)
+        return code if stdout_alive else 0
+
+    try:
+        while True:
+            fatal = death_watch.fatal_signum
+            if fatal is not None:
+                emit(
+                    {
+                        "kind": "event",
+                        "payload": {
+                            "type": "listener-exit",
+                            "reason": "signal",
+                            "signal": _listener_signal_name(fatal),
+                        },
+                    }
+                )
+                return listener_posix_signal_exit_code(fatal)
+            lease = authority.active_lease(label)
+            if lease is None or lease.nonce != nonce:
+                emit(
+                    {
+                        "kind": "event",
+                        "payload": {
+                            "type": "listener-exit",
+                            "reason": "stale-lease",
+                        },
+                    }
+                )
+                return 3
+            try:
+                snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
+                candidate_rows = [
+                    item
+                    for item in snapshot.items
+                    if str(item.get("wake_class") or "") == "waking"
+                    and int(item.get("stream_seq") or 0)
+                    > arm_high.get(str(item.get("stream_id") or ""), 0)
+                ]
+                visible = _foreign_controller_items(
+                    _envelopes_with_rows(authority, candidate_rows),
+                    controller_label=label,
+                    lease_nonce=nonce,
+                )
+            except goalflight_journal.CASMismatch as exc:
+                return fail("lease-cursor-mismatch", exc, code=3)
+            except goalflight_journal.JournalUpgradeRequired as exc:
+                return fail("journal-upgrade-required", exc, code=2)
+            except (goalflight_journal.JournalError, ValueError) as exc:
+                return fail("journal-unavailable", exc, code=2)
+
+            try:
+                alive, emitted_event = _emit_claimed_follow_events(
+                    project_root,
+                    controller_label=label,
+                    cursor_version=snapshot.cursor_version,
+                    visible=visible,
+                    emit=emit,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                return fail("ring-stamp-unavailable", exc, code=2)
+            if not alive:
+                return 0
+            now = time.monotonic()
+            if emitted_event:
+                # A heartbeat means the interval was idle.  Deferring it also
+                # keeps an event from batching with a contradictory idle beat.
+                next_heartbeat = now + heartbeat_s
+            elif now >= next_heartbeat:
+                heartbeat_seq += 1
+                if not emit(_follow_heartbeat_record(heartbeat_seq, heartbeat_s)):
+                    return 0
+                frontier = _follow_frontier_snapshot(task_store)
+                signature = _follow_frontier_signature(frontier)
+                if (
+                    signature != last_frontier_signature
+                    or now - last_frontier_at >= frontier_floor_s
+                ):
+                    if not emit(frontier):
+                        return 0
+                    last_frontier_signature = signature
+                    last_frontier_at = now
+                next_heartbeat = time.monotonic() + heartbeat_s
+            time.sleep(min(poll_s, max(0.0, next_heartbeat - time.monotonic())))
+    except FollowWriteStalled as exc:
+        return fail("stdout-backpressure", exc, code=2, write_stdout=False)
+    except FollowStateError as exc:
+        return fail("state-unavailable", exc, code=2)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return fail("stream-runtime", exc, code=2)
+    finally:
+        waiter.close()
+        death_watch.restore()
+
+
 def cmd_listen(args) -> int:
     """One-shot journal cursor listener; its exit is the wake.
 
@@ -4619,6 +5349,15 @@ def cmd_listen(args) -> int:
     except ValueError as exc:
         print(f"listen: {exc}", file=sys.stderr)
         return 2
+    watch_follow = bool(getattr(args, "watch_follow", False))
+    if watch_follow and listener_slots != 1:
+        print("listen: --watch-follow requires --listener-slots 1", file=sys.stderr)
+        return 2
+    if watch_follow:
+        stdout_refusal = _follow_stdout_refusal(sys.stdout)
+        if stdout_refusal:
+            print(f"listen: refused: {stdout_refusal}", file=sys.stderr)
+            return 2
     deadline = (
         time.monotonic() + float(args.timeout_s)
         if args.timeout_s and float(args.timeout_s) > 0
@@ -4691,6 +5430,10 @@ def cmd_listen(args) -> int:
 
     coverage_id = str(coverage["coverage_id"])
     listener_started = time.monotonic()
+    watch_started = listener_started
+    watch_state_grace = (
+        0.1 if test_mode else FOLLOW_STATE_START_GRACE_SECS
+    )
     detached_grace = _listener_startup_grace_s()
     rearm_command = _exact_listener_command()
     death_watch = _ListenerDeathWatch()
@@ -4699,11 +5442,15 @@ def cmd_listen(args) -> int:
     def rearm_plan_after_release() -> dict[str, object] | None:
         try:
             status = goalflight_wake.coverage_status(
-                project_root, controller_label=label
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
             )
-            live = status.get("live_waiters")
+            live = status.get("portable_live_waiters", status.get("live_waiters"))
             target = int(
-                status.get("target_waiters") or goalflight_wake.listener_slot_count()
+                status.get("portable_target_waiters")
+                or status.get("target_waiters")
+                or goalflight_wake.listener_slot_count()
             )
             return goalflight_wake.listener_depth_plan(
                 live if isinstance(live, int) else 0,
@@ -4777,6 +5524,32 @@ def cmd_listen(args) -> int:
             file=sys.stderr,
         )
         return DETACHED_LISTENER_EXIT_CODE
+
+    def finish_follow_dead(status: dict[str, object]) -> int:
+        payload = _follow_dead_record(
+            status,
+            rearm_command=goalflight_wake.follow_start_command(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+            ),
+        )
+        try:
+            with contextlib.suppress(
+                goalflight_journal.JournalError,
+                ValueError,
+            ):
+                authority.exit_listener(coverage_id, reason="follow-dead")
+            alive = _write_follow_record(payload, stream=sys.stdout)
+            if not alive:
+                _silence_broken_stdout(sys.stdout)
+        except FollowWriteStalled as exc:
+            print(f"listen: watchdog stdout backpressure: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            waiter.close()
+            death_watch.restore()
+        return 0
 
     def parent_exit() -> int | None:
         current_parent = os.getppid()
@@ -4918,6 +5691,30 @@ def cmd_listen(args) -> int:
             continue
         if deadline is not None and time.monotonic() >= deadline:
             return finish("timeout", code=1, detail="no waking event before timeout")
+        if watch_follow:
+            follow_status = goalflight_wake.monitor_status(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+            )
+            if (
+                follow_status is None
+                and time.monotonic() - watch_started >= watch_state_grace
+            ):
+                follow_status = {
+                    "state": "fault",
+                    "age_s": time.monotonic() - watch_started,
+                    "dead_after_s": watch_state_grace,
+                    "fault": {
+                        "reason": "state-unavailable",
+                        "detail": "durable follow state is missing or invalid",
+                    },
+                }
+            if follow_status is not None and follow_status.get("state") in {
+                "fault",
+                "stale",
+            }:
+                return finish_follow_dead(follow_status)
         try:
             lease = authority.active_lease(label)
             measured = (
@@ -5202,6 +5999,14 @@ def _run_cli(argv: list[str] | None = None) -> int:
             action="store_true",
             help="report an arm-time backlog and stay armed for only newer events",
         )
+        command_parser.add_argument(
+            "--watch-follow",
+            action="store_true",
+            help=(
+                "persistent-host backup: wake with listener-dead when durable "
+                "follow records stop"
+            ),
+        )
 
     listen = sub.add_parser(
         "listen",
@@ -5217,6 +6022,22 @@ def _run_cli(argv: list[str] | None = None) -> int:
     )
     add_listen_arguments(listen_auto)
 
+    follow = sub.add_parser(
+        "follow",
+        help="persistent JSON-line wake stream for a host stdout monitor",
+    )
+    follow.add_argument("--project-root", default=None)
+    follow.add_argument("--controller-label", default=None)
+    follow.add_argument("--lease-nonce", default=None)
+    follow.add_argument("--poll-secs", type=float, default=1.0)
+    follow.add_argument(
+        "--heartbeat-secs", type=float, default=FOLLOW_HEARTBEAT_SECS
+    )
+    follow.add_argument(
+        "--frontier-floor-secs", type=float, default=FOLLOW_FRONTIER_FLOOR_SECS
+    )
+    follow.set_defaults(func=cmd_follow)
+
     mirror = sub.add_parser("mirror")
     mirror.add_argument("--remote", type=Path, required=True, help="Remote *.jsonl inbox to merge")
     listen.set_defaults(func=cmd_listen)
@@ -5227,6 +6048,7 @@ def _run_cli(argv: list[str] | None = None) -> int:
     role_by_command = {
         "listen": "listener",
         "listen-auto": "listener",
+        "follow": "listener",
         "mirror": "mirror",
         "status": "dashboard",
         "relay": "dashboard",
@@ -5234,7 +6056,7 @@ def _run_cli(argv: list[str] | None = None) -> int:
         "post": "producer",
     }
     role = role_by_command.get(args.cmd, "controller")
-    if args.cmd not in {"listen", "listen-auto"} and not (
+    if args.cmd not in {"listen", "listen-auto", "follow"} and not (
         args.cmd == "relay" and args.drain
     ):
         entry_root = getattr(args, "controller_project_root", None) or Path.cwd()

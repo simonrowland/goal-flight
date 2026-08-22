@@ -1338,7 +1338,8 @@
     refs.health.textContent = state;
     var live = item.listener_live;
     var target = item.listener_target;
-    refs.pool.textContent = (live == null ? "?" : String(live)) + "/" + (target == null ? "?" : String(target));
+    refs.pool.textContent = (live == null ? "?" : String(live)) +
+      "/" + (target == null ? "?" : String(target));
     var ownedCount = item.owned_live == null ? item.in_flight_count : item.owned_live;
     refs.inflight.textContent = ownedCount == null ? "0" : String(ownedCount);
     refs.seen.textContent = ageFrom(item.last_seen, now);
@@ -1487,6 +1488,7 @@
       controller_liveness_state: "UNKNOWN",
       listener_live: null,
       listener_target: null,
+      wake_mode: null,
       in_flight_count: liveCount,
       owned_live: liveCount,
       last_seen: null,

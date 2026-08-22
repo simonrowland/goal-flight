@@ -158,14 +158,21 @@ frontmatter above. New categories require a frontmatter schema bump (raise
 ## Background Dispatch + Self-Pacing (don't block the controller)
 
 The controller keeps the interactive session responsive by dispatching workers in
-the background and arming a generation-bound `goalflight_messages.py listen
---project-root "$PWD" --controller-label <label> --lease-nonce <nonce>` in the
-background. Its body-free exit triggers `relay --new --json`; the controller
-processes chosen items, CAS-advances their server-known positions, then re-arms.
+the background. On a host whose persistent monitor turns each flushed stdout line
+into a wake, it arms one generation-bound `goalflight_messages.py follow
+--project-root "$PWD" --controller-label <label> --lease-nonce <nonce>` through
+that monitor, never shell `&`, and keeps one tracked `listen --listener-slots 1
+--report-pending --watch-follow` watchdog/backup. The backup reads durable record
+age; three missed heartbeat intervals make it emit `listener-dead` on stdout with
+the exact stream re-arm command. Together they are persistent coverage `live/2`.
+On hosts without a persistent stdout
+monitor, a tracked generation-bound `listen` pool remains the portable path. A
+doorbell exit triggers `relay --new --json`; the controller processes chosen items,
+CAS-advances their server-known positions, then re-arms.
 Arm the wait and let work wake it. Any tool call expected to run longer than about 10
 seconds is backgrounded so typed steers remain visible and ESC/Ctrl-C cancels only
 the observer, not the detached worker.
-Updated controllers should prefer `--report-pending`, which reports an arm-time
+Portable controllers should prefer `--report-pending`, which reports an arm-time
 backlog in place and stays armed for only newer mail while omission preserves the
 exit-driven compatibility loop.
 
@@ -285,11 +292,11 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `no-blocking-cursor-task-worker`
 - **name:** Arm the event wake without blocking
 - **category:** `worker-routing-defaults`
-- **controller_does:** The orchestrator auto-claims without stealing a live different lease, backgrounds one generation-bound doorbell, peeks authoritative mail on exit, cursor-CASes processed server-known positions, re-arms, and uses a fixed-id wait only for a deliberate unclaimed join.
+- **controller_does:** The orchestrator auto-claims without stealing a live different lease, arms `follow` through a persistent stdout monitor where supported, arms one `--watch-follow` backup that reads durable record age and emits channel death on stdout after three missed beats, treats both as persistent coverage `live/2`, and retains the portable tracked-listener pool on hosts without a monitor.
 - **failure_mode:** The orchestrator blocks the interactive session or schedules a timer to ask whether a worker finished instead of arming the available event channel.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "Arm a pool of four background generation-bound `goalflight_messages.py listen --project-root \"$PWD\" --controller-label <label> --lease-nonce <nonce> --report-pending` tasks as four separate tracked calls, never a shell `&` loop; on each exit, process the reported or authoritative mail, cursor-CAS settled server-known positions, then issue the printed remaining-depth commands as separate tracked tasks to restore depth four"
+    - **pattern:** "On a host whose persistent monitor turns each flushed stdout line into a wake, arm one generation-bound `goalflight_messages.py follow --project-root \"$PWD\" --controller-label <label> --lease-nonce <nonce>` through that monitor, never shell `&`; then arm one separately tracked `listen --listener-slots 1 --report-pending --watch-follow` watchdog/backup. It reads durable record age and treats three missed heartbeat intervals as channel death"
     - **max_section_lines:** 55
 - **verifier:**
     - **kind:** behaviour-scenario

@@ -1840,6 +1840,29 @@ async function testInteractiveHistoryAndKeyedRows() {
   }
 
   {
+    const { byId } = loadConsole(
+      fleetPayload({
+        controllers: [controllerRow({
+          controller_key: "battery:stream",
+          label: "stream-controller",
+          wake_mode: "persistent",
+          listener_live: 1,
+          listener_target: 2,
+        })],
+      }),
+      attentionPayload({ items: [] })
+    );
+    const streamController = controllerEntry(byId["fleet-section"], "stream-controller");
+    assert("persistent controller shows the required backup shortage", [
+      streamController != null,
+      descendants(streamController).some((node) =>
+        node.className === "controller-pool" && node.textContent === "1/2"
+      ),
+      !streamController.textContent.includes("1/4"),
+    ].every(Boolean));
+  }
+
+  {
     const mainWorkers = [workerRow({
       dispatch_id: "webui-main",
       controller_label: "webui",

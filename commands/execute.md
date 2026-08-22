@@ -66,15 +66,22 @@ forty-minute one idles the fast result for 38 minutes. Group by expected
 duration; wait separately on anything you need back early.
 
 **Arm the wait; let it wake you.** A controller entry auto-claims its canonical
-project lease, then backgrounds one generation-bound `goalflight_messages.py
-listen --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>`.
-When it exits, peek with `relay --new --json`, process the items, cursor-CAS their
-server-known positions with `advance`, then re-arm; an unclaimed
+project lease. On a host whose persistent monitor turns each flushed stdout line
+into a wake, arm one generation-bound `goalflight_messages.py follow --project-root
+"$PWD" --controller-label <label> --lease-nonce <nonce>` through that monitor —
+never through ordinary shell backgrounding — and keep one tracked `listen
+--listener-slots 1 --report-pending --watch-follow` watchdog/backup doorbell.
+It reads the stream's durable successful-record age; three missed heartbeat
+intervals emit `listener-dead` on stdout with the exact monitor re-arm command.
+Treat the stream and backup as shared persistent coverage `live/2`. On hosts without that
+monitor (codex, grok, cursor, opencode), keep the portable tracked `listen` pool:
+when one exits, peek with `relay --new --json`, process the items, cursor-CAS their
+server-known positions with `advance`, then re-arm. An unclaimed
 fixed-set join backgrounds the printed `goalflight_status.py --wait <ids>`
 command. Do not block the turn on either. A timer is only for non-notifiable
 external state such as CI, a remote queue, or a deploy. Scheduling one to ask
 whether a worker finished is polling a channel that would have told you.
-Updated controllers should prefer `--report-pending`, which reports an arm-time
+Portable controllers should prefer `--report-pending`, which reports an arm-time
 backlog in place and stays armed for only newer mail while omission preserves the
 exit-driven compatibility loop.
 

@@ -91,7 +91,98 @@ patch, `git apply` otherwise). The body is in the receipted envelope
 (`relay --drain --json`, or `read --dispatch-id <id> --last 1`). Worker-terminal
 state-change notices still appear; they sort after signal.
 
-## Pop-one listener pool
+## Persistent newline wake (hosts with a stdout monitor)
+
+Prefer one persistent stream when the host has a monitor whose contract says that
+each flushed stdout line becomes a controller notification. Arm the process through
+that monitor operation itself, with the repository as its working directory and this
+exact command:
+
+```bash
+python3 <skill-root>/scripts/goalflight_messages.py follow \
+  --project-root "$PWD" \
+  --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
+  --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE"
+```
+
+Do **not** run this with shell `&`, `nohup`, a detached dispatcher, or an ordinary
+background-task surface that reports output only when the process exits. Those forms
+can keep the process alive but cannot turn its lines into controller wakes. The host
+monitor must own stdout directly. Stderr is diagnostic-only and deliberately does not
+wake the controller. `follow` rejects a regular-file stdout before it claims monitor
+coverage; a log file is storage, not a wake channel.
+
+The stream emits one compact JSON object per line. `kind` is always `event`,
+`heartbeat`, or `frontier`; consume every object in a host batch independently rather
+than assuming one line equals one notification. Event `payload.data` carries the full
+message payload when it fits; an oversized payload becomes a bounded `summary` with
+`truncated: true`, and its stream/dispatch identity remains available for
+`relay --new --json`. A frontier always says `advisory: information-only`; it never
+orders a mid-chunk controller to pivot. Every line, newline included, is strictly
+below the measured 512-byte `PIPE_BUF`.
+
+Frontiers come from the materialized task projection, never the mutating/locking
+`goalflight_task.py next` path. They carry projection `age_s` and say `state:
+projected`, or `state: stale` when the canonical task file is newer or the projection
+is at least one hour old, so an old projected title cannot masquerade as an
+authoritative instruction.
+
+The default heartbeat is 120 seconds. The lower bound is host event-rate protection:
+a seconds-scale heartbeat can make the host auto-stop a noisy monitor and recreate
+deafness. The upper bound is detection latency: a reaped stream must become visible
+within minutes, not by accidental later inspection. Production configuration rejects
+cadences below 60 or above 300 seconds. Measurements on a box carrying
+six-plus concurrent workers showed that a 30-second grace sits inside ordinary
+scheduling jitter, so death requires three full missed heartbeat intervals (360
+seconds at the default cadence). Every successful stdout record updates generation-
+bound durable liveness state. The separately tracked backup below reads that state on
+each poll; stale, faulted, missing, or invalid state makes it emit a structural
+`event`/`listener-dead` record on stdout and exit, so the tracked task wakes the
+controller with the exact persistent re-arm command. Any event is also liveness
+evidence and defers the next idle heartbeat, so a batched heartbeat never claims "no
+mail" beside an event. An unchanged frontier emits only every 15 minutes; a change
+emits on the next idle beat.
+
+The monitor is tracked, not immortal. The host may reap it; stopped heartbeats make
+that failure detectable. Keep **one** portable backup doorbell as a separate tracked
+task:
+
+```bash
+python3 <skill-root>/scripts/goalflight_messages.py listen \
+  --project-root "$PWD" \
+  --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
+  --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE" \
+  --listener-slots 1 \
+  --report-pending \
+  --watch-follow
+```
+
+Arm the stream first, then this watchdog/doorbell. `--watch-follow` allows 15 seconds
+for the stream's durable state to appear, preventing an invalid or missing state file
+from becoming silent death. Persistent coverage is two required components: one live,
+healthy monitor stream and this one backup. Status, entry hints, and fleet output all
+use that shared `live/2` predicate; after stream loss the backup remains persistent
+coverage `1/2`, never a portable `1/4` pool.
+
+An `EPIPE` is the only proof that the controller side is gone; the stream exits and
+releases its monitor slot. A cursor-ring reservation is rolled back if delivery did
+not complete, so the replacement stream or backup can emit the same unread event.
+`EAGAIN`/`EWOULDBLOCK` retries without rewriting the buffered line, but is bounded at
+60 seconds: prolonged backpressure records a durable fault, releases the monitor
+flock, and lets the backup wake with the fault. Journal, cursor, and ring failures
+emit a structural `event`/`listener-fault` stdout record before exit; stderr remains
+supplemental diagnostics only.
+
+`--listener-slots`, `GOALFLIGHT_LISTENER_SLOTS`, and
+`GOALFLIGHT_LISTENER_LOW_WATER` tune only portable `listen`. `follow` rejects the
+CLI flag and warns when either pool environment variable is present; an inert accepted
+knob is not a valid stream configuration.
+
+## Portable pop-one listener pool
+
+Use this path on codex, grok, cursor, opencode, and any other host with no persistent
+stdout monitor. Do not launch `follow` there: a stream whose lines are not watched
+provides no wakes.
 
 Arm a pool of four tracked background tasks for the active lease. Four is the default
 slot count — depth is resilience, not efficiency, and survives three missed re-arms.
@@ -147,7 +238,7 @@ python3 <skill-root>/scripts/goalflight_messages.py advance \
   --position '<stream>=<seq>'
 ```
 
-The tidy steady-state loop is:
+The portable steady-state loop is:
 
 1. Keep four tracked `--report-pending` listeners armed — four separate
    tracked background calls, never a shell `&` loop (one harness task

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import errno
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -28,7 +29,8 @@ except ImportError:  # pragma: no cover - documented socket-backend platform.
 import goalflight_compat
 
 
-WAITER_KINDS = frozenset({"listener", "wait"})
+MONITOR_KIND = "monitor"
+WAITER_KINDS = frozenset({"listener", "wait", MONITOR_KIND})
 LEASE_KIND = "lease"
 LOCK_KINDS = WAITER_KINDS | {LEASE_KIND}
 ENTRY_POLL_WINDOW_S = 1.0
@@ -38,6 +40,10 @@ _GENERATION_FILE_VERSION = "generation-v1"
 _LISTENER_SLOT_FILE_VERSION = "listener-slot-v1"
 _RING_STAMP_FILE_VERSION = "ring-stamp-v1"
 _PENDING_REPORT_FILE_VERSION = "pending-report-v1"
+_MONITOR_STATE_FILE_VERSION = "monitor-state-v1"
+MONITOR_STATE_SCHEMA = "goalflight.monitor-state.v1"
+PERSISTENT_WAKE_TARGET = 2
+_OBSERVED_WAITERS_UNSET = object()
 _LEASE_EVENT_SCHEMA = "goalflight.lease-generation-event.v1"
 # Depth is resilience, not efficiency: one event wakes exactly one slot, so
 # the remaining slots are the margin for a controller that forgets to re-arm.
@@ -302,6 +308,218 @@ def _pending_report_path(
         f"{_PENDING_REPORT_FILE_VERSION}.{_label_hash(controller_label)}."
         f"{_label_hash(lease_nonce)}.claimed"
     )
+
+
+def _monitor_state_path(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+) -> Path:
+    label = str(controller_label or "").strip()
+    if not label:
+        raise ValueError("controller label is required")
+    return ledger_dir(project_root) / (
+        f"{_MONITOR_STATE_FILE_VERSION}.{_label_hash(label)}.json"
+    )
+
+
+def _monitor_generation_digest(lease_nonce: str) -> str:
+    nonce = str(lease_nonce or "").strip()
+    if not nonce:
+        raise ValueError("monitor lease nonce is required")
+    return hashlib.sha256(nonce.encode("utf-8")).hexdigest()[:24]
+
+
+def _validate_monitor_timing(heartbeat_s: float, dead_after_s: float) -> tuple[float, float]:
+    heartbeat = float(heartbeat_s)
+    dead_after = float(dead_after_s)
+    if (
+        not math.isfinite(heartbeat)
+        or heartbeat <= 0
+        or not math.isfinite(dead_after)
+        or dead_after < heartbeat
+    ):
+        raise ValueError("monitor timing must be finite and dead-after >= heartbeat")
+    return heartbeat, dead_after
+
+
+def _write_monitor_state(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as handle:
+            tmp_name = handle.name
+            json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+        tmp_name = None
+        directory_fd = _open_ledger_directory_path(path.parent, create=False)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if tmp_name is not None:
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def activate_monitor_state(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    heartbeat_s: float,
+    dead_after_s: float,
+    now_epoch: float | None = None,
+) -> dict[str, object]:
+    heartbeat, dead_after = _validate_monitor_timing(heartbeat_s, dead_after_s)
+    now = time.time() if now_epoch is None else float(now_epoch)
+    payload: dict[str, object] = {
+        "schema": MONITOR_STATE_SCHEMA,
+        "generation": _monitor_generation_digest(lease_nonce),
+        "activated_at_epoch": now,
+        "last_record_at_epoch": None,
+        "last_kind": None,
+        "heartbeat_s": heartbeat,
+        "dead_after_s": dead_after,
+        "fault": None,
+    }
+    _write_monitor_state(
+        _monitor_state_path(project_root, controller_label=controller_label),
+        payload,
+    )
+    return payload
+
+
+def _load_monitor_state(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> dict[str, object] | None:
+    path = _monitor_state_path(project_root, controller_label=controller_label)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != MONITOR_STATE_SCHEMA
+        or payload.get("generation") != _monitor_generation_digest(lease_nonce)
+    ):
+        return None
+    return payload
+
+
+def record_monitor_emit(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    record_kind: str,
+    now_epoch: float | None = None,
+) -> None:
+    payload = _load_monitor_state(
+        project_root,
+        controller_label=controller_label,
+        lease_nonce=lease_nonce,
+    )
+    if payload is None:
+        raise RuntimeError("monitor capability state is unavailable")
+    payload["last_record_at_epoch"] = (
+        time.time() if now_epoch is None else float(now_epoch)
+    )
+    payload["last_kind"] = str(record_kind or "")[:32]
+    payload["fault"] = None
+    _write_monitor_state(
+        _monitor_state_path(project_root, controller_label=controller_label),
+        payload,
+    )
+
+
+def record_monitor_fault(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    reason: str,
+    detail: str = "",
+    now_epoch: float | None = None,
+) -> None:
+    payload = _load_monitor_state(
+        project_root,
+        controller_label=controller_label,
+        lease_nonce=lease_nonce,
+    )
+    if payload is None:
+        raise RuntimeError("monitor capability state is unavailable")
+    payload["fault"] = {
+        "reason": str(reason or "unknown")[:80],
+        "detail": str(detail or "")[:160],
+        "at_epoch": time.time() if now_epoch is None else float(now_epoch),
+    }
+    _write_monitor_state(
+        _monitor_state_path(project_root, controller_label=controller_label),
+        payload,
+    )
+
+
+def monitor_status(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    now_epoch: float | None = None,
+) -> dict[str, object] | None:
+    payload = _load_monitor_state(
+        project_root,
+        controller_label=controller_label,
+        lease_nonce=lease_nonce,
+    )
+    if payload is None:
+        return None
+    now = time.time() if now_epoch is None else float(now_epoch)
+    try:
+        activated = float(payload["activated_at_epoch"])
+        last_raw = payload.get("last_record_at_epoch")
+        last_record = float(last_raw) if last_raw is not None else None
+        heartbeat, dead_after = _validate_monitor_timing(
+            float(payload["heartbeat_s"]),
+            float(payload["dead_after_s"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    age = max(0.0, now - (last_record if last_record is not None else activated))
+    fault = payload.get("fault")
+    state = (
+        "fault"
+        if isinstance(fault, dict)
+        else "stale"
+        if age >= dead_after
+        else "awaiting-first-record"
+        if last_record is None
+        else "recent"
+    )
+    return {
+        "capable": True,
+        "state": state,
+        "age_s": age,
+        "heartbeat_s": heartbeat,
+        "dead_after_s": dead_after,
+        "last_kind": payload.get("last_kind"),
+        "fault": fault if isinstance(fault, dict) else None,
+    }
 
 
 def claim_pending_report(
@@ -1038,6 +1256,70 @@ def claim_ring(
         os.close(directory_fd)
 
 
+def release_ring_claim(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    cursor_version: int,
+) -> bool:
+    """Release this cursor-version reservation after delivery failed.
+
+    The compare under the same ring lock is load-bearing: a failed old writer
+    must never erase a newer cursor claim. Removing the matching stamp makes
+    the unread cursor immediately claimable by a replacement listener.
+    """
+    label = str(controller_label or "").strip()
+    if not label:
+        raise ValueError("controller label is required")
+    if (
+        not isinstance(cursor_version, int)
+        or isinstance(cursor_version, bool)
+        or cursor_version < 0
+    ):
+        raise ValueError("cursor version must be a non-negative integer")
+    path = _ring_stamp_path(project_root, controller_label=label)
+    lock_path = _ring_stamp_lock_path(project_root, controller_label=label)
+    directory_fd = _open_ledger_directory_path(path.parent, create=True)
+    lock_fd = -1
+    try:
+        deadline = time.monotonic() + 1.0
+        while True:
+            try:
+                lock_fd = _acquire_contended_lock(
+                    lock_path,
+                    directory_fd=directory_fd,
+                )
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("timed out releasing listener ring claim")
+                time.sleep(0.01)
+        try:
+            stamp_fd = os.open(path.name, _open_flags(), dir_fd=directory_fd)
+        except FileNotFoundError:
+            return False
+        try:
+            raw = os.read(stamp_fd, 65)
+        finally:
+            os.close(stamp_fd)
+        try:
+            observed = int(raw.decode("ascii").strip())
+        except (UnicodeDecodeError, ValueError):
+            return False
+        if observed != cursor_version:
+            return False
+        _unlink_at(directory_fd, path.name)
+        os.fsync(directory_fd)
+        return True
+    finally:
+        if lock_fd >= 0:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        os.close(directory_fd)
+
+
 def _lease_lock_identity(label: str, nonce: str) -> str:
     normalized_label = str(label or "").strip()
     normalized_nonce = str(nonce or "").strip()
@@ -1230,9 +1512,12 @@ def coverage_status(
     project_root: Path | str,
     *,
     controller_label: str | None,
+    lease_nonce: str | None = None,
+    now_epoch: float | None = None,
+    observed_waiters: list[WaiterRecord] | None | object = _OBSERVED_WAITERS_UNSET,
 ) -> dict[str, object]:
-    target_waiters = listener_slot_count()
     if not controller_label:
+        target_waiters = listener_slot_count()
         return {
             "covered": False,
             "reason": "missing-label",
@@ -1241,36 +1526,308 @@ def coverage_status(
             "waiters": [],
             "monitor": {"required": False, "state": "not-applicable"},
         }
-    waiters = live_waiters(
-        project_root,
-        controller_label=controller_label,
-        kinds={"listener"},
+    durable_monitor = (
+        monitor_status(
+            project_root,
+            controller_label=controller_label,
+            lease_nonce=lease_nonce,
+            now_epoch=now_epoch,
+        )
+        if lease_nonce
+        else None
     )
+    waiters = (
+        live_waiters(
+            project_root,
+            controller_label=controller_label,
+            kinds={"listener", MONITOR_KIND},
+        )
+        if observed_waiters is _OBSERVED_WAITERS_UNSET
+        else observed_waiters
+    )
+    if waiters is not None and not isinstance(waiters, list):
+        raise TypeError("observed_waiters must be a waiter list or None")
     if waiters is None:
+        persistent = durable_monitor is not None
+        target_waiters = (
+            PERSISTENT_WAKE_TARGET if persistent else listener_slot_count()
+        )
         return {
             "covered": False,
             "reason": "waiter-probe-unavailable",
             "live_waiters": None,
             "target_waiters": target_waiters,
             "waiters": [],
-            "monitor": {"required": False, "state": "not-applicable"},
+            "monitor": {
+                "required": persistent,
+                "state": (
+                    str(durable_monitor.get("state") or "unknown")
+                    if durable_monitor
+                    else "not-applicable"
+                ),
+            },
+            **({"wake_mode": "persistent"} if persistent else {}),
         }
+    monitor_waiters = [row for row in waiters if row.kind == MONITOR_KIND]
+    portable_waiters = [row for row in waiters if row.kind == "listener"]
+    persistent = bool(monitor_waiters) or durable_monitor is not None
+    serialized_waiters = [
+        {
+            "kind": row.kind,
+            "pid": row.pid,
+            "instance_id": row.instance_id,
+            "path": str(row.path),
+        }
+        for row in waiters
+    ]
+    if persistent:
+        durable_state = (
+            str(durable_monitor.get("state") or "unknown")
+            if durable_monitor
+            else "untracked"
+        )
+        monitor_lock_live = bool(monitor_waiters)
+        monitor_healthy = monitor_lock_live and durable_state not in {
+            "fault",
+            "stale",
+        }
+        backup_live = bool(portable_waiters)
+        monitor_state = (
+            durable_state
+            if durable_state in {"fault", "stale"}
+            else "live"
+            if monitor_lock_live
+            else "missing"
+        )
+        missing_components = []
+        if not monitor_healthy:
+            missing_components.append("stream")
+        if not backup_live:
+            missing_components.append("backup")
+        if monitor_state == "fault":
+            reason = "persistent-monitor-fault"
+        elif monitor_state == "stale":
+            reason = "persistent-monitor-stale"
+        elif not monitor_lock_live:
+            reason = "persistent-monitor-missing"
+        elif not backup_live:
+            reason = "persistent-backup-missing"
+        else:
+            reason = "persistent-covered"
+        return {
+            "covered": monitor_healthy and backup_live,
+            "reason": reason,
+            "live_waiters": int(monitor_healthy) + int(backup_live),
+            "target_waiters": PERSISTENT_WAKE_TARGET,
+            "waiters": serialized_waiters,
+            "monitor": {
+                "required": True,
+                "state": monitor_state,
+                "lock_live": monitor_lock_live,
+                "age_s": (
+                    durable_monitor.get("age_s") if durable_monitor else None
+                ),
+                "dead_after_s": (
+                    durable_monitor.get("dead_after_s")
+                    if durable_monitor
+                    else None
+                ),
+                "fault": (
+                    durable_monitor.get("fault") if durable_monitor else None
+                ),
+            },
+            "backup": {
+                "required": True,
+                "state": "live" if backup_live else "missing",
+                "observed": len(portable_waiters),
+            },
+            "wake_mode": "persistent",
+            "portable_live_waiters": len(portable_waiters),
+            "portable_target_waiters": 1,
+            "missing_components": missing_components,
+        }
+    target_waiters = listener_slot_count()
     return {
         "covered": bool(waiters),
         "reason": "held-flock" if waiters else "no-live-waiter-lock",
         "live_waiters": len(waiters),
         "target_waiters": target_waiters,
-        "waiters": [
-            {
-                "kind": row.kind,
-                "pid": row.pid,
-                "instance_id": row.instance_id,
-                "path": str(row.path),
-            }
-            for row in waiters
-        ],
+        "waiters": serialized_waiters,
         "monitor": {"required": False, "state": "not-applicable"},
+        "backup": {"required": False, "state": "not-applicable"},
+        "wake_mode": "portable",
     }
+
+
+def follow_start_command(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> str:
+    messages_script = goalflight_compat.advertised_script(
+        "goalflight_messages.py",
+        running_file=__file__,
+    )
+    return shlex.join(
+        [
+            "python3",
+            str(messages_script),
+            "follow",
+            "--project-root",
+            str(Path(project_root).expanduser().resolve(strict=False)),
+            "--controller-label",
+            controller_label,
+            "--lease-nonce",
+            lease_nonce,
+        ]
+    )
+
+
+def persistent_backup_start_command(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> str:
+    messages_script = goalflight_compat.advertised_script(
+        "goalflight_messages.py",
+        running_file=__file__,
+    )
+    return shlex.join(
+        [
+            "python3",
+            str(messages_script),
+            "listen",
+            "--project-root",
+            str(Path(project_root).expanduser().resolve(strict=False)),
+            "--controller-label",
+            controller_label,
+            "--lease-nonce",
+            lease_nonce,
+            "--listener-slots",
+            "1",
+            "--report-pending",
+            "--watch-follow",
+        ]
+    )
+
+
+def coverage_rearm_commands(
+    status: dict[str, object],
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str | None = None,
+) -> list[str]:
+    """Return exact tracked-task commands for the missing wake components."""
+    live = status.get("live_waiters")
+    target = int(status.get("target_waiters") or listener_slot_count())
+    missing = max(0, target - (live if isinstance(live, int) else 0))
+    if status.get("wake_mode") != "persistent":
+        command = listener_start_command(
+            project_root,
+            controller_label=controller_label,
+        )
+        return [command for _ in range(missing)]
+    nonce = str(lease_nonce or "").strip()
+    if not nonce:
+        return []
+    commands: list[str] = []
+    components = status.get("missing_components")
+    for component in components if isinstance(components, list) else []:
+        if component == "stream":
+            commands.append(
+                follow_start_command(
+                    project_root,
+                    controller_label=controller_label,
+                    lease_nonce=nonce,
+                )
+            )
+        elif component == "backup":
+            commands.append(
+                persistent_backup_start_command(
+                    project_root,
+                    controller_label=controller_label,
+                    lease_nonce=nonce,
+                )
+            )
+    return commands
+
+
+def coverage_rearm_plan(
+    status: dict[str, object],
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str | None = None,
+    work_in_flight: bool,
+) -> dict[str, object]:
+    """Build one plan from the shared coverage predicate for every consumer."""
+    live_value = status.get("live_waiters")
+    live = live_value if isinstance(live_value, int) else 0
+    target = int(status.get("target_waiters") or listener_slot_count())
+    commands = coverage_rearm_commands(
+        status,
+        project_root,
+        controller_label=controller_label,
+        lease_nonce=lease_nonce,
+    )
+    fallback = listener_start_command(
+        project_root,
+        controller_label=controller_label,
+    )
+    plan = listener_depth_plan(
+        live,
+        target,
+        commands[0] if commands else fallback,
+        work_in_flight=work_in_flight,
+    )
+    plan["wake_mode"] = status.get("wake_mode") or "portable"
+    plan["reason"] = status.get("reason")
+    if status.get("wake_mode") == "persistent":
+        plan["commands"] = commands
+        plan["missing_components"] = list(
+            status.get("missing_components") or []
+        )
+    return plan
+
+
+def coverage_rearm_hint(plan: dict[str, object]) -> str:
+    """Render a plan without pretending stream and backup are identical slots."""
+    if not bool(plan.get("work_in_flight")):
+        return ""
+    live = int(plan.get("live") or 0)
+    target = int(plan.get("target") or 0)
+    missing = int(plan.get("missing") or 0)
+    if missing == 0:
+        return ""
+    if plan.get("wake_mode") != "persistent":
+        return listener_reserve_hint(
+            live,
+            target,
+            str(plan.get("command") or ""),
+        )
+    commands = [str(row) for row in plan.get("commands") or []]
+    components = [str(row) for row in plan.get("missing_components") or []]
+    names = ", ".join(components) if components else "unknown"
+    header = f"persistent wake coverage {live}/{target} — missing {names}:"
+    if not commands:
+        return f"{header}\n(no safe re-arm command: controller lease unavailable)"
+    numbered_rows = []
+    for index, (component, command) in enumerate(
+        zip(components, commands),
+        1,
+    ):
+        instruction = (
+            "arm through the host persistent stdout monitor; never ordinary "
+            "backgrounding"
+            if component == "stream"
+            else "arm as its own tracked background task"
+        )
+        numbered_rows.append(f"{index}. {component}: {instruction}: {command}")
+    numbered = "\n".join(numbered_rows)
+    return f"{header}\n{numbered}"
 
 
 def listener_start_command(
@@ -1311,6 +1868,7 @@ def check_tool_entry(
     project_root: Path | str,
     *,
     controller_label: str | None,
+    controller_lease_nonce: str | None = None,
     controller_claimed: bool,
     mail_bearing: bool,
     pending_probe: Callable[[], str | None] | None = None,
@@ -1331,7 +1889,11 @@ def check_tool_entry(
             "waiters": [],
             "monitor": {"required": False, "state": "not-applicable"},
         }
-    status = coverage_status(project_root, controller_label=controller_label)
+    status = coverage_status(
+        project_root,
+        controller_label=controller_label,
+        lease_nonce=controller_lease_nonce,
+    )
     live_waiters = status.get("live_waiters")
     target_waiters = int(status.get("target_waiters") or listener_slot_count())
     if isinstance(live_waiters, int) and live_waiters >= target_waiters:
@@ -1345,10 +1907,20 @@ def check_tool_entry(
             file=output,
         )
     else:
-        print(
-            listener_reserve_hint(int(live_waiters or 0), target_waiters, command),
-            file=output,
+        plan = coverage_rearm_plan(
+            status,
+            project_root,
+            controller_label=str(controller_label or ""),
+            lease_nonce=controller_lease_nonce,
+            work_in_flight=True,
         )
+        hint = coverage_rearm_hint(plan)
+        if hint:
+            print(hint, file=output)
+        status["rearm_plan"] = plan
+        commands = plan.get("commands") or []
+        if commands:
+            command = str(commands[0])
     status["start_command"] = command
     if pending_probe is None:
         return status

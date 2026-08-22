@@ -853,24 +853,21 @@ def live_session(
 def _listener_depth_after_claim(
     project_root: Path,
     label: str,
+    lease_nonce: str,
 ) -> dict[str, object] | None:
     """Fail-open remaining-depth plan so a claim never blocks on the wake plane."""
     try:
         status = goalflight_wake.coverage_status(
-            project_root, controller_label=label
-        )
-        live = status.get("live_waiters")
-        target = int(
-            status.get("target_waiters") or goalflight_wake.listener_slot_count()
+            project_root,
+            controller_label=label,
+            lease_nonce=lease_nonce,
         )
         authority = goalflight_journal.Journal.open_reader(project_root)
-        command = goalflight_wake.listener_start_command(
-            project_root, controller_label=label
-        )
-        return goalflight_wake.listener_depth_plan(
-            live if isinstance(live, int) else 0,
-            target,
-            command,
+        return goalflight_wake.coverage_rearm_plan(
+            status,
+            project_root,
+            controller_label=label,
+            lease_nonce=lease_nonce,
             work_in_flight=authority.care_work_exists(label),
         )
     except Exception:
@@ -965,7 +962,11 @@ def claim_controller_startup(
     result = {"claimed": True, "session": record}
     if resolution.get("warning"):
         result["warnings"] = [resolution["warning"]]
-    depth = _listener_depth_after_claim(project_root, resolved_label)
+    depth = _listener_depth_after_claim(
+        project_root,
+        resolved_label,
+        str(record["id"]),
+    )
     if depth is not None:
         result["listener_depth"] = depth
     return result

@@ -141,6 +141,9 @@ def test_controller_mail_exit_code_actions_and_skill_pool_instruction() -> None:
     controller_entry = next(
         line for line in skill.splitlines() if line.startswith("Controller entry auto-claims")
     )
-    assert "pool of four" in controller_entry
-    assert "--report-pending" in controller_entry
-    assert "restore depth four" in controller_entry
+    assert "goalflight_messages.py follow" in controller_entry
+    assert "three missed heartbeat intervals" in controller_entry
+    assert "listen --listener-slots 1 --report-pending --watch-follow" in controller_entry
+    assert "live/2" in controller_entry
+    assert "portable pool of four" in controller_entry
+    assert "restore depth" in controller_entry

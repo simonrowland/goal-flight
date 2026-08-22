@@ -300,6 +300,7 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             "controller_liveness_state": None,
             "listener_live": None,
             "listener_target": None,
+            "wake_mode": None,
             "in_flight_count": None,
             "owned_live": None,
             "last_seen": None,
@@ -1290,6 +1291,7 @@ def _empty_controller_context() -> dict[str, object | None]:
         "liveness_state": "UNKNOWN",
         "listener_live": None,
         "listener_target": None,
+        "wake_mode": None,
         "in_flight_count": 0,
         "last_seen": None,
         "last_error": "journal unreadable",
@@ -1309,6 +1311,7 @@ def _controller_panel_row(
     in_flight = context.get("in_flight_count")
     listener_live = context.get("listener_live")
     listener_target = context.get("listener_target")
+    wake_mode = context.get("wake_mode")
     retire = (
         _controller_retire_command(label)
         if state == "DEAD" and label
@@ -1341,6 +1344,7 @@ def _controller_panel_row(
         "controller_liveness_state": state,
         "listener_live": listener_live if isinstance(listener_live, int) and not isinstance(listener_live, bool) else None,
         "listener_target": listener_target if isinstance(listener_target, int) and not isinstance(listener_target, bool) else None,
+        "wake_mode": wake_mode if wake_mode in {"persistent", "portable"} else None,
         "in_flight_count": in_flight if isinstance(in_flight, int) and not isinstance(in_flight, bool) and in_flight >= 0 else 0,
         "owned_live": 0,
         "last_seen": _iso_timestamp(context.get("last_seen")),
@@ -1411,6 +1415,7 @@ def _aggregate_controller_rows(
             current["controller_liveness_state"] = row.get("controller_liveness_state")
             current["listener_live"] = row.get("listener_live")
             current["listener_target"] = row.get("listener_target")
+            current["wake_mode"] = row.get("wake_mode")
             current["generation"] = row.get("generation")
             current["retire_command"] = row.get("retire_command")
             current["last_error"] = row.get("last_error")
@@ -1635,7 +1640,7 @@ def _controller_contexts_by_session(
         matches = active_rows.get(session_id, []) or locked_ended_rows.get(
             session_id, []
         )
-        listener_records: list[Any] | None = []
+        wake_coverage: dict[str, object] | None = None
         lock_reason: str | None = None
         probe_error: str | None = None
         if not matches:
@@ -1664,14 +1669,17 @@ def _controller_contexts_by_session(
                 )
                 if live_waiters is None:
                     live_waiter_count = None
-                    listener_records = None
                 else:
                     live_waiter_count = len(live_waiters)
-                    listener_records = list(live_waiters)
+                wake_coverage = goalflight_wake.coverage_status(
+                    project_root,
+                    controller_label=label,
+                    lease_nonce=raw_nonce,
+                    observed_waiters=live_waiters,
+                )
             except (OSError, RuntimeError, ValueError) as exc:
                 holder_lock = None
                 live_waiter_count = None
-                listener_records = None
                 probe_error = type(exc).__name__
                 lock_reason = "lease probe failed"
         in_flight_count = _journal_in_flight_count(
@@ -1690,16 +1698,25 @@ def _controller_contexts_by_session(
             last_seen = generation_rows[0].get("renewed_at") or generation_rows[0].get(
                 "claimed_at"
             )
-        try:
-            listener_target: int | None = goalflight_wake.listener_slot_count()
-        except ValueError:
+        listener_live = (
+            wake_coverage.get("live_waiters")
+            if isinstance(wake_coverage, dict)
+            else None
+        )
+        if not isinstance(listener_live, int) or isinstance(listener_live, bool):
+            listener_live = None
+        listener_target = (
+            wake_coverage.get("target_waiters")
+            if isinstance(wake_coverage, dict)
+            else None
+        )
+        if not isinstance(listener_target, int) or isinstance(listener_target, bool):
             listener_target = None
-        if listener_records is None:
-            listener_live: int | None = None
-        else:
-            listener_live = sum(
-                1 for waiter in listener_records if getattr(waiter, "kind", None) == "listener"
-            )
+        wake_mode = (
+            wake_coverage.get("wake_mode")
+            if isinstance(wake_coverage, dict)
+            else None
+        )
         contexts[session_id] = {
             "label": label,
             "generation": generation,
@@ -1710,6 +1727,9 @@ def _controller_contexts_by_session(
             ),
             "listener_live": listener_live,
             "listener_target": listener_target,
+            "wake_mode": (
+                wake_mode if wake_mode in {"persistent", "portable"} else None
+            ),
             "in_flight_count": in_flight_count,
             "last_seen": last_seen,
             "last_error": _controller_unknown_error(

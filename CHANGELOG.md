@@ -8,6 +8,16 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- Hosts with a persistent stdout monitor can arm one `goalflight_messages.py
+  follow` JSON-line stream. Flushed event, heartbeat, and informational-frontier
+  records stay below macOS `PIPE_BUF`; old projections carry age and become
+  structurally stale. `EPIPE` rolls back an undelivered cursor-ring reservation
+  and releases the monitor lock, while `EAGAIN` is bounded and becomes durable
+  fault state. One tracked `listen --watch-follow` backup reads durable record
+  age and emits `listener-dead` on stdout after three missed beats. Monitor-
+  backed controllers share one stream-plus-backup `live/2` coverage predicate;
+  portable hosts retain the four-slot `listen` pool. Regular-file stdout and
+  stream-only pool knobs are rejected instead of silently accepted.
 - Terminal mail carries the worker's own COMPLETE/BLOCKED headline instead of
   `dispatch terminal: <state>`. The headline travels on a dedicated observation
   field, not the error channel, so a clean completion still has top-level

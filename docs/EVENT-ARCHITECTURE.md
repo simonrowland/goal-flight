@@ -311,7 +311,7 @@ as a wake. Three line kinds, structurally distinguishable:
 |---|---|---|
 | **event** | mail arrived | the payload |
 | **heartbeat** | nothing arrived | proof the channel is open |
-| **frontier** | periodic | the store's `next` — so a wake arrives with work in hand |
+| **frontier** | periodic | a non-authoritative materialized projection of the store frontier |
 
 ### What it deletes
 
@@ -353,9 +353,11 @@ with one listener there is no pool to blank — and supplies the orphan reaper
 If compaction leaves the process running but the host stops **surfacing** its
 lines, the write still succeeds while nobody is semantically listening. The
 listener cannot detect this — its pipe is fine. It collapses into the
-controller's side: heartbeats stop arriving, and missing heartbeats read as
-death. **The controller-side timeout therefore stays load-bearing** and must not
-be dropped merely because the listener has `EPIPE` detection.
+backup supervisor's side: durable successful-record time stops advancing, and
+missing heartbeats read as death. **The independently tracked watchdog timeout
+therefore stays load-bearing** and must not be dropped merely because the
+listener has `EPIPE` detection. The supervisor emits `listener-dead` on its
+waking stdout/exit channel; stderr is not a substitute.
 
 ### Invariants this must satisfy
 
@@ -387,3 +389,60 @@ task, and this host reaps those — 149 exit-144 events since 2026-06-13 across
 many task kinds. The stream is cheaper per event than a pool; it is not more
 durable than one. That is an argument for keeping one backup doorbell, not
 against the design.
+
+### Implemented contract
+
+`goalflight_messages.py follow` is the persistent JSON-line surface. The host
+persistent monitor must own its stdout directly; ordinary shell backgrounding,
+detaching, or a task surface that reports only at process exit produces no wakes.
+Only `event`, `heartbeat`, and `frontier` records go to stdout. Diagnostics go to
+stderr, which the measured host contract does not notify. Fatal journal, cursor,
+ring, and durable-state failures are therefore structural `event` records on
+stdout as well as supplemental stderr diagnostics. A regular-file stdout is
+rejected before monitor coverage is claimed.
+
+The default heartbeat is 120 seconds: seconds-scale traffic risks the host's
+automatic noisy-monitor stop, while a multi-minute beat still turns otherwise
+indefinite deafness into a bounded failure. Production values are rejected outside
+the 60-to-300-second range. On a box carrying six-plus concurrent
+workers, a 30-second grace fell inside normal scheduling jitter. The detector now
+requires three complete missed beats: 360 seconds at the default cadence. The
+stream durably records every successful stdout record; one separately tracked
+`listen --listener-slots 1 --report-pending --watch-follow` backup polls that
+generation-bound state and emits `event`/`listener-dead` plus the persistent re-arm
+command when state is stale, faulted, missing, or invalid. This makes persistent
+coverage a shared two-component `live/2` fact. It stays persistent after stream
+death, so the surviving backup reports `1/2`, not portable `1/4`.
+Unchanged frontiers have a 15-minute floor and changed frontiers emit on the next
+idle beat. The host may batch lines produced within 200 ms, so every line is an
+independently parseable JSON object and consumers enumerate all records in a batch.
+An event defers the next idle heartbeat, avoiding a contradictory event plus
+"nothing arrived" beat in the same batch.
+
+The heartbeat path never calls `goalflight_task.py next` or `TaskStore.next_frontier`:
+those surfaces may repair publishes, scan the global dispatch ledger, and emit task
+nudges. `follow` reads only the already-materialized `tasks-data.js` projection. If
+the canonical task file is newer than that projection, the frontier is structurally
+tagged `state: stale`; otherwise it says `state: projected`, never authoritative
+`ready`, because dispatch-ledger changes can outpace the generated view. The record
+also carries projection `age_s`; an hour-old projection becomes `stale` even when
+`tasks.jsonl` has not changed.
+
+`--listener-slots`, `GOALFLIGHT_LISTENER_SLOTS`, and
+`GOALFLIGHT_LISTENER_LOW_WATER` remain portable-pool controls. `follow` rejects
+the CLI knob and warns on the environment knobs; persistent depth comes only
+from the shared stream-plus-watchdog predicate.
+
+`follow` does not create a journal `listener_coverage` row, so it has no synthetic
+`EXITED/event` row to write. Its generation-bound monitor flock is the liveness
+authority. Every exit path releases that flock and restores signal handlers; fatal
+runtime paths publish `listener-fault`, while the watchdog publishes the exact
+stream re-arm command. `EPIPE` has no re-arm payload because its reader is gone.
+The watchdog remains an ordinary `listen`, so it deliberately retains journal arm
+and exit audit, tracked-task completion, and kernel-slot release.
+
+Cursor-ring ownership is a reversible reservation until stdout delivery succeeds.
+An `EPIPE` before the first event rolls it back, leaving unread mail deliverable to
+the replacement. `EAGAIN`/`EWOULDBLOCK` retries the buffered line without spinning,
+but a 60-second stall records durable fault state and releases the monitor flock so
+the watchdog can surface it and re-arm.
