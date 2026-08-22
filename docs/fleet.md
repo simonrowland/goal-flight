@@ -31,8 +31,15 @@ Add SSH-reachable workers with the node subcommand (see
 `python3 scripts/goalflight_fleet.py node --help`). Each node record includes:
 
 - SSH host alias (must match your `~/.ssh/config`)
+- Operator-expected hostname plus the answering hostname captured over SSH
 - Repository checkout path on the remote machine
 - Allowed agent transports (for example `codex-acp`, `cursor-agent`)
+- Existing GPU serialization flock path (default `/tmp/warpx-gpu-lock`)
+
+Re-run `node add --expected-hostname <LocalHostName>` for records created before
+hostname pinning. Registration itself refuses when the alias answers as another
+host. A missing hostname pin or GPU lock file fails closed instead of assuming
+the route or GPU is safe.
 
 ### Worker node install (Mac Studio / headless SSH)
 
@@ -163,6 +170,22 @@ python3 scripts/goalflight_fleet.py dispatch \
 Live SSH is **opt-in**. Without `GOALFLIGHT_LIVE_SSH=1`, `--exec` refuses to run
 so CI stays hermetic.
 
+Every live dispatch first runs one fresh, bounded probe through the fleet SSH
+allowlist. It reports the far-end hostname, one-minute load divided by core
+count, `memory_pressure` available headroom, swap used, and whether the existing
+GPU flock is held. The dispatch result and status metadata carry those values as
+structured, unit-explicit `preflight.measurements` data, including core count and
+measurement age, so a controller can defer, reroute, or reduce concurrency
+without parsing prose. Only the hard safety floor gates: a hard result or probe
+timeout refuses before remote git or launch work. `--override-preflight` is the
+explicit operator escape; it still prints and records the refusal and
+measurements. Tune the latency bound with `--preflight-timeout-s` (default 8s).
+
+This is observation, not an atomic reservation. Two controllers can both read
+healthy headroom and then overcommit the node together; the hard floor cannot
+close that race. Closing it requires node-wide launch serialization or a remote
+capacity lease shared by every controller, analogous to the GPU flock.
+
 ### 3. Watch and reconcile
 
 ```bash
@@ -249,6 +272,7 @@ export GOALFLIGHT_FLEET_NODE=localhost   # or your SSH alias
 |---------|--------|
 | SSH allowlist rejection | Dispatch plan command class; `goalflight_fleet_ssh.py` |
 | Auth blocks `--exec` | `python3 scripts/goalflight_doctor.py --fleet --json` |
+| Preflight refuses | Read `answering_hostname`, per-core load, pressure headroom, swap, and GPU-lock fields; use `--override-preflight` only after an out-of-band node check |
 | Stuck billing lock | `reconcile --all-in-flight` |
 | Remote status stale | `watch --once`; verify remote `.goal-flight/status/` |
 | claude-acp auth red / `-32603` | `claude auth status --json` on the node; re-run `claude setup-token` and refresh `CLAUDE_CODE_OAUTH_TOKEN` in the node env |

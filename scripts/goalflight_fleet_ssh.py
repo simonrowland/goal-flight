@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import inspect
 import json
+import math
 import posixpath
 import re
 import shlex
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -83,8 +86,10 @@ def wrap_remote_argv(remote_argv: list[str]) -> list[str]:
 ALLOWED_COMMAND_CLASSES = frozenset(
     {
         "probe_echo",
+        "probe_hostname",
         "probe_repo_exists",
         "probe_script_exists",
+        "dispatch_preflight",
         "doctor",
         "status",
         "capacity",
@@ -113,6 +118,7 @@ REMEDIATION_HINTS: dict[str, str] = {
     "script_missing": "Ensure goal-flight scripts exist under the remote repo_root",
     "auth_drift": "Run adapter auth probe on the remote (e.g. codex login status)",
     "probe_failed": "Verify SSH alias, identity file, and BatchMode connectivity",
+    "probe_timeout": "Treat the node as overloaded or unreachable; retry only after checking it out of band",
     "allowlist_blocked": "Command class is not on the fleet SSH allowlist",
     "unsafe_remote_blocked": "Set unsafe_remote only after explicit USER-CONFIRM",
 }
@@ -320,7 +326,9 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
         return argv
 
     repo_root = _require_repo_root(str(params.get("repo_root") or ""))
-    if command_class == "probe_repo_exists":
+    if command_class == "probe_hostname":
+        argv = ["hostname"]
+    elif command_class == "probe_repo_exists":
         argv = ["test", "-d", repo_root]
     elif command_class == "probe_script_exists":
         script = str(params.get("script") or "scripts/goalflight_doctor.py")
@@ -335,6 +343,36 @@ def build_remote_command(command_class: str, **params: Any) -> list[str]:
     elif command_class == "capacity":
         python = _validate_remote_interpreter(python, repo_root=repo_root, field="capacity python")
         argv = [python, f"{repo_root}/scripts/goalflight_capacity.py", "status", "--json"]
+    elif command_class == "dispatch_preflight":
+        python = _validate_remote_interpreter(python, repo_root=repo_root, field="dispatch_preflight python")
+        state_dir = _validate_state_dir(
+            str(params.get("state_dir") or "~/.goal-flight"),
+            field="dispatch_preflight state_dir",
+        )
+        gpu_lock_path = _validate_declared_remote_path(
+            str(params.get("gpu_lock_path") or "/tmp/warpx-gpu-lock"),
+            ["/tmp", state_dir],
+            field="dispatch_preflight gpu_lock_path",
+        )
+        try:
+            timeout_s = float(params.get("timeout_s") or 8.0)
+        except (TypeError, ValueError) as exc:
+            raise SshAllowlistError("dispatch_preflight timeout_s must be numeric") from exc
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise SshAllowlistError("dispatch_preflight timeout_s must be finite and positive")
+        argv = [
+            python,
+            f"{repo_root}/scripts/goalflight_fleet_preflight.py",
+            "--agent",
+            str(params.get("agent") or ""),
+            "--expected-hostname",
+            str(params.get("expected_hostname") or ""),
+            "--gpu-lock-path",
+            gpu_lock_path,
+            "--timeout-s",
+            f"{timeout_s:g}",
+            "--json",
+        ]
     elif command_class == "git_prune_claude_refs":
         cleanup_python = _validate_remote_interpreter(
             str(params.get("python") or "python3"),
@@ -633,6 +671,7 @@ def build_ssh_command(
     *,
     command_class: str | None = None,
     unsafe_remote: bool = False,
+    timeout_s: float | None = None,
 ) -> list[str]:
     if command_class is not None:
         assert_allowed(command_class, unsafe_remote=unsafe_remote)
@@ -643,6 +682,20 @@ def build_ssh_command(
     else:
         target = host.hostname
     cmd = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
+    if timeout_s is not None:
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise SshAllowlistError("SSH timeout_s must be finite and positive")
+        timeout_seconds = max(1, math.ceil(timeout_s))
+        cmd.extend(
+            [
+                "-o",
+                f"ConnectTimeout={timeout_seconds}",
+                "-o",
+                f"ServerAliveInterval={timeout_seconds}",
+                "-o",
+                "ServerAliveCountMax=1",
+            ]
+        )
     if host.port:
         cmd.extend(["-p", str(host.port)])
     if host.identity_file:
@@ -699,24 +752,46 @@ def run_ssh(
     *,
     runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
     dry_run: bool = False,
+    timeout_s: float | None = None,
 ) -> dict[str, Any]:
     if dry_run:
         return {"ok": True, "dry_run": True, "argv": argv, "stdout": "", "stderr": "", "exit_code": 0}
     if runner is None:
-        import subprocess
-
         def _default_runner(cmd: list[str]) -> tuple[int, str, str]:
-            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=timeout_s,
+            )
             return proc.returncode, proc.stdout, proc.stderr
 
         runner = _default_runner
-    code, stdout, stderr = runner(argv)
+    try:
+        parameters = inspect.signature(runner).parameters
+        if timeout_s is not None and "timeout_s" in parameters:
+            code, stdout, stderr = runner(argv, timeout_s=timeout_s)  # type: ignore[call-arg]
+        else:
+            code, stdout, stderr = runner(argv)
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "argv": argv,
+            "stdout": "",
+            "stderr": f"SSH probe timed out after {timeout_s:g}s" if timeout_s is not None else "SSH probe timed out",
+            "exit_code": 124,
+            "timed_out": True,
+        }
     return {
         "ok": code == 0,
         "argv": argv,
         "stdout": stdout,
         "stderr": stderr,
         "exit_code": code,
+        "timed_out": False,
     }
 
 

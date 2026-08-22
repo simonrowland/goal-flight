@@ -411,6 +411,17 @@ def main(argv: list[str] | None = None) -> int:
     dispatch.add_argument("--exec", action="store_true", help="Acquire locks and spawn (default preview)")
     dispatch.add_argument("--stub-remote", action="store_true", help="Use stub SSH runner (tests)")
     dispatch.add_argument("--stub-terminal", action="store_true", help="Complete stub dispatch immediately")
+    dispatch.add_argument(
+        "--preflight-timeout-s",
+        type=float,
+        default=8.0,
+        help="Maximum seconds for the fresh remote load/memory probe (default 8)",
+    )
+    dispatch.add_argument(
+        "--override-preflight",
+        action="store_true",
+        help="Proceed after an explicit preflight refusal while still printing and recording measurements",
+    )
     dispatch.add_argument("--json", action="store_true")
     dispatch.set_defaults(func=cmd_dispatch)
 
@@ -514,8 +525,17 @@ def main(argv: list[str] | None = None) -> int:
     node_add = node_sub.add_parser("add", help="Onboard a remote node from an SSH alias")
     node_add.add_argument("--from-ssh", required=True, help="SSH config Host alias")
     node_add.add_argument("--node-id", help="Fleet node id (defaults to alias)")
+    node_add.add_argument(
+        "--expected-hostname",
+        help="Expected far-end hostname (defaults to node id; registration refuses a mismatch)",
+    )
     node_add.add_argument("--repo-root", help="Absolute repo path on remote host")
     node_add.add_argument("--state-dir", help="Remote goal-flight state dir")
+    node_add.add_argument(
+        "--gpu-lock-path",
+        default="/tmp/warpx-gpu-lock",
+        help="Existing remote warpx GPU flock path (default /tmp/warpx-gpu-lock)",
+    )
     node_add.add_argument("--billing-accounts", help="Comma-separated account_key values")
     node_add.add_argument("--ssh-config", type=Path, help="Path to ssh config (default ~/.ssh/config)")
     node_add.add_argument("--dry-run", action="store_true")

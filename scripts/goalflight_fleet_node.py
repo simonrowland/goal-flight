@@ -12,6 +12,7 @@ import goalflight_fleet_ssh as fleet_ssh
 
 PROBE_PLAN: tuple[tuple[str, dict[str, Any]], ...] = (
     ("probe_echo", {}),
+    ("probe_hostname", {}),
     ("probe_repo_exists", {}),
     ("probe_script_exists", {"script": "scripts/goalflight_doctor.py"}),
 )
@@ -30,17 +31,48 @@ def run_node_probes(
     repo_root: str,
     runner: Callable[[list[str]], tuple[int, str, str]] | None = None,
     dry_run: bool = False,
+    plan: tuple[tuple[str, dict[str, Any]], ...] | None = None,
+    timeout_s: float | None = None,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
-    for command_class, extra in PROBE_PLAN:
+    for command_class, extra in plan or PROBE_PLAN:
         remote = fleet_ssh.build_remote_command(command_class, repo_root=repo_root, **extra)
-        ssh_argv = fleet_ssh.build_ssh_command(host, remote, command_class=command_class)
-        result = fleet_ssh.run_ssh(ssh_argv, runner=runner, dry_run=dry_run)
+        ssh_argv = fleet_ssh.build_ssh_command(
+            host,
+            remote,
+            command_class=command_class,
+            timeout_s=timeout_s,
+        )
+        result = fleet_ssh.run_ssh(
+            ssh_argv,
+            runner=runner,
+            dry_run=dry_run,
+            timeout_s=timeout_s,
+        )
         checks.append({"command_class": command_class, **result})
         if not result["ok"]:
-            code = "repo_missing" if command_class == "probe_repo_exists" else "probe_failed"
+            if result.get("timed_out"):
+                code = "probe_timeout"
+            else:
+                code = "repo_missing" if command_class == "probe_repo_exists" else "probe_failed"
             return {"ok": False, "checks": checks, "failure_code": code}
     return {"ok": True, "checks": checks}
+
+
+def probe_answering_hostname(probe: dict[str, Any]) -> str:
+    return next(
+        (
+            str(check.get("stdout") or "").strip().splitlines()[0]
+            for check in probe.get("checks") or []
+            if check.get("command_class") == "probe_hostname" and str(check.get("stdout") or "").strip()
+        ),
+        "",
+    )
+
+
+def _canonical_hostname(value: str) -> str:
+    hostname = value.strip().lower().rstrip(".")
+    return hostname[:-6] if hostname.endswith(".local") else hostname
 
 
 def build_node_record(
@@ -52,7 +84,10 @@ def build_node_record(
     billing_accounts: list[str] | None,
     probe: dict[str, Any],
     added_at: str,
+    gpu_lock_path: str,
+    expected_hostname: str,
 ) -> dict[str, Any]:
+    answering_hostname = probe_answering_hostname(probe)
     return {
         "node_id": node_id,
         "status": "active",
@@ -65,6 +100,9 @@ def build_node_record(
         },
         "repo_root": repo_root,
         "state_dir": state_dir,
+        "expected_hostname": expected_hostname,
+        "answering_hostname": answering_hostname,
+        "gpu_lock_path": gpu_lock_path,
         "billing_accounts": billing_accounts or [],
         "added_at": added_at,
         "last_probe_at": added_at,
@@ -130,6 +168,8 @@ def add_node_from_ssh(
     ssh_alias: str,
     repo_root: str,
     state_dir: str,
+    gpu_lock_path: str = "/tmp/warpx-gpu-lock",
+    expected_hostname: str | None = None,
     node_id: str | None = None,
     billing_accounts: list[str] | None = None,
     ssh_config: Path | None = None,
@@ -142,6 +182,7 @@ def add_node_from_ssh(
 
     iso_now = iso_now or fleet.iso()
     node_id = node_id or ssh_alias
+    expected_hostname = expected_hostname or node_id
     host = fleet_ssh.parse_ssh_config(ssh_alias, ssh_config)
     probe = run_node_probes(host, repo_root=repo_root, runner=runner, dry_run=dry_run)
     if not probe["ok"]:
@@ -151,6 +192,18 @@ def add_node_from_ssh(
             "failure_code": probe.get("failure_code"),
             "remediation": fleet_ssh.REMEDIATION_HINTS.get(
                 str(probe.get("failure_code")), fleet_ssh.REMEDIATION_HINTS["probe_failed"]
+            ),
+            "checks": probe["checks"],
+        }
+    answering_hostname = probe_answering_hostname(probe)
+    if not dry_run and _canonical_hostname(answering_hostname) != _canonical_hostname(expected_hostname):
+        return {
+            "ok": False,
+            "stage": "probe",
+            "failure_code": "identity_mismatch",
+            "remediation": (
+                f"SSH alias {ssh_alias!r} answered as {answering_hostname!r}, expected "
+                f"{expected_hostname!r}; fix the route or pass the verified --expected-hostname"
             ),
             "checks": probe["checks"],
         }
@@ -166,6 +219,8 @@ def add_node_from_ssh(
         billing_accounts=billing_accounts,
         probe=probe,
         added_at=iso_now,
+        gpu_lock_path=gpu_lock_path,
+        expected_hostname=expected_hostname,
     )
     preview = preview_node_add(fleet_doc, node_id, node_entry)
     if dry_run:
@@ -198,6 +253,8 @@ def cmd_node_add(args) -> int:
         ssh_alias=args.from_ssh,
         repo_root=repo_root,
         state_dir=state_dir,
+        gpu_lock_path=getattr(args, "gpu_lock_path", "/tmp/warpx-gpu-lock"),
+        expected_hostname=getattr(args, "expected_hostname", None),
         node_id=args.node_id,
         billing_accounts=billing or None,
         ssh_config=args.ssh_config,

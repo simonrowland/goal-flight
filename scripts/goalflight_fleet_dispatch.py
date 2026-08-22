@@ -13,12 +13,14 @@ import json
 import os
 import re
 import shlex
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 import goalflight_fleet_billing as billing
+import goalflight_fleet_preflight as fleet_preflight
 import goalflight_fleet_status as status
 import goalflight_fleet_status_cli as status_cli
 import goalflight_fleet_tool_smoke as tool_smoke
@@ -101,8 +103,9 @@ def _format_remote_failure(
 
 
 class DispatchGateError(DispatchError):
-    def __init__(self, message: str, *, code: str = "blocked") -> None:
+    def __init__(self, message: str, *, code: str = "blocked", details: dict[str, Any] | None = None) -> None:
         self.code = code
+        self.details = details
         super().__init__(message)
 
 
@@ -114,6 +117,142 @@ def assert_live_ssh_opt_in() -> None:
         "CI/test safety: hermetic suites must never live-SSH; preview mode "
         "works without this opt-in."
     )
+
+
+def _parse_preflight_probe(probe: dict[str, Any]) -> dict[str, Any]:
+    if not probe.get("ok"):
+        check = (probe.get("checks") or [{}])[-1]
+        return {
+            "schema": fleet_preflight.SCHEMA,
+            "ok": False,
+            "decision": "refuse",
+            "reasons": [str(probe.get("failure_code") or "probe_failed")],
+            "error": str(check.get("stderr") or "remote preflight failed").strip(),
+            "timed_out": bool(check.get("timed_out")),
+        }
+    check = (probe.get("checks") or [{}])[-1]
+    lines = [line.strip() for line in str(check.get("stdout") or "").splitlines() if line.strip()]
+    try:
+        payload = json.loads(lines[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        return {
+            "schema": fleet_preflight.SCHEMA,
+            "ok": False,
+            "decision": "refuse",
+            "reasons": ["invalid_probe_payload"],
+            "error": f"remote preflight returned invalid JSON: {exc}",
+        }
+    if not isinstance(payload, dict) or payload.get("schema") != fleet_preflight.SCHEMA:
+        return {
+            "schema": fleet_preflight.SCHEMA,
+            "ok": False,
+            "decision": "refuse",
+            "reasons": ["invalid_probe_schema"],
+            "error": "remote preflight returned an unexpected schema",
+        }
+    return payload
+
+
+def _format_preflight_message(node_id: str, payload: dict[str, Any], *, label: str) -> str:
+    thresholds = payload.get("thresholds") or {}
+
+    def shown(value: object, suffix: str = "") -> str:
+        if isinstance(value, (int, float)):
+            return f"{float(value):.2f}{suffix}"
+        return f"unknown{suffix}"
+
+    return (
+        f"remote preflight {label} node={node_id} "
+        f"answering_hostname={payload.get('hostname') or 'unknown'} "
+        f"expected_hostname={payload.get('expected_hostname') or 'unconfigured'} "
+        f"load_per_core={shown(payload.get('load_per_core'))} "
+        f"(hard={shown(thresholds.get('hard_load_per_core'))}) "
+        f"pressure_available={shown(payload.get('pressure_available_mb'), 'MB')} "
+        f"({shown(payload.get('memory_pressure_available_percent'), '%')}) "
+        f"required_available_hard={shown(thresholds.get('hard_required_available_mb'), 'MB')} "
+        f"predicted_post_launch_headroom={shown(payload.get('predicted_post_launch_headroom_mb'), 'MB')} "
+        f"incoming_worker_rss={shown(thresholds.get('incoming_worker_rss_mb'), 'MB')} "
+        f"controller_reserve={shown(thresholds.get('controller_reserve_mb'), 'MB')} "
+        f"gpu_extra_reserve={shown(thresholds.get('gpu_extra_reserve_mb'), 'MB')} "
+        f"swap_used={shown(payload.get('swap_used_mb'), 'MB')} "
+        f"gpu_lock={payload.get('gpu_lock_state') or 'unknown'} "
+        f"timeout={shown(payload.get('timeout_s'), 's')} "
+        f"reasons={','.join(str(x) for x in payload.get('reasons') or []) or 'none'}"
+    )
+
+
+def run_dispatch_preflight(
+    fleet_dir: Path,
+    preview: "DispatchPreview",
+    *,
+    runner: Callable[[list[str]], tuple[int, str, str]],
+    timeout_s: float,
+    override: bool = False,
+) -> dict[str, Any]:
+    import goalflight_fleet_node as fleet_node
+    import goalflight_fleet_ssh as fleet_ssh
+    import goalflight_fleet_store as fleet
+
+    probe_started = time.monotonic()
+    try:
+        timeout_s = fleet_preflight.normalize_timeout_s(timeout_s)
+    except fleet_preflight.ProbeCollectionError as exc:
+        raise DispatchGateError(f"remote preflight REFUSE node={preview.node_id} {exc}", code="preflight") from exc
+    fleet_doc = fleet.read_json(fleet_dir / "fleet.json")
+    node_entry = (fleet_doc.get("nodes") or {}).get(preview.node_id) or {}
+    host = fleet_ssh.host_from_node_entry(preview.node_id, node_entry)
+    repo_root = str(node_entry.get("repo_root") or "")
+    expected_hostname = str(
+        node_entry.get("expected_hostname") or node_entry.get("answering_hostname") or ""
+    )
+    remote_expected_hostname = expected_hostname or fleet_preflight.UNPINNED_HOSTNAME
+    gpu_lock_path = str(node_entry.get("gpu_lock_path") or fleet_preflight.DEFAULT_GPU_LOCK_PATH)
+    plan = (
+        (
+            "dispatch_preflight",
+            {
+                "python": str(node_entry.get("python") or "python3"),
+                "state_dir": str(node_entry.get("state_dir") or "~/.goal-flight"),
+                "agent": preview.agent,
+                "expected_hostname": remote_expected_hostname,
+                "gpu_lock_path": gpu_lock_path,
+                "timeout_s": timeout_s,
+            },
+        ),
+    )
+    # Fresh on every dispatch: there is no cache whose age can silently exceed
+    # the safety window. Timeout/unreachable is a hard refusal because a Studio
+    # too overloaded to answer promptly is itself an unsafe measurement.
+    with fleet_ssh.node_ssh_lock(preview.node_id, fleet_dir=fleet_dir):
+        probe = fleet_node.run_node_probes(
+            host,
+            repo_root=repo_root,
+            runner=runner,
+            plan=plan,
+            timeout_s=timeout_s,
+        )
+    payload = _parse_preflight_probe(probe)
+    payload["node_alias"] = preview.node_id
+    payload["expected_hostname"] = payload.get("expected_hostname") or expected_hostname
+    payload["timeout_s"] = timeout_s
+    payload["fresh"] = True
+    measurement_age_s = max(0.0, time.monotonic() - probe_started)
+    payload["measurement_age_s"] = measurement_age_s
+    measurements = payload.get("measurements")
+    if isinstance(measurements, dict):
+        measurements["age_s"] = measurement_age_s
+    decision = str(payload.get("decision") or "refuse")
+    if decision == "refuse":
+        if not override:
+            raise DispatchGateError(
+                _format_preflight_message(preview.node_id, payload, label="REFUSE"),
+                code="preflight",
+                details=payload,
+            )
+        payload["original_decision"] = "refuse"
+        payload["decision"] = "override"
+        payload["message"] = _format_preflight_message(preview.node_id, payload, label="OVERRIDE")
+    return payload
 
 
 @dataclass
@@ -630,6 +769,7 @@ def register_dispatch_meta(
     row_state: str | None = None,
     account_lock: dict[str, Any] | None = None,
     queue_launch_token: str | None = None,
+    preflight: dict[str, Any] | None = None,
 ) -> None:
     import goalflight_fleet_store as fleet
     import goalflight_fleet_watch as fleet_watch
@@ -677,6 +817,8 @@ def register_dispatch_meta(
         meta["launch_unconfirmed_at"] = now
     if queue_launch_token:
         meta["queue_launch_token"] = queue_launch_token
+    if preflight:
+        meta["preflight"] = preflight
     if launch_receipt:
         meta.update(
             {
@@ -731,6 +873,7 @@ def record_dispatch_ledger(
     *,
     state: str = "running",
     queue_launch_token: str | None = None,
+    preflight: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     import goalflight_ledger as ledger
 
@@ -751,6 +894,7 @@ def record_dispatch_ledger(
         "base_sha": preview.base_sha,
         "started_at": ledger.utc_now(),
         "hostname": __import__("socket").gethostname(),
+        "remote_preflight": preflight,
     }
     if queue_launch_token:
         record["queue_launch_token"] = queue_launch_token
@@ -759,10 +903,10 @@ def record_dispatch_ledger(
     return {"ok": True, "path": str(path), "record": record}
 
 
-def default_ssh_runner(argv: list[str]) -> tuple[int, str, str]:
+def default_ssh_runner(argv: list[str], timeout_s: float | None = None) -> tuple[int, str, str]:
     import goalflight_fleet_ssh as fleet_ssh
 
-    run = fleet_ssh.run_ssh(argv)
+    run = fleet_ssh.run_ssh(argv, timeout_s=timeout_s)
     return int(run.get("exit_code", 1)), str(run.get("stdout") or ""), str(run.get("stderr") or "")
 
 
@@ -771,9 +915,34 @@ def resolve_dispatch_runner(args) -> Callable[[list[str]], tuple[int, str, str]]
         return args.stub_runner
     if getattr(args, "stub_remote", False):
         def _stub(argv: list[str]) -> tuple[int, str, str]:
-            if "goalflight_fleet_launch_detached.py" not in " ".join(argv):
-                return 0, "{}", ""
             joined = " ".join(argv)
+            if "goalflight_fleet_preflight.py" in joined:
+                def _flag(name: str, default: str) -> str:
+                    match = re.search(rf"{re.escape(name)}\s+'?([^'\s]+)'?", joined)
+                    return match.group(1) if match else default
+
+                expected_hostname = _flag("--expected-hostname", "stub-host")
+                agent = _flag("--agent", "codex-acp")
+                payload = fleet_preflight.evaluate_measurements(
+                    {
+                        "hostname": expected_hostname,
+                        "measured_at": "2026-06-11T12:00:00+00:00",
+                        "cores": 24,
+                        "load_1m": 2.0,
+                        "load_per_core": 2.0 / 24.0,
+                        "total_ram_mb": 131072.0,
+                        "memory_pressure_available_percent": 75.0,
+                        "pressure_available_mb": 98304.0,
+                        "swap_used_mb": 0.0,
+                        "gpu_lock_path": fleet_preflight.DEFAULT_GPU_LOCK_PATH,
+                        "gpu_lock_state": "available",
+                    },
+                    agent=agent,
+                    expected_hostname=expected_hostname,
+                )
+                return 0, json.dumps(payload, sort_keys=True), ""
+            if "goalflight_fleet_launch_detached.py" not in joined:
+                return 0, "{}", ""
             dispatch_id = "unknown"
             node_id = "unknown"
             status_json = "/tmp/goal-flight-stub/status.json"
@@ -839,6 +1008,8 @@ def execute_dispatch(
     tool_smoke_policy: str | None = "auto",
     tool_smoke_sandbox: str = tool_smoke.DEFAULT_SANDBOX,
     queue_launch_token: str | None = None,
+    preflight_timeout_s: float = fleet_preflight.DEFAULT_TIMEOUT_S,
+    override_preflight: bool = False,
 ) -> dict[str, Any]:
     assert_dispatch_gates(
         fleet_dir,
@@ -849,6 +1020,14 @@ def execute_dispatch(
         dispatch_mode=dispatch_mode,
         tool_smoke_policy=tool_smoke_policy,
         tool_smoke_sandbox=tool_smoke_sandbox,
+    )
+    effective_runner = runner or default_ssh_runner
+    preflight_result = run_dispatch_preflight(
+        fleet_dir,
+        preview,
+        runner=effective_runner,
+        timeout_s=preflight_timeout_s,
+        override=override_preflight,
     )
     recovering_unconfirmed = launch_recovery_allowed(
         fleet_dir,
@@ -862,8 +1041,9 @@ def execute_dispatch(
         launch_unconfirmed=recovering_unconfirmed,
         row_state="launch_pending",
         queue_launch_token=queue_launch_token,
+        preflight=preflight_result,
     )
-    chain = acquire_lock_chain(fleet_dir, preview, runner=runner)
+    chain = acquire_lock_chain(fleet_dir, preview, runner=effective_runner)
     register_dispatch_meta(
         fleet_dir,
         preview,
@@ -874,12 +1054,14 @@ def execute_dispatch(
         row_state="launch_unconfirmed" if chain.launch_unconfirmed else "launch_receipted",
         account_lock=chain.account_lock,
         queue_launch_token=queue_launch_token,
+        preflight=preflight_result,
     )
     ledger_info = record_dispatch_ledger(
         preview,
         chain,
         state="launch_unconfirmed" if chain.launch_unconfirmed else "running",
         queue_launch_token=queue_launch_token,
+        preflight=preflight_result,
     )
     if stub_terminal:
         import goalflight_ledger as ledger
@@ -896,6 +1078,7 @@ def execute_dispatch(
             row_state="terminal",
             account_lock=chain.account_lock,
             queue_launch_token=queue_launch_token,
+            preflight=preflight_result,
         )
         with ledger.StateLock():
             record = json.loads(Path(ledger_info["path"]).read_text())
@@ -914,6 +1097,7 @@ def execute_dispatch(
             "launch_unconfirmed_error": chain.launch_unconfirmed_error,
             "ledger": ledger_info,
             "remote_log": chain.remote_log,
+            "preflight": preflight_result,
         }
     return {
         "ok": True,
@@ -924,6 +1108,7 @@ def execute_dispatch(
         "launch_unconfirmed_error": chain.launch_unconfirmed_error,
         "ledger": ledger_info,
         "remote_log": chain.remote_log,
+        "preflight": preflight_result,
         "finalize": None,
     }
 
@@ -968,7 +1153,10 @@ def cmd_dispatch(args) -> int:
             tool_smoke_sandbox=getattr(args, "tool_smoke_sandbox", tool_smoke.DEFAULT_SANDBOX),
         )
     except DispatchGateError as exc:
-        print(json.dumps({"ok": False, "error": str(exc), "code": exc.code}), file=__import__("sys").stderr)
+        error_payload = {"ok": False, "error": str(exc), "code": exc.code}
+        if exc.details is not None:
+            error_payload["preflight"] = exc.details
+        print(json.dumps(error_payload), file=__import__("sys").stderr)
         return 1
 
     try:
@@ -979,14 +1167,25 @@ def cmd_dispatch(args) -> int:
 
     runner = resolve_dispatch_runner(args)
 
-    result = execute_dispatch(
-        args.fleet_dir,
-        preview,
-        runner=runner,
-        stub_terminal=getattr(args, "stub_terminal", False),
-        dispatch_mode=getattr(args, "dispatch_mode", "one-shot"),
-        tool_smoke_policy=getattr(args, "tool_smoke", "auto"),
-        tool_smoke_sandbox=getattr(args, "tool_smoke_sandbox", tool_smoke.DEFAULT_SANDBOX),
-    )
+    try:
+        result = execute_dispatch(
+            args.fleet_dir,
+            preview,
+            runner=runner,
+            stub_terminal=getattr(args, "stub_terminal", False),
+            dispatch_mode=getattr(args, "dispatch_mode", "one-shot"),
+            tool_smoke_policy=getattr(args, "tool_smoke", "auto"),
+            tool_smoke_sandbox=getattr(args, "tool_smoke_sandbox", tool_smoke.DEFAULT_SANDBOX),
+            preflight_timeout_s=getattr(args, "preflight_timeout_s", fleet_preflight.DEFAULT_TIMEOUT_S),
+            override_preflight=getattr(args, "override_preflight", False),
+        )
+    except DispatchGateError as exc:
+        error_payload = {"ok": False, "error": str(exc), "code": exc.code}
+        if exc.details is not None:
+            error_payload["preflight"] = exc.details
+        print(json.dumps(error_payload), file=__import__("sys").stderr)
+        return 1
+    if result.get("preflight", {}).get("message"):
+        print(result["preflight"]["message"], file=__import__("sys").stderr)
     print(json.dumps(result, indent=2))
     return 0

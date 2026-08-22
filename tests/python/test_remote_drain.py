@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_fleet as fleet  # noqa: E402
 import goalflight_fleet_billing as billing  # noqa: E402
+import goalflight_fleet_preflight as fleet_preflight  # noqa: E402
 
 BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
 
@@ -110,6 +111,9 @@ def _fixture_fleet(fleet_dir: Path) -> None:
             "ssh": {"alias": "localhost", "hostname": "localhost"},
             "repo_root": str(ROOT),
             "state_dir": "/tmp/goal-flight-remote-drain-test",
+            "expected_hostname": "remote-drain-host",
+            "answering_hostname": "remote-drain-host",
+            "gpu_lock_path": fleet_preflight.DEFAULT_GPU_LOCK_PATH,
             "billing_accounts": [],
             "added_at": "2026-06-21T12:00:00+00:00",
         }
@@ -185,7 +189,29 @@ def _submit_remote_queue_entry(project_root: Path, tmp: Path, dispatch_id: str, 
 def _receipt_runner(captured: list[list[str]]):
     def run(argv: list[str]) -> tuple[int, str, str]:
         captured.append(list(argv))
-        if "goalflight_fleet_launch_detached.py" not in " ".join(argv):
+        joined = " ".join(argv)
+        if "goalflight_fleet_preflight.py" in joined:
+            agent = _extract_wrapped_flag(argv, "--agent", "codex")
+            expected_hostname = _extract_wrapped_flag(argv, "--expected-hostname", "remote-drain-host")
+            payload = fleet_preflight.evaluate_measurements(
+                {
+                    "hostname": expected_hostname,
+                    "measured_at": "2026-06-21T12:00:00+00:00",
+                    "cores": 24,
+                    "load_1m": 2.0,
+                    "load_per_core": 2.0 / 24.0,
+                    "total_ram_mb": 131072.0,
+                    "memory_pressure_available_percent": 75.0,
+                    "pressure_available_mb": 98304.0,
+                    "swap_used_mb": 0.0,
+                    "gpu_lock_path": fleet_preflight.DEFAULT_GPU_LOCK_PATH,
+                    "gpu_lock_state": "available",
+                },
+                agent=agent,
+                expected_hostname=expected_hostname,
+            )
+            return 0, json.dumps(payload, sort_keys=True), ""
+        if "goalflight_fleet_launch_detached.py" not in joined:
             return 0, "{}", ""
         dispatch_id = _extract_wrapped_flag(argv, "--dispatch-id", "remote-drain")
         node_id = _extract_wrapped_flag(argv, "--node-id", "localhost")
@@ -225,7 +251,10 @@ def _ambiguous_launch_runner(captured: list[list[str]]):
 
     def run(argv: list[str]) -> tuple[int, str, str]:
         captured.append(list(argv))
-        if "goalflight_fleet_launch_detached.py" not in " ".join(argv):
+        joined = " ".join(argv)
+        if "goalflight_fleet_preflight.py" in joined:
+            return _receipt_runner([])(argv)
+        if "goalflight_fleet_launch_detached.py" not in joined:
             return 0, "{}", ""
         return 255, "", "connection lost after launch command"
 

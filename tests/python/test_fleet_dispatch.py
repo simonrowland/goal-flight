@@ -24,6 +24,7 @@ import goalflight_fleet as fleet
 import goalflight_fleet_billing as billing
 import goalflight_fleet_dispatch as fleet_dispatch
 import goalflight_fleet_launch_detached as fleet_launch
+import goalflight_fleet_preflight as fleet_preflight
 import goalflight_fleet_status as status
 
 FIXTURES = ROOT / "tests" / "fixtures" / "fleet_mirrors"
@@ -82,7 +83,36 @@ def launch_receipt_for_argv(argv: list[str]) -> str:
     )
 
 
+def preflight_payload_for_argv(argv: list[str], **overrides: object) -> str:
+    expected_hostname = _extract_wrapped_flag(argv, "--expected-hostname", "fixture-host")
+    agent = _extract_wrapped_flag(argv, "--agent", "codex-acp")
+    measurements = {
+        "hostname": expected_hostname,
+        "measured_at": "2026-08-22T12:00:00+00:00",
+        "cores": 24,
+        "load_1m": 2.0,
+        "load_per_core": 2.0 / 24.0,
+        "total_ram_mb": 131072.0,
+        "memory_pressure_available_percent": 75.0,
+        "pressure_available_mb": 98304.0,
+        "swap_used_mb": 0.0,
+        "gpu_lock_path": fleet_preflight.DEFAULT_GPU_LOCK_PATH,
+        "gpu_lock_state": "available",
+    }
+    measurements.update(overrides)
+    return json.dumps(
+        fleet_preflight.evaluate_measurements(
+            measurements,
+            agent=agent,
+            expected_hostname=expected_hostname,
+        ),
+        sort_keys=True,
+    )
+
+
 def receipt_runner(argv: list[str]) -> tuple[int, str, str]:
+    if "goalflight_fleet_preflight.py" in " ".join(argv):
+        return 0, preflight_payload_for_argv(argv), ""
     if "goalflight_fleet_launch_detached.py" in " ".join(argv):
         return 0, launch_receipt_for_argv(argv), ""
     return 0, "{}", ""
@@ -98,6 +128,9 @@ def _fixture_fleet(fleet_dir: Path) -> None:
             "ssh": {"alias": "localhost", "hostname": "localhost"},
             "repo_root": str(ROOT),
             "state_dir": "/tmp/goal-flight-dispatch-test",
+            "expected_hostname": "fixture-host",
+            "answering_hostname": "fixture-host",
+            "gpu_lock_path": fleet_preflight.DEFAULT_GPU_LOCK_PATH,
             "billing_accounts": [],
             "added_at": "2026-05-24T12:00:00+00:00",
         }
@@ -337,6 +370,109 @@ def test_preview_ignores_live_ssh_env() -> None:
             assert_true("dry run", payload["dry_run"] is True)
 
 
+def test_preflight_passthrough_refuse_and_override_cli_flow() -> None:
+    def run_case(*, dispatch_id: str, available_mb: float, override: bool) -> tuple[int, str, dict, list[str]]:
+        launched: list[str] = []
+
+        def runner(argv: list[str]) -> tuple[int, str, str]:
+            joined = " ".join(argv)
+            if "goalflight_fleet_preflight.py" in joined:
+                return 0, preflight_payload_for_argv(
+                    argv,
+                    pressure_available_mb=available_mb,
+                    memory_pressure_available_percent=available_mb / 131072.0 * 100.0,
+                ), ""
+            if "goalflight_fleet_launch_detached.py" in joined:
+                launched.append("launch")
+            return receipt_runner(argv)
+
+        args = Args(
+            fleet_dir=fleet_dir,
+            node="localhost",
+            agent="codex-acp",
+            billing_account="openai/default",
+            prompt="chunk.md",
+            dispatch_id=dispatch_id,
+            base_sha=BASE_SHA,
+            exec=True,
+            thin_defaults=False,
+            stub_remote=False,
+            stub_runner=runner,
+            stub_terminal=True,
+            dispatch_mode="one-shot",
+            tool_smoke="auto",
+            tool_smoke_sandbox="read-only",
+            preflight_timeout_s=2.0,
+            override_preflight=override,
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = fleet_dispatch.cmd_dispatch(args)
+        payload = json.loads(stdout.getvalue()) if stdout.getvalue().strip() else {}
+        return code, stderr.getvalue(), payload, launched
+
+    with live_ssh_env("1"):
+        with tempfile.TemporaryDirectory() as td:
+            fleet_dir = Path(td) / "fleet"
+            _fixture_fleet(fleet_dir)
+            baseline = fleet_preflight.evaluate_measurements(
+                {
+                    "hostname": "fixture-host",
+                    "load_per_core": 0.1,
+                    "pressure_available_mb": 99999.0,
+                    "swap_used_mb": 0.0,
+                    "gpu_lock_state": "available",
+                },
+                agent="codex-acp",
+                expected_hostname="fixture-host",
+            )
+            thresholds = baseline["thresholds"]
+            hard_required = float(thresholds["hard_required_available_mb"])
+
+            allow_code, allow_err, allow_payload, allow_launch = run_case(
+                dispatch_id="preflight-passthrough-cli",
+                available_mb=hard_required + 0.01,
+                override=False,
+            )
+            assert_true("structured middle proceeds", allow_code == 0 and allow_launch == ["launch"])
+            assert_true("no prose warning", allow_err == "")
+            allow_preflight = allow_payload.get("preflight", {})
+            assert_true("allow recorded", allow_preflight.get("decision") == "allow")
+            assert_true("core denominator visible", allow_preflight["measurements"]["load"]["cores"] == 24)
+            assert_true("load per core visible", "per_core" in allow_preflight["measurements"]["load"])
+            assert_true("measurement age visible", allow_preflight["measurements"]["age_s"] >= 0.0)
+
+            refuse_code, refuse_err, _refuse_payload, refuse_launch = run_case(
+                dispatch_id="preflight-refuse-cli",
+                available_mb=hard_required,
+                override=False,
+            )
+            assert_true("hard refuses", refuse_code == 1 and refuse_launch == [])
+            assert_true("refuse visible", "remote preflight REFUSE" in refuse_err)
+            refuse_payload = json.loads(refuse_err)
+            assert_true("refuse structured", refuse_payload["preflight"]["measurements"]["load"]["cores"] == 24)
+
+            override_code, override_err, override_payload, override_launch = run_case(
+                dispatch_id="preflight-override-cli",
+                available_mb=hard_required,
+                override=True,
+            )
+            assert_true("override proceeds", override_code == 0 and override_launch == ["launch"])
+            assert_true("override visible", "remote preflight OVERRIDE" in override_err)
+            assert_true("override measurement", f"pressure_available={hard_required:.2f}MB" in override_err)
+            assert_true("override recorded", override_payload.get("preflight", {}).get("decision") == "override")
+            override_meta = json.loads(
+                (fleet_dir / "register" / "dispatches" / "preflight-override-cli" / "meta.json").read_text()
+            )
+            assert_true("override meta", override_meta.get("preflight", {}).get("decision") == "override")
+            override_ledger = json.loads(Path(override_payload["ledger"]["path"]).read_text())
+            assert_true(
+                "override ledger",
+                override_ledger.get("remote_preflight", {}).get("hostname") == "fixture-host",
+            )
+
+
 def test_thin_defaults_shows_billing_banner() -> None:
     with tempfile.TemporaryDirectory() as td:
         fleet_dir = Path(td) / "fleet"
@@ -424,6 +560,8 @@ def test_cleanup_refs_failure_stops_before_fetch() -> None:
 
     def fail_cleanup(argv: list[str]) -> tuple[int, str, str]:
         joined = " ".join(argv)
+        if "goalflight_fleet_preflight.py" in joined:
+            return 0, preflight_payload_for_argv(argv), ""
         if "goalflight_cleanup_dispatch_refs.py" in joined:
             invoked.append("git_prune_claude_refs")
             return 17, f"stdout leaked {secret}", f"stderr leaked {prompt_b64}"
@@ -460,7 +598,9 @@ def test_cleanup_refs_failure_stops_before_fetch() -> None:
 def test_pending_row_written_before_remote_mutation() -> None:
     dispatch_id = "acp-pending-before-ssh"
 
-    def crash_before_remote(_argv: list[str]) -> tuple[int, str, str]:
+    def crash_before_remote(argv: list[str]) -> tuple[int, str, str]:
+        if "goalflight_fleet_preflight.py" in " ".join(argv):
+            return 0, preflight_payload_for_argv(argv), ""
         meta = json.loads((fleet_dir / "register" / "dispatches" / dispatch_id / "meta.json").read_text())
         assert_true("pending row visible", meta.get("row_state") == "launch_pending")
         raise SystemExit(99)
@@ -497,6 +637,8 @@ def test_base_sha_absent_fails_pre_launch_and_rolls_back() -> None:
 
     def missing_base(argv: list[str]) -> tuple[int, str, str]:
         joined = " ".join(argv)
+        if "goalflight_fleet_preflight.py" in joined:
+            return 0, preflight_payload_for_argv(argv), ""
         if "goalflight_cleanup_dispatch_refs.py" in joined:
             invoked.append("git_prune_claude_refs")
             return 0, '{"deleted":[]}', ""
@@ -700,7 +842,10 @@ def test_stub_e2e_terminal_clears_locks() -> None:
 
 def test_launch_unconfirmed_keeps_account_lock() -> None:
     def fail_launch(argv: list[str]) -> tuple[int, str, str]:
-        if "goalflight_fleet_launch_detached.py" in " ".join(argv):
+        joined = " ".join(argv)
+        if "goalflight_fleet_preflight.py" in joined:
+            return 0, preflight_payload_for_argv(argv), ""
+        if "goalflight_fleet_launch_detached.py" in joined:
             return 1, "", "ssh connection reset after launch command was issued"
         return 0, "{}", ""
 
@@ -773,7 +918,10 @@ def test_launch_unconfirmed_retry_reuses_same_account_lock() -> None:
     dispatch_id = "acp-launch-retry"
 
     def fail_first(argv: list[str]) -> tuple[int, str, str]:
-        if "goalflight_fleet_launch_detached.py" in " ".join(argv):
+        joined = " ".join(argv)
+        if "goalflight_fleet_preflight.py" in joined:
+            return 0, preflight_payload_for_argv(argv), ""
+        if "goalflight_fleet_launch_detached.py" in joined:
             return 255, "", "ssh connection lost after remote launch may have started"
         return 0, "{}", ""
 
@@ -1145,6 +1293,7 @@ def main() -> None:
     test_goal_exec_reports_tool_smoke_before_live_ssh_refusal()
     test_exec_with_live_ssh_env_uses_runner()
     test_preview_ignores_live_ssh_env()
+    test_preflight_passthrough_refuse_and_override_cli_flow()
     test_thin_defaults_shows_billing_banner()
     test_lock_chain_rollback_before_remote_capacity()
     test_remote_failure_surfaces_ssh_details()
