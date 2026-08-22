@@ -2251,7 +2251,12 @@ def test_full_listener_pool_coverage_skips_notice_and_poll(
     with contextlib.ExitStack() as pool:
         for _slot in range(wake.DEFAULT_LISTENER_SLOTS):
             pool.enter_context(
-                wake.register_waiter(root, controller_label="wake-test", kind="listener")
+                wake.register_listener_waiter(
+                    root,
+                    controller_label="wake-test",
+                    generation_key=claimed.value.nonce,
+                    slots=wake.DEFAULT_LISTENER_SLOTS,
+                )
             )
         stream = io.StringIO()
         result = messages.emit_wake_entry_notice(project_root=root, stream=stream)

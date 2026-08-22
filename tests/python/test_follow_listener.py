@@ -669,6 +669,94 @@ def test_persistent_monitor_suppresses_pool_shortage_but_keeps_backup_depth(
         )
 
 
+def test_coverage_excludes_waiters_from_previous_lease_generation(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, _env, lease = isolated
+    replacement_nonce = "replacement-generation-nonce"
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=120,
+        dead_after_s=messages.FOLLOW_DEAD_AFTER_SECS,
+    )
+    with wake.register_waiter(
+        project,
+        controller_label=lease.label,
+        kind=wake.MONITOR_KIND,
+        generation_key=lease.nonce,
+    ):
+        with wake.register_listener_waiter(
+            project,
+            controller_label=lease.label,
+            generation_key=lease.nonce,
+            slots=1,
+        ):
+            with wake.register_watchdog_waiter(
+                project,
+                controller_label=lease.label,
+                generation_key=lease.nonce,
+            ):
+                replacement = wake.coverage_status(
+                    project,
+                    controller_label=lease.label,
+                    lease_nonce=replacement_nonce,
+                )
+
+    assert replacement["covered"] is False
+    assert replacement["wake_mode"] == "persistent"
+    assert replacement["live_waiters"] == 0
+    assert replacement["target_waiters"] == 3
+    assert replacement["missing_components"] == ["stream", "backup", "watchdog"]
+    assert replacement["waiters"] == []
+
+
+@pytest.mark.parametrize("damage", ("corrupt", "missing"))
+def test_persistent_coverage_fails_closed_when_monitor_state_is_unavailable(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    damage: str,
+) -> None:
+    project, _env, lease = isolated
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=120,
+        dead_after_s=messages.FOLLOW_DEAD_AFTER_SECS,
+    )
+    with wake.register_waiter(
+        project,
+        controller_label=lease.label,
+        kind=wake.MONITOR_KIND,
+        generation_key=lease.nonce,
+    ):
+        pass
+    state_path = wake._monitor_state_path(project, controller_label=lease.label)
+    if damage == "corrupt":
+        state_path.write_text("{not-json\n", encoding="utf-8")
+    else:
+        state_path.unlink()
+
+    with wake.register_listener_waiter(
+        project,
+        controller_label=lease.label,
+        generation_key=lease.nonce,
+        slots=1,
+    ):
+        status = wake.coverage_status(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        )
+
+    assert status["covered"] is False
+    assert status["wake_mode"] == "persistent"
+    assert status["reason"] == "persistent-monitor-state-unavailable"
+    assert status["live_waiters"] == 1
+    assert status["missing_components"] == ["stream", "watchdog"]
+
+
 def test_watchdog_generation_lock_is_independent_of_listener_slot(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
 ) -> None:
@@ -886,6 +974,123 @@ def test_watchdog_reads_durable_age_and_wakes_with_exact_rearm(
     ) == []
 
 
+def test_watchdog_releases_lock_before_listener_dead_flush(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _env, lease = isolated
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=0.05,
+        dead_after_s=0.15,
+        now_epoch=time.time() - 1,
+    )
+    observed_watchdogs: list[list[int]] = []
+
+    def observe_flush(record: dict[str, object], **_kwargs: object) -> bool:
+        payload = record.get("payload")
+        if isinstance(payload, dict) and payload.get("type") == "listener-dead":
+            observed_watchdogs.append(
+                [
+                    row.pid
+                    for row in wake.live_waiters(
+                        project,
+                        controller_label=lease.label,
+                        kinds={wake.WATCHDOG_KIND},
+                    )
+                    or []
+                ]
+            )
+        return True
+
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    monkeypatch.setattr(messages, "_stdio_peer_gone", lambda _stream: False)
+    monkeypatch.setattr(messages, "_write_follow_record", observe_flush)
+    result = messages._run_cli(_watch_command(project, lease)[2:])
+
+    assert result == 0
+    assert observed_watchdogs == [[]]
+
+
+def test_watchdog_graces_preexisting_stale_state(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _env, lease = isolated
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=0.05,
+        dead_after_s=0.15,
+        now_epoch=time.time() - 1,
+    )
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    monkeypatch.setattr(messages, "_stdio_peer_gone", lambda _stream: False)
+
+    started = time.monotonic()
+    result = messages._run_cli(_watch_command(project, lease)[2:])
+    elapsed = time.monotonic() - started
+
+    assert result == 0
+    assert elapsed >= 0.08, f"pre-existing stale state bypassed grace: {elapsed:.3f}s"
+
+
+def test_watchdog_grace_does_not_hide_a_new_follow_fault(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    env = dict(env)
+    env.pop("GOALFLIGHT_TEST_MODE", None)
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=60,
+        dead_after_s=180,
+        now_epoch=time.time() - 181,
+    )
+    watchdog = subprocess.Popen(
+        _watch_command(project, lease),
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert watchdog.stdout is not None
+    reader = _JsonLineReader(watchdog.stdout)
+    try:
+        _wait_for_waiter_kind(
+            project,
+            lease.label,
+            wake.WATCHDOG_KIND,
+            watchdog.pid,
+        )
+        time.sleep(0.1)
+        wake.activate_monitor_state(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+            heartbeat_s=60,
+            dead_after_s=180,
+        )
+        wake.record_monitor_fault(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+            reason="new-follow-fault",
+        )
+        _raw, dead = reader.read(timeout_s=2)
+        assert dead["payload"]["reason"] == "new-follow-fault"
+        assert watchdog.wait(timeout=2) == 0
+    finally:
+        if watchdog.poll() is None:
+            watchdog.terminate()
+            watchdog.wait(timeout=3)
+
+
 def test_watchdog_wakes_when_durable_follow_state_never_appears(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
 ) -> None:
@@ -1000,3 +1205,33 @@ def test_follow_rejects_pool_flag_and_warns_for_inert_pool_environment(
         os.environ.update(previous)
     assert any("GOALFLIGHT_LISTENER_SLOTS affects only" in line for line in warnings)
     assert any("GOALFLIGHT_LISTENER_LOW_WATER affects only" in line for line in warnings)
+
+
+def test_watchdog_warns_that_delivery_flags_are_ignored(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=0.05,
+        dead_after_s=0.15,
+        now_epoch=time.time() - 1,
+    )
+    completed = subprocess.run(
+        [*_watch_command(project, lease), "--listener-slots", "2", "--report-pending"],
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "ignoring --listener-slots, --report-pending" in completed.stderr
+    assert wake.persistent_backup_start_command(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    ) in completed.stderr

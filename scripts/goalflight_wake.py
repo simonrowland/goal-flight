@@ -36,7 +36,8 @@ LEASE_KIND = "lease"
 LOCK_KINDS = WAITER_KINDS | {LEASE_KIND}
 ENTRY_POLL_WINDOW_S = 1.0
 ENTRY_POLL_INTERVAL_S = 0.1
-_FILE_VERSION = "v2"
+_FILE_VERSION = "v3"
+_LEGACY_FILE_VERSION = "v2"
 _GENERATION_FILE_VERSION = "generation-v1"
 _LISTENER_SLOT_FILE_VERSION = "listener-slot-v1"
 _RING_STAMP_FILE_VERSION = "ring-stamp-v1"
@@ -70,6 +71,7 @@ class WaiterRecord:
     start_hash: str
     instance_id: str
     path: Path
+    generation_hash: str | None = None
 
 
 def _project_key(project_root: Path | str) -> str:
@@ -79,6 +81,13 @@ def _project_key(project_root: Path | str) -> str:
 
 def _label_hash(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()[:16]
+
+
+def _waiter_generation_hash(generation_key: str) -> str:
+    key = str(generation_key or "").strip()
+    if not key:
+        raise ValueError("waiter generation key is required")
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
 
 
 def controller_session_digest(value: object) -> str | None:
@@ -193,9 +202,29 @@ def read_lease_generation_event(
 
 def _parse_waiter_path(path: Path) -> WaiterRecord | None:
     parts = path.name.split(".")
-    if len(parts) != 7 or parts[0] != _FILE_VERSION or parts[-1] != "lock":
+    generation_hash: str | None
+    if len(parts) == 8 and parts[0] == _FILE_VERSION and parts[-1] == "lock":
+        (
+            _version,
+            kind,
+            label_hash,
+            generation_hash,
+            raw_pid,
+            start_hash,
+            instance_id,
+            _suffix,
+        ) = parts
+        if len(generation_hash) != 24:
+            return None
+    elif (
+        len(parts) == 7
+        and parts[0] == _LEGACY_FILE_VERSION
+        and parts[-1] == "lock"
+    ):
+        _version, kind, label_hash, raw_pid, start_hash, instance_id, _suffix = parts
+        generation_hash = None
+    else:
         return None
-    _version, kind, label_hash, raw_pid, start_hash, instance_id, _suffix = parts
     if kind not in WAITER_KINDS:
         return None
     if len(label_hash) != 16 or len(start_hash) != 16 or len(instance_id) != 32:
@@ -206,7 +235,15 @@ def _parse_waiter_path(path: Path) -> WaiterRecord | None:
         return None
     if pid <= 0:
         return None
-    return WaiterRecord(kind, label_hash, pid, start_hash, instance_id, path)
+    return WaiterRecord(
+        kind,
+        label_hash,
+        pid,
+        start_hash,
+        instance_id,
+        path,
+        generation_hash,
+    )
 
 
 def _start_hash(start_token: object) -> str:
@@ -322,6 +359,20 @@ def _monitor_state_path(
     return ledger_dir(project_root) / (
         f"{_MONITOR_STATE_FILE_VERSION}.{_label_hash(label)}.json"
     )
+
+
+def monitor_state_stamp(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+) -> tuple[int, int, int] | None:
+    """Return the atomic state-file identity used to recognize startup leftovers."""
+    path = _monitor_state_path(project_root, controller_label=controller_label)
+    try:
+        observed = path.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    return observed.st_ino, observed.st_mtime_ns, observed.st_size
 
 
 def _monitor_generation_digest(lease_nonce: str) -> str:
@@ -704,6 +755,11 @@ class WaiterRegistration:
             raise ValueError("waiter controller label is required")
         if kind not in LOCK_KINDS:
             raise ValueError(f"unknown held-lock kind: {kind}")
+        normalized_generation = None
+        generation_hash = None
+        if generation_key is not None:
+            normalized_generation = str(generation_key or "").strip()
+            generation_hash = _waiter_generation_hash(normalized_generation)
         directory = ledger_dir(project_root)
         pending_name: str | None = None
         record_name: str | None = None
@@ -714,10 +770,16 @@ class WaiterRegistration:
                 raise RuntimeError("held-lock owner process generation is unavailable")
             start_hash = _start_hash(identity["start_token"])
             instance_id = uuid.uuid4().hex
-            record_name = (
-                f"{_FILE_VERSION}.{kind}.{_label_hash(normalized_label)}."
-                f"{os.getpid()}.{start_hash}.{instance_id}.lock"
-            )
+            if generation_hash is None:
+                record_name = (
+                    f"{_LEGACY_FILE_VERSION}.{kind}.{_label_hash(normalized_label)}."
+                    f"{os.getpid()}.{start_hash}.{instance_id}.lock"
+                )
+            else:
+                record_name = (
+                    f"{_FILE_VERSION}.{kind}.{_label_hash(normalized_label)}."
+                    f"{generation_hash}.{os.getpid()}.{start_hash}.{instance_id}.lock"
+                )
             self.record = WaiterRecord(
                 kind=kind,
                 label_hash=_label_hash(normalized_label),
@@ -725,11 +787,9 @@ class WaiterRegistration:
                 start_hash=start_hash,
                 instance_id=instance_id,
                 path=directory / record_name,
+                generation_hash=generation_hash,
             )
-            if generation_key is not None:
-                normalized_generation = str(generation_key or "").strip()
-                if not normalized_generation:
-                    raise ValueError("waiter generation key is required")
+            if normalized_generation is not None:
                 if generation_slots is None:
                     candidates = [
                         _generation_lock_path(
@@ -1454,6 +1514,7 @@ def live_waiters(
     project_root: Path | str,
     *,
     controller_label: str | None = None,
+    generation_key: str | None = None,
     kinds: Iterable[str] = WAITER_KINDS,
     prune_dead: bool = True,
 ) -> list[WaiterRecord] | None:
@@ -1470,11 +1531,18 @@ def live_waiters(
             names = [
                 entry.name
                 for entry in entries
-                if entry.name.startswith(f"{_FILE_VERSION}.")
+                if entry.name.startswith(
+                    (f"{_FILE_VERSION}.", f"{_LEGACY_FILE_VERSION}.")
+                )
                 and entry.name.endswith(".lock")
             ]
         accepted_kinds = set(kinds)
         wanted_label = _label_hash(controller_label) if controller_label else None
+        wanted_generation = (
+            _waiter_generation_hash(generation_key)
+            if generation_key is not None
+            else None
+        )
         live: list[WaiterRecord] = []
         for name in names:
             path = directory / name
@@ -1482,6 +1550,11 @@ def live_waiters(
             if record is None or record.kind not in accepted_kinds:
                 continue
             if wanted_label is not None and record.label_hash != wanted_label:
+                continue
+            if (
+                wanted_generation is not None
+                and record.generation_hash != wanted_generation
+            ):
                 continue
             lock_state = _probe_locked_state_at(directory_fd, name)
             identity = goalflight_compat.process_start_identity(record.pid)
@@ -1552,10 +1625,25 @@ def coverage_status(
         if lease_nonce
         else None
     )
+    monitor_state_present = monitor_state_stamp(
+        project_root,
+        controller_label=controller_label,
+    ) is not None
+    monitor_generation_seen = False
+    if lease_nonce:
+        monitor_generation_seen = _probe_locked_state(
+            _generation_lock_path(
+                project_root,
+                kind=MONITOR_KIND,
+                label=controller_label,
+                generation_key=lease_nonce,
+            )
+        ) is not None
     waiters = (
         live_waiters(
             project_root,
             controller_label=controller_label,
+            generation_key=lease_nonce,
             kinds={"listener", MONITOR_KIND, WATCHDOG_KIND},
         )
         if observed_waiters is _OBSERVED_WAITERS_UNSET
@@ -1563,8 +1651,17 @@ def coverage_status(
     )
     if waiters is not None and not isinstance(waiters, list):
         raise TypeError("observed_waiters must be a waiter list or None")
+    if waiters is not None and lease_nonce:
+        wanted_generation = _waiter_generation_hash(lease_nonce)
+        waiters = [
+            row for row in waiters if row.generation_hash == wanted_generation
+        ]
     if waiters is None:
-        persistent = durable_monitor is not None
+        persistent = (
+            durable_monitor is not None
+            or monitor_state_present
+            or monitor_generation_seen
+        )
         target_waiters = (
             PERSISTENT_WAKE_TARGET if persistent else listener_slot_count()
         )
@@ -1579,6 +1676,8 @@ def coverage_status(
                 "state": (
                     str(durable_monitor.get("state") or "unknown")
                     if durable_monitor
+                    else "unavailable"
+                    if persistent
                     else "not-applicable"
                 ),
             },
@@ -1591,12 +1690,15 @@ def coverage_status(
         bool(monitor_waiters)
         or bool(watchdog_waiters)
         or durable_monitor is not None
+        or monitor_state_present
+        or monitor_generation_seen
     )
     serialized_waiters = [
         {
             "kind": row.kind,
             "pid": row.pid,
             "instance_id": row.instance_id,
+            "generation_hash": row.generation_hash,
             "path": str(row.path),
         }
         for row in waiters
@@ -1605,17 +1707,20 @@ def coverage_status(
         durable_state = (
             str(durable_monitor.get("state") or "unknown")
             if durable_monitor
-            else "untracked"
+            else "unavailable"
         )
         monitor_lock_live = bool(monitor_waiters)
-        monitor_healthy = monitor_lock_live and durable_state not in {
-            "fault",
-            "stale",
-        }
+        monitor_healthy = (
+            monitor_lock_live
+            and durable_monitor is not None
+            and durable_state not in {"fault", "stale"}
+        )
         backup_live = bool(portable_waiters)
         watchdog_live = bool(watchdog_waiters)
         monitor_state = (
-            durable_state
+            "unavailable"
+            if durable_monitor is None
+            else durable_state
             if durable_state in {"fault", "stale"}
             else "live"
             if monitor_lock_live
@@ -1628,7 +1733,9 @@ def coverage_status(
             missing_components.append("backup")
         if not watchdog_live:
             missing_components.append("watchdog")
-        if monitor_state == "fault":
+        if monitor_state == "unavailable":
+            reason = "persistent-monitor-state-unavailable"
+        elif monitor_state == "fault":
             reason = "persistent-monitor-fault"
         elif monitor_state == "stale":
             reason = "persistent-monitor-stale"

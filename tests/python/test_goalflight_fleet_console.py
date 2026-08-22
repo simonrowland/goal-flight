@@ -998,6 +998,7 @@ def _assert_controller_state(
                             project_root,
                             controller_label="console-test",
                             kind="listener",
+                            generation_key=lease.nonce,
                         )
                     )
 
@@ -2688,6 +2689,7 @@ def test_controller_panel_lists_live_first_and_shows_retire_command() -> None:
                         project_root,
                         controller_label="battery-main",
                         kind="listener",
+                        generation_key=live_lease.nonce,
                     )
                 )
                 started = time.perf_counter()

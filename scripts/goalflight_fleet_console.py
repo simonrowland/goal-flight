@@ -1665,6 +1665,7 @@ def _controller_contexts_by_session(
                 live_waiters = goalflight_wake.live_waiters(
                     project_root,
                     controller_label=label,
+                    generation_key=raw_nonce,
                     prune_dead=False,
                 )
                 if live_waiters is None:

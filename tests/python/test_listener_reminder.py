@@ -57,7 +57,12 @@ def test_reminder_uses_held_waiter_lock_not_journal_row(
         parent_pid=51001,
     )
     assert armed.committed
-    with wake.register_waiter(root, controller_label="bugs", kind="listener"):
+    with wake.register_listener_waiter(
+        root,
+        controller_label="bugs",
+        generation_key=lease.nonce,
+        slots=wake.DEFAULT_LISTENER_SLOTS,
+    ):
         stream = io.StringIO()
         reserve_line = msgs.emit_listener_reminder(
             project_root=root,
@@ -73,7 +78,12 @@ def test_reminder_uses_held_waiter_lock_not_journal_row(
         with contextlib.ExitStack() as rest:
             for _slot in range(wake.DEFAULT_LISTENER_SLOTS - 1):
                 rest.enter_context(
-                    wake.register_waiter(root, controller_label="bugs", kind="listener")
+                    wake.register_listener_waiter(
+                        root,
+                        controller_label="bugs",
+                        generation_key=lease.nonce,
+                        slots=wake.DEFAULT_LISTENER_SLOTS,
+                    )
                 )
             stream = io.StringIO()
             assert msgs.emit_listener_reminder(

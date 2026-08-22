@@ -5354,6 +5354,10 @@ def _cmd_watch_follow(
         return 2
 
     started = time.monotonic()
+    startup_state_stamp = goalflight_wake.monitor_state_stamp(
+        project_root,
+        controller_label=label,
+    )
     state_grace = (
         0.1
         if os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
@@ -5409,20 +5413,34 @@ def _cmd_watch_follow(
                 controller_label=label,
                 lease_nonce=nonce,
             )
-            if follow_status is None and time.monotonic() - started >= state_grace:
+            elapsed = time.monotonic() - started
+            current_state_stamp = goalflight_wake.monitor_state_stamp(
+                project_root,
+                controller_label=label,
+            )
+            preexisting_dead_state = (
+                elapsed < state_grace
+                and current_state_stamp == startup_state_stamp
+                and (
+                    follow_status is None
+                    or follow_status.get("state") in {"fault", "stale"}
+                )
+            )
+            if follow_status is None and not preexisting_dead_state:
                 follow_status = {
                     "state": "fault",
-                    "age_s": time.monotonic() - started,
+                    "age_s": elapsed,
                     "dead_after_s": state_grace,
                     "fault": {
                         "reason": "state-unavailable",
                         "detail": "durable follow state is missing or invalid",
                     },
                 }
-            if follow_status is not None and follow_status.get("state") in {
-                "fault",
-                "stale",
-            }:
+            if (
+                not preexisting_dead_state
+                and follow_status is not None
+                and follow_status.get("state") in {"fault", "stale"}
+            ):
                 payload = _follow_dead_record(
                     follow_status,
                     rearm_command=goalflight_wake.follow_start_command(
@@ -5431,6 +5449,9 @@ def _cmd_watch_follow(
                         lease_nonce=nonce,
                     ),
                 )
+                # This flushed line wakes the controller immediately. Stop
+                # counting this exiting watchdog before that coverage read.
+                waiter.close()
                 alive = _write_follow_record(payload, stream=sys.stdout)
                 if not alive:
                     _silence_broken_stdout(sys.stdout)
