@@ -4999,6 +4999,30 @@ def outstanding(project_root: str | Path | None = None, **filters: Any) -> list[
     return list("outstanding", project_root=project_root, **filters)
 
 
+def _text_or_stdin(value: str) -> str:
+    """Free text, or the whole of stdin when the value is exactly ``-``.
+
+    A note IS the durable record, so a mangled note is a corrupted record with
+    nothing to notice it. Passing text as a shell argument makes that easy: the
+    shell expands backticks and $(...) BEFORE this program is invoked, so the
+    stored note silently contains command output instead of what was written,
+    and argv arrives already destroyed. This program cannot detect that and no
+    amount of validation here would help -- the only fix is a path that does not
+    go through the shell at all.
+
+    So: pass ``-`` and pipe or heredoc the text in.
+    """
+    if value != "-":
+        return value
+    if sys.stdin.isatty():
+        raise argparse.ArgumentTypeError(
+            'text was requested from stdin with "-", but stdin is a terminal; '
+            "pipe or redirect it instead, e.g.  "
+            "goalflight_task.py append t-001 - <<'EOF'"
+        )
+    return sys.stdin.read().rstrip("\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
     examples = """common forms:
   CAPTURE:
@@ -5040,7 +5064,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     new.add_argument("--by", help=argparse.SUPPRESS)
-    new.add_argument("title")
+    new.add_argument("title", type=_text_or_stdin)
     new.add_argument("--kind", choices=["task", "bug", "decision"], default="task")
     new.add_argument("--id-family", choices=sorted(VALID_FAMILIES), help="Override id family; default follows --kind.")
     new.add_argument("--blocked-by", action="append", default=[])
@@ -5068,7 +5092,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     capture.add_argument("--by", help=argparse.SUPPRESS)
-    capture.add_argument("title")
+    capture.add_argument("title", type=_text_or_stdin)
     capture.add_argument(
         "--kind",
         choices=["task", "bug", "decision"],
@@ -5154,12 +5178,21 @@ def build_parser() -> argparse.ArgumentParser:
     append = sub.add_parser(
         "append",
         help="UPDATE: append a timestamped note to one or more items.",
-        epilog='example: goalflight_task.py append t-014,t-015 "prompt ready; fill focus area"',
+        epilog=(
+            'example: goalflight_task.py append t-014,t-015 "prompt ready"\n'
+            "\n"
+            "Pass - to read the note from stdin. Prefer that for anything\n"
+            "containing backticks or $(...): the shell substitutes those before\n"
+            "this program runs, so the note would silently store command output.\n"
+            "  goalflight_task.py append t-014 - <<'EOF'\n"
+            "  note text with `backticks` kept verbatim\n"
+            "  EOF"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     append.add_argument("--by", help=argparse.SUPPRESS)
     append.add_argument("item_ids", help="Comma-separated item ids.")
-    append.add_argument("note")
+    append.add_argument("note", type=_text_or_stdin)
     append.add_argument("--json", action="store_true")
     append.set_defaults(func=_cmd_append)
 
