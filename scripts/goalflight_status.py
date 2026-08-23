@@ -373,7 +373,7 @@ def _persist_draft_artifact_reconciliation(record: dict, reconciled: dict) -> No
     path = goalflight_ledger.record_path(str(dispatch_id))
     if not path.exists():
         return
-    with contextlib.suppress(Exception):
+    try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if raw.get("terminal_state") == "complete" or raw.get("state") == "complete":
             return
@@ -405,6 +405,12 @@ def _persist_draft_artifact_reconciliation(record: dict, reconciled: dict) -> No
                 "draft_artifact_reconciliation": reconciliation,
             }
             goalflight_ledger.write_record(raw)
+    except (OSError, goalflight_journal.JournalUnavailable):
+        # The status sweep is observational: a temporarily unavailable ledger
+        # remains eligible for the next sweep. Contract errors must escape;
+        # retrying cannot repair an invalid terminal transition or corrupt
+        # record.
+        return
 
 
 def _status_json_payload(record: dict) -> dict:

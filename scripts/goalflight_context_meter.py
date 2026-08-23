@@ -735,6 +735,8 @@ def run_hook_main(args: argparse.Namespace) -> int:
         if out:
             print(json.dumps(out, separators=(",", ":")))
     except Exception:
+        # This hook writes only optional context-usage telemetry. Losing the
+        # sample gives up one reminder; it never changes controller/task state.
         return 0
     return 0
 

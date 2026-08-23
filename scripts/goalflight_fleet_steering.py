@@ -314,7 +314,10 @@ def apply_proposal(
             patch=proposal["patch"],
             after_hash=after_hash,
         )
-    except Exception:
+    except OSError:
+        # The proposal and audit are already durable. Give up only the derived
+        # immediate envelope; the next registry reconciliation can regenerate
+        # it. Contract/schema errors must escape instead of looking successful.
         pass
 
     return {"ok": True, "audit_id": audit["audit_id"], "after_hash": after_hash}

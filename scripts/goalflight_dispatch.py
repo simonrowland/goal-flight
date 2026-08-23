@@ -1045,6 +1045,9 @@ def _repair_watcher_terminal_status(
     try:
         write_status(status_json, payload)
     except Exception as e:
+        # This repair returns the failed mirror payload to its caller. Losing
+        # the write gives up only watcher-status freshness; terminal authority
+        # stays in the journal and the failure remains in status_write_error.
         payload["state"] = "failed"
         payload["reason"] = f"{reason};status_write_error:{type(e).__name__}: {e}"
         payload["status_write_error"] = f"{type(e).__name__}: {e}"
@@ -1398,6 +1401,8 @@ def _export_dashboard_status_for_project(project_root: Path | None) -> None:
 
         goalflight_status.export_dashboard_status(project_root)
     except Exception:
+        # Derived dashboard projection only. Losing it gives up one refresh;
+        # journal/ledger/status authorities remain unchanged.
         pass
 
 
@@ -1415,6 +1420,8 @@ def _upsert_project_registry_for_dispatch(project_root: Path | None) -> None:
             throttle_s=goalflight_task.PROJECT_REGISTRY_THROTTLE_S,
         )
     except Exception:
+        # Discovery index only. Losing it gives up one dashboard project hint,
+        # never dispatch ownership or lifecycle state.
         pass
 
 
@@ -1543,7 +1550,10 @@ def _start_dashboard_refresh_for_project(project_root: Path | None) -> None:
                 )
             _write_dashboard_refresh_pidfile(pidfile, project_root, int(proc.pid))
             return
-        except Exception:
+        except OSError:
+            # Dashboard refresh is a derived monitor mirror. Transient spawn or
+            # pidfile I/O can wait for the next caller; invalid pidfile payloads
+            # and other contract faults must escape.
             return
         finally:
             with contextlib.suppress(OSError):
@@ -3902,6 +3912,8 @@ def _maybe_mark_grok_quota_exhausted(
             record = json.loads(path.read_text(encoding="utf-8"))
         grok_seats.note_exhausted_if_proven(record, state=state)
     except BaseException:
+        # Optional seat-cache freshness only: the authoritative terminal state
+        # is already committed, and a later probe repairs a missed cache flip.
         return
 
 
@@ -5805,7 +5817,7 @@ def _release_capacity(lease_id: str | None, state: str, reason: str | None) -> N
 
 
 def _release_stale_capacity_for_drain() -> None:
-    with contextlib.suppress(Exception), contextlib.redirect_stdout(io.StringIO()):
+    with contextlib.suppress(OSError), contextlib.redirect_stdout(io.StringIO()):
         goalflight_capacity.cmd_release_stale(
             argparse.Namespace(state="expired", reason="drain_stale_worker", keep=True)
         )
@@ -6759,7 +6771,10 @@ def _linked_task_truth(
             store_seen += 1
             if _task_row_durably_complete(row):
                 store_complete += 1
-    except Exception:
+    except (ImportError, OSError):
+        # Missing/unavailable task-store bytes make completion indeterminate.
+        # Invalid store schemas and publish preconditions are permanent and
+        # must not masquerade as a retryable authority result.
         store_complete = 0
         store_seen = 0
         store_conclusive = False
@@ -7240,7 +7255,9 @@ def _commit_restore_transaction(
         )
         try:
             goalflight_ledger.write_record(ledger_record)
-        except Exception:
+        except OSError:
+            # Preserve the prepared carrier for a later retry on transient I/O.
+            # Invalid ledger records are caller bugs and must escape.
             return None, None
 
     # Durable ledger row above is the cross-file commit point.
@@ -7430,6 +7447,9 @@ def _write_reconciled_terminal_status(entry: dict, marker: dict | None) -> None:
     tail = Path(str(request.get("tail") or record.get("stdout_path") or _dispatch_base_dir() / f"{dispatch_id}.tail"))
     state = str(record.get("state") or record.get("terminal_state") or "worker_dead")
     reason = record.get("reason") or record.get("error") or "claim_reconciliation"
+    # Derived post-commit mirror only: losing it gives up status freshness, not
+    # the durable terminal journal row or its outbox event. Reconciliation will
+    # rebuild it, so this must not unwind the already-committed queue cleanup.
     with contextlib.suppress(Exception):
         write_status(
             status_json,
@@ -8108,7 +8128,7 @@ def _stamp_ledger_orphan_first_seen(
     fresh["orphan_first_seen_at"] = stamp
     try:
         goalflight_ledger.write_record(fresh)
-    except Exception:
+    except OSError:
         return None
     return stamp
 
@@ -8763,7 +8783,7 @@ def commit_reconciled_terminal(
         record["terminal_event_uuid"] = committed.value.event_uuid
         try:
             goalflight_ledger.write_record(record)
-        except Exception:
+        except OSError:
             return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
         existing_state = str(record.get("state") or existing_terminal)
         _maybe_mark_grok_quota_exhausted(record=record, state=existing_state)
@@ -8831,7 +8851,7 @@ def commit_reconciled_terminal(
     record["terminal_event_uuid"] = winner.event_uuid
     try:
         goalflight_ledger.write_record(record)
-    except Exception:
+    except OSError:
         return TerminalCommitResult(TerminalCommitKind.DEFERRED, None, False)
     _maybe_mark_grok_quota_exhausted(record=record, state=state)
     return TerminalCommitResult(
@@ -9059,7 +9079,7 @@ def _maybe_requeue_terminal_claim(
         record["requeue"] = intent
         try:
             goalflight_ledger.write_record(record)
-        except BaseException as exc:
+        except OSError as exc:
             print(
                 "goalflight_dispatch: requeue intent warning: "
                 f"{type(exc).__name__}",
@@ -9104,7 +9124,7 @@ def _maybe_requeue_terminal_claim(
     child_path = _queue_entry_path(child_id, queue_dir=queue_dir)
     try:
         created = _write_json_exclusive(child_path, child)
-    except BaseException as exc:
+    except OSError as exc:
         print(
             "goalflight_dispatch: requeue child warning: "
             f"{type(exc).__name__}",
@@ -9220,6 +9240,8 @@ def _mark_claim_worker_dead(
             durable_state = str(record.get("state"))
             if record.get("terminal_state"):
                 final_reason = record.get("reason") or record.get("error") or final_reason
+    # Same derived-mirror rule as _write_reconciled_terminal_status: the
+    # journal terminal and carrier decision are already durable here.
     with contextlib.suppress(Exception):
         write_status(
             status_json,
@@ -11445,6 +11467,8 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         watch_log = base / f"{args.dispatch_id}.watcher.log"
+        # The watcher is the authoritative status writer once spawned. This
+        # prelaunch mirror gives up only early status freshness on failure.
         with contextlib.suppress(Exception):
             write_status(status_json, {
                 **_prelaunch_status_metadata(
@@ -11587,7 +11611,7 @@ def main(argv: list[str] | None = None) -> int:
             agent=args.agent,
         )
         if ledger_recorded and not detached_launched and not keep_live_watcher_open:
-            with contextlib.suppress(Exception):
+            try:
                 final_state, ledger_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
                     final_state,
                     final_reason,
@@ -11603,9 +11627,43 @@ def main(argv: list[str] | None = None) -> int:
                     elapsed_s=round(time.time() - dispatch_started, 3),
                     worker_still_alive=final_worker_alive,
                 )
+            except Exception as exc:
+                # Finalization must not mask the launch/watch outcome, but a
+                # missing terminal journal transition is never silent.
+                with contextlib.suppress(OSError, ValueError):
+                    print(
+                        "DISPATCH-FINALIZE-WARN "
+                        + json.dumps(
+                            {
+                                "dispatch_id": args.dispatch_id,
+                                "write": "terminal_ledger",
+                                "error": f"{type(exc).__name__}: {exc}",
+                            },
+                            sort_keys=True,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
         if not detached_launched and not keep_live_watcher_open:
-            with contextlib.suppress(Exception):
+            try:
                 _release_capacity(lease_id, str(capacity_state or final_state), capacity_reason)
+            except Exception as exc:
+                # Capacity release is cleanup after the death/result record.
+                # Keep that primary outcome intact and report the leaked lease.
+                with contextlib.suppress(OSError, ValueError):
+                    print(
+                        "DISPATCH-FINALIZE-WARN "
+                        + json.dumps(
+                            {
+                                "dispatch_id": args.dispatch_id,
+                                "write": "capacity_release",
+                                "error": f"{type(exc).__name__}: {exc}",
+                            },
+                            sort_keys=True,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
             _cleanup_pidfile_if_worker_dead(pidfile, worker_pid)
             _export_dashboard_status_for_project(project_root)
         if (

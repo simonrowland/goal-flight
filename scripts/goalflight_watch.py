@@ -512,6 +512,8 @@ def _maybe_note_grok_quota(dispatch_id: object, state: object) -> None:
             record, state=str(state) if state is not None else None
         )
     except BaseException:
+        # Optional seat-cache freshness only: terminal authority is already
+        # committed, and the next seat probe repairs a missed cache flip.
         return
 
 
@@ -608,6 +610,9 @@ def _finish_existing_ledger(
                 if attempt + 1 < max_attempts:
                     time.sleep(backoff_s * (attempt + 1))
             except Exception as exc:
+                # Exit publication remains nonfatal here: losing this attempt
+                # gives up only immediate journal completion. The returned
+                # error is embedded in final watcher status for reconciliation.
                 last_error = {"type": type(exc).__name__, "message": str(exc)}
                 if attempt + 1 < max_attempts:
                     time.sleep(backoff_s * (attempt + 1))
@@ -2416,6 +2421,8 @@ def main() -> int:
                         ignore_prefix_lines,
                     )
                 ):
+                    # Optional post-done suggestion only. Losing it gives up a
+                    # convenience nudge, never task completion or terminal mail.
                     with contextlib.suppress(Exception):
                         goalflight_task.post_done_suggest_nudge(task_ids, task_project_root, args.dispatch_id)
         if terminal_write:
@@ -2532,8 +2539,19 @@ def main() -> int:
             if goalflight_dispatch_states.is_limit_state(payload.get("state"))
             else reason
         )
-        with contextlib.suppress(Exception):
+        try:
             write_payload(payload, reason=write_reason, terminal_write=True)
+        except Exception as exc:
+            # Signal/atexit cleanup must preserve the primary exit and any
+            # terminal event already published by write_payload, but a failed
+            # final status/state publication must remain operator-visible.
+            with contextlib.suppress(OSError, ValueError):
+                print(
+                    "goalflight_watch: final state write failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def handle_signal(signum: int, _frame) -> None:
         name = getattr(signal.Signals(signum), "name", str(signum))

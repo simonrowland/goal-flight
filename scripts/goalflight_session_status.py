@@ -945,7 +945,15 @@ def claim_controller_startup(
                 "reason": "controller_label_conflict",
                 "conflicting_beacons": live["conflicting_beacons"],
             }
-    except _EXPECTED_OPTIONAL_ERRORS as exc:
+    except goalflight_journal.JournalUnavailable as exc:
+        return {
+            "claimed": False,
+            "reason": "claim_failed",
+            "error_type": type(exc).__name__,
+        }
+    except goalflight_journal.JournalError:
+        raise
+    except (ImportError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
         detail = str(exc)
         if "label in use" in detail:
             return {
@@ -1010,7 +1018,15 @@ def register_controller(
                 process_identity=process_identity,
                 hold_lock=True,
             )
-        except _EXPECTED_OPTIONAL_ERRORS as exc:
+        except goalflight_journal.JournalUnavailable as exc:
+            return {
+                "registered": False,
+                "reason": "claim_failed",
+                "message": str(exc),
+            }
+        except goalflight_journal.JournalError:
+            raise
+        except (ImportError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
             detail = str(exc)
             return {
                 "registered": False,
@@ -1039,7 +1055,11 @@ def register_controller(
             nonce=session_id,
             incumbent_liveness=incumbent_liveness,
         )
-    except _EXPECTED_OPTIONAL_ERRORS as exc:
+    except goalflight_journal.JournalUnavailable as exc:
+        return {"registered": False, "reason": "claim_failed", "message": str(exc)}
+    except goalflight_journal.JournalError:
+        raise
+    except (ImportError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
         return {"registered": False, "reason": "claim_failed", "message": str(exc)}
     if not result.committed or result.value is None:
         return {
@@ -1108,7 +1128,16 @@ def join_controller(
                 takeover=acknowledge_conflict,
                 hold_lock=True,
             )
-        except _EXPECTED_OPTIONAL_ERRORS as exc:
+        except goalflight_journal.JournalUnavailable as exc:
+            return {
+                "joined": False,
+                "reason": "claim_failed",
+                "message": str(exc),
+                "acknowledgement_available": True,
+            }
+        except goalflight_journal.JournalError:
+            raise
+        except (ImportError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
             detail = str(exc)
             return {
                 "joined": False,
@@ -1829,6 +1858,8 @@ def _post_resume_nudge(project_root: Path) -> None:
 
         goalflight_task.post_resume_nudge(project_root)
     except _EXPECTED_OPTIONAL_ERRORS:
+        # Optional controller-attention hint only. Losing it gives up one nudge;
+        # queue and lease state remain authoritative.
         return
 
 
@@ -2405,7 +2436,20 @@ def main(argv: list[str] | None = None) -> int:
                 takeover=args.takeover,
                 hold_lock=True,
             )
-        except _EXPECTED_OPTIONAL_ERRORS as exc:
+        except goalflight_journal.JournalUnavailable as exc:
+            print(
+                json.dumps(
+                    {
+                        "claimed": False,
+                        "reason": "claim_failed",
+                        "error_type": type(exc).__name__,
+                    }
+                )
+            )
+            return 0
+        except goalflight_journal.JournalError:
+            raise
+        except (ImportError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
             print(
                 json.dumps(
                     {

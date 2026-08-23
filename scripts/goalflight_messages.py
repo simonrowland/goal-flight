@@ -4938,6 +4938,54 @@ def _follow_fault_record(reason: str, detail: object = "") -> dict[str, object]:
     return _fit_follow_record(record, shrink_fields=("detail", "reason"))
 
 
+def _exit_listener_before_final_event(
+    authority: goalflight_journal.Journal,
+    coverage_id: str,
+    *,
+    reason: str,
+) -> None:
+    """Attempt shutdown coverage without hiding failure or losing the event."""
+    try:
+        authority.exit_listener(coverage_id, reason=reason)
+    except Exception as exc:
+        # A death/ring announcement is the last recovery handle. Keep it
+        # publishable, but surface both transient I/O and permanent contract
+        # faults in the secondary coverage write.
+        with contextlib.suppress(OSError, ValueError):
+            print(
+                "listen: coverage exit write failed "
+                f"({reason}): {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+
+def _record_monitor_fault_before_final_event(
+    project_root: Path,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    reason: str,
+    detail: object,
+) -> None:
+    """Publish secondary monitor fault state without masking the final record."""
+    try:
+        goalflight_wake.record_monitor_fault(
+            project_root,
+            controller_label=controller_label,
+            lease_nonce=lease_nonce,
+            reason=reason,
+            detail=str(detail),
+        )
+    except Exception as exc:
+        # This is an exit-path secondary write. Report every failure class so
+        # no schema/serialization bug can suppress the final fault record.
+        with contextlib.suppress(OSError, ValueError):
+            print(
+                f"follow: monitor fault state write failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+
 def _follow_dead_record(
     status: dict[str, object],
     *,
@@ -5231,14 +5279,16 @@ def cmd_follow(args) -> int:
         # may wake and run the supplied re-arm command immediately; observing
         # the fault must never race a holder that has already decided to exit.
         waiter.close()
-        with contextlib.suppress(OSError, RuntimeError, ValueError):
-            goalflight_wake.record_monitor_fault(
-                project_root,
-                controller_label=label,
-                lease_nonce=nonce,
-                reason=reason,
-                detail=str(detail),
-            )
+        # Fault publication is secondary to the stdout death/fault record.
+        # Keep that record publishable, but never make lost monitor state
+        # invisible: permanent payload bugs and transient I/O both surface.
+        _record_monitor_fault_before_final_event(
+            project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+            reason=reason,
+            detail=detail,
+        )
         stdout_alive = True
         if write_stdout:
             try:
@@ -5768,8 +5818,11 @@ def cmd_listen(args) -> int:
     def finish_detached() -> int:
         # Best-effort journal audit must never turn the refusal into multiple
         # lines; the one diagnostic is deliberately copy/paste actionable.
-        with contextlib.suppress(goalflight_journal.JournalUnavailable):
-            authority.exit_listener(coverage_id, reason="orphaned")
+        _exit_listener_before_final_event(
+            authority,
+            coverage_id,
+            reason="orphaned",
+        )
         waiter.close()
         death_watch.restore()
         print(
@@ -5786,8 +5839,11 @@ def cmd_listen(args) -> int:
         # lone watchdog death loud without a new task, daemon, or delivery
         # slot. It cannot witness its own death, and no controller-scoped task
         # survives the correlated case where the host reaps every tracked task.
-        with contextlib.suppress(goalflight_journal.JournalUnavailable):
-            authority.exit_listener(coverage_id, reason="watchdog-dead")
+        _exit_listener_before_final_event(
+            authority,
+            coverage_id,
+            reason="watchdog-dead",
+        )
         waiter.close()
         death_watch.restore()
         status = goalflight_wake.coverage_status(
@@ -6066,8 +6122,11 @@ def cmd_listen(args) -> int:
                 )
             # The cursor-version stamp, not the single audit row, arbitrates a
             # pool ring. A sibling may already have superseded this row.
-            with contextlib.suppress(goalflight_journal.JournalUnavailable, ValueError):
-                authority.exit_listener(coverage_id, reason="event")
+            _exit_listener_before_final_event(
+                authority,
+                coverage_id,
+                reason="event",
+            )
             payload = {
                 "kind": "ring",
                 "reason": "event",

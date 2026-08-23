@@ -92,6 +92,33 @@ AGENT_STDERR_ERROR_TAIL_CHARS = 1000
 LIVENESS_PROFILES = {"remote_api", "local_compute", "hybrid"}
 
 
+def _attach_worker_state_before_running(
+    attach: Callable[[int], None],
+    worker_pid: int,
+) -> None:
+    """Ignore transient capacity I/O; let invalid lease mutations abort startup."""
+    try:
+        attach(worker_pid)
+    except OSError:
+        pass
+
+
+def _detach_live_worker_state(
+    payload: dict[str, object],
+    detach: Callable[[int, object], None],
+    worker_pid: int,
+    reason: object,
+) -> None:
+    """Keep final status publishable while recording a failed lease detach."""
+    try:
+        detach(worker_pid, reason)
+    except Exception as exc:
+        payload["lease_detach_error"] = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
+
+
 def _default_dispatch_id(agent: object) -> str:
     """Build a journal-safe id even when the ACP agent is an executable path."""
     label = Path(str(agent or "")).name
@@ -3434,9 +3461,10 @@ async def _run_acp_dispatch_impl(
         nonlocal proc
         proc = p  # publish to heartbeat/note_event/on_idle closures + finally
         pgid = process_group_id(p.pid) or p.pid
-        with contextlib.suppress(Exception):
-            attach_worker_to_lease(p.pid)
         try:
+            # Capacity state can be retried/reconciled after transient I/O. A
+            # malformed update aborts before RUNNING is claimed.
+            _attach_worker_state_before_running(attach_worker_to_lease, p.pid)
             await asyncio.to_thread(
                 goalflight_ledger.claim_attempt_running,
                 project_root,
@@ -4291,8 +4319,14 @@ async def _run_acp_dispatch_impl(
                 )
         leave_lease_active = bool(detach_worker and proc is not None and proc.returncode is None)
         if leave_lease_active and proc is not None:
-            with contextlib.suppress(Exception):
-                detach_lease_to_worker(proc.pid, payload.get("error"))
+            # The live worker and its final status must survive teardown. A
+            # leaked controller-bound lease is recorded for reconciliation.
+            _detach_live_worker_state(
+                payload,
+                detach_lease_to_worker,
+                proc.pid,
+                payload.get("error"),
+            )
         elif lease_id:
             with contextlib.redirect_stdout(io.StringIO()):
                 goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=payload.get("state", state), reason=payload.get("error"), keep=True))

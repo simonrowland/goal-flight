@@ -30,6 +30,7 @@ from typing import Any, Callable, Protocol
 import goalflight_compat
 import goalflight_acp_permits as permits
 import goalflight_dispatch_states
+import goalflight_journal
 import goalflight_ledger
 import goalflight_quota_stuck
 import goalflight_terminal
@@ -1222,7 +1223,9 @@ def _release_quota_stuck_lease(worker_pid: int, *, dispatch_id: object, reason: 
                 break
             if result["released_lease_id"]:
                 goalflight_capacity.save_state(data)
-    except Exception as exc:
+    except OSError as exc:
+        # Capacity state I/O can be retried by the next quota-stuck sweep.
+        # Invalid lease payloads/serialization are permanent and must escape.
         result["lease_release_error"] = str(exc)
         log.error(
             "quota_stuck_reap: lease release failed pid=%s dispatch_id=%s: %s",
@@ -1256,7 +1259,9 @@ def _finish_quota_stuck_ledger(record: dict[str, Any], *, reason: dict[str, Any]
                 )
             )
         return code == 0
-    except Exception as exc:
+    except (OSError, goalflight_journal.JournalUnavailable) as exc:
+        # Filesystem/database availability may recover on a later sweep.
+        # Invalid terminal states and other journal contracts must escape.
         log.error("quota_stuck_reap: ledger update failed dispatch_id=%s: %s", dispatch_id, exc)
     return False
 
@@ -2542,7 +2547,8 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         try:
             # Opportunistic cruft removal (one cheap listing): reap orphan files
             # from crashes or the timeout/late-write race. Never touches a live
-            # round-trip (only files older than DEFAULT_SWEEP_AGE_S).
+            # round-trip (only files older than DEFAULT_SWEEP_AGE_S). Losing
+            # this best-effort write gives up only stale-file cleanup.
             with contextlib.suppress(Exception):
                 permits.sweep(directory)
             permits.write_request(directory, record)
@@ -2604,6 +2610,9 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
             log.info("inline permission cancelled; denying so the worker stays answerable")
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
         except Exception:
+            # A request file that cannot be published is deliberately denied.
+            # Losing this write gives up the tool invocation, not an unresolved
+            # permission; the exception log and auto-decline record stay visible.
             log.exception("inline permission IPC failed (%s); auto-declining so the worker continues", record.get("title"))
             self.permission_auto_declined.append({
                 "key": record.get("key"),
@@ -2616,6 +2625,8 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
         finally:
             self.activity.release_inline_permission(hold_id)
+            # The permission already has a definitive allow/deny outcome.
+            # Losing this best-effort cleanup leaves only sweepable IPC cruft.
             with contextlib.suppress(Exception):
                 permits.clear(directory, key)
 

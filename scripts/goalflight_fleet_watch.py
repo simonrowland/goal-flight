@@ -1353,7 +1353,9 @@ def release_lock_on_confirmed_terminal(fleet_dir: Path, dispatch_id: str, state:
             reason=f"terminal_confirmed:{state}",
         )
         return True
-    except Exception:
+    except OSError:
+        # A transient store failure leaves the fenced lock for the next poll or
+        # TTL sweep. Contract and fencing errors must not masquerade as retry.
         return False
 
 
