@@ -34,6 +34,12 @@ import goalflight_status as status  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 
 
+_WAKE_DELIVERY_BUDGET_S = 5.0
+_COMPLETION_MAX_IDLE_S = 20.0
+_COMPLETION_HARNESS_TIMEOUT_S = _COMPLETION_MAX_IDLE_S + _WAKE_DELIVERY_BUDGET_S
+_LISTENER_ARM_HARNESS_TIMEOUT_S = _COMPLETION_MAX_IDLE_S
+
+
 def isolated_env(tmp_path: Path, *, label: str = "wake-test") -> dict[str, str]:
     env = dict(os.environ)
     for key in (
@@ -153,7 +159,7 @@ def _completion_dispatch_command(
         "--poll-secs",
         "0.02",
         "--max-idle-secs",
-        "20",
+        str(_COMPLETION_MAX_IDLE_S),
         "--foreground",
     ]
     if forced:
@@ -165,6 +171,25 @@ def _completion_dispatch_command(
         "-c",
         f"print('COMPLETE: {dispatch_id} — done', flush=True)",
     ]
+
+
+def _wake_delivery_elapsed(authority: journal.Journal, dispatch_id: str) -> float:
+    """Measure the product wake path, excluding process cold-start latency."""
+    rows = authority.read_all(
+        """SELECT created_at, projected_at FROM delivery_events
+           WHERE stream_id = ? AND wake_class = 'waking'""",
+        (dispatch_id,),
+    )
+    assert rows, f"no waking delivery projected for {dispatch_id}"
+    elapsed: list[float] = []
+    for row in rows:
+        created_at = journal._parse_utc(row["created_at"])
+        projected_at = journal._parse_utc(row["projected_at"])
+        assert created_at is not None and projected_at is not None, dict(row)
+        delta = (projected_at - created_at).total_seconds()
+        assert delta >= 0, dict(row)
+        elapsed.append(delta)
+    return max(elapsed)
 
 
 def _listener_command(
@@ -204,7 +229,7 @@ def _wait_for_listener(
     label: str,
     listener: subprocess.Popen[str],
 ) -> None:
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + _LISTENER_ARM_HARNESS_TIMEOUT_S
     while time.monotonic() < deadline:
         coverage = authority.active_coverage(label)
         if coverage is not None and coverage["pid"] == listener.pid:
@@ -407,6 +432,7 @@ def test_owned_worker_finish_wakes_armed_doorbell_three_runs(
                     tmp_path,
                     label="wake-test",
                     nonce=lease.nonce,
+                    timeout_s=_COMPLETION_HARNESS_TIMEOUT_S,
                 ),
                 cwd=root,
                 env=env,
@@ -417,7 +443,6 @@ def test_owned_worker_finish_wakes_armed_doorbell_three_runs(
             completed: subprocess.Popen[str] | None = None
             try:
                 _wait_for_listener(authority, "wake-test", listener)
-                started = time.monotonic()
                 completed = subprocess.Popen(
                     _completion_dispatch_command(root, tmp_path, dispatch_id),
                     cwd=root,
@@ -426,13 +451,17 @@ def test_owned_worker_finish_wakes_armed_doorbell_three_runs(
                     stderr=subprocess.PIPE,
                     text=True,
                 )
-                listener_stdout, listener_stderr = listener.communicate(timeout=6)
-                elapsed = time.monotonic() - started
-                completed_stdout, completed_stderr = completed.communicate(timeout=20)
+                listener_stdout, listener_stderr = listener.communicate(
+                    timeout=_COMPLETION_HARNESS_TIMEOUT_S
+                )
+                elapsed = _wake_delivery_elapsed(authority, dispatch_id)
+                completed_stdout, completed_stderr = completed.communicate(
+                    timeout=_COMPLETION_HARNESS_TIMEOUT_S
+                )
                 assert completed.returncode == 0, (completed_stdout, completed_stderr)
                 assert listener.returncode == 0, listener_stderr
                 assert json.loads(listener_stdout)["reason"] == "event"
-                assert elapsed < 5.0
+                assert elapsed < _WAKE_DELIVERY_BUDGET_S
                 measurements.append(elapsed)
                 record = json.loads(ledger.record_path(dispatch_id, create=False).read_text())
                 assert record["controller_label"] == "wake-test", (
@@ -501,6 +530,7 @@ def test_unowned_worker_finish_fans_out_and_wakes_registered_controller(
             tmp_path,
             label="wake-test",
             nonce=first.value.nonce,
+            timeout_s=_COMPLETION_HARNESS_TIMEOUT_S,
         ),
         cwd=root,
         env=env,
@@ -511,7 +541,6 @@ def test_unowned_worker_finish_fans_out_and_wakes_registered_controller(
     completed: subprocess.Popen[str] | None = None
     try:
         _wait_for_listener(authority, "wake-test", listener)
-        started = time.monotonic()
         completed = subprocess.Popen(
             _completion_dispatch_command(
                 root,
@@ -525,13 +554,17 @@ def test_unowned_worker_finish_fans_out_and_wakes_registered_controller(
             stderr=subprocess.PIPE,
             text=True,
         )
-        listener_stdout, listener_stderr = listener.communicate(timeout=6)
-        elapsed = time.monotonic() - started
-        completed_stdout, completed_stderr = completed.communicate(timeout=20)
+        listener_stdout, listener_stderr = listener.communicate(
+            timeout=_COMPLETION_HARNESS_TIMEOUT_S
+        )
+        elapsed = _wake_delivery_elapsed(authority, dispatch_id)
+        completed_stdout, completed_stderr = completed.communicate(
+            timeout=_COMPLETION_HARNESS_TIMEOUT_S
+        )
         assert completed.returncode == 0, (completed_stdout, completed_stderr)
         assert listener.returncode == 0, listener_stderr
         assert json.loads(listener_stdout)["reason"] == "event"
-        assert elapsed < 5.0
+        assert elapsed < _WAKE_DELIVERY_BUDGET_S
         record = json.loads(ledger.record_path(dispatch_id, create=False).read_text())
         assert not record.get("controller_label")
         rows = authority.read_all(

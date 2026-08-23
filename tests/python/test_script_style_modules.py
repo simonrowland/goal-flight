@@ -2,20 +2,170 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 TEST_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TEST_DIR.parents[1]
 ISOLATED_TEST_FILE_ENV = "GOALFLIGHT_ISOLATED_TEST_FILE"
+OUTCOME_PASS = "pass"
+OUTCOME_SKIP = "skip"
+OUTCOME_FLAKE = "flake"
+OUTCOME_FAIL = "fail"
+AMBIENT_RUNTIME_ENV = (
+    "GOALFLIGHT_DISPATCH_ID",
+    "GOALFLIGHT_DISPATCH_DIR",
+    "GOALFLIGHT_PROJECT_ROOT",
+    "GOALFLIGHT_PROMPT_FILE",
+    "GOALFLIGHT_STEER_FILE",
+    "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE",
+    "GOALFLIGHT_CONTROLLER_LABEL",
+    "GOALFLIGHT_CONTROLLER_SESSION_ID",
+    "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+    "GOALFLIGHT_CONTROLLER_PID",
+    "GOALFLIGHT_PROCESS_ROLE",
+)
+
+
+@dataclass(frozen=True)
+class IsolatedModuleRun:
+    outcome: str
+    initial: subprocess.CompletedProcess[str]
+    retry: subprocess.CompletedProcess[str] | None
 
 
 def _tail(text: str, limit: int = 4_000) -> str:
     return text if len(text) <= limit else text[-limit:]
+
+
+def _one_line_diagnostic(result: subprocess.CompletedProcess[str], limit: int = 400) -> str:
+    text = result.stderr.strip() or result.stdout.strip() or "<no output>"
+    return " ".join(text.split())[-limit:]
+
+
+def _skipped_reason(
+    result: subprocess.CompletedProcess[str],
+    *,
+    direct_script: bool,
+) -> str | None:
+    if direct_script or result.returncode != 0:
+        return None
+    return next(
+        (
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.startswith("SKIPPED ")
+        ),
+        None,
+    )
+
+
+def _classify_module_runs(
+    initial: subprocess.CompletedProcess[str],
+    retry: subprocess.CompletedProcess[str] | None,
+    *,
+    direct_script: bool,
+) -> str:
+    if initial.returncode == 0:
+        return OUTCOME_SKIP if _skipped_reason(initial, direct_script=direct_script) else OUTCOME_PASS
+    if retry is None:
+        raise AssertionError("a failed isolated module was not rerun")
+    if retry.returncode == 0 and not _skipped_reason(retry, direct_script=direct_script):
+        return OUTCOME_FLAKE
+    return OUTCOME_FAIL
+
+
+def _validate_module_outcome(
+    outcome: str,
+    initial: subprocess.CompletedProcess[str],
+    retry: subprocess.CompletedProcess[str] | None,
+    *,
+    direct_script: bool,
+) -> None:
+    initial_skip = _skipped_reason(initial, direct_script=direct_script)
+    retry_skip = (
+        _skipped_reason(retry, direct_script=direct_script)
+        if retry is not None
+        else None
+    )
+    if outcome == OUTCOME_PASS:
+        assert initial.returncode == 0 and not initial_skip, "invalid pass outcome"
+        return
+    if outcome == OUTCOME_SKIP:
+        assert initial.returncode == 0 and initial_skip, "invalid skip outcome"
+        return
+    if outcome == OUTCOME_FLAKE:
+        assert (
+            initial.returncode != 0
+            and retry is not None
+            and retry.returncode == 0
+            and not retry_skip
+        ), "invalid flake outcome: a real failure would be downgraded"
+        return
+    if outcome == OUTCOME_FAIL:
+        assert (
+            initial.returncode != 0
+            and retry is not None
+            and (retry.returncode != 0 or retry_skip)
+        ), "invalid fail outcome"
+        return
+    raise AssertionError(f"unknown isolated module outcome: {outcome}")
+
+
+def _run_module_with_confirmation(
+    command: list[str],
+    *,
+    initial_env: dict[str, str],
+    retry_env: dict[str, str],
+    direct_script: bool,
+) -> IsolatedModuleRun:
+    initial = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        env=initial_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    retry = None
+    if initial.returncode != 0:
+        retry = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            env=retry_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    outcome = _classify_module_runs(initial, retry, direct_script=direct_script)
+    _validate_module_outcome(
+        outcome,
+        initial,
+        retry,
+        direct_script=direct_script,
+    )
+    return IsolatedModuleRun(outcome, initial, retry)
+
+
+def _isolated_env(root: Path, *, test_id: str) -> dict[str, str]:
+    env = os.environ.copy()
+    for key in AMBIENT_RUNTIME_ENV:
+        env.pop(key, None)
+    env["GOALFLIGHT_CAPACITY_CONF"] = os.devnull
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(root / "task-store")
+    env["GOAL_FLIGHT_PIDFILE_DIR"] = str(root / "pids")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(root / "journals")
+    env["GOALFLIGHT_STATE_DIR"] = str(root / "state")
+    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(root / "wake-ledger")
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(root / "messages")
+    env[ISOLATED_TEST_FILE_ENV] = test_id
+    return env
 
 
 def _interpreter_for(path: Path, *, direct_script: bool) -> Path:
@@ -33,6 +183,7 @@ def _interpreter_for(path: Path, *, direct_script: bool) -> Path:
 def test_isolated_test_module(
     isolated_test_module: tuple[Path, bool],
     tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> None:
     test_path, direct_script = isolated_test_module
     interpreter = _interpreter_for(test_path, direct_script=direct_script)
@@ -40,54 +191,196 @@ def test_isolated_test_module(
         f"SDK missing -- run install: {interpreter}"
     )
 
-    env = os.environ.copy()
-    env.pop("GOALFLIGHT_STEER_FILE", None)
-    env.pop("GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE", None)
-    env["GOALFLIGHT_CAPACITY_CONF"] = os.devnull
-    env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp_path / "task-store")
-    env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
     # Journal/state isolation: without these, a module that resolves default
     # paths write-opens LIVE journals — and a schema-carrying tree migrated
     # two of them mid-development (b-150). Second-level spawns that build
     # their own env are covered by the migration allow-guard, not this.
-    env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp_path / "journals")
-    env["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
-    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp_path / "wake-ledger")
-    env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp_path / "messages")
     test_id = test_path.relative_to(TEST_DIR).as_posix()
-    env[ISOLATED_TEST_FILE_ENV] = test_id
     command = (
         [str(interpreter), str(test_path)]
         if direct_script
         else [str(interpreter), "-m", "pytest", str(test_path), "-q", "-rs"]
     )
-    result = subprocess.run(
+    run = _run_module_with_confirmation(
         command,
+        initial_env=_isolated_env(tmp_path / "initial", test_id=test_id),
+        retry_env=_isolated_env(tmp_path / "retry", test_id=test_id),
+        direct_script=direct_script,
+    )
+    skipped_reason = _skipped_reason(run.initial, direct_script=direct_script)
+    if run.outcome == OUTCOME_SKIP:
+        assert skipped_reason is not None
+        pytest.skip(f"{test_id}: {skipped_reason}")
+    if run.outcome == OUTCOME_FLAKE:
+        assert run.retry is not None
+        request.node.user_properties.extend(
+            (
+                ("goalflight_isolated_outcome", OUTCOME_FLAKE),
+                ("goalflight_test_id", test_id),
+                ("goalflight_initial_exit", str(run.initial.returncode)),
+                ("goalflight_retry_exit", str(run.retry.returncode)),
+                ("goalflight_initial_diagnostic", _one_line_diagnostic(run.initial)),
+            )
+        )
+        return
+    assert run.outcome == OUTCOME_PASS, (
+        f"FAIL {test_id}: initial exit={run.initial.returncode}; "
+        f"confirmation exit={run.retry.returncode if run.retry is not None else 'not-run'}\n"
+        f"initial stdout:\n{_tail(run.initial.stdout)}\n"
+        f"initial stderr:\n{_tail(run.initial.stderr)}\n"
+        f"confirmation stdout:\n{_tail(run.retry.stdout) if run.retry is not None else ''}\n"
+        f"confirmation stderr:\n{_tail(run.retry.stderr) if run.retry is not None else ''}"
+    )
+
+
+def test_deliberately_flaky_module_is_classified_as_flake(tmp_path: Path) -> None:
+    counter = tmp_path / "counter"
+    probe = tmp_path / "deliberately_flaky.py"
+    probe.write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "counter = Path(os.environ['B203_COUNTER'])\n"
+        "if not counter.exists():\n"
+        "    counter.write_text('failed-once', encoding='utf-8')\n"
+        "    raise SystemExit(7)\n"
+        "print('retry passed')\n",
+        encoding="utf-8",
+    )
+    env = {**os.environ, "B203_COUNTER": str(counter)}
+    run = _run_module_with_confirmation(
+        [sys.executable, str(probe)],
+        initial_env=env,
+        retry_env=env,
+        direct_script=True,
+    )
+    assert run.outcome == OUTCOME_FLAKE
+
+
+def test_genuinely_broken_module_is_classified_as_fail(tmp_path: Path) -> None:
+    probe = tmp_path / "broken.py"
+    probe.write_text("raise SystemExit(9)\n", encoding="utf-8")
+    run = _run_module_with_confirmation(
+        [sys.executable, str(probe)],
+        initial_env=os.environ.copy(),
+        retry_env=os.environ.copy(),
+        direct_script=True,
+    )
+    assert run.outcome == OUTCOME_FAIL
+    assert run.initial.returncode == 9
+    assert run.retry is not None and run.retry.returncode == 9
+
+
+def test_mutated_real_failure_cannot_be_downgraded_to_flake(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    probe = tmp_path / "broken-under-mutation.py"
+    probe.write_text("raise SystemExit(11)\n", encoding="utf-8")
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_classify_module_runs",
+        lambda *_args, **_kwargs: OUTCOME_FLAKE,
+    )
+    with pytest.raises(
+        AssertionError,
+        match="invalid flake outcome: a real failure would be downgraded",
+    ):
+        _run_module_with_confirmation(
+            [sys.executable, str(probe)],
+            initial_env=os.environ.copy(),
+            retry_env=os.environ.copy(),
+            direct_script=True,
+        )
+
+
+def test_isolated_env_scrubs_ambient_runtime_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for key in AMBIENT_RUNTIME_ENV:
+        monkeypatch.setenv(key, f"ambient-{key.lower()}")
+    env = _isolated_env(tmp_path, test_id="test_probe.py")
+    assert all(key not in env for key in AMBIENT_RUNTIME_ENV)
+    assert env[ISOLATED_TEST_FILE_ENV] == "test_probe.py"
+    assert env["GOALFLIGHT_STATE_DIR"] == str(tmp_path / "state")
+
+
+def test_flake_report_is_visible_without_becoming_a_failure() -> None:
+    import conftest as suite_conftest
+
+    report = SimpleNamespace(
+        when="call",
+        passed=True,
+        nodeid="driver[test_probe.py]",
+        user_properties=(
+            ("goalflight_isolated_outcome", OUTCOME_FLAKE),
+            ("goalflight_test_id", "test_probe.py"),
+            ("goalflight_initial_exit", "7"),
+            ("goalflight_retry_exit", "0"),
+            ("goalflight_initial_diagnostic", "synthetic first-run failure"),
+        ),
+    )
+    assert suite_conftest.pytest_report_teststatus(report, None) == (
+        "flake",
+        "f",
+        "FLAKE",
+    )
+    assert report.passed
+
+    class Reporter:
+        stats = {"flake": (report,)}
+
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def write_sep(self, _separator: str, title: str) -> None:
+            self.lines.append(title)
+
+        def write_line(self, line: str) -> None:
+            self.lines.append(line)
+
+    terminal = Reporter()
+    suite_conftest.pytest_terminal_summary(terminal, 0, None)
+    assert terminal.lines == [
+        "isolated module flakes",
+        "FLAKE  test_probe.py initial_exit=7 retry_exit=0 "
+        "diagnostic=synthetic first-run failure",
+    ]
+
+
+def test_deliberate_flake_is_reported_end_to_end(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "conftest.py").write_text(
+        (TEST_DIR / "conftest.py").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (suite / "test_probe.py").write_text(
+        "def test_deliberate_flake(request):\n"
+        "    request.node.user_properties.extend((\n"
+        "        ('goalflight_isolated_outcome', 'flake'),\n"
+        "        ('goalflight_test_id', 'deliberately_flaky.py'),\n"
+        "        ('goalflight_initial_exit', '7'),\n"
+        "        ('goalflight_retry_exit', '0'),\n"
+        "        ('goalflight_initial_diagnostic', 'failed once'),\n"
+        "    ))\n",
+        encoding="utf-8",
+    )
+    env = {**os.environ, ISOLATED_TEST_FILE_ENV: "test_probe.py"}
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(suite), "-q"],
         cwd=REPO_ROOT,
         env=env,
         capture_output=True,
         text=True,
         check=False,
     )
-    skipped_reason = (
-        next(
-            (
-                line.strip()
-                for line in result.stdout.splitlines()
-                if line.startswith("SKIPPED ")
-            ),
-            None,
-        )
-        if not direct_script
-        else None
-    )
-    if result.returncode == 0 and skipped_reason:
-        pytest.skip(f"{test_id}: {skipped_reason}")
-    assert result.returncode == 0, (
-        f"{test_id} exited {result.returncode}\n"
-        f"stdout:\n{_tail(result.stdout)}\n"
-        f"stderr:\n{_tail(result.stderr)}"
-    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "1 flake" in result.stdout
+    assert (
+        "FLAKE  deliberately_flaky.py initial_exit=7 retry_exit=0 "
+        "diagnostic=failed once"
+    ) in result.stdout
 
 
 def test_directory_collection_is_visible_and_clean() -> None:

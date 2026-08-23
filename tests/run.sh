@@ -106,6 +106,7 @@ if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
     rm -f /tmp/goal-flight-collect-$$.out
 
     if run_isolated_test_env python3 -m pytest tests/python -q > /tmp/goal-flight-test-$$.out 2>&1; then
+      grep '^FLAKE  ' /tmp/goal-flight-test-$$.out | sed 's/^/      /' || true
       echo "PASS  tests/python (isolated pytest directory suite)"
       sed -n '$p' /tmp/goal-flight-test-$$.out | sed 's/^/      /'
       pass=$((pass + 1))

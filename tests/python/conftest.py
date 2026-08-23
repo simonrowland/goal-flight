@@ -60,3 +60,32 @@ if _isolated_child:
 )
 def isolated_test_module(request: pytest.FixtureRequest) -> tuple[Path, bool]:
     return request.param
+
+
+def pytest_report_teststatus(report, config):
+    del config
+    properties = dict(getattr(report, "user_properties", ()))
+    if (
+        report.when == "call"
+        and report.passed
+        and properties.get("goalflight_isolated_outcome") == "flake"
+    ):
+        return "flake", "f", "FLAKE"
+    return None
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
+    del exitstatus, config
+    flakes = terminalreporter.stats.get("flake", ())
+    if not flakes:
+        return
+    terminalreporter.write_sep("=", "isolated module flakes")
+    for report in flakes:
+        properties = dict(getattr(report, "user_properties", ()))
+        terminalreporter.write_line(
+            "FLAKE  "
+            f"{properties.get('goalflight_test_id', report.nodeid)} "
+            f"initial_exit={properties.get('goalflight_initial_exit', '?')} "
+            f"retry_exit={properties.get('goalflight_retry_exit', '?')} "
+            f"diagnostic={properties.get('goalflight_initial_diagnostic', '<none>')}"
+        )
