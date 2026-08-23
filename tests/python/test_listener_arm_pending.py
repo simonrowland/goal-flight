@@ -19,6 +19,7 @@ SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_journal as journal  # noqa: E402
+import goalflight_messages as messages  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 
 
@@ -47,10 +48,16 @@ def isolated(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, str]]:
     return project, {**os.environ, **env}
 
 
-def _post(env: dict[str, str], project: Path, text: str) -> None:
+def _post(
+    env: dict[str, str],
+    project: Path,
+    text: str,
+    *,
+    dispatch_id: str = "arm-backlog",
+) -> None:
     subprocess.run(
         [sys.executable, str(SCRIPTS / "goalflight_messages.py"), "post",
-         "--to-controller", "armtest", "--dispatch-id", "arm-backlog",
+         "--to-controller", "armtest", "--dispatch-id", dispatch_id,
          "--type", "controller-notice", "--text", text],
         env=env, cwd=project, check=True, capture_output=True,
     )
@@ -113,7 +120,7 @@ def test_arm_reports_backlog_stays_armed_and_rings_on_new(
                 proc.wait()
 
 
-def test_default_arm_over_backlog_exits_promptly(
+def test_default_ring_lists_entire_backlog_once_and_advances_every_stream(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
     project, env = isolated
@@ -125,7 +132,122 @@ def test_default_arm_over_backlog_exits_promptly(
     with wake.register_lease_holder(
         project, controller_label="armtest", lease_nonce=lease.nonce
     ):
-        _post(env, project, "compat backlog")
+        listener_env = {
+            **env,
+            "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+            "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+        }
+        processes = [
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "goalflight_messages.py"),
+                    "listen",
+                    "--project-root",
+                    str(project),
+                    "--controller-label",
+                    "armtest",
+                    "--listener-slots",
+                    "4",
+                    "--poll-secs",
+                    "5",
+                    "--timeout-s",
+                    "30",
+                ],
+                env=listener_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _index in range(4)
+        ]
+        try:
+            arm_deadline = time.monotonic() + 10
+            live_waiters = []
+            while time.monotonic() < arm_deadline:
+                live_waiters = wake.live_waiters(
+                    project, controller_label="armtest"
+                ) or []
+                if len(live_waiters) == 4:
+                    break
+                time.sleep(0.02)
+            assert len(live_waiters) == 4
+            for index in range(1, 11):
+                _post(
+                    env,
+                    project,
+                    f"buffered event {index}",
+                    dispatch_id=f"ev-{index}",
+                )
+
+            deadline = time.monotonic() + 10
+            exited: list[subprocess.Popen[str]] = []
+            while time.monotonic() < deadline:
+                exited = [process for process in processes if process.poll() is not None]
+                if exited:
+                    break
+                time.sleep(0.02)
+            assert len(exited) == 1, [process.poll() for process in processes]
+            time.sleep(0.2)
+            assert len([process for process in processes if process.poll() is not None]) == 1
+
+            winner = exited[0]
+            stdout, stderr = winner.communicate(timeout=5)
+            assert winner.returncode == 0, stderr
+            lines = stdout.splitlines()
+            receipt_lines = [line for line in lines if line.startswith("[controller-notice]")]
+            assert len(receipt_lines) == 10, stdout
+            for index in range(1, 11):
+                assert (
+                    f"[controller-notice] ev-{index} seq=1 — buffered event {index}"
+                    in receipt_lines
+                )
+            advance_lines = [line for line in lines if line.startswith("advance: ")]
+            assert len(advance_lines) == 1, stdout
+            for index in range(1, 11):
+                assert f"ev-{index}=1" in advance_lines[0]
+            assert "mail available; peek:" not in stdout
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=5)
+
+
+def test_default_ring_filters_controller_authored_items_from_listing(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "arm-filter-test"}
+    ).value
+    assert lease is not None
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        own_envelope = messages.post_message(
+            dispatch_id="self-authored",
+            msg_type="controller-notice",
+            payload={"text": "private own traffic"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={
+                "node": "local",
+                "adapter": "pytest",
+                "transport": "controller",
+                "controller_label": "armtest",
+            },
+            author_capability=lease.nonce,
+            addressee=messages.controller_addressee(
+                "armtest", project_root=project
+            ),
+        )["envelope"]
+        assert messages.envelope_authored_by_controller(
+            own_envelope,
+            controller_label="armtest",
+            lease_nonce=lease.nonce,
+        )
+        _post(env, project, "foreign traffic", dispatch_id="foreign")
         listener_env = {
             **env,
             "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
@@ -143,7 +265,7 @@ def test_default_arm_over_backlog_exits_promptly(
                 "--poll-secs",
                 "0.01",
                 "--timeout-s",
-                "1",
+                "5",
             ],
             env=listener_env,
             capture_output=True,
@@ -152,10 +274,16 @@ def test_default_arm_over_backlog_exits_promptly(
         )
 
     assert result.returncode == 0, result.stderr
-    lines = result.stdout.splitlines()
-    assert len(lines) == 1, result.stdout
-    assert lines[0].startswith("mail available; peek:")
-    assert "pending-at-arm" not in result.stdout
+    assert "[controller-notice] foreign seq=1 — foreign traffic" in result.stdout
+    assert "self-authored" not in "\n".join(
+        line for line in result.stdout.splitlines() if line.startswith("[")
+    )
+    advance_lines = [
+        line for line in result.stdout.splitlines() if line.startswith("advance: ")
+    ]
+    assert len(advance_lines) == 1, result.stdout
+    assert "self-authored=1" in advance_lines[0]
+    assert "foreign=1" in advance_lines[0]
 
 
 def test_report_pending_json_is_jsonl_through_ring(
@@ -170,8 +298,8 @@ def test_report_pending_json_is_jsonl_through_ring(
     with wake.register_lease_holder(
         project, controller_label="armtest", lease_nonce=lease.nonce
     ):
-        _post(env, project, "json backlog one")
-        _post(env, project, "json backlog two")
+        for index in range(1, 10):
+            _post(env, project, f"json backlog {index}")
         listener_env = {
             **env,
             "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
@@ -201,15 +329,23 @@ def test_report_pending_json_is_jsonl_through_ring(
             arm_line = proc.stdout.readline()
             arm_payload = json.loads(arm_line)
             assert arm_payload["kind"] == "pending-at-arm"
-            assert len(arm_payload["items"]) == 2
+            assert len(arm_payload["items"]) == 9
 
-            _post(env, project, "json ring")
+            _post(env, project, "json ring 10")
             remaining_stdout, _stderr = proc.communicate(timeout=30)
             lines = [arm_line, *remaining_stdout.splitlines(keepends=True)]
             payloads = [json.loads(line) for line in lines if line.strip()]
             assert len(payloads) == 2, lines
             assert payloads[1]["kind"] == "ring"
             assert payloads[1]["reason"] == "event"
+            # The arm payload carries items because an arm IS a peek. The ring
+            # deliberately does not: it is a wake signal plus the instructions
+            # to drain, and its keys are each justified as not-a-mail-body in
+            # test_goalflight_p3's body-free contract. This asymmetry is easiest
+            # to get wrong here, where both payloads are visible at once, so
+            # pin it rather than leaving a gap.
+            assert "items" not in payloads[1]
+            assert payloads[1]["advance_command"]
             assert proc.returncode == 0
         finally:
             if proc.poll() is None:

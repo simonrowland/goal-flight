@@ -304,7 +304,10 @@ def test_listen_exit_still_prints_the_numbered_hint(
             _post(env, project, "terse-ctl", "ring me")
             stdout, stderr = proc.communicate(timeout=30)
             assert proc.returncode == 0, stderr
-            assert stdout.startswith("mail available; peek:")
+            assert stdout.splitlines()[0] == (
+                "[controller-notice] terse-mail seq=1 — ring me"
+            )
+            assert stdout.splitlines()[1].startswith("advance: ")
             expected = wake.listener_floor_hint(
                 0,
                 wake.DEFAULT_LISTENER_SLOTS,

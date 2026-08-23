@@ -6127,6 +6127,12 @@ def cmd_listen(args) -> int:
                 coverage_id,
                 reason="event",
             )
+            # The JSON ring stays body-free ON PURPOSE: it is a wake signal plus
+            # the instructions to drain, never the mail itself. A --json consumer
+            # advances with advance_command and reads bodies from the drain. The
+            # human-readable path below does print every buffered item, because
+            # there the reader IS the controller and a second round-trip costs it
+            # another doorbell from the pool.
             payload = {
                 "kind": "ring",
                 "reason": "event",
@@ -6137,10 +6143,15 @@ def cmd_listen(args) -> int:
             }
             waiter.close()
             if not args.json:
-                print(
-                    "mail available; peek: goalflight_messages.py relay --new; "
-                    f"advance after processing: {advance_command}"
+                ring_items = _envelopes_with_rows(authority, list(snapshot.items))
+                visible_ring_items = _foreign_controller_items(
+                    ring_items,
+                    controller_label=label,
+                    lease_nonce=nonce,
                 )
+                for row, envelope in visible_ring_items:
+                    print(format_receipt_headline(row, envelope), flush=True)
+                print(f"advance: {advance_command}", flush=True)
             emit_payload(payload)
             death_watch.restore()
             return 0
