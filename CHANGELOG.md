@@ -6,6 +6,63 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-08-23
+
+### Changed
+
+- **Controller-facing contract change: persistent wake coverage is now three
+  components, not two.** A monitor-backed controller arms the `follow` stream,
+  one `listen --listener-slots 1 --report-pending` backup doorbell, and one
+  separately tracked `listen --watch-follow` watchdog, and reads `live/3`.
+  The watchdog previously required the single delivery slot the backup already
+  held, so a controller could have a safety net or death detection but never
+  both — and the property the design exists for could not even be tested. The
+  watchdog now takes its own generation lock and consumes no delivery slot.
+  Verified live: a killed stream is announced at 362.7s against a 360s
+  threshold, and a killed watchdog is announced by the backup within seconds.
+  The witness chain is bounded on purpose and the docs say so: a lone watchdog
+  death is loud, correlated stream-plus-watchdog death stays loud while the
+  doorbell survives, but the doorbell cannot witness its own hard death and no
+  controller-scoped task survives the host reaping every tracked task.
+- **After upgrading, existing listeners read as uncounted until re-armed.**
+  Waiter records now carry a generation identity, so a record written by
+  pre-upgrade code cannot be attributed and is not counted. Re-arming alongside
+  those still-running processes works and does not contend for slots.
+
+### Fixed
+
+- Wake coverage could report more armed than actually was. It counted waiters
+  across lease generations, so a fresh generation read full coverage off the
+  previous generation's locks and emitted no re-arm commands; the watchdog
+  published its death notice while still holding its own lock, so the coverage
+  a controller read on waking was already stale; and an unreadable durable
+  record silently downgraded a persistent controller to an apparently-covered
+  portable one, sending it to arm the wrong thing.
+- A schema fence — the client being older than the journal — was caught by a
+  handler meant for transient unavailability and reported as a stale lease
+  nonce, so a controller would re-arm forever against a condition only a
+  deployment could clear. Twenty-four journal-facing broad handlers were
+  audited alongside it.
+- Writes that could never succeed were being swallowed. A death-announcement
+  wrote its own coverage row using a reason the journal did not recognise; the
+  write was rejected on every run and the rejection suppressed, so the visible
+  half worked while coverage rows stayed armed for listeners that had gone.
+  Fifty-four write sites were audited: twenty-eight now let contract faults
+  propagate while still tolerating a busy database, and twenty-six intentional
+  best-effort writes must now name what they give up. Shutdown paths stay
+  non-fatal so a fix can never cost a final death or result event.
+- A lease whose holder had died stayed active indefinitely, so mail kept being
+  addressed to controllers that no longer existed. Claim and renew now expire
+  such leases using kernel-lock liveness, treating an indeterminate answer as
+  alive.
+- Remote dispatch asks a box whether it can take the work first, using
+  per-core load and swap pressure rather than raw numbers, and reports which
+  host actually answered.
+- The test gate can now distinguish a flake from a failure. It previously
+  treated one failed sample as a verdict and leaked ambient identity into the
+  subprocesses it spawned, so its red carried no information.
+
+
 ### Changed
 
 - Hosts with a persistent stdout monitor can arm one `goalflight_messages.py
@@ -13,10 +70,10 @@ incremented when meaningful skill behaviour changes.
   records stay below macOS `PIPE_BUF`; old projections carry age and become
   structurally stale. `EPIPE` rolls back an undelivered cursor-ring reservation
   and releases the monitor lock, while `EAGAIN` is bounded and becomes durable
-  fault state. One tracked `listen --watch-follow` backup reads durable record
-  age and emits `listener-dead` on stdout after three missed beats. Monitor-
-  backed controllers share one stream-plus-backup `live/2` coverage predicate;
-  portable hosts retain the four-slot `listen` pool. Regular-file stdout and
+  fault state. A separately tracked `listen --watch-follow` watchdog reads durable
+  record age and emits `listener-dead` on stdout after three missed beats. Monitor-
+  backed controllers share one stream-plus-backup-plus-watchdog `live/3`
+  coverage predicate; portable hosts retain the four-slot `listen` pool. Regular-file stdout and
   stream-only pool knobs are rejected instead of silently accepted.
 - Terminal mail carries the worker's own COMPLETE/BLOCKED headline instead of
   `dispatch terminal: <state>`. The headline travels on a dedicated observation

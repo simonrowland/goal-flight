@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-version: 1.5.0
+version: 1.5.1
 description: "Portable Goal Flight workflow for long-running repo work: planning, dispatch, review, recovery, file-backed resume."
 tags:
   - orchestration
