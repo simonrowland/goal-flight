@@ -216,6 +216,7 @@ LISTENER_EXIT_REASONS = frozenset(
         "corrupt",
         "upgrade-required",
         "journal-unavailable",
+        "watchdog-dead",
         "signal",
     }
 )

@@ -442,7 +442,7 @@ def test_journal_failure_is_a_waking_stdout_record(
         journal.Journal,
         "cursor_peek",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            journal.JournalError("measured journal fault")
+            journal.JournalUnavailable("measured journal fault")
         ),
     )
     result = messages._run_cli(
@@ -474,6 +474,10 @@ def test_journal_failure_is_a_waking_stdout_record(
         controller_label=lease.label,
         kinds={wake.MONITOR_KIND},
     )
+
+
+def test_watchdog_dead_audit_reason_is_registered() -> None:
+    assert "watchdog-dead" in journal.LISTENER_EXIT_REASONS
 
 
 def test_every_record_is_structural_and_below_pipe_buf_with_long_frontier() -> None:
@@ -862,6 +866,8 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    assert backup.stdout is not None
+    backup_reader = _JsonLineReader(backup.stdout)
     assert watchdog.stdout is not None
     watchdog_reader = _JsonLineReader(watchdog.stdout)
     replacement_backup: subprocess.Popen[bytes] | None = None
@@ -906,13 +912,58 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
                 project_root=project,
             ),
         )
-        backup_stdout, backup_stderr = backup.communicate(timeout=2)
-        assert backup.returncode == 0, backup_stderr.decode()
-        backup_lines = [
-            json.loads(line) for line in backup_stdout.splitlines() if line
-        ]
-        assert backup_lines[-1]["kind"] == "ring"
-        assert backup_lines[-1]["reason"] == "event"
+        _raw, backup_result = backup_reader.read(timeout_s=2)
+        if backup_result["kind"] == "pending-at-arm":
+            pending_items = backup_result.get("items")
+            assert isinstance(pending_items, list)
+            assert any(
+                isinstance(item, dict)
+                and item.get("dispatch_id") == "backup-rings-with-watchdog"
+                for item in pending_items
+            ), "waiter lock became visible before the report-pending snapshot"
+            messages.post_message(
+                dispatch_id="backup-rings-after-arm",
+                msg_type="controller-notice",
+                payload={"text": "post-arm mail must ring the backup"},
+                messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                source={
+                    "node": "peer",
+                    "adapter": "pytest",
+                    "transport": "controller",
+                },
+                addressee=messages.controller_addressee(
+                    lease.label,
+                    project_root=project,
+                ),
+            )
+            _raw, backup_result = backup_reader.read(timeout_s=2)
+        assert backup_result["kind"] == "ring"
+        assert backup_result["reason"] == "event"
+        assert backup.wait(timeout=2) == 0
+
+        authority = journal.Journal(project)
+        pending = authority.cursor_peek(
+            lease.label,
+            nonce=lease.nonce,
+            waking_only=False,
+        )
+        advances: dict[str, int] = {}
+        for item in pending.items:
+            stream_id = str(item["stream_id"])
+            advances[stream_id] = max(
+                advances.get(stream_id, 0),
+                int(item["stream_seq"]),
+            )
+        assert advances
+        advanced = authority.advance_cursor(
+            lease.label,
+            nonce=lease.nonce,
+            expected_cursor_version=pending.cursor_version,
+            expected_stream_snapshots=pending.stream_snapshots,
+            advances=advances,
+            actor="follow-listener-test",
+        )
+        assert advanced.committed, advanced.reason
 
         replacement_backup = subprocess.Popen(
             _backup_command(project, lease),
