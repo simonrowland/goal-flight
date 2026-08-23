@@ -70,6 +70,12 @@ LISTEN_EXIT_THIN_HINT_SNAPSHOT = (
     "3. CMD"
 )
 
+# t-272 excludes rendered prose and repeated path-bearing commands from this
+# every-startup machine surface.  Compact wake state is different: the later
+# persistent-listener contract needs ``wake_mode`` to choose pool versus
+# stream/backup/watchdog arming, and ``reason`` distinguishes healthy, missing,
+# stale, faulted, and unavailable coverage.  Keep this an exact set so that
+# operational additions remain deliberate rather than turning into key sprawl.
 LISTENER_DEPTH_KEYS = {
     "live",
     "target",
@@ -77,6 +83,8 @@ LISTENER_DEPTH_KEYS = {
     "work_in_flight",
     "command",
     "separate_tracked_tasks",
+    "wake_mode",
+    "reason",
 }
 
 
