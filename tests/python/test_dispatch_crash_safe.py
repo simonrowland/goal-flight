@@ -40,6 +40,15 @@ import goalflight_rate_pressure  # noqa: E402
 import goalflight_watch  # noqa: E402
 
 
+_SLOW_INTERRUPT_EXIT_SECS = 6.0
+# The loaded-exit reproducer below measures a six-second post-SIGINT delay,
+# beyond the former five-second assumption. Five reproducer windows is the
+# 30-second hang ceiling: event waits still return immediately when observed,
+# while a process that never exits cannot hang the suite indefinitely.
+_EVENT_HANG_CEILING_SECS = _SLOW_INTERRUPT_EXIT_SECS * 5
+_EVENT_POLL_SECS = 0.1
+
+
 def _isolate_state_env(env: dict[str, str], base: Path) -> None:
     for key in (
         "GOALFLIGHT_DISPATCH_ID",
@@ -64,13 +73,125 @@ def _isolate_state_env(env: dict[str, str], base: Path) -> None:
     env["GOALFLIGHT_ROOT"] = str(ROOT)
 
 
-def _wait_for(predicate, timeout: float = 8.0, interval: float = 0.1) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+def _wait_for(
+    predicate,
+    *,
+    ceiling: float = _EVENT_HANG_CEILING_SECS,
+    interval: float = _EVENT_POLL_SECS,
+) -> bool:
+    deadline = time.monotonic() + ceiling
+    while time.monotonic() < deadline:
         if predicate():
             return True
         time.sleep(interval)
     return False
+
+
+def _observe_process_exit(
+    proc: subprocess.Popen,
+    *,
+    expected_returncode: int | None = None,
+    stderr_contains: str | None = None,
+    ceiling: float = _EVENT_HANG_CEILING_SECS,
+):
+    """Collect output when exit is observed, bounded only against a true hang."""
+    deadline = time.monotonic() + ceiling
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            out, err = proc.communicate()
+            raise AssertionError(
+                f"process {proc.pid} did not exit within {ceiling:.1f}s hang ceiling; "
+                f"stdout={out!r}; stderr={err!r}"
+            )
+        try:
+            out, err = proc.communicate(timeout=min(_EVENT_POLL_SECS, remaining))
+        except subprocess.TimeoutExpired:
+            continue
+        if expected_returncode is not None:
+            assert proc.returncode == expected_returncode, (proc.returncode, out, err)
+        if stderr_contains is not None:
+            assert stderr_contains in (err or ""), err
+        return out, err
+
+
+def _observe_thread_exit(
+    thread: threading.Thread,
+    *,
+    ceiling: float = _EVENT_HANG_CEILING_SECS,
+) -> None:
+    deadline = time.monotonic() + ceiling
+    while thread.is_alive():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(
+                f"thread {thread.name!r} did not exit within {ceiling:.1f}s hang ceiling"
+            )
+        thread.join(min(_EVENT_POLL_SECS, remaining))
+
+
+def _delay_interrupt_exit(command: list[str]) -> list[str]:
+    """Proxy SIGINT to a real child, then emulate loaded scheduling before exit."""
+    proxy_code = (
+        "import signal, subprocess, sys, time\n"
+        "delay = float(sys.argv[1])\n"
+        "child = subprocess.Popen(sys.argv[2:])\n"
+        "def forward_interrupt(signum, _frame):\n"
+        "    child.send_signal(signum)\n"
+        "signal.signal(signal.SIGINT, forward_interrupt)\n"
+        "returncode = child.wait()\n"
+        "time.sleep(delay)\n"
+        "raise SystemExit(returncode)\n"
+    )
+    return [
+        sys.executable,
+        "-c",
+        proxy_code,
+        str(_SLOW_INTERRUPT_EXIT_SECS),
+        *command,
+    ]
+
+
+def case_event_wait_rejects_hangs_and_wrong_exit_codes() -> None:
+    hanging = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        try:
+            _observe_process_exit(hanging, expected_returncode=0, ceiling=0.2)
+        except AssertionError as exc:
+            assert "did not exit within 0.2s hang ceiling" in str(exc), exc
+        else:
+            raise AssertionError("a process that never exits passed the hang ceiling")
+    finally:
+        if hanging.poll() is None:
+            hanging.terminate()
+            _observe_process_exit(hanging)
+
+    wrong_exit = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys; print('expected hint', file=sys.stderr); raise SystemExit(7)",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _observe_process_exit(
+            wrong_exit,
+            expected_returncode=130,
+            stderr_contains="expected hint",
+        )
+    except AssertionError as exc:
+        assert "7" in str(exc), exc
+    else:
+        raise AssertionError("a process with the wrong exit code passed observation")
 
 
 def _process_exists(pid: int | None) -> bool:
@@ -87,7 +208,7 @@ def _process_exists(pid: int | None) -> bool:
 
 def _dead_pid() -> int:
     proc = subprocess.Popen([sys.executable, "-c", "pass"])
-    proc.wait(timeout=5)
+    _observe_process_exit(proc, expected_returncode=0)
     assert not _process_exists(proc.pid), f"pid still alive after wait: {proc.pid}"
     return proc.pid
 
@@ -306,7 +427,7 @@ def case_post_terminal_idle_worker_times_out_inconclusively() -> None:
         )
         t0 = time.time()
         try:
-            out, err = watcher.communicate(timeout=25)
+            out, err = _observe_process_exit(watcher)
             elapsed = time.time() - t0
             assert watcher.returncode == 1, (watcher.returncode, out, err)
             assert elapsed < 18, f"post-terminal idle wait took {elapsed:.1f}s"
@@ -325,10 +446,10 @@ def case_post_terminal_idle_worker_times_out_inconclusively() -> None:
         finally:
             if watcher.poll() is None:
                 watcher.terminate()
-                watcher.wait(timeout=5)
+                _observe_process_exit(watcher)
             if worker.poll() is None:
                 os.killpg(worker.pid, signal.SIGTERM)
-                worker.wait(timeout=5)
+                _observe_process_exit(worker)
 
 
 def case_worker_death_reconciliation_streams_beyond_tail_window() -> None:
@@ -344,7 +465,7 @@ def case_worker_death_reconciliation_streams_beyond_tail_window() -> None:
 
         env = os.environ.copy()
         _isolate_state_env(env, tmp_path)
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [
                 sys.executable,
                 str(WATCH),
@@ -361,13 +482,14 @@ def case_worker_death_reconciliation_streams_beyond_tail_window() -> None:
                 "--max-idle-secs",
                 "20",
             ],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=12,
             env=env,
         )
+        stdout, stderr = _observe_process_exit(proc)
         payload = json.loads(status.read_text(encoding="utf-8"))
-        assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr, payload)
+        assert proc.returncode == 0, (proc.returncode, stdout, stderr, payload)
         assert payload.get("state") == "complete", payload
         assert payload.get("reason") == "marker:COMPLETE:final_reconciliation", payload
         assert payload.get("terminal_marker", {}).get("kind") == "COMPLETE", payload
@@ -788,10 +910,10 @@ def case_post_terminal_busy_worker_stays_armed_after_grace() -> None:
         finally:
             if watcher.poll() is None:
                 watcher.terminate()
-                watcher.wait(timeout=5)
+                _observe_process_exit(watcher)
             if worker.poll() is None:
                 os.killpg(worker.pid, signal.SIGTERM)
-                worker.wait(timeout=5)
+                _observe_process_exit(worker)
 
 
 def case_post_terminal_delayed_worker_exit_is_observed() -> None:
@@ -842,7 +964,7 @@ def case_post_terminal_delayed_worker_exit_is_observed() -> None:
         worker_reaper.start()
         t0 = time.monotonic()
         try:
-            out, err = watcher.communicate(timeout=8)
+            out, err = _observe_process_exit(watcher)
             elapsed = time.monotonic() - t0
             assert watcher.returncode == 0, (watcher.returncode, out, err)
             assert elapsed >= 1.5, f"watcher truncated the delayed exit after {elapsed:.1f}s"
@@ -854,13 +976,13 @@ def case_post_terminal_delayed_worker_exit_is_observed() -> None:
             assert payload.get("terminal_marker", {}).get("kind") == "COMPLETE", payload
             assert payload.get("reason") == "marker:COMPLETE", payload
         finally:
-            worker_reaper.join(timeout=5)
+            _observe_thread_exit(worker_reaper)
             if watcher.poll() is None:
                 watcher.terminate()
-                watcher.wait(timeout=5)
+                _observe_process_exit(watcher)
             if worker.poll() is None:
                 os.killpg(worker.pid, signal.SIGTERM)
-                worker.wait(timeout=5)
+                _observe_process_exit(worker)
 
 
 def case_dispatch_post_terminal_idle_returns_inconclusive() -> None:
@@ -939,15 +1061,13 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
                 lambda: started.exists()
                 and status.exists()
                 and _status_payload().get("state") != "starting",
-                timeout=15,
             ), status.read_text(encoding="utf-8") if status.exists() else "worker/watch did not start"
             os.killpg(proc.pid, signal.SIGTERM)
-            proc.wait(timeout=5)
-            assert _wait_for(done.exists, timeout=10), "worker died with launcher process group"
+            _observe_process_exit(proc)
+            assert _wait_for(done.exists), "worker died with launcher process group"
             assert _wait_for(
                 lambda: status.exists()
                 and json.loads(status.read_text(encoding="utf-8")).get("worker_alive") is False,
-                timeout=15,
             ), status.read_text(encoding="utf-8") if status.exists() else "missing status"
             payload = json.loads(status.read_text(encoding="utf-8"))
             assert payload.get("state") == "complete", payload
@@ -955,7 +1075,7 @@ def case_worker_and_watcher_survive_launcher_pgroup_sigterm() -> None:
         finally:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait(timeout=5)
+                _observe_process_exit(proc)
 
 
 def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> None:
@@ -980,24 +1100,25 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
             "print('COMPLETE: foreground-interrupt — interrupt-safe done', flush=True)\n"
             f"pathlib.Path({str(done)!r}).write_text('done')\n"
         )
+        dispatch_command = [
+            sys.executable, str(DISPATCH), "--unregistered-forced",
+            # Pin the project root to the sandbox: the controller registry
+            # is per-project, so inheriting this repo as cwd would let a
+            # registered local controller be inferred as this dispatch's
+            # owner and break the unowned assertions below.
+            "--cwd", str(tmp_path),
+            "--agent", "test",
+            "--dispatch-id", "foreground-interrupt",
+            "--tail", str(tail),
+            "--status-json", str(status),
+            "--poll-secs", "0.2",
+            "--max-idle-secs", "10",
+            "--foreground",
+            "--",
+            sys.executable, "-c", worker_code,
+        ]
         proc = subprocess.Popen(
-            [
-                sys.executable, str(DISPATCH), "--unregistered-forced",
-                # Pin the project root to the sandbox: the controller registry
-                # is per-project, so inheriting this repo as cwd would let a
-                # registered local controller be inferred as this dispatch's
-                # owner and break the unowned assertions below.
-                "--cwd", str(tmp_path),
-                "--agent", "test",
-                "--dispatch-id", "foreground-interrupt",
-                "--tail", str(tail),
-                "--status-json", str(status),
-                "--poll-secs", "0.2",
-                "--max-idle-secs", "10",
-                "--foreground",
-                "--",
-                sys.executable, "-c", worker_code,
-            ],
+            _delay_interrupt_exit(dispatch_command),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1028,9 +1149,14 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
             assert _process_exists(worker_pid), "worker not alive before interrupt"
 
             proc.send_signal(signal.SIGINT)
-            _out, err = proc.communicate(timeout=5)
-            assert proc.returncode == 130, (proc.returncode, err)
-            assert "goalflight_status.py --wait foreground-interrupt" in err, err
+            interrupt_started = time.monotonic()
+            _out, err = _observe_process_exit(
+                proc,
+                expected_returncode=130,
+                stderr_contains="goalflight_status.py --wait foreground-interrupt",
+            )
+            interrupt_elapsed = time.monotonic() - interrupt_started
+            assert interrupt_elapsed >= _SLOW_INTERRUPT_EXIT_SECS - 0.5, interrupt_elapsed
             assert _process_exists(worker_pid), "worker died on launcher KeyboardInterrupt"
 
             pidfiles = list(pid_dir.glob("*.jsonl"))
@@ -1058,16 +1184,15 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
             assert _process_exists(worker_pid), "worker died during cleanup_ghosts sweep"
             assert pidfile.exists(), "live unowned pidfile stays available for re-attach"
 
-            assert _wait_for(done.exists, timeout=8), "worker did not finish after launcher interrupt"
+            assert _wait_for(done.exists), "worker did not finish after launcher interrupt"
             assert _wait_for(
                 lambda: status.exists()
                 and json.loads(status.read_text(encoding="utf-8")).get("state") == "complete",
-                timeout=8,
             ), status.read_text(encoding="utf-8") if status.exists() else "missing status"
         finally:
             if proc.poll() is None:
                 proc.terminate()
-                proc.wait(timeout=5)
+                _observe_process_exit(proc)
             if worker_pid and _process_exists(worker_pid):
                 try:
                     os.killpg(worker_pid, signal.SIGTERM)
@@ -1105,14 +1230,14 @@ def case_watcher_sigterm_flushes_non_running_status() -> None:
         try:
             assert _wait_for(lambda: status.exists()), "watcher did not write initial status"
             os.kill(watcher.pid, signal.SIGTERM)
-            watcher.wait(timeout=5)
+            _observe_process_exit(watcher)
             payload = json.loads(status.read_text(encoding="utf-8"))
             assert payload.get("state") == "watcher_stopped", payload
             assert payload.get("worker_alive") is True, payload
             assert str(payload.get("reason", "")).startswith("signal:SIGTERM"), payload
         finally:
             worker.terminate()
-            worker.wait(timeout=5)
+            _observe_process_exit(worker)
 
 
 def case_detached_watcher_ignores_dead_controller_pid() -> None:
@@ -1150,7 +1275,6 @@ def case_detached_watcher_ignores_dead_controller_pid() -> None:
             assert _wait_for(
                 lambda: status.exists()
                 and json.loads(status.read_text(encoding="utf-8")).get("state") in {"running", "running_quiet"},
-                timeout=5,
             ), status.read_text(encoding="utf-8") if status.exists() else "missing detached watcher status"
             payload = json.loads(status.read_text(encoding="utf-8"))
             assert payload.get("detached") is True, payload
@@ -1163,10 +1287,10 @@ def case_detached_watcher_ignores_dead_controller_pid() -> None:
         finally:
             if watcher.poll() is None:
                 watcher.terminate()
-                watcher.wait(timeout=5)
+                _observe_process_exit(watcher)
             if worker.poll() is None:
                 os.killpg(worker.pid, signal.SIGTERM)
-                worker.wait(timeout=5)
+                _observe_process_exit(worker)
 
 
 def case_non_detached_watcher_dead_controller_and_gone_worker_remains_orphaned() -> None:
@@ -1200,7 +1324,7 @@ def case_non_detached_watcher_dead_controller_and_gone_worker_remains_orphaned()
             env=env,
         )
         try:
-            out, err = watcher.communicate(timeout=8)
+            out, err = _observe_process_exit(watcher)
             assert watcher.returncode == 3, (watcher.returncode, out, err)
             payload = json.loads(status.read_text(encoding="utf-8"))
             assert payload.get("state") == "orphaned", payload
@@ -1212,10 +1336,11 @@ def case_non_detached_watcher_dead_controller_and_gone_worker_remains_orphaned()
         finally:
             if watcher.poll() is None:
                 watcher.terminate()
-                watcher.wait(timeout=5)
+                _observe_process_exit(watcher)
 
 
 def main() -> None:
+    case_event_wait_rejects_hangs_and_wrong_exit_codes()
     case_crash_detected_promptly()
     case_finished_via_marker()
     case_dispatch_usage_limit_exit_zero_is_exhausted()
