@@ -10424,6 +10424,22 @@ def _codex_context_mode_enabled() -> bool:
     return raw in {"1", "true", "yes", "enabled", "on"}
 
 
+def _cursor_acp_enabled() -> bool:
+    """Whether cursor may use the acp shape. Default OFF, blocked pending a fix.
+
+    Cursor's auto-resolved shape used to be acp. bash-tail is measured good for
+    it — five of five trials correct by parsed value, exit 0, 49-50s each, both
+    artifacts written and a clean terminal marker every run — so bash is now the
+    default and acp is refused rather than silently chosen.
+
+    Blocking beats defaulting away: a shape that stays reachable by an explicit
+    flag will be reached, and the refusal says what to use instead. Re-enable
+    with GOALFLIGHT_CURSOR_ACP once acp is repaired.
+    """
+    raw = os.environ.get("GOALFLIGHT_CURSOR_ACP", "").strip().lower()
+    return raw in {"1", "true", "yes", "enabled", "on"}
+
+
 def _cursor_context_mode_enabled() -> bool:
     """Whether a dispatched cursor worker should load the context-mode MCP server.
 
@@ -10971,8 +10987,17 @@ def main(argv: list[str] | None = None) -> int:
     # Resolve comms shape. 'auto' = best per engine.
     shape = args.shape
     if shape == "auto":
-        shape = "acp" if args.agent in ("cursor", "claude-acp", "claude") else "bash"
+        shape = "acp" if args.agent in ("claude-acp", "claude") else "bash"
     args.shape = shape
+    if args.agent in CURSOR_AGENTS and shape == "acp" and not _cursor_acp_enabled():
+        print(
+            "goalflight_dispatch: cursor over acp is blocked pending a fix; use the "
+            "bash shape, which is now the default for cursor. Measured 2026-08-24: "
+            "5/5 correct on bash-tail, ~50s each. Override with "
+            "GOALFLIGHT_CURSOR_ACP=1 once acp is repaired.",
+            file=sys.stderr,
+        )
+        return 64
     _ensure_assigned_engine_session(args)
     if (
         getattr(args, "parent_dispatch_id", None)
@@ -11812,7 +11837,7 @@ def _ensure_acp_sdk_interpreter(argv: list[str] | None = None) -> None:
         agent = _opt("--agent")
         shape = (
             "acp"
-            if agent in ("cursor", "claude-acp", "claude") or "--interactive" in argv
+            if agent in ("claude-acp", "claude") or "--interactive" in argv
             else "bash"
         )
     if shape != "acp":
