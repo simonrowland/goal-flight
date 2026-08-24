@@ -10827,6 +10827,22 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
     return None, None  # unknown preset + no raw command
 
 
+# Subcommands are matched positionally BEFORE argparse is constructed, so
+# argparse never learns they exist and they get no --help entry. That is not a
+# cosmetic gap: `resume` was invisible to `--help`, and controllers looking for
+# a resume capability the usual way concluded there was none and redispatched
+# instead, discarding accumulated worker context. Listed here so the top-level
+# help can name them; `test_dispatch_subcommands_are_discoverable` pins this
+# list against the dispatch table so a new subcommand cannot be added silently.
+_SUBCOMMAND_HELP: tuple[tuple[str, str], ...] = (
+    ("steer", "send a message to a live worker's mailbox"),
+    ("resume", "continue a recorded worker session as a tracked dispatch"),
+    ("reconcile-abandoned", "reconcile dispatches whose controller died"),
+    ("drain", "launch queued dispatch requests"),
+    ("dashboard-refresh", "rebuild the dashboard projection"),
+)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == DAEMON_SPAWN_ARG:
@@ -10856,7 +10872,19 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_dashboard_refresh(argv[1:])
 
     parser = _TerseArgumentParser(
-        description="Crash-safe worker dispatch: detached worker + decoupled watcher.",
+        description=(
+            "Crash-safe worker dispatch: detached worker + decoupled watcher.\n"
+            "\n"
+            "Subcommands (these are positional, NOT flags -- they are matched\n"
+            "before this parser is built, so they have no --help entry of their\n"
+            "own here; run `<subcommand> --help` for each):\n"
+            + "\n".join(f"  {name:<20} {purpose}"
+                        for name, purpose in _SUBCOMMAND_HELP)
+        ),
+        # Default argparse re-wraps the description into one paragraph, which
+        # turns an aligned subcommand table into an unreadable run-on. The
+        # point of listing them is that a reader can SEE them.
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         usage_hint=_DISPATCH_USAGE_HINT,
     )
     parser.add_argument("--agent", default="worker",
@@ -11228,6 +11256,31 @@ def main(argv: list[str] | None = None) -> int:
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
 
     steer_file = _steer_file(args.dispatch_id)
+    # Create the mailbox NOW, empty, so the path the briefing advertises is
+    # real from the worker's first iteration.
+    #
+    # The steer preamble tells the worker "You have a steer mailbox at
+    # $GOALFLIGHT_STEER_FILE. Read it AT THE TOP OF EACH ITERATION" -- an
+    # assertion of existence. The file used to be created only when the first
+    # steer was sent, so a worker obeying that instruction on a dispatch that
+    # never received one got "No such file or directory" and reasonably read
+    # an advertised-but-absent channel as a fault. Observed 2026-08-24: a
+    # worker listed exactly that as one of its blockers and stopped.
+    #
+    # An empty carrier parses as zero messages, so this changes nothing for a
+    # dispatch that does get steered; it only makes "no steers yet" look like
+    # an empty mailbox instead of a missing one.
+    try:
+        steer_file.parent.mkdir(parents=True, exist_ok=True)
+        steer_file.touch(mode=0o600, exist_ok=True)
+    except OSError as exc:
+        # Never fail a dispatch over the mailbox: a worker with no steer file
+        # loses steering, while a worker that never launches loses everything.
+        print(
+            f"goalflight_dispatch: could not pre-create steer mailbox {steer_file}: "
+            f"{type(exc).__name__}: {exc}; steering will start on first message",
+            file=sys.stderr,
+        )
     prompt_path = None if raw else _resolve_prompt_file(args, base)
     original_prompt_path = prompt_path
     orientation_path = None if raw else _project_orientation_path(

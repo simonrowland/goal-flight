@@ -266,11 +266,62 @@ def test_hints_flag_restores_teaching_block() -> None:
                 _kill(launched.get("caffeinate_pid"))
 
 
+def test_dispatch_subcommands_are_discoverable() -> None:
+    """Every positional subcommand must be nameable from `--help`.
+
+    Subcommands are matched before argparse is built, so argparse never learns
+    they exist and they get no help entry of their own. `resume` was therefore
+    invisible: the word appeared ZERO times in `--help`, and controllers
+    looking for a resume capability the usual way concluded there was none and
+    redispatched instead, throwing away accumulated worker context. Measured
+    2026-08-24 across several independent controllers.
+
+    Pins the advertised list against the ACTUAL dispatch table by parsing
+    `main`, so adding a subcommand without documenting it fails here.
+    """
+    import ast
+    import inspect
+    import subprocess
+    import sys
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import goalflight_dispatch as gd
+
+    # Every `if argv[0] == "<name>"` guard at the top of main().
+    dispatched: set[str] = set()
+    for node in ast.walk(ast.parse(inspect.getsource(gd.main))):
+        if not isinstance(node, ast.Compare) or not node.comparators:
+            continue
+        left, right = node.left, node.comparators[0]
+        subscripts_argv = (
+            isinstance(left, ast.Subscript)
+            and isinstance(left.value, ast.Name)
+            and left.value.id == "argv"
+        )
+        if subscripts_argv and isinstance(right, ast.Constant) and isinstance(right.value, str):
+            dispatched.add(right.value)
+    # The daemon-spawn sentinel is internal plumbing, not an operator command.
+    dispatched.discard(gd.DAEMON_SPAWN_ARG)
+
+    advertised = {name for name, _ in gd._SUBCOMMAND_HELP}
+    assert dispatched, "found no subcommand guards; the parse shape changed"
+    missing = dispatched - advertised
+    assert not missing, f"subcommands dispatched but not advertised in --help: {sorted(missing)}"
+
+    help_text = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "goalflight_dispatch.py"), "--help"],
+        capture_output=True, text=True, timeout=120,
+    ).stdout
+    for name in sorted(dispatched):
+        assert name in help_text, f"{name!r} is dispatched but absent from --help output"
+
+
 def main() -> None:
     test_unrecognized_flag_is_one_line()
     test_invalid_os_sandbox_is_one_line()
     test_steer_missing_id_is_one_line()
     test_help_still_prints_full_map()
+    test_dispatch_subcommands_are_discoverable()
     test_readonly_alias_is_accepted()
     test_os_sandbox_readonly_alias_is_accepted()
     test_default_launch_hint_and_json_contract()

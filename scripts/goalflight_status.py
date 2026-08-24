@@ -596,6 +596,44 @@ def _reattach_hint(record: dict) -> str:
     return f"worker still alive - re-attach via goalflight_status.py --wait {dispatch_id}"
 
 
+def _resume_hint(record: dict) -> str:
+    """Name the resume command on a dead dispatch that still has its session.
+
+    Resume exists and works, but it is a SUBCOMMAND matched before argparse is
+    built, so the word does not appear in `--help` at all. A controller looking
+    for a resume capability the usual way finds nothing and redispatches,
+    discarding whatever context the dead worker had accumulated.
+
+    That is not a hypothetical: on 2026-08-24 several independent controllers
+    were told "probably need to resume" and none of them used the command; one
+    threw away 46k tokens of investigation that had died to a network blip.
+    Documentation cannot reach a failure this silent, so the hint is emitted at
+    the one moment it is actionable -- next to the dead row itself.
+
+    Returns "" when there is nothing to resume, so a healthy or
+    successfully-finished dispatch gains no noise.
+    """
+    session = record.get("engine_session_id") or record.get("codex_session_id")
+    if not session:
+        return ""
+    state = str(
+        record.get("classification") or record.get("terminal_state")
+        or record.get("state") or ""
+    )
+    # Only offer it where resuming is meaningful: a death or an inconclusive
+    # stop. A completed dispatch has nothing to continue, and offering resume
+    # there would train controllers to ignore the hint.
+    resumable = state.startswith(("worker_dead", "idle_timeout", "inconclusive",
+                                  "stalled", "wedged", "orphaned", "controller_dead"))
+    if not resumable:
+        return ""
+    dispatch_id = record.get("dispatch_id") or "<id>"
+    return (
+        f"resumable (session {session}): "
+        f"goalflight_dispatch.py resume {dispatch_id} --prompt-file <brief>"
+    )
+
+
 def _dispatch_queue_dir() -> Path:
     return goalflight_ledger.state_dir() / "dispatch-queue"
 
@@ -1529,6 +1567,9 @@ def _dispatch_cells(record: dict) -> str:
             f" sandbox requested={requested} supported={supported} "
             f"enforced={enforced}"
         )
+    resume = _resume_hint(record)
+    if resume:
+        cells += f" | {resume}"
     return cells
 
 
