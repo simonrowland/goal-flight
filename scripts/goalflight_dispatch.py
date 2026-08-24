@@ -4747,6 +4747,64 @@ def _drain_on_submit(args, queue_path: Path) -> None:
     _warn_if_stranded_without_drainer(queue_path)
 
 
+# Reasons that mean the drain CONFIRMED a launch even though the entry's state
+# is not "launched".
+#
+# Both are emitted inside `if ledger_confirmed:` after a token-matched record,
+# immediately after `_alert_launched_carrier_pending`. They are held out of the
+# `launched` COUNTER only because the claim carrier could not be cleared — that
+# counter means "launched AND carrier resolved" — but the worker is running
+# either way, and the carrier itself is already reported by that alert.
+#
+# Grounded in the drain's control flow, NOT in how the reasons are spelled. A
+# name-based rule was tried here first ("launched_" reads as a completed launch,
+# "launch_" as an attempt) and it had a hole exactly where the real bug was:
+# `worker_record_present_carrier_cleanup_pending` is ledger-confirmed and
+# contains no form of the word "launch". The convention was invented rather than
+# observed — `goalflight_fleet_watch` uses `launch_recovered` and
+# `launch_receipted` for successes — so a test enforcing it certified the
+# invention instead of the code.
+_DRAIN_CONFIRMED_LAUNCH_REASONS = frozenset({
+    "launched_carrier_cleanup_pending",
+    "worker_record_present_carrier_cleanup_pending",
+})
+
+
+def _drain_detail_is_a_confirmed_launch(entry: dict) -> bool:
+    """True when THIS launch attempt is confirmed running.
+
+    Every shape admitted here is bound to the current attempt by a
+    token-matched ledger record, which is what makes suppressing its message
+    safe.
+
+    SUCCESS TERMINAL STATES ARE DELIBERATELY EXCLUDED, and the reason is worth
+    keeping. A revision of this function also silenced `complete`/`released`,
+    on the grounds that several detail sites copy a completion decision's
+    `state` verbatim and a finished dispatch should not be called "not
+    launched". That was unsafe: dispatch ids are reusable once terminal, and
+    completion authority resolves a terminal record by dispatch id WITHOUT
+    comparing `queue_launch_token`, so a `complete` from an EARLIER attempt can
+    be attached to a new one. Suppressing it would turn a pre-spawn refusal of
+    the current attempt into total silence — trading a misleading message for a
+    vanished failure, which is the worse direction.
+
+    The residual is known and NOT merely cosmetic, so do not "tidy" it by
+    suppressing terminal states here. When a reused id refuses before its new
+    ledger row is written, stale completion authority can restore-and-unlink
+    the CURRENT carrier while the earlier terminal record still reads as
+    authoritative. Printing "not launched: existing_terminal_record" is then
+    the only surviving signal that something is wrong; silencing it would leave
+    an unattended controller believing the current work was resolved. The real
+    fix is to bind completion authority to `queue_launch_token` — a separate
+    change with its own contract, since the recovery tests already require a
+    token match before treating a terminal record as current evidence.
+    """
+    return (
+        str(entry.get("state") or "") == "launched"
+        or str(entry.get("reason") or "") in _DRAIN_CONFIRMED_LAUNCH_REASONS
+    )
+
+
 def _report_why_this_entry_did_not_launch(args, payload: dict) -> None:
     """Say WHY this dispatch is still queued, not merely that it is.
 
@@ -4772,6 +4830,14 @@ def _report_why_this_entry_did_not_launch(args, payload: dict) -> None:
     for entry in payload.get("details") or []:
         if str(entry.get("dispatch_id") or "") != dispatch_id:
             continue
+        if _drain_detail_is_a_confirmed_launch(entry):
+            # This entry LAUNCHED. Saying "not launched" here states the
+            # opposite of what happened, which is worse than the silence this
+            # function was written to replace: a controller reads it as a
+            # refusal and goes looking for a blockage that does not exist.
+            # Observed 2026-08-24 — a probe dispatch printed "not launched:
+            # unspecified" and was running as pid 83652 at the time.
+            return
         reason = str(entry.get("reason") or "unspecified")
         detail = (
             entry.get("process_evidence")
@@ -8408,27 +8474,51 @@ def _mark_queue_claim_worker_spawned(args, worker_pid: int | None) -> None:
     )
 
 
-def _mark_claim_failed_locked(claim: Path, entry: dict, *, reason: str) -> None:
-    """Pre-spawn failure write; caller owns Q."""
+def _mark_claim_failed_locked(claim: Path, entry: dict, *, reason: str) -> bool:
+    """Pre-spawn failure write; caller owns Q. Returns whether the claim cleared.
+
+    Writing the `.failed` record and clearing the original carrier are separate
+    outcomes: the unlink is best-effort, so the record can exist while the
+    claimed carrier survives. Recovery ignores the `.failed` sibling and keeps
+    scanning that surviving claim, so a caller reporting "failed" on the
+    strength of the record alone would be describing a carrier that is still in
+    play.
+    """
     fresh = dict(entry)
     fresh["state"] = "failed"
     fresh["reason"] = reason
     fresh["updated_at"] = goalflight_ledger.utc_now()
     failed = claim.with_name(f"{claim.name}.failed")
     _write_json_atomic(failed, fresh)
-    with contextlib.suppress(OSError):
+    try:
         claim.unlink()
+    except FileNotFoundError:
+        return True          # already gone: the carrier is cleared either way
+    except OSError:
+        return False         # record written, carrier still present
+    return True
 
 
-def _mark_claim_failed(claim: Path, entry: dict, *, reason: str) -> None:
+def _mark_claim_failed(claim: Path, entry: dict, *, reason: str) -> bool:
+    """Mark the claim failed. Returns whether the carrier is now durably failed.
+
+    False means the carrier is still in play, for either of two reasons, and a
+    caller announcing "failed" would in both cases describe a state the queue
+    is not in:
+
+    * a launch-token race, where this returns WITHOUT writing anything because
+      the carrier on disk belongs to a different attempt;
+    * a best-effort unlink that did not succeed, leaving the claimed carrier
+      beside the `.failed` record. Recovery keeps scanning that carrier.
+    """
     with _queue_mutation_lock(claim.parent):
         try:
             fresh = json.loads(claim.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             fresh = dict(entry)
         if fresh.get("queue_launch_token") != entry.get("queue_launch_token"):
-            return
-        _mark_claim_failed_locked(claim, fresh, reason=reason)
+            return False
+        return _mark_claim_failed_locked(claim, fresh, reason=reason)
 
 
 class _RemoteDrainBlocked(RuntimeError):
@@ -9485,7 +9575,20 @@ def _drain_queue_once(args) -> dict:
         )
         if not launch_argv:
             failed += 1
-            _mark_claim_failed(claim, entry, reason="missing_dispatch_argv")
+            committed = _mark_claim_failed(claim, entry, reason="missing_dispatch_argv")
+            # Every other refusal in this loop appends a detail; this one did
+            # not, so the submitter saw only the generic failure COUNT and no
+            # reason — the exact blindness the per-entry reporter exists to
+            # remove. Report the DURABLE state: the mark writes "failed", but
+            # it declines to write at all on a launch-token race, and claiming
+            # "failed" then would describe a write that did not happen.
+            details.append(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "failed" if committed else "claimed",
+                    "reason": "missing_dispatch_argv",
+                }
+            )
             continue
         timeout_s = max(20.0, float(args.capacity_wait_s or 0.0) + 45.0)
         try:

@@ -4557,6 +4557,62 @@ def test_round5_launch_owned_claim_writers_hold_queue_lock() -> None:
         assert claim.with_name(f"{claim.name}.failed").exists()
 
 
+def test_mark_claim_failed_reports_whether_it_committed() -> None:
+    """The return value is what lets a caller name the DURABLE state.
+
+    `_mark_claim_failed` declines to write on a launch-token race, leaving the
+    carrier in its prior state. The drain's `missing_dispatch_argv` path
+    reports the entry's state alongside the reason, and announcing "failed"
+    after a write that did not happen would describe the pre-mutation state as
+    if it were durable.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        queue = Path(td)
+        claim = queue / "d-1.json.claimed-1-2"
+        entry = {
+            "dispatch_id": "d-1",
+            "state": "claimed",
+            "queue_launch_token": "tok-current",
+        }
+        claim.write_text(json.dumps(entry), encoding="utf-8")
+
+        # Token race: the carrier on disk belongs to a different attempt, so
+        # nothing may be written and the caller must be told so.
+        stale = dict(entry, queue_launch_token="tok-other")
+        assert D._mark_claim_failed(claim, stale, reason="missing_dispatch_argv") is False
+        assert claim.exists(), "a declined mark must leave the carrier intact"
+        assert not claim.with_name(f"{claim.name}.failed").exists()
+
+        # Cleanup failure: the `.failed` record is written but the unlink does
+        # not succeed, so the claimed carrier survives and recovery keeps
+        # scanning it. Reporting "failed" here would describe a state the queue
+        # is not in, so the result must distinguish record-written from
+        # carrier-cleared.
+        original_unlink = Path.unlink
+
+        def refuse_unlink(self, *a, **kw):
+            if self == claim:
+                raise OSError("simulated unlink failure")
+            return original_unlink(self, *a, **kw)
+
+        Path.unlink = refuse_unlink
+        try:
+            assert D._mark_claim_failed(
+                claim, entry, reason="missing_dispatch_argv") is False
+        finally:
+            Path.unlink = original_unlink
+        assert claim.exists(), "carrier survived, so the result must not say failed"
+        assert claim.with_name(f"{claim.name}.failed").exists(), "record still written"
+
+        # Matching token and a clean unlink: the failure commits and the
+        # carrier moves.
+        assert D._mark_claim_failed(claim, entry, reason="missing_dispatch_argv") is True
+        assert not claim.exists()
+        failed = claim.with_name(f"{claim.name}.failed")
+        assert failed.exists()
+        assert json.loads(failed.read_text())["state"] == "failed"
+
+
 def test_round5_tail_substitution_and_frozen_lock_order() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
