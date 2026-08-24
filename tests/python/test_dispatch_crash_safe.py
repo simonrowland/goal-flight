@@ -1092,11 +1092,25 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
         env["GOALFLIGHT_CONTROLLER_PID"] = "99999991"
         env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
         pid_dir = Path(env["GOAL_FLIGHT_PIDFILE_DIR"])
+        release = tmp_path / "release"
+        # The worker must still be running when the interrupt arrives, or the
+        # dispatch completes normally and exits 0 instead of 130. A fixed sleep
+        # cannot guarantee that: it is a budget, and under load the test spends
+        # it waiting for the watcher to publish `running`. Observed in a gate run
+        # as `AssertionError: (0, ...)` with DISPATCH-END already in stdout.
+        #
+        # Waiting on an explicit release makes the window unbounded from the
+        # worker's side, so the ordering is decided by the test rather than by
+        # scheduler luck. The 120s ceiling only stops an abandoned worker
+        # outliving the suite; nothing should ever reach it.
         worker_code = (
             "import pathlib, time\n"
             f"pathlib.Path({str(started)!r}).write_text('started')\n"
             "print('worker-started', flush=True)\n"
-            "time.sleep(8.0)\n"
+            f"release = pathlib.Path({str(release)!r})\n"
+            "deadline = time.monotonic() + 120.0\n"
+            "while not release.exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.05)\n"
             "print('COMPLETE: foreground-interrupt — interrupt-safe done', flush=True)\n"
             f"pathlib.Path({str(done)!r}).write_text('done')\n"
         )
@@ -1184,12 +1198,20 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
             assert _process_exists(worker_pid), "worker died during cleanup_ghosts sweep"
             assert pidfile.exists(), "live unowned pidfile stays available for re-attach"
 
+            # Every assertion about the live detached worker has now run, so let
+            # it finish. Until this point it is deliberately blocked, which is
+            # what guarantees it outlives the interrupt instead of racing it.
+            release.write_text("go", encoding="utf-8")
             assert _wait_for(done.exists), "worker did not finish after launcher interrupt"
             assert _wait_for(
                 lambda: status.exists()
                 and json.loads(status.read_text(encoding="utf-8")).get("state") == "complete",
             ), status.read_text(encoding="utf-8") if status.exists() else "missing status"
         finally:
+            # An assertion above may have raised before the worker was released;
+            # unblock it so teardown does not wait out the safety ceiling.
+            with contextlib.suppress(OSError):
+                release.write_text("go", encoding="utf-8")
             if proc.poll() is None:
                 proc.terminate()
                 _observe_process_exit(proc)
