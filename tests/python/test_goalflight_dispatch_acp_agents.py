@@ -1091,11 +1091,25 @@ def _main_capture_for(agent: str) -> tuple[int, dict[str, object]]:
     return rc, captured
 
 
-def test_auto_shape_routes_cursor_and_claude_to_acp() -> None:
+def test_auto_shape_routes_claude_to_acp_and_cursor_to_bash() -> None:
+    """Cursor moved to bash-tail; claude keeps acp.
+
+    This asserted that cursor auto-routed to acp. It no longer does: bash-tail is
+    measured good for cursor (five of five trials correct, exit 0, ~50s each)
+    while acp is the path with no evidence behind it, so cursor now resolves to
+    bash and acp is refused outright rather than merely deprioritised.
+
+    The claude half is unchanged and still checked here — the point of the
+    original test was that auto-resolution routes deliberately per engine, and
+    that is still the property worth pinning.
+    """
+    # The helper stubs _run_acp_shape, so it captures only when the ACP path is
+    # taken. Cursor going to bash means that stub is never reached — an EMPTY
+    # capture is precisely the assertion, and a populated one would mean cursor
+    # had slipped back onto acp.
     rc, captured = _main_capture_for("cursor")
     assert rc == 0
-    assert captured["shape"] == "acp"
-    assert captured["agent"] == "cursor"
+    assert captured == {}, f"cursor must not enter the acp path, got {captured}"
 
     rc, captured = _main_capture_for("claude-acp")
     assert rc == 0
