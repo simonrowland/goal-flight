@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import time
@@ -22,15 +23,177 @@ import goalflight_session_status as sessions  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 
 
-def _root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+def _root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    name: str = "project",
+) -> Path:
     monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
     monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("GOALFLIGHT_WAKE_LEDGER_DIR", str(tmp_path / "wake-ledger"))
+    monkeypatch.setenv("GOALFLIGHT_MESSAGES_DIR", str(tmp_path / "messages"))
     monkeypatch.setenv("GOAL_FLIGHT_PIDFILE_DIR", str(tmp_path / "pidfiles"))
     monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", "/dev/null")
-    root = tmp_path / "project"
+    root = tmp_path / name
     root.mkdir()
     return root
+
+
+def test_controller_startup_adopts_live_incumbent_label_and_advertises_reseat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = _root(monkeypatch, tmp_path, name="beta")
+    advertised = tmp_path / "advertised-skill"
+    monkeypatch.setenv("GOALFLIGHT_ROOT", str(advertised))
+    env = dict(os.environ)
+    host = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    base_command = [
+        sys.executable,
+        str(SCRIPTS / "goalflight_session_status.py"),
+        "--project-root",
+        str(root),
+        "--controller-startup",
+        "--session-pid",
+        str(host.pid),
+    ]
+    try:
+        first = subprocess.run(
+            [*base_command, "--session-label", "alpha"],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=8,
+        )
+        assert first.returncode == 0, first.stderr
+        first_payload = json.loads(first.stdout)
+        assert first_payload["claimed"] is True
+        assert first_payload["session"]["label"] == "alpha"
+        assert len(journal.Journal(root).lease_records()) == 1
+
+        adopted = subprocess.run(
+            base_command,
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=8,
+        )
+        assert adopted.returncode == 0, adopted.stderr
+        adopted_payload = json.loads(adopted.stdout)
+        assert adopted_payload["claimed"] is True
+        assert adopted_payload["adopted_label"] == "alpha"
+        assert adopted_payload["requested_label"] == "beta"
+        assert adopted_payload["session"]["label"] == "alpha"
+
+        active = journal.Journal(root).lease_records()
+        assert len(active) == 1
+        assert active[0]["label"] == "alpha"
+        assert journal.Journal(root).read_all("SELECT 1 FROM delivery_events") == []
+
+        script = str(advertised / "scripts" / "goalflight_session_status.py")
+        release = shlex.join(
+            [
+                "python3",
+                script,
+                "--project-root",
+                str(root.resolve()),
+                "--release-session",
+                "--session-pid",
+                str(host.pid),
+            ]
+        )
+        reclaim = shlex.join(
+            [
+                "python3",
+                script,
+                "--project-root",
+                str(root.resolve()),
+                "--controller-startup",
+                "--session-pid",
+                str(host.pid),
+                "--session-label",
+                "beta",
+            ]
+        )
+        notice = (
+            "controller startup: adopted existing label 'alpha' for this process; "
+            f"if that match is wrong, re-seat with: {release} && {reclaim}"
+        )
+        assert adopted.stderr.splitlines().count(notice) == 1
+        assert str(SCRIPTS / "goalflight_session_status.py") not in notice
+    finally:
+        host.kill()
+        host.wait(timeout=3)
+
+
+def test_dead_incumbent_is_expired_before_default_label_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = _root(monkeypatch, tmp_path, name="beta")
+    monkeypatch.setattr(
+        sessions,
+        "_controller_process_identity",
+        lambda pid: {"pid": pid, "start_token": "same-generation"},
+    )
+
+    first = sessions.claim_controller_startup(
+        root, pid=71001, label="alpha", role="controller"
+    )
+    assert first["claimed"] is True
+    assert first["session"]["label"] == "alpha"
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="alpha",
+        lease_nonce=first["session"]["lease_nonce"],
+    )
+    holder.close()
+
+    second = sessions.claim_controller_startup(
+        root, pid=71001, role="controller", environ={}
+    )
+    assert second["claimed"] is True
+    assert second["session"]["label"] == "beta"
+    assert "adopted_label" not in second
+    active = journal.Journal(root).lease_records()
+    assert len(active) == 1
+    assert active[0]["label"] == "beta"
+    alpha = next(
+        row
+        for row in journal.Journal(root).lease_records(include_ended=True)
+        if row["label"] == "alpha"
+    )
+    assert alpha["state"] == journal.LEASE_EXPIRED
+
+
+def test_default_controller_label_is_stable_across_linked_worktrees(
+    tmp_path: Path,
+) -> None:
+    main = tmp_path / "stable-repo"
+    linked = tmp_path / "different-worktree-name"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=main, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"], cwd=main, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Session Test"], cwd=main, check=True)
+    (main / "seed").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "seed"], cwd=main, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=main, check=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "--detach", str(linked)],
+        cwd=main,
+        check=True,
+    )
+
+    assert sessions.resolve_controller_label(project_root=main, environ={}) == "stable-repo"
+    assert sessions.resolve_controller_label(project_root=linked, environ={}) == "stable-repo"
 
 
 def test_controller_startup_beacon_holds_lock_between_cli_calls_and_drops_with_host(

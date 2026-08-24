@@ -46,6 +46,7 @@ import argparse
 import json
 import os
 import select
+import shlex
 import socket
 import sqlite3
 import subprocess
@@ -522,6 +523,84 @@ def _same_lease_principal(
     )
 
 
+def _live_incumbent_label_for_principal(
+    project_root: Path,
+    *,
+    requested_label: str,
+    principal: dict[str, object],
+) -> str | None:
+    """Return another live label already held by this measured principal."""
+    root = goalflight_task.resolve_project_root(str(project_root))
+    authority = goalflight_journal.open_or_create_journal(root)
+    expiry = authority.expire_stale_leases()
+    if not expiry.committed:
+        raise RuntimeError(
+            f"lease expiry sweep failed before incumbent adoption: {expiry.reason}"
+        )
+    requested = authority.active_lease(requested_label)
+    if _same_lease_principal(requested, principal):
+        return None
+    incumbents: list[goalflight_journal.LeaseIdentity] = []
+    for row in authority.lease_records():
+        label = str(row.get("label") or "")
+        if not label or label == requested_label:
+            continue
+        lease = authority.active_lease(label)
+        if not _same_lease_principal(lease, principal):
+            continue
+        liveness = _lease_holder_liveness(lease)
+        if liveness is not None and liveness.alive is True and lease is not None:
+            incumbents.append(lease)
+    if not incumbents:
+        return None
+    incumbents.sort(key=lambda lease: (lease.claimed_at, lease.label))
+    return incumbents[0].label
+
+
+def _controller_adoption_notice(
+    project_root: Path,
+    *,
+    adopted_label: str,
+    requested_label: str,
+    pid: int,
+) -> str:
+    root = goalflight_task.resolve_project_root(str(project_root))
+    script = str(
+        goalflight_compat.advertised_script(
+            "goalflight_session_status.py",
+            running_file=__file__,
+        )
+    )
+    release = shlex.join(
+        [
+            "python3",
+            script,
+            "--project-root",
+            str(root),
+            "--release-session",
+            "--session-pid",
+            str(pid),
+        ]
+    )
+    reclaim = shlex.join(
+        [
+            "python3",
+            script,
+            "--project-root",
+            str(root),
+            "--controller-startup",
+            "--session-pid",
+            str(pid),
+            "--session-label",
+            requested_label,
+        ]
+    )
+    return (
+        f"controller startup: adopted existing label {adopted_label!r} for this process; "
+        f"if that match is wrong, re-seat with: {release} && {reclaim}"
+    )
+
+
 def _publish_lease_generation_event(
     project_root: Path,
     lease: goalflight_journal.LeaseIdentity,
@@ -909,16 +988,29 @@ def claim_controller_startup(
         if resolution is None:
             return {"claimed": False, "reason": "missing_controller_pid"}
         resolved_pid = int(resolution["pid"])
+        effective_label = resolved_label
+        process_identity = resolution.get("process_identity")
+        if isinstance(process_identity, dict) and process_identity.get("start_token"):
+            incumbent_label = _live_incumbent_label_for_principal(
+                project_root,
+                requested_label=resolved_label,
+                principal={
+                    "pid": resolved_pid,
+                    "start_token": process_identity["start_token"],
+                },
+            )
+            if incumbent_label is not None:
+                effective_label = incumbent_label
         record = claim_session(
             project_root,
             pid=resolved_pid,
-            label=resolved_label,
+            label=effective_label,
             session_id=resolve_controller_session_id(session_id, environ=env),
-            process_identity=resolution.get("process_identity"),
+            process_identity=process_identity,
             takeover=takeover,
             hold_lock=hold_lock,
         )
-        if record.get("label") != resolved_label:
+        if record.get("label") != effective_label:
             return {
                 "claimed": False,
                 "reason": "controller_label_mismatch",
@@ -927,11 +1019,11 @@ def claim_controller_startup(
         if hold_lock:
             live = live_session(
                 project_root,
-                label=resolved_label,
+                label=effective_label,
                 pid=resolved_pid,
             )
         else:
-            lease = goalflight_journal.Journal(project_root).active_lease(resolved_label)
+            lease = goalflight_journal.Journal(project_root).active_lease(effective_label)
             live = (
                 {"id": lease.nonce}
                 if lease is not None and lease.principal.get("pid") == resolved_pid
@@ -968,11 +1060,14 @@ def claim_controller_startup(
             "error_type": type(exc).__name__,
         }
     result = {"claimed": True, "session": record}
+    if effective_label != resolved_label:
+        result["adopted_label"] = effective_label
+        result["requested_label"] = resolved_label
     if resolution.get("warning"):
         result["warnings"] = [resolution["warning"]]
     depth = _listener_depth_after_claim(
         project_root,
-        resolved_label,
+        effective_label,
         str(record["id"]),
     )
     if depth is not None:
@@ -2479,6 +2574,24 @@ def main(argv: list[str] | None = None) -> int:
         )
         if result.get("claimed"):
             _index_controller_project(project_root)
+        adopted_label = result.get("adopted_label")
+        requested_label = result.get("requested_label")
+        session = result.get("session")
+        if (
+            isinstance(adopted_label, str)
+            and isinstance(requested_label, str)
+            and isinstance(session, dict)
+            and isinstance(session.get("pid"), int)
+        ):
+            print(
+                _controller_adoption_notice(
+                    project_root,
+                    adopted_label=adopted_label,
+                    requested_label=requested_label,
+                    pid=int(session["pid"]),
+                ),
+                file=sys.stderr,
+            )
         print(json.dumps(result))
         return 0
 
