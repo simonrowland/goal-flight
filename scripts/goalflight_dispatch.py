@@ -4743,7 +4743,38 @@ def _drain_on_submit(args, queue_path: Path) -> None:
             f"{payload.get('failed')} drain failure(s); queued request remains durable (recoverable on a later drain pass)",
             file=sys.stderr,
         )
+    _report_why_this_entry_did_not_launch(args, payload)
     _warn_if_stranded_without_drainer(queue_path)
+
+
+def _report_why_this_entry_did_not_launch(args, payload: dict) -> None:
+    """Say WHY this dispatch is still queued, not merely that it is.
+
+    The drain already computes a per-entry reason and returns it; printing only a
+    failure count throws that away, leaving a controller unable to tell a
+    capacity wait from a permanently parked entry without importing this module
+    and calling the drain by hand. Observed 2026-08-24: three dispatches sat at
+    `queued` behind `active_queue_carrier` — claim carriers whose claimant pids
+    were all dead — and the submit output said only "1 drain failure(s)".
+
+    Only this dispatch's own reason is printed. Other entries' reasons belong to
+    whoever submitted them, and a wall of them is what makes the existing
+    CLAIM-RECOVERY-ALERT output easy to ignore.
+    """
+    dispatch_id = str(getattr(args, "dispatch_id", "") or "").strip()
+    if not dispatch_id:
+        return
+    for entry in payload.get("skipped") or []:
+        if str(entry.get("dispatch_id") or "") != dispatch_id:
+            continue
+        reason = str(entry.get("reason") or "unspecified")
+        detail = entry.get("process_evidence") or entry.get("detail") or ""
+        suffix = f" [{detail}]" if detail else ""
+        print(
+            f"goalflight_dispatch: {dispatch_id} not launched: {reason}{suffix}",
+            file=sys.stderr,
+        )
+        return
 
 
 def _warn_if_stranded_without_drainer(queue_path: Path) -> None:
