@@ -1282,7 +1282,7 @@ def main() -> None:
     test_acp_capacity_wait_deadline_blocks()
     test_acp_capacity_wait_zero_single_shot()
     test_acp_capacity_wait_sigterm_terminalizes()
-    test_auto_shape_routes_cursor_and_claude_to_acp()
+    test_auto_shape_routes_claude_to_acp_and_cursor_to_bash()
     test_claude_auth_preflight_refuses_before_attempt()
     test_claude_auth_preflight_accepts_logged_in_session()
     test_subscription_env_scrub_for_cursor_and_claude_acp()
