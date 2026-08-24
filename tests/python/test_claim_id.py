@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -29,16 +30,41 @@ if str(SCRIPTS) not in sys.path:
 import goalflight_claim_id as claim_id  # noqa: E402
 
 
-def test_concurrent_claims_are_all_distinct(tmp_path: Path) -> None:
-    """The regression that matters: N racing callers get N different ids."""
-    n = 40
+def _id_of(path: Path) -> int:
+    m = re.match(r"SC-(\d+)-", path.name)
+    assert m, path.name
+    return int(m.group(1))
+
+
+def test_concurrent_claims_with_DIFFERENT_names_get_different_ids(tmp_path: Path) -> None:
+    """The regression that matters, and the one the first version of this test missed.
+
+    Every caller here mints a DIFFERENTLY-named artifact, which is how the tool is
+    actually used — nobody allocates an id in order to write a file with the same
+    name as everyone else. The original test gave all 40 callers the same suffix,
+    so every candidate path was identical, exclusive create had something to
+    arbitrate, and it passed against an implementation that raced on the artifact
+    path. With distinct suffixes that implementation handed 24 callers only 6 ids.
+
+    Assert on the ID, never on the filename: distinct filenames are guaranteed by
+    the differing suffixes and prove nothing about allocation.
+    """
+    suffixes = [f"-class-{i:02d}.md" for i in range(24)]
+    with ThreadPoolExecutor(max_workers=len(suffixes)) as pool:
+        paths = list(pool.map(
+            lambda sfx: claim_id.claim(tmp_path, prefix="SC", suffix=sfx), suffixes))
+    ids = [_id_of(p) for p in paths]
+    assert len(set(ids)) == len(suffixes), f"id collision: {sorted(ids)}"
+    assert all(p.exists() for p in paths)
+
+
+def test_concurrent_claims_with_identical_names_also_distinct(tmp_path: Path) -> None:
+    """The weaker original case, kept so the easy path stays covered."""
+    n = 20
     with ThreadPoolExecutor(max_workers=n) as pool:
         paths = list(pool.map(
-            lambda _: claim_id.claim(tmp_path, prefix="SC", suffix="-x.md"),
-            range(n)))
-    names = [p.name for p in paths]
-    assert len(set(names)) == n, f"collision: {sorted(names)}"
-    assert all(p.exists() for p in paths)
+            lambda _: claim_id.claim(tmp_path, prefix="SC", suffix="-x.md"), range(n)))
+    assert len({_id_of(p) for p in paths}) == n
 
 
 def test_sequential_claims_increment(tmp_path: Path) -> None:

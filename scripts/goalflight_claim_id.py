@@ -13,10 +13,17 @@ neither learns anything; the collision surfaces later, once the ids have been
 cited across hundreds of unrelated documents, at which point renumbering means
 rewriting historical records that were correct when written.
 
-`O_CREAT | O_EXCL` decides the race in the kernel instead: exactly one caller
-creates a given path, everyone else gets FileExistsError and moves to the next
-candidate. Same primitive this codebase already uses to make a doorbell announce
-an absence exactly once.
+`O_CREAT | O_EXCL` decides the race in the kernel instead. The subtlety, and the
+whole reason this needs care: **exclusive create arbitrates a PATH, and the thing
+being allocated is an ID.** Two callers minting differently-named artifacts under
+the same number produce different paths, so both exclusive creates succeed and
+both walk away believing they own the number. A first version of this module had
+exactly that hole, and its concurrency test missed it by giving every caller the
+same suffix — which is not how anyone uses it.
+
+So the reservation is a marker under `.claims/` named by prefix and number ALONE,
+with no suffix. That path is identical for every caller contending for an id, so
+the kernel has something to arbitrate.
 
     goalflight_claim_id.py <dir> --prefix SC --suffix=-my-new-class.md
     goalflight_claim_id.py <dir> --prefix SC --dry-run
@@ -37,6 +44,9 @@ import re
 import sys
 
 DEFAULT_LIMIT = 10000
+# Reservations live here, named by prefix+number only, so contention for an id
+# happens on one shared path regardless of what each caller intends to name.
+CLAIMS_DIR = ".claims"
 
 
 def existing_ids(directory: Path, prefix: str, width: int) -> set[int]:
@@ -48,17 +58,24 @@ def existing_ids(directory: Path, prefix: str, width: int) -> set[int]:
     """
     pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)(?:\D.*)?$")
     found: set[int] = set()
-    try:
-        entries = list(directory.iterdir())
-    except OSError:
-        return found
-    for entry in entries:
-        stem = entry.name[:-len(entry.suffix)] if entry.suffix else entry.name
-        for candidate in (entry.name, stem):
-            match = pattern.match(candidate)
-            if match:
-                found.add(int(match.group(1)))
-                break
+
+    def scan(where: Path) -> None:
+        try:
+            entries = list(where.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            stem = entry.name[:-len(entry.suffix)] if entry.suffix else entry.name
+            for candidate in (entry.name, stem):
+                match = pattern.match(candidate)
+                if match:
+                    found.add(int(match.group(1)))
+                    break
+
+    scan(directory)
+    # Reservations count as taken even before the artifact is written, otherwise
+    # a caller that claimed an id but has not yet created its file loses it.
+    scan(directory / CLAIMS_DIR)
     return found
 
 
@@ -73,6 +90,8 @@ def claim(
 ) -> Path:
     """Create and return the first unclaimed path. Raises if none is free."""
     directory.mkdir(parents=True, exist_ok=True)
+    claims = directory / CLAIMS_DIR
+    claims.mkdir(parents=True, exist_ok=True)
     taken = existing_ids(directory, prefix, width)
     n = start if start is not None else (max(taken) + 1 if taken else 1)
 
@@ -81,15 +100,28 @@ def claim(
         if n in taken:
             n += 1
             continue
-        name = f"{prefix}-{n:0{width}d}{suffix}"
-        path = directory / name
+        # Arbitrate the ID, not the filename. The marker path omits the suffix,
+        # so every caller contending for this number races on the SAME path and
+        # the kernel can pick one winner. Racing on the artifact path instead
+        # lets two differently-named files share a number.
+        marker = claims / f"{prefix}-{n:0{width}d}"
         try:
-            # The whole point: the kernel picks one winner. A pre-check would be
-            # the same race in a different costume.
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
             n += 1
             continue
+        except OSError:
+            n += 1
+            continue
+        os.close(fd)
+
+        path = directory / f"{prefix}-{n:0{width}d}{suffix}"
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            # The number was ours but this exact filename already exists; the
+            # marker stays so the number is not handed out again.
+            return path
         os.close(fd)
         return path
     raise RuntimeError(
