@@ -144,7 +144,7 @@ def test_dual_open_failure_names_doctor_and_journal_path(
         raise sqlite3.OperationalError("unable to open database file")
 
     monkeypatch.setattr(journal, "_sqlite_connect", unavailable_connect)
-    reader = journal.Journal.open_reader(project)
+    reader = journal.Journal.open_reader(project, open_retry_budget_s=0.02)
     with pytest.raises(journal.JournalUnavailable) as captured:
         reader.epochs()
 

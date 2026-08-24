@@ -164,7 +164,7 @@ def test_present_file_with_both_opens_failing_is_probe_unavailable(
         raise sqlite3.OperationalError("unable to open database file")
 
     monkeypatch.setattr(journal, "_sqlite_connect", unavailable_connect)
-    reader = journal.Journal.open_reader(project)
+    reader = journal.Journal.open_reader(project, open_retry_budget_s=0.02)
     with pytest.raises(
         journal.JournalUnavailable,
         match="probe unavailable/unreadable",

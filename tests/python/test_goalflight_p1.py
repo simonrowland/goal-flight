@@ -375,6 +375,135 @@ def test_existing_journal_missing_required_tables_and_bad_epoch_types_fail_close
         opened.epochs()
 
 
+def test_present_journal_open_failure_retries_then_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = tmp_path / "present-open-retry"
+    project.mkdir()
+    authority = journal.Journal.create(project)
+    real_connect = journal.sqlite3.connect
+    failed_opens = 0
+
+    def fail_first_rw_open(database: object, *args: object, **kwargs: object):
+        nonlocal failed_opens
+        if "?mode=rw" in str(database) and failed_opens == 0:
+            failed_opens += 1
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(journal.sqlite3, "connect", fail_first_rw_open)
+    reopened = journal.Journal(
+        project,
+        open_retry_budget_s=0.1,
+        jitter_min_s=0.001,
+        jitter_max_s=0.002,
+    )
+
+    assert failed_opens == 1
+    assert reopened.path == authority.path
+    assert reopened.epochs().schema == journal.CURRENT_SCHEMA_EPOCH
+
+
+def test_present_journal_permanent_open_failure_is_bounded_io_not_disappearance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = tmp_path / "present-open-exhausted"
+    project.mkdir()
+    authority = journal.Journal.create(project)
+    attempts = 0
+
+    def reject_every_open(*_args: object, **_kwargs: object):
+        nonlocal attempts
+        attempts += 1
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(journal.sqlite3, "connect", reject_every_open)
+    started = time.monotonic()
+    with pytest.raises(journal.JournalIOError) as captured:
+        journal.Journal(
+            project,
+            open_retry_budget_s=0.02,
+            jitter_min_s=0.001,
+            jitter_max_s=0.002,
+        )
+    elapsed = time.monotonic() - started
+
+    assert authority.path.exists(), "the injected opener must not remove the journal"
+    assert attempts > 1, "a first-open exit silently defeats transient survival"
+    assert elapsed < 0.5, "the retry budget must remain a bound"
+    assert "still present" in str(captured.value)
+    assert "after" in str(captured.value)
+    assert not isinstance(captured.value, journal.JournalDisappeared)
+
+
+def test_genuinely_absent_journal_keeps_disappearance_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = tmp_path / "genuinely-absent"
+    project.mkdir()
+
+    with pytest.raises(journal.JournalDisappeared, match="journal database is absent"):
+        journal.Journal(project, open_retry_budget_s=0.02)
+
+
+def test_open_retry_still_detects_replacement_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = tmp_path / "replaced-during-open"
+    project.mkdir()
+    authority = journal.Journal.create(project)
+    with sqlite3.connect(authority.path) as connection:
+        assert connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (
+            0,
+            0,
+            0,
+        )
+    for suffix in ("-shm", "-wal"):
+        Path(f"{authority.path}{suffix}").unlink(missing_ok=True)
+    different_project = tmp_path / "different-project"
+    different_project.mkdir()
+    replacement_authority = journal.Journal.create(different_project)
+    with sqlite3.connect(replacement_authority.path) as connection:
+        assert connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() == (
+            0,
+            0,
+            0,
+        )
+    for suffix in ("-shm", "-wal"):
+        Path(f"{replacement_authority.path}{suffix}").unlink(missing_ok=True)
+    replacement = replacement_authority.path
+
+    real_connect = journal.sqlite3.connect
+    replaced = False
+
+    def replace_then_fail(database: object, *args: object, **kwargs: object):
+        nonlocal replaced
+        if "?mode=rw" in str(database) and not replaced:
+            os.replace(replacement, authority.path)
+            replaced = True
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(journal.sqlite3, "connect", replace_then_fail)
+    with pytest.raises(
+        journal.JournalIntegrityError,
+        match="journal database was replaced",
+    ):
+        journal.Journal(
+            project,
+            retry_budget_s=0.01,
+            open_retry_budget_s=0.1,
+            jitter_min_s=0.001,
+            jitter_max_s=0.002,
+        )
+
+    assert replaced
+
+
 def test_journal_epoch_fence_rechecks_declarative_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

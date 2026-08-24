@@ -125,6 +125,16 @@ MAX_PARAMETER_VALUE_BYTES = 65_536
 MAX_TRANSACTION_PARAMETER_BYTES = 1_048_576
 OUTBOX_MAX_PROJECTION_ATTEMPTS = 3
 OUTBOX_RETRY_BASE_S = 1.0
+# The live incident cleared within roughly one minute while the journal stayed
+# healthy. Seventy-five seconds covers that measured minute plus 15 seconds of
+# scheduler/load margin. A smaller bound repeats the observed false teardown;
+# doubling it to 150 seconds would add 75 seconds of unwitnessed failure before
+# a genuinely unreachable journal is reported and re-armed, with no measured
+# recovery benefit. Per-process exponential jitter keeps the three witnesses'
+# probes independent inside the shared bound.
+JOURNAL_OPEN_RETRY_BUDGET_S = 75.0
+JOURNAL_OPEN_RETRY_INITIAL_S = 0.050
+JOURNAL_OPEN_RETRY_MAX_S = 5.0
 ALLOW_MIGRATION_ENV = "GOALFLIGHT_ALLOW_JOURNAL_MIGRATION"
 _SQL_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _STATE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
@@ -216,6 +226,7 @@ LISTENER_EXIT_REASONS = frozenset(
         "corrupt",
         "upgrade-required",
         "journal-unavailable",
+        "journal-io-failure",
         "watchdog-dead",
         "signal",
     }
@@ -236,6 +247,18 @@ class JournalUpgradeRequired(JournalError):
 
 class JournalUnavailable(JournalError):
     """The journal could not complete required startup work in budget."""
+
+    reason = "journal-unavailable"
+
+
+class JournalDisappeared(JournalUnavailable):
+    """The configured journal path is verifiably absent."""
+
+
+class JournalIOError(JournalUnavailable):
+    """The journal path exists but SQLite cannot open it within the IO budget."""
+
+    reason = "journal-io-failure"
 
 
 # Operator-facing repair pointers. Keep these as the first clause of a refusal
@@ -837,6 +860,7 @@ class Journal:
         client_epochs: ClientEpochs | None = None,
         allow_migration: bool | None = None,
         retry_budget_s: float = 1.0,
+        open_retry_budget_s: float = JOURNAL_OPEN_RETRY_BUDGET_S,
         transaction_budget_s: float = 1.0,
         jitter_min_s: float = 0.005,
         jitter_max_s: float = 0.050,
@@ -846,6 +870,7 @@ class Journal:
             client_epochs=client_epochs,
             allow_migration=allow_migration,
             retry_budget_s=retry_budget_s,
+            open_retry_budget_s=open_retry_budget_s,
             transaction_budget_s=transaction_budget_s,
             jitter_min_s=jitter_min_s,
             jitter_max_s=jitter_max_s,
@@ -862,6 +887,7 @@ class Journal:
         *,
         client_epochs: ClientEpochs | None = None,
         retry_budget_s: float = 1.0,
+        open_retry_budget_s: float = JOURNAL_OPEN_RETRY_BUDGET_S,
         transaction_budget_s: float = 1.0,
         jitter_min_s: float = 0.005,
         jitter_max_s: float = 0.050,
@@ -873,6 +899,7 @@ class Journal:
             client_epochs=client_epochs,
             allow_migration=False,
             retry_budget_s=retry_budget_s,
+            open_retry_budget_s=open_retry_budget_s,
             transaction_budget_s=transaction_budget_s,
             jitter_min_s=jitter_min_s,
             jitter_max_s=jitter_max_s,
@@ -904,6 +931,7 @@ class Journal:
         *,
         client_epochs: ClientEpochs | None = None,
         retry_budget_s: float = 1.0,
+        open_retry_budget_s: float = JOURNAL_OPEN_RETRY_BUDGET_S,
         transaction_budget_s: float = 1.0,
         jitter_min_s: float = 0.005,
         jitter_max_s: float = 0.050,
@@ -922,6 +950,7 @@ class Journal:
             client_epochs=client_epochs,
             allow_migration=False,
             retry_budget_s=retry_budget_s,
+            open_retry_budget_s=open_retry_budget_s,
             transaction_budget_s=transaction_budget_s,
             jitter_min_s=jitter_min_s,
             jitter_max_s=jitter_max_s,
@@ -937,12 +966,15 @@ class Journal:
         client_epochs: ClientEpochs | None,
         allow_migration: bool | None,
         retry_budget_s: float,
+        open_retry_budget_s: float,
         transaction_budget_s: float,
         jitter_min_s: float,
         jitter_max_s: float,
     ) -> None:
         if retry_budget_s < 0:
             raise ValueError("retry_budget_s must be >= 0")
+        if not 0 <= open_retry_budget_s < float("inf"):
+            raise ValueError("open_retry_budget_s must be finite and >= 0")
         if transaction_budget_s <= 0:
             raise ValueError("transaction_budget_s must be > 0")
         if not 0 <= jitter_min_s <= jitter_max_s:
@@ -956,14 +988,16 @@ class Journal:
             else bool(allow_migration)
         )
         self.retry_budget_s = retry_budget_s
+        self.open_retry_budget_s = open_retry_budget_s
         self.transaction_budget_s = transaction_budget_s
         self.jitter_min_s = jitter_min_s
         self.jitter_max_s = jitter_max_s
         self._read_only_client = False
+        self._file_identity: tuple[int, int] | None = None
 
     def _require_existing_database(self) -> None:
         if not os.path.lexists(self.path):
-            raise JournalUnavailable(
+            raise JournalDisappeared(
                 f"journal database is absent: {self.path}. Failing closed because streams "
                 "cannot rebuild journal authority. Restore a validated WAL-safe backup; "
                 "use the init verb only for an intentional first bootstrap."
@@ -972,6 +1006,26 @@ class Journal:
             raise JournalIntegrityError(
                 f"journal integrity check failed for {self.path}: symlinked journal refused; "
                 "the journal is authoritative and streams cannot rebuild it"
+            )
+        try:
+            metadata = self.path.stat()
+        except FileNotFoundError as exc:
+            raise JournalDisappeared(
+                f"journal database vanished without creating a replacement: {self.path}"
+            ) from exc
+        except OSError as exc:
+            raise JournalIOError(
+                f"journal path identity is unreadable, so disappearance is unverified: "
+                f"{self.path}: {exc}"
+            ) from exc
+        identity = (int(metadata.st_dev), int(metadata.st_ino))
+        if self._file_identity is None:
+            self._file_identity = identity
+        elif identity != self._file_identity:
+            raise JournalIntegrityError(
+                f"journal database was replaced at {self.path}; expected file identity "
+                f"{self._file_identity}, observed {identity}. Failing closed because a "
+                "different database cannot inherit this client's authority."
             )
 
     def _open_validated(self, *, created_here: bool) -> None:
@@ -998,9 +1052,12 @@ class Journal:
 
     def _connect(self) -> sqlite3.Connection:
         started = time.monotonic()
+        open_started = started
         attempts = 0
+        open_failures = 0
         while True:
             attempts += 1
+            self._require_existing_database()
             try:
                 if self._read_only_client:
                     connection = _open_readonly_connection(
@@ -1015,6 +1072,12 @@ class Journal:
                         timeout=0,
                         isolation_level=None,
                     )
+            except JournalUnavailable as exc:
+                open_failures += 1
+                self._raise_disappeared_if_absent(exc)
+                if self._open_retry_delay(open_started, open_failures):
+                    continue
+                raise self._open_io_failure(open_started, open_failures, exc) from exc
             except sqlite3.DatabaseError as exc:
                 if self._read_only_client and _is_busy(exc):
                     if self._retry_delay(started):
@@ -1026,9 +1089,11 @@ class Journal:
                 if self._read_only_client and _is_corruption_error(exc):
                     self._raise_integrity_failure(f"journal reader parse failed: {exc}")
                 if _is_cantopen(exc):
-                    raise JournalUnavailable(
-                        f"journal database became unavailable without creating a replacement: {self.path}"
-                    ) from exc
+                    open_failures += 1
+                    self._raise_disappeared_if_absent(exc)
+                    if self._open_retry_delay(open_started, open_failures):
+                        continue
+                    raise self._open_io_failure(open_started, open_failures, exc) from exc
                 if self._read_only_client:
                     raise JournalUnavailable(
                         f"journal readonly probe unavailable/unreadable for {self.path}: "
@@ -1040,12 +1105,21 @@ class Journal:
                 connection.execute("PRAGMA busy_timeout = 0")
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("PRAGMA synchronous = FULL")
+                self._require_existing_database()
                 return connection
             except sqlite3.OperationalError as exc:
                 connection.close()
                 if self._read_only_client and _is_corruption_error(exc):
                     self._raise_integrity_failure(f"journal reader parse failed: {exc}")
                 if not _is_busy(exc):
+                    if _is_cantopen(exc):
+                        open_failures += 1
+                        self._raise_disappeared_if_absent(exc)
+                        if self._open_retry_delay(open_started, open_failures):
+                            continue
+                        raise self._open_io_failure(
+                            open_started, open_failures, exc
+                        ) from exc
                     if self._read_only_client:
                         raise JournalUnavailable(
                             f"journal readonly probe unavailable/unreadable for {self.path}: "
@@ -1065,12 +1139,7 @@ class Journal:
             attempts += 1
             try:
                 with contextlib.closing(
-                    sqlite3.connect(
-                        self.path.as_uri() + "?mode=rw",
-                        uri=True,
-                        timeout=0,
-                        isolation_level=None,
-                    )
+                    self._connect()
                 ) as connection:
                     rows = [
                         str(row[0])
@@ -1742,6 +1811,42 @@ class Journal:
         if delay > 0:
             time.sleep(delay)
         return time.monotonic() - started < self.retry_budget_s
+
+    def _raise_disappeared_if_absent(self, cause: BaseException) -> None:
+        if not os.path.lexists(self.path):
+            raise JournalDisappeared(
+                f"journal database vanished without creating a replacement: {self.path}"
+            ) from cause
+
+    def _open_retry_delay(self, started: float, failures: int) -> bool:
+        remaining = self.open_retry_budget_s - (time.monotonic() - started)
+        if remaining <= 0:
+            return False
+        exponent = min(max(0, failures - 1), 16)
+        ceiling = min(
+            JOURNAL_OPEN_RETRY_INITIAL_S * (2**exponent),
+            JOURNAL_OPEN_RETRY_MAX_S,
+        )
+        # Full jitter avoids phase-locking the stream, backup, and watchdog.
+        delay = min(random.uniform(ceiling / 2, ceiling), remaining)
+        if delay > 0:
+            time.sleep(delay)
+        # Permit one final measured attempt at the deadline; the next failure
+        # observes the exhausted bound and returns a durable IO verdict.
+        return True
+
+    def _open_io_failure(
+        self,
+        started: float,
+        failures: int,
+        cause: BaseException,
+    ) -> JournalIOError:
+        elapsed = time.monotonic() - started
+        return JournalIOError(
+            f"journal IO open failure after {failures} attempts within "
+            f"{elapsed:.3f}s (budget {self.open_retry_budget_s:.3f}s); "
+            f"journal path is still present: {self.path}: {cause}"
+        )
 
     def _assert_identity(self, connection: sqlite3.Connection) -> None:
         try:

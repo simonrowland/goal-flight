@@ -280,8 +280,9 @@ and none was re-armed, entry hints report `n=0`; if the default pool is short, t
 report `n=1/4` and the exact `--report-pending` re-arm command once per missing slot. A listener
 reparented to PID 1 waits through a short startup grace, then refuses with one exact
 re-arm command: its exit cannot wake an untracked parent. Superseded, orphaned,
-signal, stale-lease, corrupt, upgrade-required, and journal-unavailable exits remain durable
-audit rows. A listener never renews the controller lease. Exit 4 is the detached
+signal, stale-lease, corrupt, upgrade-required, journal-unavailable, and
+journal-io-failure exits remain durable audit rows. A listener never renews the
+controller lease. Exit 4 is the detached
 refusal; it is not POSIX 128+signal. Bulk exit-144 reports (128+16, SIGURG on
 macOS) are not detached-listener deaths — detached exits 4.
 

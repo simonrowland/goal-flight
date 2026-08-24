@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import select
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -431,19 +432,26 @@ def test_backpressure_fault_releases_monitor_before_watchdog_rearm(
     assert status["fault"]["reason"] == "stdout-backpressure"
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_reason"),
+    (
+        (journal.JournalUnavailable("measured journal fault"), "journal-unavailable"),
+        (journal.JournalIOError("measured present-path IO fault"), "journal-io-failure"),
+    ),
+)
 def test_journal_failure_is_a_waking_stdout_record(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    failure: journal.JournalUnavailable,
+    expected_reason: str,
 ) -> None:
     project, _env, lease = isolated
     monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
     monkeypatch.setattr(
         journal.Journal,
         "cursor_peek",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            journal.JournalUnavailable("measured journal fault")
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
     )
     result = messages._run_cli(
         [
@@ -468,7 +476,7 @@ def test_journal_failure_is_a_waking_stdout_record(
     ]
     assert records[-1]["kind"] == "event"
     assert records[-1]["payload"]["type"] == "listener-fault"
-    assert records[-1]["payload"]["reason"] == "journal-unavailable"
+    assert records[-1]["payload"]["reason"] == expected_reason
     assert not wake.live_waiters(
         project,
         controller_label=lease.label,
@@ -476,8 +484,56 @@ def test_journal_failure_is_a_waking_stdout_record(
     )
 
 
+def test_listener_survives_present_journal_open_failure_and_times_out(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _env, lease = isolated
+    real_connect = journal.sqlite3.connect
+    failed_opens = 0
+
+    def fail_first_rw_open(database: object, *args: object, **kwargs: object):
+        nonlocal failed_opens
+        if "?mode=rw" in str(database) and failed_opens == 0:
+            failed_opens += 1
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(journal.sqlite3, "connect", fail_first_rw_open)
+    result = messages._run_cli(
+        [
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--listener-slots",
+            "1",
+            "--json",
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "0.05",
+        ]
+    )
+
+    records = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip()
+    ]
+    assert failed_opens == 1
+    assert result == 1
+    assert records[-1]["reason"] == "timeout"
+    assert all(record.get("reason") != "journal-unavailable" for record in records)
+
+
 def test_watchdog_dead_audit_reason_is_registered() -> None:
     assert "watchdog-dead" in journal.LISTENER_EXIT_REASONS
+    assert "journal-io-failure" in journal.LISTENER_EXIT_REASONS
 
 
 def test_every_record_is_structural_and_below_pipe_buf_with_long_frontier() -> None:

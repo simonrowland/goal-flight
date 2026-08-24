@@ -3275,8 +3275,8 @@ def _ambient_claimed_controller(
     try:
         authority = goalflight_journal.Journal.open_reader(project_root)
         lease = authority.active_lease(label)
-    except goalflight_journal.JournalUnavailable:
-        return {"claimed": False, "reason": "journal-unavailable", "label": label}
+    except goalflight_journal.JournalUnavailable as exc:
+        return {"claimed": False, "reason": _journal_failure_reason(exc), "label": label}
     if lease is None:
         return {"claimed": False, "reason": "no-active-controller-lease", "label": label}
     if lease.nonce != capability:
@@ -3365,10 +3365,10 @@ def _resolve_listen_auto_lease(
 
     try:
         authority = goalflight_journal.Journal.open_reader(project_root)
-    except goalflight_journal.JournalUnavailable:
+    except goalflight_journal.JournalUnavailable as exc:
         return {
             "claimed": False,
-            "reason": "journal-unavailable",
+            "reason": _journal_failure_reason(exc),
             "label": controller_label,
         }
     live = _listen_auto_live_generations(authority, project_root, controller_label)
@@ -4926,6 +4926,14 @@ def _follow_stdout_refusal(stream: object) -> str | None:
     return None
 
 
+def _journal_failure_reason(exc: BaseException) -> str:
+    """Name verified absence separately from exhausted present-path IO."""
+    reason = str(getattr(exc, "reason", "journal-unavailable"))
+    if reason in {"journal-unavailable", "journal-io-failure"}:
+        return reason
+    return "journal-unavailable"
+
+
 def _follow_fault_record(reason: str, detail: object = "") -> dict[str, object]:
     record: dict[str, object] = {
         "kind": "event",
@@ -5212,7 +5220,7 @@ def cmd_follow(args) -> int:
     except goalflight_journal.JournalUpgradeRequired as exc:
         return startup_fail("journal-upgrade-required", exc)
     except goalflight_journal.JournalUnavailable as exc:
-        return startup_fail("journal-unavailable", exc)
+        return startup_fail(_journal_failure_reason(exc), exc)
     except goalflight_journal.JournalError:
         raise
     except (OSError, RuntimeError, ValueError) as exc:
@@ -5349,7 +5357,7 @@ def cmd_follow(args) -> int:
             except goalflight_journal.JournalUpgradeRequired as exc:
                 return fail("journal-upgrade-required", exc, code=2)
             except goalflight_journal.JournalUnavailable as exc:
-                return fail("journal-unavailable", exc, code=2)
+                return fail(_journal_failure_reason(exc), exc, code=2)
             except goalflight_journal.JournalError:
                 raise
             except ValueError as exc:
@@ -5395,7 +5403,7 @@ def cmd_follow(args) -> int:
     except goalflight_journal.JournalUpgradeRequired as exc:
         return fail("journal-upgrade-required", exc, code=2)
     except goalflight_journal.JournalUnavailable as exc:
-        return fail("journal-unavailable", exc, code=2)
+        return fail(_journal_failure_reason(exc), exc, code=2)
     except goalflight_journal.JournalError:
         raise
     except (OSError, RuntimeError, ValueError) as exc:
@@ -5454,7 +5462,10 @@ def _cmd_watch_follow(
     except goalflight_journal.JournalUpgradeRequired:
         raise
     except goalflight_journal.JournalUnavailable as exc:
-        print(f"listen: watchdog registration failed: {exc}", file=sys.stderr)
+        print(
+            f"listen: {_journal_failure_reason(exc)}: watchdog registration failed: {exc}",
+            file=sys.stderr,
+        )
         return 2
     except goalflight_journal.JournalError:
         raise
@@ -5569,7 +5580,10 @@ def _cmd_watch_follow(
     except goalflight_journal.JournalUpgradeRequired:
         raise
     except goalflight_journal.JournalUnavailable as exc:
-        print(f"listen: watchdog runtime failed: {exc}", file=sys.stderr)
+        print(
+            f"listen: {_journal_failure_reason(exc)}: watchdog runtime failed: {exc}",
+            file=sys.stderr,
+        )
         return 2
     except goalflight_journal.JournalError:
         raise
@@ -5663,7 +5677,7 @@ def cmd_listen(args) -> int:
     except goalflight_journal.JournalUpgradeRequired:
         raise
     except goalflight_journal.JournalUnavailable as exc:
-        print(f"listen: {exc}", file=sys.stderr)
+        print(f"listen: {_journal_failure_reason(exc)}: {exc}", file=sys.stderr)
         return 2
     except goalflight_journal.JournalError:
         raise
@@ -5717,7 +5731,7 @@ def cmd_listen(args) -> int:
         raise
     except goalflight_journal.JournalUnavailable as exc:
         waiter.close()
-        print(f"listen: {exc}", file=sys.stderr)
+        print(f"listen: {_journal_failure_reason(exc)}: {exc}", file=sys.stderr)
         return 2
     except goalflight_journal.JournalError:
         waiter.close()
@@ -6094,7 +6108,11 @@ def cmd_listen(args) -> int:
         except goalflight_journal.JournalUpgradeRequired as exc:
             return finish("upgrade-required", code=2, detail=str(exc))
         except goalflight_journal.JournalUnavailable as exc:
-            return finish("journal-unavailable", code=2, detail=str(exc))
+            return finish(
+                _journal_failure_reason(exc),
+                code=2,
+                detail=str(exc),
+            )
         except goalflight_journal.JournalError:
             raise
         except ValueError as exc:
