@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -14,6 +15,9 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
+import goalflight_journal as journal  # noqa: E402
+import goalflight_ledger as ledger  # noqa: E402
+
 SPEC = importlib.util.spec_from_file_location("goalflight_watch", ROOT / "scripts" / "goalflight_watch.py")
 assert SPEC and SPEC.loader
 watch = importlib.util.module_from_spec(SPEC)
@@ -55,6 +59,70 @@ def _dead_pid() -> int:
     return process.pid
 
 
+def _isolated_env(root: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "GOALFLIGHT_STATE_DIR": str(root / "state"),
+            "GOALFLIGHT_DISPATCH_DIR": str(root / "state" / "dispatch"),
+            "GOALFLIGHT_TASK_STORE_DIR": str(root / "task-store"),
+            "GOALFLIGHT_JOURNAL_DIR": str(root / "journal"),
+            "GOALFLIGHT_MESSAGES_DIR": str(root / "messages"),
+            "GOALFLIGHT_WAKE_LEDGER": str(root / "wake-ledger.jsonl"),
+            "GOALFLIGHT_WAKE_LEDGER_DIR": str(root / "wake-ledger"),
+            "GOAL_FLIGHT_PIDFILE_DIR": str(root / "pids"),
+            "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
+            "GOALFLIGHT_TEST_MODE": "1",
+        }
+    )
+    return env
+
+
+def _record_running_attempt(
+    root: Path,
+    env: dict[str, str],
+    dispatch_id: str,
+    worker_pid: int,
+) -> None:
+    with _parent_isolation(env):
+        authority = journal.Journal.create(root)
+        prepared = authority.prepare_attempt(dispatch_id)
+        assert prepared.committed and prepared.value is not None, prepared
+        started = authority.start_attempt(
+            prepared.value.attempt_id,
+            prepared.value.launch_token,
+        )
+        assert started.committed, started
+        claimed = ledger.claim_attempt_running(root, dispatch_id, worker_pid)
+    assert claimed.lifecycle_state == journal.ATTEMPT_RUNNING, claimed
+
+
+@contextlib.contextmanager
+def _parent_isolation(env: dict[str, str]):
+    keys = [key for key in env if key.startswith("GOALFLIGHT_") or key == "GOAL_FLIGHT_PIDFILE_DIR"]
+    previous = {key: os.environ.get(key) for key in keys}
+    os.environ.update({key: env[key] for key in keys})
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _journal_row(root: Path, env: dict[str, str], dispatch_id: str) -> dict:
+    with _parent_isolation(env):
+        rows = journal.Journal(root).read_all(
+            "SELECT lifecycle_state, terminal_state FROM dispatch_attempts "
+            "WHERE dispatch_id = ?",
+            (dispatch_id,),
+        )
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
 def _watcher(
     root: Path,
     *,
@@ -64,18 +132,15 @@ def _watcher(
     long_running_secs: float = 3600,
     review_secs: float = 7200,
     dispatch_id: str = "trace-watch",
+    detached: bool = False,
+    env: dict[str, str] | None = None,
+    worker_identity: dict | None = None,
 ) -> tuple[subprocess.Popen, Path, Path]:
     tail = root / "worker.tail"
     status_path = root / "status.json"
     tail.write_text("", encoding="utf-8")
     status_path.write_text(json.dumps({"trace_path": str(trace)}), encoding="utf-8")
-    env = os.environ.copy()
-    env["GOALFLIGHT_STATE_DIR"] = str(root / "state")
-    env["GOALFLIGHT_TASK_STORE_DIR"] = str(root / "task-store")
-    env["GOALFLIGHT_JOURNAL_DIR"] = str(root / "journal")
-    env["GOALFLIGHT_MESSAGES_DIR"] = str(root / "messages")
-    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(root / "wake-ledger")
-    env["GOAL_FLIGHT_PIDFILE_DIR"] = str(root / "pids")
+    env = env or _isolated_env(root)
     argv = [
         sys.executable,
         str(ROOT / "scripts" / "goalflight_watch.py"),
@@ -96,9 +161,21 @@ def _watcher(
     ]
     argv.extend(["--dispatch-id", dispatch_id])
     if controller_pid is not None:
-        argv.extend(["--controller-pid", str(controller_pid)])
+        argv.extend(
+            [
+                "--controller-session-id",
+                "dead-controller-session",
+                "--controller-pid",
+                str(controller_pid),
+            ]
+        )
+    if detached:
+        argv.append("--detached")
+    if worker_identity is not None:
+        argv.extend(["--worker-identity-json", json.dumps(worker_identity)])
     process = subprocess.Popen(
         argv,
+        cwd=root,
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -412,6 +489,122 @@ def test_dead_pid_stale_trace_reaches_worker_dead_terminal_branch() -> None:
         )
         assert process.wait(timeout=3) == 1
         assert _payload(status_path)["state"] == "worker_dead"
+
+
+@contextlib.contextmanager
+def _dead_controller_case(
+    dispatch_id: str,
+    *,
+    worker_gone: bool = False,
+    worker_sleep_s: int = 30,
+):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        trace = root / "state" / "dispatch-homes" / dispatch_id / "sessions" / "turn.jsonl"
+        trace.parent.mkdir(parents=True)
+        trace.write_text("{}\n", encoding="utf-8")
+        stale = time.time() - 2
+        os.utime(trace, (stale, stale))
+        env = _isolated_env(root)
+        worker = subprocess.Popen(
+            [sys.executable, "-c", f"import time; time.sleep({worker_sleep_s})"],
+            cwd=root,
+            env=env,
+            start_new_session=True,
+        )
+        worker_identity = ledger.process_identity(worker.pid)
+        assert worker_identity is not None
+        _record_running_attempt(root, env, dispatch_id, worker.pid)
+        if worker_gone:
+            os.killpg(worker.pid, signal.SIGTERM)
+            worker.wait(timeout=3)
+        process, status_path, tail = _watcher(
+            root,
+            worker_pid=worker.pid,
+            worker_identity=worker_identity,
+            trace=trace,
+            controller_pid=_dead_pid(),
+            dispatch_id=dispatch_id,
+            env=env,
+        )
+        try:
+            yield root, env, process, status_path, tail
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=2)
+            if worker.poll() is None:
+                os.killpg(worker.pid, signal.SIGTERM)
+                worker.wait(timeout=2)
+
+
+def _assert_live_controller_loss_is_nonterminal(
+    root: Path,
+    env: dict[str, str],
+    dispatch_id: str,
+    process: subprocess.Popen,
+    status_path: Path,
+) -> None:
+    assert _wait_for(
+        lambda: status_path.exists()
+        and _payload(status_path).get("reason") == "controller_dead_worker_alive"
+    ), _payload(status_path)
+    payload = _payload(status_path)
+    assert payload.get("trace_active") is False, payload
+    assert payload.get("controller_alive") is False, payload
+    assert payload.get("worker_alive") is True, payload
+    assert payload.get("state") not in {
+        "complete", "failed", "blocked", "worker_dead", "orphaned", "idle_timeout"
+    }, payload
+    assert process.poll() is None, "live worker was terminalized with its controller"
+    row = _journal_row(root, env, dispatch_id)
+    assert row["lifecycle_state"] == journal.ATTEMPT_RUNNING, row
+    assert row["terminal_state"] is None, row
+
+
+def test_dead_controller_live_worker_with_stale_trace_stays_nonterminal() -> None:
+    dispatch_id = "dead-controller-live-worker-stale-trace"
+    with _dead_controller_case(dispatch_id) as case:
+        root, env, process, status_path, tail = case
+        _assert_live_controller_loss_is_nonterminal(
+            root, env, dispatch_id, process, status_path
+        )
+        tail.write_text(f"COMPLETE: {dispatch_id} — test finished\n", encoding="utf-8")
+        assert process.wait(timeout=3) == 0
+
+
+def test_dead_controller_quiet_live_worker_survives_beyond_incident_gap() -> None:
+    dispatch_id = "dead-controller-quiet-live-worker"
+    with _dead_controller_case(dispatch_id, worker_sleep_s=40) as case:
+        root, env, process, status_path, tail = case
+        _assert_live_controller_loss_is_nonterminal(
+            root, env, dispatch_id, process, status_path
+        )
+        # Fourteen seconds exceeds the measured healthy maximum (13s) by 1s.
+        # Less would miss the incident; doubling to 28s adds suite latency
+        # without testing a different predicate because PID identity has no age limit.
+        time.sleep(14)
+        _assert_live_controller_loss_is_nonterminal(
+            root, env, dispatch_id, process, status_path
+        )
+        tail.write_text(f"COMPLETE: {dispatch_id} — test finished\n", encoding="utf-8")
+        assert process.wait(timeout=3) == 0
+
+
+def test_dead_controller_and_gone_worker_records_controller_dead() -> None:
+    dispatch_id = "dead-controller-gone-worker"
+    with _dead_controller_case(dispatch_id, worker_gone=True) as case:
+        root, env, process, status_path, _tail = case
+        out, err = process.communicate(timeout=5)
+        assert process.returncode == 3, (process.returncode, out, err)
+        payload = _payload(status_path)
+        assert payload.get("state") == "orphaned", payload
+        assert payload.get("reason") == "controller_dead", payload
+        assert payload.get("controller_alive") is False, payload
+        assert payload.get("worker_alive") is False, payload
+        row = _journal_row(root, env, dispatch_id)
+        assert row["lifecycle_state"] == journal.ATTEMPT_TERMINAL, row
+        assert row["terminal_state"] == "controller_dead", row
 
 
 def test_live_growing_trace_survives_caps_and_dead_controller_branch() -> None:

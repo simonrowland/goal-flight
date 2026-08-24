@@ -1169,7 +1169,7 @@ def case_detached_watcher_ignores_dead_controller_pid() -> None:
                 worker.wait(timeout=5)
 
 
-def case_non_detached_watcher_dead_controller_remains_orphaned() -> None:
+def case_non_detached_watcher_dead_controller_and_gone_worker_remains_orphaned() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         tail = tmp_path / "tail.txt"
@@ -1178,11 +1178,11 @@ def case_non_detached_watcher_dead_controller_remains_orphaned() -> None:
         _isolate_state_env(env, tmp_path)
         tail.write_text("", encoding="utf-8")
         dead_controller = _dead_pid()
-        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"], start_new_session=True)
+        worker_pid = _dead_pid()
         watcher = subprocess.Popen(
             [
                 sys.executable, str(WATCH),
-                "--pid", str(worker.pid),
+                "--pid", str(worker_pid),
                 "--tail", str(tail),
                 "--status-json", str(status),
                 "--dispatch-id", "owned-dead-controller",
@@ -1213,9 +1213,6 @@ def case_non_detached_watcher_dead_controller_remains_orphaned() -> None:
             if watcher.poll() is None:
                 watcher.terminate()
                 watcher.wait(timeout=5)
-            if worker.poll() is None:
-                os.killpg(worker.pid, signal.SIGTERM)
-                worker.wait(timeout=5)
 
 
 def main() -> None:
@@ -1240,7 +1237,7 @@ def main() -> None:
     case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running()
     case_watcher_sigterm_flushes_non_running_status()
     case_detached_watcher_ignores_dead_controller_pid()
-    case_non_detached_watcher_dead_controller_remains_orphaned()
+    case_non_detached_watcher_dead_controller_and_gone_worker_remains_orphaned()
     print("OK: goalflight_dispatch crash-safe tests pass")
 
 

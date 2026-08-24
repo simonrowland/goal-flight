@@ -645,6 +645,7 @@ def _status_snapshot(payload: dict) -> dict:
         "state",
         "reason",
         "worker_pid",
+        "controller_alive",
         "pgid",
         "worker_alive",
         "worker_identity_reason",
@@ -2825,20 +2826,23 @@ def main() -> int:
             and not alive(controller_pid)
             and _controller_dead_is_terminal(detached=bool(args.detached))
         ):
-            if bool(trace_sample.get("trace_active")):
-                # A dead launcher/controller is not authoritative while the
-                # validated worker trace is still advancing. Reconcile both
-                # process identity and output before considering an orphan
-                # verdict; the veto naturally expires when trace mtime ages
-                # past the activity window.
-                worker_is_alive, identity_reason, current_identity = worker_alive(
-                    args.pid, expected_identity
-                )
+            # Controller disappearance is an observation, not worker evidence.
+            # Recheck the identity-qualified worker after the controller probe so
+            # every path to controller_dead is gated by current worker reality.
+            payload["controller_alive"] = False
+            worker_is_alive, identity_reason, current_identity = worker_alive(
+                args.pid, expected_identity
+            )
+            payload["worker_alive"] = worker_is_alive
+            payload["worker_identity_reason"] = identity_reason
+            payload["worker_identity"] = _identity_token(current_identity)
+            if not worker_is_alive or bool(trace_sample.get("trace_active")):
                 reconciled = _final_terminal_marker(
                     tail,
                     ignore_prefix_lines=ignore_prefix_lines,
                     kimi_output=moonshot_family(args.agent),
                     expected_dispatch_id=args.dispatch_id,
+                    full_file_fallback=not worker_is_alive,
                 )
                 if reconciled:
                     terminal_seen = reconciled
@@ -2848,10 +2852,8 @@ def main() -> int:
                     exit_code = _exit_code_for_state(payload["state"])
                     write_payload(payload, reason=exit_reason, terminal_write=True)
                     break
-                payload["worker_alive"] = worker_is_alive
-                payload["worker_identity_reason"] = identity_reason
-                payload["worker_identity"] = _identity_token(current_identity)
-                write_payload(payload, reason="controller_dead_active_trace_reverify")
+            if worker_is_alive:
+                write_payload(payload, reason="controller_dead_worker_alive")
                 time.sleep(args.poll_secs)
                 continue
             payload["state"] = "orphaned"
