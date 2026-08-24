@@ -4764,11 +4764,21 @@ def _report_why_this_entry_did_not_launch(args, payload: dict) -> None:
     dispatch_id = str(getattr(args, "dispatch_id", "") or "").strip()
     if not dispatch_id:
         return
-    for entry in payload.get("skipped") or []:
+    # The per-entry list is `details`. An earlier version of this read a
+    # `skipped` key that the payload has never contained, so it reported nothing
+    # and the diagnostic was inert while looking present — worse than absent,
+    # because silence then reads as "no reason to give". Its tests passed only
+    # because they built the payload from the same wrong assumption.
+    for entry in payload.get("details") or []:
         if str(entry.get("dispatch_id") or "") != dispatch_id:
             continue
         reason = str(entry.get("reason") or "unspecified")
-        detail = entry.get("process_evidence") or entry.get("detail") or ""
+        detail = (
+            entry.get("process_evidence")
+            or entry.get("not_before")
+            or entry.get("detail")
+            or ""
+        )
         suffix = f" [{detail}]" if detail else ""
         print(
             f"goalflight_dispatch: {dispatch_id} not launched: {reason}{suffix}",
