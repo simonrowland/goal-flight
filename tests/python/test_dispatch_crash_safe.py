@@ -1109,7 +1109,16 @@ def case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running() -> No
             "print('worker-started', flush=True)\n"
             f"release = pathlib.Path({str(release)!r})\n"
             "deadline = time.monotonic() + 120.0\n"
+            "next_beat = 0.0\n"
             "while not release.exists() and time.monotonic() < deadline:\n"
+            "    now = time.monotonic()\n"
+            "    if now >= next_beat:\n"
+            # Blocking SILENTLY trips the watcher's idle timeout: a worker that
+            # produces no output for --max-idle-secs is indistinguishable from a
+            # wedged one, and the dispatch ends `idle_timeout` with exit 2 before
+            # the interrupt is ever sent. A waiting worker must still look alive.
+            "        print('worker-waiting', flush=True)\n"
+            "        next_beat = now + 1.0\n"
             "    time.sleep(0.05)\n"
             "print('COMPLETE: foreground-interrupt — interrupt-safe done', flush=True)\n"
             f"pathlib.Path({str(done)!r}).write_text('done')\n"
