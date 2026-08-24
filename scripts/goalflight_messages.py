@@ -4276,6 +4276,29 @@ def _parse_cursor_positions(
     return advances
 
 
+_ACKED_PEEK_LIMIT = 500
+
+
+def _acked_positions(peek) -> dict[str, int]:
+    """Highest deliverable seq per stream, from one peek.
+
+    Advancing means "I have seen everything up to here", so the target is the
+    largest seq the peek reports per stream. Deriving it removes the step where a
+    caller transcribes nine STREAM=SEQ pairs by hand and mistypes one.
+    """
+    positions: dict[str, int] = {}
+    for item in peek.items or []:
+        stream = getattr(item, "stream_id", None)
+        seq = getattr(item, "stream_seq", None)
+        if stream is None and isinstance(item, dict):
+            stream, seq = item.get("stream_id"), item.get("stream_seq")
+        if stream is None or seq is None:
+            continue
+        stream = str(stream)
+        positions[stream] = max(int(seq), positions.get(stream, 0))
+    return positions
+
+
 def _parse_cursor_stream_snapshots(
     values: list[str] | list[list[str]] | None,
 ) -> dict[str, str]:
@@ -4317,10 +4340,36 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
         or ""
     ).strip()
     try:
-        advances = _parse_cursor_positions(args.position)
-        stream_snapshots = _parse_cursor_stream_snapshots(args.stream_snapshot)
         if not label or not nonce:
             raise ValueError("active controller label and lease nonce are required")
+        if getattr(args, "acked", False):
+            if args.position or args.stream_snapshot or args.cursor_version is not None:
+                raise ValueError(
+                    "--acked derives cursor-version, stream-snapshot and position "
+                    "itself; pass it alone"
+                )
+            peek = controller_cursor_peek(
+                project_root=project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+                limit=_ACKED_PEEK_LIMIT,
+            )
+            advances = _acked_positions(peek)
+            stream_snapshots = dict(peek.stream_snapshots)
+            args.cursor_version = peek.cursor_version
+            if not advances:
+                if args.json:
+                    print(json.dumps({"advanced": {}, "reason": "nothing deliverable"}))
+                else:
+                    print("advance: nothing deliverable")
+                return 0
+        else:
+            if args.cursor_version is None:
+                raise ValueError(
+                    "--cursor-version is required (or pass --acked to derive it)"
+                )
+            advances = _parse_cursor_positions(args.position)
+            stream_snapshots = _parse_cursor_stream_snapshots(args.stream_snapshot)
         result = goalflight_journal.Journal(project_root).advance_cursor(
             label,
             nonce=nonce,
@@ -6304,7 +6353,17 @@ def _run_cli(argv: list[str] | None = None) -> int:
     advance.add_argument("--project-root", default=None)
     advance.add_argument("--controller-label", default=None)
     advance.add_argument("--lease-nonce", default=None)
-    advance.add_argument("--cursor-version", type=int, required=True)
+    advance.add_argument("--cursor-version", type=int, default=None)
+    advance.add_argument(
+        "--acked",
+        action="store_true",
+        help="Advance past everything currently deliverable, deriving the CAS "
+             "inputs from one peek. All three (--cursor-version, "
+             "--stream-snapshot, --position) come from the same peek anyway, so "
+             "transcribing them by hand adds friction without adding safety: the "
+             "compare-and-swap still fails if anything lands between the peek "
+             "and the write.",
+    )
     advance.add_argument(
         "--stream-snapshot",
         action="append",
