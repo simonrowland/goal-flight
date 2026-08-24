@@ -57,6 +57,7 @@ from goalflight_acp_run import (  # noqa: E402
 )
 import goalflight_acp_permits  # noqa: E402
 import goalflight_compat  # noqa: E402
+import goalflight_journal  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
 from acp_runner import has_actionable_marker_values  # noqa: E402
 from goalflight_liveness import heartbeat_wedge_decision, pgroup_cpu_pct, progress_stall_decision  # noqa: E402
@@ -431,7 +432,12 @@ def _run_fake_runner(
         env.update(
             {
                 "GOALFLIGHT_STATE_DIR": str(state_dir),
+                "GOALFLIGHT_JOURNAL_DIR": str(tmp / "journal"),
                 "GOALFLIGHT_MESSAGES_DIR": str(tmp / "messages"),
+                "GOALFLIGHT_WAKE_LEDGER_DIR": str(tmp / "wake-ledger"),
+                "GOALFLIGHT_TASK_STORE_DIR": str(tmp / "task-store"),
+                "GOAL_FLIGHT_PIDFILE_DIR": str(tmp / "pidfiles"),
+                "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
                 "GOALFLIGHT_FAKE_ACP_SCENARIO": scenario,
                 "GOALFLIGHT_FAKE_ACP_INTERVAL": "0.05",
                 "GOALFLIGHT_ACP_PYTHON": sys.executable,
@@ -441,6 +447,8 @@ def _run_fake_runner(
         )
         if extra_env:
             env.update(extra_env)
+        with patch.dict(os.environ, env, clear=False):
+            goalflight_journal.Journal.create(ROOT)
         args = [
             sys.executable,
             "scripts/goalflight_acp_run.py",
@@ -1052,6 +1060,49 @@ def case_runner_thought_stream_survives_progress_stall_wall() -> None:
     assert status["wedge_progress_seen"] >= 1, status
     assert status["worker_alive"] is False, status
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_auth_failure_output_records_blocked_terminal() -> None:
+    snapshot: dict[str, object] = {}
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "auth_expired",
+        progress_stall_s=5.0,
+        heartbeat_interval=0.05,
+        idle_timeout=5.0,
+        max_quiet_s=5.0,
+        state_snapshot=snapshot,
+    )
+
+    assert returncode != 0, (stdout, stderr, status)
+    assert status["state"] == "blocked_auth", status
+    assert status["error"]["reason"] == "authentication_required", status
+    records = [
+        record
+        for record in snapshot["records"]
+        if record.get("dispatch_id") == status["dispatch_id"]
+    ]
+    assert len(records) == 1, snapshot
+    assert records[0]["state"] == "blocked_auth", records[0]
+    assert records[0]["terminal_state"] == "blocked", records[0]
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_trivial_probe_working_engine_writes_file() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        probe_path = Path(td) / "probe.txt"
+        returncode, status, stdout, stderr = _run_fake_runner(
+            "trivial_file_probe",
+            progress_stall_s=5.0,
+            heartbeat_interval=0.05,
+            idle_timeout=5.0,
+            max_quiet_s=5.0,
+            extra_env={"GOALFLIGHT_FAKE_ACP_PROBE_FILE": str(probe_path)},
+        )
+
+        assert returncode == 0, (stdout, stderr, status)
+        assert status["state"] == "complete", status
+        assert probe_path.read_text(encoding="utf-8") == "probe completed\n"
 
 
 def case_terminal_state_endturn_beats_tail_race_wedge() -> None:
@@ -2317,6 +2368,8 @@ def main() -> None:
     case_runner_max_quiet_kills_confirmed_idle_cpu()
     case_runner_max_quiet_ignores_busy_cpu()
     case_runner_thought_stream_survives_progress_stall_wall()
+    case_runner_auth_failure_output_records_blocked_terminal()
+    case_runner_trivial_probe_working_engine_writes_file()
     case_terminal_state_endturn_beats_tail_race_wedge()
     case_runner_blocked_none_completes()
     case_runner_blocked_substantive_cancels()

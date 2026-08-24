@@ -62,6 +62,20 @@ def test_nonempty_result_text_remains_complete() -> None:
     assert error is None, error
 
 
+def test_auth_failure_output_is_not_completion_evidence_for_any_engine() -> None:
+    state, error = decide_terminal_state(
+        **BASE,
+        result_text="Login expired · Please run /login",
+        agent="future-acp-engine",
+        events_seen=7,
+        successful_terminal_marker=False,
+    )
+
+    assert state == "blocked_auth", (state, error)
+    assert error and error["reason"] == "authentication_required", error
+    assert error["message"] == "worker_authentication_required", error
+
+
 def test_successful_terminal_marker_remains_complete_without_text() -> None:
     state, error = decide_terminal_state(
         **BASE,
@@ -167,6 +181,7 @@ regressions.case_dispatch_worker_dead_ledger_liveness()
 def main() -> None:
     test_empty_clean_close_fails_with_auth_hint()
     test_nonempty_result_text_remains_complete()
+    test_auth_failure_output_is_not_completion_evidence_for_any_engine()
     test_successful_terminal_marker_remains_complete_without_text()
     test_blocking_terminal_marker_retains_existing_reconciliation()
     test_whitespace_only_result_text_is_empty()

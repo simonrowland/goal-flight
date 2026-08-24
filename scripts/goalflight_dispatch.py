@@ -78,6 +78,7 @@ import goalflight_codex_sessions
 import goalflight_dispatch_paths
 import goalflight_dispatch_states
 import goalflight_engine_sessions
+import goalflight_fleet_billing
 import goalflight_steer_mailbox
 import goalflight_ledger
 import goalflight_journal
@@ -10420,6 +10421,70 @@ def _acp_context_mode_default(args) -> str:
     return "enabled"
 
 
+def _validate_claude_auth_before_attempt(
+    args,
+    account_env: dict[str, str],
+    *,
+    runner=None,
+) -> None:
+    """Fail closed before a Claude dispatch can create an attempt.
+
+    ``claude-code-cli-acp`` completes its ACP turn cleanly when Claude Code's
+    login has expired, returning the assistant text ``Login expired · Please
+    run /login``. That is a successful protocol handshake but not a usable
+    worker. Probe the same effective HOME/token environment the worker will
+    receive, and refuse before queue/ledger mutation unless auth is provably
+    ready. Explicit API billing with an API key remains a separate supported
+    path; runtime authentication errors are still vetoed by the ACP terminal
+    evidence guard.
+    """
+    if str(getattr(args, "agent", "")).strip().lower() != "claude":
+        return
+    probe_env = os.environ.copy()
+    probe_env.update(account_env)
+    if getattr(args, "billing", "sub") == "sub":
+        probe_env.pop("ANTHROPIC_API_KEY", None)
+    elif probe_env.get("ANTHROPIC_API_KEY"):
+        return
+
+    run_probe = runner or subprocess.run
+    try:
+        completed = run_probe(
+            ["claude", "auth", "status", "--json"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+            env=probe_env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DispatchUsageError(
+            "Claude auth preflight unavailable; refusing before recording an attempt: "
+            f"{type(exc).__name__}"
+        ) from exc
+
+    status = goalflight_fleet_billing.interpret_auth_probe(
+        "anthropic-session",
+        completed.returncode,
+        completed.stdout or "",
+        completed.stderr or "",
+    )
+    if status == "green":
+        return
+    if status == "red":
+        raise DispatchUsageError(
+            "Claude worker is not authenticated (`claude auth status --json` "
+            "reports loggedIn=false); run `claude auth login` or use --agent "
+            "codex until Claude is authenticated"
+        )
+    raise DispatchUsageError(
+        "Claude auth preflight was inconclusive; refusing before recording an "
+        "attempt (verify with `claude auth status --json`)"
+    )
+
+
 def _apply_fast_mode(args) -> None:
     """Normalize --fast after arg parsing: force the urgent lane (critical
     priority -> skip the queue) for every engine/shape. Idempotent: runs again on
@@ -10924,6 +10989,8 @@ def main(argv: list[str] | None = None) -> int:
             account_env = (
                 {} if goalflight_compat.is_windows() else _resolve_launch_account_env(args)
             )
+            if not goalflight_compat.is_windows():
+                _validate_claude_auth_before_attempt(args, account_env)
             if args.submit:
                 return _submit_dispatch(args, raw, base=base)
             if (
@@ -10959,6 +11026,7 @@ def main(argv: list[str] | None = None) -> int:
         _validate_before_side_effects(args, raw)
         dispatch_warnings = _dispatch_warnings(args, raw)
         account_env = _resolve_launch_account_env(args)
+        _validate_claude_auth_before_attempt(args, account_env)
     except UnsupportedAgentSandboxRequest as e:
         try:
             return _record_unsupported_sandbox_rejection(args, e)

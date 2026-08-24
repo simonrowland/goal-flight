@@ -521,6 +521,17 @@ def handle_prompt(req_id: int, params: dict) -> None:
         )
         response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
         return
+    if SCENARIO == "trivial_file_probe":
+        probe_path = os.environ["GOALFLIGHT_FAKE_ACP_PROBE_FILE"]
+        with open(probe_path, "w", encoding="utf-8") as probe_file:
+            probe_file.write("probe completed\n")
+        text_update(session_id, "COMPLETE: trivial probe wrote its file\n")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
+    if SCENARIO == "auth_expired":
+        text_update(session_id, "Login expired · Please run /login")
+        response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
+        return
     if SCENARIO == "overlimit":
         big = {
             "jsonrpc": "2.0",

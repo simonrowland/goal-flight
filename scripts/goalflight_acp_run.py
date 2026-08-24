@@ -1284,6 +1284,42 @@ def _rate_limit_signature_excerpt(*parts: object, context_chars: int = 160) -> t
     return None
 
 
+_AUTH_FAILURE_PATTERNS = (
+    _re.compile(r"\blogin expired\b", _re.IGNORECASE),
+    _re.compile(r"\bplease (?:run /login|log in(?: again)?)\b", _re.IGNORECASE),
+    _re.compile(r"\bnot (?:logged in|authenticated)\b", _re.IGNORECASE),
+    _re.compile(r"\bauthentication required\b", _re.IGNORECASE),
+    _re.compile(
+        r"\b(?:invalid|expired|revoked) (?:api key|credential|token)\b",
+        _re.IGNORECASE,
+    ),
+)
+
+
+def _auth_failure_signature_excerpt(
+    *parts: object,
+    context_chars: int = 160,
+) -> tuple[str, str] | None:
+    """Return high-confidence authentication-failure evidence, if present.
+
+    These signatures are transport-independent. They intentionally stay
+    narrower than a generic ``auth``/``401`` search so ordinary worker prose
+    about authentication does not become a terminal failure.
+    """
+    text = "\n".join(piece for piece in (_pressure_text(part) for part in parts) if piece)
+    if not text:
+        return None
+    for pattern in _AUTH_FAILURE_PATTERNS:
+        match = pattern.search(text)
+        if match is None:
+            continue
+        start = max(0, match.start() - context_chars)
+        end = min(len(text), match.end() + context_chars)
+        excerpt = " ".join(text[start:end].split())
+        return match.group(0), excerpt
+    return None
+
+
 def _merge_prompt_results(results: list[PromptResult]) -> PromptResult:
     merged = PromptResult()
     for result in results:
@@ -1697,7 +1733,10 @@ def decide_terminal_state(
     ``"wedged"`` (the dead-sample wedge is what the kill-without-outcome path is).
 
     Clean close and end_turn are transport evidence, not work evidence. Complete
-    therefore also requires a terminal marker or non-whitespace assistant output.
+    therefore also requires a terminal marker or non-whitespace assistant output
+    that is not itself a high-confidence authentication failure. This is the
+    engine-agnostic false-green predicate: without a successful terminal marker,
+    an empty result or an authentication-error result cannot be ``complete``.
     Tool activity alone, regardless of ``events_seen``, is not sufficient: Goal
     Flight workers are required to emit a terminal marker.
     """
@@ -1727,6 +1766,21 @@ def decide_terminal_state(
                     "message": "provider_limit_signature_without_terminal_marker",
                     "signature": signature,
                     "excerpt": excerpt,
+                }
+            auth_failure = _auth_failure_signature_excerpt(
+                result_text,
+                result_error,
+                stop_reason,
+            )
+            if auth_failure:
+                signature, excerpt = auth_failure
+                return "blocked_auth", {
+                    "code": -1,
+                    "message": "worker_authentication_required",
+                    "reason": "authentication_required",
+                    "signature": signature,
+                    "excerpt": excerpt,
+                    "hint": "Re-authenticate the selected worker engine before dispatching.",
                 }
         has_terminal_marker = terminal_marker_present or successful_terminal_marker
         has_assistant_output = bool(

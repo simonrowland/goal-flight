@@ -1053,6 +1053,7 @@ def _main_capture_for(agent: str) -> tuple[int, dict[str, object]]:
     captured: dict[str, object] = {}
     old_argv = sys.argv[:]
     old_run = dispatch_mod._run_acp_shape
+    old_auth_preflight = dispatch_mod._validate_claude_auth_before_attempt
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
 
     def fake_run(args, *, base: Path, account_env: dict[str, str]) -> int:
@@ -1067,6 +1068,7 @@ def _main_capture_for(agent: str) -> tuple[int, dict[str, object]]:
         try:
             os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
             dispatch_mod._run_acp_shape = fake_run
+            dispatch_mod._validate_claude_auth_before_attempt = lambda *_args, **_kwargs: None
             sys.argv = [
                 "goalflight_dispatch.py",
                 "--agent",
@@ -1080,6 +1082,7 @@ def _main_capture_for(agent: str) -> tuple[int, dict[str, object]]:
             rc = dispatch_mod.main()
         finally:
             dispatch_mod._run_acp_shape = old_run
+            dispatch_mod._validate_claude_auth_before_attempt = old_auth_preflight
             sys.argv = old_argv
             if old_state_dir is None:
                 os.environ.pop("GOALFLIGHT_STATE_DIR", None)
@@ -1098,6 +1101,111 @@ def test_auto_shape_routes_cursor_and_claude_to_acp() -> None:
     assert rc == 0
     assert captured["shape"] == "acp"
     assert captured["agent"] == "claude"
+
+
+def test_claude_auth_preflight_refuses_before_attempt() -> None:
+    completed = subprocess.CompletedProcess(
+        ["claude", "auth", "status", "--json"],
+        0,
+        stdout='{"loggedIn": false, "authMethod": "none"}\n',
+        stderr="",
+    )
+    auth_probe_calls = 0
+    validate_auth = dispatch_mod._validate_claude_auth_before_attempt
+
+    def fake_auth_preflight(args, account_env) -> None:
+        nonlocal auth_probe_calls
+
+        def fake_runner(argv, **kwargs):
+            nonlocal auth_probe_calls
+            auth_probe_calls += 1
+            assert argv == ["claude", "auth", "status", "--json"]
+            assert "ANTHROPIC_API_KEY" not in kwargs["env"]
+            return completed
+
+        validate_auth(args, account_env, runner=fake_runner)
+
+    for shape in ("acp", "bash"):
+        dispatch_id = f"claude-auth-preflight-refusal-{shape}"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            env = {
+                "GOALFLIGHT_STATE_DIR": str(tmp / "state"),
+                "GOALFLIGHT_JOURNAL_DIR": str(tmp / "journal"),
+                "GOALFLIGHT_MESSAGES_DIR": str(tmp / "messages"),
+                "GOALFLIGHT_WAKE_LEDGER_DIR": str(tmp / "wake-ledger"),
+                "GOALFLIGHT_TASK_STORE_DIR": str(tmp / "task-store"),
+                "GOAL_FLIGHT_PIDFILE_DIR": str(tmp / "pidfiles"),
+                "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
+            }
+            stderr = io.StringIO()
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    dispatch_mod,
+                    "_validate_claude_auth_before_attempt",
+                    side_effect=fake_auth_preflight,
+                ),
+                patch.object(
+                    dispatch_mod,
+                    "_run_acp_shape",
+                    side_effect=AssertionError("unauthenticated Claude reached ACP launch"),
+                ),
+                patch.object(
+                    dispatch_mod,
+                    "_spawn_daemonized_process",
+                    side_effect=AssertionError("unauthenticated Claude reached bash launch"),
+                ),
+                contextlib.redirect_stderr(stderr),
+            ):
+                rc = dispatch_mod.main(
+                    [
+                        "--agent",
+                        "claude",
+                        "--shape",
+                        shape,
+                        "--foreground",
+                        "--unregistered-forced",
+                        "--dispatch-id",
+                        dispatch_id,
+                        "--prompt",
+                        "write a trivial probe file",
+                        "--cwd",
+                        str(tmp),
+                    ]
+                )
+                assert not dispatch_mod.goalflight_ledger.record_path(dispatch_id).exists()
+                assert not list((tmp / "journal").rglob("state-journal.sqlite3"))
+
+        assert rc == 64, stderr.getvalue()
+        assert "not authenticated" in stderr.getvalue(), stderr.getvalue()
+        assert "claude auth login" in stderr.getvalue(), stderr.getvalue()
+    assert auth_probe_calls == 2
+
+
+def test_claude_auth_preflight_accepts_logged_in_session() -> None:
+    calls = 0
+
+    def fake_runner(argv, **kwargs):
+        nonlocal calls
+        calls += 1
+        assert argv == ["claude", "auth", "status", "--json"]
+        assert "ANTHROPIC_API_KEY" not in kwargs["env"]
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout='{"loggedIn": true, "authMethod": "oauth"}\n',
+            stderr="",
+        )
+
+    args = SimpleNamespace(agent="claude", billing="sub")
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "must-be-stripped"}):
+        dispatch_mod._validate_claude_auth_before_attempt(
+            args,
+            {},
+            runner=fake_runner,
+        )
+    assert calls == 1
 
 
 def _run_acp_shape_env_capture(agent: str, env_key: str) -> dict[str, str | None]:
@@ -1161,6 +1269,8 @@ def main() -> None:
     test_acp_capacity_wait_zero_single_shot()
     test_acp_capacity_wait_sigterm_terminalizes()
     test_auto_shape_routes_cursor_and_claude_to_acp()
+    test_claude_auth_preflight_refuses_before_attempt()
+    test_claude_auth_preflight_accepts_logged_in_session()
     test_subscription_env_scrub_for_cursor_and_claude_acp()
     print("OK: goalflight_dispatch ACP agent tests pass")
 
