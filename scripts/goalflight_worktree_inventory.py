@@ -39,12 +39,14 @@ import sys
 # trips it immediately. It is a reporting threshold only — nothing is deleted.
 DEFAULT_BUSY_THRESHOLD = 32
 
-# Why 60%: ENFILE is raised against the whole-system table, so the useful alarm
-# is a fraction of kern.maxfiles, not an absolute count. The observed failure sat
-# at 53% and was still climbing when it started killing database opens, so the
-# threshold has to be at or below that to have warned in time. 60% leaves real
-# headroom on an idle box (measured 7.6% after relief) without crying wolf.
-FILE_TABLE_WARN_FRACTION = 0.60
+# Why 50%: ENFILE is raised against the whole-system table, so the useful alarm is
+# a fraction of kern.maxfiles rather than an absolute count. The observed failure
+# sat at 259,036 of 491,520 - 52.7% - and was still climbing when it began killing
+# database opens, so the threshold must be BELOW that to have warned in time. An
+# earlier version derived exactly that and then set 0.60, which would have
+# reported the very state it cites as `ok`. 50% still leaves real headroom over an
+# idle box (measured 1.7% with the indexer stopped).
+FILE_TABLE_WARN_FRACTION = 0.50
 
 
 def _git(root: Path, *args: str) -> str:

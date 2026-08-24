@@ -124,3 +124,14 @@ def _run_json(search: Path, *extra: str) -> str:
         capture_output=True, text=True, check=True,
     )
     return done.stdout
+
+
+def test_warn_threshold_matches_its_derivation() -> None:
+    """The threshold must fire at the state its own comment cites as the failure.
+
+    An earlier version derived "at or below 52.7%" and then set 0.60, so the very
+    incident it names would have been reported ok.
+    """
+    observed_failure = 259036 / 491520          # the measured incident, 52.7%
+    assert inv.FILE_TABLE_WARN_FRACTION < observed_failure, (
+        "threshold must warn at the level the derivation cites")

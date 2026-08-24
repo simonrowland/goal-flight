@@ -122,6 +122,12 @@ def main(argv: list[str] | None = None) -> int:
 
     deleted, failed = 0, []
     if args.apply:
+        # A negative limit silently becomes a slice index: --limit -1 would
+        # delete all but one instead of at most one. On a tool that deletes
+        # irreversibly, a misread flag must refuse rather than guess.
+        if args.limit < 0:
+            print("--limit must be >= 0 (0 means no limit)", file=sys.stderr)
+            return 1
         targets = orphans[: args.limit] if args.limit else orphans
         for entry in targets:
             # Re-verify immediately before deleting: the listing above is a

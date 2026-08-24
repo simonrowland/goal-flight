@@ -134,3 +134,19 @@ def test_exhaustion_raises_rather_than_looping(tmp_path: Path) -> None:
         (tmp_path / f"SC-{i:02d}-x.md").write_text("")
     with pytest.raises(RuntimeError):
         claim_id.claim(tmp_path, prefix="SC", suffix="-y.md", start=1, limit=3)
+
+
+def test_unreadable_directory_refuses_rather_than_claiming(tmp_path: Path) -> None:
+    """A namespace we cannot enumerate is not an empty namespace.
+
+    With write+execute but no read, an existing SC-01 is invisible and the
+    allocator would hand out 1 again - the exact collision this module prevents.
+    """
+    import os
+    (tmp_path / "SC-01-legacy.md").write_text("")
+    os.chmod(tmp_path, 0o300)
+    try:
+        with pytest.raises(RuntimeError):
+            claim_id.existing_ids(tmp_path, "SC", 2)
+    finally:
+        os.chmod(tmp_path, 0o755)

@@ -62,8 +62,15 @@ def existing_ids(directory: Path, prefix: str, width: int) -> set[int]:
     def scan(where: Path) -> None:
         try:
             entries = list(where.iterdir())
-        except OSError:
-            return
+        except FileNotFoundError:
+            return          # not yet created: genuinely empty
+        except OSError as exc:
+            # A directory we cannot enumerate is NOT an empty namespace. Treating
+            # it as empty hands out ids that are already taken - exactly the
+            # collision this module exists to prevent - so refuse instead.
+            raise RuntimeError(
+                f"cannot enumerate {where} to determine taken ids: {exc}"
+            ) from exc
         for entry in entries:
             stem = entry.name[:-len(entry.suffix)] if entry.suffix else entry.name
             for candidate in (entry.name, stem):

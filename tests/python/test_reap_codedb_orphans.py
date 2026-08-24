@@ -170,3 +170,22 @@ def test_reverification_refuses_a_root_that_came_back(tmp_path: Path, monkeypatc
     reap.main(["--apply"])
 
     assert store.exists(), "a root that reappeared must not be reaped"
+
+
+def test_negative_limit_is_refused_not_treated_as_a_slice(tmp_path: Path) -> None:
+    """`--limit -1` must refuse, not delete all-but-one.
+
+    Python slices accept negatives silently, so orphans[:-1] on a deleting tool
+    turns "at most one" into "all but one". Found by review at 10/10 confidence.
+    """
+    home = tmp_path / "home"
+    for i in range(5):
+        make_store(home, f"o{i}", str(tmp_path / f"absent{i}"))
+    done = subprocess.run(
+        [sys.executable, str(SCRIPTS / "goalflight_reap_codedb_orphans.py"),
+         "--apply", "--limit", "-1"],
+        capture_output=True, text=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(home), "CODEDB_HOME": str(home)},
+    )
+    assert done.returncode != 0, done.stdout
+    assert len(list((home / "projects").iterdir())) == 5, "nothing may be deleted"
