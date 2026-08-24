@@ -42,6 +42,7 @@ _GENERATION_FILE_VERSION = "generation-v1"
 _LISTENER_SLOT_FILE_VERSION = "listener-slot-v1"
 _RING_STAMP_FILE_VERSION = "ring-stamp-v1"
 _PENDING_REPORT_FILE_VERSION = "pending-report-v1"
+_WATCHDOG_DEATH_REPORT_FILE_VERSION = "watchdog-death-report-v1"
 _MONITOR_STATE_FILE_VERSION = "monitor-state-v1"
 MONITOR_STATE_SCHEMA = "goalflight.monitor-state.v1"
 PERSISTENT_WAKE_TARGET = 3
@@ -572,6 +573,60 @@ def monitor_status(
         "last_kind": payload.get("last_kind"),
         "fault": fault if isinstance(fault, dict) else None,
     }
+
+
+def _watchdog_death_report_path(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> Path:
+    return ledger_dir(project_root) / (
+        f"{_WATCHDOG_DEATH_REPORT_FILE_VERSION}.{_label_hash(controller_label)}."
+        f"{_label_hash(lease_nonce)}.claimed"
+    )
+
+
+def claim_watchdog_death_report(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> bool:
+    """First doorbell in this lease generation announces a missing watchdog.
+
+    Without this the announcement is LEVEL-triggered: a missing watchdog lock
+    is a standing condition, so every doorbell that arms into it fires
+    watchdog-dead and exits, the controller re-arms, and the replacement fires
+    immediately too. Measured across the fleet: no controller held a listener
+    longer than three minutes, one was churning twelve at once, and a doorbell
+    armed against an absent watchdog died after fifteen seconds having
+    delivered no mail.
+
+    Announcing an absence the controller has already been told about buys
+    nothing and costs the doorbell that should have been carrying mail. So the
+    first arm reports and the rest stay armed and keep delivering; coverage
+    still reports the gap on every status read, which is where a standing
+    condition belongs.
+    """
+    label = str(controller_label or "").strip()
+    nonce = str(lease_nonce or "").strip()
+    if not label or not nonce:
+        raise ValueError("controller label and lease nonce are required")
+    path = _watchdog_death_report_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, _open_flags(create_exclusive=True), 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    os.close(fd)
+    return True
 
 
 def claim_pending_report(

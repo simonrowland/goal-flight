@@ -6050,6 +6050,17 @@ def cmd_listen(args) -> int:
                     watchdog_observed_live
                     or time.monotonic() - listener_started >= watchdog_start_grace
                 )
+                # A missing watchdog lock is a STANDING condition, not an event.
+                # Announcing it costs this doorbell its life, so only the first
+                # arm in the generation does: otherwise every replacement fires
+                # on arrival and the pool churns without ever carrying mail.
+                # Coverage still reports the gap on every status read, which is
+                # where a standing condition belongs.
+                and goalflight_wake.claim_watchdog_death_report(
+                    project_root,
+                    controller_label=label,
+                    lease_nonce=nonce,
+                )
             ):
                 return finish_watchdog_dead()
             # With an arm-time backlog the cheap limit-1 peek would forever
