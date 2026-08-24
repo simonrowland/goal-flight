@@ -82,6 +82,37 @@ def test_detachable_mounts_are_never_orphans(tmp_path: Path, prefix: str) -> Non
     assert "detached" in entry["why"]
 
 
+def test_unreadable_ancestor_is_not_absence(tmp_path: Path) -> None:
+    """A root we cannot LOOK at is not a root that is GONE.
+
+    `os.path.exists()` answers False for both, and this tool deletes on that
+    answer, so a live repository behind an ancestor lacking search permission was
+    classified `orphan` and removed. Found by adversarial review after the tool
+    had already reclaimed 106 GB on a real machine.
+    """
+    import os
+    home = tmp_path / "home"
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    live_root = locked / "real-repo"
+    live_root.mkdir()
+    store = make_store(home, "behind-lock", str(live_root))
+
+    os.chmod(locked, 0o000)
+    try:
+        entry = reap.classify(store)
+        assert entry["verdict"] == "keep", entry
+        assert "unverified" in entry["why"], entry
+    finally:
+        os.chmod(locked, 0o755)
+
+
+def test_genuine_absence_is_still_detected(tmp_path: Path) -> None:
+    """The narrowing must not swallow the true positive."""
+    store = make_store(tmp_path / "home", "really-gone", str(tmp_path / "never-existed"))
+    assert reap.classify(store)["verdict"] == "orphan"
+
+
 def test_dry_run_deletes_nothing(tmp_path: Path) -> None:
     home = tmp_path / "home"
     orphan = make_store(home, "gone", str(tmp_path / "absent"))

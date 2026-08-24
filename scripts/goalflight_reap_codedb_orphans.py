@@ -73,12 +73,24 @@ def classify(project_dir: Path) -> dict:
     if root.startswith(_UNSTABLE_PREFIXES):
         entry["why"] = "root on a mount that may be detached rather than deleted"
         return entry
-    if os.path.exists(root):
-        entry["why"] = "root still exists"
+    # os.path.exists() answers False for BOTH "absent" and "I could not look" -
+    # a root behind an ancestor we lack search permission on reads as missing,
+    # and this tool deletes on that answer. stat() separates the two: only
+    # FileNotFoundError (or a broken symlink) is evidence of absence; any other
+    # OSError means the question is unanswered, and unanswered is not permission.
+    try:
+        os.stat(root)
+    except FileNotFoundError:
+        entry["verdict"] = "orphan"
+        entry["why"] = "root no longer exists"
         return entry
-
-    entry["verdict"] = "orphan"
-    entry["why"] = "root no longer exists"
+    except OSError as exc:
+        entry["why"] = (
+            f"root could not be checked ({exc.__class__.__name__}), "
+            "so absence is unverified"
+        )
+        return entry
+    entry["why"] = "root still exists"
     return entry
 
 
