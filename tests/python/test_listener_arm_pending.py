@@ -1,7 +1,14 @@
 """Opt-in arm-reports-pending listener behavior and exit-driven compatibility.
 
 Live-verified 2026-08-15 (operator-designed semantics: the arm doubles as the
-peek, and a controller that is awake enough to arm does not need the pop)."""
+peek, and a controller that is awake enough to arm does not need the pop).
+
+NOTE: `--report-pending` is now the DEFAULT, because a backlog left the
+bare path ringing every armed doorbell at once — four doorbells against a
+13-message backlog all fired immediately and coverage went to zero. The two
+tests below still cover the legacy ring shape and now request it explicitly
+with `--no-report-pending`, so both paths stay tested.
+"""
 
 from __future__ import annotations
 
@@ -151,7 +158,8 @@ def test_default_ring_lists_entire_backlog_once_and_advances_every_stream(
                     "4",
                     "--poll-secs",
                     "5",
-                    "--timeout-s",
+                    "--no-report-pending",
+                "--timeout-s",
                     "30",
                 ],
                 env=listener_env,
@@ -264,6 +272,7 @@ def test_default_ring_filters_controller_authored_items_from_listing(
                 "armtest",
                 "--poll-secs",
                 "0.01",
+                "--no-report-pending",
                 "--timeout-s",
                 "5",
             ],

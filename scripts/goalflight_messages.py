@@ -5480,7 +5480,11 @@ def _cmd_watch_follow(
     ignored = []
     if getattr(args, "listener_slots", None) is not None:
         ignored.append("--listener-slots")
-    if getattr(args, "report_pending", False):
+    # Only complain about a flag the caller actually TYPED. --report-pending
+    # defaults on now, so testing its value here would print "ignoring
+    # --report-pending" on every watchdog arm — a warning about a choice nobody
+    # made, on the one mode where the option is meaningless.
+    if any(a in ("--report-pending", "--no-report-pending") for a in sys.argv[1:]):
         ignored.append("--report-pending")
     if ignored:
         backup_command = goalflight_wake.persistent_backup_start_command(
@@ -6412,10 +6416,30 @@ def _run_cli(argv: list[str] | None = None) -> int:
             "--timeout-s", type=float, default=0.0, help="0 = wait indefinitely"
         )
         command_parser.add_argument("--json", action="store_true")
+        # DEFAULT ON. Arming a doorbell while mail is pending rings it
+        # immediately, so a controller arming four against an existing backlog
+        # has all four fire at once on old mail and is left with no coverage.
+        # Observed repeatedly across projects here, most recently a
+        # thirteen-message backlog firing all four of a controller's tracked
+        # doorbells. Controllers had begun inventing a "drain first, confirm
+        # nothing pending, then arm" ceremony purely to avoid it.
+        #
+        # Reporting converts the backlog into ONE report and raises the ring
+        # threshold to the arm-time high water, so armed slots stay armed for
+        # NEW events. Its failure mode is strictly smaller: a report followed by
+        # a death within one lease generation loses a WAKE but never the mail,
+        # because the cursor is not advanced and the reported high water is keyed
+        # by lease nonce, so a fresh generation reports the backlog again.
         command_parser.add_argument(
             "--report-pending",
-            action="store_true",
-            help="report an arm-time backlog and stay armed for only newer events",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "report an arm-time backlog once and stay armed for only newer "
+                "events (default: on). --no-report-pending restores the legacy "
+                "path where pending mail rings every armed doorbell and can "
+                "consume every listener slot"
+            ),
         )
         command_parser.add_argument(
             "--watch-follow",
