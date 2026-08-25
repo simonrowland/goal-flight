@@ -504,6 +504,65 @@ def _commit_prelaunch_terminal(payload: dict, *, project_root: Path | str) -> No
     )
 
 
+def _record_acp_ledger_state(
+    cfg: argparse.Namespace,
+    *,
+    dispatch_id: str,
+    project_root: Path,
+    controller_pid: int | None,
+    controller_session_id: str | None,
+    controller_label: str | None,
+    status_path: Path,
+    payload: dict,
+    effective_account: str | None,
+    lease_id: str | None,
+    worker_pid: int | None,
+    state: str,
+) -> None:
+    """Record one ACP lifecycle state through the shared journal authority."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        record_code = goalflight_ledger.cmd_record(
+            argparse.Namespace(
+                dispatch_id=dispatch_id,
+                prompt_id=cfg.prompt_id,
+                prompt_path=cfg.prompt,
+                task_ids=getattr(cfg, "task_ids", []),
+                agent=cfg.agent,
+                engine=goalflight_ledger.infer_engine(cfg.agent),
+                shape="acp",
+                account=getattr(cfg, "account", None) or "default",
+                effective_account=effective_account,
+                request_envelope_json=(
+                    json.dumps(cfg.request_envelope, sort_keys=True)
+                    if isinstance(getattr(cfg, "request_envelope", None), dict)
+                    else None
+                ),
+                transport="acp",
+                project_root=str(project_root),
+                controller_pid=controller_pid,
+                controller_session_id=controller_session_id,
+                controller_label=controller_label,
+                worker_pid=worker_pid,
+                acp_session_id=cfg.session_id,
+                logical_session_id=cfg.session_id,
+                engine_session_id=getattr(cfg, "engine_session_id", None)
+                or cfg.session_id,
+                lease_id=lease_id,
+                stdout_path=None,
+                stderr_path=None,
+                status_path=str(status_path),
+                os_sandbox_json=json.dumps(payload.get("os_sandbox") or {}, sort_keys=True),
+                queue_launch_token=getattr(cfg, "queue_launch_token", None),
+                state=state,
+                json=True,
+            )
+        )
+    if record_code != 0:
+        raise RuntimeError(
+            f"journal attempt transition refused for {dispatch_id}: exit {record_code}"
+        )
+
+
 class _SigtermCancelBridge:
     """Convert process termination signals into asyncio task cancellation.
 
@@ -2319,6 +2378,27 @@ async def _run_acp_dispatch_impl(
         hard_cap=goalflight_capacity.DEFAULT_HARD_CAP,
         max_total=None,
     )
+    preserve_capacity_refusal_attempt = bool(
+        getattr(cfg, "preserve_capacity_refusal_attempt", False)
+    )
+    if preserve_capacity_refusal_attempt:
+        # Prepare before acquisition. A refused detached dispatch can then be
+        # handed to the durable queue with the same launch token, while the
+        # STARTING CAS below remains the sole pre-spawn launch claim.
+        _record_acp_ledger_state(
+            cfg,
+            dispatch_id=dispatch_id,
+            project_root=project_root,
+            controller_pid=controller_pid,
+            controller_session_id=controller_session_id,
+            controller_label=controller_label,
+            status_path=status_path,
+            payload=payload,
+            effective_account=None,
+            lease_id=None,
+            worker_pid=None,
+            state="waiting_capacity",
+        )
     wait_budget_s = goalflight_capacity.resolve_capacity_wait_s(
         lane=acquire_args.priority,
         wait_s=getattr(cfg, "capacity_wait_s", None),
@@ -2376,9 +2456,23 @@ async def _run_acp_dispatch_impl(
                 "updated_at": _now(),
             }
         )
+        # Interrupts are terminal operator intent, never durable fallback.
         _commit_prelaunch_terminal(payload, project_root=project_root)
         write_status(status_path, payload)
         return payload
+    except Exception as exc:
+        if preserve_capacity_refusal_attempt:
+            payload.update(
+                {
+                    "state": "failed",
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "updated_at": _now(),
+                }
+            )
+            _commit_prelaunch_terminal(payload, project_root=project_root)
+            write_status(status_path, payload)
+        raise
     if acquire_payload.get("decision") != "allow":
         if last_capacity_wait["attempt"]:
             acquire_payload = dict(acquire_payload)
@@ -2388,7 +2482,8 @@ async def _run_acp_dispatch_impl(
             )
             acquire_payload.setdefault("attempts", int(last_capacity_wait["attempt"]) + 1)
         payload.update({"state": "blocked_capacity", "reason": acquire_payload})
-        _commit_prelaunch_terminal(payload, project_root=project_root)
+        if not preserve_capacity_refusal_attempt:
+            _commit_prelaunch_terminal(payload, project_root=project_root)
         write_status(status_path, payload)
         return payload
 
@@ -2462,60 +2557,22 @@ async def _run_acp_dispatch_impl(
     )
 
     def record_ledger_state(*, worker_pid: int | None, state: str) -> None:
-        with contextlib.redirect_stdout(io.StringIO()):
-            record_code = goalflight_ledger.cmd_record(
-                argparse.Namespace(
-                    dispatch_id=dispatch_id,
-                    prompt_id=cfg.prompt_id,
-                    prompt_path=cfg.prompt,
-                    task_ids=getattr(cfg, "task_ids", []),
-                    agent=cfg.agent,
-                    engine=goalflight_ledger.infer_engine(cfg.agent),
-                    shape="acp",
-                    account=getattr(cfg, "account", None) or "default",
-                    effective_account=effective_account,
-                    request_envelope_json=(
-                        json.dumps(cfg.request_envelope, sort_keys=True)
-                        if isinstance(
-                            getattr(cfg, "request_envelope", None), dict
-                        )
-                        else None
-                    ),
-                    transport="acp",
-                    # project_root MUST be the original --cwd (main repo
-                    # toplevel), NOT worker_cwd. For a worktree dispatch,
-                    # worker_cwd is reassigned to the leased pool seat, but
-                    # goalflight_status.scope_payload() filters
-                    # records by exact project_root == this-repo toplevel. If we
-                    # recorded the worktree path here the record would be scoped
-                    # OUT of `status --done/--dispatch/--json` for its whole
-                    # lifetime. The worktree path stays tracked in the ACP status
-                    # JSON (worktree_path/worker_cwd) and the lease's worker_cwd.
-                    # This mirrors the capacity lease, which already records the
-                    # unmodified project_root.
-                    project_root=str(project_root),
-                    controller_pid=controller_pid,
-                    controller_session_id=controller_session_id,
-                    controller_label=controller_label,
-                    worker_pid=worker_pid,
-                    acp_session_id=cfg.session_id,
-                    logical_session_id=cfg.session_id,
-                    engine_session_id=getattr(cfg, "engine_session_id", None)
-                    or cfg.session_id,
-                    lease_id=lease_id,
-                    stdout_path=None,
-                    stderr_path=None,
-                    status_path=str(status_path),
-                    os_sandbox_json=json.dumps(payload.get("os_sandbox") or {}, sort_keys=True),
-                    queue_launch_token=getattr(cfg, "queue_launch_token", None),
-                    state=state,
-                    json=True,
-                )
-            )
-        if record_code != 0:
-            raise RuntimeError(
-                f"journal attempt transition refused for {dispatch_id}: exit {record_code}"
-            )
+        # project_root MUST stay the original --cwd, not a leased worktree
+        # seat, so status scoping and capacity attribution agree.
+        _record_acp_ledger_state(
+            cfg,
+            dispatch_id=dispatch_id,
+            project_root=project_root,
+            controller_pid=controller_pid,
+            controller_session_id=controller_session_id,
+            controller_label=controller_label,
+            status_path=status_path,
+            payload=payload,
+            effective_account=effective_account,
+            lease_id=lease_id,
+            worker_pid=worker_pid,
+            state=state,
+        )
 
     def attach_worker_to_lease(worker_pid: int) -> None:
         if not lease_id:
