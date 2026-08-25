@@ -34,6 +34,15 @@ USER_CONFIRM_DECISIONS = frozenset({"yes", "no"})
 DEFAULT_WORKER_WAIT_TIMEOUT_SECS = 3600.0
 MAX_WORKER_WAIT_TIMEOUT_SECS = 4 * 3600.0
 DEFAULT_WORKER_WAIT_POLL_SECS = 0.25
+# The post-deadline final read must outlast one admitted reply writer's
+# critical section: a writer that can still land a reply has already passed
+# the in-lock deadline check, so it holds the mailbox lock and owes one short
+# append plus fsync. Budgeting the final read at one poll interval could
+# expire mid-fsync on a loaded host and report deadline for a reply that was
+# admitted.
+WORKER_WAIT_FINAL_READ_LOCK_SECS = 5.0
+# Best-effort budget for persisting one consumed reply's durable receipt.
+WORKER_WAIT_RECEIPT_LOCK_SECS = 0.5
 LEGACY_STEER_KIND_ALIASES = {
     "steer": STEERING_KIND,
     "user_confirm_reply": USER_CONFIRM_KIND,
@@ -41,22 +50,40 @@ LEGACY_STEER_KIND_ALIASES = {
 
 
 def worker_wait_reply_output_lines(entry: dict) -> tuple[str, str]:
-    """Return a bounded receipt marker plus an unparsed human-readable payload."""
-    receipt = {
-        "kind": entry.get("kind"),
-        "reply_to": entry.get("reply_to"),
-        "seq": entry.get("seq"),
-    }
+    """Return a bounded receipt marker plus an unparsed human-readable payload.
+
+    Only an exact typed wait reply may carry the STEER-REPLY prefix: the
+    watcher matches that label against the armed wait id and reply sequence,
+    and the renewal fallback collects it as the consumption receipt. Generic
+    backlog rows are controller messages, not confirmations, so they report
+    under a distinct backlog label that no consumer parses as a reply.
+    """
     detail = {
         "decision": entry.get("decision"),
         "seq": entry.get("seq"),
         "text": entry.get("text"),
     }
+    message_line = "STEER-MESSAGE: " + json.dumps(
+        detail, ensure_ascii=False, sort_keys=True
+    )
+    if entry.get("kind") == WORKER_WAIT_REPLY_KIND:
+        receipt = {
+            "kind": entry.get("kind"),
+            "reply_to": entry.get("reply_to"),
+            "seq": entry.get("seq"),
+        }
+        return (
+            "STEER-REPLY: "
+            + json.dumps(receipt, ensure_ascii=False, sort_keys=True),
+            message_line,
+        )
+    backlog = {
+        "kind": entry.get("kind"),
+        "seq": entry.get("seq"),
+    }
     return (
-        "STEER-REPLY: "
-        + json.dumps(receipt, ensure_ascii=False, sort_keys=True),
-        "STEER-MESSAGE: "
-        + json.dumps(detail, ensure_ascii=False, sort_keys=True),
+        "STEER-BACKLOG: " + json.dumps(backlog, ensure_ascii=False, sort_keys=True),
+        message_line,
     )
 
 
@@ -79,18 +106,79 @@ def _worker_wait_receipt_identity(value: object) -> tuple[str, int] | None:
     return wait_id, reply_seq
 
 
+def worker_wait_receipts_path(path: Path) -> Path:
+    """Return the append-only consumption-receipt sidecar for one mailbox.
+
+    Watched-tail STEER-REPLY receipts age out of the status marker window
+    (last 20) and the bounded stdout rescan (tail 10 MiB); this sidecar is
+    the durable home that does not age out.
+    """
+    return path.with_name(f"{Path(path).stem}.receipts.jsonl")
+
+
+def record_worker_wait_reply_receipt(
+    path: Path,
+    reply: dict,
+    *,
+    lock_timeout_secs: float = WORKER_WAIT_RECEIPT_LOCK_SECS,
+) -> None:
+    """Best-effort durable copy of one consumed typed reply's receipt.
+
+    Never raises: the watched tail, the status marker window, and the
+    best-effort end row remain parallel evidence when this append loses.
+    """
+    payload = json.dumps(
+        {
+            "kind": reply.get("kind"),
+            "reply_to": reply.get("reply_to"),
+            "seq": reply.get("seq"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    if _worker_wait_receipt_identity(payload) is None:
+        # Only an exact typed, correlated reply qualifies as a receipt.
+        return
+    messages = _carrier_module()
+    sidecar = worker_wait_receipts_path(path)
+    try:
+        with messages.carrier_transaction(
+            sidecar,
+            lock_timeout_secs=lock_timeout_secs,
+        ) as carrier:
+            carrier.read_bytes()
+            carrier.append_bytes((payload + "\n").encode("utf-8"))
+    except (OSError, RuntimeError, TimeoutError, ValueError):
+        # Mirrors the best-effort end row: receipt persistence must never
+        # mask an already-reported reply or strand the worker.
+        pass
+    except Exception as exc:
+        if not is_carrier_error(exc):
+            raise
+
+
 def consumed_worker_wait_receipts(
     record: dict,
     *,
     marker_entries: list[dict] | None = None,
+    mailbox_path: Path | str | None = None,
 ) -> set[tuple[str, int]]:
-    """Return exact typed reply receipts validated by the worker-tail scanner."""
+    """Return exact typed reply receipts from the sidecar and the worker tail."""
     receipts: set[tuple[str, int]] = set()
 
     def add(value: object) -> None:
         identity = _worker_wait_receipt_identity(value)
         if identity is not None:
             receipts.add(identity)
+
+    if mailbox_path is not None:
+        sidecar = worker_wait_receipts_path(Path(str(mailbox_path)))
+        try:
+            sidecar_text = sidecar.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            sidecar_text = ""
+        for line in sidecar_text.splitlines():
+            add(line.strip())
 
     status_value = record.get("status_path")
     if status_value:
@@ -961,6 +1049,7 @@ def wait_for_worker_entries(
                 ),
             }
         )
+        carrier_read_error_reported = False
         while True:
             remaining = remaining_secs()
             final_deadline_read = remaining <= 0
@@ -968,7 +1057,7 @@ def wait_for_worker_entries(
                 current_entries = read_steer_entries(
                     path,
                     lock_timeout_secs=(
-                        min(DEFAULT_WORKER_WAIT_POLL_SECS, poll_secs)
+                        WORKER_WAIT_FINAL_READ_LOCK_SECS
                         if final_deadline_read
                         else remaining
                     ),
@@ -977,6 +1066,24 @@ def wait_for_worker_entries(
             except TimeoutError:
                 decision = "deadline"
                 return deadline_result(str(arm["question_id"]))
+            except Exception as exc:
+                if not isinstance(exc, OSError) and not is_carrier_error(exc):
+                    raise
+                # A transient carrier read failure must not fail the wait: the
+                # reply may already be durable, and escaping here emits no
+                # receipt and no end row, so every later wait stays refused.
+                if not carrier_read_error_reported:
+                    print(
+                        "WARNING: steer mailbox read failed; retrying until "
+                        f"the wait deadline: {exc}",
+                        file=sys.stderr,
+                    )
+                    carrier_read_error_reported = True
+                if final_deadline_read:
+                    decision = "deadline"
+                    return deadline_result(str(arm["question_id"]))
+                time.sleep(min(poll_secs, remaining))
+                continue
             replies = _worker_wait_replies(
                 current_entries,
                 dispatch_id=dispatch_id,
@@ -985,6 +1092,11 @@ def wait_for_worker_entries(
             )
             if replies:
                 decision = "reply"
+                # Persist the consumption receipt before the reply is
+                # reported: it must be durable before the worker can observe
+                # the stream, and it must survive tail aging when the
+                # best-effort end row below loses its short lock race.
+                record_worker_wait_reply_receipt(path, replies[0])
                 result = {
                     "state": "messages",
                     "entries": replies,

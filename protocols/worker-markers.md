@@ -74,8 +74,16 @@ Rules:
   steer can answer or redirect the need and carries no authorization. For
   `USER-CONFIRM`, it surfaces the backlog but still emits and arms the exact
   question; only a correlated typed reply with an explicit decision succeeds.
+  Only a typed reply prints `STEER-REPLY`; generic backlog rows report as
+  `STEER-BACKLOG` plus `STEER-MESSAGE`, never as a confirmation-looking reply.
   A watched-tail typed reply receipt also settles renewal when the waiter's
-  best-effort end-row append loses its short mailbox-lock race.
+  best-effort end-row append loses its short mailbox-lock race, and each
+  consumed reply's receipt is also persisted to the mailbox's append-only
+  receipts sidecar so renewal evidence does not age out of the status marker
+  window or the bounded stdout rescan. Transient mailbox read failures inside
+  the wait are retried until the deadline rather than failing the command, and
+  the post-deadline final read waits out one admitted writer's append/fsync
+  before reporting deadline.
   An unresolved or expired arm is non-renewable; another wait is refused until a
   reply is consumed or the dispatch terminally settles. On deadline the command
   returns nonzero and ordinary idle accounting resumes.

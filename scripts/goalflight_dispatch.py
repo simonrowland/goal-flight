@@ -2507,7 +2507,7 @@ def _acked_steer_seqs(record: dict) -> set[int]:
     return goalflight_steer_mailbox.acked_steer_seqs(record)
 
 
-def _consumed_worker_wait_receipts(record: dict) -> set[tuple[str, int]]:
+def _consumed_worker_wait_receipts(dispatch_id: str, record: dict) -> set[tuple[str, int]]:
     marker_entries: list[dict] = []
     stdout_value = record.get("stdout_path")
     if stdout_value:
@@ -2521,6 +2521,7 @@ def _consumed_worker_wait_receipts(record: dict) -> set[tuple[str, int]]:
     return goalflight_steer_mailbox.consumed_worker_wait_receipts(
         record,
         marker_entries=marker_entries,
+        mailbox_path=_steer_file(dispatch_id),
     )
 
 
@@ -2644,7 +2645,7 @@ def _cmd_steer(argv: list[str]) -> int:
                 _worker_wait_mailbox(args.dispatch_id),
                 dispatch_id=args.dispatch_id,
                 acked_seqs=_acked_steer_seqs(record),
-                consumed_reply_receipts=_consumed_worker_wait_receipts(record),
+                consumed_reply_receipts=_consumed_worker_wait_receipts(args.dispatch_id, record),
                 question_kind=args.question_kind,
                 question_text=args.message,
                 timeout_secs=args.timeout_secs,

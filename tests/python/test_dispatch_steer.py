@@ -313,7 +313,10 @@ def case_worker_wait_reports_existing_backlog_without_arming() -> None:
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert time.monotonic() - started < 0.5
-        assert "STEER-REPLY:" in proc.stdout, proc.stdout
+        # Generic backlog answers the open-ended need, but it is not a typed
+        # reply and must not wear the confirmation-looking receipt label.
+        assert "STEER-BACKLOG:" in proc.stdout, proc.stdout
+        assert "STEER-REPLY:" not in proc.stdout, proc.stdout
         assert "answer arrived before arm" in proc.stdout, proc.stdout
         assert "USER-NEED:" not in proc.stdout, proc.stdout
         entries = _read_mailbox(tmp, dispatch_id)
@@ -349,6 +352,10 @@ def case_worker_confirm_does_not_accept_decision_free_backlog() -> None:
 
         assert proc.returncode == 1, proc.stdout + proc.stderr
         assert "unrelated controller note" in proc.stdout, proc.stdout
+        # The decision-free backlog is surfaced while the wait stays live, but
+        # never with the label reserved for typed correlated replies.
+        assert "STEER-BACKLOG:" in proc.stdout, proc.stdout
+        assert "STEER-REPLY:" not in proc.stdout, proc.stdout
         assert f"!USER-CONFIRM: {dispatch_id} — authorize the guarded action?" in proc.stdout
         entries = _read_mailbox(tmp, dispatch_id)
         assert [entry.get("kind") for entry in entries] == [
