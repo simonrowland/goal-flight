@@ -200,7 +200,15 @@ def _listener_command(
     nonce: str,
     slots: int | None = None,
     timeout_s: float = 8,
+    report_pending: bool = True,
 ) -> list[str]:
+    """Build a `listen` invocation.
+
+    `report_pending=False` selects the legacy path, where mail already pending
+    at arm time rings the doorbell. Tests that seed a backlog BEFORE arming and
+    then expect a ring need it: the default reports an arm-time backlog once and
+    then waits only for newer events, so pre-seeded mail no longer rings.
+    """
     command = [
         sys.executable,
         str(SCRIPTS / "goalflight_messages.py"),
@@ -221,6 +229,8 @@ def _listener_command(
     ]
     if slots is not None:
         command.extend(["--listener-slots", str(slots)])
+    if not report_pending:
+        command.append("--no-report-pending")
     return command
 
 
@@ -787,6 +797,7 @@ def test_malformed_ring_stamp_does_not_trap_listener_in_exit_two_loop(
             nonce=claimed.value.nonce,
             slots=1,
             timeout_s=2,
+            report_pending=False,
         ),
         cwd=root,
         env=env,
@@ -813,6 +824,7 @@ def test_malformed_ring_stamp_does_not_trap_listener_in_exit_two_loop(
             nonce=claimed.value.nonce,
             slots=1,
             timeout_s=0.1,
+            report_pending=False,
         ),
         cwd=root,
         env=env,
@@ -967,6 +979,7 @@ def test_cursor_advance_with_leftovers_pops_one_more_pool_member(
                 nonce=claimed.value.nonce,
                 slots=arbitration_slots,
                 timeout_s=_ARBITRATION_LISTENER_TIMEOUT_S,
+                report_pending=False,
             ),
             cwd=root,
             env=env,
