@@ -53,7 +53,33 @@ Rules:
   exit or the no-growth idle rule. Live growth after `RESULT` discards that
   candidate and keeps watching for the actual terminal marker.
 - `USER-NEED`, `BLOCKED`, and `FAILED` stop the dispatch loop and surface to the orchestrator.
-- Bash-tail keeps `USER-CONFIRM` terminal. Unattended ACP routes it to the
+- A bash-tail worker that has nothing else to do while awaiting a
+  `USER-NEED`/`USER-CONFIRM` reply may atomically arm a bounded mailbox wait and
+  emit its question with
+  `python3 "$GOALFLIGHT_DISPATCH_SCRIPT" steer "$GOALFLIGHT_DISPATCH_ID" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (substitute
+  `USER-CONFIRM` when appropriate). The watcher reports
+  `awaiting_steer_reply`, bridges the question to controller mail without taking
+  a listener slot, and suspends ordinary CPU-idle accounting only after observing
+  the exact wait-id-bound marker in the tracked worker tail and validating that
+  the live waiter belongs to the tracked worker process group. The suspension is
+  bounded by the independent wait deadline. A controller replies with
+  `python3 "$GOALFLIGHT_DISPATCH_SCRIPT" steer "$GOALFLIGHT_DISPATCH_ID" --reply-to <wait-id> [--decision yes|no] '<reply>'`; `USER-CONFIRM` requires the
+  explicit decision. Generic steers, foreign wait ids, and duplicate replies do
+  not settle the wait. While a correlated reply is durably pending consumption,
+  the watcher preserves the validated arm across transient mailbox-lock failures
+  until the waiter records its end, emits its typed `STEER-REPLY` consumption
+  line (which the watcher checks against the same wait id and reply sequence),
+  dies, or reaches its deadline. For an open-ended `USER-NEED`, the command may
+  return unacknowledged arm-time controller backlog without arming because that
+  steer can answer or redirect the need and carries no authorization. For
+  `USER-CONFIRM`, it surfaces the backlog but still emits and arms the exact
+  question; only a correlated typed reply with an explicit decision succeeds.
+  A watched-tail typed reply receipt also settles renewal when the waiter's
+  best-effort end-row append loses its short mailbox-lock race.
+  An unresolved or expired arm is non-renewable; another wait is refused until a
+  reply is consumed or the dispatch terminally settles. On deadline the command
+  returns nonzero and ordinary idle accounting resumes.
+- Bash-tail otherwise keeps `USER-CONFIRM` terminal. Unattended ACP routes it to the
   controller without cancelling the turn, preserves partial output, and waits
   at the next turn boundary for a correlated steer reply. The guarded action
   remains unauthorized: marker prose has no tool-call id, kind, or canonical

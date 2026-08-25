@@ -96,6 +96,7 @@ from goalflight_watch import (
     _last_line_is_terminal_marker,
     _marker_state as _marker_state_for_terminal,
     _terminal_marker_matches_dispatch,
+    extract_markers,
 )
 import grok_permission_mode
 
@@ -728,7 +729,12 @@ STEER_PROMPT_PREAMBLE = (
     "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH "
     "ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages "
     "into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may "
-    "redirect or HALT you — honor it."
+    "redirect or HALT you — honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and "
+    "you have nothing to do until the controller answers, use `python3 "
+    "\"$GOALFLIGHT_DISPATCH_SCRIPT\" steer "
+    "\"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED "
+    "--timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question "
+    "and wait under a separate bounded deadline."
 )
 PROMPT_FILE_PREAMBLE = (
     "Your FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any "
@@ -2466,10 +2472,21 @@ def _read_steer_entries(path: Path) -> list[dict]:
     return goalflight_steer_mailbox.read_steer_entries(path)
 
 
-def _append_steer_message(dispatch_id: str, text: str) -> dict:
+def _append_steer_message(
+    dispatch_id: str,
+    text: str,
+    *,
+    reply_to: str | None = None,
+    decision: str | None = None,
+) -> dict:
     import goalflight_messages
 
-    return goalflight_messages.post_controller_steer(dispatch_id, text)
+    return goalflight_messages.post_controller_steer(
+        dispatch_id,
+        text,
+        reply_to=reply_to,
+        decision=decision,
+    )
 
 
 def _report_steer_result(dispatch_id: str, result: dict) -> int:
@@ -2490,19 +2507,109 @@ def _acked_steer_seqs(record: dict) -> set[int]:
     return goalflight_steer_mailbox.acked_steer_seqs(record)
 
 
+def _consumed_worker_wait_receipts(record: dict) -> set[tuple[str, int]]:
+    marker_entries: list[dict] = []
+    stdout_value = record.get("stdout_path")
+    if stdout_value:
+        try:
+            marker_entries, _size = extract_markers(
+                Path(str(stdout_value)),
+                ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")),
+            )
+        except OSError:
+            marker_entries = []
+    return goalflight_steer_mailbox.consumed_worker_wait_receipts(
+        record,
+        marker_entries=marker_entries,
+    )
+
+
 def _list_steer_messages(dispatch_id: str, record: dict) -> int:
     return goalflight_steer_mailbox.list_steer_messages(dispatch_id, record)
+
+
+def _worker_wait_mailbox(dispatch_id: str) -> Path:
+    worker_dispatch_id = str(os.environ.get("GOALFLIGHT_DISPATCH_ID") or "").strip()
+    if worker_dispatch_id != dispatch_id:
+        raise DispatchUsageError(
+            "steer --wait is worker-only and requires GOALFLIGHT_DISPATCH_ID "
+            f"to equal {dispatch_id!r}"
+        )
+    configured = str(os.environ.get("GOALFLIGHT_STEER_FILE") or "").strip()
+    if not configured:
+        raise DispatchUsageError("steer --wait requires GOALFLIGHT_STEER_FILE")
+    mailbox = Path(configured).expanduser().resolve(strict=False)
+    expected = _steer_file(dispatch_id).expanduser().resolve(strict=False)
+    if mailbox != expected:
+        raise DispatchUsageError(
+            f"GOALFLIGHT_STEER_FILE does not match dispatch {dispatch_id}: {mailbox}"
+        )
+    return mailbox
+
+
+def _wait_event_reporter(
+    dispatch_id: str,
+):
+    def report(event: dict) -> None:
+        state = event.get("state")
+        if state == "armed":
+            print(
+                f"!{event['question_kind']}: {event['question_marker_text']}",
+                flush=True,
+            )
+            print(
+                "STEER-WAIT: "
+                f"dispatch_id={dispatch_id} armed timeout_secs={event['timeout_secs']:g}",
+                flush=True,
+            )
+            return
+        if state == "messages":
+            for entry in event.get("entries") or []:
+                for line in goalflight_steer_mailbox.worker_wait_reply_output_lines(
+                    entry
+                ):
+                    print(line, flush=True)
+            return
+        if state == "deadline":
+            print(f"STEER-WAIT: dispatch_id={dispatch_id} deadline reached", flush=True)
+
+    return report
 
 
 def _cmd_steer(argv: list[str]) -> int:
     parser = _TerseArgumentParser(
         prog=f"{Path(sys.argv[0]).name} steer",
-        description="Append or list mailbox steers for an existing dispatch.",
-        usage_hint="try steer <dispatch-id> <message> | steer <dispatch-id> --list",
+        description="Append, list, or wait on mailbox steers for an existing dispatch.",
+        usage_hint=(
+            "try steer <dispatch-id> <message> | steer <dispatch-id> --list | "
+            "steer <dispatch-id> --wait [--timeout-secs N]"
+        ),
     )
     parser.add_argument("dispatch_id")
     parser.add_argument("message", nargs="?")
     parser.add_argument("--list", action="store_true", dest="list_messages")
+    parser.add_argument("--wait", action="store_true", dest="wait_for_message")
+    parser.add_argument(
+        "--timeout-secs",
+        type=float,
+        default=goalflight_steer_mailbox.DEFAULT_WORKER_WAIT_TIMEOUT_SECS,
+    )
+    parser.add_argument(
+        "--poll-secs",
+        type=float,
+        default=goalflight_steer_mailbox.DEFAULT_WORKER_WAIT_POLL_SECS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--question-kind", choices=("USER-NEED", "USER-CONFIRM"))
+    parser.add_argument(
+        "--reply-to",
+        help="Correlate this typed controller reply to an active worker wait id.",
+    )
+    parser.add_argument(
+        "--decision",
+        choices=("yes", "no"),
+        help="Explicit USER-CONFIRM decision; requires --reply-to.",
+    )
     args = parser.parse_args(argv)
 
     record = _find_dispatch_record(args.dispatch_id)
@@ -2510,10 +2617,57 @@ def _cmd_steer(argv: list[str]) -> int:
         print(f"goalflight_dispatch: no ledger record for dispatch {args.dispatch_id}", file=sys.stderr)
         return 64
 
+    if args.list_messages and args.wait_for_message:
+        print("goalflight_dispatch: steer --list and --wait are mutually exclusive", file=sys.stderr)
+        return 64
+    if args.list_messages and (args.reply_to or args.decision):
+        print("goalflight_dispatch: steer --list cannot carry reply fields", file=sys.stderr)
+        return 64
     if args.list_messages:
         return _list_steer_messages(args.dispatch_id, record)
+    if args.wait_for_message:
+        if args.reply_to or args.decision:
+            print(
+                "goalflight_dispatch: steer --wait cannot carry controller reply fields",
+                file=sys.stderr,
+            )
+            return 64
+        if not args.question_kind or not str(args.message or "").strip():
+            print(
+                "goalflight_dispatch: steer --wait requires question text and "
+                "--question-kind",
+                file=sys.stderr,
+            )
+            return 64
+        try:
+            result = goalflight_steer_mailbox.wait_for_worker_entries(
+                _worker_wait_mailbox(args.dispatch_id),
+                dispatch_id=args.dispatch_id,
+                acked_seqs=_acked_steer_seqs(record),
+                consumed_reply_receipts=_consumed_worker_wait_receipts(record),
+                question_kind=args.question_kind,
+                question_text=args.message,
+                timeout_secs=args.timeout_secs,
+                poll_secs=args.poll_secs,
+                notify=_wait_event_reporter(args.dispatch_id),
+            )
+        except (OSError, ValueError, DispatchUsageError) as exc:
+            print(f"goalflight_dispatch: steer --wait failed: {exc}", file=sys.stderr)
+            return 64 if isinstance(exc, (ValueError, DispatchUsageError)) else 1
+        except Exception as exc:
+            if not goalflight_steer_mailbox.is_carrier_error(exc):
+                raise
+            print(f"goalflight_dispatch: steer --wait failed: {exc}", file=sys.stderr)
+            return 1
+        return 0 if result["state"] == "messages" else 1
     if args.message is None:
-        print("goalflight_dispatch: steer requires a message or --list", file=sys.stderr)
+        print("goalflight_dispatch: steer requires a message, --list, or --wait", file=sys.stderr)
+        return 64
+    if args.question_kind:
+        print("goalflight_dispatch: --question-kind requires --wait", file=sys.stderr)
+        return 64
+    if args.decision and not args.reply_to:
+        print("goalflight_dispatch: --decision requires --reply-to", file=sys.stderr)
         return 64
 
     shape = goalflight_ledger.infer_shape(record)
@@ -2523,7 +2677,12 @@ def _cmd_steer(argv: list[str]) -> int:
             print(warning, file=sys.stderr)
         return _report_steer_result(
             args.dispatch_id,
-            _append_steer_message(args.dispatch_id, args.message),
+            _append_steer_message(
+                args.dispatch_id,
+                args.message,
+                reply_to=args.reply_to,
+                decision=args.decision,
+            ),
         )
     if shape != "bash":
         print(f"goalflight_dispatch: dispatch {args.dispatch_id} has unsupported shape {shape!r}", file=sys.stderr)
@@ -2534,7 +2693,12 @@ def _cmd_steer(argv: list[str]) -> int:
         print(warning, file=sys.stderr)
     return _report_steer_result(
         args.dispatch_id,
-        _append_steer_message(args.dispatch_id, args.message),
+        _append_steer_message(
+            args.dispatch_id,
+            args.message,
+            reply_to=args.reply_to,
+            decision=args.decision,
+        ),
     )
 
 
@@ -11074,7 +11238,7 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
 # help can name them; `test_dispatch_subcommands_are_discoverable` pins this
 # list against the dispatch table so a new subcommand cannot be added silently.
 _SUBCOMMAND_HELP: tuple[tuple[str, str], ...] = (
-    ("steer", "send a message to a live worker's mailbox"),
+    ("steer", "append, list, or wait on a live worker's mailbox"),
     ("resume", "continue a recorded worker session as a tracked dispatch"),
     ("reconcile-abandoned", "reconcile dispatches whose controller died"),
     ("drain", "launch queued dispatch requests"),
@@ -11780,6 +11944,7 @@ def main(argv: list[str] | None = None) -> int:
             env["CODEX_HOME"] = codex_dispatch_home
             summary_head["codex_home"] = codex_dispatch_home
         env["GOALFLIGHT_STEER_FILE"] = str(steer_file)
+        env["GOALFLIGHT_DISPATCH_SCRIPT"] = str(Path(__file__).resolve())
         # A worker's only channel used to be markers scraped out of its console
         # log, which the watcher bridges into mail. That makes every message a
         # side effect of stdout: it cannot be addressed, cannot be typed, and

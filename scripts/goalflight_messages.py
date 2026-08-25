@@ -404,7 +404,7 @@ def mail_lock_path(path: Path) -> Path:
 
 
 @contextlib.contextmanager
-def mail_lock(path: Path):
+def mail_lock(path: Path, *, timeout_secs: float | None = None):
     lock = mail_lock_path(path)
     lock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if lock.is_symlink():
@@ -417,7 +417,32 @@ def mail_lock(path: Path):
     except OSError as exc:
         raise MessageError(f"{lock}: cannot open carrier lock: {exc}") from exc
     with os.fdopen(fd, "r+", encoding="utf-8") as fh:
-        goalflight_compat.flock(fh, goalflight_compat.LOCK_EX)
+        if timeout_secs is None:
+            goalflight_compat.flock(fh, goalflight_compat.LOCK_EX)
+        else:
+            try:
+                timeout = float(timeout_secs)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("carrier lock timeout must be a number") from exc
+            if not math.isfinite(timeout) or timeout < 0:
+                raise ValueError("carrier lock timeout must be finite and >= 0")
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    goalflight_compat.flock(
+                        fh,
+                        goalflight_compat.LOCK_EX | goalflight_compat.LOCK_NB,
+                    )
+                    break
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"{lock}: carrier lock deadline reached"
+                        ) from exc
+                    time.sleep(min(0.01, remaining))
         try:
             yield
         finally:
@@ -945,11 +970,21 @@ class CarrierTransaction:
 
 
 @contextlib.contextmanager
-def carrier_transaction(path: Path, *, quarantine_sidecar: bool = False):
+def carrier_transaction(
+    path: Path,
+    *,
+    quarantine_sidecar: bool = False,
+    lock_timeout_secs: float | None = None,
+):
     """Lock one canonical carrier, then re-resolve and validate its identity."""
     canonical = _canonical_jsonl_path(Path(path), allow_quarantine=quarantine_sidecar)
     canonical.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with mail_lock(canonical):
+    lock_context = (
+        mail_lock(canonical)
+        if lock_timeout_secs is None
+        else mail_lock(canonical, timeout_secs=lock_timeout_secs)
+    )
+    with lock_context:
         locked_canonical = _canonical_jsonl_path(
             canonical,
             allow_quarantine=quarantine_sidecar,
@@ -1907,16 +1942,27 @@ def post_result_is_error(result: dict) -> bool:
     return worker_error or controller_error
 
 
-def post_controller_steer(dispatch_id: str, text: str) -> dict:
+def post_controller_steer(
+    dispatch_id: str,
+    text: str,
+    *,
+    reply_to: str | None = None,
+    decision: str | None = None,
+) -> dict:
     """Record a legacy steer command, then materialize its worker-visible view."""
     source = {"node": "local", "adapter": "goalflight-dispatch", "transport": "steer"}
     sender_session_id = _controller_sender_session_id(dispatch_id)
     if sender_session_id is not None:
         source["controller_session_id"] = sender_session_id
+    payload = {"text": text}
+    if reply_to is not None:
+        payload["reply_to"] = reply_to
+    if decision is not None:
+        payload["decision"] = decision
     return post_message(
         dispatch_id=dispatch_id,
         msg_type="controller-notice",
-        payload={"text": text},
+        payload=payload,
         messages_dir=default_messages_dir(),
         source=source,
         author_capability=_presented_ambient_controller_capability(),
@@ -5480,7 +5526,11 @@ def _cmd_watch_follow(
     ignored = []
     if getattr(args, "listener_slots", None) is not None:
         ignored.append("--listener-slots")
-    if getattr(args, "report_pending", False):
+    # Only complain about a flag the caller actually TYPED. --report-pending
+    # defaults on now, so testing its value here would print "ignoring
+    # --report-pending" on every watchdog arm — a warning about a choice nobody
+    # made, on the one mode where the option is meaningless.
+    if any(a in ("--report-pending", "--no-report-pending") for a in sys.argv[1:]):
         ignored.append("--report-pending")
     if ignored:
         backup_command = goalflight_wake.persistent_backup_start_command(
@@ -6412,10 +6462,30 @@ def _run_cli(argv: list[str] | None = None) -> int:
             "--timeout-s", type=float, default=0.0, help="0 = wait indefinitely"
         )
         command_parser.add_argument("--json", action="store_true")
+        # DEFAULT ON. Arming against a backlog used to ring once PER ITEM through
+        # the ordinary one-line path, so four doorbells armed against a backlog of
+        # four fired instantly on old mail and left ZERO coverage. That is a bug,
+        # not a mode: observed repeatedly across projects, including a 13-message
+        # backlog firing all four of a controller's tracked doorbells at once, and
+        # it drove controllers to invent a "drain first, confirm none pending, THEN
+        # arm" ceremony purely to avoid it.
+        #
+        # Reporting instead converts the backlog into ONE report and raises the
+        # ring threshold to the arm-time high-water, so the slots stay armed for
+        # NEW events. Its failure mode is strictly smaller: a report-then-die
+        # within one generation loses a WAKE but never the mail, because the
+        # cursor is not advanced and `pending_report_high_water` is keyed by
+        # lease nonce, so a new generation reports the backlog again.
         command_parser.add_argument(
             "--report-pending",
-            action="store_true",
-            help="report an arm-time backlog and stay armed for only newer events",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "report an arm-time backlog once and stay armed for only newer "
+                "events (default: on). --no-report-pending restores the legacy "
+                "path where a backlog rings once per item and can consume every "
+                "listener slot"
+            ),
         )
         command_parser.add_argument(
             "--watch-follow",
