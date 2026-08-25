@@ -4102,12 +4102,56 @@ _CAPACITY_WAIT_POLL_S = goalflight_capacity.CAPACITY_WAIT_POLL_S
 
 
 def _capacity_wait_seconds(args) -> float:
-    """Resolve the queue budget: CLI flag > env > lane default."""
+    """Resolve the inline acquire budget before durable queue fallback."""
+    if (
+        not getattr(args, "foreground", False)
+        and getattr(args, "capacity_wait_s", None) is None
+        and "GOALFLIGHT_CAPACITY_WAIT_S" not in os.environ
+    ):
+        # Detached work is durable after a capacity refusal, so keeping its
+        # launcher alive for the lane default only delays the queue handoff.
+        # Explicit CLI/env budgets still opt into inline polling.
+        return 0.0
     return goalflight_capacity.resolve_capacity_wait_s(
         lane=getattr(args, "priority", None) or "normal",
         wait_s=getattr(args, "capacity_wait_s", None),
         log_prefix="goalflight_dispatch",
     )
+
+
+def _detached_capacity_queue_eligible(args) -> bool:
+    """Whether this launcher may hand a capacity refusal to the durable queue."""
+    return bool(
+        not goalflight_compat.is_windows()
+        and not getattr(args, "from_queue", False)
+        and not getattr(args, "foreground", False)
+    )
+
+
+def _capacity_refusal_attempt_stays_prepared(args) -> bool:
+    """Whether a durable carrier owns retry while this attempt stays PREPARED."""
+    if goalflight_compat.is_windows() or getattr(args, "foreground", False):
+        return False
+    if not getattr(args, "from_queue", False):
+        return True
+    return bool(
+        getattr(args, "queue_launch_token", None)
+        and getattr(args, "queue_claim_path", None)
+    )
+
+
+def _is_capacity_refusal(payload: dict | None) -> bool:
+    if not isinstance(payload, dict) or payload.get("state") != "blocked_capacity":
+        return False
+    reason = payload.get("reason")
+    return not isinstance(reason, dict) or reason.get("reason") != "wait_interrupted"
+
+
+def _queue_detached_capacity_refusal(args, payload: dict | None, *, base: Path) -> bool:
+    """Apply the one durable fallback shared by bash and ACP launchers."""
+    if not _detached_capacity_queue_eligible(args) or not _is_capacity_refusal(payload):
+        return False
+    return _submit_dispatch(args, _raw_worker_args(args), base=base) == 0
 
 
 def _resolved_engine_session_id(args) -> str | None:
@@ -4972,7 +5016,27 @@ def _warn_if_stranded_without_drainer(queue_path: Path) -> None:
     )
 
 
-def _queue_launch_token() -> str:
+def _queue_launch_token(entry: dict | None = None) -> str:
+    if isinstance(entry, dict):
+        request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+        dispatch_id = str(entry.get("dispatch_id") or "")
+        project_root = entry.get("project_root") or request.get("cwd")
+        if dispatch_id and project_root:
+            resolved_root = goalflight_task.resolve_project_root(str(project_root))
+            if os.path.lexists(goalflight_journal.resolve_journal_path(resolved_root)):
+                attempt = goalflight_journal.Journal(resolved_root).attempt_for_dispatch(
+                    dispatch_id
+                )
+                if (
+                    attempt is not None
+                    and attempt.lifecycle_state == goalflight_journal.ATTEMPT_PREPARED
+                ):
+                    # A queue child refused before spawn. The durable claim
+                    # was restored, but its journal preparation is still the
+                    # same attempt. Reuse that fencing token so the next
+                    # drain can continue PREPARED -> STARTING. A journal read
+                    # error must escape before the carrier is claimed.
+                    return attempt.launch_token
     return uuid.uuid4().hex
 
 
@@ -9862,7 +9926,7 @@ def _drain_queue_once(args) -> dict:
     for _sort_key, path, _scan_entry, _scan_read_error in entries:
         claim_error: Exception | None = None
         entry: dict | None = None
-        launch_token = _queue_launch_token()
+        launch_token = _queue_launch_token(_scan_entry)
         _test_signal_file(
             "GOALFLIGHT_TEST_DRAIN_BEFORE_CLAIM_FILE",
             str(path),
@@ -10437,7 +10501,11 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         dispatch_id=args.dispatch_id,
         task_ids=list(getattr(args, "task_ids", []) or []),
         priority=getattr(args, "priority", "normal"),
-        capacity_wait_s=getattr(args, "capacity_wait_s", None),
+        # ACP and bash use the same inline-wait policy. Detached launchers
+        # default to zero because the durable drainer owns retries; explicit
+        # CLI and environment budgets remain opt-in inline waits.
+        capacity_wait_s=_capacity_wait_seconds(args),
+        preserve_capacity_refusal_attempt=_capacity_refusal_attempt_stays_prepared(args),
         prompt_id=None,
         prompt=acp_prompt_path,
         prompt_text=acp_prompt_text,
@@ -10650,6 +10718,33 @@ def _acp_detached_child_argv(args) -> list[str]:
     return argv
 
 
+@contextlib.contextmanager
+def _forward_detached_launcher_signals(child_pid: int):
+    """Forward operator interrupts to the daemonized ACP dispatch child."""
+    received: list[int] = []
+    previous: dict[int, object] = {}
+
+    def forward(signum, _frame) -> None:
+        received.append(int(signum))
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.kill(child_pid, signum)
+
+    for signum in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if not isinstance(signum, int):
+            continue
+        try:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, forward)
+        except (OSError, ValueError):
+            previous.pop(signum, None)
+    try:
+        yield received
+    finally:
+        for signum, handler in previous.items():
+            with contextlib.suppress(OSError, ValueError):
+                signal.signal(signum, handler)
+
+
 def _run_acp_detached_launcher(
     args,
     *,
@@ -10657,6 +10752,7 @@ def _run_acp_detached_launcher(
     tail_path: Path,
     account_env: dict[str, str],
     env_remove: list[str],
+    capacity_wait_s: float,
 ) -> int:
     _mark_queue_claim_worker_spawn_intent(args)
     env = os.environ.copy()
@@ -10675,58 +10771,105 @@ def _run_acp_detached_launcher(
         label="acp",
     )
     _mark_queue_claim_worker_spawned(args, child_pid)
-    wait_s = max(20.0, float(getattr(args, "capacity_wait_s", 0.0) or 0.0) + 20.0)
+
+    def report_queued() -> None:
+        print(
+            "DISPATCH-QUEUED "
+            + json.dumps(
+                {
+                    "dispatch_id": args.dispatch_id,
+                    "agent": args.agent,
+                    "shape": "acp",
+                    "queue_path": str(_queue_entry_path(str(args.dispatch_id))),
+                    "status_json": str(status_json),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+    wait_s = max(20.0, float(capacity_wait_s) + 20.0)
     deadline = time.time() + wait_s
     last_state = None
-    while time.time() < deadline:
-        record = _find_dispatch_record(args.dispatch_id)
-        if (
-            record
-            and record.get("worker_pid")
-            and record.get("queue_launch_token") == getattr(args, "queue_launch_token", None)
-        ):
-            if getattr(args, "background_default_notice", False):
-                _print_background_default_notice()
-            print(
-                "DISPATCH-LAUNCHED "
-                + json.dumps(
-                    {
-                        "dispatch_id": args.dispatch_id,
-                        "agent": args.agent,
-                        "shape": "acp",
-                        "worker_pid": record.get("worker_pid"),
-                        "launcher_pid": child_pid,
-                        "status_json": str(status_json),
-                        "state": "running",
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
-            return 0
-        with contextlib.suppress(OSError, json.JSONDecodeError):
-            status_payload = json.loads(status_json.read_text(encoding="utf-8"))
-            last_state = status_payload.get("state")
-            if str(last_state).startswith("blocked_capacity"):
+    with _forward_detached_launcher_signals(child_pid) as forwarded_signals:
+        while time.time() < deadline:
+            record = _find_dispatch_record(args.dispatch_id)
+            if (
+                not forwarded_signals
+                and record
+                and record.get("worker_pid")
+                and record.get("queue_launch_token")
+                == getattr(args, "queue_launch_token", None)
+            ):
+                if getattr(args, "background_default_notice", False):
+                    _print_background_default_notice()
                 print(
-                    "DISPATCH-BLOCKED "
+                    "DISPATCH-LAUNCHED "
                     + json.dumps(
                         {
                             "dispatch_id": args.dispatch_id,
                             "agent": args.agent,
                             "shape": "acp",
-                            "state": last_state,
+                            "worker_pid": record.get("worker_pid"),
+                            "launcher_pid": child_pid,
                             "status_json": str(status_json),
-                            "reason": status_payload.get("reason"),
+                            "state": "running",
                         },
                         sort_keys=True,
                     ),
                     flush=True,
                 )
-                return 2
-        if not goalflight_compat.pid_alive(child_pid):
-            break
-        time.sleep(0.2)
+                return 0
+            with contextlib.suppress(OSError, json.JSONDecodeError):
+                status_payload = json.loads(status_json.read_text(encoding="utf-8"))
+                last_state = status_payload.get("state")
+                if (
+                    not forwarded_signals
+                    and last_state == "queued"
+                    and not getattr(args, "from_queue", False)
+                ):
+                    if getattr(args, "background_default_notice", False):
+                        _print_background_default_notice()
+                    report_queued()
+                    return 0
+                if str(last_state).startswith("blocked_capacity"):
+                    # A direct detached child may still be converting this
+                    # refusal into a durable queue entry. Only report terminal
+                    # refusal once that child exits.
+                    if goalflight_compat.pid_alive(child_pid):
+                        time.sleep(0.2)
+                        continue
+                    if (
+                        not forwarded_signals
+                        and _queue_entry_path(str(args.dispatch_id)).exists()
+                    ):
+                        report_queued()
+                        return 0
+                    print(
+                        "DISPATCH-BLOCKED "
+                        + json.dumps(
+                            {
+                                "dispatch_id": args.dispatch_id,
+                                "agent": args.agent,
+                                "shape": "acp",
+                                "state": last_state,
+                                "status_json": str(status_json),
+                                "reason": status_payload.get("reason"),
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    return (
+                        128 + forwarded_signals[-1]
+                        if forwarded_signals
+                        else 2
+                    )
+            if not goalflight_compat.pid_alive(child_pid):
+                break
+            time.sleep(0.2)
+    if forwarded_signals:
+        return 128 + forwarded_signals[-1]
     print(
         "goalflight_dispatch: ACP detached launch did not publish a running ledger "
         f"for {args.dispatch_id} (last_state={last_state!r})",
@@ -10736,7 +10879,11 @@ def _run_acp_detached_launcher(
 
 
 def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
-    from goalflight_acp_run import acp_dispatch_exit_code, run_acp_dispatch
+    from goalflight_acp_run import (
+        _commit_prelaunch_terminal,
+        acp_dispatch_exit_code,
+        run_acp_dispatch,
+    )
 
     if not args.dispatch_id:
         args.dispatch_id = (
@@ -10773,6 +10920,7 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
             tail_path=tail_path,
             account_env=account_env,
             env_remove=env_remove,
+            capacity_wait_s=float(cfg.capacity_wait_s or 0.0),
         )
     test_rc = _run_test_acp_shape_if_requested(args, base=base, status_json=status_json, tail_path=tail_path)
     if test_rc is not None:
@@ -10816,6 +10964,14 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
     acp_remove = list(env_remove) + list(web_qa_remove)
     with _temporary_env(acp_env, remove=acp_remove):
         payload = asyncio.run(run_acp_dispatch(cfg))
+    if _detached_capacity_queue_eligible(args) and _is_capacity_refusal(payload):
+        if _queue_detached_capacity_refusal(args, payload, base=base):
+            return 0
+        # The ACP runner left this attempt PREPARED solely for the queue
+        # handoff. If that durable write fails, close the attempt instead of
+        # leaving an invisible prepared launch with no carrier.
+        _commit_prelaunch_terminal(payload, project_root=_project_root(args))
+        write_status(status_json, payload)
     worker_pid = payload.get("worker_pid")
     if worker_pid:
         _print_status_reminder(
@@ -11283,9 +11439,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-orientation", action="store_true",
                         help="Do not auto-add the docs-private/rag/ORIENTATION.md pointer preamble.")
     parser.add_argument("--capacity-wait-s", type=float, default=None,
-                        help="How long to QUEUE for a capacity slot before DISPATCH-BLOCKED "
-                             "(re-attempts acquire every ~15s; sleep-excluding clock). Default by "
-                             "lane: bulk 900 / normal 600 / critical 120. 0 = fail instantly. "
+                        help="How long to poll inline for a capacity slot "
+                             "(re-attempts acquire every ~15s; sleep-excluding clock). Detached "
+                             "dispatches default to 0 and fall back to the durable queue; foreground "
+                             "defaults by lane: bulk 900 / normal 600 / critical 120. 0 = fail instantly. "
                              "Env override: GOALFLIGHT_CAPACITY_WAIT_S.")
     dispatch_mode = parser.add_mutually_exclusive_group()
     dispatch_mode.add_argument("--submit", action="store_true",
@@ -11670,6 +11827,7 @@ def main(argv: list[str] | None = None) -> int:
     pidfile = None
     lease_id = None
     ledger_recorded = False
+    queue_capacity_refused = False
     detached_launched = False
     codex_dispatch_home = None
     engine_session_id = _resolved_engine_session_id(args)
@@ -11719,6 +11877,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     try:
+        assert not args.submit, "--submit must bypass inline capacity acquisition"
         # Pre-record the ledger BEFORE the capacity queue: the (possibly
         # minutes-long) wait window must be visible to goalflight_status
         # (classified queued_capacity = live) and must trip the reused-id
@@ -11791,18 +11950,40 @@ def main(argv: list[str] | None = None) -> int:
         ledger_recorded = True
         try:
             lease_id = _acquire_capacity(args, project_root=project_root, status_json=status_json)
-        except (SystemExit, KeyboardInterrupt):
+        except (SystemExit, KeyboardInterrupt) as exc:
             # Queue exhausted or interrupted: the status file already says
             # blocked_capacity; make the ledger finish agree instead of the
             # generic "failed", mirroring the status plane's specific reason
             # (wait_interrupted vs machine_worker_cap vs agent_worker_cap ...).
             final_state = "blocked_capacity"
             final_reason = "capacity_wait"
+            blocked = {}
             with contextlib.suppress(Exception):
                 blocked = json.loads(Path(status_json).read_text(encoding="utf-8"))
                 specific = (blocked.get("reason") or {}).get("reason")
                 if specific:
                     final_reason = f"capacity_wait:{specific}"
+            capacity_refused = bool(
+                isinstance(exc, SystemExit)
+                and exc.code == 2
+                and _is_capacity_refusal(blocked)
+            )
+            queue_capacity_refused = bool(
+                capacity_refused
+                and args.from_queue
+                and args.queue_launch_token
+                and args.queue_claim_path
+            )
+            if capacity_refused:
+                # Reuse the canonical queue writer. It rewrites the live
+                # waiting_capacity ledger row to exact state="queued", which
+                # is the state allow_queued accepts on the drain replay. The
+                # PREPARED journal attempt stays non-terminal and its launch
+                # token is reused by the drain. Keep the finally block from
+                # terminalizing the new queued ledger row.
+                if _queue_detached_capacity_refusal(args, blocked, base=base):
+                    ledger_recorded = False
+                    return 0
             raise
         if _account_engine(args.agent) == "grok" and not args.account:
             # Same contract as the codex pointer: args.account stays None so the
@@ -12238,7 +12419,12 @@ def main(argv: list[str] | None = None) -> int:
             tail,
             agent=args.agent,
         )
-        if ledger_recorded and not detached_launched and not keep_live_watcher_open:
+        if (
+            ledger_recorded
+            and not detached_launched
+            and not keep_live_watcher_open
+            and not queue_capacity_refused
+        ):
             try:
                 final_state, ledger_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
                     final_state,
