@@ -3389,6 +3389,7 @@ def _resolve_listen_auto_lease(
     *,
     controller_label: str,
     explicit_nonce: str | None,
+    retry_budget_s: float = 1.0,
 ) -> dict[str, object]:
     """Resolve which lease generation listen should arm.
 
@@ -3413,7 +3414,10 @@ def _resolve_listen_auto_lease(
     import goalflight_journal  # type: ignore
 
     try:
-        authority = goalflight_journal.Journal.open_reader(project_root)
+        authority = goalflight_journal.Journal.open_reader(
+            project_root,
+            retry_budget_s=retry_budget_s,
+        )
     except goalflight_journal.JournalUnavailable as exc:
         return {
             "claimed": False,
@@ -4865,6 +4869,17 @@ LISTENER_JOURNAL_BUSY_BUDGET_S = 10.0
 # without one successful read means a human should hear about it.
 LISTENER_JOURNAL_TOLERANCE_S = 300.0
 LISTENER_JOURNAL_BACKOFF_CAP_S = 30.0
+# The tolerance clock starts when the first bounded operation reports busy, not
+# when SQLite first became contended. From the start of that first operation,
+# outage-to-exit can therefore approach: its 10s budget + the 300s continuous
+# failure window + one 30s backoff + one final 10s operation. Scheduler delay is
+# additional, so this is an operational estimate rather than a five-minute wall
+# clock guarantee.
+LISTENER_JOURNAL_MAX_OUTAGE_ESTIMATE_S = (
+    LISTENER_JOURNAL_TOLERANCE_S
+    + (2 * LISTENER_JOURNAL_BUSY_BUDGET_S)
+    + LISTENER_JOURNAL_BACKOFF_CAP_S
+)
 STREAM_PIPE_BUF_BYTES = 512
 # Include the newline and stay strictly below the measured 512-byte PIPE_BUF.
 STREAM_LINE_MAX_BYTES = STREAM_PIPE_BUF_BYTES - 1
@@ -5206,6 +5221,7 @@ def _follow_degraded_record(
             "reason": _truncate_utf8(reason, 72),
             "detail": sanitize_display(detail, limit=180),
             "tolerance_s": tolerance_s,
+            "outage_to_exit_estimate_s": LISTENER_JOURNAL_MAX_OUTAGE_ESTIMATE_S,
         },
     }
     return _fit_follow_record(record, shrink_fields=("detail", "reason"))
@@ -5229,11 +5245,14 @@ class _JournalBusyTolerance:
     The first failure opens the window; any successful poll closes and resets
     it. ``note_failure`` returns False once continuous failure outlasts the
     window — the caller then fails with exactly the behavior it had before
-    this tolerance existed. Degradation is reported on the state transition
-    only: one notice when the window opens and one when it closes. A notice
-    per retry would be a wall of repeated alerts, which is what makes such
-    output easy to ignore (see _report_why_this_entry_did_not_launch in
-    goalflight_dispatch for the same reasoning).
+    this tolerance existed. Because the clock begins after the first bounded
+    operation fails, the production outage-to-exit estimate is 350 seconds
+    plus scheduler delay, not five minutes. Degradation is reported on the
+    state transition only: one notice when the window opens and one when it
+    closes. A notice per retry would be a wall of repeated alerts, which is
+    what makes such output easy to ignore (see
+    _report_why_this_entry_did_not_launch in goalflight_dispatch for the same
+    reasoning).
     """
 
     def __init__(self, tolerance_s: float, backoff_cap_s: float) -> None:
@@ -5268,6 +5287,36 @@ class _JournalBusyTolerance:
         """Capped exponential spacing between degraded retries."""
         exponent = min(max(self._failures - 1, 0), 10)
         return min(poll_s * (2**exponent), self._backoff_cap_s)
+
+
+_ListenerJournalResult = TypeVar("_ListenerJournalResult")
+
+
+def _retry_listener_journal_busy(
+    operation: Callable[[], _ListenerJournalResult],
+    *,
+    busy_error: type[BaseException],
+    tolerance: _JournalBusyTolerance,
+    poll_s: float,
+    on_degraded: Callable[[BaseException], None],
+    on_recovered: Callable[[float], None],
+) -> _ListenerJournalResult:
+    """Apply one listener's busy episode across startup and re-arm operations."""
+    while True:
+        try:
+            result = operation()
+        except busy_error as exc:
+            first = not tolerance.degraded
+            if not tolerance.note_failure(exc):
+                raise
+            if first:
+                on_degraded(exc)
+            time.sleep(tolerance.backoff_s(poll_s))
+            continue
+        recovered_s = tolerance.note_success()
+        if recovered_s is not None:
+            on_recovered(recovered_s)
+        return result
 
 
 def _exit_listener_before_final_event(
@@ -5449,22 +5498,6 @@ def cmd_follow(args) -> int:
     if not label:
         print("follow: controller label is unavailable", file=sys.stderr)
         return 2
-    resolved = _resolve_listen_auto_lease(
-        project_root,
-        controller_label=label,
-        explicit_nonce=str(args.lease_nonce or "").strip() or None,
-    )
-    if not resolved.get("claimed"):
-        print(
-            "follow: " + str(resolved.get("reason") or "ambient lease unavailable"),
-            file=sys.stderr,
-        )
-        return 2
-    nonce = str(resolved.get("nonce") or "").strip()
-    if not nonce:
-        print("follow: active controller lease is unavailable", file=sys.stderr)
-        return 2
-
     test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
     minimum = 0.01 if test_mode else 1.0
     configured = {
@@ -5526,10 +5559,75 @@ def cmd_follow(args) -> int:
         print(f"follow: {reason}: {detail}", file=sys.stderr)
         return 2 if stdout_alive else 0
 
+    journal_tolerance = _JournalBusyTolerance(
+        LISTENER_JOURNAL_TOLERANCE_S,
+        LISTENER_JOURNAL_BACKOFF_CAP_S,
+    )
+
+    def startup_degraded(exc: BaseException) -> None:
+        alive = _write_follow_record(
+            _follow_degraded_record(
+                journal_tolerance.reason,
+                exc,
+                journal_tolerance.tolerance_s,
+            ),
+            stream=sys.stdout,
+        )
+        if not alive:
+            _silence_broken_stdout(sys.stdout)
+            raise FollowWriteStalled("stdout closed during journal startup degradation")
+
+    def startup_recovered(degraded_s: float) -> None:
+        alive = _write_follow_record(
+            _follow_recovered_record(journal_tolerance.reason, degraded_s),
+            stream=sys.stdout,
+        )
+        if not alive:
+            _silence_broken_stdout(sys.stdout)
+            raise FollowWriteStalled("stdout closed during journal startup recovery")
+
     try:
-        authority = goalflight_journal.Journal(
-            project_root,
-            retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+        resolved = _retry_listener_journal_busy(
+            lambda: _resolve_listen_auto_lease(
+                project_root,
+                controller_label=label,
+                explicit_nonce=str(args.lease_nonce or "").strip() or None,
+                retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+            ),
+            busy_error=goalflight_journal.JournalBusy,
+            tolerance=journal_tolerance,
+            poll_s=poll_s,
+            on_degraded=startup_degraded,
+            on_recovered=startup_recovered,
+        )
+    except (FollowWriteStalled, OSError):
+        return 0
+    except goalflight_journal.JournalUpgradeRequired as exc:
+        return startup_fail("journal-upgrade-required", exc)
+    except goalflight_journal.JournalUnavailable as exc:
+        return startup_fail(_journal_failure_reason(exc), exc)
+    if not resolved.get("claimed"):
+        print(
+            "follow: " + str(resolved.get("reason") or "ambient lease unavailable"),
+            file=sys.stderr,
+        )
+        return 2
+    nonce = str(resolved.get("nonce") or "").strip()
+    if not nonce:
+        print("follow: active controller lease is unavailable", file=sys.stderr)
+        return 2
+
+    try:
+        authority = _retry_listener_journal_busy(
+            lambda: goalflight_journal.Journal(
+                project_root,
+                retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+            ),
+            busy_error=goalflight_journal.JournalBusy,
+            tolerance=journal_tolerance,
+            poll_s=poll_s,
+            on_degraded=startup_degraded,
+            on_recovered=startup_recovered,
         )
         waiter = goalflight_wake.register_waiter(
             project_root,
@@ -5693,6 +5791,18 @@ def cmd_follow(args) -> int:
                     lease_nonce=nonce,
                 )
             except goalflight_journal.CASMismatch as exc:
+                current_lease = authority.active_lease(label)
+                if current_lease is None or current_lease.nonce != nonce:
+                    emit(
+                        {
+                            "kind": "event",
+                            "payload": {
+                                "type": "listener-exit",
+                                "reason": "stale-lease",
+                            },
+                        }
+                    )
+                    return 3
                 return fail("lease-cursor-mismatch", exc, code=3)
             except goalflight_journal.JournalUpgradeRequired as exc:
                 return fail("journal-upgrade-required", exc, code=2)
@@ -5701,17 +5811,13 @@ def cmd_follow(args) -> int:
                 # would spin forever against a deleted journal.
                 return fail(_journal_failure_reason(exc), exc, code=2)
             except goalflight_journal.JournalIOError as exc:
-                # Fatal on purpose: JournalIOError is raised only after the
-                # journal's own 75s exponential-backoff open budget is already
-                # exhausted with the path still present. That budget was sized
-                # from a measured live incident and is the agreed
-                # transient/durable boundary for open failures; re-retrying
-                # here would stack a second long window on top of the first and
-                # delay the fault record the controller needs. Busy, by
-                # contrast, surfaced after just 1.0s of flat jitter, which is
-                # why only plain JournalUnavailable is tolerated below.
+                # Fatal on purpose. JournalIOError has two origins: an immediate
+                # path.stat() OSError that prevents identity/disappearance
+                # verification, or exhausted 75s present-path open retries.
+                # Neither is SQLite contention, so only JournalBusy enters the
+                # listener tolerance below.
                 return fail(_journal_failure_reason(exc), exc, code=2)
-            except goalflight_journal.JournalUnavailable as exc:
+            except goalflight_journal.JournalBusy as exc:
                 first = not journal_tolerance.degraded
                 if not journal_tolerance.note_failure(exc):
                     return fail(_journal_failure_reason(exc), exc, code=2)
@@ -5724,6 +5830,8 @@ def cmd_follow(args) -> int:
                 ):
                     return 0
                 visible = None
+            except goalflight_journal.JournalUnavailable as exc:
+                return fail(_journal_failure_reason(exc), exc, code=2)
             except goalflight_journal.JournalError:
                 raise
             except ValueError as exc:
@@ -5811,6 +5919,7 @@ def _cmd_watch_follow(
     label: str,
     nonce: str,
     poll: float,
+    journal_tolerance: _JournalBusyTolerance,
 ) -> int:
     """Observe durable follow age without joining the doorbell delivery pool."""
     import goalflight_journal  # type: ignore
@@ -5841,10 +5950,32 @@ def _cmd_watch_follow(
             file=sys.stderr,
         )
 
+    def startup_degraded(exc: BaseException) -> None:
+        print(
+            f"listen: {journal_tolerance.reason}: watchdog degraded; "
+            f"journal busy within {journal_tolerance.tolerance_s:g}s continuous-"
+            f"failure window (outage-to-exit estimate "
+            f"{LISTENER_JOURNAL_MAX_OUTAGE_ESTIMATE_S:g}s plus scheduler delay): {exc}",
+            file=sys.stderr,
+        )
+
+    def startup_recovered(degraded_s: float) -> None:
+        print(
+            f"listen: watchdog recovered after {degraded_s:.1f}s of journal busy",
+            file=sys.stderr,
+        )
+
     try:
-        authority = goalflight_journal.Journal(
-            project_root,
-            retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+        authority = _retry_listener_journal_busy(
+            lambda: goalflight_journal.Journal(
+                project_root,
+                retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+            ),
+            busy_error=goalflight_journal.JournalBusy,
+            tolerance=journal_tolerance,
+            poll_s=poll,
+            on_degraded=startup_degraded,
+            on_recovered=startup_recovered,
         )
         waiter = goalflight_wake.register_watchdog_waiter(
             project_root,
@@ -5889,10 +6020,6 @@ def _cmd_watch_follow(
         if args.timeout_s and float(args.timeout_s) > 0
         else None
     )
-    journal_tolerance = _JournalBusyTolerance(
-        LISTENER_JOURNAL_TOLERANCE_S,
-        LISTENER_JOURNAL_BACKOFF_CAP_S,
-    )
     try:
         while True:
             current_parent = os.getppid()
@@ -5936,10 +6063,11 @@ def _cmd_watch_follow(
                 goalflight_journal.JournalIOError,
             ):
                 # Fatal via the outer handler: verified absence never recovers
-                # in place, and JournalIOError already burned the journal's
-                # own 75s open budget — see cmd_follow for the full reasoning.
+                # in place. JournalIOError is either an immediate identity/stat
+                # I/O failure or exhausted present-path open retries; neither
+                # is SQLite contention.
                 raise
-            except goalflight_journal.JournalUnavailable as exc:
+            except goalflight_journal.JournalBusy as exc:
                 first = not journal_tolerance.degraded
                 if not journal_tolerance.note_failure(exc):
                     # Past the tolerance window: the outer handler exits 2 with
@@ -5948,12 +6076,17 @@ def _cmd_watch_follow(
                 if first:
                     print(
                         f"listen: {journal_tolerance.reason}: watchdog degraded; "
-                        "journal busy, retrying for up to "
-                        f"{journal_tolerance.tolerance_s:g}s: {exc}",
+                        "journal busy within "
+                        f"{journal_tolerance.tolerance_s:g}s continuous-failure "
+                        "window (outage-to-exit estimate "
+                        f"{LISTENER_JOURNAL_MAX_OUTAGE_ESTIMATE_S:g}s plus "
+                        f"scheduler delay): {exc}",
                         file=sys.stderr,
                     )
                 time.sleep(journal_tolerance.backoff_s(poll))
                 continue
+            except goalflight_journal.JournalUnavailable:
+                raise
             recovered_s = journal_tolerance.note_success()
             if recovered_s is not None:
                 print(
@@ -6070,11 +6203,50 @@ def cmd_listen(args) -> int:
         print(f"{prefix}: controller label is unavailable", file=sys.stderr)
         return 2
     explicit_nonce = str(getattr(args, "lease_nonce", None) or "").strip() or None
-    resolved = _resolve_listen_auto_lease(
-        project_root,
-        controller_label=label,
-        explicit_nonce=explicit_nonce,
+    test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
+    poll = max(0.01 if test_mode else 0.5, float(args.poll_secs or 5.0))
+    watch_follow = bool(getattr(args, "watch_follow", False))
+    listener_role = "watchdog" if watch_follow else "listener"
+    journal_tolerance = _JournalBusyTolerance(
+        LISTENER_JOURNAL_TOLERANCE_S,
+        LISTENER_JOURNAL_BACKOFF_CAP_S,
     )
+
+    def startup_degraded(exc: BaseException) -> None:
+        print(
+            f"listen: {journal_tolerance.reason}: {listener_role} degraded; "
+            f"journal busy within {journal_tolerance.tolerance_s:g}s continuous-"
+            f"failure window (outage-to-exit estimate "
+            f"{LISTENER_JOURNAL_MAX_OUTAGE_ESTIMATE_S:g}s plus scheduler delay): {exc}",
+            file=sys.stderr,
+        )
+
+    def startup_recovered(degraded_s: float) -> None:
+        print(
+            f"listen: {listener_role} recovered after {degraded_s:.1f}s "
+            "of journal busy",
+            file=sys.stderr,
+        )
+
+    try:
+        resolved = _retry_listener_journal_busy(
+            lambda: _resolve_listen_auto_lease(
+                project_root,
+                controller_label=label,
+                explicit_nonce=explicit_nonce,
+                retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+            ),
+            busy_error=goalflight_journal.JournalBusy,
+            tolerance=journal_tolerance,
+            poll_s=poll,
+            on_degraded=startup_degraded,
+            on_recovered=startup_recovered,
+        )
+    except goalflight_journal.JournalUpgradeRequired:
+        raise
+    except goalflight_journal.JournalUnavailable as exc:
+        print(f"{prefix}: {_journal_failure_reason(exc)}: {exc}", file=sys.stderr)
+        return 2
     if not resolved.get("claimed"):
         print(
             f"{prefix}: " + str(resolved.get("reason") or "ambient lease unavailable"),
@@ -6088,9 +6260,6 @@ def cmd_listen(args) -> int:
     args.project_root = str(project_root)
     args.controller_label = label
     args.lease_nonce = nonce
-    test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
-    poll = max(0.01 if test_mode else 0.5, float(args.poll_secs or 5.0))
-    watch_follow = bool(getattr(args, "watch_follow", False))
     if watch_follow:
         return _cmd_watch_follow(
             args,
@@ -6098,6 +6267,7 @@ def cmd_listen(args) -> int:
             label=label,
             nonce=nonce,
             poll=poll,
+            journal_tolerance=journal_tolerance,
         )
     try:
         listener_slots = goalflight_wake.listener_slot_count(
@@ -6112,9 +6282,16 @@ def cmd_listen(args) -> int:
         else None
     )
     try:
-        authority = goalflight_journal.Journal(
-            project_root,
-            retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+        authority = _retry_listener_journal_busy(
+            lambda: goalflight_journal.Journal(
+                project_root,
+                retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+            ),
+            busy_error=goalflight_journal.JournalBusy,
+            tolerance=journal_tolerance,
+            poll_s=poll,
+            on_degraded=startup_degraded,
+            on_recovered=startup_recovered,
         )
         test_start_token = (
             os.environ.get("GOALFLIGHT_TEST_LISTENER_START_TOKEN")
@@ -6162,10 +6339,34 @@ def cmd_listen(args) -> int:
     arm_snapshot = None
     report_claim = None
     pending_report_settled = True
+
+    def arm_once():
+        result = authority.arm_listener(
+            label,
+            nonce=nonce,
+            pid=os.getpid(),
+            start_token=str(identity["start_token"]),
+            parent_pid=parent_pid,
+        )
+        if result.retryable:
+            raise goalflight_journal.JournalBusy(
+                result.reason or "listener coverage arm remained busy"
+            )
+        return result
+
     try:
         if getattr(args, "report_pending", False):
             try:
-                arm_snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
+                arm_snapshot = _retry_listener_journal_busy(
+                    lambda: authority.cursor_peek(label, nonce=nonce, limit=1000),
+                    busy_error=goalflight_journal.JournalBusy,
+                    tolerance=journal_tolerance,
+                    poll_s=poll,
+                    on_degraded=startup_degraded,
+                    on_recovered=startup_recovered,
+                )
+            except goalflight_journal.JournalBusy:
+                raise
             except goalflight_journal.JournalUnavailable:
                 arm_snapshot = None
             persisted_state = goalflight_wake.recover_pending_report_state(
@@ -6217,12 +6418,13 @@ def cmd_listen(args) -> int:
                 arm_high = dict(winner_state.positions)
                 pending_report_settled = winner_state.phase == "acknowledged"
 
-        armed = authority.arm_listener(
-            label,
-            nonce=nonce,
-            pid=os.getpid(),
-            start_token=str(identity["start_token"]),
-            parent_pid=parent_pid,
+        armed = _retry_listener_journal_busy(
+            arm_once,
+            busy_error=goalflight_journal.JournalBusy,
+            tolerance=journal_tolerance,
+            poll_s=poll,
+            on_degraded=startup_degraded,
+            on_recovered=startup_recovered,
         )
         if not armed.committed or not armed.value:
             raise MessageError(armed.reason or "listener coverage arm lost")
@@ -6246,10 +6448,6 @@ def cmd_listen(args) -> int:
     _emit_supervised_armed()
     listener_started = time.monotonic()
     detached_grace = _listener_startup_grace_s()
-    journal_tolerance = _JournalBusyTolerance(
-        LISTENER_JOURNAL_TOLERANCE_S,
-        LISTENER_JOURNAL_BACKOFF_CAP_S,
-    )
     watchdog_start_grace = (
         0.1
         if test_mode
@@ -6287,7 +6485,13 @@ def cmd_listen(args) -> int:
             return None
 
     def emit_payload(payload: dict[str, object], *, detail: str | None = None) -> None:
-        plan = rearm_plan_after_release()
+        try:
+            plan = rearm_plan_after_release()
+        except goalflight_journal.JournalError as exc:
+            # Rearm enrichment is secondary. The exit payload is the evidence
+            # operators need when the journal itself is unavailable.
+            payload["rearm_error"] = sanitize_display(exc, limit=180)
+            plan = None
         hint = ""
         if (
             plan
@@ -6327,7 +6531,11 @@ def cmd_listen(args) -> int:
         try:
             exited = authority.exit_listener(coverage_id, reason=reason)
             if not exited.committed:
-                payload["detail"] = detail or exited.reason or "coverage exit CAS lost"
+                payload["coverage_exit_error"] = (
+                    exited.reason or "coverage exit CAS lost"
+                )
+        except goalflight_journal.JournalError as exc:
+            payload["coverage_exit_error"] = sanitize_display(exc, limit=180)
         finally:
             if waiter is not None:
                 waiter.close()
@@ -6767,15 +6975,14 @@ def cmd_listen(args) -> int:
                 detail=str(exc),
             )
         except goalflight_journal.JournalIOError as exc:
-            # Fatal on purpose: the 75s exponential-backoff open budget was
-            # already exhausted to produce this — see cmd_follow for the full
-            # reasoning. Only plain busy JournalUnavailable is tolerated.
+            # Fatal on purpose. This is either immediate path identity/stat I/O
+            # failure or exhausted present-path open retries; neither is busy.
             return finish(
                 _journal_failure_reason(exc),
                 code=2,
                 detail=str(exc),
             )
-        except goalflight_journal.JournalUnavailable as exc:
+        except goalflight_journal.JournalBusy as exc:
             first = not journal_tolerance.degraded
             if not journal_tolerance.note_failure(exc):
                 return finish(
@@ -6786,11 +6993,20 @@ def cmd_listen(args) -> int:
             if first:
                 print(
                     f"listen: {journal_tolerance.reason}: listener degraded; "
-                    "journal busy, retrying for up to "
-                    f"{journal_tolerance.tolerance_s:g}s: {exc}",
+                    "journal busy within "
+                    f"{journal_tolerance.tolerance_s:g}s continuous-failure "
+                    "window (outage-to-exit estimate "
+                    f"{LISTENER_JOURNAL_MAX_OUTAGE_ESTIMATE_S:g}s plus "
+                    f"scheduler delay): {exc}",
                     file=sys.stderr,
                 )
             wakeable_items = False
+        except goalflight_journal.JournalUnavailable as exc:
+            return finish(
+                _journal_failure_reason(exc),
+                code=2,
+                detail=str(exc),
+            )
         except goalflight_journal.JournalError:
             raise
         except ValueError as exc:

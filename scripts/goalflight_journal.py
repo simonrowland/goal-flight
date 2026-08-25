@@ -246,9 +246,13 @@ class JournalUpgradeRequired(JournalError):
 
 
 class JournalUnavailable(JournalError):
-    """The journal could not complete required startup work in budget."""
+    """The journal could not complete a required bounded operation."""
 
     reason = "journal-unavailable"
+
+
+class JournalBusy(JournalUnavailable):
+    """SQLite contention exhausted one journal operation's retry budget."""
 
 
 class JournalDisappeared(JournalUnavailable):
@@ -256,7 +260,7 @@ class JournalDisappeared(JournalUnavailable):
 
 
 class JournalIOError(JournalUnavailable):
-    """The journal path exists but SQLite cannot open it within the IO budget."""
+    """The present journal path cannot be inspected or opened safely."""
 
     reason = "journal-io-failure"
 
@@ -827,8 +831,8 @@ def _open_readonly_connection(
             # Preserve each caller's existing absent/disappeared-file handling.
             raise
         if not _is_cantopen(primary_exc):
-            if opened and (
-                _is_corruption_error(primary_exc) or _is_busy(primary_exc)
+            if _is_busy(primary_exc) or (
+                opened and _is_corruption_error(primary_exc)
             ):
                 # Parse/malformed evidence from an opened connection is real
                 # corruption evidence; busy remains retryable. A mere open
@@ -853,6 +857,8 @@ def _open_readonly_connection(
             isolation_level=isolation_level,
         )
     except sqlite3.DatabaseError as fallback_exc:
+        if _is_busy(fallback_exc):
+            raise
         raise JournalUnavailable(
             _dual_open_unavailable(path, primary_failure, fallback_exc, stage="open")
         ) from fallback_exc
@@ -1057,8 +1063,10 @@ class Journal:
         self._bootstrap_schema(created_here=created_here)
         # Enforced on open even though P1 has only epoch 1.  Reads repeat the
         # fence so a long-lived client cannot outlive a migration unnoticed.
-        with contextlib.closing(self._connect()) as connection:
-            self._assert_epoch_fence(connection, for_write=False)
+        self._read_with_retry(
+            "journal open epoch fence",
+            lambda connection: self._assert_epoch_fence(connection, for_write=False),
+        )
 
     def _claim_fresh_database_path(self) -> None:
         """Atomically claim a path after the caller states bootstrap intent."""
@@ -1074,7 +1082,7 @@ class Journal:
         else:
             os.close(fd)
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, *, busy_deadline_s: float | None = None) -> sqlite3.Connection:
         started = time.monotonic()
         open_started = started
         attempts = 0
@@ -1109,9 +1117,9 @@ class Journal:
                 # raw would bypass every caller's JournalUnavailable handling —
                 # including the write paths that document busy as RETRYABLE.
                 if _is_busy(exc):
-                    if self._retry_delay(started):
+                    if self._retry_delay(started, deadline_s=busy_deadline_s):
                         continue
-                    raise JournalUnavailable(
+                    raise JournalBusy(
                         f"journal connection remained busy after {attempts} attempts "
                         f"within {self.retry_budget_s:.3f}s: {self.path}"
                     ) from exc
@@ -1155,8 +1163,8 @@ class Journal:
                             f"{exc}; failing closed"
                         ) from exc
                     raise
-                if not self._retry_delay(started):
-                    raise JournalUnavailable(
+                if not self._retry_delay(started, deadline_s=busy_deadline_s):
+                    raise JournalBusy(
                         f"journal connection remained busy after {attempts} attempts "
                         f"within {self.retry_budget_s:.3f}s: {self.path}"
                     ) from exc
@@ -1178,7 +1186,7 @@ class Journal:
                 if _is_busy(exc) and self._retry_delay(started):
                     continue
                 if _is_busy(exc):
-                    raise JournalUnavailable(
+                    raise JournalBusy(
                         f"journal integrity check remained busy after {attempts} attempts "
                         f"within {self.retry_budget_s:.3f}s: {self.path}"
                     ) from exc
@@ -1202,6 +1210,8 @@ class Journal:
             attempts += 1
             try:
                 connection = self._connect()
+            except JournalBusy:
+                raise
             except JournalUnavailable as exc:
                 raise JournalUnavailable(
                     f"journal startup could not open a configured connection: {self.path}"
@@ -1302,7 +1312,7 @@ class Journal:
                     connection.rollback()
                 if not _is_busy(exc) or not self._retry_delay(started):
                     if _is_busy(exc):
-                        raise JournalUnavailable(
+                        raise JournalBusy(
                             f"journal startup remained busy after {attempts} attempts "
                             f"within {self.retry_budget_s:.3f}s: {self.path}"
                         ) from exc
@@ -1832,14 +1842,24 @@ class Journal:
         )
         connection.execute("DROP TABLE IF EXISTS journal_secrets")
 
-    def _retry_delay(self, started: float) -> bool:
-        remaining = self.retry_budget_s - (time.monotonic() - started)
+    def _retry_delay(
+        self,
+        started: float,
+        *,
+        deadline_s: float | None = None,
+    ) -> bool:
+        deadline = (
+            started + self.retry_budget_s
+            if deadline_s is None
+            else deadline_s
+        )
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
         delay = min(random.uniform(self.jitter_min_s, self.jitter_max_s), remaining)
         if delay > 0:
             time.sleep(delay)
-        return time.monotonic() - started < self.retry_budget_s
+        return time.monotonic() < deadline
 
     def _raise_disappeared_if_absent(self, cause: BaseException) -> None:
         if not os.path.lexists(self.path):
@@ -1884,6 +1904,8 @@ class Journal:
                 (JOURNAL_IDENTITY_KEY,),
             ).fetchone()
         except sqlite3.DatabaseError as exc:
+            if _is_busy(exc):
+                raise
             self._raise_integrity_failure(f"journal identity schema is unreadable: {exc}")
         if row is None or str(row["value"]) != JOURNAL_IDENTITY_VALUE:
             self._raise_integrity_failure("required journal identity row is missing or invalid")
@@ -1901,6 +1923,8 @@ class Journal:
         except JournalIntegrityError:
             raise
         except sqlite3.DatabaseError as exc:
+            if _is_busy(exc):
+                raise
             self._raise_integrity_failure(f"journal epoch schema is unreadable: {exc}")
         if row is None:
             raise JournalIntegrityError(
@@ -1931,6 +1955,8 @@ class Journal:
         except JournalIntegrityError:
             raise
         except (sqlite3.DatabaseError, TypeError, ValueError, OverflowError) as exc:
+            if _is_busy(exc):
+                raise
             self._raise_integrity_failure(f"journal epoch row is invalid: {exc}")
         client = self.client_epochs
         mismatches = []
@@ -1955,9 +1981,41 @@ class Journal:
             )
         return stored
 
+    def _read_with_retry(
+        self,
+        operation: str,
+        action: Callable[[sqlite3.Connection], T],
+    ) -> T:
+        """Run every SQL read stage within one bounded busy-classification path."""
+        started = time.monotonic()
+        deadline = started + self.retry_budget_s
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                with contextlib.closing(
+                    self._connect(busy_deadline_s=deadline)
+                ) as connection:
+                    return action(connection)
+            except JournalBusy:
+                # _connect already spent this operation's retry budget. Starting
+                # another full window here would silently double the contract.
+                raise
+            except sqlite3.OperationalError as exc:
+                if not _is_busy(exc):
+                    raise
+                if self._retry_delay(started):
+                    continue
+                raise JournalBusy(
+                    f"{operation} remained busy after {attempts} attempts "
+                    f"within {self.retry_budget_s:.3f}s: {self.path}"
+                ) from exc
+
     def epochs(self) -> JournalEpochs:
-        with contextlib.closing(self._connect()) as connection:
-            return self._assert_epoch_fence(connection, for_write=False)
+        return self._read_with_retry(
+            "journal epoch read",
+            lambda connection: self._assert_epoch_fence(connection, for_write=False),
+        )
 
     def read_all(
         self, sql: str, parameters: Iterable[object] = ()
@@ -1982,9 +2040,11 @@ class Journal:
             read_only = upper.startswith("SELECT ") or upper.startswith("EXPLAIN ")
         if not read_only:
             raise ValueError("read_all accepts only read-only SELECT, EXPLAIN, and inspect PRAGMA statements")
-        with contextlib.closing(self._connect()) as connection:
+        def action(connection: sqlite3.Connection) -> list[sqlite3.Row]:
             self._assert_epoch_fence(connection, for_write=False)
             return list(connection.execute(sql, tuple(parameters)).fetchall())
+
+        return self._read_with_retry("journal read query", action)
 
     def write(self, operations: Iterable[RowOperation]) -> WriteResult[list[RowWrite]]:
         """Run declarative row operations in one bounded immediate transaction.
@@ -2491,13 +2551,16 @@ class Journal:
     def care_work_exists(self, label: str) -> bool:
         """True when this project still has live attempts or unread waking mail."""
         resolved_label = self._identity_token(label, label="controller label")
-        with contextlib.closing(self._connect()) as connection:
+
+        def action(connection: sqlite3.Connection) -> bool:
             self._assert_epoch_fence(connection, for_write=False)
             return self._care_work_exists(
                 connection,
                 project_root=str(self.project_root),
                 label=resolved_label,
             )
+
+        return self._read_with_retry("journal care-work read", action)
 
     def active_lease(self, label: str) -> LeaseIdentity | None:
         resolved_label = self._identity_token(label, label="controller label")
@@ -3405,7 +3468,8 @@ class Journal:
         if not 1 <= limit <= 10_000:
             raise ValueError("cursor peek limit must be between 1 and 10000")
         project_root = str(self.project_root)
-        with contextlib.closing(self._connect()) as connection:
+
+        def action(connection: sqlite3.Connection) -> CursorPeek:
             # Items and their per-stream safety tokens must describe one read
             # snapshot.  Autocommit SELECTs could otherwise straddle a writer
             # and bless a row the caller never received.
@@ -3463,14 +3527,16 @@ class Journal:
                 )[0]
                 for stream_id, position in positions.items()
             }
-        return CursorPeek(
-            resolved_label,
-            project_root,
-            int(cursor["registry_generation"]),
-            int(cursor["cursor_version"]),
-            stream_snapshots,
-            tuple(dict(row) for row in rows),
-        )
+            return CursorPeek(
+                resolved_label,
+                project_root,
+                int(cursor["registry_generation"]),
+                int(cursor["cursor_version"]),
+                stream_snapshots,
+                tuple(dict(row) for row in rows),
+            )
+
+        return self._read_with_retry("journal cursor peek", action)
 
     def pending_delivery_events(
         self,
@@ -4875,7 +4941,7 @@ class Journal:
         return self._domain_write(action)
 
     def inspect(self) -> dict[str, object]:
-        with contextlib.closing(self._connect()) as connection:
+        def action(connection: sqlite3.Connection) -> dict[str, object]:
             epochs = self._assert_epoch_fence(connection, for_write=False)
             integrity = [str(row[0]) for row in connection.execute("PRAGMA integrity_check")]
             if integrity != ["ok"]:
@@ -4894,13 +4960,17 @@ class Journal:
                 "tables": tables,
             }
 
+        return self._read_with_retry("journal inspect", action)
+
     def dump_sql(self) -> list[str]:
-        with contextlib.closing(self._connect()) as connection:
+        def action(connection: sqlite3.Connection) -> list[str]:
             self._assert_epoch_fence(connection, for_write=False)
             rows = [str(row[0]) for row in connection.execute("PRAGMA integrity_check")]
             if rows != ["ok"]:
                 self._raise_integrity_failure("; ".join(rows))
             return list(connection.iterdump())
+
+        return self._read_with_retry("journal SQL dump", action)
 
     def snapshot(self, output: Path | str) -> Path:
         destination = Path(output).expanduser().resolve(strict=False)
@@ -4911,13 +4981,15 @@ class Journal:
         os.close(fd)
         tmp = Path(tmp_name)
         try:
-            with contextlib.closing(self._connect()) as source:
+            def copy_source(source: sqlite3.Connection) -> None:
                 self._assert_epoch_fence(source, for_write=False)
                 rows = [str(row[0]) for row in source.execute("PRAGMA integrity_check")]
                 if rows != ["ok"]:
                     self._raise_integrity_failure("; ".join(rows))
                 with contextlib.closing(sqlite3.connect(tmp)) as target:
                     source.backup(target)
+
+            self._read_with_retry("journal snapshot read", copy_source)
             _validate_snapshot_file(tmp)
             with tmp.open("rb") as handle:
                 os.fsync(handle.fileno())

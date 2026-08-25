@@ -185,6 +185,74 @@ def test_absent_reader_keeps_legacy_unavailable_semantics(
         journal.Journal.open_reader(project)
 
 
+class _TargetedBusyConnection:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        needle: str,
+        hits: list[str],
+    ) -> None:
+        self._connection = connection
+        self._needle = needle
+        self._hits = hits
+
+    def execute(self, sql: str, *args: object, **kwargs: object):
+        normalized = " ".join(sql.split())
+        if self._needle in normalized:
+            self._hits.append(normalized)
+            raise sqlite3.OperationalError("database is locked")
+        return self._connection.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._connection, name)
+
+
+@pytest.mark.parametrize(
+    ("read_stage", "needle"),
+    (
+        ("read_all", "SELECT 1 AS injected_read"),
+        ("cursor_peek", "BEGIN"),
+    ),
+)
+def test_every_query_stage_busy_is_normalized_as_journal_busy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    read_stage: str,
+    needle: str,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.Journal.create(project)
+    claimed = authority.claim_or_renew_lease(
+        "query-busy-reader",
+        principal={"principal_id": "query-busy-reader"},
+    )
+    assert claimed.committed and claimed.value is not None
+    reader = journal.Journal.open_reader(project, retry_budget_s=0)
+    real_connect = journal.Journal._connect
+    hits: list[str] = []
+
+    def injected_connect(current: journal.Journal, **kwargs: object):
+        return _TargetedBusyConnection(
+            real_connect(current, **kwargs),
+            needle=needle,
+            hits=hits,
+        )
+
+    monkeypatch.setattr(journal.Journal, "_connect", injected_connect)
+    with pytest.raises(journal.JournalBusy, match="remained busy"):
+        if read_stage == "read_all":
+            reader.read_all("SELECT 1 AS injected_read")
+        else:
+            reader.cursor_peek(
+                claimed.value.label,
+                nonce=claimed.value.nonce,
+            )
+
+    assert hits, f"{read_stage} query-stage injection did not bind"
+
+
 def test_snapshot_and_restore_readers_share_query_only_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -209,8 +209,6 @@ system disagree, prefer the live check and record the disagreement.
 - **b-173 / b-020** — quiet treated as terminal; workers outlive their verdict
   and accumulate. A reaper needs **both** facts: owning dispatch terminal **and**
   process idle.
-- **b-165** — journal reads bounce instead of waiting (`busy_timeout = 0`, no
-  recorded rationale).
 - **b-167** — a uniform finite listener timeout blanks a whole pool at once.
 
 ---
@@ -285,7 +283,8 @@ the envelope already records.
 
 **Do not centralize the whole journal.** Dispatch state is legitimately
 per-project, and a single global SQLite would concentrate the contention this
-system already struggles with (see b-165: reads bounce rather than wait).
+system already struggles with (b-165 originally recorded reads bouncing rather
+than waiting; bounded read retries now classify that contention explicitly).
 
 **Constraint on any fix:** deliberate broadcast must survive. A shared sweep
 worker may legitimately address everyone — the goal is that *unintended* fanout
@@ -447,10 +446,13 @@ the stream, the backup doorbell pool, and the watchdog.
 authority. Every exit path releases that flock and restores signal handlers; fatal
 runtime paths publish `listener-fault`, while the watchdog publishes the exact
 stream re-arm command. A merely busy journal is not a fault: the stream then
-tolerates continuous busy for up to five minutes, publishing one
+uses a 300-second continuous-failure window, publishing one
 `listener-degraded` record when the window opens and one `listener-recovered`
 when it closes, and heartbeats keep beating so the watchdog never reads load as
-death. `EPIPE` has no re-arm payload because its reader is gone.
+death. Because the clock opens after the first bounded operation, a busy outage
+can take about 350 seconds plus scheduler delay to fault (10s first operation +
+300s window + 30s backoff + 10s final operation). `EPIPE` has no re-arm payload
+because its reader is gone.
 The watchdog remains an ordinary `listen`, so it deliberately retains journal arm
 and exit audit, tracked-task completion, and kernel-slot release.
 

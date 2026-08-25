@@ -260,8 +260,12 @@ flock, and lets the backup wake with the fault. Journal, cursor, and ring failur
 emit a structural `event`/`listener-fault` stdout record before exit; stderr remains
 supplemental diagnostics only. The one exception is transient journal busy: it is a
 load symptom, so listeners outlast it (single degrade/recover notices, bounded by a
-continuous-failure window) instead of faulting; a verified-vanished journal still
-faults immediately.
+300-second continuous-failure window) instead of faulting. The first bounded
+operation completes before that clock starts, and expiry can be observed after one
+30-second backoff plus one final 10-second operation, so outage-to-exit can approach
+350 seconds plus scheduler delay. A verified-vanished journal still faults
+immediately; journal path identity/stat I/O and exhausted present-path open retries
+are also fatal rather than being mislabeled as busy.
 
 `--listener-slots`, `GOALFLIGHT_LISTENER_SLOTS`, and
 `GOALFLIGHT_LISTENER_LOW_WATER` tune only portable `listen`. Persistent backup
