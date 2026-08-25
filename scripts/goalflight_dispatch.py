@@ -4102,7 +4102,16 @@ _CAPACITY_WAIT_POLL_S = goalflight_capacity.CAPACITY_WAIT_POLL_S
 
 
 def _capacity_wait_seconds(args) -> float:
-    """Resolve the queue budget: CLI flag > env > lane default."""
+    """Resolve the inline acquire budget before durable queue fallback."""
+    if (
+        not getattr(args, "foreground", False)
+        and getattr(args, "capacity_wait_s", None) is None
+        and "GOALFLIGHT_CAPACITY_WAIT_S" not in os.environ
+    ):
+        # Detached work is durable after a capacity refusal, so keeping its
+        # launcher alive for the lane default only delays the queue handoff.
+        # Explicit CLI/env budgets still opt into inline polling.
+        return 0.0
     return goalflight_capacity.resolve_capacity_wait_s(
         lane=getattr(args, "priority", None) or "normal",
         wait_s=getattr(args, "capacity_wait_s", None),
@@ -4968,7 +4977,27 @@ def _warn_if_stranded_without_drainer(queue_path: Path) -> None:
     )
 
 
-def _queue_launch_token() -> str:
+def _queue_launch_token(entry: dict | None = None) -> str:
+    if isinstance(entry, dict):
+        request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+        dispatch_id = str(entry.get("dispatch_id") or "")
+        project_root = entry.get("project_root") or request.get("cwd")
+        if dispatch_id and project_root:
+            resolved_root = goalflight_task.resolve_project_root(str(project_root))
+            if os.path.lexists(goalflight_journal.resolve_journal_path(resolved_root)):
+                attempt = goalflight_journal.Journal(resolved_root).attempt_for_dispatch(
+                    dispatch_id
+                )
+                if (
+                    attempt is not None
+                    and attempt.lifecycle_state == goalflight_journal.ATTEMPT_PREPARED
+                ):
+                    # A queue child refused before spawn. The durable claim
+                    # was restored, but its journal preparation is still the
+                    # same attempt. Reuse that fencing token so the next
+                    # drain can continue PREPARED -> STARTING. A journal read
+                    # error must escape before the carrier is claimed.
+                    return attempt.launch_token
     return uuid.uuid4().hex
 
 
@@ -9763,7 +9792,7 @@ def _drain_queue_once(args) -> dict:
     for _sort_key, path, _scan_entry, _scan_read_error in entries:
         claim_error: Exception | None = None
         entry: dict | None = None
-        launch_token = _queue_launch_token()
+        launch_token = _queue_launch_token(_scan_entry)
         _test_signal_file(
             "GOALFLIGHT_TEST_DRAIN_BEFORE_CLAIM_FILE",
             str(path),
@@ -11184,9 +11213,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-orientation", action="store_true",
                         help="Do not auto-add the docs-private/rag/ORIENTATION.md pointer preamble.")
     parser.add_argument("--capacity-wait-s", type=float, default=None,
-                        help="How long to QUEUE for a capacity slot before DISPATCH-BLOCKED "
-                             "(re-attempts acquire every ~15s; sleep-excluding clock). Default by "
-                             "lane: bulk 900 / normal 600 / critical 120. 0 = fail instantly. "
+                        help="How long to poll inline for a capacity slot "
+                             "(re-attempts acquire every ~15s; sleep-excluding clock). Detached "
+                             "dispatches default to 0 and fall back to the durable queue; foreground "
+                             "defaults by lane: bulk 900 / normal 600 / critical 120. 0 = fail instantly. "
                              "Env override: GOALFLIGHT_CAPACITY_WAIT_S.")
     dispatch_mode = parser.add_mutually_exclusive_group()
     dispatch_mode.add_argument("--submit", action="store_true",
@@ -11571,6 +11601,7 @@ def main(argv: list[str] | None = None) -> int:
     pidfile = None
     lease_id = None
     ledger_recorded = False
+    queue_capacity_refused = False
     detached_launched = False
     codex_dispatch_home = None
     engine_session_id = _resolved_engine_session_id(args)
@@ -11620,6 +11651,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     try:
+        assert not args.submit, "--submit must bypass inline capacity acquisition"
         # Pre-record the ledger BEFORE the capacity queue: the (possibly
         # minutes-long) wait window must be visible to goalflight_status
         # (classified queued_capacity = live) and must trip the reused-id
@@ -11692,18 +11724,46 @@ def main(argv: list[str] | None = None) -> int:
         ledger_recorded = True
         try:
             lease_id = _acquire_capacity(args, project_root=project_root, status_json=status_json)
-        except (SystemExit, KeyboardInterrupt):
+        except (SystemExit, KeyboardInterrupt) as exc:
             # Queue exhausted or interrupted: the status file already says
             # blocked_capacity; make the ledger finish agree instead of the
             # generic "failed", mirroring the status plane's specific reason
             # (wait_interrupted vs machine_worker_cap vs agent_worker_cap ...).
             final_state = "blocked_capacity"
             final_reason = "capacity_wait"
+            blocked = {}
             with contextlib.suppress(Exception):
                 blocked = json.loads(Path(status_json).read_text(encoding="utf-8"))
                 specific = (blocked.get("reason") or {}).get("reason")
                 if specific:
                     final_reason = f"capacity_wait:{specific}"
+            capacity_refused = bool(
+                isinstance(exc, SystemExit)
+                and exc.code == 2
+                and blocked.get("state") == "blocked_capacity"
+                and (blocked.get("reason") or {}).get("reason") != "wait_interrupted"
+            )
+            queue_capacity_refused = bool(
+                capacity_refused
+                and args.from_queue
+                and args.queue_launch_token
+                and args.queue_claim_path
+            )
+            if (
+                capacity_refused
+                and not args.from_queue
+                and not args.foreground
+            ):
+                # Reuse the canonical queue writer. It rewrites the live
+                # waiting_capacity ledger row to exact state="queued", which
+                # is the state allow_queued accepts on the drain replay. The
+                # PREPARED journal attempt stays non-terminal and its launch
+                # token is reused by the drain. Keep the finally block from
+                # terminalizing the new queued ledger row.
+                queued = _submit_dispatch(args, raw, base=base)
+                if queued == 0:
+                    ledger_recorded = False
+                    return 0
             raise
         if _account_engine(args.agent) == "grok" and not args.account:
             # Same contract as the codex pointer: args.account stays None so the
@@ -12139,7 +12199,12 @@ def main(argv: list[str] | None = None) -> int:
             tail,
             agent=args.agent,
         )
-        if ledger_recorded and not detached_launched and not keep_live_watcher_open:
+        if (
+            ledger_recorded
+            and not detached_launched
+            and not keep_live_watcher_open
+            and not queue_capacity_refused
+        ):
             try:
                 final_state, ledger_reason, _rate_limited = goalflight_terminal.terminal_rate_limit_outcome(
                     final_state,

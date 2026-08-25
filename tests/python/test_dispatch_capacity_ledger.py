@@ -847,6 +847,7 @@ def case_capacity_block_does_not_spawn() -> None:
                 str(status_path),
                 "--cwd",
                 str(tmp),
+                "--foreground",
                 "--",
                 sys.executable,
                 "-c",
