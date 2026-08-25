@@ -6891,7 +6891,7 @@ def _task_row_completion_timestamp_s(row: dict | None) -> float | None:
     return None
 
 
-def _completion_not_older_than_entry(
+def _completion_is_after_entry(
     completion_timestamp_s: float | None,
     entry_created_timestamp_s: float | None,
 ) -> bool | None:
@@ -6901,7 +6901,12 @@ def _completion_not_older_than_entry(
     # completion time as old could launch a genuine queued duplicate.
     if completion_timestamp_s is None or entry_created_timestamp_s is None:
         return None
-    return completion_timestamp_s >= entry_created_timestamp_s
+    if completion_timestamp_s == entry_created_timestamp_s:
+        # Equal wall-clock values do not prove event order. Current writers use
+        # whole-second timestamps, and legacy records may have the same coarse
+        # precision, so fail closed instead of superseding an ambiguous entry.
+        return None
+    return completion_timestamp_s > entry_created_timestamp_s
 
 
 def _ledger_task_ids_advanced(
@@ -6942,7 +6947,7 @@ def _ledger_task_ids_advanced(
             or state == "complete"
             or terminal == "complete"
         ):
-            completion_is_current = _completion_not_older_than_entry(
+            completion_is_current = _completion_is_after_entry(
                 _parse_timestamp_s(record.get("ended_at")),
                 entry_created_timestamp_s,
             )
@@ -7000,7 +7005,7 @@ def _linked_task_truth(
                 continue
             store_seen += 1
             if _task_row_durably_complete(row):
-                completion_is_current = _completion_not_older_than_entry(
+                completion_is_current = _completion_is_after_entry(
                     _task_row_completion_timestamp_s(row),
                     entry_created_timestamp_s,
                 )

@@ -406,7 +406,7 @@ def test_prior_ledger_completion_does_not_supersede_deliberate_follow_up() -> No
             assert D._entry_completion_authority(entry, {}) is None
 
 
-def test_same_time_ledger_completion_still_supersedes_queued_duplicate() -> None:
+def test_same_time_ledger_completion_defers_ambiguous_ordering() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         with _isolated_completion_authority(tmp):
@@ -432,8 +432,8 @@ def test_same_time_ledger_completion_still_supersedes_queued_duplicate() -> None
             decision = D._entry_completion_authority(entry, {})
 
             assert decision is not None
-            assert decision["state"] == "superseded"
-            assert decision["reason"] == "task_store:all_complete"
+            assert decision["state"] == "deferred"
+            assert decision["reason"] == "completion_authority_indeterminate"
 
 
 def test_prior_store_completion_does_not_supersede_deliberate_follow_up() -> None:

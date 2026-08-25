@@ -944,8 +944,13 @@ def cmd_finish(args: argparse.Namespace) -> int:
             else winner_state
         )
         record["state"] = effective_state
-        ended_at = utc_now()
-        record["ended_at"] = ended_at
+        ended_at = record.get("ended_at")
+        # ended_at is the first ledger terminal time and an ordering authority.
+        # An idempotent retry cannot safely backfill or refresh it because the
+        # original terminal event may predate work queued in the meantime.
+        if "ended_at" not in record and not winner.idempotent:
+            ended_at = utc_now()
+            record["ended_at"] = ended_at
         record["terminal_state"] = terminal_state
         record["liveness_state"] = goalflight_terminal.terminal_liveness_state(effective_state)
         elapsed_s = getattr(args, "elapsed_s", None)
