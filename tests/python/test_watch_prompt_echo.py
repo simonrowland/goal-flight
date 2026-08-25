@@ -1215,11 +1215,28 @@ tokens used
 179,057
 """
 
-# Verbatim incident excerpt supplied in the task brief (2026-08-24).
-OBSERVED_NETWORK_DEATH_TAIL = """failed to lookup address information: nodename nor servname provided
-stream disconnected before completion
+# A REAL tail from the 2026-08-24 network death, with the timestamps, module
+# paths and trailing context a worker actually emits.
+#
+# The previous fixture used the tidied three-line excerpt that appeared in the
+# task brief. Bare signature lines like that never occur in practice, and an
+# implementation matching them by line EQUALITY passed against them while being
+# unable to classify any real tail. Fixture and implementation shared the same
+# laundered evidence, so the test confirmed their agreement rather than the
+# behaviour. Keep this fixture ugly on purpose.
+OBSERVED_NETWORK_DEATH_TAIL = """2026-08-24T23:04:44.838554Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: IO error: failed to lookup address information: nodename nor servname provided, or not known, url: wss://chatgpt.com/backend-api/codex/responses
+ERROR: Reconnecting... 2/5
+warning: Falling back from WebSockets to HTTPS transport. stream disconnected before completion: failed to lookup address information: nodename nor servname provided
+ERROR: Reconnecting... 4/5
 ERROR: Reconnecting... 5/5
 """
+
+# A single transient disconnect is NOT a network death: it proves nothing about
+# why the worker stopped, and classifying it would silence real failures.
+LONE_DISCONNECT_TAIL = (
+    "2026-08-24T22:10:02Z ERROR: stream disconnected before completion: retrying\n"
+    "ok, resumed\n"
+)
 
 # Real Grok tool error shape that archived review tails recovered from.
 OBSERVED_RECOVERABLE_TOOL_ERROR_TAIL = (
@@ -1356,6 +1373,29 @@ def test_dead_pid_network_tail_surfaces_upstream_network() -> None:
     assert payload.get("liveness_state") == "worker_dead", payload
     assert payload.get("reason") == _worker_dead_reason("upstream_network"), payload
     assert not term, term
+
+
+def test_real_tail_lines_classify_despite_timestamps_and_context() -> None:
+    """A signature is CONTAINED in a real log line, never equal to it.
+
+    The first implementation compared the trailing lines for EQUALITY against
+    the bare signature strings, so it could not classify any real tail -- every
+    real line carries a timestamp, a module path and trailing context. It passed
+    its fixture because the fixture had been tidied down to bare signatures in
+    the task brief, so implementation and fixture shared one laundered excerpt
+    and the test confirmed their agreement rather than the behaviour.
+
+    This pins the ugly shape directly at the classifier.
+    """
+    import goalflight_terminal as term_mod
+
+    assert term_mod.classify_worker_death_text(
+        OBSERVED_NETWORK_DEATH_TAIL) == "upstream_network"
+
+    # And the discriminator that must survive it: a lone transient disconnect
+    # proves nothing about why the worker stopped.
+    assert term_mod.classify_worker_death_text(
+        LONE_DISCONNECT_TAIL) == term_mod.WORKER_DEATH_CAUSE_NO_EVIDENCE
 
 
 def test_recovered_network_incident_does_not_classify_later_death() -> None:

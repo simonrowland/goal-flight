@@ -20,6 +20,16 @@ _UPSTREAM_NETWORK_DEATH_SEQUENCE = (
     "stream disconnected before completion",
     "error: reconnecting... 5/5",
 )
+# Lines that are MORE OF THE SAME network failure rather than the worker
+# resuming work. Used only to decide whether the death evidence runs to the end
+# of the tail; a line outside this set after the sequence completes means the
+# worker carried on and died of something else.
+_UPSTREAM_NETWORK_DEATH_NOISE = (
+    "reconnecting",
+    "stream disconnected before completion",
+    "failed to lookup address information",
+    "falling back from websockets",
+)
 _PROVIDER_LIMIT_DEATH_LINE_PATTERNS = (
     # Verbatim B054 provider tail fixture.
     re.compile(
@@ -142,8 +152,35 @@ def classify_worker_death_text(text: object) -> str:
         return WORKER_DEATH_CAUSE_NO_EVIDENCE
     lowered_lines = [line.casefold() for line in lines]
     matches: set[str] = set()
-    network_width = len(_UPSTREAM_NETWORK_DEATH_SEQUENCE)
-    if tuple(lowered_lines[-network_width:]) == _UPSTREAM_NETWORK_DEATH_SEQUENCE:
+    # Each signature must appear WITHIN a line, and the signatures must appear
+    # in order, in distinct lines.
+    #
+    # An earlier version required the last N lines to EQUAL the signatures.
+    # That can never match real output: a real tail line carries a timestamp,
+    # a module path and trailing context, so it contains the signature and is
+    # never equal to it. The family it was written for -- the 2026-08-24
+    # network death -- did not classify at all. The fixture agreed with the
+    # implementation because both were built from a brief excerpt that had
+    # been tidied down to bare signature lines, so the test could not catch it.
+    #
+    # The evidence must also run to the END of the tail. A worker that hits
+    # network trouble, RECOVERS, and later dies of something else must not be
+    # blamed on the network -- so once the sequence completes, every remaining
+    # line has to be more of the same failure rather than the worker carrying
+    # on. That anchoring is why the original suffix check existed; only its
+    # use of equality was wrong.
+    remaining = list(_UPSTREAM_NETWORK_DEATH_SEQUENCE)
+    completed_at: int | None = None
+    for index, lowered in enumerate(lowered_lines):
+        if remaining and remaining[0] in lowered:
+            remaining.pop(0)
+            if not remaining:
+                completed_at = index
+                break
+    if completed_at is not None and all(
+        any(noise in lowered for noise in _UPSTREAM_NETWORK_DEATH_NOISE)
+        for lowered in lowered_lines[completed_at + 1 :]
+    ):
         matches.add("upstream_network")
 
     provider_line_indexes = [
