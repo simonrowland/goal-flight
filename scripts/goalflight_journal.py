@@ -1103,7 +1103,12 @@ class Journal:
                     continue
                 raise self._open_io_failure(open_started, open_failures, exc) from exc
             except sqlite3.DatabaseError as exc:
-                if self._read_only_client and _is_busy(exc):
+                # Busy is stage- and client-agnostic: a read-write client can
+                # hit it here at connect (WAL shared-memory recovery/checkpoint
+                # contention) exactly as the pragma stage below, and escaping
+                # raw would bypass every caller's JournalUnavailable handling —
+                # including the write paths that document busy as RETRYABLE.
+                if _is_busy(exc):
                     if self._retry_delay(started):
                         continue
                     raise JournalUnavailable(

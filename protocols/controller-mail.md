@@ -258,7 +258,10 @@ not complete, so the replacement stream or backup can emit the same unread event
 60 seconds: prolonged backpressure records a durable fault, releases the monitor
 flock, and lets the backup wake with the fault. Journal, cursor, and ring failures
 emit a structural `event`/`listener-fault` stdout record before exit; stderr remains
-supplemental diagnostics only.
+supplemental diagnostics only. The one exception is transient journal busy: it is a
+load symptom, so listeners outlast it (single degrade/recover notices, bounded by a
+continuous-failure window) instead of faulting; a verified-vanished journal still
+faults immediately.
 
 `--listener-slots`, `GOALFLIGHT_LISTENER_SLOTS`, and
 `GOALFLIGHT_LISTENER_LOW_WATER` tune only portable `listen`. Persistent backup

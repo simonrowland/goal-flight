@@ -446,7 +446,11 @@ the stream, the backup doorbell pool, and the watchdog.
 `EXITED/event` row to write. Its generation-bound monitor flock is the liveness
 authority. Every exit path releases that flock and restores signal handlers; fatal
 runtime paths publish `listener-fault`, while the watchdog publishes the exact
-stream re-arm command. `EPIPE` has no re-arm payload because its reader is gone.
+stream re-arm command. A merely busy journal is not a fault: the stream then
+tolerates continuous busy for up to five minutes, publishing one
+`listener-degraded` record when the window opens and one `listener-recovered`
+when it closes, and heartbeats keep beating so the watchdog never reads load as
+death. `EPIPE` has no re-arm payload because its reader is gone.
 The watchdog remains an ordinary `listen`, so it deliberately retains journal arm
 and exit audit, tracked-task completion, and kernel-slot release.
 
