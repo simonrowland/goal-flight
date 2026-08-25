@@ -250,7 +250,52 @@ class TerminalCommitResult:
 
 class AcquireResult(Enum):
     ACQUIRED_ALL = "acquired_all"
-    DEFER_UNCHANGED = "defer_unchanged"
+    QUEUE_LOCK_DEFERRED = "queue_lock_deferred"
+    TASK_STORE_LOCK_DEFERRED = "task_store_lock_deferred"
+    LEDGER_LOCK_DEFERRED = "ledger_lock_deferred"
+    LOCK_ERROR_DEFERRED = "lock_error_deferred"
+
+
+class ReconcileRefusalReason(Enum):
+    PRE_ADMISSION_DEFERRED = "pre_admission_deferred"
+    RECONCILIATION_MODE_DEFERRED = "reconciliation_mode_deferred"
+    TAIL_GATE_DEFERRED = "tail_gate_deferred"
+    DOWNSTREAM_LOCK_DEFERRED = "downstream_lock_deferred"
+
+
+@dataclass(frozen=True)
+class _ReconcileRefusal:
+    reason: ReconcileRefusalReason
+    admission: PreAdmitClass
+    detail: str
+    mode: ReconciliationMode | None = None
+    transport: str | None = None
+    locality: str | None = None
+    capability: FlockCapability | None = None
+    filesystem: FilesystemIdentity | None = None
+
+    def as_dict(self, dispatch_id: str) -> dict:
+        filesystem = self.filesystem
+        return {
+            "dispatch_id": dispatch_id,
+            "reason": self.reason.value,
+            "detail": self.detail,
+            "admission": self.admission.value,
+            "mode": self.mode.value if self.mode is not None else None,
+            "transport": self.transport,
+            "locality": self.locality,
+            "capability": self.capability.value if self.capability is not None else None,
+            "filesystem": (
+                {
+                    "device": filesystem.device,
+                    "mount_path": filesystem.mount_path,
+                    "filesystem_type": filesystem.filesystem_type,
+                    "locality": filesystem.locality,
+                }
+                if filesystem is not None
+                else None
+            ),
+        }
 
 
 @dataclass
@@ -276,6 +321,40 @@ class _ReconcileTransaction:
             with contextlib.suppress(Exception):
                 self.tail_gate.__exit__(None, None, None)
             self.tail_gate = None
+
+
+@dataclass(frozen=True)
+class _BeginReconcileResult:
+    transaction: _ReconcileTransaction | None = None
+    refusal: _ReconcileRefusal | None = None
+
+    def __post_init__(self) -> None:
+        if (self.transaction is None) == (self.refusal is None):
+            raise ValueError("reconcile begin result must contain exactly one outcome")
+
+
+@dataclass(frozen=True)
+class _ClaimReconcileResult:
+    action: str
+    pending_reason: str | None = None
+    refusal: _ReconcileRefusal | None = None
+
+    def __post_init__(self) -> None:
+        if self.action == "pending":
+            if (self.pending_reason is None) == (self.refusal is None):
+                raise ValueError("pending reconciliation must contain exactly one reason")
+        elif self.pending_reason is not None or self.refusal is not None:
+            raise ValueError("non-pending reconciliation cannot contain a pending reason")
+
+    def pending_detail(self, dispatch_id: str) -> dict | None:
+        if self.action != "pending":
+            return None
+        if self.refusal is not None:
+            return self.refusal.as_dict(dispatch_id)
+        return {
+            "dispatch_id": dispatch_id,
+            "reason": self.pending_reason,
+        }
 
 # --os-sandbox: opt-in, per-dispatch OS sandbox profile for the bash-shape codex
 # worker. Unset -> "workspace-write" for existing workers; Kimi is the explicit
@@ -7058,25 +7137,25 @@ def acquire_reconcile_locks(
         if need_queue:
             handle = try_acquire_queue_lock(queue_dir, deadline_s=deadline)
             if handle is None:
-                return AcquireResult.DEFER_UNCHANGED
+                return AcquireResult.QUEUE_LOCK_DEFERRED
             acquired.append(handle)
             txn.queue_locked = True
         if need_task_store:
             handle = try_acquire_task_store_lock(txn.entry, record, deadline_s=deadline)
             if handle is None:
-                return AcquireResult.DEFER_UNCHANGED
+                return AcquireResult.TASK_STORE_LOCK_DEFERRED
             acquired.append(handle)
             txn.task_store_locked = True
         if need_ledger:
             handle = try_acquire_ledger_lock(deadline_s=deadline)
             if handle is None:
-                return AcquireResult.DEFER_UNCHANGED
+                return AcquireResult.LEDGER_LOCK_DEFERRED
             acquired.append(handle)
             txn.ledger_locked = True
         txn.downstream.extend(acquired)
         return AcquireResult.ACQUIRED_ALL
     except Exception:
-        return AcquireResult.DEFER_UNCHANGED
+        return AcquireResult.LOCK_ERROR_DEFERRED
     finally:
         if len(txn.downstream) < len(acquired):
             for handle in reversed(acquired):
@@ -7101,10 +7180,16 @@ def _begin_reconcile_transaction(
     need_task_store: bool,
     need_ledger: bool,
     admission: PreAdmitClass | None = None,
-) -> _ReconcileTransaction | None:
+) -> _BeginReconcileResult:
     admission = admission or classify_reconciliation_admission(entry, time.time(), stale_s=stale_s)
     if ADMISSION_DECISION[admission] is not AdmissionAction.ADMIT_TO_GATE:
-        return None
+        return _BeginReconcileResult(
+            refusal=_ReconcileRefusal(
+                ReconcileRefusalReason.PRE_ADMISSION_DEFERRED,
+                admission,
+                ADMISSION_DECISION[admission].value,
+            )
+        )
     record = _find_dispatch_record(str(entry.get("dispatch_id") or ""))
     tail = _entry_tail_path(entry, record)
     transport = _entry_transport(entry, record)
@@ -7130,24 +7215,58 @@ def _begin_reconcile_transaction(
         worker_tail_lock_contract=bool(entry.get("queue_tail_flock_contract", True)),
     )
     if mode in {ReconciliationMode.DEFER_TO_NODE, ReconciliationMode.FAIL_CLOSED_DEFER}:
-        return None
+        return _BeginReconcileResult(
+            refusal=_ReconcileRefusal(
+                ReconcileRefusalReason.RECONCILIATION_MODE_DEFERRED,
+                admission,
+                mode.value,
+                mode=mode,
+                transport=transport,
+                locality=locality,
+                capability=capability,
+                filesystem=filesystem,
+            )
+        )
     txn = _ReconcileTransaction(entry, tail, admission, mode, filesystem, capability)
     gate = _tail_reconciliation_lock(tail) if mode is ReconciliationMode.LOCAL_FLOCK else _fallback_reconciliation_lock(tail)
     try:
         gate.__enter__()
-    except (_TailLockBusy, OSError):
-        return None
+    except (_TailLockBusy, OSError) as exc:
+        return _BeginReconcileResult(
+            refusal=_ReconcileRefusal(
+                ReconcileRefusalReason.TAIL_GATE_DEFERRED,
+                admission,
+                type(exc).__name__,
+                mode=mode,
+                transport=transport,
+                locality=locality,
+                capability=capability,
+                filesystem=filesystem,
+            )
+        )
     txn.tail_gate = gate
-    if acquire_reconcile_locks(
+    acquire_result = acquire_reconcile_locks(
         txn,
         queue_dir=queue_dir,
         need_queue=need_queue,
         need_task_store=need_task_store,
         need_ledger=need_ledger,
-    ) is not AcquireResult.ACQUIRED_ALL:
+    )
+    if acquire_result is not AcquireResult.ACQUIRED_ALL:
         txn.release()
-        return None
-    return txn
+        return _BeginReconcileResult(
+            refusal=_ReconcileRefusal(
+                ReconcileRefusalReason.DOWNSTREAM_LOCK_DEFERRED,
+                admission,
+                acquire_result.value,
+                mode=mode,
+                transport=transport,
+                locality=locality,
+                capability=capability,
+                filesystem=filesystem,
+            )
+        )
+    return _BeginReconcileResult(transaction=txn)
 
 
 def _reconcile_transaction_still_valid(
@@ -7397,7 +7516,7 @@ def _bounded_restore_claim(claim: Path, entry: dict, queue_dir: Path) -> tuple[b
         return False, None
     if _claim_recovery_count(entry) >= MAX_CLAIM_RECOVERY_REQUEUES:
         return False, None
-    txn = _begin_reconcile_transaction(
+    begin = _begin_reconcile_transaction(
         entry,
         queue_dir=queue_dir,
         stale_s=0.0,
@@ -7405,6 +7524,7 @@ def _bounded_restore_claim(claim: Path, entry: dict, queue_dir: Path) -> tuple[b
         need_task_store=_is_task_linked(entry, _find_dispatch_record(str(entry.get("dispatch_id") or ""))),
         need_ledger=True,
     )
+    txn = begin.transaction
     if txn is None:
         return False, None
     try:
@@ -7442,7 +7562,7 @@ def _restore_claim_if_incomplete(
         return None, None
     if not isinstance(observed, dict) or observed.get("queue_launch_token") != entry.get("queue_launch_token"):
         return None, None
-    txn = _begin_reconcile_transaction(
+    begin = _begin_reconcile_transaction(
         observed,
         queue_dir=queue_dir,
         stale_s=0.0,
@@ -7453,6 +7573,7 @@ def _restore_claim_if_incomplete(
         need_task_store=True,
         need_ledger=True,
     )
+    txn = begin.transaction
     if txn is None:
         return None, None
     try:
@@ -7605,14 +7726,14 @@ def _fleet_terminal_accounted_record(record: dict | None, token: str) -> bool:
     )
 
 
-def _positive_live_carrier_cleanup(
+def _positive_live_carrier_cleanup_result(
     claim: Path,
     entry: dict,
     queue_dir: Path,
     *,
     worker_record_sufficient: bool = False,
     stale_s: float = QUEUE_CLAIM_STALE_S,
-) -> str:
+) -> _ClaimReconcileResult:
     """Narrow positive-accounting exception: Q-only redundant-carrier cleanup
     after revalidation. A carrier is clearable only when its dispatch is
     provably accounted for by the ledger:
@@ -7650,29 +7771,32 @@ def _positive_live_carrier_cleanup(
             or _fleet_terminal_accounted_record(record, token)
         )
     ):
-        return "pending"
-    handle = try_acquire_queue_lock(
-        queue_dir,
-        deadline_s=time.monotonic() + RECONCILE_DOWNSTREAM_LOCK_BUDGET_S,
-    )
+        return _ClaimReconcileResult("pending", pending_reason="positive_accounting_absent")
+    try:
+        handle = try_acquire_queue_lock(
+            queue_dir,
+            deadline_s=time.monotonic() + RECONCILE_DOWNSTREAM_LOCK_BUDGET_S,
+        )
+    except OSError:
+        return _ClaimReconcileResult("pending", pending_reason="queue_lock_error_deferred")
     if handle is None:
-        return "pending"
+        return _ClaimReconcileResult("pending", pending_reason="queue_lock_deferred")
     try:
         try:
             fresh = json.loads(claim.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return "pending"
+            return _ClaimReconcileResult("pending", pending_reason="claim_read_deferred")
         if not isinstance(fresh, dict):
-            return "pending"
+            return _ClaimReconcileResult("pending", pending_reason="claim_payload_invalid")
         if not worker_record_sufficient and classify_reconciliation_admission(
             fresh, time.time(), stale_s=0.0
         ) not in (
             PreAdmitClass.LIVE,
             PreAdmitClass.REMOTE_AUTHORITY_REQUIRED,
         ):
-            return "pending"
+            return _ClaimReconcileResult("pending", pending_reason="admission_revalidation_deferred")
         if fresh.get("queue_launch_token") != token:
-            return "pending"
+            return _ClaimReconcileResult("pending", pending_reason="launch_token_changed")
         if not (
             _dispatch_has_worker_record(
                 dispatch_id,
@@ -7681,7 +7805,7 @@ def _positive_live_carrier_cleanup(
             )
             or _fleet_terminal_accounted_record(_find_dispatch_record(dispatch_id), token)
         ):
-            return "pending"
+            return _ClaimReconcileResult("pending", pending_reason="positive_accounting_changed")
         record = _find_dispatch_record(dispatch_id)
         if not _is_task_linked(fresh, record):
             # Missing task linkage is not orphan evidence. When the exact
@@ -7696,13 +7820,31 @@ def _positive_live_carrier_cleanup(
                     and not _dispatch_record_is_terminal(record)
                 )
             ):
-                return "pending"
+                return _ClaimReconcileResult("pending", pending_reason="unlinked_accounting_insufficient")
         claim.unlink()
-        return "cleared"
+        return _ClaimReconcileResult("cleared")
     except OSError:
-        return "pending"
+        return _ClaimReconcileResult("pending", pending_reason="carrier_unlink_deferred")
     finally:
         handle.release()
+
+
+def _positive_live_carrier_cleanup(
+    claim: Path,
+    entry: dict,
+    queue_dir: Path,
+    *,
+    worker_record_sufficient: bool = False,
+    stale_s: float = QUEUE_CLAIM_STALE_S,
+) -> str:
+    """Compatibility wrapper for callers that need only the cleanup action."""
+    return _positive_live_carrier_cleanup_result(
+        claim,
+        entry,
+        queue_dir,
+        worker_record_sufficient=worker_record_sufficient,
+        stale_s=stale_s,
+    ).action
 
 
 def _reconcile_claim_transaction(
@@ -7712,10 +7854,15 @@ def _reconcile_claim_transaction(
     queue_dir: Path,
     reason: str,
     stale_s: float,
-) -> str:
+) -> _ClaimReconcileResult:
     admission = classify_reconciliation_admission(entry, time.time(), stale_s=stale_s)
     if admission is PreAdmitClass.LIVE:
-        return _positive_live_carrier_cleanup(claim, entry, queue_dir, stale_s=stale_s)
+        return _positive_live_carrier_cleanup_result(
+            claim,
+            entry,
+            queue_dir,
+            stale_s=stale_s,
+        )
     if admission is PreAdmitClass.INDETERMINATE:
         _alert_identity_indeterminate(
             str(entry.get("dispatch_id") or claim.name),
@@ -7731,12 +7878,24 @@ def _reconcile_claim_transaction(
             # tombstone — clear it under the same revalidation as the LIVE
             # case. Unaccounted carriers return "pending" here, which is
             # exactly DEFER_UNCHANGED.
-            return _positive_live_carrier_cleanup(claim, entry, queue_dir, stale_s=stale_s)
-        return "pending"
+            return _positive_live_carrier_cleanup_result(
+                claim,
+                entry,
+                queue_dir,
+                stale_s=stale_s,
+            )
+        return _ClaimReconcileResult(
+            "pending",
+            refusal=_ReconcileRefusal(
+                ReconcileRefusalReason.PRE_ADMISSION_DEFERRED,
+                admission,
+                ADMISSION_DECISION[admission].value,
+            ),
+        )
 
     record = _find_dispatch_record(str(entry.get("dispatch_id") or ""))
     linked = _is_task_linked(entry, record)
-    txn = _begin_reconcile_transaction(
+    begin = _begin_reconcile_transaction(
         entry,
         queue_dir=queue_dir,
         stale_s=stale_s,
@@ -7750,19 +7909,21 @@ def _reconcile_claim_transaction(
         need_ledger=True,
         admission=admission,
     )
+    txn = begin.transaction
     if txn is None:
-        return "pending"
+        assert begin.refusal is not None
+        return _ClaimReconcileResult("pending", refusal=begin.refusal)
     mirror: tuple[dict, Path] | None = None
     terminal_mirror: tuple[dict, dict | None] | None = None
     try:
         try:
             fresh = json.loads(claim.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return "pending"
+            return _ClaimReconcileResult("pending", pending_reason="claim_read_deferred")
         if not isinstance(fresh, dict) or not _reconcile_transaction_still_valid(txn, fresh):
-            return "pending"
+            return _ClaimReconcileResult("pending", pending_reason="transaction_revalidation_deferred")
         if classify_reconciliation_admission(fresh, time.time(), stale_s=stale_s) is not admission:
-            return "pending"
+            return _ClaimReconcileResult("pending", pending_reason="admission_changed_deferred")
         record = _find_dispatch_record(str(fresh.get("dispatch_id") or ""))
         linked = _is_task_linked(fresh, record)
         carrier_stamp = str(fresh.get("orphan_first_seen_at") or "") or None
@@ -7773,7 +7934,7 @@ def _reconcile_claim_transaction(
             and not record.get("orphan_first_seen_at")
         ):
             if _stamp_ledger_orphan_first_seen(record, txn=txn, stamp=carrier_stamp) is None:
-                return "pending"
+                return _ClaimReconcileResult("pending", pending_reason="ledger_orphan_stamp_deferred")
             record = _find_dispatch_record(str(fresh.get("dispatch_id") or ""))
         age_stamp = _launch_age_timestamp_s(fresh)
         if age_stamp is None and not (
@@ -7786,27 +7947,32 @@ def _reconcile_claim_transaction(
             try:
                 _write_json_atomic(claim, staged)
             except OSError:
-                return "pending"
+                return _ClaimReconcileResult("pending", pending_reason="carrier_orphan_stamp_write_deferred")
             if record is not None and txn.ledger_locked:
                 if _stamp_ledger_orphan_first_seen(record, txn=txn, stamp=stamp) is None:
-                    return "pending"
-            return "pending"
+                    return _ClaimReconcileResult("pending", pending_reason="ledger_orphan_stamp_deferred")
+            return _ClaimReconcileResult("pending", pending_reason="orphan_stale_window_started")
         if age_stamp is not None and max(0.0, time.time() - age_stamp) < max(0.0, stale_s):
-            return "pending"
+            return _ClaimReconcileResult("pending", pending_reason="orphan_not_stale")
         if record is not None and _dispatch_record_is_terminal(record):
             if not linked:
-                return "quarantined" if _quarantine_unlinked_claim_if_observed_orphan(
+                quarantined_path = _quarantine_unlinked_claim_if_observed_orphan(
                     claim,
                     fresh,
                     record,
                     reason=f"{reason}_unlinked_terminal",
                     stale_s=stale_s,
-                ) else "pending"
+                )
+                return (
+                    _ClaimReconcileResult("quarantined")
+                    if quarantined_path
+                    else _ClaimReconcileResult("pending", pending_reason="terminal_unlinked_quarantine_deferred")
+                )
             try:
                 claim.unlink()
             except OSError:
-                return "pending"
-            return "cleared"
+                return _ClaimReconcileResult("pending", pending_reason="terminal_carrier_unlink_deferred")
+            return _ClaimReconcileResult("cleared")
 
         decision = _entry_completion_authority(
             fresh,
@@ -7815,7 +7981,7 @@ def _reconcile_claim_transaction(
         )
         if _completion_decision_blocks_restore(decision):
             if _completion_decision_is_deferred(decision):
-                return "pending"
+                return _ClaimReconcileResult("pending", pending_reason="completion_authority_deferred")
             result, _marker = _commit_claim_terminal_in_txn(
                 txn,
                 fresh,
@@ -7825,31 +7991,41 @@ def _reconcile_claim_transaction(
                 resolution_source=decision.get("resolution_source"),
             )
             if not result.committed:
-                return "pending"
+                return _ClaimReconcileResult("pending", pending_reason="terminal_commit_deferred")
             terminal_mirror = (fresh, _marker)
             if not linked:
                 record = _find_dispatch_record(str(fresh.get("dispatch_id") or ""))
-                return "quarantined" if _quarantine_unlinked_claim_if_observed_orphan(
+                quarantined_path = _quarantine_unlinked_claim_if_observed_orphan(
                     claim,
                     fresh,
                     record,
                     reason=f"{reason}_unlinked_completion",
                     stale_s=stale_s,
-                ) else "pending"
+                )
+                return (
+                    _ClaimReconcileResult("quarantined")
+                    if quarantined_path
+                    else _ClaimReconcileResult("pending", pending_reason="completion_unlinked_quarantine_deferred")
+                )
             try:
                 claim.unlink()
             except OSError:
-                return "pending"
-            return "cleared"
+                return _ClaimReconcileResult("pending", pending_reason="completed_carrier_unlink_deferred")
+            return _ClaimReconcileResult("cleared")
 
         if not linked:
-            return "quarantined" if _quarantine_unlinked_claim_if_observed_orphan(
+            quarantined_path = _quarantine_unlinked_claim_if_observed_orphan(
                 claim,
                 fresh,
                 record,
                 reason=f"{reason}_unlinked",
                 stale_s=stale_s,
-            ) else "pending"
+            )
+            return (
+                _ClaimReconcileResult("quarantined")
+                if quarantined_path
+                else _ClaimReconcileResult("pending", pending_reason="unlinked_quarantine_deferred")
+            )
 
         target = queue_dir / claim.name.split(".claimed-", 1)[0]
         pre_spawn = _entry_pre_spawn(fresh)
@@ -7863,7 +8039,7 @@ def _reconcile_claim_transaction(
             )
             if restored is not None:
                 mirror = (_sanitize_restore_envelope(fresh, increment_recovery_count=True), restored)
-                return "restored"
+                return _ClaimReconcileResult("restored")
             if locked_decision is not None:
                 result, _marker = _commit_claim_terminal_in_txn(
                     txn,
@@ -7875,14 +8051,14 @@ def _reconcile_claim_transaction(
                     terminal_mirror = (fresh, _marker)
                     with contextlib.suppress(OSError):
                         claim.unlink()
-                    return "cleared"
-                return "pending"
+                    return _ClaimReconcileResult("cleared")
+                return _ClaimReconcileResult("pending", pending_reason="restore_terminal_commit_deferred")
         if target.exists():
             try:
                 claim.unlink()
             except OSError:
-                return "pending"
-            return "cleared"
+                return _ClaimReconcileResult("pending", pending_reason="duplicate_target_unlink_deferred")
+            return _ClaimReconcileResult("cleared")
 
         terminal_reason = (
             "claim_recovery_exhausted"
@@ -7891,13 +8067,13 @@ def _reconcile_claim_transaction(
         )
         result, _marker = _commit_claim_terminal_in_txn(txn, fresh, reason=terminal_reason)
         if not result.committed:
-            return "pending"
+            return _ClaimReconcileResult("pending", pending_reason="terminal_commit_deferred")
         terminal_mirror = (fresh, _marker)
         try:
             claim.unlink()
         except OSError:
-            return "pending"
-        return "cleared"
+            return _ClaimReconcileResult("pending", pending_reason="terminal_carrier_unlink_deferred")
+        return _ClaimReconcileResult("cleared")
     finally:
         txn.release()
         if mirror is not None:
@@ -7922,7 +8098,7 @@ def _act_on_orphan_claim(
         queue_dir=queue_dir,
         reason=reason,
         stale_s=0.0,
-    )
+    ).action
 
 
 def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
@@ -7931,6 +8107,7 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
     cleared = 0
     pending_launch = 0
     quarantined = 0
+    pending_reasons: list[dict] = []
     for claim in sorted(queue_dir.glob("*.json.claimed-*")):
         if claim.name.endswith(".failed"):
             continue
@@ -7940,7 +8117,7 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
             continue
         if not isinstance(entry, dict):
             continue
-        action = _reconcile_claim_transaction(
+        outcome = _reconcile_claim_transaction(
             claim,
             entry,
             queue_dir=queue_dir,
@@ -7951,6 +8128,7 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
             ),
             stale_s=stale_s,
         )
+        action = outcome.action
         if action == "restored":
             restored += 1
         elif action == "cleared":
@@ -7959,11 +8137,15 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
             quarantined += 1
         else:
             pending_launch += 1
+            detail = outcome.pending_detail(str(entry.get("dispatch_id") or claim.name))
+            if detail is not None:
+                pending_reasons.append(detail)
 
     ledger_stats = _reconcile_ledger_prelaunch_orphans(queue_dir, stale_s=stale_s, now=time.time())
     ledger_terminalized = int(ledger_stats.get("terminalized") or 0)
     pending_launch += int(ledger_stats.get("pending") or 0)
     quarantined += int(ledger_stats.get("quarantined") or 0)
+    pending_reasons.extend(ledger_stats.get("pending_reasons") or [])
     # cleared includes carriers removed after terminalization; quarantined is
     # reported separately so callers can distinguish park-vs-delete without
     # breaking older exact-dict assertions that only key restored/cleared/pending.
@@ -7973,6 +8155,7 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
         "pending_launch": pending_launch,
         "quarantined": quarantined,
         "ledger_terminalized": ledger_terminalized,
+        "pending_reasons": pending_reasons,
     }
 
 
@@ -8094,10 +8277,16 @@ def _reconcile_ledger_prelaunch_orphans(
     terminalized = 0
     pending = 0
     quarantined = 0
+    pending_reasons: list[dict] = []
     try:
         records = goalflight_ledger.read_records()
     except Exception:
-        return {"terminalized": 0, "pending": 0, "quarantined": 0}
+        return {
+            "terminalized": 0,
+            "pending": 0,
+            "quarantined": 0,
+            "pending_reasons": [],
+        }
 
     for record in records:
         if not isinstance(record, dict):
@@ -8116,13 +8305,20 @@ def _reconcile_ledger_prelaunch_orphans(
                     queue_dir=queue_dir,
                 )
             ):
+                mark_refusals: list[_ReconcileRefusal] = []
                 if not _mark_claim_worker_dead(
                     entry,
                     reason="watcher_terminal_reconcile",
                     queue_dir=queue_dir,
                     stale_s=stale_s,
+                    refusal_out=mark_refusals,
                 ):
                     pending += 1
+                    pending_reasons.append(
+                        mark_refusals[0].as_dict(dispatch_id)
+                        if mark_refusals
+                        else {"dispatch_id": dispatch_id, "reason": "terminal_requeue_deferred"}
+                    )
             continue
         state = str(record.get("state") or "")
         if state not in PRELAUNCH_CANDIDATE_STATES and state not in {"running", "running_quiet"}:
@@ -8138,14 +8334,29 @@ def _reconcile_ledger_prelaunch_orphans(
         if admission is PreAdmitClass.INDETERMINATE:
             _alert_identity_indeterminate(dispatch_id, where="ledger", reason="pre_admit_indeterminate")
             pending += 1
+            pending_reasons.append(
+                {
+                    "dispatch_id": dispatch_id,
+                    "reason": ReconcileRefusalReason.PRE_ADMISSION_DEFERRED.value,
+                    "detail": "pre_admit_indeterminate",
+                    "admission": admission.value,
+                }
+            )
             continue
         if ADMISSION_DECISION[admission] is AdmissionAction.DEFER_UNCHANGED:
             pending += 1
+            pending_reasons.append(
+                _ReconcileRefusal(
+                    ReconcileRefusalReason.PRE_ADMISSION_DEFERRED,
+                    admission,
+                    ADMISSION_DECISION[admission].value,
+                ).as_dict(dispatch_id)
+            )
             continue
         linked = _is_task_linked(entry, record)
         age_stamp = _launch_age_timestamp_s(entry)
         if age_stamp is None:
-            txn = _begin_reconcile_transaction(
+            begin = _begin_reconcile_transaction(
                 entry,
                 queue_dir=queue_dir,
                 stale_s=stale_s,
@@ -8154,8 +8365,11 @@ def _reconcile_ledger_prelaunch_orphans(
                 need_ledger=True,
                 admission=admission,
             )
+            txn = begin.transaction
             if txn is None:
                 pending += 1
+                assert begin.refusal is not None
+                pending_reasons.append(begin.refusal.as_dict(dispatch_id))
                 continue
             try:
                 stamped = _stamp_ledger_orphan_first_seen(record, txn=txn)
@@ -8163,22 +8377,38 @@ def _reconcile_ledger_prelaunch_orphans(
                 txn.release()
             if stamped is None:
                 pending += 1
+                pending_reasons.append(
+                    {"dispatch_id": dispatch_id, "reason": "ledger_orphan_stamp_deferred"}
+                )
                 continue
             pending += 1
+            pending_reasons.append(
+                {"dispatch_id": dispatch_id, "reason": "orphan_stale_window_started"}
+            )
             continue
         if max(0.0, now_s - age_stamp) < max(0.0, stale_s):
             pending += 1
+            pending_reasons.append(
+                {"dispatch_id": dispatch_id, "reason": "orphan_not_stale"}
+            )
             continue
         if linked:
+            mark_refusals = []
             if _mark_claim_worker_dead(
                 entry,
                 reason="claim_carrier_missing",
                 queue_dir=queue_dir,
                 stale_s=stale_s,
+                refusal_out=mark_refusals,
             ):
                 terminalized += 1
             else:
                 pending += 1
+                pending_reasons.append(
+                    mark_refusals[0].as_dict(dispatch_id)
+                    if mark_refusals
+                    else {"dispatch_id": dispatch_id, "reason": "ledger_terminalization_deferred"}
+                )
         else:
             # Unlinked ledger-only zombie: alert, do not auto-terminalize (E).
             print(
@@ -8196,7 +8426,12 @@ def _reconcile_ledger_prelaunch_orphans(
                 flush=True,
             )
             quarantined += 1
-    return {"terminalized": terminalized, "pending": pending, "quarantined": quarantined}
+    return {
+        "terminalized": terminalized,
+        "pending": pending,
+        "quarantined": quarantined,
+        "pending_reasons": pending_reasons,
+    }
 
 
 def _stamp_ledger_orphan_first_seen(
@@ -9276,6 +9511,7 @@ def _mark_claim_worker_dead(
     claim: Path | None = None,
     queue_dir: Path | None = None,
     stale_s: float = 0.0,
+    refusal_out: list[_ReconcileRefusal] | None = None,
 ) -> bool:
     """Terminalize a claim/ledger orphan. Sets record ``state`` (not only
     ``terminal_state``) so ``goalflight_status.py --wait`` resolves (b-065 B).
@@ -9318,7 +9554,7 @@ def _mark_claim_worker_dead(
         if claim is not None
         else queue_dir or _dispatch_queue_dir()
     )
-    txn = _begin_reconcile_transaction(
+    begin = _begin_reconcile_transaction(
         entry,
         queue_dir=queue_dir,
         stale_s=stale_s,
@@ -9326,7 +9562,10 @@ def _mark_claim_worker_dead(
         need_task_store=_is_task_linked(entry, _find_dispatch_record(dispatch_id)),
         need_ledger=True,
     )
+    txn = begin.transaction
     if txn is None:
+        if refusal_out is not None and begin.refusal is not None:
+            refusal_out.append(begin.refusal)
         return False
     try:
         fresh = entry

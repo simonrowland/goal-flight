@@ -9,6 +9,7 @@ skip_posix_on_native_windows("dispatch queue tests launch POSIX bash workers")
 
 import argparse
 import contextlib
+import datetime as dt
 import io
 import json
 import os
@@ -1487,26 +1488,216 @@ def test_stale_claim_without_worker_record_is_recovered() -> None:
             os.environ.update(env)
             queue = tmp / "state" / "dispatch-queue"
             queue.mkdir(parents=True)
-            claim = queue / "recover-me.json.claimed-123"
-            claim.write_text(
-                json.dumps(
-                    {
-                        "schema": D.DISPATCH_QUEUE_SCHEMA,
-                        "dispatch_id": "recover-me",
-                        "dispatch_argv": ["--agent", "test-dispatch"],
-                        "task_ids": ["recover-me-task"],
-                    }
-                ),
-                encoding="utf-8",
+            project = tmp / "project"
+            project.mkdir()
+            age_s = D.QUEUE_CLAIM_STALE_S + 83.0
+            created_at = (
+                dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=age_s)
+            ).isoformat()
+            queued = queue / "recover-me.json"
+            entry = {
+                "schema": D.DISPATCH_QUEUE_SCHEMA,
+                "state": "claimed",
+                "dispatch_id": "recover-me",
+                "shape": "bash",
+                "project_root": str(project),
+                "dispatch_argv": ["--agent", "test-dispatch"],
+                "task_ids": ["recover-me-task"],
+                "queue_launch_token": "recover-me-token",
+                "created_at": created_at,
+                "request": {
+                    "cwd": str(project),
+                    "shape": "bash",
+                    "tail": str(tmp / "recover-me.tail"),
+                    "task_ids": ["recover-me-task"],
+                },
+            }
+            queued.write_text(json.dumps(entry), encoding="utf-8")
+            claimant = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,sys,time; from pathlib import Path; "
+                        "p=Path(sys.argv[1]); "
+                        "q=p.with_name(f'{p.name}.claimed-{os.getpid()}-{int(time.time()*1000)}'); "
+                        "p.rename(q); print(os.getpid())"
+                    ),
+                    str(queued),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
             )
-            os.utime(claim, (time.time() - 60, time.time() - 60))
-            result = D._recover_claimed_queue_entries(queue, stale_s=0)
+            claimant_pid = int(claimant.stdout.strip())
+            claim = next(queue.glob("recover-me.json.claimed-*"))
+            os.utime(claim, (time.time() - age_s, time.time() - age_s))
+
+            record = D._find_dispatch_record("recover-me")
+            tail = D._entry_tail_path(entry, record)
+            transport = D._entry_transport(entry, record)
+            locality = "remote" if transport == "fleet" or D._entry_node(entry, record) else "local"
+            filesystem = D._tail_filesystem_identity(tail, locality=locality)
+            capability = D._probe_flock_capability(
+                transport=transport,
+                node=None,
+                tail_path=tail,
+                filesystem=filesystem,
+            )
+            admission = D.classify_reconciliation_admission(
+                entry,
+                time.time(),
+                stale_s=D.QUEUE_CLAIM_STALE_S,
+            )
+            mode = D.resolve_reconciliation_mode(
+                transport=transport,
+                node=None,
+                locality=locality,
+                tail_path=tail,
+                tail_filesystem=filesystem,
+                flock_probe=capability,
+                producer_set_authoritative=D._producer_set_authoritative(entry, admission),
+                node_authority_available=False,
+                worker_tail_lock_contract=True,
+            )
+            result = D._recover_claimed_queue_entries(
+                queue,
+                stale_s=D.QUEUE_CLAIM_STALE_S,
+            )
         finally:
             os.environ.clear()
             os.environ.update(old_env)
+        assert D.goalflight_ledger.process_identity(claimant_pid) is None
+        assert admission is D.PreAdmitClass.STALE_NO_SPAWN
+        assert D.ADMISSION_DECISION[admission] is D.AdmissionAction.ADMIT_TO_GATE
+        assert transport == "bash" and locality == "local"
+        assert capability is D.FlockCapability.COHERENT_LOCAL
+        assert filesystem.locality == "local"
+        assert mode is D.ReconciliationMode.LOCAL_FLOCK
         assert result["restored"] == 1, result
         assert (tmp / "state" / "dispatch-queue" / "recover-me.json").exists()
         assert not claim.exists()
+
+
+def test_reconcile_refusal_paths_surface_distinct_recovery_reasons() -> None:
+    original_tail_gate = D._tail_reconciliation_lock
+    original_acquire = D.acquire_reconcile_locks
+
+    class BusyGate:
+        def __enter__(self):
+            raise D._TailLockBusy("injected busy tail")
+
+        def __exit__(self, *_args):
+            return None
+
+    cases = {
+        "A": D.ReconcileRefusalReason.PRE_ADMISSION_DEFERRED,
+        "B": D.ReconcileRefusalReason.RECONCILIATION_MODE_DEFERRED,
+        "C": D.ReconcileRefusalReason.TAIL_GATE_DEFERRED,
+        "D_queue": D.ReconcileRefusalReason.DOWNSTREAM_LOCK_DEFERRED,
+        "D_task_store": D.ReconcileRefusalReason.DOWNSTREAM_LOCK_DEFERRED,
+        "D_ledger": D.ReconcileRefusalReason.DOWNSTREAM_LOCK_DEFERRED,
+        "D_error": D.ReconcileRefusalReason.DOWNSTREAM_LOCK_DEFERRED,
+    }
+    downstream_results = {
+        "D_queue": D.AcquireResult.QUEUE_LOCK_DEFERRED,
+        "D_task_store": D.AcquireResult.TASK_STORE_LOCK_DEFERRED,
+        "D_ledger": D.AcquireResult.LEDGER_LOCK_DEFERRED,
+        "D_error": D.AcquireResult.LOCK_ERROR_DEFERRED,
+    }
+    observed: dict[str, dict] = {}
+    try:
+        for branch, expected_reason in cases.items():
+            with tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                env = _b065_env(tmp)
+                old_env = os.environ.copy()
+                try:
+                    os.environ.clear()
+                    os.environ.update(env)
+                    queue = tmp / "state" / "dispatch-queue"
+                    project = tmp / "project"
+                    queue.mkdir(parents=True)
+                    project.mkdir()
+                    age_s = 0.0 if branch == "A" else D.QUEUE_CLAIM_STALE_S + 83.0
+                    created_at = (
+                        dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=age_s)
+                    ).isoformat()
+                    dispatch_id = f"refusal-{branch.lower()}"
+                    claim = queue / f"{dispatch_id}.json.claimed-99999991"
+                    entry = {
+                        "schema": D.DISPATCH_QUEUE_SCHEMA,
+                        "state": "claimed",
+                        "dispatch_id": dispatch_id,
+                        "shape": "bash",
+                        "project_root": str(project),
+                        "dispatch_argv": ["--agent", "test-dispatch"],
+                        "task_ids": [f"task-{branch.lower()}"],
+                        "queue_launch_token": f"token-{branch.lower()}",
+                        "queue_tail_flock_contract": branch != "B",
+                        "created_at": created_at,
+                        "request": {
+                            "cwd": str(project),
+                            "shape": "bash",
+                            "tail": str(tmp / f"{dispatch_id}.tail"),
+                            "task_ids": [f"task-{branch.lower()}"],
+                        },
+                    }
+                    claim.write_text(json.dumps(entry), encoding="utf-8")
+                    os.utime(claim, (time.time() - age_s, time.time() - age_s))
+
+                    D._tail_reconciliation_lock = (
+                        (lambda _tail: BusyGate())
+                        if branch == "C"
+                        else original_tail_gate
+                    )
+                    D.acquire_reconcile_locks = (
+                        (lambda *_args, _result=downstream_results[branch], **_kwargs: _result)
+                        if branch in downstream_results
+                        else original_acquire
+                    )
+                    if branch == "A":
+                        direct = D._begin_reconcile_transaction(
+                            entry,
+                            queue_dir=queue,
+                            stale_s=D.QUEUE_CLAIM_STALE_S,
+                            need_queue=True,
+                            need_task_store=True,
+                            need_ledger=True,
+                            admission=D.PreAdmitClass.NOT_STALE,
+                        )
+                        assert direct.transaction is None, direct
+                        assert direct.refusal is not None, direct
+                        assert (
+                            direct.refusal.reason
+                            is D.ReconcileRefusalReason.PRE_ADMISSION_DEFERRED
+                        ), direct
+                    result = D._recover_claimed_queue_entries(
+                        queue,
+                        stale_s=D.QUEUE_CLAIM_STALE_S,
+                    )
+                    assert result["pending_launch"] == 1, (branch, result)
+                    assert claim.exists(), (branch, result)
+                    assert len(result["pending_reasons"]) == 1, (branch, result)
+                    detail = result["pending_reasons"][0]
+                    assert detail["reason"] == expected_reason.value, (branch, detail)
+                    observed[branch] = detail
+                finally:
+                    os.environ.clear()
+                    os.environ.update(old_env)
+    finally:
+        D._tail_reconciliation_lock = original_tail_gate
+        D.acquire_reconcile_locks = original_acquire
+
+    assert observed["A"]["admission"] == D.PreAdmitClass.NOT_STALE.value
+    assert observed["B"]["mode"] == D.ReconciliationMode.FAIL_CLOSED_DEFER.value
+    assert observed["B"]["transport"] == "bash"
+    assert observed["B"]["locality"] == "local"
+    assert observed["B"]["capability"] == D.FlockCapability.COHERENT_LOCAL.value
+    assert observed["B"]["filesystem"]["locality"] == "local"
+    assert observed["C"]["detail"] == D._TailLockBusy.__name__
+    for branch, expected in downstream_results.items():
+        assert observed[branch]["detail"] == expected.value, (branch, observed[branch])
 
 
 def test_failed_claim_tombstone_is_not_recovered() -> None:
@@ -1943,7 +2134,7 @@ def test_live_unlinked_cleanup_sites_agree_never_to_quarantine() -> None:
                                 queue_dir=queue,
                                 reason="shared_live_policy_transaction",
                                 stale_s=0,
-                            )
+                            ).action
                         finally:
                             D.classify_reconciliation_admission = original_classify
                     actions.append(action)
@@ -1954,6 +2145,93 @@ def test_live_unlinked_cleanup_sites_agree_never_to_quarantine() -> None:
             assert not list((queue / "quarantine").glob("*"))
         finally:
             D.classify_reconciliation_admission = original_classify
+            os.environ.clear()
+            os.environ.update(old_env)
+
+
+def test_positive_live_cleanup_reports_exact_pending_reason() -> None:
+    """A live worker stays protected while each cleanup refusal remains diagnosable."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _b065_env(tmp)
+        old_env = os.environ.copy()
+        original_q_lock = D.try_acquire_queue_lock
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            dispatch_id = "live-cleanup-reasons"
+            token = "live-cleanup-token"
+            claim = queue / f"{dispatch_id}.json.claimed-1"
+            with _sleeping_worker() as worker:
+                identity = D.goalflight_ledger.process_identity(worker.pid)
+                entry = {
+                    "schema": D.DISPATCH_QUEUE_SCHEMA,
+                    "state": "claimed",
+                    "dispatch_id": dispatch_id,
+                    "dispatch_argv": ["--agent", "test-dispatch"],
+                    "created_at": D.goalflight_ledger.utc_now(),
+                    "queue_launch_token": token,
+                    "queue_launch_started": True,
+                    "queue_worker_pid": worker.pid,
+                    "queue_worker_identity": identity,
+                }
+                claim.write_text(json.dumps(entry), encoding="utf-8")
+                D.goalflight_ledger.write_record(
+                    {
+                        "schema": D.goalflight_ledger.SCHEMA,
+                        "dispatch_id": dispatch_id,
+                        "state": "running",
+                        "terminal_state": "unknown",
+                        "worker_pid": worker.pid,
+                        "worker_identity": identity,
+                        "queue_launch_token": token,
+                        "started_at": D.goalflight_ledger.utc_now(),
+                    }
+                )
+
+                def assert_recovery_reason(expected: str) -> None:
+                    result = D._recover_claimed_queue_entries(queue, stale_s=300)
+                    assert result["pending_launch"] == 1, result
+                    assert [item["reason"] for item in result["pending_reasons"]] == [
+                        expected
+                    ], result
+                    assert claim.exists(), f"{expected} must preserve live carrier"
+
+                D.try_acquire_queue_lock = lambda *_args, **_kwargs: None
+                assert_recovery_reason("queue_lock_deferred")
+
+                def raise_lock_error(*_args, **_kwargs):
+                    raise OSError("injected queue lock open error")
+
+                D.try_acquire_queue_lock = raise_lock_error
+                assert_recovery_reason("queue_lock_error_deferred")
+
+                def corrupt_claim_after_lock(*args, **kwargs):
+                    handle = original_q_lock(*args, **kwargs)
+                    assert handle is not None
+                    claim.write_text("{", encoding="utf-8")
+                    return handle
+
+                claim.write_text(json.dumps(entry), encoding="utf-8")
+                D.try_acquire_queue_lock = corrupt_claim_after_lock
+                assert_recovery_reason("claim_read_deferred")
+
+                def replace_token_after_lock(*args, **kwargs):
+                    handle = original_q_lock(*args, **kwargs)
+                    assert handle is not None
+                    claim.write_text(
+                        json.dumps({**entry, "queue_launch_token": "replacement-token"}),
+                        encoding="utf-8",
+                    )
+                    return handle
+
+                claim.write_text(json.dumps(entry), encoding="utf-8")
+                D.try_acquire_queue_lock = replace_token_after_lock
+                assert_recovery_reason("launch_token_changed")
+        finally:
+            D.try_acquire_queue_lock = original_q_lock
             os.environ.clear()
             os.environ.update(old_env)
 
@@ -1984,7 +2262,13 @@ def test_unlinked_no_record_quarantine_freezes_ledger_absence() -> None:
 
             def capture_begin(*_args, **kwargs):
                 observed_need_ledger.append(bool(kwargs.get("need_ledger")))
-                return None
+                return D._BeginReconcileResult(
+                    refusal=D._ReconcileRefusal(
+                        D.ReconcileRefusalReason.DOWNSTREAM_LOCK_DEFERRED,
+                        D.PreAdmitClass.STALE_NO_SPAWN,
+                        D.AcquireResult.LEDGER_LOCK_DEFERRED.value,
+                    )
+                )
 
             D._begin_reconcile_transaction = capture_begin
             action = D._reconcile_claim_transaction(
@@ -1993,7 +2277,7 @@ def test_unlinked_no_record_quarantine_freezes_ledger_absence() -> None:
                 queue_dir=queue,
                 reason="unlinked_no_record_lock_test",
                 stale_s=0,
-            )
+            ).action
 
             assert action == "pending", action
             assert observed_need_ledger == [True], observed_need_ledger
@@ -4079,6 +4363,7 @@ def test_round5_deadline_locks_zero_mutation_and_progress() -> None:
         tmp = Path(td)
         env = _b065_env(tmp)
         old_env = os.environ.copy()
+        original_q_lock = D.try_acquire_queue_lock
         try:
             os.environ.clear()
             os.environ.update(env)
@@ -4097,16 +4382,29 @@ def test_round5_deadline_locks_zero_mutation_and_progress() -> None:
             admission = D.PreAdmitClass.STALE_NO_SPAWN
             store = goalflight_task.TaskStore(project)
             store._ensure_docs_dir_for_write()
+            # Warm filesystem/flock capability discovery so the elapsed bound
+            # below measures only the bounded downstream lock attempt.
+            warmed = D._begin_reconcile_transaction(
+                entry,
+                queue_dir=queue,
+                stale_s=0,
+                need_queue=False,
+                need_task_store=False,
+                need_ledger=False,
+                admission=admission,
+            ).transaction
+            assert warmed is not None
+            warmed.release()
             cases = []
             q_hold = D.try_acquire_queue_lock(queue, deadline_s=time.monotonic() + 1)
             assert q_hold is not None
-            cases.append((q_hold, True, True, True))
+            cases.append((q_hold, True, True, True, D.AcquireResult.QUEUE_LOCK_DEFERRED))
             s_hold = store.try_store_lock(deadline_s=time.monotonic() + 1)
             assert s_hold is not None
-            cases.append((s_hold, False, True, True))
+            cases.append((s_hold, False, True, True, D.AcquireResult.TASK_STORE_LOCK_DEFERRED))
             l_hold = D.goalflight_ledger.StateLock.try_acquire(time.monotonic() + 1)
             assert l_hold is not None
-            cases.append((l_hold, False, False, True))
+            cases.append((l_hold, False, False, True, D.AcquireResult.LEDGER_LOCK_DEFERRED))
 
             def durable_snapshot() -> dict[str, bytes | None]:
                 snapshot: dict[str, bytes | None] = {}
@@ -4118,13 +4416,13 @@ def test_round5_deadline_locks_zero_mutation_and_progress() -> None:
                 return snapshot
 
             # Exercise each independently, releasing unrelated holds first.
-            for index, (hold, need_q, need_s, need_l) in enumerate(cases):
+            for index, (hold, need_q, need_s, need_l, expected_acquire) in enumerate(cases):
                 for other, *_ in cases:
                     if other is not hold:
                         other.release()
                 before = durable_snapshot()
                 started = time.monotonic()
-                txn = D._begin_reconcile_transaction(
+                refused = D._begin_reconcile_transaction(
                     entry,
                     queue_dir=queue,
                     stale_s=0,
@@ -4134,7 +4432,10 @@ def test_round5_deadline_locks_zero_mutation_and_progress() -> None:
                     admission=admission,
                 )
                 elapsed = time.monotonic() - started
-                assert txn is None, (index, txn)
+                assert refused.transaction is None, (index, refused)
+                assert refused.refusal is not None, (index, refused)
+                assert refused.refusal.reason is D.ReconcileRefusalReason.DOWNSTREAM_LOCK_DEFERRED
+                assert refused.refusal.detail == expected_acquire.value, (index, refused)
                 assert elapsed < 0.35, (index, elapsed)
                 after = durable_snapshot()
                 assert after == before, (index, before, after)
@@ -4148,16 +4449,47 @@ def test_round5_deadline_locks_zero_mutation_and_progress() -> None:
                     need_task_store=need_s,
                     need_ledger=need_l,
                     admission=admission,
-                )
+                ).transaction
                 assert progressed is not None, index
                 progressed.release()
                 if index + 1 < len(cases):
                     # Reacquire the next case after prior handles were released.
                     if index + 1 == 1:
-                        cases[index + 1] = (store.try_store_lock(deadline_s=time.monotonic() + 1), False, True, True)
+                        cases[index + 1] = (
+                            store.try_store_lock(deadline_s=time.monotonic() + 1),
+                            False,
+                            True,
+                            True,
+                            D.AcquireResult.TASK_STORE_LOCK_DEFERRED,
+                        )
                     elif index + 1 == 2:
-                        cases[index + 1] = (D.goalflight_ledger.StateLock.try_acquire(time.monotonic() + 1), False, False, True)
+                        cases[index + 1] = (
+                            D.goalflight_ledger.StateLock.try_acquire(time.monotonic() + 1),
+                            False,
+                            False,
+                            True,
+                            D.AcquireResult.LEDGER_LOCK_DEFERRED,
+                        )
+
+            def injected_lock_error(*_args, **_kwargs):
+                raise OSError("injected lock provider error")
+
+            D.try_acquire_queue_lock = injected_lock_error
+            errored = D._begin_reconcile_transaction(
+                {**entry, "dispatch_id": "round5-lock-error"},
+                queue_dir=queue,
+                stale_s=0,
+                need_queue=True,
+                need_task_store=False,
+                need_ledger=False,
+                admission=admission,
+            )
+            assert errored.transaction is None, errored
+            assert errored.refusal is not None, errored
+            assert errored.refusal.reason is D.ReconcileRefusalReason.DOWNSTREAM_LOCK_DEFERRED
+            assert errored.refusal.detail == D.AcquireResult.LOCK_ERROR_DEFERRED.value
         finally:
+            D.try_acquire_queue_lock = original_q_lock
             os.environ.clear()
             os.environ.update(old_env)
 
@@ -4188,7 +4520,7 @@ def test_round5_missing_row_terminal_result_and_deferred_write() -> None:
                 need_task_store=False,
                 need_ledger=True,
                 admission=D.PreAdmitClass.STALE_NO_SPAWN,
-            )
+            ).transaction
             assert txn is not None
             try:
                 result = D.commit_reconciled_terminal(
@@ -4209,7 +4541,7 @@ def test_round5_missing_row_terminal_result_and_deferred_write() -> None:
                 need_task_store=False,
                 need_ledger=True,
                 admission=D.PreAdmitClass.STALE_NO_SPAWN,
-            )
+            ).transaction
             assert txn is not None
             D.goalflight_ledger.write_record = lambda _record: (_ for _ in ()).throw(OSError("injected"))
             try:
@@ -4230,7 +4562,7 @@ def test_round5_missing_row_terminal_result_and_deferred_write() -> None:
                 need_task_store=False,
                 need_ledger=True,
                 admission=D.PreAdmitClass.STALE_NO_SPAWN,
-            )
+            ).transaction
             assert txn is not None
             D.goalflight_ledger.write_record = original_write
             D._entry_completion_authority = lambda *_args, **_kwargs: {
@@ -4663,7 +4995,7 @@ def test_round5_tail_substitution_and_frozen_lock_order() -> None:
                 need_task_store=True,
                 need_ledger=True,
                 admission=D.PreAdmitClass.STALE_NO_SPAWN,
-            )
+            ).transaction
             assert txn is not None
             substituted = {**entry, "request": {**entry["request"], "tail": str(tmp / "tail-b")}}
             assert not D._reconcile_transaction_still_valid(txn, substituted)
@@ -4699,6 +5031,7 @@ def main() -> None:
     test_drain_degrades_unknown_priority_to_normal_and_survives_bad_json_prescan()
     test_drain_does_not_tombstone_valid_entry_on_stale_prescan_read_error()
     test_stale_claim_without_worker_record_is_recovered()
+    test_reconcile_refusal_paths_surface_distinct_recovery_reasons()
     test_failed_claim_tombstone_is_not_recovered()
     test_fresh_token_only_claim_waits_for_stale_window()
     test_stale_claim_launch_token_requires_matching_worker_record()
@@ -4706,6 +5039,7 @@ def main() -> None:
     test_observed_unlinked_terminal_orphan_is_quarantined()
     test_terminal_record_with_live_worker_identity_is_preserved()
     test_live_unlinked_cleanup_sites_agree_never_to_quarantine()
+    test_positive_live_cleanup_reports_exact_pending_reason()
     test_unlinked_no_record_quarantine_freezes_ledger_absence()
     test_stale_claim_result_marker_with_rate_limit_text_completes()
     test_claim_recovery_terminal_marker_normalization_is_moonshot_family()
