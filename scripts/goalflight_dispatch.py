@@ -112,6 +112,7 @@ LAUNCH_TIMEOUT_S = QUEUE_CLAIM_STALE_S
 ABANDONED_RECONCILE_STALE_S = QUEUE_CLAIM_STALE_S
 ABANDONED_RECONCILIATION_SCHEMA = "goalflight.abandoned-reconciliation.v1"
 MAX_CLAIM_RECOVERY_REQUEUES = 1
+MAX_COMPLETION_AUTHORITY_DEFERRALS = 1
 RECONCILE_DOWNSTREAM_LOCK_BUDGET_S = 0.100
 RECONCILE_LOCK_POLL_S = 0.010
 PRELAUNCH_CANDIDATE_STATES = frozenset(
@@ -5389,6 +5390,15 @@ def _claim_recovery_count(entry: dict | None) -> int:
         return 0
 
 
+def _completion_authority_deferral_count(entry: dict | None) -> int:
+    if not isinstance(entry, dict):
+        return 0
+    try:
+        return max(0, int(entry.get("completion_authority_deferral_count") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _queue_quarantine_dir(queue_dir: Path) -> Path:
     path = queue_dir / "quarantine"
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -6377,7 +6387,10 @@ def _commit_abandoned_dispatch(
         )
     winner = committed.value
     terminal_state = winner.terminal_state
-    ended_at = goalflight_ledger.utc_now()
+    ended_at = goalflight_ledger.preserve_first_terminal_time(
+        record,
+        winner.terminal_at,
+    )
     basis = "observed_terminal_marker" if marker is not None else "inferred_abandonment"
     reconciliation = {
         "source": "goalflight_dispatch.drain",
@@ -6398,7 +6411,6 @@ def _commit_abandoned_dispatch(
     record.update(
         {
             "state": state,
-            "ended_at": ended_at,
             "terminal_state": terminal_state,
             "liveness_state": goalflight_terminal.terminal_liveness_state(state),
             "worker_still_alive": False,
@@ -7130,11 +7142,21 @@ def _entry_completion_authority(
             "salvage_required": True,
         }
     if task_truth == "indeterminate":
+        if (
+            _completion_authority_deferral_count(entry)
+            >= MAX_COMPLETION_AUTHORITY_DEFERRALS
+        ):
+            # One locked re-read has already failed to order the events. No
+            # fixed timestamp can make the next read more decisive, so restore
+            # for launch: duplicate work is recoverable; a lost follow-up is not.
+            return None
         return {
             "state": "deferred",
             "reason": "completion_authority_indeterminate",
             "marker": None,
             "source": "authority",
+            "deferral_count": _completion_authority_deferral_count(entry),
+            "deferral_limit": MAX_COMPLETION_AUTHORITY_DEFERRALS,
         }
     return None
 
@@ -7418,6 +7440,25 @@ def _sanitize_restore_envelope(entry: dict, *, increment_recovery_count: bool) -
     return restored
 
 
+def _persist_completion_authority_deferral(claim: Path, entry: dict) -> int | None:
+    """Persist the bounded ambiguity budget on the durable queue carrier."""
+    staged = dict(entry)
+    count = min(
+        MAX_COMPLETION_AUTHORITY_DEFERRALS,
+        _completion_authority_deferral_count(entry) + 1,
+    )
+    staged["completion_authority_deferral_count"] = count
+    staged["completion_authority_deferred_at"] = goalflight_ledger.utc_now()
+    staged["updated_at"] = staged["completion_authority_deferred_at"]
+    try:
+        _write_json_atomic(claim, staged)
+    except OSError:
+        return None
+    entry.clear()
+    entry.update(staged)
+    return count
+
+
 def _commit_restore_transaction(
     txn: _ReconcileTransaction,
     claim: Path,
@@ -7435,7 +7476,12 @@ def _commit_restore_transaction(
     record = _find_dispatch_record(str(fresh.get("dispatch_id") or ""))
     decision = _entry_completion_authority(fresh, task_store_locked=txn.task_store_locked)
     if _completion_decision_is_deferred(decision):
-        return None, decision
+        persisted_count = _persist_completion_authority_deferral(claim, fresh)
+        return None, {
+            **decision,
+            "deferral_count": persisted_count,
+            "deferral_persisted": persisted_count is not None,
+        }
     if _completion_decision_blocks_restore(decision):
         if target.exists():
             try:
@@ -8037,6 +8083,15 @@ def _reconcile_claim_transaction(
         )
         if _completion_decision_blocks_restore(decision):
             if _completion_decision_is_deferred(decision):
+                persisted_count = _persist_completion_authority_deferral(
+                    claim,
+                    fresh,
+                )
+                if persisted_count is None:
+                    return _ClaimReconcileResult(
+                        "pending",
+                        pending_reason="completion_authority_deferral_write_deferred",
+                    )
                 return _ClaimReconcileResult("pending", pending_reason="completion_authority_deferred")
             result, _marker = _commit_claim_terminal_in_txn(
                 txn,
@@ -9241,11 +9296,13 @@ def commit_reconciled_terminal(
     winner = committed.value
     terminal_state = winner.terminal_state
 
-    ended_at = goalflight_ledger.utc_now()
+    ended_at = goalflight_ledger.preserve_first_terminal_time(
+        record,
+        winner.terminal_at,
+    )
     record.update(
         {
             "state": state,
-            "ended_at": ended_at,
             "terminal_state": terminal_state,
             "liveness_state": goalflight_terminal.terminal_liveness_state(state),
             "worker_still_alive": False,

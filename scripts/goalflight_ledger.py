@@ -385,13 +385,40 @@ def record_path(dispatch_id: str, *, create: bool = True) -> Path:
     return runs_dir(create=create) / f"{goalflight_compat.safe_dispatch_filename(dispatch_id)}.json"
 
 
+def preserve_first_terminal_time(record: dict, terminal_at: object = None) -> str | None:
+    """Keep the first terminal instant; backfill only from journal authority.
+
+    The journal commits ``terminal_at`` atomically with the winning transition.
+    Projectors may run much later or retry indefinitely, so their wall clock is
+    never terminal-ordering evidence.
+    """
+    existing = record.get("ended_at")
+    if existing not in (None, ""):
+        return str(existing)
+    if terminal_at not in (None, ""):
+        record["ended_at"] = str(terminal_at)
+        return str(terminal_at)
+    return None
+
+
 def write_record(record: dict) -> Path:
     if record.get("project_root") not in (None, ""):
         record["project_root"] = canonicalize_project_root_on_store(
             record["project_root"]
         )
-    record["updated_at"] = utc_now()
     path = record_path(record["dispatch_id"])
+    if path.exists():
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            current = None
+        if isinstance(current, dict):
+            current_ended_at = current.get("ended_at")
+            if current_ended_at not in (None, ""):
+                # The on-disk value won the first projection. A stale caller
+                # cannot replace it, even if that caller carries a timestamp.
+                record["ended_at"] = current_ended_at
+    record["updated_at"] = utc_now()
     tmp = path.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as handle:
         handle.write(json.dumps(record, indent=2, sort_keys=True) + "\n")
@@ -944,13 +971,7 @@ def cmd_finish(args: argparse.Namespace) -> int:
             else winner_state
         )
         record["state"] = effective_state
-        ended_at = record.get("ended_at")
-        # ended_at is the first ledger terminal time and an ordering authority.
-        # An idempotent retry cannot safely backfill or refresh it because the
-        # original terminal event may predate work queued in the meantime.
-        if "ended_at" not in record and not winner.idempotent:
-            ended_at = utc_now()
-            record["ended_at"] = ended_at
+        ended_at = preserve_first_terminal_time(record, winner.terminal_at)
         record["terminal_state"] = terminal_state
         record["liveness_state"] = goalflight_terminal.terminal_liveness_state(effective_state)
         elapsed_s = getattr(args, "elapsed_s", None)
@@ -1219,7 +1240,6 @@ def reconcile_terminal_outbox(
                                 or result.value.terminal_state
                             ),
                             "terminal_state": result.value.terminal_state,
-                            "ended_at": utc_now(),
                             "worker_still_alive": False,
                             "attempt_id": result.value.attempt_id,
                             "transition_id": result.value.transition_id,
@@ -1227,6 +1247,7 @@ def reconcile_terminal_outbox(
                             "reason": reason,
                         }
                     )
+                    preserve_first_terminal_time(current, result.value.terminal_at)
                     write_record(current)
                 history_records.append(dict(current))
         elif result.cas_lost:

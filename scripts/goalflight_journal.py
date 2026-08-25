@@ -371,6 +371,7 @@ class TerminalCommit:
     event_uuid: str
     event_type: str
     observation: dict[str, object]
+    terminal_at: str
     idempotent: bool = False
 
 
@@ -4274,7 +4275,7 @@ class Journal:
                 """
                 SELECT a.dispatch_id, a.lifecycle_state, a.terminal_state,
                        a.terminal_transition_id, a.terminal_outcome_json,
-                       a.start_deadline_at,
+                       a.start_deadline_at, a.terminal_at,
                        o.event_uuid, o.event_type
                 FROM dispatch_attempts AS a
                 LEFT JOIN terminal_outbox AS o
@@ -4292,14 +4293,15 @@ class Journal:
                         "terminal attempt exists without its transition/outbox row"
                     )
                 return TerminalCommit(
-                    attempt,
-                    str(existing["terminal_transition_id"]),
-                    str(existing["dispatch_id"]),
-                    str(existing["terminal_state"]),
-                    str(existing["event_uuid"]),
-                    str(existing["event_type"]),
-                    json.loads(str(existing["terminal_outcome_json"])),
-                    True,
+                    attempt_id=attempt,
+                    transition_id=str(existing["terminal_transition_id"]),
+                    dispatch_id=str(existing["dispatch_id"]),
+                    terminal_state=str(existing["terminal_state"]),
+                    event_uuid=str(existing["event_uuid"]),
+                    event_type=str(existing["event_type"]),
+                    observation=json.loads(str(existing["terminal_outcome_json"])),
+                    terminal_at=str(existing["terminal_at"]),
+                    idempotent=True,
                 )
             if str(existing["lifecycle_state"]) not in ATTEMPT_LIVE_STATES:
                 raise CASMismatch(
@@ -4424,14 +4426,15 @@ class Journal:
                 ),
             )
             return TerminalCommit(
-                attempt,
-                transition_id,
-                str(existing["dispatch_id"]),
-                terminal,
-                event_uuid,
-                resolved_event_type,
-                json.loads(observation_json),
-                False,
+                attempt_id=attempt,
+                transition_id=transition_id,
+                dispatch_id=str(existing["dispatch_id"]),
+                terminal_state=terminal,
+                event_uuid=event_uuid,
+                event_type=resolved_event_type,
+                observation=json.loads(observation_json),
+                terminal_at=now,
+                idempotent=False,
             )
 
         return self._domain_write(action)

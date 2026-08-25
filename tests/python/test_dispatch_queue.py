@@ -380,6 +380,68 @@ def _write_completed_task(tmp: Path, *, done_at: str) -> None:
     )
 
 
+def test_terminal_ended_at_uses_first_journal_commit_and_is_write_once() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            dispatch_id = "terminal-time-authority"
+            status_path = tmp / "terminal-time.status.json"
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "agent": "test-dispatch",
+                    "state": "running",
+                    "terminal_state": "unknown",
+                    "project_root": str(tmp),
+                    "status_path": str(status_path),
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                }
+            )
+            first = D.goalflight_ledger.commit_terminal_authority(
+                {
+                    "dispatch_id": dispatch_id,
+                    "project_root": str(tmp),
+                },
+                state="complete",
+                reason=None,
+                worker_still_alive=False,
+            )
+            assert first.committed and first.value is not None
+            first_terminal_at = first.value.terminal_at
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": "complete",
+                        "terminal_state": "complete",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            original_utc_now = D.goalflight_ledger.utc_now
+            D.goalflight_ledger.utc_now = lambda: "2099-01-01T00:00:00+00:00"
+            try:
+                reconciled = D.goalflight_ledger.reconcile_terminal_outbox(
+                    tmp,
+                    messages_dir=tmp / "messages",
+                )
+            finally:
+                D.goalflight_ledger.utc_now = original_utc_now
+
+            assert reconciled["already_terminal"] == 1, reconciled
+            record_path = D.goalflight_ledger.record_path(dispatch_id)
+            projected = json.loads(record_path.read_text(encoding="utf-8"))
+            assert projected["ended_at"] == first_terminal_at, projected
+
+            attempted_rewrite = dict(projected)
+            attempted_rewrite["ended_at"] = "2100-01-01T00:00:00+00:00"
+            D.goalflight_ledger.write_record(attempted_rewrite)
+            preserved = json.loads(record_path.read_text(encoding="utf-8"))
+            assert preserved["ended_at"] == first_terminal_at, preserved
+
+
 def test_prior_ledger_completion_does_not_supersede_deliberate_follow_up() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -434,6 +496,60 @@ def test_same_time_ledger_completion_defers_ambiguous_ordering() -> None:
             assert decision is not None
             assert decision["state"] == "deferred"
             assert decision["reason"] == "completion_authority_indeterminate"
+
+
+def test_same_time_completion_deferral_is_bounded_then_restores_for_launch() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            completed_at = "2026-01-02T01:00:00+00:00"
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": "same-time-prior-completion",
+                    "agent": "test-dispatch",
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "project_root": str(tmp),
+                    "task_ids": ["t-b212"],
+                    "started_at": "2026-01-02T00:00:00+00:00",
+                    "ended_at": completed_at,
+                }
+            )
+            entry = {
+                **_linked_task_entry(
+                    tmp,
+                    "same-time-bounded-deferral",
+                    created_at=completed_at,
+                ),
+                "dispatch_argv": ["--agent", "test-dispatch"],
+                "queue_launch_token": "same-time-token",
+                "request": {
+                    "cwd": str(tmp),
+                    "tail": str(tmp / "same-time.tail"),
+                    "task_ids": ["t-b212"],
+                },
+            }
+            claim = queue / f"{entry['dispatch_id']}.json.claimed-1"
+            claim.write_text(json.dumps(entry), encoding="utf-8")
+
+            first = D._recover_claimed_queue_entries(queue, stale_s=0)
+            assert first["pending_launch"] == 1, first
+            deferred = json.loads(claim.read_text(encoding="utf-8"))
+            assert deferred["completion_authority_deferral_count"] == 1, deferred
+            assert not (queue / f"{entry['dispatch_id']}.json").exists()
+
+            second = D._recover_claimed_queue_entries(queue, stale_s=0)
+            restored_path = queue / f"{entry['dispatch_id']}.json"
+            assert second["restored"] == 1, second
+            assert restored_path.exists()
+            restored = json.loads(restored_path.read_text(encoding="utf-8"))
+            assert restored["state"] == "queued", restored
+            assert restored["completion_authority_deferral_count"] == 1, restored
+            assert restored["claim_recovery_count"] == 1, restored
+            assert not claim.exists()
 
 
 def test_prior_store_completion_does_not_supersede_deliberate_follow_up() -> None:
@@ -5202,6 +5318,14 @@ def test_round5_tail_substitution_and_frozen_lock_order() -> None:
 
 
 def main() -> None:
+    test_terminal_ended_at_uses_first_journal_commit_and_is_write_once()
+    test_prior_ledger_completion_does_not_supersede_deliberate_follow_up()
+    test_same_time_ledger_completion_defers_ambiguous_ordering()
+    test_same_time_completion_deferral_is_bounded_then_restores_for_launch()
+    test_prior_store_completion_does_not_supersede_deliberate_follow_up()
+    test_later_store_completion_still_supersedes_queued_duplicate()
+    test_missing_ledger_completion_time_defers_supersession()
+    test_missing_entry_creation_time_defers_supersession()
     test_submit_status_delay_requires_test_mode()
     test_submit_records_replayable_request_without_capacity_acquire()
     test_submit_is_idempotent_for_matching_args_and_rejects_collisions()
@@ -5210,6 +5334,7 @@ def main() -> None:
     test_concurrent_submit_same_id_is_idempotent()
     test_submit_write_error_is_clean()
     test_submit_status_write_error_removes_queue_entry()
+    test_mark_claim_failed_reports_whether_it_committed()
     test_submit_rejects_active_waiting_capacity_ledger()
     test_drain_launches_queued_request_once_and_exits()
     test_registered_queue_refusal_after_controller_exit_restores_runnable_entry()

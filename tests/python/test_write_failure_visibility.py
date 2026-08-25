@@ -789,6 +789,7 @@ def test_orphan_stamp_distinguishes_contract_from_transient(
 def _terminal_winner(state: str) -> SimpleNamespace:
     return SimpleNamespace(
         terminal_state=state,
+        terminal_at="2026-01-01T00:00:00+00:00",
         attempt_id="attempt",
         transition_id="transition",
         event_uuid="event",
