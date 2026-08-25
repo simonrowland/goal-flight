@@ -4808,7 +4808,11 @@ def _drain_on_submit(args, queue_path: Path) -> None:
         limit=1,
     )
     try:
-        payload = _drain_queue_once(drain_args)
+        # Fold other dispatches' no-op claim alerts into one summary line. A
+        # submit walks the whole shared queue, and a wall of rows the caller
+        # cannot act on is what makes this output easy to ignore.
+        with _claim_alert_focus(str(getattr(args, "dispatch_id", "") or "")):
+            payload = _drain_queue_once(drain_args)
     except Exception as exc:
         print(
             "goalflight_dispatch: drain-on-submit warning: "
@@ -5438,20 +5442,14 @@ def _quarantine_claim(
         claim.unlink()
     except OSError:
         return None
-    print(
-        "CLAIM-RECOVERY-ALERT "
-        + json.dumps(
-            {
-                "dispatch_id": entry.get("dispatch_id"),
-                "action": "quarantine",
-                "reason": reason,
-                "evidence": entry.get("quarantine_evidence"),
-                "path": str(dest),
-            },
-            sort_keys=True,
-        ),
-        file=sys.stderr,
-        flush=True,
+    _emit_claim_recovery_alert(
+        {
+            "dispatch_id": entry.get("dispatch_id"),
+            "action": "quarantine",
+            "reason": reason,
+            "evidence": entry.get("quarantine_evidence"),
+            "path": str(dest),
+        },
     )
     return dest
 
@@ -5550,38 +5548,138 @@ def _persist_orphan_first_seen(entry: dict, *, now_iso: str | None = None) -> st
     return now_iso or goalflight_ledger.utc_now()
 
 
+# Which dispatch this process is submitting, while a drain pass runs.
+#
+# A drain walks the WHOLE shared queue, so it meets claim carriers belonging to
+# every project on the box. Printing a row for each one buries the caller's own
+# dispatch under a wall it cannot act on. That is the same reasoning already
+# applied to per-entry drain reasons in `_report_why_this_entry_did_not_launch`:
+# other entries' reasons belong to whoever submitted them.
+#
+# What still prints unconditionally: any alert that CHANGED state (quarantine),
+# whoever owns it. Silently losing a state mutation is worse than a noisy line.
+# Only pure `preserve*` no-ops -- where the drain looked, touched nothing, and
+# said so -- are foldable, and only for dispatches that are not ours.
+_ALERT_FOCUS: dict | None = None
+
+# Reasons the drain emits after looking at a carrier and changing NOTHING.
+# Only these fold; anything unlisted prints, so a new alert is loud by default.
+#
+# This is an explicit allowlist keyed on REASON, not a prefix match on the
+# action string. An earlier version tested `action.startswith("preserve")`,
+# which is a lexical proxy for a structural fact. It was wrong: both
+# `identity_indeterminate` and `launched_carrier_cleanup_pending` are spelled
+# action "preserve", but the latter is emitted after a launch ATTEMPT -- the
+# carrier is untouched while a worker was actually started. Folding that would
+# hide a launch. How an alert is spelled is not evidence of what the code did.
+_FOLDABLE_CLAIM_ALERT_REASONS = frozenset(
+    {
+        "identity_indeterminate",
+        "claim_carrier_missing_unlinked",
+    }
+)
+# How many dispatch ids to keep per folded reason, so the summary stays
+# self-diagnosing without growing back into a wall.
+_FOLD_SAMPLE_LIMIT = 3
+
+
+def _emit_claim_recovery_alert(payload: dict) -> None:
+    """Print a claim alert, or fold it into this drain pass's summary."""
+    focus = _ALERT_FOCUS
+    reason = str(payload.get("reason") or "")
+    foldable = reason in _FOLDABLE_CLAIM_ALERT_REASONS
+    own = focus is not None and str(payload.get("dispatch_id") or "") in focus["own"]
+    if focus is None or own or not foldable:
+        print(
+            "CLAIM-RECOVERY-ALERT " + json.dumps(payload, sort_keys=True),
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+    key = reason or "unknown"
+    focus["folded"][key] = focus["folded"].get(key, 0) + 1
+    sample = focus["samples"].setdefault(key, [])
+    if len(sample) < _FOLD_SAMPLE_LIMIT:
+        sample.append(str(payload.get("dispatch_id") or "?"))
+
+
+@contextlib.contextmanager
+def _claim_alert_focus(dispatch_id: str):
+    """Fold foreign no-op claim alerts for the duration of one drain pass.
+
+    A no-focus caller (the drain daemon, or a unit test driving these helpers
+    directly) keeps the unfolded behaviour, so this only ever narrows what an
+    interactive submit prints.
+    """
+    global _ALERT_FOCUS
+    dispatch_id = str(dispatch_id or "").strip()
+    if not dispatch_id:
+        yield
+        return
+    if _ALERT_FOCUS is not None:
+        # An outer pass already owns the fold, and it keeps owning it: an inner
+        # exit publishing a partial summary would reset the counter the outer
+        # pass is still accumulating into. But the inner dispatch IS ours, so
+        # register it as own for the duration -- otherwise its own alerts fold
+        # as if they belonged to somebody else.
+        added = dispatch_id not in _ALERT_FOCUS["own"]
+        if added:
+            _ALERT_FOCUS["own"].add(dispatch_id)
+        try:
+            yield
+        finally:
+            if added and _ALERT_FOCUS is not None:
+                _ALERT_FOCUS["own"].discard(dispatch_id)
+        return
+    _ALERT_FOCUS = {"own": {dispatch_id}, "folded": {}, "samples": {}}
+    try:
+        yield
+    finally:
+        focus, _ALERT_FOCUS = _ALERT_FOCUS, None
+        folded = focus["folded"]
+        if folded:
+            print(
+                "CLAIM-RECOVERY-SUMMARY "
+                + json.dumps(
+                    {
+                        "folded": sum(folded.values()),
+                        "reasons": folded,
+                        # Bounded id samples, because the fold is otherwise
+                        # unrecoverable. Do NOT point the reader at
+                        # `drain --json` to see the rest: a drain CLAIMS queue
+                        # entries and can LAUNCH WORKERS, so it is not a
+                        # read-only diagnostic and would not reproduce this
+                        # pass anyway.
+                        "sample_ids": focus["samples"],
+                        "detail": "no-op claim alerts for other dispatches",
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+
+
 def _alert_identity_indeterminate(dispatch_id: str, *, where: str, reason: str) -> None:
-    print(
-        "CLAIM-RECOVERY-ALERT "
-        + json.dumps(
-            {
-                "dispatch_id": dispatch_id,
-                "action": "preserve",
-                "reason": "identity_indeterminate",
-                "where": where,
-                "detail": reason,
-            },
-            sort_keys=True,
-        ),
-        file=sys.stderr,
-        flush=True,
+    _emit_claim_recovery_alert(
+        {
+            "dispatch_id": dispatch_id,
+            "action": "preserve",
+            "reason": "identity_indeterminate",
+            "where": where,
+            "detail": reason,
+        },
     )
 
 
 def _alert_launched_carrier_pending(dispatch_id: str, *, where: str) -> None:
-    print(
-        "CLAIM-RECOVERY-ALERT "
-        + json.dumps(
-            {
-                "dispatch_id": dispatch_id,
-                "action": "preserve",
-                "reason": "launched_carrier_cleanup_pending",
-                "where": where,
-            },
-            sort_keys=True,
-        ),
-        file=sys.stderr,
-        flush=True,
+    _emit_claim_recovery_alert(
+        {
+            "dispatch_id": dispatch_id,
+            "action": "preserve",
+            "reason": "launched_carrier_cleanup_pending",
+            "where": where,
+        },
     )
 
 
@@ -8277,6 +8375,7 @@ def _reconcile_ledger_prelaunch_orphans(
     terminalized = 0
     pending = 0
     quarantined = 0
+    preserved = 0
     pending_reasons: list[dict] = []
     try:
         records = goalflight_ledger.read_records()
@@ -8285,6 +8384,7 @@ def _reconcile_ledger_prelaunch_orphans(
             "terminalized": 0,
             "pending": 0,
             "quarantined": 0,
+            "preserved": 0,
             "pending_reasons": [],
         }
 
@@ -8411,25 +8511,24 @@ def _reconcile_ledger_prelaunch_orphans(
                 )
         else:
             # Unlinked ledger-only zombie: alert, do not auto-terminalize (E).
-            print(
-                "CLAIM-RECOVERY-ALERT "
-                + json.dumps(
-                    {
-                        "dispatch_id": dispatch_id,
-                        "action": "preserve_unlinked_ledger_orphan",
-                        "reason": "claim_carrier_missing_unlinked",
-                        "state": state,
-                    },
-                    sort_keys=True,
-                ),
-                file=sys.stderr,
-                flush=True,
+            _emit_claim_recovery_alert(
+                {
+                    "dispatch_id": dispatch_id,
+                    "action": "preserve_unlinked_ledger_orphan",
+                    "reason": "claim_carrier_missing_unlinked",
+                    "state": state,
+                },
             )
-            quarantined += 1
+            # Counted as PRESERVED, not quarantined. This branch deliberately
+            # leaves the orphan in place, and the caller documents `quarantined`
+            # as the park-vs-delete discriminator -- so incrementing it here
+            # made returned diagnostics claim a quarantine that never happened.
+            preserved += 1
     return {
         "terminalized": terminalized,
         "pending": pending,
         "quarantined": quarantined,
+        "preserved": preserved,
         "pending_reasons": pending_reasons,
     }
 
