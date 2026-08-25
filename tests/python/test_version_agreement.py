@@ -69,11 +69,17 @@ def test_every_tracked_manifest_is_covered() -> None:
     docs-private/ is gitignored (vendored copies of shipped packages), so it is
     excluded deliberately rather than by oversight.
     """
+    # Both exclusions are gitignored trees that rglob cannot see are excluded:
+    # docs-private/ holds vendored copies of shipped packages, and worktrees/
+    # holds per-dispatch worktrees, each a full checkout carrying its own
+    # manifests. This test asserts something about TRACKED files, so anything
+    # git ignores must not reach it.
+    ignored_prefixes = ("docs-private/", "worktrees/")
     tracked = {
         p.relative_to(ROOT).as_posix()
         for p in ROOT.rglob("plugin.json")
         if ".git/" not in p.as_posix()
-        and not p.relative_to(ROOT).as_posix().startswith("docs-private/")
+        and not p.relative_to(ROOT).as_posix().startswith(ignored_prefixes)
     }
     assert tracked == set(PLUGIN_MANIFESTS), (
         f"tracked plugin.json set changed: {sorted(tracked)}. "

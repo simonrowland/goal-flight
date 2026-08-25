@@ -81,6 +81,13 @@ NO_LEAK_SKIP_PREFIXES = (
     "docs-private/",
     "scripts/",
     "tests/",
+    # Gitignored per-dispatch worktrees (.gitignore: "worktrees/"), each a full
+    # checkout of this repo. rglob does not honour gitignore, so without this
+    # the scanner reads every worktree's copy of CHANGELOG.md and SKILL.md.
+    # Those ARE allowlisted at the repo root, but the allowlist is keyed on the
+    # exact relative path, so "worktrees/<id>/CHANGELOG.md" misses it and the
+    # validator reports a leak in a file it already accepts.
+    "worktrees/",
 )
 
 NO_LEAK_COMPAT_ALLOWLIST = {
