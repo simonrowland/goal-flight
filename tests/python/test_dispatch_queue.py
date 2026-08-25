@@ -2775,7 +2775,9 @@ def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
         # the original classification is preserved as previous_reason.
         error_obj = record.get("error", {})
         assert error_obj.get("message") == "dispatch_worker_limit_reached", record
-        assert error_obj.get("previous_reason") == "worker_dead_no_terminal_marker", record
+        assert error_obj.get("previous_reason") == (
+            "worker_dead_no_terminal_marker:death_cause=no_evidence"
+        ), record
         assert error_obj.get("previous_state") == "worker_dead", record
         # Rate-pressure policy is shared-pool scoped and now refuses per-session
         # threshold overrides. Duplicate the same terminal signature enough times

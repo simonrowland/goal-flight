@@ -315,7 +315,9 @@ def case_dispatch_usage_limit_exit_zero_is_exhausted() -> None:
     assert isinstance(reason, dict), payload
     assert reason.get("message") == "dispatch_worker_limit_reached", reason
     assert reason.get("limit_kind") == "exhausted", reason
-    assert reason.get("reason") == "worker_dead_no_terminal_marker", reason
+    assert reason.get("reason") == (
+        "worker_dead_no_terminal_marker:death_cause=no_evidence"
+    ), reason
     assert record.get("state") == "quota_exhausted", record
     assert record.get("terminal_state") == "quota_exhausted", record
     assert record.get("liveness_state") == "quota_exhausted", record

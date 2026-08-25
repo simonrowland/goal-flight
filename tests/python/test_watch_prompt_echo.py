@@ -35,6 +35,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_watch  # noqa: E402
 import goalflight_dispatch  # noqa: E402
+import goalflight_terminal  # noqa: E402
 
 
 CODEX_BANNER_14 = (
@@ -1214,12 +1215,53 @@ tokens used
 179,057
 """
 
+# Verbatim incident excerpt supplied in the task brief (2026-08-24).
+OBSERVED_NETWORK_DEATH_TAIL = """failed to lookup address information: nodename nor servname provided
+stream disconnected before completion
+ERROR: Reconnecting... 5/5
+"""
 
-def _run_dead_worker_tail(tail_text: str, prompt_text: str = "", max_idle_secs: str = "0.2"):
+# Real Grok tool error shape that archived review tails recovered from.
+OBSERVED_RECOVERABLE_TOOL_ERROR_TAIL = (
+    "ERROR tool_error: tool_output_error tool_name=read_file\n"
+    "review continued after the failed read\n"
+)
+
+# Real Grok acceptEdits narration recorded in goalflight_dispatch.py; the write
+# never happened, but the prose alone does not prove why.
+OBSERVED_NARRATION_ONLY_DEATH_TAIL = (
+    "Creating `artifact.txt` with the requested contents.\n"
+)
+
+NO_EVIDENCE_WORKER_DEAD_REASON = (
+    "worker_dead_no_terminal_marker:death_cause=no_evidence"
+)
+
+
+def _worker_dead_reason(cause: str) -> str:
+    return f"worker_dead_no_terminal_marker:death_cause={cause}"
+
+
+def _nested_worker_dead_reason(payload: dict) -> object:
+    reason = payload.get("reason")
+    return reason.get("reason") if isinstance(reason, dict) else reason
+
+
+def _run_dead_worker_tail(
+    tail_text: str,
+    prompt_text: str = "Do the requested work.\n",
+    max_idle_secs: str = "0.2",
+    prompt_mode: str = "file",
+):
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         prompt = tmp / "prompt.md"
-        prompt.write_text(prompt_text, encoding="utf-8")
+        if prompt_mode == "file":
+            prompt.write_text(prompt_text, encoding="utf-8")
+        elif prompt_mode == "directory":
+            prompt.mkdir()
+        elif prompt_mode not in {"missing", "omitted"}:
+            raise ValueError(f"unknown prompt mode: {prompt_mode}")
         tail = tmp / "tail.txt"
         tail.write_text(tail_text, encoding="utf-8")
         worker = subprocess.Popen([sys.executable, "-c", ""], start_new_session=True)
@@ -1228,7 +1270,7 @@ def _run_dead_worker_tail(tail_text: str, prompt_text: str = "", max_idle_secs: 
             tail,
             tmp / "s.json",
             prompt,
-            ignore=True,
+            ignore=prompt_mode != "omitted",
             worker_pid=worker.pid,
             poll_secs="0.05",
             max_idle_secs=max_idle_secs,
@@ -1303,7 +1345,433 @@ def case_dead_pid_stale_output_bounds_worker_dead() -> None:
     assert elapsed < 3.0, f"worker_dead should be bounded by the fresh window, elapsed={elapsed:.1f}s"
     assert payload.get("state") == "worker_dead", payload
     assert payload.get("liveness_state") == "worker_dead", payload
-    assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
+    assert not term, term
+
+
+def test_dead_pid_network_tail_surfaces_upstream_network() -> None:
+    rc, _elapsed, term, payload = _run_dead_worker_tail(OBSERVED_NETWORK_DEATH_TAIL)
+    assert rc == 1, payload
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("liveness_state") == "worker_dead", payload
+    assert payload.get("reason") == _worker_dead_reason("upstream_network"), payload
+    assert not term, term
+
+
+def test_recovered_network_incident_does_not_classify_later_death() -> None:
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        OBSERVED_NETWORK_DEATH_TAIL
+        + "connectivity restored\n"
+        + "work continued successfully\n"
+        + "fatal: brief validation failed\n"
+    )
+    assert rc == 1, payload
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
+    assert not term, term
+
+
+def test_recoverable_tool_error_tail_surfaces_no_evidence() -> None:
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        OBSERVED_RECOVERABLE_TOOL_ERROR_TAIL
+    )
+    assert rc == 1, payload
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
+    assert not term, term
+
+
+def test_dead_pid_narration_only_tail_surfaces_no_evidence() -> None:
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        OBSERVED_NARRATION_ONLY_DEATH_TAIL
+    )
+    assert rc == 1, payload
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("liveness_state") == "worker_dead", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
+    assert not term, term
+
+
+def test_death_cause_ignores_evidence_echoed_from_prompt() -> None:
+    prompt = "Investigate this prior incident:\n" + OBSERVED_NETWORK_DEATH_TAIL
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        prompt + "worker died before sign-off\n",
+        prompt_text=prompt,
+    )
+    assert rc == 1, payload
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
+    assert not term, term
+
+
+def test_death_cause_ignores_decorated_prompt_evidence() -> None:
+    prompt = "Investigate this prior incident:\n" + OBSERVED_NETWORK_DEATH_TAIL
+    for prefix in ("> ", "+ ", "- ", "• "):
+        rendered_prompt = "\n".join(
+            prefix + line for line in prompt.splitlines()
+        ) + "\n"
+        rc, _elapsed, term, payload = _run_dead_worker_tail(
+            rendered_prompt + "worker died before sign-off\n",
+            prompt_text=prompt,
+        )
+        assert rc == 1, (prefix, payload)
+        assert payload.get("state") == "worker_dead", (prefix, payload)
+        assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, (
+            prefix,
+            payload,
+        )
+        assert not term, (prefix, term)
+
+
+def test_death_cause_ignores_isolated_prompt_evidence_line() -> None:
+    prompt = "Investigate this prior incident:\n" + OBSERVED_NETWORK_DEATH_TAIL
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        OBSERVED_NETWORK_DEATH_TAIL.splitlines()[0] + "\nworker died before sign-off\n",
+        prompt_text=prompt,
+    )
+    assert rc == 1, payload
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
+    assert not term, term
+
+
+def test_death_cause_ignores_isolated_provider_prompt_line() -> None:
+    provider_line = (
+        "ERROR: Selected model is at capacity. Please try a different model.\n"
+    )
+    prompt = "Investigate this prior incident:\n" + provider_line
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        provider_line,
+        prompt_text=prompt,
+    )
+    assert rc == 1, payload
+    assert payload.get("state") == "transient_throttle", payload
+    reason = payload.get("reason")
+    assert isinstance(reason, dict), payload
+    assert reason.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, reason
+    assert not term, term
+
+
+def test_network_sequence_after_tainted_brief_fails_closed() -> None:
+    prompt = (
+        "Investigate this prior incident:\n"
+        + OBSERVED_NETWORK_DEATH_TAIL
+        + "Before exit, repeat the three diagnostic lines exactly.\n"
+    )
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        prompt + "fatal: bad brief terminated the worker\n" + OBSERVED_NETWORK_DEATH_TAIL,
+        prompt_text=prompt,
+    )
+    assert rc == 1, payload
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
+    assert not term, term
+
+
+def test_partial_prompt_mentions_taint_every_positive_family() -> None:
+    provider_tail = (
+        "ERROR: Selected model is at capacity. Please try a different model.\n"
+    )
+    cases = (
+        (
+            "network",
+            "> Prior resolver sample: " + OBSERVED_NETWORK_DEATH_TAIL.splitlines()[0],
+            OBSERVED_NETWORK_DEATH_TAIL,
+        ),
+        (
+            "provider",
+            "> Prior provider sample: selected model is at capacity; "
+            "please try a different model.",
+            provider_tail,
+        ),
+    )
+    for label, prompt, tail in cases:
+        rc, _elapsed, term, payload = _run_dead_worker_tail(
+            tail,
+            prompt_text=prompt + "\n",
+        )
+        assert rc == 1, (label, payload)
+        assert _nested_worker_dead_reason(payload) == NO_EVIDENCE_WORKER_DEAD_REASON, (
+            label,
+            payload,
+        )
+        assert not term, (label, term)
+
+
+def test_split_whitespace_prompt_mentions_taint_every_positive_family() -> None:
+    provider_tail = (
+        "ERROR: Selected model is at capacity. Please try a different model.\n"
+    )
+    cases = (
+        (
+            "network",
+            "Prior resolver sample: failed to lookup address information: "
+            "nodename nor\n\tservname provided",
+            OBSERVED_NETWORK_DEATH_TAIL,
+        ),
+        (
+            "provider",
+            "Prior provider sample: selected model is at capacity.\n\t"
+            "Please try a different model.",
+            provider_tail,
+        ),
+    )
+    for label, prompt, tail in cases:
+        rc, _elapsed, term, payload = _run_dead_worker_tail(
+            tail,
+            prompt_text=prompt + "\n",
+        )
+        assert rc == 1, (label, payload)
+        assert _nested_worker_dead_reason(payload) == NO_EVIDENCE_WORKER_DEAD_REASON, (
+            label,
+            payload,
+        )
+        assert not term, (label, term)
+
+
+def test_full_prompt_echo_plus_isolated_provider_line_fails_closed() -> None:
+    provider_line = (
+        "ERROR: Selected model is at capacity. Please try a different model.\n"
+    )
+    prompt = "Investigate this prior incident:\n" + provider_line
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        prompt + "worker started investigation\n" + provider_line,
+        prompt_text=prompt,
+    )
+    assert rc == 1, payload
+    assert _nested_worker_dead_reason(payload) == NO_EVIDENCE_WORKER_DEAD_REASON, payload
+    assert not term, term
+
+
+def test_recovered_provider_incident_surfaces_no_evidence() -> None:
+    provider_tail = (
+        "ERROR: Selected model is at capacity. Please try a different model.\n"
+    )
+    cases = (
+        (
+            "provider",
+            provider_tail
+            + "provider connection recovered\n"
+            + "work continued successfully\n"
+            + "fatal: unrelated brief validation failed\n",
+        ),
+    )
+    for label, tail in cases:
+        rc, _elapsed, term, payload = _run_dead_worker_tail(tail)
+        assert rc == 1, (label, payload)
+        expected_state = "transient_throttle" if label == "provider" else "worker_dead"
+        assert payload.get("state") == expected_state, (label, payload)
+        assert _nested_worker_dead_reason(payload) == NO_EVIDENCE_WORKER_DEAD_REASON, (
+            label,
+            payload,
+        )
+        assert not term, (label, term)
+
+
+def test_provider_footer_requires_observed_ordered_pair() -> None:
+    provider_line = (
+        "ERROR: Selected model is at capacity. Please try a different model.\n"
+    )
+    for poison_suffix in (
+        "42\n",
+        "179,057\ntokens used\n",
+        "tokens used\n",
+        "tokens used\n179,057\ncontinued work\n",
+    ):
+        cause = goalflight_terminal.classify_worker_death_text(
+            provider_line + poison_suffix
+        )
+        assert cause == "no_evidence", (poison_suffix, cause)
+
+    usage_prefix = "You've hit your usage limit. Please try again at "
+    for poison_reset in (
+        "arbitrary prose",
+        "6:13 AM. Connectivity recovered and work continued.",
+        "Jun 21st and then continue",
+    ):
+        cause = goalflight_terminal.classify_worker_death_text(
+            usage_prefix + poison_reset + "\n"
+        )
+        assert cause == "no_evidence", (poison_reset, cause)
+
+
+def test_unavailable_prompt_sidecar_fails_death_cause_closed() -> None:
+    provider_tail = (
+        "ERROR: Selected model is at capacity. Please try a different model.\n"
+    )
+    cases = (
+        ("missing", "Do the requested work.\n"),
+        ("directory", "Do the requested work.\n"),
+        ("file", ""),
+        ("file", " \n\t\n"),
+        ("omitted", "Do the requested work.\n"),
+    )
+    for prompt_mode, prompt_text in cases:
+        rc, _elapsed, term, payload = _run_dead_worker_tail(
+            provider_tail,
+            prompt_text=prompt_text,
+            prompt_mode=prompt_mode,
+        )
+        label = (prompt_mode, repr(prompt_text))
+        assert rc == 1, (label, payload)
+        assert payload.get("state") == "transient_throttle", (label, payload)
+        assert _nested_worker_dead_reason(payload) == NO_EVIDENCE_WORKER_DEAD_REASON, (
+            label,
+            payload,
+        )
+        assert not term, (label, term)
+
+
+def test_second_prompt_replacement_invalidates_death_cause_before_reload() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        prompt = tmp / "prompt.md"
+        prompt.write_text("Initial benign prompt.\n", encoding="utf-8")
+        initial_signature = goalflight_watch._prompt_file_signature(prompt.stat())
+        prompt.write_text("First benign replacement.\n", encoding="utf-8")
+        first_signature = goalflight_watch._prompt_file_signature(prompt.stat())
+        assert first_signature != initial_signature
+        first_lines = prompt.read_text(encoding="utf-8").splitlines()
+        prompt.write_text(
+            "Second replacement mentions failed to lookup address information: "
+            "nodename nor servname provided.\n",
+            encoding="utf-8",
+        )
+        second_signature = goalflight_watch._prompt_file_signature(prompt.stat())
+        assert second_signature != first_signature
+        provenance_available = goalflight_watch._prompt_provenance_matches_loaded_snapshot(
+            second_signature,
+            first_signature,
+            True,
+        )
+        tail = tmp / "tail.txt"
+        tail.write_text(OBSERVED_NETWORK_DEATH_TAIL, encoding="utf-8")
+        reason = goalflight_watch._worker_dead_no_marker_reason(
+            tail,
+            first_lines,
+            prompt_provenance_available=provenance_available,
+        )
+        assert reason == NO_EVIDENCE_WORKER_DEAD_REASON, reason
+
+
+def test_prompt_signature_reversion_retrusts_cached_snapshot() -> None:
+    loaded_signature = (101, 202, 303)
+    changed_signature = (404, 505, 606)
+    assert not goalflight_watch._prompt_provenance_matches_loaded_snapshot(
+        changed_signature,
+        loaded_signature,
+        True,
+    )
+    provenance_available = goalflight_watch._prompt_provenance_matches_loaded_snapshot(
+        loaded_signature,
+        loaded_signature,
+        True,
+    )
+    assert provenance_available
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(OBSERVED_NETWORK_DEATH_TAIL, encoding="utf-8")
+        reason = goalflight_watch._worker_dead_no_marker_reason(
+            tail,
+            ["Initial benign prompt."],
+            prompt_provenance_available=provenance_available,
+        )
+    assert reason == _worker_dead_reason("upstream_network"), reason
+
+
+def test_prompt_change_during_final_tail_snapshot_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        tail = tmp / "tail.txt"
+        tail.write_text(OBSERVED_NETWORK_DEATH_TAIL, encoding="utf-8")
+        prompt = tmp / "prompt.md"
+        prompt.write_text("Initial benign prompt.\n", encoding="utf-8")
+        expected_signature = (101, 202, 303)
+        changed_signature = (404, 505, 606)
+        snapshots = iter(
+            (
+                (["Initial benign prompt."], expected_signature),
+                (["Second prompt mentions the network evidence."], changed_signature),
+            )
+        )
+        original_reader = goalflight_watch._read_prompt_exclusion_snapshot
+        goalflight_watch._read_prompt_exclusion_snapshot = lambda _path: next(snapshots)
+        try:
+            reason = goalflight_watch._worker_dead_no_marker_reason(
+                tail,
+                ["Initial benign prompt."],
+                prompt_provenance_available=True,
+                prompt_path=prompt,
+                prompt_signature=expected_signature,
+            )
+        finally:
+            goalflight_watch._read_prompt_exclusion_snapshot = original_reader
+    assert reason == NO_EVIDENCE_WORKER_DEAD_REASON, reason
+
+
+def test_restored_same_prompt_signature_reenables_classification() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        prompt = tmp / "prompt.md"
+        prompt.write_text("Investigate the worker death.\n", encoding="utf-8")
+        original_signature = goalflight_watch._prompt_file_signature(prompt.stat())
+        held_prompt = tmp / "prompt.held"
+        tail = tmp / "tail.txt"
+        tail.write_text("worker started\n", encoding="utf-8")
+        status = tmp / "s.json"
+        status.write_text("{}\n", encoding="utf-8")
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+        )
+        cmd = _watcher_command(
+            tail=tail,
+            status=status,
+            worker_pid=worker.pid,
+            dispatch_id="prompt-provenance-restored",
+            poll_secs="0.05",
+            max_idle_secs="1",
+        ) + ["--ignore-prompt-file", str(prompt)]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_watcher_env(status),
+        )
+        try:
+            _wait_for_status_matching(status, lambda payload: payload.get("state") == "running")
+            prompt.rename(held_prompt)
+            time.sleep(0.25)
+            held_prompt.rename(prompt)
+            assert goalflight_watch._prompt_file_signature(prompt.stat()) == original_signature
+            time.sleep(0.25)
+            tail.write_text(OBSERVED_NETWORK_DEATH_TAIL, encoding="utf-8")
+            worker.terminate()
+            worker.wait(timeout=5)
+            stdout, stderr = proc.communicate(timeout=5)
+            assert proc.returncode == 1, (stdout, stderr)
+            payload = json.loads(status.read_text(encoding="utf-8"))
+            assert payload.get("state") == "worker_dead", payload
+            assert payload.get("reason") == _worker_dead_reason("upstream_network"), payload
+        finally:
+            if worker.poll() is None:
+                worker.terminate()
+                worker.wait(timeout=5)
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+
+
+def test_ordinary_provider_like_prose_surfaces_no_evidence() -> None:
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "Updated UI test for copy: try again at 6:13 AM\n"
+        + ("ordinary progress\n" * 150)
+        + "fatal: brief validation failed\n"
+    )
+    assert rc == 1, payload
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
     assert not term, term
 
 
@@ -1316,7 +1784,7 @@ def case_dead_pid_unbound_done_signoff_is_rejected() -> None:
         rc, _elapsed, term, payload = _run_dead_worker_tail(tail_text)
         assert rc == 1, f"{tail_text!r} must not satisfy dispatch identity, got {rc} ({payload})"
         assert payload.get("state") == "worker_dead", payload
-        assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+        assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
         assert not term, term
 
 
@@ -1332,7 +1800,7 @@ def case_dead_pid_usage_limit_without_success_marker_reclassifies() -> None:
     assert reason.get("message") == "dispatch_worker_limit_reached", reason
     assert reason.get("limit_kind") == "exhausted", reason
     assert reason.get("rate_limit_signature") == "usage limit", reason
-    assert reason.get("reason") == "worker_dead_no_terminal_marker", reason
+    assert reason.get("reason") == _worker_dead_reason("provider_limit"), reason
     assert "try again at 6:13 AM" in reason.get("tail_excerpt", ""), reason
     assert not term, term
 
@@ -1354,7 +1822,7 @@ def case_b054_real_evidence_marker_vocab_bullet_reclassifies_rate_limited() -> N
     assert reason.get("message") == "dispatch_worker_limit_reached", reason
     assert reason.get("limit_kind") == "transient", reason
     assert reason.get("rate_limit_signature") == "selected model is at capacity", reason
-    assert reason.get("reason") == "worker_dead_no_terminal_marker", reason
+    assert reason.get("reason") == _worker_dead_reason("provider_limit"), reason
     assert not term, term
 
 
@@ -1469,7 +1937,7 @@ def case_worker_dead_final_reconciliation_rejects_diff_and_prompt_echo() -> None
         "worker died before sign-off\n"
     )
     assert rc == 1, f"diff echo must not complete, got rc={rc} ({payload})"
-    assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
     assert not term, term
 
     negative_cases = [
@@ -1479,7 +1947,7 @@ def case_worker_dead_final_reconciliation_rejects_diff_and_prompt_echo() -> None
     for label, tail_text in negative_cases:
         rc, _elapsed, term, payload = _run_dead_worker_tail(tail_text)
         assert rc == 1, f"{label}: expected worker-dead no-marker exit 1, got rc={rc} ({payload})"
-        assert payload.get("reason") == "worker_dead_no_terminal_marker", f"{label}: {payload}"
+        assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, f"{label}: {payload}"
         assert not term, f"{label}: {term}"
 
     prompt = "Do the work.\nCOMPLETE: prompt-only\n"
@@ -1488,7 +1956,7 @@ def case_worker_dead_final_reconciliation_rejects_diff_and_prompt_echo() -> None
         prompt_text=prompt,
     )
     assert rc == 1, f"prompt echo only must not complete, got rc={rc} ({payload})"
-    assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
     assert not term, term
 
 
@@ -1536,7 +2004,7 @@ def case_worker_dead_rejects_prefixed_terminal_inside_diff_hunk() -> None:
             "worker died before sign-off\n"
         )
         assert rc == 1, f"{marker} inside a real hunk must stay worker_dead, got rc={rc} ({payload})"
-        assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+        assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
         assert not term, term
 
 
@@ -1567,7 +2035,7 @@ def case_worker_dead_rejects_banner_offset_prompt_echo() -> None:
         prompt_text=prompt,
     )
     assert rc == 1, f"banner-offset prompt echo must stay worker_dead, got rc={rc} ({payload})"
-    assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
     assert not term, term
 
 
@@ -1624,7 +2092,7 @@ def case_worker_dead_rejects_fenceless_mid_tail_prompt_quote() -> None:
         prompt_text=prompt,
     )
     assert rc == 1, f"fence-less mid-tail prompt quote must stay worker_dead, got rc={rc} ({payload})"
-    assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
     assert not term, term
 
 
@@ -1643,7 +2111,7 @@ def case_worker_dead_early_latch_retries_prompt_anchor() -> None:
         prompt_text=prompt,
     )
     assert rc == 1, f"second prompt anchor must be fenced, got rc={rc} ({payload})"
-    assert payload.get("reason") == "worker_dead_no_terminal_marker", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
     assert not term, term
 
 
@@ -1876,6 +2344,26 @@ def main() -> None:
     case_task_terminal_breadcrumb_happy_path_persists()
     case_dead_pid_fresh_output_vetoes_worker_dead()
     case_dead_pid_stale_output_bounds_worker_dead()
+    test_dead_pid_network_tail_surfaces_upstream_network()
+    test_recovered_network_incident_does_not_classify_later_death()
+    test_recoverable_tool_error_tail_surfaces_no_evidence()
+    test_dead_pid_narration_only_tail_surfaces_no_evidence()
+    test_death_cause_ignores_evidence_echoed_from_prompt()
+    test_death_cause_ignores_decorated_prompt_evidence()
+    test_death_cause_ignores_isolated_prompt_evidence_line()
+    test_death_cause_ignores_isolated_provider_prompt_line()
+    test_network_sequence_after_tainted_brief_fails_closed()
+    test_partial_prompt_mentions_taint_every_positive_family()
+    test_split_whitespace_prompt_mentions_taint_every_positive_family()
+    test_full_prompt_echo_plus_isolated_provider_line_fails_closed()
+    test_recovered_provider_incident_surfaces_no_evidence()
+    test_provider_footer_requires_observed_ordered_pair()
+    test_unavailable_prompt_sidecar_fails_death_cause_closed()
+    test_second_prompt_replacement_invalidates_death_cause_before_reload()
+    test_prompt_signature_reversion_retrusts_cached_snapshot()
+    test_prompt_change_during_final_tail_snapshot_fails_closed()
+    test_restored_same_prompt_signature_reenables_classification()
+    test_ordinary_provider_like_prose_surfaces_no_evidence()
     case_dead_pid_unbound_done_signoff_is_rejected()
     case_dead_pid_usage_limit_without_success_marker_reclassifies()
     case_b054_real_evidence_marker_vocab_bullet_reclassifies_rate_limited()

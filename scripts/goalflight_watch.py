@@ -868,6 +868,73 @@ def _prompt_echo_scan(lines: list[str], prompt_prefix: list[str]) -> tuple[set[i
     return set(), False, prompt_line_set
 
 
+def _worker_dead_no_marker_reason(
+    path: Path,
+    prompt_prefix: list[str] | None = None,
+    *,
+    prompt_provenance_available: bool = True,
+    prompt_path: Path | None = None,
+    prompt_signature: tuple[int, int, int] | None = None,
+) -> str:
+    """Add postmortem evidence without changing the worker-dead verdict."""
+
+    if not prompt_provenance_available:
+        return "worker_dead_no_terminal_marker:death_cause=no_evidence"
+    effective_prompt_prefix = prompt_prefix or []
+    if prompt_path is not None:
+        prompt_snapshot = _read_prompt_exclusion_snapshot(prompt_path)
+        if (
+            prompt_snapshot is None
+            or prompt_signature is None
+            or prompt_snapshot[1] != prompt_signature
+            or not any(line.strip() for line in prompt_snapshot[0])
+        ):
+            return "worker_dead_no_terminal_marker:death_cause=no_evidence"
+        effective_prompt_prefix = prompt_snapshot[0]
+    text = goalflight_terminal.read_tail_excerpt(
+        path,
+        goalflight_terminal.FINAL_RECONCILIATION_TAIL_BYTES,
+    )
+    lines = text.splitlines()
+    prompt_echo_lines, _echo_anchor_found, _prompt_line_set = _prompt_echo_scan(
+        lines,
+        effective_prompt_prefix,
+    )
+    normalized_lines = [_normalize_death_cause_prompt_line(line) for line in lines]
+    normalized_echo_lines, _normalized_anchor_found, _normalized_prompt_lines = (
+        _prompt_echo_scan(normalized_lines, effective_prompt_prefix)
+    )
+    prompt_echo_lines |= normalized_echo_lines
+    visible_text = "\n".join(
+        line for index, line in enumerate(lines) if index not in prompt_echo_lines
+    )[-goalflight_terminal.WORKER_DEATH_CAUSE_TAIL_BYTES :]
+    cause = goalflight_terminal.classify_worker_death_text(visible_text)
+    prompt_causes = goalflight_terminal.worker_death_causes_mentioned_in_text(
+        "\n".join(effective_prompt_prefix)
+    )
+    if prompt_path is not None:
+        final_prompt_snapshot = _read_prompt_exclusion_snapshot(prompt_path)
+        if (
+            final_prompt_snapshot is None
+            or final_prompt_snapshot[1] != prompt_signature
+            or not any(line.strip() for line in final_prompt_snapshot[0])
+        ):
+            cause = goalflight_terminal.WORKER_DEATH_CAUSE_NO_EVIDENCE
+    if cause in prompt_causes:
+        cause = goalflight_terminal.WORKER_DEATH_CAUSE_NO_EVIDENCE
+    return f"worker_dead_no_terminal_marker:death_cause={cause}"
+
+
+def _normalize_death_cause_prompt_line(line: str) -> str:
+    """Remove one observed renderer prefix for prompt-echo comparison only."""
+
+    stripped = line.strip()
+    for prefix in ("> ", "+ ", "- ", "• "):
+        if stripped.startswith(prefix):
+            return stripped[len(prefix) :].lstrip()
+    return stripped
+
+
 def _is_unfenced_prompt_quoted_bare_marker(
     stripped: str,
     *,
@@ -1981,6 +2048,20 @@ def _prompt_reload_due(
     return last_reload_at is None or now - last_reload_at >= interval - 1e-9
 
 
+def _prompt_provenance_matches_loaded_snapshot(
+    current_signature: tuple[int, int, int] | None,
+    loaded_signature: tuple[int, int, int] | None,
+    snapshot_available: bool,
+) -> bool:
+    """Trust prompt exclusions only while they describe the current sidecar."""
+
+    return bool(
+        snapshot_available
+        and current_signature is not None
+        and current_signature == loaded_signature
+    )
+
+
 def _discarded_terminal_candidate_matches(
     evidence: dict | None,
     marker: dict | None,
@@ -2090,12 +2171,21 @@ def main() -> int:
     ignore_prefix_lines: list[str] = []
     ignore_prompt_path: Path | None = None
     ignore_prompt_signature: tuple[int, int, int] | None = None
+    prompt_snapshot_available = False
+    prompt_provenance_available = False
+    prompt_snapshot_needs_retry = False
     dispatch_record_nonterminal_at_startup = False
     if args.ignore_prompt_file:
         ignore_prompt_path = Path(args.ignore_prompt_file)
         prompt_snapshot = _read_prompt_exclusion_snapshot(ignore_prompt_path)
         if prompt_snapshot is not None:
             ignore_prefix_lines, ignore_prompt_signature = prompt_snapshot
+            prompt_snapshot_available = any(
+                line.strip() for line in ignore_prefix_lines
+            )
+            prompt_provenance_available = prompt_snapshot_available
+        else:
+            prompt_snapshot_needs_retry = True
         if not ignore_prompt_path.exists() and not status_existed_at_startup:
             print(
                 "goalflight_watch: dispatch retired; prompt sidecar and status "
@@ -2577,19 +2667,37 @@ def main() -> int:
                 )
             except OSError:
                 current_prompt_signature = None
+                prompt_provenance_available = False
+                prompt_snapshot_needs_retry = True
+            prompt_provenance_available = (
+                _prompt_provenance_matches_loaded_snapshot(
+                    current_prompt_signature,
+                    ignore_prompt_signature,
+                    prompt_snapshot_available,
+                )
+            )
             reload_now = active_monotonic()
-            if _prompt_reload_due(
+            reload_prompt = (
+                current_prompt_signature is not None
+                and prompt_snapshot_needs_retry
+            ) or _prompt_reload_due(
                 current_prompt_signature,
                 ignore_prompt_signature,
                 last_reload_at=last_prompt_reload_at,
                 now=reload_now,
                 poll_secs=args.poll_secs,
-            ):
+            )
+            if reload_prompt:
                 prompt_snapshot = _read_prompt_exclusion_snapshot(
                     ignore_prompt_path
                 )
                 if prompt_snapshot is not None:
                     ignore_prefix_lines, ignore_prompt_signature = prompt_snapshot
+                    prompt_snapshot_available = any(
+                        line.strip() for line in ignore_prefix_lines
+                    )
+                    prompt_provenance_available = prompt_snapshot_available
+                    prompt_snapshot_needs_retry = False
                     last_prompt_reload_at = reload_now
                     # ACP steers regenerate the delivered prompt between turns.
                     # A startup-only snapshot lets a later echoed steer marker
@@ -2603,6 +2711,9 @@ def main() -> int:
                     tail_scanner.update_prompt_prefix(ignore_prefix_lines)
                     terminal_seen = None
                     terminal_seen_at = None
+                else:
+                    prompt_provenance_available = False
+                    prompt_snapshot_needs_retry = True
                     terminal_seen_size = None
         scan = tail_scanner.scan(kimi_output=moonshot_family(args.agent))
         markers = scan.markers
@@ -2938,7 +3049,13 @@ def main() -> int:
                     continue
                 payload["state"] = "worker_dead"
                 exit_reason = (
-                    "worker_dead_no_terminal_marker"
+                    _worker_dead_no_marker_reason(
+                        tail,
+                        ignore_prefix_lines,
+                        prompt_provenance_available=prompt_provenance_available,
+                        prompt_path=ignore_prompt_path,
+                        prompt_signature=ignore_prompt_signature,
+                    )
                     if identity_reason == "dead"
                     else f"worker_identity_mismatch:{identity_reason}"
                 )

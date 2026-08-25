@@ -11,6 +11,39 @@ import goalflight_rate_pressure
 
 RATE_LIMIT_TAIL_BYTES = 2048
 FINAL_RECONCILIATION_TAIL_BYTES = 10 * 1024 * 1024
+WORKER_DEATH_CAUSE_TAIL_BYTES = 16 * 1024
+
+WORKER_DEATH_CAUSE_NO_EVIDENCE = "no_evidence"
+_UPSTREAM_NETWORK_DEATH_SEQUENCE = (
+    # Observed verbatim, in this order, in the 2026-08-24 network-death tail.
+    "failed to lookup address information: nodename nor servname provided",
+    "stream disconnected before completion",
+    "error: reconnecting... 5/5",
+)
+_PROVIDER_LIMIT_DEATH_LINE_PATTERNS = (
+    # Verbatim B054 provider tail fixture.
+    re.compile(
+        r"^error:\s*selected model is at capacity\. please try a different model\.$",
+        re.IGNORECASE,
+    ),
+    # Verbatim usage-limit tail fixture; reset time is provider-controlled.
+    re.compile(
+        r"^(?:error:\s*)?you(?:'|’)ve hit your usage limit\. "
+        r"please try again at\s+(?:"
+        r"[0-9]{1,2}:[0-9]{2}\s*(?:am|pm)"
+        r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+"
+        r"[0-9]{1,2}(?:st|nd|rd|th)"
+        r")\.?$",
+        re.IGNORECASE,
+    ),
+)
+_PROVIDER_LIMIT_DEATH_MENTION_FRAGMENT_GROUPS = (
+    ("selected model is at capacity", "please try a different model"),
+    ("you've hit your usage limit", "please try again at"),
+    ("you’ve hit your usage limit", "please try again at"),
+)
+_PROVIDER_LIMIT_TOKEN_HEADER_PATTERN = re.compile(r"^tokens used:?$", re.IGNORECASE)
+_PROVIDER_LIMIT_TOKEN_COUNT_PATTERN = re.compile(r"^[0-9][0-9,]*$")
 # Compatibility import for callers that still name the historical umbrella.
 RATE_LIMITED_STATE = goalflight_dispatch_states.LEGACY_RATE_LIMITED_STATE
 SUCCESS_TERMINAL_MARKERS = {"COMPLETE", "READY", "RESULT"}
@@ -97,6 +130,55 @@ def read_tail_excerpt(path: Path, max_bytes: int = RATE_LIMIT_TAIL_BYTES) -> str
 
 # Compatibility export, not a second analyzer.
 rate_limit_signature_in_text = goalflight_rate_pressure.rate_limit_signature_in_text
+
+
+def classify_worker_death_text(text: object) -> str:
+    """Classify explicit death evidence, failing closed on absence or conflict."""
+
+    if not isinstance(text, str) or not text:
+        return WORKER_DEATH_CAUSE_NO_EVIDENCE
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return WORKER_DEATH_CAUSE_NO_EVIDENCE
+    lowered_lines = [line.casefold() for line in lines]
+    matches: set[str] = set()
+    network_width = len(_UPSTREAM_NETWORK_DEATH_SEQUENCE)
+    if tuple(lowered_lines[-network_width:]) == _UPSTREAM_NETWORK_DEATH_SEQUENCE:
+        matches.add("upstream_network")
+
+    provider_line_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if any(pattern.fullmatch(line) for pattern in _PROVIDER_LIMIT_DEATH_LINE_PATTERNS)
+    ]
+    provider_suffix = lines[provider_line_indexes[-1] + 1 :] if provider_line_indexes else []
+    provider_suffix_is_observed_footer = not provider_suffix or (
+        len(provider_suffix) == 2
+        and _PROVIDER_LIMIT_TOKEN_HEADER_PATTERN.fullmatch(provider_suffix[0])
+        and _PROVIDER_LIMIT_TOKEN_COUNT_PATTERN.fullmatch(provider_suffix[1])
+    )
+    if provider_line_indexes and provider_suffix_is_observed_footer:
+        matches.add("provider_limit")
+    if len(matches) != 1:
+        return WORKER_DEATH_CAUSE_NO_EVIDENCE
+    return matches.pop()
+
+
+def worker_death_causes_mentioned_in_text(text: object) -> set[str]:
+    """Return known evidence families mentioned anywhere in untrusted prompt text."""
+
+    if not isinstance(text, str) or not text:
+        return set()
+    lowered = re.sub(r"\s+", " ", text).casefold()
+    causes: set[str] = set()
+    if any(signature in lowered for signature in _UPSTREAM_NETWORK_DEATH_SEQUENCE):
+        causes.add("upstream_network")
+    if any(
+        all(fragment in lowered for fragment in group)
+        for group in _PROVIDER_LIMIT_DEATH_MENTION_FRAGMENT_GROUPS
+    ):
+        causes.add("provider_limit")
+    return causes
 
 
 def _rate_limit_outcome_from_text(
