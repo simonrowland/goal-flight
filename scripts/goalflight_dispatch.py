@@ -6878,13 +6878,45 @@ def _task_row_durably_complete(row: dict | None) -> bool:
     return derived in {"done-reviewed", "awaiting-review", "worker-finished"}
 
 
-def _ledger_task_ids_advanced(task_ids: list[str], *, self_dispatch_id: str) -> tuple[int, int, bool]:
+def _task_row_completion_timestamp_s(row: dict | None) -> float | None:
+    if not isinstance(row, dict):
+        return None
+    # done_at is the first durable completion. Review acceptance may happen
+    # later, so done_reviewed_at is only the fallback for worker-finished rows
+    # accepted without an explicit `done` transition.
+    for key in ("done_at", "done_reviewed_at", "closed_at"):
+        parsed = _parse_timestamp_s(row.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _completion_not_older_than_entry(
+    completion_timestamp_s: float | None,
+    entry_created_timestamp_s: float | None,
+) -> bool | None:
+    # Missing or malformed time is neither "older" nor "not older". Defer the
+    # authority decision instead of guessing: treating a missing entry time as
+    # old would silently drop deliberate follow-ups, while treating a missing
+    # completion time as old could launch a genuine queued duplicate.
+    if completion_timestamp_s is None or entry_created_timestamp_s is None:
+        return None
+    return completion_timestamp_s >= entry_created_timestamp_s
+
+
+def _ledger_task_ids_advanced(
+    task_ids: list[str],
+    *,
+    self_dispatch_id: str,
+    entry_created_timestamp_s: float | None = None,
+) -> tuple[int, int, bool]:
     """Return counts plus whether ledger authority was read conclusively."""
     if not task_ids:
         return 0, 0, True
     wanted = set(task_ids)
     complete_tasks: set[str] = set()
     advanced_tasks: set[str] = set()
+    unknown_completion_tasks: set[str] = set()
     try:
         records = goalflight_ledger.read_records()
     except Exception:
@@ -6910,6 +6942,15 @@ def _ledger_task_ids_advanced(task_ids: list[str], *, self_dispatch_id: str) -> 
             or state == "complete"
             or terminal == "complete"
         ):
+            completion_is_current = _completion_not_older_than_entry(
+                _parse_timestamp_s(record.get("ended_at")),
+                entry_created_timestamp_s,
+            )
+            if completion_is_current is None:
+                unknown_completion_tasks |= overlap
+                continue
+            if not completion_is_current:
+                continue
             complete_tasks |= overlap
             advanced_tasks |= overlap
             continue
@@ -6921,7 +6962,8 @@ def _ledger_task_ids_advanced(task_ids: list[str], *, self_dispatch_id: str) -> 
         if state and not goalflight_dispatch_states.is_terminal_state(state):
             if state not in {"queued", "waiting_capacity", "submitted"}:
                 advanced_tasks |= overlap
-    return len(complete_tasks), len(advanced_tasks), True
+    unresolved_unknowns = unknown_completion_tasks - complete_tasks
+    return len(complete_tasks), len(advanced_tasks), not unresolved_unknowns
 
 
 def _linked_task_truth(
@@ -6935,6 +6977,7 @@ def _linked_task_truth(
     if not task_ids:
         return "unlinked"
     project_root = _project_root_for_entry(entry, record)
+    entry_created_timestamp_s = _parse_timestamp_s(entry.get("created_at"))
     store_complete = 0
     store_seen = 0
     store_conclusive = True
@@ -6957,7 +7000,14 @@ def _linked_task_truth(
                 continue
             store_seen += 1
             if _task_row_durably_complete(row):
-                store_complete += 1
+                completion_is_current = _completion_not_older_than_entry(
+                    _task_row_completion_timestamp_s(row),
+                    entry_created_timestamp_s,
+                )
+                if completion_is_current is None:
+                    store_conclusive = False
+                elif completion_is_current:
+                    store_complete += 1
     except (ImportError, OSError):
         # Missing/unavailable task-store bytes make completion indeterminate.
         # Invalid store schemas and publish preconditions are permanent and
@@ -6970,6 +7020,7 @@ def _linked_task_truth(
     ledger_complete, ledger_advanced, ledger_conclusive = _ledger_task_ids_advanced(
         task_ids,
         self_dispatch_id=self_id,
+        entry_created_timestamp_s=entry_created_timestamp_s,
     )
 
     # Prefer explicit store truth when every linked id is present and complete.

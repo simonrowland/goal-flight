@@ -328,6 +328,193 @@ def _record_drain_launch_order(order: list[str]):
         D.subprocess.run = old_run
 
 
+@contextlib.contextmanager
+def _isolated_completion_authority(tmp: Path):
+    old_env = os.environ.copy()
+    try:
+        os.environ.clear()
+        os.environ.update(_env(tmp))
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+
+
+def _linked_task_entry(tmp: Path, dispatch_id: str, *, created_at: str) -> dict:
+    return {
+        "schema": D.DISPATCH_QUEUE_SCHEMA,
+        "state": "queued",
+        "dispatch_id": dispatch_id,
+        "agent": "test-dispatch",
+        "shape": "bash",
+        "project_root": str(tmp),
+        "created_at": created_at,
+        "task_ids": ["t-b212"],
+        "request": {"cwd": str(tmp), "task_ids": ["t-b212"]},
+    }
+
+
+def _write_completed_task(tmp: Path, *, done_at: str) -> None:
+    import goalflight_task
+
+    store = goalflight_task.TaskStore(tmp)
+    store.docs_dir.mkdir(parents=True, exist_ok=True)
+    store.tasks_path.write_text(
+        json.dumps(
+            {
+                "id": "t-b212",
+                "kind": "task",
+                "title": "completion ordering fixture",
+                "blocked_by": [],
+                "links": [],
+                "tags": [],
+                "done": True,
+                "created_at": "2025-01-01T00:00:00+00:00",
+                "created_by": "test",
+                "done_at": done_at,
+                "closed_at": done_at,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_prior_ledger_completion_does_not_supersede_deliberate_follow_up() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": "earlier-round",
+                    "agent": "test-dispatch",
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "project_root": str(tmp),
+                    "task_ids": ["t-b212"],
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "ended_at": "2026-01-01T01:00:00+00:00",
+                }
+            )
+            entry = _linked_task_entry(
+                tmp,
+                "deliberate-follow-up",
+                created_at="2026-01-02T00:00:00+00:00",
+            )
+
+            assert D._entry_completion_authority(entry, {}) is None
+
+
+def test_same_time_ledger_completion_still_supersedes_queued_duplicate() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": "winning-round",
+                    "agent": "test-dispatch",
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "project_root": str(tmp),
+                    "task_ids": ["t-b212"],
+                    "started_at": "2026-01-02T00:00:00+00:00",
+                    "ended_at": "2026-01-02T01:00:00+00:00",
+                }
+            )
+            entry = _linked_task_entry(
+                tmp,
+                "queued-duplicate",
+                created_at="2026-01-02T01:00:00+00:00",
+            )
+
+            decision = D._entry_completion_authority(entry, {})
+
+            assert decision is not None
+            assert decision["state"] == "superseded"
+            assert decision["reason"] == "task_store:all_complete"
+
+
+def test_prior_store_completion_does_not_supersede_deliberate_follow_up() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            _write_completed_task(tmp, done_at="2026-01-01T01:00:00+00:00")
+            entry = _linked_task_entry(
+                tmp,
+                "store-follow-up",
+                created_at="2026-01-02T00:00:00+00:00",
+            )
+
+            assert D._entry_completion_authority(entry, {}) is None
+
+
+def test_later_store_completion_still_supersedes_queued_duplicate() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            _write_completed_task(tmp, done_at="2026-01-02T01:00:00+00:00")
+            entry = _linked_task_entry(
+                tmp,
+                "store-duplicate",
+                created_at="2026-01-01T00:00:00+00:00",
+            )
+
+            decision = D._entry_completion_authority(entry, {})
+
+            assert decision is not None
+            assert decision["state"] == "superseded"
+            assert decision["reason"] == "task_store:all_complete"
+
+
+def test_missing_ledger_completion_time_defers_supersession() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": "completion-without-time",
+                    "agent": "test-dispatch",
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "project_root": str(tmp),
+                    "task_ids": ["t-b212"],
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                }
+            )
+            entry = _linked_task_entry(
+                tmp,
+                "unknown-order",
+                created_at="2026-01-02T00:00:00+00:00",
+            )
+
+            decision = D._entry_completion_authority(entry, {})
+
+            assert decision is not None
+            assert decision["state"] == "deferred"
+            assert decision["reason"] == "completion_authority_indeterminate"
+
+
+def test_missing_entry_creation_time_defers_supersession() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            _write_completed_task(tmp, done_at="2026-01-02T01:00:00+00:00")
+            entry = _linked_task_entry(
+                tmp,
+                "unknown-submission-time",
+                created_at="not-a-timestamp",
+            )
+
+            decision = D._entry_completion_authority(entry, {})
+
+            assert decision is not None
+            assert decision["state"] == "deferred"
+            assert decision["reason"] == "completion_authority_indeterminate"
+
+
 def test_submit_status_delay_requires_test_mode() -> None:
     keys = (
         "GOALFLIGHT_TEST_MODE",
@@ -3081,6 +3268,7 @@ def test_b065_superseded_does_not_demote_task_success() -> None:
                         "agent": "test-dispatch",
                         "shape": "bash",
                         "project_root": str(project),
+                        "created_at": "2000-01-01T00:00:00+00:00",
                         "dispatch_argv": ["--agent", "test-dispatch"],
                         "task_ids": ["b-065-task"],
                         "request": {
