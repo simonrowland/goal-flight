@@ -5768,7 +5768,51 @@ def cmd_listen(args) -> int:
         print(f"listen: wake ledger registration failed: {exc}", file=sys.stderr)
         return 2
 
+    # Fix the report-pending threshold before publishing journal coverage.
+    # Producers and controllers treat an ARMED coverage row as the listener's
+    # readiness boundary; taking this snapshot afterwards lets an event posted
+    # beyond that boundary leak into arm_high and become silent backlog.
+    arm_high: dict[str, int] = {}
+    arm_snapshot = None
+    should_report = False
     try:
+        if getattr(args, "report_pending", False):
+            try:
+                arm_snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
+            except goalflight_journal.JournalUnavailable:
+                arm_snapshot = None
+            persisted_high = goalflight_wake.pending_report_high_water(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+            )
+            if persisted_high is not None:
+                # A prior arm in this generation already reported. Use that
+                # high-water, not this process's later peek — otherwise a
+                # superseded re-arm silently swallows events that arrived after
+                # the report.
+                arm_high = persisted_high
+            elif arm_snapshot is not None and arm_snapshot.items:
+                arm_high = _cursor_positions(arm_snapshot.items)
+                # First arm in this lease generation converts the backlog into
+                # one report. Later arms stay silent so pending mail cannot spend
+                # the whole pool. Resolve the exclusive winner before any arm is
+                # externally visible, so every visible peer uses the same water.
+                should_report = goalflight_wake.claim_pending_report(
+                    project_root,
+                    controller_label=label,
+                    lease_nonce=nonce,
+                    positions=arm_high,
+                )
+                if not should_report:
+                    winner_high = goalflight_wake.pending_report_high_water(
+                        project_root,
+                        controller_label=label,
+                        lease_nonce=nonce,
+                    )
+                    if winner_high is not None:
+                        arm_high = winner_high
+
         armed = authority.arm_listener(
             label,
             nonce=nonce,
@@ -5980,84 +6024,40 @@ def cmd_listen(args) -> int:
         stream=sys.stderr,
     )
 
-    # Opt-in arm-reports-pending: report the backlog and raise the ring threshold
-    # to the arm-time high-water so only events BEYOND it ring. Without the
-    # option, the pre-existing exit-driven contract remains intact: pending mail
-    # immediately follows the ordinary one-line ring path below.
-    arm_high: dict[str, int] = {}
-    arm_snapshot = None
-    if getattr(args, "report_pending", False):
-        try:
-            arm_snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
-        except goalflight_journal.JournalUnavailable:
-            arm_snapshot = None
-        persisted_high = goalflight_wake.pending_report_high_water(
-            project_root,
+    # Report the snapshot selected before coverage became externally visible.
+    # The arm doubles as the peek: emit the same machine-readable snapshot
+    # relay --new --json would, advance command included, so the awake
+    # controller drains the backlog without another CLI round-trip.
+    if should_report and arm_snapshot is not None:
+        arm_advance = _cursor_advance_command(
+            project_root=project_root,
             controller_label=label,
             lease_nonce=nonce,
+            cursor_version=arm_snapshot.cursor_version,
+            positions=_cursor_positions(arm_snapshot.items),
+            stream_snapshots=arm_snapshot.stream_snapshots,
         )
-        if persisted_high is not None:
-            # A prior arm in this generation already reported. Use that
-            # high-water, not this process's later peek — otherwise a
-            # superseded re-arm silently swallows events that arrived after
-            # the report.
-            arm_high = persisted_high
-        elif arm_snapshot is not None and arm_snapshot.items:
-            arm_high = _cursor_positions(arm_snapshot.items)
-            # First arm in this lease generation converts the backlog into one
-            # report. Later arms stay silent so pending mail cannot spend the
-            # whole pool. Two arms racing: the exclusive claim decides the
-            # reporter; both wait beyond the *reported* positions.
-            should_report = goalflight_wake.claim_pending_report(
-                project_root,
+        arm_payload = {
+            "kind": "pending-at-arm",
+            "items": arm_snapshot.items,
+            "cursor_version": arm_snapshot.cursor_version,
+            "advance_command": arm_advance,
+        }
+        if args.json:
+            print(
+                json.dumps(arm_payload, sort_keys=True, default=str),
+                flush=True,
+            )
+        else:
+            arm_items = _envelopes_with_rows(authority, list(arm_snapshot.items))
+            visible_arm_items = _foreign_controller_items(
+                arm_items,
                 controller_label=label,
                 lease_nonce=nonce,
-                positions=arm_high,
             )
-            if not should_report:
-                winner_high = goalflight_wake.pending_report_high_water(
-                    project_root,
-                    controller_label=label,
-                    lease_nonce=nonce,
-                )
-                if winner_high is not None:
-                    arm_high = winner_high
-            else:
-                # The arm doubles as the peek: emit the same machine-readable
-                # snapshot relay --new --json would, advance command included,
-                # so the awake controller drains the backlog straight from this
-                # output without a second CLI round-trip.
-                arm_advance = _cursor_advance_command(
-                    project_root=project_root,
-                    controller_label=label,
-                    lease_nonce=nonce,
-                    cursor_version=arm_snapshot.cursor_version,
-                    positions=_cursor_positions(arm_snapshot.items),
-                    stream_snapshots=arm_snapshot.stream_snapshots,
-                )
-                arm_payload = {
-                    "kind": "pending-at-arm",
-                    "items": arm_snapshot.items,
-                    "cursor_version": arm_snapshot.cursor_version,
-                    "advance_command": arm_advance,
-                }
-                if args.json:
-                    print(
-                        json.dumps(arm_payload, sort_keys=True, default=str),
-                        flush=True,
-                    )
-                else:
-                    arm_items = _envelopes_with_rows(
-                        authority, list(arm_snapshot.items)
-                    )
-                    visible_arm_items = _foreign_controller_items(
-                        arm_items,
-                        controller_label=label,
-                        lease_nonce=nonce,
-                    )
-                    for row, envelope in visible_arm_items:
-                        print(format_receipt_headline(row, envelope), flush=True)
-                    print(f"advance: {arm_advance}", flush=True)
+            for row, envelope in visible_arm_items:
+                print(format_receipt_headline(row, envelope), flush=True)
+            print(f"advance: {arm_advance}", flush=True)
 
     while True:
         parent_result = parent_exit()

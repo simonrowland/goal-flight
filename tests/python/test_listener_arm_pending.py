@@ -30,6 +30,37 @@ import goalflight_messages as messages  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 
 
+_DELAY_FIRST_LISTENER_PEEK = r"""
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, os.environ["GOALFLIGHT_TEST_SCRIPTS"])
+import goalflight_journal as journal
+
+original_cursor_peek = journal.Journal.cursor_peek
+first_peek = True
+
+def delayed_cursor_peek(self, *args, **kwargs):
+    global first_peek
+    if first_peek:
+        first_peek = False
+        Path(os.environ["GOALFLIGHT_TEST_PEEK_READY"]).write_text("ready\n")
+        release = Path(os.environ["GOALFLIGHT_TEST_PEEK_RELEASE"])
+        deadline = time.monotonic() + 3
+        while not release.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if not release.exists():
+            raise RuntimeError("test did not release the listener arm snapshot")
+    return original_cursor_peek(self, *args, **kwargs)
+
+journal.Journal.cursor_peek = delayed_cursor_peek
+import goalflight_messages
+raise SystemExit(goalflight_messages.main(sys.argv[1:]))
+"""
+
+
 @pytest.fixture()
 def isolated(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, str]]:
     td = Path(tempfile.mkdtemp(prefix="gf-arm-pending-"))
@@ -487,6 +518,130 @@ def test_replacement_arm_rings_events_arriving_after_first_report(
     # report (and, in a pool, the other doorbells) on mail already seen.
     assert [payload["kind"] for payload in timeout_payloads] == ["exit"]
     assert timeout_payloads[-1]["reason"] == "timeout"
+
+
+@pytest.mark.parametrize("run", range(1, 4))
+def test_rearmed_listener_with_unread_backlog_rings_new_event_three_runs(
+    isolated: tuple[Path, dict[str, str]],
+    run: int,
+) -> None:
+    """Coverage cannot become visible before its backlog threshold is fixed."""
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": f"arm-production-rearm-{run}"}
+    ).value
+    assert lease is not None
+    listener_env = {
+        **env,
+        "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+    }
+    dispatch_id = f"production-rearm-{run}"
+    peek_ready = project / "peek-ready"
+    peek_release = project / "peek-release"
+    listener_env.update(
+        {
+            "GOALFLIGHT_TEST_SCRIPTS": str(SCRIPTS),
+            "GOALFLIGHT_TEST_PEEK_READY": str(peek_ready),
+            "GOALFLIGHT_TEST_PEEK_RELEASE": str(peek_release),
+        }
+    )
+    command = [
+        sys.executable,
+        "-c",
+        _DELAY_FIRST_LISTENER_PEEK,
+        "listen",
+        "--project-root",
+        str(project),
+        "--controller-label",
+        "armtest",
+        "--json",
+        "--poll-secs",
+        "0.01",
+        "--timeout-s",
+        "2",
+    ]
+
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        _post(env, project, "backlog already pending", dispatch_id=dispatch_id)
+        replacement = subprocess.Popen(
+            command,
+            env=listener_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not peek_ready.exists():
+                time.sleep(0.01)
+            assert peek_ready.exists(), "listener never reached its arm snapshot"
+
+            coverage = authority.active_coverage("armtest")
+            coverage_was_visible_before_snapshot = bool(
+                coverage is not None and coverage["pid"] == replacement.pid
+            )
+            if coverage_was_visible_before_snapshot:
+                _post(
+                    env,
+                    project,
+                    "new event after replacement arm",
+                    dispatch_id=dispatch_id,
+                )
+                peek_release.write_text("release\n", encoding="utf-8")
+            else:
+                peek_release.write_text("release\n", encoding="utf-8")
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    coverage = authority.active_coverage("armtest")
+                    if coverage is not None and coverage["pid"] == replacement.pid:
+                        break
+                    time.sleep(0.01)
+                else:
+                    pytest.fail("production-shape replacement never armed")
+                _post(
+                    env,
+                    project,
+                    "new event after replacement arm",
+                    dispatch_id=dispatch_id,
+                )
+
+            stdout, stderr = replacement.communicate(timeout=3)
+            arm_high = wake.pending_report_high_water(
+                project,
+                controller_label="armtest",
+                lease_nonce=lease.nonce,
+            )
+            pending = authority.cursor_peek("armtest", nonce=lease.nonce)
+            event_positions = {
+                str(item["stream_id"]): int(item["stream_seq"])
+                for item in pending.items
+            }
+            print(
+                "PRODUCTION_REARM "
+                f"run={run} arm_high={arm_high} "
+                f"event_positions={event_positions} "
+                f"cursor_version={pending.cursor_version} "
+                f"coverage_before_snapshot={coverage_was_visible_before_snapshot}"
+            )
+            payloads = [
+                json.loads(line) for line in stdout.splitlines() if line.strip()
+            ]
+            assert coverage_was_visible_before_snapshot is False
+            assert arm_high == {dispatch_id: 1}
+            assert replacement.returncode == 0, (stderr, payloads)
+            assert payloads[0]["kind"] == "pending-at-arm", payloads
+            assert payloads[-1]["kind"] == "ring", payloads
+            assert payloads[-1]["reason"] == "event"
+            assert f"{dispatch_id}=2" in payloads[-1]["advance_command"]
+        finally:
+            peek_release.write_text("release\n", encoding="utf-8")
+            if replacement.poll() is None:
+                replacement.kill()
+                replacement.communicate(timeout=3)
 
 
 def main() -> None:
