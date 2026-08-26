@@ -810,6 +810,18 @@ def _decorate_trace_status(record: dict) -> dict:
         out["liveness_state"] = "running_via_trace"
     if sidecar.get("state") in {"long_running", "long_running_review"}:
         out["trace_attention_state"] = sidecar["state"]
+    if sidecar.get("state") in {"worker_stalled_candidate", "worker_wedged"}:
+        # Live salvage CANDIDATE: process still exists. Overlay so a
+        # controller can distinguish "maybe stuck, tree may hold finished
+        # work" from worker_dead without terminalizing the ledger row.
+        # Not a verdict: remote-wait workers match this signature while healthy.
+        out["state"] = "worker_stalled_candidate"
+        out["liveness_state"] = "worker_stalled_candidate"
+        evidence = sidecar.get("wedge_evidence")
+        if isinstance(evidence, dict):
+            out["wedge_evidence"] = evidence
+        if sidecar.get("reason"):
+            out.setdefault("reason", sidecar["reason"])
     return out
 
 
@@ -995,6 +1007,11 @@ def _dashboard_count_bucket(record: dict) -> str:
     cls = str(record.get("classification") or record.get("state") or "")
     state = str(record.get("state") or "")
     terminal = str(record.get("terminal_state") or "")
+    if cls in {"worker_stalled_candidate", "worker_wedged"} or state in {
+        "worker_stalled_candidate",
+        "worker_wedged",
+    }:
+        return "stalled"
     if done_code(record) == 1:
         return "running"
     if cls in {"worker_dead", "stale_dead"} or state == "worker_dead" or terminal == "worker_dead":

@@ -58,6 +58,13 @@ FAILURE_TERMINAL_RECORD_STATES = frozenset(
 
 WEDGED_TERMINAL_RECORD_STATES = frozenset({"idle_timeout", "wedged"})
 
+# Watch-layer live salvage CANDIDATE. The process is still alive and may
+# hold finished work or be waiting on a remote job; the controller decides.
+# Never add this to TERMINAL_STATES or WEDGED_TERMINAL_RECORD_STATES: those
+# paths assume the worker is gone (ACP `wedged` kills; worker_dead is death).
+WORKER_STALLED_CANDIDATE_STATE = "worker_stalled_candidate"
+WORKER_WEDGED_STATE = WORKER_STALLED_CANDIDATE_STATE
+
 TERMINAL_SUCCESS_STATES = SUCCESS_TERMINAL_RECORD_STATES
 
 TERMINAL_FAILURE_STATES = FAILURE_TERMINAL_RECORD_STATES | WEDGED_TERMINAL_RECORD_STATES

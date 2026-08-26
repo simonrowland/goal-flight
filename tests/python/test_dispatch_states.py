@@ -41,6 +41,16 @@ def test_dispatch_state_aliases_and_lifecycle() -> None:
     assert states.terminal_state_for("controller_dead") == "controller_dead"
     assert states.terminal_state_for("rate_limited") == "rate_limited"
     assert states.state_seq_rank("watcher_stopped") == 45
+    # Live salvage observation: process still exists and may recover.
+    # Distinct from ACP terminal `wedged` and from `worker_dead`.
+    assert states.WORKER_STALLED_CANDIDATE_STATE == "worker_stalled_candidate"
+    assert states.is_terminal_state("worker_stalled_candidate") is False
+    assert states.is_running_state("worker_stalled_candidate") is False
+    assert states.terminal_state_for("worker_stalled_candidate") == "unknown"
+    assert states.is_terminal_state("wedged") is True
+    assert states.terminal_state_for("wedged") == "error"
+    assert states.is_terminal_state("worker_dead") is True
+    assert states.terminal_state_for("worker_dead") == "worker_dead"
 
 
 def test_limit_retry_policy_holds_exhausted_and_retries_transient() -> None:
