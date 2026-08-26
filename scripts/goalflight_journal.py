@@ -762,10 +762,14 @@ def _sqlite_primary_error_code(exc: BaseException) -> int | None:
 
 
 def _is_cantopen(exc: BaseException) -> bool:
+    cantopen = getattr(sqlite3, "SQLITE_CANTOPEN", None)
     return (
         isinstance(exc, sqlite3.DatabaseError)
         and (
-            _sqlite_primary_error_code(exc) == sqlite3.SQLITE_CANTOPEN
+            (
+                isinstance(cantopen, int)
+                and _sqlite_primary_error_code(exc) == cantopen
+            )
             or "unable to open database file" in str(exc).lower()
         )
     )
@@ -773,8 +777,12 @@ def _is_cantopen(exc: BaseException) -> bool:
 
 def _is_corruption_error(exc: BaseException) -> bool:
     corruption_codes = {
-        sqlite3.SQLITE_CORRUPT,
-        sqlite3.SQLITE_NOTADB,
+        code
+        for code in (
+            getattr(sqlite3, "SQLITE_CORRUPT", None),
+            getattr(sqlite3, "SQLITE_NOTADB", None),
+        )
+        if isinstance(code, int)
     }
     sqlite_format = getattr(sqlite3, "SQLITE_FORMAT", None)
     if isinstance(sqlite_format, int):

@@ -20,10 +20,33 @@ incremented when meaningful skill behaviour changes.
   configured target takes the next free slot; `--listener-slots` /
   `GOALFLIGHT_LISTENER_SLOTS` / `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` remain
   how many doorbells to run (`live/target`), not a cap. `listen` exit 3
-  is mail-pending only.
+  is no longer a full-pool refusal; callers must read the stderr reason.
+- Persistent wake has a preferred one-command front door:
+  `goalflight_messages.py supervise`. Arm it once through the host stdout
+  monitor; it owns the stream, the configured backup doorbell pool, and the
+  watchdog, multiplexes their stdout, restarts deaths with bounded backoff,
+  and re-arms a doorbell after a ring. Individual `follow` / `listen` /
+  `--watch-follow` commands stay valid for hosts that arm them separately.
+  Supervised children pin `--lease-nonce` under the listener role; journal
+  unreadability stays retryable and is not a dead nonce; `live` counts armed
+  flocks or a durable child armed/ring line; a unit did-not-arm (explicit
+  leftover-lock / regular-file markers) or permanent unarmed exit-2 stops
+  that slot without killing siblings. A missed lock sample on a successful
+  ring re-arms. The nonce probe reads through the non-locking journal
+  reader, so a busy write constructor cannot be mistaken for a dead lease.
 
 ### Fixed
 
+- Supervised wake classifies a child exit from the child's diagnostic
+  channel (stderr plus structured child-exit JSON reasons), never from
+  relayed mail headlines. A doorbell that reports a subject containing
+  `stale-lease` / `journal-unavailable` / `already has a live follow
+  watchdog` and then rings still re-arms; those tokens in mail no longer
+  stop the supervisor or a slot. Residual listen exit 3 is
+  `exit-3-unclassified` rather than implied contention; parent-changed
+  and controlling-stdout-closed are named `orphaned-parent` /
+  `orphaned-stdout`. The nonce hook can express `unreadable` so a busy
+  journal cannot collapse into `dead-lease-nonce`.
 - Drain no longer restores a queued dispatch whose launch argv is now a
   permanently inert `--os-sandbox` combination. Transient refusals
   (capacity, a missing controller) still restore-and-retry; a permanent

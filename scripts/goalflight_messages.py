@@ -3394,13 +3394,16 @@ def _resolve_listen_auto_lease(
 
     Ambient env is one input, not the only one. The journal ACTIVE lease
     for ``(project, label)`` is the default. ``--lease-nonce`` pins a
-    generation. Two live generations plus a disagreeing env capability
-    refuse rather than silently picking.
+    generation; a supervised child may pin under its own ``listener`` role.
+    Auto-resolution of the ACTIVE lease still requires the controller role.
+    Two live generations plus a disagreeing env capability refuse rather
+    than silently picking.
     """
     if str(os.environ.get("GOALFLIGHT_DISPATCH_ID") or "").strip():
         return {"claimed": False, "reason": "worker-dispatch", "label": controller_label}
     role = str(os.environ.get("GOALFLIGHT_PROCESS_ROLE") or "controller").strip()
-    if role != "controller":
+    pinned = str(explicit_nonce or "").strip()
+    if role != "controller" and not pinned:
         return {
             "claimed": False,
             "reason": "non-controller-role",
@@ -3419,7 +3422,6 @@ def _resolve_listen_auto_lease(
         }
     live = _listen_auto_live_generations(authority, project_root, controller_label)
     active = [row for row in live if row.get("state") == "ACTIVE"]
-    pinned = str(explicit_nonce or "").strip()
     if pinned:
         match = next((row for row in live if row.get("nonce") == pinned), None)
         if match is None:
@@ -5133,6 +5135,17 @@ def _write_follow_record(
             raise
 
 
+def _emit_supervised_armed() -> None:
+    """Durable arming witness on stdout for the supervisor, not a controller wake.
+
+    Only supervised children emit this. The supervisor records it, then drops
+    the line so it does not flush a host wake on every re-arm.
+    """
+    if os.environ.get("GOALFLIGHT_SUPERVISED") != "1":
+        return
+    print('{"kind":"armed"}', flush=True)
+
+
 def _follow_stdout_refusal(stream: object) -> str | None:
     try:
         mode = os.fstat(stream.fileno()).st_mode  # type: ignore[attr-defined]
@@ -5467,6 +5480,7 @@ def cmd_follow(args) -> int:
             pass
         print(f"follow: durable monitor state unavailable: {exc}", file=sys.stderr)
         return 2 if stdout_alive else 0
+    _emit_supervised_armed()
 
     death_watch = _ListenerDeathWatch()
     death_watch.install()
@@ -5704,6 +5718,7 @@ def _cmd_watch_follow(
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"listen: watchdog registration failed: {exc}", file=sys.stderr)
         return 2
+    _emit_supervised_armed()
 
     started = time.monotonic()
     startup_state_stamp = goalflight_wake.monitor_state_stamp(
@@ -5743,12 +5758,17 @@ def _cmd_watch_follow(
                     "listen: orphaned: watchdog parent changed",
                     file=sys.stderr,
                 )
+                # Supervised: parent is the supervisor. This is a subreaper
+                # reparent, not a live-pool condition; classified
+                # orphaned-parent rather than the exit-3 catch-all.
                 return 3
             if _stdio_peer_gone(sys.stdout):
                 print(
                     "listen: orphaned: controlling stdout closed; tracked task is gone",
                     file=sys.stderr,
                 )
+                # Supervised: stdout is the supervisor pipe we still hold.
+                # A hit is a shutdown race; classified orphaned-stdout.
                 return 3
             if deadline is not None and time.monotonic() >= deadline:
                 return 1
@@ -6033,6 +6053,7 @@ def cmd_listen(args) -> int:
         return 2
 
     coverage_id = str(coverage["coverage_id"])
+    _emit_supervised_armed()
     listener_started = time.monotonic()
     detached_grace = _listener_startup_grace_s()
     watchdog_start_grace = (
@@ -6179,6 +6200,8 @@ def cmd_listen(args) -> int:
                 return finish_detached()
             return None
         if current_parent != parent_pid:
+            # Supervised: parent is the supervisor. Same orphaned-parent
+            # classification as the watchdog path; not the exit-3 catch-all.
             return finish("orphaned", code=3, detail="listener parent changed")
         return None
 
@@ -6201,6 +6224,8 @@ def cmd_listen(args) -> int:
                 if noticed is not None
                 else ""
             )
+            # Supervised: stdout is the supervisor pipe. Shutdown race;
+            # classified orphaned-stdout, not the exit-3 catch-all.
             return finish(
                 "orphaned",
                 code=3,
@@ -6634,6 +6659,13 @@ def cmd_listen_auto(args) -> int:
     return cmd_listen(args)
 
 
+def cmd_supervise(args) -> int:
+    """One tracked task that owns the persistent wake pool."""
+    import goalflight_wake_supervise as supervise
+
+    return supervise.cmd_supervise(args)
+
+
 def cmd_mirror(args: argparse.Namespace) -> int:
     result = merge_remote_register(args.fleet_dir, args.remote, messages_dir=args.messages_dir)
     print(json.dumps(result, indent=2))
@@ -6870,6 +6902,35 @@ def _run_cli(argv: list[str] | None = None) -> int:
     )
     follow.set_defaults(func=cmd_follow)
 
+    supervise = sub.add_parser(
+        "supervise",
+        help=(
+            "one tracked task that owns the persistent wake pool and multiplexes "
+            "child stdout into a single feed"
+        ),
+        description=(
+            "Own the persistent wake pool as one tracked stdout feed: spawn the "
+            "stream, backup doorbells, and watchdog, multiplex their lines, and "
+            "restart them."
+        ),
+    )
+    supervise.add_argument("--project-root", default=None)
+    supervise.add_argument("--controller-label", default=None)
+    supervise.add_argument("--lease-nonce", default=None)
+    supervise.add_argument(
+        "--heartbeat-secs",
+        type=float,
+        default=120.0,
+        help="supervisor heartbeat interval (default 120; production 60-300)",
+    )
+    supervise.add_argument(
+        "--coverage-secs",
+        type=float,
+        default=0.0,
+        help="coverage live/target interval; 0 means the heartbeat interval",
+    )
+    supervise.set_defaults(func=cmd_supervise)
+
     mirror = sub.add_parser("mirror")
     mirror.add_argument("--remote", type=Path, required=True, help="Remote *.jsonl inbox to merge")
     listen.set_defaults(func=cmd_listen)
@@ -6881,6 +6942,7 @@ def _run_cli(argv: list[str] | None = None) -> int:
         "listen": "listener",
         "listen-auto": "listener",
         "follow": "listener",
+        "supervise": "listener",
         "mirror": "mirror",
         "status": "dashboard",
         "relay": "dashboard",
@@ -6888,7 +6950,7 @@ def _run_cli(argv: list[str] | None = None) -> int:
         "post": "producer",
     }
     role = role_by_command.get(args.cmd, "controller")
-    if args.cmd not in {"listen", "listen-auto", "follow"} and not (
+    if args.cmd not in {"listen", "listen-auto", "follow", "supervise"} and not (
         args.cmd == "relay" and args.drain
     ):
         entry_root = getattr(args, "controller_project_root", None) or Path.cwd()

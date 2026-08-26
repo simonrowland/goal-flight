@@ -873,37 +873,11 @@ def claim_session(
     }
 
 
-def live_session(
-    project_root: Path,
+def _session_dict_from_lease(
+    lease: goalflight_journal.LeaseIdentity,
     *,
-    label: str | None = None,
-    pid: int | None = None,
+    pid: int | None,
 ) -> dict | None:
-    """Return the kernel-lock-live active journal lease, or ``None``."""
-    root = goalflight_task.resolve_project_root(str(project_root))
-    if label is None and pid is None:
-        declared_pid = resolve_controller_pid()
-        label_was_declared = bool(str(os.environ.get(CONTROLLER_LABEL_ENV) or "").strip())
-        if label_was_declared or declared_pid is not None:
-            declared_label = resolve_controller_label(project_root=project_root)
-            if declared_label is None:
-                return None
-            label, pid = declared_label, declared_pid
-    try:
-        authority = goalflight_journal.Journal(root)
-    except goalflight_journal.JournalUnavailable:
-        return None
-    lease = authority.active_lease(label) if label is not None else None
-    if lease is None and label is None:
-        rows = authority.lease_records()
-        if len(rows) != 1:
-            return None
-        lease = authority.active_lease(str(rows[0]["label"]))
-    if lease is None:
-        return None
-    liveness = _lease_holder_liveness(lease)
-    if liveness is None or liveness.alive is not True:
-        return None
     principal = lease.principal
     if pid is not None and principal.get("pid") != pid:
         return None
@@ -927,6 +901,76 @@ def live_session(
         "label": lease.label,
         "process_identity": process_identity,
     }
+
+
+def probe_live_session(
+    project_root: Path,
+    *,
+    label: str | None = None,
+    pid: int | None = None,
+) -> tuple[str, dict | None]:
+    """Return ``(live|dead|unreadable, session-or-None)``.
+
+    Reads through ``Journal.open_reader`` so a busy write constructor is not
+    "there is no live session". Unreadable means the caller could not tell
+    and must retry; only a readable absent or changed lease is dead.
+    """
+    root = goalflight_task.resolve_project_root(str(project_root))
+    if label is None and pid is None:
+        declared_pid = resolve_controller_pid()
+        label_was_declared = bool(str(os.environ.get(CONTROLLER_LABEL_ENV) or "").strip())
+        if label_was_declared or declared_pid is not None:
+            declared_label = resolve_controller_label(project_root=project_root)
+            if declared_label is None:
+                return "dead", None
+            label, pid = declared_label, declared_pid
+    try:
+        authority = goalflight_journal.Journal.open_reader(
+            root,
+            retry_budget_s=0.05,
+            open_retry_budget_s=0.05,
+        )
+        lease = authority.active_lease(label) if label is not None else None
+        if lease is None and label is None:
+            rows = authority.lease_records()
+            if len(rows) != 1:
+                return "dead", None
+            lease = authority.active_lease(str(rows[0]["label"]))
+    except goalflight_journal.JournalDisappeared:
+        return "dead", None
+    except goalflight_journal.JournalUpgradeRequired:
+        raise
+    except goalflight_journal.JournalUnavailable:
+        return "unreadable", None
+    except (OSError, goalflight_journal.JournalError):
+        return "unreadable", None
+    if lease is None:
+        return "dead", None
+    liveness = _lease_holder_liveness(lease)
+    if liveness is None or liveness.alive is None:
+        return "unreadable", None
+    if liveness.alive is not True:
+        return "dead", None
+    session = _session_dict_from_lease(lease, pid=pid)
+    if session is None:
+        return "dead", None
+    return "live", session
+
+
+def live_session(
+    project_root: Path,
+    *,
+    label: str | None = None,
+    pid: int | None = None,
+) -> dict | None:
+    """Return the kernel-lock-live active journal lease, or ``None``.
+
+    ``None`` still collapses unreadable and absent for legacy callers. New
+    code that must not treat a busy journal as a dead lease should call
+    ``probe_live_session`` instead.
+    """
+    state, session = probe_live_session(project_root, label=label, pid=pid)
+    return session if state == "live" else None
 
 
 def _listener_depth_after_claim(

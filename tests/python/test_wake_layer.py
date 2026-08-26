@@ -43,6 +43,10 @@ _LISTENER_ARM_HARNESS_TIMEOUT_S = _COMPLETION_MAX_IDLE_S
 
 def isolated_env(tmp_path: Path, *, label: str = "wake-test") -> dict[str, str]:
     env = dict(os.environ)
+    # Advertised re-arm commands start with `python3`. Prefer the suite
+    # interpreter so PATH does not resolve to an unrelated system Python.
+    python_dir = str(Path(sys.executable).resolve().parent)
+    env["PATH"] = python_dir + os.pathsep + env.get("PATH", "")
     for key in (
         "GOALFLIGHT_DISPATCH_ID",
         "GOALFLIGHT_PROJECT_ROOT",

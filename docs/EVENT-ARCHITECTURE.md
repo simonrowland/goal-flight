@@ -392,9 +392,14 @@ against the design.
 
 ### Implemented contract
 
-`goalflight_messages.py follow` is the persistent JSON-line surface. The host
-persistent monitor must own its stdout directly; ordinary shell backgrounding,
-detaching, or a task surface that reports only at process exit produces no wakes.
+`goalflight_messages.py supervise` is the preferred one-task front door: it
+spawns the stream, backup doorbell pool, and watchdog from
+`coverage_rearm_commands`, multiplexes their stdout, and restarts them so a
+controller never re-arms N listeners by hand. `goalflight_messages.py follow`
+remains the persistent JSON-line surface for hosts that still arm components
+separately. The host persistent monitor must own the tracked task's stdout
+directly; ordinary shell backgrounding, detaching, or a task surface that
+reports only at process exit produces no wakes.
 Only `event`, `heartbeat`, and `frontier` records go to stdout. Diagnostics go to
 stderr, which the measured host contract does not notify. Fatal journal, cursor,
 ring, and durable-state failures are therefore structural `event` records on

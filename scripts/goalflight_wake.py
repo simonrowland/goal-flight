@@ -2633,6 +2633,114 @@ def coverage_rearm_commands(
     ]
 
 
+def coverage_supervise_items(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> list[tuple[str, str]]:
+    """Full persistent set as (kind, command), via coverage_rearm_commands."""
+    nonce = str(lease_nonce or "").strip()
+    if not nonce:
+        return []
+    backup_target = persistent_backup_slot_count()
+    target = persistent_wake_target()
+    status = {
+        "wake_mode": "persistent",
+        "live_waiters": 0,
+        "target_waiters": target,
+        "missing_components": ["stream", "backup", "watchdog"],
+        "portable_live_waiters": 0,
+        "portable_target_waiters": backup_target,
+        "backup": {
+            "required": True,
+            "state": "missing",
+            "observed": 0,
+            "target": backup_target,
+        },
+    }
+    commands = coverage_rearm_commands(
+        status,
+        project_root,
+        controller_label=controller_label,
+        lease_nonce=nonce,
+    )
+    items = _persistent_rearm_items(
+        status,
+        project_root,
+        controller_label=controller_label,
+        lease_nonce=nonce,
+    )
+    if [command for _kind, command in items] != commands:
+        return [
+            (classify_wake_command(command), command) for command in commands
+        ]
+    return items
+
+
+def coverage_supervise_commands(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> list[str]:
+    """Full persistent set from the same generator used for missing re-arms."""
+    return [
+        command
+        for _kind, command in coverage_supervise_items(
+            project_root,
+            controller_label=controller_label,
+            lease_nonce=lease_nonce,
+        )
+    ]
+
+
+def coverage_supervise_command(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> str:
+    """The one tracked-task command that owns the whole wake pool."""
+    messages_script = goalflight_compat.advertised_script(
+        "goalflight_messages.py",
+        running_file=__file__,
+    )
+    return shlex.join(
+        [
+            "python3",
+            str(messages_script),
+            "supervise",
+            "--project-root",
+            str(Path(project_root).expanduser().resolve(strict=False)),
+            "--controller-label",
+            controller_label,
+            "--lease-nonce",
+            lease_nonce,
+        ]
+    )
+
+
+def classify_wake_command(command: str) -> str:
+    """Map a coverage_rearm command string to stream/backup/watchdog."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    if "--watch-follow" in parts:
+        return "watchdog"
+    for index, part in enumerate(parts):
+        if Path(part).name in {"goalflight_messages.py", "goalflight_messages"}:
+            if index + 1 < len(parts) and parts[index + 1] == "follow":
+                return "stream"
+            if index + 1 < len(parts) and parts[index + 1] in {
+                "listen",
+                "listen-auto",
+            }:
+                return "backup"
+    return "backup"
+
+
 def coverage_rearm_plan(
     status: dict[str, object],
     project_root: Path | str,
