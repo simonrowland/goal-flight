@@ -365,7 +365,81 @@ def test_status_reconciliation_transient_io_is_deferred(
         error,
     )
 
-    assert status._persist_draft_artifact_reconciliation(record, reconciled) is None
+    assert status._persist_draft_artifact_reconciliation(record, reconciled) is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        journal.JournalIOError("one-shot journal IO"),
+        journal.JournalDisappeared("journal vanished"),
+    ),
+)
+def test_status_reconciliation_fatal_journal_failure_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    record, reconciled = _draft_reconciliation_fixture(
+        tmp_path,
+        monkeypatch,
+        error,
+    )
+
+    with pytest.raises(type(error), match="journal"):
+        status._persist_draft_artifact_reconciliation(record, reconciled)
+
+
+def test_status_does_not_claim_complete_when_terminal_persist_is_unverified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = {
+        "GOALFLIGHT_JOURNAL_DIR": tmp_path / "journal",
+        "GOALFLIGHT_STATE_DIR": tmp_path / "state",
+        "GOALFLIGHT_MESSAGES_DIR": tmp_path / "messages",
+        "GOALFLIGHT_TASK_STORE": tmp_path / "task-store",
+        "GOALFLIGHT_TASK_STORE_DIR": tmp_path / "task-store",
+        "GOALFLIGHT_WAKE_LEDGER": tmp_path / "wake-ledger.json",
+        "GOALFLIGHT_WAKE_LEDGER_DIR": tmp_path / "wake-ledger",
+        "GOALFLIGHT_DISPATCH_DIR": tmp_path / "dispatch",
+        "GOALFLIGHT_PIDFILE_DIR": tmp_path / "pidfiles",
+        "GOAL_FLIGHT_PIDFILE_DIR": tmp_path / "pidfiles",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, str(value))
+    monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", os.devnull)
+    project = tmp_path / "project"
+    project.mkdir()
+    artifact = project / "docs-private" / "research" / "draft.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("finished draft\n", encoding="utf-8")
+    record = {
+        "schema": "goalflight.dispatch.v1",
+        "dispatch_id": "draft-unverified",
+        "agent": "codex",
+        "state": "worker_dead",
+        "classification": "worker_dead",
+        "terminal_state": "worker_dead",
+        "project_root": str(project),
+        "draft_path": "docs-private/research/draft.md",
+        "draft_complete": True,
+        "started_at": "2020-01-01T00:00:00+00:00",
+    }
+    record_path = status.goalflight_ledger.record_path("draft-unverified")
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+    monkeypatch.setattr(
+        status.goalflight_ledger,
+        "cmd_finish",
+        lambda _args: (_ for _ in ()).throw(journal.JournalUnavailable("journal busy")),
+    )
+    out = status._reconcile_draft_artifact_record(record, tail=None, tail_mtime=None)
+    assert out.get("classification") != "complete"
+    assert out.get("state") != "complete"
+    assert out.get("terminal_state") != "complete"
+    assert out["draft_artifact_reconciliation"]["promoted"] is False
+    assert out["draft_artifact_reconciliation"]["reason"] == "terminal_persistence_unverified"
 
 
 def test_status_reconciliation_corrupt_record_surfaces(
@@ -423,6 +497,8 @@ def test_quota_stuck_lease_release_distinguishes_contract_from_transient(
         (ValueError("invalid terminal state"), True),
         (OSError("ledger busy"), False),
         (journal.JournalUnavailable("journal busy"), False),
+        (journal.JournalIOError("one-shot journal IO"), True),
+        (journal.JournalDisappeared("journal vanished"), True),
     ),
 )
 def test_quota_stuck_terminal_write_distinguishes_contract_from_transient(
@@ -448,7 +524,7 @@ def test_quota_stuck_terminal_write_distinguishes_contract_from_transient(
         reason={"limit_state": "quota_exhausted"},
     )
     if raises:
-        with pytest.raises(ValueError, match="invalid terminal state"):
+        with pytest.raises(type(error)):
             call()
     else:
         assert call() is False
@@ -1001,12 +1077,12 @@ def test_nested_shutdown_handlers_remain_visible_and_mutation_sensitive() -> Non
     assert "except OSError as exc:" in inspect.getsource(
         acp_client._release_quota_stuck_lease
     )
-    assert "except (OSError, goalflight_journal.JournalUnavailable) as exc:" in inspect.getsource(
-        acp_client._finish_quota_stuck_ledger
-    )
-    assert "except (OSError, goalflight_journal.JournalUnavailable):" in inspect.getsource(
-        status._persist_draft_artifact_reconciliation
-    )
+    finish_source = inspect.getsource(acp_client._finish_quota_stuck_ledger)
+    persist_source = inspect.getsource(status._persist_draft_artifact_reconciliation)
+    assert "except (goalflight_journal.JournalDisappeared, goalflight_journal.JournalIOError):" in finish_source
+    assert "except (goalflight_journal.JournalDisappeared, goalflight_journal.JournalIOError):" in persist_source
+    assert "except goalflight_journal.JournalUnavailable as exc:" in finish_source
+    assert "except goalflight_journal.JournalUnavailable:" in persist_source
 
     claim_cli_source = inspect.getsource(session_status.main)
     claim_cli_source = claim_cli_source.split("if args.claim_session:", 1)[1].split(

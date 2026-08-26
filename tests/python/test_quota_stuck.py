@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_acp_client as acp  # noqa: E402
 import goalflight_capacity as cap  # noqa: E402
+import goalflight_journal as journal  # noqa: E402
 import goalflight_ledger as ledger  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
 import goalflight_quota_stuck as quota  # noqa: E402
@@ -434,6 +435,97 @@ def test_quota_reaper_escalates_sigkill_when_sigterm_does_not_exit() -> None:
     assert_eq("quota reap escalation signals", calls, [(777, signal.SIGTERM), (777, signal.SIGKILL)])
 
 
+def test_quota_reaper_one_shot_journal_io_is_not_swallowed_after_kill() -> None:
+    """A one-shot JournalIOError after terminate cannot self-heal on a later sweep.
+
+    Quota-signature selection walks live PIDs. Once the worker is dead, a
+    swallowed fatal journal failure leaves the ledger row permanently
+    nonterminal. Persistent IO would be re-detected; one-shot would not.
+    """
+    with tempfile.TemporaryDirectory() as td, temp_env(
+        GOALFLIGHT_STATE_DIR=str(Path(td) / "state"),
+        GOALFLIGHT_TASK_STORE_DIR=str(Path(td) / "task-store"),
+        GOALFLIGHT_JOURNAL_DIR=str(Path(td) / "journal"),
+        GOALFLIGHT_MESSAGES_DIR=str(Path(td) / "messages"),
+    ):
+        tmp = Path(td)
+        record = quota_record(tmp, dispatch_id="qoneshot", pid=401, state="running_quiet")
+        ledger.write_record(record)
+        cap.save_state(
+            {
+                "schema": cap.SCHEMA,
+                "machine_id": "test",
+                "leases": {
+                    "lease-qoneshot": {
+                        "lease_id": "lease-qoneshot",
+                        "dispatch_id": "qoneshot",
+                        "agent": "grok-code",
+                        "state": "active",
+                        "worker_pid": 401,
+                        "controller_pid": os.getpid(),
+                        "mem_mb": 1,
+                        "started_at": cap.iso(),
+                        "expires_at": cap.iso(cap.utc_now() + dt.timedelta(hours=1)),
+                    }
+                },
+                "cooldowns": {},
+            }
+        )
+        killed: list[int] = []
+        finish_calls = {"n": 0}
+        original_finish = acp.goalflight_ledger.cmd_finish
+
+        def one_shot_finish(args: argparse.Namespace) -> int:
+            finish_calls["n"] += 1
+            if finish_calls["n"] == 1:
+                raise journal.JournalIOError("one-shot journal IO")
+            return original_finish(args)
+
+        acp.goalflight_ledger.cmd_finish = one_shot_finish  # type: ignore[assignment]
+        try:
+            raised: Exception | None = None
+            try:
+                acp.reap_quota_stuck_workers(
+                    process_rows=[process_row(401)],
+                    records=ledger.read_records(),
+                    ttl_s=180.0,
+                    getpgid=lambda pid: pid,
+                    terminate_group=lambda pgid: killed.append(pgid) or "SIGTERM+SIGKILL",
+                    now_ts=time.time(),
+                    enabled=True,
+                    identity_probe=live_identity,
+                    target_liveness_probe=lambda _pid, _pgid: False,
+                )
+            except journal.JournalIOError as exc:
+                raised = exc
+            assert_true("one-shot JournalIOError must escape after terminate", raised is not None)
+            assert_eq("worker already terminated", killed, [401])
+            persisted = json.loads(ledger.record_path("qoneshot").read_text(encoding="utf-8"))
+            assert_eq("ledger remains nonterminal", persisted.get("state"), "running_quiet")
+            assert_true(
+                "no durable terminal after one-shot IO",
+                persisted.get("terminal_state") not in {"quota_exhausted", "complete"},
+            )
+
+            result = acp.reap_quota_stuck_workers(
+                process_rows=[],
+                records=ledger.read_records(),
+                ttl_s=180.0,
+                getpgid=lambda pid: pid,
+                terminate_group=lambda pgid: killed.append(pgid) or "SIGTERM+SIGKILL",
+                now_ts=time.time(),
+                enabled=True,
+                identity_probe=live_identity,
+                target_liveness_probe=lambda _pid, _pgid: False,
+            )
+            assert_eq("dead pid is not re-selected", result["candidates"], [])
+            still = json.loads(ledger.record_path("qoneshot").read_text(encoding="utf-8"))
+            assert_eq("later sweep cannot self-heal", still.get("state"), "running_quiet")
+            assert_eq("one-shot finish was not retried", finish_calls["n"], 1)
+        finally:
+            acp.goalflight_ledger.cmd_finish = original_finish  # type: ignore[assignment]
+
+
 def test_quota_reaper_partial_failure_not_counted_as_reaped() -> None:
     with tempfile.TemporaryDirectory() as td, temp_env(
         GOALFLIGHT_STATE_DIR=str(Path(td) / "state"),
@@ -825,6 +917,7 @@ def main() -> None:
         test_quota_reaper_default_deny_guards_and_release,
         test_kimi_quota_reaper_and_surplus_discovery,
         test_quota_reaper_escalates_sigkill_when_sigterm_does_not_exit,
+        test_quota_reaper_one_shot_journal_io_is_not_swallowed_after_kill,
         test_quota_reaper_partial_failure_not_counted_as_reaped,
         test_quota_reaper_refuses_dispatch_lease_when_worker_pid_mismatches,
         test_quota_reaper_rejects_no_signature_young_pgid_mismatch_and_acp_shim,
