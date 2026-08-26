@@ -62,6 +62,7 @@ import io
 import json
 import os
 import re
+import select
 import shlex
 import signal
 import shutil
@@ -73,6 +74,7 @@ import uuid
 from pathlib import Path
 
 import goalflight_compat
+import goalflight_output_redact
 import goalflight_capacity
 import goalflight_codex_sessions
 import goalflight_dispatch_paths
@@ -909,28 +911,73 @@ def _cmd_spawn_daemon() -> int:
                 stdin_f = stack.enter_context(open(stdin_path, "rb"))
             else:
                 stdin_f = subprocess.DEVNULL
+            filter_proc = None
+            worker_stdout = subprocess.DEVNULL
             if stdout_path:
                 stdout_file = Path(stdout_path)
                 stdout_file.parent.mkdir(parents=True, exist_ok=True)
-                stdout_f = stack.enter_context(open(stdout_file, stdout_mode))
-                if serialize_stdout and fcntl is not None:
-                    # The child inherits this locked stdout file description.
-                    # Reconciliation takes the same flock before its final
-                    # completion read + durable write, so it cannot pass a
-                    # COMPLETE still buffered in a live worker's stdout path.
-                    fcntl.flock(stdout_f.fileno(), fcntl.LOCK_EX)
-            else:
-                stdout_f = subprocess.DEVNULL
-            stderr_f = subprocess.STDOUT if stderr_mode == "stdout" else subprocess.DEVNULL
-            child = subprocess.Popen(
-                argv,
-                stdin=stdin_f,
-                stdout=stdout_f,
-                stderr=stderr_f,
-                start_new_session=True,
-                close_fds=True,
-                pass_fds=goalflight_worktree_pool.inherited_worktree_lock_fds(),
+                # Redact by secret shape at write time. The filter process
+                # owns the tail flock so reconciliation cannot pass a
+                # COMPLETE still buffered here. Keying redaction on a
+                # resolved seat would skip the capture when lookup failed.
+                filter_argv = [
+                    sys.executable,
+                    "-u",
+                    str(SCRIPT_DIR / "goalflight_output_redact.py"),
+                ]
+                if serialize_stdout:
+                    filter_argv.append("--lock")
+                if "a" in str(stdout_mode):
+                    filter_argv.append("--append")
+                filter_argv.append(str(stdout_file))
+                ready_r, ready_w = os.pipe()
+                filter_env = os.environ.copy()
+                filter_env[goalflight_output_redact.READY_FD_ENV] = str(ready_w)
+                filter_proc = subprocess.Popen(
+                    filter_argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=filter_env,
+                    start_new_session=True,
+                    close_fds=True,
+                    pass_fds=(ready_w,),
+                )
+                os.close(ready_w)
+                try:
+                    ready, _wp, _xp = select.select([ready_r], [], [], 5.0)
+                    if not ready or not os.read(ready_r, 1):
+                        raise RuntimeError(
+                            "output redact filter did not become ready"
+                        )
+                except Exception:
+                    if filter_proc.poll() is None:
+                        filter_proc.kill()
+                    raise
+                finally:
+                    os.close(ready_r)
+                if filter_proc.poll() is not None:
+                    raise RuntimeError("output redact filter exited before worker start")
+                worker_stdout = filter_proc.stdin
+            stderr_f = (
+                subprocess.STDOUT if stderr_mode == "stdout" else subprocess.DEVNULL
             )
+            try:
+                child = subprocess.Popen(
+                    argv,
+                    stdin=stdin_f,
+                    stdout=worker_stdout,
+                    stderr=stderr_f,
+                    start_new_session=True,
+                    close_fds=True,
+                    pass_fds=goalflight_worktree_pool.inherited_worktree_lock_fds(),
+                )
+            except Exception:
+                if filter_proc is not None and filter_proc.stdin is not None:
+                    filter_proc.stdin.close()
+                raise
+            if filter_proc is not None and filter_proc.stdin is not None:
+                filter_proc.stdin.close()
         print(json.dumps({"pid": child.pid}, sort_keys=True), flush=True)
         return 0
     except Exception as e:

@@ -28,6 +28,7 @@ import goalflight_compat as fcntl
 import goalflight_dispatch_states
 import goalflight_fleet_console_history
 import goalflight_journal
+import goalflight_output_redact
 import goalflight_task
 import goalflight_terminal
 
@@ -635,6 +636,7 @@ def commit_terminal_authority(
     }
     if isinstance(headline, str) and headline.strip():
         observation["headline"] = headline.strip()
+    observation = goalflight_output_redact.redact_data(observation)
     return authority.commit_terminal(
         attempt.attempt_id,
         terminal_state=resolved_terminal,

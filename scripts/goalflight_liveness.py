@@ -21,6 +21,7 @@ from typing import Awaitable, Callable
 import uuid
 
 import goalflight_compat
+import goalflight_output_redact
 
 SYSTEM_STARVED_CACHE_TTL_S = 30.0
 SYSTEM_STARVED_IDLE_PCT = 20.0
@@ -669,6 +670,16 @@ def write_status(path: Path, payload: dict) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     _ensure_status_epoch(path, payload)
+    redacted = goalflight_output_redact.redact_data(payload)
+    if isinstance(redacted, dict):
+        if redacted is not payload:
+            payload.clear()
+            payload.update(redacted)
+    else:
+        # Fail-closed: never persist the unscrubbed payload.
+        payload.clear()
+        payload["state"] = "blocked"
+        payload["reason"] = "status_redact_failed"
     tmp = status_tmp_path(path)
     try:
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
