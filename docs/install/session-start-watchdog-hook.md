@@ -1,6 +1,6 @@
 # Install the SessionStart event-wake recovery hook
 
-Goal Flight uses event wakes for normal controller work. A claimed controller backgrounds the ownership listener; an unclaimed fixed-set controller backgrounds `goalflight_status.py --wait <ids>`. These wake promptly for owned worker terminal/escalation events and addressed mail; the canonical operating rule lives in `protocols/dispatch-routing.md` and `commands/execute.md`.
+Goal Flight uses event wakes for normal controller work. A claimed controller prefers one supervised feed; only a controller confirmed to be unsupervised backgrounds an ownership listener, while an unclaimed fixed-set controller backgrounds `goalflight_status.py --wait <ids>`. A live supervisor is restarted and UNKNOWN supervision is resolved before any direct component is armed. These wake promptly for owned worker terminal/escalation events and addressed mail; the canonical operating rule lives in `protocols/dispatch-routing.md` and `commands/execute.md`.
 
 Claude Code also has an hourly, self-suspending in-session cron as crash recovery. Its only job is to recover when the controller or background event wait was lost. If a live event wait already covers the session's in-flight dispatches, the cron reports that fact and does nothing else. The hourly interval bounds recovery of a lost event path to 60 minutes while avoiding a polling work loop.
 

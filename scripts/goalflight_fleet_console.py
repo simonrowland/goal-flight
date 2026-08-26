@@ -3,9 +3,11 @@
 
 This module consumes the aggregate status authority, then uses bounded
 read-only journal and status-sidecar evidence to explain or reconcile authority
-disagreements. It does not inspect tails, marker bodies, or process tables, and
-it does not invent a worker classification. Fleet and attention samples remain
-independent so a fast mailbox refresh never pretends to refresh worker liveness.
+disagreements. It does not inspect tails or marker bodies, and it does not invent
+a worker classification. The attention plane samples the process table once when
+HUNG controllers need supervision-aware recovery advice. Fleet and attention
+samples remain independent so a fast mailbox refresh never pretends to refresh
+worker liveness.
 """
 
 from __future__ import annotations
@@ -66,6 +68,10 @@ GENERIC_PROJECT_BASENAMES = frozenset({"project", "proj"})
 # Bound even malformed/multi-active history to the newest eight per label;
 # ended generations remain available through immutable slow history.
 CONTROLLER_GENERATION_PROBE_LIMIT = 8
+# The attention producer has a 3s wall budget and an observed 1.12s baseline.
+# A stuck process-table read must degrade to UNKNOWN without preserving a stale
+# ABSENT/direct-listener action from the prior sample.
+HUNG_SUPERVISOR_PROBE_TIMEOUT_S = 0.5
 
 # The short-poll mirror keeps a small warm terminal window for continuity.
 # Permanent immutable rows live in history-data.js instead: per project the
@@ -2918,6 +2924,7 @@ def _controller_attention_rows(
 ) -> list[dict[str, Any]]:
     """Project only HUNG controllers into operator attention."""
     rows: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     seen_roots: set[str] = set()
     for supplied_root in project_roots:
         root = _canonical_root(str(supplied_root))
@@ -2944,33 +2951,82 @@ def _controller_attention_rows(
         for session_id, context in sorted(contexts.items()):
             if context.get("liveness_state") != "HUNG":
                 continue
-            label = _display(context.get("label"), limit=64)
-            if label is None:
-                label = _controller_session_digest(session_id) or "unknown"
+            raw_label_value = context.get("label")
+            raw_label = (
+                raw_label_value.strip()
+                if isinstance(raw_label_value, str) and raw_label_value.strip()
+                else ""
+            )
+            display_label = _display(raw_label, limit=64)
+            if display_label is None:
+                display_label = _controller_session_digest(session_id) or "unknown"
             generation = context.get("generation")
             generation_text = (
                 f" generation {generation}" if isinstance(generation, int) else ""
             )
-            rows.append(
+            candidates.append(
                 {
-                    "dispatch_id": _display(
-                        f"{_project_id(root)}:controller:{label}:generation-{generation}",
-                        limit=128,
-                    ),
-                    "seq": None,
-                    "kind": "controller_hung",
-                    "action": goalflight_wake.listener_start_command(
-                        root,
-                        controller_label=label,
-                    ),
-                    "observed_at": _iso_timestamp(context.get("last_seen")),
-                    "headline": _display(
-                        f"Controller {label}{generation_text} is HUNG: "
-                        "in-flight work has no live wake waiter",
-                        limit=96,
-                    ),
+                    "root": root,
+                    "session_id": session_id,
+                    "context": context,
+                    "raw_label": raw_label,
+                    "display_label": display_label,
+                    "generation": generation,
+                    "generation_text": generation_text,
                 }
             )
+
+    supervisor_states = (
+        goalflight_wake.supervisor_generation_states(
+            (
+                (
+                    candidate["root"],
+                    candidate["raw_label"],
+                    candidate["session_id"],
+                )
+                for candidate in candidates
+            ),
+            process_timeout_s=HUNG_SUPERVISOR_PROBE_TIMEOUT_S,
+        )
+        if candidates
+        else []
+    )
+    for candidate, supervisor in zip(candidates, supervisor_states):
+        root = str(candidate["root"])
+        context = candidate["context"]
+        raw_label = str(candidate["raw_label"])
+        display_label = str(candidate["display_label"])
+        generation = candidate["generation"]
+        generation_text = str(candidate["generation_text"])
+        component_command = goalflight_wake.listener_start_command(
+            root,
+            controller_label=raw_label,
+        )
+        action_policy = goalflight_wake.supervisor_operator_action(
+            supervisor,
+            component_command=component_command,
+        )
+        rows.append(
+            {
+                "dispatch_id": _display(
+                    f"{_project_id(root)}:controller:"
+                    f"{display_label}:generation-{generation}",
+                    limit=128,
+                ),
+                "seq": None,
+                "kind": "controller_hung",
+                "action": (
+                    action_policy["command"]
+                    or action_policy["instruction"]
+                ),
+                "observed_at": _iso_timestamp(context.get("last_seen")),
+                "headline": _display(
+                    f"Controller {display_label}{generation_text} is HUNG: "
+                    "in-flight work has no live wake waiter",
+                    limit=96,
+                ),
+            }
+        )
     # Same key as mail rows and the merged attention plane: dated first,
     # then by observed_at, then dispatch_id. Leaving this on dispatch_id
     # alone would re-sort HUNG rows away from their timestamps the moment

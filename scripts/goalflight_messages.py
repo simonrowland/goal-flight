@@ -3310,14 +3310,6 @@ def listener_coverage_status(
     return status
 
 
-def listener_reminder_line(project_root: Path | str, controller_label: str) -> str:
-    command = goalflight_wake.listener_start_command(
-        _canonical_project_root(Path(project_root)),
-        controller_label=controller_label,
-    )
-    return f"listener pool n=0; start: {command}"
-
-
 def _ambient_claimed_controller(
     project_root: Path,
     *,

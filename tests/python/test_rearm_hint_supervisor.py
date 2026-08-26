@@ -17,11 +17,14 @@ from machine_isolation import AMBIENT_IDENTITY_ENV, isolated_machine_env
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
+SESSION_START_HOOK = SCRIPTS / "hooks" / "goalflight-session-start-watchdog.sh"
+HOOKS_MANIFEST = ROOT / "hooks" / "hooks.json"
 sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_doctor as doctor  # noqa: E402
 import goalflight_journal as journal  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
+import goalflight_session_status as sessions  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 import goalflight_wake_supervise as supervise  # noqa: E402
 
@@ -174,6 +177,166 @@ def _minimal_doctor_payload(wake_coverage: dict[str, object]) -> dict[str, objec
     }
 
 
+def _run_session_start_hook(
+    project: Path,
+    env: dict[str, str],
+    *,
+    source: str,
+) -> str:
+    completed = subprocess.run(
+        ["/bin/sh", str(SESSION_START_HOOK)],
+        cwd=project,
+        env=env,
+        input=json.dumps(
+            {
+                "hook_event_name": "SessionStart",
+                "source": source,
+                "cwd": str(project),
+            }
+        ),
+        capture_output=True,
+        text=True,
+        timeout=12,
+        check=True,
+        start_new_session=True,
+    )
+    assert completed.stderr == ""
+    payload = json.loads(completed.stdout)
+    return str(payload["hookSpecificOutput"]["additionalContext"])
+
+
+def test_session_start_hook_startup_and_resume_use_live_supervisor_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hooks = json.loads(HOOKS_MANIFEST.read_text(encoding="utf-8"))["hooks"]
+    session_start = hooks["SessionStart"]
+    assert len(session_start) == 1
+    assert session_start[0]["matcher"] == "startup|resume"
+    assert session_start[0]["hooks"] == [
+        {
+            "type": "command",
+            "command": (
+                "${CLAUDE_PLUGIN_ROOT}/scripts/hooks/"
+                "goalflight-session-start-watchdog.sh"
+            ),
+            "timeout": 5,
+        }
+    ]
+
+    project = tmp_path / "hook-project"
+    project.mkdir()
+    (project / "SKILL.md").write_text("hook integration facade\n", encoding="utf-8")
+    (project / "scripts").symlink_to(SCRIPTS, target_is_directory=True)
+
+    for key in AMBIENT_IDENTITY_ENV:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("GOALFLIGHT_WAKE_LEDGER", raising=False)
+    assignments = isolated_machine_env(tmp_path / "hook-machine")
+    assignments.update(
+        {
+            "GOALFLIGHT_ROOT": str(ROOT),
+            "GOALFLIGHT_CONTROLLER_LABEL": "hook-controller",
+            "GOALFLIGHT_PROCESS_ROLE": "controller",
+            "GOALFLIGHT_TEST_MODE": "1",
+            "GOALFLIGHT_WAKE_ENTRY_POLL_S": "0",
+            "GOALFLIGHT_WATCHDOG_RECENT_SECONDS": "0",
+        }
+    )
+    for key, value in assignments.items():
+        monkeypatch.setenv(key, value)
+    env = dict(os.environ)
+    authority = journal.open_or_create_journal(project)
+    assert authority.prepare_attempt("hook-live-supervisor").committed
+
+    # First entry establishes the real ancestry-bound controller generation.
+    initial_context = _run_session_start_hook(project, env, source="startup")
+    lease = authority.active_lease("hook-controller")
+    assert lease is not None, initial_context
+    env["GOALFLIGHT_CONTROLLER_SESSION_ID"] = lease.nonce
+    env["GOALFLIGHT_CONTROLLER_LEASE_NONCE"] = lease.nonce
+
+    supervise_parts = shlex.split(
+        wake.coverage_supervise_command(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        )
+    )
+    supervise_parts[0] = sys.executable
+    supervisor = subprocess.Popen(
+        supervise_parts,
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(0.2)
+        if supervisor.poll() is not None:
+            diagnostic = (
+                supervisor.stderr.read() if supervisor.stderr is not None else ""
+            )
+            raise AssertionError(
+                f"supervisor exited {supervisor.returncode}: {diagnostic}"
+            )
+        running_shim_dir = tmp_path / "probe-running"
+        running_shim_dir.mkdir()
+        running_ps = running_shim_dir / "ps"
+        process_row = f"{supervisor.pid} {shlex.join(supervise_parts)}"
+        running_ps.write_text(
+            "#!/bin/sh\nprintf '%s\\n' " + shlex.quote(process_row) + "\n",
+            encoding="utf-8",
+        )
+        running_ps.chmod(0o755)
+        running_env = {
+            **env,
+            "PATH": f"{running_shim_dir}:{env.get('PATH', '')}",
+        }
+        component_commands = _component_commands(project, lease)
+        for source in ("startup", "resume"):
+            context = _run_session_start_hook(project, running_env, source=source)
+            assert supervisor.poll() is None
+            assert '"supervisor": "running"' in context
+            assert "Restart the supervisor" in context
+            assert "goalflight_messages.py listen" not in context
+            assert "goalflight_messages.py follow" not in context
+            for component_command in component_commands:
+                assert component_command not in context
+
+        # Keep the real supervisor alive while only the hook/status subprocess
+        # loses process-table access. This exercises UNKNOWN at the producer,
+        # not by supplying a precomputed supervisor state.
+        shim_dir = tmp_path / "probe-unavailable"
+        shim_dir.mkdir()
+        ps_shim = shim_dir / "ps"
+        ps_shim.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        ps_shim.chmod(0o755)
+        unknown_env = {**env, "PATH": f"{shim_dir}:{env.get('PATH', '')}"}
+        for source in ("startup", "resume"):
+            context = _run_session_start_hook(project, unknown_env, source=source)
+            assert supervisor.poll() is None
+            assert '"supervisor": "unknown"' in context
+            assert "could not tell whether `supervise`" in context
+            assert "goalflight_messages.py listen" not in context
+            assert "goalflight_messages.py follow" not in context
+            for component_command in component_commands:
+                assert component_command not in context
+    finally:
+        if supervisor.poll() is None:
+            supervisor.terminate()
+            try:
+                supervisor.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                supervisor.kill()
+                supervisor.wait(timeout=5)
+        if supervisor.stdout is not None:
+            supervisor.stdout.close()
+        if supervisor.stderr is not None:
+            supervisor.stderr.close()
+
+
 def test_rearm_hint_supervised_omits_component_commands(
     isolated: tuple[Path, journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
@@ -242,7 +405,7 @@ def test_rearm_hint_unsupervised_keeps_three_command_form(
     )
 
 
-def test_rearm_hint_undetermined_is_true_either_way(
+def test_rearm_hint_undetermined_withholds_component_actions(
     isolated: tuple[Path, journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -253,10 +416,10 @@ def test_rearm_hint_undetermined_is_true_either_way(
     assert plan["supervisor"] == wake.SUPERVISOR_UNKNOWN
     assert "could not tell whether `supervise`" in hint
     assert "If you are running `supervise`, restart it" in hint
-    assert "Otherwise arm these:" in hint
-    assert stream_cmd in hint
-    assert backup_cmd in hint
-    assert watchdog_cmd in hint
+    assert "Otherwise" not in hint
+    assert stream_cmd not in hint
+    assert backup_cmd not in hint
+    assert watchdog_cmd not in hint
     activity = wake.listener_activity_hint(
         int(plan["live"]),
         int(plan["target"]),
@@ -265,8 +428,77 @@ def test_rearm_hint_undetermined_is_true_either_way(
         supervisor=str(plan["supervisor"]),
         supervise_command=str(plan["supervise_command"]),
     )
-    assert "if you are running `supervise`, restart it" in activity
-    assert str(plan["command"]) in activity
+    assert "If you are running `supervise`, restart it" in activity
+    assert str(plan["command"]) not in activity
+
+
+def test_unknown_operator_plan_has_reason_without_bare_component_action(
+    isolated: tuple[Path, journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, lease = isolated
+    authority = journal.Journal(project)
+    assert authority.prepare_attempt("unknown-startup-action").committed
+    monkeypatch.setattr(wake, "_process_listing", lambda: None)
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=120,
+        dead_after_s=360,
+    )
+
+    depth = sessions._listener_depth_after_claim(
+        project,
+        lease.label,
+        lease.nonce,
+    )
+
+    assert depth is not None
+    assert depth["supervisor"] == wake.SUPERVISOR_UNKNOWN
+    assert "command" not in depth
+    assert "commands" not in depth
+    assert "supervise_command" not in depth
+    encoded = json.dumps(depth)
+    for component_command in _component_commands(project, lease):
+        assert component_command not in encoded
+    action = wake.supervisor_operator_action(
+        str(depth["supervisor"]),
+        component_command="MUST-NOT-SURVIVE",
+    )
+    assert action["kind"] == "verify-supervisor"
+    assert action["command"] is None
+    assert "could not tell whether `supervise`" in str(action["instruction"])
+
+
+def test_operator_action_policy_requires_proven_absence() -> None:
+    component = "DIRECT COMPONENT"
+    supervise_command = "python3 goalflight_messages.py supervise --lease-nonce n"
+
+    running = wake.supervisor_operator_action(
+        wake.SUPERVISOR_RUNNING,
+        component_command=component,
+        supervise_command=supervise_command,
+    )
+    absent = wake.supervisor_operator_action(
+        wake.SUPERVISOR_ABSENT,
+        component_command=component,
+        supervise_command=supervise_command,
+    )
+    unknown = wake.supervisor_operator_action(
+        wake.SUPERVISOR_UNKNOWN,
+        component_command=component,
+        supervise_command=supervise_command,
+    )
+
+    assert running["kind"] == "restart-supervisor"
+    assert running["command"] == supervise_command
+    assert component not in str(running["instruction"])
+    assert absent["kind"] == "arm-component"
+    assert absent["command"] == component
+    assert unknown["kind"] == "verify-supervisor"
+    assert unknown["command"] is None
+    assert component not in str(unknown["instruction"])
 
 
 def test_unbindable_supervise_argv_is_unknown_not_absent(
@@ -287,7 +519,7 @@ def test_unbindable_supervise_argv_is_unknown_not_absent(
     assert "could not tell whether `supervise`" in hint
     assert wake.follow_start_command(
         project, controller_label=lease.label, lease_nonce=lease.nonce
-    ) in hint
+    ) not in hint
 
 
 def test_rearm_hint_supervised_portable_shortfall_omits_listen(
@@ -670,6 +902,35 @@ def test_unsupervised_dead_events_keep_direct_rearm_command(
     monkeypatch.delenv("GOALFLIGHT_SUPERVISED", raising=False)
     record = builder(status, rearm_command="EXACT UNSUPERVISED COMMAND")
     assert record["payload"]["rearm_command"] == "EXACT UNSUPERVISED COMMAND"
+
+
+def test_dead_event_contracts_scope_actions_to_unsupervised_paths() -> None:
+    contract_paths = {
+        ROOT / "protocols" / "controller-mail.md": (
+            "each poll; stale, faulted, missing, or invalid state makes it emit"
+        ),
+        ROOT / "commands" / "execute.md": (
+            "three missed heartbeat intervals emit `listener-dead`"
+        ),
+        ROOT / "docs" / "controller-behaviours.md": (
+            "reads durable record age; three missed heartbeat intervals make it emit"
+        ),
+        ROOT / "docs" / "EVENT-ARCHITECTURE.md": (
+            "and emits `event`/`listener-dead` when state"
+        ),
+        ROOT / "SKILL.md": (
+            "In the decomposed unsupervised path, `listener-dead`"
+        ),
+    }
+    for path, anchor in contract_paths.items():
+        text = path.read_text(encoding="utf-8")
+        start = text.index(anchor)
+        contract = " ".join(text[start : start + 1000].split())
+        assert "unsupervised path" in contract, path
+        assert "supervise" in contract, path
+        assert "reason" in contract, path
+        assert "omit" in contract, path
+        assert "supervisor restart" in contract, path
 
 
 def test_doctor_wake_coverage_reports_supervisor_state(

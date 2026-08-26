@@ -454,6 +454,7 @@ def test_lease_claim_emits_remaining_depth_when_work_is_in_flight(
         "_controller_process_identity",
         lambda pid: {"pid": pid, "start_token": "claim-floor-token"},
     )
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     result = sessions.claim_controller_startup(
         project, pid=71001, label="floor-ctl", role="controller"
     )
@@ -477,6 +478,7 @@ def test_lease_claim_stays_silent_without_in_flight_work(
         "_controller_process_identity",
         lambda pid: {"pid": pid, "start_token": "quiet-claim-token"},
     )
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     result = sessions.claim_controller_startup(
         project, pid=71002, label="floor-ctl", role="controller"
     )

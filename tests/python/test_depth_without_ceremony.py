@@ -201,10 +201,19 @@ def test_listen_exit_numbered_hint_is_frozen() -> None:
 
 def test_activity_hint_is_one_line_and_silent_when_done() -> None:
     command = "python3 scripts/goalflight_messages.py listen --report-pending"
-    hint = wake.listener_activity_hint(0, 4, command, work_in_flight=True)
+    hint = wake.listener_activity_hint(
+        0,
+        4,
+        command,
+        work_in_flight=True,
+        supervisor=wake.SUPERVISOR_ABSENT,
+    )
     assert hint == f"listener depth 0/4 — 4 missing; {command}"
     assert "\n" not in hint
     assert "1. " not in hint
+    unknown = wake.listener_activity_hint(0, 4, command, work_in_flight=True)
+    assert "could not tell whether `supervise`" in unknown
+    assert command not in unknown
     assert wake.listener_activity_hint(0, 4, command, work_in_flight=False) == ""
     assert wake.listener_activity_hint(4, 4, command, work_in_flight=True) == ""
 

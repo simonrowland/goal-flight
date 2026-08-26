@@ -70,6 +70,18 @@ def isolated_env(tmp_path: Path, *, label: str = "wake-test") -> dict[str, str]:
     return env
 
 
+def _env_with_empty_process_listing(
+    env: dict[str, str],
+    directory: Path,
+) -> dict[str, str]:
+    shim_dir = directory / "empty-process-listing"
+    shim_dir.mkdir(exist_ok=True)
+    ps_shim = shim_dir / "ps"
+    ps_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    ps_shim.chmod(0o755)
+    return {**env, "PATH": f"{shim_dir}:{env.get('PATH', '')}"}
+
+
 @pytest.fixture
 def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, dict[str, str]]:
     env = isolated_env(tmp_path)
@@ -1038,8 +1050,10 @@ def test_listener_reserve_hint_prints_one_command_per_missing_slot() -> None:
 def test_entry_hint_grades_crashed_pool_member_and_full_pool_is_silent(
     isolated: tuple[Path, dict[str, str]],
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, env = isolated
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     authority = journal.open_or_create_journal(root)
     claimed = authority.claim_or_renew_lease(
         "wake-test", principal={"principal_id": "pool-depth-hint"}
@@ -1219,8 +1233,10 @@ def test_cursor_advance_with_leftovers_pops_one_more_pool_member(
 def test_listener_arm_past_target_is_not_refused_then_empty_pool_hint(
     isolated: tuple[Path, dict[str, str]],
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, env = isolated
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     authority = journal.open_or_create_journal(root)
     claimed = authority.claim_or_renew_lease(
         "wake-test", principal={"principal_id": "pool-exhaustion"}
@@ -1783,6 +1799,7 @@ def test_entry_notice_distinguishes_probe_unavailable_from_offline(
     )
     assert "could not tell whether `supervise`" in unavailable_text
     assert "If you are running `supervise`" in unavailable_text
+    assert "goalflight_messages.py listen" not in unavailable_text
     assert "listener offline" not in unavailable_text
 
     wake.ledger_dir(root).mkdir(parents=True)
@@ -2588,6 +2605,7 @@ def test_unclaimed_cli_entries_stay_quiet_and_claimed_mail_entries_warn_once(
     isolated: tuple[Path, dict[str, str]], tmp_path: Path
 ) -> None:
     root, env = isolated
+    env = _env_with_empty_process_listing(env, tmp_path)
     authority = journal.open_or_create_journal(root)
     commands = _entry_commands(root, tmp_path)
     for command, _mail_bearing in commands:
@@ -2698,6 +2716,7 @@ def test_ambient_capability_still_gets_mail_fallback_when_holder_is_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, _env = isolated
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     authority = journal.open_or_create_journal(root)
     claimed = authority.claim_or_renew_lease(
         "wake-test",

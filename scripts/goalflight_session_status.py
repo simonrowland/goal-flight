@@ -1001,13 +1001,9 @@ def _listener_depth_after_claim(
         )
         # t-272: ``command`` already carries the one project-root copy.
         # ``supervise_command`` is a second path-bearing argv used only by
-        # hint printers. A live supervisor also drops ``commands`` so this
-        # payload cannot paste follow/listen beside the process that owns
-        # re-arming.
-        plan.pop("supervise_command", None)
-        if plan.get("supervisor") == goalflight_wake.SUPERVISOR_RUNNING:
-            plan.pop("commands", None)
-        return plan
+        # hint printers. Only proven supervisor absence may expose component
+        # commands: UNKNOWN is not evidence that direct arming is safe.
+        return goalflight_wake.operator_rearm_plan(plan)
     except Exception:
         return None
 

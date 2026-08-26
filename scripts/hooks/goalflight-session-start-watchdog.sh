@@ -86,7 +86,8 @@ assert d["hookSpecificOutput"]["hookEventName"] == "SessionStart"
 assert "CronList" in ctx and "CronCreate" in ctx
 assert "goalflight-watchdog-prompt.md" in ctx
 assert "ARM THE EVENT WAKE FIRST" in ctx
-assert "goalflight_messages.py listen" in ctx
+assert "goalflight_messages.py listen" not in ctx
+assert "do not arm a direct wake component" in ctx
 assert "goalflight_status.py --wait" in ctx
 assert "returned `session.lease_nonce`" in ctx
 assert "crash-recovery fallback only" in ctx
@@ -310,6 +311,37 @@ def claim_controller_entry(repo_root: str, cwd: str) -> dict:
         return {}
 
 
+def controller_wake_instruction(repo_root: str, claim_result: dict) -> str:
+    depth = claim_result.get("listener_depth")
+    if not claim_result.get("claimed") or not isinstance(depth, dict):
+        return (
+            "Wake ownership is not established; do not arm a direct wake component "
+            "until status establishes whether `supervise` is running."
+        )
+    try:
+        sys.path.insert(0, repo_root)
+        sys.path.insert(0, os.path.join(repo_root, "scripts"))
+        import goalflight_wake
+
+        state = str(depth.get("supervisor") or goalflight_wake.SUPERVISOR_UNKNOWN)
+        command = str(depth.get("command") or "")
+        action = goalflight_wake.supervisor_operator_action(
+            state,
+            component_command=(
+                command if state == goalflight_wake.SUPERVISOR_ABSENT else None
+            ),
+            supervise_command=(
+                command if state == goalflight_wake.SUPERVISOR_RUNNING else None
+            ),
+        )
+        return str(action["instruction"])
+    except Exception:
+        return (
+            "Wake ownership could not be determined; do not arm a direct wake "
+            "component until status establishes whether `supervise` is running."
+        )
+
+
 def journal_activity(repo_root: str, cwd: str) -> bool:
     try:
         sys.path.insert(0, repo_root)
@@ -353,13 +385,13 @@ def main() -> None:
         repo_prompt = os.path.join(repo_root, "templates", "goalflight-watchdog-prompt.md")
         plugin_prompt = os.path.join(plugin_root, "templates", "goalflight-watchdog-prompt.md")
         prompt_file = repo_prompt if os.path.isfile(repo_prompt) else plugin_prompt
+    wake_instruction = controller_wake_instruction(repo_root, claim_result)
     context = (
         "An active goal-flight run was detected on this session start. ARM THE EVENT WAKE FIRST "
         "as a background task per `protocols/dispatch-routing.md` and `commands/execute.md`: "
         "the SessionStart hook already attempted a role-aware lease claim; inspect its result "
         f"({json.dumps(claim_result, sort_keys=True)}). Carry the returned `session.lease_nonce`. "
-        "A claimed controller runs `goalflight_messages.py listen --project-root \"$PWD\" "
-        "--controller-label <label> --lease-nonce <nonce>`; an "
+        f"For a claimed controller: {wake_instruction} An "
         "unclaimed fixed-set controller runs the printed `goalflight_status.py --wait <ids>` "
         "command. Do not block the controller turn on either wait. CONTINUE IN-SKILL: re-invoke "
         "`/goal-flight resume` (this reloads SKILL.md fresh "

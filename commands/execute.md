@@ -69,16 +69,18 @@ duration; wait separately on anything you need back early.
 project lease. Prefer one generation-bound `goalflight_messages.py supervise
 --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>` through
 the host persistent monitor; it owns the stream, backup doorbell pool, and
-watchdog as one feed and re-arms children itself. The decomposed form remains
-valid: on a host whose persistent monitor turns each flushed stdout line
-into a wake, arm one generation-bound `goalflight_messages.py follow --project-root
+watchdog as one feed and re-arms children itself. In the decomposed fallback,
+only after supervisor absence is proven, arm one generation-bound
+`goalflight_messages.py follow --project-root
 "$PWD" --controller-label <label> --lease-nonce <nonce>` through that monitor —
 never through ordinary shell backgrounding — and keep six tracked `listen
 --listener-slots 6 --report-pending` backup doorbells plus one separately tracked
 `listen --watch-follow` watchdog. The watchdog holds its own generation lock and
 never consumes a doorbell slot. It reads the stream's durable successful-record age;
-three missed heartbeat intervals emit `listener-dead` on stdout with the exact monitor
-re-arm command. Treat stream, backup pool, and watchdog as shared persistent coverage
+three missed heartbeat intervals emit `listener-dead` on stdout. The decomposed
+unsupervised path includes the exact monitor re-arm command; under `supervise` the
+record keeps the reason but omits that component action, and recovery is a supervisor
+restart. Treat stream, backup pool, and watchdog as shared persistent coverage
 `live/8`. On hosts without that
 monitor (codex, grok, cursor, opencode), keep the portable tracked `listen` pool:
 when one exits 0, peek with `relay --new --json`, process the items, cursor-CAS their
@@ -236,7 +238,9 @@ polling by hand. That is the exact behaviour this replaced: before the wake
 existed, worker escalations sat unread for hours while a human relayed messages
 between sessions.
 
-For the normal claimed-controller path, background the one-shot journal listener.
+For a claimed controller confirmed to be unsupervised, background the one-shot
+journal listener. A live supervisor is restarted instead; UNKNOWN supervision must
+be resolved before a direct component is armed.
 It prints nothing until an assignment exists after the cursor, then exits as a
 body-free doorbell:
 

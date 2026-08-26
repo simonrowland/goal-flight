@@ -414,8 +414,10 @@ requires three complete missed beats: 360 seconds at the default cadence. The
 stream durably records every successful stdout record. Six separately tracked
 `listen --listener-slots 6 --report-pending` backup doorbells deliver mail, while an
 independently locked `listen --watch-follow` watchdog polls generation-bound state
-and emits `event`/`listener-dead` plus the persistent re-arm command when state is
-stale, faulted, missing, or invalid. The watchdog never claims a delivery slot or
+and emits `event`/`listener-dead` when state is stale, faulted, missing, or invalid.
+The decomposed unsupervised path includes the exact re-arm command; under `supervise`
+the record keeps the reason but omits that action, and recovery is a supervisor restart.
+The watchdog never claims a delivery slot or
 reads the mail cursor. This makes persistent coverage a shared eight-component
 `live/8` fact. It stays persistent after stream death, so the surviving backup pool and
 watchdog report `7/8`, not portable `1/4`.
@@ -445,7 +447,9 @@ the stream, the backup doorbell pool, and the watchdog.
 `EXITED/event` row to write. Its generation-bound monitor flock is the liveness
 authority. Every exit path releases that flock and restores signal handlers; fatal
 runtime paths publish `listener-fault`, while the watchdog publishes the exact
-stream re-arm command. A merely busy journal is not a fault: the stream then
+stream re-arm command only on the decomposed unsupervised path. Under `supervise`,
+the record keeps the reason but omits that action; recovery is a supervisor restart.
+A merely busy journal is not a fault: the stream then
 uses a 300-second continuous-failure window, publishing one
 `listener-degraded` record when the window opens and one `listener-recovered`
 when it closes, and heartbeats keep beating so the watchdog never reads load as
