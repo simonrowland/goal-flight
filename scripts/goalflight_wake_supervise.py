@@ -39,14 +39,23 @@ BACKOFF_INITIAL_S = 1.0
 BACKOFF_CAP_S = 120.0
 LONG_LIVED_S = 30.0
 STREAM_LINE_MAX_BYTES = 511
+PERMANENT_UNARMED_FAULTS = 3
 _DEAD_NONCE_MARKERS = (
     "controller-capability-mismatch",
     "lease-nonce-not-live",
     "stale-lease",
 )
+_JOURNAL_UNREADABLE_MARKERS = (
+    "journal-unavailable",
+    "journal-io-failure",
+)
 _DID_NOT_ARM_MARKERS = (
     "already has a live follow watchdog",
+    "already has a persistent stream",
     "stdout is a regular file",
+)
+_SLOT_STOP_REASONS = frozenset(
+    {"did-not-arm", "permanent-exit-2"}
 )
 
 
@@ -59,6 +68,7 @@ class SuperviseHost(Protocol):
     def spawn(self, kind: str, command: str) -> Any: ...
     def wait(self, children: list[Any], timeout_s: float) -> WaitResult: ...
     def kill_all(self) -> None: ...
+    def nonce_probe(self) -> str: ...
 
 
 @dataclass
@@ -83,6 +93,8 @@ class _Slot:
     child: Any = None
     backoff_s: float = 0.0
     next_start: float = 0.0
+    stopped_reason: str | None = None
+    unarmed_faults: int = 0
 
 
 def classify_child_exit(
@@ -92,10 +104,18 @@ def classify_child_exit(
     output: str,
     armed: bool,
 ) -> tuple[str, str]:
-    """Map a child death onto re-arm, backoff, or stop-and-say-why."""
+    """Map a child death onto re-arm, backoff, or stop-and-say-why.
+
+    ``armed`` is the production wake-lock predicate: the child PID was
+    observed holding a stream, doorbell, or watchdog flock. Exit 0 without
+    that lock is did-not-arm (b-230); journal unreadability is retryable
+    and is never collapsed into a dead nonce.
+    """
     del kind
     text = str(output or "")
     lowered = text.lower()
+    if any(marker in lowered for marker in _JOURNAL_UNREADABLE_MARKERS):
+        return ACTION_BACKOFF, "journal-unreadable"
     if any(marker in lowered for marker in _DEAD_NONCE_MARKERS):
         return ACTION_STOP, "dead-lease-nonce"
     if any(marker in lowered for marker in _DID_NOT_ARM_MARKERS):
@@ -160,10 +180,14 @@ def _supervise_line(record: dict[str, object]) -> str:
 
 
 def _live_target(slots: list[_Slot]) -> tuple[int, int]:
+    """``live`` is armed coverage, not "a child PID exists"."""
     live = sum(
         1
         for slot in slots
-        if slot.child is not None and getattr(slot.child, "alive", True)
+        if slot.child is not None
+        and getattr(slot.child, "alive", True)
+        and getattr(slot.child, "armed", False)
+        and slot.stopped_reason is None
     )
     return live, len(slots)
 
@@ -172,9 +196,24 @@ def _emit(host: SuperviseHost, record: dict[str, object]) -> bool:
     return host.write_stdout(_supervise_line(record))
 
 
-def _nonce_alive(host: SuperviseHost, expected: str) -> bool:
+def _nonce_state(host: SuperviseHost, expected: str) -> str:
+    """Return live, dead, or unreadable. Unreadable is retryable."""
+    probe = getattr(host, "nonce_probe", None)
+    if callable(probe):
+        state = str(probe() or "").strip()
+        if state == "unreadable":
+            return "unreadable"
+        if state == "dead":
+            return "dead"
+        if state == "live":
+            live = host.live_nonce()
+            if bool(live) and str(live) == expected:
+                return "live"
+            return "dead"
     live = host.live_nonce()
-    return bool(live) and str(live) == expected
+    if live is None:
+        return "dead"
+    return "live" if str(live) == expected else "dead"
 
 
 def run_supervisor(
@@ -223,7 +262,8 @@ def run_supervisor(
     ]
 
     def spawn_due() -> int | None:
-        if not _nonce_alive(host, nonce):
+        state = _nonce_state(host, nonce)
+        if state == "dead":
             live, target = _live_target(slots)
             _emit(
                 host,
@@ -231,18 +271,24 @@ def run_supervisor(
                     "kind": "supervise",
                     "type": "stop",
                     "reason": "dead-lease-nonce",
+                    "scope": "supervisor",
                     "live": live,
                     "target": target,
                     "detail": "goalflight_session_status live nonce changed or vanished",
                 },
             )
             return SUPERVISE_STOP_EXIT
+        if state == "unreadable":
+            return None
         for slot in slots:
+            if slot.stopped_reason is not None:
+                continue
             if slot.child is not None or host.now < slot.next_start:
                 continue
             slot.child = host.spawn(slot.kind, slot.command)
             setattr(slot.child, "kind", slot.kind)
             setattr(slot.child, "alive", True)
+            setattr(slot.child, "armed", False)
         return None
 
     stopped = spawn_due()
@@ -272,7 +318,8 @@ def run_supervisor(
     next_coverage = host.now + max(0.01, float(coverage_s))
 
     while host.running():
-        if not _nonce_alive(host, nonce):
+        state = _nonce_state(host, nonce)
+        if state == "dead":
             live, target = _live_target(slots)
             _emit(
                 host,
@@ -280,6 +327,7 @@ def run_supervisor(
                     "kind": "supervise",
                     "type": "stop",
                     "reason": "dead-lease-nonce",
+                    "scope": "supervisor",
                     "live": live,
                     "target": target,
                     "detail": "goalflight_session_status live nonce changed or vanished",
@@ -290,7 +338,7 @@ def run_supervisor(
         now = host.now
         wake_at = min(next_heartbeat, next_coverage)
         for slot in slots:
-            if slot.child is None:
+            if slot.child is None and slot.stopped_reason is None:
                 wake_at = min(wake_at, slot.next_start)
         timeout_s = max(0.0, wake_at - now)
         live_children = [
@@ -304,32 +352,50 @@ def run_supervisor(
             if not host.write_stdout(text):
                 host.kill_all()
                 return 0
-            if line.strip():
-                setattr(child, "armed", True)
         for event in result.exits:
             child = event.child
             slot = next((row for row in slots if row.child is child), None)
             if slot is None:
                 continue
+            armed = bool(event.armed or getattr(child, "armed", False))
             action, reason = classify_child_exit(
                 kind=slot.kind,
                 returncode=event.returncode,
                 output=event.output,
-                armed=event.armed,
+                armed=armed,
             )
+            if (
+                action == ACTION_BACKOFF
+                and reason != "journal-unreadable"
+                and not armed
+            ):
+                slot.unarmed_faults += 1
+                if slot.unarmed_faults >= PERMANENT_UNARMED_FAULTS:
+                    action, reason = ACTION_STOP, "permanent-exit-2"
+            elif action == ACTION_REARM or (
+                action == ACTION_BACKOFF and armed
+            ):
+                slot.unarmed_faults = 0
             slot.backoff_s = next_backoff(
                 slot.backoff_s, ran_s=event.ran_s, action=action
             )
-            live, target = _live_target(slots)
-            if action != ACTION_STOP and not _nonce_alive(host, nonce):
+            nonce_now = _nonce_state(host, nonce)
+            if action != ACTION_STOP and nonce_now == "dead":
                 action, reason = ACTION_STOP, "dead-lease-nonce"
+            slot.child = None
+            live, target = _live_target(slots)
             if action == ACTION_STOP:
+                scope = (
+                    "slot" if reason in _SLOT_STOP_REASONS else "supervisor"
+                )
+                slot.stopped_reason = reason
                 _emit(
                     host,
                     {
                         "kind": "supervise",
                         "type": "stop",
                         "reason": reason,
+                        "scope": scope,
                         "child": slot.kind,
                         "exit": event.returncode,
                         "live": live,
@@ -337,10 +403,11 @@ def run_supervisor(
                         "detail": str(event.output or "").strip()[:180],
                     },
                 )
-                host.kill_all()
-                return SUPERVISE_STOP_EXIT
+                if scope == "supervisor":
+                    host.kill_all()
+                    return SUPERVISE_STOP_EXIT
+                continue
             delay = slot.backoff_s
-            slot.child = None
             slot.next_start = host.now + delay
             if not _emit(
                 host,
@@ -486,6 +553,49 @@ class RealHost:
         nonce = str(session.get("lease_nonce") or "").strip()
         return nonce or None
 
+    def nonce_probe(self) -> str:
+        """Distinguish a readable dead lease from a journal we could not open."""
+        if self._nonce_reader is not None:
+            live = self._nonce_reader()
+            if live is None:
+                return "dead"
+            return "live" if str(live) == self.lease_nonce else "dead"
+        import goalflight_journal  # type: ignore
+
+        try:
+            goalflight_journal.Journal.open_reader(self.project_root)
+        except goalflight_journal.JournalUnavailable:
+            return "unreadable"
+        live = self.live_nonce()
+        if live is None:
+            return "dead"
+        return "live" if str(live) == self.lease_nonce else "dead"
+
+    def _observe_locks(self, children: list[Any]) -> None:
+        """Mark children armed only when their PID holds a wake flock."""
+        alive = [
+            child
+            for child in children
+            if isinstance(child, RealChild) and child.alive and not child.armed
+        ]
+        if not alive:
+            return
+        try:
+            waiters = wake.live_waiters(
+                self.project_root,
+                controller_label=self.controller_label,
+                generation_key=self.lease_nonce,
+                kinds={"listener", wake.MONITOR_KIND, wake.WATCHDOG_KIND},
+            )
+        except (OSError, RuntimeError, ValueError, TypeError):
+            return
+        if not waiters:
+            return
+        pids = {int(row.pid) for row in waiters}
+        for child in alive:
+            if child.pid in pids:
+                child.armed = True
+
     def write_stdout(self, line: str) -> bool:
         text = line if line.endswith("\n") else line + "\n"
         try:
@@ -566,7 +676,6 @@ class RealHost:
                 child.output += leftover if leftover.endswith("\n") else leftover + "\n"
                 if which == "out" and leftover.strip():
                     extra.append(leftover.rstrip("\r\n"))
-                    child.armed = True
                 if which == "out":
                     child.stdout_buf = b""
                 else:
@@ -580,6 +689,7 @@ class RealHost:
 
     def wait(self, children: list[Any], timeout_s: float) -> WaitResult:
         self.now = time.monotonic()
+        self._observe_locks(children)
         deadline = self.now + max(0.0, float(timeout_s))
         fdmap: dict[int, tuple[str, RealChild]] = {}
         fds: list[int] = []
@@ -608,13 +718,12 @@ class RealHost:
         elif remaining > 0:
             time.sleep(remaining)
         self.now = time.monotonic()
+        self._observe_locks(children)
         lines: list[tuple[Any, str]] = []
         for fd in readable:
             which, child = fdmap[fd]
             for line in self._read_stream(child, which):
                 lines.append((child, line))
-                if line.strip():
-                    child.armed = True
         exits: list[ChildExit] = []
         for child in children:
             if not isinstance(child, RealChild) or not child.alive:
@@ -624,8 +733,6 @@ class RealHost:
                 continue
             for line in self._drain_exited(child):
                 lines.append((child, line))
-                if line.strip():
-                    child.armed = True
             child.alive = False
             exits.append(
                 ChildExit(

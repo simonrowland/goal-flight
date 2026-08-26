@@ -27,6 +27,10 @@ incremented when meaningful skill behaviour changes.
   watchdog, multiplexes their stdout, restarts deaths with bounded backoff,
   and re-arms a doorbell after a ring. Individual `follow` / `listen` /
   `--watch-follow` commands stay valid for hosts that arm them separately.
+  Supervised children pin `--lease-nonce` under the listener role; journal
+  unreadability stays retryable and is not a dead nonce; `live` counts armed
+  flocks; a unit did-not-arm or permanent unarmed exit-2 stops that slot
+  without killing siblings.
 
 ### Fixed
 

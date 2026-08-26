@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -15,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import goalflight_journal as journal  # noqa: E402
+import goalflight_messages as messages  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 import goalflight_wake_supervise as supervise  # noqa: E402
 
@@ -39,6 +43,7 @@ class FakeChild:
     returncode: int | None
     output: str
     armed: bool
+    will_arm: bool
     stdout_lines: list[tuple[float, str]]
     emitted_through: float = -1.0
     alive: bool = True
@@ -58,23 +63,49 @@ class FakeHost:
     stop_on_restart_reason: str | None = None
     stop_on_stop_reason: str | None = None
     stop_when_lines_contain: tuple[str, ...] = ()
+    stop_after_coverage: int | None = None
+    nonce_state: str = "live"
+    alive_by_kind_at_stop: dict[str, bool] = field(default_factory=dict)
+    _coverage_seen: int = 0
 
     def running(self) -> bool:
         return not self.stop
 
     def live_nonce(self) -> str | None:
+        if self.nonce_state == "unreadable":
+            return None
         return self.nonce
+
+    def nonce_probe(self) -> str:
+        if self.nonce_state == "unreadable":
+            return "unreadable"
+        if not self.nonce:
+            return "dead"
+        return "live"
 
     def write_stdout(self, line: str) -> bool:
         text = line if line.endswith("\n") else line + "\n"
         self.lines.append(text)
+        if '"type":"coverage"' in text:
+            self._coverage_seen += 1
+            if (
+                self.stop_after_coverage is not None
+                and self._coverage_seen >= self.stop_after_coverage
+            ):
+                self.stop = True
         if self.stop_on_restart_reason and '"type":"restart"' in text:
             record = json.loads(text)
             if record.get("reason") == self.stop_on_restart_reason:
                 self.stop = True
-        if self.stop_on_stop_reason and '"type":"stop"' in text:
+        if '"type":"stop"' in text:
             record = json.loads(text)
-            if record.get("reason") == self.stop_on_stop_reason:
+            self.alive_by_kind_at_stop = {
+                child.kind: child.alive for child in self.children
+            }
+            if (
+                self.stop_on_stop_reason
+                and record.get("reason") == self.stop_on_stop_reason
+            ):
                 self.stop = True
         if self.stop_when_lines_contain:
             joined = "".join(self.lines)
@@ -99,7 +130,8 @@ class FakeHost:
                 exit_at=None,
                 returncode=None,
                 output="",
-                armed=True,
+                armed=False,
+                will_arm=True,
                 stdout_lines=[],
             )
         else:
@@ -112,7 +144,8 @@ class FakeHost:
                 exit_at=self.now + plan.lifetime_s,
                 returncode=plan.returncode,
                 output=plan.output,
-                armed=plan.armed,
+                armed=False,
+                will_arm=plan.armed,
                 stdout_lines=list(plan.stdout_lines),
             )
         self.children.append(child)
@@ -129,6 +162,9 @@ class FakeHost:
         timeout_s: float,
     ) -> supervise.WaitResult:
         deadline = self.now + max(0.0, timeout_s)
+        for child in children:
+            if child.alive and child.will_arm:
+                child.armed = True
         times: list[float] = []
         for child in children:
             if not child.alive:
@@ -217,6 +253,7 @@ def _run(
 def test_supervise_commands_call_the_rearm_generator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.delenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", raising=False)
     seen: dict[str, object] = {}
 
     def fake_rearm(
@@ -243,6 +280,8 @@ def test_supervise_commands_call_the_rearm_generator(
     assert isinstance(status, dict)
     assert status["wake_mode"] == "persistent"
     assert status["live_waiters"] == 0
+    assert status["target_waiters"] == wake.persistent_wake_target() == 8
+    assert status["backup"]["target"] == wake.persistent_backup_slot_count() == 6
     assert status["missing_components"] == ["stream", "backup", "watchdog"]
     assert seen["lease_nonce"] == "nonce-from-session"
     assert seen["controller_label"] == "bugs"
@@ -284,7 +323,8 @@ def test_supervisor_runs_the_configured_pool_size(backup_count: int) -> None:
         for record in _records(host)
         if record.get("type") == "coverage"
     )
-    assert coverage["live"] == coverage["target"] == len(items)
+    assert coverage["target"] == len(items)
+    assert coverage["live"] == 0
 
 
 def test_dead_child_is_restarted() -> None:
@@ -355,21 +395,32 @@ def test_exit_0_without_arming_stops_with_distinct_reason() -> None:
 def test_exit_0_watchdog_slot_held_without_arming_stops() -> None:
     host = FakeHost(
         scripts={
+            "stream": [],
             "watchdog": [
                 PlannedExit(
                     lifetime_s=0.1,
-                    returncode=0,
+                    returncode=3,
                     output="listen: this controller generation already has a live follow watchdog",
                     armed=False,
                 ),
             ]
-        }
+        },
+        stop_on_stop_reason="did-not-arm",
     )
-    code = _run(host, _items("watchdog"), heartbeat_s=100.0, coverage_s=100.0)
-    assert code == supervise.SUPERVISE_STOP_EXIT
+    code = _run(
+        host,
+        _items("stream", "watchdog"),
+        heartbeat_s=100.0,
+        coverage_s=100.0,
+    )
+    assert code != supervise.SUPERVISE_STOP_EXIT
     stop = next(record for record in _records(host) if record.get("type") == "stop")
     assert stop["reason"] == "did-not-arm"
+    assert stop.get("scope") == "slot"
+    assert stop["child"] == "watchdog"
     assert "already has a live follow watchdog" in str(stop.get("detail") or "")
+    assert host.alive_by_kind_at_stop.get("stream") is True
+    assert [kind for kind, _command in host.spawns].count("stream") == 1
 
 
 def test_child_stdout_reaches_multiplexed_stdout() -> None:
@@ -518,6 +569,132 @@ def test_classify_exit_taxonomy() -> None:
         output="listen: stale-lease: watchdog generation is no longer active",
         armed=True,
     ) == (supervise.ACTION_STOP, "dead-lease-nonce")
+    assert supervise.classify_child_exit(
+        kind="backup",
+        returncode=2,
+        output="listen: journal-unavailable: cannot open journal",
+        armed=False,
+    ) == (supervise.ACTION_BACKOFF, "journal-unreadable")
+    assert supervise.classify_child_exit(
+        kind="stream",
+        returncode=2,
+        output="follow: journal-io-failure: sqlite busy",
+        armed=False,
+    ) == (supervise.ACTION_BACKOFF, "journal-unreadable")
+    assert supervise.classify_child_exit(
+        kind="stream",
+        returncode=0,
+        output="",
+        armed=False,
+    ) == (supervise.ACTION_STOP, "did-not-arm")
+    assert supervise.classify_child_exit(
+        kind="stream",
+        returncode=3,
+        output="follow: this controller lease already has a persistent stream",
+        armed=False,
+    ) == (supervise.ACTION_STOP, "did-not-arm")
+
+
+def test_live_counts_armed_components_not_pids() -> None:
+    host = FakeHost(stop_after_coverage=2)
+    _run(host, _items("stream", "backup", "watchdog"), heartbeat_s=100.0, coverage_s=0.05)
+    coverages = [record for record in _records(host) if record.get("type") == "coverage"]
+    assert coverages[0]["live"] == 0
+    assert coverages[0]["target"] == 3
+    assert coverages[-1]["live"] == coverages[-1]["target"] == 3
+
+
+def test_journal_unreadable_is_retryable_not_dead_nonce() -> None:
+    host = FakeHost(
+        scripts={
+            "backup": [
+                PlannedExit(
+                    lifetime_s=0.1,
+                    returncode=2,
+                    output="listen: journal-unavailable: journal is busy",
+                    armed=False,
+                ),
+            ]
+        },
+        stop_after_spawns=2,
+    )
+    code = _run(host, _items("backup"), heartbeat_s=100.0, coverage_s=100.0)
+    assert code != supervise.SUPERVISE_STOP_EXIT
+    reasons = [record.get("reason") for record in _records(host)]
+    assert "dead-lease-nonce" not in reasons
+    restart = next(record for record in _records(host) if record.get("type") == "restart")
+    assert restart["reason"] == "journal-unreadable"
+
+
+def test_unreadable_journal_probe_does_not_stop_the_supervisor() -> None:
+    host = FakeHost(stop_after_coverage=3)
+    original = host.spawn
+
+    def spawn_then_unread(kind: str, command: str) -> FakeChild:
+        child = original(kind, command)
+        host.nonce_state = "unreadable"
+        return child
+
+    host.spawn = spawn_then_unread  # type: ignore[method-assign]
+    code = _run(host, _items("stream"), heartbeat_s=100.0, coverage_s=0.05)
+    assert code != supervise.SUPERVISE_STOP_EXIT
+    assert all(
+        record.get("reason") != "dead-lease-nonce" for record in _records(host)
+    )
+
+
+def test_permanent_unarmed_exit_2_is_visible_terminal_not_healthy() -> None:
+    host = FakeHost(
+        scripts={
+            "backup": [
+                PlannedExit(
+                    lifetime_s=0.05,
+                    returncode=2,
+                    output="listen: pending-report claim is poisoned",
+                    armed=False,
+                )
+                for _ in range(supervise.PERMANENT_UNARMED_FAULTS)
+            ],
+            "stream": [],
+        },
+        stop_on_stop_reason="permanent-exit-2",
+    )
+    code = _run(
+        host,
+        _items("stream", "backup"),
+        heartbeat_s=100.0,
+        coverage_s=0.05,
+    )
+    assert code != supervise.SUPERVISE_STOP_EXIT
+    stop = next(record for record in _records(host) if record.get("type") == "stop")
+    assert stop["reason"] == "permanent-exit-2"
+    assert stop.get("scope") == "slot"
+    assert stop["child"] == "backup"
+    assert host.alive_by_kind_at_stop.get("stream") is True
+    assert [kind for kind, _command in host.spawns].count("backup") == (
+        supervise.PERMANENT_UNARMED_FAULTS
+    )
+    assert stop["live"] < stop["target"]
+
+
+def test_supervise_items_are_the_configured_persistent_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", raising=False)
+    items = wake.coverage_supervise_items(
+        tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+    )
+    kinds = [kind for kind, _command in items]
+    assert kinds.count("stream") == 1
+    assert kinds.count("backup") == wake.persistent_backup_slot_count() == 6
+    assert kinds.count("watchdog") == 1
+    assert len(items) == wake.persistent_wake_target() == 8
+    backup = next(command for kind, command in items if kind == "backup")
+    assert f"--listener-slots {wake.persistent_backup_slot_count()}" in backup
+    assert "--report-pending" in backup
+    assert "--watch-follow" not in backup
 
 
 def test_controller_mail_documents_supervise_front_door() -> None:
@@ -553,3 +730,206 @@ def test_supervise_cli_is_the_one_command_front_door(tmp_path: Path) -> None:
     )
     assert top.returncode == 0
     assert "supervise" in top.stdout
+
+
+@pytest.fixture()
+def isolated(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, str], journal.LeaseIdentity]:
+    td = Path(tempfile.mkdtemp(prefix="gf-supervise-"))
+    label = "supervise-test"
+    env = {
+        "GOALFLIGHT_JOURNAL_DIR": str(td / "journals"),
+        "GOALFLIGHT_STATE_DIR": str(td / "state"),
+        "GOALFLIGHT_WAKE_LEDGER_DIR": str(td / "wake-ledger"),
+        "GOALFLIGHT_MESSAGES_DIR": str(td / "messages"),
+        "GOALFLIGHT_TASK_STORE_DIR": str(td / "task-store"),
+        "GOAL_FLIGHT_PIDFILE_DIR": str(td / "pids"),
+        "GOALFLIGHT_CAPACITY_CONF": os.devnull,
+        "GOALFLIGHT_TEST_MODE": "1",
+        "GOALFLIGHT_CONTROLLER_LABEL": label,
+        "GOALFLIGHT_PROCESS_ROLE": "controller",
+        "GOALFLIGHT_WAKE_ENTRY_POLL_S": "0",
+    }
+    for key in (
+        "GOALFLIGHT_DISPATCH_ID",
+        "GOALFLIGHT_PROMPT_FILE",
+        "GOALFLIGHT_STEER_FILE",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+        "GOALFLIGHT_PERSISTENT_BACKUP_SLOTS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    for value in env.values():
+        if value != os.devnull:
+            Path(value).mkdir(parents=True, exist_ok=True)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    project = td / "project"
+    project.mkdir()
+    authority = journal.open_or_create_journal(project)
+    claimed = authority.claim_or_renew_lease(
+        label,
+        principal={"principal_id": "supervise-test-principal"},
+    )
+    assert claimed.committed and claimed.value is not None
+    return project, {**os.environ, **env}, claimed.value
+
+
+def test_listener_role_can_pin_explicit_lease_nonce(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, env, lease = isolated
+    with wake.register_lease_holder(
+        project, controller_label=lease.label, lease_nonce=lease.nonce
+    ):
+        monkeypatch.setenv("GOALFLIGHT_PROCESS_ROLE", "listener")
+        monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
+        resolved = messages._resolve_listen_auto_lease(
+            project,
+            controller_label=lease.label,
+            explicit_nonce=lease.nonce,
+        )
+    assert resolved.get("claimed") is True
+    assert resolved.get("reason") == "explicit-lease-nonce"
+    assert resolved.get("nonce") == lease.nonce
+
+
+def test_listener_role_without_nonce_still_refuses_auto_claim(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _env, lease = isolated
+    monkeypatch.setenv("GOALFLIGHT_PROCESS_ROLE", "listener")
+    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
+    resolved = messages._resolve_listen_auto_lease(
+        project,
+        controller_label=lease.label,
+        explicit_nonce=None,
+    )
+    assert resolved.get("claimed") is False
+    assert resolved.get("reason") == "non-controller-role"
+
+
+def test_leftover_watchdog_is_production_did_not_arm_and_keeps_siblings(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    listener_env = {
+        **env,
+        "GOALFLIGHT_PROCESS_ROLE": "listener",
+    }
+    listener_env.pop("GOALFLIGHT_DISPATCH_ID", None)
+    with wake.register_lease_holder(
+        project, controller_label=lease.label, lease_nonce=lease.nonce
+    ):
+        with wake.register_watchdog_waiter(
+            project,
+            controller_label=lease.label,
+            generation_key=lease.nonce,
+        ):
+            refused = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "goalflight_messages.py"),
+                    "listen",
+                    "--project-root",
+                    str(project),
+                    "--controller-label",
+                    lease.label,
+                    "--lease-nonce",
+                    lease.nonce,
+                    "--watch-follow",
+                    "--poll-secs",
+                    "0.01",
+                    "--timeout-s",
+                    "1",
+                ],
+                cwd=project,
+                env=listener_env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+    assert refused.returncode == 3, refused.stderr
+    assert "already has a live follow watchdog" in refused.stderr
+    action, reason = supervise.classify_child_exit(
+        kind="watchdog",
+        returncode=refused.returncode,
+        output=refused.stderr,
+        armed=False,
+    )
+    assert (action, reason) == (supervise.ACTION_STOP, "did-not-arm")
+
+
+def test_supervise_refuses_regular_file_stdout_before_spawn(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    tmp_path: Path,
+) -> None:
+    project, env, lease = isolated
+    output = tmp_path / "not-a-monitor.jsonl"
+    supervise_env = dict(env)
+    supervise_env.pop("GOALFLIGHT_DISPATCH_ID", None)
+    with output.open("w", encoding="utf-8") as stream:
+        refused = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "goalflight_messages.py"),
+                "supervise",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                lease.label,
+                "--lease-nonce",
+                lease.nonce,
+                "--heartbeat-secs",
+                "60",
+            ],
+            cwd=project,
+            env=supervise_env,
+            stdout=stream,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    assert refused.returncode == supervise.SUPERVISE_START_EXIT
+    assert "stdout is a regular file" in refused.stderr
+    assert not wake.live_waiters(
+        project,
+        controller_label=lease.label,
+        kinds={"listener", wake.MONITOR_KIND, wake.WATCHDOG_KIND},
+    )
+
+
+def test_coverage_status_keeps_t322_sizing_after_supervise(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, _env, lease = isolated
+    with wake.register_lease_holder(
+        project, controller_label=lease.label, lease_nonce=lease.nonce
+    ):
+        wake.activate_monitor_state(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+            heartbeat_s=120,
+            dead_after_s=360,
+        )
+        with wake.register_waiter(
+            project,
+            controller_label=lease.label,
+            kind=wake.MONITOR_KIND,
+            generation_key=lease.nonce,
+        ):
+            with wake.register_watchdog_waiter(
+                project,
+                controller_label=lease.label,
+                generation_key=lease.nonce,
+            ):
+                status = wake.coverage_status(
+                    project,
+                    controller_label=lease.label,
+                    lease_nonce=lease.nonce,
+                )
+    assert status["target_waiters"] == 8
+    assert status["backup"]["target"] == 6
+    assert "target" in status["backup"]
+    assert status["portable_target_waiters"] == 6

@@ -3394,13 +3394,16 @@ def _resolve_listen_auto_lease(
 
     Ambient env is one input, not the only one. The journal ACTIVE lease
     for ``(project, label)`` is the default. ``--lease-nonce`` pins a
-    generation. Two live generations plus a disagreeing env capability
-    refuse rather than silently picking.
+    generation; a supervised child may pin under its own ``listener`` role.
+    Auto-resolution of the ACTIVE lease still requires the controller role.
+    Two live generations plus a disagreeing env capability refuse rather
+    than silently picking.
     """
     if str(os.environ.get("GOALFLIGHT_DISPATCH_ID") or "").strip():
         return {"claimed": False, "reason": "worker-dispatch", "label": controller_label}
     role = str(os.environ.get("GOALFLIGHT_PROCESS_ROLE") or "controller").strip()
-    if role != "controller":
+    pinned = str(explicit_nonce or "").strip()
+    if role != "controller" and not pinned:
         return {
             "claimed": False,
             "reason": "non-controller-role",
@@ -3419,7 +3422,6 @@ def _resolve_listen_auto_lease(
         }
     live = _listen_auto_live_generations(authority, project_root, controller_label)
     active = [row for row in live if row.get("state") == "ACTIVE"]
-    pinned = str(explicit_nonce or "").strip()
     if pinned:
         match = next((row for row in live if row.get("nonce") == pinned), None)
         if match is None:

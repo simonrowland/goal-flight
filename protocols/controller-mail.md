@@ -129,14 +129,19 @@ The supervisor's child-exit taxonomy:
 
 | Child result | Supervisor action |
 |---|---|
-| rang (exit 0 after arming) | re-arm promptly |
+| rang (exit 0 after holding a wake flock) | re-arm promptly |
 | exit 3 (pool full / contention) | re-arm promptly |
-| fault (exit 2, signals, short-lived crash) | restart with backoff: 1s, 2s, … cap 120s; reset after a long-lived run |
-| did-not-arm (exit 0 with no lock, capability-mismatch, dead nonce, watchdog slot already held) | stop, emit `type=stop`, exit 3 |
+| journal unreadability (exit 2, `journal-unavailable` / `journal-io-failure`) | retryable backoff; never `dead-lease-nonce` |
+| short-lived fault (exit 2 after arming) | restart with backoff: 1s, 2s, … cap 120s; reset after a long-lived run |
+| did-not-arm (exit 0 with no flock, leftover watchdog/stream lock, regular-file stdout) | stop **that slot**, emit `type=stop` `scope=slot`; siblings keep running |
+| three consecutive unarmed exit-2 deaths | stop **that slot** as `permanent-exit-2` (visible, not healthy); do not absorb into silent backoff |
+| dead lease nonce (capability-mismatch, `lease-nonce-not-live`, vanished live session) | stop the supervisor, emit `type=stop` `scope=supervisor`, exit 3 |
 
 A dead lease nonce is re-read from `goalflight_session_status.live_session`, never
-hand-constructed. On mismatch or a vanished live session the supervisor emits
-`{"kind":"supervise","type":"stop","reason":"dead-lease-nonce"}` and exits 3.
+hand-constructed. On mismatch or a vanished **readable** live session the supervisor
+emits `{"kind":"supervise","type":"stop","reason":"dead-lease-nonce"}` and exits 3.
+An unreadable journal is "I could not find out" and stays retryable. `live` counts
+children observed holding a wake flock, not PIDs that merely exist.
 
 The decomposed three-command form below is still the fallback when a host arms
 components as separate tracked tasks.
