@@ -114,13 +114,128 @@ except BaseException as e:  # pragma: no cover - exercised by doctor/system pyth
     StreamEvent = object  # type: ignore[assignment]
 
 
-def require_acp_sdk() -> None:
+ACP_SDK_IMPORTABLE = "importable"
+ACP_SDK_REEXEC = "reexec"
+ACP_SDK_UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class AcpSdkResolution:
+    state: str
+    current_python: str
+    target_python: str | None
+    reason: str
+
+
+def _acp_import_error_summary() -> str:
     if ACP_IMPORT_ERROR is None:
+        return "none"
+    detail = " ".join(str(ACP_IMPORT_ERROR).split()) or "no detail"
+    return f"{type(ACP_IMPORT_ERROR).__name__}: {detail}"
+
+
+def acp_sdk_resolution() -> AcpSdkResolution:
+    """Classify whether ACP is importable, re-executable, or unsatisfied."""
+    current = str(sys.executable)
+    if ACP_IMPORT_ERROR is None:
+        return AcpSdkResolution(
+            state=ACP_SDK_IMPORTABLE,
+            current_python=current,
+            target_python=None,
+            reason="acp is importable in the current interpreter",
+        )
+
+    override = os.environ.get("GOALFLIGHT_ACP_PYTHON")
+    target = (
+        Path(override).expanduser()
+        if override
+        else Path.home() / ".goal-flight" / "venvs" / "acp-0.10" / "bin" / "python"
+    )
+    target_text = str(target)
+    import_error = _acp_import_error_summary()
+    try:
+        target_exists = target.exists()
+        target_is_file = target.is_file()
+    except OSError as exc:
+        return AcpSdkResolution(
+            state=ACP_SDK_UNAVAILABLE,
+            current_python=current,
+            target_python=target_text,
+            reason=(
+                f"could not inspect configured ACP interpreter {target_text}: "
+                f"{type(exc).__name__}: {exc}; current import failed with {import_error}"
+            ),
+        )
+    if not target_exists:
+        remedy = (
+            "set GOALFLIGHT_ACP_PYTHON to an interpreter containing "
+            "agent-client-protocol==0.10.*"
+            if override
+            else "run install to create the managed agent-client-protocol==0.10.* environment"
+        )
+        return AcpSdkResolution(
+            state=ACP_SDK_UNAVAILABLE,
+            current_python=current,
+            target_python=target_text,
+            reason=(
+                f"configured ACP interpreter does not exist at {target_text}; {remedy}; "
+                f"current import failed with {import_error}"
+            ),
+        )
+    if not target_is_file:
+        return AcpSdkResolution(
+            state=ACP_SDK_UNAVAILABLE,
+            current_python=current,
+            target_python=target_text,
+            reason=(
+                f"configured ACP interpreter is not a file: {target_text}; "
+                f"current import failed with {import_error}"
+            ),
+        )
+
+    target_path = os.path.abspath(os.path.normpath(target_text))
+    current_path = os.path.abspath(os.path.normpath(current))
+    if target_path == current_path:
+        return AcpSdkResolution(
+            state=ACP_SDK_UNAVAILABLE,
+            current_python=current,
+            target_python=target_text,
+            reason=(
+                f"configured ACP interpreter is already the current interpreter {current}, "
+                f"but it cannot import acp ({import_error}); repair the SDK installation "
+                "in that interpreter"
+            ),
+        )
+    if not os.access(target, os.X_OK):
+        return AcpSdkResolution(
+            state=ACP_SDK_UNAVAILABLE,
+            current_python=current,
+            target_python=target_text,
+            reason=(
+                f"configured ACP interpreter is not executable: {target_text}; "
+                f"current import failed with {import_error}"
+            ),
+        )
+    return AcpSdkResolution(
+        state=ACP_SDK_REEXEC,
+        current_python=current,
+        target_python=target_text,
+        reason=(
+            f"current interpreter cannot import acp ({import_error}); "
+            f"re-exec is required with configured interpreter {target_text}"
+        ),
+    )
+
+
+def require_acp_sdk() -> None:
+    resolution = acp_sdk_resolution()
+    if resolution.state == ACP_SDK_IMPORTABLE:
         return
-    raise AcpError(
-        "SDK missing -- run install: agent-client-protocol==0.10.* must be "
-        "available in ~/.goal-flight/venvs/acp-0.10/"
-    ) from ACP_IMPORT_ERROR
+    if resolution.state == ACP_SDK_REEXEC:
+        message = f"ACP SDK requires a different interpreter: {resolution.reason}"
+    else:
+        message = f"ACP SDK requirement cannot be satisfied: {resolution.reason}"
+    raise AcpError(message) from ACP_IMPORT_ERROR
 
 
 def acp_limit_from_env() -> int:

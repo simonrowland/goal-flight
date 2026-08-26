@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from machine_isolation import AMBIENT_IDENTITY_ENV, isolated_machine_env
+from support import acp_sdk_unavailable_reason, requires_acp_sdk
 
 TEST_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TEST_DIR.parents[1]
@@ -153,9 +154,9 @@ def _isolated_env(root: Path, *, test_id: str) -> dict[str, str]:
     return env
 
 
-def _interpreter_for(path: Path, *, direct_script: bool) -> Path:
-    needs_acp_sdk = path.name.startswith("test_acp_") or path.name == "test_os_sandbox.py"
-    if direct_script and needs_acp_sdk and os.name != "nt":
+def _interpreter_for(path: Path) -> Path:
+    needs_acp_sdk = requires_acp_sdk(path)
+    if needs_acp_sdk and os.name != "nt":
         configured = os.environ.get("GOALFLIGHT_ACP_PYTHON")
         return (
             Path(configured).expanduser()
@@ -171,10 +172,14 @@ def test_isolated_test_module(
     request: pytest.FixtureRequest,
 ) -> None:
     test_path, direct_script = isolated_test_module
-    interpreter = _interpreter_for(test_path, direct_script=direct_script)
-    assert interpreter.is_file() and os.access(interpreter, os.X_OK), (
-        f"SDK missing -- run install: {interpreter}"
-    )
+    interpreter = _interpreter_for(test_path)
+    if requires_acp_sdk(test_path) and os.name != "nt":
+        unavailable = acp_sdk_unavailable_reason(str(interpreter))
+        if unavailable is not None:
+            pytest.skip(
+                f"{test_path.relative_to(TEST_DIR).as_posix()}: "
+                f"ACP SDK requirement unsatisfied: {unavailable}"
+            )
 
     # Journal/state isolation: without these, a module that resolves default
     # paths write-opens LIVE journals — and a schema-carrying tree migrated
