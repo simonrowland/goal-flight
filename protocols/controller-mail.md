@@ -130,11 +130,12 @@ The supervisor's child-exit taxonomy:
 | Child result | Supervisor action |
 |---|---|
 | rang (exit 0 after arming, or exit 0 whose arming was not sampled) | re-arm promptly |
-| exit 3 (pool full / contention) | re-arm promptly |
+| orphaned parent / controlling stdout closed | backoff as `orphaned-parent` / `orphaned-stdout` (named; not a live-pool condition for a supervised child) |
+| exit 3 with no matching diagnostic | backoff as `exit-3-unclassified`; do not treat as contention |
 | journal unreadability (exit 2, `journal-unavailable` / `journal-io-failure`) | retryable backoff; never `dead-lease-nonce` |
 | short-lived fault (exit 2 after arming) | restart with backoff: 1s, 2s, … cap 120s; reset after a long-lived run |
 | did-not-arm (leftover watchdog/stream lock, regular-file stdout — explicit markers, never a missed flock sample) | stop **that slot**, emit `type=stop` `scope=slot`; siblings keep running |
-| three consecutive unarmed exit-2 deaths | stop **that slot** as `permanent-exit-2` (visible, not healthy); do not absorb into silent backoff |
+| three consecutive short non-journal exit-2 deaths | stop **that slot** as `permanent-exit-2` (visible, not healthy); do not absorb into silent backoff; does not use a sampled `armed` flag |
 | dead lease nonce (capability-mismatch, `lease-nonce-not-live`, vanished live session) | stop the supervisor, emit `type=stop` `scope=supervisor`, exit 3 |
 
 A dead lease nonce is re-read through `goalflight_session_status.probe_live_session`
@@ -144,7 +145,10 @@ emits `{"kind":"supervise","type":"stop","reason":"dead-lease-nonce"}` and exits
 An unreadable journal is "I could not find out" and stays retryable at both startup
 and child-death. `live` counts children observed holding a wake flock or that
 emitted a durable armed/ring line, not PIDs that merely exist. A missed lock sample
-on a successful ring re-arms; it does not stop the slot.
+on a successful ring re-arms; it does not stop the slot. Child-exit classification
+reads the child's diagnostic channel (stderr plus structured child-exit JSON
+reasons), never relayed mail headlines — a doorbell report whose subject contains
+`stale-lease` is still a successful ring.
 
 The decomposed three-command form below is still the fallback when a host arms
 components as separate tracked tasks.

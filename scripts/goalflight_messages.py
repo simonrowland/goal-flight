@@ -5758,12 +5758,17 @@ def _cmd_watch_follow(
                     "listen: orphaned: watchdog parent changed",
                     file=sys.stderr,
                 )
+                # Supervised: parent is the supervisor. This is a subreaper
+                # reparent, not a live-pool condition; classified
+                # orphaned-parent rather than the exit-3 catch-all.
                 return 3
             if _stdio_peer_gone(sys.stdout):
                 print(
                     "listen: orphaned: controlling stdout closed; tracked task is gone",
                     file=sys.stderr,
                 )
+                # Supervised: stdout is the supervisor pipe we still hold.
+                # A hit is a shutdown race; classified orphaned-stdout.
                 return 3
             if deadline is not None and time.monotonic() >= deadline:
                 return 1
@@ -6195,6 +6200,8 @@ def cmd_listen(args) -> int:
                 return finish_detached()
             return None
         if current_parent != parent_pid:
+            # Supervised: parent is the supervisor. Same orphaned-parent
+            # classification as the watchdog path; not the exit-3 catch-all.
             return finish("orphaned", code=3, detail="listener parent changed")
         return None
 
@@ -6217,6 +6224,8 @@ def cmd_listen(args) -> int:
                 if noticed is not None
                 else ""
             )
+            # Supervised: stdout is the supervisor pipe. Shutdown race;
+            # classified orphaned-stdout, not the exit-3 catch-all.
             return finish(
                 "orphaned",
                 code=3,

@@ -54,9 +54,17 @@ _DID_NOT_ARM_MARKERS = (
     "already has a persistent stream",
     "stdout is a regular file",
 )
+_ORPHANED_PARENT_MARKERS = (
+    "orphaned: watchdog parent changed",
+    "orphaned: listener parent changed",
+)
+_ORPHANED_STDOUT_MARKERS = (
+    "orphaned: controlling stdout closed",
+)
 _SLOT_STOP_REASONS = frozenset(
     {"did-not-arm", "permanent-exit-2"}
 )
+_DIAGNOSTIC_EVENT_TYPES = frozenset({"listener-exit", "listener-fault"})
 _ARMED_STDOUT_KINDS = frozenset(
     {
         "armed",
@@ -68,6 +76,20 @@ _ARMED_STDOUT_KINDS = frozenset(
     }
 )
 SUPERVISED_ENV = "GOALFLIGHT_SUPERVISED"
+
+
+class UnreadableNonce:
+    """Sentinel: ``nonce_reader`` could not tell live from dead.
+
+    ``None`` is dead. A nonce string is live if it matches, else dead.
+    Without this third state the hook cannot express a busy journal and
+    a collapse of ``probe_live_session`` ``unreadable`` into dead is unbound.
+    """
+
+    __slots__ = ()
+
+
+UNREADABLE_NONCE = UnreadableNonce()
 
 
 class SuperviseHost(Protocol):
@@ -117,10 +139,23 @@ def classify_child_exit(
 ) -> tuple[str, str]:
     """Map a child death onto re-arm, backoff, or stop-and-say-why.
 
+    ``output`` is the child's diagnostic channel (stderr plus structured
+    child-exit JSON reasons), never relayed mail headlines. Marker scans
+    of mixed stdout would treat a doorbell report of ``stale-lease`` as
+    supervisor death.
+
     ``armed`` is a positive observation (child stdout or a sampled flock).
     A missed sample is a false negative and must re-arm, never stop: exit 0
     without an explicit did-not-arm marker is "rang". Journal unreadability
     is retryable and is never collapsed into a dead nonce.
+
+    Watch-follow return-3 sites: leftover watchdog lock is did-not-arm;
+    stale-lease is a dead nonce. Parent-changed and controlling-stdout-closed
+    are the child's view of a vanished host. A supervised child's parent is
+    this supervisor and its stdout is the pipe we still hold, so those
+    prints are a shutdown race (or a subreaper reparent) rather than a
+    live-pool condition — they are named here so they cannot hide in the
+    exit-3 catch-all. Residual exit 3 is ``exit-3-unclassified``.
     """
     del kind
     del armed
@@ -132,10 +167,14 @@ def classify_child_exit(
         return ACTION_STOP, "dead-lease-nonce"
     if any(marker in lowered for marker in _DID_NOT_ARM_MARKERS):
         return ACTION_STOP, "did-not-arm"
+    if any(marker in lowered for marker in _ORPHANED_PARENT_MARKERS):
+        return ACTION_BACKOFF, "orphaned-parent"
+    if any(marker in lowered for marker in _ORPHANED_STDOUT_MARKERS):
+        return ACTION_BACKOFF, "orphaned-stdout"
     if returncode == 0:
         return ACTION_REARM, "rang"
     if returncode == 3:
-        return ACTION_REARM, "exit-3"
+        return ACTION_BACKOFF, "exit-3-unclassified"
     return ACTION_BACKOFF, f"exit-{returncode}"
 
 
@@ -232,6 +271,45 @@ def _is_armed_control_line(line: str) -> bool:
     except (json.JSONDecodeError, TypeError, ValueError):
         return False
     return isinstance(payload, dict) and str(payload.get("kind") or "") == "armed"
+
+
+def _structured_child_reason(line: str) -> str | None:
+    """Extract a child-authored diagnostic reason from a JSON control line.
+
+    Mail headlines and follow event payloads (envelope ``data``) are not
+    diagnostics. Only ``kind=exit`` and listener-exit/fault events count.
+    Markers in those records can appear on stdout; a stderr-only scan
+    would miss follow's ``listener-exit`` stale-lease JSON.
+    """
+    text = str(line or "").strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    kind = str(payload.get("kind") or "")
+    if kind == "exit":
+        reason = str(payload.get("reason") or "").strip()
+        return reason or None
+    inner = payload.get("payload")
+    if kind == "event" and isinstance(inner, dict):
+        if str(inner.get("type") or "") in _DIAGNOSTIC_EVENT_TYPES:
+            reason = str(inner.get("reason") or "").strip()
+            return reason or None
+    return None
+
+
+def _note_child_diagnostic(child: RealChild, line: str, *, stderr: bool) -> None:
+    """Accumulate classification input; never relayed mail headlines."""
+    if stderr:
+        child.output += line if line.endswith("\n") else line + "\n"
+        return
+    reason = _structured_child_reason(line)
+    if reason:
+        child.output += reason + "\n"
 
 
 def _nonce_state(host: SuperviseHost, expected: str) -> str:
@@ -404,16 +482,22 @@ def run_supervisor(
                 output=event.output,
                 armed=armed,
             )
+            # Do not use sampled ``armed`` as negative evidence (the P0-2
+            # flock-miss hazard). Count consecutive short non-journal
+            # exit-2s regardless of the sample; a long-lived run resets.
             if (
                 action == ACTION_BACKOFF
                 and reason != "journal-unreadable"
-                and not armed
+                and event.returncode == 2
+                and event.ran_s < LONG_LIVED_S
             ):
                 slot.unarmed_faults += 1
                 if slot.unarmed_faults >= PERMANENT_UNARMED_FAULTS:
                     action, reason = ACTION_STOP, "permanent-exit-2"
-            elif action == ACTION_REARM or (
-                action == ACTION_BACKOFF and armed
+            elif (
+                action == ACTION_REARM
+                or reason == "journal-unreadable"
+                or event.ran_s >= LONG_LIVED_S
             ):
                 slot.unarmed_faults = 0
             slot.backoff_s = next_backoff(
@@ -540,7 +624,7 @@ class RealChild:
     armed: bool = False
     stdout_buf: bytes = b""
     stderr_buf: bytes = b""
-    output: str = ""
+    output: str = ""  # diagnostic: stderr + structured child-exit reasons
 
 
 class RealHost:
@@ -553,7 +637,7 @@ class RealHost:
         controller_label: str,
         lease_nonce: str,
         env: dict[str, str] | None = None,
-        nonce_reader: Callable[[], str | None] | None = None,
+        nonce_reader: Callable[[], str | None | UnreadableNonce] | None = None,
     ) -> None:
         self.now = time.monotonic()
         self.project_root = Path(project_root)
@@ -582,7 +666,10 @@ class RealHost:
 
     def live_nonce(self) -> str | None:
         if self._nonce_reader is not None:
-            return self._nonce_reader()
+            live = self._nonce_reader()
+            if live is UNREADABLE_NONCE or live is None:
+                return None
+            return str(live)
         import goalflight_session_status as sessions  # type: ignore
 
         state, session = sessions.probe_live_session(
@@ -599,9 +686,15 @@ class RealHost:
         Reads the nonce through ``probe_live_session`` (non-locking reader).
         Never calls the write ``Journal()`` constructor, and never treats
         ``live_session() is None`` as dead after a successful reader open.
+
+        ``nonce_reader`` returns a nonce string, ``None`` (dead), or
+        ``UNREADABLE_NONCE``. Collapsing ``unreadable`` into dead here
+        would recreate the busy-journal supervisor death.
         """
         if self._nonce_reader is not None:
             live = self._nonce_reader()
+            if live is UNREADABLE_NONCE:
+                return "unreadable"
             if live is None:
                 return "dead"
             return "live" if str(live) == self.lease_nonce else "dead"
@@ -701,17 +794,19 @@ class RealHost:
             lines, child.stderr_buf = _pop_lines(child.stderr_buf)
         forwarded: list[str] = []
         for line in lines:
-            child.output += line + "\n"
             if _line_signals_armed(line):
                 child.armed = True
             if which == "err":
+                _note_child_diagnostic(child, line, stderr=True)
                 try:
                     sys.stderr.write(line + "\n")
                     sys.stderr.flush()
                 except OSError:
                     pass
-            elif not _is_armed_control_line(line):
-                forwarded.append(line)
+            else:
+                _note_child_diagnostic(child, line, stderr=False)
+                if not _is_armed_control_line(line):
+                    forwarded.append(line)
         return forwarded if which == "out" else []
 
     def _drain_exited(self, child: RealChild) -> list[str]:
@@ -727,9 +822,11 @@ class RealHost:
             buf = child.stdout_buf if which == "out" else child.stderr_buf
             if buf:
                 leftover = buf.decode("utf-8", "replace")
-                child.output += leftover if leftover.endswith("\n") else leftover + "\n"
                 if _line_signals_armed(leftover):
                     child.armed = True
+                _note_child_diagnostic(
+                    child, leftover, stderr=(which == "err")
+                )
                 if (
                     which == "out"
                     and leftover.strip()

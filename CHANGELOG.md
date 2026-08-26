@@ -37,6 +37,16 @@ incremented when meaningful skill behaviour changes.
 
 ### Fixed
 
+- Supervised wake classifies a child exit from the child's diagnostic
+  channel (stderr plus structured child-exit JSON reasons), never from
+  relayed mail headlines. A doorbell that reports a subject containing
+  `stale-lease` / `journal-unavailable` / `already has a live follow
+  watchdog` and then rings still re-arms; those tokens in mail no longer
+  stop the supervisor or a slot. Residual listen exit 3 is
+  `exit-3-unclassified` rather than implied contention; parent-changed
+  and controlling-stdout-closed are named `orphaned-parent` /
+  `orphaned-stdout`. The nonce hook can express `unreadable` so a busy
+  journal cannot collapse into `dead-lease-nonce`.
 - Drain no longer restores a queued dispatch whose launch argv is now a
   permanently inert `--os-sandbox` combination. Transient refusals
   (capacity, a missing controller) still restore-and-retry; a permanent

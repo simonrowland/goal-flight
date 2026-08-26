@@ -351,14 +351,14 @@ def test_dead_child_is_restarted() -> None:
     assert restart["reason"] == "exit-2"
 
 
-def test_exit_3_rearms_promptly() -> None:
+def test_exit_3_unclassified_backoffs_instead_of_implying_contention() -> None:
     host = FakeHost(
         scripts={
             "backup": [
                 PlannedExit(
                     lifetime_s=0.2,
                     returncode=3,
-                    output="listen: all 1 listener slots hold live doorbells",
+                    output="listen: unexpected diagnostic-free exit 3",
                     armed=True,
                 ),
             ]
@@ -369,10 +369,9 @@ def test_exit_3_rearms_promptly() -> None:
     restart = next(
         record for record in _records(host) if record.get("type") == "restart"
     )
-    assert restart["reason"] == "exit-3"
-    assert float(restart["backoff_s"]) == 0.0
+    assert restart["reason"] == "exit-3-unclassified"
+    assert float(restart["backoff_s"]) == 1.0
     assert len(host.spawns) == 2
-    assert host.now < 1.0
 
 
 def test_exit_0_without_arming_stops_with_distinct_reason() -> None:
@@ -558,9 +557,27 @@ def test_classify_exit_taxonomy() -> None:
     assert supervise.classify_child_exit(
         kind="backup",
         returncode=3,
-        output="listen: all 4 listener slots hold live doorbells",
+        output="listen: unexpected diagnostic-free exit 3",
         armed=False,
-    ) == (supervise.ACTION_REARM, "exit-3")
+    ) == (supervise.ACTION_BACKOFF, "exit-3-unclassified")
+    assert supervise.classify_child_exit(
+        kind="watchdog",
+        returncode=3,
+        output="listen: orphaned: watchdog parent changed",
+        armed=True,
+    ) == (supervise.ACTION_BACKOFF, "orphaned-parent")
+    assert supervise.classify_child_exit(
+        kind="backup",
+        returncode=3,
+        output="listen: orphaned: listener parent changed",
+        armed=True,
+    ) == (supervise.ACTION_BACKOFF, "orphaned-parent")
+    assert supervise.classify_child_exit(
+        kind="watchdog",
+        returncode=3,
+        output="listen: orphaned: controlling stdout closed; tracked task is gone",
+        armed=True,
+    ) == (supervise.ACTION_BACKOFF, "orphaned-stdout")
     assert supervise.classify_child_exit(
         kind="stream",
         returncode=2,
@@ -1072,6 +1089,218 @@ def test_fast_ring_between_lock_samples_is_rearmed_not_stopped(
         for child in host._children
         if isinstance(child, supervise.RealChild)
     )
+
+
+@pytest.mark.parametrize(
+    ("token", "forbidden_reason"),
+    [
+        ("stale-lease", "dead-lease-nonce"),
+        ("journal-unavailable", "journal-unreadable"),
+        ("already has a live follow watchdog", "did-not-arm"),
+    ],
+)
+def test_relayed_mail_headline_does_not_classify_a_successful_ring(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    token: str,
+    forbidden_reason: str,
+) -> None:
+    """Reviewer refutation: a doorbell that reports a marker in a headline,
+    then exits 0 on a normal ring, is still ``rang``. Classification must
+    not read accumulated listen stdout.
+    """
+    project, env, lease = isolated
+    monkeypatch.setattr(supervise.wake, "live_waiters", lambda *args, **kwargs: [])
+    headline = f"[steer] t323 seq=1 — controller mentioned {token} in mail"
+    armed_line = json.dumps({"kind": "armed"}, separators=(",", ":"))
+    ring_line = json.dumps(
+        {"kind": "ring", "reason": "event"}, separators=(",", ":")
+    )
+    script = (
+        "import sys\n"
+        f"print({armed_line!r}, flush=True)\n"
+        f"print({headline!r}, flush=True)\n"
+        f"print({ring_line!r}, flush=True)\n"
+        "sys.exit(0)\n"
+    )
+    host = _RecordingHost(
+        project_root=project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        env=env,
+        nonce_reader=lambda: lease.nonce,
+    )
+    try:
+        code = supervise.run_supervisor(
+            project_root=project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+            host=host,
+            heartbeat_s=100.0,
+            coverage_s=100.0,
+            items=[("backup", _python_child(script))],
+        )
+        diagnostics = [
+            child.output
+            for child in host._children
+            if isinstance(child, supervise.RealChild)
+        ]
+    finally:
+        host.kill_all()
+
+    records = _records(host)
+    reasons = [record.get("reason") for record in records]
+    assert forbidden_reason not in reasons
+    assert all(record.get("type") != "stop" for record in records)
+    restart = next(record for record in records if record.get("type") == "restart")
+    assert restart["reason"] == "rang"
+    assert restart["child"] == "backup"
+    assert code != supervise.SUPERVISE_STOP_EXIT
+    assert any(token in (text or "") for text in "".join(host.lines).splitlines())
+    assert all(token not in (blob or "") for blob in diagnostics)
+
+
+def test_follow_listener_exit_json_on_stdout_is_still_dead_nonce(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    """Follow's own stale-lease diagnostic is stdout JSON, not stderr.
+
+    A stderr-only scan would miss it; structured child-exit reasons must
+    still stop the supervisor.
+    """
+    project, env, lease = isolated
+    armed_line = json.dumps({"kind": "armed"}, separators=(",", ":"))
+    exit_line = json.dumps(
+        {
+            "kind": "event",
+            "payload": {"type": "listener-exit", "reason": "stale-lease"},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    script = (
+        "import sys\n"
+        f"print({armed_line!r}, flush=True)\n"
+        f"print({exit_line!r}, flush=True)\n"
+        "sys.exit(3)\n"
+    )
+    host = _RecordingHost(
+        project_root=project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        env=env,
+        nonce_reader=lambda: lease.nonce,
+    )
+    try:
+        code = supervise.run_supervisor(
+            project_root=project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+            host=host,
+            heartbeat_s=100.0,
+            coverage_s=100.0,
+            items=[("stream", _python_child(script))],
+        )
+    finally:
+        host.kill_all()
+
+    records = _records(host)
+    stop = next(record for record in records if record.get("type") == "stop")
+    assert stop["reason"] == "dead-lease-nonce"
+    assert stop.get("scope") == "supervisor"
+    assert code == supervise.SUPERVISE_STOP_EXIT
+
+
+def test_nonce_reader_third_state_is_unreadable(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    host = supervise.RealHost(
+        project_root=project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        env=env,
+        nonce_reader=lambda: supervise.UNREADABLE_NONCE,
+    )
+    try:
+        assert host.nonce_probe() == "unreadable"
+    finally:
+        host.kill_all()
+
+
+def test_probe_live_session_unreadable_does_not_kill_the_pool(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bind probe_live_session -> unreadable must not become dead-lease-nonce.
+
+    Drives RealHost.nonce_probe, not a FakeHost that hands back the state.
+    """
+    project, env, lease = isolated
+    always_unread = supervise.RealHost(
+        project_root=project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        env=env,
+    )
+    try:
+        monkeypatch.setattr(
+            sessions,
+            "probe_live_session",
+            lambda *args, **kwargs: ("unreadable", None),
+        )
+        assert always_unread.nonce_probe() == "unreadable"
+    finally:
+        always_unread.kill_all()
+
+    state = {"mode": "live"}
+
+    def probe(*args: object, **kwargs: object) -> tuple[str, dict | None]:
+        if state["mode"] == "unreadable":
+            return ("unreadable", None)
+        return ("live", {"lease_nonce": lease.nonce})
+
+    monkeypatch.setattr(sessions, "probe_live_session", probe)
+
+    class Host(_RecordingHost):
+        def spawn(self, kind: str, command: str) -> supervise.RealChild:
+            child = super().spawn(kind, command)
+            state["mode"] = "unreadable"
+            return child
+
+    script = (
+        "import sys\n"
+        "print('{\"kind\":\"armed\"}', flush=True)\n"
+        "print('{\"kind\":\"ring\",\"reason\":\"event\"}', flush=True)\n"
+        "sys.exit(0)\n"
+    )
+    host = Host(
+        project_root=project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        env=env,
+    )
+    try:
+        assert host.nonce_probe() == "live"
+        code = supervise.run_supervisor(
+            project_root=project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+            host=host,
+            heartbeat_s=100.0,
+            coverage_s=100.0,
+            items=[("backup", _python_child(script))],
+        )
+        assert host.nonce_probe() == "unreadable"
+    finally:
+        host.kill_all()
+
+    records = _records(host)
+    reasons = [record.get("reason") for record in records]
+    assert "dead-lease-nonce" not in reasons
+    assert code != supervise.SUPERVISE_STOP_EXIT
+    restart = next(record for record in records if record.get("type") == "restart")
+    assert restart["reason"] == "rang"
 
 
 def test_unreadable_startup_with_explicit_nonce_starts(
