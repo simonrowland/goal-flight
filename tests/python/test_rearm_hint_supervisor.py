@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+import json
+import os
 from pathlib import Path
+import shlex
+import subprocess
+import time
 import sys
 
 import pytest
+
+from machine_isolation import AMBIENT_IDENTITY_ENV, isolated_machine_env
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
@@ -15,21 +23,49 @@ import goalflight_doctor as doctor  # noqa: E402
 import goalflight_journal as journal  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
+import goalflight_wake_supervise as supervise  # noqa: E402
 
 
 @pytest.fixture()
 def isolated(
     tmp_path: Path,
-) -> tuple[Path, journal.LeaseIdentity]:
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[tuple[Path, journal.LeaseIdentity]]:
+    label = "hint-ctl"
+    env = dict(os.environ)
+    for key in AMBIENT_IDENTITY_ENV:
+        env.pop(key, None)
+        monkeypatch.delenv(key, raising=False)
+    env.pop("GOALFLIGHT_WAKE_LEDGER", None)
+    env.update(isolated_machine_env(tmp_path))
+    env.update(
+        {
+            "GOALFLIGHT_ROOT": str(ROOT),
+            "GOALFLIGHT_CONTROLLER_LABEL": label,
+            "GOALFLIGHT_PROCESS_ROLE": "controller",
+            "GOALFLIGHT_TEST_MODE": "1",
+            "GOALFLIGHT_WAKE_ENTRY_POLL_S": "0",
+        }
+    )
+    for key, value in env.items():
+        if key.startswith("GOAL") or key == "PYTHONUNBUFFERED":
+            monkeypatch.setenv(key, value)
+    # Component commands must execute the tree under test, not a separately
+    # installed skill copy that may legitimately lag this branch.
     project = tmp_path / "project"
     project.mkdir()
     authority = journal.open_or_create_journal(project)
     claimed = authority.claim_or_renew_lease(
-        "hint-ctl",
+        label,
         principal={"principal_id": "rearm-hint-supervisor"},
     )
     assert claimed.committed and claimed.value is not None
-    return project, claimed.value
+    with wake.register_lease_holder(
+        project,
+        controller_label=claimed.value.label,
+        lease_nonce=claimed.value.nonce,
+    ):
+        yield project, claimed.value
 
 
 def _component_commands(
@@ -80,6 +116,62 @@ def _persistent_shortfall_plan(
         lease_nonce=lease.nonce,
         work_in_flight=True,
     )
+
+
+def _run_supervised_child(
+    project: Path,
+    lease: journal.LeaseIdentity,
+    *,
+    kind: str,
+    command: str,
+) -> tuple[list[dict[str, object]], supervise.ChildExit]:
+    env = dict(os.environ)
+    env["GOALFLIGHT_TEST_MODE"] = "1"
+    host = supervise.RealHost(
+        project_root=project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        env=env,
+        nonce_reader=lambda: lease.nonce,
+    )
+    child = host.spawn(kind, command)
+    lines: list[str] = []
+    child_exit: supervise.ChildExit | None = None
+    deadline = time.monotonic() + 8.0
+    try:
+        while child_exit is None and time.monotonic() < deadline:
+            result = host.wait([child], min(0.1, deadline - time.monotonic()))
+            for _child, line in result.lines:
+                lines.append(line)
+                assert host.write_stdout(line)
+            if result.exits:
+                child_exit = result.exits[0]
+    finally:
+        host.kill_all()
+    assert child_exit is not None, f"supervised {kind} child did not exit"
+    records = [json.loads(line) for line in lines if line.startswith("{")]
+    return records, child_exit
+
+
+def _minimal_doctor_payload(wake_coverage: dict[str, object]) -> dict[str, object]:
+    """Smallest payload that still drives the production human renderer."""
+    return {
+        "plugin": {},
+        "claude": {},
+        "codex": {"cli": {}},
+        "context_mode": {},
+        "cursor_context_mode": {},
+        "opencode_context_mode": {},
+        "gstack": {},
+        "gstack_browser": {},
+        "autoreview": {},
+        "cursor": {"agent": {}, "models": {}},
+        "opencode": {},
+        "grok": {},
+        "acp": {},
+        "project": {},
+        "wake_coverage": wake_coverage,
+    }
 
 
 def test_rearm_hint_supervised_omits_component_commands(
@@ -315,6 +407,271 @@ def test_reminder_and_activity_surfaces_follow_the_plan(
     assert wake.consume_listener_activity_signal(project, lease.label, plan) == ""
 
 
+def test_supervisor_forwarded_listener_exit_keeps_reason_not_action(
+    isolated: tuple[Path, journal.LeaseIdentity],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, lease = isolated
+    authority = journal.Journal(project)
+    assert authority.prepare_attempt("supervised-listener-exit").committed
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=120,
+        dead_after_s=360,
+    )
+    command = (
+        f"{wake.persistent_backup_start_command(project, controller_label=lease.label, lease_nonce=lease.nonce)} "
+        "--timeout-s 0.15 --poll-secs 0.02"
+    )
+    with wake.register_watchdog_waiter(
+        project,
+        controller_label=lease.label,
+        generation_key=lease.nonce,
+    ):
+        _records, child_exit = _run_supervised_child(
+            project,
+            lease,
+            kind="backup",
+            command=command,
+        )
+    forwarded = capsys.readouterr().err
+    component_command = wake.persistent_backup_start_command(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    assert child_exit.returncode == 1
+    assert "listen: timeout: no waking event before timeout" in forwarded
+    assert component_command not in forwarded
+    assert "re-arm" not in forwarded
+
+
+def test_supervisor_forwarded_json_exit_keeps_reason_not_rearm_plan(
+    isolated: tuple[Path, journal.LeaseIdentity],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, lease = isolated
+    authority = journal.Journal(project)
+    assert authority.prepare_attempt("supervised-json-listener-exit").committed
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=120,
+        dead_after_s=360,
+    )
+    command_parts = shlex.split(
+        wake.persistent_backup_start_command(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        )
+    )
+    command_parts[0] = sys.executable
+    command_parts.extend(["--timeout-s", "0.15", "--poll-secs", "0.02", "--json"])
+    command = shlex.join(command_parts)
+    with wake.register_watchdog_waiter(
+        project,
+        controller_label=lease.label,
+        generation_key=lease.nonce,
+    ):
+        records, child_exit = _run_supervised_child(
+            project,
+            lease,
+            kind="backup",
+            command=command,
+        )
+    forwarded = capsys.readouterr()
+    record = next(row for row in records if row.get("kind") == "exit")
+    assert child_exit.returncode == 1
+    assert record["reason"] == "timeout"
+    assert record["detail"] == "no waking event before timeout"
+    assert "rearm" not in record
+    assert "rearm_error" not in record
+    assert wake.persistent_backup_start_command(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    ) not in forwarded.out
+
+
+def test_unsupervised_json_exit_keeps_direct_rearm_plan(
+    isolated: tuple[Path, journal.LeaseIdentity],
+) -> None:
+    project, lease = isolated
+    authority = journal.Journal(project)
+    assert authority.prepare_attempt("unsupervised-json-listener-exit").committed
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=120,
+        dead_after_s=360,
+    )
+    command_parts = shlex.split(
+        wake.persistent_backup_start_command(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        )
+    )
+    command_parts[0] = sys.executable
+    command_parts.extend(["--timeout-s", "0.15", "--poll-secs", "0.02", "--json"])
+    command = shlex.join(command_parts)
+    env = dict(os.environ)
+    env.pop("GOALFLIGHT_SUPERVISED", None)
+    with wake.register_watchdog_waiter(
+        project,
+        controller_label=lease.label,
+        generation_key=lease.nonce,
+    ):
+        completed = subprocess.run(
+            command_parts,
+            cwd=project,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    payload = json.loads(completed.stdout)
+    assert completed.returncode == 1
+    assert payload["reason"] == "timeout"
+    assert payload["rearm"]["command"] == command
+    assert wake.SEPARATE_TRACKED_ARM_RULE in payload["rearm"]["hint"]
+
+
+@pytest.mark.parametrize("event_type", ["listener-dead", "watchdog-dead"])
+def test_supervisor_forwarded_dead_event_keeps_reason_not_rearm_command(
+    isolated: tuple[Path, journal.LeaseIdentity],
+    capsys: pytest.CaptureFixture[str],
+    event_type: str,
+) -> None:
+    project, lease = isolated
+    if event_type == "listener-dead":
+        wake.activate_monitor_state(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+            heartbeat_s=0.05,
+            dead_after_s=0.15,
+            now_epoch=time.time() - 1,
+        )
+        wake.record_monitor_fault(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+            reason="test-follow-fault",
+        )
+        command = (
+            f"{wake.follow_watchdog_start_command(project, controller_label=lease.label, lease_nonce=lease.nonce)} "
+            "--timeout-s 2 --poll-secs 0.02 --listener-slots 2 --report-pending"
+        )
+        forbidden = wake.follow_start_command(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        )
+        forbidden_stderr = (
+            forbidden,
+            wake.persistent_backup_start_command(
+                project,
+                controller_label=lease.label,
+                lease_nonce=lease.nonce,
+            ),
+        )
+        kind = "watchdog"
+    else:
+        wake.activate_monitor_state(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+            heartbeat_s=120,
+            dead_after_s=360,
+        )
+        command = (
+            f"{wake.persistent_backup_start_command(project, controller_label=lease.label, lease_nonce=lease.nonce)} "
+            "--timeout-s 2 --poll-secs 0.02"
+        )
+        forbidden = wake.follow_watchdog_start_command(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        )
+        forbidden_stderr = (forbidden,)
+        kind = "backup"
+    monitor_waiter = None
+    if event_type == "watchdog-dead":
+        monitor_waiter = wake.register_waiter(
+            project,
+            controller_label=lease.label,
+            kind=wake.MONITOR_KIND,
+            generation_key=lease.nonce,
+        )
+    try:
+        records, child_exit = _run_supervised_child(
+            project,
+            lease,
+            kind=kind,
+            command=command,
+        )
+    finally:
+        if monitor_waiter is not None:
+            monitor_waiter.close()
+    forwarded_stderr = capsys.readouterr().err
+    matches = [
+        row
+        for row in records
+        if isinstance(row.get("payload"), dict)
+        and row["payload"].get("type") == event_type
+    ]
+    assert matches, {
+        "records": records,
+        "returncode": child_exit.returncode,
+        "output": child_exit.output,
+        "stderr": forwarded_stderr,
+    }
+    record = matches[0]
+    payload = record["payload"]
+    assert isinstance(payload, dict)
+    assert child_exit.returncode == 0
+    assert payload["reason"]
+    assert "rearm_command" not in payload
+    assert forbidden not in json.dumps(record)
+    for action_command in forbidden_stderr:
+        assert action_command not in forwarded_stderr
+    if event_type == "listener-dead":
+        assert "supervisor owns backup replacement" in forwarded_stderr
+
+
+@pytest.mark.parametrize(
+    ("builder", "status"),
+    [
+        (
+            messages._follow_dead_record,
+            {"state": "stale", "age_s": 2.0, "dead_after_s": 1.0},
+        ),
+        (
+            messages._watchdog_dead_record,
+            {
+                "live_waiters": 1,
+                "target_waiters": 8,
+                "missing_components": ["watchdog"],
+            },
+        ),
+    ],
+)
+def test_unsupervised_dead_events_keep_direct_rearm_command(
+    monkeypatch: pytest.MonkeyPatch,
+    builder,
+    status: dict[str, object],
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_SUPERVISED", raising=False)
+    record = builder(status, rearm_command="EXACT UNSUPERVISED COMMAND")
+    assert record["payload"]["rearm_command"] == "EXACT UNSUPERVISED COMMAND"
+
+
 def test_doctor_wake_coverage_reports_supervisor_state(
     isolated: tuple[Path, journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
@@ -338,12 +695,13 @@ def test_doctor_wake_coverage_reports_supervisor_state(
     assert wake.follow_start_command(
         project, controller_label=lease.label, lease_nonce=lease.nonce
     ) not in str(pool["hint"])
-    line = doctor.status_line(
-        pool.get("ok"),
-        f"wake coverage {pool.get('label')}",
-        f"{pool.get('live_waiters')}/{pool.get('target_waiters')} "
-        f"supervisor={pool.get('supervisor')} missing="
-        f"{','.join(str(name) for name in (pool.get('missing_components') or [])) or 'none'}",
+    lines = doctor.collect_human_lines(
+        _minimal_doctor_payload(result)  # type: ignore[arg-type]
     )
+    line = next(line for line in lines if "wake coverage hint-ctl" in line)
     assert "wake coverage hint-ctl" in line
     assert "supervisor=running" in line
+    assert "Restart the supervisor" in line
+    assert supervise_cmd in line
+    parsed = doctor.parse_status_line(line)
+    assert "Restart the supervisor" in parsed["detail"]

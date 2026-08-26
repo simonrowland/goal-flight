@@ -5408,13 +5408,17 @@ def _write_follow_record(
             raise
 
 
+def _is_supervised_child() -> bool:
+    return os.environ.get("GOALFLIGHT_SUPERVISED") == "1"
+
+
 def _emit_supervised_armed() -> None:
     """Durable arming witness on stdout for the supervisor, not a controller wake.
 
     Only supervised children emit this. The supervisor records it, then drops
     the line so it does not flush a host wake on every re-arm.
     """
-    if os.environ.get("GOALFLIGHT_SUPERVISED") != "1":
+    if not _is_supervised_child():
         return
     print('{"kind":"armed"}', flush=True)
 
@@ -5621,16 +5625,18 @@ def _follow_dead_record(
         if isinstance(fault, dict)
         else str(status.get("state") or "stale")
     )
+    payload: dict[str, object] = {
+        "type": "listener-dead",
+        "reason": _truncate_utf8(reason, 72),
+        "age_s": round(float(status.get("age_s") or 0.0), 1),
+        "dead_after_s": float(status.get("dead_after_s") or 0.0),
+        "backup_required": True,
+    }
+    if not _is_supervised_child():
+        payload["rearm_command"] = rearm_command
     record: dict[str, object] = {
         "kind": "event",
-        "payload": {
-            "type": "listener-dead",
-            "reason": _truncate_utf8(reason, 72),
-            "age_s": round(float(status.get("age_s") or 0.0), 1),
-            "dead_after_s": float(status.get("dead_after_s") or 0.0),
-            "rearm_command": rearm_command,
-            "backup_required": True,
-        },
+        "payload": payload,
     }
     return _fit_follow_record(record, shrink_fields=("reason", "rearm_command"))
 
@@ -5641,16 +5647,18 @@ def _watchdog_dead_record(
     rearm_command: str,
 ) -> dict[str, object]:
     """Describe coverage after the dead watchdog's witness releases its lock."""
+    payload: dict[str, object] = {
+        "type": "watchdog-dead",
+        "reason": "missing-lock",
+        "live": status.get("live_waiters"),
+        "target": status.get("target_waiters"),
+        "missing_components": list(status.get("missing_components") or []),
+    }
+    if not _is_supervised_child():
+        payload["rearm_command"] = rearm_command
     record: dict[str, object] = {
         "kind": "event",
-        "payload": {
-            "type": "watchdog-dead",
-            "reason": "missing-lock",
-            "live": status.get("live_waiters"),
-            "target": status.get("target_waiters"),
-            "missing_components": list(status.get("missing_components") or []),
-            "rearm_command": rearm_command,
-        },
+        "payload": payload,
     }
     return _fit_follow_record(
         record,
@@ -6195,17 +6203,25 @@ def _cmd_watch_follow(
     if any(a in ("--report-pending", "--no-report-pending") for a in sys.argv[1:]):
         ignored.append("--report-pending")
     if ignored:
-        backup_command = goalflight_wake.persistent_backup_start_command(
-            project_root,
-            controller_label=label,
-            lease_nonce=nonce,
-        )
-        print(
-            "listen: --watch-follow is watchdog-only and does not deliver mail; "
-            f"ignoring {', '.join(ignored)}; arm the backup separately: "
-            f"{backup_command}",
-            file=sys.stderr,
-        )
+        if _is_supervised_child():
+            print(
+                "listen: --watch-follow is watchdog-only and does not deliver "
+                f"mail; ignoring {', '.join(ignored)}; the supervisor owns "
+                "backup replacement",
+                file=sys.stderr,
+            )
+        else:
+            backup_command = goalflight_wake.persistent_backup_start_command(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+            )
+            print(
+                "listen: --watch-follow is watchdog-only and does not deliver mail; "
+                f"ignoring {', '.join(ignored)}; arm the backup separately: "
+                f"{backup_command}",
+                file=sys.stderr,
+            )
 
     def startup_degraded(exc: BaseException) -> None:
         print(
@@ -6286,16 +6302,22 @@ def _cmd_watch_follow(
             current_parent = os.getppid()
             if current_parent == 1:
                 if time.monotonic() - started >= detached_grace:
-                    command = goalflight_wake.follow_watchdog_start_command(
-                        project_root,
-                        controller_label=label,
-                        lease_nonce=nonce,
-                    )
-                    print(
-                        "DETACHED WATCHDOG: my exit wakes nobody; re-arm as a "
-                        f"tracked background task: {command}",
-                        file=sys.stderr,
-                    )
+                    if _is_supervised_child():
+                        print(
+                            "DETACHED WATCHDOG: supervisor parent is gone; exiting",
+                            file=sys.stderr,
+                        )
+                    else:
+                        command = goalflight_wake.follow_watchdog_start_command(
+                            project_root,
+                            controller_label=label,
+                            lease_nonce=nonce,
+                        )
+                        print(
+                            "DETACHED WATCHDOG: my exit wakes nobody; re-arm as a "
+                            f"tracked background task: {command}",
+                            file=sys.stderr,
+                        )
                     return DETACHED_LISTENER_EXIT_CODE
             elif current_parent != parent_pid:
                 print(
@@ -6798,20 +6820,20 @@ def cmd_listen(args) -> int:
             return None
 
     def emit_payload(payload: dict[str, object], *, detail: str | None = None) -> None:
-        try:
-            plan = rearm_plan_after_release()
-        except (
-            goalflight_journal.JournalBusy,
-            goalflight_journal.JournalDisappeared,
-            goalflight_journal.JournalIOError,
-        ) as exc:
-            payload["rearm_error"] = sanitize_display(exc, limit=180)
-            plan = None
-        except goalflight_journal.JournalError as exc:
-            # Rearm enrichment is secondary. The exit payload is the evidence
-            # operators need when the journal itself is unavailable.
-            payload["rearm_error"] = sanitize_display(exc, limit=180)
-            plan = None
+        plan = None
+        if not _is_supervised_child():
+            try:
+                plan = rearm_plan_after_release()
+            except (
+                goalflight_journal.JournalBusy,
+                goalflight_journal.JournalDisappeared,
+                goalflight_journal.JournalIOError,
+            ) as exc:
+                payload["rearm_error"] = sanitize_display(exc, limit=180)
+            except goalflight_journal.JournalError as exc:
+                # Rearm enrichment is secondary. The exit payload is the evidence
+                # operators need when the journal itself is unavailable.
+                payload["rearm_error"] = sanitize_display(exc, limit=180)
         hint = ""
         if (
             plan
@@ -6836,8 +6858,9 @@ def cmd_listen(args) -> int:
         if args.json:
             print(json.dumps(payload, sort_keys=True), flush=True)
         else:
-            if detail:
-                print(f"listen: {payload.get('reason')}: {detail}", file=sys.stderr)
+            if detail or _is_supervised_child():
+                suffix = f": {detail}" if detail else ""
+                print(f"listen: {payload.get('reason')}{suffix}", file=sys.stderr)
             if hint:
                 print(hint, file=sys.stderr)
 
@@ -6879,12 +6902,19 @@ def cmd_listen(args) -> int:
         )
         waiter.close()
         death_watch.restore()
-        print(
-            "DETACHED LISTENER: my exit wakes nobody; kill me "
-            f"(pid {os.getpid()}) and re-arm as a tracked background task: "
-            f"{rearm_command}",
-            file=sys.stderr,
-        )
+        if _is_supervised_child():
+            print(
+                "DETACHED LISTENER: supervisor parent is gone; "
+                f"listener pid {os.getpid()} is exiting",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "DETACHED LISTENER: my exit wakes nobody; kill me "
+                f"(pid {os.getpid()}) and re-arm as a tracked background task: "
+                f"{rearm_command}",
+                file=sys.stderr,
+            )
         return DETACHED_LISTENER_EXIT_CODE
 
     def finish_watchdog_dead() -> int:

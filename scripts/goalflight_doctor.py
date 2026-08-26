@@ -3486,11 +3486,19 @@ def collect_human_lines(payload: dict) -> list[str]:
                 ",".join(str(name) for name in (pool.get("missing_components") or []))
                 or "none"
             )
+            hint = "; ".join(
+                line.strip()
+                for line in str(pool.get("hint") or "").splitlines()
+                if line.strip()
+            )
+            detail = f"{live}/{target} supervisor={supervisor} missing={missing}"
+            if hint:
+                detail = f"{detail}; {hint}"
             lines.append(
                 status_line(
                     pool.get("ok"),
                     f"wake coverage {pool.get('label')}",
-                    f"{live}/{target} supervisor={supervisor} missing={missing}",
+                    detail,
                 )
             )
     for row in (payload.get("grok") or {}).get("permission_modes") or []:
