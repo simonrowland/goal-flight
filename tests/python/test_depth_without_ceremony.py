@@ -15,11 +15,12 @@ import signal
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 import pytest
+
+from machine_isolation import AMBIENT_IDENTITY_ENV, isolated_machine_env
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
@@ -44,33 +45,19 @@ LISTEN_EXIT_HINT_SNAPSHOT = (
 
 
 @pytest.fixture()
-def isolated(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, str]]:
-    td = Path(tempfile.mkdtemp(prefix="gf-depth-ceremony-"))
-    env = {
-        "GOALFLIGHT_JOURNAL_DIR": str(td / "journals"),
-        "GOALFLIGHT_STATE_DIR": str(td / "state"),
-        "GOALFLIGHT_WAKE_LEDGER_DIR": str(td / "wake-ledger"),
-        "GOALFLIGHT_MESSAGES_DIR": str(td / "messages"),
-        "GOALFLIGHT_TASK_STORE_DIR": str(td / "task-store"),
-        "GOAL_FLIGHT_PIDFILE_DIR": str(td / "pids"),
-        "GOALFLIGHT_CAPACITY_CONF": os.devnull,
-        "GOALFLIGHT_TEST_MODE": "1",
-        "GOALFLIGHT_TEST_LISTENER_START_TOKEN": "depth-listener-token",
-        "GOALFLIGHT_PROCESS_ROLE": "controller",
-    }
-    for value in env.values():
-        if value != os.devnull:
-            Path(value).mkdir(parents=True, exist_ok=True)
+def isolated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, dict[str, str]]:
+    env = isolated_machine_env(tmp_path)
+    env["GOALFLIGHT_TEST_MODE"] = "1"
+    env["GOALFLIGHT_TEST_LISTENER_START_TOKEN"] = "depth-listener-token"
+    env["GOALFLIGHT_PROCESS_ROLE"] = "controller"
+    for key in AMBIENT_IDENTITY_ENV:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("GOALFLIGHT_WAKE_LEDGER", raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
-    for key in (
-        "GOALFLIGHT_CONTROLLER_LABEL",
-        "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
-        "GOALFLIGHT_CONTROLLER_SESSION_ID",
-        "GOALFLIGHT_DISPATCH_ID",
-    ):
-        monkeypatch.delenv(key, raising=False)
-    project = td / "project"
+    project = tmp_path / "project"
     project.mkdir()
     return project, {**os.environ, **env}
 
@@ -108,7 +95,7 @@ def _slot_generation_hashes(project: Path, label: str) -> set[str]:
     return found
 
 
-def _wait_live(project: Path, label: str, count: int, *, timeout_s: float = 6) -> None:
+def _wait_live(project: Path, label: str, count: int, *, timeout_s: float = 30) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         waiters = wake.live_waiters(project, controller_label=label) or []

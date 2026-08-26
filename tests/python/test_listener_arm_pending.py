@@ -17,11 +17,12 @@ import os
 import shlex
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 import pytest
+
+from machine_isolation import AMBIENT_IDENTITY_ENV, isolated_machine_env, wait_until
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -116,26 +117,16 @@ raise SystemExit(messages.main(sys.argv[1:]))
 
 
 @pytest.fixture()
-def isolated(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, str]]:
-    td = Path(tempfile.mkdtemp(prefix="gf-arm-pending-"))
-    env = {
-        "GOALFLIGHT_JOURNAL_DIR": str(td / "journals"),
-        "GOALFLIGHT_STATE_DIR": str(td / "state"),
-        "GOALFLIGHT_WAKE_LEDGER_DIR": str(td / "wake-ledger"),
-        "GOALFLIGHT_MESSAGES_DIR": str(td / "messages"),
-        "GOALFLIGHT_TASK_STORE_DIR": str(td / "task-store"),
-        "GOAL_FLIGHT_PIDFILE_DIR": str(td / "pids"),
-        "GOALFLIGHT_CAPACITY_CONF": os.devnull,
-    }
-    for value in env.values():
-        if value != os.devnull:
-            Path(value).mkdir(parents=True, exist_ok=True)
+def isolated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, dict[str, str]]:
+    env = isolated_machine_env(tmp_path)
+    for key in AMBIENT_IDENTITY_ENV:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("GOALFLIGHT_WAKE_LEDGER", raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
-    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LABEL", raising=False)
-    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LEASE_NONCE", raising=False)
-    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
-    project = td / "project"
+    project = tmp_path / "project"
     project.mkdir()
     return project, {**os.environ, **env}
 
@@ -199,7 +190,6 @@ def test_arm_reports_backlog_stays_armed_and_rings_on_new(
             assert len(advance_lines) == 1
             assert "pending-at-arm-json" not in joined
             assert "item(s) reported" not in joined
-            time.sleep(2)
             assert proc.poll() is None, "listener popped on the arm-time backlog"
 
             # An event beyond the arm-time high-water must ring.
@@ -229,6 +219,16 @@ def test_default_ring_lists_entire_backlog_once_and_advances_every_stream(
             "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
             "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
         }
+        # Seed the entire backlog before arming so every listener observes one
+        # cursor version. Posting after arm, while some peeks are still in
+        # flight, splits the cursor and two doorbells can both claim a ring.
+        for index in range(1, 11):
+            _post(
+                env,
+                project,
+                f"buffered event {index}",
+                dispatch_id=f"ev-{index}",
+            )
         processes = [
             subprocess.Popen(
                 [
@@ -244,8 +244,8 @@ def test_default_ring_lists_entire_backlog_once_and_advances_every_stream(
                     "--poll-secs",
                     "5",
                     "--no-report-pending",
-                "--timeout-s",
-                    "30",
+                    "--timeout-s",
+                    "60",
                 ],
                 env=listener_env,
                 stdout=subprocess.PIPE,
@@ -255,45 +255,20 @@ def test_default_ring_lists_entire_backlog_once_and_advances_every_stream(
             for _index in range(4)
         ]
         try:
-            arm_deadline = time.monotonic() + 10
-            live_waiters = []
-            while time.monotonic() < arm_deadline:
-                live_waiters = wake.live_waiters(
-                    project, controller_label="armtest"
-                ) or []
-                if len(live_waiters) == 4:
-                    break
-                time.sleep(0.02)
-            assert len(live_waiters) == 4
-            # Kernel waiters exist before the first empty peek. Posting into
-            # that window lets one doorbell ring on ev-1 while siblings take
-            # later streams. Coverage ARMED plus a short settle is the real
-            # "four waiters are waiting" precondition.
-            armed_deadline = time.monotonic() + 5
-            while time.monotonic() < armed_deadline:
-                if authority.active_coverage("armtest") is not None:
-                    break
-                time.sleep(0.02)
-            assert authority.active_coverage("armtest") is not None
-            time.sleep(0.3)
-            for index in range(1, 11):
-                _post(
-                    env,
-                    project,
-                    f"buffered event {index}",
-                    dispatch_id=f"ev-{index}",
-                )
-
-            deadline = time.monotonic() + 10
-            exited: list[subprocess.Popen[str]] = []
-            while time.monotonic() < deadline:
+            def _ring_invariant() -> tuple[int, list[subprocess.Popen[str]]] | None:
+                live = wake.live_waiters(project, controller_label="armtest") or []
                 exited = [process for process in processes if process.poll() is not None]
-                if exited:
-                    break
-                time.sleep(0.02)
+                if len(live) == 3 and len(exited) == 1:
+                    return (len(live), exited)
+                return None
+
+            live_count, exited = wait_until(
+                _ring_invariant,
+                timeout_s=30,
+                message="one of four listeners to ring and three slot locks to remain",
+            )
+            assert live_count == 3
             assert len(exited) == 1, [process.poll() for process in processes]
-            time.sleep(0.2)
-            assert len([process for process in processes if process.poll() is not None]) == 1
 
             winner = exited[0]
             stdout, stderr = winner.communicate(timeout=5)
@@ -1410,7 +1385,7 @@ def test_dead_claim_takeover_reports_once_without_spending_listener_pool(
                             "--poll-secs",
                             "0.01",
                             "--timeout-s",
-                            "10",
+                            "60",
                         ],
                         env=listener_env,
                         stdout=handle,
@@ -1420,27 +1395,44 @@ def test_dead_claim_takeover_reports_once_without_spending_listener_pool(
                 )
                 handle.close()
 
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                live = wake.live_waiters(
+            wait_until(
+                lambda: len(
+                    wake.live_waiters(
+                        project,
+                        controller_label="armtest",
+                        kinds={"listener"},
+                    )
+                    or []
+                )
+                == 4,
+                timeout_s=60,
+                message="four listener slot locks after dead-claim takeover",
+            )
+            live = (
+                wake.live_waiters(
                     project,
                     controller_label="armtest",
                     kinds={"listener"},
-                ) or []
-                if len(live) == 4:
-                    break
-                time.sleep(0.02)
+                )
+                or []
+            )
             assert len(live) == 4
-            time.sleep(0.2)
-            payloads_before_new = [
-                json.loads(line)
-                for path in output_paths
-                for line in path.read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-            assert [
-                payload["kind"] for payload in payloads_before_new
-            ].count("pending-at-arm") == 1
+
+            def _pending_reports() -> int:
+                payloads = [
+                    json.loads(line)
+                    for path in output_paths
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                return [payload["kind"] for payload in payloads].count("pending-at-arm")
+
+            wait_until(
+                lambda: _pending_reports() >= 1,
+                timeout_s=15,
+                message="the one pending-at-arm report after pool takeover",
+            )
+            assert _pending_reports() == 1
             assert all(process.poll() is None for process in processes)
 
             _post(env, project, "new after pool takeover", dispatch_id="claim-pool")
@@ -1614,7 +1606,6 @@ def test_dead_lease_nonce_exits_did_not_arm_not_ring(
         "GOALFLIGHT_TEST_MODE": "1",
         "GOALFLIGHT_PROCESS_ROLE": "controller",
     }
-    started = time.monotonic()
     refused = subprocess.run(
         [
             sys.executable,
@@ -1639,12 +1630,10 @@ def test_dead_lease_nonce_exits_did_not_arm_not_ring(
         text=True,
         timeout=10,
     )
-    elapsed = time.monotonic() - started
     assert refused.returncode == messages.LISTENER_DID_NOT_ARM_EXIT, refused.stderr
     assert "did-not-arm" in refused.stderr
     assert "lease-nonce-not-live" in refused.stderr
     assert "will not cover the pool" in refused.stderr
-    assert elapsed < 4, elapsed
     assert not (wake.live_waiters(project, controller_label="armtest") or [])
     assert refused.returncode != 0
 

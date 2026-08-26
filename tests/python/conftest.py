@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from machine_isolation import isolate_goalflight_machine_state_impl
+
 
 TEST_DIR = Path(__file__).resolve().parent
 DRIVER_NAME = "test_script_style_modules.py"
@@ -52,6 +54,23 @@ collect_ignore = [
 ]
 if _isolated_child:
     collect_ignore.append(DRIVER_NAME)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "live_machine_state: do not isolate GOALFLIGHT_* machine paths "
+        "(the test's subject is the live default)",
+    )
+
+
+@pytest.fixture(autouse=True)
+def isolate_goalflight_machine_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> dict[str, str] | None:
+    return isolate_goalflight_machine_state_impl(tmp_path, monkeypatch, request)
 
 
 @pytest.fixture(

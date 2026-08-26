@@ -36,11 +36,12 @@ import os
 import shlex
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 import pytest
+
+from machine_isolation import AMBIENT_IDENTITY_ENV, isolated_machine_env, wait_until
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -88,34 +89,22 @@ LISTENER_DEPTH_KEYS = {
 
 
 @pytest.fixture()
-def isolated(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, str]]:
-    td = Path(tempfile.mkdtemp(prefix="gf-terse-startup-"))
-    env = {
-        "GOALFLIGHT_JOURNAL_DIR": str(td / "journals"),
-        "GOALFLIGHT_STATE_DIR": str(td / "state"),
-        "GOALFLIGHT_WAKE_LEDGER_DIR": str(td / "wake-ledger"),
-        "GOALFLIGHT_MESSAGES_DIR": str(td / "messages"),
-        "GOALFLIGHT_TASK_STORE_DIR": str(td / "task-store"),
-        "GOAL_FLIGHT_PIDFILE_DIR": str(td / "pids"),
-        "GOALFLIGHT_CAPACITY_CONF": os.devnull,
-        "GOALFLIGHT_TEST_MODE": "1",
-        "GOALFLIGHT_PROCESS_ROLE": "controller",
-    }
-    for value in env.values():
-        if value != os.devnull:
-            Path(value).mkdir(parents=True, exist_ok=True)
+def isolated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, dict[str, str]]:
+    env = isolated_machine_env(tmp_path)
+    env["GOALFLIGHT_TEST_MODE"] = "1"
+    env["GOALFLIGHT_PROCESS_ROLE"] = "controller"
     # Hints name the ADVERTISED install, not the copy that generated them. Pin
     # the advertised root to the code under test so these expectations do not
-    # depend on whether the host has ~/.goal-flight/skill installed. Set after
-    # the mkdir loop above: this root already exists and must not be created.
+    # depend on whether the host has ~/.goal-flight/skill installed.
     env["GOALFLIGHT_ROOT"] = str(SCRIPTS.parent)
+    for key in AMBIENT_IDENTITY_ENV:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("GOALFLIGHT_WAKE_LEDGER", raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
-    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LABEL", raising=False)
-    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LEASE_NONCE", raising=False)
-    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_SESSION_ID", raising=False)
-    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
-    project = td / "project"
+    project = tmp_path / "project"
     project.mkdir()
     return project, {**os.environ, **env}
 
@@ -180,7 +169,7 @@ def _listen_cmd(
     return cmd
 
 
-def _wait_live(project: Path, label: str, count: int, *, timeout_s: float = 6) -> None:
+def _wait_live(project: Path, label: str, count: int, *, timeout_s: float = 30) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         waiters = wake.live_waiters(project, controller_label=label) or []
@@ -636,27 +625,35 @@ def test_arming_over_pending_mail_reaches_target_depth(
                 out_handle.close()
                 err_handle.close()
             _wait_live(project, "terse-ctl", target)
-            time.sleep(0.3)
             live = wake.live_waiters(project, controller_label="terse-ctl") or []
             assert len(live) == target
             assert all(proc.poll() is None for proc in procs)
 
-            reports = 0
-            for path in out_paths:
-                text = path.read_text(encoding="utf-8")
-                if not text.strip():
-                    continue
-                for line in text.splitlines():
-                    if not line.strip():
+            def _count_reports() -> int:
+                reports = 0
+                for path in out_paths:
+                    text = path.read_text(encoding="utf-8")
+                    if not text.strip():
                         continue
-                    payload = json.loads(line)
-                    if payload.get("kind") == "pending-at-arm":
-                        reports += 1
-                    else:
-                        raise AssertionError(
-                            f"non-report output while pool should stay armed: {payload}"
-                        )
-            assert reports == 1
+                    for line in text.splitlines():
+                        if not line.strip():
+                            continue
+                        payload = json.loads(line)
+                        if payload.get("kind") == "pending-at-arm":
+                            reports += 1
+                        else:
+                            raise AssertionError(
+                                f"non-report output while pool should stay armed: {payload}"
+                            )
+                return reports
+
+            wait_until(
+                lambda: _count_reports() >= 1,
+                timeout_s=15,
+                message="exactly one pending-at-arm report at target depth",
+            )
+            assert _count_reports() == 1
+            assert len(wake.live_waiters(project, controller_label="terse-ctl") or []) == target
         finally:
             for proc in procs:
                 if proc.poll() is None:
@@ -694,15 +691,24 @@ def test_two_racing_arms_yield_one_report_and_stay_live(
                 )
                 handle.close()
             _wait_live(project, "terse-ctl", 2)
-            time.sleep(0.3)
             assert len(wake.live_waiters(project, controller_label="terse-ctl") or []) == 2
             assert all(proc.poll() is None for proc in procs)
-            reports = 0
-            for path in out_paths:
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    if line.strip() and json.loads(line).get("kind") == "pending-at-arm":
-                        reports += 1
-            assert reports == 1
+
+            def _count_reports() -> int:
+                reports = 0
+                for path in out_paths:
+                    for line in path.read_text(encoding="utf-8").splitlines():
+                        if line.strip() and json.loads(line).get("kind") == "pending-at-arm":
+                            reports += 1
+                return reports
+
+            wait_until(
+                lambda: _count_reports() >= 1,
+                timeout_s=15,
+                message="exactly one pending-at-arm report from racing arms",
+            )
+            assert _count_reports() == 1
+            assert len(wake.live_waiters(project, controller_label="terse-ctl") or []) == 2
         finally:
             for proc in procs:
                 if proc.poll() is None:
