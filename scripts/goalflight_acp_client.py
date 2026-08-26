@@ -1259,9 +1259,18 @@ def _finish_quota_stuck_ledger(record: dict[str, Any], *, reason: dict[str, Any]
                 )
             )
         return code == 0
-    except (OSError, goalflight_journal.JournalUnavailable) as exc:
-        # Filesystem/database availability may recover on a later sweep.
-        # Invalid terminal states and other journal contracts must escape.
+    except OSError as exc:
+        # Transient filesystem may recover on a later sweep. After terminate,
+        # that retry is best-effort: a dead PID may drop out of selection.
+        log.error("quota_stuck_reap: ledger update failed dispatch_id=%s: %s", dispatch_id, exc)
+    except (goalflight_journal.JournalDisappeared, goalflight_journal.JournalIOError):
+        # Fatal journal subtypes. A one-shot IO/disappearance cannot be
+        # re-selected once the worker PID is gone; swallowing would leave a
+        # permanently nonterminal ledger row.
+        raise
+    except goalflight_journal.JournalUnavailable as exc:
+        # Base JournalUnavailable is busy/contention and is the only journal
+        # class this handler treats as deferrable.
         log.error("quota_stuck_reap: ledger update failed dispatch_id=%s: %s", dispatch_id, exc)
     return False
 

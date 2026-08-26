@@ -363,20 +363,28 @@ def _output_tail_reconcile_candidate(record: dict) -> bool:
     )
 
 
-def _persist_draft_artifact_reconciliation(record: dict, reconciled: dict) -> None:
+def _persist_draft_artifact_reconciliation(record: dict, reconciled: dict) -> bool:
+    """Write the promoted draft-artifact terminal, or report that it did not stick.
+
+    Returns True only when the durable row is already complete or this pass
+    wrote it. OSError and base JournalUnavailable (busy/contention) defer to
+    a later observational sweep. JournalDisappeared and JournalIOError are
+    fatal: another status pass cannot recreate vanished or unreadable
+    authority, so they escape instead of being treated as a retryable miss.
+    """
     reconciliation = reconciled.get("draft_artifact_reconciliation") or {}
     if not reconciliation.get("promoted"):
-        return
+        return True
     dispatch_id = record.get("dispatch_id")
     if not dispatch_id:
-        return
+        return True
     path = goalflight_ledger.record_path(str(dispatch_id))
     if not path.exists():
-        return
+        return True
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if raw.get("terminal_state") == "complete" or raw.get("state") == "complete":
-            return
+            return True
         reason = {
             "draft_artifact_reconciliation": reconciliation,
             "terminal_marker": reconciled.get("terminal_marker"),
@@ -391,7 +399,7 @@ def _persist_draft_artifact_reconciliation(record: dict, reconciled: dict) -> No
                     worker_still_alive=False,
                 )
             ) != 0:
-                return
+                return False
         with goalflight_ledger.StateLock():
             raw = json.loads(path.read_text(encoding="utf-8"))
             raw.setdefault("raw_state", raw.get("state"))
@@ -405,12 +413,16 @@ def _persist_draft_artifact_reconciliation(record: dict, reconciled: dict) -> No
                 "draft_artifact_reconciliation": reconciliation,
             }
             goalflight_ledger.write_record(raw)
-    except (OSError, goalflight_journal.JournalUnavailable):
-        # The status sweep is observational: a temporarily unavailable ledger
-        # remains eligible for the next sweep. Contract errors must escape;
-        # retrying cannot repair an invalid terminal transition or corrupt
-        # record.
-        return
+    except OSError:
+        # Transient filesystem: the next status sweep can retry.
+        return False
+    except (goalflight_journal.JournalDisappeared, goalflight_journal.JournalIOError):
+        raise
+    except goalflight_journal.JournalUnavailable:
+        # Base JournalUnavailable is busy/contention. A later sweep remains
+        # eligible; claiming complete here would split display from the ledger.
+        return False
+    return True
 
 
 def _status_json_payload(record: dict) -> dict:
@@ -511,7 +523,27 @@ def _reconcile_draft_artifact_record(record: dict, *, tail: Path | None, tail_mt
         "artifact_path": str(artifact),
         "reason": finality_reason,
     }
-    _persist_draft_artifact_reconciliation(record, out)
+    try:
+        persisted = _persist_draft_artifact_reconciliation(record, out)
+    except (
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
+        # Persist still raised. Degrade this row so status_payload continues.
+        persisted = False
+    if not persisted:
+        deferred = dict(record)
+        if tail is not None:
+            deferred["tail_path"] = str(tail)
+        deferred["tail_mtime"] = tail_mtime
+        deferred["draft_artifact_reconciliation"] = {
+            "candidate": True,
+            "promoted": False,
+            "artifact_path": str(artifact),
+            "reason": "terminal_persistence_unverified",
+            "finality_reason": finality_reason,
+        }
+        return deferred
     return out
 
 

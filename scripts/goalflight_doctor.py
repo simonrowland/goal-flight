@@ -569,9 +569,12 @@ def check_session_status(skill_root: Path, project_root: Path) -> dict:
 def check_controller_lease_liveness(project_root: Path) -> dict:
     """Report ACTIVE journal leases against their sole kernel liveness witness."""
     resolved_root = project_root.resolve()
-    try:
-        records = goalflight_journal.Journal.open_reader(resolved_root).lease_records()
-    except goalflight_journal.JournalUnavailable:
+    journal_path = goalflight_journal.resolve_journal_path(resolved_root)
+    if not os.path.lexists(journal_path):
+        # No journal file: there is no lease surface. That is a real, healthy
+        # doctor state. JournalUnavailable (busy) and its fatal subclasses
+        # (JournalDisappeared after the path was present, JournalIOError)
+        # are unread authority, not absence — they must not report green.
         return {
             "ok": True,
             "present": False,
@@ -581,6 +584,8 @@ def check_controller_lease_liveness(project_root: Path) -> dict:
             "unknown_controller_lease_holders_in_project": 0,
             "leases": [],
         }
+    try:
+        records = goalflight_journal.Journal.open_reader(resolved_root).lease_records()
     except (goalflight_journal.JournalError, OSError, ValueError) as exc:
         return {
             "ok": False,
@@ -3341,9 +3346,13 @@ def collect_human_lines(payload: dict) -> list[str]:
             controller_leases.get("ok"),
             "controller lease holder liveness",
             (
-                f"active={controller_leases.get('active_controller_leases_in_project', 0)} "
-                f"ACTIVE-but-dead={controller_leases.get('active_but_dead_controller_leases_in_project', 0)} "
-                f"unknown={controller_leases.get('unknown_controller_lease_holders_in_project', 0)}"
+                str(controller_leases["error"])
+                if controller_leases.get("error")
+                else (
+                    f"active={controller_leases.get('active_controller_leases_in_project', 0)} "
+                    f"ACTIVE-but-dead={controller_leases.get('active_but_dead_controller_leases_in_project', 0)} "
+                    f"unknown={controller_leases.get('unknown_controller_lease_holders_in_project', 0)}"
+                )
             ),
         ),
     ]

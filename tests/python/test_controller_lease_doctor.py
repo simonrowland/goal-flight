@@ -89,3 +89,54 @@ def test_doctor_reports_kernel_live_and_active_but_dead_controller_leases(
         assert session["active_capacity_leases_in_project"] == 0
     finally:
         live_holder.close()
+
+
+def _touch_journal_path(project: Path) -> Path:
+    path = journal.resolve_journal_path(project)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+    return path
+
+
+def test_doctor_absent_journal_is_healthy_missing_lease_surface(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = _isolate(monkeypatch, tmp_path)
+    result = doctor.check_controller_lease_liveness(project)
+    assert result["ok"] is True
+    assert result["present"] is False
+    assert result["leases"] == []
+    assert result["active_controller_leases_in_project"] == 0
+    assert "error" not in result
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        journal.JournalIOError("present journal cannot be opened"),
+        journal.JournalDisappeared("journal vanished after path check"),
+        journal.JournalUnavailable("journal connection remained busy"),
+    ),
+)
+def test_doctor_unreadable_journal_is_not_false_green(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
+) -> None:
+    project = _isolate(monkeypatch, tmp_path)
+    _touch_journal_path(project)
+
+    def refuse_open(_project_root, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(doctor.goalflight_journal.Journal, "open_reader", refuse_open)
+    result = doctor.check_controller_lease_liveness(project)
+    assert result["ok"] is False
+    assert result["present"] is True
+    assert type(error).__name__ in str(result.get("error") or "")
+    assert result["leases"] == []
+    assert result["active_controller_leases_in_project"] == 0
+    line = doctor.status_line(
+        result["ok"],
+        "controller lease holder liveness",
+        result.get("error"),
+    )
+    assert line.startswith("[WARN]")
