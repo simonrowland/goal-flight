@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import importlib.util
 import inspect
 import io
 import json
@@ -222,29 +221,31 @@ ACTIONABLE_BLOCKING_TERMINAL_MARKERS = BLOCKING_TERMINAL_MARKERS - {
 }
 
 
-def _acp_reexec_target() -> str | None:
-    """Return the python path to re-exec into for acp, or None to stay put."""
-    if importlib.util.find_spec("acp") is not None:
-        return None
-    # Env interpreter selectors are accepted-watch per the SC-13 sweep: command
-    # source overrides, but outside the source/write/safety-disable predicate.
-    override = os.environ.get("GOALFLIGHT_ACP_PYTHON")
-    target = Path(override).expanduser() if override else Path.home() / ".goal-flight/venvs/acp-0.10/bin/python"
-    if not target.exists():
-        return None
-    target_path = os.path.normpath(str(target))
-    current_path = os.path.normpath(sys.executable)
-    if target_path == current_path:
-        return None
-    return str(target)
+def _acp_reexec_target() -> AcpSdkResolution:
+    """Return the causal ACP interpreter resolution without collapsing states."""
+    return acp_sdk_resolution()
 
 
 def _ensure_acp_sdk_python() -> None:
     if goalflight_compat.is_windows():
         return
-    target = _acp_reexec_target()
-    if target is not None:
+    resolution = _acp_reexec_target()
+    if resolution.state == ACP_SDK_IMPORTABLE:
+        return
+    if resolution.state == ACP_SDK_UNAVAILABLE:
+        raise AcpError(f"ACP SDK requirement cannot be satisfied before launch: {resolution.reason}")
+    target = resolution.target_python
+    if resolution.state != ACP_SDK_REEXEC or target is None:
+        raise AcpError(f"invalid ACP SDK resolution: {resolution}")
+    try:
         os.execv(target, [target, *sys.argv])
+    except OSError as exc:
+        raise AcpError(
+            f"ACP SDK re-exec failed from {resolution.current_python} to {target}: "
+            f"{type(exc).__name__}: {exc}; the SDK may already be installed, so repair "
+            "the configured interpreter path or its execute permission"
+        ) from exc
+    raise AcpError(f"ACP SDK re-exec unexpectedly returned without replacing the process: {target}")
 
 import goalflight_capacity
 import goalflight_ledger
@@ -259,15 +260,20 @@ from goalflight_adapter_readiness import (
 from goalflight_acp_boundaries import permission_boundary_warning
 from goalflight_codex_sandbox import codex_workspace_write_args
 from goalflight_acp_client import (
+    ACP_SDK_IMPORTABLE,
+    ACP_SDK_REEXEC,
+    ACP_SDK_UNAVAILABLE,
     AcpConnection,
     AcpError,
     AcpLivenessActivity,
+    AcpSdkResolution,
     AcpTerminationResult,
     AcpTerminationUnconfirmed,
     MAX_PERMISSION_ROUTER_DECISIONS,
     PERMISSION_ALLOW,
     PERMISSION_DENY,
     cleanup_ghosts,
+    acp_sdk_resolution,
     mark_connection_detached,
     default_permission_policy,
     spawn_acp_connection,

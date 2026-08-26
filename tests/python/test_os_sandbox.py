@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+REQUIRES_ACP_SDK = True
+
 from support import note_skip, skip_case_posix_on_native_windows
 
 import argparse

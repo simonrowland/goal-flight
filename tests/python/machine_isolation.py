@@ -59,62 +59,10 @@ from pathlib import Path
 from typing import TypeVar
 
 import pytest
+from support import AMBIENT_IDENTITY_ENV, MACHINE_PATH_ENV, isolated_machine_env
 
-
-MACHINE_PATH_ENV = (
-    "GOALFLIGHT_DISPATCH_DIR",
-    "GOALFLIGHT_STATE_DIR",
-    "GOALFLIGHT_JOURNAL_DIR",
-    "GOALFLIGHT_MESSAGES_DIR",
-    "GOALFLIGHT_TASK_STORE_DIR",
-    "GOALFLIGHT_WAKE_LEDGER_DIR",
-    "GOALFLIGHT_WAKE_LEDGER",
-    "GOAL_FLIGHT_PIDFILE_DIR",
-    "GOALFLIGHT_PIDFILE_DIR",
-    "GOALFLIGHT_FLEET_DIR",
-)
-
-AMBIENT_IDENTITY_ENV = (
-    "GOALFLIGHT_DISPATCH_ID",
-    "GOALFLIGHT_DISPATCH_SCRIPT",
-    "GOALFLIGHT_PROJECT_ROOT",
-    "GOALFLIGHT_PROMPT_FILE",
-    "GOALFLIGHT_STEER_FILE",
-    "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE",
-    "GOALFLIGHT_CONTROLLER_SESSION_ID",
-    "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
-    "GOALFLIGHT_CONTROLLER_PID",
-    "GOALFLIGHT_CONTROLLER_LABEL",
-    "GOALFLIGHT_PROCESS_ROLE",
-    "GOALFLIGHT_LISTENER_SLOTS",
-    "GOALFLIGHT_LISTENER_LOW_WATER",
-    "GOALFLIGHT_PERSISTENT_BACKUP_SLOTS",
-)
 
 T = TypeVar("T")
-
-
-def isolated_machine_env(root: Path) -> dict[str, str]:
-    """Return env assignments that pin every machine-global writable default."""
-    state = root / "state"
-    pids = root / "pids"
-    mapping = {
-        "GOALFLIGHT_MESSAGES_DIR": str(root / "messages"),
-        "GOALFLIGHT_FLEET_DIR": str(root / "fleet"),
-        "GOALFLIGHT_JOURNAL_DIR": str(root / "journals"),
-        "GOALFLIGHT_TASK_STORE_DIR": str(root / "task-store"),
-        "GOALFLIGHT_STATE_DIR": str(state),
-        "GOALFLIGHT_DISPATCH_DIR": str(state / "dispatch"),
-        "GOALFLIGHT_WAKE_LEDGER_DIR": str(root / "wake-ledger"),
-        "GOAL_FLIGHT_PIDFILE_DIR": str(pids),
-        "GOALFLIGHT_PIDFILE_DIR": str(pids),
-        "GOALFLIGHT_CAPACITY_CONF": os.devnull,
-        "PYTHONUNBUFFERED": "1",
-    }
-    for key, value in mapping.items():
-        if key in MACHINE_PATH_ENV and value != os.devnull:
-            Path(value).mkdir(parents=True, exist_ok=True)
-    return mapping
 
 
 def apply_isolated_machine_env(
