@@ -79,7 +79,11 @@ def isolated(
         principal={"principal_id": "follow-test-principal"},
     )
     assert claimed.committed and claimed.value is not None
-    return project, env, claimed.value
+    lease = claimed.value
+    with wake.register_lease_holder(
+        project, controller_label=lease.label, lease_nonce=lease.nonce
+    ):
+        yield project, env, lease
 
 
 def _follow_command(
@@ -336,52 +340,49 @@ def test_follow_emits_unacked_reported_backlog(
         "GOALFLIGHT_CONTROLLER_LABEL": lease.label,
         "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
     }
-    with wake.register_lease_holder(
-        project, controller_label=lease.label, lease_nonce=lease.nonce
-    ):
-        listener = subprocess.Popen(
-            [
-                sys.executable,
-                str(SCRIPTS / "goalflight_messages.py"),
-                "listen",
-                "--project-root",
-                str(project),
-                "--controller-label",
-                lease.label,
-                "--lease-nonce",
-                lease.nonce,
-                "--report-pending",
-                "--json",
-                "--poll-secs",
-                "0.01",
-            ],
-            cwd=project,
-            env=listener_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        try:
-            report_deadline = time.monotonic() + 5
-            while time.monotonic() < report_deadline:
-                state = wake.pending_report_state(
-                    project,
-                    controller_label=lease.label,
-                    lease_nonce=lease.nonce,
-                )
-                if state is not None and state.phase == "reported":
-                    break
-                time.sleep(0.005)
-            else:
-                pytest.fail("listener never reached reported phase")
+    listener = subprocess.Popen(
+        [
+            sys.executable,
+            str(SCRIPTS / "goalflight_messages.py"),
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--report-pending",
+            "--json",
+            "--poll-secs",
+            "0.01",
+        ],
+        cwd=project,
+        env=listener_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        report_deadline = time.monotonic() + 5
+        while time.monotonic() < report_deadline:
+            state = wake.pending_report_state(
+                project,
+                controller_label=lease.label,
+                lease_nonce=lease.nonce,
+            )
+            if state is not None and state.phase == "reported":
+                break
+            time.sleep(0.005)
+        else:
+            pytest.fail("listener never reached reported phase")
+        listener.kill()
+        listener.wait(timeout=5)
+        if listener.stdout is not None:
+            listener.stdout.close()
+    finally:
+        if listener.poll() is None:
             listener.kill()
-            listener.wait(timeout=5)
-            if listener.stdout is not None:
-                listener.stdout.close()
-        finally:
-            if listener.poll() is None:
-                listener.kill()
-                listener.wait()
+            listener.wait()
 
     state = wake.pending_report_state(
         project,

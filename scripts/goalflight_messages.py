@@ -3433,6 +3433,134 @@ def _listen_auto_live_generations(
     return found
 
 
+def _probe_listen_lease_session(
+    project_root: Path, *, controller_label: str
+) -> tuple[str, dict | None]:
+    """Return ``(live|dead|unreadable, session-or-None)`` for listen arming.
+
+    Delegates to ``probe_live_session`` (non-locking reader). Unreadable is
+    "could not tell" and must not be collapsed into a dead nonce.
+    """
+    import goalflight_session_status as sessions  # type: ignore
+
+    return sessions.probe_live_session(project_root, label=controller_label)
+
+
+def _claimed_listen_lease_or_liveness(
+    project_root: Path,
+    *,
+    controller_label: str,
+    nonce: str,
+    reason: str,
+    generation: object = None,
+) -> dict[str, object]:
+    """Keep a claimed listen nonce only when the session probe says live.
+
+    An ACTIVE journal row with a dead or missing holder lock is not
+    coverage. Unreadable (busy journal, vanished witness path) stays
+    retryable via ``journal-unavailable``; only a readable dead or
+    mismatched session is ``lease-nonce-not-live`` / no-active-lease.
+    """
+    state, session = _probe_listen_lease_session(
+        project_root, controller_label=controller_label
+    )
+    if state == "unreadable":
+        import goalflight_journal  # type: ignore
+
+        # Separate "journal is contended" from "holder witness unknown".
+        # Probe collapses both to unreadable. SQLite busy must raise so
+        # the listen retry wrapper can outlast load; a vanished lock path
+        # is not busy and must not sit in the 300s degraded loop.
+        try:
+            goalflight_journal.Journal.open_reader(
+                project_root, retry_budget_s=0.05
+            )
+        except goalflight_journal.JournalBusy:
+            raise
+        except goalflight_journal.JournalUpgradeRequired:
+            raise
+        except (
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+        ) as exc:
+            return {
+                "claimed": False,
+                "reason": _journal_failure_reason(exc),
+                "label": controller_label,
+            }
+        return {
+            "claimed": False,
+            "reason": "journal-unavailable",
+            "label": controller_label,
+        }
+    live_nonce = ""
+    if state == "live" and isinstance(session, dict):
+        live_nonce = str(session.get("lease_nonce") or "").strip()
+    if state != "live" or live_nonce != nonce:
+        dead_reason = (
+            "lease-nonce-not-live"
+            if reason == "explicit-lease-nonce"
+            or (live_nonce and live_nonce != nonce)
+            else "no-active-controller-lease"
+        )
+        return {
+            "claimed": False,
+            "reason": dead_reason,
+            "label": controller_label,
+        }
+    return {
+        "claimed": True,
+        "reason": reason,
+        "label": controller_label,
+        "nonce": nonce,
+        "lease_generation": (
+            session.get("generation") if isinstance(session, dict) else generation
+        ),
+        "holder_alive": True,
+    }
+
+
+def _listen_unclaimed_exit(
+    prefix: str,
+    resolved: dict[str, object],
+    *,
+    explicit_nonce: str | None = None,
+) -> int:
+    """Map a failed listen/follow arm to a caller-visible exit.
+
+    Settled dead-nonce reasons get ``LISTENER_DID_NOT_ARM_EXIT`` so a
+    re-arm loop cannot treat them as a ring (0) or a retryable fault (2).
+    Journal unreadability stays 2 with the existing unreadable markers.
+    """
+    reason = str(resolved.get("reason") or "ambient lease unavailable")
+    if reason in _SETTLED_DID_NOT_ARM_REASONS:
+        if reason == "lease-nonce-not-live":
+            why = (
+                "--lease-nonce is not a live controller lease"
+                if str(explicit_nonce or "").strip()
+                else "resolved nonce is not a live controller lease"
+            )
+        elif reason == "controller-capability-mismatch":
+            why = "ambient controller capability does not match the live lease"
+        else:
+            why = "no live controller lease is present"
+        print(
+            f"{prefix}: did-not-arm: {reason}: {why}; "
+            "this process is not waiting and will not cover the pool",
+            file=sys.stderr,
+        )
+        return LISTENER_DID_NOT_ARM_EXIT
+    if reason in {"journal-unavailable", "journal-io-failure"}:
+        print(
+            f"{prefix}: {reason}: could not confirm a live controller lease; "
+            "this is retryable, not a dead nonce",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"{prefix}: {reason}", file=sys.stderr)
+    return 2
+
+
 def _resolve_listen_auto_lease(
     project_root: Path,
     *,
@@ -3448,6 +3576,10 @@ def _resolve_listen_auto_lease(
     Auto-resolution of the ACTIVE lease still requires the controller role.
     Two live generations plus a disagreeing env capability refuse rather
     than silently picking.
+
+    A pinned nonce is confirmed through ``probe_live_session`` so a dead
+    holder is not treated as an armable generation, and a busy journal is
+    not treated as a dead lease.
     """
     if str(os.environ.get("GOALFLIGHT_DISPATCH_ID") or "").strip():
         return {"claimed": False, "reason": "worker-dispatch", "label": controller_label}
@@ -3460,6 +3592,13 @@ def _resolve_listen_auto_lease(
             "role": role,
             "label": controller_label,
         }
+    if pinned:
+        return _claimed_listen_lease_or_liveness(
+            project_root,
+            controller_label=controller_label,
+            nonce=pinned,
+            reason="explicit-lease-nonce",
+        )
     import goalflight_journal  # type: ignore
 
     try:
@@ -3467,8 +3606,9 @@ def _resolve_listen_auto_lease(
             project_root,
             retry_budget_s=retry_budget_s,
         )
+    except goalflight_journal.JournalBusy:
+        raise
     except (
-        goalflight_journal.JournalBusy,
         goalflight_journal.JournalDisappeared,
         goalflight_journal.JournalIOError,
     ) as exc:
@@ -3479,22 +3619,6 @@ def _resolve_listen_auto_lease(
         }
     live = _listen_auto_live_generations(authority, project_root, controller_label)
     active = [row for row in live if row.get("state") == "ACTIVE"]
-    if pinned:
-        match = next((row for row in live if row.get("nonce") == pinned), None)
-        if match is None:
-            return {
-                "claimed": False,
-                "reason": "lease-nonce-not-live",
-                "label": controller_label,
-            }
-        return {
-            "claimed": True,
-            "reason": "explicit-lease-nonce",
-            "label": controller_label,
-            "nonce": pinned,
-            "lease_generation": match.get("generation"),
-            "holder_alive": match.get("holder_alive"),
-        }
 
     env_cap = _presented_ambient_controller_capability()
     if env_cap and len(live) > 1:
@@ -3506,14 +3630,13 @@ def _resolve_listen_auto_lease(
                 "reason": "ambiguous-controller-generation",
                 "label": controller_label,
             }
-        return {
-            "claimed": True,
-            "reason": "ambient-controller-lease",
-            "label": controller_label,
-            "nonce": env_cap,
-            "lease_generation": match.get("generation"),
-            "holder_alive": match.get("holder_alive"),
-        }
+        return _claimed_listen_lease_or_liveness(
+            project_root,
+            controller_label=controller_label,
+            nonce=env_cap,
+            reason="ambient-controller-lease",
+            generation=match.get("generation"),
+        )
     if env_cap:
         match = next((row for row in live if row.get("nonce") == env_cap), None)
         if match is None:
@@ -3522,24 +3645,22 @@ def _resolve_listen_auto_lease(
                 "reason": "controller-capability-mismatch",
                 "label": controller_label,
             }
-        return {
-            "claimed": True,
-            "reason": "ambient-controller-lease",
-            "label": controller_label,
-            "nonce": env_cap,
-            "lease_generation": match.get("generation"),
-            "holder_alive": match.get("holder_alive"),
-        }
+        return _claimed_listen_lease_or_liveness(
+            project_root,
+            controller_label=controller_label,
+            nonce=env_cap,
+            reason="ambient-controller-lease",
+            generation=match.get("generation"),
+        )
     if len(active) == 1:
         match = active[0]
-        return {
-            "claimed": True,
-            "reason": "journal-active-lease",
-            "label": controller_label,
-            "nonce": str(match["nonce"]),
-            "lease_generation": match.get("generation"),
-            "holder_alive": match.get("holder_alive"),
-        }
+        return _claimed_listen_lease_or_liveness(
+            project_root,
+            controller_label=controller_label,
+            nonce=str(match["nonce"]),
+            reason="journal-active-lease",
+            generation=match.get("generation"),
+        )
     if not live:
         return {
             "claimed": False,
@@ -4798,7 +4919,18 @@ def merge_remote_register(
 # Tracked-task refusal. Distinct from POSIX 128+signal: 144 is SIGURG on
 # macOS, not this code. Historical bulk-144 reports were not detached exits.
 DETACHED_LISTENER_EXIT_CODE = 4
+# Settled "never armed" for the bare listen/follow path. Distinct from
+# 0 (rang), 2 (fault / unreadable-retryable), and 3 (contention / stale
+# after an arm). Reusing those would keep a re-arm loop spinning.
+LISTENER_DID_NOT_ARM_EXIT = 5
 LISTENER_POSIX_SIGNAL_EXIT_BASE = 128
+_SETTLED_DID_NOT_ARM_REASONS = frozenset(
+    {
+        "lease-nonce-not-live",
+        "controller-capability-mismatch",
+        "no-active-controller-lease",
+    }
+)
 _LISTENER_FATAL_SIGNAL_NAMES = ("SIGTERM", "SIGHUP", "SIGINT", "SIGQUIT")
 _LISTENER_NOISY_IGNORED_SIGNAL_NAMES = ("SIGURG", "SIGIO")
 
@@ -5722,11 +5854,11 @@ def cmd_follow(args) -> int:
     ) as exc:
         return startup_fail(_journal_failure_reason(exc), exc)
     if not resolved.get("claimed"):
-        print(
-            "follow: " + str(resolved.get("reason") or "ambient lease unavailable"),
-            file=sys.stderr,
+        return _listen_unclaimed_exit(
+            "follow",
+            resolved,
+            explicit_nonce=str(args.lease_nonce or "").strip() or None,
         )
-        return 2
     nonce = str(resolved.get("nonce") or "").strip()
     if not nonce:
         print("follow: active controller lease is unavailable", file=sys.stderr)
@@ -6320,6 +6452,12 @@ def cmd_listen(args) -> int:
     lease generation has gone stale. A caller that branches on 3 must read the
     accompanying stderr reason rather than assuming contention; re-arming
     blindly on 3 will loop on the orphaned and stale-lease cases.
+
+    Exit 5 is settled did-not-arm: a dead or mismatched lease nonce, or no
+    live controller lease. It is not a ring (0), not a retryable journal
+    fault (2), and not contention (3). Unreadable journal/holder state stays
+    2 with ``journal-unavailable`` / ``journal-io-failure`` so a caller can
+    retry; collapsing that into 5 would tear the pool down on a busy read.
     """
     import goalflight_journal  # type: ignore
     import goalflight_session_status as sessions  # type: ignore
@@ -6381,14 +6519,20 @@ def cmd_listen(args) -> int:
         goalflight_journal.JournalDisappeared,
         goalflight_journal.JournalIOError,
     ) as exc:
-        print(f"{prefix}: {_journal_failure_reason(exc)}: {exc}", file=sys.stderr)
+        reason = _journal_failure_reason(exc)
+        if reason in {"journal-unavailable", "journal-io-failure"}:
+            print(
+                f"{prefix}: {reason}: could not confirm a live controller lease; "
+                "this is retryable, not a dead nonce",
+                file=sys.stderr,
+            )
+        else:
+            print(f"{prefix}: {reason}: {exc}", file=sys.stderr)
         return 2
     if not resolved.get("claimed"):
-        print(
-            f"{prefix}: " + str(resolved.get("reason") or "ambient lease unavailable"),
-            file=sys.stderr,
+        return _listen_unclaimed_exit(
+            prefix, resolved, explicit_nonce=explicit_nonce
         )
-        return 2
     nonce = str(resolved.get("nonce") or "").strip()
     if not nonce:
         print(f"{prefix}: active controller lease is unavailable", file=sys.stderr)
@@ -7544,9 +7688,11 @@ def _run_cli(argv: list[str] | None = None) -> int:
         ),
         description=(
             "one-shot journal cursor listener; self-resolves the ACTIVE lease "
-            "unless --lease-nonce pins one. Exit 3 is never a full-pool refusal, "
-            "never a full listener pool. --listener-slots is how many doorbells "
-            "to run (live/target), not a ceiling."
+            "unless --lease-nonce pins one. Exit 0 is a ring, 2 is a retryable "
+            "fault, 3 is contention/stale after arming, 5 is settled did-not-arm "
+            "(dead or mismatched lease nonce). Exit 3 is never a full-pool "
+            "refusal. --listener-slots is how many doorbells to run "
+            "(live/target), not a ceiling."
         ),
     )
     add_listen_arguments(listen)

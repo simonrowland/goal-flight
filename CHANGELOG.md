@@ -37,6 +37,15 @@ incremented when meaningful skill behaviour changes.
 
 ### Fixed
 
+- Bare `listen` / `follow` no longer treat a dead lease nonce as a
+  successful arm. An ACTIVE journal row whose holder lock is unheld, or
+  a `--lease-nonce` that is not the live session, exits 5 (`did-not-arm`)
+  with a stderr reason that names the settled cause. Exit 0 remains a
+  genuine ring. An unreadable journal or vanished holder witness stays
+  exit 2 with `journal-unavailable` / `journal-io-failure` so a caller
+  can retry; that state is not collapsed into a dead nonce. Supervised
+  children still classify from the child's diagnostic channel; exit 5
+  without a dead-nonce marker stops that slot.
 - Supervised wake classifies a child exit from the child's diagnostic
   channel (stderr plus structured child-exit JSON reasons), never from
   relayed mail headlines. A doorbell that reports a subject containing

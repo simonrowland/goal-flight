@@ -614,6 +614,22 @@ def test_classify_exit_taxonomy() -> None:
         output="follow: this controller lease already has a persistent stream",
         armed=False,
     ) == (supervise.ACTION_STOP, "did-not-arm")
+    assert supervise.classify_child_exit(
+        kind="backup",
+        returncode=5,
+        output=(
+            "listen: did-not-arm: lease-nonce-not-live: --lease-nonce is not "
+            "a live controller lease; this process is not waiting and will "
+            "not cover the pool"
+        ),
+        armed=False,
+    ) == (supervise.ACTION_STOP, "dead-lease-nonce")
+    assert supervise.classify_child_exit(
+        kind="backup",
+        returncode=5,
+        output="listen: did-not-arm: no live controller lease is present",
+        armed=False,
+    ) == (supervise.ACTION_STOP, "did-not-arm")
 
 
 def test_live_counts_armed_components_not_pids() -> None:

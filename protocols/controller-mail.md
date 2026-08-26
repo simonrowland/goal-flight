@@ -371,9 +371,10 @@ Supervisors must branch on the listener's exit code instead of blindly restartin
 |---:|---|---|
 | 0 | Ring: waking mail won the cursor-version claim. | Process the reported or authoritative mail, advance only settled positions, then issue each printed remaining-depth command as its own tracked background task. |
 | 1 | Timeout: no waking event arrived before the requested deadline. | Treat it as a clean timer expiry; re-arm only when ongoing coverage is still required. |
-| 2 | Infrastructure or corruption failure. | Preserve the one-line diagnostic, repair or escalate the journal/wake substrate, and avoid a restart loop until the fault is cleared. |
+| 2 | Infrastructure or corruption failure, including an unreadable journal or holder witness. Retryable; not a dead nonce. | Preserve the one-line diagnostic, repair or escalate the journal/wake substrate, and avoid a restart loop until the fault is cleared. |
 | 3 | Contention, supersession, orphaning, or stale lease. | Reconcile the active lease and held slot PIDs; do not kill by pattern, and re-arm only under the current lease. |
 | 4 | Detached-listener refusal: its exit cannot wake a tracked controller. | Use the emitted command to launch a tracked background listener; do not detach it again. |
+| 5 | Did-not-arm: the lease nonce is known-dead or does not match the live session. This process never waited. | Do not treat as a ring and do not re-arm this nonce; the stderr reason names the settled cause (`lease-nonce-not-live`, capability mismatch, or no live lease). |
 | 128+N | POSIX signal N. On macOS 144 is SIGURG (16). | SIGURG is logged and the listener stays alive (kernel default is discard). A terminating signal prints who/why, releases the slot, and exits 128+N. Empty 144 is a harness report, not this refusal. |
 
 The held-lock ledger, not coverage rows or `ps` output, drives the missing-listener

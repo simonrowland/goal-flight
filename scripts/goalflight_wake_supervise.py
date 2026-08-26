@@ -146,7 +146,9 @@ def classify_child_exit(
 
     ``armed`` is a positive observation (child stdout or a sampled flock).
     A missed sample is a false negative and must re-arm, never stop: exit 0
-    without an explicit did-not-arm marker is "rang". Journal unreadability
+    without an explicit did-not-arm marker is "rang". Exit 5 is the bare
+    listen/follow did-not-arm signal (never armed); marker checks still win
+    so a dead-nonce diagnostic stays supervisor-stop. Journal unreadability
     is retryable and is never collapsed into a dead nonce.
 
     Watch-follow return-3 sites: leftover watchdog lock is did-not-arm;
@@ -173,6 +175,10 @@ def classify_child_exit(
         return ACTION_BACKOFF, "orphaned-stdout"
     if returncode == 0:
         return ACTION_REARM, "rang"
+    # Bare listen/follow LISTENER_DID_NOT_ARM_EXIT. Marker checks above still
+    # win so a dead-nonce stderr stays supervisor-stop, not a slot stop.
+    if returncode == 5:
+        return ACTION_STOP, "did-not-arm"
     if returncode == 3:
         return ACTION_BACKOFF, "exit-3-unclassified"
     return ACTION_BACKOFF, f"exit-{returncode}"
