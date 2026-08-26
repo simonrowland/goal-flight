@@ -2052,6 +2052,493 @@ def test_drain_leaves_request_queued_when_capacity_full() -> None:
         assert row and row.get("classification") == "queued_capacity", row
 
 
+def test_capacity_blocked_drain_claim_is_released_and_entry_stays_queued() -> None:
+    """Claim is taken, capacity refuses, entry returns to QUEUED — not stranded.
+
+    Absence of ``*.json.claimed-*`` is only asserted after proving a claim
+    existed; the glob is the drain's real carrier pattern, not ``*.claimed.*``.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "1"
+        held = _run(
+            [
+                sys.executable,
+                str(CAPACITY),
+                "acquire",
+                "--agent",
+                "test-dispatch",
+                "--dispatch-id",
+                "held-capacity-claim",
+                "--project-root",
+                str(tmp),
+                "--controller-pid",
+                str(os.getpid()),
+                "--ttl-s",
+                "60",
+            ],
+            env,
+        )
+        assert held.returncode == 0, held.stderr
+        dispatch_id = "capacity-claim-release"
+        queue_dir = tmp / "state" / "dispatch-queue"
+        queue_path = queue_dir / f"{dispatch_id}.json"
+        submit = _run(
+            [
+                sys.executable,
+                str(DISPATCH),
+                "--agent",
+                "test-dispatch",
+                "--submit",
+                "--unregistered-forced",
+                "--no-drain-on-submit",
+                "--dispatch-id",
+                dispatch_id,
+                "--tail",
+                str(tmp / f"{dispatch_id}.tail"),
+                "--status-json",
+                str(tmp / f"{dispatch_id}.status.json"),
+                "--cwd",
+                str(tmp),
+                "--",
+                sys.executable,
+                "-c",
+                "raise SystemExit('must not run')",
+            ],
+            env,
+        )
+        assert submit.returncode == 0, (submit.stdout, submit.stderr)
+        assert queue_path.exists(), "precondition: durable queue entry must exist before drain"
+
+        claimed_paths: list[str] = []
+        original_claim = D._claim_queue_entry
+
+        def spy_claim(path: Path):
+            claimed = original_claim(path)
+            if claimed is not None:
+                claimed_paths.append(str(claimed))
+            return claimed
+
+        old_env = os.environ.copy()
+        original_release = D._release_stale_capacity_for_drain
+        original_hook = D._run_drain_prelaunch_hook
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            D._claim_queue_entry = spy_claim
+            D._release_stale_capacity_for_drain = lambda: None
+            D._run_drain_prelaunch_hook = lambda _agents: None
+            payload = D._drain_queue_once(_drain_args(queue_dir, limit=0))
+        finally:
+            D._claim_queue_entry = original_claim
+            D._release_stale_capacity_for_drain = original_release
+            D._run_drain_prelaunch_hook = original_hook
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        assert claimed_paths, "precondition: drain never took a claim, so 'no claim' is inherited"
+        assert payload["launched"] == 0, payload
+        assert payload["left_queued"] == 1, payload
+        assert payload["pending_claims"] == 0, payload
+        by_id = {str(row.get("dispatch_id")): row for row in payload.get("details") or []}
+        assert by_id.get(dispatch_id, {}).get("state") == "queued", payload
+        assert by_id[dispatch_id]["reason"] == "capacity_unavailable", by_id[dispatch_id]
+        assert queue_path.exists(), "capacity refusal lost the queued envelope"
+        assert list(queue_dir.glob("*.json.claimed-*")) == [], list(queue_dir.glob("*"))
+        queued = json.loads(queue_path.read_text(encoding="utf-8"))
+        assert queued.get("state") == "queued", queued
+        record = json.loads((tmp / "state" / "runs.d" / f"{dispatch_id}.json").read_text(encoding="utf-8"))
+        assert record.get("state") == "queued", record
+        assert record.get("terminal_state") in {None, "unknown"}, record
+        assert not D.goalflight_dispatch_states.is_terminal_state(record.get("state"))
+
+
+def test_drain_timeout_of_pre_worker_claim_restores_to_queued() -> None:
+    """TimeoutExpired used to leave the claim held; finally must restore it."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        original_run = D.subprocess.run
+        original_release = D._release_stale_capacity_for_drain
+        original_hook = D._run_drain_prelaunch_hook
+        dispatch_id = "timeout-pre-worker"
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            path = _write_queue_entry(queue, dispatch_id, filename=dispatch_id)
+
+            def timeout_after_launch_stamp(argv, **kwargs):
+                argv = list(argv)
+                if "--queue-claim-path" not in argv:
+                    return original_run(argv, **kwargs)
+                claim = Path(argv[argv.index("--queue-claim-path") + 1])
+                payload = json.loads(claim.read_text(encoding="utf-8"))
+                payload["queue_launch_started"] = True
+                payload["queue_launch_started_at"] = D.goalflight_ledger.utc_now()
+                payload["queue_launcher_pid"] = 99_999_994
+                D._write_json_atomic(claim, payload)
+                raise subprocess.TimeoutExpired(argv, 1)
+
+            D.subprocess.run = timeout_after_launch_stamp
+            D._release_stale_capacity_for_drain = lambda: None
+            D._run_drain_prelaunch_hook = lambda _agents: None
+            payload = D._drain_queue_once(_drain_args(queue))
+        finally:
+            D.subprocess.run = original_run
+            D._release_stale_capacity_for_drain = original_release
+            D._run_drain_prelaunch_hook = original_hook
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert payload["left_queued"] == 1, payload
+        assert payload["pending_claims"] == 0, payload
+        assert path.exists(), payload
+        assert list(path.parent.glob("*.json.claimed-*")) == [], list(path.parent.glob("*"))
+        queued = json.loads(path.read_text(encoding="utf-8"))
+        assert queued.get("state") == "queued", queued
+        assert not queued.get("queue_launch_started"), queued
+
+
+def test_launch_started_capacity_claim_recovers_to_queued() -> None:
+    """UNLINKED launch-started capacity claim must become QUEUED, not pending forever."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _b065_env(tmp)
+        old_env = os.environ.copy()
+        dispatch_id = "unlinked-capacity-recover"
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            now = D.goalflight_ledger.utc_now()
+            claim = queue / f"{dispatch_id}.json.claimed-1"
+            entry = {
+                "schema": D.DISPATCH_QUEUE_SCHEMA,
+                "state": "claimed",
+                "dispatch_id": dispatch_id,
+                "agent": "test-dispatch",
+                "shape": "bash",
+                "project_root": str(tmp),
+                "created_at": now,
+                "dispatch_argv": ["--agent", "test-dispatch", "--dispatch-id", dispatch_id],
+                "queue_launch_token": "unlinked-capacity-token",
+                "queue_launch_started": True,
+                "queue_launch_started_at": now,
+                "queue_launcher_pid": 99_999_995,
+                "queue_launcher_identity": {"pid": 99_999_995},
+                "request": {
+                    "cwd": str(tmp),
+                    "tail": str(tmp / f"{dispatch_id}.tail"),
+                    "status_json": str(tmp / f"{dispatch_id}.status.json"),
+                    "agent": "test-dispatch",
+                },
+            }
+            claim.write_text(json.dumps(entry), encoding="utf-8")
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "state": "waiting_capacity",
+                    "terminal_state": "unknown",
+                    "agent": "test-dispatch",
+                    "project_root": str(tmp),
+                    "queue_launch_token": "unlinked-capacity-token",
+                    "dispatch_argv": list(entry["dispatch_argv"]),
+                    "started_at": now,
+                }
+            )
+            recovered = D._recover_claimed_queue_entries(queue, stale_s=0)
+            queued_path = queue / f"{dispatch_id}.json"
+            record = json.loads(
+                (tmp / "state" / "runs.d" / f"{dispatch_id}.json").read_text(encoding="utf-8")
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert recovered["restored"] == 1, recovered
+        assert recovered.get("pending_launch", 0) == 0, recovered
+        assert not claim.exists(), "launch-started capacity claim stayed stranded"
+        assert queued_path.exists(), recovered
+        queued = json.loads(queued_path.read_text(encoding="utf-8"))
+        assert queued.get("state") == "queued", queued
+        assert record.get("state") == "queued", record
+        assert record.get("terminal_state") in {None, "unknown"}, record
+
+
+def test_linked_launch_started_capacity_claim_recovers_to_queued() -> None:
+    """Linked launch-started capacity claims must restore, not terminalize worker_dead."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _b065_env(tmp)
+        old_env = os.environ.copy()
+        dispatch_id = "linked-capacity-recover"
+        task_id = "t-b215-capacity"
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            now = D.goalflight_ledger.utc_now()
+            claim = queue / f"{dispatch_id}.json.claimed-1"
+            entry = {
+                "schema": D.DISPATCH_QUEUE_SCHEMA,
+                "state": "claimed",
+                "dispatch_id": dispatch_id,
+                "agent": "test-dispatch",
+                "shape": "bash",
+                "project_root": str(tmp),
+                "created_at": now,
+                "task_ids": [task_id],
+                "dispatch_argv": ["--agent", "test-dispatch", "--dispatch-id", dispatch_id],
+                "queue_launch_token": "linked-capacity-token",
+                "queue_launch_started": True,
+                "queue_launch_started_at": now,
+                "queue_launcher_pid": 99_999_996,
+                "queue_launcher_identity": {"pid": 99_999_996},
+                "request": {
+                    "cwd": str(tmp),
+                    "tail": str(tmp / f"{dispatch_id}.tail"),
+                    "status_json": str(tmp / f"{dispatch_id}.status.json"),
+                    "agent": "test-dispatch",
+                    "task_ids": [task_id],
+                },
+            }
+            claim.write_text(json.dumps(entry), encoding="utf-8")
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "state": "waiting_capacity",
+                    "terminal_state": "unknown",
+                    "agent": "test-dispatch",
+                    "project_root": str(tmp),
+                    "task_ids": [task_id],
+                    "queue_launch_token": "linked-capacity-token",
+                    "dispatch_argv": list(entry["dispatch_argv"]),
+                    "started_at": now,
+                }
+            )
+            recovered = D._recover_claimed_queue_entries(queue, stale_s=0)
+            queued_path = queue / f"{dispatch_id}.json"
+            record = json.loads(
+                (tmp / "state" / "runs.d" / f"{dispatch_id}.json").read_text(encoding="utf-8")
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert recovered["restored"] == 1, recovered
+        assert recovered.get("cleared", 0) == 0, recovered
+        assert not claim.exists()
+        assert queued_path.exists()
+        assert record.get("state") == "queued", record
+        assert record.get("state") != "worker_dead", record
+
+
+def test_unlinked_waiting_capacity_missing_carrier_republishes_queue() -> None:
+    """A carrier-less waiting_capacity row must become a QUEUED envelope again."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _b065_env(tmp)
+        old_env = os.environ.copy()
+        dispatch_id = "missing-carrier-capacity"
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            now = D.goalflight_ledger.utc_now()
+            argv = ["--agent", "test-dispatch", "--dispatch-id", dispatch_id]
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "state": "waiting_capacity",
+                    "terminal_state": "unknown",
+                    "agent": "test-dispatch",
+                    "project_root": str(tmp),
+                    "dispatch_argv": argv,
+                    "started_at": now,
+                    "status_path": str(tmp / f"{dispatch_id}.status.json"),
+                    "stdout_path": str(tmp / f"{dispatch_id}.tail"),
+                }
+            )
+            recovered = D._recover_claimed_queue_entries(queue, stale_s=0)
+            queued_path = queue / f"{dispatch_id}.json"
+            record = json.loads(
+                (tmp / "state" / "runs.d" / f"{dispatch_id}.json").read_text(encoding="utf-8")
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert recovered["restored"] == 1, recovered
+        assert queued_path.exists(), recovered
+        queued = json.loads(queued_path.read_text(encoding="utf-8"))
+        assert queued.get("state") == "queued", queued
+        assert list(queued.get("dispatch_argv") or []) == argv
+        assert int(queued.get("claim_recovery_count") or 0) == 0, queued
+        assert record.get("state") == "queued", record
+        assert record.get("terminal_state") in {None, "unknown"}, record
+
+
+def test_spawn_intent_timeout_does_not_restore_claim() -> None:
+    """A timeout after spawn-intent must leave the claim pending, not replay."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        old_env = os.environ.copy()
+        original_run = D.subprocess.run
+        original_release = D._release_stale_capacity_for_drain
+        original_hook = D._run_drain_prelaunch_hook
+        dispatch_id = "timeout-spawn-intent"
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            path = _write_queue_entry(queue, dispatch_id, filename=dispatch_id)
+            claimed: list[Path] = []
+
+            def timeout_after_spawn_intent(argv, **kwargs):
+                argv = list(argv)
+                if "--queue-claim-path" not in argv:
+                    return original_run(argv, **kwargs)
+                claim = Path(argv[argv.index("--queue-claim-path") + 1])
+                claimed.append(claim)
+                payload = json.loads(claim.read_text(encoding="utf-8"))
+                payload["queue_launch_started"] = True
+                payload["queue_worker_spawn_intent"] = True
+                payload["queue_worker_spawn_intent_at"] = D.goalflight_ledger.utc_now()
+                D._write_json_atomic(claim, payload)
+                raise subprocess.TimeoutExpired(argv, 1)
+
+            D.subprocess.run = timeout_after_spawn_intent
+            D._release_stale_capacity_for_drain = lambda: None
+            D._run_drain_prelaunch_hook = lambda _agents: None
+            payload = D._drain_queue_once(_drain_args(queue))
+        finally:
+            D.subprocess.run = original_run
+            D._release_stale_capacity_for_drain = original_release
+            D._run_drain_prelaunch_hook = original_hook
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert claimed, "precondition: drain never took a claim"
+        assert payload["left_queued"] == 0, payload
+        assert payload["pending_claims"] == 1, payload
+        assert not path.exists(), payload
+        assert claimed[0].exists(), "spawn-intent timeout released the in-flight claim"
+        parked = json.loads(claimed[0].read_text(encoding="utf-8"))
+        assert parked.get("queue_worker_spawn_intent") is True, parked
+
+
+def test_launch_started_queued_ledger_is_not_restored() -> None:
+    """Launch-started + queued ledger is the crash guard, not a capacity refusal."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _b065_env(tmp)
+        old_env = os.environ.copy()
+        dispatch_id = "launch-started-queued-guard"
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            now = D.goalflight_ledger.utc_now()
+            claim = queue / f"{dispatch_id}.json.claimed-1"
+            entry = {
+                "schema": D.DISPATCH_QUEUE_SCHEMA,
+                "state": "claimed",
+                "dispatch_id": dispatch_id,
+                "agent": "test-dispatch",
+                "shape": "bash",
+                "project_root": str(tmp),
+                "created_at": now,
+                "dispatch_argv": ["--agent", "test-dispatch", "--dispatch-id", dispatch_id],
+                "queue_launch_token": "queued-guard-token",
+                "queue_launch_started": True,
+                "queue_launch_started_at": now,
+                "queue_launcher_pid": 99_999_997,
+                "queue_launcher_identity": {"pid": 99_999_997},
+                "request": {
+                    "cwd": str(tmp),
+                    "tail": str(tmp / f"{dispatch_id}.tail"),
+                    "status_json": str(tmp / f"{dispatch_id}.status.json"),
+                    "agent": "test-dispatch",
+                },
+            }
+            claim.write_text(json.dumps(entry), encoding="utf-8")
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "state": "queued",
+                    "terminal_state": "unknown",
+                    "agent": "test-dispatch",
+                    "project_root": str(tmp),
+                    "queue_launch_token": "queued-guard-token",
+                    "dispatch_argv": list(entry["dispatch_argv"]),
+                    "started_at": now,
+                }
+            )
+            recovered = D._recover_claimed_queue_entries(queue, stale_s=0)
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert recovered["restored"] == 0, recovered
+        assert claim.exists(), "crash-guard claim was restored while launch may be in flight"
+        assert not (queue / f"{dispatch_id}.json").exists()
+
+
+def test_blocked_capacity_missing_carrier_republishes_or_surfaces() -> None:
+    """Carrier-less blocked_capacity must not vanish from pending_reasons."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _b065_env(tmp)
+        old_env = os.environ.copy()
+        dispatch_id = "blocked-capacity-missing"
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            now = D.goalflight_ledger.utc_now()
+            argv = ["--agent", "test-dispatch", "--dispatch-id", dispatch_id]
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "state": "blocked_capacity",
+                    "terminal_state": "blocked_capacity",
+                    "agent": "test-dispatch",
+                    "project_root": str(tmp),
+                    "dispatch_argv": argv,
+                    "started_at": now,
+                    "status_path": str(tmp / f"{dispatch_id}.status.json"),
+                    "stdout_path": str(tmp / f"{dispatch_id}.tail"),
+                }
+            )
+            recovered = D._recover_claimed_queue_entries(queue, stale_s=0)
+            queued_path = queue / f"{dispatch_id}.json"
+            record = json.loads(
+                (tmp / "state" / "runs.d" / f"{dispatch_id}.json").read_text(encoding="utf-8")
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert recovered["restored"] + recovered.get("pending_launch", 0) >= 1, recovered
+        if queued_path.exists():
+            queued = json.loads(queued_path.read_text(encoding="utf-8"))
+            assert queued.get("state") == "queued", queued
+            assert record.get("state") == "queued", record
+        else:
+            reasons = [str(row.get("reason") or "") for row in recovered.get("pending_reasons") or []]
+            assert reasons, recovered
+            assert "pre_admission_deferred" in reasons or any("blocked" in r for r in reasons), recovered
+
+
 def test_drain_orders_by_priority_then_created_at_fifo() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -5801,6 +6288,14 @@ def main() -> None:
     test_drain_write_error_is_json_error_without_traceback()
     test_acp_submit_then_drain_replays_from_queue()
     test_drain_leaves_request_queued_when_capacity_full()
+    test_capacity_blocked_drain_claim_is_released_and_entry_stays_queued()
+    test_drain_timeout_of_pre_worker_claim_restores_to_queued()
+    test_launch_started_capacity_claim_recovers_to_queued()
+    test_linked_launch_started_capacity_claim_recovers_to_queued()
+    test_unlinked_waiting_capacity_missing_carrier_republishes_queue()
+    test_spawn_intent_timeout_does_not_restore_claim()
+    test_launch_started_queued_ledger_is_not_restored()
+    test_blocked_capacity_missing_carrier_republishes_or_surfaces()
     test_drain_orders_by_priority_then_created_at_fifo()
     test_drain_degrades_unknown_priority_to_normal_and_survives_bad_json_prescan()
     test_drain_does_not_tombstone_valid_entry_on_stale_prescan_read_error()

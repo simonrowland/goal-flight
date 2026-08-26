@@ -136,6 +136,11 @@ RECONCILE_LOCK_POLL_S = 0.010
 PRELAUNCH_CANDIDATE_STATES = frozenset(
     {"queued", "waiting_capacity", "starting", "submitted", "claimed"}
 )
+# Ledger rows that have not crossed worker spawn. `starting` is excluded:
+# it is recorded after capacity is acquired, immediately before spawn intent.
+PRE_WORKER_LEDGER_STATES = frozenset(
+    {"queued", "waiting_capacity", "submitted", "claimed"}
+)
 QUEUE_PRIORITY_RANK = {lane: rank for rank, lane in enumerate(goalflight_capacity.PRIORITY_LANES)}
 QUEUE_DEFAULT_PRIORITY = "normal"
 PRESET_AGENTS = {
@@ -8372,6 +8377,59 @@ def _entry_pre_spawn(entry: dict) -> bool:
     )
 
 
+def _entry_pre_worker(entry: dict) -> bool:
+    """True when no worker spawn was attempted.
+
+    Launch-started is still pre-worker: the queue child stamps that *before*
+    capacity acquire, so a capacity-blocked claim must remain restorable.
+    """
+    return not (
+        _queue_claim_worker_spawn_intent(entry)
+        or _queue_claim_worker_spawned(entry)
+    )
+
+
+def _ledger_is_restorable_prelaunch(record: dict | None) -> bool:
+    """Whether a ledger row still names work that must return to QUEUED.
+
+    `blocked_capacity` is a terminal *label* but a transient refusal: b-216
+    made that state restorable so fire-and-forget does not discard the entry.
+    """
+    if not isinstance(record, dict):
+        return False
+    state = str(record.get("state") or "")
+    if state == "blocked_capacity":
+        return True
+    if _dispatch_record_is_terminal(record):
+        return False
+    return state in PRE_WORKER_LEDGER_STATES
+
+
+def _ledger_is_capacity_refusal(record: dict | None) -> bool:
+    """True when the ledger names a transient capacity refusal, not a launch."""
+    return isinstance(record, dict) and str(record.get("state") or "") in {
+        "waiting_capacity",
+        "blocked_capacity",
+    }
+
+
+def _claim_is_recovery_restorable(entry: dict, record: dict | None) -> bool:
+    """Whether a stale claim may return to QUEUED without double-launch.
+
+    Never-started claims stay restorable. Launch-started claims are restorable
+    only as a capacity refusal: remote drain stamps launch-started *before*
+    execute_dispatch, so treating every dead-launcher pre-worker claim as
+    restorable would relaunch an in-flight remote worker.
+    """
+    if not list(entry.get("dispatch_argv") or []):
+        return False
+    if _claim_recovery_count(entry) >= MAX_CLAIM_RECOVERY_REQUEUES:
+        return False
+    if _entry_pre_spawn(entry):
+        return True
+    return _entry_pre_worker(entry) and _ledger_is_capacity_refusal(record)
+
+
 def _sanitize_restore_envelope(entry: dict, *, increment_recovery_count: bool) -> dict:
     restored = dict(entry)
     for key in (
@@ -8694,7 +8752,7 @@ def _bounded_restore_claim(claim: Path, entry: dict, queue_dir: Path) -> tuple[b
             return False, None
         if not isinstance(fresh, dict):
             return False, None
-        if _claim_recovery_count(fresh) >= MAX_CLAIM_RECOVERY_REQUEUES or not _entry_pre_spawn(fresh):
+        if not _claim_is_recovery_restorable(fresh, _find_dispatch_record(str(fresh.get("dispatch_id") or ""))):
             return False, None
         restored, decision = _commit_restore_transaction(
             txn,
@@ -9117,7 +9175,11 @@ def _reconcile_claim_transaction(
             return _ClaimReconcileResult("pending", pending_reason="orphan_stale_window_started")
         if age_stamp is not None and max(0.0, time.time() - age_stamp) < max(0.0, stale_s):
             return _ClaimReconcileResult("pending", pending_reason="orphan_not_stale")
-        if record is not None and _dispatch_record_is_terminal(record):
+        if (
+            record is not None
+            and _dispatch_record_is_terminal(record)
+            and not _ledger_is_restorable_prelaunch(record)
+        ):
             if not linked:
                 quarantined_path = _quarantine_unlinked_claim_if_observed_orphan(
                     claim,
@@ -9194,6 +9256,53 @@ def _reconcile_claim_transaction(
                 return _ClaimReconcileResult("pending", pending_reason="completed_carrier_unlink_deferred")
             return _ClaimReconcileResult("cleared")
 
+        restorable = _claim_is_recovery_restorable(fresh, record)
+        # Unlinked never-started claims with no known dispatch stay on the
+        # quarantine path (b-065). A waiting_capacity / blocked_capacity ledger
+        # row is a known transient refusal: restore it so an UNLINKED capacity
+        # refusal can become eligible again instead of pending forever.
+        if restorable and (
+            linked
+            or _ledger_is_capacity_refusal(record)
+            or (_entry_pre_spawn(fresh) and _ledger_is_restorable_prelaunch(record))
+        ):
+            restored, locked_decision = _restore_claimed_entry(
+                claim,
+                fresh,
+                txn=txn,
+                increment_recovery_count=True,
+                reason=reason,
+            )
+            if restored is not None:
+                mirror = (_sanitize_restore_envelope(fresh, increment_recovery_count=True), restored)
+                return _ClaimReconcileResult("restored")
+            if locked_decision is not None:
+                if not linked:
+                    quarantined_path = _quarantine_unlinked_claim_if_observed_orphan(
+                        claim,
+                        fresh,
+                        record,
+                        reason=f"{reason}_unlinked_restore_blocked",
+                        stale_s=stale_s,
+                    )
+                    return (
+                        _ClaimReconcileResult("quarantined")
+                        if quarantined_path
+                        else _ClaimReconcileResult("pending", pending_reason="unlinked_restore_blocked")
+                    )
+                result, _marker = _commit_claim_terminal_in_txn(
+                    txn,
+                    fresh,
+                    reason=str(locked_decision.get("reason") or reason),
+                    force_state=str(locked_decision.get("state") or "complete"),
+                )
+                if result.committed:
+                    terminal_mirror = (fresh, _marker)
+                    with contextlib.suppress(OSError):
+                        claim.unlink()
+                    return _ClaimReconcileResult("cleared")
+                return _ClaimReconcileResult("pending", pending_reason="restore_terminal_commit_deferred")
+
         if not linked:
             quarantined_path = _quarantine_unlinked_claim_if_observed_orphan(
                 claim,
@@ -9209,31 +9318,6 @@ def _reconcile_claim_transaction(
             )
 
         target = queue_dir / claim.name.split(".claimed-", 1)[0]
-        pre_spawn = _entry_pre_spawn(fresh)
-        if pre_spawn and list(fresh.get("dispatch_argv") or []) and _claim_recovery_count(fresh) < MAX_CLAIM_RECOVERY_REQUEUES:
-            restored, locked_decision = _restore_claimed_entry(
-                claim,
-                fresh,
-                txn=txn,
-                increment_recovery_count=True,
-                reason=reason,
-            )
-            if restored is not None:
-                mirror = (_sanitize_restore_envelope(fresh, increment_recovery_count=True), restored)
-                return _ClaimReconcileResult("restored")
-            if locked_decision is not None:
-                result, _marker = _commit_claim_terminal_in_txn(
-                    txn,
-                    fresh,
-                    reason=str(locked_decision.get("reason") or reason),
-                    force_state=str(locked_decision.get("state") or "complete"),
-                )
-                if result.committed:
-                    terminal_mirror = (fresh, _marker)
-                    with contextlib.suppress(OSError):
-                        claim.unlink()
-                    return _ClaimReconcileResult("cleared")
-                return _ClaimReconcileResult("pending", pending_reason="restore_terminal_commit_deferred")
         if target.exists():
             try:
                 claim.unlink()
@@ -9243,7 +9327,7 @@ def _reconcile_claim_transaction(
 
         terminal_reason = (
             "claim_recovery_exhausted"
-            if pre_spawn and _claim_recovery_count(fresh) >= MAX_CLAIM_RECOVERY_REQUEUES
+            if _entry_pre_worker(fresh) and _claim_recovery_count(fresh) >= MAX_CLAIM_RECOVERY_REQUEUES
             else reason
         )
         result, _marker = _commit_claim_terminal_in_txn(txn, fresh, reason=terminal_reason)
@@ -9305,7 +9389,7 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
                 queue_dir=queue_dir,
                 reason=(
                     "stale_claim_pre_spawn"
-                    if _entry_pre_spawn(entry)
+                    if _entry_pre_worker(entry)
                     else "stale_claim_launch_token_lost"
                 ),
                 stale_s=stale_s,
@@ -9341,6 +9425,7 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
 
     ledger_stats = _reconcile_ledger_prelaunch_orphans(queue_dir, stale_s=stale_s, now=time.time())
     ledger_terminalized = int(ledger_stats.get("terminalized") or 0)
+    restored += int(ledger_stats.get("restored") or 0)
     pending_launch += int(ledger_stats.get("pending") or 0)
     quarantined += int(ledger_stats.get("quarantined") or 0)
     pending_reasons.extend(ledger_stats.get("pending_reasons") or [])
@@ -9407,12 +9492,24 @@ def _ledger_request_entry(record: dict) -> dict:
             "queue_tail_flock_contract": record.get("transport") != "fleet-ssh",
             "queue_worker_spawned_at": (
                 record.get("queue_worker_spawned_at")
-                or record.get("started_at")
+                or (
+                    record.get("started_at")
+                    if record.get("worker_pid")
+                    or str(record.get("state") or "")
+                    in {"starting", "running", "running_quiet"}
+                    else None
+                )
             ),
             "queue_launch_started": bool(
                 record.get("worker_pid")
                 or str(record.get("state") or "")
-                not in {"queued", "waiting_capacity", "submitted"}
+                not in {
+                    "queued",
+                    "waiting_capacity",
+                    "submitted",
+                    "claimed",
+                    "blocked_capacity",
+                }
             ),
             "queue_worker_spawn_intent": bool(
                 record.get("worker_pid")
@@ -9423,11 +9520,10 @@ def _ledger_request_entry(record: dict) -> dict:
                 record.get("task_ids") or envelope.get("task_ids") or []
             ),
             "request": request,
-            "dispatch_argv": list(envelope.get("dispatch_argv") or []),
-            "claim_recovery_count": int(
-                record.get("claim_recovery_count")
-                or MAX_CLAIM_RECOVERY_REQUEUES
+            "dispatch_argv": list(
+                envelope.get("dispatch_argv") or record.get("dispatch_argv") or []
             ),
+            "claim_recovery_count": _claim_recovery_count(record),
             "orphan_first_seen_at": record.get("orphan_first_seen_at"),
             "started_at": record.get("started_at"),
         }
@@ -9464,6 +9560,94 @@ def _terminal_ledger_requeue_pending(
     )
 
 
+def _republish_prelaunch_queue_carrier(
+    record: dict,
+    entry: dict,
+    *,
+    queue_dir: Path,
+    reason: str,
+) -> _ClaimReconcileResult:
+    """Rebuild a QUEUED envelope from a carrier-less pre-worker ledger row."""
+    dispatch_id = str(record.get("dispatch_id") or entry.get("dispatch_id") or "")
+    argv = list(entry.get("dispatch_argv") or record.get("dispatch_argv") or [])
+    if not dispatch_id or not argv:
+        return _ClaimReconcileResult("pending", pending_reason="ledger_prelaunch_missing_argv")
+    begin = _begin_reconcile_transaction(
+        entry,
+        queue_dir=queue_dir,
+        stale_s=0.0,
+        need_queue=True,
+        need_task_store=True,
+        need_ledger=True,
+    )
+    txn = begin.transaction
+    if txn is None:
+        assert begin.refusal is not None
+        return _ClaimReconcileResult("pending", refusal=begin.refusal)
+    published: dict | None = None
+    target: Path | None = None
+    try:
+        fresh_record = _find_dispatch_record(dispatch_id)
+        if not _ledger_is_restorable_prelaunch(fresh_record):
+            return _ClaimReconcileResult("pending", pending_reason="ledger_prelaunch_state_changed")
+        if _claim_has_active_carrier(queue_dir, dispatch_id):
+            return _ClaimReconcileResult("pending", pending_reason="ledger_prelaunch_carrier_present")
+        decision = _entry_completion_authority(
+            entry,
+            fresh_record,
+            task_store_locked=txn.task_store_locked,
+        )
+        if _completion_decision_is_deferred(decision):
+            return _ClaimReconcileResult(
+                "pending",
+                pending_reason=str(decision.get("reason") or "completion_authority_deferred"),
+            )
+        if _completion_decision_blocks_restore(decision):
+            return _ClaimReconcileResult(
+                "pending",
+                pending_reason=str(decision.get("reason") or "completion_authority_blocks_restore"),
+            )
+        target = queue_dir / f"{goalflight_compat.safe_dispatch_filename(dispatch_id)}.json"
+        restore_txn_id = uuid.uuid4().hex
+        published = _sanitize_restore_envelope(entry, increment_recovery_count=False)
+        published.update(
+            {
+                "state": "queued",
+                "dispatch_id": dispatch_id,
+                "dispatch_argv": argv,
+                "restore_txn_id": restore_txn_id,
+                "restore_reason": reason,
+                "updated_at": goalflight_ledger.utc_now(),
+            }
+        )
+        try:
+            _write_json_atomic(target, published)
+        except OSError:
+            return _ClaimReconcileResult("pending", pending_reason="ledger_prelaunch_queue_write_deferred")
+        ledger_record = dict(record)
+        ledger_record.update(
+            {
+                "state": "queued",
+                "terminal_state": "unknown",
+                "liveness_state": "queued",
+                "worker_still_alive": False,
+                "queue_launch_token": None,
+                "queue_path": str(target),
+                "restore_reason": reason,
+                "restore_txn_id": restore_txn_id,
+            }
+        )
+        try:
+            goalflight_ledger.write_record(ledger_record)
+        except OSError:
+            return _ClaimReconcileResult("pending", pending_reason="ledger_prelaunch_record_write_deferred")
+        return _ClaimReconcileResult("restored")
+    finally:
+        txn.release()
+        if published is not None and target is not None:
+            _restore_queued_record_from_entry(published, target)
+
+
 def _reconcile_ledger_prelaunch_orphans(
     queue_dir: Path,
     *,
@@ -9476,6 +9660,7 @@ def _reconcile_ledger_prelaunch_orphans(
     pending = 0
     quarantined = 0
     preserved = 0
+    restored = 0
     pending_reasons: list[dict] = []
     try:
         records = goalflight_ledger.read_records()
@@ -9485,6 +9670,7 @@ def _reconcile_ledger_prelaunch_orphans(
             "pending": 0,
             "quarantined": 0,
             "preserved": 0,
+            "restored": 0,
             "pending_reasons": [],
         }
 
@@ -9495,6 +9681,40 @@ def _reconcile_ledger_prelaunch_orphans(
         if not dispatch_id:
             continue
         entry = _ledger_request_entry(record)
+        if (
+            record.get("transport") != "fleet-ssh"
+            and not _claim_has_active_carrier(queue_dir, dispatch_id)
+            and _ledger_is_restorable_prelaunch(record)
+            and _entry_pre_worker(entry)
+        ):
+            admission = classify_reconciliation_admission(entry, now_s, stale_s=stale_s)
+            if ADMISSION_DECISION[admission] is AdmissionAction.ADMIT_TO_GATE:
+                outcome = _republish_prelaunch_queue_carrier(
+                    record,
+                    entry,
+                    queue_dir=queue_dir,
+                    reason="ledger_prelaunch_carrier_missing",
+                )
+                if outcome.action == "restored":
+                    restored += 1
+                else:
+                    pending += 1
+                    detail = outcome.pending_detail(dispatch_id)
+                    if detail is not None:
+                        pending_reasons.append(detail)
+                continue
+            # Do not fall through to the terminal continue: blocked_capacity
+            # is restorable but still terminal-labeled, and a silent skip
+            # here stranded the exact fire-and-forget row.
+            pending += 1
+            pending_reasons.append(
+                _ReconcileRefusal(
+                    ReconcileRefusalReason.PRE_ADMISSION_DEFERRED,
+                    admission,
+                    ADMISSION_DECISION[admission].value,
+                ).as_dict(dispatch_id)
+            )
+            continue
         if _dispatch_record_is_terminal(record):
             if (
                 not _claim_has_active_carrier(queue_dir, dispatch_id)
@@ -9592,6 +9812,21 @@ def _reconcile_ledger_prelaunch_orphans(
                 {"dispatch_id": dispatch_id, "reason": "orphan_not_stale"}
             )
             continue
+        if _ledger_is_restorable_prelaunch(record) and _entry_pre_worker(entry):
+            outcome = _republish_prelaunch_queue_carrier(
+                record,
+                entry,
+                queue_dir=queue_dir,
+                reason="ledger_prelaunch_carrier_missing",
+            )
+            if outcome.action == "restored":
+                restored += 1
+            else:
+                pending += 1
+                detail = outcome.pending_detail(dispatch_id)
+                if detail is not None:
+                    pending_reasons.append(detail)
+            continue
         if linked:
             mark_refusals = []
             if _mark_claim_worker_dead(
@@ -9629,6 +9864,7 @@ def _reconcile_ledger_prelaunch_orphans(
         "pending": pending,
         "quarantined": quarantined,
         "preserved": preserved,
+        "restored": restored,
         "pending_reasons": pending_reasons,
     }
 
@@ -10898,6 +11134,152 @@ def _run_drain_prelaunch_hook(agents: list[str]) -> None:
         pass
 
 
+class _DrainClaimGuard:
+    """Own a drain claim until launch consumes it or finally restores it.
+
+    Release is structural: ``__exit__`` always runs on return, continue, break,
+    and exception. A trailing restore call cannot be skipped by a new early
+    return. Pre-worker claims (no spawn intent) are restored to QUEUED;
+    post-spawn carriers stay pending for recovery. ``consume()`` is only for
+    paths that already resolved the carrier (launch cleanup, fail-mark).
+    """
+
+    def __init__(
+        self,
+        claim: Path,
+        entry: dict,
+        queue_dir: Path,
+        *,
+        stale_s: float,
+        dispatch_id: str,
+        acc: dict,
+    ) -> None:
+        self.claim = claim
+        self.entry = entry
+        self.queue_dir = queue_dir
+        self.stale_s = stale_s
+        self.dispatch_id = dispatch_id
+        self.acc = acc
+        self.consumed = False
+        self.allow_restore = True
+        self.release_reason = "claim_released_pre_worker"
+
+    def consume(
+        self,
+        *,
+        state: str,
+        reason: str | None = None,
+        extra: dict | None = None,
+        launched: bool = False,
+        left_queued: bool = False,
+        failed: bool = False,
+        pending: bool = False,
+    ) -> None:
+        self.consumed = True
+        if launched:
+            self.acc["launched"] += 1
+        if left_queued:
+            self.acc["left_queued"] += 1
+        if failed:
+            self.acc["failed"] += 1
+        if pending:
+            self.acc["pending_claims"] += 1
+        detail = {"dispatch_id": self.dispatch_id, "state": state}
+        if reason is not None:
+            detail["reason"] = reason
+        if extra:
+            detail.update(extra)
+        self.acc["details"].append(detail)
+
+    def __enter__(self) -> "_DrainClaimGuard":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self.consumed:
+            return False
+        if not self.claim.exists():
+            self.acc["pending_claims"] += 1
+            self.acc["details"].append(
+                {
+                    "dispatch_id": self.dispatch_id,
+                    "state": "claimed",
+                    "reason": "claim_missing_on_release",
+                }
+            )
+            return False
+        # TimeoutExpired SIGKILLs the child. Any other exception may leave a
+        # live launcher; restoring would replay it.
+        if exc_type is not None and exc_type is not subprocess.TimeoutExpired:
+            self.acc["pending_claims"] += 1
+            self.acc["failed"] += 1
+            self.acc["details"].append(
+                {
+                    "dispatch_id": self.dispatch_id,
+                    "state": "claimed",
+                    "reason": f"drain_exception_claim_held:{exc_type.__name__}",
+                }
+            )
+            return False
+        try:
+            observed = json.loads(self.claim.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            observed = None
+        if (
+            not self.allow_restore
+            or not isinstance(observed, dict)
+            or not _entry_pre_worker(observed)
+        ):
+            self.acc["pending_claims"] += 1
+            self.acc["failed"] += 1
+            self.acc["details"].append(
+                {
+                    "dispatch_id": self.dispatch_id,
+                    "state": "claimed",
+                    "reason": self.release_reason,
+                }
+            )
+            return False
+        restored, decision = _restore_claim_if_incomplete(
+            self.claim,
+            self.entry,
+            self.queue_dir,
+            stale_s=self.stale_s,
+        )
+        if decision is not None:
+            self.acc["details"].append(_drain_decision_detail(self.dispatch_id, decision))
+            if _completion_decision_is_deferred(decision):
+                self.acc["pending_claims"] += 1
+            return False
+        if restored is None:
+            uncommitted = (
+                "capacity_restore_uncommitted"
+                if self.release_reason == "capacity_unavailable"
+                else "remote_blocked_restore_uncommitted"
+                if self.release_reason.startswith("remote_blocked:")
+                else f"{self.release_reason}_uncommitted"
+            )
+            self.acc["pending_claims"] += 1
+            self.acc["failed"] += 1
+            self.acc["details"].append(
+                {
+                    "dispatch_id": self.dispatch_id,
+                    "state": "claimed",
+                    "reason": uncommitted,
+                }
+            )
+            return False
+        _restore_queued_record_from_entry(self.entry, restored)
+        self.acc["left_queued"] += 1
+        self.acc["details"].append(
+            {
+                "dispatch_id": self.dispatch_id,
+                "state": "queued",
+                "reason": self.release_reason,
+            }
+        )
+        return False
+
+
 def _drain_queue_once(args) -> dict:
     queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else _dispatch_queue_dir()
     queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -10975,6 +11357,13 @@ def _drain_queue_once(args) -> dict:
         entries = entries[: args.limit]
     if not remote_node and entries:
         _run_drain_prelaunch_hook(_pass_agent_labels(entries))
+    drain_acc = {
+        "launched": launched,
+        "left_queued": left_queued,
+        "failed": failed,
+        "pending_claims": pending_claims,
+        "details": details,
+    }
     for _sort_key, path, _scan_entry, _scan_read_error in entries:
         claim_error: Exception | None = None
         entry: dict | None = None
@@ -11010,7 +11399,7 @@ def _drain_queue_once(args) -> dict:
         if claim is None:
             continue
         if claim_error is not None or entry is None:
-            failed += 1
+            drain_acc["failed"] += 1
             if entry is not None:
                 details.append(
                     {
@@ -11021,255 +11410,171 @@ def _drain_queue_once(args) -> dict:
                 )
             continue
         dispatch_id = str(entry.get("dispatch_id") or path.stem)
-        launch_argv = _drain_launch_argv(
-            list(entry.get("dispatch_argv") or []),
-            capacity_wait_s=args.capacity_wait_s,
-            queue_launch_token=launch_token,
-            queue_claim_path=claim,
-        )
-        if not launch_argv:
-            failed += 1
-            committed = _mark_claim_failed(claim, entry, reason="missing_dispatch_argv")
-            # Every other refusal in this loop appends a detail; this one did
-            # not, so the submitter saw only the generic failure COUNT and no
-            # reason — the exact blindness the per-entry reporter exists to
-            # remove. Report the DURABLE state: the mark writes "failed", but
-            # it declines to write at all on a launch-token race, and claiming
-            # "failed" then would describe a write that did not happen.
-            details.append(
-                {
-                    "dispatch_id": dispatch_id,
-                    "state": "failed" if committed else "claimed",
-                    "reason": "missing_dispatch_argv",
-                }
+        with _DrainClaimGuard(
+            claim,
+            entry,
+            queue_dir,
+            stale_s=args.claim_stale_s,
+            dispatch_id=dispatch_id,
+            acc=drain_acc,
+        ) as lease:
+            launch_argv = _drain_launch_argv(
+                list(entry.get("dispatch_argv") or []),
+                capacity_wait_s=args.capacity_wait_s,
+                queue_launch_token=launch_token,
+                queue_claim_path=claim,
             )
-            continue
-        timeout_s = max(20.0, float(args.capacity_wait_s or 0.0) + 45.0)
-        try:
-            if remote_node:
-                proc = _drain_launch_remote_claim(
-                    args,
+            if not launch_argv:
+                committed = _mark_claim_failed(claim, entry, reason="missing_dispatch_argv")
+                # Every other refusal in this loop appends a detail; this one did
+                # not, so the submitter saw only the generic failure COUNT and no
+                # reason — the exact blindness the per-entry reporter exists to
+                # remove. Report the DURABLE state: the mark writes "failed", but
+                # it declines to write at all on a launch-token race, and claiming
+                # "failed" then would describe a write that did not happen.
+                lease.consume(
+                    state="failed" if committed else "claimed",
+                    reason="missing_dispatch_argv",
+                    failed=True,
+                    pending=not committed,
+                )
+                continue
+            timeout_s = max(20.0, float(args.capacity_wait_s or 0.0) + 45.0)
+            try:
+                if remote_node:
+                    proc = _drain_launch_remote_claim(
+                        args,
+                        entry,
+                        dispatch_id=dispatch_id,
+                        launch_token=launch_token,
+                        claim=claim,
+                    )
+                else:
+                    proc = subprocess.run(
+                        [sys.executable, str(Path(__file__).resolve()), *launch_argv],
+                        cwd=str(Path(entry.get("process_cwd") or entry.get("project_root") or Path.cwd()).resolve()),
+                        env=os.environ.copy(),
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=timeout_s,
+                    )
+            except _RemoteDrainBlocked as exc:
+                lease.release_reason = f"remote_blocked:{exc.code}:{exc}"
+                continue
+            except subprocess.TimeoutExpired:
+                lease.release_reason = "launch_timeout_pending_ledger"
+                continue
+            stdout_launched = proc.returncode == 0 and "DISPATCH-LAUNCHED " in proc.stdout
+            # Drain launch accounting: a token-matched worker_pid means launch occurred
+            # (worker may already be dead). Recovery must NOT treat that weak presence
+            # as "claim safe to drop without terminalizing" — see
+            # _recover_claimed_queue_entries (require_live_nonterminal) + ledger-only
+            # orphan scan. Clearing the claim here is fine because reconcile will
+            # terminalize a task-linked zombie from the ledger.
+            ledger_confirmed = _dispatch_has_worker_record(
+                dispatch_id,
+                queue_launch_token=launch_token,
+            )
+            no_capacity = proc.returncode == 2 and "blocked_capacity" in (proc.stdout + proc.stderr)
+            if stdout_launched and ledger_confirmed:
+                carrier_cleanup = _positive_live_carrier_cleanup(
+                    claim,
                     entry,
-                    dispatch_id=dispatch_id,
-                    launch_token=launch_token,
-                    claim=claim,
+                    queue_dir,
+                    # This drain just ledger-confirmed the launch (token-matched
+                    # record), so the carrier is redundant even if a fast worker
+                    # already exited; reconcile terminalizes from the ledger.
+                    worker_record_sufficient=True,
+                    stale_s=args.claim_stale_s,
                 )
-            else:
-                proc = subprocess.run(
-                    [sys.executable, str(Path(__file__).resolve()), *launch_argv],
-                    cwd=str(Path(entry.get("process_cwd") or entry.get("project_root") or Path.cwd()).resolve()),
-                    env=os.environ.copy(),
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=timeout_s,
-                )
-        except _RemoteDrainBlocked as exc:
-            restored, decision = _restore_claim_if_incomplete(
-                claim,
-                entry,
-                queue_dir,
-                stale_s=args.claim_stale_s,
-            )
-            if decision is not None:
-                details.append(_drain_decision_detail(dispatch_id, decision))
-                if _completion_decision_is_deferred(decision):
-                    pending_claims += 1
+                if carrier_cleanup == "pending":
+                    # Launch is durably ledger-confirmed, but the carrier could
+                    # not be cleared: surface it instead of silently reporting
+                    # success. "launched" means launched AND carrier resolved, so
+                    # a pending cleanup is counted as pending only — never as a
+                    # launch.
+                    _alert_launched_carrier_pending(dispatch_id, where="drain")
+                    lease.consume(
+                        state="claimed",
+                        reason="launched_carrier_cleanup_pending",
+                        pending=True,
+                    )
+                else:
+                    lease.consume(state="launched", launched=True)
                 continue
-            if restored is None:
-                pending_claims += 1
-                failed += 1
-                details.append(
-                    {
-                        "dispatch_id": dispatch_id,
-                        "state": "claimed",
-                        "reason": "remote_blocked_restore_uncommitted",
-                    }
-                )
+            if no_capacity:
+                lease.release_reason = "capacity_unavailable"
                 continue
-            _restore_queued_record_from_entry(entry, restored)
-            left_queued += 1
-            details.append(
-                {
-                    "dispatch_id": dispatch_id,
-                    "state": "queued",
-                    "reason": f"remote_blocked:{exc.code}:{exc}",
-                }
-            )
-            continue
-        except subprocess.TimeoutExpired:
-            pending_claims += 1
-            failed += 1
-            details.append(
-                {
-                    "dispatch_id": dispatch_id,
-                    "state": "claimed",
-                    "reason": "launch_timeout_pending_ledger",
-                }
-            )
-            continue
-        stdout_launched = proc.returncode == 0 and "DISPATCH-LAUNCHED " in proc.stdout
-        # Drain launch accounting: a token-matched worker_pid means launch occurred
-        # (worker may already be dead). Recovery must NOT treat that weak presence
-        # as "claim safe to drop without terminalizing" — see
-        # _recover_claimed_queue_entries (require_live_nonterminal) + ledger-only
-        # orphan scan. Clearing the claim here is fine because reconcile will
-        # terminalize a task-linked zombie from the ledger.
-        ledger_confirmed = _dispatch_has_worker_record(
-            dispatch_id,
-            queue_launch_token=launch_token,
-        )
-        no_capacity = proc.returncode == 2 and "blocked_capacity" in (proc.stdout + proc.stderr)
-        if stdout_launched and ledger_confirmed:
-            carrier_cleanup = _positive_live_carrier_cleanup(
-                claim,
-                entry,
-                queue_dir,
-                # This drain just ledger-confirmed the launch (token-matched
-                # record), so the carrier is redundant even if a fast worker
-                # already exited; reconcile terminalizes from the ledger.
-                worker_record_sufficient=True,
-                stale_s=args.claim_stale_s,
-            )
-            if carrier_cleanup == "pending":
-                # Launch is durably ledger-confirmed, but the carrier could
-                # not be cleared: surface it instead of silently reporting
-                # success. "launched" means launched AND carrier resolved, so
-                # a pending cleanup is counted as pending only — never as a
-                # launch.
-                pending_claims += 1
-                _alert_launched_carrier_pending(dispatch_id, where="drain")
-                details.append(
-                    {
-                        "dispatch_id": dispatch_id,
-                        "state": "claimed",
-                        "reason": "launched_carrier_cleanup_pending",
-                    }
-                )
-            else:
-                launched += 1
-                details.append({"dispatch_id": dispatch_id, "state": "launched"})
-            continue
-        if no_capacity:
-            restored, decision = _restore_claim_if_incomplete(
-                claim,
-                entry,
-                queue_dir,
-                stale_s=args.claim_stale_s,
-            )
-            if decision is not None:
-                details.append(_drain_decision_detail(dispatch_id, decision))
-                if _completion_decision_is_deferred(decision):
-                    pending_claims += 1
+            if stdout_launched and not ledger_confirmed:
+                # Stdout is not launch proof. Keep the carrier pending until a
+                # token-matched ledger row exists; restoring would replay.
+                lease.allow_restore = False
+                lease.release_reason = f"launch_failed_pending_ledger:{proc.returncode}"
                 continue
-            if restored is None:
-                pending_claims += 1
-                failed += 1
-                details.append(
-                    {
-                        "dispatch_id": dispatch_id,
-                        "state": "claimed",
-                        "reason": "capacity_restore_uncommitted",
-                    }
+            if ledger_confirmed:
+                carrier_cleanup = _positive_live_carrier_cleanup(
+                    claim,
+                    entry,
+                    queue_dir,
+                    # This drain just ledger-confirmed the launch (token-matched
+                    # record), so the carrier is redundant even if a fast worker
+                    # already exited; reconcile terminalizes from the ledger.
+                    worker_record_sufficient=True,
+                    stale_s=args.claim_stale_s,
                 )
+                if carrier_cleanup == "pending":
+                    # Same accounting contract as the stdout_launched branch: a
+                    # pending cleanup is pending, not a launch.
+                    _alert_launched_carrier_pending(dispatch_id, where="drain")
+                    lease.consume(
+                        state="claimed",
+                        reason="worker_record_present_carrier_cleanup_pending",
+                        pending=True,
+                    )
+                else:
+                    lease.consume(
+                        state="launched",
+                        reason="worker_record_present",
+                        launched=True,
+                    )
                 continue
-            _restore_queued_record_from_entry(entry, restored)
-            left_queued += 1
-            details.append({"dispatch_id": dispatch_id, "state": "queued", "reason": "capacity_unavailable"})
-            continue
-        if ledger_confirmed:
-            carrier_cleanup = _positive_live_carrier_cleanup(
-                claim,
-                entry,
-                queue_dir,
-                # This drain just ledger-confirmed the launch (token-matched
-                # record), so the carrier is redundant even if a fast worker
-                # already exited; reconcile terminalizes from the ledger.
-                worker_record_sufficient=True,
-                stale_s=args.claim_stale_s,
-            )
-            if carrier_cleanup == "pending":
-                # Same accounting contract as the stdout_launched branch: a
-                # pending cleanup is pending, not a launch.
-                pending_claims += 1
-                _alert_launched_carrier_pending(dispatch_id, where="drain")
-                details.append(
-                    {
-                        "dispatch_id": dispatch_id,
-                        "state": "claimed",
-                        "reason": "worker_record_present_carrier_cleanup_pending",
-                    }
-                )
-            else:
-                launched += 1
-                details.append({"dispatch_id": dispatch_id, "state": "launched", "reason": "worker_record_present"})
-            continue
-        try:
-            observed_claim = json.loads(claim.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            observed_claim = None
-        if (
-            proc.returncode != 0
-            and isinstance(observed_claim, dict)
-            and observed_claim.get("queue_launch_token") == launch_token
-            and _entry_pre_spawn(observed_claim)
-        ):
-            permanent_reason = _permanent_pre_spawn_refusal_reason(proc)
-            if permanent_reason:
-                # Inert flag combo / unsupported sandbox: waiting cannot
-                # make it valid. Restore-to-queued is the silent stick.
-                failed += 1
-                committed = _mark_claim_failed(
-                    claim, entry, reason=permanent_reason
-                )
-                details.append(
-                    {
-                        "dispatch_id": dispatch_id,
-                        "state": "failed" if committed else "claimed",
-                        "reason": permanent_reason,
-                    }
-                )
+            try:
+                observed_claim = json.loads(claim.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                observed_claim = None
+            if (
+                proc.returncode != 0
+                and isinstance(observed_claim, dict)
+                and observed_claim.get("queue_launch_token") == launch_token
+                and _entry_pre_worker(observed_claim)
+            ):
+                permanent_reason = _permanent_pre_spawn_refusal_reason(proc)
+                if permanent_reason:
+                    # Inert flag combo / unsupported sandbox: waiting cannot
+                    # make it valid. Restore-to-queued is the silent stick.
+                    committed = _mark_claim_failed(
+                        claim, entry, reason=permanent_reason
+                    )
+                    lease.consume(
+                        state="failed" if committed else "claimed",
+                        reason=permanent_reason,
+                        failed=True,
+                        pending=not committed,
+                    )
+                    continue
+                lease.release_reason = f"launch_refused_pre_spawn:{proc.returncode}"
                 continue
-            restored, decision = _restore_claim_if_incomplete(
-                claim,
-                entry,
-                queue_dir,
-                stale_s=args.claim_stale_s,
-            )
-            if decision is not None:
-                details.append(_drain_decision_detail(dispatch_id, decision))
-                if _completion_decision_is_deferred(decision):
-                    pending_claims += 1
-                continue
-            if restored is not None:
-                _restore_queued_record_from_entry(entry, restored)
-                left_queued += 1
-                details.append(
-                    {
-                        "dispatch_id": dispatch_id,
-                        "state": "queued",
-                        "reason": f"launch_refused_pre_spawn:{proc.returncode}",
-                    }
-                )
-                continue
-        pending_claims += 1
-        failed += 1
-        details.append(
-            {
-                "dispatch_id": dispatch_id,
-                "state": "claimed",
-                "reason": f"launch_failed_pending_ledger:{proc.returncode}",
-            }
-        )
+            lease.release_reason = f"launch_failed_pending_ledger:{proc.returncode}"
     remaining = len(list(queue_dir.glob("*.json")))
     return {
         "schema": f"{DISPATCH_QUEUE_SCHEMA}.drain.v1",
         "queue_dir": str(queue_dir),
-        "launched": launched,
-        "left_queued": left_queued,
-        "failed": failed,
+        "launched": drain_acc["launched"],
+        "left_queued": drain_acc["left_queued"],
+        "failed": drain_acc["failed"],
         "remaining": remaining,
-        "pending_claims": pending_claims,
+        "pending_claims": drain_acc["pending_claims"],
         "recovered_claims": recovery,
         "abandoned_reconciliation": abandoned_reconciliation,
         "details": details,
