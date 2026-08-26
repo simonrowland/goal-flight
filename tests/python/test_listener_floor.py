@@ -398,7 +398,7 @@ def test_detached_single_call_is_refused_not_a_floor(
             pass
 
 
-def test_arming_at_target_does_not_overshoot(
+def test_arming_past_target_is_not_refused(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
     project, env = isolated
@@ -424,17 +424,17 @@ def test_arming_at_target_does_not_overshoot(
         assert plan["command"] == command
         assert "commands" not in plan
         assert "hint" not in plan
-        refused = subprocess.run(
-            _listen_cmd(project, label="floor-ctl", nonce=lease.nonce, timeout_s=2),
-            cwd=project,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
+        extra = wake.register_listener_waiter(
+            project,
+            controller_label="floor-ctl",
+            generation_key=lease.nonce,
         )
-        assert refused.returncode == 3
-        assert "listener slots hold live doorbells" in refused.stderr
+        try:
+            live = wake.live_waiters(project, controller_label="floor-ctl") or []
+            assert len(live) == wake.DEFAULT_LISTENER_SLOTS + 1
+            assert extra.slot_index == wake.DEFAULT_LISTENER_SLOTS
+        finally:
+            extra.close()
         live = wake.live_waiters(project, controller_label="floor-ctl") or []
         assert len(live) == wake.DEFAULT_LISTENER_SLOTS
     finally:

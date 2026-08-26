@@ -81,10 +81,14 @@ def _backups(project: Path, lease: journal.LeaseIdentity, count: int) -> ExitSta
     return stack
 
 
-def test_persistent_wake_target_defaults_to_eight() -> None:
+def test_persistent_wake_target_defaults_to_eight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", raising=False)
+    monkeypatch.delenv("GOALFLIGHT_LISTENER_SLOTS", raising=False)
     assert wake.DEFAULT_LISTENER_SLOTS == 4
     assert wake.DEFAULT_PERSISTENT_BACKUP_SLOTS == 6
-    assert wake.MAX_LISTENER_SLOTS == 32
+    assert not hasattr(wake, "MAX_LISTENER_SLOTS")
     assert wake.PERSISTENT_WAKE_TARGET == 8
     assert wake.persistent_backup_slot_count() == 6
     assert wake.persistent_wake_target() == 8
@@ -106,19 +110,19 @@ def test_persistent_backup_slots_env_override_and_validation(
     assert wake.persistent_wake_target() == 3
     monkeypatch.setenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", "32")
     assert wake.persistent_backup_slot_count() == 32
+    monkeypatch.setenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", "40")
+    assert wake.persistent_backup_slot_count() == 40
+    assert wake.persistent_wake_target() == 42
     monkeypatch.setenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", "0")
-    with pytest.raises(ValueError, match="between 1 and"):
-        wake.persistent_backup_slot_count()
-    monkeypatch.setenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", "33")
-    with pytest.raises(ValueError, match="between 1 and"):
+    with pytest.raises(ValueError, match="at least 1"):
         wake.persistent_backup_slot_count()
     monkeypatch.setenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", "nope")
     with pytest.raises(ValueError, match="integer"):
         wake.persistent_backup_slot_count()
-    with pytest.raises(ValueError, match="between 1 and"):
+    with pytest.raises(ValueError, match="at least 1"):
         wake.persistent_backup_slot_count(0)
-    with pytest.raises(ValueError, match="between 1 and"):
-        wake.persistent_backup_slot_count(33)
+    assert wake.persistent_backup_slot_count(33) == 33
+    assert wake.persistent_backup_slot_count(40) == 40
 
 
 def test_portable_listener_slots_remain_a_different_knob(

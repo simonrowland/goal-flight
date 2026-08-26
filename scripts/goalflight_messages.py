@@ -5431,7 +5431,7 @@ def cmd_follow(args) -> int:
             generation_key=nonce,
         )
         task_store = goalflight_task.TaskStore(project_root)
-    except goalflight_wake.ListenerSlotsFull:
+    except BlockingIOError:
         print(
             "follow: this controller lease already has a persistent stream",
             file=sys.stderr,
@@ -5685,7 +5685,7 @@ def _cmd_watch_follow(
             controller_label=label,
             generation_key=nonce,
         )
-    except goalflight_wake.ListenerSlotsFull:
+    except BlockingIOError:
         print(
             "listen: this controller generation already has a live follow watchdog",
             file=sys.stderr,
@@ -5835,6 +5835,14 @@ def cmd_listen(args) -> int:
     """One-shot journal cursor listener; its exit is the wake.
 
     Self-resolves the journal ACTIVE lease when ``--lease-nonce`` is omitted.
+
+    Arming never refuses for pool depth: a waiter takes the first free
+    listener slot with no upper bound. ``--listener-slots`` /
+    ``$GOALFLIGHT_LISTENER_SLOTS`` is the target depth the supervisor
+    chooses to run (live/target), not a ceiling.
+
+    Exit 3 means mail pending only. It is not a full-pool refusal; that
+    overload is gone.
     """
     import goalflight_journal  # type: ignore
     import goalflight_session_status as sessions  # type: ignore
@@ -5927,22 +5935,6 @@ def cmd_listen(args) -> int:
             generation_key=nonce,
             slots=listener_slots,
         )
-    except goalflight_wake.ListenerSlotsFull:
-        holder_pids = goalflight_wake.listener_slot_holder_pids(
-            project_root,
-            controller_label=label,
-        )
-        targets = ", ".join(str(pid) for pid in holder_pids) or "unknown"
-        print(
-            f"listen: all {listener_slots} listener slots hold live doorbells — "
-            "likely your own tracked tasks; do NOT kill by pattern "
-            f"(targets: {targets})",
-            file=sys.stderr,
-        )
-        return 3
-    except BlockingIOError:
-        print("listen: listener generation already has a live doorbell", file=sys.stderr)
-        return 3
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"listen: wake ledger registration failed: {exc}", file=sys.stderr)
         return 2
@@ -6790,8 +6782,9 @@ def _run_cli(argv: list[str] | None = None) -> int:
             type=int,
             default=None,
             help=(
-                "bounded one-shot pool size; defaults to GOALFLIGHT_LISTENER_SLOTS "
-                f"or {goalflight_wake.DEFAULT_LISTENER_SLOTS}"
+                "target doorbell depth (how many to run; live/target), not a "
+                "ceiling; defaults to GOALFLIGHT_LISTENER_SLOTS or "
+                f"{goalflight_wake.DEFAULT_LISTENER_SLOTS}"
             ),
         )
         command_parser.add_argument(
@@ -6838,11 +6831,21 @@ def _run_cli(argv: list[str] | None = None) -> int:
             "one-shot journal cursor listener; self-resolves the ACTIVE lease "
             "unless --lease-nonce pins one"
         ),
+        description=(
+            "one-shot journal cursor listener; self-resolves the ACTIVE lease "
+            "unless --lease-nonce pins one. Exit 3 means mail pending only, "
+            "never a full listener pool. --listener-slots is how many doorbells "
+            "to run (live/target), not a ceiling."
+        ),
     )
     add_listen_arguments(listen)
     listen_auto = sub.add_parser(
         "listen-auto",
         help="alias for listen (kept for live fleet and SessionStart invocations)",
+        description=(
+            "alias for listen. Exit 3 means mail pending only, never a full "
+            "listener pool."
+        ),
     )
     add_listen_arguments(listen_auto)
 

@@ -53,25 +53,16 @@ MONITOR_STATE_SCHEMA = "goalflight.monitor-state.v1"
 _OBSERVED_WAITERS_UNSET = object()
 _LEASE_EVENT_SCHEMA = "goalflight.lease-generation-event.v1"
 # Depth is resilience, not efficiency: one event wakes exactly one slot, so
-# the remaining slots are the margin for a controller that forgets to re-arm.
-# 4 survives three consecutive missed re-arms. Override with
-# GOALFLIGHT_LISTENER_SLOTS; MAX_LISTENER_SLOTS stays 32.
+# extra armed waiters are the margin for a controller that forgets to re-arm.
+# GOALFLIGHT_LISTENER_SLOTS is how many doorbells the supervisor chooses to
+# run (live/target), not a ceiling on how many may arm.
 # This knob is portable-pool only. Persistent backup depth is
 # DEFAULT_PERSISTENT_BACKUP_SLOTS / GOALFLIGHT_PERSISTENT_BACKUP_SLOTS.
 DEFAULT_LISTENER_SLOTS = 4
-MAX_LISTENER_SLOTS = 32
 # Persistent wake has three roles: 1 stream, N backup doorbells, 1 watchdog.
 # Only the doorbell is a pool. Override with GOALFLIGHT_PERSISTENT_BACKUP_SLOTS.
 DEFAULT_PERSISTENT_BACKUP_SLOTS = 6
 PERSISTENT_WAKE_TARGET = 1 + DEFAULT_PERSISTENT_BACKUP_SLOTS + 1
-
-
-class ListenerSlotsFull(BlockingIOError):
-    """Every bounded one-shot listener slot is held by a live process."""
-
-    def __init__(self, slots: int) -> None:
-        self.slots = slots
-        super().__init__(errno.EAGAIN, f"all {slots} listener slots are held")
 
 
 @dataclass(frozen=True)
@@ -1402,44 +1393,43 @@ class WaiterRegistration:
             )
             if normalized_generation is not None:
                 if generation_slots is None:
-                    candidates = [
-                        _generation_lock_path(
-                            project_root,
-                            kind=kind,
-                            label=normalized_label,
-                            generation_key=normalized_generation,
-                        )
-                    ]
+                    candidate = _generation_lock_path(
+                        project_root,
+                        kind=kind,
+                        label=normalized_label,
+                        generation_key=normalized_generation,
+                    )
+                    generation_fd = _acquire_contended_lock(
+                        candidate,
+                        directory_fd=self._directory_fd,
+                    )
+                    self._generation_path = candidate
+                    self._generation_fd = generation_fd
+                    self.slot_index = None
                 else:
                     if kind != "listener":
                         raise ValueError("generation slots are only valid for listeners")
-                    if not 1 <= generation_slots <= MAX_LISTENER_SLOTS:
-                        raise ValueError(
-                            f"listener slots must be between 1 and {MAX_LISTENER_SLOTS}"
-                        )
-                    candidates = [
-                        _listener_slot_lock_path(
+                    # Target depth is not a ceiling: take the first free
+                    # listener-slot-N lock with no upper bound.
+                    slot = 0
+                    while self._generation_fd < 0:
+                        candidate = _listener_slot_lock_path(
                             project_root,
                             label=normalized_label,
                             generation_key=normalized_generation,
                             slot=slot,
                         )
-                        for slot in range(generation_slots)
-                    ]
-                for slot, candidate in enumerate(candidates):
-                    try:
-                        generation_fd = _acquire_contended_lock(
-                            candidate,
-                            directory_fd=self._directory_fd,
-                        )
-                    except BlockingIOError:
-                        continue
-                    self._generation_path = candidate
-                    self._generation_fd = generation_fd
-                    self.slot_index = slot if generation_slots is not None else None
-                    break
-                if self._generation_fd < 0:
-                    raise ListenerSlotsFull(len(candidates))
+                        try:
+                            generation_fd = _acquire_contended_lock(
+                                candidate,
+                                directory_fd=self._directory_fd,
+                            )
+                        except BlockingIOError:
+                            slot += 1
+                            continue
+                        self._generation_path = candidate
+                        self._generation_fd = generation_fd
+                        self.slot_index = slot
             pending_name = f".{record_name}.{uuid.uuid4().hex}.pending"
             self._fd = os.open(
                 pending_name,
@@ -1763,7 +1753,11 @@ def listener_low_water(target: int | None = None) -> int:
 
 
 def listener_slot_count(value: object = None) -> int:
-    """Resolve and validate the bounded listener-pool size."""
+    """Resolve the listener-pool target depth (how many doorbells to run).
+
+    This is not a ceiling on concurrent waiters. Registration takes the
+    first free slot with no upper bound.
+    """
     raw = value
     if raw is None:
         raw = os.environ.get("GOALFLIGHT_LISTENER_SLOTS", str(DEFAULT_LISTENER_SLOTS))
@@ -1771,13 +1765,17 @@ def listener_slot_count(value: object = None) -> int:
         slots = int(str(raw))
     except (TypeError, ValueError) as exc:
         raise ValueError("listener slots must be an integer") from exc
-    if not 1 <= slots <= MAX_LISTENER_SLOTS:
-        raise ValueError(f"listener slots must be between 1 and {MAX_LISTENER_SLOTS}")
+    if slots < 1:
+        raise ValueError("listener slots must be at least 1")
     return slots
 
 
 def persistent_backup_slot_count(value: object = None) -> int:
-    """Resolve and validate the persistent backup-doorbell pool size."""
+    """Resolve the persistent backup-doorbell target depth.
+
+    This is not a ceiling on concurrent waiters. Registration takes the
+    first free slot with no upper bound.
+    """
     raw = value
     if raw is None:
         raw = os.environ.get(
@@ -1788,10 +1786,8 @@ def persistent_backup_slot_count(value: object = None) -> int:
         slots = int(str(raw))
     except (TypeError, ValueError) as exc:
         raise ValueError("persistent backup slots must be an integer") from exc
-    if not 1 <= slots <= MAX_LISTENER_SLOTS:
-        raise ValueError(
-            f"persistent backup slots must be between 1 and {MAX_LISTENER_SLOTS}"
-        )
+    if slots < 1:
+        raise ValueError("persistent backup slots must be at least 1")
     return slots
 
 
@@ -1807,7 +1803,11 @@ def register_listener_waiter(
     generation_key: str,
     slots: int | None = None,
 ) -> WaiterRegistration:
-    """Take the first free listener-slot-N lock for one lease generation."""
+    """Take the first free listener-slot-N lock for one lease generation.
+
+    ``slots`` selects the target depth (how many to run). It is not a
+    ceiling; this always takes the first free slot.
+    """
     resolved_slots = listener_slot_count(slots)
     return register_waiter(
         project_root,

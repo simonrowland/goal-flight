@@ -2505,16 +2505,15 @@ def test_second_listener_supersedes_first_and_listener_never_renews_lease(
     assert after.renew_deadline_at == before.renew_deadline_at
 
 
-def test_second_real_doorbell_loses_generation_lock_and_first_wakes_body_free(
+def test_second_real_doorbell_takes_next_slot_and_first_wakes_body_free(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     env = _set_state_env(monkeypatch, tmp_path)
     env["GOALFLIGHT_TEST_LISTENER_START_TOKEN"] = "constructed-listener-token"
-    # Slot pools made a second doorbell legitimate; this test is about the
-    # contention refusal itself, so it pins a single-slot pool and asserts the
-    # FIRST surplus listener is refused. Pool-depth behavior is covered by the
-    # listener-pool tests.
+    # Target depth 1 is how many to run, not a ceiling: a second doorbell
+    # must take the next free slot. Release it before the ring so the first
+    # uniquely receives the mail.
     env["GOALFLIGHT_LISTENER_SLOTS"] = "1"
     monkeypatch.setenv("GOALFLIGHT_LISTENER_SLOTS", "1")
     project = _project(tmp_path)
@@ -2541,7 +2540,6 @@ def test_second_real_doorbell_loses_generation_lock_and_first_wakes_body_free(
         "--json",
     ]
     first = subprocess.Popen(command, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    second: subprocess.Popen[str] | None = None
     try:
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
@@ -2552,14 +2550,23 @@ def test_second_real_doorbell_loses_generation_lock_and_first_wakes_body_free(
         else:
             pytest.fail("first listener never armed coverage")
 
-        second = subprocess.Popen(command, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        second_stdout, second_stderr = second.communicate(timeout=3)
-        assert second.returncode == 3, (second_stdout, second_stderr)
-        # The refusal is actionable now: it names the slot budget and the
-        # holder pids, and warns against pattern-kills (a broad pkill once
-        # took out a sibling session's doorbell).
-        assert "listener slots hold live doorbells" in second_stderr
-        assert "do NOT kill by pattern" in second_stderr
+        extra = wake.register_listener_waiter(
+            project,
+            controller_label="controller",
+            generation_key=lease.nonce,
+            slots=1,
+        )
+        try:
+            assert extra.slot_index == 1
+            live = (
+                wake.live_waiters(
+                    project, controller_label="controller", kinds={"listener"}
+                )
+                or []
+            )
+            assert len(live) >= 2
+        finally:
+            extra.close()
 
         messages.post_message(
             dispatch_id="listener-real",
@@ -2589,10 +2596,9 @@ def test_second_real_doorbell_loses_generation_lock_and_first_wakes_body_free(
         assert doorbell["rearm"]["work_in_flight"] is True
         assert doorbell["rearm"]["missing"] >= 1
     finally:
-        for process in (first, second):
-            if process is not None and process.poll() is None:
-                process.terminate()
-                process.wait(timeout=2)
+        if first.poll() is None:
+            first.terminate()
+            first.wait(timeout=2)
 
     rows = authority.read_all(
         "SELECT state, exit_reason FROM listener_coverage ORDER BY armed_at, coverage_id"

@@ -253,11 +253,8 @@ def _configured_pool_size() -> int:
 
 
 def _assert_arbitration_pool_legal(slots: int) -> int:
-    """Explicit N-listener arbitration fixture; must stay under the slot ceiling."""
-    assert 1 <= slots <= wake.MAX_LISTENER_SLOTS, (
-        f"arbitration fixture of {slots} exceeds MAX_LISTENER_SLOTS="
-        f"{wake.MAX_LISTENER_SLOTS}"
-    )
+    """Explicit N-listener arbitration fixture; depth is a target, not a cap."""
+    assert slots >= 1, f"arbitration fixture of {slots} is not a positive depth"
     return slots
 
 
@@ -846,8 +843,11 @@ def test_listener_pool_defaults_to_the_configured_depth(
     assert _configured_pool_size() == wake.DEFAULT_LISTENER_SLOTS
     monkeypatch.setenv("GOALFLIGHT_LISTENER_SLOTS", "3")
     assert wake.listener_slot_count() == 3
-    with pytest.raises(ValueError, match="between 1 and"):
+    assert wake.listener_slot_count(40) == 40
+    with pytest.raises(ValueError, match="at least 1"):
         wake.listener_slot_count(0)
+    assert not hasattr(wake, "MAX_LISTENER_SLOTS")
+    assert not hasattr(wake, "ListenerSlotsFull")
 
 
 def test_listener_reserve_hint_prints_one_command_per_missing_slot() -> None:
@@ -1032,7 +1032,7 @@ def test_cursor_advance_with_leftovers_pops_one_more_pool_member(
             process.communicate(timeout=3)
 
 
-def test_listener_slot_exhaustion_is_actionable_then_hint_reports_n_zero(
+def test_listener_arm_past_target_is_not_refused_then_empty_pool_hint(
     isolated: tuple[Path, dict[str, str]],
     tmp_path: Path,
 ) -> None:
@@ -1061,27 +1061,21 @@ def test_listener_slot_exhaustion_is_actionable_then_hint_reports_n_zero(
         )
         for _index in range(3)
     ]
+    extra = None
     try:
         waiters = _wait_for_listener_count(root, label="wake-test", count=3)
-        contender = subprocess.run(
-            command,
-            cwd=root,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
+        assert len(waiters) == 3
+        extra = wake.register_listener_waiter(
+            root,
+            controller_label="wake-test",
+            generation_key=claimed.value.nonce,
+            slots=3,
         )
-        assert contender.returncode == 3
-        assert contender.stdout == ""
-        assert len(contender.stderr.splitlines()) == 1
-        assert "all 3 listener slots hold live doorbells" in contender.stderr
-        assert "do NOT kill by pattern" in contender.stderr
-        assert all(str(row.pid) in contender.stderr for row in waiters)
+        assert extra.slot_index == 3
         assert all(process.poll() is None for process in processes)
+        extra.close()
+        extra = None
 
-        # Removing the slot-lock acquisition lets this fourth process arm; the
-        # refusal above and the three-PID witness are the mutation-killing pair.
         for index in range(3):
             _post_notice(
                 root,
@@ -1110,10 +1104,96 @@ def test_listener_slot_exhaustion_is_actionable_then_hint_reports_n_zero(
         assert status_payload["live_waiters"] == 0
         assert stream.getvalue().startswith("listener pool n=0; start: ")
     finally:
+        if extra is not None:
+            extra.close()
         for process in processes:
             if process.poll() is None:
                 process.kill()
             process.communicate(timeout=3)
+
+
+def test_listener_arm_has_no_slot_ceiling(
+    isolated: tuple[Path, dict[str, str]],
+    tmp_path: Path,
+) -> None:
+    root, env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test", principal={"principal_id": "uncapped-arm"}
+    )
+    assert claimed.committed and claimed.value is not None
+    nonce = claimed.value.nonce
+    holders: list[wake.WaiterRegistration] = []
+    try:
+        for expected_slot in range(40):
+            holder = wake.register_listener_waiter(
+                root,
+                controller_label="wake-test",
+                generation_key=nonce,
+                slots=4,
+            )
+            holders.append(holder)
+            assert holder.slot_index == expected_slot
+        live = (
+            wake.live_waiters(
+                root, controller_label="wake-test", kinds={"listener"}
+            )
+            or []
+        )
+        assert len(live) == 40
+        status_payload = wake.coverage_status(
+            root, controller_label="wake-test", lease_nonce=nonce
+        )
+        assert status_payload["live_waiters"] == 40
+        assert status_payload["target_waiters"] == wake.DEFAULT_LISTENER_SLOTS
+        forty_first = wake.register_listener_waiter(
+            root,
+            controller_label="wake-test",
+            generation_key=nonce,
+            slots=4,
+        )
+        holders.append(forty_first)
+        assert forty_first.slot_index == 40
+        contender = subprocess.run(
+            _listener_command(
+                root,
+                tmp_path,
+                label="wake-test",
+                nonce=nonce,
+                slots=4,
+                timeout_s=0.2,
+                report_pending=False,
+            ),
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert contender.returncode == 1, (contender.stdout, contender.stderr)
+        assert "hold live doorbells" not in contender.stderr
+        assert "full" not in contender.stderr.lower()
+        help_text = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "goalflight_messages.py"),
+                "listen",
+                "--help",
+            ],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert help_text.returncode == 0, help_text.stderr
+        assert "mail pending only" in help_text.stdout
+        assert "not a ceiling" in help_text.stdout
+    finally:
+        for holder in holders:
+            holder.close()
 
 
 def test_self_post_does_not_ring_pool_foreign_post_does(
@@ -1126,7 +1206,7 @@ def test_self_post_does_not_ring_pool_foreign_post_does(
         "wake-test", principal={"principal_id": "self-wake-pool"}
     )
     assert claimed.committed and claimed.value is not None
-    # Two-listener self-vs-foreign arbitration; legal under the slot ceiling.
+    # Two-listener self-vs-foreign arbitration.
     arbitration_slots = _assert_arbitration_pool_legal(2)
     processes = [
         subprocess.Popen(
