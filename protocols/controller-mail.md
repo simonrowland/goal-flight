@@ -130,8 +130,8 @@ Each flushed line is a wake. Child kinds pass through unchanged:
 - backup: pending headlines plus one `advance: <command>` line, or a ring
 - watchdog: JSON `{"kind":"event",...}` with `listener-dead` / related payload
 - supervise: `{"kind":"supervise","type":"heartbeat"|"coverage"|"restart"|"stop"|"exit",...}`
-  carrying `live`/`target`; every stop and catchable-signal exit also carries
-  the exact supervisor `rearm` command
+  carrying `live`/`target`; every `stop` and every exit caused by `SIGTERM`,
+  `SIGINT`, or `SIGHUP` also carries the exact supervisor `rearm` command
 
 Supervisor coverage is state-driven: it emits at startup, whenever
 `(live,target)` changes, and immediately when a slot stops or restarts.
@@ -139,11 +139,14 @@ Unchanged periodic coverage is silent unless `--debug` restores per-tick
 records. The supervisor's own heartbeat is different from the stream child's
 heartbeat below: it defaults to 1500 seconds (25 minutes), and its real stdout
 write is the authoritative fallback when the fast `_stdio_peer_gone` poll has
-no evidence. Production supervisor heartbeat values stay within 60–1800
-seconds. The stream child's 120-second heartbeat and the watchdog's
+no evidence. `RealHost.wait()` also watches stdout for
+`POLLERR|POLLHUP|POLLNVAL`, so positive closure evidence wakes the loop
+independently of that heartbeat. Production supervisor heartbeat values stay
+within 60–1800 seconds. The stream child's 120-second heartbeat and the watchdog's
 three-missed-interval threshold do not change. `restart` and `stop` remain
-unconditional. A catchable signal emits `type=exit` before child teardown;
-SIGKILL cannot be caught and therefore cannot emit that recovery hint.
+unconditional. Receipt of `SIGTERM`, `SIGINT`, or `SIGHUP` emits `type=exit`
+before child teardown; SIGKILL cannot be caught and therefore cannot emit that
+recovery hint.
 
 The supervisor's child-exit taxonomy:
 

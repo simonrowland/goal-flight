@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import select
 import shlex
 import signal
 import subprocess
@@ -1154,6 +1155,33 @@ def test_controller_mail_documents_supervise_front_door() -> None:
     assert "`timeout_ms` inert" in doctrine
 
 
+def test_supervisor_signal_exit_contract_matches_installed_handlers(
+    tmp_path: Path,
+) -> None:
+    host = supervise.RealHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    try:
+        handled = {signal.Signals(signum).name for signum in host._prev_handlers}
+    finally:
+        host.kill_all()
+
+    assert handled == {"SIGTERM", "SIGINT", "SIGHUP"}
+    for relative in (
+        "protocols/controller-mail.md",
+        "docs/EVENT-ARCHITECTURE.md",
+        "CHANGELOG.md",
+    ):
+        doctrine = (ROOT / relative).read_text(encoding="utf-8")
+        for signame in handled:
+            assert f"`{signame}`" in doctrine
+        assert "catchable signal" not in doctrine.lower()
+        assert "catchable-signal" not in doctrine.lower()
+
+
 @pytest.mark.parametrize(
     "relative",
     [
@@ -1436,6 +1464,119 @@ def test_real_host_signal_wakes_blocking_wait(
     assert host.stop_signum == signal.SIGTERM
     assert result.lines == []
     assert result.exits == []
+
+
+def test_real_host_closed_stdout_wakes_wait_with_quiet_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = supervise.RealHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    child = host.spawn(
+        "backup",
+        _python_child("import time; time.sleep(5)"),
+    )
+    original_stdout = sys.stdout
+    reader_fd, writer_fd = os.pipe()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    timer = threading.Timer(0.05, os.close, args=(reader_fd,))
+    started = time.monotonic()
+    timer.start()
+    try:
+        result = host.wait([child], timeout_s=2.0)
+        elapsed = time.monotonic() - started
+    finally:
+        timer.cancel()
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        try:
+            os.close(reader_fd)
+        except OSError:
+            pass
+        host.kill_all()
+
+    assert elapsed < 0.5
+    monkeypatch.setattr(messages, "_stdio_peer_gone", lambda _stream: False)
+    assert host.stdio_peer_gone() is True
+    assert result.lines == []
+    assert result.exits == []
+
+
+def test_pollnval_preempts_ready_child_output_before_forwarding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader_fd, writer_fd = os.pipe()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+
+    class InvalidatingHost(supervise.RealHost):
+        wait_lines: list[str] = []
+
+        def wait(
+            self,
+            children: list[object],
+            timeout_s: float,
+        ) -> supervise.WaitResult:
+            child = children[0]
+            child_stdout = child.popen.stdout  # type: ignore[attr-defined]
+            assert child_stdout is not None
+            readable, _writable, _exceptional = select.select(
+                [child_stdout.fileno()], [], [], 1.0
+            )
+            assert readable
+            os.close(writer_fd)
+            result = super().wait(children, timeout_s)
+            self.wait_lines = [line for _child, line in result.lines]
+            return result
+
+    host = InvalidatingHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    child_alive_after_run: list[bool] = []
+    signal_fds_after_run: tuple[int | None, int | None] = (-1, -1)
+    try:
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            heartbeat_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            coverage_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            items=[
+                (
+                    "backup",
+                    _python_child(
+                        "import os, time; "
+                        "os.write(1, b'ready\\n'); time.sleep(5)"
+                    ),
+                )
+            ],
+        )
+        child_alive_after_run = [child.alive for child in host._children]
+        signal_fds_after_run = (host._signal_rfd, host._signal_wfd)
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        try:
+            peer_stdout.close()
+        except OSError:
+            pass
+        os.close(reader_fd)
+        host.kill_all()
+
+    assert code == 0
+    assert host.wait_lines == ["ready"]
+    assert child_alive_after_run and not any(child_alive_after_run)
+    assert signal_fds_after_run == (None, None)
 
 
 def _python_child(script: str) -> str:

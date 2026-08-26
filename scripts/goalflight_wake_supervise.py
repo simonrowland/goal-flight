@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import errno
 import json
+import math
 import os
 from pathlib import Path
 import select
@@ -554,17 +555,20 @@ def run_supervisor(
 
     while host.running():
         # Two detectors answer different questions. The fast detector calls
-        # goalflight_messages._stdio_peer_gone every tick and asks whether
-        # poll reports explicit HUP/ERR/NVAL evidence. It returns False both
-        # when no failure is visible and when it cannot inspect the fd, so
-        # False is never a health verdict. The supervisor heartbeat asks the
-        # authoritative question with a real write: success proves the peer
-        # accepted it at that instant; EPIPE proves closure. That slow
-        # supervisor heartbeat is distinct from the forwarded stream child's
-        # 120-second heartbeat, which proves stream liveness to --watch-follow
-        # and drives its three-missed-interval death threshold. Keep both
-        # detectors so an inconclusive poll is eventually settled by a write;
-        # slowing the supervisor beat must not change the stream/watchdog beat.
+        # goalflight_messages._stdio_peer_gone before and after each wait and
+        # asks whether poll reports explicit HUP/ERR/NVAL evidence.
+        # RealHost.wait watches the same descriptor so closure wakes this loop
+        # independently of the scheduled deadline. False still means either
+        # no visible failure or an
+        # uninspectable fd, never a health verdict. The supervisor heartbeat
+        # asks the authoritative question with a real write: success proves
+        # the peer accepted it at that instant; EPIPE proves closure. That
+        # slow supervisor heartbeat is distinct from the forwarded stream
+        # child's 120-second heartbeat, which proves stream liveness to
+        # --watch-follow and drives its three-missed-interval death threshold.
+        # Keep both detectors so an inconclusive poll is eventually settled by
+        # a write; slowing the supervisor beat must not change peer-gone or
+        # stream/watchdog detection.
         if _host_stdio_peer_gone(host):
             host.kill_all()
             return 0
@@ -592,6 +596,9 @@ def run_supervisor(
             if slot.child is not None and getattr(slot.child, "alive", True)
         ]
         result = host.wait(live_children, timeout_s)
+        if _host_stdio_peer_gone(host):
+            host.kill_all()
+            return 0
         wait_signum = getattr(host, "stop_signum", None)
         if (
             not host.running()
@@ -708,7 +715,7 @@ def run_supervisor(
     signum = getattr(host, "stop_signum", None)
     if isinstance(signum, int) and signum > 0:
         live, target = _live_target(slots)
-        # Catchable signals get one recovery hint while stdout is still open.
+        # SIGTERM, SIGINT, and SIGHUP get one hint while stdout is still open.
         # SIGKILL cannot be caught, so that hard-kill gap cannot emit a hint.
         _emit(
             host,
@@ -804,6 +811,7 @@ class RealHost:
         self._nonce_reader = nonce_reader
         self._children: list[RealChild] = []
         self._stop = False
+        self._stdout_peer_gone = False
         self.stop_signum: int | None = None
         self._prev_handlers: dict[int, object] = {}
         signal_rfd, signal_wfd = os.pipe()
@@ -824,7 +832,7 @@ class RealHost:
         self._stop = True
         # Flagging alone can leave select() asleep for the 25-minute heartbeat
         # because Python may restart interrupted syscalls. The self-pipe makes
-        # catchable-signal recovery output prompt; a full pipe is already awake.
+        # SIGTERM/SIGINT/SIGHUP recovery output prompt; a full pipe is awake.
         signal_wfd = self._signal_wfd
         if signal_wfd is None:
             return
@@ -921,6 +929,8 @@ class RealHost:
             raise
 
     def stdio_peer_gone(self) -> bool:
+        if self._stdout_peer_gone:
+            return True
         # Import lazily: goalflight_messages imports this module for the CLI.
         import goalflight_messages as messages  # type: ignore
 
@@ -1027,11 +1037,17 @@ class RealHost:
         self._observe_locks(children)
         deadline = self.now + max(0.0, float(timeout_s))
         fdmap: dict[int, tuple[str, RealChild | None]] = {}
-        fds: list[int] = []
+        poller = select.poll()
+        peer_gone_events = select.POLLERR | select.POLLHUP | select.POLLNVAL
+        read_events = select.POLLIN | peer_gone_events
         signal_rfd = self._signal_rfd
         if signal_rfd is not None:
-            fds.append(signal_rfd)
-            fdmap[signal_rfd] = ("signal", None)
+            try:
+                poller.register(signal_rfd, read_events)
+            except (OSError, ValueError):
+                pass
+            else:
+                fdmap[signal_rfd] = ("signal", None)
         for child in children:
             if not isinstance(child, RealChild) or not child.alive:
                 continue
@@ -1045,22 +1061,44 @@ class RealHost:
                     fd = stream.fileno()
                 except (OSError, ValueError):
                     continue
-                fds.append(fd)
-                fdmap[fd] = (which, child)
-        remaining = max(0.0, deadline - time.monotonic())
-        readable: list[int] = []
-        if fds:
+                try:
+                    poller.register(fd, read_events)
+                except (OSError, ValueError):
+                    continue
+                else:
+                    fdmap[fd] = (which, child)
+        try:
+            stdout_fd = sys.stdout.fileno()
+        except (AttributeError, OSError, ValueError):
+            stdout_fd = None
+        if stdout_fd is not None and stdout_fd not in fdmap:
             try:
-                readable, _w, _x = select.select(fds, [], [], remaining)
+                poller.register(stdout_fd, peer_gone_events)
+            except (OSError, ValueError):
+                pass
+            else:
+                fdmap[stdout_fd] = ("stdout", None)
+        remaining = max(0.0, deadline - time.monotonic())
+        ready: list[int] = []
+        if fdmap:
+            try:
+                ready = [
+                    fd
+                    for fd, events in poller.poll(math.ceil(remaining * 1000.0))
+                    if events & read_events
+                ]
             except (InterruptedError, OSError):
-                readable = []
+                ready = []
         elif remaining > 0:
             time.sleep(remaining)
         self.now = time.monotonic()
         self._observe_locks(children)
         lines: list[tuple[Any, str]] = []
-        for fd in readable:
+        for fd in ready:
             which, child = fdmap[fd]
+            if which == "stdout":
+                self._stdout_peer_gone = True
+                continue
             if which == "signal":
                 while True:
                     try:

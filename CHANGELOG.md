@@ -50,9 +50,9 @@ incremented when meaningful skill behaviour changes.
 ### Fixed
 
 - Supervisor stop records now carry a faithful re-arm command, including a
-  configured `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` depth. Catchable signals emit
-  a final `type=exit` recovery record before child teardown; SIGKILL remains an
-  explicit uncatchable gap.
+  configured `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` depth. `SIGTERM`, `SIGINT`,
+  and `SIGHUP` emit a final `type=exit` recovery record before child teardown;
+  SIGKILL remains an explicit uncatchable gap.
 
 - Bare `listen` / `follow` no longer treat a dead lease nonce as a
   successful arm. An ACTIVE journal row whose holder lock is unheld, or
