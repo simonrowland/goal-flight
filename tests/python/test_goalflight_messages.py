@@ -56,6 +56,9 @@ def run_messages_cli(
             "GOALFLIGHT_CAPACITY_CONF": os.devnull,
         }
     )
+    # A parent GOALFLIGHT_DISPATCH_DIR would send mailbox writes outside this
+    # fixture's state_dir/dispatch, so absence checks would miss them.
+    env.pop("GOALFLIGHT_DISPATCH_DIR", None)
     return subprocess.run(
         [
             sys.executable,
@@ -1359,6 +1362,172 @@ def test_controller_post_reaches_worker_steer_read_path() -> None:
         envelope = delivered["context"]["message_envelope"]
         assert_true("typed envelope survives projection", envelope["type"] == "controller-notice")
         assert_true("message sequence remains canonical", envelope["seq"] == 1)
+
+
+def test_post_type_steer_to_dispatch_id_refuses_and_names_steer_command() -> None:
+    """`post --type steer` to a worker dispatch is journal-only; refuse it."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        dispatch_id = "d-live-worker-steer"
+        write_ledger_record(
+            base,
+            dispatch_id,
+            base / "project",
+            state="running",
+            worker_pid=os.getpid(),
+        )
+        journal = messages_dir / f"{dispatch_id}.jsonl"
+        mailbox = messages_dir.parent / "state" / "dispatch" / f"{dispatch_id}.steer.jsonl"
+        assert_true("mailbox starts empty", not mailbox.exists())
+        assert_true("journal starts empty", not journal.exists())
+
+        for msg_type in ("steer", "steering"):
+            posted = run_messages_cli(
+                messages_dir,
+                fleet_dir,
+                [
+                    "post",
+                    "--dispatch-id",
+                    dispatch_id,
+                    "--type",
+                    msg_type,
+                    "--text",
+                    "looks delivered",
+                ],
+            )
+            assert_true(
+                f"{msg_type} post is usage-refuse: rc={posted.returncode} stdout={posted.stdout!r}",
+                posted.returncode == 2,
+            )
+            assert_true(
+                f"{msg_type} uses refused prefix",
+                "post: refused:" in posted.stderr,
+            )
+            assert_true(
+                f"{msg_type} names dispatch.steer",
+                "goalflight_dispatch.py steer" in posted.stderr
+                and dispatch_id in posted.stderr,
+            )
+            assert_true(
+                f"{msg_type} says no worker reads it",
+                "no worker will read" in posted.stderr,
+            )
+            assert_true(
+                f"{msg_type} does not print a success envelope",
+                "recorded" not in posted.stdout,
+            )
+            assert_true(f"{msg_type} does not write journal", not journal.exists())
+            assert_true(f"{msg_type} does not write mailbox", not mailbox.exists())
+
+
+def test_post_type_steer_to_fleet_steering_register_still_records() -> None:
+    """Fleet-register `steer` posts still file on the steering stream."""
+    import tempfile
+    from goalflight_messages import STEERING_DISPATCH_ID, read_envelopes
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        journal = messages_dir / f"{STEERING_DISPATCH_ID}.jsonl"
+        mailbox = messages_dir.parent / "state" / "dispatch" / f"{STEERING_DISPATCH_ID}.steer.jsonl"
+        assert_true("fleet-steering mailbox starts empty", not mailbox.exists())
+        assert_true("fleet-steering journal starts empty", not journal.exists())
+        posted = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            [
+                "post",
+                "--dispatch-id",
+                STEERING_DISPATCH_ID,
+                "--type",
+                "steer",
+                "--text",
+                "fleet register body",
+            ],
+        )
+        assert_true(f"fleet-steering post succeeds: {posted.stderr}", posted.returncode == 0)
+        result = json.loads(posted.stdout)
+        assert_true("fleet-steering post is recorded", result["recorded"] is True)
+        assert_true(
+            "fleet-steering post is not a worker delivery",
+            result["delivery"]["worker_view_written"] is False,
+        )
+        envelopes = read_envelopes(journal)
+        assert_true("fleet-steering journal has the body", envelopes[0]["payload"]["text"] == "fleet register body")
+        assert_true("fleet-steering journal keeps type steer", envelopes[0]["type"] == "steer")
+        assert_true("fleet-steering post does not write a worker mailbox", not mailbox.exists())
+
+
+def test_post_message_steer_type_to_dispatch_id_raises_before_write() -> None:
+    """Library and MCP post helpers refuse before creating a carrier."""
+    import tempfile
+    import goalflight_steer_mailbox as steer
+    from goalflight_messages import (
+        MessageError,
+        goalflight_post_message_tool,
+        post_message,
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        dispatch_id = "d-library-steer"
+        journal = messages_dir / f"{dispatch_id}.jsonl"
+        isolated = {
+            "GOALFLIGHT_STATE_DIR": str(base / "state"),
+            "GOALFLIGHT_MESSAGES_DIR": str(messages_dir),
+        }
+        previous = {key: os.environ.get(key) for key in (*isolated, "GOALFLIGHT_DISPATCH_DIR")}
+        os.environ.update(isolated)
+        os.environ.pop("GOALFLIGHT_DISPATCH_DIR", None)
+        try:
+            mailbox = steer.steer_file(dispatch_id, state_dir=base / "state")
+            assert_true("library journal starts empty", not journal.exists())
+            assert_true("library mailbox starts empty", not mailbox.exists())
+            callers = (
+                (
+                    "post_message",
+                    lambda: post_message(
+                        dispatch_id=dispatch_id,
+                        msg_type="steer",
+                        payload={"text": "library post"},
+                        messages_dir=messages_dir,
+                    ),
+                ),
+                (
+                    "mcp_tool",
+                    lambda: goalflight_post_message_tool(
+                        {
+                            "dispatch_id": dispatch_id,
+                            "type": "steering",
+                            "payload": {"text": "mcp post"},
+                        },
+                        messages_dir=messages_dir,
+                    ),
+                ),
+            )
+            for label, call in callers:
+                try:
+                    call()
+                except MessageError as exc:
+                    detail = str(exc)
+                    assert_true(f"{label} names dispatch.steer", "goalflight_dispatch.py steer" in detail)
+                    assert_true(f"{label} names the dispatch id", dispatch_id in detail)
+                else:
+                    raise AssertionError(f"{label} accepted a steering type to a worker dispatch")
+            assert_true("library path does not create the journal", not journal.exists())
+            assert_true("library path does not create the mailbox", not mailbox.exists())
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 def test_resolved_controller_post_reports_projected_journal_delivery() -> None:

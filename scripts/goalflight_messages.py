@@ -1250,6 +1250,24 @@ def update_envelopes(
         return result
 
 
+# Fleet-steering register stream. `steer` is an alias of `steering`; workers
+# poll the dispatch mailbox from `goalflight_dispatch.py steer`, not this type.
+STEERING_DISPATCH_ID = "fleet-steering"
+
+
+def _reject_steer_type_off_worker_mailbox(dispatch_id: str, msg_type: str) -> None:
+    """Refuse `steer`/`steering` except on the fleet-steering register."""
+    if canonical_event_type(msg_type) != "steering":
+        return
+    if dispatch_id == STEERING_DISPATCH_ID:
+        return
+    raise MessageError(
+        f"type {msg_type!r} files fleet-steering journal mail; no worker will "
+        f"read it. Use goalflight_dispatch.py steer {dispatch_id} '<message>' "
+        "to append the worker-visible steer mailbox"
+    )
+
+
 def post_message(
     *,
     dispatch_id: str,
@@ -1272,6 +1290,7 @@ def post_message(
     project_journal_delivery: bool = True,
 ) -> dict:
     """Admit one monotonic stream envelope; shared by CLI, MCP, and tests."""
+    _reject_steer_type_off_worker_mailbox(dispatch_id, msg_type)
     validate_payload(payload)
     path = inbox_path(messages_dir, dispatch_id)
     _require_carrier_path(path)
@@ -4656,9 +4675,6 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
             f"->{result.value['cursor_version']}"
         )
     return 0
-
-
-STEERING_DISPATCH_ID = "fleet-steering"
 
 
 def steering_register_path(fleet_dir: Path) -> Path:
