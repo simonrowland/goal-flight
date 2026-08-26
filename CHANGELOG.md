@@ -8,6 +8,18 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- Supervisor arming now explicitly requires no timeout and session-lifetime
+  monitoring. On Claude Code this means `persistent: true`; `timeout_ms` is
+  inert in that mode and any host-required value is a placeholder, not a knob.
+  On 2026-08-26 every controller on one machine used a bounded monitor and lost
+  its whole pool at the same one-hour wall (`listener depth 0/8 - 8 missing`).
+- The supervisor's own heartbeat now defaults to 1500 seconds and accepts
+  60–1800 seconds. It remains the authoritative real-write peer check, while
+  the distinct `follow` stream heartbeat remains 120 seconds and the watchdog
+  still declares death after three missed stream beats. Coverage emits on
+  startup and immediately for live/target or slot-state changes; unchanged
+  periodic coverage is quiet unless `--debug` is set.
+
 - Persistent wake coverage defaults to eight slots: one `follow` stream, six
   `listen --listener-slots 6 --report-pending` backup doorbells, and one
   `listen --watch-follow` watchdog (`live/8`). The backup pool is
@@ -36,6 +48,11 @@ incremented when meaningful skill behaviour changes.
   reader, so a busy write constructor cannot be mistaken for a dead lease.
 
 ### Fixed
+
+- Supervisor stop records now carry a faithful re-arm command, including a
+  configured `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` depth. Catchable signals emit
+  a final `type=exit` recovery record before child teardown; SIGKILL remains an
+  explicit uncatchable gap.
 
 - Bare `listen` / `follow` no longer treat a dead lease nonce as a
   successful arm. An ACTIVE journal row whose holder lock is unheld, or

@@ -7734,6 +7734,8 @@ def _run_cli(argv: list[str] | None = None) -> int:
     )
     follow.set_defaults(func=cmd_follow)
 
+    import goalflight_wake_supervise as wake_supervisor
+
     supervise = sub.add_parser(
         "supervise",
         help=(
@@ -7752,14 +7754,24 @@ def _run_cli(argv: list[str] | None = None) -> int:
     supervise.add_argument(
         "--heartbeat-secs",
         type=float,
-        default=120.0,
-        help="supervisor heartbeat interval (default 120; production 60-300)",
+        default=wake_supervisor.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+        help=(
+            "supervisor heartbeat interval "
+            f"(default {wake_supervisor.DEFAULT_SUPERVISOR_HEARTBEAT_S:g}; "
+            f"production {wake_supervisor.MIN_SUPERVISOR_HEARTBEAT_S:g}-"
+            f"{wake_supervisor.MAX_SUPERVISOR_HEARTBEAT_S:g})"
+        ),
     )
     supervise.add_argument(
         "--coverage-secs",
         type=float,
         default=0.0,
         help="coverage live/target interval; 0 means the heartbeat interval",
+    )
+    supervise.add_argument(
+        "--debug",
+        action="store_true",
+        help="emit unchanged heartbeat and coverage records on every tick",
     )
     supervise.set_defaults(func=cmd_supervise)
 

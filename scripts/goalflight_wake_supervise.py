@@ -40,6 +40,10 @@ BACKOFF_CAP_S = 120.0
 LONG_LIVED_S = 30.0
 STREAM_LINE_MAX_BYTES = 511
 PERMANENT_UNARMED_FAULTS = 3
+DEFAULT_SUPERVISOR_HEARTBEAT_S = 25.0 * 60.0
+MIN_SUPERVISOR_HEARTBEAT_S = 60.0
+MAX_SUPERVISOR_HEARTBEAT_S = 30.0 * 60.0
+PERSISTENT_BACKUP_SLOTS_ENV = "GOALFLIGHT_PERSISTENT_BACKUP_SLOTS"
 _DEAD_NONCE_MARKERS = (
     "controller-capability-mismatch",
     "lease-nonce-not-live",
@@ -98,6 +102,7 @@ class SuperviseHost(Protocol):
     def running(self) -> bool: ...
     def live_nonce(self) -> str | None: ...
     def write_stdout(self, line: str) -> bool: ...
+    def stdio_peer_gone(self) -> bool: ...
     def spawn(self, kind: str, command: str) -> Any: ...
     def wait(self, children: list[Any], timeout_s: float) -> WaitResult: ...
     def kill_all(self) -> None: ...
@@ -224,8 +229,12 @@ def _supervise_line(record: dict[str, object]) -> str:
                 default=str,
             ).encode("utf-8")
         ) + 1 > STREAM_LINE_MAX_BYTES:
-            value = value[:-8] + "…"
-            trimmed["detail"] = value
+            if len(value) <= 8:
+                value = ""
+                trimmed.pop("detail", None)
+            else:
+                value = value[:-8] + "…"
+                trimmed["detail"] = value
         payload = json.dumps(
             trimmed,
             ensure_ascii=False,
@@ -236,6 +245,12 @@ def _supervise_line(record: dict[str, object]) -> str:
         encoded = (payload + "\n").encode("utf-8")
         if len(encoded) <= STREAM_LINE_MAX_BYTES:
             return payload + "\n"
+    # Supervisor recovery records must remain valid JSON and preserve the
+    # exact re-arm command. Normal records stay within the stream-line cap;
+    # when the command alone exceeds it, an oversized valid record is safer
+    # than a capped fragment that cannot be parsed or used for recovery.
+    if "rearm" in record:
+        return payload + "\n"
     budget = max(0, STREAM_LINE_MAX_BYTES - 1)
     return encoded[:budget].decode("utf-8", "ignore") + "\n"
 
@@ -255,6 +270,61 @@ def _live_target(slots: list[_Slot]) -> tuple[int, int]:
 
 def _emit(host: SuperviseHost, record: dict[str, object]) -> bool:
     return host.write_stdout(_supervise_line(record))
+
+
+def _supervisor_rearm_command(
+    *,
+    project_root: Path | str,
+    controller_label: str,
+    lease_nonce: str,
+    heartbeat_s: float,
+    coverage_s: float,
+    debug: bool,
+) -> str:
+    """Build the canonical, semantically faithful supervisor invocation."""
+    argv = shlex.split(
+        wake.coverage_supervise_command(
+            project_root,
+            controller_label=controller_label,
+            lease_nonce=lease_nonce,
+        )
+    )
+    argv.extend(
+        [
+            "--heartbeat-secs",
+            format(float(heartbeat_s), ".15g"),
+            "--coverage-secs",
+            format(float(coverage_s), ".15g"),
+        ]
+    )
+    if debug:
+        argv.append("--debug")
+    if PERSISTENT_BACKUP_SLOTS_ENV in os.environ:
+        argv[:0] = [
+            "env",
+            f"{PERSISTENT_BACKUP_SLOTS_ENV}="
+            f"{os.environ[PERSISTENT_BACKUP_SLOTS_ENV]}",
+        ]
+    return shlex.join(argv)
+
+
+def _host_stdio_peer_gone(host: SuperviseHost) -> bool:
+    """Return only positive peer-death evidence from the host's poll probe."""
+    probe = getattr(host, "stdio_peer_gone", None)
+    if not callable(probe):
+        return False
+    try:
+        return bool(probe())
+    except (OSError, ValueError):
+        return False
+
+
+def _signal_reason(signum: int) -> str:
+    try:
+        name = signal.Signals(signum).name
+    except (ValueError, SystemError):
+        name = str(signum)
+    return f"signal-{name}"
 
 
 def _line_signals_armed(line: str) -> bool:
@@ -352,21 +422,35 @@ def run_supervisor(
     controller_label: str,
     lease_nonce: str,
     host: SuperviseHost,
-    heartbeat_s: float = 120.0,
-    coverage_s: float = 120.0,
+    heartbeat_s: float = DEFAULT_SUPERVISOR_HEARTBEAT_S,
+    coverage_s: float = DEFAULT_SUPERVISOR_HEARTBEAT_S,
     items: list[tuple[str, str]] | None = None,
+    debug: bool = False,
 ) -> int:
     """Run until the lease dies, stdout breaks, or the host asks to stop."""
     nonce = str(lease_nonce or "").strip()
+    rearm = _supervisor_rearm_command(
+        project_root=project_root,
+        controller_label=controller_label,
+        lease_nonce=nonce,
+        heartbeat_s=heartbeat_s,
+        coverage_s=coverage_s,
+        debug=debug,
+    )
+
+    def emit_stop(**fields: object) -> bool:
+        record: dict[str, object] = {
+            "kind": "supervise",
+            "type": "stop",
+            "rearm": rearm,
+        }
+        record.update(fields)
+        return _emit(host, record)
+
     if not nonce:
-        _emit(
-            host,
-            {
-                "kind": "supervise",
-                "type": "stop",
-                "reason": "dead-lease-nonce",
-                "detail": "lease nonce missing",
-            },
+        emit_stop(
+            reason="dead-lease-nonce",
+            detail="lease nonce missing",
         )
         return SUPERVISE_STOP_EXIT
     if items is None:
@@ -376,14 +460,9 @@ def run_supervisor(
             lease_nonce=nonce,
         )
     if not items:
-        _emit(
-            host,
-            {
-                "kind": "supervise",
-                "type": "stop",
-                "reason": "did-not-arm",
-                "detail": "coverage_rearm_commands returned no children",
-            },
+        emit_stop(
+            reason="did-not-arm",
+            detail="coverage_rearm_commands returned no children",
         )
         return SUPERVISE_START_EXIT
     slots = [
@@ -395,17 +474,12 @@ def run_supervisor(
         state = _nonce_state(host, nonce)
         if state == "dead":
             live, target = _live_target(slots)
-            _emit(
-                host,
-                {
-                    "kind": "supervise",
-                    "type": "stop",
-                    "reason": "dead-lease-nonce",
-                    "scope": "supervisor",
-                    "live": live,
-                    "target": target,
-                    "detail": "goalflight_session_status live nonce changed or vanished",
-                },
+            emit_stop(
+                reason="dead-lease-nonce",
+                scope="supervisor",
+                live=live,
+                target=target,
+                detail="goalflight_session_status live nonce changed or vanished",
             )
             return SUPERVISE_STOP_EXIT
         if state == "unreadable":
@@ -426,42 +500,83 @@ def run_supervisor(
         host.kill_all()
         return stopped
     seq = 0
+    coverage_revision = 0
+    reported_revision = -1
+    reported_counts: tuple[int, int] | None = None
 
-    def emit_counts(kind: str) -> bool:
-        nonlocal seq
+    def coverage_changed() -> None:
+        nonlocal coverage_revision
+        coverage_revision += 1
+
+    def emit_coverage(*, force: bool = False) -> tuple[bool, bool]:
+        nonlocal reported_counts, reported_revision
         live, target = _live_target(slots)
+        counts = (live, target)
+        if (
+            not force
+            and counts == reported_counts
+            and coverage_revision == reported_revision
+        ):
+            return True, False
         record: dict[str, object] = {
             "kind": "supervise",
-            "type": kind,
+            "type": "coverage",
             "live": live,
             "target": target,
         }
-        if kind == "heartbeat":
-            seq += 1
-            record["seq"] = seq
-        return _emit(host, record)
+        emitted = _emit(host, record)
+        if emitted:
+            reported_counts = counts
+            reported_revision = coverage_revision
+        return emitted, emitted
 
-    if not emit_counts("coverage") or not emit_counts("heartbeat"):
+    def emit_heartbeat() -> bool:
+        nonlocal seq
+        live, target = _live_target(slots)
+        seq += 1
+        return _emit(
+            host,
+            {
+                "kind": "supervise",
+                "type": "heartbeat",
+                "live": live,
+                "target": target,
+                "seq": seq,
+            },
+        )
+
+    coverage_ok, _coverage_emitted = emit_coverage(force=True)
+    if not coverage_ok or (debug and not emit_heartbeat()):
         host.kill_all()
         return 0
     next_heartbeat = host.now + max(0.01, float(heartbeat_s))
     next_coverage = host.now + max(0.01, float(coverage_s))
 
     while host.running():
+        # Two detectors answer different questions. The fast detector calls
+        # goalflight_messages._stdio_peer_gone every tick and asks whether
+        # poll reports explicit HUP/ERR/NVAL evidence. It returns False both
+        # when no failure is visible and when it cannot inspect the fd, so
+        # False is never a health verdict. The supervisor heartbeat asks the
+        # authoritative question with a real write: success proves the peer
+        # accepted it at that instant; EPIPE proves closure. That slow
+        # supervisor heartbeat is distinct from the forwarded stream child's
+        # 120-second heartbeat, which proves stream liveness to --watch-follow
+        # and drives its three-missed-interval death threshold. Keep both
+        # detectors so an inconclusive poll is eventually settled by a write;
+        # slowing the supervisor beat must not change the stream/watchdog beat.
+        if _host_stdio_peer_gone(host):
+            host.kill_all()
+            return 0
         state = _nonce_state(host, nonce)
         if state == "dead":
             live, target = _live_target(slots)
-            _emit(
-                host,
-                {
-                    "kind": "supervise",
-                    "type": "stop",
-                    "reason": "dead-lease-nonce",
-                    "scope": "supervisor",
-                    "live": live,
-                    "target": target,
-                    "detail": "goalflight_session_status live nonce changed or vanished",
-                },
+            emit_stop(
+                reason="dead-lease-nonce",
+                scope="supervisor",
+                live=live,
+                target=target,
+                detail="goalflight_session_status live nonce changed or vanished",
             )
             host.kill_all()
             return SUPERVISE_STOP_EXIT
@@ -477,6 +592,13 @@ def run_supervisor(
             if slot.child is not None and getattr(slot.child, "alive", True)
         ]
         result = host.wait(live_children, timeout_s)
+        wait_signum = getattr(host, "stop_signum", None)
+        if (
+            not host.running()
+            and isinstance(wait_signum, int)
+            and wait_signum > 0
+        ):
+            break
         for child, line in result.lines:
             text = line if line.endswith("\n") else line + "\n"
             if not host.write_stdout(text):
@@ -525,26 +647,27 @@ def run_supervisor(
                     "slot" if reason in _SLOT_STOP_REASONS else "supervisor"
                 )
                 slot.stopped_reason = reason
-                _emit(
-                    host,
-                    {
-                        "kind": "supervise",
-                        "type": "stop",
-                        "reason": reason,
-                        "scope": scope,
-                        "child": slot.kind,
-                        "exit": event.returncode,
-                        "live": live,
-                        "target": target,
-                        "detail": str(event.output or "").strip()[:180],
-                    },
+                coverage_changed()
+                emit_stop(
+                    reason=reason,
+                    scope=scope,
+                    child=slot.kind,
+                    exit=event.returncode,
+                    live=live,
+                    target=target,
+                    detail=str(event.output or "").strip()[:180],
                 )
+                coverage_ok, _coverage_emitted = emit_coverage()
+                if not coverage_ok:
+                    host.kill_all()
+                    return 0
                 if scope == "supervisor":
                     host.kill_all()
                     return SUPERVISE_STOP_EXIT
                 continue
             delay = slot.backoff_s
             slot.next_start = host.now + delay
+            coverage_changed()
             if not _emit(
                 host,
                 {
@@ -560,13 +683,20 @@ def run_supervisor(
             ):
                 host.kill_all()
                 return 0
+        coverage_ok, coverage_emitted = emit_coverage()
+        if not coverage_ok:
+            host.kill_all()
+            return 0
         if host.now >= next_heartbeat:
-            if not emit_counts("heartbeat"):
+            if not emit_heartbeat():
                 host.kill_all()
                 return 0
             next_heartbeat = host.now + max(0.01, float(heartbeat_s))
         if host.now >= next_coverage:
-            if not emit_counts("coverage"):
+            coverage_ok, _debug_emitted = emit_coverage(
+                force=bool(debug and not coverage_emitted)
+            )
+            if not coverage_ok:
                 host.kill_all()
                 return 0
             next_coverage = host.now + max(0.01, float(coverage_s))
@@ -575,10 +705,25 @@ def run_supervisor(
             host.kill_all()
             return stopped
 
-    host.kill_all()
     signum = getattr(host, "stop_signum", None)
     if isinstance(signum, int) and signum > 0:
+        live, target = _live_target(slots)
+        # Catchable signals get one recovery hint while stdout is still open.
+        # SIGKILL cannot be caught, so that hard-kill gap cannot emit a hint.
+        _emit(
+            host,
+            {
+                "kind": "supervise",
+                "type": "exit",
+                "reason": _signal_reason(signum),
+                "live": live,
+                "target": target,
+                "rearm": rearm,
+            },
+        )
+        host.kill_all()
         return 128 + signum
+    host.kill_all()
     return 0
 
 
@@ -661,6 +806,11 @@ class RealHost:
         self._stop = False
         self.stop_signum: int | None = None
         self._prev_handlers: dict[int, object] = {}
+        signal_rfd, signal_wfd = os.pipe()
+        self._signal_rfd: int | None = signal_rfd
+        self._signal_wfd: int | None = signal_wfd
+        os.set_blocking(self._signal_rfd, False)
+        os.set_blocking(self._signal_wfd, False)
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             try:
                 self._prev_handlers[signum] = signal.signal(
@@ -672,6 +822,16 @@ class RealHost:
     def _on_signal(self, signum: int, _frame: object) -> None:
         self.stop_signum = signum
         self._stop = True
+        # Flagging alone can leave select() asleep for the 25-minute heartbeat
+        # because Python may restart interrupted syscalls. The self-pipe makes
+        # catchable-signal recovery output prompt; a full pipe is already awake.
+        signal_wfd = self._signal_wfd
+        if signal_wfd is None:
+            return
+        try:
+            os.write(signal_wfd, b"\0")
+        except (BlockingIOError, OSError):
+            pass
 
     def running(self) -> bool:
         return not self._stop
@@ -759,6 +919,12 @@ class RealHost:
             if exc.errno == errno.EPIPE:
                 return False
             raise
+
+    def stdio_peer_gone(self) -> bool:
+        # Import lazily: goalflight_messages imports this module for the CLI.
+        import goalflight_messages as messages  # type: ignore
+
+        return bool(messages._stdio_peer_gone(sys.stdout))
 
     def spawn(self, kind: str, command: str) -> RealChild:
         env = dict(self._env if self._env is not None else os.environ)
@@ -860,8 +1026,12 @@ class RealHost:
         self.now = time.monotonic()
         self._observe_locks(children)
         deadline = self.now + max(0.0, float(timeout_s))
-        fdmap: dict[int, tuple[str, RealChild]] = {}
+        fdmap: dict[int, tuple[str, RealChild | None]] = {}
         fds: list[int] = []
+        signal_rfd = self._signal_rfd
+        if signal_rfd is not None:
+            fds.append(signal_rfd)
+            fdmap[signal_rfd] = ("signal", None)
         for child in children:
             if not isinstance(child, RealChild) or not child.alive:
                 continue
@@ -891,6 +1061,18 @@ class RealHost:
         lines: list[tuple[Any, str]] = []
         for fd in readable:
             which, child = fdmap[fd]
+            if which == "signal":
+                while True:
+                    try:
+                        if not os.read(fd, 4096):
+                            break
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        break
+                continue
+            if child is None:
+                continue
             for line in self._read_stream(child, which):
                 lines.append((child, line))
         exits: list[ChildExit] = []
@@ -942,6 +1124,15 @@ class RealHost:
             except (OSError, ValueError, RuntimeError):
                 continue
         self._prev_handlers.clear()
+        for name in ("_signal_rfd", "_signal_wfd"):
+            fd = getattr(self, name)
+            if fd is None:
+                continue
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            setattr(self, name, None)
 
 
 def resolve_startup_lease_nonce(
@@ -1026,13 +1217,23 @@ def cmd_supervise(args: Any) -> int:
         print(f"supervise: {refusal}", file=sys.stderr)
         return int(refusal_code or SUPERVISE_START_EXIT)
     test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
-    heartbeat_s = float(getattr(args, "heartbeat_secs", 120.0) or 120.0)
+    heartbeat_s = float(
+        getattr(args, "heartbeat_secs", DEFAULT_SUPERVISOR_HEARTBEAT_S)
+        or DEFAULT_SUPERVISOR_HEARTBEAT_S
+    )
     coverage_s = float(getattr(args, "coverage_secs", 0.0) or 0.0) or heartbeat_s
     if not test_mode:
-        if not 60.0 <= heartbeat_s <= 300.0:
+        if not (
+            MIN_SUPERVISOR_HEARTBEAT_S
+            <= heartbeat_s
+            <= MAX_SUPERVISOR_HEARTBEAT_S
+        ):
             print(
-                "supervise: heartbeat-secs must stay between 60 and 300; "
-                "faster risks host volume limiting and slower hides deafness",
+                "supervise: heartbeat-secs must stay between "
+                f"{MIN_SUPERVISOR_HEARTBEAT_S:g} and "
+                f"{MAX_SUPERVISOR_HEARTBEAT_S:g}; "
+                "faster risks host volume limiting and the periodic write "
+                "must remain a bounded stdout peer check",
                 file=sys.stderr,
             )
             return SUPERVISE_START_EXIT
@@ -1051,4 +1252,5 @@ def cmd_supervise(args: Any) -> int:
         host=host,
         heartbeat_s=heartbeat_s,
         coverage_s=coverage_s,
+        debug=bool(getattr(args, "debug", False)),
     )
