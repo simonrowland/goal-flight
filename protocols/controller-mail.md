@@ -144,19 +144,19 @@ mail" beside an event. An unchanged frontier emits only every 15 minutes; a chan
 emits on the next idle beat.
 
 The monitor is tracked, not immortal. The host may reap it; stopped heartbeats make
-that failure detectable. Keep **one** portable backup doorbell as a separate tracked
-task. During its existing bounded mail wait, that doorbell also checks the
-generation-scoped watchdog lock. Once it has observed the watchdog, or after the same
-15-second startup grace used for persistent state, a missing watchdog lock makes the
-doorbell release its own lock, flush a structural `event`/`watchdog-dead` record with
-the exact watchdog re-arm command, and exit:
+that failure detectable. Keep **six** backup doorbells as separate tracked
+tasks, each `--listener-slots 6`. During its existing bounded mail wait, a doorbell
+also checks the generation-scoped watchdog lock. Once it has observed the watchdog,
+or after the same 15-second startup grace used for persistent state, a missing
+watchdog lock makes the doorbell release its own lock, flush a structural
+`event`/`watchdog-dead` record with the exact watchdog re-arm command, and exit:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py listen \
   --project-root "$PWD" \
   --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
   --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE" \
-  --listener-slots 1 \
+  --listener-slots 6 \
   --report-pending
 ```
 
@@ -171,14 +171,16 @@ python3 <skill-root>/scripts/goalflight_messages.py listen \
   --watch-follow
 ```
 
-Arm the stream first, then the backup and watchdog. `--watch-follow` allows 15 seconds
+Arm the stream first, then the backup pool and watchdog. `--watch-follow` allows 15 seconds
 for the stream's durable state to appear, preventing an invalid or missing state file
 from becoming silent death. It is observer-only: `--listener-slots` and
 `--report-pending` are ignored with a warning, and the diagnostic prints the separate
-backup command. Persistent coverage is three required components: one live, healthy
-monitor stream, one backup doorbell, and one watchdog. Status, entry hints, and fleet
-output use that shared `live/3` predicate; after stream loss the surviving backup and
-watchdog report persistent coverage `2/3`, never a portable `1/4` pool.
+backup command. Persistent coverage is eight required slots: one live, healthy
+monitor stream, six backup doorbells, and one watchdog. Status, entry hints, and fleet
+output use that shared `live/8` predicate; after stream loss the surviving backup pool
+and watchdog report persistent coverage `7/8`, never a portable `1/4` pool. Override
+with `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (1–32). A shortfall is degraded, not
+binary-dead: a controller with some doorbells still covered should top the pool up.
 
 This is a bounded witness chain, not complete failure coverage. A lone watchdog death
 is loud, and correlated stream-plus-watchdog death is still loud while the backup
@@ -199,9 +201,10 @@ emit a structural `event`/`listener-fault` stdout record before exit; stderr rem
 supplemental diagnostics only.
 
 `--listener-slots`, `GOALFLIGHT_LISTENER_SLOTS`, and
-`GOALFLIGHT_LISTENER_LOW_WATER` tune only portable `listen`. `follow` rejects the
-CLI flag and warns when either pool environment variable is present; an inert accepted
-knob is not a valid stream configuration.
+`GOALFLIGHT_LISTENER_LOW_WATER` tune only portable `listen`. Persistent backup
+depth is `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 6). `follow` rejects the
+CLI flag and warns when either portable pool environment variable is present; an inert
+accepted knob is not a valid stream configuration.
 
 ## Portable pop-one listener pool
 

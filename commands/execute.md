@@ -69,13 +69,13 @@ duration; wait separately on anything you need back early.
 project lease. On a host whose persistent monitor turns each flushed stdout line
 into a wake, arm one generation-bound `goalflight_messages.py follow --project-root
 "$PWD" --controller-label <label> --lease-nonce <nonce>` through that monitor —
-never through ordinary shell backgrounding — and keep one tracked `listen
---listener-slots 1 --report-pending` backup doorbell plus one separately tracked
+never through ordinary shell backgrounding — and keep six tracked `listen
+--listener-slots 6 --report-pending` backup doorbells plus one separately tracked
 `listen --watch-follow` watchdog. The watchdog holds its own generation lock and
 never consumes a doorbell slot. It reads the stream's durable successful-record age;
 three missed heartbeat intervals emit `listener-dead` on stdout with the exact monitor
-re-arm command. Treat stream, backup, and watchdog as shared persistent coverage
-`live/3`. On hosts without that
+re-arm command. Treat stream, backup pool, and watchdog as shared persistent coverage
+`live/8`. On hosts without that
 monitor (codex, grok, cursor, opencode), keep the portable tracked `listen` pool:
 when one exits, peek with `relay --new --json`, process the items, cursor-CAS their
 server-known positions with `advance`, then re-arm. An unclaimed

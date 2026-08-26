@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import errno
 import json
 import os
@@ -44,6 +45,7 @@ def isolated(
         "GOALFLIGHT_CONTROLLER_PID",
         "GOALFLIGHT_LISTENER_SLOTS",
         "GOALFLIGHT_LISTENER_LOW_WATER",
+        "GOALFLIGHT_PERSISTENT_BACKUP_SLOTS",
     ):
         env.pop(key, None)
         monkeypatch.delenv(key, raising=False)
@@ -661,12 +663,14 @@ def test_persistent_monitor_suppresses_pool_shortage_but_keeps_backup_depth(
             controller_label=lease.label,
             lease_nonce=lease.nonce,
         )
+        backup_target = wake.persistent_backup_slot_count()
+        wake_target = wake.persistent_wake_target()
         assert stream_only["wake_mode"] == "persistent"
         assert stream_only["live_waiters"] == 1
-        assert stream_only["target_waiters"] == 3
+        assert stream_only["target_waiters"] == wake_target
         assert stream_only["missing_components"] == ["backup", "watchdog"]
         assert stream_only["portable_live_waiters"] == 0
-        assert stream_only["portable_target_waiters"] == 1
+        assert stream_only["portable_target_waiters"] == backup_target
         claim_depth = sessions._listener_depth_after_claim(
             project,
             lease.label,
@@ -674,43 +678,72 @@ def test_persistent_monitor_suppresses_pool_shortage_but_keeps_backup_depth(
         )
         assert claim_depth is not None
         assert claim_depth["live"] == 1
-        assert claim_depth["target"] == 3
-        assert claim_depth["missing"] == 2
-        assert claim_depth["missing_components"] == ["backup", "watchdog"]
-        assert "--watch-follow" not in claim_depth["commands"][0]
-        assert "--watch-follow" in claim_depth["commands"][1]
+        assert claim_depth["target"] == wake_target
+        assert claim_depth["missing"] == wake_target - 1
+        assert claim_depth["missing_components"] == (
+            ["backup"] * backup_target + ["watchdog"]
+        )
+        assert all(
+            "--watch-follow" not in command
+            for command in claim_depth["commands"][:-1]
+        )
+        assert "--watch-follow" in claim_depth["commands"][-1]
         claim_hint_plan = {**claim_depth, "work_in_flight": True}
         assert "own tracked background task" in wake.coverage_rearm_hint(
             claim_hint_plan
         )
 
-        with wake.register_listener_waiter(
-            project,
-            controller_label=lease.label,
-            generation_key=lease.nonce,
-            slots=1,
-        ):
+        with ExitStack() as pool:
+            pool.enter_context(
+                wake.register_listener_waiter(
+                    project,
+                    controller_label=lease.label,
+                    generation_key=lease.nonce,
+                    slots=backup_target,
+                )
+            )
             with_backup = wake.coverage_status(
                 project,
                 controller_label=lease.label,
                 lease_nonce=lease.nonce,
             )
             assert with_backup["live_waiters"] == 2
-            assert with_backup["target_waiters"] == 3
-            assert with_backup["missing_components"] == ["watchdog"]
+            assert with_backup["target_waiters"] == wake_target
+            assert with_backup["backup"]["state"] == "degraded"
+            assert with_backup["missing_components"] == ["backup", "watchdog"]
             assert with_backup["portable_live_waiters"] == 1
             with wake.register_watchdog_waiter(
                 project,
                 controller_label=lease.label,
                 generation_key=lease.nonce,
             ):
+                partial = wake.coverage_status(
+                    project,
+                    controller_label=lease.label,
+                    lease_nonce=lease.nonce,
+                )
+                assert partial["covered"] is True
+                assert partial["backup"]["state"] == "degraded"
+                assert partial["live_waiters"] == 3
+                assert partial["target_waiters"] == wake_target
+                assert partial["missing_components"] == ["backup"]
+                for _ in range(backup_target - 1):
+                    pool.enter_context(
+                        wake.register_listener_waiter(
+                            project,
+                            controller_label=lease.label,
+                            generation_key=lease.nonce,
+                            slots=backup_target,
+                        )
+                    )
                 complete = wake.coverage_status(
                     project,
                     controller_label=lease.label,
                     lease_nonce=lease.nonce,
                 )
                 assert complete["covered"] is True
-                assert complete["live_waiters"] == complete["target_waiters"] == 3
+                assert complete["backup"]["state"] == "live"
+                assert complete["live_waiters"] == complete["target_waiters"] == wake_target
                 assert complete["missing_components"] == []
 
     with wake.register_listener_waiter(
@@ -726,8 +759,9 @@ def test_persistent_monitor_suppresses_pool_shortage_but_keeps_backup_depth(
         )
         assert stream_gone["wake_mode"] == "persistent"
         assert stream_gone["live_waiters"] == 1
-        assert stream_gone["target_waiters"] == 3
-        assert stream_gone["missing_components"] == ["stream", "watchdog"]
+        assert stream_gone["target_waiters"] == wake.persistent_wake_target()
+        assert stream_gone["backup"]["state"] == "degraded"
+        assert stream_gone["missing_components"] == ["stream", "backup", "watchdog"]
         stream_plan = wake.coverage_rearm_plan(
             stream_gone,
             project,
@@ -778,7 +812,7 @@ def test_coverage_excludes_waiters_from_previous_lease_generation(
     assert replacement["covered"] is False
     assert replacement["wake_mode"] == "persistent"
     assert replacement["live_waiters"] == 0
-    assert replacement["target_waiters"] == 3
+    assert replacement["target_waiters"] == wake.persistent_wake_target()
     assert replacement["missing_components"] == ["stream", "backup", "watchdog"]
     assert replacement["waiters"] == []
 
@@ -825,7 +859,8 @@ def test_persistent_coverage_fails_closed_when_monitor_state_is_unavailable(
     assert status["wake_mode"] == "persistent"
     assert status["reason"] == "persistent-monitor-state-unavailable"
     assert status["live_waiters"] == 1
-    assert status["missing_components"] == ["stream", "watchdog"]
+    assert status["backup"]["state"] == "degraded"
+    assert status["missing_components"] == ["stream", "backup", "watchdog"]
 
 
 def test_watchdog_generation_lock_is_independent_of_listener_slot(
@@ -896,7 +931,7 @@ def test_fleet_console_uses_shared_persistent_coverage_predicate(
     context = contexts[lease.nonce]
     assert context["wake_mode"] == "persistent"
     assert context["listener_live"] == 1
-    assert context["listener_target"] == 3
+    assert context["listener_target"] == wake.persistent_wake_target()
 
 
 def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
@@ -1101,7 +1136,7 @@ def test_backup_wakes_when_watchdog_is_sigkilled_with_stream_alive(
         assert dead["payload"]["type"] == "watchdog-dead"
         assert dead["payload"]["reason"] == "missing-lock"
         assert dead["payload"]["live"] == 1
-        assert dead["payload"]["target"] == 3
+        assert dead["payload"]["target"] == wake.persistent_wake_target()
         assert dead["payload"]["missing_components"] == ["backup", "watchdog"]
         assert dead["payload"]["rearm_command"] == (
             wake.follow_watchdog_start_command(

@@ -6,6 +6,16 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Changed
+
+- Persistent wake coverage defaults to eight slots: one `follow` stream, six
+  `listen --listener-slots 6 --report-pending` backup doorbells, and one
+  `listen --watch-follow` watchdog (`live/8`). The backup pool is
+  `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 6, 1–32); portable
+  `DEFAULT_LISTENER_SLOTS = 4` is a different knob. A decayed backup pool
+  reports `degraded` with observed-vs-target and re-arms the missing count
+  rather than reading "live" at any depth ≥ 1.
+
 ## [1.5.1] - 2026-08-23
 
 ### Changed
