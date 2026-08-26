@@ -61,6 +61,22 @@ raise SystemExit(goalflight_messages.main(sys.argv[1:]))
 """
 
 
+_FAIL_ARM_AFTER_PENDING_CLAIM = r"""
+import os
+import sys
+
+sys.path.insert(0, os.environ["GOALFLIGHT_TEST_SCRIPTS"])
+import goalflight_journal as journal
+
+def fail_arm_after_claim(self, *args, **kwargs):
+    raise journal.JournalUnavailable("injected failure after pending claim")
+
+journal.Journal.arm_listener = fail_arm_after_claim
+import goalflight_messages
+raise SystemExit(goalflight_messages.main(sys.argv[1:]))
+"""
+
+
 @pytest.fixture()
 def isolated(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, str]]:
     td = Path(tempfile.mkdtemp(prefix="gf-arm-pending-"))
@@ -441,6 +457,21 @@ def test_replacement_arm_rings_events_arriving_after_first_report(
             arm_line = first.stdout.readline()
             arm_payload = json.loads(arm_line)
             assert arm_payload["kind"] == "pending-at-arm"
+            # Delivery is not durable merely because the pipe exposed a line.
+            # Wait for the reporter's fsynced phase transition before modeling
+            # an exit *after* the first report.
+            report_deadline = time.monotonic() + 2
+            while time.monotonic() < report_deadline:
+                state = wake.pending_report_state(
+                    project,
+                    controller_label="armtest",
+                    lease_nonce=lease.nonce,
+                )
+                if state is not None and state.phase == "reported":
+                    break
+                time.sleep(0.005)
+            else:
+                pytest.fail("pending-at-arm output never became durably reported")
             first.kill()
             first.wait(timeout=5)
 
@@ -518,6 +549,222 @@ def test_replacement_arm_rings_events_arriving_after_first_report(
     # report (and, in a pool, the other doorbells) on mail already seen.
     assert [payload["kind"] for payload in timeout_payloads] == ["exit"]
     assert timeout_payloads[-1]["reason"] == "timeout"
+
+
+def test_replacement_takes_over_claim_when_first_arm_dies_before_report(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    """An unreported claim keeps its original water and remains deliverable.
+
+    This is the production order: the first process snapshots and persists its
+    claim, then ``Journal.arm_listener`` fails before stdout can carry the
+    ``pending-at-arm`` record. Mail posted after that durable boundary must not
+    be folded into a replacement's local snapshot.
+    """
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "arm-claim-takeover-test"}
+    ).value
+    assert lease is not None
+    listener_env = {
+        **env,
+        "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+        "GOALFLIGHT_TEST_SCRIPTS": str(SCRIPTS),
+    }
+    dispatch_id = "claim-takeover"
+
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        _post(env, project, "backlog before failed arm", dispatch_id=dispatch_id)
+        failed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _FAIL_ARM_AFTER_PENDING_CLAIM,
+                "listen",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                "armtest",
+                "--json",
+            ],
+            env=listener_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert failed.returncode == 2, failed.stderr
+        assert not failed.stdout.strip(), failed.stdout
+        assert wake.pending_report_high_water(
+            project,
+            controller_label="armtest",
+            lease_nonce=lease.nonce,
+        ) == {dispatch_id: 1}
+        claimed = wake.pending_report_state(
+            project,
+            controller_label="armtest",
+            lease_nonce=lease.nonce,
+        )
+        assert claimed is not None
+        assert claimed.phase == "claimed"
+
+        # This is genuinely new mail relative to the persisted first snapshot.
+        # A replacement must report only seq=1, then ring for seq=2.
+        _post(env, project, "new after failed arm", dispatch_id=dispatch_id)
+        replacement = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "goalflight_messages.py"),
+                "listen",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                "armtest",
+                "--json",
+                "--poll-secs",
+                "0.01",
+                "--timeout-s",
+                "3",
+            ],
+            env=listener_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    payloads = [
+        json.loads(line) for line in replacement.stdout.splitlines() if line.strip()
+    ]
+    assert replacement.returncode == 0, (replacement.stderr, payloads)
+    assert [payload["kind"] for payload in payloads] == ["pending-at-arm", "ring"]
+    assert [int(item["stream_seq"]) for item in payloads[0]["items"]] == [1]
+    assert payloads[1]["reason"] == "event"
+    assert f"{dispatch_id}=2" in payloads[1]["advance_command"]
+    reported = wake.pending_report_state(
+        project,
+        controller_label="armtest",
+        lease_nonce=lease.nonce,
+    )
+    assert reported is not None
+    assert reported.phase == "reported"
+
+
+def test_dead_claim_takeover_reports_once_without_spending_listener_pool(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "arm-claim-pool-test"}
+    ).value
+    assert lease is not None
+    listener_env = {
+        **env,
+        "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+        "GOALFLIGHT_TEST_SCRIPTS": str(SCRIPTS),
+    }
+    output_paths = [project.parent / f"takeover-{index}.jsonl" for index in range(4)]
+    processes: list[subprocess.Popen[str]] = []
+
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        _post(env, project, "pool backlog", dispatch_id="claim-pool")
+        failed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _FAIL_ARM_AFTER_PENDING_CLAIM,
+                "listen",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                "armtest",
+                "--json",
+            ],
+            env=listener_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert failed.returncode == 2, failed.stderr
+
+        try:
+            for path in output_paths:
+                handle = path.open("w", encoding="utf-8")
+                processes.append(
+                    subprocess.Popen(
+                        [
+                            sys.executable,
+                            str(SCRIPTS / "goalflight_messages.py"),
+                            "listen",
+                            "--project-root",
+                            str(project),
+                            "--controller-label",
+                            "armtest",
+                            "--listener-slots",
+                            "4",
+                            "--json",
+                            "--poll-secs",
+                            "0.01",
+                            "--timeout-s",
+                            "10",
+                        ],
+                        env=listener_env,
+                        stdout=handle,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                    )
+                )
+                handle.close()
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                live = wake.live_waiters(
+                    project,
+                    controller_label="armtest",
+                    kinds={"listener"},
+                ) or []
+                if len(live) == 4:
+                    break
+                time.sleep(0.02)
+            assert len(live) == 4
+            time.sleep(0.2)
+            payloads_before_new = [
+                json.loads(line)
+                for path in output_paths
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            assert [
+                payload["kind"] for payload in payloads_before_new
+            ].count("pending-at-arm") == 1
+            assert all(process.poll() is None for process in processes)
+
+            _post(env, project, "new after pool takeover", dispatch_id="claim-pool")
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                exited = [process for process in processes if process.poll() is not None]
+                if exited:
+                    break
+                time.sleep(0.02)
+            assert len(exited) == 1
+            assert exited[0].returncode == 0
+            live = wake.live_waiters(
+                project,
+                controller_label="armtest",
+                kinds={"listener"},
+            ) or []
+            assert len(live) == 3
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
 
 
 @pytest.mark.parametrize("run", range(1, 4))

@@ -16,13 +16,12 @@ t-273 design (argued, not picked by habit):
     waiting. Chosen. One tracked task per slot, no new drain-then-arm
     ordering rule. Pending mail becomes one report, not four exits.
 
-    Two arms racing: ``claim_pending_report`` exclusive-creates a per-lease
-    stamp. Exactly one wins and emits. The loser still raises its local
-    high-water from its own peek, so the same backlog cannot pop the rest
-    of the pool. If mail arrives between the two peeks, the earlier
-    listener has the older high-water and still rings; the later one is
-    conservative about that in-flight item. Depth stays at target until
-    that one ring.
+    Two arms racing: an atomic per-lease claim fixes one immutable high-water.
+    Exactly one live owner emits, then fsyncs the ``reported`` phase. Losers
+    discard their later local high-water and adopt the claim boundary, so mail
+    arriving between peeks still rings. If the owner dies before reporting,
+    exactly one peer takes over the same boundary. Depth stays at target until
+    the genuinely new event wins one ring.
 
 (c) An arm-to-depth helper that drains once then forks N waiters. Rejected:
     one tracked parent of N children is the untracked-stray shape the
@@ -340,6 +339,12 @@ def test_claim_pending_report_first_writer_wins(
     assert wake.pending_report_high_water(
         project, controller_label="terse-ctl", lease_nonce="nonce-a"
     ) == {"arm-backlog": 2}
+    claimed = wake.pending_report_state(
+        project, controller_label="terse-ctl", lease_nonce="nonce-a"
+    )
+    assert claimed is not None
+    assert claimed.phase == "claimed"
+    assert claimed.claim_token
     assert (
         wake.claim_pending_report(
             project,
@@ -352,6 +357,17 @@ def test_claim_pending_report_first_writer_wins(
     assert wake.pending_report_high_water(
         project, controller_label="terse-ctl", lease_nonce="nonce-a"
     ) == {"arm-backlog": 2}
+    assert wake.mark_pending_report_reported(
+        project,
+        controller_label="terse-ctl",
+        lease_nonce="nonce-a",
+        claim_token=claimed.claim_token,
+    )
+    reported = wake.pending_report_state(
+        project, controller_label="terse-ctl", lease_nonce="nonce-a"
+    )
+    assert reported is not None
+    assert reported.phase == "reported"
     assert (
         wake.claim_pending_report(
             project, controller_label="terse-ctl", lease_nonce="nonce-b"
@@ -364,6 +380,68 @@ def test_claim_pending_report_first_writer_wins(
         )
         == {}
     )
+
+
+def test_partial_pending_report_state_fails_closed(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, _env = isolated
+    path = wake._pending_report_path(
+        project,
+        controller_label="terse-ctl",
+        lease_nonce="partial-state",
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"schema":"goalflight.pending-report.v2",', encoding="utf-8")
+
+    with pytest.raises(wake.PendingReportStateError, match="incomplete"):
+        wake.pending_report_high_water(
+            project,
+            controller_label="terse-ctl",
+            lease_nonce="partial-state",
+        )
+    with pytest.raises(wake.PendingReportStateError, match="incomplete"):
+        wake.acquire_pending_report(
+            project,
+            controller_label="terse-ctl",
+            lease_nonce="partial-state",
+            positions={"newer-local-snapshot": 99},
+        )
+    assert path.read_text(encoding="utf-8").endswith(",")
+
+
+def test_ambiguous_v1_claim_cannot_suppress_v2_delivery(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, _env = isolated
+    v2_path = wake._pending_report_path(
+        project,
+        controller_label="terse-ctl",
+        lease_nonce="upgrade-state",
+    )
+    v1_path = v2_path.with_name(
+        v2_path.name.replace("pending-report-v2", "pending-report-v1")
+    )
+    v1_path.parent.mkdir(parents=True, exist_ok=True)
+    v1_path.write_text('{"positions":{"old-boundary":77}}\n', encoding="utf-8")
+
+    # v1 never recorded delivery, so its high-water is deliberately not trusted.
+    assert wake.pending_report_high_water(
+        project,
+        controller_label="terse-ctl",
+        lease_nonce="upgrade-state",
+    ) is None
+    assert wake.claim_pending_report(
+        project,
+        controller_label="terse-ctl",
+        lease_nonce="upgrade-state",
+        positions={"current-backlog": 1},
+    )
+    assert wake.pending_report_high_water(
+        project,
+        controller_label="terse-ctl",
+        lease_nonce="upgrade-state",
+    ) == {"current-backlog": 1}
 
 
 def test_arming_over_pending_mail_reaches_target_depth(
