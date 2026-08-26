@@ -367,10 +367,10 @@ def _persist_draft_artifact_reconciliation(record: dict, reconciled: dict) -> bo
     """Write the promoted draft-artifact terminal, or report that it did not stick.
 
     Returns True only when the durable row is already complete or this pass
-    wrote it. OSError and base JournalUnavailable (busy/contention) defer to
-    a later observational sweep. JournalDisappeared and JournalIOError are
-    fatal: another status pass cannot recreate vanished or unreadable
-    authority, so they escape instead of being treated as a retryable miss.
+    wrote it. OSError and JournalBusy (contention) defer to a later
+    observational sweep. JournalDisappeared and JournalIOError are fatal:
+    another status pass cannot recreate vanished or unreadable authority, so
+    they escape instead of being treated as a retryable miss.
     """
     reconciliation = reconciled.get("draft_artifact_reconciliation") or {}
     if not reconciliation.get("promoted"):
@@ -418,9 +418,9 @@ def _persist_draft_artifact_reconciliation(record: dict, reconciled: dict) -> bo
         return False
     except (goalflight_journal.JournalDisappeared, goalflight_journal.JournalIOError):
         raise
-    except goalflight_journal.JournalUnavailable:
-        # Base JournalUnavailable is busy/contention. A later sweep remains
-        # eligible; claiming complete here would split display from the ledger.
+    except goalflight_journal.JournalBusy:
+        # Busy/contention. A later sweep remains eligible; claiming complete
+        # here would split display from the ledger.
         return False
     return True
 

@@ -76,7 +76,7 @@ class _ClosedDiagnosticStream:
     "error",
     (
         ValueError("listener exit reason is not registered"),
-        journal.JournalUnavailable("journal busy"),
+        journal.JournalBusy("journal busy"),
     ),
 )
 def test_coverage_exit_failure_is_visible_without_losing_final_event(
@@ -177,7 +177,7 @@ def test_controller_claim_contract_fault_propagates(
 
 @pytest.mark.parametrize(
     "error",
-    (OSError("temporary I/O"), journal.JournalUnavailable("journal busy")),
+    (OSError("temporary I/O"), journal.JournalBusy("journal busy")),
 )
 def test_controller_claim_transient_failure_still_returns_claim_failed(
     isolated: Path,
@@ -352,7 +352,7 @@ def test_status_reconciliation_contract_fault_propagates(
 
 @pytest.mark.parametrize(
     "error",
-    (OSError("temporary ledger I/O"), journal.JournalUnavailable("journal busy")),
+    (OSError("temporary ledger I/O"), journal.JournalBusy("journal busy")),
 )
 def test_status_reconciliation_transient_io_is_deferred(
     tmp_path: Path,
@@ -432,7 +432,7 @@ def test_status_does_not_claim_complete_when_terminal_persist_is_unverified(
     monkeypatch.setattr(
         status.goalflight_ledger,
         "cmd_finish",
-        lambda _args: (_ for _ in ()).throw(journal.JournalUnavailable("journal busy")),
+        lambda _args: (_ for _ in ()).throw(journal.JournalBusy("journal busy")),
     )
     out = status._reconcile_draft_artifact_record(record, tail=None, tail_mtime=None)
     assert out.get("classification") != "complete"
@@ -575,7 +575,7 @@ def test_quota_stuck_lease_release_distinguishes_contract_from_transient(
     (
         (ValueError("invalid terminal state"), True),
         (OSError("ledger busy"), False),
-        (journal.JournalUnavailable("journal busy"), False),
+        (journal.JournalBusy("journal busy"), False),
         (journal.JournalIOError("one-shot journal IO"), True),
         (journal.JournalDisappeared("journal vanished"), True),
     ),
@@ -1174,8 +1174,10 @@ def test_nested_shutdown_handlers_remain_visible_and_mutation_sensitive() -> Non
     persist_source = inspect.getsource(status._persist_draft_artifact_reconciliation)
     assert "except (goalflight_journal.JournalDisappeared, goalflight_journal.JournalIOError):" in finish_source
     assert "except (goalflight_journal.JournalDisappeared, goalflight_journal.JournalIOError):" in persist_source
-    assert "except goalflight_journal.JournalUnavailable as exc:" in finish_source
-    assert "except goalflight_journal.JournalUnavailable:" in persist_source
+    assert "except goalflight_journal.JournalBusy as exc:" in finish_source
+    assert "except goalflight_journal.JournalBusy:" in persist_source
+    for source in (finish_source, persist_source):
+        assert "JournalUnavailable" not in source
 
     claim_cli_source = inspect.getsource(session_status.main)
     claim_cli_source = claim_cli_source.split("if args.claim_session:", 1)[1].split(

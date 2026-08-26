@@ -3642,7 +3642,11 @@ def _kernel_live_controller_sessions(project_root: Path) -> list[dict]:
     root = goalflight_task.resolve_project_root(str(project_root))
     try:
         authority = goalflight_journal.Journal(root)
-    except goalflight_journal.JournalUnavailable:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
         return []
     sessions: list[dict] = []
     seen: set[tuple[str, int, str]] = set()

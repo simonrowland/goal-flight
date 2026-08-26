@@ -209,8 +209,6 @@ system disagree, prefer the live check and record the disagreement.
 - **b-173 / b-020** — quiet treated as terminal; workers outlive their verdict
   and accumulate. A reaper needs **both** facts: owning dispatch terminal **and**
   process idle.
-- **b-165** — journal reads bounce instead of waiting (`busy_timeout = 0`, no
-  recorded rationale).
 - **b-167** — a uniform finite listener timeout blanks a whole pool at once.
 
 ---
@@ -285,7 +283,8 @@ the envelope already records.
 
 **Do not centralize the whole journal.** Dispatch state is legitimately
 per-project, and a single global SQLite would concentrate the contention this
-system already struggles with (see b-165: reads bounce rather than wait).
+system already struggles with (b-165 originally recorded reads bouncing rather
+than waiting; bounded read retries now classify that contention explicitly).
 
 **Constraint on any fix:** deliberate broadcast must survive. A shared sweep
 worker may legitimately address everyone — the goal is that *unintended* fanout
@@ -446,9 +445,28 @@ the stream, the backup doorbell pool, and the watchdog.
 `EXITED/event` row to write. Its generation-bound monitor flock is the liveness
 authority. Every exit path releases that flock and restores signal handlers; fatal
 runtime paths publish `listener-fault`, while the watchdog publishes the exact
-stream re-arm command. `EPIPE` has no re-arm payload because its reader is gone.
+stream re-arm command. A merely busy journal is not a fault: the stream then
+uses a 300-second continuous-failure window, publishing one
+`listener-degraded` record when the window opens and one `listener-recovered`
+when it closes, and heartbeats keep beating so the watchdog never reads load as
+death. Bounded listener reads/writes carry one absolute 10-second deadline
+through their lock, connect, query, and transaction stages rather than composing
+fresh budgets. Because the clock opens after the first bounded operation,
+continuous busy is therefore bounded at 350 seconds plus scheduler delay (10s
+first operation + 300s window plus 30s backoff + 10s final operation). `EPIPE`
+has no re-arm payload because its reader is gone. The bound is elapsed-time
+based, not attempt-count based: an earlier stage or the first timeout=0 connect
+may consume the shared deadline and correctly yield a one-attempt busy verdict.
 The watchdog remains an ordinary `listen`, so it deliberately retains journal arm
 and exit audit, tracked-task completion, and kernel-slot release.
+
+The canonical non-JSON backup uses the same bound. Before it persists an arm
+high-water or claims a cursor ring, it materializes the complete human-readable
+receipt batch under busy tolerance. Synthetic carriers are resolved by one unioned
+attention query for the whole batch, not one query per envelope, so that stage is
+still one 10-second bounded journal operation. If stdout delivery fails after a
+claim, the matching high-water or ring reservation is removed and a replacement may
+deliver the same unread cursor.
 
 Cursor-ring ownership is a reversible reservation until stdout delivery succeeds.
 An `EPIPE` before the first event rolls it back, leaving unread mail deliverable to

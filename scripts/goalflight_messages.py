@@ -2878,7 +2878,11 @@ def controller_pending_events(
             stream_ids=dispatch_ids,
             limit=limit,
         )
-    except goalflight_journal.JournalUnavailable:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
         return []
 
 
@@ -2900,7 +2904,12 @@ def controller_cursor_peek(
     )
 
 
-def _listener_envelope(authority, row: dict[str, object]) -> dict:
+def _listener_envelope(
+    authority,
+    row: dict[str, object],
+    *,
+    attention_by_id: dict[str, dict[str, object]] | None = None,
+) -> dict:
     carrier_path = str(row.get("carrier_path") or "")
     # Synthetic journal carriers ("journal:goal-flight-resume:",
     # "journal:outbox-quarantine:", …) have no .jsonl file; their payload lives
@@ -2909,10 +2918,12 @@ def _listener_envelope(authority, row: dict[str, object]) -> dict:
     # the "journal:" prefix so a new synthetic stream cannot wedge the whole relay.
     if carrier_path.startswith("journal:"):
         item_id = str(row.get("event_uuid") or "")
-        item = next(
-            (value for value in authority.attention_items() if value.get("item_id") == item_id),
-            None,
-        )
+        if attention_by_id is None:
+            attention_by_id = {
+                str(value.get("item_id") or ""): value
+                for value in authority.attention_items()
+            }
+        item = attention_by_id.get(item_id)
         if item is None:
             raise MessageError("journal attention delivery points to a missing item")
         payload = json.loads(str(item["payload_json"]))
@@ -3193,7 +3204,12 @@ def controller_mail_summary(
         if label is None:
             return {}
         rows = authority.pending_delivery_events(label, waking_only=True, limit=1000)
-    except (goalflight_journal.JournalUnavailable, ValueError):
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+        ValueError,
+    ):
         return {}
 
     items: list[dict[str, object]] = []
@@ -3253,7 +3269,11 @@ def listener_coverage_status(
 
             lease = goalflight_journal.Journal.open_reader(root).active_lease(label)
             nonce = lease.nonce if lease is not None else None
-        except goalflight_journal.JournalUnavailable:
+        except (
+            goalflight_journal.JournalBusy,
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+        ):
             nonce = None
     status = goalflight_wake.coverage_status(
         root,
@@ -3321,7 +3341,11 @@ def _ambient_claimed_controller(
     try:
         authority = goalflight_journal.Journal.open_reader(project_root)
         lease = authority.active_lease(label)
-    except goalflight_journal.JournalUnavailable as exc:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
         return {"claimed": False, "reason": _journal_failure_reason(exc), "label": label}
     if lease is None:
         return {"claimed": False, "reason": "no-active-controller-lease", "label": label}
@@ -3389,6 +3413,7 @@ def _resolve_listen_auto_lease(
     *,
     controller_label: str,
     explicit_nonce: str | None,
+    retry_budget_s: float = 1.0,
 ) -> dict[str, object]:
     """Resolve which lease generation listen should arm.
 
@@ -3413,8 +3438,15 @@ def _resolve_listen_auto_lease(
     import goalflight_journal  # type: ignore
 
     try:
-        authority = goalflight_journal.Journal.open_reader(project_root)
-    except goalflight_journal.JournalUnavailable as exc:
+        authority = goalflight_journal.Journal.open_reader(
+            project_root,
+            retry_budget_s=retry_budget_s,
+        )
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
         return {
             "claimed": False,
             "reason": _journal_failure_reason(exc),
@@ -3725,7 +3757,11 @@ def emit_listener_activity_signal(
         if hint:
             print(hint, file=sys.stderr if stream is None else stream)
         return hint
-    except goalflight_journal.JournalUnavailable:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
         return ""
     except (ImportError, OSError, TypeError, ValueError, sqlite3.DatabaseError):
         return ""
@@ -3988,8 +4024,42 @@ def format_receipt_headline(row: dict, envelope: dict) -> str:
     return f"[{kind}] {stream} seq={seq} — {payload_head}"
 
 
-def _envelopes_with_rows(authority, rows: list[dict] | tuple[dict, ...]) -> list[tuple[dict, dict]]:
-    return [(row, _listener_envelope(authority, row)) for row in rows]
+def _attention_items_for_rows(
+    authority,
+    rows: list[dict] | tuple[dict, ...],
+) -> dict[str, dict[str, object]] | None:
+    if not any(
+        str(row.get("carrier_path") or "").startswith("journal:") for row in rows
+    ):
+        return None
+    # One bounded journal read covers every synthetic carrier in the batch.
+    # Besides removing the N+1 query pattern, this keeps listener busy
+    # tolerance's documented per-operation timing bound honest.
+    return {
+        str(value.get("item_id") or ""): value
+        for value in authority.attention_items()
+    }
+
+
+def _envelopes_with_rows(
+    authority,
+    rows: list[dict] | tuple[dict, ...],
+    *,
+    attention_by_id: dict[str, dict[str, object]] | None = None,
+) -> list[tuple[dict, dict]]:
+    if attention_by_id is None:
+        attention_by_id = _attention_items_for_rows(authority, rows)
+    return [
+        (
+            row,
+            _listener_envelope(
+                authority,
+                row,
+                attention_by_id=attention_by_id,
+            ),
+        )
+        for row in rows
+    ]
 
 
 def _foreign_controller_items(
@@ -4254,7 +4324,13 @@ def cmd_relay(args: argparse.Namespace) -> int:
             lease_nonce=lease.nonce,
         )
         visible_envelopes = [envelope for _row, envelope in visible_items]
-    except (goalflight_journal.JournalUnavailable, MessageError, ValueError) as exc:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+        MessageError,
+        ValueError,
+    ) as exc:
         print(f"relay: {exc}", file=sys.stderr)
         return 2
     positions = _cursor_positions(rows)
@@ -4306,7 +4382,11 @@ def cmd_relay(args: argparse.Namespace) -> int:
             conflict_reason = str(exc)
         except goalflight_journal.JournalUpgradeRequired:
             raise
-        except goalflight_journal.JournalUnavailable as exc:
+        except (
+            goalflight_journal.JournalBusy,
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+        ) as exc:
             print(f"relay: {exc}", file=sys.stderr)
             return 2
         except goalflight_journal.JournalError:
@@ -4539,7 +4619,11 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
         )
     except goalflight_journal.JournalUpgradeRequired:
         raise
-    except goalflight_journal.JournalUnavailable as exc:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
         print(f"advance: {exc}", file=sys.stderr)
         return 2
     except goalflight_journal.JournalError:
@@ -4850,6 +4934,35 @@ FOLLOW_FRONTIER_STALE_SECS = 60.0 * 60.0
 FOLLOW_WRITE_RETRY_SECS = 1.0
 FOLLOW_WRITE_STALL_SECS = 60.0
 FOLLOW_STATE_START_GRACE_SECS = 15.0
+# Persistent listeners live for hours, so a busy journal is a load symptom to
+# outlast, not a fault to die on. 2026-08-25, loadavg ~94: the follower burned
+# the default 1.0s flat-jitter busy budget in 34 connect attempts and exited 2
+# while the journal stayed healthy — coverage silently read 0/3. Listener-owned
+# Journal clients get a wider per-operation busy budget so ordinary multi-writer
+# contention never reaches the poll loops. One-shot CLI readers keep the 1.0s
+# Journal default: they want to fail fast, and widening the global default
+# would touch every caller of Journal.
+LISTENER_JOURNAL_BUSY_BUDGET_S = 10.0
+# Continuous journal-busy failure past this window is no longer transient.
+# The journal's own open budget (goalflight_journal.JOURNAL_OPEN_RETRY_BUDGET_S,
+# 75s) was sized from a measured one-minute live incident; four of those spans
+# without one successful read means a human should hear about it.
+LISTENER_JOURNAL_TOLERANCE_S = 300.0
+LISTENER_JOURNAL_BACKOFF_CAP_S = 30.0
+# Every bounded read/write used by these listener paths carries one absolute
+# busy deadline through its lock, connect, query, and transaction stages. Those
+# stages cannot each restart the 10-second budget. The tolerance clock starts
+# when the first bounded operation reports busy, so continuous busy is bounded
+# by: first 10s operation + 300s failure window + one 30s backoff + one final
+# 10s operation. The arithmetic is elapsed-time based, not attempt-count based:
+# an upstream stage or the first timeout=0 connect may spend the whole absolute
+# deadline and correctly report one attempt. Scheduler delay is outside this
+# operational bound.
+LISTENER_JOURNAL_MAX_OUTAGE_BOUND_S = (
+    LISTENER_JOURNAL_TOLERANCE_S
+    + (2 * LISTENER_JOURNAL_BUSY_BUDGET_S)
+    + LISTENER_JOURNAL_BACKOFF_CAP_S
+)
 STREAM_PIPE_BUF_BYTES = 512
 # Include the newline and stay strictly below the measured 512-byte PIPE_BUF.
 STREAM_LINE_MAX_BYTES = STREAM_PIPE_BUF_BYTES - 1
@@ -5179,6 +5292,116 @@ def _follow_fault_record(reason: str, detail: object = "") -> dict[str, object]:
     return _fit_follow_record(record, shrink_fields=("detail", "reason"))
 
 
+def _follow_degraded_record(
+    reason: str,
+    detail: object,
+    tolerance_s: float,
+) -> dict[str, object]:
+    record: dict[str, object] = {
+        "kind": "event",
+        "payload": {
+            "type": "listener-degraded",
+            "reason": _truncate_utf8(reason, 72),
+            "detail": sanitize_display(detail, limit=180),
+            "tolerance_s": tolerance_s,
+            "outage_to_exit_bound_s": LISTENER_JOURNAL_MAX_OUTAGE_BOUND_S,
+        },
+    }
+    return _fit_follow_record(record, shrink_fields=("detail", "reason"))
+
+
+def _follow_recovered_record(reason: str, degraded_s: float) -> dict[str, object]:
+    record: dict[str, object] = {
+        "kind": "event",
+        "payload": {
+            "type": "listener-recovered",
+            "reason": _truncate_utf8(reason, 72),
+            "degraded_s": round(degraded_s, 3),
+        },
+    }
+    return _fit_follow_record(record, shrink_fields=("reason",))
+
+
+class _JournalBusyTolerance:
+    """One persistent listener loop's continuous journal-busy failure window.
+
+    The first failure opens the window; any successful poll closes and resets
+    it. ``note_failure`` returns False once continuous failure outlasts the
+    window — the caller then fails with exactly the behavior it had before
+    this tolerance existed. Because the clock begins after the first bounded
+    operation fails, the production outage-to-exit bound is 350 seconds plus
+    scheduler delay, not five minutes. Degradation is reported on the
+    state transition only: one notice when the window opens and one when it
+    closes. A notice per retry would be a wall of repeated alerts, which is
+    what makes such output easy to ignore (see
+    _report_why_this_entry_did_not_launch in goalflight_dispatch for the same
+    reasoning).
+    """
+
+    def __init__(self, tolerance_s: float, backoff_cap_s: float) -> None:
+        self.tolerance_s = tolerance_s
+        self._backoff_cap_s = backoff_cap_s
+        self.degraded = False
+        self.reason = "journal-unavailable"
+        self._first_failure_at = 0.0
+        self._failures = 0
+
+    def note_failure(self, exc: BaseException) -> bool:
+        """Record one failed poll; False once the window is exceeded."""
+        now = time.monotonic()
+        if not self.degraded:
+            self.degraded = True
+            self._first_failure_at = now
+            self._failures = 0
+            self.reason = _journal_failure_reason(exc)
+        self._failures += 1
+        return now - self._first_failure_at < self.tolerance_s
+
+    def note_success(self) -> float | None:
+        """Reset after a healthy poll; returns degraded seconds when recovering."""
+        if not self.degraded:
+            return None
+        elapsed = time.monotonic() - self._first_failure_at
+        self.degraded = False
+        self._failures = 0
+        return elapsed
+
+    def backoff_s(self, poll_s: float) -> float:
+        """Capped exponential spacing between degraded retries."""
+        exponent = min(max(self._failures - 1, 0), 10)
+        return min(poll_s * (2**exponent), self._backoff_cap_s)
+
+
+_ListenerJournalResult = TypeVar("_ListenerJournalResult")
+
+
+def _retry_listener_journal_busy(
+    operation: Callable[[], _ListenerJournalResult],
+    *,
+    busy_error: type[BaseException],
+    tolerance: _JournalBusyTolerance,
+    poll_s: float,
+    on_degraded: Callable[[BaseException], None],
+    on_recovered: Callable[[float], None],
+) -> _ListenerJournalResult:
+    """Apply one listener's busy episode across startup and re-arm operations."""
+    while True:
+        try:
+            result = operation()
+        except busy_error as exc:
+            first = not tolerance.degraded
+            if not tolerance.note_failure(exc):
+                raise
+            if first:
+                on_degraded(exc)
+            time.sleep(tolerance.backoff_s(poll_s))
+            continue
+        recovered_s = tolerance.note_success()
+        if recovered_s is not None:
+            on_recovered(recovered_s)
+        return result
+
+
 def _exit_listener_before_final_event(
     authority: goalflight_journal.Journal,
     coverage_id: str,
@@ -5358,22 +5581,6 @@ def cmd_follow(args) -> int:
     if not label:
         print("follow: controller label is unavailable", file=sys.stderr)
         return 2
-    resolved = _resolve_listen_auto_lease(
-        project_root,
-        controller_label=label,
-        explicit_nonce=str(args.lease_nonce or "").strip() or None,
-    )
-    if not resolved.get("claimed"):
-        print(
-            "follow: " + str(resolved.get("reason") or "ambient lease unavailable"),
-            file=sys.stderr,
-        )
-        return 2
-    nonce = str(resolved.get("nonce") or "").strip()
-    if not nonce:
-        print("follow: active controller lease is unavailable", file=sys.stderr)
-        return 2
-
     test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
     minimum = 0.01 if test_mode else 1.0
     configured = {
@@ -5435,8 +5642,80 @@ def cmd_follow(args) -> int:
         print(f"follow: {reason}: {detail}", file=sys.stderr)
         return 2 if stdout_alive else 0
 
+    journal_tolerance = _JournalBusyTolerance(
+        LISTENER_JOURNAL_TOLERANCE_S,
+        LISTENER_JOURNAL_BACKOFF_CAP_S,
+    )
+
+    def startup_degraded(exc: BaseException) -> None:
+        alive = _write_follow_record(
+            _follow_degraded_record(
+                journal_tolerance.reason,
+                exc,
+                journal_tolerance.tolerance_s,
+            ),
+            stream=sys.stdout,
+        )
+        if not alive:
+            _silence_broken_stdout(sys.stdout)
+            raise FollowWriteStalled("stdout closed during journal startup degradation")
+
+    def startup_recovered(degraded_s: float) -> None:
+        alive = _write_follow_record(
+            _follow_recovered_record(journal_tolerance.reason, degraded_s),
+            stream=sys.stdout,
+        )
+        if not alive:
+            _silence_broken_stdout(sys.stdout)
+            raise FollowWriteStalled("stdout closed during journal startup recovery")
+
     try:
-        authority = goalflight_journal.Journal(project_root)
+        resolved = _retry_listener_journal_busy(
+            lambda: _resolve_listen_auto_lease(
+                project_root,
+                controller_label=label,
+                explicit_nonce=str(args.lease_nonce or "").strip() or None,
+                retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+            ),
+            busy_error=goalflight_journal.JournalBusy,
+            tolerance=journal_tolerance,
+            poll_s=poll_s,
+            on_degraded=startup_degraded,
+            on_recovered=startup_recovered,
+        )
+    except (FollowWriteStalled, OSError):
+        return 0
+    except goalflight_journal.JournalUpgradeRequired as exc:
+        return startup_fail("journal-upgrade-required", exc)
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
+        return startup_fail(_journal_failure_reason(exc), exc)
+    if not resolved.get("claimed"):
+        print(
+            "follow: " + str(resolved.get("reason") or "ambient lease unavailable"),
+            file=sys.stderr,
+        )
+        return 2
+    nonce = str(resolved.get("nonce") or "").strip()
+    if not nonce:
+        print("follow: active controller lease is unavailable", file=sys.stderr)
+        return 2
+
+    try:
+        authority = _retry_listener_journal_busy(
+            lambda: goalflight_journal.Journal(
+                project_root,
+                retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+            ),
+            busy_error=goalflight_journal.JournalBusy,
+            tolerance=journal_tolerance,
+            poll_s=poll_s,
+            on_degraded=startup_degraded,
+            on_recovered=startup_recovered,
+        )
         waiter = goalflight_wake.register_waiter(
             project_root,
             controller_label=label,
@@ -5452,7 +5731,11 @@ def cmd_follow(args) -> int:
         return 3
     except goalflight_journal.JournalUpgradeRequired as exc:
         return startup_fail("journal-upgrade-required", exc)
-    except goalflight_journal.JournalUnavailable as exc:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
         return startup_fail(_journal_failure_reason(exc), exc)
     except goalflight_journal.JournalError:
         raise
@@ -5488,6 +5771,10 @@ def cmd_follow(args) -> int:
     next_heartbeat = time.monotonic()
     last_frontier_signature: str | None = None
     last_frontier_at = float("-inf")
+    journal_tolerance = _JournalBusyTolerance(
+        LISTENER_JOURNAL_TOLERANCE_S,
+        LISTENER_JOURNAL_BACKOFF_CAP_S,
+    )
     pending_report = goalflight_wake.recover_pending_report_state(
         project_root,
         controller_label=label,
@@ -5568,19 +5855,19 @@ def cmd_follow(args) -> int:
                     }
                 )
                 return listener_posix_signal_exit_code(fatal)
-            lease = authority.active_lease(label)
-            if lease is None or lease.nonce != nonce:
-                emit(
-                    {
-                        "kind": "event",
-                        "payload": {
-                            "type": "listener-exit",
-                            "reason": "stale-lease",
-                        },
-                    }
-                )
-                return 3
             try:
+                lease = authority.active_lease(label)
+                if lease is None or lease.nonce != nonce:
+                    emit(
+                        {
+                            "kind": "event",
+                            "payload": {
+                                "type": "listener-exit",
+                                "reason": "stale-lease",
+                            },
+                        }
+                    )
+                    return 3
                 snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
                 candidate_rows = [
                     item
@@ -5589,21 +5876,80 @@ def cmd_follow(args) -> int:
                     and int(item.get("stream_seq") or 0)
                     > arm_high.get(str(item.get("stream_id") or ""), 0)
                 ]
-                visible = _foreign_controller_items(
+                visible: list[tuple[dict, dict]] | None = _foreign_controller_items(
                     _envelopes_with_rows(authority, candidate_rows),
                     controller_label=label,
                     lease_nonce=nonce,
                 )
             except goalflight_journal.CASMismatch as exc:
+                current_lease = authority.active_lease(label)
+                if current_lease is None or current_lease.nonce != nonce:
+                    emit(
+                        {
+                            "kind": "event",
+                            "payload": {
+                                "type": "listener-exit",
+                                "reason": "stale-lease",
+                            },
+                        }
+                    )
+                    return 3
                 return fail("lease-cursor-mismatch", exc, code=3)
             except goalflight_journal.JournalUpgradeRequired as exc:
                 return fail("journal-upgrade-required", exc, code=2)
-            except goalflight_journal.JournalUnavailable as exc:
+            except goalflight_journal.JournalDisappeared as exc:
+                # Verified absence never recovers in place; a blanket retry
+                # would spin forever against a deleted journal.
                 return fail(_journal_failure_reason(exc), exc, code=2)
+            except goalflight_journal.JournalIOError as exc:
+                # Fatal on purpose. JournalIOError has two origins: an immediate
+                # path.stat() OSError that prevents identity/disappearance
+                # verification, or exhausted 75s present-path open retries.
+                # Neither is SQLite contention, so only JournalBusy enters the
+                # listener tolerance below.
+                return fail(_journal_failure_reason(exc), exc, code=2)
+            except goalflight_journal.JournalBusy as exc:
+                first = not journal_tolerance.degraded
+                if not journal_tolerance.note_failure(exc):
+                    return fail(_journal_failure_reason(exc), exc, code=2)
+                if first and not emit(
+                    _follow_degraded_record(
+                        journal_tolerance.reason,
+                        exc,
+                        journal_tolerance.tolerance_s,
+                    )
+                ):
+                    return 0
+                visible = None
             except goalflight_journal.JournalError:
                 raise
             except ValueError as exc:
                 return fail("journal-unavailable", exc, code=2)
+            else:
+                recovered_s = journal_tolerance.note_success()
+                if recovered_s is not None:
+                    if not emit(
+                        _follow_recovered_record(
+                            journal_tolerance.reason, recovered_s
+                        )
+                    ):
+                        return 0
+                    # The recovery record just spoke for this interval.
+                    next_heartbeat = time.monotonic() + heartbeat_s
+            if visible is None:
+                # Degraded iteration: the heartbeat must keep beating. It is
+                # the watchdog's only liveness witness while the journal is
+                # contended; dropping it would turn journal load into a false
+                # follow-death and a pointless re-arm.
+                now = time.monotonic()
+                if now >= next_heartbeat:
+                    heartbeat_seq += 1
+                    if not emit(_follow_heartbeat_record(heartbeat_seq, heartbeat_s)):
+                        return 0
+                    next_heartbeat = time.monotonic() + heartbeat_s
+                delay = journal_tolerance.backoff_s(poll_s)
+                time.sleep(min(delay, max(0.0, next_heartbeat - time.monotonic())))
+                continue
 
             try:
                 alive, emitted_event = _emit_claimed_follow_events(
@@ -5644,7 +5990,11 @@ def cmd_follow(args) -> int:
         return fail("state-unavailable", exc, code=2)
     except goalflight_journal.JournalUpgradeRequired as exc:
         return fail("journal-upgrade-required", exc, code=2)
-    except goalflight_journal.JournalUnavailable as exc:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
         return fail(_journal_failure_reason(exc), exc, code=2)
     except goalflight_journal.JournalError:
         raise
@@ -5662,6 +6012,7 @@ def _cmd_watch_follow(
     label: str,
     nonce: str,
     poll: float,
+    journal_tolerance: _JournalBusyTolerance,
 ) -> int:
     """Observe durable follow age without joining the doorbell delivery pool."""
     import goalflight_journal  # type: ignore
@@ -5692,8 +6043,33 @@ def _cmd_watch_follow(
             file=sys.stderr,
         )
 
+    def startup_degraded(exc: BaseException) -> None:
+        print(
+            f"listen: {journal_tolerance.reason}: watchdog degraded; "
+            f"journal busy within {journal_tolerance.tolerance_s:g}s continuous-"
+            f"failure window (outage-to-exit bound "
+            f"{LISTENER_JOURNAL_MAX_OUTAGE_BOUND_S:g}s plus scheduler delay): {exc}",
+            file=sys.stderr,
+        )
+
+    def startup_recovered(degraded_s: float) -> None:
+        print(
+            f"listen: watchdog recovered after {degraded_s:.1f}s of journal busy",
+            file=sys.stderr,
+        )
+
     try:
-        authority = goalflight_journal.Journal(project_root)
+        authority = _retry_listener_journal_busy(
+            lambda: goalflight_journal.Journal(
+                project_root,
+                retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+            ),
+            busy_error=goalflight_journal.JournalBusy,
+            tolerance=journal_tolerance,
+            poll_s=poll,
+            on_degraded=startup_degraded,
+            on_recovered=startup_recovered,
+        )
         waiter = goalflight_wake.register_watchdog_waiter(
             project_root,
             controller_label=label,
@@ -5707,7 +6083,11 @@ def _cmd_watch_follow(
         return 3
     except goalflight_journal.JournalUpgradeRequired:
         raise
-    except goalflight_journal.JournalUnavailable as exc:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
         print(
             f"listen: {_journal_failure_reason(exc)}: watchdog registration failed: {exc}",
             file=sys.stderr,
@@ -5773,7 +6153,47 @@ def _cmd_watch_follow(
             if deadline is not None and time.monotonic() >= deadline:
                 return 1
 
-            lease = authority.active_lease(label)
+            try:
+                lease = authority.active_lease(label)
+            except (
+                goalflight_journal.JournalDisappeared,
+                goalflight_journal.JournalIOError,
+            ):
+                # Fatal via the outer handler: verified absence never recovers
+                # in place. JournalIOError is either an immediate identity/stat
+                # I/O failure or exhausted present-path open retries; neither
+                # is SQLite contention.
+                raise
+            except goalflight_journal.JournalBusy as exc:
+                first = not journal_tolerance.degraded
+                if not journal_tolerance.note_failure(exc):
+                    # Past the tolerance window: the outer handler exits 2 with
+                    # the same record this failure produced before tolerance.
+                    raise
+                if first:
+                    print(
+                        f"listen: {journal_tolerance.reason}: watchdog degraded; "
+                        "journal busy within "
+                        f"{journal_tolerance.tolerance_s:g}s continuous-failure "
+                        "window (outage-to-exit bound "
+                        f"{LISTENER_JOURNAL_MAX_OUTAGE_BOUND_S:g}s plus "
+                        f"scheduler delay): {exc}",
+                        file=sys.stderr,
+                    )
+                time.sleep(journal_tolerance.backoff_s(poll))
+                continue
+            except (
+                goalflight_journal.JournalDisappeared,
+                goalflight_journal.JournalIOError,
+            ):
+                raise
+            recovered_s = journal_tolerance.note_success()
+            if recovered_s is not None:
+                print(
+                    f"listen: watchdog recovered after {recovered_s:.1f}s "
+                    "of journal busy",
+                    file=sys.stderr,
+                )
             if lease is None or lease.nonce != nonce:
                 print(
                     "listen: stale-lease: watchdog generation is no longer active",
@@ -5831,7 +6251,11 @@ def _cmd_watch_follow(
             time.sleep(poll)
     except goalflight_journal.JournalUpgradeRequired:
         raise
-    except goalflight_journal.JournalUnavailable as exc:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
         print(
             f"listen: {_journal_failure_reason(exc)}: watchdog runtime failed: {exc}",
             file=sys.stderr,
@@ -5883,11 +6307,54 @@ def cmd_listen(args) -> int:
         print(f"{prefix}: controller label is unavailable", file=sys.stderr)
         return 2
     explicit_nonce = str(getattr(args, "lease_nonce", None) or "").strip() or None
-    resolved = _resolve_listen_auto_lease(
-        project_root,
-        controller_label=label,
-        explicit_nonce=explicit_nonce,
+    test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
+    poll = max(0.01 if test_mode else 0.5, float(args.poll_secs or 5.0))
+    watch_follow = bool(getattr(args, "watch_follow", False))
+    listener_role = "watchdog" if watch_follow else "listener"
+    journal_tolerance = _JournalBusyTolerance(
+        LISTENER_JOURNAL_TOLERANCE_S,
+        LISTENER_JOURNAL_BACKOFF_CAP_S,
     )
+
+    def startup_degraded(exc: BaseException) -> None:
+        print(
+            f"listen: {journal_tolerance.reason}: {listener_role} degraded; "
+            f"journal busy within {journal_tolerance.tolerance_s:g}s continuous-"
+            f"failure window (outage-to-exit bound "
+            f"{LISTENER_JOURNAL_MAX_OUTAGE_BOUND_S:g}s plus scheduler delay): {exc}",
+            file=sys.stderr,
+        )
+
+    def startup_recovered(degraded_s: float) -> None:
+        print(
+            f"listen: {listener_role} recovered after {degraded_s:.1f}s "
+            "of journal busy",
+            file=sys.stderr,
+        )
+
+    try:
+        resolved = _retry_listener_journal_busy(
+            lambda: _resolve_listen_auto_lease(
+                project_root,
+                controller_label=label,
+                explicit_nonce=explicit_nonce,
+                retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+            ),
+            busy_error=goalflight_journal.JournalBusy,
+            tolerance=journal_tolerance,
+            poll_s=poll,
+            on_degraded=startup_degraded,
+            on_recovered=startup_recovered,
+        )
+    except goalflight_journal.JournalUpgradeRequired:
+        raise
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
+        print(f"{prefix}: {_journal_failure_reason(exc)}: {exc}", file=sys.stderr)
+        return 2
     if not resolved.get("claimed"):
         print(
             f"{prefix}: " + str(resolved.get("reason") or "ambient lease unavailable"),
@@ -5901,9 +6368,6 @@ def cmd_listen(args) -> int:
     args.project_root = str(project_root)
     args.controller_label = label
     args.lease_nonce = nonce
-    test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
-    poll = max(0.01 if test_mode else 0.5, float(args.poll_secs or 5.0))
-    watch_follow = bool(getattr(args, "watch_follow", False))
     if watch_follow:
         return _cmd_watch_follow(
             args,
@@ -5911,6 +6375,7 @@ def cmd_listen(args) -> int:
             label=label,
             nonce=nonce,
             poll=poll,
+            journal_tolerance=journal_tolerance,
         )
     try:
         listener_slots = goalflight_wake.listener_slot_count(
@@ -5925,7 +6390,17 @@ def cmd_listen(args) -> int:
         else None
     )
     try:
-        authority = goalflight_journal.Journal(project_root)
+        authority = _retry_listener_journal_busy(
+            lambda: goalflight_journal.Journal(
+                project_root,
+                retry_budget_s=LISTENER_JOURNAL_BUSY_BUDGET_S,
+            ),
+            busy_error=goalflight_journal.JournalBusy,
+            tolerance=journal_tolerance,
+            poll_s=poll,
+            on_degraded=startup_degraded,
+            on_recovered=startup_recovered,
+        )
         test_start_token = (
             os.environ.get("GOALFLIGHT_TEST_LISTENER_START_TOKEN")
             if test_mode
@@ -5941,7 +6416,11 @@ def cmd_listen(args) -> int:
         parent_pid = os.getppid()
     except goalflight_journal.JournalUpgradeRequired:
         raise
-    except goalflight_journal.JournalUnavailable as exc:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
         print(f"listen: {_journal_failure_reason(exc)}: {exc}", file=sys.stderr)
         return 2
     except goalflight_journal.JournalError:
@@ -5972,12 +6451,32 @@ def cmd_listen(args) -> int:
     arm_snapshot = None
     report_claim = None
     pending_report_settled = True
+    prearmed_visible_items: list[tuple[dict, dict]] | None = None
+
+    def arm_once():
+        result = authority.arm_listener(
+            label,
+            nonce=nonce,
+            pid=os.getpid(),
+            start_token=str(identity["start_token"]),
+            parent_pid=parent_pid,
+        )
+        if result.retryable:
+            raise goalflight_journal.JournalBusy(
+                result.reason or "listener coverage arm remained busy"
+            )
+        return result
+
     try:
         if getattr(args, "report_pending", False):
-            try:
-                arm_snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
-            except goalflight_journal.JournalUnavailable:
-                arm_snapshot = None
+            arm_snapshot = _retry_listener_journal_busy(
+                lambda: authority.cursor_peek(label, nonce=nonce, limit=1000),
+                busy_error=goalflight_journal.JournalBusy,
+                tolerance=journal_tolerance,
+                poll_s=poll,
+                on_degraded=startup_degraded,
+                on_recovered=startup_recovered,
+            )
             persisted_state = goalflight_wake.recover_pending_report_state(
                 project_root,
                 controller_label=label,
@@ -6006,6 +6505,25 @@ def cmd_listen(args) -> int:
                         )
             elif arm_snapshot is not None and arm_snapshot.items:
                 local_high = _cursor_positions(arm_snapshot.items)
+                if not args.json:
+                    # Human-readable envelopes must exist before the durable
+                    # claim: a query-stage busy cannot stamp a high-water that
+                    # no arm actually reported.
+                    prearmed_visible_items = _retry_listener_journal_busy(
+                        lambda: _foreign_controller_items(
+                            _envelopes_with_rows(
+                                authority,
+                                list(arm_snapshot.items),
+                            ),
+                            controller_label=label,
+                            lease_nonce=nonce,
+                        ),
+                        busy_error=goalflight_journal.JournalBusy,
+                        tolerance=journal_tolerance,
+                        poll_s=poll,
+                        on_degraded=startup_degraded,
+                        on_recovered=startup_recovered,
+                    )
                 # The first arm publishes a complete claim atomically. A loser
                 # reloads that claim's water and discards its later local water,
                 # so mail arriving behind the winner remains ringable.
@@ -6027,12 +6545,13 @@ def cmd_listen(args) -> int:
                 arm_high = dict(winner_state.positions)
                 pending_report_settled = winner_state.phase == "acknowledged"
 
-        armed = authority.arm_listener(
-            label,
-            nonce=nonce,
-            pid=os.getpid(),
-            start_token=str(identity["start_token"]),
-            parent_pid=parent_pid,
+        armed = _retry_listener_journal_busy(
+            arm_once,
+            busy_error=goalflight_journal.JournalBusy,
+            tolerance=journal_tolerance,
+            poll_s=poll,
+            on_degraded=startup_degraded,
+            on_recovered=startup_recovered,
         )
         if not armed.committed or not armed.value:
             raise MessageError(armed.reason or "listener coverage arm lost")
@@ -6040,7 +6559,11 @@ def cmd_listen(args) -> int:
     except goalflight_journal.JournalUpgradeRequired:
         waiter.close()
         raise
-    except goalflight_journal.JournalUnavailable as exc:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
         waiter.close()
         print(f"listen: {_journal_failure_reason(exc)}: {exc}", file=sys.stderr)
         return 2
@@ -6087,13 +6610,32 @@ def cmd_listen(args) -> int:
             )
         except goalflight_journal.JournalUpgradeRequired:
             raise
+        except (
+            goalflight_journal.JournalBusy,
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+        ):
+            raise
         except goalflight_journal.JournalError:
             raise
         except Exception:
             return None
 
     def emit_payload(payload: dict[str, object], *, detail: str | None = None) -> None:
-        plan = rearm_plan_after_release()
+        try:
+            plan = rearm_plan_after_release()
+        except (
+            goalflight_journal.JournalBusy,
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+        ) as exc:
+            payload["rearm_error"] = sanitize_display(exc, limit=180)
+            plan = None
+        except goalflight_journal.JournalError as exc:
+            # Rearm enrichment is secondary. The exit payload is the evidence
+            # operators need when the journal itself is unavailable.
+            payload["rearm_error"] = sanitize_display(exc, limit=180)
+            plan = None
         hint = ""
         if (
             plan
@@ -6116,7 +6658,7 @@ def cmd_listen(args) -> int:
                 "hint": hint,
             }
         if args.json:
-            print(json.dumps(payload, sort_keys=True))
+            print(json.dumps(payload, sort_keys=True), flush=True)
         else:
             if detail:
                 print(f"listen: {payload.get('reason')}: {detail}", file=sys.stderr)
@@ -6133,7 +6675,17 @@ def cmd_listen(args) -> int:
         try:
             exited = authority.exit_listener(coverage_id, reason=reason)
             if not exited.committed:
-                payload["detail"] = detail or exited.reason or "coverage exit CAS lost"
+                payload["coverage_exit_error"] = (
+                    exited.reason or "coverage exit CAS lost"
+                )
+        except (
+            goalflight_journal.JournalBusy,
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+        ) as exc:
+            payload["coverage_exit_error"] = sanitize_display(exc, limit=180)
+        except goalflight_journal.JournalError as exc:
+            payload["coverage_exit_error"] = sanitize_display(exc, limit=180)
         finally:
             if waiter is not None:
                 waiter.close()
@@ -6256,6 +6808,7 @@ def cmd_listen(args) -> int:
     def emit_pending_report(
         claim: goalflight_wake.PendingReportState,
         snapshot,
+        visible_items: list[tuple[dict, dict]] | None = None,
     ) -> bool:
         """Flush one claimed boundary. True when handled; False means retry."""
         settled = _settle_pending_report_if_consumed(
@@ -6364,12 +6917,20 @@ def cmd_listen(args) -> int:
                 flush=True,
             )
         else:
-            arm_items = _envelopes_with_rows(authority, list(report_items))
-            visible_arm_items = _foreign_controller_items(
-                arm_items,
-                controller_label=label,
-                lease_nonce=nonce,
-            )
+            visible_arm_items = visible_items
+            if visible_arm_items is None:
+                visible_arm_items = _retry_listener_journal_busy(
+                    lambda: _foreign_controller_items(
+                        _envelopes_with_rows(authority, list(report_items)),
+                        controller_label=label,
+                        lease_nonce=nonce,
+                    ),
+                    busy_error=goalflight_journal.JournalBusy,
+                    tolerance=journal_tolerance,
+                    poll_s=poll,
+                    on_degraded=startup_degraded,
+                    on_recovered=startup_recovered,
+                )
             for row, envelope in visible_arm_items:
                 print(format_receipt_headline(row, envelope), flush=True)
             print(f"advance: {arm_advance}", flush=True)
@@ -6387,13 +6948,22 @@ def cmd_listen(args) -> int:
     # It remains takeover-eligible after owner death until cursor acknowledgement.
     if report_claim is not None:
         try:
-            if emit_pending_report(report_claim, arm_snapshot):
+            if emit_pending_report(
+                report_claim,
+                arm_snapshot,
+                visible_items=prearmed_visible_items,
+            ):
                 pending_report_settled = True
         except goalflight_journal.CASMismatch as exc:
             return finish("stale-lease", code=3, detail=str(exc))
         except goalflight_journal.JournalUpgradeRequired as exc:
             return finish("upgrade-required", code=2, detail=str(exc))
-        except goalflight_journal.JournalUnavailable as exc:
+        except goalflight_journal.JournalBusy as exc:
+            return finish(_journal_failure_reason(exc), code=2, detail=str(exc))
+        except (
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+        ) as exc:
             return finish(_journal_failure_reason(exc), code=2, detail=str(exc))
         except goalflight_journal.JournalError:
             raise
@@ -6454,7 +7024,12 @@ def cmd_listen(args) -> int:
                 return finish("stale-lease", code=3, detail=str(exc))
             except goalflight_journal.JournalUpgradeRequired as exc:
                 return finish("upgrade-required", code=2, detail=str(exc))
-            except goalflight_journal.JournalUnavailable as exc:
+            except goalflight_journal.JournalBusy as exc:
+                return finish(_journal_failure_reason(exc), code=2, detail=str(exc))
+            except (
+                goalflight_journal.JournalDisappeared,
+                goalflight_journal.JournalIOError,
+            ) as exc:
                 return finish(_journal_failure_reason(exc), code=2, detail=str(exc))
             except goalflight_journal.JournalError:
                 raise
@@ -6478,6 +7053,7 @@ def cmd_listen(args) -> int:
             continue
         if deadline is not None and time.monotonic() >= deadline:
             return finish("timeout", code=1, detail="no waking event before timeout")
+        visible_ring_items: list[tuple[dict, dict]] | None = None
         try:
             lease = authority.active_lease(label)
             measured = (
@@ -6550,7 +7126,15 @@ def cmd_listen(args) -> int:
                     > arm_high.get(str(item.get("stream_id") or ""), 0)
                 )
             ]
-            candidate_items = _envelopes_with_rows(authority, candidate_rows)
+            candidate_attention = _attention_items_for_rows(
+                authority,
+                candidate_rows,
+            )
+            candidate_items = _envelopes_with_rows(
+                authority,
+                candidate_rows,
+                attention_by_id=candidate_attention,
+            )
             wakeable_items = bool(
                 _foreign_controller_items(
                     candidate_items,
@@ -6558,22 +7142,76 @@ def cmd_listen(args) -> int:
                     lease_nonce=nonce,
                 )
             )
+            if wakeable_items and not args.json:
+                # The non-JSON listener is the controller: it prints every
+                # buffered item before exiting. Materialize those envelopes
+                # while coverage and the kernel waiter are still live and before
+                # claiming the one ring for this cursor version.
+                # Reuse a waking synthetic candidate's attention read when the
+                # complete snapshot is rendered. When the candidate is a normal
+                # carrier, a quiet synthetic backlog is loaded once here.
+                visible_ring_items = _foreign_controller_items(
+                    _envelopes_with_rows(
+                        authority,
+                        list(peek.items),
+                        attention_by_id=candidate_attention,
+                    ),
+                    controller_label=label,
+                    lease_nonce=nonce,
+                )
         except goalflight_journal.CASMismatch as exc:
             lease = authority.active_lease(label)
             reason = "stale-lease" if lease is not None else "superseded"
             return finish(reason, code=3, detail=str(exc))
         except goalflight_journal.JournalUpgradeRequired as exc:
             return finish("upgrade-required", code=2, detail=str(exc))
-        except goalflight_journal.JournalUnavailable as exc:
+        except goalflight_journal.JournalDisappeared as exc:
+            # Verified absence never recovers in place; a blanket retry would
+            # spin forever against a deleted journal.
             return finish(
                 _journal_failure_reason(exc),
                 code=2,
                 detail=str(exc),
             )
+        except goalflight_journal.JournalIOError as exc:
+            # Fatal on purpose. This is either immediate path identity/stat I/O
+            # failure or exhausted present-path open retries; neither is busy.
+            return finish(
+                _journal_failure_reason(exc),
+                code=2,
+                detail=str(exc),
+            )
+        except goalflight_journal.JournalBusy as exc:
+            first = not journal_tolerance.degraded
+            if not journal_tolerance.note_failure(exc):
+                return finish(
+                    _journal_failure_reason(exc),
+                    code=2,
+                    detail=str(exc),
+                )
+            if first:
+                print(
+                    f"listen: {journal_tolerance.reason}: listener degraded; "
+                    "journal busy within "
+                    f"{journal_tolerance.tolerance_s:g}s continuous-failure "
+                    "window (outage-to-exit bound "
+                    f"{LISTENER_JOURNAL_MAX_OUTAGE_BOUND_S:g}s plus "
+                    f"scheduler delay): {exc}",
+                    file=sys.stderr,
+                )
+            wakeable_items = False
         except goalflight_journal.JournalError:
             raise
         except ValueError as exc:
             return finish("corrupt", code=2, detail=str(exc))
+        else:
+            recovered_s = journal_tolerance.note_success()
+            if recovered_s is not None:
+                print(
+                    f"listen: listener recovered after {recovered_s:.1f}s "
+                    "of journal busy",
+                    file=sys.stderr,
+                )
         if wakeable_items:
             snapshot = peek
             try:
@@ -6606,13 +7244,6 @@ def cmd_listen(args) -> int:
                     code=2,
                     detail="waking cursor snapshot has no advance positions",
                 )
-            # The cursor-version stamp, not the single audit row, arbitrates a
-            # pool ring. A sibling may already have superseded this row.
-            _exit_listener_before_final_event(
-                authority,
-                coverage_id,
-                reason="event",
-            )
             # The JSON ring stays body-free ON PURPOSE: it is a wake signal plus
             # the instructions to drain, never the mail itself. A --json consumer
             # advances with advance_command and reads bodies from the drain. The
@@ -6627,21 +7258,36 @@ def cmd_listen(args) -> int:
                 "cursor_version": snapshot.cursor_version,
                 "advance_command": advance_command,
             }
-            waiter.close()
-            if not args.json:
-                ring_items = _envelopes_with_rows(authority, list(snapshot.items))
-                visible_ring_items = _foreign_controller_items(
-                    ring_items,
-                    controller_label=label,
-                    lease_nonce=nonce,
+            try:
+                # The cursor-version stamp, not the single audit row, arbitrates
+                # a pool ring. A sibling may already have superseded this row.
+                _exit_listener_before_final_event(
+                    authority,
+                    coverage_id,
+                    reason="event",
                 )
-                for row, envelope in visible_ring_items:
-                    print(format_receipt_headline(row, envelope), flush=True)
-                print(f"advance: {advance_command}", flush=True)
-            emit_payload(payload)
+                waiter.close()
+                if not args.json:
+                    assert visible_ring_items is not None
+                    for row, envelope in visible_ring_items:
+                        print(format_receipt_headline(row, envelope), flush=True)
+                    print(f"advance: {advance_command}", flush=True)
+                emit_payload(payload)
+            except BaseException:
+                # Delivery did not complete. Make the unread cursor immediately
+                # claimable by a replacement listener instead of stranding a
+                # consumed ring behind a dying reporter.
+                goalflight_wake.release_ring_claim(
+                    project_root,
+                    controller_label=label,
+                    cursor_version=snapshot.cursor_version,
+                )
+                death_watch.restore()
+                raise
             death_watch.restore()
             return 0
-        sleep_until = time.monotonic() + poll
+        delay = journal_tolerance.backoff_s(poll) if journal_tolerance.degraded else poll
+        sleep_until = time.monotonic() + delay
         while time.monotonic() < sleep_until:
             parent_result = parent_exit()
             if parent_result is not None:

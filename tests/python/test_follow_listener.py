@@ -12,6 +12,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -189,7 +190,7 @@ def _backup_command(project: Path, lease: journal.LeaseIdentity) -> list[str]:
         "--poll-secs",
         "0.01",
         "--timeout-s",
-        "4",
+        "8",
     ]
 
 
@@ -567,7 +568,7 @@ def test_backpressure_fault_releases_monitor_before_watchdog_rearm(
 @pytest.mark.parametrize(
     ("failure", "expected_reason"),
     (
-        (journal.JournalUnavailable("measured journal fault"), "journal-unavailable"),
+        (journal.JournalBusy("measured journal busy"), "journal-unavailable"),
         (journal.JournalIOError("measured present-path IO fault"), "journal-io-failure"),
     ),
 )
@@ -580,6 +581,11 @@ def test_journal_failure_is_a_waking_stdout_record(
 ) -> None:
     project, _env, lease = isolated
     monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    # Persistent busy must still fail after the shrunken tolerance window; the
+    # non-busy JournalIOError case remains immediately fatal.
+    monkeypatch.setattr(
+        messages, "LISTENER_JOURNAL_TOLERANCE_S", 0.2, raising=False
+    )
     monkeypatch.setattr(
         journal.Journal,
         "cursor_peek",
@@ -1076,13 +1082,6 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
     follow_reader = _JsonLineReader(follow.stdout)
     assert follow_reader.read()[1]["kind"] == "heartbeat"
     assert follow_reader.read()[1]["kind"] == "frontier"
-    backup = subprocess.Popen(
-        _backup_command(project, lease),
-        cwd=project,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
     watchdog = subprocess.Popen(
         _watch_command(project, lease),
         cwd=project,
@@ -1090,15 +1089,22 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    assert backup.stdout is not None
-    backup_reader = _JsonLineReader(backup.stdout)
     assert watchdog.stdout is not None
     watchdog_reader = _JsonLineReader(watchdog.stdout)
+    _wait_for_waiter_kind(project, lease.label, wake.MONITOR_KIND, follow.pid)
+    _wait_for_waiter_kind(project, lease.label, "watchdog", watchdog.pid)
+    backup = subprocess.Popen(
+        _backup_command(project, lease),
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert backup.stdout is not None
+    backup_reader = _JsonLineReader(backup.stdout)
     replacement_backup: subprocess.Popen[bytes] | None = None
     try:
-        _wait_for_waiter_kind(project, lease.label, wake.MONITOR_KIND, follow.pid)
         _wait_for_waiter_kind(project, lease.label, "listener", backup.pid)
-        _wait_for_waiter_kind(project, lease.label, "watchdog", watchdog.pid)
 
         listener_pids = [
             row.pid
@@ -1146,7 +1152,7 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
                 project_root=project,
             ),
         )
-        _raw, backup_result = backup_reader.read(timeout_s=2)
+        _raw, backup_result = backup_reader.read(timeout_s=5)
         if backup_result["kind"] == "pending-at-arm":
             pending_items = backup_result.get("items")
             assert isinstance(pending_items, list)
@@ -1170,8 +1176,8 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
                     project_root=project,
                 ),
             )
-            _raw, backup_result = backup_reader.read(timeout_s=2)
-        assert backup_result["kind"] == "ring"
+            _raw, backup_result = backup_reader.read(timeout_s=5)
+        assert backup_result["kind"] == "ring", backup_result
         assert backup_result["reason"] == "event"
         assert backup.wait(timeout=2) == 0
 
@@ -1687,3 +1693,953 @@ def test_watchdog_warns_that_delivery_flags_are_ignored(
         controller_label=lease.label,
         lease_nonce=lease.nonce,
     ) in completed.stderr
+
+
+# --- b-214: a transient journal-busy must not kill a persistent listener ---
+#
+# The busy condition is injected deterministically by gating sqlite3.connect on
+# the temp journal's URI (the same injection style as
+# test_listener_survives_present_journal_open_failure_and_times_out), so the
+# tests drive goalflight_journal._connect's real _is_busy/_retry_delay path —
+# the exact code that produced the observed "journal connection remained busy
+# after 34 attempts within 1.000s" fault. No fixed sleeps are used for
+# synchronization: every wait is an event-driven poll with a generous bound,
+# safe on a heavily loaded box.
+
+
+class _LiveCapture:
+    """Accumulate capsys output while a listener runs in a thread."""
+
+    def __init__(self, capsys: pytest.CaptureFixture[str]) -> None:
+        self._capsys = capsys
+        self._pending = ""
+        self.records: list[dict[str, object]] = []
+        self.stdout = ""
+        self.stderr = ""
+
+    def pump(self) -> None:
+        captured = self._capsys.readouterr()
+        self.stderr += captured.err
+        self.stdout += captured.out
+        self._pending += captured.out
+        while "\n" in self._pending:
+            line, self._pending = self._pending.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # non-JSON noise is not a follow record
+            if isinstance(record, dict):
+                self.records.append(record)
+
+    def count(self, predicate) -> int:
+        self.pump()
+        return sum(1 for record in self.records if predicate(record))
+
+    def await_count(self, predicate, minimum: int, timeout_s: float = 15.0) -> None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self.count(predicate) >= minimum:
+                return
+            time.sleep(0.02)
+        raise AssertionError(
+            f"timed out waiting for {minimum} records; saw {self.records!r} "
+            f"stderr={self.stderr!r}"
+        )
+
+    def await_stderr(self, needle: str, timeout_s: float = 15.0) -> None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            self.pump()
+            if needle in self.stderr:
+                return
+            time.sleep(0.02)
+        raise AssertionError(
+            f"timed out waiting for stderr {needle!r}; saw {self.stderr!r}"
+        )
+
+    def await_stdout(self, needle: str, timeout_s: float = 15.0) -> None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            self.pump()
+            if needle in self.stdout:
+                return
+            time.sleep(0.02)
+        raise AssertionError(
+            f"timed out waiting for stdout {needle!r}; saw {self.stdout!r}"
+        )
+
+
+def _run_in_thread(argv: list[str]) -> tuple[threading.Thread, list[int]]:
+    results: list[int] = []
+    thread = threading.Thread(
+        target=lambda: results.append(messages._run_cli(argv)),
+        daemon=True,
+    )
+    thread.start()
+    return thread, results
+
+
+def _gate_journal_connects(
+    monkeypatch: pytest.MonkeyPatch,
+    project: Path,
+    gate: threading.Event,
+) -> list[str]:
+    """While `gate` is set, every fresh connect to this journal reports busy."""
+    journal_uri = journal.resolve_journal_path(project).as_uri()
+    real_connect = journal.sqlite3.connect
+    hits: list[str] = []
+
+    def gated_connect(database: object, *args: object, **kwargs: object):
+        if gate.is_set() and str(database).startswith(journal_uri):
+            hits.append(str(database))
+            raise sqlite3.OperationalError("database is locked")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(journal.sqlite3, "connect", gated_connect)
+    return hits
+
+
+class _QueryBusyConnection:
+    """Connection proxy that injects busy only after _connect setup succeeds."""
+
+    def __init__(self, connection: sqlite3.Connection, hits: list[str]) -> None:
+        self._connection = connection
+        self._hits = hits
+
+    def execute(self, sql: str, *args: object, **kwargs: object):
+        self._hits.append(" ".join(sql.split())[:80])
+        raise sqlite3.OperationalError("database is locked")
+
+    def __getattr__(self, name: str):
+        return getattr(self._connection, name)
+
+
+def _gate_journal_queries(
+    monkeypatch: pytest.MonkeyPatch,
+    project: Path,
+    gate: threading.Event,
+) -> list[str]:
+    """Inject busy on SQL after each real connection completed its PRAGMAs."""
+    journal_path = journal.resolve_journal_path(project)
+    real_connect = journal.Journal._connect
+    hits: list[str] = []
+
+    def gated_connect(authority: journal.Journal, **kwargs: object):
+        connection = real_connect(authority, **kwargs)
+        if gate.is_set() and authority.path == journal_path:
+            return _QueryBusyConnection(connection, hits)
+        return connection
+
+    monkeypatch.setattr(journal.Journal, "_connect", gated_connect)
+    return hits
+
+
+def _gate_attention_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    gate: threading.Event,
+) -> list[str]:
+    """Inject typed query-stage busy in synthetic envelope materialization."""
+    real_attention_items = journal.Journal.attention_items
+    hits: list[str] = []
+
+    def gated_attention_items(authority: journal.Journal, *args: object, **kwargs: object):
+        if gate.is_set():
+            hits.append("busy")
+            raise journal.JournalBusy("injected attention query busy")
+        hits.append("success")
+        return real_attention_items(authority, *args, **kwargs)
+
+    monkeypatch.setattr(journal.Journal, "attention_items", gated_attention_items)
+    return hits
+
+
+def _materialize_synthetic_attention(
+    project: Path,
+    lease: journal.LeaseIdentity,
+) -> None:
+    """Create a journal-backed carrier without touching the real journal."""
+    authority = journal.Journal(project)
+    prepared = authority.prepare_attempt("round3-attention-work")
+    assert prepared.committed
+    armed = authority.arm_listener(
+        lease.label,
+        nonce=lease.nonce,
+        pid=os.getpid(),
+        start_token="round3-attention-source",
+        parent_pid=os.getppid() or os.getpid(),
+    )
+    assert armed.committed and armed.value is not None
+    exited = authority.exit_listener(
+        str(armed.value["coverage_id"]),
+        reason="orphaned",
+    )
+    assert exited.committed
+    assert authority.attention_items()
+
+
+def _await_live_waiter(project: Path, label: str, kind: str, timeout_s: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        waiters = wake.live_waiters(project, controller_label=label, kinds={kind})
+        if waiters:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"no live {kind} waiter appeared")
+
+
+def _await_armed_listener(project: Path, label: str, timeout_s: float = 15.0) -> None:
+    """Wait past kernel registration until the journal arm transaction commits."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        coverage = journal.Journal(project).active_coverage(label)
+        if coverage is not None and coverage.get("state") == journal.COVERAGE_ARMED:
+            return
+        time.sleep(0.02)
+    raise AssertionError("listener kernel waiter appeared but journal coverage never armed")
+
+
+def _is_heartbeat(record: dict[str, object]) -> bool:
+    return record.get("kind") == "heartbeat"
+
+
+def _is_follow_event(record: dict[str, object], event_type: str) -> bool:
+    payload = record.get("payload")
+    return (
+        record.get("kind") == "event"
+        and isinstance(payload, dict)
+        and payload.get("type") == event_type
+    )
+
+
+def _follow_argv(project: Path, lease: journal.LeaseIdentity) -> list[str]:
+    return [
+        "follow",
+        "--project-root",
+        str(project),
+        "--controller-label",
+        lease.label,
+        "--lease-nonce",
+        lease.nonce,
+        "--heartbeat-secs",
+        "0.01",
+        "--poll-secs",
+        "0.01",
+    ]
+
+
+def _release_lease(project: Path, lease: journal.LeaseIdentity) -> None:
+    released = journal.Journal(project).release_lease(lease.label, nonce=lease.nonce)
+    assert released.committed
+
+
+def _pin_listener_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    lease: journal.LeaseIdentity,
+) -> None:
+    monkeypatch.setattr(
+        messages,
+        "_resolve_listen_auto_lease",
+        lambda *_args, **_kwargs: {
+            "claimed": True,
+            "reason": "test-pinned",
+            "label": lease.label,
+            "nonce": lease.nonce,
+            "lease_generation": lease.generation,
+        },
+    )
+
+
+def test_follow_survives_busy_during_constructor_startup(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _env, lease = isolated
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_TOLERANCE_S", 30.0)
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_BUSY_BUDGET_S", 0.05)
+    _pin_listener_resolution(monkeypatch, lease)
+    gate = threading.Event()
+    gate.set()
+    hits = _gate_journal_connects(monkeypatch, project, gate)
+    cap = _LiveCapture(capsys)
+
+    thread, results = _run_in_thread(_follow_argv(project, lease))
+    try:
+        cap.await_count(
+            lambda record: _is_follow_event(record, "listener-degraded"), 1
+        )
+        assert hits, "constructor connect-stage busy injection did not bind"
+        assert thread.is_alive()
+        gate.clear()
+        cap.await_count(
+            lambda record: _is_follow_event(record, "listener-recovered"), 1
+        )
+        cap.await_count(_is_heartbeat, 1)
+    finally:
+        gate.clear()
+        _release_lease(project, lease)
+    thread.join(15.0)
+    assert results == [3]
+
+
+def test_watchdog_survives_busy_during_constructor_startup(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _env, lease = isolated
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_TOLERANCE_S", 30.0)
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_BUSY_BUDGET_S", 0.05)
+    _pin_listener_resolution(monkeypatch, lease)
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=60.0,
+        dead_after_s=180.0,
+    )
+    gate = threading.Event()
+    gate.set()
+    hits = _gate_journal_connects(monkeypatch, project, gate)
+    cap = _LiveCapture(capsys)
+
+    thread, results = _run_in_thread(
+        [
+            "listen",
+            "--watch-follow",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "60",
+        ]
+    )
+    try:
+        cap.await_stderr("watchdog degraded")
+        assert hits, "watchdog constructor busy injection did not bind"
+        assert thread.is_alive()
+        gate.clear()
+        cap.await_stderr("watchdog recovered")
+        _await_live_waiter(project, lease.label, wake.WATCHDOG_KIND)
+    finally:
+        gate.clear()
+        _release_lease(project, lease)
+    thread.join(15.0)
+    assert results == [3]
+
+
+def test_listen_survives_busy_during_journal_coverage_arm(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _env, lease = isolated
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_TOLERANCE_S", 30.0)
+    gate = threading.Event()
+    gate.set()
+    hits: list[str] = []
+    real_try_acquire = journal.goalflight_task.FileLock.try_acquire
+
+    def gated_try_acquire(
+        _cls: type,
+        path: Path,
+        *,
+        deadline_s: float,
+        poll_s: float = 0.010,
+    ):
+        if gate.is_set():
+            if not hits:
+                hits.append("domain_write_lock")
+            return None
+        return real_try_acquire(path, deadline_s=deadline_s, poll_s=poll_s)
+
+    monkeypatch.setattr(
+        journal.goalflight_task.FileLock,
+        "try_acquire",
+        classmethod(gated_try_acquire),
+    )
+    cap = _LiveCapture(capsys)
+    thread, results = _run_in_thread(
+        [
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--listener-slots",
+            "1",
+            "--json",
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "60",
+        ]
+    )
+    try:
+        cap.await_stderr("listener degraded")
+        assert hits == ["domain_write_lock"], "_domain_write retryable path did not bind"
+        assert thread.is_alive()
+        gate.clear()
+        cap.await_stderr("listener recovered")
+        _await_armed_listener(project, lease.label)
+    finally:
+        gate.clear()
+        _release_lease(project, lease)
+    thread.join(15.0)
+    assert results == [3]
+
+
+def test_listen_coverage_arm_exits_promptly_when_journal_vanishes(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Deletion after construction but before arm must bypass busy tolerance."""
+    project, _env, lease = isolated
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_TOLERANCE_S", 3600.0)
+    _pin_listener_resolution(monkeypatch, lease)
+    real_arm = journal.Journal.arm_listener
+    hits: list[str] = []
+
+    def vanish_then_arm(authority: journal.Journal, *args: object, **kwargs: object):
+        if not hits:
+            hits.append("arm_listener")
+            authority.path.unlink()
+        return real_arm(authority, *args, **kwargs)
+
+    monkeypatch.setattr(journal.Journal, "arm_listener", vanish_then_arm)
+    cap = _LiveCapture(capsys)
+    thread, results = _run_in_thread(
+        [
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--listener-slots",
+            "1",
+            "--json",
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "60",
+        ]
+    )
+    thread.join(5.0)
+    cap.pump()
+
+    assert hits == ["arm_listener"]
+    assert not thread.is_alive(), "vanished journal entered the 3600s busy window"
+    assert results == [2]
+    assert "journal-unavailable" in cap.stderr
+    assert "listener degraded" not in cap.stderr
+
+
+def test_listen_coverage_arm_keeps_journal_io_failure_fatal(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _env, lease = isolated
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_TOLERANCE_S", 3600.0)
+    _pin_listener_resolution(monkeypatch, lease)
+    hits: list[str] = []
+
+    def fail_arm(*_args: object, **_kwargs: object):
+        hits.append("arm_listener")
+        raise journal.JournalIOError("injected arm path I/O failure")
+
+    monkeypatch.setattr(journal.Journal, "arm_listener", fail_arm)
+    cap = _LiveCapture(capsys)
+    result = messages._run_cli(
+        [
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--listener-slots",
+            "1",
+            "--json",
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "60",
+        ]
+    )
+    cap.pump()
+
+    assert result == 2
+    assert hits == ["arm_listener"]
+    assert "journal-io-failure" in cap.stderr
+    assert "listener degraded" not in cap.stderr
+
+
+def test_report_pending_one_shot_cursor_io_failure_is_fatal(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A recovered second peek must not hide the fatal arm-time failure."""
+    project, _env, lease = isolated
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_TOLERANCE_S", 3600.0)
+    _pin_listener_resolution(monkeypatch, lease)
+    real_peek = journal.Journal.cursor_peek
+    calls: list[str] = []
+
+    def fail_once(authority: journal.Journal, *args: object, **kwargs: object):
+        calls.append("cursor_peek")
+        if len(calls) == 1:
+            raise journal.JournalIOError("one-shot arm snapshot I/O failure")
+        return real_peek(authority, *args, **kwargs)
+
+    monkeypatch.setattr(journal.Journal, "cursor_peek", fail_once)
+    cap = _LiveCapture(capsys)
+    result = messages._run_cli(
+        [
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--listener-slots",
+            "1",
+            "--report-pending",
+            "--json",
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "0.1",
+        ]
+    )
+    cap.pump()
+
+    assert result == 2
+    assert calls == ["cursor_peek"], "listener retried after a fatal one-shot failure"
+    assert "journal-io-failure" in cap.stderr
+    assert "one-shot arm snapshot I/O failure" in cap.stderr
+    assert "listener degraded" not in cap.stderr
+
+
+def test_non_json_arm_materializes_attention_before_pending_claim(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Query busy cannot persist high-water before the human report exists."""
+    project, _env, lease = isolated
+    _materialize_synthetic_attention(project, lease)
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_TOLERANCE_S", 30.0)
+    gate = threading.Event()
+    gate.set()
+    hits = _gate_attention_reads(monkeypatch, gate)
+    cap = _LiveCapture(capsys)
+    thread, results = _run_in_thread(
+        [
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--listener-slots",
+            "1",
+            "--report-pending",
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "60",
+        ]
+    )
+    try:
+        cap.await_stderr("listener degraded")
+        assert "busy" in hits, "non-JSON arm attention query injection did not bind"
+        assert thread.is_alive()
+        assert wake.pending_report_high_water(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        ) is None, "a dying arm persisted an undelivered high-water"
+        gate.clear()
+        cap.await_stderr("listener recovered")
+        cap.await_stdout("advance:")
+        assert wake.pending_report_high_water(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        ) is not None
+    finally:
+        gate.clear()
+        _release_lease(project, lease)
+    thread.join(15.0)
+    cap.pump()
+
+    assert results == [3]
+    assert "[controller_attention]" in cap.stdout
+    assert hits.count("success") == 1
+
+
+def test_non_json_ring_materializes_attention_before_ring_claim(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A consumed ring is impossible while buffered attention reads are busy."""
+    project, env, lease = isolated
+    _materialize_synthetic_attention(project, lease)
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_TOLERANCE_S", 30.0)
+    gate = threading.Event()
+    hits = _gate_attention_reads(monkeypatch, gate)
+    cap = _LiveCapture(capsys)
+    thread, results = _run_in_thread(
+        [
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--listener-slots",
+            "1",
+            "--report-pending",
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "60",
+        ]
+    )
+    try:
+        cap.await_stdout("advance:")
+        gate.set()
+        messages.post_message(
+            dispatch_id="ring-after-attention",
+            msg_type="controller-notice",
+            payload={"text": "ring only after every envelope is ready"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(
+                lease.label,
+                project_root=project,
+            ),
+        )
+        cap.await_stderr("listener degraded")
+        assert "busy" in hits, "non-JSON ring attention query injection did not bind"
+        assert thread.is_alive()
+        assert not wake._ring_stamp_path(
+            project,
+            controller_label=lease.label,
+        ).exists(), "ring was consumed before human-readable envelopes materialized"
+        gate.clear()
+        cap.await_stderr("listener recovered")
+        thread.join(15.0)
+    finally:
+        gate.clear()
+        if thread.is_alive():
+            _release_lease(project, lease)
+            thread.join(15.0)
+    cap.pump()
+
+    assert results == [0]
+    assert hits.count("success") == 2
+    assert cap.stdout.count("advance:") == 2
+    assert "ring-after-attention" in cap.stdout
+    assert wake._ring_stamp_path(
+        project,
+        controller_label=lease.label,
+    ).exists()
+
+
+@pytest.mark.parametrize("busy_stage", ("connect", "query"))
+def test_follow_survives_transient_journal_busy_and_recovers(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    busy_stage: str,
+) -> None:
+    """A busy spell must degrade the follower, never kill it."""
+    project, _env, lease = isolated
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    monkeypatch.setattr(
+        messages, "LISTENER_JOURNAL_TOLERANCE_S", 30.0, raising=False
+    )
+    # Surface each busy connect fast; the loop-level window is what is under
+    # test, not the per-operation budget.
+    monkeypatch.setattr(
+        messages, "LISTENER_JOURNAL_BUSY_BUDGET_S", 0.05, raising=False
+    )
+    gate = threading.Event()
+    hits = (
+        _gate_journal_connects(monkeypatch, project, gate)
+        if busy_stage == "connect"
+        else _gate_journal_queries(monkeypatch, project, gate)
+    )
+    cap = _LiveCapture(capsys)
+
+    thread, results = _run_in_thread(_follow_argv(project, lease))
+    try:
+        cap.await_count(_is_heartbeat, 1)
+        gate.set()
+        cap.await_count(
+            lambda record: _is_follow_event(record, "listener-degraded"), 1
+        )
+        assert hits, f"{busy_stage} busy injection did not bind"
+        # The degradation notice itself proves the loop survived a busy
+        # failure; before the fix this was a listener-fault record and exit 2.
+        assert thread.is_alive()
+        gate.clear()
+        cap.await_count(
+            lambda record: _is_follow_event(record, "listener-recovered"), 1
+        )
+        assert thread.is_alive()
+        # Still polling after recovery: another heartbeat lands.
+        cap.await_count(_is_heartbeat, cap.count(_is_heartbeat) + 1)
+    finally:
+        gate.clear()
+        _release_lease(project, lease)
+    thread.join(15.0)
+    cap.pump()
+    assert results == [3]  # stale-lease shutdown, not a fault exit
+    assert (
+        sum(
+            1
+            for record in cap.records
+            if _is_follow_event(record, "listener-degraded")
+        )
+        == 1
+    )
+    assert (
+        sum(
+            1
+            for record in cap.records
+            if _is_follow_event(record, "listener-recovered")
+        )
+        == 1
+    )
+    faults = [
+        record
+        for record in cap.records
+        if _is_follow_event(record, "listener-fault")
+    ]
+    assert not faults, cap.records
+
+
+def test_follow_still_exits_when_journal_vanishes(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """JournalDisappeared stays fatal — tolerance must never spin on it."""
+    project, _env, lease = isolated
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    # A huge window proves disappearance bypasses tolerance entirely: the
+    # follower must exit promptly anyway.
+    monkeypatch.setattr(
+        messages, "LISTENER_JOURNAL_TOLERANCE_S", 3600.0, raising=False
+    )
+    cap = _LiveCapture(capsys)
+
+    thread, results = _run_in_thread(_follow_argv(project, lease))
+    try:
+        cap.await_count(_is_heartbeat, 1)
+        journal.resolve_journal_path(project).unlink()
+        thread.join(15.0)
+    finally:
+        if thread.is_alive():
+            _release_lease(project, lease)
+            thread.join(15.0)
+    cap.pump()
+    assert results == [2]
+    faults = [
+        record for record in cap.records if _is_follow_event(record, "listener-fault")
+    ]
+    assert faults and faults[-1]["payload"]["reason"] == "journal-unavailable"
+    assert not any(
+        _is_follow_event(record, "listener-degraded") for record in cap.records
+    )
+
+
+@pytest.mark.parametrize("busy_stage", ("connect", "query"))
+def test_watchdog_survives_transient_journal_busy(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    busy_stage: str,
+) -> None:
+    """The follow watchdog died the same way in the incident; audit-fix it too."""
+    project, _env, lease = isolated
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    monkeypatch.setattr(
+        messages, "LISTENER_JOURNAL_TOLERANCE_S", 30.0, raising=False
+    )
+    monkeypatch.setattr(
+        messages, "LISTENER_JOURNAL_BUSY_BUDGET_S", 0.05, raising=False
+    )
+    gate = threading.Event()
+    hits = (
+        _gate_journal_connects(monkeypatch, project, gate)
+        if busy_stage == "connect"
+        else _gate_journal_queries(monkeypatch, project, gate)
+    )
+    cap = _LiveCapture(capsys)
+    # A live follow stream keeps the watchdog from its follow-dead exit (0);
+    # the only exit left to observe is the lease check.
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=60.0,
+        dead_after_s=180.0,
+    )
+
+    thread, results = _run_in_thread(
+        [
+            "listen",
+            "--watch-follow",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "60",
+        ]
+    )
+    try:
+        _await_live_waiter(project, lease.label, wake.WATCHDOG_KIND)
+        gate.set()
+        cap.await_stderr("watchdog degraded")
+        assert hits, f"{busy_stage} busy injection did not bind"
+        assert thread.is_alive()
+        gate.clear()
+        cap.await_stderr("watchdog recovered")
+        assert thread.is_alive()
+    finally:
+        gate.clear()
+        _release_lease(project, lease)
+    thread.join(15.0)
+    cap.pump()
+    assert results == [3]  # stale-lease shutdown, not a fault exit
+    assert cap.stderr.count("watchdog degraded") == 1
+    assert cap.stderr.count("watchdog recovered") == 1
+    assert "watchdog runtime failed" not in cap.stderr
+
+
+@pytest.mark.parametrize("busy_stage", ("connect", "query"))
+def test_listen_survives_transient_journal_busy(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    busy_stage: str,
+) -> None:
+    """A doorbell may exit after a ring — never from a transient busy."""
+    project, _env, lease = isolated
+    monkeypatch.setattr(
+        messages, "LISTENER_JOURNAL_TOLERANCE_S", 30.0, raising=False
+    )
+    monkeypatch.setattr(
+        messages, "LISTENER_JOURNAL_BUSY_BUDGET_S", 0.05, raising=False
+    )
+    gate = threading.Event()
+    hits = (
+        _gate_journal_connects(monkeypatch, project, gate)
+        if busy_stage == "connect"
+        else _gate_journal_queries(monkeypatch, project, gate)
+    )
+    cap = _LiveCapture(capsys)
+
+    thread, results = _run_in_thread(
+        [
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--listener-slots",
+            "1",
+            "--json",
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "60",
+        ]
+    )
+    try:
+        _await_armed_listener(project, lease.label)
+        gate.set()
+        cap.await_stderr("listener degraded")
+        assert hits, f"{busy_stage} busy injection did not bind"
+        assert thread.is_alive()
+        gate.clear()
+        cap.await_stderr("listener recovered")
+        assert thread.is_alive()
+    finally:
+        gate.clear()
+        _release_lease(project, lease)
+    thread.join(15.0)
+    cap.pump()
+    assert results == [3]  # stale-lease/superseded shutdown, not a fault exit
+    assert cap.stderr.count("listener degraded") == 1
+    assert cap.stderr.count("listener recovered") == 1
+
+
+def test_listen_emits_structured_exit_when_journal_disappears(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Terminal audit/enrichment failure must not swallow the JSON fault."""
+    project, _env, lease = isolated
+    cap = _LiveCapture(capsys)
+    thread, results = _run_in_thread(
+        [
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--listener-slots",
+            "1",
+            "--json",
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "60",
+        ]
+    )
+    _await_armed_listener(project, lease.label)
+    journal.resolve_journal_path(project).unlink()
+    thread.join(15.0)
+    cap.pump()
+
+    assert results == [2]
+    exits = [record for record in cap.records if record.get("kind") == "exit"]
+    assert exits, f"structured exit was lost: stderr={cap.stderr!r}"
+    assert exits[-1]["reason"] == "journal-unavailable"
+    assert "coverage_exit_error" in exits[-1]
+    assert "rearm_error" in exits[-1]
