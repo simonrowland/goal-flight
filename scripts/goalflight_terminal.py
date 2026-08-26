@@ -80,6 +80,79 @@ MARKER_SIGIL_OPT_RE = rf"{re.escape(MARKER_SIGIL)}?"
 STEER_ACK_RE = re.compile(
     rf"^\**{MARKER_SIGIL_OPT_RE}\**STEER-ACK:\**\s*(\d+)\b"
 )
+# Own-signal attention is an ALLOWLIST. A line is the worker's own escalation
+# only when the marker token sits at column 0 after these decorations:
+# optional wrapping ` / * / **, optional ``!`` sigil, optional ``STATUS:``
+# prefix, and (when *kimi_output*) the renderer bullet ``• `` or two-space
+# continuation. Relay forms this repo actually produces — ``>``, ``- ``, ``* ``,
+# ``+``, ``|``, ``1.``, tab, extra indent — are rejected because they are not
+# on the list. Fence and hunk membership are caller context (a fenced
+# ``BLOCKED:`` is byte-identical to an own-signal line).
+#
+# Start-anchored on purpose. A marker preceded by ANSI SGR codes or a
+# timestamp is a PRE-EXISTING false negative; this predicate keeps those
+# misses and does not add new ones.
+_ATTENTION_KIND_ALTERNATION = "|".join(
+    re.escape(kind) for kind in sorted(ATTENTION_MARKERS)
+)
+_OWN_SIGNAL_ATTENTION_RE = re.compile(
+    rf"^`?\**{MARKER_SIGIL_OPT_RE}\**(?:STATUS:\s*)?"
+    rf"({_ATTENTION_KIND_ALTERNATION}):(.*)$"
+)
+
+
+def _strip_marker_decoration(text: str) -> str:
+    value = text.strip()
+    while value.startswith("*") or value.startswith("`"):
+        value = value[1:].lstrip()
+    while value.endswith("*") or value.endswith("`"):
+        value = value[:-1].rstrip()
+    return value
+
+
+def parse_own_signal_attention_line(
+    raw_line: str,
+    line_no: int = 0,
+    *,
+    kimi_output: bool = False,
+) -> dict | None:
+    """Parse *raw_line* as this worker's own attention emission, or None.
+
+    This is the single form predicate for "did the sender emit this as its
+    own terminal signal?". Verdict, harvest, and outbox must call it (or a
+    scan that calls it) rather than growing per-surface rejectors.
+    """
+    if not raw_line:
+        return None
+    if raw_line.startswith("\t"):
+        return None
+    if raw_line.startswith(" "):
+        kimi_continuation = (
+            kimi_output
+            and raw_line.startswith("  ")
+            and not raw_line.startswith("   ")
+        )
+        if not kimi_continuation:
+            return None
+    stripped = raw_line.strip()
+    if not stripped:
+        return None
+    if kimi_output and stripped.startswith("• "):
+        stripped = stripped[2:].lstrip()
+        if not stripped:
+            return None
+    match = _OWN_SIGNAL_ATTENTION_RE.match(stripped)
+    if not match:
+        return None
+    kind = match.group(1)
+    payload = match.group(2)
+    if marker_is_template_example(kind, payload):
+        return None
+    return {
+        "line": line_no,
+        "kind": kind,
+        "text": _strip_marker_decoration(payload)[:1000],
+    }
 
 
 class MarkdownFenceTracker:

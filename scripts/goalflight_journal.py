@@ -169,7 +169,15 @@ def outbox_headline_text(terminal_state: str, observation: object) -> str:
     headline is the work; ``dispatch terminal: <state>`` is only the fallback
     when no marker was harvested. ``terminal_state`` on the same payload is
     unchanged. Completions travel on ``headline``, not ``outcome.error``.
+
+    Attention headlines must already have passed
+    ``goalflight_terminal.parse_own_signal_attention_line`` via watcher
+    ``harvest_headline_marker`` and arrived here as ``observation.headline``.
+    ``last_marker`` / ``terminal_marker`` attention is scrape vocabulary and
+    is not promoted; SUCCESS markers may still headline from those keys.
     """
+    import goalflight_terminal
+
     fallback = f"dispatch terminal: {terminal_state}"
     if not isinstance(observation, dict):
         return fallback
@@ -182,6 +190,8 @@ def outbox_headline_text(terminal_state: str, observation: object) -> str:
             continue
         kind = marker.get("kind")
         text = marker.get("text")
+        if kind in goalflight_terminal.ATTENTION_MARKERS:
+            continue
         if (
             kind in OUTBOX_HEADLINE_MARKER_KINDS
             and isinstance(text, str)
@@ -189,6 +199,8 @@ def outbox_headline_text(terminal_state: str, observation: object) -> str:
         ):
             return text.strip()
         for marker_kind, marker_text in marker.items():
+            if marker_kind in goalflight_terminal.ATTENTION_MARKERS:
+                continue
             if (
                 marker_kind in OUTBOX_HEADLINE_MARKER_KINDS
                 and isinstance(marker_text, str)

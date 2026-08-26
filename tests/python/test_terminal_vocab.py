@@ -21,6 +21,7 @@ import goalflight_fleet_status as fleet_status  # noqa: E402
 import goalflight_ledger  # noqa: E402
 import goalflight_messages  # noqa: E402
 import goalflight_status  # noqa: E402
+import goalflight_terminal  # noqa: E402
 import goalflight_watch  # noqa: E402
 
 
@@ -511,6 +512,59 @@ def test_false_death_marker_poison_pairs() -> None:
                 f"{name} remains non-terminal",
                 goalflight_watch._last_line_is_terminal_marker(tail) is None,
             )
+
+
+def test_own_signal_attention_allowlist_and_kept_false_negatives() -> None:
+    """Own-signal attention is allowlist-shaped; ANSI/timestamp misses are kept."""
+
+    own = goalflight_terminal.parse_own_signal_attention_line
+    accepted = (
+        ("BLOCKED: sandbox denied the write", "BLOCKED", "sandbox denied the write"),
+        ("!BLOCKED: sandbox denied the write", "BLOCKED", "sandbox denied the write"),
+        ("**BLOCKED:** sandbox denied the write", "BLOCKED", "sandbox denied the write"),
+        ("STATUS: BLOCKED: sandbox denied the write", "BLOCKED", "sandbox denied the write"),
+        ("USER-NEED: what is the target path?", "USER-NEED", "what is the target path?"),
+        ("FAILED: tests exploded before the commit step", "FAILED", "tests exploded before the commit step"),
+    )
+    for line, kind, excerpt in accepted:
+        marker = own(line, 7)
+        assert_true(f"allowlist accepts {line!r}", marker is not None)
+        assert_eq(f"allowlist kind for {line!r}", marker["kind"], kind)
+        assert_eq(f"allowlist text for {line!r}", marker["text"], excerpt)
+
+    kimi_bullet = own("• BLOCKED: renderer bullet", 3, kimi_output=True)
+    assert_true("kimi bullet is own-signal", kimi_bullet is not None)
+    assert_eq("kimi bullet kind", kimi_bullet["kind"], "BLOCKED")
+    assert_true(
+        "kimi bullet is not own-signal for other agents",
+        own("• BLOCKED: renderer bullet", 3, kimi_output=False) is None,
+    )
+
+    rejected = (
+        "- BLOCKED: list item",
+        "> BLOCKED: markdown quote",
+        "* BLOCKED: star list",
+        "+BLOCKED: diff plus",
+        "+ BLOCKED: plus space",
+        "| BLOCKED: table cell",
+        "1. BLOCKED: numbered list",
+        "\tBLOCKED: tab indented",
+        "    BLOCKED: space indented",
+        "BLOCKED: <intended-path> not writable due to <reason>",
+    )
+    for line in rejected:
+        assert_true(f"allowlist rejects {line!r}", own(line) is None)
+
+    # Pre-existing false negatives: the regex is start-anchored. KEEP these
+    # misses; do not silently worsen them by requiring even more prefix.
+    assert_true(
+        "ANSI-prefixed BLOCKED remains a false negative",
+        own("\x1b[32mBLOCKED: ansi wrapped") is None,
+    )
+    assert_true(
+        "timestamp-prefixed BLOCKED remains a false negative",
+        own("12:34:56 BLOCKED: stamped") is None,
+    )
 
 
 def test_marker_docs_preserve_result_summary_workflows() -> None:

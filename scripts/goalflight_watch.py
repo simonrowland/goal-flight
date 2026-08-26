@@ -1405,7 +1405,22 @@ def _final_terminal_marker_from_line(
             return None
     direct_match = MARKER_RE.match(stripped)
     if not allow_status_prefix and direct_match and direct_match.group(1) == "STATUS":
-        return None
+        # Progress ``STATUS:`` is not terminal. ``STATUS: BLOCKED:`` is the
+        # allowlisted own-signal form; live last-line used to return here
+        # before the shared predicate ran, so harvest/dead accepted a line
+        # live ignored. Consult the allowlist instead of a second STATUS
+        # rejector. ``STATUS: COMPLETE:`` stays live-rejected (SUCCESS still
+        # needs allow_status_prefix, as before).
+        own = goalflight_terminal.parse_own_signal_attention_line(
+            raw_line, line_no, kimi_output=kimi_output
+        )
+        if own is None:
+            return None
+        return (
+            own
+            if _terminal_marker_matches_dispatch(own, expected_dispatch_id)
+            else None
+        )
     signoff = _completion_signoff_marker(stripped, line_no)
     if signoff:
         return (
@@ -1423,6 +1438,17 @@ def _final_terminal_marker_from_line(
         "kind": match.group(1),
         "text": _strip_marker_decoration(match.group(2))[:1000],
     }
+    if marker["kind"] in goalflight_terminal.ATTENTION_MARKERS:
+        # Prefix stripping above is for SUCCESS renderer forms (``+READY:``,
+        # ``- COMPLETE:``, ``> COMPLETE:``). Attention uses the shared
+        # allowlist on the *raw* line so a list-item or quote cannot become
+        # an escalation by surviving one of those strippers.
+        own = goalflight_terminal.parse_own_signal_attention_line(
+            raw_line, line_no, kimi_output=kimi_output
+        )
+        if own is None:
+            return None
+        marker = own
     return marker if _terminal_marker_matches_dispatch(marker, expected_dispatch_id) else None
 
 
@@ -2312,6 +2338,10 @@ def _is_headline_kind(marker: object) -> bool:
     return isinstance(marker, dict) and marker.get("kind") in HEADLINE_MAIL_MARKER_KINDS
 
 
+def _is_success_headline_kind(marker: object) -> bool:
+    return isinstance(marker, dict) and marker.get("kind") in SUCCESS_TERMINAL_MARKERS
+
+
 def harvest_headline_marker(
     payload: dict,
     tail: Path,
@@ -2326,13 +2356,20 @@ def harvest_headline_marker(
     final scan, so a worker that signed off and then went quiet arrived with
     ``last_marker is None``. Terminal writes rescan the tail; the verdict is
     not rewritten.
+
+    Attention headlines use the same own-signal predicate as the dead-path
+    verdict (``parse_own_signal_attention_line`` inside ``_final_terminal_marker``).
+    ``extract_markers`` / payload ``markers`` still list mid-tail BLOCKED as
+    diagnostic vocabulary; they must not become the harvest/outbox headline.
+
+    Remaining extract_markers consumers that still answer "was attention
+    vocabulary seen?" rather than "did this worker escalate?": ACP
+    early-cancel and IncrementalTailScanner diagnostic ``markers``.
+    Death-cause (``_attention_marker_kind_in_text``) now goes through
+    ``_final_terminal_marker_from_line`` and therefore the allowlist; it
+    is evidence, not a harvest headline. Those leftover scrapes are not
+    harvest/outbox.
     """
-    for candidate in (payload.get("terminal_marker"), payload.get("last_marker")):
-        if _is_headline_kind(candidate):
-            return candidate  # type: ignore[return-value]
-    for marker in reversed(list(payload.get("markers") or [])):
-        if _is_headline_kind(marker):
-            return marker
     harvested = _final_terminal_marker(
         tail,
         ignore_prefix_lines=ignore_prefix_lines,
@@ -2342,9 +2379,17 @@ def harvest_headline_marker(
     )
     if _is_headline_kind(harvested):
         return harvested
+    # Success-only fallbacks: a completed worker's COMPLETE/READY/RESULT may
+    # sit behind extra summary. Attention is never taken from extract_markers.
+    for candidate in (payload.get("terminal_marker"), payload.get("last_marker")):
+        if _is_success_headline_kind(candidate):
+            return candidate  # type: ignore[return-value]
+    for marker in reversed(list(payload.get("markers") or [])):
+        if _is_success_headline_kind(marker):
+            return marker
     markers, _size = extract_markers(tail, ignore_prefix_lines=ignore_prefix_lines)
     for marker in reversed(markers):
-        if _is_headline_kind(marker):
+        if _is_success_headline_kind(marker):
             return marker
     return None
 
@@ -2407,25 +2452,11 @@ def _dead_path_terminal_from_line(
 
     Success markers (COMPLETE/READY/RESULT) may be quote-prefixed: a dead
     worker that signed off with a renderer or markdown quote has still
-    finished. Attention markers are re-parsed with quote prefix disabled so
-    ``> BLOCKED:`` / ``> USER-NEED:`` quoted from another transcript cannot
-    count as this worker's own escalation.
+    finished. Attention uses the shared own-signal allowlist
+    (``parse_own_signal_attention_line``) so ``> BLOCKED:``, ``- BLOCKED:``,
+    and other relay forms cannot count as this worker's own escalation.
 
-    Admits as own-signal attention, once the caller also confirms last-line
-    position, unfenced, and unindented:
-
-    - ``BLOCKED: reason`` / ``USER-NEED:`` / ``USER-CONFIRM:`` / ``FAILED:``
-    - optional ``!`` sigil, wrapping ``*``/``**``, ``STATUS:`` prefix
-    - kimi ``• `` bullet when ``kimi_output``
-    - a single ``+``/``-`` renderer prefix *outside* a diff hunk (same as
-      genuine ``+READY:``)
-
-    Rejects even on the last line:
-
-    - markdown quote ``> BLOCKED:`` (relayed / discussed, not emitted)
-    - leading space or tab (indented example; kimi two-space continuation
-      remains the existing live-path exception)
-    - template ``BLOCKED: <reason>``
+    Position (last own line, unfenced, not in a hunk) is the caller's job.
     """
     candidate = _final_terminal_marker_from_line(
         line,
@@ -2438,20 +2469,7 @@ def _dead_path_terminal_from_line(
     )
     if not candidate:
         return None, False
-    if candidate.get("kind") not in goalflight_terminal.ATTENTION_MARKERS:
-        return candidate, False
-    own = _final_terminal_marker_from_line(
-        line,
-        line_no,
-        allow_prefixed_marker=True,
-        allow_quote_prefix=False,
-        allow_status_prefix=True,
-        kimi_output=kimi_output,
-        expected_dispatch_id=expected_dispatch_id,
-    )
-    if own and own.get("kind") in goalflight_terminal.ATTENTION_MARKERS:
-        return own, True
-    return None, False
+    return candidate, candidate.get("kind") in goalflight_terminal.ATTENTION_MARKERS
 
 
 def _select_dead_path_terminal(
@@ -2462,10 +2480,10 @@ def _select_dead_path_terminal(
     """Dead-path terminal: success may be anywhere; attention only as last own line.
 
     An attention marker terminalizes only as the worker's own terminal
-    signal: the last non-empty non-trailer line, already parsed as unquoted
-    and unindented, and not fenced (the caller skipped fences for the
-    candidate). Quoted / fenced / indented / mid-tail attention does not
-    terminalize.
+    signal: the last non-empty non-trailer line, already parsed by the
+    shared own-signal allowlist, and not fenced (the caller skipped fences
+    for the candidate). Quoted / list-item / fenced / indented / mid-tail
+    attention does not terminalize.
 
     Success markers still win from anywhere in the completed tail, including
     quote-prefixed forms, because a dead worker that signed off and then had
@@ -2732,9 +2750,10 @@ def _final_terminal_marker(
     Success markers (COMPLETE/READY/RESULT) may appear anywhere in the
     completed tail, including quote-prefixed renderer forms. Attention
     markers (BLOCKED/USER-NEED/USER-CONFIRM/FAILED) terminalize only as the
-    worker's own final signal: last non-empty non-trailer line, unquoted,
-    unfenced, unindented. Quoted, fenced, indented, or mid-tail attention
-    is relayed or abandoned content and does not stop the dispatch.
+    worker's own final signal: last non-empty non-trailer line matching
+    ``parse_own_signal_attention_line``, unfenced. Quoted, list-item, fenced,
+    indented, or mid-tail attention is relayed or abandoned content and
+    does not stop the dispatch.
     """
     if not path.exists():
         return None

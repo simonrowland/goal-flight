@@ -1989,6 +1989,164 @@ def test_dead_path_attention_only_own_final_unquoted_line() -> None:
         assert trailer_term.get("text") == excerpt, f"trailer {kind}: {trailer_term}"
 
 
+def _attention_surface_bundle(tail_text: str, dispatch_id: str) -> dict:
+    """Verdict + harvest/outbox on one tail, with extract_markers preloaded.
+
+    Harvest is fed the scrape payload that used to promote mid-tail BLOCKED
+    into an outbox headline. That is the P1 this round closes.
+    """
+    import goalflight_journal as journal
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(tail_text, encoding="utf-8")
+        markers, _size = goalflight_watch.extract_markers(tail)
+        payload = {
+            "last_marker": markers[-1] if markers else None,
+            "terminal_marker": None,
+            "markers": markers,
+        }
+        harvested = goalflight_watch.harvest_headline_marker(
+            payload, tail, expected_dispatch_id=dispatch_id
+        )
+        dead = goalflight_watch._final_terminal_marker(
+            tail, expected_dispatch_id=dispatch_id
+        )
+        live = goalflight_watch._last_line_is_terminal_marker(
+            tail, expected_dispatch_id=dispatch_id
+        )
+        scrape_last = payload.get("last_marker")
+    if (
+        isinstance(harvested, dict)
+        and harvested.get("kind") in goalflight_terminal.ATTENTION_MARKERS
+    ):
+        outbox = journal.outbox_headline_text(
+            "blocked",
+            {"headline": str(harvested.get("text") or "")},
+        )
+    else:
+        # Feed the scrape last_marker, not harvest, so outbox cannot agree
+        # tautologically. Mid-tail BLOCKED lives here; the helper must not
+        # promote it.
+        observation = {"last_marker": scrape_last} if scrape_last else {}
+        outbox = journal.outbox_headline_text("worker_dead", observation)
+    return {
+        "harvested": harvested,
+        "dead": dead,
+        "live": live,
+        "outbox": outbox,
+        "extract_markers": markers,
+    }
+
+
+def _is_attention_escalation(marker: object) -> bool:
+    return (
+        isinstance(marker, dict)
+        and marker.get("kind") in goalflight_terminal.ATTENTION_MARKERS
+    )
+
+
+def test_list_item_blocked_is_not_an_escalation_on_any_surface() -> None:
+    """`- BLOCKED:` as the final line is a markdown list item, not a stop."""
+
+    dispatch_id = "watch-attention-list-item"
+    excerpt = "sandbox denied the write"
+    tail_text = f"worker copied a checklist\n- BLOCKED: {excerpt}\n"
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        tail_text, dispatch_id=dispatch_id
+    )
+    assert rc == 1, f"list-item BLOCKED must not block, got rc={rc} ({payload})"
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("state") != "blocked", payload
+    assert not term, term
+
+    surfaces = _attention_surface_bundle(tail_text, dispatch_id)
+    assert not _is_attention_escalation(surfaces["dead"]), surfaces
+    assert not _is_attention_escalation(surfaces["live"]), surfaces
+    assert not _is_attention_escalation(surfaces["harvested"]), surfaces
+    assert surfaces["outbox"].startswith("dispatch terminal:"), surfaces["outbox"]
+    assert excerpt not in surfaces["outbox"], surfaces["outbox"]
+
+
+def test_quoted_and_mid_tail_blocked_are_not_harvest_or_outbox_escalations() -> None:
+    """Round 2 closed verdict for `> BLOCKED:` / mid-tail; harvest/outbox must agree."""
+
+    dispatch_id = "watch-attention-harvest-relay"
+    excerpt = "sandbox denied the write"
+    quoted = f"worker copied prior output\n> BLOCKED: {excerpt}\n"
+    mid = f"work stalled\nBLOCKED: {excerpt}\nworker kept going after the marker\n"
+    for label, tail_text in (("quoted", quoted), ("mid-tail", mid)):
+        surfaces = _attention_surface_bundle(tail_text, dispatch_id)
+        assert not _is_attention_escalation(surfaces["dead"]), (label, surfaces)
+        assert not _is_attention_escalation(surfaces["harvested"]), (label, surfaces)
+        assert surfaces["outbox"].startswith("dispatch terminal:"), (label, surfaces["outbox"])
+        assert excerpt not in surfaces["outbox"], (label, surfaces["outbox"])
+        if label == "mid-tail":
+            kinds = [marker.get("kind") for marker in surfaces["extract_markers"]]
+            assert "BLOCKED" in kinds, (
+                "precondition: extract_markers still sees mid-tail BLOCKED; "
+                f"got {surfaces['extract_markers']!r}"
+            )
+
+
+def test_genuine_last_line_blocked_still_terminalizes_and_headlines() -> None:
+    """A real last-line BLOCKED must still exit 4, keep text, and headline outbox."""
+
+    dispatch_id = "watch-attention-own-headline"
+    excerpt = "cannot write sandbox path; needs controller"
+    tail_text = f"work stalled\nBLOCKED: {excerpt}\n"
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        tail_text, dispatch_id=dispatch_id
+    )
+    assert rc == 4, f"own final BLOCKED must block, got rc={rc} ({payload})"
+    assert payload.get("state") == "blocked", payload
+    assert payload.get("liveness_state") == "blocked", payload
+    assert payload.get("reason") == "marker:BLOCKED", payload
+    assert term.get("kind") == "BLOCKED", term
+    assert term.get("text") == excerpt, term
+
+    surfaces = _attention_surface_bundle(tail_text, dispatch_id)
+    assert _is_attention_escalation(surfaces["dead"]), surfaces
+    assert _is_attention_escalation(surfaces["live"]), surfaces
+    assert _is_attention_escalation(surfaces["harvested"]), surfaces
+    assert surfaces["harvested"]["kind"] == "BLOCKED", surfaces["harvested"]
+    assert surfaces["harvested"]["text"] == excerpt, surfaces["harvested"]
+    assert surfaces["outbox"] == excerpt, surfaces["outbox"]
+
+
+def test_attention_surfaces_agree_on_the_same_transcript() -> None:
+    """The same tail must not be an escalation on one surface and not the other."""
+
+    dispatch_id = "watch-attention-surface-agree"
+    excerpt = "sandbox denied the write"
+    cases = (
+        ("list-item", f"- BLOCKED: {excerpt}\n"),
+        ("quoted", f"> BLOCKED: {excerpt}\n"),
+        ("star-list", f"* BLOCKED: {excerpt}\n"),
+        ("numbered", f"1. BLOCKED: {excerpt}\n"),
+        ("pipe", f"| BLOCKED: {excerpt}\n"),
+        ("mid-tail", f"work stalled\nBLOCKED: {excerpt}\nkept going\n"),
+        ("genuine", f"work stalled\nBLOCKED: {excerpt}\n"),
+        ("sigil", f"!BLOCKED: {excerpt}\n"),
+        ("status-prefix", f"STATUS: BLOCKED: {excerpt}\n"),
+    )
+    for label, tail_text in cases:
+        surfaces = _attention_surface_bundle(tail_text, dispatch_id)
+        dead = _is_attention_escalation(surfaces["dead"])
+        harvest = _is_attention_escalation(surfaces["harvested"])
+        live = _is_attention_escalation(surfaces["live"])
+        assert dead == harvest, (
+            f"{label}: dead-path verdict {dead} vs harvest {harvest}: {surfaces}"
+        )
+        assert live == harvest, (
+            f"{label}: live last-line {live} vs harvest {harvest}: {surfaces}"
+        )
+        outbox_escalated = not surfaces["outbox"].startswith("dispatch terminal:")
+        assert outbox_escalated == harvest, (
+            f"{label}: outbox {surfaces['outbox']!r} vs harvest {harvest}"
+        )
+
+
 def test_worker_dead_reason_does_not_claim_no_evidence_for_indented_blocked() -> None:
     """extract_markers strips indent; death-cause must not then claim ignorance.
 
@@ -2609,6 +2767,10 @@ def main() -> None:
     case_dead_pid_unbound_attention_markers_block_not_die()
     test_worker_dead_reason_does_not_claim_no_evidence_for_blocked_transcript()
     test_dead_path_attention_only_own_final_unquoted_line()
+    test_list_item_blocked_is_not_an_escalation_on_any_surface()
+    test_quoted_and_mid_tail_blocked_are_not_harvest_or_outbox_escalations()
+    test_genuine_last_line_blocked_still_terminalizes_and_headlines()
+    test_attention_surfaces_agree_on_the_same_transcript()
     test_worker_dead_reason_does_not_claim_no_evidence_for_indented_blocked()
     case_dead_pid_usage_limit_without_success_marker_reclassifies()
     case_b054_real_evidence_marker_vocab_bullet_reclassifies_rate_limited()
