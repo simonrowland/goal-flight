@@ -343,6 +343,10 @@ def test_doctor_json_shape() -> None:
         "leases",
     ):
         assert_true(f"controller_lease_liveness.{key} present", key in cls)
+    assert_true("wake_coverage section", "wake_coverage" in payload)
+    wake_coverage = payload["wake_coverage"]
+    for key in ("ok", "present", "pools"):
+        assert_true(f"wake_coverage.{key} present", key in wake_coverage)
     assert_true("resume_notes_pattern section", "resume_notes_pattern" in payload)
     rnp = payload["resume_notes_pattern"]
     for key in ("present", "count", "pattern_violations", "ok"):

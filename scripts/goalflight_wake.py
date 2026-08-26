@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import shlex
+import subprocess
 import sys
 import time
 import tempfile
@@ -32,6 +33,15 @@ import goalflight_compat
 MONITOR_KIND = "monitor"
 WATCHDOG_KIND = "watchdog"
 WAITER_KINDS = frozenset({"listener", "wait", MONITOR_KIND, WATCHDOG_KIND})
+SUPERVISOR_RUNNING = "running"
+SUPERVISOR_ABSENT = "absent"
+SUPERVISOR_UNKNOWN = "unknown"
+_MESSAGES_ARGV_NAMES = frozenset({"goalflight_messages.py", "goalflight_messages"})
+_SUPERVISE_FLAG_KEYS = {
+    "--project-root": "project_root",
+    "--controller-label": "controller_label",
+    "--lease-nonce": "lease_nonce",
+}
 LEASE_KIND = "lease"
 LOCK_KINDS = WAITER_KINDS | {LEASE_KIND}
 ENTRY_POLL_WINDOW_S = 1.0
@@ -1678,11 +1688,14 @@ def listener_activity_hint(
     command: str,
     *,
     work_in_flight: bool,
+    supervisor: str | None = None,
+    supervise_command: str | None = None,
 ) -> str:
     """One-line remaining-depth cue for relay/status/next.
 
     The numbered list stays on listen-exit. Empty when there is no
-    in-flight work or the pool is already at target.
+    in-flight work or the pool is already at target. A live supervisor
+    owns re-arming: do not paste follow/listen/--watch-follow beside it.
     """
     if not work_in_flight:
         return ""
@@ -1691,6 +1704,22 @@ def listener_activity_hint(
     missing = max(0, target - live)
     if missing == 0:
         return ""
+    state = str(supervisor or SUPERVISOR_ABSENT)
+    if state == SUPERVISOR_RUNNING:
+        restart = str(supervise_command or "").strip()
+        action = (
+            "`supervise` owns this pool; restart it "
+            "(stopped slots are not recovered)"
+        )
+        if restart:
+            action = f"{action}: {restart}"
+        return f"listener depth {live}/{target} — {missing} missing; {action}"
+    if state == SUPERVISOR_UNKNOWN:
+        return (
+            f"listener depth {live}/{target} — {missing} missing; "
+            "if you are running `supervise`, restart it; otherwise: "
+            f"{command}"
+        )
     return f"listener depth {live}/{target} — {missing} missing; {command}"
 
 
@@ -1708,11 +1737,15 @@ def _activity_depth_state_path(
 
 
 def _activity_depth_key(plan: dict[str, object]) -> dict[str, object]:
-    return {
+    key = {
         "live": int(plan["live"]),
         "target": int(plan["target"]),
         "work_in_flight": bool(plan["work_in_flight"]),
     }
+    supervisor = str(plan.get("supervisor") or "").strip()
+    if supervisor:
+        key["supervisor"] = supervisor
+    return key
 
 
 def _load_activity_depth_state(path: Path) -> dict[str, object] | None:
@@ -1763,13 +1796,21 @@ def consume_listener_activity_signal(
 
     Same band-suppression idea as the context meter: a live controller
     runs these surfaces constantly, so a repeat of the same (live,
-    target, work_in_flight) tuple is not news.
+    target, work_in_flight, supervisor) tuple is not news.
     """
     hint = listener_activity_hint(
         int(plan["live"]),
         int(plan["target"]),
         str(plan["command"]),
         work_in_flight=bool(plan["work_in_flight"]),
+        supervisor=(
+            str(plan["supervisor"]) if plan.get("supervisor") else None
+        ),
+        supervise_command=(
+            str(plan["supervise_command"])
+            if plan.get("supervise_command")
+            else None
+        ),
     )
     current = _activity_depth_key(plan)
     path = _activity_depth_state_path(
@@ -2764,6 +2805,193 @@ def coverage_supervise_command(
     )
 
 
+def _process_listing() -> list[tuple[int | None, str]] | None:
+    """Live process argv table, or None when the listing cannot be trusted.
+
+    Detection is process identity, not a wake-ledger lock: ``supervise`` does
+    not hold a generation flock of its own, and the harmful shortfall case is
+    exactly when its children also hold none. A missing ``ps``, a timeout, or
+    an unreadable table is UNKNOWN, never a guessed empty pool.
+    """
+    if os.name == "nt" or fcntl is None:
+        return None
+    try:
+        output = subprocess.check_output(
+            ["ps", "-axww", "-o", "pid=,command="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+    rows: list[tuple[int | None, str]] = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        pid_text, _sep, command = line.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            rows.append((None, line))
+            continue
+        rows.append((pid, command.strip()))
+    return rows
+
+
+def _supervise_argv_fields(command: str) -> dict[str, str] | None:
+    """Flag fields for a ``goalflight_messages … supervise`` argv, else None."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    supervise_at: int | None = None
+    for index, part in enumerate(parts):
+        if Path(part).name in _MESSAGES_ARGV_NAMES:
+            if index + 1 < len(parts) and parts[index + 1] == "supervise":
+                supervise_at = index + 1
+                break
+    if supervise_at is None:
+        return None
+    fields: dict[str, str] = {}
+    index = supervise_at + 1
+    while index < len(parts):
+        key = _SUPERVISE_FLAG_KEYS.get(parts[index])
+        if key is None:
+            index += 1
+            continue
+        if index + 1 >= len(parts):
+            return fields
+        fields[key] = parts[index + 1]
+        index += 2
+    return fields
+
+
+def _bind_supervise_to_generation(
+    fields: dict[str, str],
+    *,
+    project_root: Path | str,
+    controller_label: str,
+    lease_nonce: str,
+) -> str:
+    """running, absent (other generation), or unknown (cannot bind)."""
+    try:
+        wanted_root = str(Path(project_root).expanduser().resolve(strict=False))
+    except OSError:
+        return SUPERVISOR_UNKNOWN
+    raw_root = str(fields.get("project_root") or "").strip()
+    if raw_root:
+        try:
+            listed_root = str(Path(raw_root).expanduser().resolve(strict=False))
+        except OSError:
+            return SUPERVISOR_UNKNOWN
+        if listed_root != wanted_root:
+            # `ps` joins argv with spaces and drops quotes, so a root with
+            # spaces can parse as a parent-prefix of the real path. That is
+            # not a confident other-generation; it is UNKNOWN. Require a
+            # path separator so `/tmp/proj` does not match `/tmp/project`.
+            sep = os.sep
+            if wanted_root.startswith(listed_root + sep) or listed_root.startswith(
+                wanted_root + sep
+            ):
+                return SUPERVISOR_UNKNOWN
+            return SUPERVISOR_ABSENT
+    raw_label = str(fields.get("controller_label") or "").strip()
+    if raw_label and raw_label != controller_label:
+        return SUPERVISOR_ABSENT
+    raw_nonce = str(fields.get("lease_nonce") or "").strip()
+    if raw_nonce and raw_nonce != lease_nonce:
+        # A truncated ``ps`` argv can clip the nonce. Prefix/superstring of
+        # a real token is UNKNOWN; two complete different nonces stay absent.
+        shorter, longer = (
+            (raw_nonce, lease_nonce)
+            if len(raw_nonce) <= len(lease_nonce)
+            else (lease_nonce, raw_nonce)
+        )
+        if len(shorter) >= 8 and longer.startswith(shorter):
+            return SUPERVISOR_UNKNOWN
+        return SUPERVISOR_ABSENT
+    if raw_nonce == lease_nonce:
+        if not lease_nonce:
+            return SUPERVISOR_UNKNOWN
+        return SUPERVISOR_RUNNING
+    return SUPERVISOR_UNKNOWN
+
+
+def supervisor_generation_state(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> str:
+    """Whether ``supervise`` is live for this controller generation.
+
+    Uses process identity (``ps`` argv): a matching
+    ``goalflight_messages.py supervise --lease-nonce <this nonce>`` (and
+    matching ``--project-root`` / ``--controller-label`` when those flags
+    are present). Returns ``running``, ``absent``, or ``unknown``.
+
+    ``unknown`` when the process table cannot be read, a supervise argv
+    cannot be bound to this generation (missing nonce, truncated flags),
+    or the project root cannot be resolved. Callers must not print a
+    confident supervised or unsupervised re-arm in that case.
+    """
+    label = str(controller_label or "").strip()
+    nonce = str(lease_nonce or "").strip()
+    if not label:
+        return SUPERVISOR_UNKNOWN
+    listing = _process_listing()
+    if listing is None:
+        return SUPERVISOR_UNKNOWN
+    if not nonce:
+        # Cannot pin a generation, but an empty table is still absent.
+        for _pid, command in listing:
+            fields = _supervise_argv_fields(command)
+            if fields is None:
+                continue
+            raw_label = str(fields.get("controller_label") or "").strip()
+            if raw_label and raw_label != label:
+                continue
+            raw_root = str(fields.get("project_root") or "").strip()
+            if raw_root:
+                try:
+                    wanted_root = str(
+                        Path(project_root).expanduser().resolve(strict=False)
+                    )
+                    listed_root = str(
+                        Path(raw_root).expanduser().resolve(strict=False)
+                    )
+                except OSError:
+                    return SUPERVISOR_UNKNOWN
+                if listed_root != wanted_root:
+                    sep = os.sep
+                    if wanted_root.startswith(listed_root + sep) or (
+                        listed_root.startswith(wanted_root + sep)
+                    ):
+                        return SUPERVISOR_UNKNOWN
+                    continue
+            return SUPERVISOR_UNKNOWN
+        return SUPERVISOR_ABSENT
+    saw_unknown = False
+    for _pid, command in listing:
+        fields = _supervise_argv_fields(command)
+        if fields is None:
+            continue
+        bound = _bind_supervise_to_generation(
+            fields,
+            project_root=project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+        )
+        if bound == SUPERVISOR_RUNNING:
+            return SUPERVISOR_RUNNING
+        if bound == SUPERVISOR_UNKNOWN:
+            saw_unknown = True
+    if saw_unknown:
+        return SUPERVISOR_UNKNOWN
+    return SUPERVISOR_ABSENT
+
+
 def classify_wake_command(command: str) -> str:
     """Map a coverage_rearm command string to stream/backup/watchdog."""
     try:
@@ -2814,9 +3042,23 @@ def coverage_rearm_plan(
     )
     plan["wake_mode"] = status.get("wake_mode") or "portable"
     plan["reason"] = status.get("reason")
+    nonce = str(lease_nonce or "").strip()
+    plan["supervisor"] = supervisor_generation_state(
+        project_root,
+        controller_label=controller_label,
+        lease_nonce=nonce,
+    )
+    if nonce:
+        supervise_cmd = coverage_supervise_command(
+            project_root,
+            controller_label=controller_label,
+            lease_nonce=nonce,
+        )
+        plan["supervise_command"] = supervise_cmd
+        if plan["supervisor"] == SUPERVISOR_RUNNING:
+            plan["command"] = supervise_cmd
     if status.get("wake_mode") == "persistent":
         plan["commands"] = commands
-        nonce = str(lease_nonce or "").strip()
         if nonce:
             plan["missing_components"] = [
                 component
@@ -2834,27 +3076,9 @@ def coverage_rearm_plan(
     return plan
 
 
-def coverage_rearm_hint(plan: dict[str, object]) -> str:
-    """Render a plan without pretending stream and backup are identical slots."""
-    if not bool(plan.get("work_in_flight")):
-        return ""
-    live = int(plan.get("live") or 0)
-    target = int(plan.get("target") or 0)
-    missing = int(plan.get("missing") or 0)
-    if missing == 0:
-        return ""
-    if plan.get("wake_mode") != "persistent":
-        return listener_reserve_hint(
-            live,
-            target,
-            str(plan.get("command") or ""),
-        )
-    commands = [str(row) for row in plan.get("commands") or []]
-    components = [str(row) for row in plan.get("missing_components") or []]
-    names = ", ".join(dict.fromkeys(components)) if components else "unknown"
-    header = f"persistent wake coverage {live}/{target} — missing {names}:"
-    if not commands:
-        return f"{header}\n(no safe re-arm command: controller lease unavailable)"
+def _persistent_component_hint_rows(
+    components: list[str], commands: list[str]
+) -> str:
     numbered_rows = []
     for index, (component, command) in enumerate(
         zip(components, commands),
@@ -2867,7 +3091,89 @@ def coverage_rearm_hint(plan: dict[str, object]) -> str:
             else "arm as its own tracked background task"
         )
         numbered_rows.append(f"{index}. {component}: {instruction}: {command}")
-    numbered = "\n".join(numbered_rows)
+    return "\n".join(numbered_rows)
+
+
+def _supervise_restart_lines(plan: dict[str, object]) -> list[str]:
+    command = str(plan.get("supervise_command") or "").strip()
+    if not command:
+        fallback = str(plan.get("command") or "").strip()
+        if " supervise " in f" {fallback} ":
+            command = fallback
+    lines = [
+        "`supervise` owns this generation's pool.",
+        (
+            "Do not arm follow/listen/--watch-follow beside it: those take "
+            "the generation locks its children need, and a stopped slot is "
+            "not recovered without restarting the supervisor."
+        ),
+    ]
+    if command:
+        lines.append(f"Restart the supervisor: {command}")
+    else:
+        lines.append("Restart the supervisor.")
+    return lines
+
+
+def _unknown_supervisor_lines() -> list[str]:
+    return [
+        "could not tell whether `supervise` is already running for this generation.",
+        (
+            "If you are running `supervise`, restart it (a stopped slot is "
+            "not recovered without a restart); do not arm follow/listen/"
+            "--watch-follow beside a live supervisor."
+        ),
+    ]
+
+
+def coverage_rearm_hint(plan: dict[str, object]) -> str:
+    """Render a plan without pretending stream and backup are identical slots."""
+    if not bool(plan.get("work_in_flight")):
+        return ""
+    live = int(plan.get("live") or 0)
+    target = int(plan.get("target") or 0)
+    missing = int(plan.get("missing") or 0)
+    if missing == 0:
+        return ""
+    supervisor = str(plan.get("supervisor") or SUPERVISOR_ABSENT)
+    if supervisor == SUPERVISOR_RUNNING:
+        if plan.get("wake_mode") == "persistent":
+            components = [str(row) for row in plan.get("missing_components") or []]
+            names = ", ".join(dict.fromkeys(components)) if components else "slots"
+            header = f"persistent wake coverage {live}/{target} — missing {names}:"
+        else:
+            header = f"listener pool n={live}/{target} — shortfall:"
+        return "\n".join([header, *_supervise_restart_lines(plan)])
+    if plan.get("wake_mode") != "persistent":
+        portable = listener_reserve_hint(
+            live,
+            target,
+            str(plan.get("command") or ""),
+        )
+        if supervisor == SUPERVISOR_UNKNOWN and portable:
+            return "\n".join(
+                [*_unknown_supervisor_lines(), f"Otherwise {portable}"]
+            )
+        return portable
+    commands = [str(row) for row in plan.get("commands") or []]
+    components = [str(row) for row in plan.get("missing_components") or []]
+    names = ", ".join(dict.fromkeys(components)) if components else "unknown"
+    header = f"persistent wake coverage {live}/{target} — missing {names}:"
+    if not commands:
+        body = "(no safe re-arm command: controller lease unavailable)"
+        if supervisor == SUPERVISOR_UNKNOWN:
+            return "\n".join([header, *_unknown_supervisor_lines(), body])
+        return f"{header}\n{body}"
+    numbered = _persistent_component_hint_rows(components, commands)
+    if supervisor == SUPERVISOR_UNKNOWN:
+        return "\n".join(
+            [
+                header,
+                *_unknown_supervisor_lines(),
+                "Otherwise arm these:",
+                numbered,
+            ]
+        )
     return f"{header}\n{numbered}"
 
 
@@ -2941,27 +3247,37 @@ def check_tool_entry(
         return status
     output = sys.stderr if stream is None else stream
     command = listener_start_command(project_root, controller_label=controller_label)
+    plan = coverage_rearm_plan(
+        status,
+        project_root,
+        controller_label=str(controller_label or ""),
+        lease_nonce=controller_lease_nonce,
+        work_in_flight=True,
+    )
     if status.get("reason") == "waiter-probe-unavailable":
-        print(
-            "listener coverage UNKNOWN (probe unavailable); "
-            f"if you have no listener, start: {command}",
-            file=output,
-        )
-    else:
-        plan = coverage_rearm_plan(
-            status,
-            project_root,
-            controller_label=str(controller_label or ""),
-            lease_nonce=controller_lease_nonce,
-            work_in_flight=True,
-        )
-        hint = coverage_rearm_hint(plan)
+        if plan.get("supervisor") != SUPERVISOR_RUNNING:
+            plan = {**plan, "supervisor": SUPERVISOR_UNKNOWN}
+    hint = coverage_rearm_hint(plan)
+    if status.get("reason") == "waiter-probe-unavailable":
+        print("listener coverage UNKNOWN (probe unavailable).", file=output)
         if hint:
             print(hint, file=output)
-        status["rearm_plan"] = plan
-        commands = plan.get("commands") or []
-        if commands:
-            command = str(commands[0])
+        else:
+            print(
+                "if you are running `supervise`, restart it, otherwise "
+                f"if you have no listener, start: {command}",
+                file=output,
+            )
+    elif hint:
+        print(hint, file=output)
+    status["rearm_plan"] = plan
+    commands = plan.get("commands") or []
+    if commands:
+        command = str(commands[0])
+    if plan.get("supervisor") == SUPERVISOR_RUNNING and plan.get(
+        "supervise_command"
+    ):
+        command = str(plan["supervise_command"])
     status["start_command"] = command
     if pending_probe is None:
         return status

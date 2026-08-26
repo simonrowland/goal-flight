@@ -1764,8 +1764,10 @@ def test_wake_ledger_symlink_policy_is_symmetric_and_real_dir_scan_holds_fd(
 
 def test_entry_notice_distinguishes_probe_unavailable_from_offline(
     isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, _env = isolated
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     unavailable_stream = io.StringIO()
     unavailable = wake.check_tool_entry(
         root,
@@ -1775,11 +1777,13 @@ def test_entry_notice_distinguishes_probe_unavailable_from_offline(
         stream=unavailable_stream,
     )
     assert unavailable["reason"] == "waiter-probe-unavailable"
-    assert unavailable_stream.getvalue().startswith(
-        "listener coverage UNKNOWN (probe unavailable); "
-        "if you have no listener, start: "
+    unavailable_text = unavailable_stream.getvalue()
+    assert unavailable_text.startswith(
+        "listener coverage UNKNOWN (probe unavailable)."
     )
-    assert "listener offline" not in unavailable_stream.getvalue()
+    assert "could not tell whether `supervise`" in unavailable_text
+    assert "If you are running `supervise`" in unavailable_text
+    assert "listener offline" not in unavailable_text
 
     wake.ledger_dir(root).mkdir(parents=True)
     offline_stream = io.StringIO()

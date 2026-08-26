@@ -992,13 +992,22 @@ def _listener_depth_after_claim(
             lease_nonce=lease_nonce,
         )
         authority = goalflight_journal.Journal.open_reader(project_root)
-        return goalflight_wake.coverage_rearm_plan(
+        plan = goalflight_wake.coverage_rearm_plan(
             status,
             project_root,
             controller_label=label,
             lease_nonce=lease_nonce,
             work_in_flight=authority.care_work_exists(label),
         )
+        # t-272: ``command`` already carries the one project-root copy.
+        # ``supervise_command`` is a second path-bearing argv used only by
+        # hint printers. A live supervisor also drops ``commands`` so this
+        # payload cannot paste follow/listen beside the process that owns
+        # re-arming.
+        plan.pop("supervise_command", None)
+        if plan.get("supervisor") == goalflight_wake.SUPERVISOR_RUNNING:
+            plan.pop("commands", None)
+        return plan
     except Exception:
         return None
 

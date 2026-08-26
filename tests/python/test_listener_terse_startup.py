@@ -73,7 +73,8 @@ LISTEN_EXIT_THIN_HINT_SNAPSHOT = (
 # every-startup machine surface.  Compact wake state is different: the later
 # persistent-listener contract needs ``wake_mode`` to choose pool versus
 # stream/backup/watchdog arming, and ``reason`` distinguishes healthy, missing,
-# stale, faulted, and unavailable coverage.  Keep this an exact set so that
+# stale, faulted, and unavailable coverage. ``supervisor`` is a compact enum
+# (running/absent/unknown) with no extra path. Keep this an exact set so that
 # operational additions remain deliberate rather than turning into key sprawl.
 LISTENER_DEPTH_KEYS = {
     "live",
@@ -84,6 +85,7 @@ LISTENER_DEPTH_KEYS = {
     "separate_tracked_tasks",
     "wake_mode",
     "reason",
+    "supervisor",
 }
 
 

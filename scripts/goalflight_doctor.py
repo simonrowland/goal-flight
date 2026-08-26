@@ -655,6 +655,88 @@ def check_controller_lease_liveness(project_root: Path) -> dict:
     }
 
 
+def check_wake_coverage(project_root: Path) -> dict:
+    """Report wake-pool coverage and the generation-safe re-arm hint."""
+    resolved_root = project_root.resolve()
+    journal_path = goalflight_journal.resolve_journal_path(resolved_root)
+    if not os.path.lexists(journal_path):
+        return {
+            "ok": True,
+            "present": False,
+            "project_root": str(resolved_root),
+            "pools": [],
+        }
+    try:
+        authority = goalflight_journal.Journal.open_reader(resolved_root)
+        records = authority.lease_records()
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
+        return {
+            "ok": False,
+            "present": True,
+            "project_root": str(resolved_root),
+            "error": f"{type(exc).__name__}: {exc}",
+            "pools": [],
+        }
+    except (goalflight_journal.JournalError, OSError, ValueError) as exc:
+        return {
+            "ok": False,
+            "present": True,
+            "project_root": str(resolved_root),
+            "error": f"{type(exc).__name__}: {exc}",
+            "pools": [],
+        }
+
+    pools: list[dict[str, object]] = []
+    for record in records:
+        label = str(record.get("label") or "").strip()
+        nonce = str(record.get("nonce") or "").strip()
+        if not label:
+            continue
+        status = goalflight_wake.coverage_status(
+            resolved_root,
+            controller_label=label,
+            lease_nonce=nonce or None,
+        )
+        plan = goalflight_wake.coverage_rearm_plan(
+            status,
+            resolved_root,
+            controller_label=label,
+            lease_nonce=nonce or None,
+            work_in_flight=True,
+        )
+        live = status.get("live_waiters")
+        target = status.get("target_waiters")
+        covered = status.get("covered") is True
+        supervisor = str(plan.get("supervisor") or "")
+        probe_unknown = live is None or supervisor == goalflight_wake.SUPERVISOR_UNKNOWN
+        pools.append(
+            {
+                "label": label,
+                "covered": covered,
+                "live_waiters": live,
+                "target_waiters": target,
+                "missing_components": list(status.get("missing_components") or []),
+                "supervisor": supervisor or None,
+                "wake_mode": status.get("wake_mode"),
+                "reason": status.get("reason"),
+                "hint": goalflight_wake.coverage_rearm_hint(plan),
+                "ok": None if probe_unknown else covered,
+            }
+        )
+    unknown = sum(row["ok"] is None for row in pools)
+    short = sum(row["ok"] is False for row in pools)
+    return {
+        "ok": False if short else None if unknown else True,
+        "present": True,
+        "project_root": str(resolved_root),
+        "pools": pools,
+    }
+
+
 def check_resume_notes_pattern(project_root: Path) -> dict:
     """Probe `docs-private/RESUME-NOTES-*.md` for the canonical filename
     pattern: RESUME-NOTES-<YYYY-MM-DD>[-rev<N>].md. Surfaces topic-prefixed
@@ -3070,6 +3152,7 @@ def doctor(
         "agents_md_state": check_agents_md_state(repo),
         "session_status": check_session_status(skill_root, repo),
         "controller_lease_liveness": check_controller_lease_liveness(repo),
+        "wake_coverage": check_wake_coverage(repo),
         "resume_notes_pattern": check_resume_notes_pattern(repo),
         "cursor": {
             "desktop_present": cursor_desktop,
@@ -3379,6 +3462,37 @@ def collect_human_lines(payload: dict) -> list[str]:
                 f"generation={lease.get('generation')} holder={lease.get('holder_state')}",
             )
         )
+    wake_coverage = payload.get("wake_coverage")
+    if isinstance(wake_coverage, dict):
+        if wake_coverage.get("error"):
+            lines.append(
+                status_line(
+                    False,
+                    "wake coverage",
+                    str(wake_coverage["error"]),
+                )
+            )
+        elif wake_coverage.get("present") is False:
+            lines.append(status_line(True, "wake coverage", "no journal"))
+        elif not wake_coverage.get("pools"):
+            lines.append(
+                status_line(True, "wake coverage", "no active controller lease")
+            )
+        for pool in wake_coverage.get("pools") or []:
+            live = pool.get("live_waiters")
+            target = pool.get("target_waiters")
+            supervisor = pool.get("supervisor") or "unknown"
+            missing = (
+                ",".join(str(name) for name in (pool.get("missing_components") or []))
+                or "none"
+            )
+            lines.append(
+                status_line(
+                    pool.get("ok"),
+                    f"wake coverage {pool.get('label')}",
+                    f"{live}/{target} supervisor={supervisor} missing={missing}",
+                )
+            )
     for row in (payload.get("grok") or {}).get("permission_modes") or []:
         config = row.get("config") or "config.toml"
         if row.get("status") == "present":

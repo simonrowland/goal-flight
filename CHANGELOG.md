@@ -37,6 +37,14 @@ incremented when meaningful skill behaviour changes.
 
 ### Fixed
 
+- Persistent shortfall hints no longer tell operators to arm `follow` /
+  `listen` / `--watch-follow` beside a live `supervise`. Status, next,
+  relay, reminder, tool-entry, and doctor reuse one three-state detector
+  (`running` / `absent` / `unknown` from `ps` argv bound to this lease
+  nonce). A live supervisor prints restart-only advice (a stopped slot is
+  not recovered without that). No supervisor keeps the existing
+  three-command form. If the process table cannot tell, the hint is true
+  either way.
 - Bare `listen` / `follow` no longer treat a dead lease nonce as a
   successful arm. An ACTIVE journal row whose holder lock is unheld, or
   a `--lease-nonce` that is not the live session, exits 5 (`did-not-arm`)
