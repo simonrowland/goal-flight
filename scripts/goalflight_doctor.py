@@ -712,21 +712,40 @@ def check_wake_coverage(project_root: Path) -> dict:
         target = status.get("target_waiters")
         covered = status.get("covered") is True
         supervisor = str(plan.get("supervisor") or "")
-        probe_unknown = live is None or supervisor == goalflight_wake.SUPERVISOR_UNKNOWN
-        pools.append(
-            {
-                "label": label,
-                "covered": covered,
-                "live_waiters": live,
-                "target_waiters": target,
-                "missing_components": list(status.get("missing_components") or []),
-                "supervisor": supervisor or None,
-                "wake_mode": status.get("wake_mode"),
-                "reason": status.get("reason"),
-                "hint": goalflight_wake.coverage_rearm_hint(plan),
-                "ok": None if probe_unknown else covered,
-            }
-        )
+        pool: dict[str, object] = {
+            "label": label,
+            "supervisor": supervisor or None,
+            "wake_mode": status.get("wake_mode"),
+        }
+        if supervisor == goalflight_wake.SUPERVISOR_RUNNING:
+            # The supervisor owns, measures, and repairs its pool. A sampled
+            # shortfall is neither a controller action nor a doctor failure.
+            pool["ok"] = True
+        elif supervisor == goalflight_wake.SUPERVISOR_UNKNOWN or live is None:
+            # UNKNOWN remains numberless: inability to bind a supervisor is
+            # not proof that a zero-depth pool or direct re-arm is real.
+            pool.update(
+                {
+                    "reason": status.get("reason"),
+                    "hint": goalflight_wake.coverage_rearm_hint(plan),
+                    "ok": None,
+                }
+            )
+        else:
+            pool.update(
+                {
+                    "covered": covered,
+                    "live_waiters": live,
+                    "target_waiters": target,
+                    "missing_components": list(
+                        status.get("missing_components") or []
+                    ),
+                    "reason": status.get("reason"),
+                    "hint": goalflight_wake.coverage_rearm_hint(plan),
+                    "ok": covered,
+                }
+            )
+        pools.append(pool)
     unknown = sum(row["ok"] is None for row in pools)
     short = sum(row["ok"] is False for row in pools)
     return {
@@ -3491,7 +3510,17 @@ def collect_human_lines(payload: dict) -> list[str]:
                 for line in str(pool.get("hint") or "").splitlines()
                 if line.strip()
             )
-            detail = f"{live}/{target} supervisor={supervisor} missing={missing}"
+            reason = str(pool.get("reason") or "").strip()
+            if supervisor == goalflight_wake.SUPERVISOR_RUNNING:
+                detail = "supervisor=running"
+            elif supervisor == goalflight_wake.SUPERVISOR_UNKNOWN or live is None:
+                detail = f"coverage=unknown supervisor={supervisor}"
+                if reason:
+                    detail = f"{detail} reason={reason}"
+            else:
+                detail = (
+                    f"{live}/{target} supervisor={supervisor} missing={missing}"
+                )
             if hint:
                 detail = f"{detail}; {hint}"
             lines.append(

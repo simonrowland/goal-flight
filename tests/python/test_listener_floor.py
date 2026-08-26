@@ -44,8 +44,21 @@ def isolated(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, str]]:
     for value in env.values():
         if value != os.devnull:
             Path(value).mkdir(parents=True, exist_ok=True)
+    ps_dir = td / "empty-process-listing"
+    ps_dir.mkdir()
+    ps_shim = ps_dir / "ps"
+    ps_shim.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"-axww\" ]; then exit 0; fi\n"
+        "exec /bin/ps \"$@\"\n",
+        encoding="utf-8",
+    )
+    ps_shim.chmod(0o755)
+    env["PATH"] = f"{ps_dir}:{os.environ.get('PATH', '')}"
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     for key, value in env.items():
-        monkeypatch.setenv(key, value)
+        if key != "PATH":
+            monkeypatch.setenv(key, value)
     monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LABEL", raising=False)
     monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LEASE_NONCE", raising=False)
     monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
@@ -461,8 +474,8 @@ def test_lease_claim_emits_remaining_depth_when_work_is_in_flight(
     assert result["claimed"] is True
     depth = result["listener_depth"]
     assert depth["work_in_flight"] is True
-    assert depth["live"] == 0
-    assert depth["missing"] == wake.DEFAULT_LISTENER_SLOTS
+    assert depth["live"] is None
+    assert depth["missing"] is None
     assert isinstance(depth["command"], str) and depth["command"]
     assert "commands" not in depth
     assert "hint" not in depth

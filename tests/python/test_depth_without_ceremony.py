@@ -52,6 +52,12 @@ def isolated(
     env["GOALFLIGHT_TEST_MODE"] = "1"
     env["GOALFLIGHT_TEST_LISTENER_START_TOKEN"] = "depth-listener-token"
     env["GOALFLIGHT_PROCESS_ROLE"] = "controller"
+    ps_dir = tmp_path / "empty-process-listing"
+    ps_dir.mkdir()
+    ps_shim = ps_dir / "ps"
+    ps_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    ps_shim.chmod(0o755)
+    env["PATH"] = f"{ps_dir}:{os.environ.get('PATH', '')}"
     for key in AMBIENT_IDENTITY_ENV:
         monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("GOALFLIGHT_WAKE_LEDGER", raising=False)

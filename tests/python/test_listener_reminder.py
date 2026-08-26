@@ -1,4 +1,4 @@
-"""Journal coverage reminder contracts; no host process inspection."""
+"""Journal coverage reminder contracts with shared supervisor detection."""
 
 from __future__ import annotations
 
@@ -39,6 +39,9 @@ def test_reminder_uses_held_waiter_lock_not_journal_row(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root, authority, lease = _authority(monkeypatch, tmp_path)
+    # The actionable component command requires proven supervisor absence.
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
+    wake.ledger_dir(root).mkdir(parents=True, exist_ok=True)
     assert msgs.controller_mail_summary(task_store_project_root=root)["controller_label"] == "bugs"
     stream = io.StringIO()
     line = msgs.emit_listener_reminder(

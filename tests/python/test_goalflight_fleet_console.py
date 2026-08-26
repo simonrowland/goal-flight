@@ -1114,9 +1114,12 @@ def _assert_controller_state(
                     item for item in attention["items"]
                     if item["kind"] == "controller_hung"
                 ]
+                expect_hung_item = (
+                    expected == "HUNG" and supervisor_mode != "running"
+                )
                 assert_true(
-                    "only HUNG enters attention",
-                    len(hung_items) == (1 if expected == "HUNG" else 0),
+                    "only unsupervised or indeterminate HUNG enters attention",
+                    len(hung_items) == (1 if expect_hung_item else 0),
                 )
                 if expected == "HUNG":
                     listener_command = F.goalflight_wake.listener_start_command(
@@ -1125,12 +1128,8 @@ def _assert_controller_state(
                     )
                     if supervisor_mode == "running":
                         assert_true(
-                            "supervised HUNG offers a supervisor restart",
-                            "Restart the supervisor" in hung_items[0]["action"],
-                        )
-                        assert_true(
-                            "supervised HUNG omits the direct listener",
-                            listener_command not in hung_items[0]["action"],
+                            "supervised HUNG suppresses controller-facing depth",
+                            not hung_items,
                         )
                     elif supervisor_mode == "unknown":
                         assert_true(
@@ -1142,28 +1141,45 @@ def _assert_controller_state(
                             "UNKNOWN HUNG omits the direct listener",
                             listener_command not in hung_items[0]["action"],
                         )
+                        encoded_hung = json.dumps(hung_items[0], sort_keys=True)
+                        assert_true(
+                            "UNKNOWN HUNG guidance stays numberless",
+                            "0/" not in encoded_hung
+                            and "listener pool n=" not in encoded_hung,
+                        )
+                        assert_true(
+                            "UNKNOWN HUNG keeps numberless verification context",
+                            "wake ownership needs verification"
+                            in str(hung_items[0]["headline"]),
+                        )
+                        assert_true(
+                            "UNKNOWN HUNG does not assert zero coverage",
+                            "no live wake waiter"
+                            not in str(hung_items[0]["headline"]),
+                        )
                     else:
                         assert_true(
                             "unsupervised HUNG carries the exact listener command",
                             hung_items[0]["action"] == listener_command,
                         )
-                    hung_context = F._controller_contexts_by_session(
-                        project_root,
-                        machine_status["dispatch"]["records"],
-                        include_all=True,
-                        include_locked_ended=True,
-                        authority=reader,
-                        open_if_missing=False,
-                    )
-                    last_seen = next(iter(hung_context.values())).get("last_seen")
-                    assert_true(
-                        "HUNG last_seen is a real journal timestamp",
-                        last_seen is not None,
-                    )
-                    assert_true(
-                        "HUNG observed_at is the normalised last_seen, not None",
-                        hung_items[0]["observed_at"] == F._iso_timestamp(last_seen),
-                    )
+                    if hung_items:
+                        hung_context = F._controller_contexts_by_session(
+                            project_root,
+                            machine_status["dispatch"]["records"],
+                            include_all=True,
+                            include_locked_ended=True,
+                            authority=reader,
+                            open_if_missing=False,
+                        )
+                        last_seen = next(iter(hung_context.values())).get("last_seen")
+                        assert_true(
+                            "HUNG last_seen is a real journal timestamp",
+                            last_seen is not None,
+                        )
+                        assert_true(
+                            "HUNG observed_at is the normalised last_seen, not None",
+                            hung_items[0]["observed_at"] == F._iso_timestamp(last_seen),
+                        )
 
 
 def test_controller_state_alive_with_held_lease_and_one_live_waiter() -> None:
@@ -1175,7 +1191,7 @@ def test_controller_state_alive_with_held_lease_and_one_live_waiter() -> None:
     )
 
 
-def test_controller_state_hung_with_live_supervisor_offers_restart() -> None:
+def test_controller_state_hung_with_live_supervisor_suppresses_depth() -> None:
     _assert_controller_state(
         "HUNG",
         holder_mode="held",
@@ -3495,7 +3511,7 @@ def main() -> None:
     test_live_worker_count_ignores_permanent_terminal_history()
     test_controller_liveness_projection_rejects_unregistered_scalar()
     test_controller_state_alive_with_held_lease_and_one_live_waiter()
-    test_controller_state_hung_with_live_supervisor_offers_restart()
+    test_controller_state_hung_with_live_supervisor_suppresses_depth()
     test_controller_state_hung_with_unknown_supervisor_omits_listener()
     test_controller_state_hung_long_label_binds_live_supervisor()
     test_controller_state_hung_long_label_keeps_unsupervised_command()

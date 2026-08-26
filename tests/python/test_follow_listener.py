@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import select
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -53,8 +54,15 @@ def isolated(
             "GOALFLIGHT_WAKE_ENTRY_POLL_S": "0",
         }
     )
+    ps_dir = tmp_path / "empty-process-listing"
+    ps_dir.mkdir()
+    ps_shim = ps_dir / "ps"
+    ps_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    ps_shim.chmod(0o755)
+    env["PATH"] = f"{ps_dir}:{env.get('PATH', '')}"
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     for key, value in env.items():
-        if key.startswith("GOAL") or key == "PYTHONUNBUFFERED":
+        if key.startswith("GOAL") or key in {"PYTHONUNBUFFERED", "PATH"}:
             monkeypatch.setenv(key, value)
     project = tmp_path / "project"
     project.mkdir()
@@ -675,7 +683,11 @@ def test_watchdog_dead_audit_reason_is_registered() -> None:
     assert "journal-io-failure" in journal.LISTENER_EXIT_REASONS
 
 
-def test_every_record_is_structural_and_below_pipe_buf_with_long_frontier() -> None:
+def test_every_record_is_structural_and_below_pipe_buf_with_long_frontier(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     frontier = messages._follow_frontier_record(
         {
             "id": "t-very-long-frontier",
@@ -697,6 +709,9 @@ def test_every_record_is_structural_and_below_pipe_buf_with_long_frontier() -> N
         messages._follow_fault_record("journal-unavailable", "x" * 10_000),
         messages._follow_dead_record(
             {"state": "stale", "age_s": 999, "dead_after_s": 360},
+            project_root=tmp_path,
+            controller_label="structural-test",
+            lease_nonce="structural-test-nonce",
             rearm_command="python3 goalflight_messages.py follow " + "x" * 10_000,
         ),
         messages._watchdog_dead_record(
@@ -705,6 +720,9 @@ def test_every_record_is_structural_and_below_pipe_buf_with_long_frontier() -> N
                 "target_waiters": 3,
                 "missing_components": ["stream", "backup", "watchdog"],
             },
+            project_root=tmp_path,
+            controller_label="structural-test",
+            lease_nonce="structural-test-nonce",
             rearm_command=(
                 "python3 goalflight_messages.py listen --watch-follow "
                 + "x" * 10_000
@@ -1739,6 +1757,167 @@ def test_watchdog_warns_that_delivery_flags_are_ignored(
         controller_label=lease.label,
         lease_nonce=lease.nonce,
     ) in completed.stderr
+
+
+def test_direct_watchdog_beside_detected_supervisor_omits_backup_command(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    tmp_path: Path,
+) -> None:
+    project, env, lease = isolated
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=0.05,
+        dead_after_s=0.15,
+        now_epoch=time.time() - 1,
+    )
+    supervisor = wake.coverage_supervise_command(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    shim_dir = tmp_path / "running-supervisor-process-listing"
+    shim_dir.mkdir()
+    ps_shim = shim_dir / "ps"
+    process_row = f"4242 {supervisor}"
+    ps_shim.write_text(
+        "#!/bin/sh\nprintf '%s\\n' " + shlex.quote(process_row) + "\n",
+        encoding="utf-8",
+    )
+    ps_shim.chmod(0o755)
+    direct_env = {**env, "PATH": f"{shim_dir}:{env.get('PATH', '')}"}
+    direct_env.pop("GOALFLIGHT_SUPERVISED", None)
+
+    completed = subprocess.run(
+        [*_watch_command(project, lease), "--listener-slots", "2"],
+        cwd=project,
+        env=direct_env,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+
+    forbidden = wake.persistent_backup_start_command(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "ignoring --listener-slots; the supervisor owns backup replacement" in completed.stderr
+    assert forbidden not in completed.stderr
+
+
+@pytest.mark.parametrize("mode", ["direct-with-supervisor", "orphaned-child"])
+def test_detached_watchdog_uses_detected_supervisor_ownership(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mode: str,
+) -> None:
+    project, _env, lease = isolated
+    supervise_command = wake.coverage_supervise_command(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    monkeypatch.setenv("GOALFLIGHT_LISTENER_STARTUP_GRACE_S", "0.05")
+    monkeypatch.setattr(messages.os, "getppid", lambda: 1)
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    if mode == "direct-with-supervisor":
+        monkeypatch.delenv("GOALFLIGHT_SUPERVISED", raising=False)
+        monkeypatch.setattr(
+            wake,
+            "_process_listing",
+            lambda: [(4242, supervise_command)],
+        )
+    else:
+        monkeypatch.setenv("GOALFLIGHT_SUPERVISED", "1")
+        monkeypatch.setattr(wake, "_process_listing", lambda: [])
+
+    code = messages._cmd_watch_follow(
+        SimpleNamespace(timeout_s=2),
+        project_root=project,
+        label=lease.label,
+        nonce=lease.nonce,
+        poll=0.01,
+        journal_tolerance=messages._JournalBusyTolerance(
+            messages.LISTENER_JOURNAL_TOLERANCE_S,
+            messages.LISTENER_JOURNAL_BACKOFF_CAP_S,
+        ),
+    )
+    captured = capsys.readouterr()
+
+    assert code == messages.DETACHED_LISTENER_EXIT_CODE
+    assert "goalflight_messages.py listen" not in captured.err
+    assert "goalflight_messages.py follow" not in captured.err
+    if mode == "direct-with-supervisor":
+        assert "supervisor owns replacement" in captured.err
+        assert "Restart the supervisor" not in captured.err
+    else:
+        assert "supervisor parent is gone" in captured.err
+        assert "Restart the supervisor" in captured.err
+        assert supervise_command in captured.err
+
+
+def test_supervised_watchdog_stdout_loss_during_orphan_grace_restarts_supervisor(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _env, lease = isolated
+    supervise_command = wake.coverage_supervise_command(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    released = False
+    real_register = wake.register_watchdog_waiter
+
+    class TrackedWaiter:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+
+        def close(self) -> None:
+            nonlocal released
+            self.inner.close()
+            released = True
+
+    def register_tracked(*args, **kwargs):
+        return TrackedWaiter(real_register(*args, **kwargs))
+
+    def listing_after_release():
+        assert released, "watchdog recovery was emitted before lock release"
+        return []
+
+    monkeypatch.setenv("GOALFLIGHT_SUPERVISED", "1")
+    monkeypatch.setenv("GOALFLIGHT_LISTENER_STARTUP_GRACE_S", "60")
+    monkeypatch.setattr(messages.os, "getppid", lambda: 1)
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    monkeypatch.setattr(messages, "_stdio_peer_gone", lambda _stream: True)
+    monkeypatch.setattr(wake, "register_watchdog_waiter", register_tracked)
+    monkeypatch.setattr(wake, "_process_listing", listing_after_release)
+
+    code = messages._cmd_watch_follow(
+        SimpleNamespace(timeout_s=2),
+        project_root=project,
+        label=lease.label,
+        nonce=lease.nonce,
+        poll=0.01,
+        journal_tolerance=messages._JournalBusyTolerance(
+            messages.LISTENER_JOURNAL_TOLERANCE_S,
+            messages.LISTENER_JOURNAL_BACKOFF_CAP_S,
+        ),
+    )
+    captured = capsys.readouterr()
+
+    assert code == 3
+    assert released
+    assert "supervisor parent is gone" in captured.err
+    assert "Restart the supervisor" in captured.err
+    assert supervise_command in captured.err
+    assert "goalflight_messages.py listen" not in captured.err
+    assert "goalflight_messages.py follow" not in captured.err
 
 
 # --- b-214: a transient journal-busy must not kill a persistent listener ---

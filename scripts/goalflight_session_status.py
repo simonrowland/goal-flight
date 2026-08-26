@@ -1002,7 +1002,8 @@ def _listener_depth_after_claim(
         # t-272: ``command`` already carries the one project-root copy.
         # ``supervise_command`` is a second path-bearing argv used only by
         # hint printers. Only proven supervisor absence may expose component
-        # commands: UNKNOWN is not evidence that direct arming is safe.
+        # commands or depth: UNKNOWN is not evidence that direct arming is
+        # safe, and RUNNING owns its pool without controller intervention.
         return goalflight_wake.operator_rearm_plan(plan)
     except Exception:
         return None
@@ -1130,7 +1131,11 @@ def claim_controller_startup(
         str(record["id"]),
     )
     if depth is not None:
-        result["listener_depth"] = depth
+        supervisor = str(depth.get("supervisor") or "")
+        if supervisor == goalflight_wake.SUPERVISOR_RUNNING:
+            result["wake_supervisor"] = supervisor
+        else:
+            result["listener_depth"] = depth
     return result
 
 

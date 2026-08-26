@@ -42,8 +42,12 @@ Each payload stamps its producer cadence. The renderer declares a plane stale
 at two missed stamped intervals; its own reload timer is transport, never
 freshness authority. Every degraded `last_error` and stale banner names the
 plane launchd log plus `scripts/install-fleet-console.sh --status --plane
-<plane>`. HUNG controller attention carries the exact `listen` command
-rendered by the wake layer.
+<plane>`. HUNG controller attention follows the wake layer's three-state
+supervisor contract. Proven supervisor absence carries the exact component
+command. A running supervisor suppresses controller-facing depth advice because
+it owns and reports its pool. Unknown supervisor state carries numberless
+verification guidance and no component command; it never guesses that direct
+`listen`, `follow`, or `--watch-follow` is safe.
 
 ## Tick behavior
 

@@ -2992,6 +2992,11 @@ def _controller_attention_rows(
         else []
     )
     for candidate, supervisor in zip(candidates, supervisor_states):
+        if supervisor == goalflight_wake.SUPERVISOR_RUNNING:
+            # The supervisor owns, measures, and repairs this generation's wake
+            # pool. Its coverage-change record is authoritative; repeating a
+            # controller-side HUNG/depth alarm here is a false action surface.
+            continue
         root = str(candidate["root"])
         context = candidate["context"]
         raw_label = str(candidate["raw_label"])
@@ -3005,6 +3010,15 @@ def _controller_attention_rows(
         action_policy = goalflight_wake.supervisor_operator_action(
             supervisor,
             component_command=component_command,
+        )
+        headline = (
+            f"Controller {display_label}{generation_text} wake ownership "
+            "needs verification while work remains in flight"
+            if supervisor == goalflight_wake.SUPERVISOR_UNKNOWN
+            else (
+                f"Controller {display_label}{generation_text} is HUNG: "
+                "in-flight work has no live wake waiter"
+            )
         )
         rows.append(
             {
@@ -3020,11 +3034,7 @@ def _controller_attention_rows(
                     or action_policy["instruction"]
                 ),
                 "observed_at": _iso_timestamp(context.get("last_seen")),
-                "headline": _display(
-                    f"Controller {display_label}{generation_text} is HUNG: "
-                    "in-flight work has no live wake waiter",
-                    limit=96,
-                ),
+                "headline": _display(headline, limit=96),
             }
         )
     # Same key as mail rows and the merged attention plane: dated first,

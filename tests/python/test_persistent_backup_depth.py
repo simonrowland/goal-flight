@@ -39,6 +39,7 @@ def isolated(
     monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", os.devnull)
     monkeypatch.setenv("GOALFLIGHT_TEST_MODE", "1")
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     project = tmp_path / "project"
     project.mkdir()
     authority = journal.open_or_create_journal(project)

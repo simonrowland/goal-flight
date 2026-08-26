@@ -312,6 +312,11 @@ def claim_controller_entry(repo_root: str, cwd: str) -> dict:
 
 
 def controller_wake_instruction(repo_root: str, claim_result: dict) -> str:
+    if (
+        claim_result.get("claimed")
+        and claim_result.get("wake_supervisor") == "running"
+    ):
+        return ""
     depth = claim_result.get("listener_depth")
     if not claim_result.get("claimed") or not isinstance(depth, dict):
         return (
@@ -386,12 +391,41 @@ def main() -> None:
         plugin_prompt = os.path.join(plugin_root, "templates", "goalflight-watchdog-prompt.md")
         prompt_file = repo_prompt if os.path.isfile(repo_prompt) else plugin_prompt
     wake_instruction = controller_wake_instruction(repo_root, claim_result)
+    depth = claim_result.get("listener_depth")
+    wake_state = (
+        str(claim_result.get("wake_supervisor") or "")
+        or (
+            str(depth.get("supervisor") or "")
+            if isinstance(depth, dict)
+            else ""
+        )
+    )
+    if wake_state == "running":
+        wake_preamble = (
+            "A live `supervise` process already owns this controller generation's "
+            "event wake; no controller wake action is required. "
+        )
+    elif wake_state == "unknown":
+        wake_preamble = (
+            "RESOLVE EVENT WAKE OWNERSHIP FIRST before arming any direct wake "
+            "component: "
+        )
+    else:
+        wake_preamble = (
+            "ARM THE EVENT WAKE FIRST as a background task per "
+            "`protocols/dispatch-routing.md` and `commands/execute.md`: "
+        )
+    claimed_instruction = (
+        f"For a claimed controller: {wake_instruction} "
+        if wake_instruction
+        else ""
+    )
     context = (
-        "An active goal-flight run was detected on this session start. ARM THE EVENT WAKE FIRST "
-        "as a background task per `protocols/dispatch-routing.md` and `commands/execute.md`: "
+        "An active goal-flight run was detected on this session start. "
+        f"{wake_preamble}"
         "the SessionStart hook already attempted a role-aware lease claim; inspect its result "
         f"({json.dumps(claim_result, sort_keys=True)}). Carry the returned `session.lease_nonce`. "
-        f"For a claimed controller: {wake_instruction} An "
+        f"{claimed_instruction}An "
         "unclaimed fixed-set controller runs the printed `goalflight_status.py --wait <ids>` "
         "command. Do not block the controller turn on either wait. CONTINUE IN-SKILL: re-invoke "
         "`/goal-flight resume` (this reloads SKILL.md fresh "
