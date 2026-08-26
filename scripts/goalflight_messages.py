@@ -5726,7 +5726,11 @@ def _emit_claimed_follow_events(
 
 
 def cmd_follow(args) -> int:
-    """Persistent newline-delimited wake stream for a host monitor."""
+    """Persistent newline-delimited wake stream for a host monitor.
+
+    Exit 5 is settled did-not-arm (dead or mismatched lease nonce), the
+    same contract as ``listen``. Exit 2 is retryable journal unreadability.
+    """
     import goalflight_journal  # type: ignore
     import goalflight_session_status as sessions  # type: ignore
     import goalflight_task  # type: ignore
@@ -7700,8 +7704,10 @@ def _run_cli(argv: list[str] | None = None) -> int:
         "listen-auto",
         help="alias for listen (kept for live fleet and SessionStart invocations)",
         description=(
-            "alias for listen. Exit 3 is never a full-pool refusal, "
-            "listener pool."
+            "alias for listen. Exit 0 is a ring, 2 is a retryable "
+            "fault, 3 is contention/stale after arming, 5 is settled did-not-arm "
+            "(dead or mismatched lease nonce). Exit 3 is never a full-pool "
+            "refusal."
         ),
     )
     add_listen_arguments(listen_auto)
@@ -7709,6 +7715,12 @@ def _run_cli(argv: list[str] | None = None) -> int:
     follow = sub.add_parser(
         "follow",
         help="persistent JSON-line wake stream for a host stdout monitor",
+        description=(
+            "persistent JSON-line wake stream for a host stdout monitor. "
+            "Exit 0 is a clean stream stop, 2 is a retryable fault, 3 is "
+            "contention/stale after arming, 5 is settled did-not-arm "
+            "(dead or mismatched lease nonce)."
+        ),
     )
     follow.add_argument("--project-root", default=None)
     follow.add_argument("--controller-label", default=None)

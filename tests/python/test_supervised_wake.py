@@ -629,7 +629,13 @@ def test_classify_exit_taxonomy() -> None:
         returncode=5,
         output="listen: did-not-arm: no live controller lease is present",
         armed=False,
-    ) == (supervise.ACTION_STOP, "did-not-arm")
+    ) == (supervise.ACTION_STOP, "dead-lease-nonce")
+    assert supervise.classify_child_exit(
+        kind="backup",
+        returncode=5,
+        output="",
+        armed=False,
+    ) == (supervise.ACTION_STOP, "dead-lease-nonce")
 
 
 def test_live_counts_armed_components_not_pids() -> None:
@@ -1225,6 +1231,68 @@ def test_follow_listener_exit_json_on_stdout_is_still_dead_nonce(
     assert stop["reason"] == "dead-lease-nonce"
     assert stop.get("scope") == "supervisor"
     assert code == supervise.SUPERVISE_STOP_EXIT
+
+
+def test_bare_exit_5_stops_the_supervisor_not_one_slot() -> None:
+    """Exit 5 with no diagnostic is still supervisor-wide never-armed."""
+    host = FakeHost(
+        scripts={
+            "stream": [],
+            "backup": [
+                PlannedExit(
+                    lifetime_s=0.1,
+                    returncode=5,
+                    output="",
+                    armed=False,
+                ),
+            ],
+        },
+        stop_when_lines_contain=('"type":"stop"',),
+    )
+    code = _run(
+        host,
+        _items("stream", "backup"),
+        heartbeat_s=100.0,
+        coverage_s=100.0,
+    )
+    assert code == supervise.SUPERVISE_STOP_EXIT
+    stop = next(record for record in _records(host) if record.get("type") == "stop")
+    assert stop["reason"] == "dead-lease-nonce"
+    assert stop.get("scope") == "supervisor"
+    assert stop["child"] == "backup"
+
+
+def test_open_reader_busy_nonce_probe_is_unreadable_not_dead(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Busy open_reader through the real probe must stay retryable.
+
+    A stub that returns ``("unreadable", None)`` cannot catch a collapse of
+    unreadable into dead inside ``probe_live_session`` or ``nonce_probe``.
+    """
+    project, env, lease = isolated
+
+    def busy_open_reader(cls, project_root, **kwargs):  # type: ignore[no-untyped-def]
+        raise journal.JournalBusy(
+            "journal connection remained busy after 1 attempts within 1.000s"
+        )
+
+    monkeypatch.setattr(
+        journal.Journal, "open_reader", classmethod(busy_open_reader)
+    )
+    state, session = sessions.probe_live_session(project, label=lease.label)
+    assert state == "unreadable" and session is None
+    host = supervise.RealHost(
+        project_root=project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        env=env,
+    )
+    try:
+        assert host.nonce_probe() == "unreadable"
+    finally:
+        host.kill_all()
 
 
 def test_nonce_reader_third_state_is_unreadable(

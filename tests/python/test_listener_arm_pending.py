@@ -100,13 +100,15 @@ import os
 import sys
 
 sys.path.insert(0, os.environ["GOALFLIGHT_TEST_SCRIPTS"])
-import goalflight_session_status as sessions
+import goalflight_journal as journal
 import goalflight_messages as messages
 
-def unreadable(*args, **kwargs):
-    return ("unreadable", None)
+def busy_open_reader(cls, project_root, **kwargs):
+    raise journal.JournalBusy(
+        "journal connection remained busy after 1 attempts within 1.000s"
+    )
 
-sessions.probe_live_session = unreadable
+journal.Journal.open_reader = classmethod(busy_open_reader)
 messages.LISTENER_JOURNAL_TOLERANCE_S = 0.05
 messages.LISTENER_JOURNAL_BUSY_BUDGET_S = 0.01
 raise SystemExit(messages.main(sys.argv[1:]))
@@ -1650,7 +1652,13 @@ def test_dead_lease_nonce_exits_did_not_arm_not_ring(
 def test_unreadable_lease_nonce_is_retryable_not_dead(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
-    """Busy/unreadable probe must not become did-not-arm or a ring."""
+    """Busy open_reader through the real probe must not become did-not-arm.
+
+    Drives ``probe_live_session``: ``Journal.open_reader`` raises
+    ``JournalBusy`` under the probe's 0.05s budgets. A stub that returns
+    ``("unreadable", None)`` cannot catch a collapse of unreadable into
+    dead inside the probe.
+    """
     project, env = isolated
     authority = journal.open_or_create_journal(project)
     lease = authority.claim_or_renew_lease(

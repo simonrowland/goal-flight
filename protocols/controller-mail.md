@@ -136,7 +136,7 @@ The supervisor's child-exit taxonomy:
 | short-lived fault (exit 2 after arming) | restart with backoff: 1s, 2s, … cap 120s; reset after a long-lived run |
 | did-not-arm (leftover watchdog/stream lock, regular-file stdout — explicit markers, never a missed flock sample) | stop **that slot**, emit `type=stop` `scope=slot`; siblings keep running |
 | three consecutive short non-journal exit-2 deaths | stop **that slot** as `permanent-exit-2` (visible, not healthy); do not absorb into silent backoff; does not use a sampled `armed` flag |
-| dead lease nonce (capability-mismatch, `lease-nonce-not-live`, vanished live session) | stop the supervisor, emit `type=stop` `scope=supervisor`, exit 3 |
+| dead lease nonce (capability-mismatch, `lease-nonce-not-live`, vanished live session; child listen/follow exit 5, even with empty stderr) | stop the supervisor, emit `type=stop` `scope=supervisor`, exit 3 |
 
 A dead lease nonce is re-read through `goalflight_session_status.probe_live_session`
 (the non-locking journal reader), never the write `Journal()` constructor and never
@@ -349,9 +349,11 @@ The portable steady-state loop is:
    cannot own four doorbells).
 2. One rings; use `relay --drain` when its headlines settle every item, or peek,
    process bodies, and advance explicitly.
-3. Re-arm toward target: the listen exit (and a lease claim while work is
-   in flight) prints the exact remaining-depth commands, numbered, one
-   per missing slot. Issue each as its own tracked background task.
+3. Re-arm toward target on a ring (exit 0): the listen exit (and a lease
+   claim while work is in flight) prints the exact remaining-depth
+   commands, numbered, one per missing slot. Issue each as its own
+   tracked background task. Exit 5 is settled did-not-arm — do not re-arm
+   that nonce. Exit 2 is retryable journal unreadability, not a dead nonce.
 
 Never advance before processing is settled. If all slots are occupied, startup
 reports their exact PIDs and says not to kill by pattern. If all listeners have rung

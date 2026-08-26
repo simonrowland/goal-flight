@@ -45,7 +45,8 @@ incremented when meaningful skill behaviour changes.
   exit 2 with `journal-unavailable` / `journal-io-failure` so a caller
   can retry; that state is not collapsed into a dead nonce. Supervised
   children still classify from the child's diagnostic channel; exit 5
-  without a dead-nonce marker stops that slot.
+  is supervisor-wide never-armed even with empty stderr (leftover-lock
+  did-not-arm remains a slot stop via its explicit markers).
 - Supervised wake classifies a child exit from the child's diagnostic
   channel (stderr plus structured child-exit JSON reasons), never from
   relayed mail headlines. A doorbell that reports a subject containing

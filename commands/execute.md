@@ -81,8 +81,10 @@ three missed heartbeat intervals emit `listener-dead` on stdout with the exact m
 re-arm command. Treat stream, backup pool, and watchdog as shared persistent coverage
 `live/8`. On hosts without that
 monitor (codex, grok, cursor, opencode), keep the portable tracked `listen` pool:
-when one exits, peek with `relay --new --json`, process the items, cursor-CAS their
-server-known positions with `advance`, then re-arm. An unclaimed
+when one exits 0, peek with `relay --new --json`, process the items, cursor-CAS their
+server-known positions with `advance`, then re-arm. Exit 5 is settled did-not-arm
+(dead or mismatched lease nonce): do not treat it as a ring and do not re-arm that
+nonce. Exit 2 is retryable journal unreadability, not a dead nonce. An unclaimed
 fixed-set join backgrounds the printed `goalflight_status.py --wait <ids>`
 command. Do not block the turn on either. A timer is only for non-notifiable
 external state such as CI, a remote queue, or a deploy. Scheduling one to ask
@@ -243,9 +245,11 @@ python3 <skill-root>/scripts/goalflight_messages.py listen \
   --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>
 ```
 
-Peek with `relay --new --json`, process the items, advance their server-known
-positions with the returned cursor version, then re-arm. Never use the listener to
-renew the lease.
+On exit 0, peek with `relay --new --json`, process the items, advance their
+server-known positions with the returned cursor version, then re-arm. Exit 5 is
+settled did-not-arm (dead or mismatched lease nonce): do not re-arm that nonce.
+Exit 2 is retryable journal unreadability. Never use the listener to renew the
+lease.
 
 7. Completion:
 

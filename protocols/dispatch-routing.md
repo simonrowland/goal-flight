@@ -202,11 +202,14 @@ python3 <skill-root>/scripts/goalflight_messages.py listen \
 ```
 
 The listener writes an audit row and terminates body-free when mail exists after the
-stored cursor. The controller peeks with `relay --new --json`, processes the returned
-items, advances their server-known stream positions with `advance --cursor-version
-<version> --position <stream>=<seq>`, then re-arms. Peek again to derive remaining
-mail. Listener, drainer, mirror, and dashboard roles never claim or renew the
-controller lease; a verified watchdog tick may renew it.
+stored cursor. On exit 0 the controller peeks with `relay --new --json`, processes
+the returned items, advances their server-known stream positions with
+`advance --cursor-version <version> --position <stream>=<seq>`, then re-arms. Exit 5
+is settled did-not-arm (dead or mismatched lease nonce): do not treat it as a ring
+and do not re-arm that nonce. Exit 2 is retryable journal unreadability, not a dead
+nonce. Peek again to derive remaining mail. Listener, drainer, mirror, and dashboard
+roles never claim or renew the controller lease; a verified watchdog tick may renew
+it.
 
 ### Controller correspondence addressing
 
