@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 
 import goalflight_compat
 import goalflight_codex_sessions
+import goalflight_capacity
 import goalflight_dispatch_states
 import goalflight_engine_sessions
 import goalflight_ledger
@@ -34,7 +35,11 @@ import goalflight_task
 import goalflight_terminal
 from goalflight_agent_limits import moonshot_family
 from goalflight_liveness import (
+    LIVENESS_INDETERMINATE_STATE,
     LivenessThresholds,
+    TREE_PROBE_MEASURED,
+    TREE_PROBE_SKIPPED,
+    TREE_PROBE_UNAVAILABLE,
     active_monotonic,
     classify_liveness,
     cpu_confirmed_idle,
@@ -42,6 +47,7 @@ from goalflight_liveness import (
     pgroup_cpu_pct,
     pgroup_cputime_snapshot,
     process_group_id,
+    resolve_indeterminate_timeout_s,
     system_starved,
     write_status,
 )
@@ -143,10 +149,11 @@ TAIL_SCAN_BOUNDARY_BYTES = 64
 # single physical line must never defeat that memory bound. Every text read is
 # capped; overlong physical lines keep only this prefix and skip the remainder.
 STREAM_READ_CHUNK_CHARS = 64 * 1024
-# CPU-sampling-failure grace (codex 2026-05-20 P2): idle_timeout exits only on
-# confirmed-idle CPU. Unavailable CPU (ps failure -> None) keeps waiting instead
-# of false-killing a healthy quiet worker. The streak still protects against
-# one-off noisy idle samples.
+# Cannot-tell grace: idle_timeout exits only when every applicable probe
+# looked and found nothing. CPU / descendants / tree mtime that return None
+# (ps failed, walk failed) keep waiting; unknown is not death. A later
+# give-up is liveness_indeterminate, not idle_timeout. The streak still
+# protects against one-off noisy idle samples.
 WEDGE_CONFIRM_SAMPLES = 2
 REPLY_WAIT_MARKER_KINDS = frozenset({"USER-NEED", "USER-CONFIRM"})
 WORKER_WAIT_ARM_GRACE_SECS = 1.0
@@ -180,6 +187,8 @@ WEDGE_EVIDENCE_KEYS = (
 )
 WEDGE_TREE_LEG_WORKER_CWD = "worker_cwd"
 WEDGE_TREE_LEG_INDETERMINATE = "indeterminate"
+INDETERMINATE_TERM_GRACE_S = 1.0
+INDETERMINATE_KILL_GRACE_S = 1.0
 _TREE_SKIP_DIR_NAMES = frozenset(
     {
         ".git",
@@ -309,41 +318,96 @@ def apply_worker_wedge(
     return {"event": event, "wedged": is_wedged}
 
 
-def newest_mtime_under(
+class TreeMtimeSample:
+    """Result of one worktree mtime walk.
+
+    ``available`` is True only when the walk finished. ``newest`` is None
+    for an empty tree (looked, found no files) and a float when at least
+    one file was stat'd. Callers must not treat ``available is False`` as
+    an empty tree: that is "could not look".
+    """
+
+    __slots__ = ("newest", "available")
+
+    def __init__(self, newest: float | None, available: bool) -> None:
+        self.newest = newest
+        self.available = available
+
+    def __repr__(self) -> str:
+        return f"TreeMtimeSample(newest={self.newest!r}, available={self.available!r})"
+
+
+def sample_newest_mtime_under(
     root: Path | None,
     *,
     skip_names: frozenset[str] = _TREE_SKIP_DIR_NAMES,
     stop_if_newer_than: float | None = None,
-) -> float | None:
-    """Newest file mtime under ``root``, skipping cache/VCS noise dirs.
+) -> TreeMtimeSample:
+    """Walk ``root`` for the newest file mtime, skipping cache/VCS noise dirs.
 
     When ``stop_if_newer_than`` is set, return as soon as any file is newer
     than that cutoff (the tree is not quiet). Does not follow symlinks.
+    A walk or individual file ``stat()`` that raises is unavailable, unless a
+    file newer than the cutoff was already found — that positive observation
+    is enough to prove the tree is alive.
     """
     if root is None:
-        return None
+        return TreeMtimeSample(newest=None, available=False)
     try:
         if not root.is_dir():
-            return None
+            return TreeMtimeSample(newest=None, available=False)
     except OSError:
-        return None
+        return TreeMtimeSample(newest=None, available=False)
     newest: float | None = None
+    stat_failed = False
+
+    def _raise_walk_error(err: OSError) -> None:
+        # Default os.walk swallows scandir errors, so a permission failure
+        # looks like an empty tree. That is the same cannot-tell class as a
+        # failed ps walk: "could not look" must not become "looked, nothing".
+        raise err
+
     try:
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for dirpath, dirnames, filenames in os.walk(
+            root, followlinks=False, onerror=_raise_walk_error
+        ):
             dirnames[:] = [name for name in dirnames if name not in skip_names]
             for name in filenames:
                 path = Path(dirpath) / name
                 try:
                     mtime = path.stat().st_mtime
                 except OSError:
+                    stat_failed = True
                     continue
                 if newest is None or mtime > newest:
                     newest = mtime
                 if stop_if_newer_than is not None and mtime > stop_if_newer_than:
-                    return mtime
+                    return TreeMtimeSample(newest=mtime, available=True)
     except OSError:
-        return newest
-    return newest
+        if (
+            stop_if_newer_than is not None
+            and newest is not None
+            and newest > stop_if_newer_than
+        ):
+            return TreeMtimeSample(newest=newest, available=True)
+        return TreeMtimeSample(newest=newest, available=False)
+    return TreeMtimeSample(newest=newest, available=not stat_failed)
+
+
+def newest_mtime_under(
+    root: Path | None,
+    *,
+    skip_names: frozenset[str] = _TREE_SKIP_DIR_NAMES,
+    stop_if_newer_than: float | None = None,
+) -> float | None:
+    """Newest file mtime under ``root``, or None if empty/unreadable.
+
+    Prefer ``sample_newest_mtime_under`` when the caller must distinguish
+    "looked and found nothing" from "could not look".
+    """
+    return sample_newest_mtime_under(
+        root, skip_names=skip_names, stop_if_newer_than=stop_if_newer_than
+    ).newest
 
 
 def _expand_path(raw: object) -> Path | None:
@@ -628,6 +692,31 @@ def _newest_trace_file(root: Path, roots: tuple[Path, ...]) -> Path | None:
         return None
 
 
+def _parse_ppid_children(ps_output: str) -> dict[int, list[int]]:
+    children: dict[int, list[int]] = {}
+    for line in ps_output.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+        except ValueError:
+            continue
+    return children
+
+
+def _walk_process_tree(pid: int, children: dict[int, list[int]]) -> tuple[int, ...]:
+    found: list[int] = []
+    pending = [pid]
+    while pending:
+        current = pending.pop()
+        if current in found:
+            continue
+        found.append(current)
+        pending.extend(children.get(current, ()))
+    return tuple(found)
+
+
 def _worker_process_tree(pid: int, *, ps_runner=None) -> tuple[int, ...]:
     runner = ps_runner or subprocess.run
     try:
@@ -638,21 +727,36 @@ def _worker_process_tree(pid: int, *, ps_runner=None) -> tuple[int, ...]:
             timeout=TRACE_LSOF_TIMEOUT_SECS,
             check=False,
         )
-        children: dict[int, list[int]] = {}
-        for line in (proc.stdout or "").splitlines():
-            child_text, parent_text = line.split()
-            children.setdefault(int(parent_text), []).append(int(child_text))
-        found: list[int] = []
-        pending = [pid]
-        while pending:
-            current = pending.pop()
-            if current in found:
-                continue
-            found.append(current)
-            pending.extend(children.get(current, ()))
-        return tuple(found)
+        children = _parse_ppid_children(proc.stdout or "")
+        return _walk_process_tree(pid, children)
     except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
         return (pid,)
+
+
+def live_descendant_count(pid: int, *, ps_runner=None) -> int | None:
+    """Live descendants of ``pid``, excluding itself.
+
+    None means the sample was unavailable. 0 means the walk ran and found
+    no children. Callers must not treat None as idle.
+    """
+    runner = ps_runner or subprocess.run
+    try:
+        proc = runner(
+            ["ps", "-axo", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if getattr(proc, "returncode", 0) not in (0, None):
+            return None
+        stdout = proc.stdout or ""
+        if not stdout.strip():
+            return None
+        tree = _walk_process_tree(pid, _parse_ppid_children(stdout))
+        return max(0, len(tree) - 1)
+    except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
+        return None
 
 
 def _trace_from_lsof(
@@ -1048,7 +1152,7 @@ def _exit_code_for_state(state: str) -> int:
         return 1
     if goalflight_dispatch_states.is_limit_state(state):
         return 1
-    if state == "idle_timeout":
+    if state in {"idle_timeout", LIVENESS_INDETERMINATE_STATE}:
         return 2
     if state in {"orphaned", "controller_dead"}:
         return 3
@@ -1669,6 +1773,236 @@ def worker_alive(pid: int | None, expected_identity: dict | None) -> tuple[bool,
         int(pid), expected_identity, current
     )
     return is_alive, reason, current
+
+
+def _pgroup_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def verify_indeterminate_worker_scope(
+    pid: int,
+    pgid: int | None,
+    expected_identity: dict | None,
+) -> tuple[int | None, str]:
+    """Verify a destructive cleanup scope while its fine-identity leader lives."""
+    current_identity = goalflight_ledger.process_identity(pid)
+    identity_ok, identity_reason = goalflight_ledger.compare_fine_process_identities(
+        pid, expected_identity, current_identity
+    )
+    if not identity_ok:
+        return None, identity_reason
+    try:
+        current_pgid = os.getpgid(pid)
+    except OSError as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    supplied_pgid = int(pgid or current_pgid)
+    if (
+        current_pgid <= 1
+        or current_pgid == os.getpgrp()
+        or current_pgid != pid
+        or supplied_pgid != current_pgid
+    ):
+        return None, (
+            f"unverified worker process group supplied={supplied_pgid} "
+            f"current={current_pgid} pid={pid}"
+        )
+    return current_pgid, "verified"
+
+
+def terminate_indeterminate_worker(
+    pid: int,
+    pgid: int | None,
+    expected_identity: dict | None,
+    *,
+    term_grace_s: float = INDETERMINATE_TERM_GRACE_S,
+    kill_grace_s: float = INDETERMINATE_KILL_GRACE_S,
+) -> dict:
+    """Bound an unresolved worker before its managed capacity is released."""
+    supplied_pgid = int(pgid or 0)
+    current_identity = goalflight_ledger.process_identity(pid)
+    if current_identity is None:
+        if supplied_pgid > 1 and _pgroup_alive(supplied_pgid):
+            return {
+                "worker_alive": True,
+                "worker_disposition": "indeterminate_cleanup_failed",
+                "worker_termination_identity_reason": "dead",
+                "worker_termination_error": (
+                    "leader gone before current process group verification; "
+                    "historical PGID retained but not signaled"
+                ),
+                "worker_termination_signals": [],
+            }
+        else:
+            return {
+                "worker_alive": False,
+                "worker_disposition": "already_gone_before_indeterminate_cleanup",
+                "worker_termination_identity_reason": "dead",
+                "worker_termination_confirmed": True,
+            }
+    else:
+        current_pgid, identity_reason = verify_indeterminate_worker_scope(
+            pid, pgid, expected_identity
+        )
+    if current_pgid is None:
+        return {
+            "worker_alive": True,
+            "worker_disposition": "indeterminate_cleanup_failed",
+            "worker_termination_identity_reason": identity_reason,
+            "worker_termination_error": (
+                "fine worker identity unavailable"
+                if identity_reason == "identity_indeterminate"
+                else identity_reason
+            ),
+            "worker_termination_signals": [],
+        }
+
+    signals_sent: list[str] = []
+    try:
+        os.killpg(current_pgid, signal.SIGTERM)
+        signals_sent.append("SIGTERM")
+    except ProcessLookupError:
+        return {
+            "worker_alive": False,
+            "worker_disposition": "already_gone_before_indeterminate_cleanup",
+            "worker_termination_identity_reason": "group_gone",
+            "worker_termination_signal_scope": "verified_process_group",
+            "worker_termination_signals": signals_sent,
+            "worker_termination_confirmed": True,
+        }
+    except OSError as exc:
+        return {
+            "worker_alive": True,
+            "worker_disposition": "indeterminate_cleanup_failed",
+            "worker_termination_identity_reason": identity_reason,
+            "worker_termination_signal_scope": "verified_process_group",
+            "worker_termination_signals": signals_sent,
+            "worker_termination_error": f"{type(exc).__name__}: {exc}",
+        }
+
+    deadline = active_monotonic() + max(0.0, term_grace_s)
+    while active_monotonic() < deadline and _pgroup_alive(current_pgid):
+        time.sleep(0.05)
+    if not _pgroup_alive(current_pgid):
+        return {
+            "worker_alive": False,
+            "worker_disposition": "terminated_on_liveness_indeterminate",
+            "worker_termination_identity_reason": "group_gone_after_sigterm",
+            "worker_termination_signal_scope": "verified_process_group",
+            "worker_termination_signals": signals_sent,
+            "worker_termination_confirmed": True,
+        }
+
+    # The successful group TERM established ownership of this still-allocated
+    # PGID while the leader's fine identity matched. If the leader exited, the
+    # same group remains the safe target for TERM-resistant descendants.
+    current_identity = goalflight_ledger.process_identity(pid)
+    leader_ok, leader_reason = goalflight_ledger.compare_fine_process_identities(
+        pid, expected_identity, current_identity
+    )
+    leader_gone = current_identity is None or goalflight_compat.pid_is_zombie(pid) is True
+    if not leader_ok and not leader_gone:
+        return {
+            "worker_alive": True,
+            "worker_disposition": "indeterminate_cleanup_failed",
+            "worker_termination_identity_reason": leader_reason,
+            "worker_termination_signal_scope": "verified_process_group",
+            "worker_termination_signals": signals_sent,
+            "worker_termination_error": "worker identity changed before SIGKILL",
+        }
+    try:
+        os.killpg(current_pgid, signal.SIGKILL)
+        signals_sent.append("SIGKILL")
+    except OSError as exc:
+        return {
+            "worker_alive": True,
+            "worker_disposition": "indeterminate_cleanup_failed",
+            "worker_termination_identity_reason": leader_reason,
+            "worker_termination_signal_scope": "verified_process_group",
+            "worker_termination_signals": signals_sent,
+            "worker_termination_error": f"{type(exc).__name__}: {exc}",
+        }
+
+    deadline = active_monotonic() + max(0.0, kill_grace_s)
+    while active_monotonic() < deadline and _pgroup_alive(current_pgid):
+        time.sleep(0.05)
+    group_gone = not _pgroup_alive(current_pgid)
+    return {
+        # Signal delivery is not death confirmation: an uninterruptible member
+        # can keep the group allocated past the reap deadline. Preserve that
+        # third state so capacity cannot be released on signal history alone.
+        "worker_alive": not group_gone,
+        "worker_disposition": (
+            "terminated_on_liveness_indeterminate"
+            if group_gone
+            else "indeterminate_cleanup_unconfirmed"
+        ),
+        "worker_termination_identity_reason": leader_reason,
+        "worker_termination_signal_scope": "verified_process_group",
+        "worker_termination_signals": signals_sent,
+        "worker_termination_confirmed": group_gone,
+    }
+
+
+def release_indeterminate_capacity(
+    dispatch_record: dict | None,
+    *,
+    worker_disposition: dict,
+    reason: str,
+) -> dict:
+    """Release the durable managed lease only after the worker is gone."""
+    lease_id = dispatch_record.get("lease_id") if isinstance(dispatch_record, dict) else None
+    if not lease_id:
+        return {"capacity_lease_disposition": "no_managed_lease"}
+    result = {
+        "capacity_lease_id": str(lease_id),
+        "capacity_lease_disposition": "retained_worker_live",
+    }
+    if (
+        worker_disposition.get("worker_termination_confirmed") is not True
+        or worker_disposition.get("worker_alive") is not False
+    ):
+        try:
+            retained = goalflight_capacity.retain_indeterminate_live_lease(
+                str(lease_id),
+                pgid=(dispatch_record or {}).get("worker_pgid")
+                or (dispatch_record or {}).get("pgid")
+                or (dispatch_record or {}).get("worker_pid"),
+            )
+            result["capacity_lease_state"] = "active"
+            result["capacity_lease_reason"] = goalflight_capacity.INDETERMINATE_LIVE_REASON
+            result["capacity_lease_accounted_until"] = retained.get(
+                "accounted_live_until"
+            )
+        except Exception as exc:
+            result["capacity_lease_disposition"] = "retained_worker_live_note_failed"
+            result["capacity_lease_release_error"] = f"{type(exc).__name__}: {exc}"
+        return result
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = goalflight_capacity.cmd_release(
+                argparse.Namespace(
+                    lease_id=str(lease_id),
+                    state=LIVENESS_INDETERMINATE_STATE,
+                    reason=reason,
+                    keep=True,
+                )
+            )
+        if code == 0:
+            result["capacity_lease_disposition"] = "released"
+            result["capacity_lease_state"] = LIVENESS_INDETERMINATE_STATE
+        else:
+            result["capacity_lease_disposition"] = "release_failed"
+            result["capacity_lease_release_error"] = f"capacity release exited {code}"
+    except Exception as exc:
+        result["capacity_lease_disposition"] = "release_failed"
+        result["capacity_lease_release_error"] = f"{type(exc).__name__}: {exc}"
+    return result
 
 
 class TailScanResult:
@@ -2955,6 +3289,19 @@ def main() -> int:
             "range; default is 900s. 0 disables."
         ),
     )
+    parser.add_argument(
+        "--liveness-indeterminate-secs",
+        type=float,
+        default=None,
+        help=(
+            "Universal give-up bound for an event-silent live worker, whether "
+            "activity probes are positive or unavailable. Unknown never counts "
+            "as death. Default is max(--max-idle-secs, 7200), so a 55-minute "
+            "working worker survives with margin. Reaching this terminates the "
+            "unresolved worker scope, releases its managed capacity lease, and "
+            "records liveness_indeterminate, not idle_timeout."
+        ),
+    )
     parser.add_argument("--cpu-epsilon", type=float, default=0.1)
     parser.add_argument(
         "--trace-long-running-secs",
@@ -3044,6 +3391,11 @@ def main() -> int:
             )
             return 0
     expected_identity = _load_identity(args.worker_identity_json)
+    if expected_identity is None:
+        # Direct legacy callers may omit the launcher's identity token. Pin the
+        # identity observed at watcher startup so the later outer-wall cleanup
+        # cannot signal a PID that was reused during the watch.
+        expected_identity = goalflight_ledger.process_identity(args.pid)
     task_ids = _split_task_ids(args.task_ids)
     task_project_root = goalflight_task.resolve_project_root(args.project_root)
 
@@ -3125,6 +3477,7 @@ def main() -> int:
     exit_reason = "unknown"
     exit_code = 1
     wedge_streak = 0
+    indeterminate_streak = 0
     tracked_worker_pgid = args.pgid or process_group_id(args.pid)
     pgid = tracked_worker_pgid or args.pid
     prior_status = _read_json_object(status_path) if status_existed_at_startup else None
@@ -3719,12 +4072,48 @@ def main() -> int:
             prev_cputime_sample = None
             prev_cputime_at_mono = None
             prev_cputime_at_epoch = None
-        low_power_relax = (
+        live_descendants: int | None = None
+        idle_tree_age_s: float | None = None
+        tree_probe = TREE_PROBE_SKIPPED
+        idle_window_expired = (
             worker_is_alive
-            and cpu_confirmed_idle(cpu_pct, args.cpu_epsilon)
             and args.max_idle_secs > 0
             and seconds_since_event >= args.max_idle_secs
+        )
+        # Extra activity is consulted when the idle window has expired and
+        # CPU is idle *or unknown*. A busy group already vetoes. Failed
+        # descendant/mtime samples stay None/unavailable so classify_liveness
+        # can wait; live children still veto even when CPU could not be read.
+        if idle_window_expired and (
+            cpu_confirmed_idle(cpu_pct, args.cpu_epsilon) or cpu_pct is None
+        ):
+            live_descendants = live_descendant_count(args.pid)
+            if not (isinstance(live_descendants, int) and live_descendants > 0):
+                if (
+                    tree_leg.get("kind") == WEDGE_TREE_LEG_WORKER_CWD
+                    and isinstance(tree_root, Path)
+                ):
+                    tree_sample = sample_newest_mtime_under(
+                        tree_root,
+                        stop_if_newer_than=now - args.max_idle_secs,
+                    )
+                    if not tree_sample.available:
+                        tree_probe = TREE_PROBE_UNAVAILABLE
+                    else:
+                        tree_probe = TREE_PROBE_MEASURED
+                        if tree_sample.newest is None:
+                            # Walk finished; empty tree is stale, not unknown.
+                            idle_tree_age_s = args.max_idle_secs
+                        else:
+                            idle_tree_age_s = max(0.0, now - tree_sample.newest)
+        low_power_relax = (
+            idle_window_expired
+            and cpu_confirmed_idle(cpu_pct, args.cpu_epsilon)
             and system_starved()
+        )
+        indeterminate_timeout_s = resolve_indeterminate_timeout_s(
+            args.max_idle_secs,
+            getattr(args, "liveness_indeterminate_secs", None),
         )
         liveness_state = classify_liveness(
             worker_is_alive,
@@ -3732,6 +4121,10 @@ def main() -> int:
             seconds_since_event,
             thresholds,
             low_power_relax=low_power_relax,
+            live_descendants=live_descendants,
+            tree_age_s=idle_tree_age_s,
+            tree_probe=tree_probe,
+            indeterminate_timeout_s=indeterminate_timeout_s,
         )
         intentionally_waiting = bool(worker_wait and worker_is_alive)
         if intentionally_waiting:
@@ -3758,6 +4151,9 @@ def main() -> int:
             "pgroup_cpu_pct": cpu_pct,
             "seconds_since_event": seconds_since_event,
             "liveness_state": liveness_state,
+            "live_descendants": live_descendants,
+            "idle_tree_age_s": idle_tree_age_s,
+            "tree_probe": tree_probe,
             "tail_path": str(tail),
             "tail_scan": scan.metrics(),
             "markers": markers[-20:],
@@ -3775,11 +4171,21 @@ def main() -> int:
             # a budget that cannot be audited from status.json reads as
             # unhonored -- the flag was honored all along, but the record lied.
             "max_idle_secs": args.max_idle_secs,
+            "liveness_indeterminate_secs": indeterminate_timeout_s,
             "wedge_idle_secs": float(
                 getattr(args, "wedge_idle_secs", DEFAULT_WEDGE_IDLE_SECS) or 0.0
             ),
             "updated_at": int(now),
         }
+        if idle_window_expired:
+            unknown_probes = []
+            if live_descendants is None:
+                unknown_probes.append("descendants")
+            if tree_probe in {TREE_PROBE_SKIPPED, TREE_PROBE_UNAVAILABLE}:
+                unknown_probes.append("tree_mtime")
+            if cpu_pct is None:
+                unknown_probes.append("cpu")
+            payload["liveness_unknown_probes"] = unknown_probes
         if ignore_prompt_signature is not None:
             payload["ignore_prompt_mtime_ns"] = ignore_prompt_signature[0]
             payload["ignore_prompt_signature"] = {
@@ -3839,12 +4245,12 @@ def main() -> int:
             and cpu_delta_s <= WEDGE_CPU_DELTA_EPSILON_S
             and isinstance(tree_root, Path)
         ):
-            newest_tree = newest_mtime_under(
+            newest_tree_sample = sample_newest_mtime_under(
                 tree_root,
                 stop_if_newer_than=now - wedge_idle_s,
             )
-            if newest_tree is not None:
-                tree_age_s = max(0.0, now - newest_tree)
+            if newest_tree_sample.available and newest_tree_sample.newest is not None:
+                tree_age_s = max(0.0, now - newest_tree_sample.newest)
         if terminal:
             # A sign-off is not a recover event. Leave wedge classification
             # off this payload so the marker path can terminalize cleanly.
@@ -3883,10 +4289,19 @@ def main() -> int:
             payload["low_power_relax"] = True
         if liveness_state == "wedged":
             wedge_streak += 1
+            indeterminate_streak = 0
+        elif liveness_state == LIVENESS_INDETERMINATE_STATE:
+            indeterminate_streak += 1
+            wedge_streak = 0
         else:
             wedge_streak = 0
+            indeterminate_streak = 0
         idle_confirmed = (
             liveness_state == "wedged" and wedge_streak >= WEDGE_CONFIRM_SAMPLES
+        )
+        indeterminate_confirmed = (
+            liveness_state == LIVENESS_INDETERMINATE_STATE
+            and indeterminate_streak >= WEDGE_CONFIRM_SAMPLES
         )
         if terminal and terminal != terminal_seen:
             terminal_seen = terminal
@@ -3986,6 +4401,7 @@ def main() -> int:
             terminal_seen_at = None
             terminal_seen_size = None
             wedge_streak = 0
+            indeterminate_streak = 0
             write_payload(
                 payload,
                 reason="discarded_terminal_marker:worker_alive_tail_grew_since_marker",
@@ -4195,6 +4611,61 @@ def main() -> int:
                     exit_code = _exit_code_for_state(payload["state"])
                     exit_reason = payload.get("reason", exit_reason)
                     break
+        if (
+            liveness_state == LIVENESS_INDETERMINATE_STATE
+            and indeterminate_confirmed
+        ):
+            unknown_probes = []
+            if live_descendants is None:
+                unknown_probes.append("descendants")
+            if tree_probe in {TREE_PROBE_SKIPPED, TREE_PROBE_UNAVAILABLE}:
+                unknown_probes.append("tree_mtime")
+            if cpu_pct is None:
+                unknown_probes.append("cpu")
+            payload["state"] = LIVENESS_INDETERMINATE_STATE
+            payload["liveness_unknown_probes"] = unknown_probes
+            exit_reason = (
+                LIVENESS_INDETERMINATE_STATE + ":" + ",".join(unknown_probes)
+                if unknown_probes
+                else LIVENESS_INDETERMINATE_STATE
+            )
+            payload["reason"] = exit_reason
+            if post_terminal_wait:
+                payload["terminal_pending_state"] = terminal_state
+                if post_terminal_wait_elapsed is not None:
+                    payload["post_terminal_wait_elapsed_secs"] = round(
+                        post_terminal_wait_elapsed, 3
+                    )
+            worker_disposition = terminate_indeterminate_worker(
+                args.pid,
+                pgid,
+                expected_identity,
+            )
+            payload.update(worker_disposition)
+            if worker_disposition.get("worker_alive") is False:
+                payload["pgroup_cpu_pct"] = 0.0
+            refreshed_dispatch_record = (
+                _load_dispatch_record(args.dispatch_id) or dispatch_record
+            )
+            payload.update(
+                release_indeterminate_capacity(
+                    refreshed_dispatch_record,
+                    worker_disposition=worker_disposition,
+                    reason=exit_reason,
+                )
+            )
+            exit_code = 2
+            if apply_tail_quota_status(
+                payload,
+                previous_state=LIVENESS_INDETERMINATE_STATE,
+                previous_reason=exit_reason,
+            ):
+                exit_reason = payload["reason"]
+                exit_code = 1
+            write_payload(payload, reason=exit_reason, terminal_write=True)
+            exit_code = _exit_code_for_state(payload["state"])
+            exit_reason = payload.get("reason", exit_reason)
+            break
         if post_terminal_wait:
             payload["state"] = "running_after_terminal"
             payload["terminal_pending_state"] = terminal_state

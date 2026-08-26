@@ -424,4 +424,6 @@ def terminal_liveness_state(state: object) -> str:
         return "controller_dead"
     if state == "idle_timeout":
         return "idle_timeout"
+    if state == "liveness_indeterminate":
+        return "liveness_indeterminate"
     return str(state or "terminal")

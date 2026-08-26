@@ -656,7 +656,8 @@ def _resume_hint(record: dict) -> str:
     # stop. A completed dispatch has nothing to continue, and offering resume
     # there would train controllers to ignore the hint.
     resumable = state.startswith(("worker_dead", "idle_timeout", "inconclusive",
-                                  "stalled", "wedged", "orphaned", "controller_dead"))
+                                  "liveness_indeterminate", "stalled", "wedged",
+                                  "orphaned", "controller_dead"))
     if not resumable:
         return ""
     dispatch_id = record.get("dispatch_id") or "<id>"
@@ -1048,7 +1049,12 @@ def _dashboard_count_bucket(record: dict) -> str:
         return "running"
     if cls in {"worker_dead", "stale_dead"} or state == "worker_dead" or terminal == "worker_dead":
         return "worker_dead"
-    if cls in {"idle_timeout", "wedged", "stalled"} or state in {"idle_timeout", "wedged", "stalled"}:
+    if cls in {"idle_timeout", "wedged", "stalled", "liveness_indeterminate"} or state in {
+        "idle_timeout",
+        "wedged",
+        "stalled",
+        "liveness_indeterminate",
+    }:
         return "stalled"
     if cls in dispatch_states.SUCCESS_TERMINAL_RECORD_STATES or terminal == "complete":
         return "worker_finished"

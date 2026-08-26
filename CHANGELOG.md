@@ -61,7 +61,23 @@ incremented when meaningful skill behaviour changes.
   configured `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` depth. `SIGTERM`, `SIGINT`,
   and `SIGHUP` emit a final `type=exit` recovery record before child teardown;
   SIGKILL remains an explicit uncatchable gap.
-
+- Idle watchers no longer treat a silent tail as a dead worker. Capture
+  buffers until a newline (and, without a bound, without a size/time
+  flush), so a worker grinding tests or writing its tree produced no tail
+  bytes while it was busiest. After the idle window the watcher now checks
+  live descendants and the worker's own worktree mtime before terminating;
+  process-group CPU remains a veto. A child that sleeps without printing
+  keeps the worker alive. The three probes are symmetric: a descendant
+  walk or mtime walk that *fails* (busy-box `ps`, unreadable tree) is
+  unknown, and unknown never counts as death — the same cannot-tell rule
+  CPU `None` already had. A later give-up is `liveness_indeterminate`,
+  not `idle_timeout`, so an operator can tell "it was idle" from "we
+  never found out". The bound is `max(idle_timeout, 7200s)` so a
+  55-minute working worker survives probe failure with margin; known-idle
+  still dies at `idle_timeout`. The redaction filter now also flushes a
+  partial line on a size or time bound, holding back a possible secret
+  prefix so a credential split across the flush stays redacted. That
+  restores tail observability and caps newline-free buffering.
 - Bare `listen` / `follow` no longer treat a dead lease nonce as a
   successful arm. An ACTIVE journal row whose holder lock is unheld, or
   a `--lease-nonce` that is not the live session, exits 5 (`did-not-arm`)

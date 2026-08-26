@@ -72,7 +72,7 @@ python3 "$root/scripts/goalflight_acp_run.py" \
   ${os_sandbox_args[@]+"${os_sandbox_args[@]}"} \
   --status-json "$status_path" \
   --max-tool-s 1800 \
-  --max-quiet-s 3600 \
+  --max-quiet-s 7200 \
   --json \
   --prompt "$prompt_file" \
   > "$stdout_path" \

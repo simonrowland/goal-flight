@@ -382,8 +382,11 @@ separate worktrees and merge through the normal review gate.
 
 Event/tail silence alone is NOT a wedge signal. A healthy worker grinding a long
 test or compile can emit zero ACP events (or zero tail bytes) for tens of
-minutes; treating that as a timeout false-positives it into a retry storm. The
-runner and watchers use **process-group CPU** as the false-positive killer:
+minutes; treating that as a timeout false-positives it into a retry storm. Tail
+bytes are a proxy, and the capture redaction filter buffers until a newline (it
+now also flushes on a size or time bound), so a busy worker can look idle
+exactly while it is working. After the idle window the runner and watchers
+measure whether the worker is actually working:
 
 - The ACP runner (`goalflight_acp_run.py`) writes a *progressive* status JSON
   (`starting → handshaking → running`) and runs a concurrent heartbeat task that
@@ -393,12 +396,13 @@ runner and watchers use **process-group CPU** as the false-positive killer:
   ⇒ `running_quiet`, keep waiting; CPU ≈ 0 ⇒ wedged, cancel.** A busy-but-quiet
   worker is never killed; a genuinely stuck one still is.
 - The watchers (`goalflight_watch.py`, `watch-dispatch-tail.sh`) apply the same
-  rule to bash-tail dispatches: PID alive + pgroup-CPU > epsilon ⇒ `running_quiet`
-  (no idle-timeout exit). CPU is summed across the worker's current process
-  group, so a quiet parent with a CPU-active test/compile child still counts as
-  active. A single failed CPU sample is never read as a wedge — the runner
-  re-samples and the watchers require consecutive samples, riding out a transient
-  `ps` failure before declaring a wedge.
+  CPU rule to bash-tail dispatches, **and they also refuse to idle-timeout a
+  worker that still has live descendants**. A quiet parent whose pytest/compile
+  child is sleeping or I/O-waiting is 0% CPU and tail-silent; killing it is the
+  wrong default. `goalflight_watch.py` additionally treats a distinct
+  `--worker-cwd` whose files were written inside the idle window as work.
+  Unavailable CPU still fails open; a single failed sample is never a wedge —
+  the runner re-samples and the watchers require consecutive samples.
 - Heartbeats are **runner-written FILES, never task-notifications.** The
   orchestrator is woken only on an actionable transition (completion / wedge /
   blocked), never per beat — a per-beat wake would re-process the orchestrator's

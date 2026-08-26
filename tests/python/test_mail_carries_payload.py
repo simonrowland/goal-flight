@@ -382,6 +382,8 @@ def test_idle_timeout_still_mails_the_complete_headline(
     _set_state_env(monkeypatch, tmp_path)
     project = _git_project(tmp_path)
     monkeypatch.chdir(project)
+    worker_tree = tmp_path / "worker-tree"
+    worker_tree.mkdir()
     tail = tmp_path / "worker.tail"
     status = tmp_path / "watcher.status.json"
     tail.write_text(
@@ -426,6 +428,10 @@ def test_idle_timeout_still_mails_the_complete_headline(
             str(status),
             "--dispatch-id",
             IDLE_DISPATCH,
+            "--project-root",
+            str(project),
+            "--worker-cwd",
+            str(worker_tree),
             "--poll-secs",
             str(POLL_SECS),
             "--max-idle-secs",
@@ -447,6 +453,18 @@ def test_idle_timeout_still_mails_the_complete_headline(
     )
     monkeypatch.setattr(watch, "process_group_id", lambda pid: pid)
     monkeypatch.setattr(watch, "pgroup_cpu_pct", lambda _pgid: 0.0)
+    # This test owns mail projection, not liveness probe failure. Supply
+    # independently negative descendant and tree probes so the production
+    # classifier derives ordinary idle instead of the two-hour unknown floor.
+    monkeypatch.setattr(watch, "live_descendant_count", lambda _pid: 0)
+    monkeypatch.setattr(
+        watch,
+        "sample_newest_mtime_under",
+        lambda *_args, **_kwargs: watch.TreeMtimeSample(
+            newest=0.0,
+            available=True,
+        ),
+    )
     monkeypatch.setattr(watch, "system_starved", lambda: False)
     monkeypatch.setattr(watch.TraceLiveness, "sample", lambda self, **_kwargs: {})
 

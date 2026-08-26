@@ -218,6 +218,40 @@ class AcpError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class AcpTerminationResult:
+    """Three-state worker-scope termination evidence.
+
+    Capacity may be released only when ``confirmed`` is true and
+    ``scope_alive`` is false. Live and unknown scopes remain accounted; reap
+    deadlines bound cleanup latency, never the capacity record.
+    """
+
+    pid: int
+    pgid: int
+    confirmed: bool
+    scope_alive: bool | None
+    reason: str
+    reap_timed_out: bool = False
+
+
+class AcpTerminationUnconfirmed(AcpError):
+    """Cleanup returned on deadline without proving worker-group death."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        result: AcpTerminationResult,
+        proc: asyncio.subprocess.Process,
+        started_identity: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.result = result
+        self.proc = proc
+        self.started_identity = started_identity
+
+
 class PoolExhaustedError(AcpError):
     pass
 
@@ -322,6 +356,7 @@ CLAUDE_ACP_SHIM_BASENAME = "claude-code-cli-acp"
 DEFAULT_SHIM_ORPHAN_TTL_S = 600.0
 _SHIM_REAP_GRACE_S = 5.0
 _SHIM_REAP_POST_KILL_GRACE_S = 1.0
+DEFAULT_ACP_PROCESS_REAP_TIMEOUT_S = 2.0
 # Dedicated provenance marker injected into every goal-flight-launched shim's
 # environment (see spawn_acp_connection). The reaper DEFAULT-DENIES any orphan
 # whose environment does not carry this var: the claude-code-cli-acp shim's
@@ -883,17 +918,26 @@ def count_orphaned_acp_shims(
 
 
 def _pgid_alive(pgid: int) -> bool:
+    return _pgid_liveness(pgid) is not False
+
+
+def _pgid_liveness(pgid: int) -> bool | None:
     try:
         os.killpg(pgid, 0)
         return True
     except ProcessLookupError:
         return False
-    except PermissionError:
-        return True
+    except (PermissionError, OSError):
+        return None
 
 
-def _termination_targets_live(*, pid: int, pgid: int) -> bool:
-    """Report non-zombie target/group members, falling back conservatively."""
+def _termination_scope_liveness(*, pid: int, pgid: int) -> tuple[bool | None, str]:
+    """Return live/dead/unknown for the full worker scope.
+
+    A successful ``ps`` walk can prove the group empty (zombies do not consume
+    capacity). Failed probes stay unknown unless both direct PID and PGID
+    fallbacks independently report absence.
+    """
     try:
         result = subprocess.run(
             ["ps", "-axo", "pid=,pgid=,stat="],
@@ -904,24 +948,72 @@ def _termination_targets_live(*, pid: int, pgid: int) -> bool:
             timeout=5.0,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return goalflight_compat.pid_alive(pid) or _pgid_alive(pgid)
-    if result.returncode != 0:
-        return goalflight_compat.pid_alive(pid) or _pgid_alive(pgid)
-    for line in result.stdout.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) != 3:
-            continue
-        try:
-            row_pid = int(parts[0])
-            row_pgid = int(parts[1])
-        except ValueError:
-            continue
-        if row_pid != pid and row_pgid != pgid:
-            continue
-        state = parts[2].strip().upper()
-        if not state or not state.startswith("Z"):
-            return True
-    return False
+        result = None
+    if result is not None and result.returncode == 0:
+        for line in result.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) != 3:
+                continue
+            try:
+                row_pid = int(parts[0])
+                row_pgid = int(parts[1])
+            except ValueError:
+                continue
+            if row_pid != pid and row_pgid != pgid:
+                continue
+            state = parts[2].strip().upper()
+            if not state or not state.startswith("Z"):
+                return True, "process_group_live"
+        return False, "process_group_gone"
+
+    pid_live = goalflight_compat.pid_alive(pid)
+    pgid_live = _pgid_liveness(pgid)
+    if pid_live or pgid_live is True:
+        return True, "process_group_live_probe_fallback"
+    if not pid_live and pgid_live is False:
+        return False, "process_group_gone_probe_fallback"
+    return None, "process_group_liveness_indeterminate"
+
+
+def _termination_targets_live(*, pid: int, pgid: int) -> bool:
+    """Report non-zombie target/group members, falling back conservatively."""
+    alive, _reason = _termination_scope_liveness(pid=pid, pgid=pgid)
+    return alive is not False
+
+
+def termination_result_for_process(
+    *,
+    pid: int,
+    pgid: int,
+    reason: str,
+    reap_timed_out: bool = False,
+) -> AcpTerminationResult:
+    scope_alive, scope_reason = _termination_scope_liveness(pid=pid, pgid=pgid)
+    return AcpTerminationResult(
+        pid=pid,
+        pgid=pgid,
+        confirmed=scope_alive is False,
+        scope_alive=scope_alive,
+        reason=f"{reason}:{scope_reason}",
+        reap_timed_out=reap_timed_out,
+    )
+
+
+async def bounded_process_reap(
+    proc: asyncio.subprocess.Process,
+    *,
+    timeout_s: float = DEFAULT_ACP_PROCESS_REAP_TIMEOUT_S,
+) -> bool:
+    """Await one child reap under a deadline; false means not confirmed reaped."""
+    if proc.returncode is not None:
+        return True
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=max(0.001, float(timeout_s)))
+    except (asyncio.TimeoutError, TimeoutError):
+        return proc.returncode is not None
+    except Exception:
+        return False
+    return proc.returncode is not None
 
 
 def _terminate_process_group(
@@ -2681,6 +2773,87 @@ class GoalflightClient(ClientBase):  # type: ignore[misc, valid-type]
         return None
 
 
+async def _terminate_tracked_process(
+    proc: asyncio.subprocess.Process,
+    *,
+    pgid: int,
+    started_identity: dict[str, Any] | None,
+    reap_timeout_s: float,
+) -> AcpTerminationResult:
+    """Signal one tracked scope and return bounded whole-group evidence."""
+    outcome_reason = "already_exited"
+    reap_timed_out = False
+    if proc.returncode is None:
+        live_identity = goalflight_ledger.process_identity(proc.pid)
+        matched, reason = goalflight_ledger.compare_fine_process_identities(
+            proc.pid, started_identity, live_identity
+        )
+        if not matched:
+            log.warning(
+                "kill skipped: pid=%d identity changed reason=%s live=%r recorded=%r",
+                proc.pid,
+                reason,
+                _identity_token(live_identity),
+                _identity_token(started_identity),
+            )
+            outcome_reason = reason
+        else:
+            signal_sent = False
+            try:
+                hard_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+                signal_sent = goalflight_compat.kill_pid(
+                    proc.pid,
+                    hard_signal,
+                    pgid=pgid,
+                    process_group=True,
+                    fallback_to_pid=False,
+                )
+            except (ProcessLookupError, PermissionError, OSError):
+                signal_sent = False
+            if not signal_sent:
+                retry_identity = goalflight_ledger.process_identity(proc.pid)
+                retry_ok, retry_reason = (
+                    goalflight_ledger.compare_fine_process_identities(
+                        proc.pid,
+                        started_identity,
+                        retry_identity,
+                    )
+                )
+                if not retry_ok:
+                    log.warning(
+                        "kill fallback skipped: pid=%d identity changed "
+                        "reason=%s live=%r recorded=%r",
+                        proc.pid,
+                        retry_reason,
+                        _identity_token(retry_identity),
+                        _identity_token(started_identity),
+                    )
+                    outcome_reason = retry_reason
+                else:
+                    try:
+                        proc.kill()
+                        signal_sent = True
+                    except ProcessLookupError:
+                        outcome_reason = "fallback_process_gone"
+                    except (PermissionError, OSError):
+                        outcome_reason = "fallback_signal_failed"
+            if signal_sent:
+                reaped = await bounded_process_reap(
+                    proc,
+                    timeout_s=reap_timeout_s,
+                )
+                reap_timed_out = not reaped
+                outcome_reason = (
+                    "hard_signal_reaped" if reaped else "hard_signal_reap_deadline"
+                )
+    return termination_result_for_process(
+        pid=proc.pid,
+        pgid=pgid,
+        reason=outcome_reason,
+        reap_timed_out=reap_timed_out,
+    )
+
+
 @dataclass
 class GoalflightAcpConnection:
     agent: str
@@ -2841,7 +3014,12 @@ class GoalflightAcpConnection:
             return
         await self.conn.cancel(session_id=session_id or self.acp_session_id)
 
-    async def close_gracefully(self, soft_timeout: float = 2.0) -> None:
+    async def close_gracefully(
+        self,
+        soft_timeout: float = 2.0,
+        *,
+        reap_timeout_s: float = DEFAULT_ACP_PROCESS_REAP_TIMEOUT_S,
+    ) -> AcpTerminationResult:
         if self.alive and self.acp_session_id is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self.conn.close_session(self.acp_session_id), timeout=soft_timeout)
@@ -2853,70 +3031,34 @@ class GoalflightAcpConnection:
         if self.alive:
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self.proc.wait(), timeout=soft_timeout)
-        await self.kill()
+        return await self.kill(reap_timeout_s=reap_timeout_s)
 
-    async def kill(self) -> None:
-        if self.alive:
-            live_identity = goalflight_ledger.process_identity(self.proc.pid)
-            matched, reason = goalflight_ledger.compare_fine_process_identities(
-                self.proc.pid, self._started_identity, live_identity
+    async def kill(
+        self,
+        *,
+        reap_timeout_s: float = DEFAULT_ACP_PROCESS_REAP_TIMEOUT_S,
+    ) -> AcpTerminationResult:
+        """Signal safely, reap under a deadline, and prove whole-group death.
+
+        Unconfirmed is a first-class result: the connection remains registered
+        and capacity callers must retain its lease. Leader ``returncode`` alone
+        never proves descendants are gone.
+        """
+        outcome = await _terminate_tracked_process(
+            self.proc,
+            pgid=self.verified_pgid,
+            started_identity=self._started_identity,
+            reap_timeout_s=reap_timeout_s,
+        )
+        if not outcome.confirmed:
+            log.warning(
+                "kill unconfirmed: pid=%d pgid=%d scope_alive=%r reason=%s",
+                outcome.pid,
+                outcome.pgid,
+                outcome.scope_alive,
+                outcome.reason,
             )
-            if not matched:
-                log.warning(
-                    "kill skipped: pid=%d identity changed reason=%s live=%r recorded=%r",
-                    self.proc.pid,
-                    reason,
-                    _identity_token(live_identity),
-                    _identity_token(self._started_identity),
-                )
-                if reason == "identity_indeterminate":
-                    return
-            else:
-                signal_sent = False
-                try:
-                    hard_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    signal_sent = goalflight_compat.kill_pid(
-                        self.proc.pid,
-                        hard_signal,
-                        pgid=self.verified_pgid,
-                        process_group=True,
-                        fallback_to_pid=False,
-                    )
-                except (ProcessLookupError, PermissionError):
-                    signal_sent = False
-                if not signal_sent:
-                    retry_identity = goalflight_ledger.process_identity(
-                        self.proc.pid
-                    )
-                    retry_ok, retry_reason = (
-                        goalflight_ledger.compare_fine_process_identities(
-                            self.proc.pid,
-                            self._started_identity,
-                            retry_identity,
-                        )
-                    )
-                    if not retry_ok:
-                        log.warning(
-                            "kill fallback skipped: pid=%d identity changed "
-                            "reason=%s live=%r recorded=%r",
-                            self.proc.pid,
-                            retry_reason,
-                            _identity_token(retry_identity),
-                            _identity_token(self._started_identity),
-                        )
-                        if retry_reason == "identity_indeterminate":
-                            return
-                    else:
-                        try:
-                            self.proc.kill()
-                            signal_sent = True
-                        except ProcessLookupError:
-                            pass
-                        except (PermissionError, OSError):
-                            return
-                if signal_sent:
-                    with contextlib.suppress(Exception):
-                        await self.proc.wait()
+            return outcome
         if self._registered:
             with contextlib.suppress(Exception):
                 _unregister_connection(self)
@@ -2928,6 +3070,7 @@ class GoalflightAcpConnection:
                 await self._stderr_task
         with contextlib.suppress(Exception):
             await self.conn.close()
+        return outcome
 
     async def __aenter__(self) -> "GoalflightAcpConnection":
         return self
@@ -3011,6 +3154,71 @@ def ensure_codex_acp_elicitation(command: str, acp_args: list[str]) -> list[str]
     return ensure_codex_acp_args(command, acp_args, context_mode=True)
 
 
+async def _raise_after_failed_spawn_cleanup(
+    proc: asyncio.subprocess.Process,
+    *,
+    pgid: int,
+    message: str,
+    force_unconfirmed: bool = False,
+    started_identity: dict[str, Any] | None = None,
+    reap_timeout_s: float = DEFAULT_ACP_PROCESS_REAP_TIMEOUT_S,
+) -> None:
+    """Kill a rejected spawn without ever blocking or hiding a live scope."""
+    signal_failed = False
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    except (PermissionError, OSError):
+        signal_failed = True
+    reap_task = asyncio.create_task(
+        bounded_process_reap(proc, timeout_s=reap_timeout_s)
+    )
+    cancellation_seen = False
+    while True:
+        try:
+            reaped = await asyncio.shield(reap_task)
+            break
+        except asyncio.CancelledError:
+            # A cancellation request cannot erase ownership between spawn and
+            # the group probe. The reap task has its own deadline; finish it,
+            # derive three-state evidence, then re-propagate cancellation only
+            # if the full group is confirmed gone.
+            cancellation_seen = True
+            current = asyncio.current_task()
+            if current is not None and hasattr(current, "uncancel"):
+                current.uncancel()
+    result = termination_result_for_process(
+        pid=proc.pid,
+        pgid=pgid,
+        reason=(
+            "spawn_cleanup_signal_failed"
+            if signal_failed
+            else "spawn_cleanup"
+        ),
+        reap_timed_out=not reaped,
+    )
+    if result.confirmed:
+        # GoalflightAcpConnection.__post_init__ registers before starting its
+        # stderr task. If a later constructor step raises, confirmed cleanup
+        # must remove only that exact partial handle from the live registry.
+        with _registry_lock:
+            tracked = _live_connections.get(proc.pid)
+            if tracked is not None and tracked.proc is proc:
+                _live_connections.pop(proc.pid, None)
+                _write_through_pidfile_locked()
+    if force_unconfirmed or not result.confirmed:
+        raise AcpTerminationUnconfirmed(
+            message,
+            result=result,
+            proc=proc,
+            started_identity=started_identity,
+        )
+    if cancellation_seen:
+        raise asyncio.CancelledError()
+    raise AcpError(message)
+
+
 async def spawn_acp_connection(
     command: str,
     acp_args: list[str],
@@ -3066,46 +3274,68 @@ async def spawn_acp_connection(
         env=child_env,
         pass_fds=pass_fds,
     )
+    spawned_worker_identity = goalflight_ledger.process_identity(proc.pid)
     if proc.stdin is None or proc.stdout is None:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        raise AcpError("failed to create ACP stdio pipes")
+        await _raise_after_failed_spawn_cleanup(
+            proc,
+            pgid=proc.pid,
+            message="failed to create ACP stdio pipes",
+            started_identity=spawned_worker_identity,
+        )
     try:
         verified_pgid = os.getpgid(proc.pid)
     except (ProcessLookupError, PermissionError, OSError) as e:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        raise AcpError(f"could not verify process group for pid={proc.pid}") from e
+        try:
+            await _raise_after_failed_spawn_cleanup(
+                proc,
+                pgid=proc.pid,
+                message=f"could not verify process group for pid={proc.pid}",
+                started_identity=spawned_worker_identity,
+            )
+        except AcpError as cleanup_error:
+            raise cleanup_error from e
     if verified_pgid != proc.pid:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        raise AcpError(
-            f"process group isolation failed: pid={proc.pid} pgid={verified_pgid}; "
-            "start_new_session=True did not produce a session leader"
+        await _raise_after_failed_spawn_cleanup(
+            proc,
+            pgid=verified_pgid,
+            message=(
+                f"process group isolation failed: pid={proc.pid} pgid={verified_pgid}; "
+                "start_new_session=True did not produce a session leader"
+            ),
+            # No worker-owned group exists, so group death cannot be proven.
+            force_unconfirmed=True,
+            started_identity=spawned_worker_identity,
         )
-    oversized_worker_identity = goalflight_ledger.process_identity(proc.pid)
+    oversized_worker_identity = spawned_worker_identity
 
-    activity = activity or AcpLivenessActivity()
-    effective_policy = permission_policy or permission_policy_for_dispatch(sandboxed.profile)
-    client = GoalflightClient(
-        activity=activity,
-        auto_allow_tools=auto_allow_tools,
-        cwd=cwd,
-        permission_policy=effective_policy,
-        permission_mode=permission_mode,
-        permission_dir=permission_dir,
-        permission_inline_timeout_s=permission_inline_timeout_s,
-        permission_user_timeout_s=permission_user_timeout_s,
-    )
-    stdout_reader: asyncio.StreamReader = proc.stdout
-    if os.path.basename(str(sandboxed.command)) == "opencode":
-        stdout_reader = JsonRpcLineFilterReader(proc.stdout)
+    try:
+        activity = activity or AcpLivenessActivity()
+        effective_policy = permission_policy or permission_policy_for_dispatch(
+            sandboxed.profile
+        )
+        client = GoalflightClient(
+            activity=activity,
+            auto_allow_tools=auto_allow_tools,
+            cwd=cwd,
+            permission_policy=effective_policy,
+            permission_mode=permission_mode,
+            permission_dir=permission_dir,
+            permission_inline_timeout_s=permission_inline_timeout_s,
+            permission_user_timeout_s=permission_user_timeout_s,
+        )
+        stdout_reader: asyncio.StreamReader = proc.stdout
+        if os.path.basename(str(sandboxed.command)) == "opencode":
+            stdout_reader = JsonRpcLineFilterReader(proc.stdout)
+    except Exception as exc:
+        try:
+            await _raise_after_failed_spawn_cleanup(
+                proc,
+                pgid=verified_pgid,
+                message="failed to configure spawned ACP connection",
+                started_identity=spawned_worker_identity,
+            )
+        except AcpError as cleanup_error:
+            raise cleanup_error from exc
 
     async def kill_pathological_oversized_frame() -> None:
         if proc.returncode is not None:
@@ -3153,38 +3383,111 @@ async def spawn_acp_connection(
             except (PermissionError, OSError):
                 return
         if signal_sent:
-            with contextlib.suppress(Exception):
-                await proc.wait()
+            await bounded_process_reap(proc)
 
-    guarded_reader = GuardedStreamReader(
-        stdout_reader,
-        limit=limit,
-        drain_cap=acp_oversized_drain_cap_from_env(limit),
-        on_drop=activity.note_dropped_frame,
-        response_writer=proc.stdin,
-        on_pathological_drop=kill_pathological_oversized_frame,
-    )
-    conn = connect_to_agent(
-        client,
-        proc.stdin,
-        guarded_reader,
-        observers=[client.observe_stream_event],
-    )
-    return GoalflightAcpConnection(
-        agent=agent,
-        session_id=session_id,
-        proc=proc,
-        conn=conn,
-        client=client,
-        guarded_reader=guarded_reader,
-        verified_pgid=verified_pgid,
-        verbose=verbose,
-        auto_allow_tools=auto_allow_tools,
-        context_mode=context_mode,
-        os_sandbox=sandboxed.profile,
-        os_sandbox_metadata=sandboxed.metadata(),
-        cwd=cwd,
-    )
+    try:
+        guarded_reader = GuardedStreamReader(
+            stdout_reader,
+            limit=limit,
+            drain_cap=acp_oversized_drain_cap_from_env(limit),
+            on_drop=activity.note_dropped_frame,
+            response_writer=proc.stdin,
+            on_pathological_drop=kill_pathological_oversized_frame,
+        )
+        conn = connect_to_agent(
+            client,
+            proc.stdin,
+            guarded_reader,
+            observers=[client.observe_stream_event],
+        )
+        return GoalflightAcpConnection(
+            agent=agent,
+            session_id=session_id,
+            proc=proc,
+            conn=conn,
+            client=client,
+            guarded_reader=guarded_reader,
+            verified_pgid=verified_pgid,
+            verbose=verbose,
+            auto_allow_tools=auto_allow_tools,
+            context_mode=context_mode,
+            os_sandbox=sandboxed.profile,
+            os_sandbox_metadata=sandboxed.metadata(),
+            cwd=cwd,
+        )
+    except Exception as exc:
+        try:
+            await _raise_after_failed_spawn_cleanup(
+                proc,
+                pgid=verified_pgid,
+                message="failed to construct spawned ACP connection",
+                started_identity=spawned_worker_identity,
+            )
+        except AcpError as cleanup_error:
+            raise cleanup_error from exc
+
+
+@dataclass
+class AcpTerminationHold:
+    """Count an unconfirmed spawned scope until whole-group death is proved."""
+
+    agent: str
+    session_id: str
+    proc: asyncio.subprocess.Process
+    verified_pgid: int
+    _started_identity: dict[str, Any] | None
+    reusable: bool = False
+    last_active: float = field(default_factory=time.time)
+    _registered: bool = False
+    _detached: bool = False
+
+    def __post_init__(self) -> None:
+        _register_connection(self)
+        self._registered = True
+
+    @property
+    def alive(self) -> bool:
+        return termination_result_for_process(
+            pid=self.proc.pid,
+            pgid=self.verified_pgid,
+            reason="pool_termination_hold_probe",
+        ).scope_alive is not False
+
+    async def ping(self) -> bool:
+        return False
+
+    async def kill(
+        self,
+        *,
+        reap_timeout_s: float = DEFAULT_ACP_PROCESS_REAP_TIMEOUT_S,
+    ) -> AcpTerminationResult:
+        outcome = await _terminate_tracked_process(
+            self.proc,
+            pgid=self.verified_pgid,
+            started_identity=self._started_identity,
+            reap_timeout_s=reap_timeout_s,
+        )
+        if outcome.confirmed and self._registered:
+            with contextlib.suppress(Exception):
+                _unregister_connection(self)
+            self._registered = False
+        return outcome
+
+
+async def _shielded_pool_connection_cleanup(
+    conn: GoalflightAcpConnection | AcpTerminationHold,
+) -> tuple[AcpTerminationResult, bool]:
+    """Let a connection's bounded cleanup finish through pool cancellation."""
+    cleanup_task = asyncio.create_task(conn.kill())
+    cancellation_seen = False
+    while True:
+        try:
+            return await asyncio.shield(cleanup_task), cancellation_seen
+        except asyncio.CancelledError:
+            cancellation_seen = True
+            current = asyncio.current_task()
+            if current is not None and hasattr(current, "uncancel"):
+                current.uncancel()
 
 
 class AcpProcessPool:
@@ -3215,10 +3518,15 @@ class AcpProcessPool:
         self._permission_user_timeout_s = permission_user_timeout_s
         self._context_mode = context_mode
         self._os_sandbox = canonical_os_sandbox(os_sandbox)
-        self._connections: dict[tuple[str, str], GoalflightAcpConnection] = {}
+        self._connections: dict[
+            tuple[str, str], GoalflightAcpConnection | AcpTerminationHold
+        ] = {}
+        self._reservations: set[tuple[str, str]] = set()
+        self._admission_lock = asyncio.Lock()
 
     def _count_agent(self, agent: str) -> int:
-        return sum(1 for (a, _) in self._connections if a == agent)
+        occupied = set(self._connections) | self._reservations
+        return sum(1 for (occupied_agent, _) in occupied if occupied_agent == agent)
 
     async def get_or_create(
         self,
@@ -3237,75 +3545,154 @@ class AcpProcessPool:
         effective_os_sandbox = self._os_sandbox if os_sandbox is None else canonical_os_sandbox(os_sandbox)
         key = (agent, session_id)
         agent_cfg = self._config.get(agent)
-        workdir = cwd or (agent_cfg.get("working_dir", "/tmp") if agent_cfg else "/tmp")
-        conn = self._connections.get(key)
-        if (
-            conn
-            and conn.alive
-            and conn.reusable
-            and conn.context_mode == effective_context_mode
-            and conn.os_sandbox == effective_os_sandbox
-            and _same_dir(conn.cwd, workdir)
-        ):
-            return conn
-        is_rebuild = conn is not None
-        if conn:
-            self._connections.pop(key, None)
-            with contextlib.suppress(Exception):
-                await conn.kill()
-        if len(self._connections) >= self._max:
-            raise PoolExhaustedError(f"global limit reached ({self._max})")
-        if self._count_agent(agent) >= self._max_per_agent:
-            raise PoolExhaustedError(f"per-agent limit reached for {agent} ({self._max_per_agent})")
         if not agent_cfg:
             raise AcpError(f"agent not found: {agent}")
+        workdir = cwd or agent_cfg.get("working_dir", "/tmp")
         os_sandbox_gate = validate_os_sandbox_request(agent, effective_os_sandbox)
         if os_sandbox_gate is not None:
             raise AcpError(f"os sandbox blocked: {json.dumps(os_sandbox_gate, sort_keys=True)}")
         command = agent_cfg["command"]
         acp_args = agent_cfg.get("acp_args", [agent_cfg.get("acp_arg", "acp")])
-        new_conn = await spawn_acp_connection(
-            command,
-            acp_args,
-            agent=agent,
-            session_id=session_id,
-            cwd=workdir,
-            auto_allow_tools=self._auto_allow_tools,
-            verbose=self._verbose,
-            permission_policy=self._permission_policy,
-            permission_mode=self._permission_mode,
-            permission_dir=self._permission_dir,
-            permission_inline_timeout_s=self._permission_inline_timeout_s,
-            permission_user_timeout_s=self._permission_user_timeout_s,
-            context_mode=effective_context_mode,
-            os_sandbox=effective_os_sandbox,
-        )
-        if is_rebuild:
-            new_conn.session_reset = True
+        async with self._admission_lock:
+            if key in self._reservations:
+                raise PoolExhaustedError(
+                    f"session initialization already in progress for {agent}/{session_id}"
+                )
+            conn = self._connections.get(key)
+            if (
+                conn
+                and conn.alive
+                and conn.reusable
+                and conn.context_mode == effective_context_mode
+                and conn.os_sandbox == effective_os_sandbox
+                and _same_dir(conn.cwd, workdir)
+            ):
+                return conn
+            occupied = set(self._connections) | self._reservations
+            if conn is None and len(occupied) >= self._max:
+                raise PoolExhaustedError(f"global limit reached ({self._max})")
+            if conn is None and self._count_agent(agent) >= self._max_per_agent:
+                raise PoolExhaustedError(
+                    f"per-agent limit reached for {agent} ({self._max_per_agent})"
+                )
+            self._reservations.add(key)
+
         try:
-            await new_conn.initialize()
-            await new_conn.new_session(workdir)
-        except Exception:
-            with contextlib.suppress(Exception):
-                await new_conn.kill()
-            raise
-        self._connections[key] = new_conn
-        return new_conn
+            is_rebuild = conn is not None
+            if conn:
+                cleanup = await conn.kill()
+                if not cleanup.confirmed:
+                    raise AcpTerminationUnconfirmed(
+                        "pool rebuild cleanup did not confirm worker-group death; "
+                        "replacement spawn refused",
+                        result=cleanup,
+                        proc=conn.proc,
+                        started_identity=getattr(conn, "_started_identity", None),
+                    )
+                async with self._admission_lock:
+                    if self._connections.get(key) is conn:
+                        self._connections.pop(key, None)
+
+            try:
+                new_conn = await spawn_acp_connection(
+                    command,
+                    acp_args,
+                    agent=agent,
+                    session_id=session_id,
+                    cwd=workdir,
+                    auto_allow_tools=self._auto_allow_tools,
+                    verbose=self._verbose,
+                    permission_policy=self._permission_policy,
+                    permission_mode=self._permission_mode,
+                    permission_dir=self._permission_dir,
+                    permission_inline_timeout_s=self._permission_inline_timeout_s,
+                    permission_user_timeout_s=self._permission_user_timeout_s,
+                    context_mode=effective_context_mode,
+                    os_sandbox=effective_os_sandbox,
+                )
+            except AcpTerminationUnconfirmed as exc:
+                hold = AcpTerminationHold(
+                    agent=agent,
+                    session_id=session_id,
+                    proc=exc.proc,
+                    verified_pgid=exc.result.pgid,
+                    _started_identity=(
+                        exc.started_identity
+                        or goalflight_ledger.process_identity(exc.proc.pid)
+                    ),
+                )
+                async with self._admission_lock:
+                    self._connections[key] = hold
+                raise
+
+            if is_rebuild:
+                new_conn.session_reset = True
+            # The reservation blocks same-key reuse until handshake completes;
+            # the connection supplies process identity for cleanup and stats.
+            async with self._admission_lock:
+                self._connections[key] = new_conn
+            try:
+                await new_conn.initialize()
+                await new_conn.new_session(workdir)
+            except BaseException as exc:
+                cleanup, cleanup_cancelled = (
+                    await _shielded_pool_connection_cleanup(new_conn)
+                )
+                if not cleanup.confirmed:
+                    new_conn.reusable = False
+                    raise AcpTerminationUnconfirmed(
+                        "pool handshake cleanup did not confirm worker-group death",
+                        result=cleanup,
+                        proc=new_conn.proc,
+                        started_identity=new_conn._started_identity,
+                    ) from exc
+                async with self._admission_lock:
+                    if self._connections.get(key) is new_conn:
+                        self._connections.pop(key, None)
+                if cleanup_cancelled and not isinstance(exc, asyncio.CancelledError):
+                    raise asyncio.CancelledError() from exc
+                raise
+            return new_conn
+        finally:
+            async with self._admission_lock:
+                self._reservations.discard(key)
 
     async def close(self, agent: str, session_id: str) -> None:
-        conn = self._connections.pop((agent, session_id), None)
+        key = (agent, session_id)
+        conn = self._connections.get(key)
         if conn:
-            await conn.kill()
+            cleanup = await conn.kill()
+            if cleanup.confirmed:
+                self._connections.pop(key, None)
 
-    def remove(self, agent: str, session_id: str) -> None:
-        self._connections.pop((agent, session_id), None)
+    def remove(self, agent: str, session_id: str) -> bool:
+        """Forget only a scope whose full process group is confirmed gone."""
+        key = (agent, session_id)
+        conn = self._connections.get(key)
+        if conn is None:
+            return False
+        outcome = termination_result_for_process(
+            pid=conn.proc.pid,
+            pgid=conn.verified_pgid,
+            reason="pool_remove_probe",
+        )
+        if not outcome.confirmed:
+            return False
+        self._connections.pop(key, None)
+        if conn._registered:
+            with contextlib.suppress(Exception):
+                _unregister_connection(conn)
+            conn._registered = False
+        return True
 
     async def cleanup_idle(self, ttl_seconds: float) -> None:
         cutoff = time.time() - ttl_seconds
         stale = [k for k, c in self._connections.items() if c.last_active < cutoff]
         for key in stale:
-            conn = self._connections.pop(key)
-            await conn.kill()
+            conn = self._connections[key]
+            cleanup = await conn.kill()
+            if cleanup.confirmed:
+                self._connections.pop(key, None)
 
     async def health_check(self) -> None:
         dead: list[tuple[str, str]] = []
@@ -3313,14 +3700,17 @@ class AcpProcessPool:
             if not conn.alive or not await conn.ping():
                 dead.append(key)
         for key in dead:
-            conn = self._connections.pop(key, None)
+            conn = self._connections.get(key)
             if conn:
-                await conn.kill()
+                cleanup = await conn.kill()
+                if cleanup.confirmed:
+                    self._connections.pop(key, None)
 
     async def shutdown(self) -> None:
-        for _, conn in list(self._connections.items()):
-            await conn.kill()
-        self._connections.clear()
+        for key, conn in list(self._connections.items()):
+            cleanup = await conn.kill()
+            if cleanup.confirmed:
+                self._connections.pop(key, None)
 
     def cleanup_ghosts(self) -> int:
         return cleanup_ghosts({c.proc.pid for c in self._connections.values()})
@@ -3328,10 +3718,10 @@ class AcpProcessPool:
     @property
     def stats(self) -> dict[str, Any]:
         agents: dict[str, int] = {}
-        for (agent, _), conn in self._connections.items():
-            if conn.alive:
-                agents[agent] = agents.get(agent, 0) + 1
-        return {"total": len(self._connections), "by_agent": agents}
+        occupied = set(self._connections) | self._reservations
+        for agent, _ in occupied:
+            agents[agent] = agents.get(agent, 0) + 1
+        return {"total": len(occupied), "by_agent": agents}
 
 
 AcpConnection = GoalflightAcpConnection

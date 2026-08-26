@@ -20,6 +20,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -73,6 +74,130 @@ def test_filter_stream_keeps_clean_lines_when_one_line_is_secret() -> None:
     assert "keep-me\n" in text
     assert "keep-too\n" in text
     assert f"LEAK:{redact.REDACTED}\n" in text
+
+
+class _ChunkedSource:
+    """Readable that yields one chunk per read so a size flush can fire mid-stream."""
+
+    def __init__(self, chunks: list[bytes], dst: io.BytesIO) -> None:
+        self._chunks = list(chunks)
+        self._dst = dst
+        self.sizes_before_read: list[int] = []
+
+    def read(self, _size: int) -> bytes:
+        self.sizes_before_read.append(len(self._dst.getvalue()))
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
+
+
+def test_filter_stream_size_flush_emits_before_newline() -> None:
+    dst = io.BytesIO()
+    src = _ChunkedSource([b"a" * 2000, b"b" * 2000], dst)
+    redact.filter_stream(src, dst, flush_bytes=1024, flush_secs=0)
+    assert src.sizes_before_read[0] == 0
+    assert src.sizes_before_read[1] > 0, src.sizes_before_read
+    text = dst.getvalue().decode("utf-8")
+    assert "a" * 2000 in text
+    assert "b" * 2000 in text
+
+
+def test_filter_stream_redacts_secret_split_across_size_flush() -> None:
+    assert PLACEHOLDER.startswith("xai-")
+    prefix, rest = PLACEHOLDER[:10], PLACEHOLDER[10:]
+    dst = io.BytesIO()
+    src = _ChunkedSource(
+        [f"LEAK:{prefix}".encode("utf-8"), f"{rest} trailing\n".encode("utf-8")],
+        dst,
+    )
+    redact.filter_stream(src, dst, flush_bytes=8, flush_secs=0)
+    text = dst.getvalue().decode("utf-8")
+    assert PLACEHOLDER not in text
+    assert prefix not in text
+    assert rest not in text
+    assert "LEAK:" in text
+    assert redact.REDACTED in text
+    assert "trailing" in text
+
+
+def test_filter_stream_time_flush_redacts_secret_split_across_boundary() -> None:
+    read_fd, write_fd = os.pipe()
+    dst = io.BytesIO()
+    events: list[tuple[float, bytes]] = []
+
+    class _Recording(io.RawIOBase):
+        def write(self, data: bytes) -> int:  # type: ignore[override]
+            chunk = bytes(data)
+            events.append((time.monotonic(), chunk))
+            dst.write(chunk)
+            return len(chunk)
+
+        def flush(self) -> None:
+            return None
+
+    assert PLACEHOLDER.startswith("xai-")
+    prefix, rest = PLACEHOLDER[:12], PLACEHOLDER[12:]
+
+    def producer() -> None:
+        os.write(write_fd, f"LEAK:{prefix}".encode("utf-8"))
+        time.sleep(0.8)
+        os.write(write_fd, f"{rest} trailing\n".encode("utf-8"))
+        os.close(write_fd)
+
+    worker = threading.Thread(target=producer)
+    started = time.monotonic()
+    worker.start()
+    try:
+        with os.fdopen(read_fd, "rb", buffering=0) as src:
+            redact.filter_stream(src, _Recording(), flush_bytes=1_000_000, flush_secs=0.2)
+    finally:
+        worker.join(timeout=5)
+
+    elapsed = time.monotonic() - started
+    text = dst.getvalue().decode("utf-8")
+    assert PLACEHOLDER not in text
+    assert prefix not in text
+    assert rest not in text
+    assert redact.REDACTED in text
+    assert "LEAK:" in text
+    assert "trailing" in text
+    assert events, "time flush must emit something before EOF"
+    assert events[0][0] - started < 0.6, (events, elapsed)
+    first_payload = b"".join(chunk for _ts, chunk in events[:1])
+    assert b"LEAK:" in first_payload
+    assert PLACEHOLDER.encode("utf-8") not in first_payload
+
+
+def test_secret_holdback_keeps_incomplete_prefix() -> None:
+    buf = b"hello xai-abcdefghij"
+    hold = redact.secret_holdback_len(buf)
+    assert hold == len(b"xai-abcdefghij")
+    emit, keep = redact.split_partial_flush(buf)
+    assert emit == b"hello "
+    assert keep == b"xai-abcdefghij"
+    assert PLACEHOLDER.encode("utf-8") not in emit
+
+
+def test_secret_holdback_keeps_19_char_entropy_prefix() -> None:
+    """xai- + 19 entropy chars sits on the 19/20 match boundary.
+
+    One more char becomes a credential; holding 19 must not emit the prefix.
+    """
+    prefix = b"xai-" + b"a" * 19
+    assert len(prefix) == 23
+    buf = b"hello " + prefix
+    hold = redact.secret_holdback_len(buf)
+    assert hold == 23, hold
+    emit, keep = redact.split_partial_flush(buf)
+    assert emit == b"hello "
+    assert keep == prefix
+    completed = prefix + b"b trailing\n"
+    flushed, leftover = redact.split_partial_flush(completed)
+    assert leftover == b""
+    assert prefix not in flushed
+    assert b"xai-" + b"a" * 20 not in flushed
+    assert redact.REDACTED.encode("utf-8") in flushed
+    assert b"trailing" in flushed
 
 
 def test_write_status_redacts_nested_marker_text(tmp_path: Path) -> None:

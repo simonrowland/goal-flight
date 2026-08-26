@@ -51,6 +51,7 @@ from goalflight_watch import (  # noqa: E402
     BLOCKING_TERMINAL_MARKERS,
     SUCCESS_TERMINAL_MARKERS,
     TERMINAL_MARKERS,
+    live_descendant_count,
 )
 
 DEFAULT_REMOTE_TURN_SILENCE_S = 1200.0
@@ -92,15 +93,34 @@ AGENT_STDERR_ERROR_TAIL_CHARS = 1000
 LIVENESS_PROFILES = {"remote_api", "local_compute", "hybrid"}
 
 
-def _attach_worker_state_before_running(
-    attach: Callable[[int], None],
+def attach_worker_to_capacity_lease(
+    lease_id: str | None,
     worker_pid: int,
+    worker_pgid: int | None = None,
 ) -> None:
-    """Ignore transient capacity I/O; let invalid lease mutations abort startup."""
-    try:
+    """Persist worker identity before RUNNING so stale reclaim sees its group."""
+    if not lease_id:
+        return
+    with goalflight_capacity.StateLock():
+        data = goalflight_capacity.load_state()
+        lease = data.get("leases", {}).get(lease_id)
+        if lease:
+            lease["worker_pid"] = worker_pid
+            if worker_pgid and worker_pgid > 1:
+                lease["worker_pgid"] = worker_pgid
+            goalflight_capacity.save_state(data)
+
+
+def _attach_worker_state_before_running(
+    attach: Callable[..., None],
+    worker_pid: int,
+    worker_pgid: int | None = None,
+) -> None:
+    """Persist PID/PGID before RUNNING; any failure aborts into cleanup."""
+    if worker_pgid is None:
         attach(worker_pid)
-    except OSError:
-        pass
+    else:
+        attach(worker_pid, worker_pgid)
 
 
 def _detach_live_worker_state(
@@ -117,6 +137,70 @@ def _detach_live_worker_state(
             "type": type(exc).__name__,
             "message": str(exc),
         }
+
+
+def _finalize_capacity_after_cleanup(
+    payload: dict[str, object],
+    *,
+    lease_id: str | None,
+    worker_pid: int | None,
+    pgid: int | None,
+    termination_result: AcpTerminationResult | None,
+    detach_worker: bool,
+    detach: Callable[[int, object], None],
+    state: str,
+    reason: object,
+) -> None:
+    """Release only after confirmed group death; otherwise retain visibly."""
+    if not lease_id:
+        return
+    release_confirmed = (
+        worker_pid is None
+        or (
+            termination_result is not None
+            and termination_result.confirmed
+            and termination_result.scope_alive is False
+        )
+    )
+    if release_confirmed:
+        with contextlib.redirect_stdout(io.StringIO()):
+            goalflight_capacity.cmd_release(
+                argparse.Namespace(
+                    lease_id=lease_id,
+                    state=state,
+                    reason=reason,
+                    keep=True,
+                )
+            )
+        payload["capacity_lease_disposition"] = "released_group_death_confirmed"
+        return
+
+    # Every reap is bounded. Its deadline does not authorize a capacity
+    # release: live and unknown scopes remain active until a later reconciler
+    # proves group death.
+    payload.update(
+        capacity_lease_disposition="retained_death_unconfirmed",
+        capacity_lease_state="active",
+    )
+    if not detach_worker:
+        try:
+            retained = goalflight_capacity.retain_indeterminate_live_lease(
+                str(lease_id),
+                pgid=pgid or worker_pid or 0,
+            )
+            payload.update(
+                capacity_lease_reason=goalflight_capacity.INDETERMINATE_LIVE_REASON,
+                capacity_lease_accounted_until=retained.get(
+                    "accounted_live_until"
+                ),
+            )
+        except Exception as exc:
+            payload.update(
+                capacity_lease_disposition="retained_note_failed",
+                capacity_lease_error=f"{type(exc).__name__}: {exc}",
+            )
+    if worker_pid is not None:
+        _detach_live_worker_state(payload, detach, worker_pid, reason)
 
 
 def _default_dispatch_id(agent: object) -> str:
@@ -178,6 +262,8 @@ from goalflight_acp_client import (
     AcpConnection,
     AcpError,
     AcpLivenessActivity,
+    AcpTerminationResult,
+    AcpTerminationUnconfirmed,
     MAX_PERMISSION_ROUTER_DECISIONS,
     PERMISSION_ALLOW,
     PERMISSION_DENY,
@@ -185,6 +271,7 @@ from goalflight_acp_client import (
     mark_connection_detached,
     default_permission_policy,
     spawn_acp_connection,
+    termination_result_for_process,
 )
 import goalflight_acp_permits as permits
 import re as _re
@@ -461,9 +548,11 @@ from goalflight_liveness import (
     cpu_confirmed_idle,
     heartbeat_wedge_decision,
     IdleLivenessGate,
+    LIVENESS_INDETERMINATE_STATE,
     pgroup_cpu_pct,
     progress_stall_decision,
     process_group_id,
+    resolve_indeterminate_timeout_s,
     system_sleep_pause_note,
     system_sleep_pause_s,
     write_status,
@@ -1790,8 +1879,9 @@ def decide_terminal_state(
     the heartbeat verdict, in priority order.
 
     A genuine end_turn (``result_ok``) refutes the SILENCE-class heartbeat
-    terminals — the dead-sample wedge, ``progress_stall``, and ``max_quiet_s``,
-    all reported as ``"wedged"`` and all gated on ``outstanding_count == 0``.
+    terminals — the dead-sample wedge, ``progress_stall``, and the typed
+    ``liveness_indeterminate`` event-silence outer bound. They are all gated on
+    ``outstanding_count == 0``.
     Those fire on inactivity; the heartbeat loop keeps sampling until the outer
     ``finally`` cancels it, so a worker that has ALREADY completed its turn is
     briefly alive-and-silent (returned from the turn, waiting to be closed) and
@@ -1884,6 +1974,22 @@ def decide_terminal_state(
     return "failed", result_error
 
 
+async def _shielded_bounded_connection_cleanup(
+    conn: AcpConnection,
+) -> tuple[AcpTerminationResult, bool]:
+    """Finish the connection's bounded reap even if the caller is cancelled."""
+    cleanup_task = asyncio.create_task(conn.kill())
+    cancellation_seen = False
+    while True:
+        try:
+            return await asyncio.shield(cleanup_task), cancellation_seen
+        except asyncio.CancelledError:
+            cancellation_seen = True
+            current = asyncio.current_task()
+            if current is not None and hasattr(current, "uncancel"):
+                current.uncancel()
+
+
 async def spawn_and_handshake_with_retry(
     command: str,
     acp_args: list[str],
@@ -1946,21 +2052,26 @@ async def spawn_and_handshake_with_retry(
             env=env,
             pass_fds=pass_fds,
         )
-        if stderr_capture is not None:
-            await stderr_capture.attach(conn)
         proc = conn.proc
-        if on_attempt is not None:
-            maybe = on_attempt(attempt, proc)
-            if inspect.isawaitable(maybe):
-                await maybe
+        retry_error: AcpError | None = None
         try:
-            await conn.initialize(timeout=handshake_timeout)
-            if resume_session_id:
-                await conn.load_session(
-                    resume_session_id, cwd, timeout=handshake_timeout
-                )
-            else:
-                await conn.new_session(cwd, timeout=handshake_timeout)
+            if stderr_capture is not None:
+                await stderr_capture.attach(conn)
+            if on_attempt is not None:
+                maybe = on_attempt(attempt, proc)
+                if inspect.isawaitable(maybe):
+                    await maybe
+            try:
+                await conn.initialize(timeout=handshake_timeout)
+                if resume_session_id:
+                    await conn.load_session(
+                        resume_session_id, cwd, timeout=handshake_timeout
+                    )
+                else:
+                    await conn.new_session(cwd, timeout=handshake_timeout)
+            except AcpError as exc:
+                retry_error = exc
+                raise
             if session_model and _uses_session_model(agent):
                 try:
                     await conn.set_session_model(str(session_model), timeout=handshake_timeout)
@@ -1972,12 +2083,28 @@ async def spawn_and_handshake_with_retry(
                         file=sys.stderr,
                     )
             return proc, conn
-        except AcpError as e:
-            last_err = e
-            # Reap the wedged worker before respawning — never leave an
-            # identity-matched PID alive.
-            with contextlib.suppress(Exception):
-                await conn.kill()
+        except BaseException as exc:
+            # Ownership begins when spawn returns, before stderr attachment or
+            # callbacks can await. Cleanup itself is shielded, while conn.kill
+            # supplies the reap deadline. Cancellation cannot turn a spawned
+            # worker back into proc=None.
+            cleanup, cleanup_cancelled = (
+                await _shielded_bounded_connection_cleanup(conn)
+            )
+            if not cleanup.confirmed:
+                raise AcpTerminationUnconfirmed(
+                    "handshake cleanup did not confirm worker-group death; "
+                    "replacement spawn refused",
+                    result=cleanup,
+                    proc=proc,
+                    started_identity=getattr(conn, "_started_identity", None),
+                ) from exc
+            if cleanup_cancelled and not isinstance(exc, asyncio.CancelledError):
+                raise asyncio.CancelledError() from exc
+            if retry_error is not None:
+                last_err = retry_error
+                continue
+            raise
     raise AcpError(f"handshake failed after {max(1, attempts)} attempt(s): {last_err}")
 
 
@@ -2092,7 +2219,10 @@ async def _run_acp_dispatch_impl(
                 "enforcement": "acp-permissions",
             }
             os_sandbox_profile = OS_SANDBOX_OFF
-    remote_turn_silence_s = getattr(cfg, "remote_turn_silence_s", None)
+    configured_remote_turn_silence_s = getattr(
+        cfg, "remote_turn_silence_s", None
+    )
+    remote_turn_silence_s = configured_remote_turn_silence_s
     if remote_turn_silence_s is None:
         remote_turn_silence_s = manifest_remote_turn_silence_s
     try:
@@ -2101,6 +2231,32 @@ async def _run_acp_dispatch_impl(
         remote_turn_silence_s = DEFAULT_REMOTE_TURN_SILENCE_S
     if remote_turn_silence_s <= 0:
         remote_turn_silence_s = DEFAULT_REMOTE_TURN_SILENCE_S
+    # Stock adapter silence values are ordinary quiet windows, not proof that
+    # an in-flight remote turn is dead. Give unverifiable turns the same shared
+    # indeterminate floor as ACP's outer wall. A positive explicit runner value
+    # remains an operator/test override, matching resolve_indeterminate_timeout_s.
+    explicit_remote_turn_silence_s = None
+    if configured_remote_turn_silence_s is not None:
+        try:
+            explicit_remote_turn_silence_s = float(
+                configured_remote_turn_silence_s
+            )
+        except (TypeError, ValueError):
+            explicit_remote_turn_silence_s = None
+        if (
+            explicit_remote_turn_silence_s is not None
+            and explicit_remote_turn_silence_s <= 0
+        ):
+            explicit_remote_turn_silence_s = None
+    if explicit_remote_turn_silence_s is None:
+        remote_turn_silence_s = max(
+            remote_turn_silence_s,
+            float(getattr(cfg, "max_quiet_s", 0.0) or 0.0),
+        )
+    remote_turn_silence_s = resolve_indeterminate_timeout_s(
+        remote_turn_silence_s,
+        override=explicit_remote_turn_silence_s,
+    )
     remote_turn_cancel_grace_s = getattr(cfg, "remote_turn_cancel_grace_s", DEFAULT_REMOTE_TURN_CANCEL_GRACE_S)
     try:
         remote_turn_cancel_grace_s = float(remote_turn_cancel_grace_s)
@@ -2515,6 +2671,7 @@ async def _run_acp_dispatch_impl(
 
     proc: asyncio.subprocess.Process | None = None
     conn: AcpConnection | None = None
+    termination_result: AcpTerminationResult | None = None
     worktree_seat: goalflight_worktree_pool.WorktreeSeatLease | None = None
     heartbeat_task: asyncio.Task | None = None
     ledger_recorded = False
@@ -2542,9 +2699,11 @@ async def _run_acp_dispatch_impl(
     awaiting_user_confirm = False
     user_confirm_expiry_lock = asyncio.Lock()
     # CPU-aware idle gate: keeps a busy-but-silent worker (running_quiet) but
-    # enforces a hard wall (lease lifetime) so a pathological CPU spinner that
+    # enforces a hard wall for the cleanup attempt so a pathological CPU spinner
+    # that
     # never emits an event can't hang the runner forever.
     idle_gate = IdleLivenessGate(cfg.cpu_epsilon, cfg.max_quiet_s)
+    liveness_outer_lock = asyncio.Lock()
     runaway_caps = AcpRunawayCaps(
         max_consecutive_tool_errors=int(getattr(cfg, "max_consecutive_tool_errors", DEFAULT_MAX_CONSECUTIVE_TOOL_ERRORS)),
         max_acp_events=int(getattr(cfg, "max_acp_events", DEFAULT_MAX_ACP_EVENTS)),
@@ -2598,15 +2757,11 @@ async def _run_acp_dispatch_impl(
             state=state,
         )
 
-    def attach_worker_to_lease(worker_pid: int) -> None:
-        if not lease_id:
-            return
-        with goalflight_capacity.StateLock():
-            data = goalflight_capacity.load_state()
-            lease = data.get("leases", {}).get(lease_id)
-            if lease:
-                lease["worker_pid"] = worker_pid
-                goalflight_capacity.save_state(data)
+    def attach_worker_to_lease(
+        worker_pid: int,
+        worker_pgid: int | None = None,
+    ) -> None:
+        attach_worker_to_capacity_lease(lease_id, worker_pid, worker_pgid)
 
     def attach_worktree_to_lease(path: Path) -> None:
         if not lease_id:
@@ -3099,6 +3254,74 @@ async def _run_acp_dispatch_impl(
             )
             write_status(status_path, payload)
 
+    async def mark_liveness_outer_terminal(
+        *,
+        pgid: int,
+        cpu: float | None,
+        quiet_for_s: float,
+        source: str,
+    ) -> tuple[str, float | None, int | None]:
+        """Publish one evidence-based outer-wall verdict across ACP paths."""
+        async with liveness_outer_lock:
+            if heartbeat_outcome is not None:
+                return (
+                    heartbeat_outcome,
+                    cpu,
+                    payload.get("live_descendants"),
+                )
+            measured_cpu = (
+                cpu
+                if cpu is not None
+                else await asyncio.to_thread(pgroup_cpu_pct, pgid)
+            )
+            descendants = await asyncio.to_thread(live_descendant_count, proc.pid)
+            known_idle = (
+                cpu_confirmed_idle(measured_cpu, cfg.cpu_epsilon)
+                and descendants == 0
+            )
+            outer_state = "wedged" if known_idle else LIVENESS_INDETERMINATE_STATE
+            outer_error = (
+                {
+                    "code": -1,
+                    "message": "idle_timeout_confirmed",
+                    "reason": "confirmed_idle",
+                    "quiet_for_s": round(quiet_for_s, 3),
+                    "hard_wall_s": cfg.max_quiet_s,
+                }
+                if known_idle
+                else {
+                    "code": -1,
+                    "message": LIVENESS_INDETERMINATE_STATE,
+                    "reason": "event_silence_outer_bound",
+                    "quiet_for_s": round(quiet_for_s, 3),
+                    "hard_wall_s": cfg.max_quiet_s,
+                }
+            )
+            await mark_heartbeat_terminal(outer_state, outer_error)
+            await update_status(
+                pgroup_cpu_pct=measured_cpu,
+                live_descendants=descendants,
+                liveness_hard_wall_expired=True,
+                liveness_descendant_veto_observed=(
+                    True
+                    if descendants is None or descendants > 0
+                    else payload.get("liveness_descendant_veto_observed")
+                ),
+                liveness_descendant_veto_kind=(
+                    "unknown"
+                    if descendants is None
+                    else "live"
+                    if descendants > 0
+                    else payload.get("liveness_descendant_veto_kind")
+                ),
+                liveness_outer_bound_classification=(
+                    "confirmed_idle" if known_idle else "indeterminate"
+                ),
+                liveness_outer_bound_source=source,
+                quiet_for_s=round(quiet_for_s, 3),
+            )
+            return outer_state, measured_cpu, descendants
+
     async def mark_runaway_terminal(error: dict[str, object]) -> None:
         nonlocal heartbeat_outcome, heartbeat_error, wedged_by_heartbeat
         if conn is not None:
@@ -3449,16 +3672,18 @@ async def _run_acp_dispatch_impl(
                 and outstanding_count == 0
                 and quiet_for_s >= cfg.max_quiet_s
                 and pid_alive
-                and cpu_confirmed_idle(cpu_pct, cfg.cpu_epsilon)
             ):
-                await mark_heartbeat_terminal(
-                    "wedged",
-                    {
-                        "code": -1,
-                        "message": "max_quiet_s",
-                        "quiet_for_s": round(quiet_for_s, 3),
-                        "cpu_pct": cpu_pct,
-                    },
+                # Universal event-silence wall. This heartbeat runs even when
+                # run_prompt's ordinary idle timeout is disabled, so positive
+                # CPU and live/unknown descendants cannot make liveness
+                # unfalsifiable. Conversely this is not a death verdict: the
+                # typed state records indeterminate liveness, and finalization
+                # retains capacity unless later cleanup proves group death.
+                await mark_liveness_outer_terminal(
+                    pgid=pgid,
+                    cpu=cpu_pct,
+                    quiet_for_s=quiet_for_s,
+                    source="heartbeat",
                 )
                 await conn.kill()
                 return
@@ -3473,12 +3698,26 @@ async def _run_acp_dispatch_impl(
                 wedge_samples=cfg.wedge_samples,
             )
             dead_samples = decision.dead_samples
+            heartbeat_descendants = None
+            descendant_veto = False
+            if decision.dead_sample:
+                heartbeat_descendants = await asyncio.to_thread(
+                    live_descendant_count, proc.pid
+                )
+                if heartbeat_descendants is None or heartbeat_descendants > 0:
+                    # The CPU/progress sample alone is not proof of death. A
+                    # live or unavailable descendant walk resets the ordinary
+                    # dead-sample streak; only the outer silence wall may end
+                    # this worker, and it does so as indeterminate.
+                    dead_samples = 0
+                    descendant_veto = True
             last_sample_progress_seen = progress_seen
             await update_status(
                 worker_pid=proc.pid,
                 pgid=pgid,
                 worker_alive=pid_alive,
                 pgroup_cpu_pct=cpu_pct,
+                live_descendants=heartbeat_descendants,
                 heartbeat_at=_now(),
                 heartbeat_dead_samples=dead_samples,
                 wedge_progress_seen=progress_seen,
@@ -3489,8 +3728,18 @@ async def _run_acp_dispatch_impl(
                 progress_stall_s=progress_stall_s,
                 turn_in_flight=turn_in_flight,
                 turn_silent_for_s=round(turn_silent_for_s, 3),
+                liveness_descendant_veto_observed=(
+                    True if descendant_veto else payload.get("liveness_descendant_veto_observed")
+                ),
+                liveness_descendant_veto_kind=(
+                    "unknown"
+                    if descendant_veto and heartbeat_descendants is None
+                    else "live"
+                    if descendant_veto
+                    else payload.get("liveness_descendant_veto_kind")
+                ),
             )
-            if decision.wedged:
+            if decision.wedged and not descendant_veto:
                 await mark_heartbeat_terminal(
                     "wedged",
                     {"code": -1, "message": "wedged_by_heartbeat"},
@@ -3583,33 +3832,57 @@ async def _run_acp_dispatch_impl(
         keep_waiting, cpu = await idle_gate.keep_waiting(
             lambda: asyncio.to_thread(pgroup_cpu_pct, pgid)
         )
-        await update_status(
+        if idle_gate.hard_wall_expired:
+            await mark_liveness_outer_terminal(
+                pgid=pgid,
+                cpu=cpu,
+                quiet_for_s=cfg.max_quiet_s,
+                source="idle_callback",
+            )
+            return False
+        descendants = None
+        descendant_veto = False
+        if not keep_waiting:
+            descendants = await asyncio.to_thread(live_descendant_count, proc.pid)
+            # Unknown or live children: cannot treat CPU-idle as death.
+            if descendants is None or descendants > 0:
+                keep_waiting = True
+                descendant_veto = True
+        status_fields = dict(
             state="running_quiet" if keep_waiting else "wedged",
             pgid=pgid,
             pgroup_cpu_pct=cpu,
+            live_descendants=descendants,
+            liveness_hard_wall_expired=idle_gate.hard_wall_expired,
             worker_alive=(proc.returncode is None),
             heartbeat_at=_now(),
         )
+        if descendant_veto:
+            status_fields["liveness_descendant_veto_observed"] = True
+            status_fields["liveness_descendant_veto_kind"] = (
+                "unknown" if descendants is None else "live"
+            )
+        await update_status(**status_fields)
         return keep_waiting
 
     async def mark_attempt(attempt: int, p: asyncio.subprocess.Process) -> None:
         nonlocal proc
         proc = p  # publish to heartbeat/note_event/on_idle closures + finally
         pgid = process_group_id(p.pid) or p.pid
-        try:
-            # Capacity state can be retried/reconciled after transient I/O. A
-            # malformed update aborts before RUNNING is claimed.
-            _attach_worker_state_before_running(attach_worker_to_lease, p.pid)
-            await asyncio.to_thread(
-                goalflight_ledger.claim_attempt_running,
-                project_root,
-                dispatch_id,
-                p.pid,
-            )
-        except Exception:
-            with contextlib.suppress(Exception):
-                p.kill()
-            raise
+        # Capacity attachment is the admission truth and must precede RUNNING.
+        # Any failure propagates to spawn_and_handshake_with_retry, whose
+        # shielded bounded cleanup owns the already-spawned process group.
+        _attach_worker_state_before_running(
+            attach_worker_to_lease,
+            p.pid,
+            pgid,
+        )
+        await asyncio.to_thread(
+            goalflight_ledger.claim_attempt_running,
+            project_root,
+            dispatch_id,
+            p.pid,
+        )
         updates: dict[str, object] = dict(
             worker_pid=p.pid, pgid=pgid, worker_alive=True, state="handshaking"
         )
@@ -3790,36 +4063,56 @@ async def _run_acp_dispatch_impl(
             # located edits after the OS sandbox has been removed.
             permission_policy = _read_only_permission_policy
 
-        async with StartupGate(cfg.agent):
-            proc, conn = await spawn_and_handshake_with_retry(
-                command,
-                acp_args,
-                agent=cfg.agent,
-                session_id=cfg.session_id,
-                attempts=1,
-                cwd=worker_cwd,
-                activity=activity,
-                on_attempt=mark_attempt,
-                context_mode=(getattr(cfg, "context_mode", "enabled") != "disabled"),
-                permission_mode=getattr(cfg, "permission_mode", "auto"),
-                permission_dir=resolved_permission_dir,
-                permission_inline_timeout_s=getattr(cfg, "permission_inline_timeout_s", None),
-                permission_user_timeout_s=getattr(cfg, "permission_user_timeout_s", None),
-                permission_policy=permission_policy,
-                os_sandbox=spawn_os_sandbox_profile,
-                session_model=getattr(cfg, "model", None),
-                env=spawn_env,
-                stderr_capture=agent_stderr_capture,
-                resume_session_id=getattr(cfg, "resume_session_id", None),
-                pass_fds=tuple(
-                    dict.fromkeys(
-                        (
-                            *goalflight_worktree_pool.inherited_worktree_lock_fds(),
-                            *((worktree_seat.fileno(),) if worktree_seat is not None else ()),
+        try:
+            async with StartupGate(cfg.agent):
+                proc, conn = await spawn_and_handshake_with_retry(
+                    command,
+                    acp_args,
+                    agent=cfg.agent,
+                    session_id=cfg.session_id,
+                    attempts=1,
+                    cwd=worker_cwd,
+                    activity=activity,
+                    on_attempt=mark_attempt,
+                    context_mode=(getattr(cfg, "context_mode", "enabled") != "disabled"),
+                    permission_mode=getattr(cfg, "permission_mode", "auto"),
+                    permission_dir=resolved_permission_dir,
+                    permission_inline_timeout_s=getattr(cfg, "permission_inline_timeout_s", None),
+                    permission_user_timeout_s=getattr(cfg, "permission_user_timeout_s", None),
+                    permission_policy=permission_policy,
+                    os_sandbox=spawn_os_sandbox_profile,
+                    session_model=getattr(cfg, "model", None),
+                    env=spawn_env,
+                    stderr_capture=agent_stderr_capture,
+                    resume_session_id=getattr(cfg, "resume_session_id", None),
+                    pass_fds=tuple(
+                        dict.fromkeys(
+                            (
+                                *goalflight_worktree_pool.inherited_worktree_lock_fds(),
+                                *((worktree_seat.fileno(),) if worktree_seat is not None else ()),
+                            )
                         )
-                    )
-                ),
+                    ),
+                )
+        except AcpTerminationUnconfirmed as exc:
+            # Pre-connection and handshake cleanup can return on a reap
+            # deadline. Carry that live/unknown scope into the shared finalizer;
+            # otherwise proc=None would release its lease and hide the worker.
+            proc = exc.proc
+            termination_result = exc.result
+            _attach_worker_state_before_running(
+                attach_worker_to_lease,
+                proc.pid,
+                exc.result.pgid,
             )
+            await update_status(
+                worker_pid=proc.pid,
+                pgid=exc.result.pgid,
+                worker_alive=exc.result.scope_alive is not False,
+                worker_termination_confirmed=False,
+                worker_termination_reason=exc.result.reason,
+            )
+            raise
         native_session = getattr(conn, "acp_session_id", None)
         if native_session:
             cfg.session_id = native_session
@@ -4345,7 +4638,12 @@ async def _run_acp_dispatch_impl(
             # end_turn; without this the record would be self-contradictory
             # (state=complete, killed_by_heartbeat=true) and mislead an orchestrator
             # keying retry off the flag.
-            "killed_by_heartbeat": state in ("wedged", "tool_timeout", "remote_turn_silence")
+            "killed_by_heartbeat": state in (
+                "wedged",
+                "tool_timeout",
+                "remote_turn_silence",
+                LIVENESS_INDETERMINATE_STATE,
+            )
             or runaway_terminal,
             "wedged_by_heartbeat": state == "wedged",
         }
@@ -4413,9 +4711,28 @@ async def _run_acp_dispatch_impl(
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat_task
         if conn is not None and not detach_worker:
-            with contextlib.suppress(Exception):
-                await conn.close_gracefully()
+            try:
+                close_result = await conn.close_gracefully()
+                if isinstance(close_result, AcpTerminationResult):
+                    termination_result = close_result
+            except Exception as exc:
+                payload["worker_termination_error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
         if proc is not None:
+            final_pgid = int(
+                payload.get("pgid") or process_group_id(proc.pid) or proc.pid
+            )
+            if termination_result is None:
+                termination_result = termination_result_for_process(
+                    pid=proc.pid,
+                    pgid=final_pgid,
+                    reason=(
+                        "intentional_detach"
+                        if detach_worker
+                        else "runner_final_probe"
+                    ),
+                )
             snapshot = activity.snapshot(active_monotonic())
             payload.update(
                 events_seen=int(snapshot["raw_events_seen"]),
@@ -4427,12 +4744,29 @@ async def _run_acp_dispatch_impl(
                 progress_stall_s=progress_stall_s,
                 turn_in_flight=bool(snapshot.get("turn_in_flight")),
                 turn_silent_for_s=round(float(snapshot.get("turn_silent_for_s", 0.0)), 3),
-                worker_alive=proc.returncode is None,
-                pgid=payload.get("pgid") or process_group_id(proc.pid) or proc.pid,
+                worker_alive=termination_result.scope_alive is not False,
+                worker_termination_confirmed=termination_result.confirmed,
+                worker_termination_reason=termination_result.reason,
+                worker_reap_timed_out=termination_result.reap_timed_out,
+                pgid=final_pgid,
                 heartbeat_at=_now(),
             )
             payload["worker_still_alive"] = payload.get("worker_alive")
             payload["pgroup_cpu_pct"] = pgroup_cpu_pct(payload.get("pgid"))
+        # Capacity state is part of terminal truth. Persist release only for
+        # confirmed group death, or the visible retained third state, before a
+        # terminal ledger row can advertise the attempt as finished.
+        _finalize_capacity_after_cleanup(
+            payload,
+            lease_id=str(lease_id) if lease_id else None,
+            worker_pid=proc.pid if proc is not None else None,
+            pgid=int(payload.get("pgid") or proc.pid) if proc is not None else None,
+            termination_result=termination_result,
+            detach_worker=detach_worker,
+            detach=detach_lease_to_worker,
+            state=str(payload.get("state", state)),
+            reason=payload.get("error"),
+        )
         if ledger_recorded:
             with contextlib.redirect_stdout(io.StringIO()):
                 terminal_code = goalflight_ledger.cmd_finish(
@@ -4452,19 +4786,6 @@ async def _run_acp_dispatch_impl(
                 payload["terminal_commit_error"] = (
                     f"journal terminal emitter exited {terminal_code}"
                 )
-        leave_lease_active = bool(detach_worker and proc is not None and proc.returncode is None)
-        if leave_lease_active and proc is not None:
-            # The live worker and its final status must survive teardown. A
-            # leaked controller-bound lease is recorded for reconciliation.
-            _detach_live_worker_state(
-                payload,
-                detach_lease_to_worker,
-                proc.pid,
-                payload.get("error"),
-            )
-        elif lease_id:
-            with contextlib.redirect_stdout(io.StringIO()):
-                goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=payload.get("state", state), reason=payload.get("error"), keep=True))
         if worktree_seat is not None:
             worktree_seat.release()
     _attach_agent_stderr_tail(payload, agent_stderr_capture)
@@ -4502,8 +4823,16 @@ def normalized_acp_dispatch_cfg(args: argparse.Namespace) -> argparse.Namespace:
         values["user_confirm_timeout_s"] = DEFAULT_USER_CONFIRM_TIMEOUT_S
     if values["user_confirm_timeout_s"] <= 0:
         values["user_confirm_timeout_s"] = DEFAULT_USER_CONFIRM_TIMEOUT_S
-    if values.get("max_quiet_s", 0) <= 0:
-        values["max_quiet_s"] = 3600.0
+    try:
+        parsed_max_quiet_s = float(values.get("max_quiet_s") or 0.0)
+    except (TypeError, ValueError):
+        parsed_max_quiet_s = 0.0
+    if parsed_max_quiet_s <= 0:
+        values["max_quiet_s"] = resolve_indeterminate_timeout_s(
+            values.get("idle_timeout")
+        )
+    else:
+        values["max_quiet_s"] = parsed_max_quiet_s
     if values.get("progress_stall_s", 0) <= 0:
         values["progress_stall_s"] = 300.0
     values["stall_kill"] = bool(values.get("stall_kill", False))
@@ -4788,8 +5117,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-quiet-s",
         type=float,
-        default=float(os.environ.get("GOALFLIGHT_MAX_QUIET_S", "3600")),
-        help="Absolute event-silence hard wall for CPU-busy quiet workers, independent of idle-timeout.",
+        default=(
+            float(os.environ["GOALFLIGHT_MAX_QUIET_S"])
+            if os.environ.get("GOALFLIGHT_MAX_QUIET_S")
+            else None
+        ),
+        help="Absolute event-silence hard wall for CPU-busy quiet workers, "
+        "independent of idle-timeout (default: at least the shared two-hour "
+        "indeterminate-liveness floor, following any longer idle default).",
     )
     parser.add_argument(
         "--progress-stall-s",

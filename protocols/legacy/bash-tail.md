@@ -166,7 +166,7 @@ Exit codes:
 |---|---|
 | 0 | terminal marker (`COMPLETE` / `BLOCKED` / `USER-NEED` / `USER-CONFIRM`) |
 | 1 | worker PID died without a terminal marker |
-| 2 | tail file idle past `--max-idle-secs` (direct watcher default 180s; dispatch wrapper default 600s for write-capable code workers) — worker likely wedged |
+| 2 | confirmed idle past `--max-idle-secs` (`idle-timeout`), or positive/unknown liveness at the outer bound (`liveness_indeterminate`). The direct outer bound defaults to `max(--max-idle-secs + the five-sample confirmation window, 7200)` and can be shortened for tests/direct callers with `GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS` |
 | 3 | orchestrator PID died — watcher self-detected orphan |
 
 The watcher registers a pidfile under `/tmp/goal-flight-acp-pids.d/` so

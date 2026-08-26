@@ -184,7 +184,7 @@ def _acp_cmd(
         "--idle-timeout",
         "1800",
         "--max-quiet-s",
-        "3600",
+        "7200",
     ]
     # HARD WRITE FENCE: run the review under a read-only OS sandbox where it is
     # enforced (macOS sandbox-exec). grok can read any file but CANNOT write or

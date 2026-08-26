@@ -499,7 +499,10 @@ def case_incomplete_identity_is_inconclusive_alive() -> None:
         prompt.write_text("", encoding="utf-8")
         tail = tmp / "tail.txt"
         tail.write_text("COMPLETE: identity stayed fail-safe\n", encoding="utf-8")
-        worker = subprocess.Popen(["bash", "-c", "sleep 10"], start_new_session=True)
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            start_new_session=True,
+        )
         try:
             rc, _elapsed, term, payload = _run_watcher(
                 tail,

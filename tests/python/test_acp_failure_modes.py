@@ -14,6 +14,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -53,14 +54,21 @@ from goalflight_acp_run import (  # noqa: E402
     adapter_liveness_config,
     agent_command,
     decide_terminal_state,
+    normalized_acp_dispatch_cfg,
     spawn_and_handshake_with_retry,
 )
 import goalflight_acp_permits  # noqa: E402
 import goalflight_compat  # noqa: E402
 import goalflight_journal  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
+import goalflight_dispatch  # noqa: E402
 from acp_runner import has_actionable_marker_values  # noqa: E402
-from goalflight_liveness import heartbeat_wedge_decision, pgroup_cpu_pct, progress_stall_decision  # noqa: E402
+from goalflight_liveness import (  # noqa: E402
+    INDETERMINATE_LIVENESS_FLOOR_S,
+    heartbeat_wedge_decision,
+    pgroup_cpu_pct,
+    progress_stall_decision,
+)
 
 
 def env_override_fields(text: str, env_name: str) -> dict[str, str]:
@@ -339,6 +347,46 @@ def _make_fake_agent_wrapper(tmp: Path, scenario: str | None = None) -> Path:
     wrapper.write_text("\n".join(lines) + "\n")
     wrapper.chmod(0o755)
     return wrapper
+
+
+def _descendant_ps_fail_bindir(tmp: Path) -> Path:
+    bindir = tmp / "ps-fail-bin"
+    bindir.mkdir()
+    real_ps = shutil.which("ps") or "/bin/ps"
+    stub = bindir / "ps"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "for arg in \"$@\"; do\n"
+        "  if [ \"$arg\" = \"pid=,ppid=\" ]; then\n"
+        "    echo 'ps: enumeration failed' >&2\n"
+        "    exit 1\n"
+        "  fi\n"
+        "done\n"
+        f"exec {shlex.quote(real_ps)} \"$@\"\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return bindir
+
+
+def _descendant_ps_table_bindir(tmp: Path, table: Path) -> Path:
+    bindir = tmp / "ps-table-bin"
+    bindir.mkdir()
+    real_ps = shutil.which("ps") or "/bin/ps"
+    stub = bindir / "ps"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "for arg in \"$@\"; do\n"
+        "  if [ \"$arg\" = \"pid=,ppid=\" ]; then\n"
+        f"    cat {shlex.quote(str(table))}\n"
+        "    exit $?\n"
+        "  fi\n"
+        "done\n"
+        f"exec {shlex.quote(real_ps)} \"$@\"\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return bindir
 
 
 def _write_supported_adapter_manifest(directory: Path, name: str) -> None:
@@ -899,18 +947,35 @@ def case_detached_pidfile_entry_survives_ghost_cleanup() -> None:
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_progress_then_silent_wedges_and_reaps() -> None:
-    returncode, status, stdout, stderr = _run_fake_runner(
-        "progress_then_silent",
-        progress_stall_s=30.0,
-        liveness_profile="local_compute",
-        extra_env={"GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0", "GOALFLIGHT_TEST_MODE": "1"},
-    )
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        process_table_file = tmp / "process-table.txt"
+        bindir = _descendant_ps_table_bindir(tmp, process_table_file)
+        returncode, status, stdout, stderr = _run_fake_runner(
+            "progress_then_silent",
+            progress_stall_s=30.0,
+            heartbeat_interval=0.05,
+            # Leave the universal outer wall beyond the two-sample poison
+            # check so this case proves measured-zero descendants still
+            # permit the ordinary confirmed-idle verdict.
+            max_quiet_s=3.0,
+            liveness_profile="local_compute",
+            extra_env={
+                "GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE": str(process_table_file),
+                "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0",
+                "GOALFLIGHT_TEST_MODE": "1",
+                "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+            },
+        )
+        process_rows = process_table_file.read_text(encoding="utf-8").splitlines()
+        assert process_rows == [f"{status['worker_pid']} 1"], process_rows
 
     assert returncode != 0, stdout
     assert status["state"] == "wedged", status
     assert status["error"]["message"] == "wedged_by_heartbeat", status
     assert status["wedge_progress_seen"] >= 1, status
     assert status["heartbeat_dead_samples"] >= 2, status
+    assert status.get("live_descendants") == 0, status
     assert status["worker_alive"] is False, status
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
 
@@ -939,6 +1004,131 @@ def case_runner_remote_long_reasoning_pause_survives_old_walls() -> None:
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_read_only_acp_buffered_work_survives_incident_duration() -> None:
+    """Acceptance: production bounds preserve 55 minutes of buffered work."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        args = argparse.Namespace(
+            dispatch_id="read-only-buffered-acceptance",
+            agent="codex",
+            account=None,
+            read_only=True,
+            os_sandbox=None,
+            controller_pid=None,
+            controller_session_id=None,
+            controller_label=None,
+            task_ids=[],
+            launch_detached=False,
+            queue_launch_token=None,
+            cwd=str(ROOT),
+            prompt="buffered acceptance",
+            prompt_file=None,
+            no_orientation=True,
+            model=None,
+            priority="normal",
+            capacity_wait_s=0,
+            max_idle_secs=None,
+            poll_secs=0.05,
+            permission_mode="auto",
+            permission_dir=None,
+            permission_inline_timeout_s=None,
+            permission_user_timeout_s=None,
+            interactive=False,
+            context_mode=None,
+        )
+        goalflight_dispatch._apply_max_idle_default(args)
+        cfg = goalflight_dispatch._build_acp_cfg(
+            args,
+            status_json=tmp / "acceptance.status.json",
+            base=tmp / "dispatch",
+        )
+
+    assert cfg.idle_timeout == 900.0, cfg
+    assert cfg.max_quiet_s >= INDETERMINATE_LIVENESS_FLOOR_S, cfg
+    assert cfg.remote_turn_silence_s == cfg.max_quiet_s, cfg
+    direct_values = vars(cfg).copy()
+    direct_values["max_quiet_s"] = 0.0
+    direct_cfg = normalized_acp_dispatch_cfg(
+        argparse.Namespace(**direct_values)
+    )
+    assert direct_cfg.max_quiet_s == cfg.max_quiet_s, direct_cfg
+    goal_cfg = normalized_acp_dispatch_cfg(
+        argparse.Namespace(
+            mode="goal",
+            idle_timeout=None,
+            max_quiet_s=None,
+        )
+    )
+    assert goal_cfg.max_quiet_s == goal_cfg.idle_timeout == 36000.0, goal_cfg
+
+    # One real second represents one awake hour. The fake ACP worker emits a
+    # start event, does real process work behind a buffered stream, then emits
+    # completion after the simulated incident point. With the old plumbing,
+    # cfg.max_quiet_s was 900 and this run was killed around 0.25 real seconds.
+    active_time_scale = 3600.0
+    production_profile = (
+        getattr(cfg, "liveness_profile", None)
+        or adapter_liveness_config(cfg.agent)[0]
+    )
+    assert production_profile == "remote_api", production_profile
+    started = time.monotonic()
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "long_reasoning_busy",
+        progress_stall_s=cfg.max_quiet_s,
+        heartbeat_interval=0.05,
+        wedge_samples=999,
+        idle_timeout=cfg.idle_timeout,
+        max_quiet_s=cfg.max_quiet_s,
+        max_tool_s=cfg.max_quiet_s,
+        liveness_profile=production_profile,
+        remote_turn_silence_s=cfg.remote_turn_silence_s,
+        extra_env={
+            "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "1.0",
+            "GOALFLIGHT_TEST_MODE": "1",
+            "GOALFLIGHT_TEST_ACTIVE_TIME_SCALE": str(active_time_scale),
+        },
+        timeout_s=30.0,
+    )
+    simulated_awake_s = (time.monotonic() - started) * active_time_scale
+
+    assert simulated_awake_s > 55 * 60, simulated_awake_s
+    assert returncode == 0, (stdout, stderr, status)
+    assert status["state"] == "complete", status
+    assert status["ok"] is True, status
+    assert status.get("liveness_hard_wall_expired") is not True, status
+    assert "finished" in (status.get("text_excerpt") or ""), status
+
+    # Null hypothesis/control: retain the old conflated 900-second outer walls
+    # while keeping every other worker and timing input identical. Production
+    # liveness must then terminate this same real work before its buffered end.
+    old_returncode, old_status, old_stdout, old_stderr = _run_fake_runner(
+        "long_reasoning_busy",
+        progress_stall_s=900.0,
+        heartbeat_interval=0.05,
+        wedge_samples=999,
+        idle_timeout=900.0,
+        max_quiet_s=900.0,
+        max_tool_s=900.0,
+        liveness_profile=production_profile,
+        remote_turn_silence_s=900.0,
+        extra_env={
+            "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "1.0",
+            "GOALFLIGHT_TEST_MODE": "1",
+            "GOALFLIGHT_TEST_ACTIVE_TIME_SCALE": str(active_time_scale),
+        },
+        timeout_s=30.0,
+    )
+    assert old_returncode != 0, (old_stdout, old_stderr, old_status)
+    assert "finished" not in (old_status.get("text_excerpt") or ""), old_status
+    assert old_status["state"] in {
+        "remote_turn_silence",
+        "liveness_indeterminate",
+        "idle_timeout",
+    }, old_status
+    assert old_status["remote_turn_silence_s"] == 900.0, old_status
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_remote_dead_silent_turn_hits_remote_wall() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "dead_silent_turn",
@@ -963,14 +1153,14 @@ def case_runner_remote_dead_silent_turn_hits_remote_wall() -> None:
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
-def case_runner_max_quiet_requires_confirmed_idle_cpu() -> None:
+def case_runner_outer_bound_with_unknown_cpu_and_idle_disabled() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "long_reasoning_pause",
         progress_stall_s=30.0,
         heartbeat_interval=0.05,
         wedge_samples=99,
-        idle_timeout=5.0,
-        max_quiet_s=0.05,
+        idle_timeout=0.0,
+        max_quiet_s=0.15,
         max_tool_s=30.0,
         extra_env={
             "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "0.6",
@@ -980,46 +1170,97 @@ def case_runner_max_quiet_requires_confirmed_idle_cpu() -> None:
         timeout_s=30.0,
     )
 
-    assert returncode == 0, (stdout, stderr, status)
-    assert status["state"] == "complete", status
-    assert status["ok"] is True, status
-    assert status.get("error") is None, status
-
-
-@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
-def case_runner_max_quiet_kills_confirmed_idle_cpu() -> None:
-    returncode, status, stdout, stderr = _run_fake_runner(
-        "long_reasoning_pause",
-        progress_stall_s=30.0,
-        heartbeat_interval=0.05,
-        wedge_samples=99,
-        idle_timeout=5.0,
-        max_quiet_s=0.05,
-        max_tool_s=30.0,
-        extra_env={
-            "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "0.6",
-            "GOALFLIGHT_TEST_MODE": "1",
-            "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0",
-        },
-        timeout_s=30.0,
-    )
-
     assert returncode != 0, (stdout, stderr, status)
-    assert status["state"] == "wedged", status
-    assert status["error"]["message"] == "max_quiet_s", status
-    assert status["error"]["cpu_pct"] == 0.0, status
+    assert status["state"] == "liveness_indeterminate", status
+    assert status["error"]["reason"] == "event_silence_outer_bound", status
+    assert status["error"]["quiet_for_s"] >= 0.15, status
+    assert status["killed_by_heartbeat"] is True, status
     assert status["worker_alive"] is False, status
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
-def case_runner_max_quiet_ignores_busy_cpu() -> None:
+def case_runner_outer_bound_classifies_measured_idle() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        process_table_file = tmp / "process-table.txt"
+        bindir = _descendant_ps_table_bindir(tmp, process_table_file)
+        returncode, status, stdout, stderr = _run_fake_runner(
+            "long_reasoning_pause",
+            progress_stall_s=30.0,
+            heartbeat_interval=0.05,
+            wedge_samples=99,
+            idle_timeout=0.0,
+            max_quiet_s=0.15,
+            max_tool_s=30.0,
+            extra_env={
+                "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "0.6",
+                "GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE": str(process_table_file),
+                "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0",
+                "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+            },
+            timeout_s=30.0,
+        )
+        process_rows = process_table_file.read_text(encoding="utf-8").splitlines()
+        assert process_rows == [f"{status['worker_pid']} 1"], process_rows
+
+    assert returncode != 0, (stdout, stderr, status)
+    assert status["state"] == "wedged", status
+    assert status["error"]["message"] == "idle_timeout_confirmed", status
+    assert status["error"]["reason"] == "confirmed_idle", status
+    assert status["error"]["quiet_for_s"] >= 0.15, status
+    assert status.get("live_descendants") == 0, status
+    assert status.get("liveness_outer_bound_source") == "heartbeat", status
+    assert status["worker_alive"] is False, status
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_idle_callback_uses_same_outer_classifier() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        process_table_file = tmp / "process-table.txt"
+        bindir = _descendant_ps_table_bindir(tmp, process_table_file)
+        returncode, status, stdout, stderr = _run_fake_runner(
+            "long_reasoning_pause",
+            progress_stall_s=30.0,
+            heartbeat_interval=30.0,
+            wedge_samples=99,
+            # Keep the first immediate heartbeat inside the outer wall; the
+            # runner's idle callback must be the path that reaches the shared
+            # classifier in this case.
+            idle_timeout=2.0,
+            max_quiet_s=2.0,
+            max_tool_s=30.0,
+            extra_env={
+                "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "30",
+                "GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE": str(process_table_file),
+                "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0",
+                "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+            },
+            timeout_s=20.0,
+        )
+        process_rows = process_table_file.read_text(encoding="utf-8").splitlines()
+        assert process_rows == [f"{status['worker_pid']} 1"], process_rows
+
+    assert returncode != 0, (stdout, stderr, status)
+    assert status["state"] == "wedged", status
+    assert status["error"]["message"] == "idle_timeout_confirmed", status
+    assert status["error"]["reason"] == "confirmed_idle", status
+    assert status.get("live_descendants") == 0, status
+    assert status.get("liveness_outer_bound_source") == "idle_callback", status
+    assert status["worker_alive"] is False, status
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_outer_bound_with_busy_cpu_and_idle_disabled() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
         "long_reasoning_pause",
         progress_stall_s=30.0,
         heartbeat_interval=0.05,
         wedge_samples=99,
-        idle_timeout=5.0,
-        max_quiet_s=0.05,
+        idle_timeout=0.0,
+        max_quiet_s=0.15,
         max_tool_s=30.0,
         extra_env={
             "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "0.6",
@@ -1029,9 +1270,12 @@ def case_runner_max_quiet_ignores_busy_cpu() -> None:
         timeout_s=30.0,
     )
 
-    assert returncode == 0, (stdout, stderr, status)
-    assert status["state"] == "complete", status
-    assert status["ok"] is True, status
+    assert returncode != 0, (stdout, stderr, status)
+    assert status["state"] == "liveness_indeterminate", status
+    assert status["error"]["reason"] == "event_silence_outer_bound", status
+    assert status["error"]["quiet_for_s"] >= 0.15, status
+    assert status["killed_by_heartbeat"] is True, status
+    assert status["worker_alive"] is False, status
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -1865,6 +2109,94 @@ def case_runner_idle_silent_idle_timeout_reaps() -> None:
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_idle_descendant_cannot_override_hard_wall() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        child_pid_file = tmp / "child.pid"
+        process_table_file = tmp / "process-table.txt"
+        bindir = _descendant_ps_table_bindir(tmp, process_table_file)
+        path = str(bindir) + os.pathsep + os.environ.get("PATH", "")
+        returncode, status, stdout, stderr = _run_fake_runner(
+            "progress_then_silent_with_child",
+            progress_stall_s=30.0,
+            heartbeat_interval=0.05,
+            idle_timeout=0.1,
+            max_quiet_s=0.3,
+            max_tool_s=30.0,
+            extra_env={
+                "GOALFLIGHT_FAKE_ACP_CHILD_PID_FILE": str(child_pid_file),
+                "GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE": str(process_table_file),
+                "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0",
+                "PATH": path,
+            },
+            timeout_s=20.0,
+        )
+        assert child_pid_file.is_file(), "precondition failed: fake ACP child was not spawned"
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        process_rows = process_table_file.read_text(encoding="utf-8").splitlines()
+        assert f"{child_pid} {status['worker_pid']}" in process_rows, process_rows
+
+    assert returncode != 0, (stdout, stderr, status)
+    assert status["state"] == "liveness_indeterminate", status
+    assert status["error"]["message"] == "liveness_indeterminate", status
+    assert status["error"]["reason"] == "event_silence_outer_bound", status
+    assert status.get("wedge_progress_seen", 0) >= 1, status
+    assert status.get("liveness_descendant_veto_observed") is True, status
+    assert status.get("liveness_descendant_veto_kind") == "live", status
+    assert status["error"]["quiet_for_s"] >= 0.3, status
+    assert status["state"] != "wedged", status
+    assert status.get("liveness_hard_wall_expired") is True, status
+    assert status["killed_by_heartbeat"] is True, status
+    assert status["worker_alive"] is False, status
+    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+    assert not _pid_alive(child_pid), (child_pid, status, stderr)
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_unknown_descendants_cannot_override_hard_wall() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        bindir = _descendant_ps_fail_bindir(tmp)
+        env = os.environ.copy()
+        env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+        probe = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert probe.returncode != 0, "precondition failed: descendant ps probe succeeded"
+        returncode, status, stdout, stderr = _run_fake_runner(
+            "progress_then_silent",
+            progress_stall_s=30.0,
+            heartbeat_interval=0.05,
+            idle_timeout=0.1,
+            max_quiet_s=0.3,
+            max_tool_s=30.0,
+            extra_env={
+                "PATH": env["PATH"],
+                "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0",
+            },
+            timeout_s=20.0,
+        )
+
+    assert returncode != 0, (stdout, stderr, status)
+    assert status["state"] == "liveness_indeterminate", status
+    assert status["error"]["message"] == "liveness_indeterminate", status
+    assert status.get("wedge_progress_seen", 0) >= 1, status
+    assert status.get("liveness_descendant_veto_observed") is True, status
+    assert status.get("liveness_descendant_veto_kind") == "unknown", status
+    assert status["error"]["quiet_for_s"] >= 0.3, status
+    assert status["state"] != "wedged", status
+    assert status.get("liveness_hard_wall_expired") is True, status
+    assert status["killed_by_heartbeat"] is True, status
+    assert status["worker_alive"] is False, status
+    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_oversized_frame_dropped_then_completes() -> None:
     # GuardedStreamReader drop-and-continue at the runner level: with a small
     # ACP frame limit the agent's over-limit frame is dropped (and counted in
@@ -1889,6 +2221,7 @@ def case_runner_oversized_frame_dropped_then_completes() -> None:
     assert returncode == 0, (stdout, stderr)
     assert status["state"] == "complete", status
     assert status["ok"] is True, status
+    assert status["killed_by_heartbeat"] is False, status
     assert status["acp_dropped_frames"] >= 1, status
     record = status["acp_dropped_frame_records"][0]
     assert record["byte_count"] > 4096, status
@@ -2363,10 +2696,12 @@ def main() -> None:
     case_detached_pidfile_entry_survives_ghost_cleanup()
     case_runner_progress_then_silent_wedges_and_reaps()
     case_runner_remote_long_reasoning_pause_survives_old_walls()
+    case_read_only_acp_buffered_work_survives_incident_duration()
     case_runner_remote_dead_silent_turn_hits_remote_wall()
-    case_runner_max_quiet_requires_confirmed_idle_cpu()
-    case_runner_max_quiet_kills_confirmed_idle_cpu()
-    case_runner_max_quiet_ignores_busy_cpu()
+    case_runner_outer_bound_with_unknown_cpu_and_idle_disabled()
+    case_runner_outer_bound_classifies_measured_idle()
+    case_runner_idle_callback_uses_same_outer_classifier()
+    case_runner_outer_bound_with_busy_cpu_and_idle_disabled()
     case_runner_thought_stream_survives_progress_stall_wall()
     case_runner_auth_failure_output_records_blocked_terminal()
     case_runner_trivial_probe_working_engine_writes_file()
@@ -2387,6 +2722,8 @@ def main() -> None:
     case_user_confirm_midturn_deadline_reenables_remote_silence_terminal()
     case_runner_user_need_none_completes()
     case_runner_idle_silent_idle_timeout_reaps()
+    case_runner_idle_descendant_cannot_override_hard_wall()
+    case_runner_unknown_descendants_cannot_override_hard_wall()
     case_runner_oversized_frame_dropped_then_completes()
     case_runner_oversized_request_gets_safe_reply()
     case_runner_oversized_request_late_id_gets_safe_reply()

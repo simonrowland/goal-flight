@@ -580,8 +580,21 @@ def test_dispatch_end_hint() -> None:
     )
     check("watcher-stopped live worker gets reattach hint",
           hint == "worker still alive - re-attach via goalflight_status.py --wait marker-worker")
+    hint = D._dispatch_end_reattach_hint(
+        "indeterminate-live",
+        terminal_state="liveness_indeterminate",
+        worker_alive=True,
+    )
+    check("liveness-indeterminate live worker gets reattach hint",
+          hint == "worker still alive - re-attach via goalflight_status.py --wait indeterminate-live")
     check("dead idle-timeout gets no hint",
           D._dispatch_end_reattach_hint("dead", terminal_state="idle_timeout", worker_alive=False) is None)
+    check("dead liveness-indeterminate gets no hint",
+          D._dispatch_end_reattach_hint(
+              "dead-indeterminate",
+              terminal_state="liveness_indeterminate",
+              worker_alive=False,
+          ) is None)
 
 
 def main() -> int:

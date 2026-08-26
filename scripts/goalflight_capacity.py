@@ -78,6 +78,13 @@ CAPACITY_WAIT_POLL_S = 15.0
 CAPACITY_WAIT_JITTER_S = 2.0
 CAPACITY_WAIT_SLEEP_SLICE_S = 0.5
 
+# A watcher that cannot safely dispose an unresolved process group keeps its
+# slot accounted.  The historical PGID is safe for this non-destructive
+# existence check (a recycled group can only retain capacity), but the hold is
+# bounded so PID/PGID reuse cannot consume a slot forever.
+INDETERMINATE_LIVE_RETENTION_S = 7200
+INDETERMINATE_LIVE_REASON = "liveness_indeterminate_worker_live"
+
 
 class CapacityWaitInterrupted(Exception):
     """Raised when SIGTERM/SIGINT interrupts acquire_with_wait."""
@@ -534,6 +541,83 @@ def profile(args: argparse.Namespace | None = None) -> dict:
     return payload
 
 
+def _process_group_liveness(pgid: object) -> bool | None:
+    """Return process-group liveness; None means the safe probe is unavailable."""
+    try:
+        parsed_pgid = int(pgid)
+    except (TypeError, ValueError):
+        return None
+    if parsed_pgid <= 1 or not hasattr(os, "killpg"):
+        return None
+    try:
+        os.killpg(parsed_pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return None
+
+
+def retained_live_scope_holds_capacity(
+    lease: dict,
+    *,
+    now: dt.datetime | None = None,
+) -> bool:
+    """Keep an unresolved worker scope accounted until death is confirmed.
+
+    ``accounted_live_until`` is a reap/recheck horizon, not permission to stop
+    accounting. A live or unprobeable group remains capacity-bearing after it;
+    only a negative process-group liveness probe releases the retained scope.
+    """
+    if lease.get("reason") != INDETERMINATE_LIVE_REASON:
+        return False
+    del now  # retained for call compatibility and deterministic older tests
+    # A historical PGID is never signaled here; reuse can delay capacity, not
+    # hurt a process. Unknown is conservative because release requires proof.
+    return _process_group_liveness(lease.get("accounted_live_pgid")) is not False
+
+
+def retain_indeterminate_live_lease(
+    lease_id: str,
+    *,
+    pgid: object,
+    retention_s: float = INDETERMINATE_LIVE_RETENTION_S,
+) -> dict:
+    """Durably account an unresolved group and record its next recheck horizon."""
+    with StateLock():
+        data = load_state()
+        lease = data.get("leases", {}).get(str(lease_id))
+        if not isinstance(lease, dict):
+            raise KeyError(f"missing capacity lease {lease_id}")
+        now = utc_now()
+        lease["state"] = "active"
+        lease["reason"] = INDETERMINATE_LIVE_REASON
+        lease["accounted_live_at"] = iso(now)
+        lease["accounted_live_until"] = iso(
+            now + dt.timedelta(seconds=max(0.0, float(retention_s)))
+        )
+        try:
+            parsed_pgid = int(pgid)
+        except (TypeError, ValueError):
+            parsed_pgid = 0
+        if parsed_pgid > 1:
+            lease["accounted_live_pgid"] = parsed_pgid
+        save_state(data)
+        return dict(lease)
+
+
+def attached_worker_group_holds_capacity(lease: dict) -> bool:
+    """Keep an attached worker accounted until its full group is confirmed gone."""
+    if not lease.get("worker_pgid"):
+        return False
+    # Unknown is the third state: it retains capacity. A deadline or a dead
+    # group leader is not proof that descendants have left the recorded group.
+    group_alive = _process_group_liveness(lease.get("worker_pgid"))
+    if group_alive is not False:
+        return True
+    return pid_alive(lease.get("worker_pid"))
+
+
 def _lease_pids_dead(lease: dict) -> bool:
     """True only when every process that can hold the lease is gone.
 
@@ -542,6 +626,11 @@ def _lease_pids_dead(lease: dict) -> bool:
     clock-only TTL check (capacity.json is shared across sibling projects, so a
     TTL eviction here would over-subscribe the machine while the lease is LIVE).
     """
+    if (
+        retained_live_scope_holds_capacity(lease)
+        or attached_worker_group_holds_capacity(lease)
+    ):
+        return False
     worker_pid = lease.get("worker_pid")
     claimant_pid = lease.get("claimant_pid") if worker_pid is None else None
     return (
@@ -1021,9 +1110,16 @@ def stale_active_leases(data: dict) -> list[dict]:
     """Active leases with no live worker, controller, or pre-attach claimant."""
     stale: list[dict] = []
     for lease in active_leases(data):
+        if retained_live_scope_holds_capacity(lease):
+            continue
         controller_pid = lease.get("controller_pid")
         worker_pid = lease.get("worker_pid")
         if worker_pid is not None:
+            if lease.get("worker_pgid"):
+                if attached_worker_group_holds_capacity(lease):
+                    continue
+                stale.append(lease)
+                continue
             if pid_alive(worker_pid):
                 continue
             stale.append(lease)
@@ -1082,7 +1178,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     for lease in payload["active"]:
         prio = lease.get("priority")
         prio_part = f" prio={prio}" if prio and prio != "normal" else ""
-        print(f"- {lease['lease_id']} agent={lease['agent']} dispatch={lease.get('dispatch_id')} mem={lease.get('mem_mb')}MB{prio_part}")
+        retained_part = ""
+        if lease.get("reason") == INDETERMINATE_LIVE_REASON:
+            retained_part = (
+                f" retained-indeterminate-pgid={lease.get('accounted_live_pgid')}"
+                f" recheck-after={lease.get('accounted_live_until')}"
+            )
+        print(f"- {lease['lease_id']} agent={lease['agent']} dispatch={lease.get('dispatch_id')} mem={lease.get('mem_mb')}MB{prio_part}{retained_part}")
     if data.get("cooldowns"):
         print("cooldowns:")
         for cooldown in data["cooldowns"].values():
