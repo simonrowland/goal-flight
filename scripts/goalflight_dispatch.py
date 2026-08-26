@@ -1294,6 +1294,19 @@ def _project_root(args) -> Path:
     return goalflight_task.resolve_project_root(args.cwd or str(Path.cwd()))
 
 
+def _worker_cwd(args) -> Path:
+    """Tree the worker process is rooted in.
+
+    Distinct from ``_project_root``, which collapses worktrees so they share a
+    task store. The stall detector must measure this cwd, not the canonical
+    root (b-229): sibling worktrees keep the shared tree "active" forever.
+    """
+    raw = getattr(args, "cwd", None)
+    if raw:
+        return Path(str(raw)).expanduser().resolve(strict=False)
+    return Path.cwd().resolve(strict=False)
+
+
 def _parse_task_ids(values: list[str] | None) -> list[str]:
     out: list[str] = []
     for value in values or []:
@@ -5921,6 +5934,7 @@ def _watcher_spawn_argv(
     dispatch_id: str,
     pgid: int,
     project_root: Path | None = None,
+    worker_cwd: Path | None = None,
     task_ids: list[str] | None = None,
     worker_identity: dict | None = None,
     launch_detached: bool = False,
@@ -5962,6 +5976,8 @@ def _watcher_spawn_argv(
     ]
     if project_root is not None:
         watch_cmd += ["--project-root", str(project_root)]
+    if worker_cwd is not None:
+        watch_cmd += ["--worker-cwd", str(worker_cwd)]
     if task_ids:
         if project_root is None:
             raise ValueError("project_root is required when task_ids are present")
@@ -12275,6 +12291,7 @@ def main(argv: list[str] | None = None) -> int:
             dispatch_id=args.dispatch_id,
             pgid=pgid,
             project_root=project_root,
+            worker_cwd=_worker_cwd(args),
             task_ids=getattr(args, "task_ids", None),
             worker_identity=worker_identity_token,
             launch_detached=bool(args.launch_detached),

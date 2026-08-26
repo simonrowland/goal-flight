@@ -26,7 +26,12 @@ incremented when meaningful skill behaviour changes.
   not kill. A recent tree write vetoes the naive tail+CPU rule. Emits
   `WATCHER-STALL-CANDIDATE` once on enter and `WATCHER-STALL-CLEAR` once
   on recover. The state is not terminal and does not trip `worker_dead`
-  cleanup.
+  cleanup. Round 2: the tree-quiet leg scans the dispatch's own
+  `worker_cwd` (b-217's recorded `-C`) and skips `.git/`; when cwd is the
+  canonical root or missing, the leg is indeterminate rather than reading
+  sibling worktree writes as this worker's life. Last CPU sample and
+  candidate announcement persist in the status sidecar so a watcher
+  restart does not reset the window or re-announce.
 
 ## [1.5.1] - 2026-08-23
 

@@ -164,9 +164,13 @@ WEDGE_EVIDENCE_KEYS = (
     "sample_interval_s",
     "threshold_s",
     "tail_bytes_grown",
+    "tree_scan_kind",
+    "tree_scan_root",
     "authoritative",
     "caveat",
 )
+WEDGE_TREE_LEG_WORKER_CWD = "worker_cwd"
+WEDGE_TREE_LEG_INDETERMINATE = "indeterminate"
 _TREE_SKIP_DIR_NAMES = frozenset(
     {
         ".git",
@@ -331,6 +335,215 @@ def newest_mtime_under(
     except OSError:
         return newest
     return newest
+
+
+def _expand_path(raw: object) -> Path | None:
+    if raw in (None, ""):
+        return None
+    try:
+        return Path(str(raw)).expanduser()
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolved_path(path: Path) -> Path:
+    try:
+        return path.resolve(strict=False)
+    except OSError:
+        return path
+
+
+def _argv_option_value(argv: object, flag: str) -> str | None:
+    if not isinstance(argv, list):
+        return None
+    prefix = flag + "="
+    for index, item in enumerate(argv):
+        if not isinstance(item, str):
+            continue
+        if item == flag and index + 1 < len(argv):
+            nxt = argv[index + 1]
+            if isinstance(nxt, str) and not nxt.startswith("-"):
+                return nxt
+        if item.startswith(prefix) and len(item) > len(prefix):
+            return item[len(prefix) :]
+    return None
+
+
+def _first_path(*raws: object) -> Path | None:
+    for raw in raws:
+        path = _expand_path(raw)
+        if path is not None:
+            return path
+    return None
+
+
+def resolve_wedge_tree_leg(
+    record: dict | None = None,
+    *,
+    project_root: Path | str | None = None,
+    worker_cwd: Path | str | None = None,
+    status: dict | None = None,
+) -> dict:
+    """Choose the tree the stall detector may scan.
+
+    A distinct per-dispatch cwd (b-217 ``worker_cwd`` / ``-C``) is the only
+    shape this leg can measure: sibling worktrees under the canonical root
+    are other workers' writes. When cwd is missing or *is* the canonical
+    root, the leg is indeterminate — do not pretend the shared tree is this
+    worker's life.
+    """
+    rec = record if isinstance(record, dict) else {}
+    sidecar = status if isinstance(status, dict) else {}
+    envelope = rec.get("request_envelope") if isinstance(rec.get("request_envelope"), dict) else {}
+    env_request = envelope.get("request") if isinstance(envelope.get("request"), dict) else {}
+    request = rec.get("request") if isinstance(rec.get("request"), dict) else {}
+    cwd = _first_path(
+        worker_cwd,
+        rec.get("worker_cwd"),
+        _argv_option_value(rec.get("dispatch_argv"), "--cwd"),
+        env_request.get("cwd"),
+        request.get("cwd"),
+        sidecar.get("worker_cwd"),
+        sidecar.get("worktree_path"),
+    )
+    canonical = _first_path(
+        rec.get("project_root"),
+        project_root,
+        sidecar.get("project_root"),
+    )
+    cwd_s = str(_resolved_path(cwd)) if cwd is not None else None
+    canonical_s = str(_resolved_path(canonical)) if canonical is not None else None
+    if cwd is None:
+        return {
+            "kind": WEDGE_TREE_LEG_INDETERMINATE,
+            "reason": "missing_worker_cwd",
+            "scan_root": None,
+            "worker_cwd": None,
+            "canonical_root": canonical_s,
+        }
+    if canonical is None:
+        return {
+            "kind": WEDGE_TREE_LEG_INDETERMINATE,
+            "reason": "missing_canonical_root",
+            "scan_root": None,
+            "worker_cwd": cwd_s,
+            "canonical_root": None,
+        }
+    cwd_cmp = _resolved_path(cwd)
+    canonical_cmp = _resolved_path(canonical)
+    if cwd_cmp == canonical_cmp:
+        return {
+            "kind": WEDGE_TREE_LEG_INDETERMINATE,
+            "reason": "cwd_is_canonical_root",
+            "scan_root": None,
+            "worker_cwd": str(cwd_cmp),
+            "canonical_root": str(canonical_cmp),
+        }
+    return {
+        "kind": WEDGE_TREE_LEG_WORKER_CWD,
+        "reason": "distinct_worker_cwd",
+        "scan_root": cwd_cmp,
+        "worker_cwd": str(cwd_cmp),
+        "canonical_root": str(canonical_cmp),
+    }
+
+
+def serialize_cputime_sample(sample: dict[int, float] | None) -> dict[str, float] | None:
+    if not sample:
+        return None
+    out: dict[str, float] = {}
+    for pid, seconds in sample.items():
+        try:
+            out[str(int(pid))] = float(seconds)
+        except (TypeError, ValueError):
+            continue
+    return out or None
+
+
+def deserialize_cputime_sample(raw: object) -> dict[int, float] | None:
+    if not isinstance(raw, dict) or not raw:
+        return None
+    out: dict[int, float] = {}
+    for key, value in raw.items():
+        try:
+            out[int(key)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return out or None
+
+
+def load_wedge_watch_state(payload: dict | None) -> dict:
+    """Restore last CPU sample + announcement from the status sidecar.
+
+    Chosen persistence: the watcher's own status.json, written every poll.
+    CPU samples cannot be derived from other durable inputs; announcement
+    can also be inferred from ``state == worker_stalled_candidate``.
+    """
+    empty = {
+        "cputime_sample": None,
+        "cputime_sampled_at": None,
+        "candidate_announced_at": None,
+    }
+    if not isinstance(payload, dict):
+        return dict(empty)
+    blob = payload.get("wedge_watch")
+    if not isinstance(blob, dict):
+        blob = {}
+    sampled_at = blob.get("cputime_sampled_at")
+    announced = blob.get("candidate_announced_at")
+    try:
+        sampled_at_f = float(sampled_at) if sampled_at is not None else None
+    except (TypeError, ValueError):
+        sampled_at_f = None
+    try:
+        announced_f = float(announced) if announced is not None else None
+    except (TypeError, ValueError):
+        announced_f = None
+    if announced_f is None and payload.get("state") in {
+        WORKER_STALLED_CANDIDATE_STATE,
+        "worker_wedged",
+    }:
+        updated = payload.get("updated_at")
+        try:
+            announced_f = float(updated) if updated is not None else 0.0
+        except (TypeError, ValueError):
+            announced_f = 0.0
+    return {
+        "cputime_sample": deserialize_cputime_sample(blob.get("cputime_sample")),
+        "cputime_sampled_at": sampled_at_f,
+        "candidate_announced_at": announced_f,
+    }
+
+
+def dump_wedge_watch_state(
+    *,
+    cputime_sample: dict[int, float] | None,
+    cputime_sampled_at: float | None,
+    candidate_announced_at: float | None,
+) -> dict:
+    return {
+        "cputime_sample": serialize_cputime_sample(cputime_sample),
+        "cputime_sampled_at": cputime_sampled_at,
+        "candidate_announced_at": candidate_announced_at,
+    }
+
+
+def _read_json_object(path: Path) -> dict | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _load_dispatch_record(dispatch_id: str) -> dict | None:
+    if not dispatch_id:
+        return None
+    try:
+        path = goalflight_ledger.record_path(dispatch_id, create=False)
+        return _read_json_object(path)
+    except OSError:
+        return None
 
 
 def _tail_mtime_age_s(path: Path, *, now: float) -> float | None:
@@ -2296,6 +2509,14 @@ def main() -> int:
         help="Expected dispatch identity; terminal evidence for any other id is ignored.",
     )
     parser.add_argument("--project-root")
+    parser.add_argument(
+        "--worker-cwd",
+        help=(
+            "Dispatch working directory (effective -C). The stall tree-leg "
+            "scans this when it is distinct from --project-root; a root-rooted "
+            "cwd is indeterminate."
+        ),
+    )
     parser.add_argument("--task-ids")
     parser.add_argument("--agent", default="unknown")
     parser.add_argument("--poll-secs", type=float, default=2.0)
@@ -2492,15 +2713,25 @@ def main() -> int:
     exit_reason = "unknown"
     exit_code = 1
     wedge_streak = 0
-    previously_wedged = False
-    prev_cputime_sample: dict[int, float] | None = None
-    prev_cputime_at: float | None = None
-    tail_size_samples: deque[tuple[float, int]] = deque()
-    tree_root = (
-        Path(args.project_root).expanduser()
-        if getattr(args, "project_root", None)
-        else None
+    prior_status = _read_json_object(status_path) if status_existed_at_startup else None
+    dispatch_record = _load_dispatch_record(args.dispatch_id)
+    tree_leg = resolve_wedge_tree_leg(
+        dispatch_record,
+        project_root=getattr(args, "project_root", None),
+        worker_cwd=getattr(args, "worker_cwd", None),
+        status=prior_status,
     )
+    tree_root = tree_leg.get("scan_root")
+    restored_watch = load_wedge_watch_state(prior_status)
+    prev_cputime_sample: dict[int, float] | None = restored_watch["cputime_sample"]
+    prev_cputime_at_epoch: float | None = restored_watch["cputime_sampled_at"]
+    prev_cputime_at_mono: float | None = None
+    candidate_announced_at: float | None = restored_watch["candidate_announced_at"]
+    previously_wedged = candidate_announced_at is not None or (
+        isinstance(prior_status, dict)
+        and prior_status.get("state") in {WORKER_STALLED_CANDIDATE_STATE, "worker_wedged"}
+    )
+    tail_size_samples: deque[tuple[float, int]] = deque()
     pgid = args.pgid or process_group_id(args.pid) or args.pid
     thresholds = LivenessThresholds(idle_timeout_s=args.max_idle_secs, cpu_epsilon_pct=args.cpu_epsilon)
     last_payload: dict | None = None
@@ -2990,20 +3221,24 @@ def main() -> int:
             pgid = args.pgid or process_group_id(args.pid) or pgid
             cpu_pct = pgroup_cpu_pct(pgid)
             cpu_sample = pgroup_cputime_snapshot(pgid)
-            if (
-                cpu_sample is not None
-                and prev_cputime_sample is not None
-                and prev_cputime_at is not None
-            ):
-                sample_interval_s = now_mono - prev_cputime_at
-                cpu_delta_s = cputime_delta_seconds(prev_cputime_sample, cpu_sample)
+            if cpu_sample is not None and prev_cputime_sample is not None:
+                if prev_cputime_at_mono is not None:
+                    sample_interval_s = now_mono - prev_cputime_at_mono
+                elif prev_cputime_at_epoch is not None:
+                    sample_interval_s = max(0.0, now - prev_cputime_at_epoch)
+                if sample_interval_s is not None and sample_interval_s > 0:
+                    cpu_delta_s = cputime_delta_seconds(prev_cputime_sample, cpu_sample)
+                else:
+                    sample_interval_s = None
             if cpu_sample is not None:
                 prev_cputime_sample = cpu_sample
-                prev_cputime_at = now_mono
+                prev_cputime_at_mono = now_mono
+                prev_cputime_at_epoch = now
         else:
             cpu_pct = 0.0
             prev_cputime_sample = None
-            prev_cputime_at = None
+            prev_cputime_at_mono = None
+            prev_cputime_at_epoch = None
         low_power_relax = (
             worker_is_alive
             and cpu_confirmed_idle(cpu_pct, args.cpu_epsilon)
@@ -3089,8 +3324,19 @@ def main() -> int:
         trace_active = bool(trace_sample.get("trace_active"))
         tail_age_s = _tail_mtime_age_s(tail, now=now)
         tree_age_s: float | None = None
+        if wedge_idle_s > 0:
+            payload["wedge_tree_leg"] = {
+                "kind": tree_leg.get("kind"),
+                "reason": tree_leg.get("reason"),
+                "scan_root": (
+                    str(tree_leg["scan_root"]) if tree_leg.get("scan_root") else None
+                ),
+                "worker_cwd": tree_leg.get("worker_cwd"),
+                "canonical_root": tree_leg.get("canonical_root"),
+            }
         if (
             wedge_idle_s > 0
+            and tree_leg.get("kind") == WEDGE_TREE_LEG_WORKER_CWD
             and worker_is_alive
             and not trace_active
             and not trace_attention
@@ -3100,7 +3346,7 @@ def main() -> int:
             and sample_interval_s is not None
             and sample_interval_s > 0
             and cpu_delta_s <= WEDGE_CPU_DELTA_EPSILON_S
-            and tree_root is not None
+            and isinstance(tree_root, Path)
         ):
             newest_tree = newest_mtime_under(
                 tree_root,
@@ -3122,6 +3368,10 @@ def main() -> int:
                 threshold_s=wedge_idle_s,
                 tail_bytes_grown=tail_bytes_grown,
             )
+            if wedge_evidence is not None:
+                wedge_evidence["tree_scan_kind"] = tree_leg.get("kind")
+                if tree_leg.get("scan_root") is not None:
+                    wedge_evidence["tree_scan_root"] = str(tree_leg["scan_root"])
             wedge_applied = apply_worker_wedge(
                 payload,
                 evidence=wedge_evidence,
@@ -3129,6 +3379,15 @@ def main() -> int:
                 dispatch_id=args.dispatch_id,
             )
             previously_wedged = bool(wedge_applied["wedged"])
+            if wedge_applied["event"] == "enter":
+                candidate_announced_at = now
+            elif wedge_applied["event"] == "recover":
+                candidate_announced_at = None
+        payload["wedge_watch"] = dump_wedge_watch_state(
+            cputime_sample=prev_cputime_sample,
+            cputime_sampled_at=prev_cputime_at_epoch,
+            candidate_announced_at=candidate_announced_at,
+        )
         if low_power_relax:
             payload["low_power_relax"] = True
         if liveness_state == "wedged":

@@ -233,6 +233,13 @@ def normalize_state(
         return "running"
     if status_state == "waiting_capacity" or record_state == "waiting_capacity":
         return "running"
+    if status_state in {"worker_stalled_candidate", "worker_wedged"} or record_state in {
+        "worker_stalled_candidate",
+        "worker_wedged",
+    }:
+        # Live salvage CANDIDATE: process still exists. Do not collapse to
+        # "missing" and do not treat as wedged/failed (not a verdict).
+        return "running"
     if (status_state and status_state.startswith("running")) or (
         record_state and record_state.startswith("running")
     ):

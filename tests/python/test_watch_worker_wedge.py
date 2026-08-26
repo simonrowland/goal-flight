@@ -34,6 +34,8 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import goalflight_chunk_summary as chunk_summary  # noqa: E402
+import goalflight_compat  # noqa: E402
 import goalflight_dispatch_states as states  # noqa: E402
 import goalflight_watch as watch  # noqa: E402
 
@@ -388,10 +390,13 @@ def test_watcher_loop_true_positive_emits_once_and_stays_alive() -> None:
             "--wedge-idle-secs",
             "300",
             "--project-root",
+            str(tmp / "canonical"),
+            "--worker-cwd",
             str(tree),
             "--agent",
             "grok",
         ]
+        (tmp / "canonical").mkdir()
 
         def on_poll(index: int, tail_path: Path) -> None:
             if index == 0:
@@ -457,10 +462,13 @@ def test_watcher_loop_recent_tree_write_never_wedges() -> None:
             "--wedge-idle-secs",
             "300",
             "--project-root",
+            str(tmp / "canonical"),
+            "--worker-cwd",
             str(tree),
             "--agent",
             "grok",
         ]
+        (tmp / "canonical").mkdir()
 
         def on_poll(index: int, tail_path: Path) -> None:
             if index == 2:
@@ -534,6 +542,370 @@ def test_cputime_delta_pairs_pids_instead_of_group_sum() -> None:
     assert abs(cputime_delta_seconds(before, after_born) - 0.4) < 1e-9
 
 
+def _write_dispatch_record(
+    tmp: Path,
+    *,
+    dispatch_id: str,
+    project_root: Path,
+    worker_cwd: Path | None,
+) -> Path:
+    env = _isolate_env(tmp)
+    runs = Path(env["GOALFLIGHT_STATE_DIR"]) / "runs.d"
+    runs.mkdir(parents=True, exist_ok=True)
+    path = runs / f"{goalflight_compat.safe_dispatch_filename(dispatch_id)}.json"
+    record = {
+        "schema": "goalflight.dispatch.v1",
+        "dispatch_id": dispatch_id,
+        "project_root": str(project_root),
+        "state": "running",
+    }
+    if worker_cwd is not None:
+        record["worker_cwd"] = str(worker_cwd)
+    path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def _dual_tree_layout(tmp: Path) -> tuple[Path, Path, Path]:
+    """Canonical root with a sibling's recent write + a quiet per-dispatch cwd."""
+    canonical = tmp / "repo"
+    other = canonical / "worktrees" / "other-dispatch" / "busy.py"
+    other.parent.mkdir(parents=True)
+    other.write_text("other worker still editing\n", encoding="utf-8")
+    worker = canonical / "worktrees" / "this-dispatch"
+    src = worker / "app.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("print(1)\n", encoding="utf-8")
+    return canonical, worker, src
+
+
+def test_tree_leg_scans_distinct_worker_cwd_not_canonical_root() -> None:
+    """P1: a real per-dispatch cwd is scanned; the shared root is not."""
+    canonical = Path("/repo")
+    worker = Path("/repo/worktrees/b229")
+    leg = watch.resolve_wedge_tree_leg(
+        {"project_root": str(canonical), "worker_cwd": str(worker)},
+        project_root=canonical,
+    )
+    assert leg["kind"] == "worker_cwd", leg
+    assert Path(leg["scan_root"]) == worker.resolve() or Path(str(leg["scan_root"])) == worker
+    assert "repo/worktrees/b229" in str(leg["scan_root"]).replace("\\", "/")
+
+
+def test_tree_leg_indeterminate_when_cwd_is_canonical_root() -> None:
+    """P1: root-rooted (or pre-b217) records cannot discriminate sibling writes."""
+    root = Path("/repo")
+    leg = watch.resolve_wedge_tree_leg(
+        {"project_root": str(root), "worker_cwd": str(root)},
+        project_root=root,
+    )
+    assert leg["kind"] == "indeterminate", leg
+    assert leg["scan_root"] is None
+    assert "canonical" in str(leg.get("reason") or "").lower() or "root" in str(
+        leg.get("reason") or ""
+    ).lower()
+
+
+def test_tree_leg_indeterminate_when_worker_cwd_missing() -> None:
+    root = Path("/repo")
+    leg = watch.resolve_wedge_tree_leg(
+        {"project_root": str(root)},
+        project_root=root,
+    )
+    assert leg["kind"] == "indeterminate", leg
+    assert leg["scan_root"] is None
+
+
+def test_chunk_summary_treats_stall_candidate_as_live_not_missing() -> None:
+    """P3: novel candidate must not vanish as 'missing'; still not a verdict."""
+    assert (
+        chunk_summary.normalize_state(
+            {"state": "running"},
+            {"state": "worker_stalled_candidate"},
+            None,
+            worker_live=True,
+        )
+        == "running"
+    )
+    assert states.is_terminal_state("worker_stalled_candidate") is False
+
+
+def test_watcher_loop_quiet_worktree_flags_despite_busy_canonical_root() -> None:
+    """The tree-leg test the review required: per-dispatch cwd ≠ repo root.
+
+    Sibling worktree writes keep the canonical root 'active'. Measuring the
+    shared root would stay blind forever; measuring this dispatch's cwd flags.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        canonical, worker, src = _dual_tree_layout(tmp)
+        tail = tmp / "worker.tail"
+        tail.write_text("STATUS: investigating mid-senten", encoding="utf-8")
+        now = time.time()
+        os.utime(src, (now - 400.0, now - 400.0))
+        os.utime(tail, (now - 400.0, now - 400.0))
+        # Other worker is actively writing in a sibling tree under the root.
+        os.utime(canonical / "worktrees" / "other-dispatch" / "busy.py", (now - 5.0, now - 5.0))
+        _write_dispatch_record(
+            tmp,
+            dispatch_id=DISPATCH_ID,
+            project_root=canonical,
+            worker_cwd=worker,
+        )
+        status = tmp / "watcher.status.json"
+        argv = [
+            "goalflight_watch.py",
+            "--pid",
+            "424242",
+            "--tail",
+            str(tail),
+            "--status-json",
+            str(status),
+            "--dispatch-id",
+            DISPATCH_ID,
+            "--poll-secs",
+            str(POLL_SECS),
+            "--max-idle-secs",
+            "999999",
+            "--wedge-idle-secs",
+            "300",
+            "--project-root",
+            str(canonical),
+            "--agent",
+            "grok",
+        ]
+
+        def on_poll(index: int, tail_path: Path) -> None:
+            if index == 2:
+                tail_path.write_text(
+                    "STATUS: investigating mid-sentence\n"
+                    f"COMPLETE: {DISPATCH_ID} — recovered\n",
+                    encoding="utf-8",
+                )
+                return
+            if index > 6:
+                raise AssertionError("watcher did not observe the terminal marker")
+
+        rc, payloads, output = _run_wedge_watcher(
+            argv,
+            tmp,
+            tree=worker,
+            cpu_samples=[{424242: 12.0}, {424242: 12.0}, {424242: 12.0}, {424242: 12.0}],
+            on_poll_sleep=on_poll,
+        )
+        wedged = [p for p in payloads if p.get("state") == "worker_stalled_candidate"]
+        assert wedged, [p.get("state") for p in payloads]
+        evidence = wedged[0].get("wedge_evidence") or {}
+        tree_leg = wedged[0].get("wedge_tree_leg") or evidence
+        scan_root = str(
+            tree_leg.get("scan_root") or evidence.get("tree_scan_root") or ""
+        )
+        assert str(worker) in scan_root or Path(scan_root).resolve() == worker.resolve(), (
+            scan_root,
+            worker,
+        )
+        assert str(canonical) != scan_root
+        assert "WATCHER-STALL-CANDIDATE " in output
+        assert rc == 0
+
+
+def test_watcher_loop_root_rooted_record_is_indeterminate() -> None:
+    """cwd == canonical root: do not read other workers' writes as this life."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        canonical, _worker, src = _dual_tree_layout(tmp)
+        # Root-rooted dispatch: the worker cwd IS the shared root.
+        root_file = canonical / "app.py"
+        root_file.write_text("print(1)\n", encoding="utf-8")
+        tail = tmp / "worker.tail"
+        tail.write_text("STATUS: maybe stuck\n", encoding="utf-8")
+        now = time.time()
+        os.utime(src, (now - 400.0, now - 400.0))
+        os.utime(root_file, (now - 400.0, now - 400.0))
+        os.utime(tail, (now - 400.0, now - 400.0))
+        _write_dispatch_record(
+            tmp,
+            dispatch_id=DISPATCH_ID,
+            project_root=canonical,
+            worker_cwd=canonical,
+        )
+        status = tmp / "watcher.status.json"
+        argv = [
+            "goalflight_watch.py",
+            "--pid",
+            "424242",
+            "--tail",
+            str(tail),
+            "--status-json",
+            str(status),
+            "--dispatch-id",
+            DISPATCH_ID,
+            "--poll-secs",
+            str(POLL_SECS),
+            "--max-idle-secs",
+            "999999",
+            "--wedge-idle-secs",
+            "300",
+            "--project-root",
+            str(canonical),
+            "--agent",
+            "grok",
+        ]
+
+        def on_poll(index: int, tail_path: Path) -> None:
+            if index == 2:
+                tail_path.write_text(
+                    "STATUS: maybe stuck\n"
+                    f"COMPLETE: {DISPATCH_ID} — done\n",
+                    encoding="utf-8",
+                )
+                return
+            if index > 6:
+                raise AssertionError("watcher did not observe the terminal marker")
+
+        rc, payloads, output = _run_wedge_watcher(
+            argv,
+            tmp,
+            tree=canonical,
+            cpu_samples=[{424242: 4.0}, {424242: 4.0}, {424242: 4.0}],
+            on_poll_sleep=on_poll,
+        )
+        assert all(p.get("state") != "worker_stalled_candidate" for p in payloads), [
+            p.get("state") for p in payloads
+        ]
+        assert "WATCHER-STALL-CANDIDATE " not in output, output
+        legs = [p.get("wedge_tree_leg") for p in payloads if p.get("wedge_tree_leg")]
+        assert legs, "indeterminate tree leg must be named in the payload"
+        assert legs[0].get("kind") == "indeterminate"
+        assert rc == 0
+
+
+def test_watcher_restart_does_not_reannounce_candidate() -> None:
+    """P2: persist announcement in the status sidecar so a restart is silent."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        canonical, worker, src = _dual_tree_layout(tmp)
+        tail = tmp / "worker.tail"
+        tail.write_text("STATUS: investigating mid-senten", encoding="utf-8")
+        now = time.time()
+        os.utime(src, (now - 400.0, now - 400.0))
+        os.utime(tail, (now - 400.0, now - 400.0))
+        os.utime(canonical / "worktrees" / "other-dispatch" / "busy.py", (now - 5.0, now - 5.0))
+        _write_dispatch_record(
+            tmp,
+            dispatch_id=DISPATCH_ID,
+            project_root=canonical,
+            worker_cwd=worker,
+        )
+        status = tmp / "watcher.status.json"
+        status.write_text(
+            json.dumps(
+                {
+                    "schema": "goalflight.status.v1",
+                    "dispatch_id": DISPATCH_ID,
+                    "state": "worker_stalled_candidate",
+                    "reason": "worker_stalled_candidate",
+                    "wedge_watch": {
+                        "cputime_sample": {"424242": 12.0},
+                        "cputime_sampled_at": now - 8.0,
+                        "candidate_announced_at": now - 120.0,
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        argv = [
+            "goalflight_watch.py",
+            "--pid",
+            "424242",
+            "--tail",
+            str(tail),
+            "--status-json",
+            str(status),
+            "--dispatch-id",
+            DISPATCH_ID,
+            "--poll-secs",
+            str(POLL_SECS),
+            "--max-idle-secs",
+            "999999",
+            "--wedge-idle-secs",
+            "300",
+            "--project-root",
+            str(canonical),
+            "--agent",
+            "grok",
+        ]
+
+        def on_poll(index: int, tail_path: Path) -> None:
+            if index == 2:
+                tail_path.write_text(
+                    "STATUS: investigating mid-sentence\n"
+                    f"COMPLETE: {DISPATCH_ID} — recovered\n",
+                    encoding="utf-8",
+                )
+                return
+            if index > 6:
+                raise AssertionError("watcher did not observe the terminal marker")
+
+        rc, payloads, output = _run_wedge_watcher(
+            argv,
+            tmp,
+            tree=worker,
+            cpu_samples=[{424242: 12.0}, {424242: 12.0}, {424242: 12.0}],
+            on_poll_sleep=on_poll,
+        )
+        assert "WATCHER-STALL-CANDIDATE " not in output, output
+        assert any(p.get("state") == "worker_stalled_candidate" for p in payloads), [
+            p.get("state") for p in payloads
+        ]
+        assert rc == 0
+
+
+def test_watcher_spawn_argv_passes_worker_cwd_distinct_from_project_root() -> None:
+    """Launcher wiring the review found untested: cwd is not the collapsed root."""
+    import goalflight_dispatch as dispatch
+
+    argv = dispatch._watcher_spawn_argv(
+        worker_pid=1,
+        tail=Path("/tmp/t"),
+        status_json=Path("/tmp/s"),
+        agent="grok",
+        poll_secs=2.0,
+        max_idle_secs=900.0,
+        dispatch_id="d",
+        pgid=1,
+        project_root=Path("/repo"),
+        worker_cwd=Path("/repo/worktrees/d"),
+    )
+    assert "--worker-cwd" in argv, argv
+    assert argv[argv.index("--worker-cwd") + 1] == "/repo/worktrees/d"
+    assert argv[argv.index("--project-root") + 1] == "/repo"
+    assert argv[argv.index("--worker-cwd") + 1] != argv[argv.index("--project-root") + 1]
+
+
+def test_watcher_restart_reuses_persisted_cpu_sample() -> None:
+    """P2: last CPU sample lives in the sidecar, not only in RAM."""
+    persisted = watch.load_wedge_watch_state(
+        {
+            "wedge_watch": {
+                "cputime_sample": {"424242": 12.0},
+                "cputime_sampled_at": 1_700_000_000.0,
+                "candidate_announced_at": 1_700_000_090.0,
+            }
+        }
+    )
+    assert persisted["cputime_sample"] == {424242: 12.0}
+    assert persisted["cputime_sampled_at"] == 1_700_000_000.0
+    assert persisted["candidate_announced_at"] == 1_700_000_090.0
+    dumped = watch.dump_wedge_watch_state(
+        cputime_sample={424242: 12.5},
+        cputime_sampled_at=1_700_000_010.0,
+        candidate_announced_at=None,
+    )
+    assert dumped["cputime_sample"] == {"424242": 12.5}
+    assert dumped["candidate_announced_at"] is None
+
+
 def main() -> None:
     test_true_positive_all_three_legs_is_stall_candidate()
     test_default_sustain_is_fifteen_minutes_not_five()
@@ -556,6 +928,15 @@ def main() -> None:
     test_watcher_loop_true_positive_emits_once_and_stays_alive()
     test_watcher_loop_recent_tree_write_never_wedges()
     test_cputime_delta_pairs_pids_instead_of_group_sum()
+    test_tree_leg_scans_distinct_worker_cwd_not_canonical_root()
+    test_tree_leg_indeterminate_when_cwd_is_canonical_root()
+    test_tree_leg_indeterminate_when_worker_cwd_missing()
+    test_chunk_summary_treats_stall_candidate_as_live_not_missing()
+    test_watcher_loop_quiet_worktree_flags_despite_busy_canonical_root()
+    test_watcher_loop_root_rooted_record_is_indeterminate()
+    test_watcher_restart_does_not_reannounce_candidate()
+    test_watcher_restart_reuses_persisted_cpu_sample()
+    test_watcher_spawn_argv_passes_worker_cwd_distinct_from_project_root()
     print("OK: watch worker-wedge tests pass")
 
 
