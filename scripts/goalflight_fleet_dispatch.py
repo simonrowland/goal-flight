@@ -1065,6 +1065,7 @@ def execute_dispatch(
     )
     if stub_terminal:
         import goalflight_ledger as ledger
+        import goalflight_terminal
 
         write_terminal_mirror(fleet_dir, preview)
         register_dispatch_meta(
@@ -1082,8 +1083,28 @@ def execute_dispatch(
         )
         with ledger.StateLock():
             record = json.loads(Path(ledger_info["path"]).read_text())
-            record["state"] = "complete"
-            record["ended_at"] = ledger.utc_now()
+            committed = ledger.commit_terminal_authority(
+                record,
+                state="complete",
+                reason=None,
+                terminal_state="complete",
+                worker_still_alive=False,
+            )
+            if not committed.committed or committed.value is None:
+                raise DispatchError(
+                    f"stub terminal journal commit deferred: {committed.reason or committed.disposition.value}"
+                )
+            winner = committed.value
+            record["state"] = str(winner.observation.get("state") or winner.terminal_state)
+            record["terminal_state"] = winner.terminal_state
+            record["liveness_state"] = goalflight_terminal.terminal_liveness_state(
+                record["state"]
+            )
+            record["worker_still_alive"] = False
+            record["attempt_id"] = winner.attempt_id
+            record["transition_id"] = winner.transition_id
+            record["terminal_event_uuid"] = winner.event_uuid
+            ledger.preserve_first_terminal_time(record, winner.terminal_at)
             ledger.write_record(record)
         import goalflight_fleet_reconcile as fleet_reconcile
 

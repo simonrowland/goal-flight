@@ -552,6 +552,50 @@ def test_same_time_completion_deferral_is_bounded_then_restores_for_launch() -> 
             assert not claim.exists()
 
 
+def test_authority_read_failure_never_uses_equality_escape_and_surfaces() -> None:
+    import goalflight_task
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            entry = {
+                **_linked_task_entry(
+                    tmp,
+                    "permanently-unreadable-authority",
+                    created_at="2026-01-02T01:00:00+00:00",
+                ),
+                "dispatch_argv": ["--agent", "test-dispatch"],
+                "queue_launch_token": "unreadable-authority-token",
+                "request": {
+                    "cwd": str(tmp),
+                    "tail": str(tmp / "unreadable-authority.tail"),
+                    "task_ids": ["t-b212"],
+                },
+            }
+            claim = queue / f"{entry['dispatch_id']}.json.claimed-1"
+            claim.write_text(json.dumps(entry), encoding="utf-8")
+            original_load = goalflight_task.TaskStore.load_items
+            goalflight_task.TaskStore.load_items = lambda *_args, **_kwargs: (
+                _ for _ in ()
+            ).throw(OSError("injected permanent task-store failure"))
+            try:
+                for _attempt in range(D.MAX_COMPLETION_AUTHORITY_DEFERRALS + 2):
+                    result = D._recover_claimed_queue_entries(queue, stale_s=0)
+                    assert result["restored"] == 0, result
+                    assert result["pending_launch"] == 1, result
+                    assert any(
+                        detail.get("reason") == "completion_authority_unavailable"
+                        for detail in result["pending_reasons"]
+                    ), result
+                    parked = json.loads(claim.read_text(encoding="utf-8"))
+                    assert "completion_authority_deferral_count" not in parked, parked
+                    assert not (queue / f"{entry['dispatch_id']}.json").exists()
+            finally:
+                goalflight_task.TaskStore.load_items = original_load
+
+
 def test_prior_store_completion_does_not_supersede_deliberate_follow_up() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -5069,6 +5113,7 @@ def test_round5_authority_errors_defer_before_restore() -> None:
         old_env = os.environ.copy()
         original_load = goalflight_task.TaskStore.load_items
         original_read_records = D.goalflight_ledger.read_records
+        original_find_record = D._find_dispatch_record
         try:
             os.environ.clear()
             os.environ.update(_b065_env(tmp))
@@ -5105,9 +5150,21 @@ def test_round5_authority_errors_defer_before_restore() -> None:
             )
             ledger_error = D._entry_completion_authority(entry, record={})
             assert ledger_error and ledger_error["state"] == "deferred", ledger_error
+            assert ledger_error["reason"] == "completion_authority_unavailable", ledger_error
+            assert ledger_error["bounded_deferral"] is False, ledger_error
+
+            D.goalflight_ledger.read_records = original_read_records
+            D._find_dispatch_record = lambda _dispatch_id: (_ for _ in ()).throw(
+                OSError("injected ledger row failure")
+            )
+            row_error = D._entry_completion_authority(entry)
+            assert row_error and row_error["state"] == "deferred", row_error
+            assert row_error["reason"] == "completion_authority_unavailable", row_error
+            assert row_error["bounded_deferral"] is False, row_error
         finally:
             goalflight_task.TaskStore.load_items = original_load
             D.goalflight_ledger.read_records = original_read_records
+            D._find_dispatch_record = original_find_record
             os.environ.clear()
             os.environ.update(old_env)
 
@@ -5322,6 +5379,7 @@ def main() -> None:
     test_prior_ledger_completion_does_not_supersede_deliberate_follow_up()
     test_same_time_ledger_completion_defers_ambiguous_ordering()
     test_same_time_completion_deferral_is_bounded_then_restores_for_launch()
+    test_authority_read_failure_never_uses_equality_escape_and_surfaces()
     test_prior_store_completion_does_not_supersede_deliberate_follow_up()
     test_later_store_completion_still_supersedes_queued_duplicate()
     test_missing_ledger_completion_time_defers_supersession()

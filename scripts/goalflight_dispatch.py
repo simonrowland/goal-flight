@@ -6903,22 +6903,22 @@ def _task_row_completion_timestamp_s(row: dict | None) -> float | None:
     return None
 
 
-def _completion_is_after_entry(
+def _completion_order(
     completion_timestamp_s: float | None,
     entry_created_timestamp_s: float | None,
-) -> bool | None:
+) -> str:
     # Missing or malformed time is neither "older" nor "not older". Defer the
     # authority decision instead of guessing: treating a missing entry time as
     # old would silently drop deliberate follow-ups, while treating a missing
     # completion time as old could launch a genuine queued duplicate.
     if completion_timestamp_s is None or entry_created_timestamp_s is None:
-        return None
+        return "indeterminate"
     if completion_timestamp_s == entry_created_timestamp_s:
         # Equal wall-clock values do not prove event order. Current writers use
         # whole-second timestamps, and legacy records may have the same coarse
         # precision, so fail closed instead of superseding an ambiguous entry.
-        return None
-    return completion_timestamp_s > entry_created_timestamp_s
+        return "equal"
+    return "after" if completion_timestamp_s > entry_created_timestamp_s else "before"
 
 
 def _ledger_task_ids_advanced(
@@ -6926,18 +6926,19 @@ def _ledger_task_ids_advanced(
     *,
     self_dispatch_id: str,
     entry_created_timestamp_s: float | None = None,
-) -> tuple[int, int, bool]:
-    """Return counts plus whether ledger authority was read conclusively."""
+) -> tuple[int, int, str]:
+    """Return counts plus the typed reason ledger authority is inconclusive."""
     if not task_ids:
-        return 0, 0, True
+        return 0, 0, "conclusive"
     wanted = set(task_ids)
     complete_tasks: set[str] = set()
     advanced_tasks: set[str] = set()
-    unknown_completion_tasks: set[str] = set()
+    equal_completion_tasks: set[str] = set()
+    indeterminate_completion_tasks: set[str] = set()
     try:
         records = goalflight_ledger.read_records()
     except Exception:
-        return 0, 0, False
+        return 0, 0, "ledger_unavailable"
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -6959,14 +6960,17 @@ def _ledger_task_ids_advanced(
             or state == "complete"
             or terminal == "complete"
         ):
-            completion_is_current = _completion_is_after_entry(
+            completion_order = _completion_order(
                 _parse_timestamp_s(record.get("ended_at")),
                 entry_created_timestamp_s,
             )
-            if completion_is_current is None:
-                unknown_completion_tasks |= overlap
+            if completion_order == "equal":
+                equal_completion_tasks |= overlap
                 continue
-            if not completion_is_current:
+            if completion_order == "indeterminate":
+                indeterminate_completion_tasks |= overlap
+                continue
+            if completion_order != "after":
                 continue
             complete_tasks |= overlap
             advanced_tasks |= overlap
@@ -6979,25 +6983,32 @@ def _ledger_task_ids_advanced(
         if state and not goalflight_dispatch_states.is_terminal_state(state):
             if state not in {"queued", "waiting_capacity", "submitted"}:
                 advanced_tasks |= overlap
-    unresolved_unknowns = unknown_completion_tasks - complete_tasks
-    return len(complete_tasks), len(advanced_tasks), not unresolved_unknowns
+    unresolved_indeterminate = indeterminate_completion_tasks - complete_tasks
+    unresolved_equal = equal_completion_tasks - complete_tasks
+    if unresolved_indeterminate:
+        conclusion = "timestamp_indeterminate"
+    elif unresolved_equal:
+        conclusion = "timestamp_equal"
+    else:
+        conclusion = "conclusive"
+    return len(complete_tasks), len(advanced_tasks), conclusion
 
 
-def _linked_task_truth(
+def _linked_task_truth_detail(
     entry: dict,
     record: dict | None = None,
     *,
     task_store_locked: bool = False,
-) -> str:
-    """Return all_complete | some_advanced | none | indeterminate | unlinked."""
+) -> tuple[str, str | None, tuple[str, ...]]:
+    """Return task truth plus a typed indeterminate cause and its sources."""
     task_ids = _entry_task_ids(entry, record)
     if not task_ids:
-        return "unlinked"
+        return "unlinked", None, ()
     project_root = _project_root_for_entry(entry, record)
     entry_created_timestamp_s = _parse_timestamp_s(entry.get("created_at"))
     store_complete = 0
     store_seen = 0
-    store_conclusive = True
+    store_issue: str | None = None
     try:
         root = SCRIPT_DIR.parent
         if str(root) not in sys.path:
@@ -7017,13 +7028,16 @@ def _linked_task_truth(
                 continue
             store_seen += 1
             if _task_row_durably_complete(row):
-                completion_is_current = _completion_is_after_entry(
+                completion_order = _completion_order(
                     _task_row_completion_timestamp_s(row),
                     entry_created_timestamp_s,
                 )
-                if completion_is_current is None:
-                    store_conclusive = False
-                elif completion_is_current:
+                if completion_order == "equal":
+                    if store_issue is None:
+                        store_issue = "timestamp_equal"
+                elif completion_order == "indeterminate":
+                    store_issue = "timestamp_indeterminate"
+                elif completion_order == "after":
                     store_complete += 1
     except (ImportError, OSError):
         # Missing/unavailable task-store bytes make completion indeterminate.
@@ -7031,10 +7045,10 @@ def _linked_task_truth(
         # must not masquerade as a retryable authority result.
         store_complete = 0
         store_seen = 0
-        store_conclusive = False
+        store_issue = "task_store_unavailable"
 
     self_id = str(entry.get("dispatch_id") or (record or {}).get("dispatch_id") or "")
-    ledger_complete, ledger_advanced, ledger_conclusive = _ledger_task_ids_advanced(
+    ledger_complete, ledger_advanced, ledger_issue = _ledger_task_ids_advanced(
         task_ids,
         self_dispatch_id=self_id,
         entry_created_timestamp_s=entry_created_timestamp_s,
@@ -7042,28 +7056,54 @@ def _linked_task_truth(
 
     # Prefer explicit store truth when every linked id is present and complete.
     if store_seen == len(task_ids) and store_complete == len(task_ids):
-        return "all_complete"
+        return "all_complete", None, ()
     if ledger_complete >= len(task_ids):
-        return "all_complete"
+        return "all_complete", None, ()
     # Mix of store + ledger completions covering all ids.
     if store_complete + ledger_complete >= len(task_ids) and (store_complete > 0 or ledger_complete > 0):
         # Conservative: only when store_complete alone is full, or ledger alone.
         # Partial overlap of different ids is handled by some_advanced below.
         covered = store_complete  # already counted store-complete ids
         if covered >= len(task_ids):
-            return "all_complete"
+            return "all_complete", None, ()
 
     advanced = max(store_complete, ledger_advanced, ledger_complete)
     # Also treat partial store completion as advanced.
     if store_complete > 0 and store_complete < len(task_ids):
-        return "some_advanced"
+        return "some_advanced", None, ()
     if 0 < advanced < len(task_ids) or (ledger_advanced > 0 and ledger_complete < len(task_ids)):
-        return "some_advanced"
+        return "some_advanced", None, ()
     if store_complete >= len(task_ids) or ledger_complete >= len(task_ids):
-        return "all_complete"
-    if not store_conclusive or not ledger_conclusive:
-        return "indeterminate"
-    return "none"
+        return "all_complete", None, ()
+    issues = tuple(
+        issue
+        for issue in (store_issue, ledger_issue if ledger_issue != "conclusive" else None)
+        if issue is not None
+    )
+    if issues:
+        if any(issue.endswith("_unavailable") for issue in issues):
+            cause = "authority_unavailable"
+        elif "timestamp_indeterminate" in issues:
+            cause = "timestamp_indeterminate"
+        else:
+            cause = "timestamp_equal"
+        return "indeterminate", cause, issues
+    return "none", None, ()
+
+
+def _linked_task_truth(
+    entry: dict,
+    record: dict | None = None,
+    *,
+    task_store_locked: bool = False,
+) -> str:
+    """Compatibility projection of the typed linked-task authority result."""
+    truth, _cause, _sources = _linked_task_truth_detail(
+        entry,
+        record,
+        task_store_locked=task_store_locked,
+    )
+    return truth
 
 
 def _entry_completion_authority(
@@ -7086,9 +7126,12 @@ def _entry_completion_authority(
         except Exception:
             return {
                 "state": "deferred",
-                "reason": "ledger_authority_indeterminate",
+                "reason": "completion_authority_unavailable",
                 "marker": None,
                 "source": "authority",
+                "indeterminate_cause": "authority_unavailable",
+                "indeterminate_sources": ["ledger_record_unavailable"],
+                "bounded_deferral": False,
             }
 
     # Leg 0: already-terminal ledger for this dispatch (first-terminal-wins).
@@ -7124,7 +7167,11 @@ def _entry_completion_authority(
         # Declared artifacts missing → not completion authority; fall through.
 
     # Leg 3: linked task store / later-pass durable completion.
-    task_truth = _linked_task_truth(entry, record, task_store_locked=task_store_locked)
+    task_truth, indeterminate_cause, indeterminate_sources = _linked_task_truth_detail(
+        entry,
+        record,
+        task_store_locked=task_store_locked,
+    )
     if task_truth == "all_complete":
         return {
             "state": "superseded",
@@ -7142,7 +7189,8 @@ def _entry_completion_authority(
             "salvage_required": True,
         }
     if task_truth == "indeterminate":
-        if (
+        bounded_equality = indeterminate_cause == "timestamp_equal"
+        if bounded_equality and (
             _completion_authority_deferral_count(entry)
             >= MAX_COMPLETION_AUTHORITY_DEFERRALS
         ):
@@ -7150,13 +7198,30 @@ def _entry_completion_authority(
             # fixed timestamp can make the next read more decisive, so restore
             # for launch: duplicate work is recoverable; a lost follow-up is not.
             return None
+        # An unreadable authority never consumes equality's escape budget. Its
+        # carrier remains parked, and recovery reports the distinct unavailable
+        # reason on every pass until the store/ledger can be read again.
+        reason = (
+            "completion_authority_unavailable"
+            if indeterminate_cause == "authority_unavailable"
+            else "completion_authority_indeterminate"
+        )
         return {
             "state": "deferred",
-            "reason": "completion_authority_indeterminate",
+            "reason": reason,
             "marker": None,
             "source": "authority",
-            "deferral_count": _completion_authority_deferral_count(entry),
-            "deferral_limit": MAX_COMPLETION_AUTHORITY_DEFERRALS,
+            "indeterminate_cause": indeterminate_cause,
+            "indeterminate_sources": list(indeterminate_sources),
+            "bounded_deferral": bounded_equality,
+            **(
+                {
+                    "deferral_count": _completion_authority_deferral_count(entry),
+                    "deferral_limit": MAX_COMPLETION_AUTHORITY_DEFERRALS,
+                }
+                if bounded_equality
+                else {}
+            ),
         }
     return None
 
@@ -7175,6 +7240,10 @@ def _completion_decision_blocks_restore(decision: dict | None) -> bool:
 
 def _completion_decision_is_deferred(decision: dict | None) -> bool:
     return isinstance(decision, dict) and decision.get("state") == "deferred"
+
+
+def _completion_decision_uses_bounded_deferral(decision: dict | None) -> bool:
+    return _completion_decision_is_deferred(decision) and decision.get("bounded_deferral") is True
 
 
 # Removed _task_store_mutation_lock: the bounded Q→S→L transaction now owns reconciliation lock ordering.
@@ -7441,7 +7510,7 @@ def _sanitize_restore_envelope(entry: dict, *, increment_recovery_count: bool) -
 
 
 def _persist_completion_authority_deferral(claim: Path, entry: dict) -> int | None:
-    """Persist the bounded ambiguity budget on the durable queue carrier."""
+    """Persist exact-timestamp-equality's bounded ambiguity budget."""
     staged = dict(entry)
     count = min(
         MAX_COMPLETION_AUTHORITY_DEFERRALS,
@@ -7476,6 +7545,8 @@ def _commit_restore_transaction(
     record = _find_dispatch_record(str(fresh.get("dispatch_id") or ""))
     decision = _entry_completion_authority(fresh, task_store_locked=txn.task_store_locked)
     if _completion_decision_is_deferred(decision):
+        if not _completion_decision_uses_bounded_deferral(decision):
+            return None, {**decision, "deferral_persisted": False}
         persisted_count = _persist_completion_authority_deferral(claim, fresh)
         return None, {
             **decision,
@@ -8083,6 +8154,13 @@ def _reconcile_claim_transaction(
         )
         if _completion_decision_blocks_restore(decision):
             if _completion_decision_is_deferred(decision):
+                if not _completion_decision_uses_bounded_deferral(decision):
+                    return _ClaimReconcileResult(
+                        "pending",
+                        pending_reason=str(
+                            decision.get("reason") or "completion_authority_deferred"
+                        ),
+                    )
                 persisted_count = _persist_completion_authority_deferral(
                     claim,
                     fresh,
@@ -9259,6 +9337,10 @@ def commit_reconciled_terminal(
         record["attempt_id"] = committed.value.attempt_id
         record["transition_id"] = committed.value.transition_id
         record["terminal_event_uuid"] = committed.value.event_uuid
+        goalflight_ledger.preserve_first_terminal_time(
+            record,
+            committed.value.terminal_at,
+        )
         try:
             goalflight_ledger.write_record(record)
         except OSError:

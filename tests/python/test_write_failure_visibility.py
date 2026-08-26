@@ -646,7 +646,11 @@ def test_task_publish_recovery_distinguishes_contract_from_transient(
             raise AssertionError("recovery failure should stop the store read")
 
     monkeypatch.setattr(sys.modules["goalflight_task"], "TaskStore", FailingStore)
-    monkeypatch.setattr(dispatch, "_ledger_task_ids_advanced", lambda *_args, **_kwargs: (0, 0, True))
+    monkeypatch.setattr(
+        dispatch,
+        "_ledger_task_ids_advanced",
+        lambda *_args, **_kwargs: (0, 0, "conclusive"),
+    )
     call = lambda: dispatch._linked_task_truth(
         {"dispatch_id": "task-write", "task_ids": ["t-1"], "project_root": str(tmp_path)},
         task_store_locked=True,
@@ -838,10 +842,16 @@ def test_reconciled_terminal_write_distinguishes_contract_from_transient(
             value=_terminal_winner(state),
         ),
     )
+    writes: list[dict] = []
+
+    def fail_write(record: dict) -> None:
+        writes.append(dict(record))
+        raise error
+
     monkeypatch.setattr(
         dispatch.goalflight_ledger,
         "write_record",
-        lambda _record: (_ for _ in ()).throw(error),
+        fail_write,
     )
     call = lambda: dispatch.commit_reconciled_terminal(
         txn,
@@ -855,6 +865,9 @@ def test_reconciled_terminal_write_distinguishes_contract_from_transient(
         result = call()
         assert result.kind is dispatch.TerminalCommitKind.DEFERRED
         assert result.committed is False
+    assert writes
+    if existing:
+        assert writes[0]["ended_at"] == "2026-01-01T00:00:00+00:00"
 
 
 @pytest.mark.parametrize(
@@ -994,7 +1007,7 @@ def test_nested_shutdown_handlers_remain_visible_and_mutation_sensitive() -> Non
         dispatch._start_dashboard_refresh_for_project
     )
     assert "except (ImportError, OSError):" in inspect.getsource(
-        dispatch._linked_task_truth
+        dispatch._linked_task_truth_detail
     )
     assert "except OSError as exc:" in inspect.getsource(
         dispatch._maybe_requeue_terminal_claim
