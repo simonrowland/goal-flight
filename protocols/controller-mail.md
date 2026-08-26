@@ -136,7 +136,7 @@ The supervisor's child-exit taxonomy:
 | short-lived fault (exit 2 after arming) | restart with backoff: 1s, 2s, … cap 120s; reset after a long-lived run |
 | did-not-arm (leftover watchdog/stream lock, regular-file stdout — explicit markers, never a missed flock sample) | stop **that slot**, emit `type=stop` `scope=slot`; siblings keep running |
 | three consecutive short non-journal exit-2 deaths | stop **that slot** as `permanent-exit-2` (visible, not healthy); do not absorb into silent backoff; does not use a sampled `armed` flag |
-| dead lease nonce (capability-mismatch, `lease-nonce-not-live`, vanished live session) | stop the supervisor, emit `type=stop` `scope=supervisor`, exit 3 |
+| dead lease nonce (capability-mismatch, `lease-nonce-not-live`, vanished live session; child listen/follow exit 5, even with empty stderr) | stop the supervisor, emit `type=stop` `scope=supervisor`, exit 3 |
 
 A dead lease nonce is re-read through `goalflight_session_status.probe_live_session`
 (the non-locking journal reader), never the write `Journal()` constructor and never
@@ -349,9 +349,11 @@ The portable steady-state loop is:
    cannot own four doorbells).
 2. One rings; use `relay --drain` when its headlines settle every item, or peek,
    process bodies, and advance explicitly.
-3. Re-arm toward target: the listen exit (and a lease claim while work is
-   in flight) prints the exact remaining-depth commands, numbered, one
-   per missing slot. Issue each as its own tracked background task.
+3. Re-arm toward target on a ring (exit 0): the listen exit (and a lease
+   claim while work is in flight) prints the exact remaining-depth
+   commands, numbered, one per missing slot. Issue each as its own
+   tracked background task. Exit 5 is settled did-not-arm — do not re-arm
+   that nonce. Exit 2 is retryable journal unreadability, not a dead nonce.
 
 Never advance before processing is settled. If all slots are occupied, startup
 reports their exact PIDs and says not to kill by pattern. If all listeners have rung
@@ -371,9 +373,10 @@ Supervisors must branch on the listener's exit code instead of blindly restartin
 |---:|---|---|
 | 0 | Ring: waking mail won the cursor-version claim. | Process the reported or authoritative mail, advance only settled positions, then issue each printed remaining-depth command as its own tracked background task. |
 | 1 | Timeout: no waking event arrived before the requested deadline. | Treat it as a clean timer expiry; re-arm only when ongoing coverage is still required. |
-| 2 | Infrastructure or corruption failure. | Preserve the one-line diagnostic, repair or escalate the journal/wake substrate, and avoid a restart loop until the fault is cleared. |
+| 2 | Infrastructure or corruption failure, including an unreadable journal or holder witness. Retryable; not a dead nonce. | Preserve the one-line diagnostic, repair or escalate the journal/wake substrate, and avoid a restart loop until the fault is cleared. |
 | 3 | Contention, supersession, orphaning, or stale lease. | Reconcile the active lease and held slot PIDs; do not kill by pattern, and re-arm only under the current lease. |
 | 4 | Detached-listener refusal: its exit cannot wake a tracked controller. | Use the emitted command to launch a tracked background listener; do not detach it again. |
+| 5 | Did-not-arm: the lease nonce is known-dead or does not match the live session. This process never waited. | Do not treat as a ring and do not re-arm this nonce; the stderr reason names the settled cause (`lease-nonce-not-live`, capability mismatch, or no live lease). |
 | 128+N | POSIX signal N. On macOS 144 is SIGURG (16). | SIGURG is logged and the listener stays alive (kernel default is discard). A terminating signal prints who/why, releases the slot, and exits 128+N. Empty 144 is a harness report, not this refusal. |
 
 The held-lock ledger, not coverage rows or `ps` output, drives the missing-listener

@@ -146,8 +146,13 @@ def classify_child_exit(
 
     ``armed`` is a positive observation (child stdout or a sampled flock).
     A missed sample is a false negative and must re-arm, never stop: exit 0
-    without an explicit did-not-arm marker is "rang". Journal unreadability
-    is retryable and is never collapsed into a dead nonce.
+    without an explicit did-not-arm marker is "rang". Exit 5 is settled
+    never-armed (dead or missing lease) and is supervisor-wide even with
+    empty stderr: leftover-lock / regular-file did-not-arm is a slot stop
+    identified by the markers above (typically exit 3). Mapping bare exit 5
+    onto the slot-stop reason made the same dead-nonce condition two
+    outcomes depending on whether a marker was captured. Journal
+    unreadability is retryable and is never collapsed into a dead nonce.
 
     Watch-follow return-3 sites: leftover watchdog lock is did-not-arm;
     stale-lease is a dead nonce. Parent-changed and controlling-stdout-closed
@@ -173,6 +178,13 @@ def classify_child_exit(
         return ACTION_BACKOFF, "orphaned-stdout"
     if returncode == 0:
         return ACTION_REARM, "rang"
+    # LISTENER_DID_NOT_ARM_EXIT: the child never waited because the lease
+    # is known-dead or missing. That is supervisor-wide (do not re-arm this
+    # nonce), not a per-slot leftover-lock. Marker checks above still win
+    # so an explicit leftover-lock diagnostic stays a slot stop even if a
+    # child somehow also used this code.
+    if returncode == 5:
+        return ACTION_STOP, "dead-lease-nonce"
     if returncode == 3:
         return ACTION_BACKOFF, "exit-3-unclassified"
     return ACTION_BACKOFF, f"exit-{returncode}"

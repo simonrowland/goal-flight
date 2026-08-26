@@ -175,8 +175,10 @@ own death or host-reaping of every tracked task. Together they are persistent co
 `live/8`, detectable but not reap-proof.
 On hosts without a persistent stdout
 monitor, a tracked generation-bound `listen` pool remains the portable path. A
-doorbell exit triggers `relay --new --json`; the controller processes chosen items,
-CAS-advances their server-known positions, then re-arms.
+doorbell exit 0 triggers `relay --new --json`; the controller processes chosen items,
+CAS-advances their server-known positions, then re-arms. Exit 5 is settled
+did-not-arm (dead or mismatched lease nonce): do not treat it as a ring and do
+not re-arm that nonce. Exit 2 is retryable journal unreadability, not a dead nonce.
 Arm the wait and let work wake it. Any tool call expected to run longer than about 10
 seconds is backgrounded so typed steers remain visible and ESC/Ctrl-C cancels only
 the observer, not the detached worker.

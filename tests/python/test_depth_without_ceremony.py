@@ -406,26 +406,32 @@ def test_listen_auto_genuinely_stale_nonce_remains_distinct(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
     project, env = isolated
-    _claim(project)
+    lease = _claim(project)
     stale_nonce = "genuinely-stale-listener-nonce"
 
-    resolved = messages._resolve_listen_auto_lease(
-        project,
-        controller_label="depth-ctl",
-        explicit_nonce=stale_nonce,
-    )
-    assert resolved == {
-        "claimed": False,
-        "reason": "lease-nonce-not-live",
-        "label": "depth-ctl",
-    }
+    # A live session with a different nonce is the precondition: without a
+    # held lock the session probe is unreadable, which is a different exit.
+    with wake.register_lease_holder(
+        project, controller_label="depth-ctl", lease_nonce=lease.nonce
+    ):
+        resolved = messages._resolve_listen_auto_lease(
+            project,
+            controller_label="depth-ctl",
+            explicit_nonce=stale_nonce,
+        )
+        assert resolved == {
+            "claimed": False,
+            "reason": "lease-nonce-not-live",
+            "label": "depth-ctl",
+        }
 
-    refused = _run(
-        project,
-        env,
-        _listen_auto_cmd(project, label="depth-ctl", nonce=stale_nonce),
-    )
-    assert refused.returncode == 2, refused.stderr
+        refused = _run(
+            project,
+            env,
+            _listen_auto_cmd(project, label="depth-ctl", nonce=stale_nonce),
+        )
+    assert refused.returncode == messages.LISTENER_DID_NOT_ARM_EXIT, refused.stderr
+    assert "did-not-arm" in refused.stderr
     assert "lease-nonce-not-live" in refused.stderr
     assert "UPGRADE_REQUIRED:" not in refused.stderr
 

@@ -253,6 +253,19 @@ def _wait_for_listener(
     raise AssertionError(f"listener for {label} never armed")
 
 
+def _hold_claimed_lease(
+    root: Path, lease: journal.LeaseIdentity
+) -> wake.LeaseHolderRegistration:
+    """Keep the controller lease lock live while a test arms listen/follow."""
+    holder = wake.register_lease_holder(
+        root,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    holder.__enter__()
+    return holder
+
+
 def _configured_pool_size() -> int:
     return wake.listener_slot_count()
 
@@ -526,6 +539,7 @@ def test_unowned_worker_finish_fans_out_and_wakes_registered_controller(
     )
     assert first.committed and first.value is not None
     assert second.committed and second.value is not None
+    lease_holder = _hold_claimed_lease(root, first.value)
     dispatch_env = dict(env)
     for key in (
         "GOALFLIGHT_CONTROLLER_LABEL",
@@ -594,6 +608,7 @@ def test_unowned_worker_finish_fans_out_and_wakes_registered_controller(
             f"seconds={elapsed:.3f} recipients=second-controller,wake-test"
         )
     finally:
+        lease_holder.close()
         if listener.poll() is None:
             listener.kill()
             listener.communicate(timeout=3)
@@ -667,6 +682,7 @@ def test_listener_pool_one_event_pops_exactly_one_real_process(
         "wake-test", principal={"principal_id": "pool-pop-one"}
     )
     assert claimed.committed and claimed.value is not None
+    lease_holder = _hold_claimed_lease(root, claimed.value)
     # Deliberate three-listener arbitration: one event must pop exactly one.
     arbitration_slots = _assert_arbitration_pool_legal(3)
     processes = [
@@ -731,6 +747,7 @@ def test_listener_pool_one_event_pops_exactly_one_real_process(
         assert inverted_compare(7, 7) is True
         assert inverted_compare(7, 8) is False
     finally:
+        lease_holder.close()
         for process in processes:
             if process.poll() is None:
                 process.kill()
@@ -822,64 +839,68 @@ def test_malformed_ring_stamp_does_not_trap_listener_in_exit_two_loop(
         "wake-test", principal={"principal_id": "ring-stamp-listener-recovery"}
     )
     assert claimed.committed and claimed.value is not None
-    _post_notice(
-        root,
-        tmp_path,
-        label="wake-test",
-        dispatch_id="ring-stamp-recovery",
-        text="ring after torn stamp",
-    )
-    stamp = wake._ring_stamp_path(root, controller_label="wake-test")
-    stamp.parent.mkdir(parents=True, exist_ok=True)
-    stamp.write_bytes(b"nonnumeric-torn-write\n")
-
-    first = subprocess.run(
-        _listener_command(
+    lease_holder = _hold_claimed_lease(root, claimed.value)
+    try:
+        _post_notice(
             root,
             tmp_path,
             label="wake-test",
-            nonce=claimed.value.nonce,
-            slots=1,
-            timeout_s=2,
-            report_pending=False,
-        ),
-        cwd=root,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=5,
-        check=False,
-    )
-    assert first.returncode == 0, (first.stdout, first.stderr)
-    recovery_lines = [
-        line for line in first.stderr.splitlines() if "listener ring stamp" in line
-    ]
-    assert len(recovery_lines) == 1
-    assert "listener ring stamp quarantined as " in recovery_lines[0]
-    assert json.loads(first.stdout)["kind"] == "ring"
+            dispatch_id="ring-stamp-recovery",
+            text="ring after torn stamp",
+        )
+        stamp = wake._ring_stamp_path(root, controller_label="wake-test")
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_bytes(b"nonnumeric-torn-write\n")
 
-    # The same still-pending cursor version was stamped by the first listener.
-    # A re-arm therefore times out cleanly instead of repeating exit 2 forever.
-    second = subprocess.run(
-        _listener_command(
-            root,
-            tmp_path,
-            label="wake-test",
-            nonce=claimed.value.nonce,
-            slots=1,
-            timeout_s=0.1,
-            report_pending=False,
-        ),
-        cwd=root,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=5,
-        check=False,
-    )
-    assert second.returncode == 1, (second.stdout, second.stderr)
-    assert "ring stamp" not in second.stderr
-    assert json.loads(second.stdout)["reason"] == "timeout"
+        first = subprocess.run(
+            _listener_command(
+                root,
+                tmp_path,
+                label="wake-test",
+                nonce=claimed.value.nonce,
+                slots=1,
+                timeout_s=2,
+                report_pending=False,
+            ),
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert first.returncode == 0, (first.stdout, first.stderr)
+        recovery_lines = [
+            line for line in first.stderr.splitlines() if "listener ring stamp" in line
+        ]
+        assert len(recovery_lines) == 1
+        assert "listener ring stamp quarantined as " in recovery_lines[0]
+        assert json.loads(first.stdout)["kind"] == "ring"
+
+        # The same still-pending cursor version was stamped by the first listener.
+        # A re-arm therefore times out cleanly instead of repeating exit 2 forever.
+        second = subprocess.run(
+            _listener_command(
+                root,
+                tmp_path,
+                label="wake-test",
+                nonce=claimed.value.nonce,
+                slots=1,
+                timeout_s=0.1,
+                report_pending=False,
+            ),
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert second.returncode == 1, (second.stdout, second.stderr)
+        assert "ring stamp" not in second.stderr
+        assert json.loads(second.stdout)["reason"] == "timeout"
+    finally:
+        lease_holder.close()
 
 
 def test_listener_pool_defaults_to_the_configured_depth(
@@ -929,6 +950,7 @@ def test_entry_hint_grades_crashed_pool_member_and_full_pool_is_silent(
         "wake-test", principal={"principal_id": "pool-depth-hint"}
     )
     assert claimed.committed and claimed.value is not None
+    lease_holder = _hold_claimed_lease(root, claimed.value)
     command = _listener_command(
         root,
         tmp_path,
@@ -991,6 +1013,7 @@ def test_entry_hint_grades_crashed_pool_member_and_full_pool_is_silent(
             wake.DEFAULT_LISTENER_SLOTS - reserve["live_waiters"]
         )
     finally:
+        lease_holder.close()
         for process in processes:
             if process.poll() is None:
                 process.kill()
@@ -1007,6 +1030,7 @@ def test_cursor_advance_with_leftovers_pops_one_more_pool_member(
         "wake-test", principal={"principal_id": "pool-leftovers"}
     )
     assert claimed.committed and claimed.value is not None
+    lease_holder = _hold_claimed_lease(root, claimed.value)
     for dispatch_id in ("leftover-a", "leftover-b"):
         _post_notice(
             root,
@@ -1073,6 +1097,7 @@ def test_cursor_advance_with_leftovers_pops_one_more_pool_member(
         assert sum(process.poll() is None for process in processes) == 1
         assert len(_wait_for_listener_count(root, label="wake-test", count=1)) == 1
     finally:
+        lease_holder.close()
         for process in processes:
             if process.poll() is None:
                 process.kill()
@@ -1089,6 +1114,7 @@ def test_listener_arm_past_target_is_not_refused_then_empty_pool_hint(
         "wake-test", principal={"principal_id": "pool-exhaustion"}
     )
     assert claimed.committed and claimed.value is not None
+    lease_holder = _hold_claimed_lease(root, claimed.value)
     command = _listener_command(
         root,
         tmp_path,
@@ -1151,6 +1177,7 @@ def test_listener_arm_past_target_is_not_refused_then_empty_pool_hint(
         assert status_payload["live_waiters"] == 0
         assert stream.getvalue().startswith("listener pool n=0; start: ")
     finally:
+        lease_holder.close()
         if extra is not None:
             extra.close()
         for process in processes:
@@ -1174,6 +1201,7 @@ def test_listener_arm_has_no_slot_ceiling(
     )
     assert claimed.committed and claimed.value is not None
     nonce = claimed.value.nonce
+    lease_holder = _hold_claimed_lease(root, claimed.value)
     holders: list[wake.WaiterRegistration] = []
     try:
         for expected_slot in range(40):
@@ -1249,6 +1277,7 @@ def test_listener_arm_has_no_slot_ceiling(
         assert "never a full-pool refusal" in help_text.stdout
         assert "not a ceiling" in help_text.stdout
     finally:
+        lease_holder.close()
         for holder in holders:
             holder.close()
 
@@ -1296,6 +1325,7 @@ def test_self_post_does_not_ring_pool_foreign_post_does(
         "wake-test", principal={"principal_id": "self-wake-pool"}
     )
     assert claimed.committed and claimed.value is not None
+    lease_holder = _hold_claimed_lease(root, claimed.value)
     # Two-listener self-vs-foreign arbitration.
     arbitration_slots = _assert_arbitration_pool_legal(2)
     processes = [
@@ -1369,6 +1399,7 @@ def test_self_post_does_not_ring_pool_foreign_post_does(
         _advance_all(authority, label="wake-test", nonce=claimed.value.nonce)
         assert not authority.cursor_peek("wake-test", nonce=claimed.value.nonce).items
     finally:
+        lease_holder.close()
         for process in processes:
             if process.poll() is None:
                 process.kill()
@@ -1386,37 +1417,41 @@ def test_detached_listener_refuses_ppid_one_with_distinct_code_and_one_line(
         "wake-test", principal={"principal_id": "detached-code-test"}
     )
     assert claimed.committed and claimed.value is not None
-    monkeypatch.setenv("GOALFLIGHT_LISTENER_STARTUP_GRACE_S", "0.05")
-    monkeypatch.setattr(messages.os, "getppid", lambda: 1)
-    args = SimpleNamespace(
-        project_root=str(root),
-        controller_label="wake-test",
-        lease_nonce=claimed.value.nonce,
-        poll_secs=0.01,
-        listener_slots=1,
-        timeout_s=2,
-        json=False,
-        report_pending=False,
-    )
+    lease_holder = _hold_claimed_lease(root, claimed.value)
+    try:
+        monkeypatch.setenv("GOALFLIGHT_LISTENER_STARTUP_GRACE_S", "0.05")
+        monkeypatch.setattr(messages.os, "getppid", lambda: 1)
+        args = SimpleNamespace(
+            project_root=str(root),
+            controller_label="wake-test",
+            lease_nonce=claimed.value.nonce,
+            poll_secs=0.01,
+            listener_slots=1,
+            timeout_s=2,
+            json=False,
+            report_pending=False,
+        )
 
-    prior_term = signal.getsignal(signal.SIGTERM)
-    code = messages.cmd_listen(args)
-    captured = capsys.readouterr()
-    assert signal.getsignal(signal.SIGTERM) == prior_term
+        prior_term = signal.getsignal(signal.SIGTERM)
+        code = messages.cmd_listen(args)
+        captured = capsys.readouterr()
+        assert signal.getsignal(signal.SIGTERM) == prior_term
 
-    assert code == messages.DETACHED_LISTENER_EXIT_CODE
-    assert code not in {0, 1, 2, 3}
-    # 144 is POSIX 128+SIGURG on macOS, not the detached refusal.
-    assert code != 144
-    assert messages.DETACHED_LISTENER_EXIT_CODE != 128 + int(signal.SIGURG)
-    assert captured.out == ""
-    lines = captured.err.splitlines()
-    assert len(lines) == 1
-    assert lines[0].startswith(
-        f"DETACHED LISTENER: my exit wakes nobody; kill me (pid {os.getpid()}) "
-        "and re-arm as a tracked background task: "
-    )
-    assert "--report-pending" in lines[0]
+        assert code == messages.DETACHED_LISTENER_EXIT_CODE
+        assert code not in {0, 1, 2, 3, 5}
+        # 144 is POSIX 128+SIGURG on macOS, not the detached refusal.
+        assert code != 144
+        assert messages.DETACHED_LISTENER_EXIT_CODE != 128 + int(signal.SIGURG)
+        assert captured.out == ""
+        lines = captured.err.splitlines()
+        assert len(lines) == 1
+        assert lines[0].startswith(
+            f"DETACHED LISTENER: my exit wakes nobody; kill me (pid {os.getpid()}) "
+            "and re-arm as a tracked background task: "
+        )
+        assert "--report-pending" in lines[0]
+    finally:
+        lease_holder.close()
 
 
 def test_shell_detached_listener_is_reaped_after_startup_grace_real_process(
@@ -1429,6 +1464,7 @@ def test_shell_detached_listener_is_reaped_after_startup_grace_real_process(
         "wake-test", principal={"principal_id": "detached-regression"}
     )
     assert claimed.committed and claimed.value is not None
+    lease_holder = _hold_claimed_lease(root, claimed.value)
     env = dict(env)
     env["GOALFLIGHT_LISTENER_STARTUP_GRACE_S"] = "0.2"
     # The re-arm hint now names the ADVERTISED install rather than the running
@@ -1485,6 +1521,7 @@ def test_shell_detached_listener_is_reaped_after_startup_grace_real_process(
         assert stdout_path.read_text(encoding="utf-8") == ""
         _wait_for_listener_count(root, label="wake-test", count=0)
     finally:
+        lease_holder.close()
         with contextlib.suppress(ProcessLookupError):
             os.kill(listener_pid, signal.SIGKILL)
 
@@ -2003,6 +2040,7 @@ def test_scoped_status_wait_does_not_cover_controller_mail(
         "wake-test", principal={"principal_id": "wake-layer-test"}
     )
     assert claimed.committed and claimed.value is not None
+    lease_holder = _hold_claimed_lease(root, claimed.value)
     listener = subprocess.Popen(
         [
             sys.executable,
@@ -2076,6 +2114,7 @@ def test_scoped_status_wait_does_not_cover_controller_mail(
             time.sleep(0.02)
         assert wake.coverage_status(root, controller_label="wake-test")["covered"] is False
     finally:
+        lease_holder.close()
         for process in (listener, long_wait):
             if process.poll() is None:
                 process.kill()
@@ -2275,6 +2314,7 @@ def test_deleted_cursor_token_cli_surface_does_not_displace_healthy_listener(
         "wake-test", principal={"principal_id": "bad-token-test"}
     )
     assert claimed.committed and claimed.value is not None
+    lease_holder = _hold_claimed_lease(root, claimed.value)
     command = [
         sys.executable,
         str(SCRIPTS / "goalflight_messages.py"),
@@ -2325,6 +2365,7 @@ def test_deleted_cursor_token_cli_surface_does_not_displace_healthy_listener(
         assert healthy.poll() is None
         assert wake.coverage_status(root, controller_label="wake-test")["covered"] is True
     finally:
+        lease_holder.close()
         if healthy.poll() is None:
             healthy.kill()
         healthy.communicate(timeout=3)
@@ -2339,6 +2380,7 @@ def test_failed_waiter_registration_does_not_displace_healthy_listener(
         "wake-test", principal={"principal_id": "registration-order-test"}
     )
     assert claimed.committed and claimed.value is not None
+    lease_holder = _hold_claimed_lease(root, claimed.value)
     command = [
         sys.executable,
         str(SCRIPTS / "goalflight_messages.py"),
@@ -2387,13 +2429,17 @@ def test_failed_waiter_registration_does_not_displace_healthy_listener(
             timeout=5,
         )
         assert replacement.returncode == 2
-        assert "wake ledger registration failed" in replacement.stderr
+        # A broken wake-ledger path cannot confirm holder liveness, so listen
+        # refuses before waiter registration rather than displacing coverage.
+        assert "journal-unavailable" in replacement.stderr
+        assert "did-not-arm" not in replacement.stderr
         current = authority.active_coverage("wake-test")
         assert current is not None
         assert current["coverage_id"] == original_coverage["coverage_id"]
         assert healthy.poll() is None
         assert wake.coverage_status(root, controller_label="wake-test")["covered"] is True
     finally:
+        lease_holder.close()
         if healthy.poll() is None:
             healthy.kill()
         healthy.communicate(timeout=3)

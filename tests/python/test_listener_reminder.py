@@ -141,6 +141,7 @@ def test_controller_mail_exit_code_actions_and_skill_pool_instruction() -> None:
         ("| 2 | Infrastructure or corruption", "avoid a restart loop"),
         ("| 3 | Contention, supersession", "Reconcile the active lease"),
         ("| 4 | Detached-listener refusal", "tracked background listener"),
+        ("| 5 | Did-not-arm:", "do not re-arm this nonce"),
     )
     for meaning, action in expected_rows:
         row = next((line for line in doctrine.splitlines() if meaning in line), "")
@@ -158,4 +159,7 @@ def test_controller_mail_exit_code_actions_and_skill_pool_instruction() -> None:
     assert "never consumes a delivery slot" in controller_entry
     assert "live/8" in controller_entry
     assert "portable pool of four" in controller_entry
+    assert "on each ring (exit 0)" in controller_entry
     assert "restore depth" in controller_entry
+    assert "Exit 5 is settled did-not-arm" in controller_entry
+    assert "do not re-arm that nonce" in controller_entry

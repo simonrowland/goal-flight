@@ -28,6 +28,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_journal as journal  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
+import goalflight_session_status as sessions  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 
 
@@ -91,6 +92,26 @@ def fail_cursor_status(self, *args, **kwargs):
 journal.Journal.cursor_status = fail_cursor_status
 import goalflight_messages
 raise SystemExit(goalflight_messages.main(sys.argv[1:]))
+"""
+
+
+_UNREADABLE_LEASE_PROBE = r"""
+import os
+import sys
+
+sys.path.insert(0, os.environ["GOALFLIGHT_TEST_SCRIPTS"])
+import goalflight_journal as journal
+import goalflight_messages as messages
+
+def busy_open_reader(cls, project_root, **kwargs):
+    raise journal.JournalBusy(
+        "journal connection remained busy after 1 attempts within 1.000s"
+    )
+
+journal.Journal.open_reader = classmethod(busy_open_reader)
+messages.LISTENER_JOURNAL_TOLERANCE_S = 0.05
+messages.LISTENER_JOURNAL_BUSY_BUDGET_S = 0.01
+raise SystemExit(messages.main(sys.argv[1:]))
 """
 
 
@@ -1566,6 +1587,179 @@ def test_rearmed_listener_with_unread_backlog_rings_new_event_three_runs(
             if replacement.poll() is None:
                 replacement.kill()
                 replacement.communicate(timeout=3)
+
+
+def test_dead_lease_nonce_exits_did_not_arm_not_ring(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    """ACTIVE journal row whose holder lock is unheld must not look like a ring."""
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "dead-nonce-arm"}
+    ).value
+    assert lease is not None
+    holder = wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    )
+    holder.__enter__()
+    holder.close()
+    state, _session = sessions.probe_live_session(project, label="armtest")
+    assert state == "dead", "precondition: released holder lock is readable dead"
+    _post(env, project, "would have rung a dead-nonce doorbell")
+    listener_env = {
+        **env,
+        "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+        "GOALFLIGHT_TEST_MODE": "1",
+        "GOALFLIGHT_PROCESS_ROLE": "controller",
+    }
+    started = time.monotonic()
+    refused = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "goalflight_messages.py"),
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            "armtest",
+            "--lease-nonce",
+            lease.nonce,
+            "--no-report-pending",
+            "--poll-secs",
+            "0.05",
+            "--timeout-s",
+            "8",
+            "--json",
+        ],
+        env=listener_env,
+        cwd=project,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    elapsed = time.monotonic() - started
+    assert refused.returncode == messages.LISTENER_DID_NOT_ARM_EXIT, refused.stderr
+    assert "did-not-arm" in refused.stderr
+    assert "lease-nonce-not-live" in refused.stderr
+    assert "will not cover the pool" in refused.stderr
+    assert elapsed < 4, elapsed
+    assert not (wake.live_waiters(project, controller_label="armtest") or [])
+    assert refused.returncode != 0
+
+
+def test_unreadable_lease_nonce_is_retryable_not_dead(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    """Busy open_reader through the real probe must not become did-not-arm.
+
+    Drives ``probe_live_session``: ``Journal.open_reader`` raises
+    ``JournalBusy`` under the probe's 0.05s budgets. A stub that returns
+    ``("unreadable", None)`` cannot catch a collapse of unreadable into
+    dead inside the probe.
+    """
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "unreadable-nonce-arm"}
+    ).value
+    assert lease is not None
+    listener_env = {
+        **env,
+        "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+        "GOALFLIGHT_TEST_SCRIPTS": str(SCRIPTS),
+        "GOALFLIGHT_TEST_MODE": "1",
+        "GOALFLIGHT_PROCESS_ROLE": "controller",
+    }
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        state, session = sessions.probe_live_session(project, label="armtest")
+        assert state == "live" and session is not None
+        refused = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _UNREADABLE_LEASE_PROBE,
+                "listen",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                "armtest",
+                "--lease-nonce",
+                lease.nonce,
+                "--poll-secs",
+                "0.05",
+                "--timeout-s",
+                "3",
+                "--json",
+            ],
+            env=listener_env,
+            cwd=project,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    assert refused.returncode == 2, refused.stderr
+    assert refused.returncode != messages.LISTENER_DID_NOT_ARM_EXIT
+    assert "journal-unavailable" in refused.stderr
+    assert "retryable, not a dead nonce" in refused.stderr
+    assert "lease-nonce-not-live" not in refused.stderr
+    assert "did-not-arm" not in refused.stderr
+    assert not (wake.live_waiters(project, controller_label="armtest") or [])
+
+
+def test_genuine_ring_still_exits_zero(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "live-ring-arm"}
+    ).value
+    assert lease is not None
+    listener_env = {
+        **env,
+        "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+        "GOALFLIGHT_TEST_MODE": "1",
+        "GOALFLIGHT_PROCESS_ROLE": "controller",
+    }
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        _post(env, project, "live ring mail")
+        rang = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "goalflight_messages.py"),
+                "listen",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                "armtest",
+                "--lease-nonce",
+                lease.nonce,
+                "--no-report-pending",
+                "--poll-secs",
+                "0.05",
+                "--timeout-s",
+                "8",
+                "--json",
+            ],
+            env=listener_env,
+            cwd=project,
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+    assert rang.returncode == 0, rang.stderr
+    payloads = [json.loads(line) for line in rang.stdout.splitlines() if line.strip()]
+    assert payloads
+    assert payloads[-1]["kind"] == "ring"
+    assert payloads[-1]["reason"] == "event"
 
 
 def main() -> None:
