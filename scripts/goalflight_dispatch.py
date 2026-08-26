@@ -1294,6 +1294,19 @@ def _project_root(args) -> Path:
     return goalflight_task.resolve_project_root(args.cwd or str(Path.cwd()))
 
 
+def _worker_cwd(args) -> Path:
+    """Tree the worker process is rooted in.
+
+    Distinct from ``_project_root``, which collapses worktrees so they share a
+    task store. Feeding that collapsed root back as ``--cwd`` made queued and
+    resumed workers launch with ``-C <main checkout>`` (b-217, b-227).
+    """
+    raw = getattr(args, "cwd", None)
+    if raw:
+        return Path(str(raw)).expanduser().resolve(strict=False)
+    return Path.cwd().resolve(strict=False)
+
+
 def _parse_task_ids(values: list[str] | None) -> list[str]:
     out: list[str] = []
     for value in values or []:
@@ -3124,57 +3137,127 @@ def _cmd_resume(argv: list[str]) -> int:
         print(f"goalflight_dispatch: {exc}", file=sys.stderr)
         return 64
 
+    launch_argv = _resume_launch_argv(
+        source,
+        child_dispatch_id=child_dispatch_id,
+        prompt_path=prompt_path,
+        resume_args=args,
+    )
+    return main(launch_argv)
+
+
+def _dispatch_argv_from_record(record: dict) -> list[str]:
+    envelope = (
+        record.get("request_envelope")
+        if isinstance(record.get("request_envelope"), dict)
+        else {}
+    )
+    for blob in (record.get("dispatch_argv"), envelope.get("dispatch_argv")):
+        if isinstance(blob, list) and blob:
+            return [str(part) for part in blob]
+    return []
+
+
+def _resume_worker_cwd(record: dict) -> Path:
+    envelope = (
+        record.get("request_envelope")
+        if isinstance(record.get("request_envelope"), dict)
+        else {}
+    )
+    env_request = (
+        envelope.get("request") if isinstance(envelope.get("request"), dict) else {}
+    )
+    request = record.get("request") if isinstance(record.get("request"), dict) else {}
+    recorded = _dispatch_argv_from_record(record)
+    from_argv = (
+        _option_value_before_worker_remainder(recorded, "--cwd") if recorded else None
+    )
+    for raw in (
+        record.get("worker_cwd"),
+        from_argv,
+        env_request.get("cwd"),
+        request.get("cwd"),
+        record.get("project_root"),
+    ):
+        if raw:
+            return Path(str(raw)).expanduser().resolve(strict=False)
+    return Path.cwd().resolve(strict=False)
+
+
+def _synthesize_resume_base_argv(source: dict) -> list[str]:
+    """Fallback when an older record never stored dispatch_argv."""
     record = source["record"]
-    project_root = Path(
-        str(record.get("project_root") or Path.cwd())
-    ).expanduser().resolve(strict=False)
     shape = source["shape"] if source["shape"] in {"bash", "acp"} else "bash"
-    launch_argv = [
+    argv = [
         "--agent",
         source["agent"],
         "--shape",
         shape,
-        "--dispatch-id",
-        child_dispatch_id,
         "--cwd",
-        str(project_root),
-        "--prompt-file",
-        str(prompt_path),
-        "--parent-dispatch-id",
-        args.dispatch_id,
-        "--engine-session-id",
-        source["session_id"],
+        str(_resume_worker_cwd(record)),
     ]
-    if args.unregistered_forced:
-        launch_argv.append("--unregistered-forced")
+    posture = record.get("os_sandbox")
+    if isinstance(posture, dict):
+        requested = posture.get("requested_profile")
+        if isinstance(requested, str) and requested:
+            argv += ["--os-sandbox", requested]
+    task_ids = record.get("task_ids")
+    if isinstance(task_ids, list):
+        for task_id in task_ids:
+            if isinstance(task_id, str) and task_id:
+                argv.extend(["--task", task_id])
+    return argv
+
+
+def _resume_launch_argv(
+    source: dict,
+    *,
+    child_dispatch_id: str,
+    prompt_path: Path,
+    resume_args,
+) -> list[str]:
+    record = source["record"]
+    recorded = _dispatch_argv_from_record(record)
+    base = recorded or _synthesize_resume_base_argv(source)
+    replace = {
+        "--dispatch-id": child_dispatch_id,
+        "--prompt-file": str(prompt_path),
+        "--parent-dispatch-id": str(resume_args.dispatch_id),
+        "--engine-session-id": source["session_id"],
+        "--cwd": str(_resume_worker_cwd(record)),
+    }
+    inject: list[str] = []
+    if resume_args.unregistered_forced:
+        inject.append("--unregistered-forced")
     for flag, value in (
-        ("--controller-label", args.controller_label),
-        ("--controller-pid", args.controller_pid),
-        ("--controller-session-id", args.controller_session_id),
+        ("--controller-label", resume_args.controller_label),
+        ("--controller-pid", resume_args.controller_pid),
+        ("--controller-session-id", resume_args.controller_session_id),
     ):
         if value is not None:
-            launch_argv.extend([flag, str(value)])
+            replace[flag] = str(value)
     if source["engine"] == "codex":
-        launch_argv += [
-            "--codex-session-id",
-            source["session_id"],
-            "--codex-resume-home",
-            str(source["codex_home"]),
-            "--codex-home-owner-dispatch-id",
-            source["codex_home_owner_dispatch_id"],
+        replace["--codex-session-id"] = source["session_id"]
+        replace["--codex-resume-home"] = str(source["codex_home"])
+        replace["--codex-home-owner-dispatch-id"] = source[
+            "codex_home_owner_dispatch_id"
         ]
     else:
         # Stay on the seat that owns the session files. Codex rebuilds a
         # per-dispatch home; grok/cursor/claude sessions live in the seat HOME.
         account = record.get("effective_account") or record.get("account")
         if isinstance(account, str) and account and account != "default":
-            launch_argv += ["--account", account]
-    task_ids = record.get("task_ids")
-    if isinstance(task_ids, list):
-        for task_id in task_ids:
-            if isinstance(task_id, str) and task_id:
-                launch_argv.extend(["--task", task_id])
-    return main(launch_argv)
+            replace["--account"] = account
+    argv = _reconstruct_launch_argv(
+        base,
+        replace=replace,
+        inject=inject,
+        strip_flags=_replay_strip_flags() + ("--unregistered-forced",),
+        strip_options=("--tail", "--status-json", "--prompt"),
+    )
+    if source["engine"] == "codex":
+        argv = _remove_option_before_worker_remainder(argv, "--account")
+    return argv
 
 
 def _mark_reconciled_parent_resumed(
@@ -3638,21 +3721,7 @@ def _unregistered_controller_warning() -> str:
 
 
 def _remove_option_before_worker_remainder(argv: list[str], flag: str) -> list[str]:
-    try:
-        split = argv.index("--")
-    except ValueError:
-        split = len(argv)
-    head = argv[:split]
-    tail = argv[split:]
-    out: list[str] = []
-    index = 0
-    while index < len(head):
-        if head[index] == flag:
-            index += 2
-            continue
-        out.append(head[index])
-        index += 1
-    return out + tail
+    return _drop_option_before_worker_remainder(argv, flag, takes_value=True)
 
 
 def _registered_dispatch_command(args, session: dict) -> str:
@@ -4262,7 +4331,7 @@ def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | N
         prompt_id=None,
         project_root=str(project_root),
         worktree_path=None,
-        worker_cwd=str(project_root),
+        worker_cwd=str(_worker_cwd(args)),
         controller_pid=_controller_pid(args),
         worker_pid=None,
         lease_id=None,
@@ -4443,6 +4512,15 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 codex_home=codex_home or getattr(args, "codex_resume_home", None),
                 codex_home_owner_dispatch_id=_codex_home_owner_dispatch_id(args),
                 parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
+                worker_cwd=str(_worker_cwd(args)),
+                dispatch_argv=_canonical_replay_argv(
+                    args,
+                    _raw_worker_args(args)
+                    if getattr(args, "worker", None) is not None
+                    else [],
+                    tail=tail,
+                    status_json=status_json,
+                ),
                 lease_id=lease_id,
                 stdout_path=str(tail),
                 stderr_path=None,
@@ -4527,6 +4605,13 @@ def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | N
         "stderr_path": None,
         "status_path": str(status_json),
         "os_sandbox": _os_sandbox_posture(args, worker_pid=None),
+        "worker_cwd": str(_worker_cwd(args)),
+        "dispatch_argv": _canonical_replay_argv(
+            args,
+            _raw_worker_args(args) if getattr(args, "worker", None) is not None else [],
+            tail=tail,
+            status_json=status_json,
+        ),
         "state": "queued",
         "terminal_state": goalflight_ledger.terminal_state_for("queued"),
         "started_at": now,
@@ -4564,6 +4649,7 @@ def _record_queued_status(args, *, project_root: Path, status_json: Path, tail: 
             "reason": "dispatch_queue",
             "queue_path": str(queue_path),
             "project_root": str(project_root),
+            "worker_cwd": str(_worker_cwd(args)),
             "worker_pid": None,
             "worker_alive": False,
             "tail_path": str(tail),
@@ -4632,46 +4718,270 @@ def _record_unsupported_sandbox_rejection(
     return 64
 
 
+def _argv_split_worker_remainder(argv: list[str]) -> tuple[list[str], list[str]]:
+    try:
+        split = argv.index("--")
+    except ValueError:
+        split = len(argv)
+    return list(argv[:split]), list(argv[split:])
+
+
 def _insert_before_worker_remainder(argv: list[str], additions: list[str]) -> list[str]:
-    try:
-        split = argv.index("--")
-    except ValueError:
-        split = len(argv)
-    return argv[:split] + additions + argv[split:]
+    head, tail = _argv_split_worker_remainder(argv)
+    return head + list(additions) + tail
 
 
-def _remove_flag_before_worker_remainder(argv: list[str], flag: str) -> list[str]:
-    try:
-        split = argv.index("--")
-    except ValueError:
-        split = len(argv)
-    return [part for part in argv[:split] if part != flag] + argv[split:]
+def _option_skip_count(head: list[str], index: int, flag: str, *, takes_value: bool) -> int:
+    token = head[index]
+    if token.startswith(flag + "="):
+        return 1
+    if token != flag:
+        return 1
+    if not takes_value:
+        return 1
+    if index + 1 < len(head):
+        return 2
+    return 1
 
 
-def _set_option_before_worker_remainder(argv: list[str], flag: str, value: str) -> list[str]:
-    try:
-        split = argv.index("--")
-    except ValueError:
-        split = len(argv)
-    head = argv[:split]
-    tail = argv[split:]
+def _drop_option_before_worker_remainder(
+    argv: list[str],
+    flag: str,
+    *,
+    takes_value: bool,
+) -> list[str]:
+    head, tail = _argv_split_worker_remainder(argv)
     out: list[str] = []
-    i = 0
-    while i < len(head):
-        if head[i] == flag:
-            i += 2
+    index = 0
+    while index < len(head):
+        token = head[index]
+        if token == flag or token.startswith(flag + "="):
+            index += _option_skip_count(head, index, flag, takes_value=takes_value)
             continue
-        out.append(head[i])
-        i += 1
-    out += [flag, value]
+        out.append(token)
+        index += 1
     return out + tail
 
 
+def _remove_flag_before_worker_remainder(argv: list[str], flag: str) -> list[str]:
+    return _drop_option_before_worker_remainder(argv, flag, takes_value=False)
+
+
+def _set_option_before_worker_remainder(argv: list[str], flag: str, value: str) -> list[str]:
+    argv = _drop_option_before_worker_remainder(argv, flag, takes_value=True)
+    return _insert_before_worker_remainder(argv, [flag, str(value)])
+
+
+def _option_value_before_worker_remainder(argv: list[str], flag: str) -> str | None:
+    head, _tail = _argv_split_worker_remainder(argv)
+    prefix = flag + "="
+    index = 0
+    while index < len(head):
+        token = head[index]
+        if token == flag:
+            if index + 1 < len(head):
+                return head[index + 1]
+            return None
+        if token.startswith(prefix):
+            return token[len(prefix) :]
+        index += 1
+    return None
+
+
+# Classification of every launch-parser option string. Preserve-class flags are
+# carried by reconstructing from the recorded invocation. Replace/inject/strip
+# are the per-attempt exceptions. A new add_argument must land in exactly one
+# class or test_dispatch_argv_fidelity.test_every_launch_flag_is_classified fails.
+LAUNCH_ARGV_CLASS: dict[str, str] = {
+    "--agent": "preserve",
+    "--prompt-file": "preserve",
+    "--prompt": "preserve",
+    "--task": "preserve",
+    "--cwd": "preserve",
+    "--model": "preserve",
+    "--read-only": "preserve",
+    "--readonly": "preserve",
+    "--os-sandbox": "preserve",
+    "--priority": "preserve",
+    "--fast": "preserve",
+    "--web-research-ok": "preserve",
+    "--web-qa": "preserve",
+    "--ignore-git-warn": "preserve",
+    "--no-orientation": "preserve",
+    "--capacity-wait-s": "preserve",
+    "--account": "preserve",
+    "--billing": "preserve",
+    "--shape": "preserve",
+    "--interactive": "preserve",
+    "--permission-mode": "preserve",
+    "--permission-dir": "preserve",
+    "--permission-inline-timeout-s": "preserve",
+    "--permission-user-timeout-s": "preserve",
+    "--permission-allow-tool-title-pattern": "preserve",
+    "--poll-secs": "preserve",
+    "--max-idle-secs": "preserve",
+    "--controller-pid": "preserve",
+    "--controller-label": "preserve",
+    "--session-label": "preserve",
+    "--unregistered-forced": "preserve",
+    "--controller-beacon-pid": "preserve",
+    "--controller-session-id": "preserve",
+    "--parent-dispatch-id": "preserve",
+    "--engine-session-id": "preserve",
+    "--codex-session-id": "preserve",
+    "--codex-resume-home": "preserve",
+    "--codex-home-owner-dispatch-id": "preserve",
+    "--dispatch-id": "replace",
+    "--tail": "replace",
+    "--status-json": "replace",
+    "--submit": "strip",
+    "--foreground": "strip",
+    "--drain-on-submit": "strip",
+    "--no-drain-on-submit": "strip",
+    "--takeover": "strip",
+    "--acp-detached-child": "strip",
+    "--from-queue": "inject",
+    "--queue-launch-token": "inject",
+    "--queue-claim-path": "inject",
+    "--launch-detached": "inject",
+    "--stats": "ignore",
+    "--json": "ignore",
+    "--hints": "ignore",
+    "--help": "ignore",
+    "-h": "ignore",
+}
+
+_REPLAY_VALUE_OPTIONS = {
+    "--agent",
+    "--prompt-file",
+    "--prompt",
+    "--task",
+    "--cwd",
+    "--model",
+    "--os-sandbox",
+    "--priority",
+    "--capacity-wait-s",
+    "--account",
+    "--billing",
+    "--shape",
+    "--permission-mode",
+    "--permission-dir",
+    "--permission-inline-timeout-s",
+    "--permission-user-timeout-s",
+    "--permission-allow-tool-title-pattern",
+    "--poll-secs",
+    "--max-idle-secs",
+    "--controller-pid",
+    "--controller-label",
+    "--session-label",
+    "--controller-beacon-pid",
+    "--controller-session-id",
+    "--parent-dispatch-id",
+    "--engine-session-id",
+    "--codex-session-id",
+    "--codex-resume-home",
+    "--codex-home-owner-dispatch-id",
+    "--dispatch-id",
+    "--tail",
+    "--status-json",
+    "--queue-launch-token",
+    "--queue-claim-path",
+}
+
+
+def _reconstruct_launch_argv(
+    recorded: list[str],
+    *,
+    replace: dict[str, str] | None = None,
+    inject: list[str] | None = None,
+    strip_flags: tuple[str, ...] = (),
+    strip_options: tuple[str, ...] = (),
+) -> list[str]:
+    """Rebuild a launch argv from a recorded invocation.
+
+    Preserve everything that is not stripped or replaced. Per-attempt identity
+    (dispatch-id, tail, status-json) is replaced by the caller. Queue control
+    flags are injected by the drain path, not inherited.
+    """
+    argv = list(recorded)
+    for flag in strip_flags:
+        argv = _drop_option_before_worker_remainder(
+            argv,
+            flag,
+            takes_value=flag in _REPLAY_VALUE_OPTIONS or flag == "--stats",
+        )
+    for flag in strip_options:
+        argv = _drop_option_before_worker_remainder(argv, flag, takes_value=True)
+    for flag, value in (replace or {}).items():
+        argv = _set_option_before_worker_remainder(argv, flag, value)
+    if inject:
+        argv = _insert_before_worker_remainder(argv, list(inject))
+    return argv
+
+
+def _replay_strip_flags() -> tuple[str, ...]:
+    return tuple(
+        flag
+        for flag, cls in LAUNCH_ARGV_CLASS.items()
+        if cls in {"strip", "inject", "ignore"}
+    )
+
+
+def _canonical_replay_argv_from_original(
+    args,
+    raw_argv: list[str],
+    *,
+    tail: Path,
+    status_json: Path,
+) -> list[str]:
+    source = list(getattr(args, "_original_argv", None) or [])
+    replace = {
+        "--dispatch-id": str(args.dispatch_id),
+        "--cwd": str(_worker_cwd(args)),
+        "--tail": str(tail),
+        "--status-json": str(status_json),
+    }
+    if args.prompt_file:
+        replace["--prompt-file"] = str(Path(args.prompt_file).expanduser())
+    if getattr(args, "shape", None) and args.shape != "auto":
+        replace["--shape"] = str(args.shape)
+    argv = _reconstruct_launch_argv(
+        source,
+        replace=replace,
+        strip_flags=_replay_strip_flags(),
+    )
+    controller_label = _controller_label(args)
+    controller_beacon_pid = _controller_pid(args)
+    controller_session_id = _controller_session_id(args)
+    if controller_label is not None:
+        argv = _set_option_before_worker_remainder(
+            argv, "--controller-label", controller_label
+        )
+    if controller_beacon_pid is not None:
+        argv = _set_option_before_worker_remainder(
+            argv, "--controller-beacon-pid", str(controller_beacon_pid)
+        )
+    if controller_session_id is not None:
+        argv = _set_option_before_worker_remainder(
+            argv, "--controller-session-id", controller_session_id
+        )
+    if getattr(args, "unregistered_forced", False):
+        if "--unregistered-forced" not in argv:
+            argv = _insert_before_worker_remainder(argv, ["--unregistered-forced"])
+    if raw_argv and "--" not in argv:
+        argv += ["--", *raw_argv]
+    return argv
+
+
 def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json: Path) -> list[str]:
+    if getattr(args, "_original_argv", None):
+        return _canonical_replay_argv_from_original(
+            args, raw_argv, tail=tail, status_json=status_json
+        )
     argv = [
         "--agent", str(args.agent),
         "--dispatch-id", str(args.dispatch_id),
-        "--cwd", str(_project_root(args)),
+        "--cwd", str(_worker_cwd(args)),
         "--shape", str(args.shape),
         "--priority", str(args.priority),
         "--billing", str(args.billing),
@@ -5762,6 +6072,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
         "shape": args.shape,
         "project_root": str(project_root),
         "process_cwd": str(Path.cwd().resolve()),
+        "worker_cwd": str(_worker_cwd(args)),
         "created_at": goalflight_ledger.utc_now(),
         "updated_at": goalflight_ledger.utc_now(),
         "queue_path": str(queue_path),
@@ -5776,7 +6087,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
             "priority": args.priority,
             "fast": bool(getattr(args, "fast", False)),
             "dispatch_id": args.dispatch_id,
-            "cwd": str(project_root),
+            "cwd": str(_worker_cwd(args)),
             "model": args.model,
             "shape": args.shape,
             "read_only": bool(args.read_only),
@@ -9121,18 +9432,17 @@ def _drain_launch_argv(
 ) -> list[str]:
     if not dispatch_argv:
         return []
-    argv = _set_option_before_worker_remainder(
-        list(dispatch_argv),
-        "--capacity-wait-s",
-        str(max(0.0, float(capacity_wait_s))),
-    )
-    additions = ["--from-queue"]
+    inject = ["--from-queue"]
     if queue_launch_token:
-        additions += ["--queue-launch-token", queue_launch_token]
+        inject += ["--queue-launch-token", queue_launch_token]
     if queue_claim_path is not None:
-        additions += ["--queue-claim-path", str(queue_claim_path)]
-    additions.append("--launch-detached")
-    return _insert_before_worker_remainder(argv, additions)
+        inject += ["--queue-claim-path", str(queue_claim_path)]
+    inject.append("--launch-detached")
+    return _reconstruct_launch_argv(
+        list(dispatch_argv),
+        replace={"--capacity-wait-s": str(max(0.0, float(capacity_wait_s)))},
+        inject=inject,
+    )
 
 
 def _queued_args_for_status(entry: dict):
@@ -10489,7 +10799,7 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         model=getattr(args, "model", None),
         install_slot=None,
         account=getattr(args, "account", None),
-        cwd=str(project_root),
+        cwd=str(_worker_cwd(args)),
         worktree="off",
         session_id=_resolved_engine_session_id(args),
         resume_session_id=(
@@ -11337,34 +11647,7 @@ _SUBCOMMAND_HELP: tuple[tuple[str, str], ...] = (
 )
 
 
-def main(argv: list[str] | None = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] == DAEMON_SPAWN_ARG:
-        return _cmd_spawn_daemon()
-    option_argv = argv[: argv.index("--")] if "--" in argv else argv
-    # The dir-privacy sweep is invoked lazily by dispatch-dir writers (see
-    # _persist_acp_watcher_prompt and the launch path), never here: a refused
-    # dispatch must leave zero side effects before its guards run.
-    try:
-        import goalflight_messages
-
-        goalflight_messages.emit_wake_entry_notice(
-            project_root=goalflight_task.resolve_project_root(str(Path.cwd())),
-            stream=sys.stderr,
-        )
-    except Exception:
-        pass
-    if argv and argv[0] == "steer":
-        return _cmd_steer(argv[1:])
-    if argv and argv[0] == "resume":
-        return _cmd_resume(argv[1:])
-    if argv and argv[0] == "reconcile-abandoned":
-        return _cmd_reconcile_abandoned(argv[1:])
-    if argv and argv[0] == "drain":
-        return _cmd_drain(argv[1:])
-    if argv and argv[0] == "dashboard-refresh":
-        return _cmd_dashboard_refresh(argv[1:])
-
+def _build_launch_parser() -> argparse.ArgumentParser:
     parser = _TerseArgumentParser(
         description=(
             "Crash-safe worker dispatch: detached worker + decoupled watcher.\n"
@@ -11583,6 +11866,38 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("worker", nargs=argparse.REMAINDER,
                         help="Optional `-- <cmd...>` raw worker (overrides the preset)")
     parser.set_defaults(drain_on_submit=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == DAEMON_SPAWN_ARG:
+        return _cmd_spawn_daemon()
+    option_argv = argv[: argv.index("--")] if "--" in argv else argv
+    # The dir-privacy sweep is invoked lazily by dispatch-dir writers (see
+    # _persist_acp_watcher_prompt and the launch path), never here: a refused
+    # dispatch must leave zero side effects before its guards run.
+    try:
+        import goalflight_messages
+
+        goalflight_messages.emit_wake_entry_notice(
+            project_root=goalflight_task.resolve_project_root(str(Path.cwd())),
+            stream=sys.stderr,
+        )
+    except Exception:
+        pass
+    if argv and argv[0] == "steer":
+        return _cmd_steer(argv[1:])
+    if argv and argv[0] == "resume":
+        return _cmd_resume(argv[1:])
+    if argv and argv[0] == "reconcile-abandoned":
+        return _cmd_reconcile_abandoned(argv[1:])
+    if argv and argv[0] == "drain":
+        return _cmd_drain(argv[1:])
+    if argv and argv[0] == "dashboard-refresh":
+        return _cmd_dashboard_refresh(argv[1:])
+
+    parser = _build_launch_parser()
     args = parser.parse_args(argv)
     try:
         args.task_ids = _parse_task_ids(args.tasks)
