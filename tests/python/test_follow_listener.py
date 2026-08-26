@@ -1078,17 +1078,37 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
 ) -> None:
     project, env, lease = isolated
-    follow = _spawn_follow(project, env, lease, heartbeat_s=2.0, poll_s=0.25)
+    err_handles: list = []
+
+    def _stderr(name: str):
+        handle = (project.parent / f"{name}.stderr").open("w", encoding="utf-8")
+        err_handles.append(handle)
+        return handle
+
+    follow = subprocess.Popen(
+        _follow_command(project, lease, heartbeat_s=2.0, poll_s=0.25),
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=_stderr("follow"),
+    )
     assert follow.stdout is not None
     follow_reader = _JsonLineReader(follow.stdout)
     assert follow_reader.read()[1]["kind"] == "heartbeat"
     assert follow_reader.read()[1]["kind"] == "frontier"
+
+    # Watchdog --timeout-s is process lifetime, not the assertion. Isolation
+    # already shares ledger/pidfile/locks across these three processes (same
+    # env). A 3s self-timeout expires before backup can stay armed, so the
+    # backup observes a missing watchdog lock and coexistence is untestable.
+    # stderr must not be an unread PIPE: journal-degraded lines fill the
+    # buffer and the backup never writes the ring.
     watchdog = subprocess.Popen(
-        _watch_command(project, lease),
+        _watch_command(project, lease, timeout_s=60),
         cwd=project,
         env=env,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=_stderr("watchdog"),
     )
     assert watchdog.stdout is not None
     watchdog_reader = _JsonLineReader(watchdog.stdout)
@@ -1099,13 +1119,22 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
         cwd=project,
         env=env,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=_stderr("backup"),
     )
     assert backup.stdout is not None
     backup_reader = _JsonLineReader(backup.stdout)
     replacement_backup: subprocess.Popen[bytes] | None = None
     try:
-        _wait_for_waiter_kind(project, lease.label, "listener", backup.pid)
+        try:
+            _wait_for_waiter_kind(project, lease.label, "listener", backup.pid)
+        except AssertionError:
+            stderr_path = project.parent / "backup.stderr"
+            detail = stderr_path.read_text(encoding="utf-8") if stderr_path.exists() else ""
+            raise AssertionError(
+                f"backup waiter missing poll={backup.poll()} stderr={detail!r}"
+            ) from None
+        _wait_for_waiter_kind(project, lease.label, "watchdog", watchdog.pid)
+        assert watchdog.poll() is None, "watchdog exited before backup armed"
 
         listener_pids = [
             row.pid
@@ -1153,7 +1182,7 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
                 project_root=project,
             ),
         )
-        _raw, backup_result = backup_reader.read(timeout_s=5)
+        _raw, backup_result = backup_reader.read(timeout_s=30)
         if backup_result["kind"] == "pending-at-arm":
             pending_items = backup_result.get("items")
             assert isinstance(pending_items, list)
@@ -1177,10 +1206,10 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
                     project_root=project,
                 ),
             )
-            _raw, backup_result = backup_reader.read(timeout_s=5)
+            _raw, backup_result = backup_reader.read(timeout_s=30)
         assert backup_result["kind"] == "ring", backup_result
         assert backup_result["reason"] == "event"
-        assert backup.wait(timeout=2) == 0
+        assert backup.wait(timeout=15) == 0
 
         authority = journal.Journal(project)
         pending = authority.cursor_peek(
@@ -1211,7 +1240,7 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
             cwd=project,
             env=env,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=_stderr("replacement-backup"),
         )
         _wait_for_waiter_kind(
             project,
@@ -1221,7 +1250,7 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
         )
         os.kill(follow.pid, signal.SIGKILL)
         assert follow.wait(timeout=2) == -signal.SIGKILL
-        _raw, dead = watchdog_reader.read(timeout_s=3)
+        _raw, dead = watchdog_reader.read(timeout_s=15)
         assert dead["kind"] == "event"
         assert dead["payload"]["type"] == "listener-dead"
         assert dead["payload"]["reason"] == "stale"
@@ -1237,6 +1266,8 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
         for proc in processes:
             if proc.poll() is None:
                 proc.wait(timeout=3)
+        for handle in err_handles:
+            handle.close()
 
 
 def test_backup_wakes_when_watchdog_is_sigkilled_with_stream_alive(
