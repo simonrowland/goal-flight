@@ -19,6 +19,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -27,6 +28,8 @@ WATCH = ROOT / "scripts" / "goalflight_watch.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_compat  # noqa: E402
+import goalflight_capacity  # noqa: E402
+import goalflight_ledger  # noqa: E402
 import goalflight_watch  # noqa: E402
 
 
@@ -56,6 +59,9 @@ def _watcher_cmd(
     poll_secs: str = "0.2",
     max_idle_secs: str = "1",
     liveness_indeterminate_secs: str | None = None,
+    stay_after_terminal: bool = False,
+    detached: bool = False,
+    worker_identity: dict | None = None,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -79,6 +85,12 @@ def _watcher_cmd(
         cmd += ["--worker-cwd", str(worker_cwd)]
     if liveness_indeterminate_secs is not None:
         cmd += ["--liveness-indeterminate-secs", liveness_indeterminate_secs]
+    if stay_after_terminal:
+        cmd.append("--stay-after-terminal")
+    if detached:
+        cmd.append("--detached")
+    if worker_identity is not None:
+        cmd += ["--worker-identity-json", json.dumps(worker_identity)]
     return cmd
 
 
@@ -105,6 +117,27 @@ def _descendant_ps_fail_bindir(tmp: Path) -> Path:
         encoding="utf-8",
     )
     stub.chmod(stub.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return bindir
+
+
+def _descendant_ps_table_bindir(tmp: Path, table: Path) -> Path:
+    """PATH prefix exposing an asserted real parent/child pair to the ps parser."""
+    bindir = tmp / "ps-table-bin"
+    bindir.mkdir()
+    real_ps = shutil.which("ps") or "/bin/ps"
+    stub = bindir / "ps"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "for arg in \"$@\"; do\n"
+        "  if [ \"$arg\" = \"pid=,ppid=\" ]; then\n"
+        f"    cat {str(table)!r}\n"
+        "    exit $?\n"
+        "  fi\n"
+        "done\n"
+        f"exec {real_ps} \"$@\"\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
     return bindir
 
 
@@ -171,6 +204,25 @@ def test_mtime_sample_unavailable_when_scandir_fails(tmp_path: Path) -> None:
         root.chmod(0o700)
 
 
+def _make_newest_unstatable_file(root: Path) -> Path:
+    """Create a newest directory entry whose real ``stat()`` follows nowhere."""
+    seed = root / "older.txt"
+    seed.write_text("old\n", encoding="utf-8")
+    now_ns = time.time_ns()
+    os.utime(seed, ns=(now_ns - 10_000_000_000, now_ns - 10_000_000_000))
+    broken = root / "newest.txt"
+    broken.symlink_to(root / "missing-target")
+    os.utime(broken, ns=(now_ns, now_ns), follow_symlinks=False)
+    try:
+        broken.stat()
+    except OSError:
+        pass
+    else:
+        raise AssertionError("precondition failed: dangling newest file stat succeeded")
+    assert broken.lstat().st_mtime_ns > seed.stat().st_mtime_ns
+    return broken
+
+
 def test_live_descendant_count_walks_grandchildren() -> None:
     class _Result:
         stdout = "10 1\n11 10\n12 11\n13 2\n"
@@ -188,6 +240,59 @@ def _read_status(path: Path) -> dict:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _auto_reap_worker(worker: subprocess.Popen) -> None:
+    """Match detached production, whose worker is promptly reaped by init."""
+    def reap() -> None:
+        while worker.poll() is None:
+            time.sleep(0.02)
+
+    threading.Thread(target=reap, daemon=True).start()
+
+
+def _seed_managed_detached_lease(
+    *,
+    dispatch_id: str,
+    lease_id: str,
+    worker: subprocess.Popen,
+    tail: Path,
+    status: Path,
+    project_root: Path,
+) -> dict:
+    identity = goalflight_ledger.process_identity(worker.pid)
+    assert identity and identity.get("start_token"), identity
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": dispatch_id,
+            "agent": "codex",
+            "transport": "bash",
+            "project_root": str(project_root),
+            "worker_pid": worker.pid,
+            "worker_identity": identity,
+            "worker_pgid": identity.get("pgid") or worker.pid,
+            "lease_id": lease_id,
+            "detached": True,
+            "stdout_path": str(tail),
+            "status_path": str(status),
+            "state": "running",
+            "terminal_state": "unknown",
+            "started_at": goalflight_ledger.utc_now(),
+        }
+    )
+    capacity = goalflight_capacity.load_state()
+    capacity["leases"][lease_id] = {
+        "lease_id": lease_id,
+        "dispatch_id": dispatch_id,
+        "agent": "codex",
+        "project_root": str(project_root),
+        "worker_pid": worker.pid,
+        "state": "active",
+        "started_at": goalflight_capacity.iso(),
+    }
+    goalflight_capacity.save_state(capacity)
+    return identity
 
 
 def test_quiet_worker_with_sleeping_child_is_not_idle_killed(tmp_path: Path) -> None:
@@ -212,6 +317,7 @@ def test_quiet_worker_with_sleeping_child_is_not_idle_killed(tmp_path: Path) -> 
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    _auto_reap_worker(worker)
     watcher = None
     try:
         deadline = time.monotonic() + 5.0
@@ -312,6 +418,7 @@ def test_quiet_worker_writing_worktree_is_not_idle_killed(tmp_path: Path) -> Non
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    _auto_reap_worker(worker)
     watcher = None
     try:
         deadline = time.monotonic() + 5.0
@@ -377,11 +484,16 @@ def test_quiet_worker_writing_worktree_is_not_idle_killed(tmp_path: Path) -> Non
 
 
 def test_quiet_worker_without_children_still_idle_times_out(tmp_path: Path) -> None:
+    project_root = tmp_path / "repo"
+    worker_cwd = tmp_path / "worktree"
+    project_root.mkdir()
+    worker_cwd.mkdir()
     tail = tmp_path / "worker.tail"
     tail.write_text("worker started\n", encoding="utf-8")
     status = tmp_path / "worker.status.json"
     worker = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],
+        cwd=str(worker_cwd),
         start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -399,6 +511,8 @@ def test_quiet_worker_without_children_still_idle_times_out(tmp_path: Path) -> N
                 status=status,
                 worker_pid=worker.pid,
                 dispatch_id="truly-idle",
+                project_root=project_root,
+                worker_cwd=worker_cwd,
             ),
             capture_output=True,
             text=True,
@@ -415,12 +529,232 @@ def test_quiet_worker_without_children_still_idle_times_out(tmp_path: Path) -> N
 
 
 def _run_quiet_sleeper(tmp_path: Path) -> subprocess.Popen:
-    return subprocess.Popen(
+    worker = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"],
         start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    _auto_reap_worker(worker)
+    return worker
+
+
+def test_indeterminate_cleanup_rejects_wrong_process_group(tmp_path: Path) -> None:
+    worker = _run_quiet_sleeper(tmp_path)
+    sentinel = _run_quiet_sleeper(tmp_path)
+    try:
+        identity = goalflight_ledger.process_identity(worker.pid)
+        assert identity and identity.get("start_token"), identity
+        result = goalflight_watch.terminate_indeterminate_worker(
+            worker.pid,
+            sentinel.pid,
+            identity,
+            term_grace_s=0.05,
+            kill_grace_s=0.05,
+        )
+        assert result["worker_disposition"] == "indeterminate_cleanup_failed", result
+        assert result["worker_termination_signals"] == [], result
+        assert "unverified worker process group" in result["worker_termination_error"], result
+        assert worker.poll() is None, "wrong PGID check signaled the worker"
+        assert sentinel.poll() is None, "wrong PGID check signaled the sentinel"
+    finally:
+        worker.kill()
+        sentinel.kill()
+        worker.wait(timeout=5)
+        sentinel.wait(timeout=5)
+
+
+def test_indeterminate_cleanup_retains_unverified_group_after_leader_exit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    lease_id = "leader-exit-race-lease"
+    child_pid_file = tmp_path / "pinned-child.pid"
+    ready = tmp_path / "pinned-ready"
+    release = tmp_path / "release-leader"
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os, signal, subprocess, sys, time\n"
+            "from pathlib import Path\n"
+            "child = subprocess.Popen([\n"
+            "    sys.executable, '-c',\n"
+            "    'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'\n"
+            "])\n"
+            f"Path({str(child_pid_file)!r}).write_text(str(child.pid))\n"
+            f"Path({str(ready)!r}).write_text('ready')\n"
+            f"release = Path({str(release)!r})\n"
+            "while not release.exists():\n"
+            "    time.sleep(0.02)\n"
+            "os._exit(0)\n",
+        ],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    _auto_reap_worker(worker)
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not ready.exists():
+            time.sleep(0.02)
+        assert ready.exists(), "leader never established the resistant child"
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        identity = goalflight_ledger.process_identity(worker.pid)
+        assert identity and identity.get("start_token"), identity
+        capacity = goalflight_capacity.load_state()
+        capacity["leases"][lease_id] = {
+            "lease_id": lease_id,
+            "dispatch_id": "leader-exit-race",
+            "agent": "codex",
+            "worker_pid": worker.pid,
+            "worker_pgid": worker.pid,
+            "state": "active",
+        }
+        goalflight_capacity.save_state(capacity)
+
+        release.write_text("go", encoding="utf-8")
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and worker.poll() is None:
+            time.sleep(0.02)
+        assert worker.poll() is not None, "leader did not exit before cleanup entry"
+        assert goalflight_compat.pid_alive(child_pid), child_pid
+
+        result = goalflight_watch.terminate_indeterminate_worker(
+            worker.pid,
+            worker.pid,
+            identity,
+            term_grace_s=0.1,
+            kill_grace_s=0.1,
+        )
+        assert result["worker_disposition"] == "indeterminate_cleanup_failed", result
+        assert result["worker_termination_signals"] == [], result
+        assert "historical PGID retained but not signaled" in result["worker_termination_error"], result
+        assert goalflight_compat.pid_alive(child_pid), child_pid
+        capacity_result = goalflight_watch.release_indeterminate_capacity(
+            {"lease_id": lease_id, "worker_pgid": worker.pid},
+            worker_disposition=result,
+            reason="liveness_indeterminate",
+        )
+        assert capacity_result["capacity_lease_disposition"] == "retained_worker_live", capacity_result
+        retained = goalflight_capacity.load_state()["leases"][lease_id]
+        assert retained["state"] == "active", retained
+        assert retained["reason"] == "liveness_indeterminate_worker_live", retained
+        assert retained.get("accounted_live_at"), retained
+        assert retained.get("accounted_live_until"), retained
+        assert retained.get("accounted_live_pgid") == worker.pid, retained
+
+        # Exercise the same stale-reconciliation entry point used before every
+        # local drain. The dead leader cannot free capacity while its resistant
+        # child still occupies the unresolved historical group.
+        rc = goalflight_capacity.main(
+            ["release-stale", "--keep", "--reason", "test_release_stale"]
+        )
+        assert rc == 0, rc
+        reconciled = goalflight_capacity.load_state()["leases"][lease_id]
+        assert reconciled["state"] == "active", reconciled
+        assert len(goalflight_capacity.active_leases(goalflight_capacity.load_state())) == 1
+
+        os.kill(child_pid, 9)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and goalflight_watch._pgroup_alive(worker.pid):
+            time.sleep(0.02)
+        assert not goalflight_watch._pgroup_alive(worker.pid), (
+            "historical process group remained live after resistant child exit"
+        )
+        rc = goalflight_capacity.main(
+            ["release-stale", "--keep", "--reason", "test_release_stale"]
+        )
+        assert rc == 0, rc
+        recovered = goalflight_capacity.load_state()["leases"][lease_id]
+        assert recovered["state"] == "expired", recovered
+
+        # The conservative unknown/reused-PGID hold also has a hard end: once
+        # its deadline passes, it cannot occupy capacity forever.
+        recovered["state"] = "active"
+        recovered["reason"] = goalflight_capacity.INDETERMINATE_LIVE_REASON
+        recovered["accounted_live_until"] = goalflight_capacity.iso(
+            goalflight_capacity.utc_now()
+        )
+        assert not goalflight_capacity.retained_live_scope_holds_capacity(recovered)
+    finally:
+        if child_pid and goalflight_compat.pid_alive(child_pid):
+            try:
+                os.kill(child_pid, 9)
+            except ProcessLookupError:
+                pass
+        if worker.poll() is None:
+            worker.kill()
+        worker.wait(timeout=5)
+
+
+def test_indeterminate_cleanup_requires_fine_identity(tmp_path: Path) -> None:
+    worker = _run_quiet_sleeper(tmp_path)
+    try:
+        result = goalflight_watch.terminate_indeterminate_worker(
+            worker.pid,
+            worker.pid,
+            {"pid": worker.pid},
+            term_grace_s=0.05,
+            kill_grace_s=0.05,
+        )
+        assert result["worker_disposition"] == "indeterminate_cleanup_failed", result
+        assert result["worker_termination_signals"] == [], result
+        assert result["worker_termination_identity_reason"] == "identity_indeterminate", result
+        assert worker.poll() is None, "missing fine identity authorized a destructive signal"
+    finally:
+        worker.kill()
+        worker.wait(timeout=5)
+
+
+def test_indeterminate_cleanup_signal_error_retains_worker(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    lease_id = "signal-error-lease"
+    capacity = goalflight_capacity.load_state()
+    capacity["leases"][lease_id] = {
+        "lease_id": lease_id,
+        "dispatch_id": "signal-error",
+        "agent": "codex",
+        "worker_pid": None,
+        "state": "active",
+    }
+    goalflight_capacity.save_state(capacity)
+    worker = _run_quiet_sleeper(tmp_path)
+    try:
+        identity = goalflight_ledger.process_identity(worker.pid)
+        assert identity and identity.get("start_token"), identity
+        with monkeypatch.context() as scoped:
+            def deny_signal(*_args) -> None:
+                raise PermissionError("denied")
+
+            scoped.setattr(goalflight_watch.os, "killpg", deny_signal)
+            result = goalflight_watch.terminate_indeterminate_worker(
+                worker.pid,
+                worker.pid,
+                identity,
+                term_grace_s=0.05,
+                kill_grace_s=0.05,
+            )
+        assert result["worker_disposition"] == "indeterminate_cleanup_failed", result
+        assert result["worker_alive"] is True, result
+        assert result["worker_termination_signals"] == [], result
+        assert "PermissionError" in result["worker_termination_error"], result
+        assert worker.poll() is None, "failed signal path killed the worker"
+        capacity_result = goalflight_watch.release_indeterminate_capacity(
+            {"lease_id": lease_id},
+            worker_disposition=result,
+            reason="liveness_indeterminate",
+        )
+        assert capacity_result["capacity_lease_disposition"] == "retained_worker_live", capacity_result
+        assert goalflight_capacity.load_state()["leases"][lease_id]["state"] == "active"
+    finally:
+        worker.kill()
+        worker.wait(timeout=5)
 
 
 def _assert_watcher_survives(
@@ -556,6 +890,324 @@ def test_failed_mtime_probe_does_not_idle_kill(tmp_path: Path) -> None:
                 watcher.kill()
                 watcher.communicate(timeout=5)
         worker.kill()
+        worker.wait(timeout=5)
+
+
+def test_newest_file_stat_failure_reaches_indeterminate(tmp_path: Path) -> None:
+    project_root = tmp_path / "repo"
+    worker_cwd = tmp_path / "worktree"
+    project_root.mkdir()
+    worker_cwd.mkdir()
+    newest = _make_newest_unstatable_file(worker_cwd)
+    sample = goalflight_watch.sample_newest_mtime_under(worker_cwd)
+    assert sample.available is False, (
+        f"newest real stat failure was collapsed into an available sample: {sample}"
+    )
+    try:
+        newest.stat()
+    except OSError:
+        pass
+    else:
+        raise AssertionError("precondition failed: newest file no longer fails stat")
+
+    tail = tmp_path / "worker.tail"
+    tail.write_text("worker started\n", encoding="utf-8")
+    status = tmp_path / "worker.status.json"
+    worker = _run_quiet_sleeper(tmp_path)
+    try:
+        env = _watcher_env(tmp_path)
+        env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+        proc = subprocess.run(
+            _watcher_cmd(
+                tail=tail,
+                status=status,
+                worker_pid=worker.pid,
+                dispatch_id="newest-stat-fail",
+                project_root=project_root,
+                worker_cwd=worker_cwd,
+                poll_secs="0.1",
+                max_idle_secs="0.4",
+                liveness_indeterminate_secs="1.2",
+            ),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+        payload = _read_status(status)
+        assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr, payload)
+        assert payload.get("state") == "liveness_indeterminate", payload
+        assert payload.get("tree_probe") == "unavailable", payload
+        assert "tree_mtime" in (payload.get("liveness_unknown_probes") or []), payload
+        assert payload.get("worker_disposition") == "terminated_on_liveness_indeterminate", payload
+        assert worker.poll() is not None, "outer bound must dispose of the unresolved worker"
+    finally:
+        worker.kill()
+        worker.wait(timeout=5)
+
+
+def test_canonical_root_writer_reaches_indeterminate_not_idle_timeout(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    progress = project_root / "progress.txt"
+    tail = tmp_path / "worker.tail"
+    tail.write_text("worker started\n", encoding="utf-8")
+    status = tmp_path / "worker.status.json"
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time\n"
+            "from pathlib import Path\n"
+            f"path = Path({str(progress)!r})\n"
+            "n = 0\n"
+            "while True:\n"
+            "    n += 1\n"
+            "    pending = path.with_suffix('.tmp')\n"
+            "    pending.write_text(str(n))\n"
+            "    pending.replace(path)\n"
+            "    time.sleep(0.05)\n",
+        ],
+        cwd=str(project_root),
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    _auto_reap_worker(worker)
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not progress.exists():
+            time.sleep(0.05)
+        assert progress.is_file(), "precondition failed: canonical-root worker wrote nothing"
+        before = int(progress.read_text(encoding="utf-8"))
+        env = _watcher_env(tmp_path)
+        env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+        proc = subprocess.run(
+            _watcher_cmd(
+                tail=tail,
+                status=status,
+                worker_pid=worker.pid,
+                dispatch_id="canonical-root-writer",
+                project_root=project_root,
+                worker_cwd=project_root,
+                poll_secs="0.1",
+                max_idle_secs="0.4",
+                liveness_indeterminate_secs="1.2",
+            ),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+        payload = _read_status(status)
+        after = int(progress.read_text(encoding="utf-8"))
+        assert after > before, (before, after)
+        assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr, payload)
+        assert payload.get("state") == "liveness_indeterminate", payload
+        assert payload.get("state") != "idle_timeout", payload
+        assert payload.get("tree_probe") == "skipped", payload
+        assert "tree_mtime" in (payload.get("liveness_unknown_probes") or []), payload
+        assert payload.get("worker_disposition") == "terminated_on_liveness_indeterminate", payload
+        assert worker.poll() is not None, "outer bound must dispose of the unresolved writer"
+    finally:
+        worker.kill()
+        worker.wait(timeout=5)
+
+
+def test_live_descendant_reaches_universal_outer_bound(tmp_path: Path) -> None:
+    project_root = tmp_path / "repo"
+    worker_cwd = tmp_path / "worktree"
+    project_root.mkdir()
+    worker_cwd.mkdir()
+    child_pid_file = tmp_path / "child.pid"
+    process_table_file = tmp_path / "process-table.txt"
+    tail = tmp_path / "worker.tail"
+    tail.write_text("worker started\n", encoding="utf-8")
+    status = tmp_path / "worker.status.json"
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os, subprocess, time\n"
+            "from pathlib import Path\n"
+            "child = subprocess.Popen([\n"
+            "    __import__('sys').executable, '-c',\n"
+            "    'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'\n"
+            "])\n"
+            f"Path({str(child_pid_file)!r}).write_text(str(child.pid))\n"
+            f"Path({str(process_table_file)!r}).write_text(f'{{os.getpid()}} 1\\n{{child.pid}} {{os.getpid()}}\\n')\n"
+            "try:\n"
+            "    time.sleep(60)\n"
+            "finally:\n"
+            "    child.kill()\n",
+        ],
+        cwd=str(worker_cwd),
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    _auto_reap_worker(worker)
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not child_pid_file.exists():
+            time.sleep(0.05)
+        assert child_pid_file.is_file(), "precondition failed: child was not spawned"
+        child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        assert goalflight_compat.pid_alive(child_pid), child_pid
+        process_rows = process_table_file.read_text(encoding="utf-8").splitlines()
+        assert f"{child_pid} {worker.pid}" in process_rows, process_rows
+        bindir = _descendant_ps_table_bindir(tmp_path, process_table_file)
+        env = _watcher_env(tmp_path)
+        env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+        count = goalflight_watch.live_descendant_count(
+            worker.pid,
+            ps_runner=lambda *a, **k: subprocess.run(*a, **k, env=env),
+        )
+        assert count is not None and count >= 1, count
+        env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+        proc = subprocess.run(
+            _watcher_cmd(
+                tail=tail,
+                status=status,
+                worker_pid=worker.pid,
+                dispatch_id="positive-descendant-bound",
+                project_root=project_root,
+                worker_cwd=worker_cwd,
+                poll_secs="0.1",
+                max_idle_secs="0.4",
+                liveness_indeterminate_secs="1.2",
+            ),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+        payload = _read_status(status)
+        assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr, payload)
+        assert payload.get("state") == "liveness_indeterminate", payload
+        assert int(payload.get("live_descendants") or 0) >= 1, payload
+        assert "descendants" not in (payload.get("liveness_unknown_probes") or []), payload
+        assert payload.get("worker_disposition") == "terminated_on_liveness_indeterminate", payload
+        assert payload.get("worker_termination_signals") == ["SIGTERM", "SIGKILL"], payload
+        assert worker.poll() is not None, payload
+        deadline = time.monotonic() + 2.0
+        while (
+            time.monotonic() < deadline
+            and goalflight_compat.pid_alive(child_pid)
+            and goalflight_compat.pid_is_zombie(child_pid) is not True
+        ):
+            time.sleep(0.05)
+        assert (
+            not goalflight_compat.pid_alive(child_pid)
+            or goalflight_compat.pid_is_zombie(child_pid) is True
+        ), child_pid
+    finally:
+        worker.kill()
+        worker.wait(timeout=5)
+
+
+def test_post_terminal_unknown_probes_release_managed_capacity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dispatch_id = "post-terminal-unknown"
+    lease_id = "post-terminal-unknown-lease"
+    tail = tmp_path / "worker.tail"
+    tail.write_text(f"COMPLETE: {dispatch_id} — done\n", encoding="utf-8")
+    status = tmp_path / "worker.status.json"
+    worker = _run_quiet_sleeper(tmp_path)
+    watcher = None
+    try:
+        env = _watcher_env(tmp_path)
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+        monkeypatch.setenv("GOALFLIGHT_TEST_PGROUP_CPU_PCT", "0.0")
+        env["PATH"] = str(_descendant_ps_fail_bindir(tmp_path)) + os.pathsep + env.get(
+            "PATH", ""
+        )
+        assert (
+            goalflight_watch.live_descendant_count(
+                worker.pid,
+                ps_runner=lambda *a, **k: subprocess.run(*a, **k, env=env),
+            )
+            is None
+        ), "precondition failed: descendant walk did not fail"
+        identity = _seed_managed_detached_lease(
+            dispatch_id=dispatch_id,
+            lease_id=lease_id,
+            worker=worker,
+            tail=tail,
+            status=status,
+            project_root=tmp_path,
+        )
+        watcher = subprocess.Popen(
+            _watcher_cmd(
+                tail=tail,
+                status=status,
+                worker_pid=worker.pid,
+                dispatch_id=dispatch_id,
+                poll_secs="0.1",
+                max_idle_secs="0.4",
+                liveness_indeterminate_secs="2.0",
+                stay_after_terminal=True,
+                detached=True,
+                worker_identity=identity,
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+
+        # Poison control: after ordinary idle expiry, failed descendant
+        # enumeration is still UNKNOWN. The worker and its detached managed
+        # lease remain live until the universal outer bound.
+        deadline = time.monotonic() + 1.5
+        prebound = {}
+        while time.monotonic() < deadline:
+            prebound = _read_status(status)
+            if (
+                prebound.get("state") == "running_after_terminal"
+                and "descendants" in (prebound.get("liveness_unknown_probes") or [])
+            ):
+                break
+            time.sleep(0.05)
+        assert prebound.get("state") == "running_after_terminal", prebound
+        assert worker.poll() is None, "unknown evidence killed the worker before the outer bound"
+        assert watcher.poll() is None, "watcher exited before the universal outer bound"
+        active_lease = goalflight_capacity.load_state()["leases"][lease_id]
+        assert active_lease["state"] == "active", active_lease
+
+        stdout, stderr = watcher.communicate(timeout=15)
+        payload = _read_status(status)
+        assert watcher.returncode == 2, (watcher.returncode, stdout, stderr, payload)
+        assert payload.get("state") == "liveness_indeterminate", payload
+        assert payload.get("terminal_pending_state") == "complete", payload
+        assert payload.get("terminal_marker", {}).get("kind") == "COMPLETE", payload
+        assert "descendants" in (payload.get("liveness_unknown_probes") or []), payload
+        assert payload.get("worker_disposition") == "terminated_on_liveness_indeterminate", payload
+        assert "SIGTERM" in (payload.get("worker_termination_signals") or []), payload
+        assert payload.get("capacity_lease_id") == lease_id, payload
+        assert payload.get("capacity_lease_disposition") == "released", payload
+        assert payload.get("capacity_lease_state") == "liveness_indeterminate", payload
+        assert worker.poll() is not None, "terminal bound left the detached worker live"
+        released_lease = goalflight_capacity.load_state()["leases"][lease_id]
+        assert released_lease["state"] == "liveness_indeterminate", released_lease
+        assert released_lease.get("released_at"), released_lease
+        terminal_record = json.loads(
+            goalflight_ledger.record_path(dispatch_id).read_text(encoding="utf-8")
+        )
+        assert terminal_record["state"] == "liveness_indeterminate", terminal_record
+        assert terminal_record.get("worker_still_alive") is False, terminal_record
+    finally:
+        if watcher is not None and watcher.poll() is None:
+            watcher.kill()
+            watcher.communicate(timeout=5)
+        if worker.poll() is None:
+            worker.kill()
         worker.wait(timeout=5)
 
 

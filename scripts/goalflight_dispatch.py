@@ -1119,7 +1119,11 @@ def _dispatch_end_reattach_hint(
     terminal_state: str | None,
     worker_alive: object,
 ) -> str | None:
-    if terminal_state in {"idle_timeout", "watcher_stopped"} and worker_alive is True:
+    if terminal_state in {
+        "idle_timeout",
+        "liveness_indeterminate",
+        "watcher_stopped",
+    } and worker_alive is True:
         return _reattach_hint(dispatch_id)
     return None
 

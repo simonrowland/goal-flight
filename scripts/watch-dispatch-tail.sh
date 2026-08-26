@@ -9,8 +9,7 @@
 #   - worker PID dies without terminal marker     → exit 1  ("WATCHER-EXIT: pid-dead")
 #   - no tail update for --max-idle-secs seconds, no live children, and
 #     process-group CPU idle → exit 2  ("WATCHER-EXIT: idle-timeout")
-#   - unknown descendants/CPU never count as idle; give-up is runtime-timeout
-#   - direct watcher exceeds total runtime         → exit 2  ("WATCHER-EXIT: runtime-timeout")
+#   - positive/unknown liveness reaches outer bound → exit 2 ("WATCHER-EXIT: liveness_indeterminate")
 #   - orchestrator PID dies                         → exit 3  ("WATCHER-EXIT: controller-dead")
 #
 # Registers a per-watcher entry in the same pidfile dir scripts/acp_client.py uses
@@ -37,7 +36,8 @@
 #                   (terminal-marker subset; emphasis-tolerant for grok's **MARKER:**)
 #   --poll-secs     15
 #   --max-idle-secs 180   (matches protocol idle/no-progress guidance)
-#   GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS defaults to 10x max-idle (direct-call bound)
+#   GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS defaults to
+#                   max(max-idle + idle-confirmation window, 7200) of tail silence
 #   --cpu-epsilon   0.1   (process-group CPU % of one core above this is running_quiet;
 #                          measured as a cputime delta, not ps's decaying %cpu average)
 #
@@ -299,6 +299,22 @@ live_descendant_count() {
     }
   '
 }
+
+# Mirror goalflight_liveness.INDETERMINATE_LIVENESS_FLOOR_S. The bash test
+# asserts parity with the Python constant so the two supported watchers cannot
+# silently drift again.
+INDETERMINATE_LIVENESS_FLOOR_SECS=7200
+WEDGE_CONFIRM_SAMPLES=5
+default_total_runtime_secs() {
+  local max_idle="$1"
+  local poll_secs="${2:-15}"
+  local confirmed_idle_bound=$(( max_idle + (poll_secs * WEDGE_CONFIRM_SAMPLES) ))
+  if [ "$confirmed_idle_bound" -gt "$INDETERMINATE_LIVENESS_FLOOR_SECS" ]; then
+    echo "$confirmed_idle_bound"
+  else
+    echo "$INDETERMINATE_LIVENESS_FLOOR_SECS"
+  fi
+}
 # Pure CPU helpers above are sourceable for unit tests without running the watcher:
 #   GOALFLIGHT_WATCH_HELPERS_ONLY=1 source scripts/watch-dispatch-tail.sh
 if [ "${GOALFLIGHT_WATCH_HELPERS_ONLY:-}" = "1" ]; then
@@ -331,8 +347,9 @@ POST_TERMINAL_EXIT_GRACE_SECS=6
 # can't false-positive a healthy CPU-busy worker. Full-suite load on macOS can
 # produce several low process-group samples even while the worker is active.
 # Not a flag — this is the watcher mirror of the runner's intra-decision
-# re-sample grace (goalflight_liveness.cpu_liveness_keep_waiting).
-WEDGE_CONFIRM_SAMPLES=5
+# re-sample grace (goalflight_liveness.cpu_liveness_keep_waiting). The constant
+# is declared with the outer-bound helper above so its default leaves enough
+# room for every confirmation sample.
 # Pidfile dir. Honors $GOAL_FLIGHT_PIDFILE_DIR so tests can redirect registration
 # into an isolated temp dir. Default is unchanged, so in production the watcher and
 # scripts/acp_client.py still share /tmp/goal-flight-acp-pids.d and cleanup_ghosts
@@ -361,13 +378,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Direct invocations need a hard lifetime even when a forever-chatty worker
-# continuously resets the idle clock. Managed callers already impose their own
-# process timeout (scripts/hosts/controller/common.py:132), so this generous
-# default is primarily a standalone-watcher backstop. The environment override
-# keeps short hermetic tests and unusual direct callers configurable without
-# expanding the public CLI surface.
-TOTAL_RUNTIME_SECS="${GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS:-$(( MAX_IDLE_SECS * 10 ))}"
+# Every direct invocation needs the same outer event-silence bound as
+# the Python watcher. Positive activity and unavailable probes may veto the
+# ordinary idle timeout, but neither may hold capacity forever. The environment
+# override keeps short hermetic tests and unusual direct callers configurable.
+TOTAL_RUNTIME_SECS="${GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS:-$(default_total_runtime_secs "$MAX_IDLE_SECS" "$POLL_SECS")}"
 case "$TOTAL_RUNTIME_SECS" in
   ''|*[!0-9]*)
     echo "invalid GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS '$TOTAL_RUNTIME_SECS' (must be a positive integer)" >&2
@@ -516,7 +531,6 @@ trap cleanup_pidfile_on_exit EXIT INT TERM
 # Track tail file size for idle detection. Re-stat at each poll.
 last_size=0
 last_size_change_ts=$(date +%s)
-runtime_started_ts=$last_size_change_ts
 wedge_streak=0
 if [ -f "$TAIL_PATH" ]; then
   last_size=$(wc -c < "$TAIL_PATH" 2>/dev/null | tr -d ' ')
@@ -644,14 +658,14 @@ emit_marker_exit() {
   exit "$exit_code"
 }
 
-emit_runtime_timeout() {
+emit_liveness_indeterminate() {
   local elapsed="$1"
-  echo "[$(date '+%H:%M:%S')] watcher total runtime ${elapsed}s reached ${TOTAL_RUNTIME_SECS}s bound"
+  echo "[$(date '+%H:%M:%S')] watcher observed no tail event for ${elapsed}s; reached ${TOTAL_RUNTIME_SECS}s outer bound"
   if [ -f "$TAIL_PATH" ]; then
     echo "=== tail last 30 lines ==="
     tail -30 "$TAIL_PATH"
   fi
-  echo "WATCHER-EXIT: runtime-timeout exit_code=2"
+  echo "WATCHER-EXIT: liveness_indeterminate exit_code=2"
   exit 2
 }
 
@@ -671,7 +685,6 @@ while true; do
   if [ "$loop_gap" -gt "$SLEEP_GAP_GRACE_SECS" ]; then
     echo "[$(date '+%H:%M:%S')] WATCHER-STATE: suspend-gap detected (${loop_gap}s between polls > ${SLEEP_GAP_GRACE_SECS}s grace) — resetting idle clock (system slept; worker not idle)"
     last_size_change_ts=$now_loop_ts
-    runtime_started_ts=$(( runtime_started_ts + loop_gap ))
     wedge_streak=0
   fi
   prev_loop_ts=$now_loop_ts
@@ -687,10 +700,18 @@ while true; do
     exit 3
   fi
 
-  runtime_elapsed=$(( now_loop_ts - runtime_started_ts ))
-  if [ "$runtime_elapsed" -ge "$TOTAL_RUNTIME_SECS" ]; then
-    emit_runtime_timeout "$runtime_elapsed"
+  # Refresh tail growth BEFORE testing the outer silence bound. Otherwise a
+  # write that lands on the boundary can be missed until after a false exit.
+  if [ -f "$TAIL_PATH" ]; then
+    current_size=$(wc -c < "$TAIL_PATH" 2>/dev/null | tr -d ' ')
+    current_size=${current_size:-0}
+    if [ "$current_size" -ne "$last_size" ]; then
+      last_size="$current_size"
+      last_size_change_ts=$now_loop_ts
+      wedge_streak=0
+    fi
   fi
+  silence_elapsed=$(( now_loop_ts - last_size_change_ts ))
 
   # 2. Terminal marker in tail?
   # Hardening (C-P1/D-P1 marker injection): only the LAST non-empty line counts as
@@ -712,22 +733,25 @@ while true; do
           while kill -0 "$WORKER_PID" 2>/dev/null; do
             candidate_now=$(date +%s)
             candidate_idle_for=$(( candidate_now - candidate_started ))
-            candidate_runtime_elapsed=$(( candidate_now - runtime_started_ts ))
-            if [ "$candidate_runtime_elapsed" -ge "$TOTAL_RUNTIME_SECS" ]; then
-              emit_runtime_timeout "$candidate_runtime_elapsed"
+            candidate_current_size=$(wc -c < "$TAIL_PATH" 2>/dev/null | tr -d ' ')
+            candidate_current_size=${candidate_current_size:-0}
+            if [ "$candidate_current_size" -gt "$candidate_size" ]; then
+              echo "[$(date '+%H:%M:%S')] WATCHER-DISCARD: terminal candidate disproved by live tail growth (${candidate_size}->${candidate_current_size}; $seen_marker)"
+              last_size="$candidate_current_size"
+              last_size_change_ts=$candidate_now
+              wedge_streak=0
+              candidate_discarded=1
+              break
+            fi
+            candidate_silence_elapsed=$(( candidate_now - last_size_change_ts ))
+            if [ "$candidate_silence_elapsed" -ge "$TOTAL_RUNTIME_SECS" ]; then
+              emit_liveness_indeterminate "$candidate_silence_elapsed"
             fi
             if [ "$candidate_idle_for" -ge "$POST_TERMINAL_EXIT_GRACE_SECS" ]; then
               echo "[$(date '+%H:%M:%S')] WATCHER-STATE: terminal candidate still pending while worker is alive (${candidate_idle_for}s no growth; $seen_marker)"
               break
             fi
             sleep "$POLL_SECS"
-            candidate_current_size=$(wc -c < "$TAIL_PATH" 2>/dev/null | tr -d ' ')
-            candidate_current_size=${candidate_current_size:-0}
-            if [ "$candidate_current_size" -gt "$candidate_size" ]; then
-              echo "[$(date '+%H:%M:%S')] WATCHER-DISCARD: terminal candidate disproved by live tail growth (${candidate_size}->${candidate_current_size}; $seen_marker)"
-              candidate_discarded=1
-              break
-            fi
           done
           if [ "$candidate_discarded" -eq 1 ]; then
             continue
@@ -777,16 +801,9 @@ while true; do
   # 4. Idle timeout? Tail-size silence is not enough: a worker with live
   #    children (or process-group CPU) is still working.
   if [ -f "$TAIL_PATH" ]; then
-    cur_size=$(wc -c < "$TAIL_PATH" 2>/dev/null | tr -d ' ')
-    cur_size=${cur_size:-0}
-    if [ "$cur_size" -ne "$last_size" ]; then
-      last_size="$cur_size"
-      last_size_change_ts=$(date +%s)
-      wedge_streak=0   # worker made progress — reset the wedge confirm streak
-    else
-      now_ts=$(date +%s)
-      idle_for=$(( now_ts - last_size_change_ts ))
-      if [ "$idle_for" -ge "$MAX_IDLE_SECS" ]; then
+    now_ts=$(date +%s)
+    idle_for=$(( now_ts - last_size_change_ts ))
+    if [ "$idle_for" -ge "$MAX_IDLE_SECS" ]; then
         current_worker_pgid=$(worker_pgid_current "$WORKER_PID")
         [ -n "$current_worker_pgid" ] && worker_pgid="$current_worker_pgid"
         cpu_pct=$(pgroup_cpu_pct "$worker_pgid")
@@ -795,23 +812,35 @@ while true; do
         if [ "$cpu_check_rc" -eq 0 ]; then
           wedge_streak=0
           echo "[$(date '+%H:%M:%S')] WATCHER-STATE: running_quiet worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=$cpu_pct idle_for=${idle_for}s (worker-or-child CPU active)"
+          if [ "$idle_for" -ge "$TOTAL_RUNTIME_SECS" ]; then
+            emit_liveness_indeterminate "$idle_for"
+          fi
           sleep "$POLL_SECS"
           continue
         fi
         if [ "$cpu_check_rc" -eq 2 ]; then
           echo "[$(date '+%H:%M:%S')] WATCHER-STATE: running_quiet worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=unknown idle_for=${idle_for}s (cpu unavailable; unknown is not idle)"
+          if [ "$idle_for" -ge "$TOTAL_RUNTIME_SECS" ]; then
+            emit_liveness_indeterminate "$idle_for"
+          fi
           sleep "$POLL_SECS"
           continue
         fi
         desc_count=$(live_descendant_count "$WORKER_PID")
         if [ "$desc_count" = "unknown" ]; then
           echo "[$(date '+%H:%M:%S')] WATCHER-STATE: running_quiet worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=$cpu_pct live_descendants=unknown idle_for=${idle_for}s (descendants unavailable; unknown is not idle)"
+          if [ "$idle_for" -ge "$TOTAL_RUNTIME_SECS" ]; then
+            emit_liveness_indeterminate "$idle_for"
+          fi
           sleep "$POLL_SECS"
           continue
         fi
         if [ "$desc_count" -gt 0 ]; then
           wedge_streak=0
           echo "[$(date '+%H:%M:%S')] WATCHER-STATE: running_quiet worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=$cpu_pct live_descendants=$desc_count idle_for=${idle_for}s (live child; tail-quiet is not idle)"
+          if [ "$idle_for" -ge "$TOTAL_RUNTIME_SECS" ]; then
+            emit_liveness_indeterminate "$idle_for"
+          fi
           sleep "$POLL_SECS"
           continue
         fi
@@ -831,8 +860,15 @@ while true; do
         tail -30 "$TAIL_PATH"
         echo "WATCHER-EXIT: idle-timeout exit_code=2"
         exit 2
-      fi
     fi
+  fi
+
+  # Marker reconciliation, PID death, and confirmed-idle classification all
+  # outrank indeterminacy. Only a worker that is still alive but has not yet
+  # reached the ordinary idle threshold can arrive here at the outer bound.
+  silence_elapsed=$(( $(date +%s) - last_size_change_ts ))
+  if [ "$silence_elapsed" -ge "$TOTAL_RUNTIME_SECS" ]; then
+    emit_liveness_indeterminate "$silence_elapsed"
   fi
 
   sleep "$POLL_SECS"

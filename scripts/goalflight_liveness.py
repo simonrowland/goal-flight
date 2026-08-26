@@ -37,8 +37,9 @@ LOW_POWER_RELAX_CAP_S = 600.0
 # never counts as death (the b-238 class: a failed `ps` on a busy box looks
 # like "no children"). Waiting forever leaks capacity. 7200s is 2 hours:
 # a 55-minute working worker (b-238) survives with ~65 minutes of margin,
-# and the bound matches the dispatch lease TTL cap. Known-idle still dies
-# at idle_timeout; only cannot-tell waits until max(idle_timeout, this floor).
+# and the bound matches the dispatch lease TTL cap. Known-idle still dies at
+# idle_timeout; positive or cannot-tell probes keep the worker until this outer
+# event-silence bound, then release capacity without claiming the worker is dead.
 INDETERMINATE_LIVENESS_FLOOR_S = 7200.0
 LIVENESS_INDETERMINATE_STATE = "liveness_indeterminate"
 TREE_PROBE_SKIPPED = "skipped"
@@ -515,12 +516,12 @@ def resolve_indeterminate_timeout_s(
     idle_timeout_s: float | None,
     override: float | None = None,
 ) -> float:
-    """Seconds of silence before cannot-tell liveness gives up capacity.
+    """Seconds of silence before non-idle liveness gives up capacity.
 
     Override, when positive, is the bound. Otherwise the bound is
     ``max(idle_timeout, INDETERMINATE_LIVENESS_FLOOR_S)`` so a short one-shot
-    idle still waits two hours when probes fail, and a long goal-mode idle
-    does not die earlier just because the probes were unknown.
+    idle still waits two hours when probes are positive or fail, and a long
+    goal-mode idle does not end earlier just because probes were inconclusive.
     """
     if override is not None and override > 0:
         return float(override)
@@ -563,10 +564,10 @@ def classify_liveness(
     names the gap instead of asserting the worker was idle.
 
     ``tree_probe`` is ``skipped`` when there is no distinct worker cwd
-    (canonical-root writes are other workers'; do not invent a sample),
-    ``measured`` when the walk finished, and ``unavailable`` when the walk
-    failed. A numeric ``tree_age_s`` without an explicit probe is treated
-    as ``measured`` so existing callers stay valid.
+    (canonical-root writes cannot be attributed), ``measured`` when the walk
+    finished, and ``unavailable`` when the walk failed. Skipped and unavailable
+    are both unknown, never negative evidence. A numeric ``tree_age_s`` without
+    an explicit probe is treated as ``measured`` so existing callers stay valid.
     """
     if not pid_alive:
         return "worker_dead"
@@ -593,19 +594,24 @@ def classify_liveness(
         and tree_age_s < idle_timeout
     )
     cpu_alive = pgroup_cpu is not None and pgroup_cpu > thresholds.cpu_epsilon_pct
+    give_up_s = resolve_indeterminate_timeout_s(
+        idle_timeout, indeterminate_timeout_s
+    )
+    give_up_expired = (
+        seconds_since_event is not None and seconds_since_event >= give_up_s
+    )
     if descendants_alive or tree_alive or cpu_alive:
+        if give_up_expired:
+            return LIVENESS_INDETERMINATE_STATE
         return "running_quiet"
 
     unknown = (
         live_descendants is None
-        or tree_probe == TREE_PROBE_UNAVAILABLE
+        or tree_probe in {TREE_PROBE_SKIPPED, TREE_PROBE_UNAVAILABLE}
         or pgroup_cpu is None
     )
     if unknown:
-        give_up_s = resolve_indeterminate_timeout_s(
-            idle_timeout, indeterminate_timeout_s
-        )
-        if seconds_since_event is not None and seconds_since_event >= give_up_s:
+        if give_up_expired:
             return LIVENESS_INDETERMINATE_STATE
         return "running"
 
@@ -817,15 +823,11 @@ class IdleLivenessGate:
     """Stateful liveness gate for the ACP runner's idle path.
 
     Wraps ``cpu_liveness_keep_waiting`` (the transient-ps-failure grace) with a
-    *hard wall*. A worker that stays CPU-busy but emits NO events resets the idle
-    clock every window, so without a ceiling a pathological spinner would keep
-    the runner alive forever (the one regression the bare CPU rule introduces
-    versus the old idle-timeout). The gate caps cumulative running_quiet time
-    *since the last real event* at ``hard_wall_s``; past it, ``keep_waiting``
-    returns False so the runner cancels even though CPU > epsilon. A real ACP
-    event calls ``note_event()`` and resets the wall — legitimate work that
-    emits anything periodically is never capped. The full total-runtime / typed
-    timeout-state taxonomy is Phase 2; this is the minimal no-hang backstop.
+    *hard wall*. CPU activity and live/unknown descendants can veto an ordinary
+    idle decision, but no probe can make event-silent liveness unfalsifiable.
+    The gate caps total quiet time since the first idle check at ``hard_wall_s``;
+    past it, ``keep_waiting`` returns False before any probe can extend the wait.
+    A real ACP event calls ``note_event()`` and resets the wall.
     """
 
     def __init__(
@@ -838,26 +840,29 @@ class IdleLivenessGate:
         self.cpu_epsilon_pct = cpu_epsilon_pct
         self.hard_wall_s = hard_wall_s
         self._now = now
-        self._quiet_since: float | None = None
+        # Start at construction so a caller that delays its first idle probe
+        # cannot silently add an idle-timeout window to the hard wall.
+        self._quiet_since: float | None = self._now()
+        self._hard_wall_expired = False
+
+    @property
+    def hard_wall_expired(self) -> bool:
+        return self._hard_wall_expired
 
     def note_event(self) -> None:
-        """Call when a real ACP event arrives — resets the running_quiet wall."""
-        self._quiet_since = None
+        """Call when a real ACP event arrives — resets the event-silence wall."""
+        self._quiet_since = self._now()
+        self._hard_wall_expired = False
 
     async def keep_waiting(
         self, sampler: Callable[[], Awaitable[float | None]]
     ) -> tuple[bool, float | None]:
-        """Return (keep_waiting, last_cpu). True only if the worker is CPU-busy
-        AND has not been continuously event-silent past the hard wall."""
-        keep, cpu = await cpu_liveness_keep_waiting(sampler, self.cpu_epsilon_pct)
-        if not keep:
-            self._quiet_since = None
-            return False, cpu
+        """Return (keep_waiting, last_cpu), bounded by event silence."""
         t = self._now()
         if self._quiet_since is None:
             self._quiet_since = t
-        elif t - self._quiet_since > self.hard_wall_s:
-            # Hard wall: CPU-busy but event-silent past the lease lifetime →
-            # give up so a pathological spinner can't hang the runner forever.
-            return False, cpu
-        return True, cpu
+        elif t - self._quiet_since >= self.hard_wall_s:
+            self._hard_wall_expired = True
+            return False, None
+        self._hard_wall_expired = False
+        return await cpu_liveness_keep_waiting(sampler, self.cpu_epsilon_pct)

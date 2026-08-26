@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import uuid
@@ -829,16 +830,37 @@ def handle_prompt(req_id: int, params: dict) -> None:
         while True:
             vendor_update(session_id, "noise")
             time.sleep(interval)
-    if SCENARIO == "progress_then_silent":
+    if SCENARIO in {"progress_then_silent", "progress_then_silent_with_child"}:
         marker = os.environ.get("GOALFLIGHT_FAKE_ACP_PROGRESS_FILE")
         if marker:
             with open(marker, "w", encoding="utf-8") as f:
                 f.write("progress\n")
+        child = None
+        if SCENARIO == "progress_then_silent_with_child":
+            child = subprocess.Popen(["sleep", "60"])
+            child_pid_file = os.environ.get("GOALFLIGHT_FAKE_ACP_CHILD_PID_FILE")
+            if child_pid_file:
+                with open(child_pid_file, "w", encoding="utf-8") as handle:
+                    handle.write(str(child.pid))
+        process_table_file = os.environ.get("GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE")
+        if process_table_file:
+            with open(process_table_file, "w", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()} 1\n")
+                if child is not None:
+                    handle.write(f"{child.pid} {os.getpid()}\n")
         text_update(session_id, "started")
-        while True:
-            time.sleep(1.0)
+        try:
+            while True:
+                time.sleep(1.0)
+        finally:
+            if child is not None:
+                child.kill()
     if SCENARIO == "long_reasoning_pause":
         pause_s = float(os.environ.get("GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S", "1.0"))
+        process_table_file = os.environ.get("GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE")
+        if process_table_file:
+            with open(process_table_file, "w", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()} 1\n")
         text_update(session_id, "started")
         time.sleep(pause_s)
         text_update(session_id, "finished")
@@ -853,15 +875,32 @@ def handle_prompt(req_id: int, params: dict) -> None:
                 time.sleep(interval)
         response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
         return
-    if SCENARIO in {"idle_silent", "dead_silent_turn"}:
+    if SCENARIO in {"idle_silent", "idle_silent_with_child", "dead_silent_turn"}:
         # Handshake completes, then the prompt turn emits NOTHING and never
         # responds — models a worker that goes fully event-silent (no progress,
         # no vendor noise). The heartbeat wedge can't fire (it requires >=1 prior
         # progress event), so the runner's idle-timeout / IdleLivenessGate path
         # is the only thing that can reap it. Stays low-CPU so the CPU-aware idle
         # gate classifies it wedged rather than running_quiet.
-        while True:
-            time.sleep(1.0)
+        child = None
+        if SCENARIO == "idle_silent_with_child":
+            child = subprocess.Popen(["sleep", "60"])
+            child_pid_file = os.environ.get("GOALFLIGHT_FAKE_ACP_CHILD_PID_FILE")
+            if child_pid_file:
+                with open(child_pid_file, "w", encoding="utf-8") as handle:
+                    handle.write(str(child.pid))
+            process_table_file = os.environ.get(
+                "GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE"
+            )
+            if process_table_file:
+                with open(process_table_file, "w", encoding="utf-8") as handle:
+                    handle.write(f"{os.getpid()} 1\n{child.pid} {os.getpid()}\n")
+        try:
+            while True:
+                time.sleep(1.0)
+        finally:
+            if child is not None:
+                child.kill()
     if SCENARIO == "blocked":
         text_update(session_id, "BLOCKED: need maintainer\n")
         while True:

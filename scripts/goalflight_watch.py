@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 
 import goalflight_compat
 import goalflight_codex_sessions
+import goalflight_capacity
 import goalflight_dispatch_states
 import goalflight_engine_sessions
 import goalflight_ledger
@@ -186,6 +187,8 @@ WEDGE_EVIDENCE_KEYS = (
 )
 WEDGE_TREE_LEG_WORKER_CWD = "worker_cwd"
 WEDGE_TREE_LEG_INDETERMINATE = "indeterminate"
+INDETERMINATE_TERM_GRACE_S = 1.0
+INDETERMINATE_KILL_GRACE_S = 1.0
 _TREE_SKIP_DIR_NAMES = frozenset(
     {
         ".git",
@@ -344,8 +347,9 @@ def sample_newest_mtime_under(
 
     When ``stop_if_newer_than`` is set, return as soon as any file is newer
     than that cutoff (the tree is not quiet). Does not follow symlinks.
-    A walk that raises is unavailable, unless a file newer than the cutoff
-    was already found — that is enough to prove the tree is alive.
+    A walk or individual file ``stat()`` that raises is unavailable, unless a
+    file newer than the cutoff was already found — that positive observation
+    is enough to prove the tree is alive.
     """
     if root is None:
         return TreeMtimeSample(newest=None, available=False)
@@ -355,6 +359,7 @@ def sample_newest_mtime_under(
     except OSError:
         return TreeMtimeSample(newest=None, available=False)
     newest: float | None = None
+    stat_failed = False
 
     def _raise_walk_error(err: OSError) -> None:
         # Default os.walk swallows scandir errors, so a permission failure
@@ -372,6 +377,7 @@ def sample_newest_mtime_under(
                 try:
                     mtime = path.stat().st_mtime
                 except OSError:
+                    stat_failed = True
                     continue
                 if newest is None or mtime > newest:
                     newest = mtime
@@ -385,7 +391,7 @@ def sample_newest_mtime_under(
         ):
             return TreeMtimeSample(newest=newest, available=True)
         return TreeMtimeSample(newest=newest, available=False)
-    return TreeMtimeSample(newest=newest, available=True)
+    return TreeMtimeSample(newest=newest, available=not stat_failed)
 
 
 def newest_mtime_under(
@@ -1769,6 +1775,229 @@ def worker_alive(pid: int | None, expected_identity: dict | None) -> tuple[bool,
     return is_alive, reason, current
 
 
+def _pgroup_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def verify_indeterminate_worker_scope(
+    pid: int,
+    pgid: int | None,
+    expected_identity: dict | None,
+) -> tuple[int | None, str]:
+    """Verify a destructive cleanup scope while its fine-identity leader lives."""
+    current_identity = goalflight_ledger.process_identity(pid)
+    identity_ok, identity_reason = goalflight_ledger.compare_fine_process_identities(
+        pid, expected_identity, current_identity
+    )
+    if not identity_ok:
+        return None, identity_reason
+    try:
+        current_pgid = os.getpgid(pid)
+    except OSError as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    supplied_pgid = int(pgid or current_pgid)
+    if (
+        current_pgid <= 1
+        or current_pgid == os.getpgrp()
+        or current_pgid != pid
+        or supplied_pgid != current_pgid
+    ):
+        return None, (
+            f"unverified worker process group supplied={supplied_pgid} "
+            f"current={current_pgid} pid={pid}"
+        )
+    return current_pgid, "verified"
+
+
+def terminate_indeterminate_worker(
+    pid: int,
+    pgid: int | None,
+    expected_identity: dict | None,
+    *,
+    term_grace_s: float = INDETERMINATE_TERM_GRACE_S,
+    kill_grace_s: float = INDETERMINATE_KILL_GRACE_S,
+) -> dict:
+    """Bound an unresolved worker before its managed capacity is released."""
+    supplied_pgid = int(pgid or 0)
+    current_identity = goalflight_ledger.process_identity(pid)
+    if current_identity is None:
+        if supplied_pgid > 1 and _pgroup_alive(supplied_pgid):
+            return {
+                "worker_alive": True,
+                "worker_disposition": "indeterminate_cleanup_failed",
+                "worker_termination_identity_reason": "dead",
+                "worker_termination_error": (
+                    "leader gone before current process group verification; "
+                    "historical PGID retained but not signaled"
+                ),
+                "worker_termination_signals": [],
+            }
+        else:
+            return {
+                "worker_alive": False,
+                "worker_disposition": "already_gone_before_indeterminate_cleanup",
+                "worker_termination_identity_reason": "dead",
+                "worker_termination_confirmed": True,
+            }
+    else:
+        current_pgid, identity_reason = verify_indeterminate_worker_scope(
+            pid, pgid, expected_identity
+        )
+    if current_pgid is None:
+        return {
+            "worker_alive": True,
+            "worker_disposition": "indeterminate_cleanup_failed",
+            "worker_termination_identity_reason": identity_reason,
+            "worker_termination_error": (
+                "fine worker identity unavailable"
+                if identity_reason == "identity_indeterminate"
+                else identity_reason
+            ),
+            "worker_termination_signals": [],
+        }
+
+    signals_sent: list[str] = []
+    try:
+        os.killpg(current_pgid, signal.SIGTERM)
+        signals_sent.append("SIGTERM")
+    except ProcessLookupError:
+        return {
+            "worker_alive": False,
+            "worker_disposition": "already_gone_before_indeterminate_cleanup",
+            "worker_termination_identity_reason": "group_gone",
+            "worker_termination_signal_scope": "verified_process_group",
+            "worker_termination_signals": signals_sent,
+            "worker_termination_confirmed": True,
+        }
+    except OSError as exc:
+        return {
+            "worker_alive": True,
+            "worker_disposition": "indeterminate_cleanup_failed",
+            "worker_termination_identity_reason": identity_reason,
+            "worker_termination_signal_scope": "verified_process_group",
+            "worker_termination_signals": signals_sent,
+            "worker_termination_error": f"{type(exc).__name__}: {exc}",
+        }
+
+    deadline = active_monotonic() + max(0.0, term_grace_s)
+    while active_monotonic() < deadline and _pgroup_alive(current_pgid):
+        time.sleep(0.05)
+    if not _pgroup_alive(current_pgid):
+        return {
+            "worker_alive": False,
+            "worker_disposition": "terminated_on_liveness_indeterminate",
+            "worker_termination_identity_reason": "group_gone_after_sigterm",
+            "worker_termination_signal_scope": "verified_process_group",
+            "worker_termination_signals": signals_sent,
+            "worker_termination_confirmed": True,
+        }
+
+    # The successful group TERM established ownership of this still-allocated
+    # PGID while the leader's fine identity matched. If the leader exited, the
+    # same group remains the safe target for TERM-resistant descendants.
+    current_identity = goalflight_ledger.process_identity(pid)
+    leader_ok, leader_reason = goalflight_ledger.compare_fine_process_identities(
+        pid, expected_identity, current_identity
+    )
+    leader_gone = current_identity is None or goalflight_compat.pid_is_zombie(pid) is True
+    if not leader_ok and not leader_gone:
+        return {
+            "worker_alive": True,
+            "worker_disposition": "indeterminate_cleanup_failed",
+            "worker_termination_identity_reason": leader_reason,
+            "worker_termination_signal_scope": "verified_process_group",
+            "worker_termination_signals": signals_sent,
+            "worker_termination_error": "worker identity changed before SIGKILL",
+        }
+    try:
+        os.killpg(current_pgid, signal.SIGKILL)
+        signals_sent.append("SIGKILL")
+    except OSError as exc:
+        return {
+            "worker_alive": True,
+            "worker_disposition": "indeterminate_cleanup_failed",
+            "worker_termination_identity_reason": leader_reason,
+            "worker_termination_signal_scope": "verified_process_group",
+            "worker_termination_signals": signals_sent,
+            "worker_termination_error": f"{type(exc).__name__}: {exc}",
+        }
+
+    deadline = active_monotonic() + max(0.0, kill_grace_s)
+    while active_monotonic() < deadline and _pgroup_alive(current_pgid):
+        time.sleep(0.05)
+    group_gone = not _pgroup_alive(current_pgid)
+    return {
+        # A correctly scoped SIGKILL cannot be caught or ignored. The watcher
+        # may still observe an unreaped zombie because it is not the parent;
+        # that is not a runnable worker or capacity consumer.
+        "worker_alive": False,
+        "worker_disposition": "terminated_on_liveness_indeterminate",
+        "worker_termination_identity_reason": leader_reason,
+        "worker_termination_signal_scope": "verified_process_group",
+        "worker_termination_signals": signals_sent,
+        "worker_termination_confirmed": group_gone,
+    }
+
+
+def release_indeterminate_capacity(
+    dispatch_record: dict | None,
+    *,
+    worker_disposition: dict,
+    reason: str,
+) -> dict:
+    """Release the durable managed lease only after the worker is gone."""
+    lease_id = dispatch_record.get("lease_id") if isinstance(dispatch_record, dict) else None
+    if not lease_id:
+        return {"capacity_lease_disposition": "no_managed_lease"}
+    result = {
+        "capacity_lease_id": str(lease_id),
+        "capacity_lease_disposition": "retained_worker_live",
+    }
+    if worker_disposition.get("worker_alive") is not False:
+        try:
+            retained = goalflight_capacity.retain_indeterminate_live_lease(
+                str(lease_id),
+                pgid=(dispatch_record or {}).get("worker_pgid")
+                or (dispatch_record or {}).get("pgid")
+                or (dispatch_record or {}).get("worker_pid"),
+            )
+            result["capacity_lease_state"] = "active"
+            result["capacity_lease_reason"] = goalflight_capacity.INDETERMINATE_LIVE_REASON
+            result["capacity_lease_accounted_until"] = retained.get(
+                "accounted_live_until"
+            )
+        except Exception as exc:
+            result["capacity_lease_disposition"] = "retained_worker_live_note_failed"
+            result["capacity_lease_release_error"] = f"{type(exc).__name__}: {exc}"
+        return result
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = goalflight_capacity.cmd_release(
+                argparse.Namespace(
+                    lease_id=str(lease_id),
+                    state=LIVENESS_INDETERMINATE_STATE,
+                    reason=reason,
+                    keep=True,
+                )
+            )
+        if code == 0:
+            result["capacity_lease_disposition"] = "released"
+            result["capacity_lease_state"] = LIVENESS_INDETERMINATE_STATE
+        else:
+            result["capacity_lease_disposition"] = "release_failed"
+            result["capacity_lease_release_error"] = f"capacity release exited {code}"
+    except Exception as exc:
+        result["capacity_lease_disposition"] = "release_failed"
+        result["capacity_lease_release_error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
 class TailScanResult:
     __slots__ = (
         "markers",
@@ -3058,10 +3287,12 @@ def main() -> int:
         type=float,
         default=None,
         help=(
-            "Give-up bound when descendants/mtime/CPU cannot determine liveness. "
-            "Unknown never counts as death. Default is max(--max-idle-secs, 7200) "
-            "so a 55-minute working worker survives probe failure with margin. "
-            "Reaching this records liveness_indeterminate, not idle_timeout."
+            "Universal give-up bound for an event-silent live worker, whether "
+            "activity probes are positive or unavailable. Unknown never counts "
+            "as death. Default is max(--max-idle-secs, 7200), so a 55-minute "
+            "working worker survives with margin. Reaching this terminates the "
+            "unresolved worker scope, releases its managed capacity lease, and "
+            "records liveness_indeterminate, not idle_timeout."
         ),
     )
     parser.add_argument("--cpu-epsilon", type=float, default=0.1)
@@ -3153,6 +3384,11 @@ def main() -> int:
             )
             return 0
     expected_identity = _load_identity(args.worker_identity_json)
+    if expected_identity is None:
+        # Direct legacy callers may omit the launcher's identity token. Pin the
+        # identity observed at watcher startup so the later outer-wall cleanup
+        # cannot signal a PID that was reused during the watch.
+        expected_identity = goalflight_ledger.process_identity(args.pid)
     task_ids = _split_task_ids(args.task_ids)
     task_project_root = goalflight_task.resolve_project_root(args.project_root)
 
@@ -3938,7 +4174,7 @@ def main() -> int:
             unknown_probes = []
             if live_descendants is None:
                 unknown_probes.append("descendants")
-            if tree_probe == TREE_PROBE_UNAVAILABLE:
+            if tree_probe in {TREE_PROBE_SKIPPED, TREE_PROBE_UNAVAILABLE}:
                 unknown_probes.append("tree_mtime")
             if cpu_pct is None:
                 unknown_probes.append("cpu")
@@ -4371,12 +4607,11 @@ def main() -> int:
         if (
             liveness_state == LIVENESS_INDETERMINATE_STATE
             and indeterminate_confirmed
-            and not post_terminal_wait
         ):
             unknown_probes = []
             if live_descendants is None:
                 unknown_probes.append("descendants")
-            if tree_probe == TREE_PROBE_UNAVAILABLE:
+            if tree_probe in {TREE_PROBE_SKIPPED, TREE_PROBE_UNAVAILABLE}:
                 unknown_probes.append("tree_mtime")
             if cpu_pct is None:
                 unknown_probes.append("cpu")
@@ -4388,6 +4623,30 @@ def main() -> int:
                 else LIVENESS_INDETERMINATE_STATE
             )
             payload["reason"] = exit_reason
+            if post_terminal_wait:
+                payload["terminal_pending_state"] = terminal_state
+                if post_terminal_wait_elapsed is not None:
+                    payload["post_terminal_wait_elapsed_secs"] = round(
+                        post_terminal_wait_elapsed, 3
+                    )
+            worker_disposition = terminate_indeterminate_worker(
+                args.pid,
+                pgid,
+                expected_identity,
+            )
+            payload.update(worker_disposition)
+            if worker_disposition.get("worker_alive") is False:
+                payload["pgroup_cpu_pct"] = 0.0
+            refreshed_dispatch_record = (
+                _load_dispatch_record(args.dispatch_id) or dispatch_record
+            )
+            payload.update(
+                release_indeterminate_capacity(
+                    refreshed_dispatch_record,
+                    worker_disposition=worker_disposition,
+                    reason=exit_reason,
+                )
+            )
             exit_code = 2
             if apply_tail_quota_status(
                 payload,

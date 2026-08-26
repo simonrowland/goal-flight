@@ -377,6 +377,10 @@ def case_post_terminal_idle_worker_times_out_inconclusively() -> None:
         tmp_path = Path(tmp)
         tail = tmp_path / "tail.txt"
         status = tmp_path / "status.json"
+        project_root = tmp_path / "repo"
+        worker_cwd = tmp_path / "worker-cwd"
+        project_root.mkdir()
+        worker_cwd.mkdir()
         env = os.environ.copy()
         _isolate_state_env(env, tmp_path)
         env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
@@ -406,6 +410,7 @@ def case_post_terminal_idle_worker_times_out_inconclusively() -> None:
                 text=True,
                 start_new_session=True,
                 env=env,
+                cwd=worker_cwd,
             )
         watcher = subprocess.Popen(
             [
@@ -415,6 +420,8 @@ def case_post_terminal_idle_worker_times_out_inconclusively() -> None:
                 "--status-json", str(status),
                 "--dispatch-id", "post-terminal-idle",
                 "--agent", "test",
+                "--project-root", str(project_root),
+                "--worker-cwd", str(worker_cwd),
                 "--poll-secs", "0.2",
                 "--max-idle-secs", "1",
                 "--pgid", str(worker.pid),
@@ -706,6 +713,10 @@ def case_stability_recheck_uses_its_own_growth_baseline() -> None:
         tmp_path = Path(tmp)
         tail = tmp_path / "tail.txt"
         status = tmp_path / "status.json"
+        project_root = tmp_path / "repo"
+        worker_cwd = tmp_path / "worker-cwd"
+        project_root.mkdir()
+        worker_cwd.mkdir()
         tail.write_text("synthetic tail\n", encoding="utf-8")
         env = os.environ.copy()
         _isolate_state_env(env, tmp_path)
@@ -721,6 +732,10 @@ def case_stability_recheck_uses_its_own_growth_baseline() -> None:
             str(status),
             "--dispatch-id",
             "recheck-baseline",
+            "--project-root",
+            str(project_root),
+            "--worker-cwd",
+            str(worker_cwd),
             "--poll-secs",
             "0.1",
             "--max-idle-secs",
@@ -734,6 +749,7 @@ def case_stability_recheck_uses_its_own_growth_baseline() -> None:
                 patch.object(goalflight_watch, "TraceLiveness", FakeTraceLiveness), \
                 patch.object(goalflight_watch, "worker_alive", return_value=(True, "match", {"pid": 4242})), \
                 patch.object(goalflight_watch, "pgroup_cpu_pct", return_value=0.0), \
+                patch.object(goalflight_watch, "live_descendant_count", return_value=0), \
                 patch.object(goalflight_watch, "system_starved", return_value=False), \
                 patch.object(goalflight_watch, "active_monotonic", side_effect=fake_active_monotonic), \
                 patch.object(goalflight_watch.time, "sleep", return_value=None), \
@@ -808,6 +824,10 @@ def case_stability_recheck_detects_growth_after_surviving_candidate() -> None:
         tmp_path = Path(tmp)
         tail = tmp_path / "tail.txt"
         status = tmp_path / "status.json"
+        project_root = tmp_path / "repo"
+        worker_cwd = tmp_path / "worker-cwd"
+        project_root.mkdir()
+        worker_cwd.mkdir()
         tail.write_text("synthetic tail\n", encoding="utf-8")
         env = os.environ.copy()
         _isolate_state_env(env, tmp_path)
@@ -818,6 +838,8 @@ def case_stability_recheck_detects_growth_after_surviving_candidate() -> None:
             "--tail", str(tail),
             "--status-json", str(status),
             "--dispatch-id", "recheck-survivor",
+            "--project-root", str(project_root),
+            "--worker-cwd", str(worker_cwd),
             "--poll-secs", "0.1",
             "--max-idle-secs", "0.1",
             "--stay-after-terminal",
@@ -829,6 +851,7 @@ def case_stability_recheck_detects_growth_after_surviving_candidate() -> None:
                 patch.object(goalflight_watch, "TraceLiveness", FakeTraceLiveness), \
                 patch.object(goalflight_watch, "worker_alive", return_value=(True, "match", {"pid": 4242})), \
                 patch.object(goalflight_watch, "pgroup_cpu_pct", return_value=0.0), \
+                patch.object(goalflight_watch, "live_descendant_count", return_value=0), \
                 patch.object(goalflight_watch, "system_starved", return_value=False), \
                 patch.object(goalflight_watch, "active_monotonic", side_effect=fake_active_monotonic), \
                 patch.object(goalflight_watch.time, "sleep", return_value=None), \

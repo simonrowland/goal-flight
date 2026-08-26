@@ -272,31 +272,157 @@ fi
 rm -f "$TAIL" "$OUT"
 cleanup_pidfile "$PIDFILE_STEM"
 
-# ---- Case 1r: direct watcher total-runtime bound stops forever-chatty workers ----
+# ---- Case 1r: tail growth resets the outer event-silence clock ----
 TAIL=/tmp/test-watch-runtime-bound-$$.txt
 OUT=/tmp/watcher-out-runtime-bound-$$.txt
+CHILD_PID_FILE=/tmp/test-watch-runtime-child-$$.txt
 : > "$TAIL"
 (
-  i=0
-  while true; do
-    echo "STATUS: runtime-bound tick $i"
-    i=$((i + 1))
-    sleep 1
-  done
+  sleep 60 &
+  child_pid=$!
+  echo "$child_pid" > "$CHILD_PID_FILE"
+  echo "STATUS: runtime-bound initial"
+  sleep 2
+  echo "STATUS: runtime-bound reset"
+  wait "$child_pid"
 ) >> "$TAIL" & WORKER_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -s "$CHILD_PID_FILE" ] && break
+  sleep 0.1
+done
+expect_eq "case-1r live descendant precondition" "yes" "$([ -s "$CHILD_PID_FILE" ] && kill -0 "$(cat "$CHILD_PID_FILE")" 2>/dev/null && echo yes || echo no)"
 PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
+case_1r_started=$(date +%s)
 GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS=3 bash "$WATCHER" \
   --pid "$WORKER_PID" --tail "$TAIL" \
   --controller-pid "$$" --agent test-bashtail \
   --session-id runtime-bound \
-  --poll-secs 1 --max-idle-secs 30 \
+  --poll-secs 1 --max-idle-secs 1 \
   > "$OUT" 2>&1
 watcher_exit=$?
-expect_eq "case-1r total-runtime exit code" "2" "$watcher_exit"
-if grep -q "WATCHER-EXIT: runtime-timeout exit_code=2" "$OUT"; then
-  expect_eq "case-1r total-runtime summary" "yes" "yes"
+case_1r_elapsed=$(( $(date +%s) - case_1r_started ))
+expect_eq "case-1r event-silence exit code" "2" "$watcher_exit"
+if [ "$case_1r_elapsed" -ge 4 ]; then
+  expect_eq "case-1r tail growth reset the outer clock" "yes" "yes"
 else
-  expect_eq "case-1r total-runtime summary" "yes" "no"
+  expect_eq "case-1r tail growth reset the outer clock" "elapsed-at-least-4" "$case_1r_elapsed"
+fi
+if grep -q "WATCHER-EXIT: liveness_indeterminate exit_code=2" "$OUT"; then
+  expect_eq "case-1r event-silence summary" "yes" "yes"
+else
+  expect_eq "case-1r event-silence summary" "yes" "no"
+fi
+kill "$WORKER_PID" 2>/dev/null
+wait "$WORKER_PID" 2>/dev/null
+rm -f "$TAIL" "$OUT" "$CHILD_PID_FILE"
+cleanup_pidfile "$PIDFILE_STEM"
+
+# ---- Case 1s: real descendant-probe failure gives up as indeterminate ----
+TAIL=/tmp/test-watch-unknown-bound-$$.txt
+OUT=/tmp/watcher-out-unknown-bound-$$.txt
+: > "$TAIL"
+PS_FAIL_DIR="$PIDFILE_DIR/ps-fail"
+mkdir -p "$PS_FAIL_DIR"
+REAL_PS=$(command -v ps)
+cat > "$PS_FAIL_DIR/ps" <<EOF
+#!/bin/sh
+case " \$* " in
+  *" pid=,ppid= "*)
+    echo 'ps: enumeration failed' >&2
+    exit 1
+    ;;
+  *" pgid=,pid=,time= "*)
+    echo "\${GOALFLIGHT_TEST_WORKER_PID:-0} \${GOALFLIGHT_TEST_WORKER_PID:-0} 0:00.00"
+    exit 0
+    ;;
+  *" pgid= "*)
+    echo "\${GOALFLIGHT_TEST_WORKER_PID:-0}"
+    exit 0
+    ;;
+esac
+exec "$REAL_PS" "\$@"
+EOF
+chmod +x "$PS_FAIL_DIR/ps"
+PATH="$PS_FAIL_DIR:$PATH" ps -axo pid=,ppid= >/dev/null 2>&1
+expect_eq "case-1s descendant probe really fails" "1" "$?"
+WORKER_PID=$(start_isolated_sleep 60)
+PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
+PATH="$PS_FAIL_DIR:$PATH" GOALFLIGHT_TEST_WORKER_PID="$WORKER_PID" \
+  GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS=3 bash "$WATCHER" \
+  --pid "$WORKER_PID" --tail "$TAIL" \
+  --controller-pid "$$" --agent test-bashtail \
+  --session-id unknown-bound \
+  --poll-secs 1 --max-idle-secs 1 \
+  > "$OUT" 2>&1
+watcher_exit=$?
+expect_eq "case-1s unknown-probe outer-bound exit code" "2" "$watcher_exit"
+if grep -q "live_descendants=unknown" "$OUT"; then
+  expect_eq "case-1s real unknown descendant observed" "yes" "yes"
+else
+  expect_eq "case-1s real unknown descendant observed" "yes" "no"
+fi
+if grep -q "WATCHER-EXIT: liveness_indeterminate exit_code=2" "$OUT"; then
+  expect_eq "case-1s unknown reason vocabulary" "yes" "yes"
+else
+  expect_eq "case-1s unknown reason vocabulary" "yes" "no"
+fi
+if grep -q "WATCHER-EXIT: idle-timeout" "$OUT"; then
+  expect_eq "case-1s unknown is never idle" "absent" "present"
+else
+  expect_eq "case-1s unknown is never idle" "absent" "absent"
+fi
+kill "$WORKER_PID" 2>/dev/null
+wait "$WORKER_PID" 2>/dev/null
+rm -f "$TAIL" "$OUT"
+cleanup_pidfile "$PIDFILE_STEM"
+
+# ---- Case 1t: confirmed idle outranks a coincident outer bound ----
+TAIL=/tmp/test-watch-known-idle-bound-$$.txt
+OUT=/tmp/watcher-out-known-idle-bound-$$.txt
+: > "$TAIL"
+PS_ZERO_DIR="$PIDFILE_DIR/ps-zero"
+mkdir -p "$PS_ZERO_DIR"
+cat > "$PS_ZERO_DIR/ps" <<'EOF'
+#!/bin/sh
+case " $* " in
+  *" pid=,ppid= "*)
+    echo "${GOALFLIGHT_TEST_WORKER_PID:-0} 1"
+    exit 0
+    ;;
+  *" pgid=,pid=,time= "*)
+    echo "${GOALFLIGHT_TEST_WORKER_PID:-0} ${GOALFLIGHT_TEST_WORKER_PID:-0} 0:00.00"
+    exit 0
+    ;;
+  *" pgid= "*)
+    echo "${GOALFLIGHT_TEST_WORKER_PID:-0}"
+    exit 0
+    ;;
+esac
+exit 1
+EOF
+chmod +x "$PS_ZERO_DIR/ps"
+WORKER_PID=$(start_isolated_sleep 60)
+PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
+known_idle_rows=$(PATH="$PS_ZERO_DIR:$PATH" GOALFLIGHT_TEST_WORKER_PID="$WORKER_PID" ps -axo pid=,ppid=)
+expect_eq "case-1t measured-zero descendant precondition" "$WORKER_PID 1" "$known_idle_rows"
+PATH="$PS_ZERO_DIR:$PATH" GOALFLIGHT_TEST_WORKER_PID="$WORKER_PID" \
+  GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS=2 bash "$WATCHER" \
+  --pid "$WORKER_PID" --tail "$TAIL" \
+  --controller-pid "$$" --agent test-bashtail \
+  --session-id known-idle-bound \
+  --poll-secs 1 --max-idle-secs 1 \
+  > "$OUT" 2>&1
+watcher_exit=$?
+expect_eq "case-1t confirmed idle exit code" "2" "$watcher_exit"
+if grep -q "WATCHER-EXIT: idle-timeout exit_code=2" "$OUT"; then
+  expect_eq "case-1t confirmed idle beats indeterminate" "yes" "yes"
+else
+  expect_eq "case-1t confirmed idle beats indeterminate" "yes" "no"
+fi
+if grep -q "WATCHER-EXIT: liveness_indeterminate" "$OUT"; then
+  expect_eq "case-1t no false indeterminate" "absent" "present"
+else
+  expect_eq "case-1t no false indeterminate" "absent" "absent"
 fi
 kill "$WORKER_PID" 2>/dev/null
 wait "$WORKER_PID" 2>/dev/null
@@ -1021,6 +1147,16 @@ got=$(cpu_pct_from_cputime_delta "100 10.0" "$(printf '100 10.0\n102 2.0')" 2.0)
 expect_eq "case-6 born child counts in full" "100.0" "$got"
 got=$(cpu_pct_from_cputime_delta "1 0.0" "1 5.0" 0.0)
 expect_eq "case-6 nonpositive window is 0%" "0.0" "$got"
+got=$(default_total_runtime_secs 180)
+expect_eq "case-6 default outer bound survives 55-minute incident" "7200" "$got"
+python_floor=$(PYTHONPATH="$REPO_ROOT/scripts" python3 - <<'PY'
+from goalflight_liveness import INDETERMINATE_LIVENESS_FLOOR_S
+print(int(INDETERMINATE_LIVENESS_FLOOR_S))
+PY
+)
+expect_eq "case-6 shell/Python indeterminate floor parity" "$python_floor" "$got"
+got=$(default_total_runtime_secs 8000 15)
+expect_eq "case-6 long max-idle leaves confirmation room" "8075" "$got"
 
 # Live sampler: measures NOW, not a decaying average. Spinner in its own
 # session (mirrors start_new_session workers), then sleeps — delta must drop
