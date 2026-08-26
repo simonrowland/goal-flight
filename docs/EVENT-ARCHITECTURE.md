@@ -432,7 +432,8 @@ also carries projection `age_s`; an hour-old projection becomes `stale` even whe
 
 `--listener-slots`, `GOALFLIGHT_LISTENER_SLOTS`, and
 `GOALFLIGHT_LISTENER_LOW_WATER` remain portable-pool controls. Persistent backup
-depth is `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 6, max 32). `follow` rejects
+depth is `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 6; target depth, not a
+ceiling). `follow` rejects
 the CLI knob and warns on the portable environment knobs; persistent depth is
 the stream, the backup doorbell pool, and the watchdog.
 

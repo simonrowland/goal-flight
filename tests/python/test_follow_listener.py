@@ -1018,14 +1018,17 @@ def test_watchdog_generation_lock_is_independent_of_listener_slot(
                 or []
             }
             assert kinds == {"listener", "watchdog"}
-            with pytest.raises(wake.ListenerSlotsFull):
-                wake.register_listener_waiter(
-                    project,
-                    controller_label=lease.label,
-                    generation_key=lease.nonce,
-                    slots=1,
-                )
-            with pytest.raises(wake.ListenerSlotsFull):
+            extra = wake.register_listener_waiter(
+                project,
+                controller_label=lease.label,
+                generation_key=lease.nonce,
+                slots=1,
+            )
+            try:
+                assert extra.slot_index == 1
+            finally:
+                extra.close()
+            with pytest.raises(BlockingIOError):
                 wake.register_watchdog_waiter(
                     project,
                     controller_label=lease.label,
@@ -1108,19 +1111,29 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
         ]
         assert listener_pids == [backup.pid]
         assert backup.poll() is None, "arming the watchdog displaced the backup"
-        refused = subprocess.run(
-            _backup_command(project, lease),
-            cwd=project,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=2,
+        extra = wake.register_listener_waiter(
+            project,
+            controller_label=lease.label,
+            generation_key=lease.nonce,
+            slots=1,
         )
-        assert refused.returncode == 3
-        assert "listener slots hold live doorbells" in refused.stderr
-        assert "likely your own tracked tasks" in refused.stderr
-        assert "do NOT kill by pattern" in refused.stderr
-        assert backup.poll() is None, "a refused contender displaced the live backup"
+        try:
+            assert extra.slot_index == 1
+            extra_pids = [
+                row.pid
+                for row in wake.live_waiters(
+                    project,
+                    controller_label=lease.label,
+                    kinds={"listener"},
+                )
+                or []
+            ]
+            assert backup.pid in extra_pids
+            assert len(extra_pids) == 2
+            assert backup.poll() is None, "a second doorbell displaced the live backup"
+        finally:
+            extra.close()
+        assert backup.poll() is None, "releasing the extra doorbell displaced the backup"
 
         messages.post_message(
             dispatch_id="backup-rings-with-watchdog",

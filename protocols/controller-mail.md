@@ -179,8 +179,9 @@ backup command. Persistent coverage is eight required slots: one live, healthy
 monitor stream, six backup doorbells, and one watchdog. Status, entry hints, and fleet
 output use that shared `live/8` predicate; after stream loss the surviving backup pool
 and watchdog report persistent coverage `7/8`, never a portable `1/4` pool. Override
-with `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (1–32). A shortfall is degraded, not
-binary-dead: a controller with some doorbells still covered should top the pool up.
+with `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 6; target depth, not a
+ceiling). A shortfall is degraded, not binary-dead: a controller with some
+doorbells still covered should top the pool up.
 
 This is a bounded witness chain, not complete failure coverage. A lone watchdog death
 is loud, and correlated stream-plus-watchdog death is still loud while the backup
