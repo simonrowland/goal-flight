@@ -70,7 +70,7 @@ sys.path.insert(0, os.environ["GOALFLIGHT_TEST_SCRIPTS"])
 import goalflight_journal as journal
 
 def fail_arm_after_claim(self, *args, **kwargs):
-    raise journal.JournalUnavailable("injected failure after pending claim")
+    raise journal.JournalIOError("injected failure after pending claim")
 
 journal.Journal.arm_listener = fail_arm_after_claim
 import goalflight_messages

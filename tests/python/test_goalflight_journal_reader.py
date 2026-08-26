@@ -167,7 +167,7 @@ def test_present_file_with_both_opens_failing_is_probe_unavailable(
     monkeypatch.setattr(journal, "_sqlite_connect", unavailable_connect)
     reader = journal.Journal.open_reader(project, open_retry_budget_s=0.02)
     with pytest.raises(
-        journal.JournalUnavailable,
+        journal.JournalIOError,
         match="probe unavailable/unreadable",
     ) as captured:
         reader.epochs()
@@ -182,7 +182,7 @@ def test_absent_reader_keeps_legacy_unavailable_semantics(
     _set_state_env(monkeypatch, tmp_path)
     project = _project(tmp_path)
 
-    with pytest.raises(journal.JournalUnavailable, match="journal database is absent"):
+    with pytest.raises(journal.JournalDisappeared, match="journal database is absent"):
         journal.Journal.open_reader(project)
 
 
