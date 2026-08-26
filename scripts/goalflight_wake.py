@@ -46,6 +46,7 @@ _RING_STAMP_FILE_VERSION = "ring-stamp-v1"
 # so an upgrade re-reports once instead of trusting unacknowledged high-water.
 _PENDING_REPORT_FILE_VERSION = "pending-report-v3"
 PENDING_REPORT_STATE_SCHEMA = "goalflight.pending-report.v3"
+MAX_PENDING_REPORT_QUARANTINES = 8
 _WATCHDOG_DEATH_REPORT_FILE_VERSION = "watchdog-death-report-v1"
 _MONITOR_STATE_FILE_VERSION = "monitor-state-v1"
 MONITOR_STATE_SCHEMA = "goalflight.monitor-state.v1"
@@ -809,6 +810,26 @@ def pending_report_state(
     )
 
 
+def _prune_pending_report_quarantines(directory_fd: int, claimed_name: str) -> None:
+    prefix = f".{claimed_name}."
+    suffix = ".corrupt"
+    dated: list[tuple[int, str]] = []
+    for name in os.listdir(directory_fd):
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            continue
+        try:
+            st = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        dated.append((int(st.st_mtime_ns), name))
+    dated.sort()
+    overflow = len(dated) - MAX_PENDING_REPORT_QUARANTINES
+    if overflow <= 0:
+        return
+    for _mtime, name in dated[:overflow]:
+        _unlink_at(directory_fd, name)
+
+
 def recover_pending_report_state(
     project_root: Path | str,
     *,
@@ -853,6 +874,7 @@ def recover_pending_report_state(
             except FileNotFoundError:
                 return None
             os.fsync(directory_fd)
+            _prune_pending_report_quarantines(directory_fd, path.name)
             return None
     finally:
         if lock_fd >= 0:

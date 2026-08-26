@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import contextlib
 from dataclasses import dataclass, field
 import datetime as dt
@@ -3991,6 +3991,74 @@ def _cursor_positions(rows: list[dict] | tuple[dict, ...]) -> dict[str, int]:
     return positions
 
 
+def _journal_cursor_positions(authority, controller_label: str) -> dict[str, int]:
+    status = authority.cursor_status(controller_label)
+    if not isinstance(status, dict):
+        return {}
+    raw = status.get("positions")
+    if not isinstance(raw, dict):
+        return {}
+    return {str(stream_id): int(position) for stream_id, position in raw.items()}
+
+
+def _cursor_covers_claim(
+    cursor_positions: Mapping[str, int],
+    claim_positions: Mapping[str, int],
+) -> bool:
+    if not claim_positions:
+        return False
+    return not any(
+        int(cursor_positions.get(stream_id, 0)) < int(high_water)
+        for stream_id, high_water in claim_positions.items()
+    )
+
+
+def _acknowledge_pending_report_from_cursor(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    cursor_positions: Mapping[str, int],
+) -> None:
+    if not cursor_positions:
+        return
+    try:
+        goalflight_wake.acknowledge_pending_report(
+            project_root,
+            controller_label=controller_label,
+            lease_nonce=lease_nonce,
+            positions=cursor_positions,
+        )
+    except (OSError, RuntimeError, ValueError):
+        # The journal cursor is authoritative. Sidecar settlement must not
+        # turn a committed advance into a lost delivery.
+        pass
+
+
+def _settle_pending_report_if_consumed(
+    authority,
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    claim_positions: Mapping[str, int],
+) -> bool:
+    """Return True when the journal cursor already consumed this claim."""
+    try:
+        cursor_positions = _journal_cursor_positions(authority, controller_label)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if not _cursor_covers_claim(cursor_positions, claim_positions):
+        return False
+    _acknowledge_pending_report_from_cursor(
+        project_root,
+        controller_label=controller_label,
+        lease_nonce=lease_nonce,
+        cursor_positions=cursor_positions,
+    )
+    return True
+
+
 def _cursor_advance_command(
     *,
     project_root: Path | str,
@@ -4190,11 +4258,13 @@ def cmd_relay(args: argparse.Namespace) -> int:
             )
             return 3
         try:
-            goalflight_wake.acknowledge_pending_report(
+            _acknowledge_pending_report_from_cursor(
                 root,
                 controller_label=controller_label,
                 lease_nonce=lease.nonce,
-                positions=positions,
+                cursor_positions=_journal_cursor_positions(
+                    authority, controller_label
+                ),
             )
         except (OSError, RuntimeError, ValueError):
             # The cursor commit is authoritative. A stale claim may duplicate a
@@ -4403,11 +4473,14 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
         print(f"advance: {result.reason or 'cursor CAS lost'}", file=sys.stderr)
         return 3
     try:
-        goalflight_wake.acknowledge_pending_report(
+        _acknowledge_pending_report_from_cursor(
             project_root,
             controller_label=label,
             lease_nonce=nonce,
-            positions=advances,
+            cursor_positions=_journal_cursor_positions(
+                goalflight_journal.Journal(project_root),
+                label,
+            ),
         )
     except (OSError, RuntimeError, ValueError):
         # The cursor already committed; preserving a provisional claim can
@@ -5330,7 +5403,14 @@ def cmd_follow(args) -> int:
         controller_label=label,
         lease_nonce=nonce,
     )
-    arm_high = dict(pending_report.positions) if pending_report is not None else {}
+    # Follow never takes over and never emits pending-at-arm, so only an
+    # acknowledged boundary is a delivery watermark it can honour. claimed
+    # and reported prove a local flush, not that this monitor saw the mail.
+    arm_high = (
+        dict(pending_report.positions)
+        if pending_report is not None and pending_report.phase == "acknowledged"
+        else {}
+    )
 
     def emit(record: dict[str, object]) -> bool:
         alive = _write_follow_record(record, stream=sys.stdout)
@@ -5813,15 +5893,25 @@ def cmd_listen(args) -> int:
             if persisted_state is not None:
                 # Every phase shares one immutable boundary. A replacement may
                 # take ownership until cursor acknowledgement settles it, but it
-                # never substitutes its own later snapshot positions.
+                # never substitutes its own later snapshot positions. A journal
+                # cursor that already covers the claim is consumed, not missing.
                 arm_high = dict(persisted_state.positions)
                 pending_report_settled = persisted_state.phase == "acknowledged"
                 if not pending_report_settled:
-                    report_claim = goalflight_wake.acquire_pending_report(
+                    if _settle_pending_report_if_consumed(
+                        authority,
                         project_root,
                         controller_label=label,
                         lease_nonce=nonce,
-                    )
+                        claim_positions=persisted_state.positions,
+                    ):
+                        pending_report_settled = True
+                    else:
+                        report_claim = goalflight_wake.acquire_pending_report(
+                            project_root,
+                            controller_label=label,
+                            lease_nonce=nonce,
+                        )
             elif arm_snapshot is not None and arm_snapshot.items:
                 local_high = _cursor_positions(arm_snapshot.items)
                 # The first arm publishes a complete claim atomically. A loser
@@ -6061,6 +6151,14 @@ def cmd_listen(args) -> int:
         snapshot,
     ) -> None:
         """Flush one claimed boundary, then record the provisional report."""
+        if _settle_pending_report_if_consumed(
+            authority,
+            project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+            claim_positions=claim.positions,
+        ):
+            return
         if snapshot is None:
             snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
         report_items = tuple(
@@ -6096,6 +6194,14 @@ def cmd_listen(args) -> int:
                 )
             )
         if _cursor_positions(report_items) != claim.positions:
+            if _settle_pending_report_if_consumed(
+                authority,
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+                claim_positions=claim.positions,
+            ):
+                return
             raise MessageError("pending-report claim boundary cannot be reconstructed")
         if (
             claim.cursor_version is None
@@ -6166,6 +6272,14 @@ def cmd_listen(args) -> int:
                     lease_nonce=nonce,
                 )
                 if observed_report is None or observed_report.phase == "acknowledged":
+                    pending_report_settled = True
+                elif _settle_pending_report_if_consumed(
+                    authority,
+                    project_root,
+                    controller_label=label,
+                    lease_nonce=nonce,
+                    claim_positions=observed_report.positions,
+                ):
                     pending_report_settled = True
                 else:
                     takeover = goalflight_wake.acquire_pending_report(

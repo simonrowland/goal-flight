@@ -439,6 +439,31 @@ def test_partial_pending_report_state_fails_closed(
     assert path.read_text(encoding="utf-8").endswith(",")
 
 
+def test_corrupt_pending_report_quarantine_is_bounded(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, _env = isolated
+    path = wake._pending_report_path(
+        project,
+        controller_label="terse-ctl",
+        lease_nonce="bounded-quarantine",
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(wake.MAX_PENDING_REPORT_QUARANTINES + 5):
+        path.write_text('{"schema":"goalflight.pending-report.v3",', encoding="utf-8")
+        assert (
+            wake.recover_pending_report_state(
+                project,
+                controller_label="terse-ctl",
+                lease_nonce="bounded-quarantine",
+            )
+            is None
+        )
+        assert not path.exists()
+    quarantines = list(path.parent.glob(f".{path.name}.*.corrupt"))
+    assert len(quarantines) == wake.MAX_PENDING_REPORT_QUARANTINES
+
+
 def test_listen_recovers_corrupt_pending_report_and_stays_armed(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:

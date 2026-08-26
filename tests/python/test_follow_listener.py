@@ -315,6 +315,100 @@ def test_follow_recovers_corrupt_pending_report_and_stays_armed(
         proc.wait(timeout=5)
 
 
+def test_follow_emits_unacked_reported_backlog(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    """Follow cannot act on ``reported``, so that phase is not a skip watermark."""
+    project, env, lease = isolated
+    messages.post_message(
+        dispatch_id="follow-unacked-reported",
+        msg_type="controller-notice",
+        payload={"text": "unread reported flush"},
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+        addressee=messages.controller_addressee(lease.label, project_root=project),
+    )
+    listener_env = {
+        **env,
+        "GOALFLIGHT_CONTROLLER_LABEL": lease.label,
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+    }
+    with wake.register_lease_holder(
+        project, controller_label=lease.label, lease_nonce=lease.nonce
+    ):
+        listener = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPTS / "goalflight_messages.py"),
+                "listen",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                lease.label,
+                "--lease-nonce",
+                lease.nonce,
+                "--report-pending",
+                "--json",
+                "--poll-secs",
+                "0.01",
+            ],
+            cwd=project,
+            env=listener_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            report_deadline = time.monotonic() + 5
+            while time.monotonic() < report_deadline:
+                state = wake.pending_report_state(
+                    project,
+                    controller_label=lease.label,
+                    lease_nonce=lease.nonce,
+                )
+                if state is not None and state.phase == "reported":
+                    break
+                time.sleep(0.005)
+            else:
+                pytest.fail("listener never reached reported phase")
+            listener.kill()
+            listener.wait(timeout=5)
+            if listener.stdout is not None:
+                listener.stdout.close()
+        finally:
+            if listener.poll() is None:
+                listener.kill()
+                listener.wait()
+
+    state = wake.pending_report_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    assert state is not None
+    assert state.phase == "reported"
+
+    proc = _spawn_follow(project, env, lease, heartbeat_s=0.2)
+    assert proc.stdout is not None
+    reader = _JsonLineReader(proc.stdout)
+    try:
+        _wait_for_monitor_slot(project, lease.label, proc.pid)
+        deadline = time.monotonic() + 2
+        event = None
+        while time.monotonic() < deadline:
+            _raw, record = reader.read(timeout_s=max(0.01, deadline - time.monotonic()))
+            if record["kind"] == "event":
+                event = record
+                break
+        assert event is not None, "follow-only monitor never emitted the unacked backlog"
+        assert event["payload"]["dispatch_id"] == "follow-unacked-reported"
+        assert proc.poll() is None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
 def test_epipe_exits_and_releases_persistent_monitor_slot(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
 ) -> None:
