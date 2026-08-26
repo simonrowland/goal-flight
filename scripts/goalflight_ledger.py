@@ -385,13 +385,51 @@ def record_path(dispatch_id: str, *, create: bool = True) -> Path:
     return runs_dir(create=create) / f"{goalflight_compat.safe_dispatch_filename(dispatch_id)}.json"
 
 
+def _is_usable_terminal_time(value: object) -> bool:
+    """True when *value* is a stored terminal time, not a missing or poisoned field.
+
+    The journal idempotent reread used to stringify SQL NULL as ``"None"``.
+    That token is not a time; freezing it would block later journal backfill.
+    """
+    if value in (None, ""):
+        return False
+    return str(value).strip() not in {"None", "null"}
+
+
+def preserve_first_terminal_time(record: dict, terminal_at: object = None) -> str | None:
+    """Keep the first terminal instant; backfill only from journal authority.
+
+    The journal commits ``terminal_at`` atomically with the winning transition.
+    Projectors may run much later or retry indefinitely, so their wall clock is
+    never terminal-ordering evidence.
+    """
+    existing = record.get("ended_at")
+    if _is_usable_terminal_time(existing):
+        return str(existing)
+    if _is_usable_terminal_time(terminal_at):
+        record["ended_at"] = str(terminal_at)
+        return str(terminal_at)
+    return None
+
+
 def write_record(record: dict) -> Path:
     if record.get("project_root") not in (None, ""):
         record["project_root"] = canonicalize_project_root_on_store(
             record["project_root"]
         )
-    record["updated_at"] = utc_now()
     path = record_path(record["dispatch_id"])
+    if path.exists():
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            current = None
+        if isinstance(current, dict):
+            current_ended_at = current.get("ended_at")
+            if current_ended_at not in (None, ""):
+                # The on-disk value won the first projection. A stale caller
+                # cannot replace it, even if that caller carries a timestamp.
+                record["ended_at"] = current_ended_at
+    record["updated_at"] = utc_now()
     tmp = path.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as handle:
         handle.write(json.dumps(record, indent=2, sort_keys=True) + "\n")
@@ -443,6 +481,15 @@ def read_records() -> list[dict]:
     return records
 
 
+def record_is_unreadable(record: dict | None) -> bool:
+    """True when *record* is the placeholder ``read_records`` inserts for a bad file.
+
+    Production never raises on corrupt ledger JSON. Callers that treat the
+    placeholder as a settled terminal invent a verdict they did not observe.
+    """
+    return isinstance(record, dict) and record.get("state") == "unreadable"
+
+
 def infer_engine(agent: object) -> str:
     if not isinstance(agent, str) or not agent:
         return "unknown"
@@ -477,6 +524,10 @@ def terminal_state_for(state: object, reason: object = None) -> str:
         # queued/waiting_capacity = queued for a capacity slot (pre-spawn, live):
         # non-terminal, so the reused-dispatch-id guard refuses duplicates
         # while a launcher is queued.
+        return "unknown"
+    if state == "unreadable":
+        # Placeholder from read_records(): the file could not be parsed. That is
+        # "I could not find out", never a settled error/terminal.
         return "unknown"
     return "error"
 
@@ -956,8 +1007,7 @@ def cmd_finish(args: argparse.Namespace) -> int:
             else winner_state
         )
         record["state"] = effective_state
-        ended_at = utc_now()
-        record["ended_at"] = ended_at
+        ended_at = preserve_first_terminal_time(record, winner.terminal_at)
         record["terminal_state"] = terminal_state
         record["liveness_state"] = goalflight_terminal.terminal_liveness_state(effective_state)
         elapsed_s = getattr(args, "elapsed_s", None)
@@ -1226,7 +1276,6 @@ def reconcile_terminal_outbox(
                                 or result.value.terminal_state
                             ),
                             "terminal_state": result.value.terminal_state,
-                            "ended_at": utc_now(),
                             "worker_still_alive": False,
                             "attempt_id": result.value.attempt_id,
                             "transition_id": result.value.transition_id,
@@ -1234,6 +1283,7 @@ def reconcile_terminal_outbox(
                             "reason": reason,
                         }
                     )
+                    preserve_first_terminal_time(current, result.value.terminal_at)
                     write_record(current)
                 history_records.append(dict(current))
         elif result.cas_lost:

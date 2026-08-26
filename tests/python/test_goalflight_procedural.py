@@ -236,12 +236,19 @@ def test_ledger_record_finish_status() -> None:
         )
         assert_true("record wrote", rec["ok"])
         run(["python3", "scripts/goalflight_ledger.py", "finish", "--dispatch-id", dispatch_id, "--state", "complete"], state_dir=state_dir)
+        first_record_path = Path(rec["path"])
+        first_record = json.loads(first_record_path.read_text())
+        assert_true("first finish records ended_at", bool(first_record.get("ended_at")))
+        first_ended_at = "2026-01-01T00:00:00.100000+00:00"
+        first_record["ended_at"] = first_ended_at
+        first_record_path.write_text(json.dumps(first_record) + "\n")
         run(["python3", "scripts/goalflight_ledger.py", "finish", "--dispatch-id", dispatch_id, "--state", "failed", "--reason", "late-watcher-error"], state_dir=state_dir)
         status = json.loads(run(["python3", "scripts/goalflight_ledger.py", "status", "--json"], state_dir=state_dir).stdout)
         assert_true("ledger schema", status["schema"] == "goalflight.dispatch.v1")
         assert_true("finished visible", any(row["state"] == "complete" for row in status["records"]))
         weird_row = next(row for row in status["records"] if row["dispatch_id"] == dispatch_id)
         assert_true("conflicting terminal finish is idempotent no-op", weird_row["state"] == "complete")
+        assert_true("repeated finish preserves first ended_at", weird_row["ended_at"] == first_ended_at)
 
         run(
             [

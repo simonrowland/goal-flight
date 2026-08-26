@@ -328,6 +328,746 @@ def _record_drain_launch_order(order: list[str]):
         D.subprocess.run = old_run
 
 
+@contextlib.contextmanager
+def _isolated_completion_authority(tmp: Path):
+    old_env = os.environ.copy()
+    try:
+        os.environ.clear()
+        os.environ.update(_env(tmp))
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+
+
+def _linked_task_entry(tmp: Path, dispatch_id: str, *, created_at: str) -> dict:
+    return {
+        "schema": D.DISPATCH_QUEUE_SCHEMA,
+        "state": "queued",
+        "dispatch_id": dispatch_id,
+        "agent": "test-dispatch",
+        "shape": "bash",
+        "project_root": str(tmp),
+        "created_at": created_at,
+        "task_ids": ["t-b212"],
+        "request": {"cwd": str(tmp), "task_ids": ["t-b212"]},
+    }
+
+
+def _write_completed_task(tmp: Path, *, done_at: str) -> None:
+    import goalflight_task
+
+    store = goalflight_task.TaskStore(tmp)
+    store.docs_dir.mkdir(parents=True, exist_ok=True)
+    store.tasks_path.write_text(
+        json.dumps(
+            {
+                "id": "t-b212",
+                "kind": "task",
+                "title": "completion ordering fixture",
+                "blocked_by": [],
+                "links": [],
+                "tags": [],
+                "done": True,
+                "created_at": "2025-01-01T00:00:00+00:00",
+                "created_by": "test",
+                "done_at": done_at,
+                "closed_at": done_at,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_terminal_ended_at_uses_first_journal_commit_and_is_write_once() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            dispatch_id = "terminal-time-authority"
+            status_path = tmp / "terminal-time.status.json"
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "agent": "test-dispatch",
+                    "state": "running",
+                    "terminal_state": "unknown",
+                    "project_root": str(tmp),
+                    "status_path": str(status_path),
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                }
+            )
+            first = D.goalflight_ledger.commit_terminal_authority(
+                {
+                    "dispatch_id": dispatch_id,
+                    "project_root": str(tmp),
+                },
+                state="complete",
+                reason=None,
+                worker_still_alive=False,
+            )
+            assert first.committed and first.value is not None
+            first_terminal_at = first.value.terminal_at
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": "complete",
+                        "terminal_state": "complete",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            original_utc_now = D.goalflight_ledger.utc_now
+            D.goalflight_ledger.utc_now = lambda: "2099-01-01T00:00:00+00:00"
+            try:
+                reconciled = D.goalflight_ledger.reconcile_terminal_outbox(
+                    tmp,
+                    messages_dir=tmp / "messages",
+                )
+            finally:
+                D.goalflight_ledger.utc_now = original_utc_now
+
+            assert reconciled["already_terminal"] == 1, reconciled
+            record_path = D.goalflight_ledger.record_path(dispatch_id)
+            projected = json.loads(record_path.read_text(encoding="utf-8"))
+            assert projected["ended_at"] == first_terminal_at, projected
+
+            attempted_rewrite = dict(projected)
+            attempted_rewrite["ended_at"] = "2100-01-01T00:00:00+00:00"
+            D.goalflight_ledger.write_record(attempted_rewrite)
+            preserved = json.loads(record_path.read_text(encoding="utf-8"))
+            assert preserved["ended_at"] == first_terminal_at, preserved
+
+
+def test_prior_ledger_completion_does_not_supersede_deliberate_follow_up() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": "earlier-round",
+                    "agent": "test-dispatch",
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "project_root": str(tmp),
+                    "task_ids": ["t-b212"],
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "ended_at": "2026-01-01T01:00:00+00:00",
+                }
+            )
+            entry = _linked_task_entry(
+                tmp,
+                "deliberate-follow-up",
+                created_at="2026-01-02T00:00:00+00:00",
+            )
+
+            assert D._entry_completion_authority(entry, {}) is None
+
+
+def test_same_time_ledger_completion_defers_ambiguous_ordering() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": "winning-round",
+                    "agent": "test-dispatch",
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "project_root": str(tmp),
+                    "task_ids": ["t-b212"],
+                    "started_at": "2026-01-02T00:00:00+00:00",
+                    "ended_at": "2026-01-02T01:00:00+00:00",
+                }
+            )
+            entry = _linked_task_entry(
+                tmp,
+                "queued-duplicate",
+                created_at="2026-01-02T01:00:00+00:00",
+            )
+
+            decision = D._entry_completion_authority(entry, {})
+
+            assert decision is not None
+            assert decision["state"] == "deferred"
+            assert decision["reason"] == "completion_authority_indeterminate"
+
+
+def test_same_time_completion_deferral_is_bounded_then_restores_for_launch() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            completed_at = "2026-01-02T01:00:00+00:00"
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": "same-time-prior-completion",
+                    "agent": "test-dispatch",
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "project_root": str(tmp),
+                    "task_ids": ["t-b212"],
+                    "started_at": "2026-01-02T00:00:00+00:00",
+                    "ended_at": completed_at,
+                }
+            )
+            entry = {
+                **_linked_task_entry(
+                    tmp,
+                    "same-time-bounded-deferral",
+                    created_at=completed_at,
+                ),
+                "dispatch_argv": ["--agent", "test-dispatch"],
+                "queue_launch_token": "same-time-token",
+                "request": {
+                    "cwd": str(tmp),
+                    "tail": str(tmp / "same-time.tail"),
+                    "task_ids": ["t-b212"],
+                },
+            }
+            claim = queue / f"{entry['dispatch_id']}.json.claimed-1"
+            claim.write_text(json.dumps(entry), encoding="utf-8")
+
+            first = D._recover_claimed_queue_entries(queue, stale_s=0)
+            assert first["pending_launch"] == 1, first
+            deferred = json.loads(claim.read_text(encoding="utf-8"))
+            assert deferred["completion_authority_deferral_count"] == 1, deferred
+            assert not (queue / f"{entry['dispatch_id']}.json").exists()
+
+            second = D._recover_claimed_queue_entries(queue, stale_s=0)
+            restored_path = queue / f"{entry['dispatch_id']}.json"
+            assert second["restored"] == 1, second
+            assert restored_path.exists()
+            restored = json.loads(restored_path.read_text(encoding="utf-8"))
+            assert restored["state"] == "queued", restored
+            assert restored["completion_authority_deferral_count"] == 1, restored
+            assert restored["claim_recovery_count"] == 1, restored
+            assert not claim.exists()
+
+
+def test_authority_read_failure_never_uses_equality_escape_and_surfaces() -> None:
+    import goalflight_task
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            entry = {
+                **_linked_task_entry(
+                    tmp,
+                    "permanently-unreadable-authority",
+                    created_at="2026-01-02T01:00:00+00:00",
+                ),
+                "dispatch_argv": ["--agent", "test-dispatch"],
+                "queue_launch_token": "unreadable-authority-token",
+                "request": {
+                    "cwd": str(tmp),
+                    "tail": str(tmp / "unreadable-authority.tail"),
+                    "task_ids": ["t-b212"],
+                },
+            }
+            claim = queue / f"{entry['dispatch_id']}.json.claimed-1"
+            claim.write_text(json.dumps(entry), encoding="utf-8")
+            original_load = goalflight_task.TaskStore.load_items
+            goalflight_task.TaskStore.load_items = lambda *_args, **_kwargs: (
+                _ for _ in ()
+            ).throw(OSError("injected permanent task-store failure"))
+            try:
+                for _attempt in range(D.MAX_COMPLETION_AUTHORITY_DEFERRALS + 2):
+                    result = D._recover_claimed_queue_entries(queue, stale_s=0)
+                    assert result["restored"] == 0, result
+                    assert result["pending_launch"] == 1, result
+                    assert any(
+                        detail.get("reason") == "completion_authority_unavailable"
+                        for detail in result["pending_reasons"]
+                    ), result
+                    parked = json.loads(claim.read_text(encoding="utf-8"))
+                    assert "completion_authority_deferral_count" not in parked, parked
+                    assert not (queue / f"{entry['dispatch_id']}.json").exists()
+            finally:
+                goalflight_task.TaskStore.load_items = original_load
+
+
+def test_authority_park_visible_on_claim_status_drain_and_unparks() -> None:
+    """A dead store must park out loud, and restore must not invent a race.
+
+    Round 4 parked on `completion_authority_unavailable` but left the reason in
+    a recover return value. Claim files, status.json, and drain `details` were
+    silent, so a parked entry looked stuck. Restore-after-capacity then labeled
+    that park a race it never observed.
+    """
+    import goalflight_task
+
+    def _unreadable_load(*_args, **_kwargs):
+        raise OSError("injected permanent task-store failure")
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            status_path = tmp / "parked-recover.status.json"
+            status_path.write_text(
+                json.dumps({"state": "queued", "reason": "dispatch_queue"}),
+                encoding="utf-8",
+            )
+            recover_id = "park-visible-recover"
+            recover_entry = {
+                **_linked_task_entry(
+                    tmp,
+                    recover_id,
+                    created_at="2026-01-02T01:00:00+00:00",
+                ),
+                "dispatch_argv": ["--agent", "test-dispatch"],
+                "queue_launch_token": "park-visible-recover-token",
+                "request": {
+                    "cwd": str(tmp),
+                    "tail": str(tmp / f"{recover_id}.tail"),
+                    "status_json": str(status_path),
+                    "task_ids": ["t-b212"],
+                },
+            }
+            recover_claim = queue / f"{recover_id}.json.claimed-1"
+            recover_claim.write_text(json.dumps(recover_entry), encoding="utf-8")
+
+            drain_id = "park-visible-drain"
+            drain_path = _write_queue_entry(queue, drain_id, filename=drain_id)
+            drain_entry = json.loads(drain_path.read_text(encoding="utf-8"))
+            drain_entry["project_root"] = str(tmp)
+            drain_entry["task_ids"] = ["t-b212"]
+            drain_entry["request"]["cwd"] = str(tmp)
+            drain_entry["request"]["task_ids"] = ["t-b212"]
+            D._write_json_atomic(drain_path, drain_entry)
+
+            original_load = goalflight_task.TaskStore.load_items
+            original_run = D.subprocess.run
+            original_release = D._release_stale_capacity_for_drain
+            original_hook = D._run_drain_prelaunch_hook
+            goalflight_task.TaskStore.load_items = _unreadable_load
+            D._release_stale_capacity_for_drain = lambda: None
+            D._run_drain_prelaunch_hook = lambda _agents: None
+            D.subprocess.run = lambda argv, **kwargs: subprocess.CompletedProcess(
+                argv,
+                2,
+                stdout="blocked_capacity\n",
+                stderr="",
+            )
+            try:
+                recovered = D._recover_claimed_queue_entries(queue, stale_s=0)
+                assert recovered["restored"] == 0, recovered
+                assert recovered["pending_launch"] >= 1, recovered
+                parked = json.loads(recover_claim.read_text(encoding="utf-8"))
+                assert parked.get("reason") == "completion_authority_unavailable", parked
+                assert parked.get("unpark_event") == "completion_authority_readable", parked
+                assert "completion_authority_deferral_count" not in parked, parked
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                assert status.get("reason") == "completion_authority_unavailable", status
+                assert status.get("unpark_event") == "completion_authority_readable", status
+
+                args = _drain_args(queue)
+                args.claim_stale_s = 0
+                payload = D._drain_queue_once(args)
+            finally:
+                D.subprocess.run = original_run
+                D._release_stale_capacity_for_drain = original_release
+                D._run_drain_prelaunch_hook = original_hook
+                goalflight_task.TaskStore.load_items = original_load
+
+            details = payload.get("details") or []
+            reasons = [str(row.get("reason") or "") for row in details]
+            assert "completion_authority_unavailable" in reasons, payload
+            assert all("raced" not in reason for reason in reasons), payload
+            by_id = {str(row.get("dispatch_id")): row for row in details}
+            recover_row = by_id.get(recover_id)
+            drain_row = by_id.get(drain_id)
+            assert recover_row is not None, payload
+            assert recover_row["reason"] == "completion_authority_unavailable", recover_row
+            assert recover_row.get("unpark_event") == "completion_authority_readable", recover_row
+            assert drain_row is not None, payload
+            assert drain_row["reason"] == "completion_authority_unavailable", drain_row
+            assert drain_row.get("unpark_event") == "completion_authority_readable", drain_row
+            assert drain_row["reason"] != "capacity_restore_raced", drain_row
+
+            drain_claims = list(queue.glob(f"{drain_id}.json.claimed-*"))
+            assert len(drain_claims) == 1, drain_claims
+            drain_parked = json.loads(drain_claims[0].read_text(encoding="utf-8"))
+            assert drain_parked.get("reason") == "completion_authority_unavailable", drain_parked
+            assert drain_parked.get("unpark_event") == "completion_authority_readable", drain_parked
+            drain_status = json.loads(
+                Path(drain_entry["request"]["status_json"]).read_text(encoding="utf-8")
+            )
+            assert drain_status.get("reason") == "completion_authority_unavailable", drain_status
+            assert drain_status.get("unpark_event") == "completion_authority_readable", drain_status
+
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                D._report_why_this_entry_did_not_launch(
+                    argparse.Namespace(dispatch_id=drain_id),
+                    payload,
+                )
+            reported = captured.getvalue()
+            assert f"{drain_id} not launched: completion_authority_unavailable" in reported, reported
+            assert "completion_authority_readable" in reported, reported
+
+            unpark = D._recover_claimed_queue_entries(queue, stale_s=0)
+            restored_path = queue / f"{recover_id}.json"
+            assert unpark["restored"] >= 1, unpark
+            assert restored_path.exists(), unpark
+            restored = json.loads(restored_path.read_text(encoding="utf-8"))
+            assert restored["state"] == "queued", restored
+            assert restored.get("reason") != "completion_authority_unavailable", restored
+            assert "unpark_event" not in restored, restored
+
+
+def test_prior_store_completion_does_not_supersede_deliberate_follow_up() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            _write_completed_task(tmp, done_at="2026-01-01T01:00:00+00:00")
+            entry = _linked_task_entry(
+                tmp,
+                "store-follow-up",
+                created_at="2026-01-02T00:00:00+00:00",
+            )
+
+            assert D._entry_completion_authority(entry, {}) is None
+
+
+def test_later_store_completion_still_supersedes_queued_duplicate() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            _write_completed_task(tmp, done_at="2026-01-02T01:00:00+00:00")
+            entry = _linked_task_entry(
+                tmp,
+                "store-duplicate",
+                created_at="2026-01-01T00:00:00+00:00",
+            )
+
+            decision = D._entry_completion_authority(entry, {})
+
+            assert decision is not None
+            assert decision["state"] == "superseded"
+            assert decision["reason"] == "task_store:all_complete"
+
+
+def test_missing_ledger_completion_time_defers_supersession() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": "completion-without-time",
+                    "agent": "test-dispatch",
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "project_root": str(tmp),
+                    "task_ids": ["t-b212"],
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                }
+            )
+            entry = _linked_task_entry(
+                tmp,
+                "unknown-order",
+                created_at="2026-01-02T00:00:00+00:00",
+            )
+
+            decision = D._entry_completion_authority(entry, {})
+
+            assert decision is not None
+            assert decision["state"] == "deferred"
+            assert decision["reason"] == "completion_authority_timestamp_unreadable"
+            assert decision["bounded_deferral"] is False
+            assert decision["reason"] != "completion_authority_indeterminate"
+
+
+def test_missing_entry_creation_time_defers_supersession() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            _write_completed_task(tmp, done_at="2026-01-02T01:00:00+00:00")
+            entry = _linked_task_entry(
+                tmp,
+                "unknown-submission-time",
+                created_at="not-a-timestamp",
+            )
+
+            decision = D._entry_completion_authority(entry, {})
+
+            assert decision is not None
+            assert decision["state"] == "deferred"
+            assert decision["reason"] == "completion_authority_timestamp_unreadable"
+            assert decision["bounded_deferral"] is False
+            assert decision["reason"] != "completion_authority_indeterminate"
+
+
+def _write_corrupt_ledger_json(dispatch_id: str) -> Path:
+    """Write genuinely unparseable bytes through the real runs.d path."""
+    path = D.goalflight_ledger.record_path(dispatch_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{this is not json\n", encoding="utf-8")
+    return path
+
+
+def _assert_real_unreadable_placeholder(dispatch_id: str) -> dict:
+    """The production read_records path must itself produce the placeholder."""
+    records = D.goalflight_ledger.read_records()
+    matches = [
+        row
+        for row in records
+        if isinstance(row, dict) and row.get("dispatch_id") == dispatch_id
+    ]
+    assert matches, records
+    placeholder = matches[0]
+    assert placeholder.get("state") == "unreadable", placeholder
+    assert D._dispatch_record_is_terminal(placeholder) is False, placeholder
+    assert D.goalflight_ledger.terminal_state_for("unreadable") == "unknown"
+    return placeholder
+
+
+def _claimed_linked_entry(tmp: Path, queue: Path, dispatch_id: str, *, created_at: str) -> tuple[Path, dict]:
+    entry = {
+        **_linked_task_entry(tmp, dispatch_id, created_at=created_at),
+        "dispatch_argv": ["--agent", "test-dispatch"],
+        "queue_launch_token": f"{dispatch_id}-token",
+        "request": {
+            "cwd": str(tmp),
+            "tail": str(tmp / f"{dispatch_id}.tail"),
+            "status_json": str(tmp / f"{dispatch_id}.status.json"),
+            "task_ids": ["t-b212"],
+        },
+    }
+    claim = queue / f"{dispatch_id}.json.claimed-1"
+    claim.write_text(json.dumps(entry), encoding="utf-8")
+    return claim, entry
+
+
+def test_corrupt_self_ledger_json_parks_and_keeps_claim() -> None:
+    """Production-shaped Failure A: corrupt runs/<self>.json must not unlink the claim."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            dispatch_id = "corrupt-self-ledger"
+            claim, _entry = _claimed_linked_entry(
+                tmp,
+                queue,
+                dispatch_id,
+                created_at="2026-01-02T01:00:00+00:00",
+            )
+            corrupt = _write_corrupt_ledger_json(dispatch_id)
+            placeholder = _assert_real_unreadable_placeholder(dispatch_id)
+            assert placeholder.get("path") == str(corrupt), placeholder
+
+            recovered = D._recover_claimed_queue_entries(queue, stale_s=0)
+
+            assert recovered["cleared"] == 0, recovered
+            assert recovered["restored"] == 0, recovered
+            assert claim.exists(), "unreadable self ledger must not unlink the claim"
+            assert not (queue / f"{dispatch_id}.json").exists()
+            parked = json.loads(claim.read_text(encoding="utf-8"))
+            assert parked.get("reason") == "completion_authority_unavailable", parked
+            assert parked.get("unpark_event") == "completion_authority_readable", parked
+            assert any(
+                detail.get("reason") == "completion_authority_unavailable"
+                for detail in recovered["pending_reasons"]
+            ), recovered
+
+
+def test_corrupt_prior_ledger_json_is_unavailable_not_launchable() -> None:
+    """Production-shaped Failure B: corrupt prior-round.json must not look like 'none'."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            _write_corrupt_ledger_json("prior-round")
+            _assert_real_unreadable_placeholder("prior-round")
+            entry = _linked_task_entry(
+                tmp,
+                "queued-after-corrupt-prior",
+                created_at="2026-01-02T00:00:00+00:00",
+            )
+
+            decision = D._entry_completion_authority(entry, {})
+
+            assert decision is not None, "unreadable prior must not return launchable None"
+            assert decision["state"] == "deferred", decision
+            assert decision["reason"] == "completion_authority_unavailable", decision
+            assert decision["bounded_deferral"] is False, decision
+
+            claim, _claimed = _claimed_linked_entry(
+                tmp,
+                queue,
+                "claimed-after-corrupt-prior",
+                created_at="2026-01-02T00:00:00+00:00",
+            )
+            recovered = D._recover_claimed_queue_entries(queue, stale_s=0)
+            assert recovered["restored"] == 0, recovered
+            assert recovered["cleared"] == 0, recovered
+            assert claim.exists()
+            parked = json.loads(claim.read_text(encoding="utf-8"))
+            assert parked.get("reason") == "completion_authority_unavailable", parked
+
+
+def test_timestamp_unreadable_parks_then_terminalizes() -> None:
+    """Missing ended_at parks with a distinct reason, then exits as blocked."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": "completion-without-time",
+                    "agent": "test-dispatch",
+                    "state": "complete",
+                    "terminal_state": "complete",
+                    "project_root": str(tmp),
+                    "task_ids": ["t-b212"],
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                }
+            )
+            claim, entry = _claimed_linked_entry(
+                tmp,
+                queue,
+                "missing-time-exit",
+                created_at="2026-01-02T00:00:00+00:00",
+            )
+
+            first = D._recover_claimed_queue_entries(queue, stale_s=0)
+            assert first["restored"] == 0, first
+            assert first["cleared"] == 0, first
+            assert claim.exists()
+            parked = json.loads(claim.read_text(encoding="utf-8"))
+            assert parked.get("reason") == "completion_authority_timestamp_unreadable", parked
+            assert parked.get("park_exit_state") == "blocked_completion_authority", parked
+            assert "completion_authority_deferral_count" not in parked, parked
+            assert any(
+                detail.get("reason") == "completion_authority_timestamp_unreadable"
+                for detail in first["pending_reasons"]
+            ), first
+
+            second = D._recover_claimed_queue_entries(queue, stale_s=0)
+            assert second["cleared"] == 1, second
+            assert not claim.exists(), second
+            record = D._find_dispatch_record(entry["dispatch_id"])
+            assert record is not None, record
+            assert record.get("state") == "blocked_completion_authority", record
+            assert record.get("reason") == "completion_authority_timestamp_unreadable" or (
+                isinstance(record.get("reason"), str)
+                and "completion_authority_timestamp_unreadable" in str(record.get("reason"))
+            ), record
+
+
+def test_journal_null_terminal_at_is_not_the_string_none() -> None:
+    assert journal.journal_terminal_at(None) == ""
+    assert journal.journal_terminal_at("None") == ""
+    assert journal.journal_terminal_at("null") == ""
+    stamp = "2026-01-01T00:00:00+00:00"
+    assert journal.journal_terminal_at(stamp) == stamp
+
+
+def test_poisoned_ended_at_none_string_can_backfill_from_journal() -> None:
+    record = {"ended_at": "None"}
+    filled = D.goalflight_ledger.preserve_first_terminal_time(
+        record, "2026-01-02T00:00:00+00:00"
+    )
+    assert filled == "2026-01-02T00:00:00+00:00", record
+    assert record["ended_at"] == "2026-01-02T00:00:00+00:00"
+    frozen = {"ended_at": "2026-01-01T00:00:00+00:00"}
+    assert (
+        D.goalflight_ledger.preserve_first_terminal_time(
+            frozen, "2099-01-01T00:00:00+00:00"
+        )
+        == "2026-01-01T00:00:00+00:00"
+    )
+    assert frozen["ended_at"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_corrupt_task_store_row_does_not_abort_recover_or_drain() -> None:
+    """One bad tasks.jsonl line must not abort the rest of the drain pass."""
+    import goalflight_task
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            store = goalflight_task.TaskStore(tmp)
+            store.docs_dir.mkdir(parents=True, exist_ok=True)
+            store.tasks_path.write_text("{not-a-task-row\n", encoding="utf-8")
+            first_claim, _first = _claimed_linked_entry(
+                tmp, queue, "store-row-a", created_at="2026-01-02T00:00:00+00:00"
+            )
+            second_claim, _second = _claimed_linked_entry(
+                tmp, queue, "store-row-b", created_at="2026-01-02T00:00:00+00:00"
+            )
+            recovered = D._recover_claimed_queue_entries(queue, stale_s=0)
+            assert recovered["restored"] == 0, recovered
+            assert first_claim.exists() and second_claim.exists()
+            reasons = [str(row.get("reason") or "") for row in recovered["pending_reasons"]]
+            assert any("completion_authority_unavailable" in reason or reason.startswith("reconcile_fault:") for reason in reasons), recovered
+
+            original_run = D.subprocess.run
+            original_release = D._release_stale_capacity_for_drain
+            original_hook = D._run_drain_prelaunch_hook
+            D._release_stale_capacity_for_drain = lambda: None
+            D._run_drain_prelaunch_hook = lambda _agents: None
+            D.subprocess.run = lambda argv, **kwargs: subprocess.CompletedProcess(
+                argv, 2, stdout="blocked_capacity\n", stderr=""
+            )
+            try:
+                payload = D._drain_queue_once(_drain_args(queue))
+            finally:
+                D.subprocess.run = original_run
+                D._release_stale_capacity_for_drain = original_release
+                D._run_drain_prelaunch_hook = original_hook
+            assert isinstance(payload, dict), payload
+            assert payload.get("failed") is not None
+
+
+def test_parked_status_write_failure_is_visible_on_claim() -> None:
+    original_write = D.write_status
+
+    def fail_status(_path, _payload):
+        raise OSError("injected status sidecar failure")
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            _write_corrupt_ledger_json("prior-round")
+            claim, _entry = _claimed_linked_entry(
+                tmp,
+                queue,
+                "status-write-visible",
+                created_at="2026-01-02T00:00:00+00:00",
+            )
+            D.write_status = fail_status
+            try:
+                recovered = D._recover_claimed_queue_entries(queue, stale_s=0)
+            finally:
+                D.write_status = original_write
+            assert recovered["cleared"] == 0, recovered
+            parked = json.loads(claim.read_text(encoding="utf-8"))
+            assert parked.get("reason") == "completion_authority_unavailable", parked
+            assert parked.get("status_write_failed") is True, parked
+            assert any(row.get("status_write_failed") for row in recovered["pending_reasons"]), recovered
+
+
 def test_submit_status_delay_requires_test_mode() -> None:
     keys = (
         "GOALFLIGHT_TEST_MODE",
@@ -3081,6 +3821,7 @@ def test_b065_superseded_does_not_demote_task_success() -> None:
                         "agent": "test-dispatch",
                         "shape": "bash",
                         "project_root": str(project),
+                        "created_at": "2000-01-01T00:00:00+00:00",
                         "dispatch_argv": ["--agent", "test-dispatch"],
                         "task_ids": ["b-065-task"],
                         "request": {
@@ -4765,6 +5506,7 @@ def test_round5_authority_errors_defer_before_restore() -> None:
         old_env = os.environ.copy()
         original_load = goalflight_task.TaskStore.load_items
         original_read_records = D.goalflight_ledger.read_records
+        original_find_record = D._find_dispatch_record
         try:
             os.environ.clear()
             os.environ.update(_b065_env(tmp))
@@ -4801,9 +5543,21 @@ def test_round5_authority_errors_defer_before_restore() -> None:
             )
             ledger_error = D._entry_completion_authority(entry, record={})
             assert ledger_error and ledger_error["state"] == "deferred", ledger_error
+            assert ledger_error["reason"] == "completion_authority_unavailable", ledger_error
+            assert ledger_error["bounded_deferral"] is False, ledger_error
+
+            D.goalflight_ledger.read_records = original_read_records
+            D._find_dispatch_record = lambda _dispatch_id: (_ for _ in ()).throw(
+                OSError("injected ledger row failure")
+            )
+            row_error = D._entry_completion_authority(entry)
+            assert row_error and row_error["state"] == "deferred", row_error
+            assert row_error["reason"] == "completion_authority_unavailable", row_error
+            assert row_error["bounded_deferral"] is False, row_error
         finally:
             goalflight_task.TaskStore.load_items = original_load
             D.goalflight_ledger.read_records = original_read_records
+            D._find_dispatch_record = original_find_record
             os.environ.clear()
             os.environ.update(old_env)
 
@@ -5014,6 +5768,23 @@ def test_round5_tail_substitution_and_frozen_lock_order() -> None:
 
 
 def main() -> None:
+    test_terminal_ended_at_uses_first_journal_commit_and_is_write_once()
+    test_prior_ledger_completion_does_not_supersede_deliberate_follow_up()
+    test_same_time_ledger_completion_defers_ambiguous_ordering()
+    test_same_time_completion_deferral_is_bounded_then_restores_for_launch()
+    test_authority_read_failure_never_uses_equality_escape_and_surfaces()
+    test_authority_park_visible_on_claim_status_drain_and_unparks()
+    test_prior_store_completion_does_not_supersede_deliberate_follow_up()
+    test_later_store_completion_still_supersedes_queued_duplicate()
+    test_missing_ledger_completion_time_defers_supersession()
+    test_missing_entry_creation_time_defers_supersession()
+    test_corrupt_self_ledger_json_parks_and_keeps_claim()
+    test_corrupt_prior_ledger_json_is_unavailable_not_launchable()
+    test_timestamp_unreadable_parks_then_terminalizes()
+    test_journal_null_terminal_at_is_not_the_string_none()
+    test_poisoned_ended_at_none_string_can_backfill_from_journal()
+    test_corrupt_task_store_row_does_not_abort_recover_or_drain()
+    test_parked_status_write_failure_is_visible_on_claim()
     test_submit_status_delay_requires_test_mode()
     test_submit_records_replayable_request_without_capacity_acquire()
     test_submit_is_idempotent_for_matching_args_and_rejects_collisions()
@@ -5022,6 +5793,7 @@ def main() -> None:
     test_concurrent_submit_same_id_is_idempotent()
     test_submit_write_error_is_clean()
     test_submit_status_write_error_removes_queue_entry()
+    test_mark_claim_failed_reports_whether_it_committed()
     test_submit_rejects_active_waiting_capacity_ledger()
     test_drain_launches_queued_request_once_and_exits()
     test_registered_queue_refusal_after_controller_exit_restores_runnable_entry()

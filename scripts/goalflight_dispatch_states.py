@@ -41,6 +41,7 @@ FAILURE_TERMINAL_RECORD_STATES = frozenset(
         "blocked_adapter_gate",
         "blocked_auth",
         "blocked_capacity",
+        "blocked_completion_authority",
         "blocked_os_sandbox",
         "blocked_session_limit",
         "blocked_windows_dispatch",

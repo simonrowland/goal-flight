@@ -26,6 +26,7 @@ import goalflight_fleet_dispatch as fleet_dispatch
 import goalflight_fleet_launch_detached as fleet_launch
 import goalflight_fleet_preflight as fleet_preflight
 import goalflight_fleet_status as status
+import goalflight_ledger as ledger
 
 FIXTURES = ROOT / "tests" / "fixtures" / "fleet_mirrors"
 BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -840,6 +841,65 @@ def test_stub_e2e_terminal_clears_locks() -> None:
         assert_true("lock cleared", lock is None or lock.get("state") == "released")
 
 
+def test_stub_terminal_projects_journal_time() -> None:
+    keys = (
+        "GOALFLIGHT_STATE_DIR",
+        "GOALFLIGHT_JOURNAL_DIR",
+        "GOALFLIGHT_MESSAGES_DIR",
+        "GOALFLIGHT_TASK_STORE",
+        "GOALFLIGHT_WAKE_LEDGER",
+        "GOALFLIGHT_PIDFILE_DIR",
+    )
+    old_env = {key: os.environ.get(key) for key in keys}
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        try:
+            for key in keys:
+                os.environ[key] = str(tmp / key.lower())
+            fleet_dir = tmp / "fleet"
+            _fixture_fleet(fleet_dir)
+            dispatch_id = "acp-stub-journal-time"
+            preview = fleet_dispatch.preview_dispatch(
+                fleet_dir,
+                node_id="localhost",
+                agent="codex-acp",
+                billing_account="openai/default",
+                prompt="chunk.md",
+                dispatch_id=dispatch_id,
+                base_sha=BASE_SHA,
+            )
+            first = ledger.commit_terminal_authority(
+                {"dispatch_id": dispatch_id, "project_root": str(Path.cwd())},
+                state="complete",
+                reason=None,
+                terminal_state="complete",
+                worker_still_alive=False,
+            )
+            assert_true("journal terminal committed", first.committed and first.value is not None)
+            terminal_at = first.value.terminal_at
+            original_utc_now = ledger.utc_now
+            ledger.utc_now = lambda: "2099-01-01T00:00:00+00:00"
+            try:
+                result = fleet_dispatch.execute_dispatch(
+                    fleet_dir,
+                    preview,
+                    runner=receipt_runner,
+                    stub_terminal=True,
+                )
+            finally:
+                ledger.utc_now = original_utc_now
+            record = json.loads(Path(result["ledger"]["path"]).read_text())
+            assert_true("journal time projected", record.get("ended_at") == terminal_at)
+            assert_true("wall clock not invented", record.get("ended_at") != "2099-01-01T00:00:00+00:00")
+            assert_true("terminal event projected", record.get("terminal_event_uuid") == first.value.event_uuid)
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
 def test_launch_unconfirmed_keeps_account_lock() -> None:
     def fail_launch(argv: list[str]) -> tuple[int, str, str]:
         joined = " ".join(argv)
@@ -1312,6 +1372,7 @@ def main() -> None:
     test_exec_without_stub_uses_runner()
     test_exec_runner_uses_node_ssh_identity()
     test_stub_e2e_terminal_clears_locks()
+    test_stub_terminal_projects_journal_time()
     test_async_launch_receipt_persisted_and_locks_remain()
     test_ledger_launch_receipt_roundtrip()
     test_tool_smoke_skip_is_authoritative_even_in_goal_mode()
