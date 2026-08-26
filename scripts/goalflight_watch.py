@@ -628,6 +628,31 @@ def _newest_trace_file(root: Path, roots: tuple[Path, ...]) -> Path | None:
         return None
 
 
+def _parse_ppid_children(ps_output: str) -> dict[int, list[int]]:
+    children: dict[int, list[int]] = {}
+    for line in ps_output.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+        except ValueError:
+            continue
+    return children
+
+
+def _walk_process_tree(pid: int, children: dict[int, list[int]]) -> tuple[int, ...]:
+    found: list[int] = []
+    pending = [pid]
+    while pending:
+        current = pending.pop()
+        if current in found:
+            continue
+        found.append(current)
+        pending.extend(children.get(current, ()))
+    return tuple(found)
+
+
 def _worker_process_tree(pid: int, *, ps_runner=None) -> tuple[int, ...]:
     runner = ps_runner or subprocess.run
     try:
@@ -638,21 +663,34 @@ def _worker_process_tree(pid: int, *, ps_runner=None) -> tuple[int, ...]:
             timeout=TRACE_LSOF_TIMEOUT_SECS,
             check=False,
         )
-        children: dict[int, list[int]] = {}
-        for line in (proc.stdout or "").splitlines():
-            child_text, parent_text = line.split()
-            children.setdefault(int(parent_text), []).append(int(child_text))
-        found: list[int] = []
-        pending = [pid]
-        while pending:
-            current = pending.pop()
-            if current in found:
-                continue
-            found.append(current)
-            pending.extend(children.get(current, ()))
-        return tuple(found)
+        children = _parse_ppid_children(proc.stdout or "")
+        return _walk_process_tree(pid, children)
     except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
         return (pid,)
+
+
+def live_descendant_count(pid: int, *, ps_runner=None) -> int | None:
+    """Live descendants of ``pid``, excluding itself.
+
+    None means the sample was unavailable. 0 means the walk ran and found
+    no children. Callers must not treat None as idle.
+    """
+    runner = ps_runner or subprocess.run
+    try:
+        proc = runner(
+            ["ps", "-axo", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        stdout = proc.stdout or ""
+        if not stdout.strip():
+            return None
+        tree = _walk_process_tree(pid, _parse_ppid_children(stdout))
+        return max(0, len(tree) - 1)
+    except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
+        return None
 
 
 def _trace_from_lsof(
@@ -3719,11 +3757,32 @@ def main() -> int:
             prev_cputime_sample = None
             prev_cputime_at_mono = None
             prev_cputime_at_epoch = None
-        low_power_relax = (
+        live_descendants: int | None = None
+        idle_tree_age_s: float | None = None
+        idle_window_expired = (
             worker_is_alive
-            and cpu_confirmed_idle(cpu_pct, args.cpu_epsilon)
             and args.max_idle_secs > 0
             and seconds_since_event >= args.max_idle_secs
+        )
+        # Extra activity is consulted only on the path that would otherwise
+        # kill: tail quiet AND CPU measured idle. A busy group already
+        # vetoes; missing CPU already fails open.
+        if idle_window_expired and cpu_confirmed_idle(cpu_pct, args.cpu_epsilon):
+            live_descendants = live_descendant_count(args.pid)
+            if not (isinstance(live_descendants, int) and live_descendants > 0):
+                if (
+                    tree_leg.get("kind") == WEDGE_TREE_LEG_WORKER_CWD
+                    and isinstance(tree_root, Path)
+                ):
+                    newest_idle_tree = newest_mtime_under(
+                        tree_root,
+                        stop_if_newer_than=now - args.max_idle_secs,
+                    )
+                    if newest_idle_tree is not None:
+                        idle_tree_age_s = max(0.0, now - newest_idle_tree)
+        low_power_relax = (
+            idle_window_expired
+            and cpu_confirmed_idle(cpu_pct, args.cpu_epsilon)
             and system_starved()
         )
         liveness_state = classify_liveness(
@@ -3732,6 +3791,8 @@ def main() -> int:
             seconds_since_event,
             thresholds,
             low_power_relax=low_power_relax,
+            live_descendants=live_descendants,
+            tree_age_s=idle_tree_age_s,
         )
         intentionally_waiting = bool(worker_wait and worker_is_alive)
         if intentionally_waiting:
@@ -3758,6 +3819,8 @@ def main() -> int:
             "pgroup_cpu_pct": cpu_pct,
             "seconds_since_event": seconds_since_event,
             "liveness_state": liveness_state,
+            "live_descendants": live_descendants,
+            "idle_tree_age_s": idle_tree_age_s,
             "tail_path": str(tail),
             "tail_scan": scan.metrics(),
             "markers": markers[-20:],

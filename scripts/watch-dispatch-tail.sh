@@ -7,7 +7,8 @@
 # Exits when:
 #   - terminal marker reconciled after exit/idle  → exit 0  ("WATCHER-EXIT: marker")
 #   - worker PID dies without terminal marker     → exit 1  ("WATCHER-EXIT: pid-dead")
-#   - no tail update for --max-idle-secs seconds  → exit 2  ("WATCHER-EXIT: idle-timeout")
+#   - no tail update for --max-idle-secs seconds, no live children, and
+#     process-group CPU idle → exit 2  ("WATCHER-EXIT: idle-timeout")
 #   - direct watcher exceeds total runtime         → exit 2  ("WATCHER-EXIT: runtime-timeout")
 #   - orchestrator PID dies                         → exit 3  ("WATCHER-EXIT: controller-dead")
 #
@@ -255,6 +256,47 @@ pgroup_cpu_pct() {
   _CPU_CACHE_SAMPLE="$later_sample"
   printf '%s\n' "$pct"
   return 0
+}
+
+# Live descendants of a worker pid, excluding itself. "unknown" when the
+# sample is unavailable. A quiet-but-working child (pytest, sleep, a
+# compiler) must veto idle-timeout even at 0% CPU.
+live_descendant_count() {
+  local root="$1"
+  if [ -z "$root" ]; then
+    echo "unknown"
+    return 0
+  fi
+  ps -axo pid=,ppid= 2>/dev/null | awk -v root="$root" '
+    BEGIN { root = root + 0 }
+    NF >= 2 {
+      c = $1 + 0
+      p = $2 + 0
+      kids[p] = kids[p] " " c
+      parsed++
+    }
+    END {
+      if (parsed + 0 < 1) {
+        print "unknown"
+        exit 0
+      }
+      n = 0
+      qn = 1
+      q[1] = root
+      seen[root] = 1
+      for (i = 1; i <= qn; i++) {
+        nsplit = split(kids[q[i]], arr, " ")
+        for (j = 1; j <= nsplit; j++) {
+          k = arr[j] + 0
+          if (k == 0 || seen[k]) continue
+          seen[k] = 1
+          n++
+          q[++qn] = k
+        }
+      }
+      print n
+    }
+  '
 }
 # Pure CPU helpers above are sourceable for unit tests without running the watcher:
 #   GOALFLIGHT_WATCH_HELPERS_ONLY=1 source scripts/watch-dispatch-tail.sh
@@ -732,7 +774,8 @@ while true; do
     exit 1
   fi
 
-  # 4. Idle timeout? (no tail-size change for max-idle-secs)
+  # 4. Idle timeout? Tail-size silence is not enough: a worker with live
+  #    children (or process-group CPU) is still working.
   if [ -f "$TAIL_PATH" ]; then
     cur_size=$(wc -c < "$TAIL_PATH" 2>/dev/null | tr -d ' ')
     cur_size=${cur_size:-0}
@@ -762,6 +805,13 @@ while true; do
             sleep "$POLL_SECS"
             continue
           fi
+        fi
+        desc_count=$(live_descendant_count "$WORKER_PID")
+        if [ "$desc_count" != "unknown" ] && [ "$desc_count" -gt 0 ]; then
+          wedge_streak=0
+          echo "[$(date '+%H:%M:%S')] WATCHER-STATE: running_quiet worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=$cpu_pct live_descendants=$desc_count idle_for=${idle_for}s (live child; tail-quiet is not idle)"
+          sleep "$POLL_SECS"
+          continue
         fi
         # CPU at/below epsilon: looks wedged. Require consecutive confirmations
         # so a single transient `ps` failure (cpu→0.0 for one poll) can't

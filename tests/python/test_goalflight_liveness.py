@@ -219,6 +219,51 @@ def test_idle_silent_worker_classifies_wedged() -> None:
     assert state == "wedged", state
 
 
+def test_quiet_worker_with_live_child_classifies_running_quiet() -> None:
+    thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
+    state = classify_liveness(
+        pid_alive=True,
+        pgroup_cpu=0.0,
+        seconds_since_event=30.0,
+        thresholds=thresholds,
+        live_descendants=1,
+    )
+    assert state == "running_quiet", state
+
+
+def test_quiet_worker_with_fresh_tree_classifies_running_quiet() -> None:
+    thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
+    state = classify_liveness(
+        pid_alive=True,
+        pgroup_cpu=0.0,
+        seconds_since_event=30.0,
+        thresholds=thresholds,
+        live_descendants=0,
+        tree_age_s=2.0,
+    )
+    assert state == "running_quiet", state
+
+
+def test_stale_tree_without_children_still_wedges() -> None:
+    thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
+    state = classify_liveness(
+        pid_alive=True,
+        pgroup_cpu=0.0,
+        seconds_since_event=30.0,
+        thresholds=thresholds,
+        live_descendants=0,
+        tree_age_s=10.0,
+    )
+    assert state == "wedged", state
+
+
+def test_unmeasured_descendants_do_not_invent_a_kill() -> None:
+    thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
+    assert classify_liveness(
+        True, None, 30.0, thresholds, live_descendants=None, tree_age_s=None
+    ) == "running"
+
+
 def test_none_cpu_idle_keeps_running() -> None:
     # CPU sample unavailable (ps failed) + idle-expired does not prove idle.
     # Keep waiting instead of false-killing a healthy quiet worker.
@@ -1019,6 +1064,10 @@ def main() -> None:
     test_status_tmp_path_is_unique_sibling()
     test_busy_silent_worker_classifies_running_quiet()
     test_idle_silent_worker_classifies_wedged()
+    test_quiet_worker_with_live_child_classifies_running_quiet()
+    test_quiet_worker_with_fresh_tree_classifies_running_quiet()
+    test_stale_tree_without_children_still_wedges()
+    test_unmeasured_descendants_do_not_invent_a_kill()
     test_none_cpu_idle_keeps_running()
     test_cpu_confirmed_idle_requires_measured_cpu()
     test_starved_zero_cpu_extends_idle_once_then_wedges()

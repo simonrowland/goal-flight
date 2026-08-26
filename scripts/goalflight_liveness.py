@@ -508,8 +508,26 @@ def classify_liveness(
     *,
     low_power_relax: bool = False,
     low_power_relax_factor: float = LOW_POWER_RELAX_FACTOR,
+    live_descendants: int | None = None,
+    tree_age_s: float | None = None,
 ) -> LivenessState:
-    """Classify worker liveness from identity, CPU, and progress silence."""
+    """Classify worker liveness from identity, activity, and progress silence.
+
+    Tail/event silence is a proxy for "not working". After the idle window it
+    is not proof: a worker can be grinding a test suite whose stdout is
+    buffered, or writing the worktree without narrating. Extra signals, when
+    measured, veto a wedge:
+
+    - ``live_descendants > 0``: a child still exists (pytest, a compiler, a
+      tool that sleeps without printing).
+    - ``tree_age_s < idle_timeout``: the worker's own tree was written inside
+      the idle window.
+    - process-group CPU above epsilon: already-busy work, even with no children
+      in the sample.
+
+    Unavailable CPU still fails open. Missing descendant/tree samples simply
+    omit those vetoes; they do not invent a kill.
+    """
     if not pid_alive:
         return "worker_dead"
 
@@ -522,6 +540,16 @@ def classify_liveness(
     )
     if not idle_expired:
         return "running"
+
+    if live_descendants is not None and live_descendants > 0:
+        return "running_quiet"
+    if (
+        tree_age_s is not None
+        and idle_timeout is not None
+        and idle_timeout > 0
+        and tree_age_s < idle_timeout
+    ):
+        return "running_quiet"
 
     if pgroup_cpu is None:
         return "running"

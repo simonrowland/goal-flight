@@ -12,6 +12,8 @@ replaces that line, and the rest of the capture still lands.
 
 When invoked as a stdin-to-file filter, this process owns the tail flock for
 its lifetime so reconciliation cannot pass a COMPLETE still buffered here.
+Partial lines flush on a size or time bound as well as on newline/EOF, so a
+newline-free worker stream cannot hold the tail silent or grow without bound.
 """
 
 from __future__ import annotations
@@ -21,7 +23,9 @@ import io
 import os
 from pathlib import Path
 import re
+import select
 import sys
+import time
 from typing import Any
 
 try:
@@ -35,6 +39,14 @@ _SECRET_SHAPE_RE = re.compile(r"(?i)xai-[a-z0-9]{20,}")
 REDACTED = "[redacted]"
 _LINE_FAIL = b"[redacted]"
 _CHUNK_SIZE = 4096
+# Partial-line flush so a newline-free stream cannot hold the tail silent or
+# grow the pending buffer without bound (a size-unbounded ``buf += chunk``
+# copies quadratically). Hold back a possible secret prefix so a credential
+# split across the flush is still redacted.
+PARTIAL_FLUSH_BYTES = 1024
+PARTIAL_FLUSH_SECS = 1.0
+_SECRET_PREFIX_MAX = 4 + 19  # "xai-" plus one short of the entropy bound
+_SECRET_PREFIX_RE = re.compile(br"(?i)(?:x|xa|xai|xai-[a-z0-9]{0,19})\Z")
 READY_FD_ENV = "GOALFLIGHT_REDACT_READY_FD"
 
 
@@ -87,6 +99,16 @@ def _redact_line_bytes(line: bytes) -> bytes:
         return _LINE_FAIL
 
 
+def _src_fileno(src) -> int | None:
+    try:
+        fileno = src.fileno()
+    except (AttributeError, io.UnsupportedOperation, OSError, ValueError):
+        return None
+    if isinstance(fileno, int) and fileno >= 0:
+        return fileno
+    return None
+
+
 def _read_chunk(src, size: int) -> bytes:
     """Return available bytes without waiting to fill ``size``.
 
@@ -94,11 +116,8 @@ def _read_chunk(src, size: int) -> bytes:
     worker that prints a short line would not reach the tail until it
     exited — and the flock would drop at the same moment.
     """
-    try:
-        fileno = src.fileno()
-    except (AttributeError, io.UnsupportedOperation, OSError, ValueError):
-        fileno = None
-    if isinstance(fileno, int) and fileno >= 0:
+    fileno = _src_fileno(src)
+    if fileno is not None:
         while True:
             try:
                 return os.read(fileno, size)
@@ -112,37 +131,121 @@ def _read_chunk(src, size: int) -> bytes:
         return b""
 
 
-def filter_stream(src, dst) -> None:
-    """Copy src to dst, redacting complete lines. Partial lines flush at EOF.
+def _wait_readable(fileno: int | None, timeout: float | None) -> bool:
+    """True if ``src`` should be read. False is a wait timeout with no data."""
+    if fileno is None:
+        return True
+    try:
+        ready, _, _ = select.select([fileno], [], [], timeout)
+        return bool(ready)
+    except (OSError, TypeError, ValueError):
+        return True
+
+
+def secret_holdback_len(buf: bytes) -> int:
+    """Trailing bytes that could still grow into a credential-shaped token."""
+    if not buf:
+        return 0
+    limit = min(len(buf), _SECRET_PREFIX_MAX)
+    for n in range(limit, 0, -1):
+        if _SECRET_PREFIX_RE.fullmatch(buf[-n:]):
+            return n
+    return 0
+
+
+def split_partial_flush(buf: bytes) -> tuple[bytes, bytes]:
+    """Redacted prefix that is safe to emit, plus the unemitted suffix.
+
+    Complete secrets in the emit region are redacted. A possible secret
+    prefix stays in the suffix so a later chunk can still match.
+    """
+    hold = secret_holdback_len(buf)
+    if hold >= len(buf):
+        return b"", buf
+    emit_raw = buf[:-hold] if hold else buf
+    keep = buf[-hold:] if hold else b""
+    return _redact_line_bytes(emit_raw), keep
+
+
+def filter_stream(
+    src,
+    dst,
+    *,
+    flush_bytes: int = PARTIAL_FLUSH_BYTES,
+    flush_secs: float = PARTIAL_FLUSH_SECS,
+    clock=None,
+) -> None:
+    """Copy src to dst, redacting complete lines and bounded partial lines.
+
+    Partial lines also flush when they exceed ``flush_bytes`` or have been
+    buffered for ``flush_secs``, so a newline-free stream cannot hold the
+    tail silent or accumulate without bound. A possible secret prefix is
+    held back across those flushes. Remaining bytes flush at EOF.
 
     Sink write failures stop emitting but keep reading until stdin EOF so
     the tail flock is not dropped while the worker can still write.
     """
     buf = b""
     sink_ok = True
+    now = clock or time.monotonic
+    buf_since: float | None = None
+    fileno = _src_fileno(src)
+
+    def emit(data: bytes) -> None:
+        nonlocal sink_ok
+        if not data or not sink_ok:
+            return
+        try:
+            dst.write(data)
+            dst.flush()
+        except Exception:
+            sink_ok = False
+
+    def note_buf() -> None:
+        nonlocal buf_since
+        if not buf:
+            buf_since = None
+        elif buf_since is None:
+            buf_since = now()
+
+    def flush_partial() -> None:
+        nonlocal buf, buf_since
+        if not buf or not sink_ok:
+            return
+        out, buf = split_partial_flush(buf)
+        emit(out)
+        buf_since = now() if buf else None
+
     while True:
+        timeout: float | None = None
+        flushable = (
+            sink_ok
+            and bool(buf)
+            and secret_holdback_len(buf) < len(buf)
+        )
+        if flushable and flush_secs > 0 and buf_since is not None:
+            remaining = flush_secs - (now() - buf_since)
+            timeout = remaining if remaining > 0 else 0.0
+        if not _wait_readable(fileno, timeout):
+            flush_partial()
+            continue
         chunk = _read_chunk(src, _CHUNK_SIZE)
         if not chunk:
             break
         buf += chunk
+        note_buf()
         while True:
             idx = buf.find(b"\n")
             if idx < 0:
                 break
             line, buf = buf[:idx], buf[idx + 1 :]
-            if not sink_ok:
-                continue
-            try:
-                dst.write(_redact_line_bytes(line) + b"\n")
-                dst.flush()
-            except Exception:
-                sink_ok = False
+            emit(_redact_line_bytes(line) + b"\n")
+            buf_since = None
+            note_buf()
+        if flush_bytes > 0 and len(buf) >= flush_bytes:
+            flush_partial()
     if buf and sink_ok:
-        try:
-            dst.write(_redact_line_bytes(buf))
-            dst.flush()
-        except Exception:
-            pass
+        emit(_redact_line_bytes(buf))
 
 
 def _signal_ready() -> None:

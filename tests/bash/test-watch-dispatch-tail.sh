@@ -807,6 +807,56 @@ wait "$WORKER_PID" 2>/dev/null
 rm -f "$TAIL" /tmp/watcher-out-idle-$$.txt
 cleanup_pidfile "$PIDFILE_STEM"
 
+# ---- Case 3c: a quiet worker with a live child must not idle-timeout ----
+TAIL=/tmp/test-watch-idle-child-$$.txt
+: > "$TAIL"
+WORKER_PID="$(python3 - <<'PY'
+import subprocess
+import sys
+
+proc = subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        "import subprocess, time\n"
+        "subprocess.Popen(['sleep', '30'])\n"
+        "time.sleep(30)\n",
+    ],
+    start_new_session=True,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+print(proc.pid)
+PY
+)"
+PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
+bash "$WATCHER" \
+  --pid "$WORKER_PID" --tail "$TAIL" \
+  --controller-pid "$$" --agent test-bashtail \
+  --session-id "test-idle-child" \
+  --poll-secs 1 --max-idle-secs 2 \
+  > /tmp/watcher-out-idle-child-$$.txt 2>&1 &
+WATCHER_PID=$!
+sleep 6
+if kill -0 "$WATCHER_PID" 2>/dev/null; then
+  expect_eq "case-3c watcher still running with live child" "alive" "alive"
+  if grep -q "live_descendants=" /tmp/watcher-out-idle-child-$$.txt; then
+    expect_eq "case-3c live_descendants logged" "yes" "yes"
+  else
+    expect_eq "case-3c live_descendants logged" "yes" "no"
+  fi
+  kill "$WATCHER_PID" 2>/dev/null
+  wait "$WATCHER_PID" 2>/dev/null
+else
+  wait "$WATCHER_PID"
+  expect_eq "case-3c watcher still running with live child" "alive" "exited:$?"
+fi
+kill "$WORKER_PID" 2>/dev/null
+wait "$WORKER_PID" 2>/dev/null
+rm -f "$TAIL" /tmp/watcher-out-idle-child-$$.txt
+cleanup_pidfile "$PIDFILE_STEM"
+
 # ---- Case 3b: CPU-busy silence → running_quiet, not exit 2 ----
 TAIL=/tmp/test-watch-running-quiet-$$.txt
 : > "$TAIL"
