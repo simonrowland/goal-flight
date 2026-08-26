@@ -523,7 +523,15 @@ def _reconcile_draft_artifact_record(record: dict, *, tail: Path | None, tail_mt
         "artifact_path": str(artifact),
         "reason": finality_reason,
     }
-    if not _persist_draft_artifact_reconciliation(record, out):
+    try:
+        persisted = _persist_draft_artifact_reconciliation(record, out)
+    except (
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
+        # Persist still raised. Degrade this row so status_payload continues.
+        persisted = False
+    if not persisted:
         deferred = dict(record)
         if tail is not None:
             deferred["tail_path"] = str(tail)

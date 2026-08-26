@@ -442,6 +442,85 @@ def test_status_does_not_claim_complete_when_terminal_persist_is_unverified(
     assert out["draft_artifact_reconciliation"]["reason"] == "terminal_persistence_unverified"
 
 
+@pytest.mark.parametrize(
+    "error",
+    (
+        journal.JournalIOError("one-shot journal IO"),
+        journal.JournalDisappeared("journal vanished"),
+    ),
+)
+def test_status_payload_keeps_other_rows_when_one_persist_is_unverified(
+    isolated: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    """One unverifiable draft row must not take down machine-wide status."""
+    artifact = isolated / "docs-private" / "research" / "draft.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("finished draft\n", encoding="utf-8")
+    bad = {
+        "schema": "goalflight.dispatch.v1",
+        "dispatch_id": "draft-fatal",
+        "agent": "codex",
+        "state": "worker_dead",
+        "classification": "worker_dead",
+        "terminal_state": "worker_dead",
+        "project_root": str(isolated),
+        "draft_path": "docs-private/research/draft.md",
+        "draft_complete": True,
+        "started_at": "2020-01-01T00:00:00+00:00",
+    }
+    good = {
+        "schema": "goalflight.dispatch.v1",
+        "dispatch_id": "live-ok",
+        "agent": "codex",
+        "state": "running",
+        "classification": "expected_live",
+        "worker_pid": 4242,
+        "project_root": str(isolated),
+    }
+    record_path = status.goalflight_ledger.record_path("draft-fatal")
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps(bad), encoding="utf-8")
+
+    def _cmd_finish(args: argparse.Namespace) -> int:
+        if getattr(args, "dispatch_id", None) == "draft-fatal":
+            raise error
+        return 0
+
+    monkeypatch.setattr(status.goalflight_ledger, "cmd_finish", _cmd_finish)
+    monkeypatch.setattr(
+        status.goalflight_ledger,
+        "status_payload",
+        lambda: {
+            "schema": "goalflight.dispatch.v1",
+            "records": [bad, good],
+            "surplus_processes": [],
+        },
+    )
+
+    payload = status.status_payload()
+    records = payload["dispatch"]["records"]
+    by_id = {row["dispatch_id"]: row for row in records}
+    assert set(by_id) == {"draft-fatal", "live-ok"}
+
+    unverified = by_id["draft-fatal"]
+    assert unverified.get("classification") != "complete"
+    assert unverified.get("state") != "complete"
+    assert unverified.get("terminal_state") != "complete"
+    assert unverified["draft_artifact_reconciliation"]["promoted"] is False
+    assert (
+        unverified["draft_artifact_reconciliation"]["reason"]
+        == "terminal_persistence_unverified"
+    )
+
+    honest = by_id["live-ok"]
+    assert honest.get("classification") == "expected_live"
+    assert honest.get("state") == "running"
+    assert honest.get("worker_pid") == 4242
+    assert "draft_artifact_reconciliation" not in honest
+
+
 def test_status_reconciliation_corrupt_record_surfaces(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
