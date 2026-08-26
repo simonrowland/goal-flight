@@ -2900,7 +2900,12 @@ def controller_cursor_peek(
     )
 
 
-def _listener_envelope(authority, row: dict[str, object]) -> dict:
+def _listener_envelope(
+    authority,
+    row: dict[str, object],
+    *,
+    attention_by_id: dict[str, dict[str, object]] | None = None,
+) -> dict:
     carrier_path = str(row.get("carrier_path") or "")
     # Synthetic journal carriers ("journal:goal-flight-resume:",
     # "journal:outbox-quarantine:", …) have no .jsonl file; their payload lives
@@ -2909,10 +2914,12 @@ def _listener_envelope(authority, row: dict[str, object]) -> dict:
     # the "journal:" prefix so a new synthetic stream cannot wedge the whole relay.
     if carrier_path.startswith("journal:"):
         item_id = str(row.get("event_uuid") or "")
-        item = next(
-            (value for value in authority.attention_items() if value.get("item_id") == item_id),
-            None,
-        )
+        if attention_by_id is None:
+            attention_by_id = {
+                str(value.get("item_id") or ""): value
+                for value in authority.attention_items()
+            }
+        item = attention_by_id.get(item_id)
         if item is None:
             raise MessageError("journal attention delivery points to a missing item")
         payload = json.loads(str(item["payload_json"]))
@@ -3992,8 +3999,42 @@ def format_receipt_headline(row: dict, envelope: dict) -> str:
     return f"[{kind}] {stream} seq={seq} — {payload_head}"
 
 
-def _envelopes_with_rows(authority, rows: list[dict] | tuple[dict, ...]) -> list[tuple[dict, dict]]:
-    return [(row, _listener_envelope(authority, row)) for row in rows]
+def _attention_items_for_rows(
+    authority,
+    rows: list[dict] | tuple[dict, ...],
+) -> dict[str, dict[str, object]] | None:
+    if not any(
+        str(row.get("carrier_path") or "").startswith("journal:") for row in rows
+    ):
+        return None
+    # One bounded journal read covers every synthetic carrier in the batch.
+    # Besides removing the N+1 query pattern, this keeps listener busy
+    # tolerance's documented per-operation timing bound honest.
+    return {
+        str(value.get("item_id") or ""): value
+        for value in authority.attention_items()
+    }
+
+
+def _envelopes_with_rows(
+    authority,
+    rows: list[dict] | tuple[dict, ...],
+    *,
+    attention_by_id: dict[str, dict[str, object]] | None = None,
+) -> list[tuple[dict, dict]]:
+    if attention_by_id is None:
+        attention_by_id = _attention_items_for_rows(authority, rows)
+    return [
+        (
+            row,
+            _listener_envelope(
+                authority,
+                row,
+                attention_by_id=attention_by_id,
+            ),
+        )
+        for row in rows
+    ]
 
 
 def _foreign_controller_items(
@@ -6766,11 +6807,17 @@ def cmd_listen(args) -> int:
                 flush=True,
             )
         else:
-            arm_items = _envelopes_with_rows(authority, list(report_items))
-            visible_arm_items = _foreign_controller_items(
-                arm_items,
-                controller_label=label,
-                lease_nonce=nonce,
+            visible_arm_items = _retry_listener_journal_busy(
+                lambda: _foreign_controller_items(
+                    _envelopes_with_rows(authority, list(report_items)),
+                    controller_label=label,
+                    lease_nonce=nonce,
+                ),
+                busy_error=goalflight_journal.JournalBusy,
+                tolerance=journal_tolerance,
+                poll_s=poll,
+                on_degraded=startup_degraded,
+                on_recovered=startup_recovered,
             )
             for row, envelope in visible_arm_items:
                 print(format_receipt_headline(row, envelope), flush=True)
@@ -6880,6 +6927,7 @@ def cmd_listen(args) -> int:
             continue
         if deadline is not None and time.monotonic() >= deadline:
             return finish("timeout", code=1, detail="no waking event before timeout")
+        visible_ring_items: list[tuple[dict, dict]] | None = None
         try:
             lease = authority.active_lease(label)
             measured = (
@@ -6952,7 +7000,15 @@ def cmd_listen(args) -> int:
                     > arm_high.get(str(item.get("stream_id") or ""), 0)
                 )
             ]
-            candidate_items = _envelopes_with_rows(authority, candidate_rows)
+            candidate_attention = _attention_items_for_rows(
+                authority,
+                candidate_rows,
+            )
+            candidate_items = _envelopes_with_rows(
+                authority,
+                candidate_rows,
+                attention_by_id=candidate_attention,
+            )
             wakeable_items = bool(
                 _foreign_controller_items(
                     candidate_items,
@@ -6960,6 +7016,23 @@ def cmd_listen(args) -> int:
                     lease_nonce=nonce,
                 )
             )
+            if wakeable_items and not args.json:
+                # The non-JSON listener is the controller: it prints every
+                # buffered item before exiting. Materialize those envelopes
+                # while coverage and the kernel waiter are still live and before
+                # claiming the one ring for this cursor version.
+                # Reuse a waking synthetic candidate's attention read when the
+                # complete snapshot is rendered. When the candidate is a normal
+                # carrier, a quiet synthetic backlog is loaded once here.
+                visible_ring_items = _foreign_controller_items(
+                    _envelopes_with_rows(
+                        authority,
+                        list(peek.items),
+                        attention_by_id=candidate_attention,
+                    ),
+                    controller_label=label,
+                    lease_nonce=nonce,
+                )
         except goalflight_journal.CASMismatch as exc:
             lease = authority.active_lease(label)
             reason = "stale-lease" if lease is not None else "superseded"
@@ -7051,13 +7124,6 @@ def cmd_listen(args) -> int:
                     code=2,
                     detail="waking cursor snapshot has no advance positions",
                 )
-            # The cursor-version stamp, not the single audit row, arbitrates a
-            # pool ring. A sibling may already have superseded this row.
-            _exit_listener_before_final_event(
-                authority,
-                coverage_id,
-                reason="event",
-            )
             # The JSON ring stays body-free ON PURPOSE: it is a wake signal plus
             # the instructions to drain, never the mail itself. A --json consumer
             # advances with advance_command and reads bodies from the drain. The
@@ -7072,18 +7138,32 @@ def cmd_listen(args) -> int:
                 "cursor_version": snapshot.cursor_version,
                 "advance_command": advance_command,
             }
-            waiter.close()
-            if not args.json:
-                ring_items = _envelopes_with_rows(authority, list(snapshot.items))
-                visible_ring_items = _foreign_controller_items(
-                    ring_items,
-                    controller_label=label,
-                    lease_nonce=nonce,
+            try:
+                # The cursor-version stamp, not the single audit row, arbitrates
+                # a pool ring. A sibling may already have superseded this row.
+                _exit_listener_before_final_event(
+                    authority,
+                    coverage_id,
+                    reason="event",
                 )
-                for row, envelope in visible_ring_items:
-                    print(format_receipt_headline(row, envelope), flush=True)
-                print(f"advance: {advance_command}", flush=True)
-            emit_payload(payload)
+                waiter.close()
+                if not args.json:
+                    assert visible_ring_items is not None
+                    for row, envelope in visible_ring_items:
+                        print(format_receipt_headline(row, envelope), flush=True)
+                    print(f"advance: {advance_command}", flush=True)
+                emit_payload(payload)
+            except BaseException:
+                # Delivery did not complete. Make the unread cursor immediately
+                # claimable by a replacement listener instead of stranding a
+                # consumed ring behind a dying reporter.
+                goalflight_wake.release_ring_claim(
+                    project_root,
+                    controller_label=label,
+                    cursor_version=snapshot.cursor_version,
+                )
+                death_watch.restore()
+                raise
             death_watch.restore()
             return 0
         delay = journal_tolerance.backoff_s(poll) if journal_tolerance.degraded else poll

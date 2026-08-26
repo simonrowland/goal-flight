@@ -263,9 +263,13 @@ load symptom, so listeners outlast it (single degrade/recover notices, bounded b
 300-second continuous-failure window) instead of faulting. The first bounded
 operation completes before that clock starts, and expiry can be observed after one
 30-second backoff plus one final 10-second operation, so outage-to-exit can approach
-350 seconds plus scheduler delay. A verified-vanished journal still faults
-immediately; journal path identity/stat I/O and exhausted present-path open retries
-are also fatal rather than being mislabeled as busy.
+350 seconds plus scheduler delay. That remains the true bound for the human-readable
+backup too: it batches all synthetic attention carriers through one bounded journal
+read and materializes every receipt under busy tolerance before persisting either the
+arm high-water or ring reservation. A failed stdout delivery rolls its exact claim
+back so a replacement can report the unread cursor. A verified-vanished journal
+still faults immediately; journal path identity/stat I/O and exhausted present-path
+open retries are also fatal rather than being mislabeled as busy.
 
 `--listener-slots`, `GOALFLIGHT_LISTENER_SLOTS`, and
 `GOALFLIGHT_LISTENER_LOW_WATER` tune only portable `listen`. Persistent backup

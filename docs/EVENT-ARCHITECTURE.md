@@ -456,6 +456,14 @@ because its reader is gone.
 The watchdog remains an ordinary `listen`, so it deliberately retains journal arm
 and exit audit, tracked-task completion, and kernel-slot release.
 
+The canonical non-JSON backup uses the same bound. Before it persists an arm
+high-water or claims a cursor ring, it materializes the complete human-readable
+receipt batch under busy tolerance. Synthetic carriers are resolved by one unioned
+attention query for the whole batch, not one query per envelope, so that stage is
+still one 10-second bounded journal operation. If stdout delivery fails after a
+claim, the matching high-water or ring reservation is removed and a replacement may
+deliver the same unread cursor.
+
 Cursor-ring ownership is a reversible reservation until stdout delivery succeeds.
 An `EPIPE` before the first event rolls it back, leaving unread mail deliverable to
 the replacement. `EAGAIN`/`EWOULDBLOCK` retries the buffered line without spinning,

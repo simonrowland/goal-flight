@@ -2040,9 +2040,14 @@ class Journal:
             read_only = upper.startswith("SELECT ") or upper.startswith("EXPLAIN ")
         if not read_only:
             raise ValueError("read_all accepts only read-only SELECT, EXPLAIN, and inspect PRAGMA statements")
+        # A retry must replay the same bindings. Materialize one-shot iterables
+        # before entering the retried closure so a busy first attempt cannot
+        # exhaust a generator and change the query on the next connection.
+        prepared_parameters = tuple(parameters)
+
         def action(connection: sqlite3.Connection) -> list[sqlite3.Row]:
             self._assert_epoch_fence(connection, for_write=False)
-            return list(connection.execute(sql, tuple(parameters)).fetchall())
+            return list(connection.execute(sql, prepared_parameters).fetchall())
 
         return self._read_with_retry("journal read query", action)
 
@@ -2208,13 +2213,19 @@ class Journal:
                 )
             try:
                 connection = self._connect()
-            except JournalUnavailable as exc:
+            except JournalBusy as exc:
                 write_lock.release()
                 return WriteResult(
                     WriteDisposition.RETRYABLE,
                     attempts=attempts,
                     reason=str(exc),
                 )
+            except JournalUnavailable:
+                # Disappearance and path/open I/O failures are not contention.
+                # Preserve their typed fatal contract instead of flattening
+                # them into a RETRYABLE result that a caller may treat as busy.
+                write_lock.release()
+                raise
             except BaseException:
                 write_lock.release()
                 raise
@@ -4029,29 +4040,31 @@ class Journal:
 
     def attention_items(self, *, state: str = "OPEN") -> list[dict[str, object]]:
         resolved_state = self._state_token(state, label="attention state")
-        controller_rows = self.read_all(
+        rows = self.read_all(
             """
-            SELECT * FROM attention_items
-            WHERE project_root = ? AND state = ? ORDER BY created_at, item_id
-            """,
-            (str(self.project_root), resolved_state),
-        )
-        system_rows = self.read_all(
-            """
+            SELECT item_id, project_root, item_type, state, source_label,
+                   source_generation, trigger_side, reason, payload_json,
+                   wake_class, created_at, resolved_at
+            FROM attention_items
+            WHERE project_root = ? AND state = ?
+            UNION ALL
             SELECT item_id, project_root, item_type, state,
                    'journal-outbox' AS source_label,
                    0 AS source_generation,
                    'projection' AS trigger_side,
                    reason, payload_json, wake_class, created_at, resolved_at
             FROM system_attention_items
-            WHERE project_root = ? AND state = ? ORDER BY created_at, item_id
+            WHERE project_root = ? AND state = ?
+            ORDER BY created_at, item_id
             """,
-            (str(self.project_root), resolved_state),
+            (
+                str(self.project_root),
+                resolved_state,
+                str(self.project_root),
+                resolved_state,
+            ),
         )
-        return sorted(
-            [dict(row) for row in (*controller_rows, *system_rows)],
-            key=lambda row: (str(row.get("created_at") or ""), str(row.get("item_id") or "")),
-        )
+        return [dict(row) for row in rows]
 
     def attempt_for_dispatch(self, dispatch_id: str) -> AttemptIdentity | None:
         dispatch = self._identity_token(dispatch_id, label="dispatch_id")

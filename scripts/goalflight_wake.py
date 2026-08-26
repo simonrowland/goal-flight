@@ -1282,6 +1282,49 @@ def pending_report_high_water(
     return None if state is None else dict(state.positions)
 
 
+def release_pending_report_claim(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    positions: Mapping[str, int] | None = None,
+) -> bool:
+    """Release an exact pending-report claim when its stdout delivery failed.
+
+    The compare is load-bearing: a failed reporter must not remove a different
+    generation's or differently positioned report stamp. While this path
+    exists, ``claim_pending_report``'s O_EXCL prevents a replacement writer, so
+    an exact payload match identifies the claim being rolled back.
+    """
+    label = str(controller_label or "").strip()
+    nonce = str(lease_nonce or "").strip()
+    if not label or not nonce:
+        raise ValueError("controller label and lease nonce are required")
+    normalized: dict[str, int] = {}
+    for stream, position in dict(positions or {}).items():
+        stream_id = str(stream or "").strip()
+        if not stream_id:
+            continue
+        if not isinstance(position, int) or isinstance(position, bool) or position < 1:
+            raise ValueError("pending-report position is invalid")
+        normalized[stream_id] = position
+    expected = (json.dumps({"positions": normalized}, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    path = _pending_report_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    try:
+        if path.read_bytes() != expected:
+            return False
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def _ring_stamp_lock_path(project_root: Path | str, *, controller_label: str) -> Path:
     return ledger_dir(project_root) / (
         f"{_RING_STAMP_FILE_VERSION}.{_label_hash(controller_label)}.lock"

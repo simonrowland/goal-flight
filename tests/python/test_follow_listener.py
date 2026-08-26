@@ -1714,11 +1714,13 @@ class _LiveCapture:
         self._capsys = capsys
         self._pending = ""
         self.records: list[dict[str, object]] = []
+        self.stdout = ""
         self.stderr = ""
 
     def pump(self) -> None:
         captured = self._capsys.readouterr()
         self.stderr += captured.err
+        self.stdout += captured.out
         self._pending += captured.out
         while "\n" in self._pending:
             line, self._pending = self._pending.split("\n", 1)
@@ -1756,6 +1758,17 @@ class _LiveCapture:
             time.sleep(0.02)
         raise AssertionError(
             f"timed out waiting for stderr {needle!r}; saw {self.stderr!r}"
+        )
+
+    def await_stdout(self, needle: str, timeout_s: float = 15.0) -> None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            self.pump()
+            if needle in self.stdout:
+                return
+            time.sleep(0.02)
+        raise AssertionError(
+            f"timed out waiting for stdout {needle!r}; saw {self.stdout!r}"
         )
 
 
@@ -1822,6 +1835,49 @@ def _gate_journal_queries(
 
     monkeypatch.setattr(journal.Journal, "_connect", gated_connect)
     return hits
+
+
+def _gate_attention_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    gate: threading.Event,
+) -> list[str]:
+    """Inject typed query-stage busy in synthetic envelope materialization."""
+    real_attention_items = journal.Journal.attention_items
+    hits: list[str] = []
+
+    def gated_attention_items(authority: journal.Journal, *args: object, **kwargs: object):
+        if gate.is_set():
+            hits.append("busy")
+            raise journal.JournalBusy("injected attention query busy")
+        hits.append("success")
+        return real_attention_items(authority, *args, **kwargs)
+
+    monkeypatch.setattr(journal.Journal, "attention_items", gated_attention_items)
+    return hits
+
+
+def _materialize_synthetic_attention(
+    project: Path,
+    lease: journal.LeaseIdentity,
+) -> None:
+    """Create a journal-backed carrier without touching the real journal."""
+    authority = journal.Journal(project)
+    prepared = authority.prepare_attempt("round3-attention-work")
+    assert prepared.committed
+    armed = authority.arm_listener(
+        lease.label,
+        nonce=lease.nonce,
+        pid=os.getpid(),
+        start_token="round3-attention-source",
+        parent_pid=os.getppid() or os.getpid(),
+    )
+    assert armed.committed and armed.value is not None
+    exited = authority.exit_listener(
+        str(armed.value["coverage_id"]),
+        reason="orphaned",
+    )
+    assert exited.committed
+    assert authority.attention_items()
 
 
 def _await_live_waiter(project: Path, label: str, kind: str, timeout_s: float = 15.0) -> None:
@@ -1997,10 +2053,7 @@ def test_listen_survives_busy_during_journal_coverage_arm(
     def gated_arm(authority: journal.Journal, *args: object, **kwargs: object):
         if gate.is_set():
             hits.append("arm_listener")
-            return journal.WriteResult(
-                disposition=journal.WriteDisposition.RETRYABLE,
-                reason="injected listener arm busy",
-            )
+            raise journal.JournalBusy("injected listener arm busy")
         return real_arm(authority, *args, **kwargs)
 
     monkeypatch.setattr(journal.Journal, "arm_listener", gated_arm)
@@ -2035,6 +2088,226 @@ def test_listen_survives_busy_during_journal_coverage_arm(
         _release_lease(project, lease)
     thread.join(15.0)
     assert results == [3]
+
+
+def test_listen_coverage_arm_exits_promptly_when_journal_vanishes(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Deletion after construction but before arm must bypass busy tolerance."""
+    project, _env, lease = isolated
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_TOLERANCE_S", 3600.0)
+    _pin_listener_resolution(monkeypatch, lease)
+    real_arm = journal.Journal.arm_listener
+    hits: list[str] = []
+
+    def vanish_then_arm(authority: journal.Journal, *args: object, **kwargs: object):
+        if not hits:
+            hits.append("arm_listener")
+            authority.path.unlink()
+        return real_arm(authority, *args, **kwargs)
+
+    monkeypatch.setattr(journal.Journal, "arm_listener", vanish_then_arm)
+    cap = _LiveCapture(capsys)
+    thread, results = _run_in_thread(
+        [
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--listener-slots",
+            "1",
+            "--json",
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "60",
+        ]
+    )
+    thread.join(5.0)
+    cap.pump()
+
+    assert hits == ["arm_listener"]
+    assert not thread.is_alive(), "vanished journal entered the 3600s busy window"
+    assert results == [2]
+    assert "journal-unavailable" in cap.stderr
+    assert "listener degraded" not in cap.stderr
+
+
+def test_listen_coverage_arm_keeps_journal_io_failure_fatal(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _env, lease = isolated
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_TOLERANCE_S", 3600.0)
+    _pin_listener_resolution(monkeypatch, lease)
+    hits: list[str] = []
+
+    def fail_arm(*_args: object, **_kwargs: object):
+        hits.append("arm_listener")
+        raise journal.JournalIOError("injected arm path I/O failure")
+
+    monkeypatch.setattr(journal.Journal, "arm_listener", fail_arm)
+    cap = _LiveCapture(capsys)
+    result = messages._run_cli(
+        [
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--listener-slots",
+            "1",
+            "--json",
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "60",
+        ]
+    )
+    cap.pump()
+
+    assert result == 2
+    assert hits == ["arm_listener"]
+    assert "journal-io-failure" in cap.stderr
+    assert "listener degraded" not in cap.stderr
+
+
+def test_non_json_arm_materializes_attention_before_pending_claim(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Query busy cannot persist high-water before the human report exists."""
+    project, _env, lease = isolated
+    _materialize_synthetic_attention(project, lease)
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_TOLERANCE_S", 30.0)
+    gate = threading.Event()
+    gate.set()
+    hits = _gate_attention_reads(monkeypatch, gate)
+    cap = _LiveCapture(capsys)
+    thread, results = _run_in_thread(
+        [
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--listener-slots",
+            "1",
+            "--report-pending",
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "60",
+        ]
+    )
+    try:
+        cap.await_stderr("listener degraded")
+        assert "busy" in hits, "non-JSON arm attention query injection did not bind"
+        assert thread.is_alive()
+        assert wake.pending_report_high_water(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        ) is None, "a dying arm persisted an undelivered high-water"
+        gate.clear()
+        cap.await_stderr("listener recovered")
+        cap.await_stdout("advance:")
+        assert wake.pending_report_high_water(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        ) is not None
+    finally:
+        gate.clear()
+        _release_lease(project, lease)
+    thread.join(15.0)
+    cap.pump()
+
+    assert results == [3]
+    assert "[controller_attention]" in cap.stdout
+    assert hits.count("success") == 1
+
+
+def test_non_json_ring_materializes_attention_before_ring_claim(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A consumed ring is impossible while buffered attention reads are busy."""
+    project, env, lease = isolated
+    _materialize_synthetic_attention(project, lease)
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_TOLERANCE_S", 30.0)
+    gate = threading.Event()
+    hits = _gate_attention_reads(monkeypatch, gate)
+    cap = _LiveCapture(capsys)
+    thread, results = _run_in_thread(
+        [
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--listener-slots",
+            "1",
+            "--report-pending",
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "60",
+        ]
+    )
+    try:
+        cap.await_stdout("advance:")
+        gate.set()
+        messages.post_message(
+            dispatch_id="ring-after-attention",
+            msg_type="controller-notice",
+            payload={"text": "ring only after every envelope is ready"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(
+                lease.label,
+                project_root=project,
+            ),
+        )
+        cap.await_stderr("listener degraded")
+        assert "busy" in hits, "non-JSON ring attention query injection did not bind"
+        assert thread.is_alive()
+        assert not wake._ring_stamp_path(
+            project,
+            controller_label=lease.label,
+        ).exists(), "ring was consumed before human-readable envelopes materialized"
+        gate.clear()
+        cap.await_stderr("listener recovered")
+        thread.join(15.0)
+    finally:
+        gate.clear()
+        if thread.is_alive():
+            _release_lease(project, lease)
+            thread.join(15.0)
+    cap.pump()
+
+    assert results == [0]
+    assert hits.count("success") == 2
+    assert cap.stdout.count("advance:") == 2
+    assert "ring-after-attention" in cap.stdout
+    assert wake._ring_stamp_path(
+        project,
+        controller_label=lease.label,
+    ).exists()
 
 
 @pytest.mark.parametrize("busy_stage", ("connect", "query"))

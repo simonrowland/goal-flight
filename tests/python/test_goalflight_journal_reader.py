@@ -253,6 +253,109 @@ def test_every_query_stage_busy_is_normalized_as_journal_busy(
     assert hits, f"{read_stage} query-stage injection did not bind"
 
 
+def test_read_all_replays_generator_bindings_after_query_stage_busy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A busy first execute must not consume one-shot bindings for the retry."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    journal.Journal.create(project)
+    reader = journal.Journal.open_reader(
+        project,
+        retry_budget_s=1.0,
+        jitter_min_s=0,
+        jitter_max_s=0,
+    )
+    real_connect = journal.Journal._connect
+    observed_bindings: list[tuple[object, ...]] = []
+
+    class BusyOnceConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def execute(self, sql: str, *args: object, **kwargs: object):
+            if "SELECT ? AS replayed_value" in " ".join(sql.split()):
+                bindings = tuple(args[0]) if args else ()
+                observed_bindings.append(bindings)
+                if len(observed_bindings) == 1:
+                    raise sqlite3.OperationalError("database is locked")
+            return self._connection.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name: str):
+            return getattr(self._connection, name)
+
+    def injected_connect(current: journal.Journal, **kwargs: object):
+        return BusyOnceConnection(real_connect(current, **kwargs))
+
+    monkeypatch.setattr(journal.Journal, "_connect", injected_connect)
+    rows = reader.read_all(
+        "SELECT ? AS replayed_value",
+        (value for value in (41,)),
+    )
+
+    assert [row["replayed_value"] for row in rows] == [41]
+    assert observed_bindings == [(41,), (41,)]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        journal.JournalDisappeared("injected arm disappearance"),
+        journal.JournalIOError("injected arm path I/O failure"),
+    ),
+)
+def test_domain_write_preserves_nonbusy_journal_failure_type(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: journal.JournalUnavailable,
+) -> None:
+    """Coverage-arm writes may retry busy, never disappearance or path I/O."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.Journal.create(project)
+    claimed = authority.claim_or_renew_lease(
+        "typed-arm-failure",
+        principal={"principal_id": "typed-arm-failure"},
+    )
+    assert claimed.committed and claimed.value is not None
+    monkeypatch.setattr(
+        authority,
+        "_connect",
+        lambda **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(type(failure), match="injected arm"):
+        authority.arm_listener(
+            claimed.value.label,
+            nonce=claimed.value.nonce,
+            pid=os.getpid(),
+            start_token="typed-arm-failure",
+            parent_pid=os.getppid() or os.getpid(),
+        )
+
+
+def test_attention_items_use_one_bounded_journal_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Synthetic-envelope batching must not widen the 10-second operation bound."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.Journal.create(project)
+    real_read_all = authority.read_all
+    calls: list[str] = []
+
+    def measured_read(sql: str, parameters=()):
+        calls.append(" ".join(sql.split()))
+        return real_read_all(sql, parameters)
+
+    monkeypatch.setattr(authority, "read_all", measured_read)
+    assert authority.attention_items() == []
+    assert len(calls) == 1
+    assert "UNION ALL" in calls[0]
+
+
 def test_snapshot_and_restore_readers_share_query_only_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

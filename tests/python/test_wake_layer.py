@@ -770,6 +770,48 @@ def test_malformed_ring_stamp_is_quarantined_and_next_observation_recovers(
     assert capsys.readouterr().err == ""
 
 
+def test_failed_pending_report_claim_is_exactly_recoverable(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    root, _env = isolated
+    positions = {"stream-a": 3, "stream-b": 8}
+    assert wake.claim_pending_report(
+        root,
+        controller_label="wake-test",
+        lease_nonce="recoverable-pending-report",
+        positions=positions,
+    )
+    assert wake.pending_report_high_water(
+        root,
+        controller_label="wake-test",
+        lease_nonce="recoverable-pending-report",
+    ) == positions
+
+    assert not wake.release_pending_report_claim(
+        root,
+        controller_label="wake-test",
+        lease_nonce="recoverable-pending-report",
+        positions={"stream-a": 4, "stream-b": 8},
+    ), "a mismatched reporter must not erase the durable claim"
+    assert wake.release_pending_report_claim(
+        root,
+        controller_label="wake-test",
+        lease_nonce="recoverable-pending-report",
+        positions=positions,
+    )
+    assert wake.pending_report_high_water(
+        root,
+        controller_label="wake-test",
+        lease_nonce="recoverable-pending-report",
+    ) is None
+    assert wake.claim_pending_report(
+        root,
+        controller_label="wake-test",
+        lease_nonce="recoverable-pending-report",
+        positions=positions,
+    ), "a replacement arm must be able to report after delivery rollback"
+
+
 def test_malformed_ring_stamp_does_not_trap_listener_in_exit_two_loop(
     isolated: tuple[Path, dict[str, str]],
     tmp_path: Path,
