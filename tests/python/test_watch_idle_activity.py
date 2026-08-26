@@ -15,6 +15,7 @@ skip_posix_on_native_windows("idle activity tests use POSIX process trees")
 
 import json
 import os
+import signal
 import shutil
 import stat
 import subprocess
@@ -29,6 +30,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_compat  # noqa: E402
 import goalflight_capacity  # noqa: E402
+import goalflight_acp_run  # noqa: E402
 import goalflight_ledger  # noqa: E402
 import goalflight_watch  # noqa: E402
 
@@ -609,11 +611,17 @@ def test_indeterminate_cleanup_retains_unverified_group_after_leader_exit(
             "lease_id": lease_id,
             "dispatch_id": "leader-exit-race",
             "agent": "codex",
-            "worker_pid": worker.pid,
-            "worker_pgid": worker.pid,
             "state": "active",
         }
         goalflight_capacity.save_state(capacity)
+        goalflight_acp_run.attach_worker_to_capacity_lease(
+            lease_id,
+            worker.pid,
+            worker.pid,
+        )
+        attached = goalflight_capacity.load_state()["leases"][lease_id]
+        assert attached["worker_pid"] == worker.pid, attached
+        assert attached["worker_pgid"] == worker.pid, attached
 
         release.write_text("go", encoding="utf-8")
         deadline = time.monotonic() + 5.0
@@ -621,6 +629,17 @@ def test_indeterminate_cleanup_retains_unverified_group_after_leader_exit(
             time.sleep(0.02)
         assert worker.poll() is not None, "leader did not exit before cleanup entry"
         assert goalflight_compat.pid_alive(child_pid), child_pid
+
+        # Reconciliation can race cleanup after the leader exits. The PGID
+        # recorded at initial attachment must keep the lease visible before the
+        # later indeterminate-retention reason has been persisted.
+        rc = goalflight_capacity.main(
+            ["release-stale", "--keep", "--reason", "test_pre_cleanup_race"]
+        )
+        assert rc == 0, rc
+        pre_cleanup = goalflight_capacity.load_state()["leases"][lease_id]
+        assert pre_cleanup["state"] == "active", pre_cleanup
+        assert pre_cleanup.get("reason") != goalflight_capacity.INDETERMINATE_LIVE_REASON
 
         result = goalflight_watch.terminate_indeterminate_worker(
             worker.pid,
@@ -657,6 +676,20 @@ def test_indeterminate_cleanup_retains_unverified_group_after_leader_exit(
         assert reconciled["state"] == "active", reconciled
         assert len(goalflight_capacity.active_leases(goalflight_capacity.load_state())) == 1
 
+        # The reap deadline bounds cleanup latency, not accounting. Expire it
+        # while the real resistant child still owns the historical group; both
+        # the direct predicate and stale reconciliation must retain the lease.
+        reconciled["accounted_live_until"] = "1970-01-01T00:00:00Z"
+        capacity = goalflight_capacity.load_state()
+        capacity["leases"][lease_id] = reconciled
+        goalflight_capacity.save_state(capacity)
+        assert goalflight_capacity.retained_live_scope_holds_capacity(reconciled)
+        rc = goalflight_capacity.main(
+            ["release-stale", "--keep", "--reason", "test_past_deadline_live"]
+        )
+        assert rc == 0, rc
+        assert goalflight_capacity.load_state()["leases"][lease_id]["state"] == "active"
+
         os.kill(child_pid, 9)
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline and goalflight_watch._pgroup_alive(worker.pid):
@@ -670,14 +703,6 @@ def test_indeterminate_cleanup_retains_unverified_group_after_leader_exit(
         assert rc == 0, rc
         recovered = goalflight_capacity.load_state()["leases"][lease_id]
         assert recovered["state"] == "expired", recovered
-
-        # The conservative unknown/reused-PGID hold also has a hard end: once
-        # its deadline passes, it cannot occupy capacity forever.
-        recovered["state"] = "active"
-        recovered["reason"] = goalflight_capacity.INDETERMINATE_LIVE_REASON
-        recovered["accounted_live_until"] = goalflight_capacity.iso(
-            goalflight_capacity.utc_now()
-        )
         assert not goalflight_capacity.retained_live_scope_holds_capacity(recovered)
     finally:
         if child_pid and goalflight_compat.pid_alive(child_pid):
@@ -752,6 +777,65 @@ def test_indeterminate_cleanup_signal_error_retains_worker(
         )
         assert capacity_result["capacity_lease_disposition"] == "retained_worker_live", capacity_result
         assert goalflight_capacity.load_state()["leases"][lease_id]["state"] == "active"
+    finally:
+        worker.kill()
+        worker.wait(timeout=5)
+
+
+def test_indeterminate_cleanup_sigkill_without_group_death_retains_worker(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    lease_id = "sigkill-unconfirmed-lease"
+    capacity = goalflight_capacity.load_state()
+    capacity["leases"][lease_id] = {
+        "lease_id": lease_id,
+        "dispatch_id": "sigkill-unconfirmed",
+        "agent": "codex",
+        "worker_pid": None,
+        "state": "active",
+    }
+    goalflight_capacity.save_state(capacity)
+    worker = _run_quiet_sleeper(tmp_path)
+    try:
+        identity = goalflight_ledger.process_identity(worker.pid)
+        assert identity and identity.get("start_token"), identity
+        signals: list[int] = []
+
+        def accepted_but_still_present(_pgid: int, sig: int) -> None:
+            if sig != 0:
+                signals.append(sig)
+            # Signal-zero probes keep reporting the real group as allocated.
+            return None
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                goalflight_watch.os,
+                "killpg",
+                accepted_but_still_present,
+            )
+            result = goalflight_watch.terminate_indeterminate_worker(
+                worker.pid,
+                worker.pid,
+                identity,
+                term_grace_s=0.0,
+                kill_grace_s=0.0,
+            )
+
+        assert signals == [signal.SIGTERM, signal.SIGKILL], signals
+        assert result["worker_termination_confirmed"] is False, result
+        assert result["worker_alive"] is True, result
+        assert result["worker_disposition"] == "indeterminate_cleanup_unconfirmed", result
+        capacity_result = goalflight_watch.release_indeterminate_capacity(
+            {"lease_id": lease_id, "worker_pgid": worker.pid},
+            worker_disposition=result,
+            reason="liveness_indeterminate",
+        )
+        assert capacity_result["capacity_lease_disposition"] == "retained_worker_live"
+        retained = goalflight_capacity.load_state()["leases"][lease_id]
+        assert retained["state"] == "active", retained
+        assert retained["reason"] == goalflight_capacity.INDETERMINATE_LIVE_REASON
     finally:
         worker.kill()
         worker.wait(timeout=5)

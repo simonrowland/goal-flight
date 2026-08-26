@@ -91,7 +91,12 @@ import goalflight_terminal
 import goalflight_worktree_pool
 from goalflight_agent_limits import moonshot_family
 from goalflight_codex_sandbox import codex_workspace_write_args
-from goalflight_liveness import active_monotonic, process_group_id, write_status
+from goalflight_liveness import (
+    active_monotonic,
+    process_group_id,
+    resolve_indeterminate_timeout_s,
+    write_status,
+)
 from goalflight_watch import (
     SUCCESS_TERMINAL_MARKERS,
     _final_terminal_marker,
@@ -11892,10 +11897,19 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         heartbeat_interval=max(float(args.poll_secs or 0.0), 0.1),
         wedge_samples=4,
         max_tool_s=DEFAULT_MAX_TOOL_S,
-        max_quiet_s=max(float(args.max_idle_secs or 300.0), 1.0),
+        # Ordinary idle and indeterminate liveness answer different questions.
+        # max_idle_secs bounds normal event silence; positive/unknown probes get
+        # the shared generous floor before ACP may give up as indeterminate.
+        max_quiet_s=resolve_indeterminate_timeout_s(
+            max(float(args.max_idle_secs or 300.0), 1.0)
+        ),
         progress_stall_s=300.0,
         liveness_profile=liveness_profile,
-        remote_turn_silence_s=None,
+        # Remote-turn silence is another unverifiable-liveness bound. Keep it
+        # distinct from the ordinary idle window and aligned with max_quiet_s.
+        remote_turn_silence_s=resolve_indeterminate_timeout_s(
+            max(float(args.max_idle_secs or 300.0), 1.0)
+        ),
         remote_turn_cancel_grace_s=DEFAULT_REMOTE_TURN_CANCEL_GRACE_S,
         steer_file=str(_steer_file(args.dispatch_id)),
         queue_launch_token=getattr(args, "queue_launch_token", None),

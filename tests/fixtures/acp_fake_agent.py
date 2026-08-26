@@ -855,14 +855,25 @@ def handle_prompt(req_id: int, params: dict) -> None:
         finally:
             if child is not None:
                 child.kill()
-    if SCENARIO == "long_reasoning_pause":
+    if SCENARIO in {"long_reasoning_pause", "long_reasoning_busy"}:
         pause_s = float(os.environ.get("GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S", "1.0"))
         process_table_file = os.environ.get("GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE")
         if process_table_file:
             with open(process_table_file, "w", encoding="utf-8") as handle:
                 handle.write(f"{os.getpid()} 1\n")
         text_update(session_id, "started")
-        time.sleep(pause_s)
+        if SCENARIO == "long_reasoning_busy":
+            # Incident-shaped buffered work: burn real CPU without emitting ACP
+            # frames until the computation completes. Tests must observe the
+            # production probe path, not inject a precomputed liveness verdict.
+            deadline = time.monotonic() + pause_s
+            accumulator = 0
+            while time.monotonic() < deadline:
+                accumulator = (accumulator * 33 + 17) % 1_000_003
+            if accumulator < 0:  # pragma: no cover - keeps the work observable
+                text_update(session_id, str(accumulator))
+        else:
+            time.sleep(pause_s)
         text_update(session_id, "finished")
         response(req_id, {"sessionId": session_id, "stopReason": "end_turn"})
         return

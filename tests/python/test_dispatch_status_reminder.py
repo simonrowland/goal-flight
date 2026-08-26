@@ -3,7 +3,12 @@
 
 from __future__ import annotations
 
+import os
+import shlex
+import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -114,12 +119,152 @@ def test_wait_hint_teaches_the_backgrounded_form() -> None:
         assert "clock" in text, f"{shape}: hint must say why a timer is wrong"
 
 
+def _assert_generated_bash_watch_command(
+    *,
+    extra_args: list[str],
+    expected_max_idle: float,
+) -> None:
+    """Execute the exact production-generated argv, including float spellings."""
+    parser = goalflight_dispatch._build_launch_parser()
+    args = parser.parse_args(
+        [
+            "--agent",
+            "codex",
+            "--prompt",
+            "generated watcher",
+            "--read-only",
+            *extra_args,
+        ]
+    )
+    goalflight_dispatch._apply_max_idle_default(args)
+    assert args.poll_secs == 2.0, args
+    assert args.max_idle_secs == expected_max_idle, args
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        tail = tmp / "generated.tail"
+        tail.write_text(
+            "COMPLETE: generated-decimal-argv — done\n",
+            encoding="utf-8",
+        )
+        prompt = tmp / "generated.prompt.md"
+        prompt.write_text("fixture\n", encoding="utf-8")
+        worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            start_new_session=True,
+        )
+        watcher = None
+        try:
+            lines = goalflight_dispatch._status_reminder_lines(
+                "generated-decimal-argv",
+                status_json=tmp / "generated.status.json",
+                tail_path=tail,
+                worker_pid=worker.pid,
+                shape="bash",
+                skill_root=ROOT,
+                agent="codex",
+                controller_pid=os.getpid(),
+                poll_secs=args.poll_secs,
+                max_idle_secs=args.max_idle_secs,
+                prompt_path=prompt,
+                hints=True,
+            )
+            generated = next(line for line in lines if line.startswith("  watch:  "))
+            command = shlex.split(generated.removeprefix("  watch:  "))
+            env = os.environ.copy()
+            env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pidfiles")
+            watcher = subprocess.Popen(
+                command,
+                cwd=ROOT,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            pidfile_dir = tmp / "pidfiles"
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not list(pidfile_dir.glob("*.jsonl")):
+                time.sleep(0.02)
+            assert list(pidfile_dir.glob("*.jsonl")), "generated watcher did not start"
+            # Reap the fixture so kill(0) does not keep seeing a zombie as live.
+            worker.kill()
+            worker.wait(timeout=5)
+            stdout, stderr = watcher.communicate(timeout=10)
+            result = subprocess.CompletedProcess(
+                command,
+                watcher.returncode,
+                stdout,
+                stderr,
+            )
+        finally:
+            if watcher is not None and watcher.poll() is None:
+                watcher.kill()
+                watcher.communicate(timeout=5)
+            if worker.poll() is None:
+                worker.kill()
+            worker.wait(timeout=5)
+
+    assert result.returncode == 0, (command, result.stdout, result.stderr)
+    assert "invalid arithmetic operator" not in result.stderr
+    assert "WATCHER-EXIT: marker exit_code=0" in result.stdout
+
+
+def test_generated_bash_watch_command_accepts_decimal_defaults() -> None:
+    _assert_generated_bash_watch_command(
+        extra_args=[],
+        expected_max_idle=900.0,
+    )
+
+
+def test_generated_bash_watch_command_accepts_disabled_idle_gate() -> None:
+    _assert_generated_bash_watch_command(
+        extra_args=["--max-idle-secs", "0"],
+        expected_max_idle=0.0,
+    )
+
+
+def test_generated_bash_watch_command_rejects_invalid_idle_values() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        tail = tmp / "invalid.tail"
+        tail.write_text("fixture\n", encoding="utf-8")
+        for value in ("-1", "nan"):
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(ROOT / "scripts" / "watch-dispatch-tail.sh"),
+                    "--pid",
+                    str(os.getpid()),
+                    "--tail",
+                    str(tail),
+                    "--poll-secs",
+                    "2.0",
+                    "--max-idle-secs",
+                    value,
+                ],
+                cwd=ROOT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            assert result.returncode == 64, (value, result)
+            assert "finite and nonnegative" in result.stderr, (value, result)
+
+
 def main() -> None:
     test_default_reminder_is_one_line_with_id_and_status()
     test_status_reminder_bash_shape()
     test_status_reminder_acp_shape()
     test_wait_hint_teaches_the_backgrounded_form()
-    print("OK: dispatch status reminder tests pass")
+    test_generated_bash_watch_command_accepts_decimal_defaults()
+    test_generated_bash_watch_command_accepts_disabled_idle_gate()
+    test_generated_bash_watch_command_rejects_invalid_idle_values()
+    print("OK: 7 dispatch status reminder tests pass")
 
 
 if __name__ == "__main__":

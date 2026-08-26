@@ -305,9 +305,38 @@ live_descendant_count() {
 # silently drift again.
 INDETERMINATE_LIVENESS_FLOOR_SECS=7200
 WEDGE_CONFIRM_SAMPLES=5
+ceil_positive_seconds() {
+  python3 - "$1" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except (IndexError, ValueError):
+    raise SystemExit(1)
+if not math.isfinite(value) or value <= 0:
+    raise SystemExit(1)
+print(math.ceil(value))
+PY
+}
+ceil_nonnegative_seconds() {
+  python3 - "$1" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except (IndexError, ValueError):
+    raise SystemExit(1)
+if not math.isfinite(value) or value < 0:
+    raise SystemExit(1)
+print(math.ceil(value))
+PY
+}
 default_total_runtime_secs() {
-  local max_idle="$1"
-  local poll_secs="${2:-15}"
+  local max_idle poll_secs
+  max_idle=$(ceil_nonnegative_seconds "$1") || return 1
+  poll_secs=$(ceil_positive_seconds "${2:-15}") || return 1
   local confirmed_idle_bound=$(( max_idle + (poll_secs * WEDGE_CONFIRM_SAMPLES) ))
   if [ "$confirmed_idle_bound" -gt "$INDETERMINATE_LIVENESS_FLOOR_SECS" ]; then
     echo "$confirmed_idle_bound"
@@ -378,11 +407,23 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Dispatch owns these values as floats and production-generated commands use
+# decimal spellings such as 2.0 / 900.0. Preserve the raw poll interval for
+# sleep, but derive ceiling integers for Bash arithmetic and epoch comparisons.
+POLL_SECS_CEIL=$(ceil_positive_seconds "$POLL_SECS") || {
+  echo "invalid --poll-secs '$POLL_SECS' (must be finite and positive)" >&2
+  usage
+}
+MAX_IDLE_SECS_CEIL=$(ceil_nonnegative_seconds "$MAX_IDLE_SECS") || {
+  echo "invalid --max-idle-secs '$MAX_IDLE_SECS' (must be finite and nonnegative)" >&2
+  usage
+}
+
 # Every direct invocation needs the same outer event-silence bound as
 # the Python watcher. Positive activity and unavailable probes may veto the
-# ordinary idle timeout, but neither may hold capacity forever. The environment
-# override keeps short hermetic tests and unusual direct callers configurable.
-TOTAL_RUNTIME_SECS="${GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS:-$(default_total_runtime_secs "$MAX_IDLE_SECS" "$POLL_SECS")}"
+# ordinary idle timeout, but neither may keep this watcher waiting forever. The
+# environment override keeps short hermetic tests and unusual direct callers configurable.
+TOTAL_RUNTIME_SECS="${GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS:-$(default_total_runtime_secs "$MAX_IDLE_SECS_CEIL" "$POLL_SECS_CEIL")}"
 case "$TOTAL_RUNTIME_SECS" in
   ''|*[!0-9]*)
     echo "invalid GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS '$TOTAL_RUNTIME_SECS' (must be a positive integer)" >&2
@@ -543,7 +584,7 @@ fi
 # idle). Observed 2026-06-09: lid-close sleep produced phantom idle_for >> max-idle
 # on wake and killed two healthy mid-verify codex workers (macOS ps %cpu also reads
 # ~0 right after wake, defeating the CPU/wedge grace).
-SLEEP_GAP_GRACE_SECS=$(( POLL_SECS * 5 + 120 ))
+SLEEP_GAP_GRACE_SECS=$(( POLL_SECS_CEIL * 5 + 120 ))
 prev_loop_ts=$(date +%s)
 
 echo "[watcher start $(date '+%H:%M:%S')] worker_pid=$WORKER_PID controller_pid=$CONTROLLER_PID tail=$TAIL_PATH markers='$MARKER_RE' poll=${POLL_SECS}s max_idle=${MAX_IDLE_SECS}s total_runtime=${TOTAL_RUNTIME_SECS}s"
@@ -803,7 +844,7 @@ while true; do
   if [ -f "$TAIL_PATH" ]; then
     now_ts=$(date +%s)
     idle_for=$(( now_ts - last_size_change_ts ))
-    if [ "$idle_for" -ge "$MAX_IDLE_SECS" ]; then
+    if [ "$MAX_IDLE_SECS_CEIL" -gt 0 ] && [ "$idle_for" -ge "$MAX_IDLE_SECS_CEIL" ]; then
         current_worker_pgid=$(worker_pgid_current "$WORKER_PID")
         [ -n "$current_worker_pgid" ] && worker_pgid="$current_worker_pgid"
         cpu_pct=$(pgroup_cpu_pct "$worker_pgid")

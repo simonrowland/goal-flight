@@ -1933,11 +1933,15 @@ def terminate_indeterminate_worker(
         time.sleep(0.05)
     group_gone = not _pgroup_alive(current_pgid)
     return {
-        # A correctly scoped SIGKILL cannot be caught or ignored. The watcher
-        # may still observe an unreaped zombie because it is not the parent;
-        # that is not a runnable worker or capacity consumer.
-        "worker_alive": False,
-        "worker_disposition": "terminated_on_liveness_indeterminate",
+        # Signal delivery is not death confirmation: an uninterruptible member
+        # can keep the group allocated past the reap deadline. Preserve that
+        # third state so capacity cannot be released on signal history alone.
+        "worker_alive": not group_gone,
+        "worker_disposition": (
+            "terminated_on_liveness_indeterminate"
+            if group_gone
+            else "indeterminate_cleanup_unconfirmed"
+        ),
         "worker_termination_identity_reason": leader_reason,
         "worker_termination_signal_scope": "verified_process_group",
         "worker_termination_signals": signals_sent,
@@ -1959,7 +1963,10 @@ def release_indeterminate_capacity(
         "capacity_lease_id": str(lease_id),
         "capacity_lease_disposition": "retained_worker_live",
     }
-    if worker_disposition.get("worker_alive") is not False:
+    if (
+        worker_disposition.get("worker_termination_confirmed") is not True
+        or worker_disposition.get("worker_alive") is not False
+    ):
         try:
             retained = goalflight_capacity.retain_indeterminate_live_lease(
                 str(lease_id),

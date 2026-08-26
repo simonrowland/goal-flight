@@ -54,14 +54,21 @@ from goalflight_acp_run import (  # noqa: E402
     adapter_liveness_config,
     agent_command,
     decide_terminal_state,
+    normalized_acp_dispatch_cfg,
     spawn_and_handshake_with_retry,
 )
 import goalflight_acp_permits  # noqa: E402
 import goalflight_compat  # noqa: E402
 import goalflight_journal  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
+import goalflight_dispatch  # noqa: E402
 from acp_runner import has_actionable_marker_values  # noqa: E402
-from goalflight_liveness import heartbeat_wedge_decision, pgroup_cpu_pct, progress_stall_decision  # noqa: E402
+from goalflight_liveness import (  # noqa: E402
+    INDETERMINATE_LIVENESS_FLOOR_S,
+    heartbeat_wedge_decision,
+    pgroup_cpu_pct,
+    progress_stall_decision,
+)
 
 
 def env_override_fields(text: str, env_name: str) -> dict[str, str]:
@@ -994,6 +1001,131 @@ def case_runner_remote_long_reasoning_pause_survives_old_walls() -> None:
     assert "finished" in (status.get("text_excerpt") or ""), status
     assert status["worker_alive"] is False, status
     assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_read_only_acp_buffered_work_survives_incident_duration() -> None:
+    """Acceptance: production bounds preserve 55 minutes of buffered work."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        args = argparse.Namespace(
+            dispatch_id="read-only-buffered-acceptance",
+            agent="codex",
+            account=None,
+            read_only=True,
+            os_sandbox=None,
+            controller_pid=None,
+            controller_session_id=None,
+            controller_label=None,
+            task_ids=[],
+            launch_detached=False,
+            queue_launch_token=None,
+            cwd=str(ROOT),
+            prompt="buffered acceptance",
+            prompt_file=None,
+            no_orientation=True,
+            model=None,
+            priority="normal",
+            capacity_wait_s=0,
+            max_idle_secs=None,
+            poll_secs=0.05,
+            permission_mode="auto",
+            permission_dir=None,
+            permission_inline_timeout_s=None,
+            permission_user_timeout_s=None,
+            interactive=False,
+            context_mode=None,
+        )
+        goalflight_dispatch._apply_max_idle_default(args)
+        cfg = goalflight_dispatch._build_acp_cfg(
+            args,
+            status_json=tmp / "acceptance.status.json",
+            base=tmp / "dispatch",
+        )
+
+    assert cfg.idle_timeout == 900.0, cfg
+    assert cfg.max_quiet_s >= INDETERMINATE_LIVENESS_FLOOR_S, cfg
+    assert cfg.remote_turn_silence_s == cfg.max_quiet_s, cfg
+    direct_values = vars(cfg).copy()
+    direct_values["max_quiet_s"] = 0.0
+    direct_cfg = normalized_acp_dispatch_cfg(
+        argparse.Namespace(**direct_values)
+    )
+    assert direct_cfg.max_quiet_s == cfg.max_quiet_s, direct_cfg
+    goal_cfg = normalized_acp_dispatch_cfg(
+        argparse.Namespace(
+            mode="goal",
+            idle_timeout=None,
+            max_quiet_s=None,
+        )
+    )
+    assert goal_cfg.max_quiet_s == goal_cfg.idle_timeout == 36000.0, goal_cfg
+
+    # One real second represents one awake hour. The fake ACP worker emits a
+    # start event, does real process work behind a buffered stream, then emits
+    # completion after the simulated incident point. With the old plumbing,
+    # cfg.max_quiet_s was 900 and this run was killed around 0.25 real seconds.
+    active_time_scale = 3600.0
+    production_profile = (
+        getattr(cfg, "liveness_profile", None)
+        or adapter_liveness_config(cfg.agent)[0]
+    )
+    assert production_profile == "remote_api", production_profile
+    started = time.monotonic()
+    returncode, status, stdout, stderr = _run_fake_runner(
+        "long_reasoning_busy",
+        progress_stall_s=cfg.max_quiet_s,
+        heartbeat_interval=0.05,
+        wedge_samples=999,
+        idle_timeout=cfg.idle_timeout,
+        max_quiet_s=cfg.max_quiet_s,
+        max_tool_s=cfg.max_quiet_s,
+        liveness_profile=production_profile,
+        remote_turn_silence_s=cfg.remote_turn_silence_s,
+        extra_env={
+            "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "1.0",
+            "GOALFLIGHT_TEST_MODE": "1",
+            "GOALFLIGHT_TEST_ACTIVE_TIME_SCALE": str(active_time_scale),
+        },
+        timeout_s=30.0,
+    )
+    simulated_awake_s = (time.monotonic() - started) * active_time_scale
+
+    assert simulated_awake_s > 55 * 60, simulated_awake_s
+    assert returncode == 0, (stdout, stderr, status)
+    assert status["state"] == "complete", status
+    assert status["ok"] is True, status
+    assert status.get("liveness_hard_wall_expired") is not True, status
+    assert "finished" in (status.get("text_excerpt") or ""), status
+
+    # Null hypothesis/control: retain the old conflated 900-second outer walls
+    # while keeping every other worker and timing input identical. Production
+    # liveness must then terminate this same real work before its buffered end.
+    old_returncode, old_status, old_stdout, old_stderr = _run_fake_runner(
+        "long_reasoning_busy",
+        progress_stall_s=900.0,
+        heartbeat_interval=0.05,
+        wedge_samples=999,
+        idle_timeout=900.0,
+        max_quiet_s=900.0,
+        max_tool_s=900.0,
+        liveness_profile=production_profile,
+        remote_turn_silence_s=900.0,
+        extra_env={
+            "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "1.0",
+            "GOALFLIGHT_TEST_MODE": "1",
+            "GOALFLIGHT_TEST_ACTIVE_TIME_SCALE": str(active_time_scale),
+        },
+        timeout_s=30.0,
+    )
+    assert old_returncode != 0, (old_stdout, old_stderr, old_status)
+    assert "finished" not in (old_status.get("text_excerpt") or ""), old_status
+    assert old_status["state"] in {
+        "remote_turn_silence",
+        "liveness_indeterminate",
+        "idle_timeout",
+    }, old_status
+    assert old_status["remote_turn_silence_s"] == 900.0, old_status
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -2564,6 +2696,7 @@ def main() -> None:
     case_detached_pidfile_entry_survives_ghost_cleanup()
     case_runner_progress_then_silent_wedges_and_reaps()
     case_runner_remote_long_reasoning_pause_survives_old_walls()
+    case_read_only_acp_buffered_work_survives_incident_duration()
     case_runner_remote_dead_silent_turn_hits_remote_wall()
     case_runner_outer_bound_with_unknown_cpu_and_idle_disabled()
     case_runner_outer_bound_classifies_measured_idle()

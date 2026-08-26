@@ -35,11 +35,12 @@ LOW_POWER_RELAX_FACTOR = 3.0
 LOW_POWER_RELAX_CAP_S = 600.0
 # Give-up bound when a liveness probe cannot determine its answer. Unknown
 # never counts as death (the b-238 class: a failed `ps` on a busy box looks
-# like "no children"). Waiting forever leaks capacity. 7200s is 2 hours:
+# like "no children"). Waiting forever stalls finalization. 7200s is 2 hours:
 # a 55-minute working worker (b-238) survives with ~65 minutes of margin,
 # and the bound matches the dispatch lease TTL cap. Known-idle still dies at
 # idle_timeout; positive or cannot-tell probes keep the worker until this outer
-# event-silence bound, then release capacity without claiming the worker is dead.
+# event-silence bound, then start bounded cleanup. Capacity remains held unless
+# that cleanup proves the full worker group is dead.
 INDETERMINATE_LIVENESS_FLOOR_S = 7200.0
 LIVENESS_INDETERMINATE_STATE = "liveness_indeterminate"
 TREE_PROBE_SKIPPED = "skipped"
@@ -48,6 +49,8 @@ TREE_PROBE_UNAVAILABLE = "unavailable"
 _SYSTEM_STARVED_CACHE: tuple[float, bool] | None = None
 _STATUS_EPOCH_SCHEMAS = {"goalflight.acp-run.v1", "goalflight.status.v1"}
 _STATUS_EPOCH_CACHE: dict[str, str] = {}
+_TEST_ACTIVE_TIME_SCALE: tuple[float, float] | None = None
+_TEST_ACTIVE_TIME_SCALE_CHECKED = False
 
 
 def active_monotonic() -> float:
@@ -55,14 +58,40 @@ def active_monotonic() -> float:
 
     macOS CLOCK_UPTIME_RAW excludes sleep; Linux CLOCK_MONOTONIC excludes suspend.
     """
+    now: float | None = None
     for name in ("CLOCK_UPTIME_RAW", "CLOCK_MONOTONIC"):
         clk = getattr(time, name, None)
         if clk is not None:
             try:
-                return time.clock_gettime(clk)
+                now = time.clock_gettime(clk)
+                break
             except OSError:
                 pass
-    return time.monotonic()
+    if now is None:
+        now = time.monotonic()
+
+    # Hermetic acceptance tests can compress an incident-scale awake-time gap
+    # without sleeping for an hour. The gate is test-mode-only and resolved
+    # once, so production clocks and hot-loop logging remain untouched.
+    global _TEST_ACTIVE_TIME_SCALE, _TEST_ACTIVE_TIME_SCALE_CHECKED
+    if not _TEST_ACTIVE_TIME_SCALE_CHECKED:
+        raw_scale = goalflight_compat.allowed_env_override(
+            "GOALFLIGHT_TEST_ACTIVE_TIME_SCALE",
+            "",
+            test_mode=True,
+        )
+        if raw_scale is not None:
+            try:
+                scale = float(raw_scale)
+            except ValueError:
+                scale = 0.0
+            if scale > 0:
+                _TEST_ACTIVE_TIME_SCALE = (now, scale)
+        _TEST_ACTIVE_TIME_SCALE_CHECKED = True
+    if _TEST_ACTIVE_TIME_SCALE is not None:
+        origin, scale = _TEST_ACTIVE_TIME_SCALE
+        return origin + ((now - origin) * scale)
+    return now
 
 
 def system_sleep_pause_s(
@@ -516,7 +545,7 @@ def resolve_indeterminate_timeout_s(
     idle_timeout_s: float | None,
     override: float | None = None,
 ) -> float:
-    """Seconds of silence before non-idle liveness gives up capacity.
+    """Seconds of silence before non-idle liveness starts bounded cleanup.
 
     Override, when positive, is the bound. Otherwise the bound is
     ``max(idle_timeout, INDETERMINATE_LIVENESS_FLOOR_S)`` so a short one-shot

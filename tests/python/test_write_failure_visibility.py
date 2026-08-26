@@ -825,14 +825,12 @@ def test_acp_lease_attach_contract_fault_propagates() -> None:
         )
 
 
-def test_acp_lease_attach_transient_io_still_defers() -> None:
-    assert (
+def test_acp_lease_attach_transient_io_aborts_before_running() -> None:
+    with pytest.raises(OSError, match="temporary capacity I/O"):
         acp_run._attach_worker_state_before_running(
             lambda _pid: (_ for _ in ()).throw(OSError("temporary capacity I/O")),
             123,
         )
-        is None
-    )
 
 
 @pytest.mark.parametrize(
