@@ -1269,6 +1269,7 @@ def _run_dead_worker_tail(
     prompt_text: str = "Do the requested work.\n",
     max_idle_secs: str = "0.2",
     prompt_mode: str = "file",
+    dispatch_id: str | None = None,
 ):
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -1291,6 +1292,7 @@ def _run_dead_worker_tail(
             worker_pid=worker.pid,
             poll_secs="0.05",
             max_idle_secs=max_idle_secs,
+            dispatch_id=dispatch_id,
         )
 
 
@@ -1826,6 +1828,363 @@ def case_dead_pid_unbound_done_signoff_is_rejected() -> None:
         assert payload.get("state") == "worker_dead", payload
         assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
         assert not term, term
+
+
+def case_dead_pid_unbound_attention_markers_block_not_die() -> None:
+    """BLOCKED/USER-NEED/USER-CONFIRM must terminalize without a dispatch-id prefix.
+
+    Production always passes ``--dispatch-id``. The worker-contract shape is
+    ``BLOCKED: <reason>`` with no id. Identity binding written for COMPLETE
+    dropped that line, ``last_marker`` kept it, and death_cause claimed
+    ``no_evidence``. Drive the real watcher with an independent dispatch id
+    that is not a prefix of the payload so the helper cannot infer a match.
+    """
+    dispatch_id = "watch-attention-escalation"
+    cases = (
+        (
+            "BLOCKED",
+            "BLOCKED: cannot write sandbox path; needs controller\n",
+            "cannot write sandbox path; needs controller",
+        ),
+        (
+            "USER-NEED",
+            "USER-NEED: what is the target path?\n",
+            "what is the target path?",
+        ),
+        (
+            "USER-CONFIRM",
+            "USER-CONFIRM: may I rewrite history?\n",
+            "may I rewrite history?",
+        ),
+        (
+            "FAILED",
+            "FAILED: tests exploded before the commit step\n",
+            "tests exploded before the commit step",
+        ),
+    )
+    for kind, marker_line, excerpt in cases:
+        rc, _elapsed, term, payload = _run_dead_worker_tail(
+            f"work stalled\n{marker_line}",
+            dispatch_id=dispatch_id,
+        )
+        assert rc == 4, f"{kind}: expected blocked exit 4, got rc={rc} ({payload})"
+        assert payload.get("state") == "blocked", f"{kind}: {payload}"
+        assert payload.get("liveness_state") == "blocked", f"{kind}: {payload}"
+        assert payload.get("reason") == f"marker:{kind}", f"{kind}: {payload}"
+        assert "no_evidence" not in str(payload.get("reason")), f"{kind}: {payload}"
+        assert payload.get("state") != "worker_dead", f"{kind}: {payload}"
+        assert term.get("kind") == kind, f"{kind}: {term}"
+        assert term.get("text") == excerpt, f"{kind}: {term}"
+
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "done\nCOMPLETE: finished the work\n",
+        dispatch_id=dispatch_id,
+    )
+    assert rc == 1, f"unbound COMPLETE must stay dead, got rc={rc} ({payload})"
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
+    assert not term, term
+
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "worker quoted an example\n"
+        "```\n"
+        "BLOCKED: cannot write sandbox path; needs controller\n"
+        "```\n"
+        "worker died before sign-off\n",
+        dispatch_id=dispatch_id,
+    )
+    assert rc == 1, f"fenced BLOCKED must stay dead, got rc={rc} ({payload})"
+    assert payload.get("state") == "worker_dead", payload
+    assert not term, term
+
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "BLOCKED: <intended-path> not writable due to <reason>\n",
+        dispatch_id=dispatch_id,
+    )
+    assert rc == 1, f"template BLOCKED must stay dead, got rc={rc} ({payload})"
+    assert payload.get("state") == "worker_dead", payload
+    assert not term, term
+
+
+def test_worker_dead_reason_does_not_claim_no_evidence_for_blocked_transcript() -> None:
+    """The death-cause classifier must not assert ignorance of a BLOCKED line.
+
+    Even if the watcher later declines to terminalize, the function that emits
+    ``death_cause=no_evidence`` is lying when its input contains the marker.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(
+            "work stalled\nBLOCKED: cannot write sandbox path; needs controller\n",
+            encoding="utf-8",
+        )
+        reason = goalflight_watch._worker_dead_no_marker_reason(
+            tail,
+            ["Do the requested work."],
+            prompt_provenance_available=True,
+        )
+    assert reason != NO_EVIDENCE_WORKER_DEAD_REASON, reason
+    assert "no_evidence" not in reason, reason
+    assert "BLOCKED" in reason, reason
+
+
+def test_dead_path_attention_only_own_final_unquoted_line() -> None:
+    """Quoted / mid-tail attention is relayed or abandoned, not a stop.
+
+    Drive the real watcher with real transcripts. A genuine last-line
+    unquoted unindented escalation must still terminalize (exit 4) so the
+    false-negative that hid BLOCKED as unexplained death does not return.
+    """
+    dispatch_id = "watch-attention-own-signal"
+    cases = (
+        ("BLOCKED", "cannot write sandbox path; needs controller"),
+        ("USER-NEED", "what is the target path?"),
+    )
+    for kind, excerpt in cases:
+        quoted_rc, _elapsed, quoted_term, quoted_payload = _run_dead_worker_tail(
+            f"worker copied prior output\n> {kind}: {excerpt}\n",
+            dispatch_id=dispatch_id,
+        )
+        assert quoted_rc == 1, (
+            f"quoted {kind} must not block, got rc={quoted_rc} ({quoted_payload})"
+        )
+        assert quoted_payload.get("state") == "worker_dead", f"quoted {kind}: {quoted_payload}"
+        assert quoted_payload.get("state") != "blocked", f"quoted {kind}: {quoted_payload}"
+        assert not quoted_term, f"quoted {kind}: {quoted_term}"
+
+        mid_rc, _elapsed, mid_term, mid_payload = _run_dead_worker_tail(
+            f"work stalled\n{kind}: {excerpt}\nworker kept going after the marker\n",
+            dispatch_id=dispatch_id,
+        )
+        assert mid_rc == 1, (
+            f"mid-tail {kind} must not block, got rc={mid_rc} ({mid_payload})"
+        )
+        assert mid_payload.get("state") == "worker_dead", f"mid-tail {kind}: {mid_payload}"
+        assert mid_payload.get("state") != "blocked", f"mid-tail {kind}: {mid_payload}"
+        assert not mid_term, f"mid-tail {kind}: {mid_term}"
+
+        own_rc, _elapsed, own_term, own_payload = _run_dead_worker_tail(
+            f"work stalled\n{kind}: {excerpt}\n",
+            dispatch_id=dispatch_id,
+        )
+        assert own_rc == 4, (
+            f"own final {kind} must block, got rc={own_rc} ({own_payload})"
+        )
+        assert own_payload.get("state") == "blocked", f"own {kind}: {own_payload}"
+        assert own_payload.get("liveness_state") == "blocked", f"own {kind}: {own_payload}"
+        assert own_payload.get("reason") == f"marker:{kind}", f"own {kind}: {own_payload}"
+        assert own_term.get("kind") == kind, f"own {kind}: {own_term}"
+        assert own_term.get("text") == excerpt, f"own {kind}: {own_term}"
+
+        trailer_rc, _elapsed, trailer_term, trailer_payload = _run_dead_worker_tail(
+            f"work stalled\n{kind}: {excerpt}\nhook: Stop\ntokens used\n42\n",
+            dispatch_id=dispatch_id,
+        )
+        assert trailer_rc == 4, (
+            f"{kind} plus harness trailer must still block, got rc={trailer_rc} "
+            f"({trailer_payload})"
+        )
+        assert trailer_payload.get("state") == "blocked", f"trailer {kind}: {trailer_payload}"
+        assert trailer_term.get("kind") == kind, f"trailer {kind}: {trailer_term}"
+        assert trailer_term.get("text") == excerpt, f"trailer {kind}: {trailer_term}"
+
+
+def _attention_surface_bundle(tail_text: str, dispatch_id: str) -> dict:
+    """Verdict + harvest/outbox on one tail, with extract_markers preloaded.
+
+    Harvest is fed the scrape payload that used to promote mid-tail BLOCKED
+    into an outbox headline. That is the P1 this round closes.
+    """
+    import goalflight_journal as journal
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(tail_text, encoding="utf-8")
+        markers, _size = goalflight_watch.extract_markers(tail)
+        payload = {
+            "last_marker": markers[-1] if markers else None,
+            "terminal_marker": None,
+            "markers": markers,
+        }
+        harvested = goalflight_watch.harvest_headline_marker(
+            payload, tail, expected_dispatch_id=dispatch_id
+        )
+        dead = goalflight_watch._final_terminal_marker(
+            tail, expected_dispatch_id=dispatch_id
+        )
+        live = goalflight_watch._last_line_is_terminal_marker(
+            tail, expected_dispatch_id=dispatch_id
+        )
+        scrape_last = payload.get("last_marker")
+    if (
+        isinstance(harvested, dict)
+        and harvested.get("kind") in goalflight_terminal.ATTENTION_MARKERS
+    ):
+        outbox = journal.outbox_headline_text(
+            "blocked",
+            {"headline": str(harvested.get("text") or "")},
+        )
+    else:
+        # Feed the scrape last_marker, not harvest, so outbox cannot agree
+        # tautologically. Mid-tail BLOCKED lives here; the helper must not
+        # promote it.
+        observation = {"last_marker": scrape_last} if scrape_last else {}
+        outbox = journal.outbox_headline_text("worker_dead", observation)
+    return {
+        "harvested": harvested,
+        "dead": dead,
+        "live": live,
+        "outbox": outbox,
+        "extract_markers": markers,
+    }
+
+
+def _is_attention_escalation(marker: object) -> bool:
+    return (
+        isinstance(marker, dict)
+        and marker.get("kind") in goalflight_terminal.ATTENTION_MARKERS
+    )
+
+
+def test_list_item_blocked_is_not_an_escalation_on_any_surface() -> None:
+    """`- BLOCKED:` as the final line is a markdown list item, not a stop."""
+
+    dispatch_id = "watch-attention-list-item"
+    excerpt = "sandbox denied the write"
+    tail_text = f"worker copied a checklist\n- BLOCKED: {excerpt}\n"
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        tail_text, dispatch_id=dispatch_id
+    )
+    assert rc == 1, f"list-item BLOCKED must not block, got rc={rc} ({payload})"
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("state") != "blocked", payload
+    assert not term, term
+
+    surfaces = _attention_surface_bundle(tail_text, dispatch_id)
+    assert not _is_attention_escalation(surfaces["dead"]), surfaces
+    assert not _is_attention_escalation(surfaces["live"]), surfaces
+    assert not _is_attention_escalation(surfaces["harvested"]), surfaces
+    assert surfaces["outbox"].startswith("dispatch terminal:"), surfaces["outbox"]
+    assert excerpt not in surfaces["outbox"], surfaces["outbox"]
+
+
+def test_quoted_and_mid_tail_blocked_are_not_harvest_or_outbox_escalations() -> None:
+    """Round 2 closed verdict for `> BLOCKED:` / mid-tail; harvest/outbox must agree."""
+
+    dispatch_id = "watch-attention-harvest-relay"
+    excerpt = "sandbox denied the write"
+    quoted = f"worker copied prior output\n> BLOCKED: {excerpt}\n"
+    mid = f"work stalled\nBLOCKED: {excerpt}\nworker kept going after the marker\n"
+    for label, tail_text in (("quoted", quoted), ("mid-tail", mid)):
+        surfaces = _attention_surface_bundle(tail_text, dispatch_id)
+        assert not _is_attention_escalation(surfaces["dead"]), (label, surfaces)
+        assert not _is_attention_escalation(surfaces["harvested"]), (label, surfaces)
+        assert surfaces["outbox"].startswith("dispatch terminal:"), (label, surfaces["outbox"])
+        assert excerpt not in surfaces["outbox"], (label, surfaces["outbox"])
+        if label == "mid-tail":
+            kinds = [marker.get("kind") for marker in surfaces["extract_markers"]]
+            assert "BLOCKED" in kinds, (
+                "precondition: extract_markers still sees mid-tail BLOCKED; "
+                f"got {surfaces['extract_markers']!r}"
+            )
+
+
+def test_genuine_last_line_blocked_still_terminalizes_and_headlines() -> None:
+    """A real last-line BLOCKED must still exit 4, keep text, and headline outbox."""
+
+    dispatch_id = "watch-attention-own-headline"
+    excerpt = "cannot write sandbox path; needs controller"
+    tail_text = f"work stalled\nBLOCKED: {excerpt}\n"
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        tail_text, dispatch_id=dispatch_id
+    )
+    assert rc == 4, f"own final BLOCKED must block, got rc={rc} ({payload})"
+    assert payload.get("state") == "blocked", payload
+    assert payload.get("liveness_state") == "blocked", payload
+    assert payload.get("reason") == "marker:BLOCKED", payload
+    assert term.get("kind") == "BLOCKED", term
+    assert term.get("text") == excerpt, term
+
+    surfaces = _attention_surface_bundle(tail_text, dispatch_id)
+    assert _is_attention_escalation(surfaces["dead"]), surfaces
+    assert _is_attention_escalation(surfaces["live"]), surfaces
+    assert _is_attention_escalation(surfaces["harvested"]), surfaces
+    assert surfaces["harvested"]["kind"] == "BLOCKED", surfaces["harvested"]
+    assert surfaces["harvested"]["text"] == excerpt, surfaces["harvested"]
+    assert surfaces["outbox"] == excerpt, surfaces["outbox"]
+
+
+def test_attention_surfaces_agree_on_the_same_transcript() -> None:
+    """The same tail must not be an escalation on one surface and not the other."""
+
+    dispatch_id = "watch-attention-surface-agree"
+    excerpt = "sandbox denied the write"
+    cases = (
+        ("list-item", f"- BLOCKED: {excerpt}\n"),
+        ("quoted", f"> BLOCKED: {excerpt}\n"),
+        ("star-list", f"* BLOCKED: {excerpt}\n"),
+        ("numbered", f"1. BLOCKED: {excerpt}\n"),
+        ("pipe", f"| BLOCKED: {excerpt}\n"),
+        ("mid-tail", f"work stalled\nBLOCKED: {excerpt}\nkept going\n"),
+        ("genuine", f"work stalled\nBLOCKED: {excerpt}\n"),
+        ("sigil", f"!BLOCKED: {excerpt}\n"),
+        ("status-prefix", f"STATUS: BLOCKED: {excerpt}\n"),
+    )
+    for label, tail_text in cases:
+        surfaces = _attention_surface_bundle(tail_text, dispatch_id)
+        dead = _is_attention_escalation(surfaces["dead"])
+        harvest = _is_attention_escalation(surfaces["harvested"])
+        live = _is_attention_escalation(surfaces["live"])
+        assert dead == harvest, (
+            f"{label}: dead-path verdict {dead} vs harvest {harvest}: {surfaces}"
+        )
+        assert live == harvest, (
+            f"{label}: live last-line {live} vs harvest {harvest}: {surfaces}"
+        )
+        outbox_escalated = not surfaces["outbox"].startswith("dispatch terminal:")
+        assert outbox_escalated == harvest, (
+            f"{label}: outbox {surfaces['outbox']!r} vs harvest {harvest}"
+        )
+
+
+def test_worker_dead_reason_does_not_claim_no_evidence_for_indented_blocked() -> None:
+    """extract_markers strips indent; death-cause must not then claim ignorance.
+
+    An indented BLOCKED line is not the worker's own terminal signal, so the
+    watcher must not exit blocked. The same input is still determinate
+    evidence: last_marker.kind is BLOCKED and death_cause must not say
+    no_evidence.
+    """
+    dispatch_id = "watch-attention-indented"
+    indented = (
+        "work stalled\n"
+        "    BLOCKED: cannot write sandbox path; needs controller\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(indented, encoding="utf-8")
+        markers, _size = goalflight_watch.extract_markers(tail)
+        last_marker = markers[-1] if markers else None
+        reason = goalflight_watch._worker_dead_no_marker_reason(
+            tail,
+            ["Do the requested work."],
+            prompt_provenance_available=True,
+            last_marker=last_marker,
+        )
+    assert last_marker is not None and last_marker.get("kind") == "BLOCKED", last_marker
+    assert reason != NO_EVIDENCE_WORKER_DEAD_REASON, reason
+    assert "no_evidence" not in reason, reason
+    assert "BLOCKED" in reason, reason
+
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        indented,
+        dispatch_id=dispatch_id,
+    )
+    assert rc == 1, f"indented BLOCKED must not terminalize, got rc={rc} ({payload})"
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("state") != "blocked", payload
+    assert not term, term
+    assert "no_evidence" not in str(payload.get("reason")), payload
 
 
 def case_dead_pid_usage_limit_without_success_marker_reclassifies() -> None:
@@ -2405,6 +2764,14 @@ def main() -> None:
     test_restored_same_prompt_signature_reenables_classification()
     test_ordinary_provider_like_prose_surfaces_no_evidence()
     case_dead_pid_unbound_done_signoff_is_rejected()
+    case_dead_pid_unbound_attention_markers_block_not_die()
+    test_worker_dead_reason_does_not_claim_no_evidence_for_blocked_transcript()
+    test_dead_path_attention_only_own_final_unquoted_line()
+    test_list_item_blocked_is_not_an_escalation_on_any_surface()
+    test_quoted_and_mid_tail_blocked_are_not_harvest_or_outbox_escalations()
+    test_genuine_last_line_blocked_still_terminalizes_and_headlines()
+    test_attention_surfaces_agree_on_the_same_transcript()
+    test_worker_dead_reason_does_not_claim_no_evidence_for_indented_blocked()
     case_dead_pid_usage_limit_without_success_marker_reclassifies()
     case_b054_real_evidence_marker_vocab_bullet_reclassifies_rate_limited()
     case_b054_error_after_reconciled_marker_vetoes_complete()

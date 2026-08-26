@@ -1325,24 +1325,13 @@ def _marker_survives_unbalanced_fence(marker: dict | None) -> bool:
     return bool(marker and marker.get("kind") in SUCCESS_TERMINAL_MARKERS)
 
 
-def _terminal_marker_matches_dispatch(
-    marker: dict | None,
-    expected_dispatch_id: str | None,
+def _payload_binds_to_dispatch(
+    marker: dict,
+    expected: str,
     *,
     require_terminated: bool = False,
 ) -> bool:
-    """Bind scraped terminal evidence to the dispatch that owns the tail.
-
-    A marker payload may be exactly the dispatch id or start with it followed by
-    an explicit separator and a human summary.  Empty sign-offs and generic
-    summaries remain usable by parser-only callers that have no expected id,
-    but never satisfy a dispatch boundary.
-    """
-    expected = str(expected_dispatch_id or "").strip()
-    if not expected:
-        return marker is not None
-    if not isinstance(marker, dict):
-        return False
+    """True when the payload is this dispatch's id, optionally plus a summary."""
     embedded = str(marker.get("dispatch_id") or "").strip()
     if embedded:
         return embedded == expected
@@ -1355,6 +1344,31 @@ def _terminal_marker_matches_dispatch(
         return False
     suffix = text[len(expected) :]
     return bool(suffix and (suffix[0].isspace() or suffix[0] in ":;|\N{EM DASH}\N{EN DASH}"))
+
+
+def _terminal_marker_matches_dispatch(
+    marker: dict | None,
+    expected_dispatch_id: str | None,
+    *,
+    require_terminated: bool = False,
+) -> bool:
+    """Bind scraped terminal evidence to the dispatch that owns the tail.
+
+    Success markers (COMPLETE/READY/RESULT) must carry this dispatch's id.
+    Attention markers (BLOCKED, USER-NEED, USER-CONFIRM, FAILED) bind without
+    that prefix so a deliberate escalation is not dropped as a missing sign-off.
+    Empty sign-offs remain usable only when the caller has no expected id.
+    """
+    expected = str(expected_dispatch_id or "").strip()
+    if not expected:
+        return marker is not None
+    if not isinstance(marker, dict):
+        return False
+    if _payload_binds_to_dispatch(
+        marker, expected, require_terminated=require_terminated
+    ):
+        return True
+    return marker.get("kind") in goalflight_terminal.ATTENTION_MARKERS
 
 
 def _final_terminal_marker_from_line(
@@ -1391,7 +1405,22 @@ def _final_terminal_marker_from_line(
             return None
     direct_match = MARKER_RE.match(stripped)
     if not allow_status_prefix and direct_match and direct_match.group(1) == "STATUS":
-        return None
+        # Progress ``STATUS:`` is not terminal. ``STATUS: BLOCKED:`` is the
+        # allowlisted own-signal form; live last-line used to return here
+        # before the shared predicate ran, so harvest/dead accepted a line
+        # live ignored. Consult the allowlist instead of a second STATUS
+        # rejector. ``STATUS: COMPLETE:`` stays live-rejected (SUCCESS still
+        # needs allow_status_prefix, as before).
+        own = goalflight_terminal.parse_own_signal_attention_line(
+            raw_line, line_no, kimi_output=kimi_output
+        )
+        if own is None:
+            return None
+        return (
+            own
+            if _terminal_marker_matches_dispatch(own, expected_dispatch_id)
+            else None
+        )
     signoff = _completion_signoff_marker(stripped, line_no)
     if signoff:
         return (
@@ -1409,6 +1438,17 @@ def _final_terminal_marker_from_line(
         "kind": match.group(1),
         "text": _strip_marker_decoration(match.group(2))[:1000],
     }
+    if marker["kind"] in goalflight_terminal.ATTENTION_MARKERS:
+        # Prefix stripping above is for SUCCESS renderer forms (``+READY:``,
+        # ``- COMPLETE:``, ``> COMPLETE:``). Attention uses the shared
+        # allowlist on the *raw* line so a list-item or quote cannot become
+        # an escalation by surviving one of those strippers.
+        own = goalflight_terminal.parse_own_signal_attention_line(
+            raw_line, line_no, kimi_output=kimi_output
+        )
+        if own is None:
+            return None
+        marker = own
     return marker if _terminal_marker_matches_dispatch(marker, expected_dispatch_id) else None
 
 
@@ -1471,6 +1511,41 @@ def _prompt_echo_scan(lines: list[str], prompt_prefix: list[str]) -> tuple[set[i
     return set(), False, prompt_line_set
 
 
+def _attention_marker_kind_in_text(text: str) -> str | None:
+    """Return the last unfenced, unquoted attention-marker kind in *text*, if any.
+
+    death_cause=no_evidence is invalid while one of these lines is in view.
+    Leading whitespace is stripped, matching ``extract_markers``, so an
+    indented attention line cannot leave ``last_marker.kind`` determinate
+    while this helper claims the tail contains no evidence. Markdown quotes
+    (``> ``) and fences still do not count: those are relayed content, not
+    the worker's own signal. Indentation is evidence for death-cause only;
+    the dead-path scan still refuses to terminalize an indented line.
+    """
+    kind = None
+    fence = goalflight_terminal.MarkdownFenceTracker()
+    for idx, raw in enumerate(text.splitlines(), start=1):
+        if fence.consume_boundary(raw):
+            continue
+        if fence.in_fence:
+            continue
+        marker = _final_terminal_marker_from_line(raw.lstrip(" \t"), idx)
+        if marker and marker.get("kind") in goalflight_terminal.ATTENTION_MARKERS:
+            kind = str(marker["kind"])
+    return kind
+
+
+def _attention_kind_from_last_marker(last_marker: object) -> str | None:
+    """Return an attention kind already recorded on *last_marker*, if any."""
+
+    if not isinstance(last_marker, dict):
+        return None
+    kind = last_marker.get("kind")
+    if kind in goalflight_terminal.ATTENTION_MARKERS:
+        return str(kind)
+    return None
+
+
 def _worker_dead_no_marker_reason(
     path: Path,
     prompt_prefix: list[str] | None = None,
@@ -1478,6 +1553,7 @@ def _worker_dead_no_marker_reason(
     prompt_provenance_available: bool = True,
     prompt_path: Path | None = None,
     prompt_signature: tuple[int, int, int] | None = None,
+    last_marker: dict | None = None,
 ) -> str:
     """Add postmortem evidence without changing the worker-dead verdict."""
 
@@ -1525,6 +1601,12 @@ def _worker_dead_no_marker_reason(
             cause = goalflight_terminal.WORKER_DEATH_CAUSE_NO_EVIDENCE
     if cause in prompt_causes:
         cause = goalflight_terminal.WORKER_DEATH_CAUSE_NO_EVIDENCE
+    if cause == goalflight_terminal.WORKER_DEATH_CAUSE_NO_EVIDENCE:
+        attention_kind = _attention_marker_kind_in_text(visible_text)
+        if not attention_kind:
+            attention_kind = _attention_kind_from_last_marker(last_marker)
+        if attention_kind:
+            cause = f"attention_marker:{attention_kind}"
     return f"worker_dead_no_terminal_marker:death_cause={cause}"
 
 
@@ -2256,6 +2338,10 @@ def _is_headline_kind(marker: object) -> bool:
     return isinstance(marker, dict) and marker.get("kind") in HEADLINE_MAIL_MARKER_KINDS
 
 
+def _is_success_headline_kind(marker: object) -> bool:
+    return isinstance(marker, dict) and marker.get("kind") in SUCCESS_TERMINAL_MARKERS
+
+
 def harvest_headline_marker(
     payload: dict,
     tail: Path,
@@ -2270,13 +2356,20 @@ def harvest_headline_marker(
     final scan, so a worker that signed off and then went quiet arrived with
     ``last_marker is None``. Terminal writes rescan the tail; the verdict is
     not rewritten.
+
+    Attention headlines use the same own-signal predicate as the dead-path
+    verdict (``parse_own_signal_attention_line`` inside ``_final_terminal_marker``).
+    ``extract_markers`` / payload ``markers`` still list mid-tail BLOCKED as
+    diagnostic vocabulary; they must not become the harvest/outbox headline.
+
+    Remaining extract_markers consumers that still answer "was attention
+    vocabulary seen?" rather than "did this worker escalate?": ACP
+    early-cancel and IncrementalTailScanner diagnostic ``markers``.
+    Death-cause (``_attention_marker_kind_in_text``) now goes through
+    ``_final_terminal_marker_from_line`` and therefore the allowlist; it
+    is evidence, not a harvest headline. Those leftover scrapes are not
+    harvest/outbox.
     """
-    for candidate in (payload.get("terminal_marker"), payload.get("last_marker")):
-        if _is_headline_kind(candidate):
-            return candidate  # type: ignore[return-value]
-    for marker in reversed(list(payload.get("markers") or [])):
-        if _is_headline_kind(marker):
-            return marker
     harvested = _final_terminal_marker(
         tail,
         ignore_prefix_lines=ignore_prefix_lines,
@@ -2286,9 +2379,17 @@ def harvest_headline_marker(
     )
     if _is_headline_kind(harvested):
         return harvested
+    # Success-only fallbacks: a completed worker's COMPLETE/READY/RESULT may
+    # sit behind extra summary. Attention is never taken from extract_markers.
+    for candidate in (payload.get("terminal_marker"), payload.get("last_marker")):
+        if _is_success_headline_kind(candidate):
+            return candidate  # type: ignore[return-value]
+    for marker in reversed(list(payload.get("markers") or [])):
+        if _is_success_headline_kind(marker):
+            return marker
     markers, _size = extract_markers(tail, ignore_prefix_lines=ignore_prefix_lines)
     for marker in reversed(markers):
-        if _is_headline_kind(marker):
+        if _is_success_headline_kind(marker):
             return marker
     return None
 
@@ -2318,6 +2419,87 @@ def _recorded_terminal_success_marker(
     return None
 
 
+def _advance_last_own_output_line(
+    stripped: str,
+    line_no: int,
+    *,
+    previous_stripped: str,
+    last_output_line_no: int | None,
+) -> tuple[int | None, str]:
+    """Track the last non-empty worker line, skipping known harness trailers.
+
+    Empty lines, ``hook: Stop`` / resume footers, and a ``tokens used`` count
+    pair are not the worker keeping going. Any other non-empty line is.
+    """
+    if not stripped:
+        return last_output_line_no, previous_stripped
+    if HARNESS_TOKEN_COUNT_RE.fullmatch(stripped):
+        if previous_stripped != "tokens used":
+            last_output_line_no = line_no
+    elif stripped != "tokens used" and not _is_harness_trailer_line(stripped):
+        last_output_line_no = line_no
+    return last_output_line_no, stripped
+
+
+def _dead_path_terminal_from_line(
+    line: str,
+    line_no: int,
+    *,
+    kimi_output: bool,
+    expected_dispatch_id: str | None,
+) -> tuple[dict | None, bool]:
+    """Parse one dead-path candidate.
+
+    Success markers (COMPLETE/READY/RESULT) may be quote-prefixed: a dead
+    worker that signed off with a renderer or markdown quote has still
+    finished. Attention uses the shared own-signal allowlist
+    (``parse_own_signal_attention_line``) so ``> BLOCKED:``, ``- BLOCKED:``,
+    and other relay forms cannot count as this worker's own escalation.
+
+    Position (last own line, unfenced, not in a hunk) is the caller's job.
+    """
+    candidate = _final_terminal_marker_from_line(
+        line,
+        line_no,
+        allow_prefixed_marker=True,
+        allow_quote_prefix=True,
+        allow_status_prefix=True,
+        kimi_output=kimi_output,
+        expected_dispatch_id=expected_dispatch_id,
+    )
+    if not candidate:
+        return None, False
+    return candidate, candidate.get("kind") in goalflight_terminal.ATTENTION_MARKERS
+
+
+def _select_dead_path_terminal(
+    last_success: dict | None,
+    last_attention: dict | None,
+    last_output_line_no: int | None,
+) -> dict | None:
+    """Dead-path terminal: success may be anywhere; attention only as last own line.
+
+    An attention marker terminalizes only as the worker's own terminal
+    signal: the last non-empty non-trailer line, already parsed by the
+    shared own-signal allowlist, and not fenced (the caller skipped fences
+    for the candidate). Quoted / list-item / fenced / indented / mid-tail
+    attention does not terminalize.
+
+    Success markers still win from anywhere in the completed tail, including
+    quote-prefixed forms, because a dead worker that signed off and then had
+    a summary has finished. A later own-signal attention line outranks an
+    earlier success (the worker stopped to escalate after previously signing
+    off).
+    """
+    if (
+        last_attention
+        and last_output_line_no is not None
+        and last_attention.get("line") == last_output_line_no
+    ):
+        return last_attention
+    return last_success
+
+
 def _scan_final_terminal_marker(
     lines: list[str],
     *,
@@ -2331,11 +2513,20 @@ def _scan_final_terminal_marker(
 ) -> dict | None:
     fence = goalflight_terminal.MarkdownFenceTracker()
     in_hunk = False
-    terminal: dict | None = None
+    last_success: dict | None = None
+    last_attention: dict | None = None
+    last_output_line_no: int | None = None
+    previous_stripped = ""
     for idx, line in enumerate(lines, start=1):
         stripped = line.strip()
         if idx - 1 in prompt_echo_lines:
             continue
+        last_output_line_no, previous_stripped = _advance_last_own_output_line(
+            stripped,
+            idx,
+            previous_stripped=previous_stripped,
+            last_output_line_no=last_output_line_no,
+        )
         fence_was_open = fence.in_fence
         if fence.consume_boundary(line):
             continue
@@ -2349,12 +2540,9 @@ def _scan_final_terminal_marker(
         if HUNK_HEADER_RE.match(line):
             in_hunk = True
             continue
-        candidate = _final_terminal_marker_from_line(
+        candidate, is_attention = _dead_path_terminal_from_line(
             line,
             idx,
-            allow_prefixed_marker=True,
-            allow_quote_prefix=True,
-            allow_status_prefix=True,
             kimi_output=kimi_output,
             expected_dispatch_id=expected_dispatch_id,
         )
@@ -2374,8 +2562,13 @@ def _scan_final_terminal_marker(
                 suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
             ):
                 continue
-            terminal = candidate
-    return terminal
+            if is_attention:
+                last_attention = candidate
+            else:
+                last_success = candidate
+    return _select_dead_path_terminal(
+        last_success, last_attention, last_output_line_no
+    )
 
 
 def _iter_bounded_text_lines(handle, max_chars: int = STREAM_READ_CHUNK_CHARS):
@@ -2432,13 +2625,23 @@ def _stream_final_terminal_marker(
 
         fence = goalflight_terminal.MarkdownFenceTracker()
         in_hunk = False
-        terminal: dict | None = None
+        last_success: dict | None = None
+        last_attention: dict | None = None
+        last_output_line_no: int | None = None
+        previous_stripped = ""
 
         def consume(line: str, line_no: int, *, oversized: bool) -> None:
-            nonlocal in_hunk, terminal
+            nonlocal in_hunk, last_success, last_attention
+            nonlocal last_output_line_no, previous_stripped
             stripped = line.strip()
             if line_no - 1 in prompt_echo_lines:
                 return
+            last_output_line_no, previous_stripped = _advance_last_own_output_line(
+                stripped,
+                line_no,
+                previous_stripped=previous_stripped,
+                last_output_line_no=last_output_line_no,
+            )
             fence_was_open = fence.in_fence
             if fence.consume_boundary(line):
                 return
@@ -2452,12 +2655,9 @@ def _stream_final_terminal_marker(
             if HUNK_HEADER_RE.match(line):
                 in_hunk = True
                 return
-            candidate = _final_terminal_marker_from_line(
+            candidate, is_attention = _dead_path_terminal_from_line(
                 line,
                 line_no,
-                allow_prefixed_marker=True,
-                allow_quote_prefix=True,
-                allow_status_prefix=True,
                 kimi_output=kimi_output,
                 expected_dispatch_id=expected_dispatch_id,
             )
@@ -2485,13 +2685,19 @@ def _stream_final_terminal_marker(
                 suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
             ):
                 return
-            terminal = candidate
+            if is_attention:
+                last_attention = candidate
+            else:
+                last_success = candidate
 
         for line_no, line, oversized in leading_records:
             consume(line, line_no, oversized=oversized)
         for line_no, line, oversized in line_iter:
             consume(line, line_no, oversized=oversized)
-    return terminal, fence.in_fence
+    return (
+        _select_dead_path_terminal(last_success, last_attention, last_output_line_no),
+        fence.in_fence,
+    )
 
 
 def _full_file_terminal_marker(
@@ -2536,10 +2742,18 @@ def _final_terminal_marker(
     expected_dispatch_id: str | None = None,
     full_file_fallback: bool = False,
 ) -> dict | None:
-    """Return the last terminal marker anywhere in the completed post-prompt tail.
+    """Return the terminal marker from a completed post-prompt tail.
 
     Live detection remains last-line-only. This reconciliation scan is for the
     worker-dead path, after no more output can arrive.
+
+    Success markers (COMPLETE/READY/RESULT) may appear anywhere in the
+    completed tail, including quote-prefixed renderer forms. Attention
+    markers (BLOCKED/USER-NEED/USER-CONFIRM/FAILED) terminalize only as the
+    worker's own final signal: last non-empty non-trailer line matching
+    ``parse_own_signal_attention_line``, unfenced. Quoted, list-item, fenced,
+    indented, or mid-tail attention is relayed or abandoned content and
+    does not stop the dispatch.
     """
     if not path.exists():
         return None
@@ -3918,6 +4132,11 @@ def main() -> int:
                         prompt_provenance_available=prompt_provenance_available,
                         prompt_path=ignore_prompt_path,
                         prompt_signature=ignore_prompt_signature,
+                        last_marker=(
+                            payload.get("last_marker")
+                            if isinstance(payload.get("last_marker"), dict)
+                            else None
+                        ),
                     )
                     if identity_reason == "dead"
                     else f"worker_identity_mismatch:{identity_reason}"

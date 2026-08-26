@@ -152,6 +152,19 @@ def test_outbox_headline_helper_is_the_load_bearing_projection() -> None:
     assert "dispatch terminal:" in src
 
 
+def test_outbox_does_not_headline_scrape_attention_last_marker() -> None:
+    """last_marker BLOCKED without harvest headline is scrape, not an escalation."""
+
+    excerpt = "sandbox denied the write"
+    scrape = {"kind": "BLOCKED", "line": 2, "text": excerpt}
+    assert journal.outbox_headline_text("worker_dead", {"last_marker": scrape}) == (
+        "dispatch terminal: worker_dead"
+    )
+    assert journal.outbox_headline_text(
+        "blocked", {"headline": excerpt, "last_marker": scrape}
+    ) == excerpt
+
+
 def test_harvest_headline_when_status_last_marker_is_none(tmp_path: Path) -> None:
     tail = tmp_path / "worker.tail"
     tail.write_text(
@@ -168,6 +181,79 @@ def test_harvest_headline_when_status_last_marker_is_none(tmp_path: Path) -> Non
     assert harvested is not None
     assert harvested["kind"] == "COMPLETE"
     assert harvested["text"] == HEADLINE
+
+
+def test_harvest_does_not_promote_extract_markers_attention(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Relay/mid-tail BLOCKED in extract_markers must not become the outbox line."""
+
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    monkeypatch.chdir(project)
+    excerpt = "sandbox denied the write"
+    cases = (
+        ("quoted", f"worker copied prior output\n> BLOCKED: {excerpt}\n", "worker_dead"),
+        ("list-item", f"checklist\n- BLOCKED: {excerpt}\n", "worker_dead"),
+        ("mid-tail", f"work stalled\nBLOCKED: {excerpt}\nkept going\n", "worker_dead"),
+        ("genuine", f"work stalled\nBLOCKED: {excerpt}\n", "blocked"),
+    )
+    for label, tail_text, expected_state in cases:
+        tail = tmp_path / f"{label}.tail"
+        tail.write_text(tail_text, encoding="utf-8")
+        markers, _size = watch.extract_markers(tail)
+        harvested = watch.harvest_headline_marker(
+            {
+                "last_marker": markers[-1] if markers else None,
+                "terminal_marker": None,
+                "markers": markers,
+            },
+            tail,
+            expected_dispatch_id=f"harvest-{label}",
+        )
+        if expected_state == "blocked":
+            assert harvested is not None and harvested["kind"] == "BLOCKED", (label, harvested)
+            assert harvested["text"] == excerpt, (label, harvested)
+            dispatch_id = f"harvest-{label}"
+            error = watch._finish_existing_ledger(
+                dispatch_id,
+                "blocked",
+                "marker:BLOCKED",
+                worker_still_alive=False,
+                terminal_marker=harvested,
+                headline=str(harvested.get("text") or ""),
+            )
+            assert error is None, (label, error)
+            payload = json.loads(
+                str(
+                    journal.Journal(project).read_all(
+                        "SELECT payload_json FROM terminal_outbox WHERE recipient = ?",
+                        (dispatch_id,),
+                    )[0]["payload_json"]
+                )
+            )
+            assert payload["text"] == excerpt, (label, payload)
+            continue
+        assert harvested is None or harvested.get("kind") != "BLOCKED", (label, harvested)
+        dispatch_id = f"harvest-{label}"
+        error = watch._finish_existing_ledger(
+            dispatch_id,
+            "worker_dead",
+            "worker_dead_no_terminal_marker:death_cause=no_evidence",
+            worker_still_alive=False,
+            headline=None,
+        )
+        assert error is None, (label, error)
+        payload = json.loads(
+            str(
+                journal.Journal(project).read_all(
+                    "SELECT payload_json FROM terminal_outbox WHERE recipient = ?",
+                    (dispatch_id,),
+                )[0]["payload_json"]
+            )
+        )
+        assert payload["text"] == "dispatch terminal: worker_dead", (label, payload)
+        assert excerpt not in payload["text"], (label, payload)
 
 
 def test_finish_ledger_complete_marker_becomes_mail_text(
