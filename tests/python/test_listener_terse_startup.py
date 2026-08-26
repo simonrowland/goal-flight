@@ -411,6 +411,54 @@ def test_claim_pending_report_first_writer_wins(
     )
 
 
+def test_acknowledge_pending_report_shrinks_to_unconsumed_remainder(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, _env = isolated
+    snapshot_a = "aa" * 32
+    snapshot_b = "bb" * 32
+    claimed = wake.acquire_pending_report(
+        project,
+        controller_label="terse-ctl",
+        lease_nonce="nonce-subset",
+        positions={"stream-a": 1, "stream-b": 1},
+        cursor_version=0,
+        stream_snapshots={"stream-a": snapshot_a, "stream-b": snapshot_b},
+    )
+    assert claimed is not None
+    assert wake.mark_pending_report_reported(
+        project,
+        controller_label="terse-ctl",
+        lease_nonce="nonce-subset",
+        claim_token=claimed.claim_token,
+    )
+    assert not wake.acknowledge_pending_report(
+        project,
+        controller_label="terse-ctl",
+        lease_nonce="nonce-subset",
+        positions={"stream-a": 1},
+    )
+    reduced = wake.pending_report_state(
+        project, controller_label="terse-ctl", lease_nonce="nonce-subset"
+    )
+    assert reduced is not None
+    assert reduced.phase == "reported"
+    assert reduced.positions == {"stream-b": 1}
+    assert reduced.stream_snapshots == {"stream-b": snapshot_b}
+    assert wake.acknowledge_pending_report(
+        project,
+        controller_label="terse-ctl",
+        lease_nonce="nonce-subset",
+        positions={"stream-a": 1, "stream-b": 1},
+    )
+    acknowledged = wake.pending_report_state(
+        project, controller_label="terse-ctl", lease_nonce="nonce-subset"
+    )
+    assert acknowledged is not None
+    assert acknowledged.phase == "acknowledged"
+    assert acknowledged.positions == {"stream-b": 1}
+
+
 def test_partial_pending_report_state_fails_closed(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:

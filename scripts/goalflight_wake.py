@@ -810,6 +810,23 @@ def pending_report_state(
     )
 
 
+def _quarantine_pending_report_locked(path: Path, *, directory_fd: int) -> bool:
+    """Move the claim aside under an already-held ledger lock."""
+    quarantine = f".{path.name}.{uuid.uuid4().hex}.corrupt"
+    try:
+        os.replace(
+            path.name,
+            quarantine,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+    except FileNotFoundError:
+        return False
+    os.fsync(directory_fd)
+    _prune_pending_report_quarantines(directory_fd, path.name)
+    return True
+
+
 def _prune_pending_report_quarantines(directory_fd: int, claimed_name: str) -> None:
     prefix = f".{claimed_name}."
     suffix = ".corrupt"
@@ -863,19 +880,40 @@ def recover_pending_report_state(
         try:
             return _read_pending_report_state(path)
         except PendingReportStateError:
-            quarantine = f".{path.name}.{uuid.uuid4().hex}.corrupt"
-            try:
-                os.replace(
-                    path.name,
-                    quarantine,
-                    src_dir_fd=directory_fd,
-                    dst_dir_fd=directory_fd,
-                )
-            except FileNotFoundError:
-                return None
-            os.fsync(directory_fd)
-            _prune_pending_report_quarantines(directory_fd, path.name)
+            _quarantine_pending_report_locked(path, directory_fd=directory_fd)
             return None
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(directory_fd)
+
+
+def quarantine_pending_report(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> bool:
+    """Move an undeliverable claim aside so a replacement listener can stay armed."""
+    label = str(controller_label or "").strip()
+    nonce = str(lease_nonce or "").strip()
+    if not label or not nonce:
+        raise ValueError("controller label and lease nonce are required")
+    path = _pending_report_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    lock_path = _pending_report_lock_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    directory_fd = _open_ledger_directory_path(path.parent, create=True)
+    lock_fd = -1
+    try:
+        lock_fd = _acquire_pending_report_lock(lock_path, directory_fd=directory_fd)
+        return _quarantine_pending_report_locked(path, directory_fd=directory_fd)
     finally:
         if lock_fd >= 0:
             os.close(lock_fd)
@@ -1125,7 +1163,12 @@ def acknowledge_pending_report(
     lease_nonce: str,
     positions: Mapping[str, int],
 ) -> bool:
-    """Settle a claim after authoritative cursor positions prove acknowledgement."""
+    """Settle streams the cursor covers; keep any unconsumed remainder reportable.
+
+    A fully covered claim becomes acknowledged. A subset advance shrinks the
+    durable boundary to the streams still pending so a replacement can re-report
+    that remainder instead of reconstructing the original claim.
+    """
     label = str(controller_label or "").strip()
     nonce = str(lease_nonce or "").strip()
     if not label or not nonce:
@@ -1149,13 +1192,43 @@ def acknowledge_pending_report(
             current = _read_pending_report_state(path)
         except PendingReportStateError:
             return False
-        if current is None or any(
-            normalized.get(stream_id, 0) < high_water
-            for stream_id, high_water in current.positions.items()
-        ):
+        if current is None:
             return False
         if current.phase == "acknowledged":
             return True
+        remainder = {
+            stream_id: high_water
+            for stream_id, high_water in current.positions.items()
+            if int(normalized.get(stream_id, 0)) < int(high_water)
+        }
+        if remainder == current.positions:
+            return False
+        if remainder:
+            remainder_snapshots = {
+                stream_id: snapshot
+                for stream_id, snapshot in current.stream_snapshots.items()
+                if stream_id in remainder
+            }
+            _write_pending_report_state(
+                path,
+                {
+                    "schema": PENDING_REPORT_STATE_SCHEMA,
+                    "phase": current.phase,
+                    "positions": remainder,
+                    "cursor_version": current.cursor_version,
+                    "stream_snapshots": remainder_snapshots,
+                    "claim_token": current.claim_token,
+                    "owner": {
+                        "pid": current.owner_pid,
+                        "start_token": current.owner_start_token,
+                    },
+                    "claimed_at_epoch": None,
+                    "reported_at_epoch": None,
+                    "acknowledged_at_epoch": None,
+                },
+                directory_fd=directory_fd,
+            )
+            return False
         _write_pending_report_state(
             path,
             {
@@ -1204,7 +1277,7 @@ def pending_report_high_water(
     controller_label: str,
     lease_nonce: str,
 ) -> dict[str, int] | None:
-    """Return the fixed claim boundary for every durable phase."""
+    """Return the live claim boundary for every durable phase."""
     state = pending_report_state(
         project_root,
         controller_label=controller_label,
