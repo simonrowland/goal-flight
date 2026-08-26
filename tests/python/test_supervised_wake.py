@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass, field
 import errno
 import json
@@ -1598,28 +1599,185 @@ def test_real_host_stdout_registration_failure_fails_closed_with_quiet_child(
     ) in capsys.readouterr().err
 
 
-def test_real_host_retries_transient_poll_interruption(
+@pytest.mark.parametrize("text", ["¢", "€", "😀"])
+def test_utf8_completion_finishes_each_multibyte_split(text: str) -> None:
+    data = text.encode("utf-8")
+    for offset in range(1, len(data)):
+        completed = data[:offset] + supervise._utf8_completion(data, offset)
+        assert completed.decode("utf-8") == text
+
+
+def test_full_nonblocking_pipe_eagain_retries_then_keeps_children_alive(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reader_fd, writer_fd = os.pipe()
+    os.set_blocking(writer_fd, False)
+    while True:
+        try:
+            os.write(writer_fd, b"x" * 4096)
+        except BlockingIOError as exc:
+            assert exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}
+            break
+
+    class BackpressuredHost(FakeHost):
+        actual_errnos: list[int] = []
+        children_alive_after_retry = False
+
+        def write_stdout(self, line: str) -> bool:
+            try:
+                os.write(writer_fd, line.encode("utf-8"))
+            except BlockingIOError as exc:
+                self.actual_errnos.append(int(exc.errno))
+                os.read(reader_fd, 65536)
+                raise
+            self.children_alive_after_retry = bool(self.children) and all(
+                child.alive for child in self.children
+            )
+            return super().write_stdout(line)
+
+    host = BackpressuredHost(stop_after_coverage=1)
+    try:
+        code = _run(host, _items("stream"))
+    finally:
+        os.close(writer_fd)
+        os.close(reader_fd)
+
+    assert code == 0
+    assert host.actual_errnos == [errno.EAGAIN]
+    assert host.children_alive_after_retry
+    assert not any(
+        record.get("type") == "stop" for record in _records(host)
+    )
+    status = host.stdout_detector_status()
+    assert status.availability == "available"
+    assert status.failure is None
+    assert capsys.readouterr().err == ""
+
+
+def test_partial_nonblocking_write_resumes_without_duplicate_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    real_poll = supervise.select.poll
-    calls: list[int | None] = []
-
-    class InterruptOncePoll:
-        def __init__(self) -> None:
-            self.inner = real_poll()
-
-        def register(self, fd: int, eventmask: int) -> None:
-            self.inner.register(fd, eventmask)
-
-        def poll(self, timeout: int | None = None) -> list[tuple[int, int]]:
-            calls.append(timeout)
-            if len(calls) == 1:
-                raise InterruptedError(errno.EINTR, "interrupted")
-            return self.inner.poll(timeout)
-
-    monkeypatch.setattr(supervise.select, "poll", InterruptOncePoll)
     reader_fd, writer_fd = os.pipe()
+    os.set_blocking(writer_fd, False)
+    while True:
+        try:
+            os.write(writer_fd, b"x" * 4096)
+        except BlockingIOError as exc:
+            assert exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}
+            break
+    os.read(reader_fd, 4096)
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    relieved = bytearray()
+    relief_calls: list[float] = []
+
+    def relieve_pipe(delay_s: float) -> None:
+        relief_calls.append(delay_s)
+        relieved.extend(os.read(reader_fd, 4096))
+
+    monkeypatch.setattr(supervise.time, "sleep", relieve_pipe)
+    host = supervise.RealHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    line = "a" * 25000
+    try:
+        assert supervise._write_stdout(host, line, source="write-child-output")
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        host.kill_all()
+    remaining = bytearray()
+    while True:
+        chunk = os.read(reader_fd, 65536)
+        if not chunk:
+            break
+        remaining.extend(chunk)
+    os.close(reader_fd)
+
+    forwarded = bytes(relieved + remaining)
+    assert len(relief_calls) > supervise.TRANSIENT_DETECTOR_FAILURE_LIMIT
+    assert set(relief_calls) == {supervise.TRANSIENT_DETECTOR_RETRY_S}
+    assert forwarded.count(b"a") == len(line)
+    assert forwarded.endswith(b"\n")
+    assert host._stdout_pending is None
+    assert host.stdout_detector_status().failure is None
+
+
+def test_failed_recovery_stop_write_escalates_rearm_to_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reader_fd, writer_fd = os.pipe()
+    os.set_blocking(writer_fd, False)
+
+    class FailedStopHost(FakeHost):
+        pipe_filled = False
+        actual_errnos: list[int] = []
+
+        def write_stdout(self, line: str) -> bool:
+            try:
+                os.write(writer_fd, line.encode("utf-8"))
+            except BlockingIOError as exc:
+                self.actual_errnos.append(int(exc.errno))
+                raise
+            return super().write_stdout(line)
+
+        def stdio_peer_gone(self) -> bool:
+            if not self.pipe_filled:
+                self.report_stdout_detector(
+                    "poll",
+                    "unavailable",
+                    "stdout poll failed: ENOMEM: out of memory",
+                    "ENOMEM",
+                )
+                while True:
+                    try:
+                        os.write(writer_fd, b"x" * 4096)
+                    except BlockingIOError as exc:
+                        assert exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}
+                        break
+                self.pipe_filled = True
+            return False
+
+    host = FailedStopHost()
+    try:
+        code = _run(host, _items("stream"))
+    finally:
+        os.close(writer_fd)
+        os.close(reader_fd)
+
+    assert code == supervise.SUPERVISE_STOP_EXIT
+    assert host.actual_errnos == [errno.EAGAIN] * (
+        supervise.TRANSIENT_DETECTOR_FAILURE_LIMIT
+    )
+    assert not any(child.alive for child in host.children)
+    assert not any(
+        record.get("type") == "stop" for record in _records(host)
+    )
+    error = capsys.readouterr().err
+    assert "recovery record could not be written to stdout" in error
+    assert "stop: stdout-peer-detector-unavailable" in error
+    assert "re-arm with:" in error
+    assert "goalflight_messages.py supervise" in error
+
+
+def test_real_host_failed_write_clears_pending_before_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reader_fd, writer_fd = os.pipe()
+    os.set_blocking(writer_fd, False)
+    while True:
+        try:
+            os.write(writer_fd, b"x" * 4096)
+        except BlockingIOError as exc:
+            assert exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}
+            break
     peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
     original_stdout = sys.stdout
     monkeypatch.setattr(sys, "stdout", peer_stdout)
@@ -1630,27 +1788,217 @@ def test_real_host_retries_transient_poll_interruption(
         nonce_reader=lambda: "nonce-1",
     )
     try:
-        result = host.wait([], timeout_s=0.01)
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            items=[
+                (
+                    "backup",
+                    _python_child("import time; time.sleep(5)"),
+                )
+            ],
+        )
     finally:
         monkeypatch.setattr(sys, "stdout", original_stdout)
         peer_stdout.close()
         os.close(reader_fd)
         host.kill_all()
 
-    assert len(calls) == 2
-    assert result.lines == []
-    assert result.exits == []
+    assert code == supervise.SUPERVISE_STOP_EXIT
+    assert host._stdout_pending is None
+    assert not any(child.alive for child in host._children)
+    error = capsys.readouterr().err
+    assert "recovery record could not be written to stdout" in error
+    assert "re-arm with:" in error
+    assert "Traceback" not in error
+
+
+def test_abandoned_partial_write_delimits_next_recovery_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader_fd, writer_fd = os.pipe()
+    os.set_blocking(writer_fd, False)
+    while True:
+        try:
+            os.write(writer_fd, b"x" * 4096)
+        except BlockingIOError:
+            break
+    os.read(reader_fd, 4096)
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    monkeypatch.setattr(supervise.time, "sleep", lambda _delay_s: None)
+    host = supervise.RealHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    wire = bytearray()
+    try:
+        assert not supervise._write_stdout(
+            host,
+            "a" * 4095 + "€" + "b" * 20000,
+            source="write-child-output",
+        )
+        assert host._stdout_pending is None
+        assert host._stdout_needs_delimiter
+        assert host._stdout_recovery_completion == "€".encode("utf-8")[1:]
+        os.set_blocking(reader_fd, False)
+        try:
+            while True:
+                wire.extend(os.read(reader_fd, 65536))
+        except BlockingIOError:
+            pass
+        finally:
+            os.set_blocking(reader_fd, True)
+        assert wire.endswith("€".encode("utf-8")[:1])
+        assert supervise._emit(
+            host,
+            {
+                "kind": "supervise",
+                "type": "stop",
+                "reason": "stdout-peer-detector-unavailable",
+                "rearm": "python3 goalflight_messages.py supervise",
+            },
+        )
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        host.kill_all()
+    while True:
+        chunk = os.read(reader_fd, 65536)
+        if not chunk:
+            break
+        wire.extend(chunk)
+    os.close(reader_fd)
+
+    decoded = wire.decode("utf-8")
+    assert "€\n{" in decoded
+    records = [
+        json.loads(line)
+        for line in decoded.splitlines()
+        if line.startswith("{")
+    ]
+    assert len(records) == 1
+    assert records[0]["type"] == "stop"
+    assert "goalflight_messages.py supervise" in records[0]["rearm"]
+    assert not host._stdout_needs_delimiter
+
+
+def test_real_host_retries_transient_poll_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_poll = supervise.select.poll
+    calls: list[int | None] = []
+    observed_errnos: list[int] = []
+    libc = ctypes.CDLL(None, use_errno=True)
+
+    class InterruptThreePoll:
+        def __init__(self) -> None:
+            self.inner = real_poll()
+
+        def register(self, fd: int, eventmask: int) -> None:
+            self.inner.register(fd, eventmask)
+
+        def poll(self, timeout: int | None = None) -> list[tuple[int, int]]:
+            calls.append(timeout)
+            if len(calls) <= 3:
+                ctypes.set_errno(0)
+                signal.setitimer(signal.ITIMER_REAL, 0.01)
+                try:
+                    result = libc.poll(None, 0, 1000)
+                    actual_errno = ctypes.get_errno()
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                assert result == -1
+                assert actual_errno == errno.EINTR
+                observed_errnos.append(actual_errno)
+                raise OSError(actual_errno, os.strerror(actual_errno))
+            return self.inner.poll(timeout)
+
+    class StopAfterSuccessfulPollHost(supervise.RealHost):
+        children_alive_after_poll = False
+
+        def wait(
+            self,
+            children: list[object],
+            timeout_s: float,
+        ) -> supervise.WaitResult:
+            result = super().wait(children, timeout_s)
+            self.children_alive_after_poll = bool(children) and all(
+                getattr(child, "alive", False) for child in children
+            )
+            self._stop = True
+            return result
+
+    monkeypatch.setattr(supervise.select, "poll", InterruptThreePoll)
+    monkeypatch.setattr(messages, "_stdio_peer_gone", lambda _stream: False)
+    reader_fd, writer_fd = os.pipe()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    old_alarm_handler = signal.signal(signal.SIGALRM, lambda *_args: None)
+    old_alarm_timer = signal.getitimer(signal.ITIMER_REAL)
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.siginterrupt(signal.SIGALRM, True)
+    host = StopAfterSuccessfulPollHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    try:
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            heartbeat_s=0.01,
+            coverage_s=0.01,
+            items=[
+                (
+                    "backup",
+                    _python_child("import time; time.sleep(5)"),
+                )
+            ],
+        )
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_alarm_handler)
+        signal.setitimer(signal.ITIMER_REAL, *old_alarm_timer)
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        os.close(reader_fd)
+        host.kill_all()
+
+    assert code == 0
+    assert observed_errnos == [errno.EINTR] * 3
+    assert len(calls) == 4
+    assert host.children_alive_after_poll
     status = host.stdout_detector_status()
     assert status.availability == "available"
     assert status.failure is None
     assert not status.peer_gone
 
 
-@pytest.mark.parametrize("poll_errno", [errno.ENOMEM, errno.EAGAIN])
+@pytest.mark.parametrize(
+    ("poll_errno", "expected_calls"),
+    [
+        (errno.ENOMEM, 1),
+        (errno.EINVAL, 1),
+        (errno.EAGAIN, supervise.TRANSIENT_DETECTOR_FAILURE_LIMIT),
+    ],
+)
 def test_real_host_persistent_poll_failure_emits_recovery_and_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     poll_errno: int,
+    expected_calls: int,
 ) -> None:
     real_poll = supervise.select.poll
     calls: list[int | None] = []
@@ -1702,7 +2050,7 @@ def test_real_host_persistent_poll_failure_emits_recovery_and_fails_closed(
 
     assert elapsed < 1.0
     supervisor_calls = [timeout for timeout in calls if timeout and timeout > 1000]
-    assert len(supervisor_calls) == supervise.POLL_FAILURE_LIMIT
+    assert len(supervisor_calls) == expected_calls
     assert code == supervise.SUPERVISE_STOP_EXIT
     status = host.stdout_detector_status()
     assert status.availability == "unavailable"
@@ -1716,6 +2064,11 @@ def test_real_host_persistent_poll_failure_emits_recovery_and_fails_closed(
     assert stop["detector"] == "poll"
     assert stop["error"] == errno.errorcode[poll_errno]
     assert "goalflight_messages.py supervise" in stop["rearm"]
+    if poll_errno == errno.EAGAIN:
+        assert (
+            f"{supervise.TRANSIENT_DETECTOR_FAILURE_LIMIT} consecutive EAGAIN"
+            in str(status.failure.detail)
+        )
 
 
 def test_pollnval_preempts_ready_child_output_before_forwarding(

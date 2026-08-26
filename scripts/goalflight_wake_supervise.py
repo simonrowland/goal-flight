@@ -41,7 +41,8 @@ BACKOFF_CAP_S = 120.0
 LONG_LIVED_S = 30.0
 STREAM_LINE_MAX_BYTES = 511
 PERMANENT_UNARMED_FAULTS = 3
-POLL_FAILURE_LIMIT = 3
+TRANSIENT_DETECTOR_FAILURE_LIMIT = 3
+TRANSIENT_DETECTOR_RETRY_S = 0.01
 DEFAULT_SUPERVISOR_HEARTBEAT_S = 25.0 * 60.0
 MIN_SUPERVISOR_HEARTBEAT_S = 60.0
 MAX_SUPERVISOR_HEARTBEAT_S = 30.0 * 60.0
@@ -156,6 +157,51 @@ class _PeerLossDetector:
             peer_gone=self._peer_gone,
             failure=self._failure,
         )
+
+
+def _detector_error_policy(exc: BaseException) -> tuple[str, str]:
+    """Classify detector I/O errors without weakening unknown-error closure."""
+    if not isinstance(exc, OSError):
+        return "persistent", type(exc).__name__
+    error_number = exc.errno
+    error_name = (
+        errno.errorcode.get(error_number, str(error_number))
+        if error_number is not None
+        else type(exc).__name__
+    )
+    if error_number == errno.EPIPE:
+        return "peer-gone", error_name
+    if error_number == errno.EINTR:
+        return "retry", error_name
+    if error_number in {errno.EAGAIN, errno.EWOULDBLOCK}:
+        return "retry-bounded", error_name
+    return "persistent", error_name
+
+
+def _utf8_completion(data: bytes, offset: int) -> bytes:
+    """Return bytes needed to finish a code point split at ``offset``."""
+    if offset <= 0 or offset >= len(data):
+        return b""
+    start = offset - 1
+    while start >= 0 and data[start] & 0xC0 == 0x80:
+        start -= 1
+    if start < 0:
+        return b""
+    lead = data[start]
+    if lead < 0x80:
+        expected = 1
+    elif lead & 0xE0 == 0xC0:
+        expected = 2
+    elif lead & 0xF0 == 0xE0:
+        expected = 3
+    elif lead & 0xF8 == 0xF0:
+        expected = 4
+    else:
+        return b""
+    written = offset - start
+    if written >= expected:
+        return b""
+    return data[offset : start + expected]
 
 
 class SuperviseHost(Protocol):
@@ -345,41 +391,98 @@ def _report_stdout_detector(
     host.report_stdout_detector(source, outcome, detail, error)
 
 
-def _write_stdout(host: SuperviseHost, line: str, *, source: str) -> bool:
-    """Write once and report the write detector through the shared choke point."""
+def _abandon_stdout_write(host: SuperviseHost) -> None:
+    abandon = getattr(host, "abandon_stdout_write", None)
+    if not callable(abandon):
+        return
     try:
-        written = host.write_stdout(line)
-    except (AttributeError, OSError, TypeError, ValueError) as exc:
-        if isinstance(exc, OSError) and exc.errno == errno.EPIPE:
-            _report_stdout_detector(
-                host,
-                source=source,
-                outcome="peer-gone",
-                detail="controlling stdout closed during write",
-            )
-        else:
-            error_name = ""
-            if isinstance(exc, OSError) and exc.errno is not None:
-                error_name = errno.errorcode.get(exc.errno, str(exc.errno)) + ": "
-            _report_stdout_detector(
-                host,
-                source=source,
-                outcome="unavailable",
-                detail=f"stdout write failed: {error_name}{exc}",
-                error=(
-                    error_name.removesuffix(": ")
-                    if error_name
-                    else type(exc).__name__
-                ),
-            )
-        return False
-    _report_stdout_detector(
-        host,
-        source=source,
-        outcome="available" if written else "peer-gone",
-        detail="" if written else "controlling stdout closed during write",
-    )
-    return written
+        abandon()
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _report_stdout_detector(
+            host,
+            source="write",
+            outcome="unavailable",
+            detail=f"stdout pending write could not be abandoned: {exc}",
+            error=type(exc).__name__,
+        )
+
+
+def _write_stdout(host: SuperviseHost, line: str, *, source: str) -> bool:
+    """Write through the shared detector, retrying only known transients."""
+    bounded_failures = 0
+    while True:
+        progress_before = getattr(host, "stdout_write_progress", None)
+        try:
+            written = host.write_stdout(line)
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            policy, error_name = _detector_error_policy(exc)
+            if policy == "retry":
+                _report_stdout_detector(
+                    host,
+                    source=source,
+                    outcome="unknown",
+                    detail=f"stdout write interrupted by {error_name}; retrying",
+                )
+                continue
+            if policy == "retry-bounded":
+                progress_after = getattr(host, "stdout_write_progress", None)
+                if (
+                    isinstance(progress_before, int)
+                    and isinstance(progress_after, int)
+                    and progress_after > progress_before
+                ):
+                    bounded_failures = 0
+                bounded_failures += 1
+                if bounded_failures < TRANSIENT_DETECTOR_FAILURE_LIMIT:
+                    _report_stdout_detector(
+                        host,
+                        source=source,
+                        outcome="unknown",
+                        detail=(
+                            "stdout write temporarily unavailable; retrying "
+                            f"({bounded_failures}/"
+                            f"{TRANSIENT_DETECTOR_FAILURE_LIMIT})"
+                        ),
+                    )
+                    time.sleep(TRANSIENT_DETECTOR_RETRY_S)
+                    continue
+                _report_stdout_detector(
+                    host,
+                    source=source,
+                    outcome="unavailable",
+                    detail=(
+                        "stdout write failed after "
+                        f"{bounded_failures} consecutive {error_name} attempts: "
+                        f"{exc}"
+                    ),
+                    error=error_name,
+                )
+            elif policy == "peer-gone":
+                _report_stdout_detector(
+                    host,
+                    source=source,
+                    outcome="peer-gone",
+                    detail="controlling stdout closed during write",
+                )
+            else:
+                _report_stdout_detector(
+                    host,
+                    source=source,
+                    outcome="unavailable",
+                    detail=f"stdout write failed: {error_name}: {exc}",
+                    error=error_name,
+                )
+            _abandon_stdout_write(host)
+            return False
+        _report_stdout_detector(
+            host,
+            source=source,
+            outcome="available" if written else "peer-gone",
+            detail="" if written else "controlling stdout closed during write",
+        )
+        if not written:
+            _abandon_stdout_write(host)
+        return written
 
 
 def _emit(host: SuperviseHost, record: dict[str, object]) -> bool:
@@ -575,6 +678,20 @@ def run_supervisor(
         debug=debug,
     )
 
+    def emit_recovery(record: dict[str, object]) -> bool:
+        if _emit(host, record):
+            return True
+        try:
+            sys.stderr.write(
+                "goalflight supervise: recovery record could not be written to "
+                f"stdout ({record.get('type', 'record')}: "
+                f"{record.get('reason', 'unknown')}); re-arm with: {rearm}\n"
+            )
+            sys.stderr.flush()
+        except (AttributeError, OSError, ValueError):
+            pass
+        return False
+
     def emit_stop(**fields: object) -> bool:
         record: dict[str, object] = {
             "kind": "supervise",
@@ -582,13 +699,14 @@ def run_supervisor(
             "rearm": rearm,
         }
         record.update(fields)
-        return _emit(host, record)
+        return emit_recovery(record)
 
     if not nonce:
-        emit_stop(
+        if not emit_stop(
             reason="dead-lease-nonce",
             detail="lease nonce missing",
-        )
+        ):
+            return SUPERVISE_STOP_EXIT
         return SUPERVISE_STOP_EXIT
     if items is None:
         items = wake.coverage_supervise_items(
@@ -597,10 +715,11 @@ def run_supervisor(
             lease_nonce=nonce,
         )
     if not items:
-        emit_stop(
+        if not emit_stop(
             reason="did-not-arm",
             detail="coverage_rearm_commands returned no children",
-        )
+        ):
+            return SUPERVISE_START_EXIT
         return SUPERVISE_START_EXIT
     slots = [
         _Slot(kind=kind, command=command, next_start=host.now)
@@ -613,7 +732,7 @@ def run_supervisor(
         failure = status.failure
         if failure is not None:
             live, target = _live_target(slots)
-            emit_stop(
+            emitted = emit_stop(
                 reason="stdout-peer-detector-unavailable",
                 scope="supervisor",
                 detector=failure.source,
@@ -622,6 +741,9 @@ def run_supervisor(
                 target=target,
                 detail=failure.detail,
             )
+            if not emitted:
+                host.kill_all()
+                return SUPERVISE_STOP_EXIT
             try:
                 sys.stderr.write(
                     "goalflight supervise: stdout peer-gone detector unavailable; "
@@ -663,13 +785,14 @@ def run_supervisor(
         state = _nonce_state(host, nonce)
         if state == "dead":
             live, target = _live_target(slots)
-            emit_stop(
+            if not emit_stop(
                 reason="dead-lease-nonce",
                 scope="supervisor",
                 live=live,
                 target=target,
                 detail="goalflight_session_status live nonce changed or vanished",
-            )
+            ):
+                return SUPERVISE_STOP_EXIT
             return SUPERVISE_STOP_EXIT
         if state == "unreadable":
             return None
@@ -756,7 +879,7 @@ def run_supervisor(
         state = _nonce_state(host, nonce)
         if state == "dead":
             live, target = _live_target(slots)
-            emit_stop(
+            emitted = emit_stop(
                 reason="dead-lease-nonce",
                 scope="supervisor",
                 live=live,
@@ -764,6 +887,8 @@ def run_supervisor(
                 detail="goalflight_session_status live nonce changed or vanished",
             )
             host.kill_all()
+            if not emitted:
+                return SUPERVISE_STOP_EXIT
             return SUPERVISE_STOP_EXIT
         now = host.now
         wake_at = min(next_heartbeat, next_coverage)
@@ -836,7 +961,7 @@ def run_supervisor(
                 )
                 slot.stopped_reason = reason
                 coverage_changed()
-                emit_stop(
+                emitted = emit_stop(
                     reason=reason,
                     scope=scope,
                     child=slot.kind,
@@ -845,6 +970,9 @@ def run_supervisor(
                     target=target,
                     detail=str(event.output or "").strip()[:180],
                 )
+                if not emitted:
+                    host.kill_all()
+                    return SUPERVISE_STOP_EXIT
                 coverage_ok, _coverage_emitted = emit_coverage()
                 if not coverage_ok:
                     return stop_after_failed_write()
@@ -893,8 +1021,7 @@ def run_supervisor(
         live, target = _live_target(slots)
         # SIGTERM, SIGINT, and SIGHUP get one hint while stdout is still open.
         # SIGKILL cannot be caught, so that hard-kill gap cannot emit a hint.
-        _emit(
-            host,
+        if not emit_recovery(
             {
                 "kind": "supervise",
                 "type": "exit",
@@ -902,8 +1029,10 @@ def run_supervisor(
                 "live": live,
                 "target": target,
                 "rearm": rearm,
-            },
-        )
+            }
+        ):
+            host.kill_all()
+            return SUPERVISE_STOP_EXIT
         host.kill_all()
         return 128 + signum
     host.kill_all()
@@ -988,6 +1117,10 @@ class RealHost:
         self._children: list[RealChild] = []
         self._stop = False
         self._stdout_detector = _PeerLossDetector()
+        self._stdout_pending: tuple[object, str, bytes, int, int] | None = None
+        self._stdout_needs_delimiter = False
+        self._stdout_recovery_completion = b""
+        self.stdout_write_progress = 0
         self.stop_signum: int | None = None
         self._prev_handlers: dict[int, object] = {}
         signal_rfd, signal_wfd = os.pipe()
@@ -1095,14 +1228,68 @@ class RealHost:
 
     def write_stdout(self, line: str) -> bool:
         text = line if line.endswith("\n") else line + "\n"
-        try:
-            sys.stdout.write(text)
-            sys.stdout.flush()
+        stream = sys.stdout
+        if getattr(stream, "buffer", None) is None:
+            stream.write(text)
+            stream.flush()
             return True
-        except OSError as exc:
-            if exc.errno == errno.EPIPE:
+        pending = self._stdout_pending
+        if pending is None:
+            prefix = self._stdout_recovery_completion
+            leading_completion = len(prefix)
+            if self._stdout_needs_delimiter:
+                prefix += b"\n"
+            self._stdout_needs_delimiter = False
+            self._stdout_recovery_completion = b""
+            data = prefix + text.encode("utf-8")
+            offset = 0
+        else:
+            (
+                pending_stream,
+                pending_text,
+                data,
+                offset,
+                leading_completion,
+            ) = pending
+            if pending_stream is not stream or pending_text != text:
+                raise RuntimeError("stdout retry does not match pending write")
+        while offset < len(data):
+            try:
+                written = os.write(stream.fileno(), data[offset:])
+            except OSError:
+                self._stdout_pending = (
+                    stream,
+                    text,
+                    data,
+                    offset,
+                    leading_completion,
+                )
+                raise
+            if written <= 0:
+                self._stdout_pending = None
                 return False
-            raise
+            offset += written
+            self.stdout_write_progress += written
+            self._stdout_pending = (
+                stream,
+                text,
+                data,
+                offset,
+                leading_completion,
+            )
+        self._stdout_pending = None
+        return True
+
+    def abandon_stdout_write(self) -> None:
+        pending = self._stdout_pending
+        if pending is not None and pending[3] > 0:
+            data, offset, leading_completion = pending[2], pending[3], pending[4]
+            if offset < leading_completion:
+                self._stdout_recovery_completion = data[offset:leading_completion]
+            else:
+                self._stdout_recovery_completion = _utf8_completion(data, offset)
+            self._stdout_needs_delimiter = True
+        self._stdout_pending = None
 
     def stdio_peer_gone(self) -> bool:
         if self.stdout_detector_status().peer_gone:
@@ -1298,7 +1485,7 @@ class RealHost:
             remaining = 0.0
         ready: list[int] = []
         if fdmap and self.stdout_detector_status().failure is None:
-            poll_failures = 0
+            bounded_failures = 0
             while True:
                 try:
                     events_ready = poller.poll(
@@ -1307,32 +1494,41 @@ class RealHost:
                         )
                     )
                 except (OSError, ValueError) as exc:
-                    poll_failures += 1
-                    error_number = getattr(exc, "errno", None)
-                    error_name = (
-                        errno.errorcode.get(error_number, str(error_number))
-                        if error_number is not None
-                        else type(exc).__name__
-                    )
-                    if poll_failures >= POLL_FAILURE_LIMIT:
+                    policy, error_name = _detector_error_policy(exc)
+                    if policy == "retry":
+                        self.report_stdout_detector(
+                            "poll",
+                            "unknown",
+                            f"stdout poll interrupted by {error_name}; retrying",
+                        )
+                        continue
+                    if policy == "retry-bounded":
+                        bounded_failures += 1
+                        if bounded_failures < TRANSIENT_DETECTOR_FAILURE_LIMIT:
+                            self.report_stdout_detector(
+                                "poll",
+                                "unknown",
+                                "stdout poll temporarily unavailable; retrying "
+                                f"({bounded_failures}/"
+                                f"{TRANSIENT_DETECTOR_FAILURE_LIMIT})",
+                            )
+                            continue
                         self.report_stdout_detector(
                             "poll",
                             "unavailable",
                             "stdout poll failed persistently after "
-                            f"{poll_failures} attempts: {error_name}: {exc}",
+                            f"{bounded_failures} consecutive {error_name} "
+                            f"attempts: {exc}",
                             error_name,
                         )
                         break
                     self.report_stdout_detector(
                         "poll",
-                        "unknown",
-                        (
-                            "stdout poll interrupted; retrying"
-                            if error_number == errno.EINTR
-                            else "stdout poll failed transiently; retrying"
-                        ),
+                        "unavailable",
+                        f"stdout poll failed: {error_name}: {exc}",
+                        error_name,
                     )
-                    continue
+                    break
                 self.report_stdout_detector("poll", "available")
                 ready = [
                     fd
