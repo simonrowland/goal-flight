@@ -247,7 +247,9 @@ def _wait_for_listener(
 
     def _covered() -> bool:
         try:
-            coverage = journal.Journal(root, retry_budget_s=5.0).active_coverage(label)
+            coverage = journal.Journal.open_reader(
+                root, retry_budget_s=5.0
+            ).active_coverage(label)
         except journal.JournalBusy:
             return False
         return coverage is not None and int(coverage.get("pid") or 0) == listener.pid
@@ -302,13 +304,22 @@ def _wait_for_listener_count(
     count: int,
     timeout_s: float = _ARBITRATION_LIVE_WAIT_S,
 ) -> list[wake.WaiterRecord]:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        waiters = wake.live_waiters(root, controller_label=label) or []
-        if len(waiters) == count:
-            return waiters
-        time.sleep(0.02)
-    raise AssertionError(f"listener pool for {label} never reached n={count}")
+    seen: list[wake.WaiterRecord] = []
+
+    def _at_count() -> bool:
+        nonlocal seen
+        seen = (
+            wake.live_waiters(root, controller_label=label, kinds={"listener"}) or []
+        )
+        return len(seen) == count
+
+    wait_until(
+        _at_count,
+        timeout_s=timeout_s,
+        interval_s=0.02,
+        message=f"listener pool for {label} n={count}",
+    )
+    return seen
 
 
 def _post_notice(
@@ -479,6 +490,19 @@ def test_owned_worker_finish_wakes_armed_doorbell_three_runs(
             completed: subprocess.Popen[str] | None = None
             try:
                 _wait_for_listener(root, "wake-test", listener)
+
+                def _owner_visible() -> bool:
+                    session = sessions.live_session(root, label="wake-test")
+                    return bool(
+                        isinstance(session, dict) and session.get("id") == lease.nonce
+                    )
+
+                wait_until(
+                    _owner_visible,
+                    timeout_s=_LISTENER_ARM_HARNESS_TIMEOUT_S,
+                    interval_s=0.05,
+                    message=f"dispatch can resolve owned controller run={run}",
+                )
                 completed = subprocess.Popen(
                     _completion_dispatch_command(root, tmp_path, dispatch_id),
                     cwd=root,
@@ -491,9 +515,29 @@ def test_owned_worker_finish_wakes_armed_doorbell_three_runs(
                     timeout=_COMPLETION_HARNESS_TIMEOUT_S
                 )
                 assert completed.returncode == 0, (completed_stdout, completed_stderr)
-                listener_stdout, listener_stderr = listener.communicate(
-                    timeout=_COMPLETION_HARNESS_TIMEOUT_S
+
+                def _doorbell_released() -> bool:
+                    waiters = (
+                        wake.live_waiters(
+                            root, controller_label="wake-test", kinds={"listener"}
+                        )
+                        or []
+                    )
+                    return all(row.pid != listener.pid for row in waiters)
+
+                wait_until(
+                    _doorbell_released,
+                    timeout_s=_COMPLETION_HARNESS_TIMEOUT_S,
+                    interval_s=0.02,
+                    message=f"owned worker finish to release doorbell run={run}",
                 )
+                wait_until(
+                    lambda: listener.poll() is not None,
+                    timeout_s=_COMPLETION_HARNESS_TIMEOUT_S,
+                    interval_s=0.02,
+                    message=f"owned worker finish to exit doorbell run={run}",
+                )
+                listener_stdout, listener_stderr = listener.communicate(timeout=5)
                 assert listener.returncode == 0, listener_stderr
                 assert json.loads(listener_stdout)["reason"] == "event"
                 elapsed = _wake_delivery_elapsed(
@@ -866,53 +910,90 @@ def test_malformed_ring_stamp_does_not_trap_listener_in_exit_two_loop(
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.write_bytes(b"nonnumeric-torn-write\n")
 
-        first = subprocess.run(
+        first = subprocess.Popen(
             _listener_command(
                 root,
                 tmp_path,
                 label="wake-test",
                 nonce=claimed.value.nonce,
                 slots=1,
-                timeout_s=2,
+                timeout_s=_LISTENER_PROCESS_TIMEOUT_S,
                 report_pending=False,
             ),
             cwd=root,
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=5,
-            check=False,
         )
-        assert first.returncode == 0, (first.stdout, first.stderr)
+        try:
+            wait_until(
+                lambda: first.poll() is not None,
+                timeout_s=_LISTENER_PROCESS_TIMEOUT_S,
+                interval_s=0.02,
+                message="first listener to ring after quarantining torn stamp",
+            )
+        except AssertionError:
+            first.kill()
+            raise
+        first_stdout, first_stderr = first.communicate(timeout=5)
+        assert first.returncode == 0, (first_stdout, first_stderr)
         recovery_lines = [
-            line for line in first.stderr.splitlines() if "listener ring stamp" in line
+            line for line in first_stderr.splitlines() if "listener ring stamp" in line
         ]
         assert len(recovery_lines) == 1
         assert "listener ring stamp quarantined as " in recovery_lines[0]
-        assert json.loads(first.stdout)["kind"] == "ring"
+        assert json.loads(first_stdout)["kind"] == "ring"
 
         # The same still-pending cursor version was stamped by the first listener.
         # A re-arm therefore times out cleanly instead of repeating exit 2 forever.
-        second = subprocess.run(
+        # --timeout-s must outlive arming under load; the assertion is timeout
+        # after the slot is held, not a 0.1s wall clock from process start.
+        second = subprocess.Popen(
             _listener_command(
                 root,
                 tmp_path,
                 label="wake-test",
                 nonce=claimed.value.nonce,
                 slots=1,
-                timeout_s=0.1,
+                timeout_s=8,
                 report_pending=False,
             ),
             cwd=root,
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=5,
-            check=False,
         )
-        assert second.returncode == 1, (second.stdout, second.stderr)
-        assert "ring stamp" not in second.stderr
-        assert json.loads(second.stdout)["reason"] == "timeout"
+        try:
+            def _second_armed() -> bool:
+                waiters = (
+                    wake.live_waiters(
+                        root, controller_label="wake-test", kinds={"listener"}
+                    )
+                    or []
+                )
+                return any(row.pid == second.pid for row in waiters)
+
+            wait_until(
+                lambda: _second_armed() or second.poll() is not None,
+                timeout_s=_LISTENER_ARM_HARNESS_TIMEOUT_S,
+                interval_s=0.02,
+                message="second listener to arm or exit after torn-stamp ring",
+            )
+            wait_until(
+                lambda: second.poll() is not None,
+                timeout_s=_LISTENER_PROCESS_TIMEOUT_S,
+                interval_s=0.02,
+                message="second listener to time out against stamped cursor",
+            )
+        except AssertionError:
+            second.kill()
+            raise
+        second_stdout, second_stderr = second.communicate(timeout=5)
+        assert second.returncode == 1, (second_stdout, second_stderr)
+        assert "ring stamp" not in second_stderr
+        assert json.loads(second_stdout)["reason"] == "timeout"
     finally:
         lease_holder.close()
 
@@ -999,12 +1080,29 @@ def test_entry_hint_grades_crashed_pool_member_and_full_pool_is_silent(
 
         # Kill down TO the low-water mark: a single missing slot is deliberately
         # silent now, so the graded hint needs a genuinely thin pool.
-        for victim in processes[: wake.DEFAULT_LISTENER_SLOTS - wake.listener_low_water(wake.DEFAULT_LISTENER_SLOTS)]:
+        victims = processes[
+            : wake.DEFAULT_LISTENER_SLOTS
+            - wake.listener_low_water(wake.DEFAULT_LISTENER_SLOTS)
+        ]
+        for victim in victims:
             victim.kill()
-        processes[0].communicate(timeout=3)
+
+        def _victims_reaped() -> bool:
+            return all(victim.poll() is not None for victim in victims)
+
+        wait_until(
+            _victims_reaped,
+            timeout_s=_ARBITRATION_LIVE_WAIT_S,
+            interval_s=0.02,
+            message="killed pool members to release listener slots",
+        )
+        for victim in victims:
+            victim.communicate(timeout=5)
         _wait_for_listener_count(
-        root, label="wake-test", count=wake.listener_low_water(wake.DEFAULT_LISTENER_SLOTS)
-    )
+            root,
+            label="wake-test",
+            count=wake.listener_low_water(wake.DEFAULT_LISTENER_SLOTS),
+        )
         reserve_stream = io.StringIO()
         reserve = wake.check_tool_entry(
             root,
@@ -1135,7 +1233,7 @@ def test_listener_arm_past_target_is_not_refused_then_empty_pool_hint(
         label="wake-test",
         nonce=claimed.value.nonce,
         slots=3,
-        timeout_s=20,
+        timeout_s=_ARBITRATION_LISTENER_TIMEOUT_S,
     )
     processes = [
         subprocess.Popen(
@@ -1171,8 +1269,14 @@ def test_listener_arm_past_target_is_not_refused_then_empty_pool_hint(
                 dispatch_id=f"exhaust-{index}",
                 text=f"ring {index}",
             )
-            exited = _wait_for_exited_count(processes, index + 1)
-            assert len(exited) == index + 1
+            remaining = 3 - (index + 1)
+            _wait_for_listener_count(root, label="wake-test", count=remaining)
+            exited = _wait_for_exited_count(
+                processes,
+                index + 1,
+                timeout_s=_ARBITRATION_LIVE_WAIT_S,
+            )
+            assert len(exited) == index + 1, _pool_exit_codes(processes)
             if index < 2:
                 _advance_all(
                     authority,

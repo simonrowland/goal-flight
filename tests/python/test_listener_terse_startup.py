@@ -36,7 +36,6 @@ import os
 import shlex
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -169,16 +168,18 @@ def _listen_cmd(
     return cmd
 
 
-def _wait_live(project: Path, label: str, count: int, *, timeout_s: float = 30) -> None:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        waiters = wake.live_waiters(project, controller_label=label) or []
-        if len(waiters) == count:
-            return
-        time.sleep(0.02)
-    raise AssertionError(
-        f"live waiters for {label} never reached {count}; "
-        f"saw {len(wake.live_waiters(project, controller_label=label) or [])}"
+def _wait_live(project: Path, label: str, count: int, *, timeout_s: float = 60) -> None:
+    def _at_count() -> bool:
+        waiters = (
+            wake.live_waiters(project, controller_label=label, kinds={"listener"}) or []
+        )
+        return len(waiters) == count
+
+    wait_until(
+        _at_count,
+        timeout_s=timeout_s,
+        interval_s=0.02,
+        message=f"live listeners for {label} n={count}",
     )
 
 
@@ -614,6 +615,7 @@ def test_arming_over_pending_mail_reaches_target_depth(
                             project,
                             label="terse-ctl",
                             nonce=lease.nonce,
+                            timeout_s=60,
                             json_out=True,
                         ),
                         cwd=project,
@@ -625,7 +627,12 @@ def test_arming_over_pending_mail_reaches_target_depth(
                 out_handle.close()
                 err_handle.close()
             _wait_live(project, "terse-ctl", target)
-            live = wake.live_waiters(project, controller_label="terse-ctl") or []
+            live = (
+                wake.live_waiters(
+                    project, controller_label="terse-ctl", kinds={"listener"}
+                )
+                or []
+            )
             assert len(live) == target
             assert all(proc.poll() is None for proc in procs)
 
@@ -648,12 +655,20 @@ def test_arming_over_pending_mail_reaches_target_depth(
                 return reports
 
             wait_until(
-                lambda: _count_reports() >= 1,
-                timeout_s=15,
+                lambda: _count_reports() == 1,
+                timeout_s=30,
                 message="exactly one pending-at-arm report at target depth",
             )
             assert _count_reports() == 1
-            assert len(wake.live_waiters(project, controller_label="terse-ctl") or []) == target
+            assert (
+                len(
+                    wake.live_waiters(
+                        project, controller_label="terse-ctl", kinds={"listener"}
+                    )
+                    or []
+                )
+                == target
+            )
         finally:
             for proc in procs:
                 if proc.poll() is None:
