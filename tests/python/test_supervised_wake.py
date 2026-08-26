@@ -1507,6 +1507,76 @@ def test_real_host_closed_stdout_wakes_wait_with_quiet_child(
     assert result.exits == []
 
 
+def test_real_host_stdout_registration_failure_fails_closed_with_quiet_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class InvalidatedStdout:
+        def __init__(self, stream: object) -> None:
+            self.stream = stream
+            self.valid_fd = True
+
+        def fileno(self) -> int:
+            if not self.valid_fd:
+                return -1
+            return self.stream.fileno()  # type: ignore[attr-defined,no-any-return]
+
+        def write(self, text: str) -> int:
+            return self.stream.write(text)  # type: ignore[attr-defined,no-any-return]
+
+        def flush(self) -> None:
+            self.stream.flush()  # type: ignore[attr-defined]
+
+    host = supervise.RealHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    original_stdout = sys.stdout
+    reader_fd, writer_fd = os.pipe()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    wrapped_stdout = InvalidatedStdout(peer_stdout)
+    monkeypatch.setattr(sys, "stdout", wrapped_stdout)
+    assert supervise._stdout_is_regular_file(wrapped_stdout) is None
+    wrapped_stdout.valid_fd = False
+
+    started = time.monotonic()
+    try:
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            heartbeat_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            coverage_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            items=[
+                (
+                    "backup",
+                    _python_child("import time; time.sleep(5)"),
+                )
+            ],
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        os.close(reader_fd)
+        host.kill_all()
+
+    assert elapsed < 1.0
+    assert code == 0
+    assert host._stdout_detector_failure == (
+        "stdout file descriptor registration failed"
+    )
+    assert not any(child.alive for child in host._children)
+    assert (
+        "stdout peer-gone detector unavailable; stopping: "
+        "stdout file descriptor registration failed"
+    ) in capsys.readouterr().err
+
+
 def test_pollnval_preempts_ready_child_output_before_forwarding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

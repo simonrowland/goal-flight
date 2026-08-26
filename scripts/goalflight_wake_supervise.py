@@ -554,21 +554,22 @@ def run_supervisor(
     next_coverage = host.now + max(0.01, float(coverage_s))
 
     while host.running():
-        # Two detectors answer different questions. The fast detector calls
-        # goalflight_messages._stdio_peer_gone before and after each wait and
-        # asks whether poll reports explicit HUP/ERR/NVAL evidence.
-        # RealHost.wait watches the same descriptor so closure wakes this loop
-        # independently of the scheduled deadline. False still means either
-        # no visible failure or an
-        # uninspectable fd, never a health verdict. The supervisor heartbeat
-        # asks the authoritative question with a real write: success proves
-        # the peer accepted it at that instant; EPIPE proves closure. That
-        # slow supervisor heartbeat is distinct from the forwarded stream
-        # child's 120-second heartbeat, which proves stream liveness to
-        # --watch-follow and drives its three-missed-interval death threshold.
-        # Keep both detectors so an inconclusive poll is eventually settled by
-        # a write; slowing the supervisor beat must not change peer-gone or
-        # stream/watchdog detection.
+        # Three detectors answer different questions. The probes around wait
+        # call goalflight_messages._stdio_peer_gone; False means either no
+        # HUP/ERR/NVAL evidence or an uninspectable fd, never a health verdict.
+        # RealHost.wait registers the same descriptor so explicit peer-gone
+        # events wake this loop independently of the scheduled deadline; no
+        # event is likewise only no evidence. The supervisor heartbeat asks
+        # the authoritative question with a real write: success proves the
+        # peer accepted it at that instant; EPIPE proves closure. If wait
+        # cannot establish its registered detector, it records a terminal
+        # detector failure and returns immediately: when none of the fast
+        # detectors can tell, the supervisor fails closed instead of sleeping
+        # until that heartbeat. The slow supervisor heartbeat is distinct from
+        # the forwarded stream child's 120-second heartbeat, which proves
+        # stream liveness to --watch-follow and drives its three-missed-
+        # interval death threshold. Slowing the supervisor beat must not
+        # change peer-gone or stream/watchdog detection.
         if _host_stdio_peer_gone(host):
             host.kill_all()
             return 0
@@ -812,6 +813,7 @@ class RealHost:
         self._children: list[RealChild] = []
         self._stop = False
         self._stdout_peer_gone = False
+        self._stdout_detector_failure: str | None = None
         self.stop_signum: int | None = None
         self._prev_handlers: dict[int, object] = {}
         signal_rfd, signal_wfd = os.pipe()
@@ -929,12 +931,26 @@ class RealHost:
             raise
 
     def stdio_peer_gone(self) -> bool:
-        if self._stdout_peer_gone:
+        if self._stdout_peer_gone or self._stdout_detector_failure is not None:
             return True
         # Import lazily: goalflight_messages imports this module for the CLI.
         import goalflight_messages as messages  # type: ignore
 
         return bool(messages._stdio_peer_gone(sys.stdout))
+
+    def _fail_closed_stdout_detector(self, reason: str) -> None:
+        """Make an unavailable stdout closure detector terminal and visible."""
+        if self._stdout_detector_failure is not None:
+            return
+        self._stdout_detector_failure = reason
+        try:
+            sys.stderr.write(
+                "goalflight supervise: stdout peer-gone detector unavailable; "
+                f"stopping: {reason}\n"
+            )
+            sys.stderr.flush()
+        except (AttributeError, OSError, ValueError):
+            pass
 
     def spawn(self, kind: str, command: str) -> RealChild:
         env = dict(self._env if self._env is not None else os.environ)
@@ -1069,16 +1085,33 @@ class RealHost:
                     fdmap[fd] = (which, child)
         try:
             stdout_fd = sys.stdout.fileno()
-        except (AttributeError, OSError, ValueError):
-            stdout_fd = None
-        if stdout_fd is not None and stdout_fd not in fdmap:
-            try:
-                poller.register(stdout_fd, peer_gone_events)
-            except (OSError, ValueError):
-                pass
+        except (AttributeError, OSError, TypeError, ValueError):
+            self._fail_closed_stdout_detector(
+                "stdout has no inspectable file descriptor"
+            )
+        else:
+            if stdout_fd in fdmap:
+                self._fail_closed_stdout_detector(
+                    "stdout file descriptor collides with another wait source"
+                )
             else:
-                fdmap[stdout_fd] = ("stdout", None)
+                try:
+                    poller.register(stdout_fd, peer_gone_events)
+                except (OSError, TypeError, ValueError):
+                    self._fail_closed_stdout_detector(
+                        "stdout file descriptor registration failed"
+                    )
+                else:
+                    fdmap[stdout_fd] = ("stdout", None)
+        # _stdio_peer_gone returns False both for no evidence and when it
+        # cannot inspect stdout. Registration success adds an independent
+        # detector whose no-event result is likewise only no evidence. If
+        # registration cannot be established, no detector can be trusted to
+        # wake this wait, so fail closed now instead of using the heartbeat as
+        # an implicit 25-minute fallback.
         remaining = max(0.0, deadline - time.monotonic())
+        if self._stdout_detector_failure is not None:
+            remaining = 0.0
         ready: list[int] = []
         if fdmap:
             try:
