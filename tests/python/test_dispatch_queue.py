@@ -596,6 +596,137 @@ def test_authority_read_failure_never_uses_equality_escape_and_surfaces() -> Non
                 goalflight_task.TaskStore.load_items = original_load
 
 
+def test_authority_park_visible_on_claim_status_drain_and_unparks() -> None:
+    """A dead store must park out loud, and restore must not invent a race.
+
+    Round 4 parked on `completion_authority_unavailable` but left the reason in
+    a recover return value. Claim files, status.json, and drain `details` were
+    silent, so a parked entry looked stuck. Restore-after-capacity then labeled
+    that park a race it never observed.
+    """
+    import goalflight_task
+
+    def _unreadable_load(*_args, **_kwargs):
+        raise OSError("injected permanent task-store failure")
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        with _isolated_completion_authority(tmp):
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            status_path = tmp / "parked-recover.status.json"
+            status_path.write_text(
+                json.dumps({"state": "queued", "reason": "dispatch_queue"}),
+                encoding="utf-8",
+            )
+            recover_id = "park-visible-recover"
+            recover_entry = {
+                **_linked_task_entry(
+                    tmp,
+                    recover_id,
+                    created_at="2026-01-02T01:00:00+00:00",
+                ),
+                "dispatch_argv": ["--agent", "test-dispatch"],
+                "queue_launch_token": "park-visible-recover-token",
+                "request": {
+                    "cwd": str(tmp),
+                    "tail": str(tmp / f"{recover_id}.tail"),
+                    "status_json": str(status_path),
+                    "task_ids": ["t-b212"],
+                },
+            }
+            recover_claim = queue / f"{recover_id}.json.claimed-1"
+            recover_claim.write_text(json.dumps(recover_entry), encoding="utf-8")
+
+            drain_id = "park-visible-drain"
+            drain_path = _write_queue_entry(queue, drain_id, filename=drain_id)
+            drain_entry = json.loads(drain_path.read_text(encoding="utf-8"))
+            drain_entry["project_root"] = str(tmp)
+            drain_entry["task_ids"] = ["t-b212"]
+            drain_entry["request"]["cwd"] = str(tmp)
+            drain_entry["request"]["task_ids"] = ["t-b212"]
+            D._write_json_atomic(drain_path, drain_entry)
+
+            original_load = goalflight_task.TaskStore.load_items
+            original_run = D.subprocess.run
+            original_release = D._release_stale_capacity_for_drain
+            original_hook = D._run_drain_prelaunch_hook
+            goalflight_task.TaskStore.load_items = _unreadable_load
+            D._release_stale_capacity_for_drain = lambda: None
+            D._run_drain_prelaunch_hook = lambda _agents: None
+            D.subprocess.run = lambda argv, **kwargs: subprocess.CompletedProcess(
+                argv,
+                2,
+                stdout="blocked_capacity\n",
+                stderr="",
+            )
+            try:
+                recovered = D._recover_claimed_queue_entries(queue, stale_s=0)
+                assert recovered["restored"] == 0, recovered
+                assert recovered["pending_launch"] >= 1, recovered
+                parked = json.loads(recover_claim.read_text(encoding="utf-8"))
+                assert parked.get("reason") == "completion_authority_unavailable", parked
+                assert parked.get("unpark_event") == "completion_authority_readable", parked
+                assert "completion_authority_deferral_count" not in parked, parked
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                assert status.get("reason") == "completion_authority_unavailable", status
+                assert status.get("unpark_event") == "completion_authority_readable", status
+
+                args = _drain_args(queue)
+                args.claim_stale_s = 0
+                payload = D._drain_queue_once(args)
+            finally:
+                D.subprocess.run = original_run
+                D._release_stale_capacity_for_drain = original_release
+                D._run_drain_prelaunch_hook = original_hook
+                goalflight_task.TaskStore.load_items = original_load
+
+            details = payload.get("details") or []
+            reasons = [str(row.get("reason") or "") for row in details]
+            assert "completion_authority_unavailable" in reasons, payload
+            assert all("raced" not in reason for reason in reasons), payload
+            by_id = {str(row.get("dispatch_id")): row for row in details}
+            recover_row = by_id.get(recover_id)
+            drain_row = by_id.get(drain_id)
+            assert recover_row is not None, payload
+            assert recover_row["reason"] == "completion_authority_unavailable", recover_row
+            assert recover_row.get("unpark_event") == "completion_authority_readable", recover_row
+            assert drain_row is not None, payload
+            assert drain_row["reason"] == "completion_authority_unavailable", drain_row
+            assert drain_row.get("unpark_event") == "completion_authority_readable", drain_row
+            assert drain_row["reason"] != "capacity_restore_raced", drain_row
+
+            drain_claims = list(queue.glob(f"{drain_id}.json.claimed-*"))
+            assert len(drain_claims) == 1, drain_claims
+            drain_parked = json.loads(drain_claims[0].read_text(encoding="utf-8"))
+            assert drain_parked.get("reason") == "completion_authority_unavailable", drain_parked
+            assert drain_parked.get("unpark_event") == "completion_authority_readable", drain_parked
+            drain_status = json.loads(
+                Path(drain_entry["request"]["status_json"]).read_text(encoding="utf-8")
+            )
+            assert drain_status.get("reason") == "completion_authority_unavailable", drain_status
+            assert drain_status.get("unpark_event") == "completion_authority_readable", drain_status
+
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                D._report_why_this_entry_did_not_launch(
+                    argparse.Namespace(dispatch_id=drain_id),
+                    payload,
+                )
+            reported = captured.getvalue()
+            assert f"{drain_id} not launched: completion_authority_unavailable" in reported, reported
+            assert "completion_authority_readable" in reported, reported
+
+            unpark = D._recover_claimed_queue_entries(queue, stale_s=0)
+            restored_path = queue / f"{recover_id}.json"
+            assert unpark["restored"] >= 1, unpark
+            assert restored_path.exists(), unpark
+            restored = json.loads(restored_path.read_text(encoding="utf-8"))
+            assert restored["state"] == "queued", restored
+            assert restored.get("reason") != "completion_authority_unavailable", restored
+            assert "unpark_event" not in restored, restored
+
+
 def test_prior_store_completion_does_not_supersede_deliberate_follow_up() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -5380,6 +5511,7 @@ def main() -> None:
     test_same_time_ledger_completion_defers_ambiguous_ordering()
     test_same_time_completion_deferral_is_bounded_then_restores_for_launch()
     test_authority_read_failure_never_uses_equality_escape_and_surfaces()
+    test_authority_park_visible_on_claim_status_drain_and_unparks()
     test_prior_store_completion_does_not_supersede_deliberate_follow_up()
     test_later_store_completion_still_supersedes_queued_duplicate()
     test_missing_ledger_completion_time_defers_supersession()

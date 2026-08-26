@@ -113,6 +113,10 @@ ABANDONED_RECONCILE_STALE_S = QUEUE_CLAIM_STALE_S
 ABANDONED_RECONCILIATION_SCHEMA = "goalflight.abandoned-reconciliation.v1"
 MAX_CLAIM_RECOVERY_REQUEUES = 1
 MAX_COMPLETION_AUTHORITY_DEFERRALS = 1
+# Event that releases a carrier parked because the task store or ledger could
+# not be read. Recovery re-evaluates completion authority on every pass; a
+# readable authority either restores for launch, supersedes, or parks again.
+COMPLETION_AUTHORITY_UNPARK_EVENT = "completion_authority_readable"
 RECONCILE_DOWNSTREAM_LOCK_BUDGET_S = 0.100
 RECONCILE_LOCK_POLL_S = 0.010
 PRELAUNCH_CANDIDATE_STATES = frozenset(
@@ -352,10 +356,14 @@ class _ClaimReconcileResult:
             return None
         if self.refusal is not None:
             return self.refusal.as_dict(dispatch_id)
-        return {
+        reason = self.pending_reason
+        detail = {
             "dispatch_id": dispatch_id,
-            "reason": self.pending_reason,
+            "reason": reason,
         }
+        if reason == "completion_authority_unavailable":
+            detail["unpark_event"] = COMPLETION_AUTHORITY_UNPARK_EVENT
+        return detail
 
 # --os-sandbox: opt-in, per-dispatch OS sandbox profile for the bash-shape codex
 # worker. Unset -> "workspace-write" for existing workers; Kimi is the explicit
@@ -4850,6 +4858,21 @@ _DRAIN_CONFIRMED_LAUNCH_REASONS = frozenset({
 })
 
 
+def _drain_decision_detail(dispatch_id: str, decision: dict) -> dict:
+    """Render a restore/completion decision onto the drain details path."""
+    reason = str(decision.get("reason") or "completion_authority")
+    state = str(decision.get("state") or "complete")
+    if _completion_decision_is_deferred(decision):
+        state = "claimed"
+    detail = {
+        "dispatch_id": dispatch_id,
+        "state": state,
+        "reason": reason,
+    }
+    detail.update(_completion_authority_park_fields(reason))
+    return detail
+
+
 def _drain_detail_is_a_confirmed_launch(entry: dict) -> bool:
     """True when THIS launch attempt is confirmed running.
 
@@ -4923,6 +4946,7 @@ def _report_why_this_entry_did_not_launch(args, payload: dict) -> None:
             entry.get("process_evidence")
             or entry.get("not_before")
             or entry.get("detail")
+            or entry.get("unpark_event")
             or ""
         )
         suffix = f" [{detail}]" if detail else ""
@@ -7199,8 +7223,9 @@ def _entry_completion_authority(
             # for launch: duplicate work is recoverable; a lost follow-up is not.
             return None
         # An unreadable authority never consumes equality's escape budget. Its
-        # carrier remains parked, and recovery reports the distinct unavailable
-        # reason on every pass until the store/ledger can be read again.
+        # carrier remains parked, and the unavailable reason is written onto the
+        # claim, the status sidecar, and drain details. The park lifts when the
+        # store or ledger can be read again (`completion_authority_readable`).
         reason = (
             "completion_authority_unavailable"
             if indeterminate_cause == "authority_unavailable"
@@ -7502,11 +7527,91 @@ def _sanitize_restore_envelope(entry: dict, *, increment_recovery_count: bool) -
         "queue_producer_group_contract_enforced",
         "queue_producer_group_contract_reason",
         "queue_tail_flock_contract",
+        "completion_authority_reason",
+        "completion_authority_parked_at",
+        "unpark_event",
     ):
         restored.pop(key, None)
+    if restored.get("reason") == "completion_authority_unavailable":
+        restored.pop("reason", None)
     if increment_recovery_count:
         restored["claim_recovery_count"] = _claim_recovery_count(entry) + 1
     return restored
+
+
+def _completion_authority_park_fields(reason: str | None) -> dict:
+    if reason == "completion_authority_unavailable":
+        return {"unpark_event": COMPLETION_AUTHORITY_UNPARK_EVENT}
+    return {}
+
+
+def _write_parked_status(entry: dict, decision: dict) -> None:
+    """Best-effort status sidecar for a parked, still-unlaunched carrier."""
+    dispatch_id = str(entry.get("dispatch_id") or "")
+    if not dispatch_id:
+        return
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    args = _queued_args_for_status(entry)
+    status_json = Path(
+        str(
+            request.get("status_json")
+            or _dispatch_base_dir() / f"{dispatch_id}.status.json"
+        )
+    )
+    tail = Path(
+        str(request.get("tail") or _dispatch_base_dir() / f"{dispatch_id}.tail")
+    )
+    reason = str(decision.get("reason") or "completion_authority_unavailable")
+    with contextlib.suppress(Exception):
+        write_status(
+            status_json,
+            {
+                "schema": "goalflight.status.v1",
+                "dispatch_id": dispatch_id,
+                "agent": args.agent,
+                "shape": args.shape,
+                "state": "queued",
+                "reason": reason,
+                **_completion_authority_park_fields(reason),
+                "project_root": str(
+                    entry.get("project_root") or request.get("cwd") or Path.cwd()
+                ),
+                "worker_pid": None,
+                "worker_alive": False,
+                "tail_path": str(tail),
+                "status_path": str(status_json),
+                "updated_at": int(time.time()),
+                **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
+            },
+        )
+
+
+def _persist_completion_authority_park(
+    claim: Path,
+    entry: dict,
+    decision: dict,
+) -> bool:
+    """Persist an unreadable-authority park onto the claim the operator reads.
+
+    This is not equality's bounded deferral: it never consumes that budget.
+    The next recovery pass that can read the store or ledger releases the park
+    (`unpark_event=completion_authority_readable`).
+    """
+    reason = str(decision.get("reason") or "completion_authority_unavailable")
+    staged = dict(entry)
+    staged["reason"] = reason
+    staged["completion_authority_reason"] = reason
+    staged["completion_authority_parked_at"] = goalflight_ledger.utc_now()
+    staged["updated_at"] = staged["completion_authority_parked_at"]
+    staged.update(_completion_authority_park_fields(reason))
+    try:
+        _write_json_atomic(claim, staged)
+    except OSError:
+        return False
+    entry.clear()
+    entry.update(staged)
+    _write_parked_status(staged, decision)
+    return True
 
 
 def _persist_completion_authority_deferral(claim: Path, entry: dict) -> int | None:
@@ -7546,7 +7651,10 @@ def _commit_restore_transaction(
     decision = _entry_completion_authority(fresh, task_store_locked=txn.task_store_locked)
     if _completion_decision_is_deferred(decision):
         if not _completion_decision_uses_bounded_deferral(decision):
-            return None, {**decision, "deferral_persisted": False}
+            persisted = False
+            if str(decision.get("reason") or "") == "completion_authority_unavailable":
+                persisted = _persist_completion_authority_park(claim, fresh, decision)
+            return None, {**decision, "deferral_persisted": persisted}
         persisted_count = _persist_completion_authority_deferral(claim, fresh)
         return None, {
             **decision,
@@ -7769,7 +7877,7 @@ def _restore_claim_if_incomplete(
         )
         if decision is not None:
             if _completion_decision_is_deferred(decision):
-                return None, None
+                return None, decision
             record = _find_dispatch_record(str(fresh.get("dispatch_id") or ""))
             if not _is_task_linked(fresh, record):
                 if _quarantine_unlinked_claim_if_observed_orphan(
@@ -8155,6 +8263,8 @@ def _reconcile_claim_transaction(
         if _completion_decision_blocks_restore(decision):
             if _completion_decision_is_deferred(decision):
                 if not _completion_decision_uses_bounded_deferral(decision):
+                    if str(decision.get("reason") or "") == "completion_authority_unavailable":
+                        _persist_completion_authority_park(claim, fresh, decision)
                     return _ClaimReconcileResult(
                         "pending",
                         pending_reason=str(
@@ -9914,6 +10024,14 @@ def _drain_queue_once(args) -> dict:
     failed = 0
     pending_claims = 0
     details: list[dict] = []
+    for pending in recovery.get("pending_reasons") or []:
+        if not isinstance(pending, dict):
+            continue
+        row = dict(pending)
+        row.setdefault("dispatch_id", str(pending.get("dispatch_id") or ""))
+        row.setdefault("state", "claimed")
+        row.update(_completion_authority_park_fields(str(row.get("reason") or "")))
+        details.append(row)
     entries = sorted(
         candidate
         for path in queue_dir.glob("*.json")
@@ -10052,13 +10170,9 @@ def _drain_queue_once(args) -> dict:
                 stale_s=args.claim_stale_s,
             )
             if decision is not None:
-                details.append(
-                    {
-                        "dispatch_id": dispatch_id,
-                        "state": str(decision.get("state") or "complete"),
-                        "reason": str(decision.get("reason") or "completion_authority"),
-                    }
-                )
+                details.append(_drain_decision_detail(dispatch_id, decision))
+                if _completion_decision_is_deferred(decision):
+                    pending_claims += 1
                 continue
             if restored is None:
                 pending_claims += 1
@@ -10067,7 +10181,7 @@ def _drain_queue_once(args) -> dict:
                     {
                         "dispatch_id": dispatch_id,
                         "state": "claimed",
-                        "reason": "remote_blocked_restore_raced",
+                        "reason": "remote_blocked_restore_uncommitted",
                     }
                 )
                 continue
@@ -10142,13 +10256,9 @@ def _drain_queue_once(args) -> dict:
                 stale_s=args.claim_stale_s,
             )
             if decision is not None:
-                details.append(
-                    {
-                        "dispatch_id": dispatch_id,
-                        "state": str(decision.get("state") or "complete"),
-                        "reason": str(decision.get("reason") or "completion_authority"),
-                    }
-                )
+                details.append(_drain_decision_detail(dispatch_id, decision))
+                if _completion_decision_is_deferred(decision):
+                    pending_claims += 1
                 continue
             if restored is None:
                 pending_claims += 1
@@ -10157,7 +10267,7 @@ def _drain_queue_once(args) -> dict:
                     {
                         "dispatch_id": dispatch_id,
                         "state": "claimed",
-                        "reason": "capacity_restore_raced",
+                        "reason": "capacity_restore_uncommitted",
                     }
                 )
                 continue
@@ -10209,15 +10319,9 @@ def _drain_queue_once(args) -> dict:
                 stale_s=args.claim_stale_s,
             )
             if decision is not None:
-                details.append(
-                    {
-                        "dispatch_id": dispatch_id,
-                        "state": str(decision.get("state") or "complete"),
-                        "reason": str(
-                            decision.get("reason") or "completion_authority"
-                        ),
-                    }
-                )
+                details.append(_drain_decision_detail(dispatch_id, decision))
+                if _completion_decision_is_deferred(decision):
+                    pending_claims += 1
                 continue
             if restored is not None:
                 _restore_queued_record_from_entry(entry, restored)
