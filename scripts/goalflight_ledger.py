@@ -780,6 +780,12 @@ def cmd_record(args: argparse.Namespace) -> int:
             request_envelope = None
         if isinstance(request_envelope, dict):
             record["request_envelope"] = request_envelope
+    worker_cwd = getattr(args, "worker_cwd", None)
+    if worker_cwd:
+        record["worker_cwd"] = str(worker_cwd)
+    dispatch_argv = getattr(args, "dispatch_argv", None)
+    if isinstance(dispatch_argv, list) and dispatch_argv:
+        record["dispatch_argv"] = [str(part) for part in dispatch_argv]
     task_ids = task_ids_from_args(args)
     if task_ids:
         record["task_ids"] = task_ids
@@ -865,6 +871,12 @@ def cmd_record(args: argparse.Namespace) -> int:
                 and isinstance(existing.get("request_envelope"), dict)
             ):
                 record["request_envelope"] = existing["request_envelope"]
+            if "worker_cwd" not in record and existing.get("worker_cwd"):
+                record["worker_cwd"] = existing["worker_cwd"]
+            if "dispatch_argv" not in record and isinstance(
+                existing.get("dispatch_argv"), list
+            ):
+                record["dispatch_argv"] = existing["dispatch_argv"]
             existing_controller_session_id = existing.get("controller_session_id")
             existing_controller_pid = existing.get("controller_pid")
             if (

@@ -20,6 +20,7 @@ def test_dispatch_state_aliases_and_lifecycle() -> None:
     assert states.is_running_state("waiting_capacity") is True
     assert states.is_terminal_state("idle_timeout") is True
     assert states.is_terminal_state("blocked_capacity") is True
+    assert states.is_terminal_state("blocked_os_sandbox") is True
     assert states.is_running_state("watcher_stopped") is True
     assert states.is_terminal_state("watcher_stopped") is False
     assert states.is_terminal_state("controller_dead") is True

@@ -529,24 +529,58 @@ def _validate_os_sandbox_boundary(args) -> None:
         ) from exc
 
 
+def _os_sandbox_enforced_by_launch(args) -> bool:
+    """True when an explicit --os-sandbox actually constrains this launch path.
+
+    Bash-shape grok/cursor/claude ignore the flag (no CLI/OS mapping). ACP
+    honours it only when the adapter and platform can wrap the worker.
+    An accepted-but-inert safety flag is worse than a refusal.
+    """
+    explicit = getattr(args, "os_sandbox", None)
+    if explicit not in OS_SANDBOX_PROFILES:
+        return True
+    agent = str(getattr(args, "agent", "") or "")
+    shape = getattr(args, "shape", "bash")
+    if shape == "acp":
+        from goalflight_adapter_readiness import validate_os_sandbox_request
+
+        return validate_os_sandbox_request(agent, explicit) is None
+    if agent == "codex":
+        return True
+    if agent == "moonshot":
+        return explicit == OS_SANDBOX_OFF
+    return False
+
+
 def _validate_agent_os_sandbox(args) -> None:
     profile = _effective_os_sandbox(args)
-    if str(getattr(args, "agent", "")) == "moonshot" and profile != OS_SANDBOX_OFF:
+    agent = str(getattr(args, "agent", "") or "")
+    shape = getattr(args, "shape", "bash")
+    if agent == "moonshot" and profile != OS_SANDBOX_OFF:
         raise UnsupportedAgentSandboxRequest(
             f"--agent moonshot supports only --os-sandbox {OS_SANDBOX_OFF}; "
             f"requested profile {profile!r} is not enforced and cannot be enforced; "
             "refusing before launch (b-079)"
         )
+    explicit = getattr(args, "os_sandbox", None)
+    if explicit in OS_SANDBOX_PROFILES and not _os_sandbox_enforced_by_launch(args):
+        raise UnsupportedAgentSandboxRequest(
+            f"--os-sandbox {explicit} is ignored for agent={agent} "
+            f"shape={shape}; refusing to launch with an inert safety flag. "
+            "Use --read-only instead (grok: deny rules for Write/Edit/Bash; "
+            "bash-shape codex: codex --sandbox read-only). --os-sandbox is "
+            "honoured by bash-shape codex and by ACP shapes whose adapter "
+            "and platform can enforce it."
+        )
 
 
 def _os_sandbox_warning(args) -> str | None:
-    """Dispatch-time advisory: log when 'off' is selected (required), and when an
-    explicit --os-sandbox is a no-op on a worker that can't honor it."""
-    explicit = getattr(args, "os_sandbox", None)
+    """Dispatch-time advisory: log when bash-shape codex selects 'off'."""
     profile = _effective_os_sandbox(args)
     if (
         getattr(args, "shape", "bash") == "acp"
         and _effective_read_only(args)
+        and getattr(args, "os_sandbox", None) not in OS_SANDBOX_PROFILES
         and str(getattr(args, "agent", "")) in {"claude", "claude-acp"}
     ):
         from goalflight_acp_run import acp_permission_read_only_supported
@@ -573,12 +607,6 @@ def _os_sandbox_warning(args) -> str | None:
             "(Metal/MPS reachable; linked-worktree git metadata writable to "
             "self-commit). Commit-guard (explicit pathspecs, no auto-push) + "
             "capacity/ledger tracking unchanged."
-        )
-    if explicit and not codex_bash:
-        return (
-            f"--os-sandbox {explicit} only affects bash-shape codex workers; "
-            f"ignored for agent={getattr(args, 'agent', '?')} "
-            f"shape={getattr(args, 'shape', '?')}."
         )
     return None
 
@@ -1292,6 +1320,19 @@ def _project_orientation_preamble(orientation_path: Path) -> str:
 
 def _project_root(args) -> Path:
     return goalflight_task.resolve_project_root(args.cwd or str(Path.cwd()))
+
+
+def _worker_cwd(args) -> Path:
+    """Tree the worker process is rooted in.
+
+    Distinct from ``_project_root``, which collapses worktrees so they share a
+    task store. Feeding that collapsed root back as ``--cwd`` made queued and
+    resumed workers launch with ``-C <main checkout>`` (b-217, b-227).
+    """
+    raw = getattr(args, "cwd", None)
+    if raw:
+        return Path(str(raw)).expanduser().resolve(strict=False)
+    return Path.cwd().resolve(strict=False)
 
 
 def _parse_task_ids(values: list[str] | None) -> list[str]:
@@ -2302,30 +2343,32 @@ def _guard_grok_code_research_prompt(args) -> None:
 
 
 def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
-    if raw_argv:
-        return
-    retired = RETIRED_AGENT_LABELS.get(args.agent)
-    if retired:
-        raise DispatchUsageError(
-            f"--agent {args.agent!r} is retired — {retired}"
-        )
-    if args.agent not in PRESET_AGENTS:
-        raise DispatchUsageError(
-            "no worker preset for --agent "
-            f"{args.agent!r} — use --agent codex|grok-code|grok-research|moonshot|cursor|claude with "
-            "--prompt/--prompt-file, or pass a raw worker after `-- <cmd...>`"
-        )
-    if args.agent in STDIN_PROMPT_AGENTS and not _prompt_requested(args):
-        raise DispatchUsageError(
-            f"--agent {args.agent} requires --prompt or --prompt-file; refusing to feed empty stdin"
-        )
-    if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
-        raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
+    if not raw_argv:
+        retired = RETIRED_AGENT_LABELS.get(args.agent)
+        if retired:
+            raise DispatchUsageError(
+                f"--agent {args.agent!r} is retired — {retired}"
+            )
+        if args.agent not in PRESET_AGENTS:
+            raise DispatchUsageError(
+                "no worker preset for --agent "
+                f"{args.agent!r} — use --agent codex|grok-code|grok-research|moonshot|cursor|claude with "
+                "--prompt/--prompt-file, or pass a raw worker after `-- <cmd...>`"
+            )
+        if args.agent in STDIN_PROMPT_AGENTS and not _prompt_requested(args):
+            raise DispatchUsageError(
+                f"--agent {args.agent} requires --prompt or --prompt-file; refusing to feed empty stdin"
+            )
+        if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
+            raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
+        _guard_read_only_write_prompt(args)
+        _guard_grok_code_research_prompt(args)
+    # `--os-sandbox` is a dispatch-level safety claim even when `-- <cmd>`
+    # overrides the preset. Skipping it here made a raw grok argv with an
+    # inert profile launch as if the flag were honoured.
     _validate_os_sandbox_conflict(args)
     _validate_agent_os_sandbox(args)
     _validate_os_sandbox_boundary(args)
-    _guard_read_only_write_prompt(args)
-    _guard_grok_code_research_prompt(args)
 
 
 def _nonterminal_dispatch_reuse_reason(
@@ -3106,6 +3149,14 @@ def _cmd_resume(argv: list[str]) -> int:
         action="store_true",
         help="Resume without a registered controller and keep NULL ownership.",
     )
+    parser.add_argument(
+        "--cwd",
+        help=(
+            "Worker tree for this resume. Required when the parent record "
+            "has no worker_cwd and no --cwd in dispatch_argv; the shared "
+            "checkout is not a fallback."
+        ),
+    )
     args = parser.parse_args(argv)
 
     prompt_path = Path(args.prompt_file).expanduser()
@@ -3117,64 +3168,152 @@ def _cmd_resume(argv: list[str]) -> int:
         return 64
     try:
         source = _validate_resume_source(args.dispatch_id)
+        _resume_worker_cwd(
+            source["record"], override=getattr(args, "cwd", None)
+        )
         child_dispatch_id = _reserve_auto_dispatch_id(
             f"{source['engine']}-resume", _dispatch_base_dir()
+        )
+        launch_argv = _resume_launch_argv(
+            source,
+            child_dispatch_id=child_dispatch_id,
+            prompt_path=prompt_path,
+            resume_args=args,
         )
     except DispatchUsageError as exc:
         print(f"goalflight_dispatch: {exc}", file=sys.stderr)
         return 64
+    return main(launch_argv)
 
+
+def _dispatch_argv_from_record(record: dict) -> list[str]:
+    envelope = (
+        record.get("request_envelope")
+        if isinstance(record.get("request_envelope"), dict)
+        else {}
+    )
+    for blob in (record.get("dispatch_argv"), envelope.get("dispatch_argv")):
+        if isinstance(blob, list) and blob:
+            return [str(part) for part in blob]
+    return []
+
+
+def _resume_cwd_from_record(record: dict) -> Path | None:
+    envelope = (
+        record.get("request_envelope")
+        if isinstance(record.get("request_envelope"), dict)
+        else {}
+    )
+    env_request = (
+        envelope.get("request") if isinstance(envelope.get("request"), dict) else {}
+    )
+    request = record.get("request") if isinstance(record.get("request"), dict) else {}
+    recorded = _dispatch_argv_from_record(record)
+    from_argv = (
+        _option_value_before_worker_remainder(recorded, "--cwd") if recorded else None
+    )
+    for raw in (
+        record.get("worker_cwd"),
+        from_argv,
+        env_request.get("cwd"),
+        request.get("cwd"),
+    ):
+        if raw:
+            return Path(str(raw)).expanduser().resolve(strict=False)
+    return None
+
+
+def _resume_worker_cwd(record: dict, *, override: str | None = None) -> Path:
+    if override:
+        return Path(str(override)).expanduser().resolve(strict=False)
+    path = _resume_cwd_from_record(record)
+    if path is not None:
+        return path
+    raise DispatchUsageError(
+        "resume refused: record has no worker cwd evidence "
+        "(missing worker_cwd and --cwd in dispatch_argv). "
+        "Pass --cwd <path> to resume at an explicit tree "
+        "(informed consent; the shared checkout is not a fallback)."
+    )
+
+
+def _synthesize_resume_base_argv(source: dict, *, cwd: Path) -> list[str]:
+    """Fallback when an older record never stored dispatch_argv."""
     record = source["record"]
-    project_root = Path(
-        str(record.get("project_root") or Path.cwd())
-    ).expanduser().resolve(strict=False)
     shape = source["shape"] if source["shape"] in {"bash", "acp"} else "bash"
-    launch_argv = [
+    argv = [
         "--agent",
         source["agent"],
         "--shape",
         shape,
-        "--dispatch-id",
-        child_dispatch_id,
         "--cwd",
-        str(project_root),
-        "--prompt-file",
-        str(prompt_path),
-        "--parent-dispatch-id",
-        args.dispatch_id,
-        "--engine-session-id",
-        source["session_id"],
+        str(cwd),
     ]
-    if args.unregistered_forced:
-        launch_argv.append("--unregistered-forced")
+    posture = record.get("os_sandbox")
+    if isinstance(posture, dict):
+        requested = posture.get("requested_profile")
+        if isinstance(requested, str) and requested:
+            argv += ["--os-sandbox", requested]
+    task_ids = record.get("task_ids")
+    if isinstance(task_ids, list):
+        for task_id in task_ids:
+            if isinstance(task_id, str) and task_id:
+                argv.extend(["--task", task_id])
+    return argv
+
+
+def _resume_launch_argv(
+    source: dict,
+    *,
+    child_dispatch_id: str,
+    prompt_path: Path,
+    resume_args,
+) -> list[str]:
+    record = source["record"]
+    recorded = _dispatch_argv_from_record(record)
+    cwd = _resume_worker_cwd(
+        record, override=getattr(resume_args, "cwd", None)
+    )
+    base = recorded or _synthesize_resume_base_argv(source, cwd=cwd)
+    replace = {
+        "--dispatch-id": child_dispatch_id,
+        "--prompt-file": str(prompt_path),
+        "--parent-dispatch-id": str(resume_args.dispatch_id),
+        "--engine-session-id": source["session_id"],
+        "--cwd": str(cwd),
+    }
+    inject: list[str] = []
+    if resume_args.unregistered_forced:
+        inject.append("--unregistered-forced")
     for flag, value in (
-        ("--controller-label", args.controller_label),
-        ("--controller-pid", args.controller_pid),
-        ("--controller-session-id", args.controller_session_id),
+        ("--controller-label", resume_args.controller_label),
+        ("--controller-pid", resume_args.controller_pid),
+        ("--controller-session-id", resume_args.controller_session_id),
     ):
         if value is not None:
-            launch_argv.extend([flag, str(value)])
+            replace[flag] = str(value)
     if source["engine"] == "codex":
-        launch_argv += [
-            "--codex-session-id",
-            source["session_id"],
-            "--codex-resume-home",
-            str(source["codex_home"]),
-            "--codex-home-owner-dispatch-id",
-            source["codex_home_owner_dispatch_id"],
+        replace["--codex-session-id"] = source["session_id"]
+        replace["--codex-resume-home"] = str(source["codex_home"])
+        replace["--codex-home-owner-dispatch-id"] = source[
+            "codex_home_owner_dispatch_id"
         ]
     else:
         # Stay on the seat that owns the session files. Codex rebuilds a
         # per-dispatch home; grok/cursor/claude sessions live in the seat HOME.
         account = record.get("effective_account") or record.get("account")
         if isinstance(account, str) and account and account != "default":
-            launch_argv += ["--account", account]
-    task_ids = record.get("task_ids")
-    if isinstance(task_ids, list):
-        for task_id in task_ids:
-            if isinstance(task_id, str) and task_id:
-                launch_argv.extend(["--task", task_id])
-    return main(launch_argv)
+            replace["--account"] = account
+    argv = _reconstruct_launch_argv(
+        base,
+        replace=replace,
+        inject=inject,
+        strip_flags=_replay_strip_flags() + ("--unregistered-forced",),
+        strip_options=("--tail", "--status-json", "--prompt"),
+    )
+    if source["engine"] == "codex":
+        argv = _remove_option_before_worker_remainder(argv, "--account")
+    return argv
 
 
 def _mark_reconciled_parent_resumed(
@@ -3638,21 +3777,7 @@ def _unregistered_controller_warning() -> str:
 
 
 def _remove_option_before_worker_remainder(argv: list[str], flag: str) -> list[str]:
-    try:
-        split = argv.index("--")
-    except ValueError:
-        split = len(argv)
-    head = argv[:split]
-    tail = argv[split:]
-    out: list[str] = []
-    index = 0
-    while index < len(head):
-        if head[index] == flag:
-            index += 2
-            continue
-        out.append(head[index])
-        index += 1
-    return out + tail
+    return _drop_option_before_worker_remainder(argv, flag, takes_value=True)
 
 
 def _registered_dispatch_command(args, session: dict) -> str:
@@ -4262,7 +4387,7 @@ def _acquire_capacity(args, *, project_root: Path, status_json: Path) -> str | N
         prompt_id=None,
         project_root=str(project_root),
         worktree_path=None,
-        worker_cwd=str(project_root),
+        worker_cwd=str(_worker_cwd(args)),
         controller_pid=_controller_pid(args),
         worker_pid=None,
         lease_id=None,
@@ -4443,6 +4568,15 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                 codex_home=codex_home or getattr(args, "codex_resume_home", None),
                 codex_home_owner_dispatch_id=_codex_home_owner_dispatch_id(args),
                 parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
+                worker_cwd=str(_worker_cwd(args)),
+                dispatch_argv=_canonical_replay_argv(
+                    args,
+                    _raw_worker_args(args)
+                    if getattr(args, "worker", None) is not None
+                    else [],
+                    tail=tail,
+                    status_json=status_json,
+                ),
                 lease_id=lease_id,
                 stdout_path=str(tail),
                 stderr_path=None,
@@ -4527,6 +4661,13 @@ def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | N
         "stderr_path": None,
         "status_path": str(status_json),
         "os_sandbox": _os_sandbox_posture(args, worker_pid=None),
+        "worker_cwd": str(_worker_cwd(args)),
+        "dispatch_argv": _canonical_replay_argv(
+            args,
+            _raw_worker_args(args) if getattr(args, "worker", None) is not None else [],
+            tail=tail,
+            status_json=status_json,
+        ),
         "state": "queued",
         "terminal_state": goalflight_ledger.terminal_state_for("queued"),
         "started_at": now,
@@ -4564,6 +4705,7 @@ def _record_queued_status(args, *, project_root: Path, status_json: Path, tail: 
             "reason": "dispatch_queue",
             "queue_path": str(queue_path),
             "project_root": str(project_root),
+            "worker_cwd": str(_worker_cwd(args)),
             "worker_pid": None,
             "worker_alive": False,
             "tail_path": str(tail),
@@ -4582,96 +4724,392 @@ def _record_queued_status(args, *, project_root: Path, status_json: Path, tail: 
     _start_dashboard_refresh_for_project(project_root)
 
 
+DISPATCH_REFUSED_PREFIX = "DISPATCH-REFUSED "
+
+
+def _permanent_sandbox_refusal_payload(
+    args, error: UnsupportedAgentSandboxRequest
+) -> dict:
+    return {
+        "dispatch_id": getattr(args, "dispatch_id", None),
+        "permanent": True,
+        "reason": str(error),
+        "state": "blocked_os_sandbox",
+    }
+
+
+def _emit_permanent_sandbox_refusal(
+    args, error: UnsupportedAgentSandboxRequest
+) -> None:
+    """Tell drain this refusal cannot become valid by waiting."""
+    print(
+        DISPATCH_REFUSED_PREFIX
+        + json.dumps(_permanent_sandbox_refusal_payload(args, error), sort_keys=True),
+        flush=True,
+    )
+
+
+def _permanent_pre_spawn_refusal_reason(
+    proc: subprocess.CompletedProcess,
+) -> str | None:
+    """Child's own permanent-refusal text, or None for a transient pre-spawn miss.
+
+    Capacity and busy restore-and-retry. An inert flag combination cannot.
+    Drain must terminalize the latter; restoring it is the b-215/b-219 stick.
+    """
+    blob = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    prefix = DISPATCH_REFUSED_PREFIX
+    for line in blob.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(prefix):
+            continue
+        try:
+            payload = json.loads(stripped[len(prefix) :])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or not payload.get("permanent"):
+            continue
+        reason = str(payload.get("reason") or "").strip()
+        if reason:
+            return reason
+    return None
+
+
 def _record_unsupported_sandbox_rejection(
     args, error: UnsupportedAgentSandboxRequest
 ) -> int:
     """Persist an honest terminal audit row without launching or taking capacity."""
+    _emit_permanent_sandbox_refusal(args, error)
+    reason = str(error)
+    print(f"goalflight_dispatch: {reason}", file=sys.stderr)
     base = _dispatch_base_dir()
     if not args.dispatch_id:
         args.dispatch_id = _reserve_auto_dispatch_id(args.agent, base)
-    _refuse_reused_dispatch_id_for_launch(args.dispatch_id)
-    tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
-    status_json = (
-        Path(args.status_json)
-        if args.status_json
-        else base / f"{args.dispatch_id}.status.json"
-    )
-    project_root = _project_root(args)
-    reason = str(error)
-    posture = _os_sandbox_posture(args, worker_pid=None)
-    write_status(
-        status_json,
-        {
-            "dispatch_id": args.dispatch_id,
-            "agent": args.agent,
-            "state": "blocked_os_sandbox",
-            "reason": reason,
-            "project_root": str(project_root),
-            "worker_pid": None,
-            "worker_alive": False,
-            "tail_path": str(tail),
-            "os_sandbox": posture,
-            "updated_at": int(time.time()),
-        },
-    )
-    _record_ledger(
-        args,
-        project_root=project_root,
-        prompt_path=(
-            str(Path(args.prompt_file).expanduser()) if args.prompt_file else None
-        ),
-        status_json=status_json,
-        tail=tail,
-        lease_id=None,
-        worker_pid=None,
-        state="blocked_os_sandbox",
-    )
-    _finish_ledger(args.dispatch_id, "blocked_os_sandbox", reason, elapsed_s=0.0)
-    _export_dashboard_status_for_project(project_root)
-    print(f"goalflight_dispatch: {reason}", file=sys.stderr)
+    try:
+        _refuse_reused_dispatch_id_for_launch(
+            args.dispatch_id,
+            allow_queued=bool(
+                getattr(args, "from_queue", False) or getattr(args, "submit", False)
+            ),
+        )
+        tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
+        status_json = (
+            Path(args.status_json)
+            if args.status_json
+            else base / f"{args.dispatch_id}.status.json"
+        )
+        project_root = _project_root(args)
+        posture = _os_sandbox_posture(args, worker_pid=None)
+        write_status(
+            status_json,
+            {
+                "dispatch_id": args.dispatch_id,
+                "agent": args.agent,
+                "state": "blocked_os_sandbox",
+                "reason": reason,
+                "project_root": str(project_root),
+                "worker_pid": None,
+                "worker_alive": False,
+                "tail_path": str(tail),
+                "os_sandbox": posture,
+                "updated_at": int(time.time()),
+            },
+        )
+        _record_ledger(
+            args,
+            project_root=project_root,
+            prompt_path=(
+                str(Path(args.prompt_file).expanduser()) if args.prompt_file else None
+            ),
+            status_json=status_json,
+            tail=tail,
+            lease_id=None,
+            worker_pid=None,
+            state="blocked_os_sandbox",
+        )
+        _finish_ledger(args.dispatch_id, "blocked_os_sandbox", reason, elapsed_s=0.0)
+        _export_dashboard_status_for_project(project_root)
+    except (DispatchUsageError, OSError, RuntimeError):
+        # Token + stderr already carry the child's refusal. Drain still
+        # terminalizes the claim from DISPATCH-REFUSED even if this audit row
+        # cannot land (queued id already present, journal busy, ...).
+        return 64
     return 64
 
 
+def _argv_split_worker_remainder(argv: list[str]) -> tuple[list[str], list[str]]:
+    try:
+        split = argv.index("--")
+    except ValueError:
+        split = len(argv)
+    return list(argv[:split]), list(argv[split:])
+
+
 def _insert_before_worker_remainder(argv: list[str], additions: list[str]) -> list[str]:
-    try:
-        split = argv.index("--")
-    except ValueError:
-        split = len(argv)
-    return argv[:split] + additions + argv[split:]
+    head, tail = _argv_split_worker_remainder(argv)
+    return head + list(additions) + tail
 
 
-def _remove_flag_before_worker_remainder(argv: list[str], flag: str) -> list[str]:
-    try:
-        split = argv.index("--")
-    except ValueError:
-        split = len(argv)
-    return [part for part in argv[:split] if part != flag] + argv[split:]
+def _option_skip_count(head: list[str], index: int, flag: str, *, takes_value: bool) -> int:
+    token = head[index]
+    if token.startswith(flag + "="):
+        return 1
+    if token != flag:
+        return 1
+    if not takes_value:
+        return 1
+    if index + 1 < len(head):
+        return 2
+    return 1
 
 
-def _set_option_before_worker_remainder(argv: list[str], flag: str, value: str) -> list[str]:
-    try:
-        split = argv.index("--")
-    except ValueError:
-        split = len(argv)
-    head = argv[:split]
-    tail = argv[split:]
+def _drop_option_before_worker_remainder(
+    argv: list[str],
+    flag: str,
+    *,
+    takes_value: bool,
+) -> list[str]:
+    head, tail = _argv_split_worker_remainder(argv)
     out: list[str] = []
-    i = 0
-    while i < len(head):
-        if head[i] == flag:
-            i += 2
+    index = 0
+    while index < len(head):
+        token = head[index]
+        if token == flag or token.startswith(flag + "="):
+            index += _option_skip_count(head, index, flag, takes_value=takes_value)
             continue
-        out.append(head[i])
-        i += 1
-    out += [flag, value]
+        out.append(token)
+        index += 1
     return out + tail
 
 
+def _remove_flag_before_worker_remainder(argv: list[str], flag: str) -> list[str]:
+    return _drop_option_before_worker_remainder(argv, flag, takes_value=False)
+
+
+def _set_option_before_worker_remainder(argv: list[str], flag: str, value: str) -> list[str]:
+    argv = _drop_option_before_worker_remainder(argv, flag, takes_value=True)
+    return _insert_before_worker_remainder(argv, [flag, str(value)])
+
+
+def _option_value_before_worker_remainder(argv: list[str], flag: str) -> str | None:
+    head, _tail = _argv_split_worker_remainder(argv)
+    prefix = flag + "="
+    index = 0
+    while index < len(head):
+        token = head[index]
+        if token == flag:
+            if index + 1 < len(head):
+                return head[index + 1]
+            return None
+        if token.startswith(prefix):
+            return token[len(prefix) :]
+        index += 1
+    return None
+
+
+# Classification of every launch-parser option string. Preserve-class flags are
+# carried by reconstructing from the recorded invocation. Replace/inject/strip
+# are the per-attempt exceptions. A new add_argument must land in exactly one
+# class or test_dispatch_argv_fidelity.test_every_launch_flag_is_classified fails.
+LAUNCH_ARGV_CLASS: dict[str, str] = {
+    "--agent": "preserve",
+    "--prompt-file": "preserve",
+    "--prompt": "preserve",
+    "--task": "preserve",
+    "--cwd": "preserve",
+    "--model": "preserve",
+    "--read-only": "preserve",
+    "--readonly": "preserve",
+    "--os-sandbox": "preserve",
+    "--priority": "preserve",
+    "--fast": "preserve",
+    "--web-research-ok": "preserve",
+    "--web-qa": "preserve",
+    "--ignore-git-warn": "preserve",
+    "--no-orientation": "preserve",
+    "--capacity-wait-s": "preserve",
+    "--account": "preserve",
+    "--billing": "preserve",
+    "--shape": "preserve",
+    "--interactive": "preserve",
+    "--permission-mode": "preserve",
+    "--permission-dir": "preserve",
+    "--permission-inline-timeout-s": "preserve",
+    "--permission-user-timeout-s": "preserve",
+    "--permission-allow-tool-title-pattern": "preserve",
+    "--poll-secs": "preserve",
+    "--max-idle-secs": "preserve",
+    "--controller-pid": "preserve",
+    "--controller-label": "preserve",
+    "--session-label": "preserve",
+    "--unregistered-forced": "preserve",
+    "--controller-beacon-pid": "preserve",
+    "--controller-session-id": "preserve",
+    "--parent-dispatch-id": "preserve",
+    "--engine-session-id": "preserve",
+    "--codex-session-id": "preserve",
+    "--codex-resume-home": "preserve",
+    "--codex-home-owner-dispatch-id": "preserve",
+    "--dispatch-id": "replace",
+    "--tail": "replace",
+    "--status-json": "replace",
+    "--submit": "strip",
+    "--foreground": "strip",
+    "--drain-on-submit": "strip",
+    "--no-drain-on-submit": "strip",
+    "--takeover": "strip",
+    "--acp-detached-child": "strip",
+    "--from-queue": "inject",
+    "--queue-launch-token": "inject",
+    "--queue-claim-path": "inject",
+    "--launch-detached": "inject",
+    "--stats": "ignore",
+    "--json": "ignore",
+    "--hints": "ignore",
+    "--help": "ignore",
+    "-h": "ignore",
+}
+
+_REPLAY_VALUE_OPTIONS = {
+    "--agent",
+    "--prompt-file",
+    "--prompt",
+    "--task",
+    "--cwd",
+    "--model",
+    "--os-sandbox",
+    "--priority",
+    "--capacity-wait-s",
+    "--account",
+    "--billing",
+    "--shape",
+    "--permission-mode",
+    "--permission-dir",
+    "--permission-inline-timeout-s",
+    "--permission-user-timeout-s",
+    "--permission-allow-tool-title-pattern",
+    "--poll-secs",
+    "--max-idle-secs",
+    "--controller-pid",
+    "--controller-label",
+    "--session-label",
+    "--controller-beacon-pid",
+    "--controller-session-id",
+    "--parent-dispatch-id",
+    "--engine-session-id",
+    "--codex-session-id",
+    "--codex-resume-home",
+    "--codex-home-owner-dispatch-id",
+    "--dispatch-id",
+    "--tail",
+    "--status-json",
+    "--queue-launch-token",
+    "--queue-claim-path",
+}
+
+
+def _reconstruct_launch_argv(
+    recorded: list[str],
+    *,
+    replace: dict[str, str] | None = None,
+    inject: list[str] | None = None,
+    strip_flags: tuple[str, ...] = (),
+    strip_options: tuple[str, ...] = (),
+) -> list[str]:
+    """Rebuild a launch argv from a recorded invocation.
+
+    Preserve everything that is not stripped or replaced. Per-attempt identity
+    (dispatch-id, tail, status-json) is replaced by the caller. Queue control
+    flags are injected by the drain path, not inherited.
+
+    Classification in LAUNCH_ARGV_CLASS is authoritative: strip/inject/ignore
+    flags are dropped from the recorded argv before any caller inject/replace.
+    Drain therefore cannot double-inject on replay.
+    """
+    argv = list(recorded)
+    classified_strip = _replay_strip_flags()
+    seen: set[str] = set()
+    for flag in (*classified_strip, *strip_flags):
+        if flag in seen:
+            continue
+        seen.add(flag)
+        argv = _drop_option_before_worker_remainder(
+            argv,
+            flag,
+            takes_value=flag in _REPLAY_VALUE_OPTIONS or flag == "--stats",
+        )
+    for flag in strip_options:
+        argv = _drop_option_before_worker_remainder(argv, flag, takes_value=True)
+    for flag, value in (replace or {}).items():
+        argv = _set_option_before_worker_remainder(argv, flag, value)
+    if inject:
+        argv = _insert_before_worker_remainder(argv, list(inject))
+    return argv
+
+
+def _replay_strip_flags() -> tuple[str, ...]:
+    return tuple(
+        flag
+        for flag, cls in LAUNCH_ARGV_CLASS.items()
+        if cls in {"strip", "inject", "ignore"}
+    )
+
+
+def _canonical_replay_argv_from_original(
+    args,
+    raw_argv: list[str],
+    *,
+    tail: Path,
+    status_json: Path,
+) -> list[str]:
+    source = list(getattr(args, "_original_argv", None) or [])
+    replace = {
+        "--dispatch-id": str(args.dispatch_id),
+        "--cwd": str(_worker_cwd(args)),
+        "--tail": str(tail),
+        "--status-json": str(status_json),
+    }
+    if args.prompt_file:
+        replace["--prompt-file"] = str(Path(args.prompt_file).expanduser())
+    if getattr(args, "shape", None) and args.shape != "auto":
+        replace["--shape"] = str(args.shape)
+    argv = _reconstruct_launch_argv(
+        source,
+        replace=replace,
+        strip_flags=_replay_strip_flags(),
+    )
+    controller_label = _controller_label(args)
+    controller_beacon_pid = _controller_pid(args)
+    controller_session_id = _controller_session_id(args)
+    if controller_label is not None:
+        argv = _set_option_before_worker_remainder(
+            argv, "--controller-label", controller_label
+        )
+    if controller_beacon_pid is not None:
+        argv = _set_option_before_worker_remainder(
+            argv, "--controller-beacon-pid", str(controller_beacon_pid)
+        )
+    if controller_session_id is not None:
+        argv = _set_option_before_worker_remainder(
+            argv, "--controller-session-id", controller_session_id
+        )
+    if getattr(args, "unregistered_forced", False):
+        if "--unregistered-forced" not in argv:
+            argv = _insert_before_worker_remainder(argv, ["--unregistered-forced"])
+    if raw_argv and "--" not in argv:
+        argv += ["--", *raw_argv]
+    return argv
+
+
 def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json: Path) -> list[str]:
+    if getattr(args, "_original_argv", None):
+        return _canonical_replay_argv_from_original(
+            args, raw_argv, tail=tail, status_json=status_json
+        )
     argv = [
         "--agent", str(args.agent),
         "--dispatch-id", str(args.dispatch_id),
-        "--cwd", str(_project_root(args)),
+        "--cwd", str(_worker_cwd(args)),
         "--shape", str(args.shape),
         "--priority", str(args.priority),
         "--billing", str(args.billing),
@@ -5762,6 +6200,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
         "shape": args.shape,
         "project_root": str(project_root),
         "process_cwd": str(Path.cwd().resolve()),
+        "worker_cwd": str(_worker_cwd(args)),
         "created_at": goalflight_ledger.utc_now(),
         "updated_at": goalflight_ledger.utc_now(),
         "queue_path": str(queue_path),
@@ -5776,7 +6215,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
             "priority": args.priority,
             "fast": bool(getattr(args, "fast", False)),
             "dispatch_id": args.dispatch_id,
-            "cwd": str(project_root),
+            "cwd": str(_worker_cwd(args)),
             "model": args.model,
             "shape": args.shape,
             "read_only": bool(args.read_only),
@@ -9121,18 +9560,17 @@ def _drain_launch_argv(
 ) -> list[str]:
     if not dispatch_argv:
         return []
-    argv = _set_option_before_worker_remainder(
-        list(dispatch_argv),
-        "--capacity-wait-s",
-        str(max(0.0, float(capacity_wait_s))),
-    )
-    additions = ["--from-queue"]
+    inject = ["--from-queue"]
     if queue_launch_token:
-        additions += ["--queue-launch-token", queue_launch_token]
+        inject += ["--queue-launch-token", queue_launch_token]
     if queue_claim_path is not None:
-        additions += ["--queue-claim-path", str(queue_claim_path)]
-    additions.append("--launch-detached")
-    return _insert_before_worker_remainder(argv, additions)
+        inject += ["--queue-claim-path", str(queue_claim_path)]
+    inject.append("--launch-detached")
+    return _reconstruct_launch_argv(
+        list(dispatch_argv),
+        replace={"--capacity-wait-s": str(max(0.0, float(capacity_wait_s)))},
+        inject=inject,
+    )
 
 
 def _queued_args_for_status(entry: dict):
@@ -10170,6 +10608,22 @@ def _drain_queue_once(args) -> dict:
             and observed_claim.get("queue_launch_token") == launch_token
             and _entry_pre_spawn(observed_claim)
         ):
+            permanent_reason = _permanent_pre_spawn_refusal_reason(proc)
+            if permanent_reason:
+                # Inert flag combo / unsupported sandbox: waiting cannot
+                # make it valid. Restore-to-queued is the silent stick.
+                failed += 1
+                committed = _mark_claim_failed(
+                    claim, entry, reason=permanent_reason
+                )
+                details.append(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": "failed" if committed else "claimed",
+                        "reason": permanent_reason,
+                    }
+                )
+                continue
             restored, decision = _restore_claim_if_incomplete(
                 claim,
                 entry,
@@ -10489,7 +10943,7 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         model=getattr(args, "model", None),
         install_slot=None,
         account=getattr(args, "account", None),
-        cwd=str(project_root),
+        cwd=str(_worker_cwd(args)),
         worktree="off",
         session_id=_resolved_engine_session_id(args),
         resume_session_id=(
@@ -11249,18 +11703,19 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         # model note above: grok flags drift; re-validate before trusting one.
         argv = ["grok", "--prompt-file", str(prompt_path)]
         if _effective_read_only(args):
-            # Grok has no OS sandbox here (--os-sandbox is a codex-bash knob) and
-            # its ACP adapter bypasses the permission gate for writes, so until
-            # 2026-08-25 a "read-only" grok review was enforced by nothing but
-            # brief discipline. --deny rules are the mechanism the CLI actually
-            # honours, and they hold against the model's own bypass attempts:
-            # probed on grok 1.0.0 (write prompt, seat `info`) the worker tried
-            # the write tool, then a shell command, then a relative path, and
-            # reported honestly that writes were blocked. The broken
-            # --permission-mode flag documented above stays omitted — deny rules
-            # are a different, measured surface. If a new write-capable tool
-            # ships, the deny list must grow with it; the probe in
-            # tests/python/test_grok_read_only_deny.py is the tripwire.
+            # Grok has no OS sandbox here (--os-sandbox is a codex-bash knob,
+            # and is now REFUSED at dispatch rather than accepted and ignored)
+            # and its ACP adapter bypasses the permission gate for writes, so
+            # until 2026-08-25 a "read-only" grok review was enforced by nothing
+            # but brief discipline. --deny rules are the mechanism the CLI
+            # actually honours, and they hold against the model's own bypass
+            # attempts: probed on grok 1.0.0 and re-validated on 1.0.5 (write
+            # prompt, seat `info`) the worker tried the write tool, then a shell
+            # command, then a subagent, and reported honestly that writes were
+            # blocked. The broken --permission-mode flag documented above stays
+            # omitted — deny rules are a different, measured surface. If a new
+            # write-capable tool ships, the deny list must grow with it; the
+            # probe in tests/python/test_grok_read_only_deny.py is the tripwire.
             argv += ["--deny", "Write", "--deny", "Edit", "--deny", "Bash"]
         # Only pin a model when one is EXPLICITLY requested; otherwise omit the
         # flag entirely and let grok's CLI default (grok-4.5) apply.
@@ -11351,34 +11806,7 @@ _SUBCOMMAND_HELP: tuple[tuple[str, str], ...] = (
 )
 
 
-def main(argv: list[str] | None = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] == DAEMON_SPAWN_ARG:
-        return _cmd_spawn_daemon()
-    option_argv = argv[: argv.index("--")] if "--" in argv else argv
-    # The dir-privacy sweep is invoked lazily by dispatch-dir writers (see
-    # _persist_acp_watcher_prompt and the launch path), never here: a refused
-    # dispatch must leave zero side effects before its guards run.
-    try:
-        import goalflight_messages
-
-        goalflight_messages.emit_wake_entry_notice(
-            project_root=goalflight_task.resolve_project_root(str(Path.cwd())),
-            stream=sys.stderr,
-        )
-    except Exception:
-        pass
-    if argv and argv[0] == "steer":
-        return _cmd_steer(argv[1:])
-    if argv and argv[0] == "resume":
-        return _cmd_resume(argv[1:])
-    if argv and argv[0] == "reconcile-abandoned":
-        return _cmd_reconcile_abandoned(argv[1:])
-    if argv and argv[0] == "drain":
-        return _cmd_drain(argv[1:])
-    if argv and argv[0] == "dashboard-refresh":
-        return _cmd_dashboard_refresh(argv[1:])
-
+def _build_launch_parser() -> argparse.ArgumentParser:
     parser = _TerseArgumentParser(
         description=(
             "Crash-safe worker dispatch: detached worker + decoupled watcher.\n"
@@ -11415,14 +11843,14 @@ def main(argv: list[str] | None = None) -> int:
                              "--os-sandbox read-only.")
     parser.add_argument("--os-sandbox", type=_parse_os_sandbox_arg, default=None,
                         metavar="{workspace-write,read-only,off}",
-                        help="Opt-in OS sandbox profile for the bash-shape codex worker. Unset = "
-                             "workspace-write (the unchanged default; existing dispatches are "
-                             "unaffected). 'off' disables codex's Seatbelt sandbox "
-                             "(codex --sandbox danger-full-access) for TRUSTED LOCAL GPU/perf work — "
-                             "lets the worker reach Metal/MPS and write .git/worktrees/<name> to "
-                             "self-commit. Sanctioned adapter profile, DISTINCT from the always-"
-                             "forbidden --dangerously-*/--no-sandbox bypass flags. Commit-guard "
-                             "(explicit pathspecs, no auto-push) + capacity/ledger tracking unchanged.")
+                        help="OS sandbox profile. Honoured by bash-shape codex (maps to "
+                             "codex --sandbox) and by ACP shapes whose adapter and platform "
+                             "can wrap the worker (macOS sandbox-exec). Unset = workspace-write "
+                             "for bash-shape codex. An accepted-but-inert request is refused; "
+                             "grok bash should pass --read-only instead. 'off' disables codex's "
+                             "Seatbelt sandbox (codex --sandbox danger-full-access) for TRUSTED "
+                             "LOCAL GPU/perf work. Sanctioned adapter profile, DISTINCT from the "
+                             "always-forbidden --dangerously-*/--no-sandbox bypass flags.")
     parser.add_argument("--priority", choices=["critical", "normal", "bulk"], default="normal",
                         help="Capacity lane. bulk = review storms / batch work (reserves the last "
                              "machine+pool slots for others); critical = fix dispatches (may borrow "
@@ -11597,6 +12025,38 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("worker", nargs=argparse.REMAINDER,
                         help="Optional `-- <cmd...>` raw worker (overrides the preset)")
     parser.set_defaults(drain_on_submit=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == DAEMON_SPAWN_ARG:
+        return _cmd_spawn_daemon()
+    option_argv = argv[: argv.index("--")] if "--" in argv else argv
+    # The dir-privacy sweep is invoked lazily by dispatch-dir writers (see
+    # _persist_acp_watcher_prompt and the launch path), never here: a refused
+    # dispatch must leave zero side effects before its guards run.
+    try:
+        import goalflight_messages
+
+        goalflight_messages.emit_wake_entry_notice(
+            project_root=goalflight_task.resolve_project_root(str(Path.cwd())),
+            stream=sys.stderr,
+        )
+    except Exception:
+        pass
+    if argv and argv[0] == "steer":
+        return _cmd_steer(argv[1:])
+    if argv and argv[0] == "resume":
+        return _cmd_resume(argv[1:])
+    if argv and argv[0] == "reconcile-abandoned":
+        return _cmd_reconcile_abandoned(argv[1:])
+    if argv and argv[0] == "drain":
+        return _cmd_drain(argv[1:])
+    if argv and argv[0] == "dashboard-refresh":
+        return _cmd_dashboard_refresh(argv[1:])
+
+    parser = _build_launch_parser()
     args = parser.parse_args(argv)
     try:
         args.task_ids = _parse_task_ids(args.tasks)
@@ -11677,6 +12137,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
                 raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
             _validate_os_sandbox_conflict(args)
+            _validate_agent_os_sandbox(args)
             _validate_os_sandbox_boundary(args)
             _guard_read_only_write_prompt(args)
             dispatch_warnings = _dispatch_warnings(args, raw)
@@ -11720,6 +12181,12 @@ def main(argv: list[str] | None = None) -> int:
                 ]
             _mark_queue_claim_launch_started(args)
             return _run_acp_shape(args, base=base, account_env=account_env)
+        except UnsupportedAgentSandboxRequest as e:
+            try:
+                return _record_unsupported_sandbox_rejection(args, e)
+            except DispatchUsageError as record_error:
+                print(f"goalflight_dispatch: {record_error}", file=sys.stderr)
+                return 64
         except DispatchUsageError as e:
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64

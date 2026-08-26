@@ -65,6 +65,7 @@ def _record(
         "shape": "bash",
         "transport": "dispatch",
         "project_root": str(tmp_path),
+        "worker_cwd": str(tmp_path),
         "hostname": socket.gethostname(),
         "state": state,
         "terminal_state": "unknown",
