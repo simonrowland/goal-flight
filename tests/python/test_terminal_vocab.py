@@ -424,6 +424,20 @@ def test_terminal_marker_dispatch_identity_poison_pairs() -> None:
             {"kind": "COMPLETE", "text": ""}, expected
         ),
     )
+    for kind in ("BLOCKED", "USER-NEED", "USER-CONFIRM", "FAILED"):
+        assert_true(
+            f"unbound {kind} still belongs to the expected dispatch",
+            goalflight_watch._terminal_marker_matches_dispatch(
+                {"kind": kind, "text": "cannot write sandbox path"}, expected
+            ),
+        )
+        assert_true(
+            f"bound {kind} still matches",
+            goalflight_watch._terminal_marker_matches_dispatch(
+                {"kind": kind, "text": f"{expected} — cannot write sandbox path"},
+                expected,
+            ),
+        )
 
     with tempfile.TemporaryDirectory() as tmp:
         tail = Path(tmp) / "identity.tail"
@@ -447,6 +461,28 @@ def test_terminal_marker_dispatch_identity_poison_pairs() -> None:
             )
             is None,
         )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        blocked = Path(tmp) / "blocked.tail"
+        blocked.write_text(
+            "work stalled\nBLOCKED: cannot write sandbox path\n",
+            encoding="utf-8",
+        )
+        marker = goalflight_watch._final_terminal_marker(
+            blocked, expected_dispatch_id=expected
+        )
+        assert_true("unbound BLOCKED reconciles", marker is not None)
+        assert_eq("unbound BLOCKED kind", marker["kind"], "BLOCKED")
+        assert_eq(
+            "unbound BLOCKED text",
+            marker["text"],
+            "cannot write sandbox path",
+        )
+        last = goalflight_watch._last_line_is_terminal_marker(
+            blocked, expected_dispatch_id=expected
+        )
+        assert_true("unbound BLOCKED is last-line terminal", last is not None)
+        assert_eq("last-line unbound BLOCKED kind", last["kind"], "BLOCKED")
 
 
 def test_false_death_marker_poison_pairs() -> None:

@@ -1269,6 +1269,7 @@ def _run_dead_worker_tail(
     prompt_text: str = "Do the requested work.\n",
     max_idle_secs: str = "0.2",
     prompt_mode: str = "file",
+    dispatch_id: str | None = None,
 ):
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -1291,6 +1292,7 @@ def _run_dead_worker_tail(
             worker_pid=worker.pid,
             poll_secs="0.05",
             max_idle_secs=max_idle_secs,
+            dispatch_id=dispatch_id,
         )
 
 
@@ -1826,6 +1828,104 @@ def case_dead_pid_unbound_done_signoff_is_rejected() -> None:
         assert payload.get("state") == "worker_dead", payload
         assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
         assert not term, term
+
+
+def case_dead_pid_unbound_attention_markers_block_not_die() -> None:
+    """BLOCKED/USER-NEED/USER-CONFIRM must terminalize without a dispatch-id prefix.
+
+    Production always passes ``--dispatch-id``. The worker-contract shape is
+    ``BLOCKED: <reason>`` with no id. Identity binding written for COMPLETE
+    dropped that line, ``last_marker`` kept it, and death_cause claimed
+    ``no_evidence``. Drive the real watcher with an independent dispatch id
+    that is not a prefix of the payload so the helper cannot infer a match.
+    """
+    dispatch_id = "watch-attention-escalation"
+    cases = (
+        (
+            "BLOCKED",
+            "BLOCKED: cannot write sandbox path; needs controller\n",
+            "cannot write sandbox path; needs controller",
+        ),
+        (
+            "USER-NEED",
+            "USER-NEED: what is the target path?\n",
+            "what is the target path?",
+        ),
+        (
+            "USER-CONFIRM",
+            "USER-CONFIRM: may I rewrite history?\n",
+            "may I rewrite history?",
+        ),
+        (
+            "FAILED",
+            "FAILED: tests exploded before the commit step\n",
+            "tests exploded before the commit step",
+        ),
+    )
+    for kind, marker_line, excerpt in cases:
+        rc, _elapsed, term, payload = _run_dead_worker_tail(
+            f"work stalled\n{marker_line}",
+            dispatch_id=dispatch_id,
+        )
+        assert rc == 4, f"{kind}: expected blocked exit 4, got rc={rc} ({payload})"
+        assert payload.get("state") == "blocked", f"{kind}: {payload}"
+        assert payload.get("liveness_state") == "blocked", f"{kind}: {payload}"
+        assert payload.get("reason") == f"marker:{kind}", f"{kind}: {payload}"
+        assert "no_evidence" not in str(payload.get("reason")), f"{kind}: {payload}"
+        assert payload.get("state") != "worker_dead", f"{kind}: {payload}"
+        assert term.get("kind") == kind, f"{kind}: {term}"
+        assert term.get("text") == excerpt, f"{kind}: {term}"
+
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "done\nCOMPLETE: finished the work\n",
+        dispatch_id=dispatch_id,
+    )
+    assert rc == 1, f"unbound COMPLETE must stay dead, got rc={rc} ({payload})"
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("reason") == NO_EVIDENCE_WORKER_DEAD_REASON, payload
+    assert not term, term
+
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "worker quoted an example\n"
+        "```\n"
+        "BLOCKED: cannot write sandbox path; needs controller\n"
+        "```\n"
+        "worker died before sign-off\n",
+        dispatch_id=dispatch_id,
+    )
+    assert rc == 1, f"fenced BLOCKED must stay dead, got rc={rc} ({payload})"
+    assert payload.get("state") == "worker_dead", payload
+    assert not term, term
+
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        "BLOCKED: <intended-path> not writable due to <reason>\n",
+        dispatch_id=dispatch_id,
+    )
+    assert rc == 1, f"template BLOCKED must stay dead, got rc={rc} ({payload})"
+    assert payload.get("state") == "worker_dead", payload
+    assert not term, term
+
+
+def test_worker_dead_reason_does_not_claim_no_evidence_for_blocked_transcript() -> None:
+    """The death-cause classifier must not assert ignorance of a BLOCKED line.
+
+    Even if the watcher later declines to terminalize, the function that emits
+    ``death_cause=no_evidence`` is lying when its input contains the marker.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(
+            "work stalled\nBLOCKED: cannot write sandbox path; needs controller\n",
+            encoding="utf-8",
+        )
+        reason = goalflight_watch._worker_dead_no_marker_reason(
+            tail,
+            ["Do the requested work."],
+            prompt_provenance_available=True,
+        )
+    assert reason != NO_EVIDENCE_WORKER_DEAD_REASON, reason
+    assert "no_evidence" not in reason, reason
+    assert "BLOCKED" in reason, reason
 
 
 def case_dead_pid_usage_limit_without_success_marker_reclassifies() -> None:
@@ -2405,6 +2505,8 @@ def main() -> None:
     test_restored_same_prompt_signature_reenables_classification()
     test_ordinary_provider_like_prose_surfaces_no_evidence()
     case_dead_pid_unbound_done_signoff_is_rejected()
+    case_dead_pid_unbound_attention_markers_block_not_die()
+    test_worker_dead_reason_does_not_claim_no_evidence_for_blocked_transcript()
     case_dead_pid_usage_limit_without_success_marker_reclassifies()
     case_b054_real_evidence_marker_vocab_bullet_reclassifies_rate_limited()
     case_b054_error_after_reconciled_marker_vetoes_complete()

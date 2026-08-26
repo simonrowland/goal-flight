@@ -1325,24 +1325,13 @@ def _marker_survives_unbalanced_fence(marker: dict | None) -> bool:
     return bool(marker and marker.get("kind") in SUCCESS_TERMINAL_MARKERS)
 
 
-def _terminal_marker_matches_dispatch(
-    marker: dict | None,
-    expected_dispatch_id: str | None,
+def _payload_binds_to_dispatch(
+    marker: dict,
+    expected: str,
     *,
     require_terminated: bool = False,
 ) -> bool:
-    """Bind scraped terminal evidence to the dispatch that owns the tail.
-
-    A marker payload may be exactly the dispatch id or start with it followed by
-    an explicit separator and a human summary.  Empty sign-offs and generic
-    summaries remain usable by parser-only callers that have no expected id,
-    but never satisfy a dispatch boundary.
-    """
-    expected = str(expected_dispatch_id or "").strip()
-    if not expected:
-        return marker is not None
-    if not isinstance(marker, dict):
-        return False
+    """True when the payload is this dispatch's id, optionally plus a summary."""
     embedded = str(marker.get("dispatch_id") or "").strip()
     if embedded:
         return embedded == expected
@@ -1355,6 +1344,31 @@ def _terminal_marker_matches_dispatch(
         return False
     suffix = text[len(expected) :]
     return bool(suffix and (suffix[0].isspace() or suffix[0] in ":;|\N{EM DASH}\N{EN DASH}"))
+
+
+def _terminal_marker_matches_dispatch(
+    marker: dict | None,
+    expected_dispatch_id: str | None,
+    *,
+    require_terminated: bool = False,
+) -> bool:
+    """Bind scraped terminal evidence to the dispatch that owns the tail.
+
+    Success markers (COMPLETE/READY/RESULT) must carry this dispatch's id.
+    Attention markers (BLOCKED, USER-NEED, USER-CONFIRM, FAILED) bind without
+    that prefix so a deliberate escalation is not dropped as a missing sign-off.
+    Empty sign-offs remain usable only when the caller has no expected id.
+    """
+    expected = str(expected_dispatch_id or "").strip()
+    if not expected:
+        return marker is not None
+    if not isinstance(marker, dict):
+        return False
+    if _payload_binds_to_dispatch(
+        marker, expected, require_terminated=require_terminated
+    ):
+        return True
+    return marker.get("kind") in goalflight_terminal.ATTENTION_MARKERS
 
 
 def _final_terminal_marker_from_line(
@@ -1471,6 +1485,24 @@ def _prompt_echo_scan(lines: list[str], prompt_prefix: list[str]) -> tuple[set[i
     return set(), False, prompt_line_set
 
 
+def _attention_marker_kind_in_text(text: str) -> str | None:
+    """Return the last unfenced attention-marker kind in *text*, if any.
+
+    death_cause=no_evidence is invalid while one of these lines is in view.
+    """
+    kind = None
+    fence = goalflight_terminal.MarkdownFenceTracker()
+    for idx, raw in enumerate(text.splitlines(), start=1):
+        if fence.consume_boundary(raw):
+            continue
+        if fence.in_fence:
+            continue
+        marker = _final_terminal_marker_from_line(raw, idx)
+        if marker and marker.get("kind") in goalflight_terminal.ATTENTION_MARKERS:
+            kind = str(marker["kind"])
+    return kind
+
+
 def _worker_dead_no_marker_reason(
     path: Path,
     prompt_prefix: list[str] | None = None,
@@ -1525,6 +1557,10 @@ def _worker_dead_no_marker_reason(
             cause = goalflight_terminal.WORKER_DEATH_CAUSE_NO_EVIDENCE
     if cause in prompt_causes:
         cause = goalflight_terminal.WORKER_DEATH_CAUSE_NO_EVIDENCE
+    if cause == goalflight_terminal.WORKER_DEATH_CAUSE_NO_EVIDENCE:
+        attention_kind = _attention_marker_kind_in_text(visible_text)
+        if attention_kind:
+            cause = f"attention_marker:{attention_kind}"
     return f"worker_dead_no_terminal_marker:death_cause={cause}"
 
 
