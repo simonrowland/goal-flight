@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
@@ -28,6 +29,7 @@ import goalflight_dispatch_states
 import goalflight_engine_sessions
 import goalflight_ledger
 import goalflight_quota_stuck
+import goalflight_steer_mailbox
 import goalflight_task
 import goalflight_terminal
 from goalflight_agent_limits import moonshot_family
@@ -54,6 +56,7 @@ from goalflight_liveness import (
 _MARKER_KIND_ORDER = (
     "STATUS",
     "STEER-ACK",
+    "STEER-REPLY",
     "RESULT",
     "USER-NEED",
     "USER-CONFIRM",
@@ -66,7 +69,11 @@ TERMINAL_MARKERS = frozenset(goalflight_terminal.TERMINAL_MARKERS)
 TERMINAL_MARKER_KINDS = TERMINAL_MARKERS
 SUCCESS_TERMINAL_MARKERS = frozenset(goalflight_terminal.SUCCESS_TERMINAL_MARKERS)
 BLOCKING_TERMINAL_MARKERS = TERMINAL_MARKERS - SUCCESS_TERMINAL_MARKERS
-MARKER_KINDS = frozenset(kind for kind in _MARKER_KIND_ORDER if kind in TERMINAL_MARKERS or kind in {"STATUS", "STEER-ACK"})
+MARKER_KINDS = frozenset(
+    kind
+    for kind in _MARKER_KIND_ORDER
+    if kind in TERMINAL_MARKERS or kind in {"STATUS", "STEER-ACK", "STEER-REPLY"}
+)
 _MARKER_KIND_ALTERNATION = "|".join(re.escape(kind) for kind in _MARKER_KIND_ORDER if kind in MARKER_KINDS)
 _TERMINAL_MARKER_KIND_ALTERNATION = "|".join(re.escape(kind) for kind in _MARKER_KIND_ORDER if kind in TERMINAL_MARKERS)
 # Optional `!` comes from the shared grammar used by ACP extraction, permission
@@ -139,6 +146,8 @@ STREAM_READ_CHUNK_CHARS = 64 * 1024
 # of false-killing a healthy quiet worker. The streak still protects against
 # one-off noisy idle samples.
 WEDGE_CONFIRM_SAMPLES = 2
+REPLY_WAIT_MARKER_KINDS = frozenset({"USER-NEED", "USER-CONFIRM"})
+WORKER_WAIT_ARM_GRACE_SECS = 1.0
 # A terminal marker is the worker's final act. Three default two-second poll
 # intervals give wrappers time to flush and exit before the watcher decides
 # whether later output disproved the candidate. This is a minimum decision
@@ -394,6 +403,194 @@ def post_trace_attention(
             source={"node": "local", "adapter": "watcher", "transport": "trace-liveness"},
         )
     except Exception:
+        return
+
+
+def _read_active_worker_wait(
+    path: Path,
+    dispatch_id: str,
+    *,
+    now_mono: float,
+    worker_pid: int | None = None,
+    worker_pgid: int | None = None,
+) -> tuple[dict | None, bool]:
+    try:
+        entries = goalflight_steer_mailbox.read_steer_entries(
+            path,
+            lock_timeout_secs=0.05,
+            quarantine_errors=False,
+        )
+        return (
+            goalflight_steer_mailbox.active_worker_wait(
+                entries,
+                dispatch_id=dispatch_id,
+                now_mono=now_mono,
+                worker_pid=worker_pid,
+                worker_pgid=worker_pgid,
+            ),
+            True,
+        )
+    except (OSError, RuntimeError, ValueError):
+        return None, False
+    except Exception as exc:
+        if goalflight_steer_mailbox.is_carrier_error(exc):
+            return None, False
+        raise
+
+
+def _active_worker_wait(
+    path: Path,
+    dispatch_id: str,
+    *,
+    now_mono: float,
+    worker_pid: int | None = None,
+    worker_pgid: int | None = None,
+) -> dict | None:
+    wait_state, _read_succeeded = _read_active_worker_wait(
+        path,
+        dispatch_id,
+        now_mono=now_mono,
+        worker_pid=worker_pid,
+        worker_pgid=worker_pgid,
+    )
+    return wait_state
+
+
+def _cached_worker_wait_is_valid(
+    wait_state: dict | None,
+    *,
+    now_mono: float,
+    worker_pid: int,
+    worker_pgid: int | None,
+) -> bool:
+    """Revalidate cached identity/deadline while the mailbox lock is unavailable."""
+    if not wait_state:
+        return False
+    deadline_ns = wait_state.get("deadline_awake_mono_ns")
+    waiter_pid = wait_state.get("waiter_pid")
+    waiter_token = wait_state.get("waiter_start_token")
+    waiter_pgid = wait_state.get("waiter_pgid")
+    if (
+        not isinstance(deadline_ns, int)
+        or isinstance(deadline_ns, bool)
+        or int(now_mono * 1_000_000_000) >= deadline_ns
+        or isinstance(waiter_pid, bool)
+        or not isinstance(waiter_pid, int)
+        or waiter_pid <= 0
+        or not isinstance(waiter_token, str)
+        or not waiter_token
+        or goalflight_compat.process_identity_matches(waiter_pid, waiter_token) is not True
+    ):
+        return False
+    if worker_pgid is not None:
+        return bool(
+            isinstance(waiter_pgid, int)
+            and not isinstance(waiter_pgid, bool)
+            and waiter_pgid == worker_pgid
+            and process_group_id(waiter_pid) == worker_pgid
+        )
+    return waiter_pid == worker_pid
+
+
+def _worker_wait_marker_matches(
+    marker: dict | None,
+    wait_state: dict,
+    dispatch_id: str,
+) -> bool:
+    return bool(
+        marker
+        and marker.get("kind") == wait_state.get("question_kind")
+        and marker.get("text") == wait_state.get("question_marker_text")
+        and _terminal_marker_matches_dispatch(marker, dispatch_id)
+    )
+
+
+def _worker_wait_reply_output_matches(
+    marker: dict | None,
+    wait_state: dict,
+) -> bool:
+    if not marker or marker.get("kind") != "STEER-REPLY":
+        return False
+    try:
+        payload = json.loads(str(marker.get("text") or ""))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    expected_reply_seq = wait_state.get("reply_seq")
+    reply_seq = payload.get("seq") if isinstance(payload, dict) else None
+    return bool(
+        isinstance(payload, dict)
+        and wait_state.get("phase") == "reply_pending"
+        and payload.get("kind") == goalflight_steer_mailbox.WORKER_WAIT_REPLY_KIND
+        and payload.get("reply_to") == wait_state.get("wait_id")
+        and isinstance(expected_reply_seq, int)
+        and not isinstance(expected_reply_seq, bool)
+        and expected_reply_seq > 0
+        and isinstance(reply_seq, int)
+        and not isinstance(reply_seq, bool)
+        and reply_seq > 0
+        and reply_seq == expected_reply_seq
+    )
+
+
+def post_worker_wait_attention(
+    dispatch_id: str,
+    wait_state: dict,
+    marker: dict | None,
+    posted: set[tuple[str, int, str]],
+    *,
+    post_func=None,
+) -> None:
+    """Bridge a non-terminal waiting question without claiming a listener lease."""
+    if (
+        not _worker_wait_marker_matches(marker, wait_state, dispatch_id)
+    ):
+        return
+    wait_id = str(wait_state.get("wait_id") or "")
+    try:
+        line = int(marker.get("line") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return
+    key = (wait_id, line, str(marker["kind"]))
+    if not wait_id or line <= 0 or key in posted:
+        return
+    try:
+        if post_func is None:
+            import goalflight_messages as gm
+
+            def post_func(**kwargs):
+                return gm.post_message(messages_dir=gm.default_messages_dir(), **kwargs)
+
+            marker_type = gm.marker_type(str(marker["kind"]))
+            payload = gm.marker_payload(
+                str(marker["kind"]),
+                str(marker.get("text") or ""),
+            )
+        else:
+            marker_type = (
+                "user_need" if marker["kind"] == "USER-NEED" else "user_confirm"
+            )
+            payload = {"text": str(marker.get("text") or "")}
+        payload.update({"awaiting_reply": True, "wait_id": wait_id})
+        post_func(
+            dispatch_id=dispatch_id,
+            msg_type=marker_type,
+            payload=payload,
+            source={
+                "node": "local",
+                "adapter": "watcher",
+                "transport": "steer-wait",
+            },
+            event_id=str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"goalflight:steer-wait:{dispatch_id}:{wait_id}:{line}:{marker['kind']}",
+                )
+            ),
+        )
+        posted.add(key)
+    except Exception:
+        # A stable event id makes the next poll an idempotent retry if the
+        # carrier write succeeded before a later delivery step failed.
         return
 
 
@@ -2266,6 +2463,7 @@ def main() -> int:
         ignore_prefix_lines,
         expected_dispatch_id=args.dispatch_id,
     )
+    steer_mailbox = goalflight_steer_mailbox.steer_file(args.dispatch_id)
     last_size = -1
     trace_liveness = TraceLiveness(
         dispatch_id=args.dispatch_id,
@@ -2287,13 +2485,16 @@ def main() -> int:
     exit_reason = "unknown"
     exit_code = 1
     wedge_streak = 0
-    pgid = args.pgid or process_group_id(args.pid) or args.pid
+    tracked_worker_pgid = args.pgid or process_group_id(args.pid)
+    pgid = tracked_worker_pgid or args.pid
     thresholds = LivenessThresholds(idle_timeout_s=args.max_idle_secs, cpu_epsilon_pct=args.cpu_epsilon)
     last_payload: dict | None = None
     terminal_seen: dict | None = None
     terminal_seen_at: float | None = None
     terminal_seen_size: int | None = None
     last_discarded_terminal_evidence: dict | None = None
+    cached_worker_wait: dict | None = None
+    disproved_worker_wait_ids: set[str] = set()
     final_status_written = False
     working_breadcrumb_written = False
     dispatch_retired = False
@@ -2656,6 +2857,7 @@ def main() -> int:
     atexit.register(lambda: flush_terminal_status("watcher_exit"))
 
     posted_trace_attention: set[str] = set()
+    posted_worker_wait_attention: set[tuple[str, int, str]] = set()
     while True:
         if dispatch_retired:
             break
@@ -2722,7 +2924,68 @@ def main() -> int:
             last_size = size
             last_change = active_monotonic()
         now = time.time()
-        seconds_since_event = active_monotonic() - last_change
+        loop_mono = active_monotonic()
+        fresh_worker_wait, wait_read_succeeded = _read_active_worker_wait(
+            steer_mailbox,
+            args.dispatch_id,
+            now_mono=loop_mono,
+            worker_pid=args.pid,
+            worker_pgid=tracked_worker_pgid,
+        )
+        if wait_read_succeeded:
+            if fresh_worker_wait is None:
+                cached_worker_wait = None
+            else:
+                fresh_wait_id = str(fresh_worker_wait.get("wait_id") or "")
+                same_cached_wait = bool(
+                    cached_worker_wait
+                    and cached_worker_wait.get("wait_id")
+                    == fresh_wait_id
+                )
+                observed_marker = next(
+                    (
+                        marker
+                        for marker in reversed(markers)
+                        if _worker_wait_marker_matches(
+                            marker,
+                            fresh_worker_wait,
+                            args.dispatch_id,
+                        )
+                    ),
+                    None,
+                )
+                if fresh_wait_id in disproved_worker_wait_ids:
+                    cached_worker_wait = None
+                elif same_cached_wait or observed_marker is not None:
+                    cached_worker_wait = fresh_worker_wait
+                else:
+                    # An arm is only an intent record. It cannot suspend the
+                    # tracked worker until this watcher observes its exact
+                    # wait-id-bound question marker in the tracked tail.
+                    cached_worker_wait = None
+        elif not _cached_worker_wait_is_valid(
+            cached_worker_wait,
+            now_mono=loop_mono,
+            worker_pid=args.pid,
+            worker_pgid=tracked_worker_pgid,
+        ):
+            cached_worker_wait = None
+        if cached_worker_wait and any(
+            _worker_wait_reply_output_matches(marker, cached_worker_wait)
+            for marker in markers
+        ):
+            disproved_worker_wait_ids.add(
+                str(cached_worker_wait.get("wait_id") or "")
+            )
+            cached_worker_wait = None
+        worker_wait = cached_worker_wait
+        if worker_wait:
+            # Option (a): suspend the idle clock for an explicit, independently
+            # bounded reply wait. This represents controller-blocked work without
+            # coupling the reply deadline to max_idle_secs; the mailbox arm owns
+            # its capped deadline, and ordinary idle accounting resumes afterward.
+            last_change = loop_mono
+        seconds_since_event = loop_mono - last_change
         trace_sample = trace_liveness.sample(
             now_epoch=now,
             now_mono=active_monotonic(),
@@ -2761,7 +3024,8 @@ def main() -> int:
             scan.terminal = None
         worker_is_alive, identity_reason, current_identity = worker_alive(args.pid, expected_identity)
         if worker_is_alive:
-            pgid = args.pgid or process_group_id(args.pid) or pgid
+            tracked_worker_pgid = args.pgid or process_group_id(args.pid)
+            pgid = tracked_worker_pgid or pgid
             cpu_pct = pgroup_cpu_pct(pgid)
         else:
             cpu_pct = 0.0
@@ -2779,6 +3043,9 @@ def main() -> int:
             thresholds,
             low_power_relax=low_power_relax,
         )
+        intentionally_waiting = bool(worker_wait and worker_is_alive)
+        if intentionally_waiting:
+            liveness_state = "intentionally_blocked"
         trace_idle_veto = (
             liveness_state == "wedged"
             and _trace_vetoes_idle(
@@ -2806,7 +3073,13 @@ def main() -> int:
             "markers": markers[-20:],
             "last_marker": markers[-1] if markers else None,
             "terminal_marker": terminal,
-            "state": "running_quiet" if liveness_state == "running_quiet" else "running",
+            "state": (
+                "awaiting_steer_reply"
+                if intentionally_waiting
+                else "running_quiet"
+                if liveness_state == "running_quiet"
+                else "running"
+            ),
             # b-054: record the EFFECTIVE idle budget.  The launcher's initial
             # status may say None (its record predates default resolution), and
             # a budget that cannot be audited from status.json reads as
@@ -2822,6 +3095,8 @@ def main() -> int:
                 "ino": ignore_prompt_signature[2],
             }
         payload.update(trace_sample)
+        if intentionally_waiting and worker_wait is not None:
+            payload["worker_wait"] = dict(worker_wait)
         if last_discarded_terminal_evidence:
             payload["last_discarded_terminal_evidence"] = dict(
                 last_discarded_terminal_evidence
@@ -2836,7 +3111,7 @@ def main() -> int:
             long_running_secs=args.trace_long_running_secs,
             review_secs=args.trace_review_secs,
         )
-        if trace_attention:
+        if trace_attention and not intentionally_waiting:
             payload["state"] = trace_attention
             payload["reason"] = "quiet_console_active_trace"
             post_trace_attention(
@@ -2861,6 +3136,40 @@ def main() -> int:
                 if scan.terminal_observed_size is not None
                 else size
             )
+        if intentionally_waiting and worker_wait is not None:
+            waiting_marker = next(
+                (
+                    marker
+                    for marker in reversed(markers)
+                    if _worker_wait_marker_matches(
+                        marker,
+                        worker_wait,
+                        args.dispatch_id,
+                    )
+                ),
+                None,
+            )
+            post_worker_wait_attention(
+                args.dispatch_id,
+                worker_wait,
+                waiting_marker,
+                posted_worker_wait_attention,
+            )
+            if (
+                terminal_seen
+                and _worker_wait_marker_matches(
+                    terminal_seen,
+                    worker_wait,
+                    args.dispatch_id,
+                )
+            ):
+                # The durable wait arm makes this an attention event, not a
+                # dispatch terminal. The later reply/timeout output disproves
+                # final-line status and receives a fresh idle budget.
+                terminal_seen = None
+                terminal_seen_at = None
+                terminal_seen_size = None
+                payload.pop("terminal_marker", None)
         terminal_state = _marker_state(terminal_seen) if terminal_seen else None
         terminal_reason = f"marker:{terminal_seen['kind']}" if terminal_seen else None
         post_terminal_wait = (
@@ -2924,7 +3233,15 @@ def main() -> int:
             )
             time.sleep(args.poll_secs)
             continue
-        if terminal_seen and not post_terminal_wait:
+        reply_wait_arm_grace = bool(
+            terminal_seen
+            and terminal_seen.get("kind") in REPLY_WAIT_MARKER_KINDS
+            and worker_is_alive
+            and terminal_seen_at is not None
+            and active_monotonic() - terminal_seen_at
+            < max(WORKER_WAIT_ARM_GRACE_SECS, args.poll_secs * 2.0)
+        )
+        if terminal_seen and not post_terminal_wait and not reply_wait_arm_grace:
             payload["state"] = terminal_state
             exit_code = _exit_code_for_state(payload["state"])
             exit_reason = terminal_reason

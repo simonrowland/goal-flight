@@ -53,7 +53,58 @@ Rules:
   exit or the no-growth idle rule. Live growth after `RESULT` discards that
   candidate and keeps watching for the actual terminal marker.
 - `USER-NEED`, `BLOCKED`, and `FAILED` stop the dispatch loop and surface to the orchestrator.
-- Bash-tail keeps `USER-CONFIRM` terminal. Unattended ACP routes it to the
+- A bash-tail worker that has nothing else to do while awaiting a
+  `USER-NEED`/`USER-CONFIRM` reply may atomically arm a bounded mailbox wait and
+  emit its question with
+  `python3 "$GOALFLIGHT_DISPATCH_SCRIPT" steer "$GOALFLIGHT_DISPATCH_ID" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (substitute
+  `USER-CONFIRM` when appropriate). The watcher reports
+  `awaiting_steer_reply`, bridges the question to controller mail without taking
+  a listener slot, and suspends ordinary CPU-idle accounting only after observing
+  the exact wait-id-bound marker in the tracked worker tail and validating that
+  the live waiter belongs to the tracked worker process group. The suspension is
+  bounded by the independent wait deadline. A controller replies with
+  `python3 "$GOALFLIGHT_DISPATCH_SCRIPT" steer "$GOALFLIGHT_DISPATCH_ID" --reply-to <wait-id> [--decision yes|no] '<reply>'`; `USER-CONFIRM` requires the
+  explicit decision. Generic steers, foreign wait ids, and duplicate replies do
+  not settle the wait. The writer's fsynced typed reply row is the durable
+  admission record; admission does not depend on the original waiter observing
+  it. While a correlated reply is durably pending consumption,
+  the watcher preserves the validated arm across transient mailbox-lock failures
+  until the waiter records its end, emits its typed `STEER-REPLY` consumption
+  line (which the watcher checks against the same wait id and reply sequence),
+  dies, or reaches its deadline. For an open-ended `USER-NEED`, the command may
+  return unacknowledged arm-time controller backlog without arming because that
+  steer can answer or redirect the need and carries no authorization. For
+  `USER-CONFIRM`, it surfaces the backlog but still emits and arms the exact
+  question; only a correlated typed reply with an explicit decision succeeds.
+  Only a typed reply prints `STEER-REPLY`; its human `STEER-MESSAGE` is flushed
+  first so partial output cannot claim consumption before delivery. Generic
+  backlog rows report as `STEER-BACKLOG` plus `STEER-MESSAGE`, never as a
+  confirmation-looking reply.
+  A watched-tail typed reply receipt also settles renewal when the waiter's end
+  row is unavailable, and each consumed reply's receipt is persisted to the
+  mailbox's append-only receipts sidecar so renewal evidence does not age out
+  of the status marker window or bounded stdout rescan. After flushing the
+  reply, `steer --wait` launches the receipt and end-row writes as independent
+  detached operations and returns without waiting on either lock, write, or
+  fsync. Each helper owns its complete operation and survives the short-lived
+  wait command; separating them prevents one wedged fsync from serializing the
+  other evidence write. During the lag window a reader accepts whichever exact
+  evidence has completed. If neither has, the fsynced typed reply remains the
+  recovery record and is redelivered at least once, scheduling cleanup again.
+  Redelivery does not spawn another helper while one is already live for that
+  same `(wait_id, reply_seq, operation)`: at most one receipt helper and one
+  end-row helper in flight per exact reply. A helper that finds the slot held
+  exits without retrying the write. A helper holding the mailbox lock may make
+  that bounded read report its own deadline, but cannot create a lasting
+  refusal. Transient mailbox read failures
+  inside the wait are retried until the deadline. A lock-holding admitted writer
+  may outlive that deadline, and the current wait may therefore return nonzero;
+  deadline writes no settlement or lasting refusal. Before creating another
+  arm, the next wait redelivers the prior exact typed reply when consumption is
+  unproven. A genuinely unresolved arm with no typed reply remains
+  non-renewable, so repeated waits cannot re-arm forever. On deadline ordinary
+  idle accounting resumes.
+- Bash-tail otherwise keeps `USER-CONFIRM` terminal. Unattended ACP routes it to the
   controller without cancelling the turn, preserves partial output, and waits
   at the next turn boundary for a correlated steer reply. The guarded action
   remains unauthorized: marker prose has no tool-call id, kind, or canonical

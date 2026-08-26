@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from support import skip_case_posix_on_native_windows
@@ -127,6 +128,19 @@ def _run_steer(tmp: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(DISPATCH), "steer", *args],
         env=_env(tmp),
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+
+def _run_worker_wait(tmp: Path, dispatch_id: str, *args: str) -> subprocess.CompletedProcess[str]:
+    env = _env(tmp)
+    env["GOALFLIGHT_DISPATCH_ID"] = dispatch_id
+    env["GOALFLIGHT_STEER_FILE"] = str(_mailbox(tmp, dispatch_id))
+    return subprocess.run(
+        [sys.executable, str(DISPATCH), "steer", dispatch_id, "--wait", *args],
+        env=env,
         capture_output=True,
         text=True,
         timeout=20,
@@ -275,6 +289,225 @@ def case_steer_is_no_worker_early_exit() -> None:
         assert envelopes[0]["payload"]["text"] == "redirect", envelopes
 
 
+def case_worker_wait_reports_existing_backlog_without_arming() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "wait-backlog"
+        _record(tmp, dispatch_id, worker_pid=os.getpid())
+        with _state_dir(tmp):
+            goalflight_steer_mailbox.append_steer_entry(
+                _mailbox(tmp, dispatch_id),
+                "answer arrived before arm",
+                dispatch_id=dispatch_id,
+            )
+
+        started = time.monotonic()
+        proc = _run_worker_wait(
+            tmp,
+            dispatch_id,
+            "--question-kind",
+            "USER-NEED",
+            "need a decision",
+            "--timeout-secs",
+            "1",
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert time.monotonic() - started < 0.5
+        # Generic backlog answers the open-ended need, but it is not a typed
+        # reply and must not wear the confirmation-looking receipt label.
+        assert "STEER-BACKLOG:" in proc.stdout, proc.stdout
+        assert "STEER-REPLY:" not in proc.stdout, proc.stdout
+        assert "answer arrived before arm" in proc.stdout, proc.stdout
+        assert "USER-NEED:" not in proc.stdout, proc.stdout
+        entries = _read_mailbox(tmp, dispatch_id)
+        assert not any(
+            entry.get("kind") == goalflight_steer_mailbox.WORKER_WAIT_STARTED_KIND
+            for entry in entries
+        ), entries
+
+
+def case_worker_confirm_does_not_accept_decision_free_backlog() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "confirm-backlog"
+        _record(tmp, dispatch_id, worker_pid=os.getpid())
+        with _state_dir(tmp):
+            goalflight_steer_mailbox.append_steer_entry(
+                _mailbox(tmp, dispatch_id),
+                "unrelated controller note",
+                dispatch_id=dispatch_id,
+            )
+
+        proc = _run_worker_wait(
+            tmp,
+            dispatch_id,
+            "--question-kind",
+            "USER-CONFIRM",
+            "authorize the guarded action?",
+            "--timeout-secs",
+            "0.2",
+            "--poll-secs",
+            "1",
+        )
+
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "unrelated controller note" in proc.stdout, proc.stdout
+        # The decision-free backlog is surfaced while the wait stays live, but
+        # never with the label reserved for typed correlated replies.
+        assert "STEER-BACKLOG:" in proc.stdout, proc.stdout
+        assert "STEER-REPLY:" not in proc.stdout, proc.stdout
+        assert f"!USER-CONFIRM: {dispatch_id} — authorize the guarded action?" in proc.stdout
+        entries = _read_mailbox(tmp, dispatch_id)
+        assert [entry.get("kind") for entry in entries] == [
+            goalflight_steer_mailbox.STEERING_KIND,
+            goalflight_steer_mailbox.WORKER_WAIT_STARTED_KIND,
+        ], entries
+
+
+def case_worker_wait_atomic_question_has_own_deadline() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "wait-deadline"
+        _record(tmp, dispatch_id, worker_pid=os.getpid())
+
+        started = time.monotonic()
+        proc = _run_worker_wait(
+            tmp,
+            dispatch_id,
+            "--question-kind",
+            "USER-CONFIRM",
+            "authorize the guarded action?",
+            "--timeout-secs",
+            "0.2",
+            "--poll-secs",
+            "1",
+        )
+        elapsed = time.monotonic() - started
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert 0.15 <= elapsed < 0.8, elapsed
+        lines = proc.stdout.splitlines()
+        assert lines[0].startswith(
+            f"!USER-CONFIRM: {dispatch_id} — authorize the guarded action? "
+            "[wait-id:"
+        ) and lines[0].endswith("]"), lines
+        assert lines[1].startswith(f"STEER-WAIT: dispatch_id={dispatch_id} armed"), lines
+        assert lines[-1] == f"STEER-WAIT: dispatch_id={dispatch_id} deadline reached", lines
+        entries = _read_mailbox(tmp, dispatch_id)
+        assert [entry.get("kind") for entry in entries] == [
+            goalflight_steer_mailbox.WORKER_WAIT_STARTED_KIND,
+        ], entries
+
+
+def case_worker_wait_requires_an_atomic_question() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "wait-requires-question"
+        _record(tmp, dispatch_id, worker_pid=os.getpid())
+
+        proc = _run_worker_wait(tmp, dispatch_id, "--timeout-secs", "0.1")
+        assert proc.returncode == 64, proc.stdout + proc.stderr
+        assert "requires question text and --question-kind" in proc.stderr, proc.stderr
+        assert not _mailbox(tmp, dispatch_id).exists()
+
+
+def case_worker_wait_carrier_error_is_reported() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "wait-carrier-error"
+        _record(tmp, dispatch_id, worker_pid=os.getpid())
+        old_wait = goalflight_steer_mailbox.wait_for_worker_entries
+        old_dispatch_id = os.environ.get("GOALFLIGHT_DISPATCH_ID")
+        old_steer_file = os.environ.get("GOALFLIGHT_STEER_FILE")
+
+        def broken_wait(*_args, **_kwargs):
+            raise goalflight_steer_mailbox._carrier_module().MessageError(
+                "carrier identity changed"
+            )
+
+        try:
+            goalflight_steer_mailbox.wait_for_worker_entries = broken_wait
+            os.environ["GOALFLIGHT_DISPATCH_ID"] = dispatch_id
+            os.environ["GOALFLIGHT_STEER_FILE"] = str(_mailbox(tmp, dispatch_id))
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with _state_dir(tmp), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                rc = goalflight_dispatch.main(
+                    [
+                        "steer",
+                        dispatch_id,
+                        "--wait",
+                        "--question-kind",
+                        "USER-NEED",
+                        "need a decision",
+                    ]
+                )
+        finally:
+            goalflight_steer_mailbox.wait_for_worker_entries = old_wait
+            if old_dispatch_id is None:
+                os.environ.pop("GOALFLIGHT_DISPATCH_ID", None)
+            else:
+                os.environ["GOALFLIGHT_DISPATCH_ID"] = old_dispatch_id
+            if old_steer_file is None:
+                os.environ.pop("GOALFLIGHT_STEER_FILE", None)
+            else:
+                os.environ["GOALFLIGHT_STEER_FILE"] = old_steer_file
+
+        assert rc == 1, stdout.getvalue() + stderr.getvalue()
+        assert "steer --wait failed: carrier identity changed" in stderr.getvalue()
+
+
+def case_controller_reply_is_typed_and_wait_id_correlated() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        dispatch_id = "typed-wait-reply"
+        _record(tmp, dispatch_id, worker_pid=os.getpid())
+        with _state_dir(tmp):
+            arm = goalflight_steer_mailbox.append_worker_wait_started(
+                _mailbox(tmp, dispatch_id),
+                dispatch_id=dispatch_id,
+                timeout_secs=2,
+                question_kind="USER-CONFIRM",
+                question_text="approve?",
+            )
+
+        proc = _run_steer(
+            tmp,
+            dispatch_id,
+            "approved",
+            "--reply-to",
+            str(arm["question_id"]),
+            "--decision",
+            "yes",
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        reply = _read_mailbox(tmp, dispatch_id)[-1]
+        assert reply["kind"] == goalflight_steer_mailbox.WORKER_WAIT_REPLY_KIND, reply
+        assert reply["reply_to"] == arm["question_id"], reply
+        assert reply["decision"] == "yes", reply
+
+        duplicate = _run_steer(
+            tmp,
+            dispatch_id,
+            "second answer",
+            "--reply-to",
+            str(arm["question_id"]),
+            "--decision",
+            "no",
+        )
+        assert duplicate.returncode == 1, duplicate.stdout + duplicate.stderr
+        assert "already has a reply" in duplicate.stderr, duplicate.stderr
+
+        missing_correlation = _run_steer(
+            tmp,
+            dispatch_id,
+            "ambiguous answer",
+            "--decision",
+            "yes",
+        )
+        assert missing_correlation.returncode == 64
+        assert "--decision requires --reply-to" in missing_correlation.stderr
+
+
 def case_concurrent_appends_have_monotonic_unique_seq() -> None:
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -315,6 +548,7 @@ def case_spawn_exports_steer_env() -> None:
         worker_code = (
             "import os; "
             "print(os.environ.get('GOALFLIGHT_STEER_FILE', '')); "
+            "print(os.environ.get('GOALFLIGHT_DISPATCH_SCRIPT', '')); "
             f"print('COMPLETE: {dispatch_id} — env seen', flush=True)"
         )
         proc = subprocess.run(
@@ -346,7 +580,9 @@ def case_spawn_exports_steer_env() -> None:
             timeout=30,
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
-        assert str(_mailbox(tmp, dispatch_id)) in tail.read_text(encoding="utf-8"), tail.read_text(encoding="utf-8")
+        tail_text = tail.read_text(encoding="utf-8")
+        assert str(_mailbox(tmp, dispatch_id)) in tail_text, tail_text
+        assert str(DISPATCH.resolve()) in tail_text, tail_text
 
 
 def _run_prompt_env_case(tmp: Path, dispatch_id: str, prompt_args: list[str], seen_path: Path) -> str:
@@ -525,6 +761,7 @@ def case_prompt_preamble_is_materialized() -> None:
         assert text == expected, text
         assert text.startswith(goalflight_dispatch.STEER_PROMPT_PREAMBLE + "\n\n"), text
         assert "`!STEER-ACK: <seq>`" in text, text
+        assert "$GOALFLIGHT_DISPATCH_SCRIPT" in text, text
         assert "$GOALFLIGHT_PROMPT_FILE" in text, text
         assert "Re-read it after any internal compaction/summarization" in text, text
         assert "disk file is authoritative" in text, text
@@ -671,6 +908,12 @@ def main() -> None:
     case_prefixed_ack_is_parsed_by_both_call_sites()
     case_dead_worker_records_but_does_not_claim_delivery()
     case_steer_is_no_worker_early_exit()
+    case_worker_wait_reports_existing_backlog_without_arming()
+    case_worker_confirm_does_not_accept_decision_free_backlog()
+    case_worker_wait_atomic_question_has_own_deadline()
+    case_worker_wait_requires_an_atomic_question()
+    case_worker_wait_carrier_error_is_reported()
+    case_controller_reply_is_typed_and_wait_id_correlated()
     case_concurrent_appends_have_monotonic_unique_seq()
     case_spawn_exports_steer_env()
     case_inline_prompt_exports_original_prompt_file()
