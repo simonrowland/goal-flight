@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import contextlib
 from dataclasses import dataclass, field
 import datetime as dt
@@ -4037,6 +4037,104 @@ def _cursor_positions(rows: list[dict] | tuple[dict, ...]) -> dict[str, int]:
     return positions
 
 
+@dataclass(frozen=True)
+class _JournalCursorRead:
+    """Covering vs short vs unreadable stay distinct; empty is a real short cursor."""
+
+    readable: bool
+    positions: dict[str, int]
+
+
+def _read_journal_cursor_positions(authority, controller_label: str) -> _JournalCursorRead:
+    try:
+        status = authority.cursor_status(controller_label)
+    except (OSError, TypeError, ValueError):
+        return _JournalCursorRead(False, {})
+    except RuntimeError as exc:
+        import goalflight_journal  # type: ignore
+
+        if isinstance(exc, goalflight_journal.JournalError):
+            raise
+        return _JournalCursorRead(False, {})
+    if status is None or not isinstance(status, dict):
+        return _JournalCursorRead(False, {})
+    raw = status.get("positions")
+    if not isinstance(raw, dict):
+        return _JournalCursorRead(False, {})
+    try:
+        positions = {
+            str(stream_id): int(position) for stream_id, position in raw.items()
+        }
+    except (TypeError, ValueError):
+        return _JournalCursorRead(False, {})
+    return _JournalCursorRead(True, positions)
+
+
+def _journal_cursor_positions(authority, controller_label: str) -> dict[str, int]:
+    read = _read_journal_cursor_positions(authority, controller_label)
+    if not read.readable:
+        raise RuntimeError("journal cursor is unreadable")
+    return read.positions
+
+
+def _cursor_covers_claim(
+    cursor_positions: Mapping[str, int],
+    claim_positions: Mapping[str, int],
+) -> bool:
+    if not claim_positions:
+        return False
+    return not any(
+        int(cursor_positions.get(stream_id, 0)) < int(high_water)
+        for stream_id, high_water in claim_positions.items()
+    )
+
+
+def _acknowledge_pending_report_from_cursor(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    cursor_positions: Mapping[str, int],
+) -> None:
+    try:
+        goalflight_wake.acknowledge_pending_report(
+            project_root,
+            controller_label=controller_label,
+            lease_nonce=lease_nonce,
+            positions=cursor_positions,
+        )
+    except (OSError, RuntimeError, ValueError):
+        # The journal cursor is authoritative. Sidecar settlement must not
+        # turn a committed advance into a lost delivery.
+        pass
+
+
+def _settle_pending_report_if_consumed(
+    authority,
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    claim_positions: Mapping[str, int],
+) -> bool | None:
+    """Reconcile a claim with the journal cursor.
+
+    True: the cursor covers every claimed stream (sidecar acknowledged).
+    False: a remainder is still pending (covered streams are dropped).
+    None: the cursor could not be read; retry without failing the waiter.
+    """
+    read = _read_journal_cursor_positions(authority, controller_label)
+    if not read.readable:
+        return None
+    _acknowledge_pending_report_from_cursor(
+        project_root,
+        controller_label=controller_label,
+        lease_nonce=lease_nonce,
+        cursor_positions=read.positions,
+    )
+    return _cursor_covers_claim(read.positions, claim_positions)
+
+
 def _cursor_advance_command(
     *,
     project_root: Path | str,
@@ -4235,6 +4333,19 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 project_root=root, controller_label=controller_label
             )
             return 3
+        try:
+            _acknowledge_pending_report_from_cursor(
+                root,
+                controller_label=controller_label,
+                lease_nonce=lease.nonce,
+                cursor_positions=_journal_cursor_positions(
+                    authority, controller_label
+                ),
+            )
+        except (OSError, RuntimeError, ValueError):
+            # The cursor commit is authoritative. A stale claim may duplicate a
+            # report, but acknowledgement cleanup must not turn success into loss.
+            pass
         previous_version = int(advanced.value["previous_cursor_version"])
         cursor_version = int(advanced.value["cursor_version"])
         if getattr(args, "json", False):
@@ -4437,6 +4548,20 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
     if not result.committed or result.value is None:
         print(f"advance: {result.reason or 'cursor CAS lost'}", file=sys.stderr)
         return 3
+    try:
+        _acknowledge_pending_report_from_cursor(
+            project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+            cursor_positions=_journal_cursor_positions(
+                goalflight_journal.Journal(project_root),
+                label,
+            ),
+        )
+    except (OSError, RuntimeError, ValueError):
+        # The cursor already committed; preserving a provisional claim can
+        # duplicate a report but cannot revoke the acknowledged delivery.
+        pass
     if args.json:
         print(json.dumps(result.value, sort_keys=True))
     else:
@@ -5349,11 +5474,19 @@ def cmd_follow(args) -> int:
     next_heartbeat = time.monotonic()
     last_frontier_signature: str | None = None
     last_frontier_at = float("-inf")
-    arm_high = goalflight_wake.pending_report_high_water(
+    pending_report = goalflight_wake.recover_pending_report_state(
         project_root,
         controller_label=label,
         lease_nonce=nonce,
-    ) or {}
+    )
+    # Follow never takes over and never emits pending-at-arm, so only an
+    # acknowledged boundary is a delivery watermark it can honour. claimed
+    # and reported prove a local flush, not that this monitor saw the mail.
+    arm_high = (
+        dict(pending_report.positions)
+        if pending_report is not None and pending_report.phase == "acknowledged"
+        else {}
+    )
 
     def emit(record: dict[str, object]) -> bool:
         alive = _write_follow_record(record, stream=sys.stdout)
@@ -5814,7 +5947,69 @@ def cmd_listen(args) -> int:
         print(f"listen: wake ledger registration failed: {exc}", file=sys.stderr)
         return 2
 
+    # Fix the report-pending threshold before publishing journal coverage.
+    # Producers and controllers treat an ARMED coverage row as the listener's
+    # readiness boundary; taking this snapshot afterwards lets an event posted
+    # beyond that boundary leak into arm_high and become silent backlog.
+    arm_high: dict[str, int] = {}
+    arm_snapshot = None
+    report_claim = None
+    pending_report_settled = True
     try:
+        if getattr(args, "report_pending", False):
+            try:
+                arm_snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
+            except goalflight_journal.JournalUnavailable:
+                arm_snapshot = None
+            persisted_state = goalflight_wake.recover_pending_report_state(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+            )
+            if persisted_state is not None:
+                # The claim never raises its water. Covered streams may drop
+                # off so a replacement re-reports only the unconsumed remainder.
+                arm_high = dict(persisted_state.positions)
+                pending_report_settled = persisted_state.phase == "acknowledged"
+                if not pending_report_settled:
+                    settled = _settle_pending_report_if_consumed(
+                        authority,
+                        project_root,
+                        controller_label=label,
+                        lease_nonce=nonce,
+                        claim_positions=persisted_state.positions,
+                    )
+                    if settled is True:
+                        pending_report_settled = True
+                    elif settled is False:
+                        report_claim = goalflight_wake.acquire_pending_report(
+                            project_root,
+                            controller_label=label,
+                            lease_nonce=nonce,
+                        )
+            elif arm_snapshot is not None and arm_snapshot.items:
+                local_high = _cursor_positions(arm_snapshot.items)
+                # The first arm publishes a complete claim atomically. A loser
+                # reloads that claim's water and discards its later local water,
+                # so mail arriving behind the winner remains ringable.
+                report_claim = goalflight_wake.acquire_pending_report(
+                    project_root,
+                    controller_label=label,
+                    lease_nonce=nonce,
+                    positions=local_high,
+                    cursor_version=arm_snapshot.cursor_version,
+                    stream_snapshots=arm_snapshot.stream_snapshots,
+                )
+                winner_state = goalflight_wake.recover_pending_report_state(
+                    project_root,
+                    controller_label=label,
+                    lease_nonce=nonce,
+                )
+                if winner_state is None:
+                    raise MessageError("pending-report claim was not published")
+                arm_high = dict(winner_state.positions)
+                pending_report_settled = winner_state.phase == "acknowledged"
+
         armed = authority.arm_listener(
             label,
             nonce=nonce,
@@ -5835,7 +6030,7 @@ def cmd_listen(args) -> int:
     except goalflight_journal.JournalError:
         waiter.close()
         raise
-    except (MessageError, ValueError) as exc:
+    except (MessageError, OSError, RuntimeError, ValueError) as exc:
         waiter.close()
         print(f"listen: {exc}", file=sys.stderr)
         return 2
@@ -6026,84 +6221,172 @@ def cmd_listen(args) -> int:
         stream=sys.stderr,
     )
 
-    # Opt-in arm-reports-pending: report the backlog and raise the ring threshold
-    # to the arm-time high-water so only events BEYOND it ring. Without the
-    # option, the pre-existing exit-driven contract remains intact: pending mail
-    # immediately follows the ordinary one-line ring path below.
-    arm_high: dict[str, int] = {}
-    arm_snapshot = None
-    if getattr(args, "report_pending", False):
+    def quarantine_claim_unit() -> None:
         try:
-            arm_snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
-        except goalflight_journal.JournalUnavailable:
-            arm_snapshot = None
-        persisted_high = goalflight_wake.pending_report_high_water(
+            goalflight_wake.quarantine_pending_report(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+            )
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+    def emit_pending_report(
+        claim: goalflight_wake.PendingReportState,
+        snapshot,
+    ) -> bool:
+        """Flush one claimed boundary. True when handled; False means retry."""
+        settled = _settle_pending_report_if_consumed(
+            authority,
+            project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+            claim_positions=claim.positions,
+        )
+        if settled is None:
+            return False
+        if settled is True:
+            return True
+        live = goalflight_wake.recover_pending_report_state(
             project_root,
             controller_label=label,
             lease_nonce=nonce,
         )
-        if persisted_high is not None:
-            # A prior arm in this generation already reported. Use that
-            # high-water, not this process's later peek — otherwise a
-            # superseded re-arm silently swallows events that arrived after
-            # the report.
-            arm_high = persisted_high
-        elif arm_snapshot is not None and arm_snapshot.items:
-            arm_high = _cursor_positions(arm_snapshot.items)
-            # First arm in this lease generation converts the backlog into one
-            # report. Later arms stay silent so pending mail cannot spend the
-            # whole pool. Two arms racing: the exclusive claim decides the
-            # reporter; both wait beyond the *reported* positions.
-            should_report = goalflight_wake.claim_pending_report(
-                project_root,
+        if live is None or live.phase == "acknowledged":
+            return True
+        claim = live
+        cursor = _read_journal_cursor_positions(authority, label)
+        if not cursor.readable:
+            return False
+        if snapshot is None:
+            snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
+        report_items = tuple(
+            item
+            for item in snapshot.items
+            if int(item.get("stream_seq") or 0)
+            <= claim.positions.get(str(item.get("stream_id") or ""), 0)
+        )
+        if _cursor_positions(report_items) != claim.positions:
+            # New traffic in an earlier-sorting stream can push an old claimed
+            # row beyond cursor_peek's global limit. A takeover is rare, so
+            # recover each claimed stream independently; rows beyond its fixed
+            # water sort later and cannot crowd the claim out.
+            recovered: list[dict[str, object]] = []
+            for stream_id, high_water in claim.positions.items():
+                recovered.extend(
+                    item
+                    for item in authority.pending_delivery_events(
+                        label,
+                        stream_ids=[stream_id],
+                        limit=10_000,
+                    )
+                    if int(item.get("stream_seq") or 0) <= high_water
+                )
+            report_items = tuple(
+                sorted(
+                    recovered,
+                    key=lambda item: (
+                        str(item.get("stream_id") or ""),
+                        int(item.get("stream_seq") or 0),
+                        int(item.get("rowid") or 0),
+                    ),
+                )
+            )
+        reconstructed = _cursor_positions(report_items)
+        remainder = {
+            stream_id: high_water
+            for stream_id, high_water in claim.positions.items()
+            if int(cursor.positions.get(stream_id, 0)) < int(high_water)
+        }
+        report_positions = dict(claim.positions)
+        report_snapshots = dict(claim.stream_snapshots)
+        if reconstructed != claim.positions:
+            if remainder and reconstructed == remainder:
+                report_positions = dict(remainder)
+                report_snapshots = {
+                    stream_id: stream_snapshot
+                    for stream_id, stream_snapshot in claim.stream_snapshots.items()
+                    if stream_id in remainder
+                }
+                report_items = tuple(
+                    item
+                    for item in report_items
+                    if str(item.get("stream_id") or "") in remainder
+                )
+            else:
+                quarantine_claim_unit()
+                return True
+        if (
+            claim.cursor_version is None
+            or report_snapshots.keys() != report_positions.keys()
+        ):
+            quarantine_claim_unit()
+            return True
+        arm_advance = _cursor_advance_command(
+            project_root=project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+            cursor_version=claim.cursor_version,
+            positions=report_positions,
+            stream_snapshots=report_snapshots,
+        )
+        arm_payload = {
+            "kind": "pending-at-arm",
+            "items": report_items,
+            "cursor_version": claim.cursor_version,
+            "advance_command": arm_advance,
+        }
+        if args.json:
+            print(
+                json.dumps(arm_payload, sort_keys=True, default=str),
+                flush=True,
+            )
+        else:
+            arm_items = _envelopes_with_rows(authority, list(report_items))
+            visible_arm_items = _foreign_controller_items(
+                arm_items,
                 controller_label=label,
                 lease_nonce=nonce,
-                positions=arm_high,
             )
-            if not should_report:
-                winner_high = goalflight_wake.pending_report_high_water(
-                    project_root,
-                    controller_label=label,
-                    lease_nonce=nonce,
-                )
-                if winner_high is not None:
-                    arm_high = winner_high
+            for row, envelope in visible_arm_items:
+                print(format_receipt_headline(row, envelope), flush=True)
+            print(f"advance: {arm_advance}", flush=True)
+        if claim.claim_token is None or not goalflight_wake.mark_pending_report_reported(
+            project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+            claim_token=claim.claim_token,
+        ):
+            return True
+        return True
+
+    # Report the snapshot selected before coverage became externally visible.
+    # The reported phase proves only that this complete local write returned.
+    # It remains takeover-eligible after owner death until cursor acknowledgement.
+    if report_claim is not None:
+        try:
+            if emit_pending_report(report_claim, arm_snapshot):
+                pending_report_settled = True
+        except goalflight_journal.CASMismatch as exc:
+            return finish("stale-lease", code=3, detail=str(exc))
+        except goalflight_journal.JournalUpgradeRequired as exc:
+            return finish("upgrade-required", code=2, detail=str(exc))
+        except goalflight_journal.JournalUnavailable as exc:
+            return finish(_journal_failure_reason(exc), code=2, detail=str(exc))
+        except goalflight_journal.JournalError:
+            raise
+        except MessageError as exc:
+            if "superseded" not in str(exc):
+                quarantine_claim_unit()
+            pending_report_settled = True
+        except goalflight_wake.PendingReportStateError as exc:
+            if "lock remained busy" in str(exc):
+                pending_report_settled = False
             else:
-                # The arm doubles as the peek: emit the same machine-readable
-                # snapshot relay --new --json would, advance command included,
-                # so the awake controller drains the backlog straight from this
-                # output without a second CLI round-trip.
-                arm_advance = _cursor_advance_command(
-                    project_root=project_root,
-                    controller_label=label,
-                    lease_nonce=nonce,
-                    cursor_version=arm_snapshot.cursor_version,
-                    positions=_cursor_positions(arm_snapshot.items),
-                    stream_snapshots=arm_snapshot.stream_snapshots,
-                )
-                arm_payload = {
-                    "kind": "pending-at-arm",
-                    "items": arm_snapshot.items,
-                    "cursor_version": arm_snapshot.cursor_version,
-                    "advance_command": arm_advance,
-                }
-                if args.json:
-                    print(
-                        json.dumps(arm_payload, sort_keys=True, default=str),
-                        flush=True,
-                    )
-                else:
-                    arm_items = _envelopes_with_rows(
-                        authority, list(arm_snapshot.items)
-                    )
-                    visible_arm_items = _foreign_controller_items(
-                        arm_items,
-                        controller_label=label,
-                        lease_nonce=nonce,
-                    )
-                    for row, envelope in visible_arm_items:
-                        print(format_receipt_headline(row, envelope), flush=True)
-                    print(f"advance: {arm_advance}", flush=True)
+                quarantine_claim_unit()
+                pending_report_settled = True
+        except (OSError, RuntimeError, ValueError):
+            pending_report_settled = False
 
     while True:
         parent_result = parent_exit()
@@ -6112,6 +6395,59 @@ def cmd_listen(args) -> int:
         signal_result = signal_or_stdio_exit()
         if signal_result is not None:
             return signal_result
+        if getattr(args, "report_pending", False) and not pending_report_settled:
+            try:
+                observed_report = goalflight_wake.recover_pending_report_state(
+                    project_root,
+                    controller_label=label,
+                    lease_nonce=nonce,
+                )
+                if observed_report is None or observed_report.phase == "acknowledged":
+                    pending_report_settled = True
+                else:
+                    settled = _settle_pending_report_if_consumed(
+                        authority,
+                        project_root,
+                        controller_label=label,
+                        lease_nonce=nonce,
+                        claim_positions=observed_report.positions,
+                    )
+                    if settled is True:
+                        pending_report_settled = True
+                    elif settled is False:
+                        takeover = goalflight_wake.acquire_pending_report(
+                            project_root,
+                            controller_label=label,
+                            lease_nonce=nonce,
+                        )
+                        if takeover is not None:
+                            takeover_snapshot = authority.cursor_peek(
+                                label,
+                                nonce=nonce,
+                                limit=1000,
+                            )
+                            if emit_pending_report(takeover, takeover_snapshot):
+                                pending_report_settled = True
+            except goalflight_journal.CASMismatch as exc:
+                return finish("stale-lease", code=3, detail=str(exc))
+            except goalflight_journal.JournalUpgradeRequired as exc:
+                return finish("upgrade-required", code=2, detail=str(exc))
+            except goalflight_journal.JournalUnavailable as exc:
+                return finish(_journal_failure_reason(exc), code=2, detail=str(exc))
+            except goalflight_journal.JournalError:
+                raise
+            except MessageError as exc:
+                if "superseded" not in str(exc):
+                    quarantine_claim_unit()
+                pending_report_settled = True
+            except goalflight_wake.PendingReportStateError as exc:
+                if "lock remained busy" in str(exc):
+                    pending_report_settled = False
+                else:
+                    quarantine_claim_unit()
+                    pending_report_settled = True
+            except (OSError, RuntimeError, ValueError):
+                pending_report_settled = False
         # A shell-detached listener can already have PPID 1 at process start.
         # Give launch/track plumbing a bounded grace, but never let that
         # untracked process consume the ring during the grace window.

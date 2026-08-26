@@ -41,7 +41,12 @@ _LEGACY_FILE_VERSION = "v2"
 _GENERATION_FILE_VERSION = "generation-v1"
 _LISTENER_SLOT_FILE_VERSION = "listener-slot-v1"
 _RING_STAMP_FILE_VERSION = "ring-stamp-v1"
-_PENDING_REPORT_FILE_VERSION = "pending-report-v1"
+# v1 could not distinguish claimed from output. v2 made a complete local flush
+# durable but mistook it for controller receipt. Rotate each ambiguous address
+# so an upgrade re-reports once instead of trusting unacknowledged high-water.
+_PENDING_REPORT_FILE_VERSION = "pending-report-v3"
+PENDING_REPORT_STATE_SCHEMA = "goalflight.pending-report.v3"
+MAX_PENDING_REPORT_QUARANTINES = 8
 _WATCHDOG_DEATH_REPORT_FILE_VERSION = "watchdog-death-report-v1"
 _MONITOR_STATE_FILE_VERSION = "monitor-state-v1"
 MONITOR_STATE_SCHEMA = "goalflight.monitor-state.v1"
@@ -78,6 +83,21 @@ class WaiterRecord:
     instance_id: str
     path: Path
     generation_hash: str | None = None
+
+
+class PendingReportStateError(RuntimeError):
+    """A durable pending-report boundary exists but cannot be interpreted."""
+
+
+@dataclass(frozen=True)
+class PendingReportState:
+    phase: str
+    positions: dict[str, int]
+    cursor_version: int | None
+    stream_snapshots: dict[str, str]
+    claim_token: str | None
+    owner_pid: int | None
+    owner_start_token: str | None
 
 
 def _project_key(project_root: Path | str) -> str:
@@ -352,6 +372,19 @@ def _pending_report_path(
         f"{_PENDING_REPORT_FILE_VERSION}.{_label_hash(controller_label)}."
         f"{_label_hash(lease_nonce)}.claimed"
     )
+
+
+def _pending_report_lock_path(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> Path:
+    return _pending_report_path(
+        project_root,
+        controller_label=controller_label,
+        lease_nonce=lease_nonce,
+    ).with_suffix(".lock")
 
 
 def _monitor_state_path(
@@ -634,6 +667,599 @@ def claim_watchdog_death_report(
     return True
 
 
+def _normalize_pending_report_positions(
+    positions: Mapping[str, int] | None,
+    *,
+    strict: bool,
+) -> dict[str, int]:
+    if not isinstance(positions, Mapping):
+        raise ValueError("pending-report positions are invalid")
+    normalized: dict[str, int] = {}
+    for stream, position in positions.items():
+        if strict and not isinstance(stream, str):
+            raise ValueError("pending-report stream is invalid")
+        stream_id = str(stream or "").strip()
+        if not stream_id:
+            if strict:
+                raise ValueError("pending-report stream is invalid")
+            continue
+        if not isinstance(position, int) or isinstance(position, bool) or position < 1:
+            raise ValueError("pending-report position is invalid")
+        normalized[stream_id] = position
+    return normalized
+
+
+def _normalize_pending_report_snapshots(
+    snapshots: Mapping[str, str] | None,
+    *,
+    strict: bool,
+) -> dict[str, str]:
+    if snapshots is None and not strict:
+        return {}
+    if not isinstance(snapshots, Mapping):
+        raise ValueError("pending-report stream snapshots are invalid")
+    normalized: dict[str, str] = {}
+    for stream, snapshot in snapshots.items():
+        if strict and not isinstance(stream, str):
+            raise ValueError("pending-report snapshot stream is invalid")
+        stream_id = str(stream or "").strip()
+        snapshot_value = str(snapshot or "").strip()
+        if not stream_id or len(snapshot_value) != 64:
+            raise ValueError("pending-report stream snapshot is invalid")
+        try:
+            int(snapshot_value, 16)
+        except ValueError as exc:
+            raise ValueError("pending-report stream snapshot is invalid") from exc
+        normalized[stream_id] = snapshot_value
+    return normalized
+
+
+def _read_pending_report_state(path: Path) -> PendingReportState | None:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as exc:
+        raise PendingReportStateError(
+            f"pending-report state is unreadable: {path}: {exc}"
+        ) from exc
+    text = raw.strip()
+    if not text:
+        raise PendingReportStateError(f"pending-report state is incomplete: {path}")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise PendingReportStateError(
+            f"pending-report state is incomplete: {path}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise PendingReportStateError(f"pending-report state is malformed: {path}")
+    try:
+        positions = _normalize_pending_report_positions(
+            payload.get("positions"),
+            strict=True,
+        )
+    except ValueError as exc:
+        raise PendingReportStateError(
+            f"pending-report state is malformed: {path}: {exc}"
+        ) from exc
+
+    if payload.get("schema") != PENDING_REPORT_STATE_SCHEMA:
+        raise PendingReportStateError(f"pending-report state has unknown schema: {path}")
+    phase = payload.get("phase")
+    if phase not in {"claimed", "reported", "acknowledged"}:
+        raise PendingReportStateError(f"pending-report state has invalid phase: {path}")
+    cursor_version = payload.get("cursor_version")
+    if cursor_version is not None and (
+        not isinstance(cursor_version, int)
+        or isinstance(cursor_version, bool)
+        or cursor_version < 0
+    ):
+        raise PendingReportStateError(
+            f"pending-report state has invalid cursor version: {path}"
+        )
+    try:
+        stream_snapshots = _normalize_pending_report_snapshots(
+            payload.get("stream_snapshots"),
+            strict=True,
+        )
+    except ValueError as exc:
+        raise PendingReportStateError(
+            f"pending-report state is malformed: {path}: {exc}"
+        ) from exc
+    if cursor_version is not None and stream_snapshots.keys() != positions.keys():
+        raise PendingReportStateError(
+            f"pending-report state snapshot boundary is incomplete: {path}"
+        )
+    claim_token = payload.get("claim_token")
+    owner = payload.get("owner")
+    if (
+        not isinstance(claim_token, str)
+        or not claim_token
+        or not isinstance(owner, dict)
+        or not isinstance(owner.get("pid"), int)
+        or isinstance(owner.get("pid"), bool)
+        or int(owner["pid"]) <= 0
+        or not isinstance(owner.get("start_token"), str)
+        or not owner.get("start_token")
+    ):
+        raise PendingReportStateError(f"pending-report state owner is malformed: {path}")
+    return PendingReportState(
+        str(phase),
+        positions,
+        cursor_version,
+        stream_snapshots,
+        claim_token,
+        int(owner["pid"]),
+        str(owner["start_token"]),
+    )
+
+
+def pending_report_state(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> PendingReportState | None:
+    """Read one atomic generation claim; malformed/partial state fails closed."""
+    label = str(controller_label or "").strip()
+    nonce = str(lease_nonce or "").strip()
+    if not label or not nonce:
+        raise ValueError("controller label and lease nonce are required")
+    return _read_pending_report_state(
+        _pending_report_path(
+            project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+        )
+    )
+
+
+def _quarantine_pending_report_locked(path: Path, *, directory_fd: int) -> bool:
+    """Move the claim aside under an already-held ledger lock."""
+    quarantine = f".{path.name}.{uuid.uuid4().hex}.corrupt"
+    try:
+        os.replace(
+            path.name,
+            quarantine,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+    except FileNotFoundError:
+        return False
+    os.fsync(directory_fd)
+    _prune_pending_report_quarantines(directory_fd, path.name)
+    return True
+
+
+def _prune_pending_report_quarantines(directory_fd: int, claimed_name: str) -> None:
+    prefix = f".{claimed_name}."
+    suffix = ".corrupt"
+    dated: list[tuple[int, str]] = []
+    for name in os.listdir(directory_fd):
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            continue
+        try:
+            st = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        dated.append((int(st.st_mtime_ns), name))
+    dated.sort()
+    overflow = len(dated) - MAX_PENDING_REPORT_QUARANTINES
+    if overflow <= 0:
+        return
+    for _mtime, name in dated[:overflow]:
+        _unlink_at(directory_fd, name)
+
+
+def recover_pending_report_state(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> PendingReportState | None:
+    """Read listener state, quarantining corruption so coverage can stay armed."""
+    label = str(controller_label or "").strip()
+    nonce = str(lease_nonce or "").strip()
+    if not label or not nonce:
+        raise ValueError("controller label and lease nonce are required")
+    path = _pending_report_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    try:
+        return _read_pending_report_state(path)
+    except PendingReportStateError:
+        pass
+
+    lock_path = _pending_report_lock_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    directory_fd = _open_ledger_directory_path(path.parent, create=True)
+    lock_fd = -1
+    try:
+        lock_fd = _acquire_pending_report_lock(lock_path, directory_fd=directory_fd)
+        try:
+            return _read_pending_report_state(path)
+        except PendingReportStateError:
+            _quarantine_pending_report_locked(path, directory_fd=directory_fd)
+            return None
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(directory_fd)
+
+
+def quarantine_pending_report(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> bool:
+    """Move an undeliverable claim aside so a replacement listener can stay armed."""
+    label = str(controller_label or "").strip()
+    nonce = str(lease_nonce or "").strip()
+    if not label or not nonce:
+        raise ValueError("controller label and lease nonce are required")
+    path = _pending_report_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    lock_path = _pending_report_lock_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    directory_fd = _open_ledger_directory_path(path.parent, create=True)
+    lock_fd = -1
+    try:
+        lock_fd = _acquire_pending_report_lock(lock_path, directory_fd=directory_fd)
+        return _quarantine_pending_report_locked(path, directory_fd=directory_fd)
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(directory_fd)
+
+
+def _pending_report_owner() -> tuple[int, str]:
+    pid = os.getpid()
+    identity = goalflight_compat.process_start_identity(pid)
+    if not isinstance(identity, dict) or not identity.get("start_token"):
+        raise RuntimeError("pending-report owner process generation is unavailable")
+    return pid, str(identity["start_token"])
+
+
+def _pending_report_owner_liveness(state: PendingReportState) -> bool | None:
+    if state.owner_pid is None or state.owner_start_token is None:
+        return False
+    matches = goalflight_compat.process_identity_matches(
+        state.owner_pid,
+        state.owner_start_token,
+    )
+    if matches is not True:
+        return matches
+    return False if goalflight_compat.pid_is_zombie(state.owner_pid) is True else True
+
+
+def _acquire_pending_report_lock(path: Path, *, directory_fd: int) -> int:
+    deadline = time.monotonic() + ENTRY_POLL_WINDOW_S
+    while True:
+        try:
+            return _acquire_contended_lock(path, directory_fd=directory_fd)
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise PendingReportStateError("pending-report state lock remained busy")
+            time.sleep(min(0.01, ENTRY_POLL_INTERVAL_S))
+
+
+def _write_pending_report_state(
+    path: Path,
+    payload: Mapping[str, object],
+    *,
+    directory_fd: int,
+) -> None:
+    encoded = (json.dumps(dict(payload), separators=(",", ":"), sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    pending = f".{path.name}.{uuid.uuid4().hex}.pending"
+    pending_fd = -1
+    try:
+        pending_fd = os.open(
+            pending,
+            _open_flags(create_exclusive=True),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        remaining = memoryview(encoded)
+        while remaining:
+            written = os.write(pending_fd, remaining)
+            if written <= 0:
+                raise OSError(errno.EIO, "short pending-report state write")
+            remaining = remaining[written:]
+        os.fsync(pending_fd)
+        os.replace(
+            pending,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        pending = ""
+        os.fsync(directory_fd)
+    finally:
+        if pending_fd >= 0:
+            os.close(pending_fd)
+        if pending:
+            _unlink_at(directory_fd, pending)
+
+
+def acquire_pending_report(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    positions: Mapping[str, int] | None = None,
+    cursor_version: int | None = None,
+    stream_snapshots: Mapping[str, str] | None = None,
+) -> PendingReportState | None:
+    """Create or take over a provisional claim while preserving its boundary.
+
+    A takeover is permitted only after PID/start-token evidence proves that the
+    previous claimant is gone. Every rewrite is temp-file + fsync + replace +
+    directory-fsync, so readers see the old complete phase or the new one.
+    """
+    label = str(controller_label or "").strip()
+    nonce = str(lease_nonce or "").strip()
+    if not label or not nonce:
+        raise ValueError("controller label and lease nonce are required")
+    normalized = (
+        _normalize_pending_report_positions(positions, strict=False)
+        if positions is not None
+        else None
+    )
+    normalized_snapshots = _normalize_pending_report_snapshots(
+        stream_snapshots,
+        strict=False,
+    )
+    if cursor_version is not None and (
+        not isinstance(cursor_version, int)
+        or isinstance(cursor_version, bool)
+        or cursor_version < 0
+    ):
+        raise ValueError("pending-report cursor version is invalid")
+    if cursor_version is not None and (
+        normalized is None or normalized_snapshots.keys() != normalized.keys()
+    ):
+        raise ValueError("pending-report snapshot boundary is incomplete")
+    path = _pending_report_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    lock_path = _pending_report_lock_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    directory_fd = _open_ledger_directory_path(path.parent, create=True)
+    lock_fd = -1
+    try:
+        lock_fd = _acquire_pending_report_lock(lock_path, directory_fd=directory_fd)
+        current = _read_pending_report_state(path)
+        if current is not None:
+            if (
+                current.phase == "acknowledged"
+                or _pending_report_owner_liveness(current) is not False
+            ):
+                return None
+            claim_positions = current.positions
+            claim_cursor_version = current.cursor_version
+            claim_stream_snapshots = current.stream_snapshots
+        else:
+            if normalized is None:
+                return None
+            claim_positions = normalized
+            claim_cursor_version = cursor_version
+            claim_stream_snapshots = normalized_snapshots
+        owner_pid, owner_start_token = _pending_report_owner()
+        claim_token = uuid.uuid4().hex
+        claimed = PendingReportState(
+            "claimed",
+            dict(claim_positions),
+            claim_cursor_version,
+            dict(claim_stream_snapshots),
+            claim_token,
+            owner_pid,
+            owner_start_token,
+        )
+        _write_pending_report_state(
+            path,
+            {
+                "schema": PENDING_REPORT_STATE_SCHEMA,
+                "phase": "claimed",
+                "positions": claimed.positions,
+                "cursor_version": claimed.cursor_version,
+                "stream_snapshots": claimed.stream_snapshots,
+                "claim_token": claim_token,
+                "owner": {"pid": owner_pid, "start_token": owner_start_token},
+                "claimed_at_epoch": time.time(),
+                "reported_at_epoch": None,
+                "acknowledged_at_epoch": None,
+            },
+            directory_fd=directory_fd,
+        )
+        return claimed
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(directory_fd)
+
+
+def mark_pending_report_reported(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    claim_token: str,
+) -> bool:
+    """Record a complete local flush; receipt remains provisional until ack."""
+    label = str(controller_label or "").strip()
+    nonce = str(lease_nonce or "").strip()
+    token = str(claim_token or "").strip()
+    if not label or not nonce or not token:
+        raise ValueError("controller label, lease nonce, and claim token are required")
+    path = _pending_report_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    lock_path = _pending_report_lock_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    directory_fd = _open_ledger_directory_path(path.parent, create=True)
+    lock_fd = -1
+    try:
+        lock_fd = _acquire_pending_report_lock(lock_path, directory_fd=directory_fd)
+        current = _read_pending_report_state(path)
+        if current is None:
+            raise PendingReportStateError("pending-report claim disappeared before report")
+        if current.claim_token != token:
+            return False
+        if current.phase in {"reported", "acknowledged"}:
+            return True
+        owner_pid, owner_start_token = _pending_report_owner()
+        if (
+            current.owner_pid != owner_pid
+            or current.owner_start_token != owner_start_token
+        ):
+            return False
+        _write_pending_report_state(
+            path,
+            {
+                "schema": PENDING_REPORT_STATE_SCHEMA,
+                "phase": "reported",
+                "positions": current.positions,
+                "cursor_version": current.cursor_version,
+                "stream_snapshots": current.stream_snapshots,
+                "claim_token": token,
+                "owner": {"pid": owner_pid, "start_token": owner_start_token},
+                "claimed_at_epoch": None,
+                "reported_at_epoch": time.time(),
+                "acknowledged_at_epoch": None,
+            },
+            directory_fd=directory_fd,
+        )
+        return True
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(directory_fd)
+
+
+def acknowledge_pending_report(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    positions: Mapping[str, int],
+) -> bool:
+    """Settle streams the cursor covers; keep any unconsumed remainder reportable.
+
+    A fully covered claim becomes acknowledged. A subset advance shrinks the
+    durable boundary to the streams still pending so a replacement can re-report
+    that remainder instead of reconstructing the original claim.
+    """
+    label = str(controller_label or "").strip()
+    nonce = str(lease_nonce or "").strip()
+    if not label or not nonce:
+        raise ValueError("controller label and lease nonce are required")
+    normalized = _normalize_pending_report_positions(positions, strict=False)
+    path = _pending_report_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    lock_path = _pending_report_lock_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    directory_fd = _open_ledger_directory_path(path.parent, create=True)
+    lock_fd = -1
+    try:
+        lock_fd = _acquire_pending_report_lock(lock_path, directory_fd=directory_fd)
+        try:
+            current = _read_pending_report_state(path)
+        except PendingReportStateError:
+            return False
+        if current is None:
+            return False
+        if current.phase == "acknowledged":
+            return True
+        remainder = {
+            stream_id: high_water
+            for stream_id, high_water in current.positions.items()
+            if int(normalized.get(stream_id, 0)) < int(high_water)
+        }
+        if remainder == current.positions:
+            return False
+        if remainder:
+            remainder_snapshots = {
+                stream_id: snapshot
+                for stream_id, snapshot in current.stream_snapshots.items()
+                if stream_id in remainder
+            }
+            _write_pending_report_state(
+                path,
+                {
+                    "schema": PENDING_REPORT_STATE_SCHEMA,
+                    "phase": current.phase,
+                    "positions": remainder,
+                    "cursor_version": current.cursor_version,
+                    "stream_snapshots": remainder_snapshots,
+                    "claim_token": current.claim_token,
+                    "owner": {
+                        "pid": current.owner_pid,
+                        "start_token": current.owner_start_token,
+                    },
+                    "claimed_at_epoch": None,
+                    "reported_at_epoch": None,
+                    "acknowledged_at_epoch": None,
+                },
+                directory_fd=directory_fd,
+            )
+            return False
+        _write_pending_report_state(
+            path,
+            {
+                "schema": PENDING_REPORT_STATE_SCHEMA,
+                "phase": "acknowledged",
+                "positions": current.positions,
+                "cursor_version": current.cursor_version,
+                "stream_snapshots": current.stream_snapshots,
+                "claim_token": current.claim_token,
+                "owner": {
+                    "pid": current.owner_pid,
+                    "start_token": current.owner_start_token,
+                },
+                "claimed_at_epoch": None,
+                "reported_at_epoch": None,
+                "acknowledged_at_epoch": time.time(),
+            },
+            directory_fd=directory_fd,
+        )
+        return True
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(directory_fd)
+
+
 def claim_pending_report(
     project_root: Path | str,
     *,
@@ -641,52 +1267,13 @@ def claim_pending_report(
     lease_nonce: str,
     positions: Mapping[str, int] | None = None,
 ) -> bool:
-    """First --report-pending arm in this lease generation emits the backlog.
-
-    Later arms keep waiting without reprinting. The winner persists the
-    reported high-water so a replacement arm after a superseded exit does
-    not raise the water to its own later peek and swallow events that
-    arrived after the report. Peek skew is then visible to every later
-    arm: they wait beyond the *reported* positions, not beyond whatever
-    happens to be pending at the moment they start.
-    """
-    label = str(controller_label or "").strip()
-    nonce = str(lease_nonce or "").strip()
-    if not label or not nonce:
-        raise ValueError("controller label and lease nonce are required")
-    normalized: dict[str, int] = {}
-    for stream, position in dict(positions or {}).items():
-        stream_id = str(stream or "").strip()
-        if not stream_id:
-            continue
-        if not isinstance(position, int) or isinstance(position, bool) or position < 1:
-            raise ValueError("pending-report position is invalid")
-        normalized[stream_id] = position
-    path = _pending_report_path(
+    """Compatibility wrapper: claim a provisional generation boundary."""
+    return acquire_pending_report(
         project_root,
-        controller_label=label,
-        lease_nonce=nonce,
-    )
-    payload = (json.dumps({"positions": normalized}, sort_keys=True) + "\n").encode(
-        "utf-8"
-    )
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, _open_flags(create_exclusive=True), 0o600)
-    except FileExistsError:
-        return False
-    except OSError:
-        return False
-    try:
-        remaining = memoryview(payload)
-        while remaining:
-            written = os.write(fd, remaining)
-            if written <= 0:
-                raise OSError(errno.EIO, "short pending-report stamp write")
-            remaining = remaining[written:]
-    finally:
-        os.close(fd)
-    return True
+        controller_label=controller_label,
+        lease_nonce=lease_nonce,
+        positions=positions or {},
+    ) is not None
 
 
 def pending_report_high_water(
@@ -695,49 +1282,13 @@ def pending_report_high_water(
     controller_label: str,
     lease_nonce: str,
 ) -> dict[str, int] | None:
-    """Return the first-arm reported high-water, or None if none claimed yet."""
-    label = str(controller_label or "").strip()
-    nonce = str(lease_nonce or "").strip()
-    if not label or not nonce:
-        raise ValueError("controller label and lease nonce are required")
-    path = _pending_report_path(
+    """Return the live claim boundary for every durable phase."""
+    state = pending_report_state(
         project_root,
-        controller_label=label,
-        lease_nonce=nonce,
+        controller_label=controller_label,
+        lease_nonce=lease_nonce,
     )
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    except OSError:
-        return None
-    text = raw.strip()
-    if not text or text == "claimed":
-        # Pre-persistence stamps exist but carry no positions; treat as
-        # unknown so the caller can fall back to its own peek.
-        return None
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    positions = payload.get("positions")
-    if not isinstance(positions, dict):
-        return None
-    normalized: dict[str, int] = {}
-    for stream, position in positions.items():
-        stream_id = str(stream or "").strip()
-        if not stream_id:
-            continue
-        try:
-            value = int(position)
-        except (TypeError, ValueError):
-            continue
-        if value < 1:
-            continue
-        normalized[stream_id] = value
-    return normalized
+    return None if state is None else dict(state.positions)
 
 
 def _ring_stamp_lock_path(project_root: Path | str, *, controller_label: str) -> Path:
