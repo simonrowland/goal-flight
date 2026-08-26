@@ -178,6 +178,28 @@ def test_secret_holdback_keeps_incomplete_prefix() -> None:
     assert PLACEHOLDER.encode("utf-8") not in emit
 
 
+def test_secret_holdback_keeps_19_char_entropy_prefix() -> None:
+    """xai- + 19 entropy chars sits on the 19/20 match boundary.
+
+    One more char becomes a credential; holding 19 must not emit the prefix.
+    """
+    prefix = b"xai-" + b"a" * 19
+    assert len(prefix) == 23
+    buf = b"hello " + prefix
+    hold = redact.secret_holdback_len(buf)
+    assert hold == 23, hold
+    emit, keep = redact.split_partial_flush(buf)
+    assert emit == b"hello "
+    assert keep == prefix
+    completed = prefix + b"b trailing\n"
+    flushed, leftover = redact.split_partial_flush(completed)
+    assert leftover == b""
+    assert prefix not in flushed
+    assert b"xai-" + b"a" * 20 not in flushed
+    assert redact.REDACTED.encode("utf-8") in flushed
+    assert b"trailing" in flushed
+
+
 def test_write_status_redacts_nested_marker_text(tmp_path: Path) -> None:
     path = tmp_path / "worker.status.json"
     payload = {

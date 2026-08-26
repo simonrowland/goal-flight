@@ -51,6 +51,7 @@ from goalflight_watch import (  # noqa: E402
     BLOCKING_TERMINAL_MARKERS,
     SUCCESS_TERMINAL_MARKERS,
     TERMINAL_MARKERS,
+    live_descendant_count,
 )
 
 DEFAULT_REMOTE_TURN_SILENCE_S = 1200.0
@@ -3577,10 +3578,17 @@ async def _run_acp_dispatch_impl(
         keep_waiting, cpu = await idle_gate.keep_waiting(
             lambda: asyncio.to_thread(pgroup_cpu_pct, pgid)
         )
+        descendants = None
+        if not keep_waiting:
+            descendants = await asyncio.to_thread(live_descendant_count, proc.pid)
+            # Unknown or live children: cannot treat CPU-idle as death.
+            if descendants is None or descendants > 0:
+                keep_waiting = True
         await update_status(
             state="running_quiet" if keep_waiting else "wedged",
             pgid=pgid,
             pgroup_cpu_pct=cpu,
+            live_descendants=descendants,
             worker_alive=(proc.returncode is None),
             heartbeat_at=_now(),
         )

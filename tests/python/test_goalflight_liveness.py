@@ -22,6 +22,10 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import goalflight_liveness  # noqa: E402
 import goalflight_capacity  # noqa: E402
 from goalflight_liveness import (  # noqa: E402
+    INDETERMINATE_LIVENESS_FLOOR_S,
+    LIVENESS_INDETERMINATE_STATE,
+    TREE_PROBE_MEASURED,
+    TREE_PROBE_UNAVAILABLE,
     _system_starved_uncached,
     active_monotonic,
     heartbeat_wedge_decision,
@@ -36,6 +40,7 @@ from goalflight_liveness import (  # noqa: E402
     parse_ps_pgroup_cputime,
     pgroup_cpu_pct,
     progress_stall_decision,
+    resolve_indeterminate_timeout_s,
     system_starved,
     system_sleep_pause_note,
     system_sleep_pause_s,
@@ -215,6 +220,7 @@ def test_idle_silent_worker_classifies_wedged() -> None:
         pgroup_cpu=0.0,
         seconds_since_event=30.0,
         thresholds=thresholds,
+        live_descendants=0,
     )
     assert state == "wedged", state
 
@@ -264,6 +270,95 @@ def test_unmeasured_descendants_do_not_invent_a_kill() -> None:
     ) == "running"
 
 
+def test_unknown_descendants_with_idle_cpu_keep_running() -> None:
+    thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
+    assert (
+        classify_liveness(
+            True, 0.0, 30.0, thresholds, live_descendants=None, tree_age_s=None
+        )
+        == "running"
+    )
+
+
+def test_unknown_tree_with_idle_cpu_keep_running() -> None:
+    thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
+    assert (
+        classify_liveness(
+            True,
+            0.0,
+            30.0,
+            thresholds,
+            live_descendants=0,
+            tree_age_s=None,
+            tree_probe=TREE_PROBE_UNAVAILABLE,
+        )
+        == "running"
+    )
+
+
+def test_unknown_probes_give_up_as_indeterminate_not_wedged() -> None:
+    thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
+    assert (
+        classify_liveness(
+            True,
+            0.0,
+            19.9,
+            thresholds,
+            live_descendants=None,
+            tree_probe=TREE_PROBE_UNAVAILABLE,
+            indeterminate_timeout_s=20.0,
+        )
+        == "running"
+    )
+    assert (
+        classify_liveness(
+            True,
+            0.0,
+            20.0,
+            thresholds,
+            live_descendants=None,
+            tree_probe=TREE_PROBE_UNAVAILABLE,
+            indeterminate_timeout_s=20.0,
+        )
+        == LIVENESS_INDETERMINATE_STATE
+    )
+    assert (
+        classify_liveness(
+            True,
+            0.0,
+            INDETERMINATE_LIVENESS_FLOOR_S,
+            thresholds,
+            live_descendants=None,
+        )
+        == LIVENESS_INDETERMINATE_STATE
+    )
+
+
+def test_empty_measured_tree_is_stale_not_unknown() -> None:
+    thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
+    assert (
+        classify_liveness(
+            True,
+            0.0,
+            30.0,
+            thresholds,
+            live_descendants=0,
+            tree_age_s=None,
+            tree_probe=TREE_PROBE_MEASURED,
+        )
+        == "wedged"
+    )
+
+
+def test_indeterminate_timeout_floor_covers_b238_worker() -> None:
+    assert resolve_indeterminate_timeout_s(300.0) == INDETERMINATE_LIVENESS_FLOOR_S
+    assert resolve_indeterminate_timeout_s(900.0) == INDETERMINATE_LIVENESS_FLOOR_S
+    assert resolve_indeterminate_timeout_s(3600.0) == INDETERMINATE_LIVENESS_FLOOR_S
+    assert resolve_indeterminate_timeout_s(36000.0) == 36000.0
+    assert resolve_indeterminate_timeout_s(10.0, override=2.0) == 2.0
+    assert INDETERMINATE_LIVENESS_FLOOR_S >= 55 * 60 + 30 * 60
+
+
 def test_none_cpu_idle_keeps_running() -> None:
     # CPU sample unavailable (ps failed) + idle-expired does not prove idle.
     # Keep waiting instead of false-killing a healthy quiet worker.
@@ -288,6 +383,7 @@ def test_starved_zero_cpu_extends_idle_once_then_wedges() -> None:
         thresholds,
         low_power_relax=True,
         low_power_relax_factor=3.0,
+        live_descendants=0,
     ) == "running"
     assert classify_liveness(
         True,
@@ -296,6 +392,7 @@ def test_starved_zero_cpu_extends_idle_once_then_wedges() -> None:
         thresholds,
         low_power_relax=True,
         low_power_relax_factor=3.0,
+        live_descendants=0,
     ) == "running"
     assert classify_liveness(
         True,
@@ -304,6 +401,7 @@ def test_starved_zero_cpu_extends_idle_once_then_wedges() -> None:
         thresholds,
         low_power_relax=True,
         low_power_relax_factor=3.0,
+        live_descendants=0,
     ) == "wedged"
 
 
@@ -320,16 +418,19 @@ def test_starved_long_idle_wedges_at_absolute_cap_not_multiplied() -> None:
     assert classify_liveness(
         True, 0.0, 36000.0 + cap - 1.0, thresholds,
         low_power_relax=True, low_power_relax_factor=3.0,
+        live_descendants=0,
     ) == "running"
     # at the absolute wall -> wedged (NOT extended to idle*3 = 108000s)
     assert classify_liveness(
         True, 0.0, 36000.0 + cap, thresholds,
         low_power_relax=True, low_power_relax_factor=3.0,
+        live_descendants=0,
     ) == "wedged"
     # well before idle*3 but past idle+cap -> wedged (proves no 30h hang)
     assert classify_liveness(
         True, 0.0, 50000.0, thresholds,
         low_power_relax=True, low_power_relax_factor=3.0,
+        live_descendants=0,
     ) == "wedged"
 
 
@@ -340,10 +441,12 @@ def test_starved_short_idle_still_gets_factor_benefit() -> None:
     assert classify_liveness(
         True, 0.0, 850.0, thresholds,
         low_power_relax=True, low_power_relax_factor=3.0,
+        live_descendants=0,
     ) == "running"
     assert classify_liveness(
         True, 0.0, 900.0, thresholds,
         low_power_relax=True, low_power_relax_factor=3.0,
+        live_descendants=0,
     ) == "wedged"
 
 
@@ -356,6 +459,7 @@ def test_not_starved_zero_cpu_still_wedges_at_idle_timeout() -> None:
         10.0,
         thresholds,
         low_power_relax=False,
+        live_descendants=0,
     ) == "wedged"
 
 

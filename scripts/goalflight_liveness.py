@@ -33,6 +33,17 @@ LOW_POWER_RELAX_FACTOR = 3.0
 # hang. So a starved worker waits at most idle_timeout + 10min before wedging,
 # preserving the fail-fast / no-multi-hour-hang invariant regardless of config.
 LOW_POWER_RELAX_CAP_S = 600.0
+# Give-up bound when a liveness probe cannot determine its answer. Unknown
+# never counts as death (the b-238 class: a failed `ps` on a busy box looks
+# like "no children"). Waiting forever leaks capacity. 7200s is 2 hours:
+# a 55-minute working worker (b-238) survives with ~65 minutes of margin,
+# and the bound matches the dispatch lease TTL cap. Known-idle still dies
+# at idle_timeout; only cannot-tell waits until max(idle_timeout, this floor).
+INDETERMINATE_LIVENESS_FLOOR_S = 7200.0
+LIVENESS_INDETERMINATE_STATE = "liveness_indeterminate"
+TREE_PROBE_SKIPPED = "skipped"
+TREE_PROBE_MEASURED = "measured"
+TREE_PROBE_UNAVAILABLE = "unavailable"
 _SYSTEM_STARVED_CACHE: tuple[float, bool] | None = None
 _STATUS_EPOCH_SCHEMAS = {"goalflight.acp-run.v1", "goalflight.status.v1"}
 _STATUS_EPOCH_CACHE: dict[str, str] = {}
@@ -500,6 +511,23 @@ def cpu_confirmed_idle(cpu_pct: float | None, epsilon_pct: float) -> bool:
     return cpu_pct is not None and cpu_pct <= epsilon_pct
 
 
+def resolve_indeterminate_timeout_s(
+    idle_timeout_s: float | None,
+    override: float | None = None,
+) -> float:
+    """Seconds of silence before cannot-tell liveness gives up capacity.
+
+    Override, when positive, is the bound. Otherwise the bound is
+    ``max(idle_timeout, INDETERMINATE_LIVENESS_FLOOR_S)`` so a short one-shot
+    idle still waits two hours when probes fail, and a long goal-mode idle
+    does not die earlier just because the probes were unknown.
+    """
+    if override is not None and override > 0:
+        return float(override)
+    idle = float(idle_timeout_s) if idle_timeout_s is not None and idle_timeout_s > 0 else 0.0
+    return max(idle, INDETERMINATE_LIVENESS_FLOOR_S)
+
+
 def classify_liveness(
     pid_alive: bool,
     pgroup_cpu: float | None,
@@ -510,6 +538,8 @@ def classify_liveness(
     low_power_relax_factor: float = LOW_POWER_RELAX_FACTOR,
     live_descendants: int | None = None,
     tree_age_s: float | None = None,
+    tree_probe: str = TREE_PROBE_SKIPPED,
+    indeterminate_timeout_s: float | None = None,
 ) -> LivenessState:
     """Classify worker liveness from identity, activity, and progress silence.
 
@@ -525,8 +555,18 @@ def classify_liveness(
     - process-group CPU above epsilon: already-busy work, even with no children
       in the sample.
 
-    Unavailable CPU still fails open. Missing descendant/tree samples simply
-    omit those vetoes; they do not invent a kill.
+    The three probes are symmetric. A probe that cannot determine its answer
+    is unknown, and unknown is never evidence of death. ``idle_timeout`` /
+    ``wedged`` requires every *applicable* probe to have looked and found
+    nothing. If the watcher later gives up because it still cannot tell,
+    the state is ``liveness_indeterminate``, not ``wedged``: that reason
+    names the gap instead of asserting the worker was idle.
+
+    ``tree_probe`` is ``skipped`` when there is no distinct worker cwd
+    (canonical-root writes are other workers'; do not invent a sample),
+    ``measured`` when the walk finished, and ``unavailable`` when the walk
+    failed. A numeric ``tree_age_s`` without an explicit probe is treated
+    as ``measured`` so existing callers stay valid.
     """
     if not pid_alive:
         return "worker_dead"
@@ -541,20 +581,34 @@ def classify_liveness(
     if not idle_expired:
         return "running"
 
-    if live_descendants is not None and live_descendants > 0:
-        return "running_quiet"
-    if (
-        tree_age_s is not None
+    if tree_probe == TREE_PROBE_SKIPPED and tree_age_s is not None:
+        tree_probe = TREE_PROBE_MEASURED
+
+    descendants_alive = live_descendants is not None and live_descendants > 0
+    tree_alive = (
+        tree_probe == TREE_PROBE_MEASURED
+        and tree_age_s is not None
         and idle_timeout is not None
         and idle_timeout > 0
         and tree_age_s < idle_timeout
-    ):
+    )
+    cpu_alive = pgroup_cpu is not None and pgroup_cpu > thresholds.cpu_epsilon_pct
+    if descendants_alive or tree_alive or cpu_alive:
         return "running_quiet"
 
-    if pgroup_cpu is None:
+    unknown = (
+        live_descendants is None
+        or tree_probe == TREE_PROBE_UNAVAILABLE
+        or pgroup_cpu is None
+    )
+    if unknown:
+        give_up_s = resolve_indeterminate_timeout_s(
+            idle_timeout, indeterminate_timeout_s
+        )
+        if seconds_since_event is not None and seconds_since_event >= give_up_s:
+            return LIVENESS_INDETERMINATE_STATE
         return "running"
-    if pgroup_cpu > thresholds.cpu_epsilon_pct:
-        return "running_quiet"
+
     if low_power_relax and cpu_confirmed_idle(pgroup_cpu, thresholds.cpu_epsilon_pct):
         # Absolute hard wall: the relax adds at most LOW_POWER_RELAX_CAP_S of
         # extra grace, never a multiple of a long idle_timeout. min() of the

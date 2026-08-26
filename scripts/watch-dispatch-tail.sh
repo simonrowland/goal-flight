@@ -9,6 +9,7 @@
 #   - worker PID dies without terminal marker     → exit 1  ("WATCHER-EXIT: pid-dead")
 #   - no tail update for --max-idle-secs seconds, no live children, and
 #     process-group CPU idle → exit 2  ("WATCHER-EXIT: idle-timeout")
+#   - unknown descendants/CPU never count as idle; give-up is runtime-timeout
 #   - direct watcher exceeds total runtime         → exit 2  ("WATCHER-EXIT: runtime-timeout")
 #   - orchestrator PID dies                         → exit 3  ("WATCHER-EXIT: controller-dead")
 #
@@ -332,7 +333,6 @@ POST_TERMINAL_EXIT_GRACE_SECS=6
 # Not a flag — this is the watcher mirror of the runner's intra-decision
 # re-sample grace (goalflight_liveness.cpu_liveness_keep_waiting).
 WEDGE_CONFIRM_SAMPLES=5
-CPU_UNKNOWN_CONFIRM_SAMPLES=$(( WEDGE_CONFIRM_SAMPLES + 2 ))
 # Pidfile dir. Honors $GOAL_FLIGHT_PIDFILE_DIR so tests can redirect registration
 # into an isolated temp dir. Default is unchanged, so in production the watcher and
 # scripts/acp_client.py still share /tmp/goal-flight-acp-pids.d and cleanup_ghosts
@@ -799,15 +799,17 @@ while true; do
           continue
         fi
         if [ "$cpu_check_rc" -eq 2 ]; then
-          wedge_streak=$(( wedge_streak + 1 ))
-          if [ "$wedge_streak" -lt "$CPU_UNKNOWN_CONFIRM_SAMPLES" ]; then
-            echo "[$(date '+%H:%M:%S')] WATCHER-STATE: running_quiet worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=unknown idle_for=${idle_for}s (cpu unavailable $wedge_streak/$CPU_UNKNOWN_CONFIRM_SAMPLES) — re-checking"
-            sleep "$POLL_SECS"
-            continue
-          fi
+          echo "[$(date '+%H:%M:%S')] WATCHER-STATE: running_quiet worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=unknown idle_for=${idle_for}s (cpu unavailable; unknown is not idle)"
+          sleep "$POLL_SECS"
+          continue
         fi
         desc_count=$(live_descendant_count "$WORKER_PID")
-        if [ "$desc_count" != "unknown" ] && [ "$desc_count" -gt 0 ]; then
+        if [ "$desc_count" = "unknown" ]; then
+          echo "[$(date '+%H:%M:%S')] WATCHER-STATE: running_quiet worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=$cpu_pct live_descendants=unknown idle_for=${idle_for}s (descendants unavailable; unknown is not idle)"
+          sleep "$POLL_SECS"
+          continue
+        fi
+        if [ "$desc_count" -gt 0 ]; then
           wedge_streak=0
           echo "[$(date '+%H:%M:%S')] WATCHER-STATE: running_quiet worker_pid=$WORKER_PID pgid=$worker_pgid pgroup_cpu_pct=$cpu_pct live_descendants=$desc_count idle_for=${idle_for}s (live child; tail-quiet is not idle)"
           sleep "$POLL_SECS"

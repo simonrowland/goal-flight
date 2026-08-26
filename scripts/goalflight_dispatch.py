@@ -1041,7 +1041,7 @@ def _status_exit_code(state: object) -> int:
         return 1
     if state == "rate_limited":
         return 1
-    if state == "idle_timeout":
+    if state in {"idle_timeout", "liveness_indeterminate"}:
         return 2
     if state in {"orphaned", "controller_dead"}:
         return 3

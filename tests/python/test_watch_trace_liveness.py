@@ -356,6 +356,7 @@ def test_trace_stopping_resumes_normal_idle_classification() -> None:
         0.0,
         31.0,
         watch.LivenessThresholds(idle_timeout_s=30.0, cpu_epsilon_pct=0.1),
+        live_descendants=0,
     )
     assert verdict == "wedged"
 
@@ -427,12 +428,14 @@ def test_channel_absent_keeps_verdict_identical() -> None:
         0.0,
         31.0,
         watch.LivenessThresholds(idle_timeout_s=30.0, cpu_epsilon_pct=0.1),
+        live_descendants=0,
     )
     absent = watch.classify_liveness(
         True,
         0.0,
         31.0,
         watch.LivenessThresholds(idle_timeout_s=30.0, cpu_epsilon_pct=0.1),
+        live_descendants=0,
     )
     assert baseline == absent == "wedged"
 

@@ -58,7 +58,9 @@ FAILURE_TERMINAL_RECORD_STATES = frozenset(
     }
 ) | LIMIT_TERMINAL_STATES
 
-WEDGED_TERMINAL_RECORD_STATES = frozenset({"idle_timeout", "wedged"})
+WEDGED_TERMINAL_RECORD_STATES = frozenset(
+    {"idle_timeout", "wedged", "liveness_indeterminate"}
+)
 
 # Watch-layer live salvage CANDIDATE. The process is still alive and may
 # hold finished work or be waiting on a remote job; the controller decides.
@@ -149,7 +151,9 @@ STATE_SEQ_RANKS = {
 
 AMBIGUOUS_LIVE_CLASSES = frozenset({"unknown_no_pid", "identity_indeterminate", "unknown"})
 
-LIVENESS_RECHECK_STATES = frozenset({"idle_timeout", "watcher_stopped"})
+LIVENESS_RECHECK_STATES = frozenset(
+    {"idle_timeout", "watcher_stopped", "liveness_indeterminate"}
+)
 
 OUTPUT_TAIL_RECONCILE_STATES = frozenset(
     {
@@ -157,6 +161,7 @@ OUTPUT_TAIL_RECONCILE_STATES = frozenset(
         "watcher_stopped",
         "idle_timeout",
         "inconclusive_timeout",
+        "liveness_indeterminate",
     }
 ) | LIMIT_TERMINAL_STATES
 
@@ -166,6 +171,7 @@ LIMIT_RECONCILE_INPUT_STATES = frozenset(
     {
         "idle_timeout",
         "inconclusive_timeout",
+        "liveness_indeterminate",
         "running_quiet",
         "stalled",
         "watcher_stopped",
@@ -363,6 +369,8 @@ def terminal_state_for(state: object, reason: object = None) -> str:
         return "worker_dead"
     if is_limit_state(state):
         return str(state)
+    if state == "liveness_indeterminate":
+        return "liveness_indeterminate"
     if state == "idle_timeout" or state == "inconclusive_timeout":
         return "idle_timeout"
     if state == "watcher_stopped":
