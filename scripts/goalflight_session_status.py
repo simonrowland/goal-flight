@@ -194,7 +194,11 @@ def _registered_controller_records(
     try:
         root = goalflight_task.resolve_project_root(str(project_root))
         authority = goalflight_journal.Journal(root)
-    except goalflight_journal.JournalUnavailable:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
         return []
     records = []
     for row in authority.lease_records(include_ended=include_retired):
@@ -940,7 +944,9 @@ def probe_live_session(
         return "dead", None
     except goalflight_journal.JournalUpgradeRequired:
         raise
-    except goalflight_journal.JournalUnavailable:
+    except goalflight_journal.JournalBusy:
+        return "unreadable", None
+    except goalflight_journal.JournalIOError:
         return "unreadable", None
     except (OSError, goalflight_journal.JournalError):
         return "unreadable", None
@@ -1081,7 +1087,11 @@ def claim_controller_startup(
                 "reason": "controller_label_conflict",
                 "conflicting_beacons": live["conflicting_beacons"],
             }
-    except goalflight_journal.JournalUnavailable as exc:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
         return {
             "claimed": False,
             "reason": "claim_failed",
@@ -1157,7 +1167,11 @@ def register_controller(
                 process_identity=process_identity,
                 hold_lock=True,
             )
-        except goalflight_journal.JournalUnavailable as exc:
+        except (
+            goalflight_journal.JournalBusy,
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+        ) as exc:
             return {
                 "registered": False,
                 "reason": "claim_failed",
@@ -1194,7 +1208,11 @@ def register_controller(
             nonce=session_id,
             incumbent_liveness=incumbent_liveness,
         )
-    except goalflight_journal.JournalUnavailable as exc:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
         return {"registered": False, "reason": "claim_failed", "message": str(exc)}
     except goalflight_journal.JournalError:
         raise
@@ -1267,7 +1285,11 @@ def join_controller(
                 takeover=acknowledge_conflict,
                 hold_lock=True,
             )
-        except goalflight_journal.JournalUnavailable as exc:
+        except (
+            goalflight_journal.JournalBusy,
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+        ) as exc:
             return {
                 "joined": False,
                 "reason": "claim_failed",
@@ -1530,7 +1552,11 @@ def retire_controller(
         return {"retired": False, "reason": "missing_controller_label"}
     try:
         authority = goalflight_journal.Journal(project_root)
-    except goalflight_journal.JournalUnavailable:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
         return {"retired": False, "reason": "controller_not_registered"}
     lease = authority.active_lease(label)
     if lease is None:
@@ -1587,7 +1613,11 @@ def release_session(project_root: Path, *, pid: int) -> bool:
     """Release the active lease owned by this exact process generation."""
     try:
         authority = goalflight_journal.Journal(project_root)
-    except goalflight_journal.JournalUnavailable:
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
         return False
     measured = _controller_process_identity(pid)
     if measured is None:
@@ -2575,7 +2605,11 @@ def main(argv: list[str] | None = None) -> int:
                 takeover=args.takeover,
                 hold_lock=True,
             )
-        except goalflight_journal.JournalUnavailable as exc:
+        except (
+            goalflight_journal.JournalBusy,
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+        ) as exc:
             print(
                 json.dumps(
                     {

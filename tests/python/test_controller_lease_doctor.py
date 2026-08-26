@@ -115,7 +115,7 @@ def test_doctor_absent_journal_is_healthy_missing_lease_surface(
     (
         journal.JournalIOError("present journal cannot be opened"),
         journal.JournalDisappeared("journal vanished after path check"),
-        journal.JournalUnavailable("journal connection remained busy"),
+        journal.JournalBusy("journal connection remained busy"),
     ),
 )
 def test_doctor_unreadable_journal_is_not_false_green(

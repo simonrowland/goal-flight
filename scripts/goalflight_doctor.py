@@ -572,7 +572,7 @@ def check_controller_lease_liveness(project_root: Path) -> dict:
     journal_path = goalflight_journal.resolve_journal_path(resolved_root)
     if not os.path.lexists(journal_path):
         # No journal file: there is no lease surface. That is a real, healthy
-        # doctor state. JournalUnavailable (busy) and its fatal subclasses
+        # doctor state. JournalBusy and the fatal subclasses
         # (JournalDisappeared after the path was present, JournalIOError)
         # are unread authority, not absence — they must not report green.
         return {
@@ -586,6 +586,21 @@ def check_controller_lease_liveness(project_root: Path) -> dict:
         }
     try:
         records = goalflight_journal.Journal.open_reader(resolved_root).lease_records()
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ) as exc:
+        return {
+            "ok": False,
+            "present": True,
+            "project_root": str(resolved_root),
+            "error": f"{type(exc).__name__}: {exc}",
+            "active_controller_leases_in_project": 0,
+            "active_but_dead_controller_leases_in_project": 0,
+            "unknown_controller_lease_holders_in_project": 0,
+            "leases": [],
+        }
     except (goalflight_journal.JournalError, OSError, ValueError) as exc:
         return {
             "ok": False,

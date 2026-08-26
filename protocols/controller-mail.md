@@ -262,14 +262,19 @@ supplemental diagnostics only. The one exception is transient journal busy: it i
 load symptom, so listeners outlast it (single degrade/recover notices, bounded by a
 300-second continuous-failure window) instead of faulting. The first bounded
 operation completes before that clock starts, and expiry can be observed after one
-30-second backoff plus one final 10-second operation, so outage-to-exit can approach
-350 seconds plus scheduler delay. That remains the true bound for the human-readable
-backup too: it batches all synthetic attention carriers through one bounded journal
-read and materializes every receipt under busy tolerance before persisting either the
-arm high-water or ring reservation. A failed stdout delivery rolls its exact claim
-back so a replacement can report the unread cursor. A verified-vanished journal
+30-second backoff plus one final 10-second operation. Bounded listener reads/writes
+carry the same absolute operation deadline through lock, connect, query, and
+transaction stages, so continuous busy is bounded at 350 seconds plus scheduler
+delay instead of composing hidden stage budgets. That is also the bound for the
+human-readable backup: it batches all
+synthetic attention carriers through one bounded journal read and materializes every
+receipt under busy tolerance before persisting either the arm high-water or ring
+reservation. A failed stdout delivery rolls its exact claim back so a replacement
+can report the unread cursor. A verified-vanished journal
 still faults immediately; journal path identity/stat I/O and exhausted present-path
-open retries are also fatal rather than being mislabeled as busy.
+open retries are also fatal rather than being mislabeled as busy. The busy bound
+depends on elapsed time, not retry count: an earlier stage or the first timeout=0
+connect may spend the absolute deadline and correctly stop after one attempt.
 
 `--listener-slots`, `GOALFLIGHT_LISTENER_SLOTS`, and
 `GOALFLIGHT_LISTENER_LOW_WATER` tune only portable `listen`. Persistent backup

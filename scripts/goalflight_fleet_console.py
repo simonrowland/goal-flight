@@ -964,6 +964,12 @@ def _journal_authority_by_dispatch(
                     tuple(chunk),
                 )
             )
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
+        return {}
     except (goalflight_journal.JournalError, OSError, ValueError):
         return {}
     return {
@@ -979,6 +985,12 @@ def _project_journal_reader(
     """Open at most one read-only journal handle for a fast-plane project."""
     try:
         return goalflight_journal.Journal.open_reader(project_root)
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
+        return None
     except (goalflight_journal.JournalError, OSError, ValueError):
         return None
 
@@ -1191,6 +1203,12 @@ def probe_holder_lock(
     try:
         authority = goalflight_journal.Journal.open_reader(root)
         rows = authority.lease_records(include_ended=generation is not None)
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
+        return None
     except (goalflight_journal.JournalError, OSError, ValueError):
         return None
     matches: list[dict[str, Any]] = []
@@ -1541,6 +1559,15 @@ def _controller_contexts_by_session(
         lease_rows = authority.lease_records(
             include_ended=include_ended or include_locked_ended
         )
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
+        return {
+            session_id: _empty_controller_context()
+            for session_id in (requested or set())
+        }
     except (goalflight_journal.JournalError, OSError, ValueError):
         return {
             session_id: _empty_controller_context()
@@ -1761,6 +1788,12 @@ def _controller_labels_by_session(
         lease_rows = goalflight_journal.Journal.open_reader(
             project_root
         ).lease_records(include_ended=True)
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+    ):
+        return {}
     except (goalflight_journal.JournalError, OSError, ValueError):
         return {}
     labels: dict[str, set[str]] = {}

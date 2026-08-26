@@ -418,9 +418,9 @@ def _persist_draft_artifact_reconciliation(record: dict, reconciled: dict) -> bo
         return False
     except (goalflight_journal.JournalDisappeared, goalflight_journal.JournalIOError):
         raise
-    except goalflight_journal.JournalUnavailable:
-        # Base JournalUnavailable is busy/contention. A later sweep remains
-        # eligible; claiming complete here would split display from the ledger.
+    except goalflight_journal.JournalBusy:
+        # Busy/contention. A later sweep remains eligible; claiming complete
+        # here would split display from the ledger.
         return False
     return True
 

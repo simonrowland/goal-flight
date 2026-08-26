@@ -838,7 +838,7 @@ def _open_readonly_connection(
                 # corruption evidence; busy remains retryable. A mere open
                 # failure never becomes a corruption verdict.
                 raise
-            raise JournalUnavailable(
+            raise JournalIOError(
                 f"journal readonly probe unavailable/unreadable for {path}: "
                 f"readonly open failed: {primary_exc}; failing closed"
             ) from primary_exc
@@ -859,7 +859,7 @@ def _open_readonly_connection(
     except sqlite3.DatabaseError as fallback_exc:
         if _is_busy(fallback_exc):
             raise
-        raise JournalUnavailable(
+        raise JournalIOError(
             _dual_open_unavailable(path, primary_failure, fallback_exc, stage="open")
         ) from fallback_exc
     try:
@@ -870,7 +870,7 @@ def _open_readonly_connection(
         fallback.close()
         if _is_corruption_error(fallback_exc) or _is_busy(fallback_exc):
             raise
-        raise JournalUnavailable(
+        raise JournalIOError(
             _dual_open_unavailable(path, primary_failure, fallback_exc, stage="probe")
         ) from fallback_exc
 
@@ -1078,7 +1078,7 @@ class Journal:
         except FileExistsError:
             raise JournalError(f"journal init raced an existing database: {self.path}")
         except OSError as exc:
-            raise JournalUnavailable(f"cannot create journal path {self.path}: {exc}") from exc
+            raise JournalIOError(f"cannot create journal path {self.path}: {exc}") from exc
         else:
             os.close(fd)
 
@@ -1104,7 +1104,7 @@ class Journal:
                         timeout=0,
                         isolation_level=None,
                     )
-            except JournalUnavailable as exc:
+            except (JournalDisappeared, JournalIOError) as exc:
                 open_failures += 1
                 self._raise_disappeared_if_absent(exc)
                 if self._open_retry_delay(open_started, open_failures):
@@ -1132,7 +1132,7 @@ class Journal:
                         continue
                     raise self._open_io_failure(open_started, open_failures, exc) from exc
                 if self._read_only_client:
-                    raise JournalUnavailable(
+                    raise JournalIOError(
                         f"journal readonly probe unavailable/unreadable for {self.path}: "
                         f"{exc}; failing closed"
                     ) from exc
@@ -1158,7 +1158,7 @@ class Journal:
                             open_started, open_failures, exc
                         ) from exc
                     if self._read_only_client:
-                        raise JournalUnavailable(
+                        raise JournalIOError(
                             f"journal readonly probe unavailable/unreadable for {self.path}: "
                             f"{exc}; failing closed"
                         ) from exc
@@ -1212,8 +1212,8 @@ class Journal:
                 connection = self._connect()
             except JournalBusy:
                 raise
-            except JournalUnavailable as exc:
-                raise JournalUnavailable(
+            except (JournalDisappeared, JournalIOError) as exc:
+                raise type(exc)(
                     f"journal startup could not open a configured connection: {self.path}"
                 ) from exc
             try:
@@ -2095,12 +2095,13 @@ class Journal:
                 f"limit is {MAX_TRANSACTION_PARAMETER_BYTES}"
             )
         started = time.monotonic()
+        operation_deadline = started + self.retry_budget_s
         attempts = 0
         while True:
             attempts += 1
             write_lock = goalflight_task.FileLock.try_acquire(
                 journal_write_lock_path(self.path),
-                deadline_s=started + self.retry_budget_s,
+                deadline_s=operation_deadline,
             )
             if write_lock is None:
                 return WriteResult(
@@ -2112,8 +2113,8 @@ class Journal:
                     ),
                 )
             try:
-                connection = self._connect()
-            except JournalUnavailable as exc:
+                connection = self._connect(busy_deadline_s=operation_deadline)
+            except JournalBusy as exc:
                 write_lock.release()
                 return WriteResult(
                     WriteDisposition.RETRYABLE,
@@ -2125,11 +2126,16 @@ class Journal:
                 raise
             try:
                 transaction_started = time.monotonic()
-                deadline = transaction_started + self.transaction_budget_s
+                deadline = min(
+                    operation_deadline,
+                    transaction_started + self.transaction_budget_s,
+                )
                 connection.set_progress_handler(
                     lambda: 1 if time.monotonic() >= deadline else 0,
                     1000,
                 )
+                if transaction_started >= deadline:
+                    raise TimeoutError("journal operation deadline reached before transaction")
                 connection.execute("BEGIN IMMEDIATE")
                 self._assert_epoch_fence(connection, for_write=True)
                 values: list[RowWrite] = []
@@ -2198,12 +2204,13 @@ class Journal:
     def _domain_write(self, action: Callable[[sqlite3.Connection], T]) -> WriteResult[T]:
         """Run one module-owned bounded transaction for P2 state machines."""
         started = time.monotonic()
+        operation_deadline = started + self.retry_budget_s
         attempts = 0
         while True:
             attempts += 1
             write_lock = goalflight_task.FileLock.try_acquire(
                 journal_write_lock_path(self.path),
-                deadline_s=started + self.retry_budget_s,
+                deadline_s=operation_deadline,
             )
             if write_lock is None:
                 return WriteResult(
@@ -2212,7 +2219,7 @@ class Journal:
                     reason=f"journal write lock timeout within {self.retry_budget_s:.3f}s",
                 )
             try:
-                connection = self._connect()
+                connection = self._connect(busy_deadline_s=operation_deadline)
             except JournalBusy as exc:
                 write_lock.release()
                 return WriteResult(
@@ -2220,7 +2227,7 @@ class Journal:
                     attempts=attempts,
                     reason=str(exc),
                 )
-            except JournalUnavailable:
+            except (JournalDisappeared, JournalIOError):
                 # Disappearance and path/open I/O failures are not contention.
                 # Preserve their typed fatal contract instead of flattening
                 # them into a RETRYABLE result that a caller may treat as busy.
@@ -2230,11 +2237,17 @@ class Journal:
                 write_lock.release()
                 raise
             try:
-                deadline = time.monotonic() + self.transaction_budget_s
+                transaction_started = time.monotonic()
+                deadline = min(
+                    operation_deadline,
+                    transaction_started + self.transaction_budget_s,
+                )
                 connection.set_progress_handler(
                     lambda: 1 if time.monotonic() >= deadline else 0,
                     1000,
                 )
+                if transaction_started >= deadline:
+                    raise TimeoutError("journal operation deadline reached before transaction")
                 connection.execute("BEGIN IMMEDIATE")
                 self._assert_epoch_fence(connection, for_write=True)
                 value = action(connection)
@@ -4869,7 +4882,8 @@ class Journal:
                 fallback_to_wildcard_if_inactive=require_active,
             )
             if not recorded.committed or recorded.value is None:
-                raise JournalUnavailable(
+                failure_type = JournalBusy if recorded.retryable else JournalError
+                raise failure_type(
                     recorded.reason or "terminal delivery assignment was not committed"
                 )
             actual_recipient = str(recorded.value["recipient_label"])
@@ -4879,7 +4893,8 @@ class Journal:
                 event_uuid=event_uuid,
             )
             if not marked.committed or marked.value is None:
-                raise JournalUnavailable(
+                failure_type = JournalBusy if marked.retryable else JournalError
+                raise failure_type(
                     marked.reason or "terminal delivery projection was not committed"
                 )
             # Retirement can transactionally rehome an exact row to wildcard
@@ -4896,7 +4911,8 @@ class Journal:
             authoritative_recipients=actual_recipients,
         )
         if not reconciled.committed:
-            raise JournalUnavailable(
+            failure_type = JournalBusy if reconciled.retryable else JournalError
+            raise failure_type(
                 reconciled.reason or "stale terminal delivery reconciliation was not committed"
             )
 
@@ -5024,6 +5040,10 @@ def open_or_create_journal(
         return Journal(project_root, allow_migration=allow_migration)
     try:
         return Journal.create(project_root)
+    except (JournalBusy, JournalDisappeared, JournalIOError):
+        # Availability failures are not a create race. Preserve their concrete
+        # operator verdict instead of retrying them merely because a path exists.
+        raise
     except JournalError:
         if not os.path.lexists(path):
             raise
@@ -5104,7 +5124,7 @@ def restore_snapshot(
     source = Path(os.path.abspath(os.fspath(Path(snapshot).expanduser())))
     destination = resolve_journal_path(project_root)
     if not os.path.lexists(destination):
-        raise JournalUnavailable(
+        raise JournalDisappeared(
             f"restore target journal is absent: {destination}. Failing closed; use init only "
             "for an intentional bootstrap, then retry restore from the validated snapshot."
         )
@@ -5119,7 +5139,7 @@ def restore_snapshot(
 
     with goalflight_task.FileLock(journal_write_lock_path(destination)):
         if not os.path.lexists(destination):
-            raise JournalUnavailable(
+            raise JournalDisappeared(
                 f"restore target journal disappeared before exclusion was acquired: {destination}"
             )
         if destination.is_symlink() or not destination.is_file():
@@ -5141,11 +5161,12 @@ def restore_snapshot(
                         "PRAGMA wal_checkpoint(TRUNCATE)"
                     ).fetchone()
             except sqlite3.DatabaseError as exc:
-                raise JournalUnavailable(
+                failure_type = JournalBusy if _is_busy(exc) else JournalIOError
+                raise failure_type(
                     f"restore could not checkpoint the excluded target {destination}: {exc}"
                 ) from exc
             if checkpoint is None or int(checkpoint[0]) != 0:
-                raise JournalUnavailable(
+                raise JournalBusy(
                     f"restore target could not reach an offline checkpoint: {destination}"
                 )
             for sidecar in live_sidecars:
@@ -5259,12 +5280,12 @@ def _fsync_directory(path: Path) -> None:
     try:
         fd = os.open(path, flags)
     except OSError as exc:
-        raise JournalUnavailable(f"cannot fsync journal directory {path}: {exc}") from exc
+        raise JournalIOError(f"cannot fsync journal directory {path}: {exc}") from exc
     try:
         try:
             os.fsync(fd)
         except OSError as exc:
-            raise JournalUnavailable(f"cannot fsync journal directory {path}: {exc}") from exc
+            raise JournalIOError(f"cannot fsync journal directory {path}: {exc}") from exc
     finally:
         os.close(fd)
 
@@ -5323,6 +5344,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         return 0
+    except (JournalBusy, JournalDisappeared, JournalIOError) as exc:
+        print(f"{args.command}: refused: {exc}", file=sys.stderr)
+        return 2
     except (JournalError, OSError) as exc:
         print(f"{args.command}: refused: {exc}", file=sys.stderr)
         return 2

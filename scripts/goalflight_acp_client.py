@@ -1268,9 +1268,9 @@ def _finish_quota_stuck_ledger(record: dict[str, Any], *, reason: dict[str, Any]
         # re-selected once the worker PID is gone; swallowing would leave a
         # permanently nonterminal ledger row.
         raise
-    except goalflight_journal.JournalUnavailable as exc:
-        # Base JournalUnavailable is busy/contention and is the only journal
-        # class this handler treats as deferrable.
+    except goalflight_journal.JournalBusy as exc:
+        # Busy/contention is the only journal class this handler treats as
+        # deferrable.
         log.error("quota_stuck_reap: ledger update failed dispatch_id=%s: %s", dispatch_id, exc)
     return False
 

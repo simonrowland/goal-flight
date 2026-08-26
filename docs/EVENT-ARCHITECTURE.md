@@ -449,10 +449,14 @@ stream re-arm command. A merely busy journal is not a fault: the stream then
 uses a 300-second continuous-failure window, publishing one
 `listener-degraded` record when the window opens and one `listener-recovered`
 when it closes, and heartbeats keep beating so the watchdog never reads load as
-death. Because the clock opens after the first bounded operation, a busy outage
-can take about 350 seconds plus scheduler delay to fault (10s first operation +
-300s window + 30s backoff + 10s final operation). `EPIPE` has no re-arm payload
-because its reader is gone.
+death. Bounded listener reads/writes carry one absolute 10-second deadline
+through their lock, connect, query, and transaction stages rather than composing
+fresh budgets. Because the clock opens after the first bounded operation,
+continuous busy is therefore bounded at 350 seconds plus scheduler delay (10s
+first operation + 300s window plus 30s backoff + 10s final operation). `EPIPE`
+has no re-arm payload because its reader is gone. The bound is elapsed-time
+based, not attempt-count based: an earlier stage or the first timeout=0 connect
+may consume the shared deadline and correctly yield a one-attempt busy verdict.
 The watchdog remains an ordinary `listen`, so it deliberately retains journal arm
 and exit audit, tracked-task completion, and kernel-slot release.
 

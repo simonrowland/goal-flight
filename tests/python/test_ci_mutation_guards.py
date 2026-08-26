@@ -153,7 +153,7 @@ def test_missing_narrow_journal_api_is_not_silently_skipped(
     monkeypatch.setattr(status.goalflight_task, "resolve_project_root", lambda _value: project)
 
     def expected_unavailable(_cls: object, _root: object) -> object:
-        raise journal.JournalUnavailable("expected read outage")
+        raise journal.JournalBusy("expected read outage")
 
     monkeypatch.setattr(journal.Journal, "open_reader", classmethod(expected_unavailable))
     assert status._mail_watermark(str(project), ["shape-check"]) == set()

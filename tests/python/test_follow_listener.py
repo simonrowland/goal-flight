@@ -2048,15 +2048,26 @@ def test_listen_survives_busy_during_journal_coverage_arm(
     gate = threading.Event()
     gate.set()
     hits: list[str] = []
-    real_arm = journal.Journal.arm_listener
+    real_try_acquire = journal.goalflight_task.FileLock.try_acquire
 
-    def gated_arm(authority: journal.Journal, *args: object, **kwargs: object):
+    def gated_try_acquire(
+        _cls: type,
+        path: Path,
+        *,
+        deadline_s: float,
+        poll_s: float = 0.010,
+    ):
         if gate.is_set():
-            hits.append("arm_listener")
-            raise journal.JournalBusy("injected listener arm busy")
-        return real_arm(authority, *args, **kwargs)
+            if not hits:
+                hits.append("domain_write_lock")
+            return None
+        return real_try_acquire(path, deadline_s=deadline_s, poll_s=poll_s)
 
-    monkeypatch.setattr(journal.Journal, "arm_listener", gated_arm)
+    monkeypatch.setattr(
+        journal.goalflight_task.FileLock,
+        "try_acquire",
+        classmethod(gated_try_acquire),
+    )
     cap = _LiveCapture(capsys)
     thread, results = _run_in_thread(
         [
@@ -2078,7 +2089,7 @@ def test_listen_survives_busy_during_journal_coverage_arm(
     )
     try:
         cap.await_stderr("listener degraded")
-        assert hits, "arm_listener retryable injection did not bind"
+        assert hits == ["domain_write_lock"], "_domain_write retryable path did not bind"
         assert thread.is_alive()
         gate.clear()
         cap.await_stderr("listener recovered")
@@ -2177,6 +2188,54 @@ def test_listen_coverage_arm_keeps_journal_io_failure_fatal(
     assert result == 2
     assert hits == ["arm_listener"]
     assert "journal-io-failure" in cap.stderr
+    assert "listener degraded" not in cap.stderr
+
+
+def test_report_pending_one_shot_cursor_io_failure_is_fatal(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A recovered second peek must not hide the fatal arm-time failure."""
+    project, _env, lease = isolated
+    monkeypatch.setattr(messages, "LISTENER_JOURNAL_TOLERANCE_S", 3600.0)
+    _pin_listener_resolution(monkeypatch, lease)
+    real_peek = journal.Journal.cursor_peek
+    calls: list[str] = []
+
+    def fail_once(authority: journal.Journal, *args: object, **kwargs: object):
+        calls.append("cursor_peek")
+        if len(calls) == 1:
+            raise journal.JournalIOError("one-shot arm snapshot I/O failure")
+        return real_peek(authority, *args, **kwargs)
+
+    monkeypatch.setattr(journal.Journal, "cursor_peek", fail_once)
+    cap = _LiveCapture(capsys)
+    result = messages._run_cli(
+        [
+            "listen",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--listener-slots",
+            "1",
+            "--report-pending",
+            "--json",
+            "--poll-secs",
+            "0.01",
+            "--timeout-s",
+            "0.1",
+        ]
+    )
+    cap.pump()
+
+    assert result == 2
+    assert calls == ["cursor_peek"], "listener retried after a fatal one-shot failure"
+    assert "journal-io-failure" in cap.stdout
+    assert "one-shot arm snapshot I/O failure" in cap.stdout
     assert "listener degraded" not in cap.stderr
 
 
