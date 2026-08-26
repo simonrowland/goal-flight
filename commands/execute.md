@@ -66,7 +66,11 @@ forty-minute one idles the fast result for 38 minutes. Group by expected
 duration; wait separately on anything you need back early.
 
 **Arm the wait; let it wake you.** A controller entry auto-claims its canonical
-project lease. On a host whose persistent monitor turns each flushed stdout line
+project lease. Prefer one generation-bound `goalflight_messages.py supervise
+--project-root "$PWD" --controller-label <label> --lease-nonce <nonce>` through
+the host persistent monitor; it owns the stream, backup doorbell pool, and
+watchdog as one feed and re-arms children itself. The decomposed form remains
+valid: on a host whose persistent monitor turns each flushed stdout line
 into a wake, arm one generation-bound `goalflight_messages.py follow --project-root
 "$PWD" --controller-label <label> --lease-nonce <nonce>` through that monitor —
 never through ordinary shell backgrounding — and keep six tracked `listen

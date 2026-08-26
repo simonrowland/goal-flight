@@ -93,10 +93,56 @@ state-change notices still appear; they sort after signal.
 
 ## Persistent newline wake (hosts with a stdout monitor)
 
-Prefer one persistent stream when the host has a monitor whose contract says that
-each flushed stdout line becomes a controller notification. Arm the process through
-that monitor operation itself, with the repository as its working directory and this
-exact command:
+Prefer **one** supervised feed when the host has a monitor whose contract says that
+each flushed stdout line becomes a controller notification. Arm this once through
+that monitor operation itself, with the repository as its working directory:
+
+```bash
+python3 <skill-root>/scripts/goalflight_messages.py supervise \
+  --project-root "$PWD" \
+  --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
+  --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE"
+```
+
+`supervise` spawns the stream, the configured backup doorbell pool, and the
+watchdog from the same `coverage_rearm_commands` generator used everywhere else,
+multiplexes every child's stdout line-by-line into its own stdout, restarts
+deaths, and re-arms a doorbell after a ring. The host watches this one task.
+Individual `follow` / `listen` / `--watch-follow` commands remain valid for hosts
+that arm them separately; doctor and status still read those waiters.
+
+Do **not** run this with shell `&`, `nohup`, a detached dispatcher, or an ordinary
+background-task surface that reports output only when the process exits. The host
+monitor must own stdout directly. `supervise` rejects a regular-file stdout
+before it starts children: `follow` dies on a file, so a redirected supervisor
+would be deaf on arrival.
+
+Each flushed line is a wake. Child kinds pass through unchanged:
+
+- stream: compact JSON `{"kind":"heartbeat"| "event"|"frontier",...}`
+- backup: pending headlines plus one `advance: <command>` line, or a ring
+- watchdog: JSON `{"kind":"event",...}` with `listener-dead` / related payload
+- supervise: `{"kind":"supervise","type":"heartbeat"|"coverage"|"restart"|"stop",...}`
+  carrying `live`/`target` so silence and deafness never look the same
+
+The supervisor's child-exit taxonomy:
+
+| Child result | Supervisor action |
+|---|---|
+| rang (exit 0 after arming) | re-arm promptly |
+| exit 3 (pool full / contention) | re-arm promptly |
+| fault (exit 2, signals, short-lived crash) | restart with backoff: 1s, 2s, … cap 120s; reset after a long-lived run |
+| did-not-arm (exit 0 with no lock, capability-mismatch, dead nonce, watchdog slot already held) | stop, emit `type=stop`, exit 3 |
+
+A dead lease nonce is re-read from `goalflight_session_status.live_session`, never
+hand-constructed. On mismatch or a vanished live session the supervisor emits
+`{"kind":"supervise","type":"stop","reason":"dead-lease-nonce"}` and exits 3.
+
+The decomposed three-command form below is still the fallback when a host arms
+components as separate tracked tasks.
+
+Arm the stream through that monitor, with the repository as its working directory
+and this exact command:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py follow \
@@ -188,9 +234,10 @@ is loud, and correlated stream-plus-watchdog death is still loud while the backu
 survives. The backup cannot witness its own hard death. If the host reaps every
 tracked task, no controller-session process remains to emit a line; if the machine is
 suspended, no line can be emitted until a tracked process runs again. Full coverage
-would require an external supervisor, which this design deliberately forbids. The
-doorbell witness therefore shrinks the silent window and moves the last unwitnessed
-link one hop; it does not make persistent coverage reap-proof.
+would require a process the host is not watching. `supervise` is that supervisor
+when it is the one tracked task; it still cannot outlive the host reaping that
+task. The doorbell witness therefore shrinks the silent window and moves the last
+unwitnessed link one hop; it does not make persistent coverage reap-proof.
 
 An `EPIPE` is the only proof that the controller side is gone; the stream exits and
 releases its monitor slot. A cursor-ring reservation is rolled back if delivery did

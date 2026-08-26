@@ -6634,6 +6634,13 @@ def cmd_listen_auto(args) -> int:
     return cmd_listen(args)
 
 
+def cmd_supervise(args) -> int:
+    """One tracked task that owns the persistent wake pool."""
+    import goalflight_wake_supervise as supervise
+
+    return supervise.cmd_supervise(args)
+
+
 def cmd_mirror(args: argparse.Namespace) -> int:
     result = merge_remote_register(args.fleet_dir, args.remote, messages_dir=args.messages_dir)
     print(json.dumps(result, indent=2))
@@ -6870,6 +6877,35 @@ def _run_cli(argv: list[str] | None = None) -> int:
     )
     follow.set_defaults(func=cmd_follow)
 
+    supervise = sub.add_parser(
+        "supervise",
+        help=(
+            "one tracked task that owns the persistent wake pool and multiplexes "
+            "child stdout into a single feed"
+        ),
+        description=(
+            "Own the persistent wake pool as one tracked stdout feed: spawn the "
+            "stream, backup doorbells, and watchdog, multiplex their lines, and "
+            "restart them."
+        ),
+    )
+    supervise.add_argument("--project-root", default=None)
+    supervise.add_argument("--controller-label", default=None)
+    supervise.add_argument("--lease-nonce", default=None)
+    supervise.add_argument(
+        "--heartbeat-secs",
+        type=float,
+        default=120.0,
+        help="supervisor heartbeat interval (default 120; production 60-300)",
+    )
+    supervise.add_argument(
+        "--coverage-secs",
+        type=float,
+        default=0.0,
+        help="coverage live/target interval; 0 means the heartbeat interval",
+    )
+    supervise.set_defaults(func=cmd_supervise)
+
     mirror = sub.add_parser("mirror")
     mirror.add_argument("--remote", type=Path, required=True, help="Remote *.jsonl inbox to merge")
     listen.set_defaults(func=cmd_listen)
@@ -6881,6 +6917,7 @@ def _run_cli(argv: list[str] | None = None) -> int:
         "listen": "listener",
         "listen-auto": "listener",
         "follow": "listener",
+        "supervise": "listener",
         "mirror": "mirror",
         "status": "dashboard",
         "relay": "dashboard",
@@ -6888,7 +6925,7 @@ def _run_cli(argv: list[str] | None = None) -> int:
         "post": "producer",
     }
     role = role_by_command.get(args.cmd, "controller")
-    if args.cmd not in {"listen", "listen-auto", "follow"} and not (
+    if args.cmd not in {"listen", "listen-auto", "follow", "supervise"} and not (
         args.cmd == "relay" and args.drain
     ):
         entry_root = getattr(args, "controller_project_root", None) or Path.cwd()

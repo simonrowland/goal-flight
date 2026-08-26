@@ -20,7 +20,13 @@ incremented when meaningful skill behaviour changes.
   configured target takes the next free slot; `--listener-slots` /
   `GOALFLIGHT_LISTENER_SLOTS` / `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` remain
   how many doorbells to run (`live/target`), not a cap. `listen` exit 3
-  is mail-pending only.
+  is no longer a full-pool refusal; callers must read the stderr reason.
+- Persistent wake has a preferred one-command front door:
+  `goalflight_messages.py supervise`. Arm it once through the host stdout
+  monitor; it owns the stream, the configured backup doorbell pool, and the
+  watchdog, multiplexes their stdout, restarts deaths with bounded backoff,
+  and re-arms a doorbell after a ring. Individual `follow` / `listen` /
+  `--watch-follow` commands stay valid for hosts that arm them separately.
 
 ### Fixed
 

@@ -159,9 +159,12 @@ frontmatter above. New categories require a frontmatter schema bump (raise
 
 The controller keeps the interactive session responsive by dispatching workers in
 the background. On a host whose persistent monitor turns each flushed stdout line
-into a wake, it arms one generation-bound `goalflight_messages.py follow
+into a wake, it prefers one generation-bound `goalflight_messages.py supervise`
+through that monitor, which owns the stream, backup pool, and watchdog as a
+single feed. The decomposed form remains: arm one generation-bound
+`goalflight_messages.py follow
 --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>` through
-that monitor, never shell `&`, and keeps six tracked `listen --listener-slots 6
+that monitor, never shell `&`, and keep six tracked `listen --listener-slots 6
 --report-pending` backup doorbells plus one separately tracked `listen --watch-follow`
 watchdog. The watchdog holds its own generation lock, never consumes a doorbell slot,
 and reads durable record age; three missed heartbeat intervals make it emit
@@ -297,7 +300,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `no-blocking-cursor-task-worker`
 - **name:** Arm the event wake without blocking
 - **category:** `worker-routing-defaults`
-- **controller_does:** The orchestrator auto-claims without stealing a live different lease, arms `follow` through a persistent stdout monitor where supported, arms a six-doorbell backup pool plus one independently locked `--watch-follow` watchdog that reads durable record age and emits channel death on stdout after three missed beats, lets the backup witness a missing watchdog lock while stating that all-tracked-task death remains unwitnessed, treats stream, backup pool, and watchdog as persistent coverage `live/8`, and retains the portable tracked-listener pool on hosts without a monitor.
+- **controller_does:** The orchestrator auto-claims without stealing a live different lease, prefers one `supervise` feed that owns the persistent set, otherwise arms `follow` through a persistent stdout monitor where supported, arms a six-doorbell backup pool plus one independently locked `--watch-follow` watchdog that reads durable record age and emits channel death on stdout after three missed beats, lets the backup witness a missing watchdog lock while stating that all-tracked-task death remains unwitnessed, treats stream, backup pool, and watchdog as persistent coverage `live/8`, and retains the portable tracked-listener pool on hosts without a monitor.
 - **failure_mode:** The orchestrator blocks the interactive session or schedules a timer to ask whether a worker finished instead of arming the available event channel.
 - **skill_md_compressed_form:**
     - **kind:** literal
