@@ -1157,6 +1157,7 @@ class Journal:
                         raise self._open_io_failure(
                             open_started, open_failures, exc
                         ) from exc
+                    self._raise_disappeared_if_absent(exc)
                     if self._read_only_client:
                         raise JournalIOError(
                             f"journal readonly probe unavailable/unreadable for {self.path}: "
@@ -2003,6 +2004,7 @@ class Journal:
                 raise
             except sqlite3.OperationalError as exc:
                 if not _is_busy(exc):
+                    self._raise_disappeared_if_absent(exc)
                     raise
                 if self._retry_delay(started):
                     continue

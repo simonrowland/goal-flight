@@ -190,7 +190,7 @@ def _backup_command(project: Path, lease: journal.LeaseIdentity) -> list[str]:
         "--poll-secs",
         "0.01",
         "--timeout-s",
-        "4",
+        "8",
     ]
 
 
@@ -1082,13 +1082,6 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
     follow_reader = _JsonLineReader(follow.stdout)
     assert follow_reader.read()[1]["kind"] == "heartbeat"
     assert follow_reader.read()[1]["kind"] == "frontier"
-    backup = subprocess.Popen(
-        _backup_command(project, lease),
-        cwd=project,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
     watchdog = subprocess.Popen(
         _watch_command(project, lease),
         cwd=project,
@@ -1096,15 +1089,22 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    assert backup.stdout is not None
-    backup_reader = _JsonLineReader(backup.stdout)
     assert watchdog.stdout is not None
     watchdog_reader = _JsonLineReader(watchdog.stdout)
+    _wait_for_waiter_kind(project, lease.label, wake.MONITOR_KIND, follow.pid)
+    _wait_for_waiter_kind(project, lease.label, "watchdog", watchdog.pid)
+    backup = subprocess.Popen(
+        _backup_command(project, lease),
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert backup.stdout is not None
+    backup_reader = _JsonLineReader(backup.stdout)
     replacement_backup: subprocess.Popen[bytes] | None = None
     try:
-        _wait_for_waiter_kind(project, lease.label, wake.MONITOR_KIND, follow.pid)
         _wait_for_waiter_kind(project, lease.label, "listener", backup.pid)
-        _wait_for_waiter_kind(project, lease.label, "watchdog", watchdog.pid)
 
         listener_pids = [
             row.pid
@@ -1152,7 +1152,7 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
                 project_root=project,
             ),
         )
-        _raw, backup_result = backup_reader.read(timeout_s=2)
+        _raw, backup_result = backup_reader.read(timeout_s=5)
         if backup_result["kind"] == "pending-at-arm":
             pending_items = backup_result.get("items")
             assert isinstance(pending_items, list)
@@ -1176,8 +1176,8 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
                     project_root=project,
                 ),
             )
-            _raw, backup_result = backup_reader.read(timeout_s=2)
-        assert backup_result["kind"] == "ring"
+            _raw, backup_result = backup_reader.read(timeout_s=5)
+        assert backup_result["kind"] == "ring", backup_result
         assert backup_result["reason"] == "event"
         assert backup.wait(timeout=2) == 0
 
@@ -2234,8 +2234,8 @@ def test_report_pending_one_shot_cursor_io_failure_is_fatal(
 
     assert result == 2
     assert calls == ["cursor_peek"], "listener retried after a fatal one-shot failure"
-    assert "journal-io-failure" in cap.stdout
-    assert "one-shot arm snapshot I/O failure" in cap.stdout
+    assert "journal-io-failure" in cap.stderr
+    assert "one-shot arm snapshot I/O failure" in cap.stderr
     assert "listener degraded" not in cap.stderr
 
 

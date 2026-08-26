@@ -1292,37 +1292,37 @@ def release_pending_report_claim(
     """Release an exact pending-report claim when its stdout delivery failed.
 
     The compare is load-bearing: a failed reporter must not remove a different
-    generation's or differently positioned report stamp. While this path
-    exists, ``claim_pending_report``'s O_EXCL prevents a replacement writer, so
-    an exact payload match identifies the claim being rolled back.
+    generation's or differently positioned report stamp.
     """
     label = str(controller_label or "").strip()
     nonce = str(lease_nonce or "").strip()
     if not label or not nonce:
         raise ValueError("controller label and lease nonce are required")
-    normalized: dict[str, int] = {}
-    for stream, position in dict(positions or {}).items():
-        stream_id = str(stream or "").strip()
-        if not stream_id:
-            continue
-        if not isinstance(position, int) or isinstance(position, bool) or position < 1:
-            raise ValueError("pending-report position is invalid")
-        normalized[stream_id] = position
-    expected = (json.dumps({"positions": normalized}, sort_keys=True) + "\n").encode(
-        "utf-8"
-    )
+    normalized = _normalize_pending_report_positions(positions or {}, strict=False)
     path = _pending_report_path(
         project_root,
         controller_label=label,
         lease_nonce=nonce,
     )
+    lock_path = _pending_report_lock_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    directory_fd = _open_ledger_directory_path(path.parent, create=True)
+    lock_fd = -1
     try:
-        if path.read_bytes() != expected:
+        lock_fd = _acquire_pending_report_lock(lock_path, directory_fd=directory_fd)
+        current = _read_pending_report_state(path)
+        if current is None or current.positions != normalized:
             return False
-        path.unlink()
-    except FileNotFoundError:
-        return False
-    return True
+        _unlink_at(directory_fd, path.name)
+        os.fsync(directory_fd)
+        return True
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(directory_fd)
 
 
 def _ring_stamp_lock_path(project_root: Path | str, *, controller_label: str) -> Path:

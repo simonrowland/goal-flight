@@ -6451,6 +6451,7 @@ def cmd_listen(args) -> int:
     arm_snapshot = None
     report_claim = None
     pending_report_settled = True
+    prearmed_visible_items: list[tuple[dict, dict]] | None = None
 
     def arm_once():
         result = authority.arm_listener(
@@ -6504,6 +6505,25 @@ def cmd_listen(args) -> int:
                         )
             elif arm_snapshot is not None and arm_snapshot.items:
                 local_high = _cursor_positions(arm_snapshot.items)
+                if not args.json:
+                    # Human-readable envelopes must exist before the durable
+                    # claim: a query-stage busy cannot stamp a high-water that
+                    # no arm actually reported.
+                    prearmed_visible_items = _retry_listener_journal_busy(
+                        lambda: _foreign_controller_items(
+                            _envelopes_with_rows(
+                                authority,
+                                list(arm_snapshot.items),
+                            ),
+                            controller_label=label,
+                            lease_nonce=nonce,
+                        ),
+                        busy_error=goalflight_journal.JournalBusy,
+                        tolerance=journal_tolerance,
+                        poll_s=poll,
+                        on_degraded=startup_degraded,
+                        on_recovered=startup_recovered,
+                    )
                 # The first arm publishes a complete claim atomically. A loser
                 # reloads that claim's water and discards its later local water,
                 # so mail arriving behind the winner remains ringable.
@@ -6638,7 +6658,7 @@ def cmd_listen(args) -> int:
                 "hint": hint,
             }
         if args.json:
-            print(json.dumps(payload, sort_keys=True))
+            print(json.dumps(payload, sort_keys=True), flush=True)
         else:
             if detail:
                 print(f"listen: {payload.get('reason')}: {detail}", file=sys.stderr)
@@ -6788,6 +6808,7 @@ def cmd_listen(args) -> int:
     def emit_pending_report(
         claim: goalflight_wake.PendingReportState,
         snapshot,
+        visible_items: list[tuple[dict, dict]] | None = None,
     ) -> bool:
         """Flush one claimed boundary. True when handled; False means retry."""
         settled = _settle_pending_report_if_consumed(
@@ -6896,18 +6917,20 @@ def cmd_listen(args) -> int:
                 flush=True,
             )
         else:
-            visible_arm_items = _retry_listener_journal_busy(
-                lambda: _foreign_controller_items(
-                    _envelopes_with_rows(authority, list(report_items)),
-                    controller_label=label,
-                    lease_nonce=nonce,
-                ),
-                busy_error=goalflight_journal.JournalBusy,
-                tolerance=journal_tolerance,
-                poll_s=poll,
-                on_degraded=startup_degraded,
-                on_recovered=startup_recovered,
-            )
+            visible_arm_items = visible_items
+            if visible_arm_items is None:
+                visible_arm_items = _retry_listener_journal_busy(
+                    lambda: _foreign_controller_items(
+                        _envelopes_with_rows(authority, list(report_items)),
+                        controller_label=label,
+                        lease_nonce=nonce,
+                    ),
+                    busy_error=goalflight_journal.JournalBusy,
+                    tolerance=journal_tolerance,
+                    poll_s=poll,
+                    on_degraded=startup_degraded,
+                    on_recovered=startup_recovered,
+                )
             for row, envelope in visible_arm_items:
                 print(format_receipt_headline(row, envelope), flush=True)
             print(f"advance: {arm_advance}", flush=True)
@@ -6925,7 +6948,11 @@ def cmd_listen(args) -> int:
     # It remains takeover-eligible after owner death until cursor acknowledgement.
     if report_claim is not None:
         try:
-            if emit_pending_report(report_claim, arm_snapshot):
+            if emit_pending_report(
+                report_claim,
+                arm_snapshot,
+                visible_items=prearmed_visible_items,
+            ):
                 pending_report_settled = True
         except goalflight_journal.CASMismatch as exc:
             return finish("stale-lease", code=3, detail=str(exc))
