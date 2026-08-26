@@ -19,6 +19,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from typing import Any, Protocol
@@ -47,6 +48,11 @@ DEFAULT_SUPERVISOR_HEARTBEAT_S = 25.0 * 60.0
 MIN_SUPERVISOR_HEARTBEAT_S = 60.0
 MAX_SUPERVISOR_HEARTBEAT_S = 30.0 * 60.0
 PERSISTENT_BACKUP_SLOTS_ENV = "GOALFLIGHT_PERSISTENT_BACKUP_SLOTS"
+# ``follow`` writes a heartbeat before computing a possibly changed frontier.
+# Hold the beat briefly so one pipe-read split does not create two wakes. The
+# bound preserves anti-stall if projection work hangs; a late frontier is cached
+# for the next beat and remains advisory-only.
+STREAM_FRONTIER_GRACE_S = 1.0
 _DEAD_NONCE_MARKERS = (
     "controller-capability-mismatch",
     "lease-nonce-not-live",
@@ -501,7 +507,8 @@ def _supervisor_rearm_command(
     lease_nonce: str,
     heartbeat_s: float,
     coverage_s: float,
-    debug: bool,
+    chatty: bool = False,
+    debug: bool = False,
 ) -> str:
     """Build the canonical, semantically faithful supervisor invocation."""
     argv = shlex.split(
@@ -519,6 +526,8 @@ def _supervisor_rearm_command(
             format(float(coverage_s), ".15g"),
         ]
     )
+    if chatty:
+        argv.append("--chatty")
     if debug:
         argv.append("--debug")
     if PERSISTENT_BACKUP_SLOTS_ENV in os.environ:
@@ -595,6 +604,89 @@ def _is_armed_control_line(line: str) -> bool:
     return isinstance(payload, dict) and str(payload.get("kind") or "") == "armed"
 
 
+def _own_stream_record(child: Any, line: str, *, kind: str) -> dict[str, object] | None:
+    """Return one structural record authored by the stream child itself.
+
+    A relayed mail headline may quote a heartbeat and an event payload may contain
+    the same word.  Neither is the stream's own top-level signal, and a backup or
+    watchdog child that happens to emit the same JSON shape is not the stream.
+    """
+    if str(getattr(child, "kind", "") or "") != "stream":
+        return None
+    text = str(line or "").strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        record = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(record, dict) or str(record.get("kind") or "") != kind:
+        return None
+    payload = record.get("payload")
+    return record if isinstance(payload, dict) else None
+
+
+def _bounded_payload_text(value: object, *, max_bytes: int) -> str:
+    encoded = str(value or "").encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return encoded.decode("utf-8")
+    return encoded[: max(0, max_bytes - 3)].decode("utf-8", "ignore") + "…"
+
+
+def _actionable_stream_wake(
+    frontier: dict[str, object] | None,
+) -> dict[str, object]:
+    """Replace an idle keepalive with the latest action-bearing frontier."""
+    source = frontier.get("payload") if isinstance(frontier, dict) else None
+    source_payload = source if isinstance(source, dict) else {}
+    state = str(source_payload.get("state") or "unknown")
+    payload: dict[str, object] = {
+        "directive": "Nothing pending" if state == "empty" else "goal-flight next",
+        "state": state,
+    }
+    if source_payload.get("id") not in (None, ""):
+        payload["id"] = _bounded_payload_text(source_payload["id"], max_bytes=72)
+    if source_payload.get("title") not in (None, ""):
+        payload["title"] = _bounded_payload_text(
+            source_payload["title"], max_bytes=240
+        )
+    if source_payload.get("detail") not in (None, "") and "title" not in payload:
+        payload["detail"] = _bounded_payload_text(
+            source_payload["detail"], max_bytes=240
+        )
+    return {"kind": "next", "payload": payload}
+
+
+@dataclass
+class _ForwardingFrontierRead:
+    done: threading.Event
+    record: dict[str, object] | None = None
+    expired: bool = False
+
+
+def _start_forwarding_frontier_read(
+    reader: Callable[[], dict[str, object]],
+) -> _ForwardingFrontierRead:
+    """Read the supervisor-only projection without blocking its wake deadline."""
+    state = _ForwardingFrontierRead(done=threading.Event())
+
+    def run() -> None:
+        try:
+            record = reader()
+        except Exception:
+            record = None
+        payload = record.get("payload") if isinstance(record, dict) else None
+        state.record = record if isinstance(payload, dict) else None
+        state.done.set()
+
+    threading.Thread(
+        target=run,
+        name="goalflight-forwarding-frontier",
+        daemon=True,
+    ).start()
+    return state
+
+
 def _structured_child_reason(line: str) -> str | None:
     """Extract a child-authored diagnostic reason from a JSON control line.
 
@@ -667,6 +759,8 @@ def run_supervisor(
     items: list[tuple[str, str]] | None = None,
     emit_depth: bool = False,
     debug: bool = False,
+    chatty: bool = False,
+    forwarding_frontier: Callable[[], dict[str, object]] | None = None,
 ) -> int:
     """Run until the lease dies, stdout breaks, or the host asks to stop."""
     nonce = str(lease_nonce or "").strip()
@@ -676,6 +770,7 @@ def run_supervisor(
         lease_nonce=nonce,
         heartbeat_s=heartbeat_s,
         coverage_s=coverage_s,
+        chatty=chatty,
         debug=debug,
     )
 
@@ -864,6 +959,69 @@ def run_supervisor(
         return stop_after_failed_write()
     next_heartbeat = host.now + max(0.01, float(heartbeat_s))
     next_coverage = host.now + max(0.01, float(coverage_s))
+    latest_frontier: dict[str, object] | None = None
+    pending_stream_heartbeat: dict[str, object] | None = None
+    pending_stream_heartbeat_due = float("inf")
+    pending_stream_frontier: dict[str, object] | None = None
+    active_forwarding_read: _ForwardingFrontierRead | None = None
+    pending_forwarding_read: _ForwardingFrontierRead | None = None
+
+    def emit_pending_stream_wake(*, paired_frontier: bool = False) -> bool:
+        nonlocal latest_frontier
+        nonlocal pending_forwarding_read, pending_stream_frontier
+        nonlocal pending_stream_heartbeat, pending_stream_heartbeat_due
+        if pending_stream_heartbeat is None:
+            return True
+        frontier = latest_frontier
+        child_payload = (
+            pending_stream_frontier.get("payload")
+            if isinstance(pending_stream_frontier, dict)
+            else None
+        )
+        if forwarding_frontier is not None:
+            if (
+                isinstance(child_payload, dict)
+                and child_payload.get("state") != "empty"
+            ):
+                frontier = pending_stream_frontier
+                if (
+                    pending_forwarding_read is not None
+                    and not pending_forwarding_read.done.is_set()
+                ):
+                    pending_forwarding_read.expired = True
+            elif (
+                pending_forwarding_read is not None
+                and pending_forwarding_read.done.is_set()
+            ):
+                frontier = pending_forwarding_read.record
+            else:
+                # The richer selection did not complete within this beat's
+                # grace. Keep the cadence and preserve uncertainty.
+                frontier = None
+                if pending_forwarding_read is not None:
+                    pending_forwarding_read.expired = True
+        elif pending_stream_frontier is not None:
+            frontier = pending_stream_frontier
+        pending_stream_heartbeat = None
+        pending_stream_heartbeat_due = float("inf")
+        pending_stream_frontier = None
+        pending_forwarding_read = None
+        frontier_payload = (
+            frontier.get("payload") if isinstance(frontier, dict) else None
+        )
+        if (
+            forwarding_frontier is None
+            and not paired_frontier
+            and isinstance(frontier_payload, dict)
+            and frontier_payload.get("state") == "empty"
+        ):
+            # A cached empty projection cannot prove that nothing appeared
+            # during a slow current refresh. Preserve the wake, but never turn
+            # that ambiguity into a false idle directive.
+            frontier = None
+        if isinstance(frontier, dict):
+            latest_frontier = frontier
+        return _emit(host, _actionable_stream_wake(frontier))
 
     while host.running():
         # Every detector reports to _PeerLossDetector; stop_for_stdout_detector
@@ -894,6 +1052,8 @@ def run_supervisor(
             return SUPERVISE_STOP_EXIT
         now = host.now
         wake_at = min(next_heartbeat, next_coverage)
+        if pending_stream_heartbeat is not None:
+            wake_at = min(wake_at, pending_stream_heartbeat_due)
         for slot in slots:
             if slot.child is None and slot.stopped_reason is None:
                 wake_at = min(wake_at, slot.next_start)
@@ -916,8 +1076,62 @@ def run_supervisor(
         ):
             break
         for child, line in result.lines:
+            if not chatty:
+                heartbeat = _own_stream_record(child, line, kind="heartbeat")
+                if heartbeat is not None:
+                    if pending_stream_heartbeat is not None:
+                        if not emit_pending_stream_wake():
+                            return stop_after_failed_write()
+                    pending_stream_heartbeat = heartbeat
+                    pending_stream_heartbeat_due = (
+                        host.now + STREAM_FRONTIER_GRACE_S
+                    )
+                    pending_stream_frontier = None
+                    pending_forwarding_read = None
+                    if forwarding_frontier is not None:
+                        if (
+                            active_forwarding_read is None
+                            or active_forwarding_read.done.is_set()
+                        ):
+                            active_forwarding_read = (
+                                _start_forwarding_frontier_read(
+                                    forwarding_frontier
+                                )
+                            )
+                        if not active_forwarding_read.expired:
+                            pending_forwarding_read = active_forwarding_read
+                    continue
+                frontier = _own_stream_record(child, line, kind="frontier")
+                if frontier is not None:
+                    if pending_stream_heartbeat is None:
+                        latest_frontier = frontier
+                        continue
+                    pending_stream_frontier = frontier
+                    frontier_payload = frontier.get("payload")
+                    forwarding_ready = (
+                        pending_forwarding_read is not None
+                        and pending_forwarding_read.done.is_set()
+                    )
+                    if (
+                        forwarding_frontier is None
+                        or not isinstance(frontier_payload, dict)
+                        or frontier_payload.get("state") != "empty"
+                        or forwarding_ready
+                    ):
+                        if not emit_pending_stream_wake(paired_frontier=True):
+                            return stop_after_failed_write()
+                    continue
             text = line if line.endswith("\n") else line + "\n"
             if not _write_stdout(host, text, source="write-child-output"):
+                return stop_after_failed_write()
+        stream_exited = any(
+            str(getattr(event.child, "kind", "") or "") == "stream"
+            for event in result.exits
+        )
+        if pending_stream_heartbeat is not None and (
+            stream_exited or host.now >= pending_stream_heartbeat_due
+        ):
+            if not emit_pending_stream_wake():
                 return stop_after_failed_write()
         for event in result.exits:
             child = event.child
@@ -1681,7 +1895,11 @@ def resolve_startup_lease_nonce(
     return live, None, None
 
 
-def cmd_supervise(args: Any) -> int:
+def cmd_supervise(
+    args: Any,
+    *,
+    forwarding_frontier: Callable[[Path], dict[str, object]] | None = None,
+) -> int:
     """CLI entry used by goalflight_messages.py supervise."""
     import goalflight_session_status as sessions  # type: ignore
     import goalflight_task  # type: ignore
@@ -1752,4 +1970,10 @@ def cmd_supervise(args: Any) -> int:
         coverage_s=coverage_s,
         emit_depth=bool(getattr(args, "chatty", False)),
         debug=bool(getattr(args, "debug", False)),
+        chatty=bool(getattr(args, "chatty", False)),
+        forwarding_frontier=(
+            (lambda: forwarding_frontier(project_root))
+            if forwarding_frontier is not None
+            else None
+        ),
     )

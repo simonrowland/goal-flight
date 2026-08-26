@@ -790,6 +790,94 @@ def test_frontier_reads_only_materialized_projection_and_marks_stale(
     assert stale["payload"]["state"] == "stale"
     assert stale["payload"]["advisory"] == "information-only"
 
+    projection.write_text(
+        "// generated\nwindow.GF_ITEMS = "
+        + json.dumps(
+            [
+                {
+                    "id": "t-working",
+                    "kind": "task",
+                    "title": "worker remains in flight",
+                    "derived_status": "working",
+                    "lane": "default",
+                    "dispatches": [
+                        {
+                            "dispatch_id": "working-child",
+                            "state": "working",
+                            "ts": "2026-08-26T00:00:00+00:00",
+                        }
+                    ],
+                }
+            ]
+        )
+        + ";\n",
+        encoding="utf-8",
+    )
+    canonical.unlink()
+    working_child = messages._follow_frontier_snapshot(store)
+    assert working_child["payload"]["state"] == "empty"
+    assert "id" not in working_child["payload"]
+    working_forwarded = messages._supervisor_frontier_snapshot(store)
+    assert working_forwarded["payload"]["id"] == "t-working"
+    assert working_forwarded["payload"]["state"] == "working"
+    assert working_forwarded["payload"]["title"] == "worker remains in flight"
+
+    projection.write_text(
+        "// generated\nwindow.GF_ITEMS = "
+        + json.dumps(
+            [
+                {
+                    "id": "t-complete",
+                    "kind": "task",
+                    "title": "historical dispatch is terminal",
+                    "derived_status": "done-reviewed",
+                    "lane": "default",
+                    "dispatches": [
+                        {
+                            "dispatch_id": "completed-child",
+                            "state": "completed",
+                            "ts": "2026-08-26T00:00:00+00:00",
+                        }
+                    ],
+                }
+            ]
+        )
+        + ";\n",
+        encoding="utf-8",
+    )
+    complete = messages._follow_frontier_snapshot(store)
+    assert complete["payload"]["state"] == "empty"
+
+    projection.write_text(
+        "// generated\nwindow.GF_ITEMS = "
+        + json.dumps(
+            [
+                {
+                    "id": "q-decision",
+                    "kind": "decision",
+                    "title": "owner choice remains pending",
+                    "derived_status": "decision",
+                    "lane": "default",
+                }
+            ]
+        )
+        + ";\n",
+        encoding="utf-8",
+    )
+    decision_child = messages._follow_frontier_snapshot(store)
+    assert decision_child["payload"]["state"] == "empty"
+    assert "id" not in decision_child["payload"]
+    decision_forwarded = messages._supervisor_frontier_snapshot(store)
+    assert decision_forwarded["payload"]["id"] == "q-decision"
+    assert decision_forwarded["payload"]["state"] == "decision"
+
+    projection.write_text(
+        "// generated\nwindow.GF_ITEMS = [];\n",
+        encoding="utf-8",
+    )
+    empty = messages._follow_frontier_snapshot(store)
+    assert empty["payload"]["state"] == "empty"
+
 
 def test_persistent_monitor_suppresses_pool_shortage_but_keeps_backup_depth(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
