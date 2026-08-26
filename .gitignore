@@ -65,3 +65,24 @@ tests/python/ext
 templates/fleet-console/fleet-data.js
 templates/fleet-console/attention-data.js
 *.assembled.prompt
+
+# pytest scratch. `pytest-of-<user>/` is pytest's tmp_path base; it normally
+# lands under $TMPDIR, but a run whose cwd is this repo (including a run started
+# by ANOTHER project's controller) drops it here instead — observed 2026-08-25
+# holding 362 files of a different repo's test tmpdirs. Untracked and unignored,
+# it was one `git add -A` away from being committed.
+pytest-of-*/
+.pytest_cache/
+
+# Local UI-backend databases. These are per-operator runtime state, never
+# artifacts: nothing matching *.sqlite3 has ever been tracked here. The standing
+# rule was "never commit ui-backend*.sqlite3", enforced only by each controller
+# remembering to pass explicit pathspecs — one `git add -A` defeated it, and the
+# larger of the two is ~5.6 MB. Make the rule structural instead.
+# This glob is deliberately broader than the two known files, so note the
+# escape hatch: an sqlite file that IS a real artifact (a golden test fixture,
+# say) must be added with `git add -f`. Nothing matching this was tracked when
+# the rule landed, so it silently excludes nothing that existed.
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
