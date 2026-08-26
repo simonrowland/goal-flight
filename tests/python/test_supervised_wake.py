@@ -24,6 +24,7 @@ import goalflight_messages as messages  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 import goalflight_wake_supervise as supervise  # noqa: E402
+import goalflight_task as task  # noqa: E402
 
 
 @dataclass
@@ -242,6 +243,7 @@ def _run(
     heartbeat_s: float = 30.0,
     coverage_s: float = 30.0,
     nonce: str = "nonce-1",
+    chatty: bool = False,
 ) -> int:
     host.lease_nonce = nonce
     return supervise.run_supervisor(
@@ -252,6 +254,7 @@ def _run(
         heartbeat_s=heartbeat_s,
         coverage_s=coverage_s,
         items=items,
+        chatty=chatty,
     )
 
 
@@ -427,7 +430,7 @@ def test_exit_0_watchdog_slot_held_without_arming_stops() -> None:
     assert [kind for kind, _command in host.spawns].count("stream") == 1
 
 
-def test_child_stdout_reaches_multiplexed_stdout() -> None:
+def test_terse_supervisor_replaces_only_own_stream_heartbeat() -> None:
     host = FakeHost(
         scripts={
             "stream": [
@@ -437,6 +440,14 @@ def test_child_stdout_reaches_multiplexed_stdout() -> None:
                     armed=True,
                     stdout_lines=[
                         (0.0, '{"kind":"heartbeat","payload":{"seq":1,"from":"stream"}}'),
+                        (
+                            0.01,
+                            '{"kind":"frontier","payload":{"advisory":"information-only","id":"t-022","state":"projected","title":"Useful next task"}}',
+                        ),
+                        (
+                            0.02,
+                            '{"kind":"event","payload":{"data":{"subject":"heartbeat quoted in event"},"type":"controller-notice"}}',
+                        ),
                     ],
                 )
             ],
@@ -445,7 +456,13 @@ def test_child_stdout_reaches_multiplexed_stdout() -> None:
                     lifetime_s=5.0,
                     returncode=0,
                     armed=True,
-                    stdout_lines=[(0.0, "FROM worker subject=done")],
+                    stdout_lines=[
+                        (0.0, "FROM worker subject=heartbeat quoted in mail"),
+                        (
+                            0.01,
+                            '{"kind":"heartbeat","payload":{"from":"backup","seq":9}}',
+                        ),
+                    ],
                 )
             ],
             "watchdog": [
@@ -460,8 +477,11 @@ def test_child_stdout_reaches_multiplexed_stdout() -> None:
             ],
         },
         stop_when_lines_contain=(
-            '{"kind":"heartbeat","payload":{"seq":1,"from":"stream"}}',
-            "FROM worker subject=done",
+            '"kind":"next"',
+            '"id":"t-022"',
+            "FROM worker subject=heartbeat quoted in mail",
+            '{"kind":"heartbeat","payload":{"from":"backup","seq":9}}',
+            '"subject":"heartbeat quoted in event"',
             '{"kind":"event","payload":{"type":"listener-dead"}}',
         ),
     )
@@ -475,9 +495,110 @@ def test_child_stdout_reaches_multiplexed_stdout() -> None:
         coverage_s=50.0,
     )
     joined = "".join(host.lines)
-    assert '{"kind":"heartbeat","payload":{"seq":1,"from":"stream"}}' in joined
-    assert "FROM worker subject=done" in joined
+    assert '{"kind":"heartbeat","payload":{"seq":1,"from":"stream"}}' not in joined
+    assert "FROM worker subject=heartbeat quoted in mail" in joined
+    assert '{"kind":"heartbeat","payload":{"from":"backup","seq":9}}' in joined
+    assert '"subject":"heartbeat quoted in event"' in joined
     assert '{"kind":"event","payload":{"type":"listener-dead"}}' in joined
+    next_record = next(record for record in _records(host) if record.get("kind") == "next")
+    assert next_record["payload"] == {
+        "directive": "goal-flight next",
+        "id": "t-022",
+        "state": "projected",
+        "title": "Useful next task",
+    }
+    assert any(
+        record.get("kind") == "supervise" and record.get("type") == "heartbeat"
+        for record in _records(host)
+    )
+
+
+def test_late_frontier_does_not_create_a_second_wake() -> None:
+    host = FakeHost(
+        scripts={
+            "stream": [
+                PlannedExit(
+                    lifetime_s=2.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (
+                            0.0,
+                            '{"kind":"heartbeat","payload":{"seq":1}}',
+                        ),
+                        (
+                            0.01,
+                            '{"kind":"frontier","payload":{"state":"empty"}}',
+                        ),
+                        (
+                            0.1,
+                            '{"kind":"heartbeat","payload":{"seq":2}}',
+                        ),
+                        (
+                            1.6,
+                            '{"kind":"frontier","payload":{"id":"t-delayed","state":"projected","title":"Computed slowly"}}',
+                        ),
+                    ],
+                )
+            ]
+        },
+        stop_after_spawns=2,
+    )
+
+    _run(host, _items("stream"), heartbeat_s=100.0, coverage_s=100.0)
+
+    actionable = [record for record in _records(host) if record.get("kind") == "next"]
+    assert len(actionable) == 2
+    assert actionable[0]["payload"]["directive"] == "Nothing pending"
+    assert actionable[1]["payload"] == {
+        "directive": "goal-flight next",
+        "state": "unknown",
+    }
+
+
+def test_batched_heartbeat_frontier_pairs_keep_their_own_state() -> None:
+    host = FakeHost(
+        scripts={"stream": []},
+        stop_when_lines_contain=('"id":"t-one"', '"id":"t-two"'),
+    )
+    delivered = False
+
+    def wait_once(
+        children: list[FakeChild], _timeout_s: float
+    ) -> supervise.WaitResult:
+        nonlocal delivered
+        if delivered:
+            host.stop = True
+            return supervise.WaitResult(lines=[], exits=[])
+        delivered = True
+        child = children[0]
+        return supervise.WaitResult(
+            lines=[
+                (
+                    child,
+                    '{"kind":"heartbeat","payload":{"seq":1}}',
+                ),
+                (
+                    child,
+                    '{"kind":"frontier","payload":{"id":"t-one","state":"projected","title":"One"}}',
+                ),
+                (
+                    child,
+                    '{"kind":"heartbeat","payload":{"seq":2}}',
+                ),
+                (
+                    child,
+                    '{"kind":"frontier","payload":{"id":"t-two","state":"projected","title":"Two"}}',
+                ),
+            ],
+            exits=[],
+        )
+
+    host.wait = wait_once  # type: ignore[method-assign]
+    _run(host, _items("stream"), heartbeat_s=100.0, coverage_s=100.0)
+
+    actionable = [record for record in _records(host) if record.get("kind") == "next"]
+    assert [record["payload"]["id"] for record in actionable] == ["t-one", "t-two"]
 
 
 def test_backoff_resets_after_long_lived_and_escalates_after_fast_failure() -> None:
@@ -766,6 +887,8 @@ def test_supervise_cli_is_the_one_command_front_door(tmp_path: Path) -> None:
     )
     assert help_text.returncode == 0
     assert "persistent wake pool" in help_text.stdout
+    assert "--chatty" in help_text.stdout
+    assert "restore raw stream keepalives" in help_text.stdout
     top = subprocess.run(
         [sys.executable, str(SCRIPTS / "goalflight_messages.py"), "--help"],
         check=False,
@@ -985,6 +1108,290 @@ class _RecordingHost(supervise.RealHost):
 
 def _python_child(script: str) -> str:
     return shlex.join([sys.executable, "-c", script])
+
+
+class _ActionWakeHost(_RecordingHost):
+    def __init__(self, *args: object, next_target: int, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.next_target = next_target
+
+    def write_stdout(self, line: str) -> bool:
+        alive = super().write_stdout(line)
+        joined = "".join(self.lines)
+        next_count = sum(
+            1
+            for record in _records(self)  # type: ignore[arg-type]
+            if record.get("kind") == "next"
+        )
+        if (
+            next_count >= self.next_target
+            and "heartbeat quoted in a stream event" in joined
+            and "heartbeat quoted in a mail headline" in joined
+        ):
+            self._stop = True
+        return alive
+
+
+class _NextCountHost(_RecordingHost):
+    def __init__(self, *args: object, next_target: int, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.next_target = next_target
+
+    def write_stdout(self, line: str) -> bool:
+        alive = super().write_stdout(line)
+        records = _records(self)  # type: ignore[arg-type]
+        if sum(record.get("kind") == "next" for record in records) >= self.next_target:
+            self._stop = True
+        return alive
+
+
+class _ChattyRecordHost(_RecordingHost):
+    def write_stdout(self, line: str) -> bool:
+        alive = super().write_stdout(line)
+        records = _records(self)  # type: ignore[arg-type]
+        if any(record.get("kind") == "heartbeat" for record in records) and any(
+            record.get("kind") == "frontier" for record in records
+        ):
+            self._stop = True
+        return alive
+
+
+def test_actual_follow_child_emits_one_actionable_wake_per_idle_beat(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive follow's real computation and stdout contract through RealHost."""
+    project, env, lease = isolated
+    monkeypatch.setattr(supervise.wake, "live_waiters", lambda *args, **kwargs: [])
+    task.TaskStore(project).save_items_atomic([])
+    command = shlex.join(
+        [
+            sys.executable,
+            str(SCRIPTS / "goalflight_messages.py"),
+            "follow",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--poll-secs",
+            "0.01",
+            "--heartbeat-secs",
+            "0.12",
+            "--frontier-floor-secs",
+            "30",
+        ]
+    )
+    host = _NextCountHost(
+        project_root=project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        env=env,
+        nonce_reader=lambda: lease.nonce,
+        next_target=3,
+    )
+    with wake.register_lease_holder(
+        project, controller_label=lease.label, lease_nonce=lease.nonce
+    ):
+        try:
+            code = supervise.run_supervisor(
+                project_root=project,
+                controller_label=lease.label,
+                lease_nonce=lease.nonce,
+                host=host,
+                heartbeat_s=100.0,
+                coverage_s=100.0,
+                items=[("stream", command)],
+            )
+        finally:
+            host.kill_all()
+
+    records = _records(host)  # type: ignore[arg-type]
+    actionable = [record for record in records if record.get("kind") == "next"]
+    assert code == 0
+    assert len(actionable) == 3
+    assert [record["payload"]["state"] for record in actionable] == [
+        "empty",
+        "unknown",
+        "unknown",
+    ]
+    assert actionable[0]["payload"]["directive"] == "Nothing pending"
+    assert all(
+        record["payload"]["directive"] == "goal-flight next"
+        for record in actionable[1:]
+    )
+    assert not [record for record in records if record.get("kind") == "heartbeat"]
+    assert not [record for record in records if record.get("kind") == "frontier"]
+
+
+def test_real_children_emit_one_actionable_wake_per_idle_beat(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise raw child stdout; no test double supplies classification."""
+    project, env, lease = isolated
+    monkeypatch.setattr(supervise.wake, "live_waiters", lambda *args, **kwargs: [])
+    stream_records = [
+        {"kind": "heartbeat", "payload": {"interval_s": 120.0, "seq": 1}},
+        {
+            "kind": "frontier",
+            "payload": {
+                "advisory": "information-only",
+                "id": "t-001",
+                "state": "projected",
+                "title": "First frontier",
+            },
+        },
+        {
+            "kind": "event",
+            "payload": {
+                "data": {"subject": "heartbeat quoted in a stream event"},
+                "type": "controller-notice",
+            },
+        },
+        {"kind": "heartbeat", "payload": {"interval_s": 120.0, "seq": 2}},
+        {
+            "kind": "frontier",
+            "payload": {
+                "advisory": "information-only",
+                "id": "t-002",
+                "state": "projected",
+                "title": "Changed frontier",
+            },
+        },
+        {"kind": "heartbeat", "payload": {"interval_s": 120.0, "seq": 3}},
+        {"kind": "heartbeat", "payload": {"interval_s": 120.0, "seq": 4}},
+        {
+            "kind": "frontier",
+            "payload": {"advisory": "information-only", "state": "empty"},
+        },
+    ]
+    stream_lines = [
+        json.dumps(record, sort_keys=True, separators=(",", ":"))
+        for record in stream_records
+    ]
+    stream_script = (
+        "import sys,time\n"
+        "print('{\"kind\":\"armed\"}', flush=True)\n"
+        f"lines={stream_lines!r}\n"
+        "for index,line in enumerate(lines):\n"
+        " print(line, flush=True)\n"
+        " time.sleep(0.03 if index not in {0, 3, 6} else 0.01)\n"
+        "time.sleep(2)\n"
+    )
+    backup_script = (
+        "import time\n"
+        "print('{\"kind\":\"armed\"}', flush=True)\n"
+        "print('FROM worker subject=heartbeat quoted in a mail headline', flush=True)\n"
+        "time.sleep(2)\n"
+    )
+    host = _ActionWakeHost(
+        project_root=project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        env=env,
+        nonce_reader=lambda: lease.nonce,
+        next_target=4,
+    )
+    try:
+        code = supervise.run_supervisor(
+            project_root=project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+            host=host,
+            heartbeat_s=100.0,
+            coverage_s=100.0,
+            items=[
+                ("stream", _python_child(stream_script)),
+                ("backup", _python_child(backup_script)),
+            ],
+        )
+    finally:
+        host.kill_all()
+
+    records = _records(host)  # type: ignore[arg-type]
+    actionable = [record for record in records if record.get("kind") == "next"]
+    assert code == 0
+    assert len(actionable) == 4
+    assert [record["payload"].get("id") for record in actionable] == [
+        "t-001",
+        "t-002",
+        "t-002",
+        None,
+    ]
+    assert actionable[-1]["payload"] == {
+        "directive": "Nothing pending",
+        "state": "empty",
+    }
+    assert not [record for record in records if record.get("kind") == "heartbeat"]
+    assert any(
+        record.get("kind") == "event"
+        and "heartbeat quoted in a stream event" in json.dumps(record)
+        for record in records
+    )
+    joined = "".join(host.lines)
+    assert "heartbeat quoted in a mail headline" in joined
+    assert any(
+        record.get("kind") == "supervise" and record.get("type") == "heartbeat"
+        for record in records
+    )
+
+
+def test_chatty_restores_real_stream_keepalive_and_frontier(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, env, lease = isolated
+    monkeypatch.setattr(supervise.wake, "live_waiters", lambda *args, **kwargs: [])
+    command = shlex.join(
+        [
+            sys.executable,
+            str(SCRIPTS / "goalflight_messages.py"),
+            "follow",
+            "--project-root",
+            str(project),
+            "--controller-label",
+            lease.label,
+            "--lease-nonce",
+            lease.nonce,
+            "--poll-secs",
+            "0.01",
+            "--heartbeat-secs",
+            "0.12",
+            "--frontier-floor-secs",
+            "30",
+        ]
+    )
+    host = _ChattyRecordHost(
+        project_root=project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        env=env,
+        nonce_reader=lambda: lease.nonce,
+    )
+    with wake.register_lease_holder(
+        project, controller_label=lease.label, lease_nonce=lease.nonce
+    ):
+        try:
+            code = supervise.run_supervisor(
+                project_root=project,
+                controller_label=lease.label,
+                lease_nonce=lease.nonce,
+                host=host,
+                heartbeat_s=100.0,
+                coverage_s=100.0,
+                items=[("stream", command)],
+                chatty=True,
+            )
+        finally:
+            host.kill_all()
+
+    records = _records(host)  # type: ignore[arg-type]
+    assert code != supervise.SUPERVISE_STOP_EXIT
+    assert sum(record.get("kind") == "heartbeat" for record in records) == 1
+    assert sum(record.get("kind") == "frontier" for record in records) == 1
+    assert not any(record.get("kind") == "next" for record in records)
 
 
 def test_open_reader_success_live_session_none_does_not_kill_the_pool(

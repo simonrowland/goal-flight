@@ -111,19 +111,40 @@ deaths, and re-arms a doorbell after a ring. The host watches this one task.
 Individual `follow` / `listen` / `--watch-follow` commands remain valid for hosts
 that arm them separately; doctor and status still read those waiters.
 
+The default supervised feed is terse but remains anti-stall. On each stream
+keepalive it emits exactly one actionable
+`{"kind":"next","payload":{"directive":"goal-flight next","id":"...","state":"projected","title":"..."}}`
+record using the stream's already-materialized frontier, instead of forwarding
+the bare keepalive plus its `information-only` frontier. If no ready frontier
+exists but work is in flight, awaiting review, failed, waiting, or needs a
+decision, that item's id, title, and state occupy the same record. Only a
+freshly paired, genuinely empty projection emits
+`directive: "Nothing pending"`; an unavailable or not-yet-observed projection
+retains `directive: "goal-flight next"` so uncertainty cannot masquerade as idle.
+Use `supervise --chatty` to restore the raw stream keepalives and advisory
+frontier lines when diagnosing the feed. The supervisor's own separately
+rate-limited `kind=supervise`, `type=heartbeat` record is unchanged.
+
 Do **not** run this with shell `&`, `nohup`, a detached dispatcher, or an ordinary
 background-task surface that reports output only when the process exits. The host
 monitor must own stdout directly. `supervise` rejects a regular-file stdout
 before it starts children: `follow` dies on a file, so a redirected supervisor
 would be deaf on arrival.
 
-Each flushed line is a wake. Child kinds pass through unchanged:
+Each flushed line is a wake. In default terse mode, child kinds pass through as
+follows:
 
-- stream: compact JSON `{"kind":"heartbeat"| "event"|"frontier",...}`
+- stream: events/faults/exits unchanged; each bare `heartbeat` plus advisory
+  `frontier` pair becomes one actionable `kind=next` record
 - backup: pending headlines plus one `advance: <command>` line, or a ring
 - watchdog: JSON `{"kind":"event",...}` with `listener-dead` / related payload
 - supervise: `{"kind":"supervise","type":"heartbeat"|"coverage"|"restart"|"stop",...}`
   carrying `live`/`target` so silence and deafness never look the same
+
+The replacement predicate is structural: the emitting child must be the stream
+and the parsed top-level JSON `kind` must be `heartbeat`. A stream event whose
+payload mentions heartbeat, a mail headline quoting one, and the supervisor's
+own heartbeat therefore continue to reach the controller.
 
 The supervisor's child-exit taxonomy:
 

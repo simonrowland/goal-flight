@@ -5268,7 +5268,20 @@ def _follow_frontier_record(row: dict[str, object] | None) -> dict[str, object]:
             },
         }
     derived = str(row.get("derived_status") or "pending")
-    state = derived if derived in {"blocked", "stale"} else "ready"
+    state = (
+        derived
+        if derived
+        in {
+            "awaiting-review",
+            "blocked",
+            "decision",
+            "stale",
+            "waiting",
+            "worker-failed",
+            "working",
+        }
+        else "ready"
+    )
     record: dict[str, object] = {
         "kind": "frontier",
         "payload": {
@@ -5307,10 +5320,8 @@ def _follow_frontier_snapshot(task_store) -> dict[str, object]:
             row
             for row in rows
             if isinstance(row, dict)
-            and row.get("kind", "task") in {"task", "bug"}
-            and row.get("derived_status") == "pending"
+            and row.get("kind", "task") in {"task", "bug", "decision"}
             and row.get("lane") not in goalflight_task.RESERVED_LANES
-            and goalflight_task._latest_dispatch_breadcrumb(row) is None
         ]
     except Exception as exc:
         record: dict[str, object] = {
@@ -5322,7 +5333,26 @@ def _follow_frontier_snapshot(task_store) -> dict[str, object]:
             },
         }
         return _fit_follow_record(record, shrink_fields=("detail",))
-    record = _follow_frontier_record(rows[0] if rows else None)
+    frontier = [
+        row
+        for row in rows
+        if row.get("derived_status") == "pending"
+        and goalflight_task._latest_dispatch_breadcrumb(row) is None
+    ]
+    active = [
+        row
+        for row in rows
+        if row.get("derived_status")
+        in {
+            "awaiting-review",
+            "blocked",
+            "decision",
+            "waiting",
+            "worker-failed",
+            "working",
+        }
+    ]
+    record = _follow_frontier_record((frontier or active or [None])[0])
     payload = record.get("payload")
     assert isinstance(payload, dict)
     payload["source"] = "materialized-projection"
@@ -7760,6 +7790,14 @@ def _run_cli(argv: list[str] | None = None) -> int:
         type=float,
         default=0.0,
         help="coverage live/target interval; 0 means the heartbeat interval",
+    )
+    supervise.add_argument(
+        "--chatty",
+        action="store_true",
+        help=(
+            "restore raw stream keepalives and advisory frontier lines instead "
+            "of the default actionable next wake"
+        ),
     )
     supervise.set_defaults(func=cmd_supervise)
 

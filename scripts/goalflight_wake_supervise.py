@@ -40,6 +40,11 @@ BACKOFF_CAP_S = 120.0
 LONG_LIVED_S = 30.0
 STREAM_LINE_MAX_BYTES = 511
 PERMANENT_UNARMED_FAULTS = 3
+# ``follow`` writes a heartbeat before computing a possibly changed frontier.
+# Hold the beat briefly so one pipe-read split does not create two wakes. The
+# bound preserves anti-stall if projection work hangs; a late frontier is cached
+# for the next beat and remains advisory-only.
+STREAM_FRONTIER_GRACE_S = 1.0
 _DEAD_NONCE_MARKERS = (
     "controller-capability-mismatch",
     "lease-nonce-not-live",
@@ -285,6 +290,59 @@ def _is_armed_control_line(line: str) -> bool:
     return isinstance(payload, dict) and str(payload.get("kind") or "") == "armed"
 
 
+def _own_stream_record(child: Any, line: str, *, kind: str) -> dict[str, object] | None:
+    """Return one structural record authored by the stream child itself.
+
+    A relayed mail headline may quote a heartbeat and an event payload may contain
+    the same word.  Neither is the stream's own top-level signal, and a backup or
+    watchdog child that happens to emit the same JSON shape is not the stream.
+    """
+    if str(getattr(child, "kind", "") or "") != "stream":
+        return None
+    text = str(line or "").strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        record = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(record, dict) or str(record.get("kind") or "") != kind:
+        return None
+    payload = record.get("payload")
+    return record if isinstance(payload, dict) else None
+
+
+def _bounded_payload_text(value: object, *, max_bytes: int) -> str:
+    encoded = str(value or "").encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return encoded.decode("utf-8")
+    return encoded[: max(0, max_bytes - 3)].decode("utf-8", "ignore") + "…"
+
+
+def _actionable_stream_wake(
+    frontier: dict[str, object] | None,
+) -> dict[str, object]:
+    """Replace an idle keepalive with the latest action-bearing frontier."""
+    source = frontier.get("payload") if isinstance(frontier, dict) else None
+    source_payload = source if isinstance(source, dict) else {}
+    state = str(source_payload.get("state") or "unknown")
+    payload: dict[str, object] = {
+        "directive": "Nothing pending" if state == "empty" else "goal-flight next",
+        "state": state,
+    }
+    if source_payload.get("id") not in (None, ""):
+        payload["id"] = _bounded_payload_text(source_payload["id"], max_bytes=72)
+    if source_payload.get("title") not in (None, ""):
+        payload["title"] = _bounded_payload_text(
+            source_payload["title"], max_bytes=240
+        )
+    if source_payload.get("detail") not in (None, "") and "title" not in payload:
+        payload["detail"] = _bounded_payload_text(
+            source_payload["detail"], max_bytes=240
+        )
+    return {"kind": "next", "payload": payload}
+
+
 def _structured_child_reason(line: str) -> str | None:
     """Extract a child-authored diagnostic reason from a JSON control line.
 
@@ -355,6 +413,7 @@ def run_supervisor(
     heartbeat_s: float = 120.0,
     coverage_s: float = 120.0,
     items: list[tuple[str, str]] | None = None,
+    chatty: bool = False,
 ) -> int:
     """Run until the lease dies, stdout breaks, or the host asks to stop."""
     nonce = str(lease_nonce or "").strip()
@@ -446,6 +505,30 @@ def run_supervisor(
         return 0
     next_heartbeat = host.now + max(0.01, float(heartbeat_s))
     next_coverage = host.now + max(0.01, float(coverage_s))
+    latest_frontier: dict[str, object] | None = None
+    pending_stream_heartbeat: dict[str, object] | None = None
+    pending_stream_heartbeat_due = float("inf")
+
+    def emit_pending_stream_wake(*, paired_frontier: bool = False) -> bool:
+        nonlocal pending_stream_heartbeat, pending_stream_heartbeat_due
+        if pending_stream_heartbeat is None:
+            return True
+        pending_stream_heartbeat = None
+        pending_stream_heartbeat_due = float("inf")
+        frontier = latest_frontier
+        frontier_payload = (
+            frontier.get("payload") if isinstance(frontier, dict) else None
+        )
+        if (
+            not paired_frontier
+            and isinstance(frontier_payload, dict)
+            and frontier_payload.get("state") == "empty"
+        ):
+            # A cached empty projection cannot prove that nothing appeared
+            # during a slow current refresh. Preserve the wake, but never turn
+            # that ambiguity into a false idle directive.
+            frontier = None
+        return _emit(host, _actionable_stream_wake(frontier))
 
     while host.running():
         state = _nonce_state(host, nonce)
@@ -467,6 +550,8 @@ def run_supervisor(
             return SUPERVISE_STOP_EXIT
         now = host.now
         wake_at = min(next_heartbeat, next_coverage)
+        if pending_stream_heartbeat is not None:
+            wake_at = min(wake_at, pending_stream_heartbeat_due)
         for slot in slots:
             if slot.child is None and slot.stopped_reason is None:
                 wake_at = min(wake_at, slot.next_start)
@@ -478,8 +563,37 @@ def run_supervisor(
         ]
         result = host.wait(live_children, timeout_s)
         for child, line in result.lines:
+            if not chatty:
+                heartbeat = _own_stream_record(child, line, kind="heartbeat")
+                if heartbeat is not None:
+                    if pending_stream_heartbeat is not None:
+                        if not emit_pending_stream_wake():
+                            host.kill_all()
+                            return 0
+                    pending_stream_heartbeat = heartbeat
+                    pending_stream_heartbeat_due = (
+                        host.now + STREAM_FRONTIER_GRACE_S
+                    )
+                    continue
+                frontier = _own_stream_record(child, line, kind="frontier")
+                if frontier is not None:
+                    latest_frontier = frontier
+                    if not emit_pending_stream_wake(paired_frontier=True):
+                        host.kill_all()
+                        return 0
+                    continue
             text = line if line.endswith("\n") else line + "\n"
             if not host.write_stdout(text):
+                host.kill_all()
+                return 0
+        stream_exited = any(
+            str(getattr(event.child, "kind", "") or "") == "stream"
+            for event in result.exits
+        )
+        if pending_stream_heartbeat is not None and (
+            stream_exited or host.now >= pending_stream_heartbeat_due
+        ):
+            if not emit_pending_stream_wake():
                 host.kill_all()
                 return 0
         for event in result.exits:
@@ -1051,4 +1165,5 @@ def cmd_supervise(args: Any) -> int:
         host=host,
         heartbeat_s=heartbeat_s,
         coverage_s=coverage_s,
+        chatty=bool(getattr(args, "chatty", False)),
     )
