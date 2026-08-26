@@ -1304,7 +1304,14 @@ def _acquire_contended_lock(path: Path, *, directory_fd: int) -> int:
                 dir_fd=directory_fd,
             )
             try:
-                _lock_nonblocking(pending_fd)
+                try:
+                    _lock_nonblocking(pending_fd)
+                except BlockingIOError as exc:
+                    # Unique pending inode: EAGAIN is not "slot taken".
+                    # Re-raise so the unbounded walk cannot spin.
+                    raise RuntimeError(
+                        "could not lock a newly created waiter slot file"
+                    ) from exc
                 try:
                     os.link(
                         pending,

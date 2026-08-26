@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -1198,6 +1199,39 @@ def test_listener_arm_has_no_slot_ceiling(
     finally:
         for holder in holders:
             holder.close()
+
+
+def test_create_path_lock_failure_is_not_treated_as_slot_taken(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EAGAIN on a unique new inode is fail-closed, not 'try slot N+1'."""
+    root, _env = isolated
+    monkeypatch.delenv("GOALFLIGHT_LISTENER_SLOTS", raising=False)
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test", principal={"principal_id": "create-lock-fail"}
+    )
+    assert claimed.committed and claimed.value is not None
+    attempts = {"n": 0}
+
+    def boom(_fd: int) -> None:
+        attempts["n"] += 1
+        if attempts["n"] > 3:
+            raise AssertionError(
+                "create-path BlockingIOError was treated as a taken slot"
+            )
+        raise BlockingIOError(errno.EAGAIN, "locked")
+
+    monkeypatch.setattr(wake, "_lock_nonblocking", boom)
+    with pytest.raises(RuntimeError, match="newly created"):
+        wake.register_listener_waiter(
+            root,
+            controller_label="wake-test",
+            generation_key=claimed.value.nonce,
+            slots=4,
+        )
+    assert attempts["n"] == 1
 
 
 def test_self_post_does_not_ring_pool_foreign_post_does(
@@ -2397,6 +2431,10 @@ def test_unclaimed_cli_entries_stay_quiet_and_claimed_mail_entries_warn_once(
         holder.close()
 
     argv = shlex.split(lines[0].split("start: ", 1)[1])
+    # The advertised command is pasteable (`python3`); run it with the
+    # pytest interpreter so PATH python is not a hidden precondition.
+    if argv and argv[0] == "python3":
+        argv[0] = sys.executable
     runnable_holder = wake.register_lease_holder(
         root,
         controller_label="wake-test",
