@@ -1115,8 +1115,12 @@ def test_listener_arm_past_target_is_not_refused_then_empty_pool_hint(
 def test_listener_arm_has_no_slot_ceiling(
     isolated: tuple[Path, dict[str, str]],
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, env = isolated
+    monkeypatch.delenv("GOALFLIGHT_LISTENER_SLOTS", raising=False)
+    env = dict(env)
+    env.pop("GOALFLIGHT_LISTENER_SLOTS", None)
     authority = journal.open_or_create_journal(root)
     claimed = authority.claim_or_renew_lease(
         "wake-test", principal={"principal_id": "uncapped-arm"}
