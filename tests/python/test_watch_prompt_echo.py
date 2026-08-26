@@ -1928,6 +1928,107 @@ def test_worker_dead_reason_does_not_claim_no_evidence_for_blocked_transcript() 
     assert "BLOCKED" in reason, reason
 
 
+def test_dead_path_attention_only_own_final_unquoted_line() -> None:
+    """Quoted / mid-tail attention is relayed or abandoned, not a stop.
+
+    Drive the real watcher with real transcripts. A genuine last-line
+    unquoted unindented escalation must still terminalize (exit 4) so the
+    false-negative that hid BLOCKED as unexplained death does not return.
+    """
+    dispatch_id = "watch-attention-own-signal"
+    cases = (
+        ("BLOCKED", "cannot write sandbox path; needs controller"),
+        ("USER-NEED", "what is the target path?"),
+    )
+    for kind, excerpt in cases:
+        quoted_rc, _elapsed, quoted_term, quoted_payload = _run_dead_worker_tail(
+            f"worker copied prior output\n> {kind}: {excerpt}\n",
+            dispatch_id=dispatch_id,
+        )
+        assert quoted_rc == 1, (
+            f"quoted {kind} must not block, got rc={quoted_rc} ({quoted_payload})"
+        )
+        assert quoted_payload.get("state") == "worker_dead", f"quoted {kind}: {quoted_payload}"
+        assert quoted_payload.get("state") != "blocked", f"quoted {kind}: {quoted_payload}"
+        assert not quoted_term, f"quoted {kind}: {quoted_term}"
+
+        mid_rc, _elapsed, mid_term, mid_payload = _run_dead_worker_tail(
+            f"work stalled\n{kind}: {excerpt}\nworker kept going after the marker\n",
+            dispatch_id=dispatch_id,
+        )
+        assert mid_rc == 1, (
+            f"mid-tail {kind} must not block, got rc={mid_rc} ({mid_payload})"
+        )
+        assert mid_payload.get("state") == "worker_dead", f"mid-tail {kind}: {mid_payload}"
+        assert mid_payload.get("state") != "blocked", f"mid-tail {kind}: {mid_payload}"
+        assert not mid_term, f"mid-tail {kind}: {mid_term}"
+
+        own_rc, _elapsed, own_term, own_payload = _run_dead_worker_tail(
+            f"work stalled\n{kind}: {excerpt}\n",
+            dispatch_id=dispatch_id,
+        )
+        assert own_rc == 4, (
+            f"own final {kind} must block, got rc={own_rc} ({own_payload})"
+        )
+        assert own_payload.get("state") == "blocked", f"own {kind}: {own_payload}"
+        assert own_payload.get("liveness_state") == "blocked", f"own {kind}: {own_payload}"
+        assert own_payload.get("reason") == f"marker:{kind}", f"own {kind}: {own_payload}"
+        assert own_term.get("kind") == kind, f"own {kind}: {own_term}"
+        assert own_term.get("text") == excerpt, f"own {kind}: {own_term}"
+
+        trailer_rc, _elapsed, trailer_term, trailer_payload = _run_dead_worker_tail(
+            f"work stalled\n{kind}: {excerpt}\nhook: Stop\ntokens used\n42\n",
+            dispatch_id=dispatch_id,
+        )
+        assert trailer_rc == 4, (
+            f"{kind} plus harness trailer must still block, got rc={trailer_rc} "
+            f"({trailer_payload})"
+        )
+        assert trailer_payload.get("state") == "blocked", f"trailer {kind}: {trailer_payload}"
+        assert trailer_term.get("kind") == kind, f"trailer {kind}: {trailer_term}"
+        assert trailer_term.get("text") == excerpt, f"trailer {kind}: {trailer_term}"
+
+
+def test_worker_dead_reason_does_not_claim_no_evidence_for_indented_blocked() -> None:
+    """extract_markers strips indent; death-cause must not then claim ignorance.
+
+    An indented BLOCKED line is not the worker's own terminal signal, so the
+    watcher must not exit blocked. The same input is still determinate
+    evidence: last_marker.kind is BLOCKED and death_cause must not say
+    no_evidence.
+    """
+    dispatch_id = "watch-attention-indented"
+    indented = (
+        "work stalled\n"
+        "    BLOCKED: cannot write sandbox path; needs controller\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(indented, encoding="utf-8")
+        markers, _size = goalflight_watch.extract_markers(tail)
+        last_marker = markers[-1] if markers else None
+        reason = goalflight_watch._worker_dead_no_marker_reason(
+            tail,
+            ["Do the requested work."],
+            prompt_provenance_available=True,
+            last_marker=last_marker,
+        )
+    assert last_marker is not None and last_marker.get("kind") == "BLOCKED", last_marker
+    assert reason != NO_EVIDENCE_WORKER_DEAD_REASON, reason
+    assert "no_evidence" not in reason, reason
+    assert "BLOCKED" in reason, reason
+
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        indented,
+        dispatch_id=dispatch_id,
+    )
+    assert rc == 1, f"indented BLOCKED must not terminalize, got rc={rc} ({payload})"
+    assert payload.get("state") == "worker_dead", payload
+    assert payload.get("state") != "blocked", payload
+    assert not term, term
+    assert "no_evidence" not in str(payload.get("reason")), payload
+
+
 def case_dead_pid_usage_limit_without_success_marker_reclassifies() -> None:
     rc, _elapsed, term, payload = _run_dead_worker_tail(
         "You've hit your usage limit. Please try again at 6:13 AM.\n"
@@ -2507,6 +2608,8 @@ def main() -> None:
     case_dead_pid_unbound_done_signoff_is_rejected()
     case_dead_pid_unbound_attention_markers_block_not_die()
     test_worker_dead_reason_does_not_claim_no_evidence_for_blocked_transcript()
+    test_dead_path_attention_only_own_final_unquoted_line()
+    test_worker_dead_reason_does_not_claim_no_evidence_for_indented_blocked()
     case_dead_pid_usage_limit_without_success_marker_reclassifies()
     case_b054_real_evidence_marker_vocab_bullet_reclassifies_rate_limited()
     case_b054_error_after_reconciled_marker_vetoes_complete()
