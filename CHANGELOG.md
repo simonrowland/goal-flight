@@ -57,6 +57,32 @@ incremented when meaningful skill behaviour changes.
   safety flag does not.
 - `--os-sandbox` help names ACP honouring as a refusal axis, not
   bash-codex-only.
+### Added
+
+- **Watch-layer `worker_stalled_candidate` detector for an alive-but-stuck
+  worker.** Grok workers have wedged mid-sentence with `state=running` and
+  `worker_alive=True` indefinitely: the process stays resident at 0 CPU,
+  the tail stops, and the idle backstop never fires because liveness is
+  judged by process existence plus the status heartbeat. The watcher now
+  flags `worker_stalled_candidate` when three legs are sustained (default
+  15 minutes, `--wedge-idle-secs`): tail mtime stale, worker-tree quiet,
+  and cumulative CPU time flat across two spaced samples (not a single
+  `%cpu` snapshot). A 5-minute default was rejected: healthy grok tails
+  grow in bursts with multi-minute silences, and a same-source band that
+  looked clean failed on sixteen live workers in another fleet. This is a
+  candidate, not a verdict — a worker waiting on a remote/studio job
+  matches all three legs while healthy. Evidence includes `tail_age_s`,
+  `tree_age_s`, `cpu_delta_s`, `sample_interval_s`, and `tail_bytes_grown`
+  (burst history for the controller, not a discriminator). Detection does
+  not kill. A recent tree write vetoes the naive tail+CPU rule. Emits
+  `WATCHER-STALL-CANDIDATE` once on enter and `WATCHER-STALL-CLEAR` once
+  on recover. The state is not terminal and does not trip `worker_dead`
+  cleanup. Round 2: the tree-quiet leg scans the dispatch's own
+  `worker_cwd` (b-217's recorded `-C`) and skips `.git/`; when cwd is the
+  canonical root or missing, the leg is indeterminate rather than reading
+  sibling worktree writes as this worker's life. Last CPU sample and
+  candidate announcement persist in the status sidecar so a watcher
+  restart does not reset the window or re-announce.
 
 ## [1.5.1] - 2026-08-23
 

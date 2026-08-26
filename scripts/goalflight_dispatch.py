@@ -1353,6 +1353,8 @@ def _worker_cwd(args) -> Path:
     Distinct from ``_project_root``, which collapses worktrees so they share a
     task store. Feeding that collapsed root back as ``--cwd`` made queued and
     resumed workers launch with ``-C <main checkout>`` (b-217, b-227).
+    task store. The stall detector must measure this cwd, not the canonical
+    root (b-229): sibling worktrees keep the shared tree "active" forever.
     """
     raw = getattr(args, "cwd", None)
     if raw:
@@ -6570,6 +6572,7 @@ def _watcher_spawn_argv(
     dispatch_id: str,
     pgid: int,
     project_root: Path | None = None,
+    worker_cwd: Path | None = None,
     task_ids: list[str] | None = None,
     worker_identity: dict | None = None,
     launch_detached: bool = False,
@@ -6611,6 +6614,8 @@ def _watcher_spawn_argv(
     ]
     if project_root is not None:
         watch_cmd += ["--project-root", str(project_root)]
+    if worker_cwd is not None:
+        watch_cmd += ["--worker-cwd", str(worker_cwd)]
     if task_ids:
         if project_root is None:
             raise ValueError("project_root is required when task_ids are present")
@@ -13287,6 +13292,7 @@ def main(argv: list[str] | None = None) -> int:
             dispatch_id=args.dispatch_id,
             pgid=pgid,
             project_root=project_root,
+            worker_cwd=_worker_cwd(args),
             task_ids=getattr(args, "task_ids", None),
             worker_identity=worker_identity_token,
             launch_detached=bool(args.launch_detached),

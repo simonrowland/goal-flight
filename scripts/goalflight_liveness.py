@@ -360,12 +360,11 @@ def parse_ps_pgroup_cputime(ps_output: str, target_pgid: int | str) -> dict[int,
     return sample
 
 
-def cpu_pct_from_cputime_delta(
+def cputime_delta_seconds(
     before: dict[int, float],
     after: dict[int, float],
-    window_s: float,
 ) -> float:
-    """Percent of one core burned by a process group over ``window_s``.
+    """CPU-seconds burned by a process group between two snapshots.
 
     Paired PER PID rather than summing the group, because a group sum is wrong
     in two ways that happen on every tick of a real worker:
@@ -383,8 +382,6 @@ def cpu_pct_from_cputime_delta(
     biased toward "idle" -- which callers already cross-check against output
     and marker activity before declaring a worker dead.
     """
-    if window_s <= 0:
-        return 0.0
     busy = 0.0
     for pid, after_s in after.items():
         before_s = before.get(pid)
@@ -392,7 +389,18 @@ def cpu_pct_from_cputime_delta(
             busy += after_s
         elif after_s > before_s:
             busy += after_s - before_s
-    return max(0.0, busy / window_s * 100.0)
+    return max(0.0, busy)
+
+
+def cpu_pct_from_cputime_delta(
+    before: dict[int, float],
+    after: dict[int, float],
+    window_s: float,
+) -> float:
+    """Percent of one core burned by a process group over ``window_s``."""
+    if window_s <= 0:
+        return 0.0
+    return cputime_delta_seconds(before, after) / window_s * 100.0
 
 
 def _pgroup_cputime_snapshot(pgid: int) -> dict[int, float] | None:
@@ -409,6 +417,23 @@ def _pgroup_cputime_snapshot(pgid: int) -> dict[int, float] | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return parse_ps_pgroup_cputime(output, pgid)
+
+
+def pgroup_cputime_snapshot(pgid_or_pid: int | str | None) -> dict[int, float] | None:
+    """Map pid -> cumulative cpu-seconds for a process group.
+
+    Accepts a pgid or a live pid (resolved to its group). Returns None only
+    when the sample itself is unavailable. This is the raw counter the wedge
+    detector diffs across two polls; it is not an instantaneous ``%cpu``.
+    """
+    try:
+        target = int(pgid_or_pid) if pgid_or_pid is not None else None
+    except (TypeError, ValueError):
+        return None
+    if target is None:
+        return None
+    pgid = process_group_id(target) or target
+    return _pgroup_cputime_snapshot(pgid)
 
 
 def pgroup_cpu_pct(pgid_or_pid: int | str | None) -> float | None:
