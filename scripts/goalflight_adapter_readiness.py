@@ -47,15 +47,23 @@ def load_manifest(agent: str) -> dict[str, Any] | None:
     return manifest
 
 
+RETRYABLE_MANIFEST_REASONS = frozenset(
+    {
+        "adapter_manifest_unreadable",
+        "adapter_manifest_invalid",
+    }
+)
+
+
 def load_manifest_with_reason(agent: str) -> tuple[dict[str, Any] | None, str | None]:
     for path in manifest_candidates(agent):
-        if not path.exists():
-            continue
         try:
+            if not path.exists():
+                continue
             data = json.loads(path.read_text())
         except OSError:
             return None, "adapter_manifest_unreadable"
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return None, "adapter_manifest_invalid"
         if not isinstance(data, dict):
             return None, "adapter_manifest_invalid"
@@ -168,50 +176,98 @@ def validate_acp_dispatch_readiness(agent: str, argv: list[str]) -> dict[str, An
     return None if decision.get("allowed") else decision
 
 
+def os_sandbox_refusal_is_retryable(gate: dict[str, Any] | None) -> bool:
+    """True when capability could not be determined; waiting may change the answer."""
+    if not isinstance(gate, dict):
+        return False
+    if "retryable" in gate:
+        return bool(gate["retryable"])
+    return gate.get("reason") in RETRYABLE_MANIFEST_REASONS
+
+
+def _os_sandbox_refusal(
+    *,
+    reason: str,
+    profile: str | None,
+    retryable: bool,
+    safe_next_action: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "allowed": False,
+        "reason": reason,
+        "profile": profile,
+        "retryable": retryable,
+        "safe_next_action": safe_next_action,
+    }
+    payload.update(extra)
+    return payload
+
+
 def validate_os_sandbox_request(agent: str, profile: str | None) -> dict[str, Any] | None:
     if profile in {None, OS_SANDBOX_OFF}:
         return None
     platform_key = os_sandbox_platform_key()
     platform_supported = platform_supported_os_sandbox_profiles()
-    manifest = load_manifest(agent) or {}
-    os_spec = ((manifest.get("permission_surface") or {}).get("os_sandbox") or {})
+    manifest, manifest_error = load_manifest_with_reason(agent)
+    if manifest is None:
+        reason = manifest_error or "adapter_manifest_missing"
+        retryable = reason in RETRYABLE_MANIFEST_REASONS
+        return _os_sandbox_refusal(
+            reason=reason,
+            profile=profile,
+            retryable=retryable,
+            safe_next_action=(
+                "retry_when_adapter_manifest_readable"
+                if retryable
+                else "fix_adapter_manifest_or_select_known_adapter"
+            ),
+        )
+    permission_surface = manifest.get("permission_surface")
+    os_spec = (
+        permission_surface.get("os_sandbox")
+        if isinstance(permission_surface, dict)
+        else None
+    )
     if not isinstance(os_spec, dict):
-        return {
-            "allowed": False,
-            "reason": "os_sandbox_undeclared",
-            "profile": profile,
-            "safe_next_action": "declare_os_sandbox_support_or_use_off",
-        }
+        return _os_sandbox_refusal(
+            reason="os_sandbox_undeclared",
+            profile=profile,
+            retryable=False,
+            safe_next_action="declare_os_sandbox_support_or_use_off",
+        )
     supported = os_spec.get("supported_profiles")
     if not isinstance(supported, list) or profile not in supported:
-        return {
-            "allowed": False,
-            "reason": "os_sandbox_unsupported",
-            "profile": profile,
-            "supported_profiles": supported if isinstance(supported, list) else [],
-            "safe_next_action": "select_supported_os_sandbox_profile",
-        }
+        return _os_sandbox_refusal(
+            reason="os_sandbox_unsupported",
+            profile=profile,
+            retryable=False,
+            safe_next_action="select_supported_os_sandbox_profile",
+            supported_profiles=supported if isinstance(supported, list) else [],
+        )
     platform_scoped = os_spec.get("platform_supported_profiles")
     if isinstance(platform_scoped, dict):
         scoped_supported = platform_scoped.get(platform_key)
         if scoped_supported is None and platform_key == "wsl":
             scoped_supported = platform_scoped.get("linux")
         if not isinstance(scoped_supported, list) or profile not in scoped_supported:
-            return {
-                "allowed": False,
-                "reason": "os_sandbox_platform_unsupported",
-                "profile": profile,
-                "platform": platform_key,
-                "supported_profiles": scoped_supported if isinstance(scoped_supported, list) else [],
-                "safe_next_action": "use_os_sandbox_off_on_this_platform",
-            }
+            return _os_sandbox_refusal(
+                reason="os_sandbox_platform_unsupported",
+                profile=profile,
+                retryable=False,
+                safe_next_action="use_os_sandbox_off_on_this_platform",
+                platform=platform_key,
+                supported_profiles=(
+                    scoped_supported if isinstance(scoped_supported, list) else []
+                ),
+            )
     if profile not in platform_supported:
-        return {
-            "allowed": False,
-            "reason": "os_sandbox_platform_unsupported",
-            "profile": profile,
-            "platform": platform_key,
-            "supported_profiles": platform_supported,
-            "safe_next_action": "use_os_sandbox_off_on_this_platform",
-        }
+        return _os_sandbox_refusal(
+            reason="os_sandbox_platform_unsupported",
+            profile=profile,
+            retryable=False,
+            safe_next_action="use_os_sandbox_off_on_this_platform",
+            platform=platform_key,
+            supported_profiles=platform_supported,
+        )
     return None

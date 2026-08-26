@@ -168,6 +168,7 @@ from goalflight_rate_pressure import RATE_LIMIT_PATTERNS
 from goalflight_adapter_readiness import (
     load_manifest,
     manifest_candidates,
+    os_sandbox_refusal_is_retryable,
     validate_acp_dispatch_readiness,
     validate_os_sandbox_request,
 )
@@ -2080,7 +2081,11 @@ async def _run_acp_dispatch_impl(
     )
     if os_sandbox_error is None and read_only_intent:
         os_sandbox_gate = validate_os_sandbox_request(cfg.agent, os_sandbox_profile)
-        if os_sandbox_gate is not None and acp_permission_read_only_supported(cfg.agent):
+        if (
+            os_sandbox_gate is not None
+            and not os_sandbox_refusal_is_retryable(os_sandbox_gate)
+            and acp_permission_read_only_supported(cfg.agent)
+        ):
             sandbox_fallback = {
                 "requested": str(os_sandbox_profile),
                 "applied": OS_SANDBOX_OFF,
@@ -2338,7 +2343,8 @@ async def _run_acp_dispatch_impl(
     os_sandbox_gate = validate_os_sandbox_request(cfg.agent, os_sandbox_profile)
     if os_sandbox_gate is not None:
         payload.update({"state": "blocked_os_sandbox", "error": os_sandbox_gate})
-        _commit_prelaunch_terminal(payload, project_root=project_root)
+        if not os_sandbox_refusal_is_retryable(os_sandbox_gate):
+            _commit_prelaunch_terminal(payload, project_root=project_root)
         write_status(status_path, payload)
         return payload
     try:

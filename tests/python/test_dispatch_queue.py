@@ -28,6 +28,7 @@ CAPACITY = ROOT / "scripts" / "goalflight_capacity.py"
 FAKE_ACP_AGENT = ROOT / "tests" / "fixtures" / "acp_fake_agent.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import goalflight_adapter_readiness as adapter_readiness  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_journal as journal  # noqa: E402
 import goalflight_ledger as ledger  # noqa: E402
@@ -1987,6 +1988,214 @@ def test_acp_submit_then_drain_replays_from_queue() -> None:
                     status_path,
                     watcher=False,
                 )
+
+
+def _write_grok_os_sandbox_manifest(
+    adapters: Path,
+    *,
+    supported_profiles: list[str],
+) -> Path:
+    adapters.mkdir(parents=True, exist_ok=True)
+    path = adapters / "grok.json"
+    path.write_text(
+        json.dumps(
+            {
+                "agent_id": "grok",
+                "permission_surface": {
+                    "os_sandbox": {
+                        "supported_profiles": supported_profiles,
+                        "default_profile": "off",
+                        "implementation": "runner:sandbox-exec",
+                        "platform_supported_profiles": {
+                            "darwin": supported_profiles,
+                            "linux": ["off"],
+                            "wsl": ["off"],
+                            "windows": ["off"],
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _queue_acp_os_sandbox_row(
+    tmp: Path,
+    *,
+    dispatch_id: str,
+) -> Path:
+    prompt = tmp / "prompt.md"
+    prompt.write_text("Review the change.\n", encoding="utf-8")
+    queue = D._dispatch_queue_dir()
+    queue.mkdir(parents=True, exist_ok=True)
+    queue_path = queue / f"{dispatch_id}.json"
+    argv = [
+        "--agent",
+        "grok-acp",
+        "--shape",
+        "acp",
+        "--os-sandbox",
+        "read-only",
+        "--prompt-file",
+        str(prompt),
+        "--dispatch-id",
+        dispatch_id,
+        "--cwd",
+        str(tmp),
+        "--unregistered-forced",
+        "--no-orientation",
+        "--ignore-git-warn",
+        "--tail",
+        str(tmp / f"{dispatch_id}.tail"),
+        "--status-json",
+        str(tmp / f"{dispatch_id}.status.json"),
+    ]
+    D._write_json_atomic(
+        queue_path,
+        {
+            "schema": D.DISPATCH_QUEUE_SCHEMA,
+            "state": "queued",
+            "dispatch_id": dispatch_id,
+            "agent": "grok-acp",
+            "shape": "acp",
+            "project_root": str(tmp),
+            "process_cwd": str(tmp),
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "queue_path": str(queue_path),
+            "dispatch_argv": argv,
+            "request": {
+                "agent": "grok-acp",
+                "cwd": str(tmp),
+                "os_sandbox": "read-only",
+                "prompt_file": str(prompt),
+                "tail": str(tmp / f"{dispatch_id}.tail"),
+                "status_json": str(tmp / f"{dispatch_id}.status.json"),
+            },
+        },
+    )
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": dispatch_id,
+            "agent": "grok-acp",
+            "engine": "grok",
+            "shape": "acp",
+            "transport": "dispatch",
+            "project_root": str(tmp),
+            "state": "queued",
+            "started_at": ledger.utc_now(),
+            "dispatch_argv": argv,
+        }
+    )
+    return queue_path
+
+
+def test_unreadable_adapter_manifest_does_not_terminalize_queued_os_sandbox() -> None:
+    """A chmod-000 manifest is undetermined, not inert. Drain must keep the row."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        adapters = tmp / "adapters"
+        manifest = _write_grok_os_sandbox_manifest(
+            adapters,
+            supported_profiles=["off", "read-only", "workspace-write"],
+        )
+        manifest.chmod(0)
+        env["GOALFLIGHT_ADAPTERS_DIR"] = str(adapters)
+        env["GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE"] = "1"
+        old_env = os.environ.copy()
+        old_adapters_dir = adapter_readiness.ADAPTERS_DIR
+        dispatch_id = "unreadable-manifest-queued"
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            adapter_readiness.ADAPTERS_DIR = adapters
+            loaded, reason = adapter_readiness.load_manifest_with_reason("grok-acp")
+            assert loaded is None, loaded
+            assert reason == "adapter_manifest_unreadable", reason
+            gate = adapter_readiness.validate_os_sandbox_request("grok-acp", "read-only")
+            assert gate is not None
+            assert gate["reason"] == "adapter_manifest_unreadable", gate
+            assert gate["retryable"] is True, gate
+
+            queue_path = _queue_acp_os_sandbox_row(tmp, dispatch_id=dispatch_id)
+            payload = D._drain_queue_once(_drain_args(queue_path.parent))
+            detail = next(
+                row
+                for row in payload["details"]
+                if row.get("dispatch_id") == dispatch_id
+            )
+            assert detail["state"] == "queued", (detail, payload)
+            assert str(detail.get("reason") or "").startswith(
+                "launch_refused_pre_spawn:"
+            ), detail
+            assert payload["failed"] == 0, payload
+            assert payload["left_queued"] >= 1, payload
+            assert queue_path.exists(), (
+                "unreadable adapter manifest terminalized a valid queued row"
+            )
+            assert list(queue_path.parent.glob(f"{dispatch_id}.json.claimed-*.failed")) == []
+            record = json.loads(ledger.record_path(dispatch_id).read_text(encoding="utf-8"))
+            assert record.get("state") != "blocked_os_sandbox", record
+        finally:
+            adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+            with contextlib.suppress(OSError):
+                manifest.chmod(0o644)
+            os.environ.clear()
+            os.environ.update(old_env)
+
+
+def test_absent_os_sandbox_capability_still_terminalizes_queued_row() -> None:
+    """A readable manifest that does not honour the profile stays permanent."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        adapters = tmp / "adapters"
+        _write_grok_os_sandbox_manifest(adapters, supported_profiles=["off"])
+        env["GOALFLIGHT_ADAPTERS_DIR"] = str(adapters)
+        env["GOALFLIGHT_ALLOW_ADAPTERS_DIR_OVERRIDE"] = "1"
+        old_env = os.environ.copy()
+        old_adapters_dir = adapter_readiness.ADAPTERS_DIR
+        dispatch_id = "absent-capability-queued"
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            adapter_readiness.ADAPTERS_DIR = adapters
+            gate = adapter_readiness.validate_os_sandbox_request("grok-acp", "read-only")
+            assert gate is not None
+            assert gate["reason"] == "os_sandbox_unsupported", gate
+            assert gate["retryable"] is False, gate
+
+            queue_path = _queue_acp_os_sandbox_row(tmp, dispatch_id=dispatch_id)
+            payload = D._drain_queue_once(_drain_args(queue_path.parent))
+            detail = next(
+                row
+                for row in payload["details"]
+                if row.get("dispatch_id") == dispatch_id
+            )
+            assert detail["state"] != "queued", detail
+            assert not str(detail.get("reason") or "").startswith(
+                "launch_refused_pre_spawn:"
+            ), detail
+            assert "os_sandbox_unsupported" in str(detail.get("reason") or ""), detail
+            assert payload["left_queued"] == 0, payload
+            assert queue_path.exists() is False, "capability-absent row restored"
+            failed_records = list(
+                queue_path.parent.glob(f"{dispatch_id}.json.claimed-*.failed")
+            )
+            assert failed_records, (payload, list(queue_path.parent.iterdir()))
+            failed = json.loads(failed_records[0].read_text(encoding="utf-8"))
+            assert failed["state"] == "failed", failed
+            assert "os_sandbox_unsupported" in str(failed.get("reason") or ""), failed
+            record = json.loads(ledger.record_path(dispatch_id).read_text(encoding="utf-8"))
+            assert record.get("state") == "blocked_os_sandbox", record
+        finally:
+            adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+            os.environ.clear()
+            os.environ.update(old_env)
 
 
 def test_drain_leaves_request_queued_when_capacity_full() -> None:
@@ -6287,6 +6496,8 @@ def main() -> None:
     test_drain_waits_for_submit_status_recording()
     test_drain_write_error_is_json_error_without_traceback()
     test_acp_submit_then_drain_replays_from_queue()
+    test_unreadable_adapter_manifest_does_not_terminalize_queued_os_sandbox()
+    test_absent_os_sandbox_capability_still_terminalizes_queued_row()
     test_drain_leaves_request_queued_when_capacity_full()
     test_capacity_blocked_drain_claim_is_released_and_entry_stays_queued()
     test_drain_timeout_of_pre_worker_claim_restores_to_queued()
