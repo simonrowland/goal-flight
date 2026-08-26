@@ -84,6 +84,40 @@ def _wait_for_status(status: Path, predicate, *, timeout_s: float = 5.0) -> dict
     raise AssertionError(f"status predicate not reached: {latest}")
 
 
+def _wait_for_cleanup_evidence(
+    mailbox: Path,
+    *,
+    wait_id: str,
+    reply_seq: int,
+    require_receipt: bool = True,
+    require_end: bool = True,
+    timeout_s: float = 5.0,
+) -> tuple[list[dict], set[tuple[str, int]]]:
+    """Wait for independently persisted post-delivery evidence in tests."""
+    expected_receipt = (wait_id, reply_seq)
+    deadline = time.monotonic() + timeout_s
+    entries: list[dict] = []
+    receipts: set[tuple[str, int]] = set()
+    receipt_ready = not require_receipt
+    end_ready = not require_end
+    while time.monotonic() < deadline:
+        entries = steer.read_steer_entries(mailbox)
+        receipts = steer.consumed_worker_wait_receipts({}, mailbox_path=mailbox)
+        receipt_ready = not require_receipt or expected_receipt in receipts
+        end_ready = not require_end or any(
+            entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
+            and entry.get("reply_to") == wait_id
+            and (entry.get("context") or {}).get("reply_seq") == reply_seq
+            for entry in entries
+        )
+        if receipt_ready and end_ready:
+            return entries, receipts
+        threading.Event().wait(0.01)
+    assert receipt_ready, receipts
+    assert end_ready, entries
+    return entries, receipts
+
+
 def _watcher_command(
     *,
     dispatch_id: str,
@@ -221,7 +255,11 @@ def test_next_wait_recovers_reply_written_during_final_sleep(
     assert second["entries"][0]["text"] == "accepted before the deadline"
     assert second["wait_id"] == first["wait_id"]
     assert second["recovered_admitted_reply"] is True
-    entries = steer.read_steer_entries(mailbox)
+    entries, _receipts = _wait_for_cleanup_evidence(
+        mailbox,
+        wait_id=str(first["wait_id"]),
+        reply_seq=int(second["entries"][0]["seq"]),
+    )
     assert sum(
         entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND for entry in entries
     ) == 1
@@ -1207,10 +1245,10 @@ import goalflight_steer_mailbox as steer
 
 dispatch_id = os.environ["TEST_DISPATCH_ID"]
 
-def missed_end_write(*_args, **_kwargs):
-    raise TimeoutError("forced cleanup lock miss")
+def receipt_only_cleanup(path, _arm, reply):
+    steer.record_worker_wait_reply_receipt(path, reply)
 
-steer.append_worker_wait_ended = missed_end_write
+steer.schedule_worker_wait_reply_cleanup = receipt_only_cleanup
 
 def report(event):
     if event["state"] == "armed":
@@ -1302,10 +1340,14 @@ def test_consumed_receipt_allows_second_wait_when_end_row_write_fails(
     mailbox = tmp_path / "cleanup-retry.steer.jsonl"
     tail = tmp_path / "cleanup-retry.tail"
 
-    def missed_end_write(*_args, **_kwargs):
-        raise TimeoutError("forced cleanup lock miss")
+    def receipt_only_cleanup(path, _arm, reply):
+        steer.record_worker_wait_reply_receipt(path, reply)
 
-    monkeypatch.setattr(steer, "append_worker_wait_ended", missed_end_write)
+    monkeypatch.setattr(
+        steer,
+        "schedule_worker_wait_reply_cleanup",
+        receipt_only_cleanup,
+    )
 
     def report(event: dict) -> None:
         if event["state"] == "armed":
@@ -1415,24 +1457,19 @@ def test_report_failure_does_not_record_reply_as_consumed(
     assert recovered["recovered_admitted_reply"] is True
 
 
-def test_bounded_consumption_cleanup_miss_redelivers_instead_of_refusing(
+def test_missing_consumption_cleanup_redelivers_instead_of_refusing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Missing both best-effort receipts may duplicate, but cannot strand."""
+    """Missing both cleanup records may duplicate, but cannot strand."""
     dispatch_id = "cleanup-miss-redelivery"
     mailbox = tmp_path / "cleanup-miss-redelivery.steer.jsonl"
 
     monkeypatch.setattr(
         steer,
-        "record_worker_wait_reply_receipt",
+        "schedule_worker_wait_reply_cleanup",
         lambda *_args, **_kwargs: None,
     )
-
-    def missed_end_write(*_args, **_kwargs):
-        raise TimeoutError("forced bounded cleanup miss")
-
-    monkeypatch.setattr(steer, "append_worker_wait_ended", missed_end_write)
 
     def report(event: dict) -> None:
         if event["state"] == "armed":
@@ -1605,6 +1642,166 @@ def test_generic_backlog_rows_do_not_wear_the_reply_receipt_label() -> None:
     )
 
 
+def test_cleanup_fsync_stall_does_not_hold_waiter_return(tmp_path: Path) -> None:
+    """A receipts-sidecar fsync runs after delivery and cannot hold --wait.
+
+    The site hook is inherited by the real wait process and any detached
+    cleanup process it launches. It stalls only the sidecar's actual os.fsync,
+    after the typed reply has already been flushed to worker output. Before
+    cleanup left the synchronous return path, this barrier held the wait process.
+    """
+    mailbox = tmp_path / "cleanup-stall.steer.jsonl"
+    dispatch_id = "cleanup-stall"
+    stall_started = tmp_path / "cleanup-fsync.started"
+    release_stall = tmp_path / "cleanup-fsync.release"
+    hook_dir = tmp_path / "python-hook"
+    hook_dir.mkdir()
+    hook_dir.joinpath("sitecustomize.py").write_text(
+        """
+import os
+import time
+from pathlib import Path
+
+import goalflight_messages as messages
+
+real_append_fsync = messages._append_fsync
+stall_started = Path(os.environ["TEST_CLEANUP_FSYNC_STARTED"])
+release_stall = Path(os.environ["TEST_CLEANUP_FSYNC_RELEASE"])
+
+def stalled_cleanup_fsync(path, data):
+    if not Path(path).name.endswith(".receipts.jsonl"):
+        return real_append_fsync(path, data)
+    real_fsync = messages.os.fsync
+    stalled = False
+
+    def fsync_with_barrier(fd):
+        nonlocal stalled
+        if not stalled:
+            stalled = True
+            stall_started.write_text(str(path), encoding="utf-8")
+            while not release_stall.exists():
+                time.sleep(0.01)
+        return real_fsync(fd)
+
+    messages.os.fsync = fsync_with_barrier
+    try:
+        return real_append_fsync(path, data)
+    finally:
+        messages.os.fsync = real_fsync
+
+messages._append_fsync = stalled_cleanup_fsync
+""",
+        encoding="utf-8",
+    )
+    worker_code = r'''
+import os
+from pathlib import Path
+
+import goalflight_steer_mailbox as steer
+
+def report(event):
+    if event["state"] == "armed":
+        print(f"ARMED: {event['arm']['question_id']}", flush=True)
+    elif event["state"] == "messages":
+        for entry in event["entries"]:
+            for line in steer.worker_wait_reply_output_lines(entry):
+                print(line, flush=True)
+
+result = steer.wait_for_worker_entries(
+    Path(os.environ["TEST_STEER_FILE"]),
+    dispatch_id=os.environ["TEST_DISPATCH_ID"],
+    acked_seqs=set(),
+    question_kind="USER-NEED",
+    question_text="prove cleanup cannot hold my return",
+    timeout_secs=4.0,
+    poll_secs=0.02,
+    notify=report,
+)
+if result["state"] != "messages":
+    raise SystemExit(1)
+print("WAIT-RETURNED", flush=True)
+'''
+    env = _env(tmp_path)
+    env.update(
+        {
+            "PYTHONPATH": str(hook_dir) + os.pathsep + env["PYTHONPATH"],
+            "TEST_CLEANUP_FSYNC_STARTED": str(stall_started),
+            "TEST_CLEANUP_FSYNC_RELEASE": str(release_stall),
+            "TEST_DISPATCH_ID": dispatch_id,
+            "TEST_STEER_FILE": str(mailbox),
+        }
+    )
+    waiter = subprocess.Popen(
+        [sys.executable, "-c", worker_code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+    )
+    waiter_out = ""
+    waiter_err = ""
+    try:
+        deadline = time.monotonic() + 5.0
+        arm = None
+        while time.monotonic() < deadline:
+            try:
+                arm = next(
+                    entry
+                    for entry in steer.read_steer_entries(mailbox)
+                    if entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND
+                )
+            except (FileNotFoundError, StopIteration):
+                time.sleep(0.01)
+            else:
+                break
+        assert arm is not None, "waiter never durably armed"
+        reply = steer.append_worker_wait_reply(
+            mailbox,
+            dispatch_id=dispatch_id,
+            wait_id=str(arm["question_id"]),
+            text="cleanup may finish later",
+        )
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not stall_started.exists():
+            time.sleep(0.01)
+        assert stall_started.exists(), "the cleanup sidecar fsync never stalled"
+        assert stall_started.read_text(encoding="utf-8") == str(
+            steer.worker_wait_receipts_path(mailbox)
+        )
+
+        waiter_out, waiter_err = waiter.communicate(timeout=2.0)
+        assert waiter.returncode == 0, waiter_out + waiter_err
+        assert "STEER-REPLY:" in waiter_out, waiter_out
+        assert "WAIT-RETURNED" in waiter_out, waiter_out
+        end_entries, _receipts = _wait_for_cleanup_evidence(
+            mailbox,
+            wait_id=str(arm["question_id"]),
+            reply_seq=int(reply["seq"]),
+            require_receipt=False,
+        )
+        assert any(
+            entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
+            for entry in end_entries
+        ), end_entries
+    finally:
+        release_stall.write_text("release\n", encoding="utf-8")
+        if waiter.poll() is None:
+            waiter.kill()
+            waiter_out, waiter_err = waiter.communicate(timeout=5.0)
+
+    expected_receipt = (str(arm["question_id"]), int(reply["seq"]))
+    entries, receipts = _wait_for_cleanup_evidence(
+        mailbox,
+        wait_id=expected_receipt[0],
+        reply_seq=expected_receipt[1],
+    )
+    assert receipts == {expected_receipt}, receipts
+    assert any(
+        entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND for entry in entries
+    ), entries
+
+
 def test_next_wait_recovers_reply_from_writer_admitted_before_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1706,12 +1903,15 @@ def test_next_wait_recovers_reply_from_writer_admitted_before_deadline(
     assert second["entries"] == [durable_reply]
     assert second["wait_id"] == first["wait_id"]
     assert second["recovered_admitted_reply"] is True
-    entries = steer.read_steer_entries(mailbox)
+    reply_seq = int(durable_reply["seq"])
+    entries, receipts = _wait_for_cleanup_evidence(
+        mailbox,
+        wait_id=str(first["wait_id"]),
+        reply_seq=reply_seq,
+    )
     assert sum(
         entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND for entry in entries
     ) == 1, entries
-    reply_seq = durable_reply["seq"]
-    receipts = steer.consumed_worker_wait_receipts({}, mailbox_path=mailbox)
     assert receipts == {(first["wait_id"], reply_seq)}
 
 
@@ -1765,7 +1965,12 @@ def test_wait_tolerates_transient_carrier_read_errors(
     assert failures_left["count"] == 0, "the injected failures never fired"
     assert result["state"] == "messages", result
     assert result["entries"][0]["text"] == "durable before the read hiccup"
-    entries = steer.read_steer_entries(mailbox)
+    reply = result["entries"][0]
+    entries, _receipts = _wait_for_cleanup_evidence(
+        mailbox,
+        wait_id=str(result["wait_id"]),
+        reply_seq=int(reply["seq"]),
+    )
     assert any(
         entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND for entry in entries
     ), entries
@@ -1858,10 +2063,14 @@ def test_consumed_receipt_survives_tail_aging_via_mailbox_sidecar(
     dispatch_id = "receipt-aging"
     mailbox = tmp_path / "receipt-aging.steer.jsonl"
 
-    def missed_end_write(*_args, **_kwargs):
-        raise TimeoutError("forced cleanup lock miss")
+    def receipt_only_cleanup(path, _arm, reply):
+        steer.record_worker_wait_reply_receipt(path, reply)
 
-    monkeypatch.setattr(steer, "append_worker_wait_ended", missed_end_write)
+    monkeypatch.setattr(
+        steer,
+        "schedule_worker_wait_reply_cleanup",
+        receipt_only_cleanup,
+    )
 
     def report(event: dict) -> None:
         if event["state"] == "armed":

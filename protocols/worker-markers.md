@@ -80,13 +80,21 @@ Rules:
   first so partial output cannot claim consumption before delivery. Generic
   backlog rows report as `STEER-BACKLOG` plus `STEER-MESSAGE`, never as a
   confirmation-looking reply.
-  A watched-tail typed reply receipt also settles renewal when the waiter's
-  best-effort end-row append loses its short mailbox-lock race, and each
-  consumed reply's receipt is also persisted to the mailbox's append-only
-  receipts sidecar so renewal evidence does not age out of the status marker
-  window or the bounded stdout rescan. Transient mailbox read failures inside
-  the wait are retried until the deadline. A lock-holding admitted writer may
-  outlive that deadline, and the current wait may therefore return nonzero;
+  A watched-tail typed reply receipt also settles renewal when the waiter's end
+  row is unavailable, and each consumed reply's receipt is persisted to the
+  mailbox's append-only receipts sidecar so renewal evidence does not age out
+  of the status marker window or bounded stdout rescan. After flushing the
+  reply, `steer --wait` launches the receipt and end-row writes as independent
+  detached operations and returns without waiting on either lock, write, or
+  fsync. Each helper owns its complete operation and survives the short-lived
+  wait command; separating them prevents one wedged fsync from serializing the
+  other evidence write. During the lag window a reader accepts whichever exact
+  evidence has completed. If neither has, the fsynced typed reply remains the
+  recovery record and is redelivered at least once, scheduling cleanup again;
+  a helper holding the mailbox lock may make that bounded read report its own
+  deadline, but cannot create a lasting refusal. Transient mailbox read failures
+  inside the wait are retried until the deadline. A lock-holding admitted writer
+  may outlive that deadline, and the current wait may therefore return nonzero;
   deadline writes no settlement or lasting refusal. Before creating another
   arm, the next wait redelivers the prior exact typed reply when consumption is
   unproven. A genuinely unresolved arm with no typed reply remains

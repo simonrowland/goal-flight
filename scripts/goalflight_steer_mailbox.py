@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -34,8 +35,9 @@ USER_CONFIRM_DECISIONS = frozenset({"yes", "no"})
 DEFAULT_WORKER_WAIT_TIMEOUT_SECS = 3600.0
 MAX_WORKER_WAIT_TIMEOUT_SECS = 4 * 3600.0
 DEFAULT_WORKER_WAIT_POLL_SECS = 0.25
-# Best-effort budget for persisting one consumed reply's durable receipt.
-WORKER_WAIT_RECEIPT_LOCK_SECS = 0.5
+WORKER_WAIT_CLEANUP_MODE = "--worker-wait-cleanup"
+WORKER_WAIT_CLEANUP_RECEIPT = "receipt"
+WORKER_WAIT_CLEANUP_END = "end"
 LEGACY_STEER_KIND_ALIASES = {
     "steer": STEERING_KIND,
     "user_confirm_reply": USER_CONFIRM_KIND,
@@ -123,17 +125,13 @@ def worker_wait_receipts_path(path: Path) -> Path:
     return path.with_name(f"{Path(path).stem}.receipts.jsonl")
 
 
-def record_worker_wait_reply_receipt(
+def _append_worker_wait_reply_receipt(
     path: Path,
     reply: dict,
     *,
-    lock_timeout_secs: float = WORKER_WAIT_RECEIPT_LOCK_SECS,
+    lock_timeout_secs: float | None,
 ) -> None:
-    """Best-effort durable copy of one consumed typed reply's receipt.
-
-    Never raises: the watched tail, the status marker window, and the
-    best-effort end row remain parallel evidence when this append loses.
-    """
+    """Append and fsync one exact receipt, raising on any incomplete write."""
     payload = json.dumps(
         {
             "kind": reply.get("kind"),
@@ -144,24 +142,153 @@ def record_worker_wait_reply_receipt(
         sort_keys=True,
     )
     if _worker_wait_receipt_identity(payload) is None:
-        # Only an exact typed, correlated reply qualifies as a receipt.
-        return
+        raise ValueError("worker wait receipt requires one exact typed reply")
     messages = _carrier_module()
     sidecar = worker_wait_receipts_path(path)
+    with messages.carrier_transaction(
+        sidecar,
+        lock_timeout_secs=lock_timeout_secs,
+    ) as carrier:
+        carrier.read_bytes()
+        carrier.append_bytes((payload + "\n").encode("utf-8"))
+
+
+def record_worker_wait_reply_receipt(
+    path: Path,
+    reply: dict,
+) -> None:
+    """Best-effort durable copy of one consumed typed reply's receipt.
+
+    Never raises: the watched tail, the status marker window, and the
+    independent end row remain parallel evidence when this append loses.
+    """
     try:
-        with messages.carrier_transaction(
-            sidecar,
-            lock_timeout_secs=lock_timeout_secs,
-        ) as carrier:
-            carrier.read_bytes()
-            carrier.append_bytes((payload + "\n").encode("utf-8"))
+        _append_worker_wait_reply_receipt(
+            path,
+            reply,
+            lock_timeout_secs=None,
+        )
     except (OSError, RuntimeError, TimeoutError, ValueError):
-        # Mirrors the best-effort end row: receipt persistence must never
+        # Mirrors the independent end row: receipt persistence must never
         # mask an already-reported reply or strand the worker.
         pass
     except Exception as exc:
         if not is_carrier_error(exc):
             raise
+
+
+def _worker_wait_cleanup_command(
+    operation: str,
+    path: Path,
+    arm: dict,
+    reply: dict,
+) -> list[str]:
+    """Build one self-contained cleanup helper command from validated rows."""
+    wait_id = str(arm.get("question_id") or "").strip()
+    dispatch_id = str(arm.get("dispatch_id") or "").strip()
+    try:
+        arm_seq = int(arm["seq"])
+        reply_seq = int(reply["seq"])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("worker wait cleanup requires valid row sequences") from exc
+    if (
+        operation not in {WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END}
+        or not wait_id
+        or not dispatch_id
+        or arm_seq <= 0
+        or reply_seq <= 0
+        or reply.get("kind") != WORKER_WAIT_REPLY_KIND
+        or reply.get("reply_to") != wait_id
+        or reply.get("dispatch_id") != dispatch_id
+    ):
+        raise ValueError("worker wait cleanup requires one exact correlated reply")
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        WORKER_WAIT_CLEANUP_MODE,
+        operation,
+        str(Path(path)),
+        dispatch_id,
+        wait_id,
+        str(arm_seq),
+        str(reply_seq),
+    ]
+
+
+def schedule_worker_wait_reply_cleanup(path: Path, arm: dict, reply: dict) -> None:
+    """Detach receipt and end-row writes from the delivered wait's return path.
+
+    Each record gets an independent process so one stuck lock, write, or fsync
+    cannot hold either ``steer --wait`` or the other evidence write. Helpers
+    own the complete operation without a timeout and survive the short-lived
+    wait command's exit. If launch or host failure loses an attempt, the
+    fsynced typed reply remains the durable recovery job: an unproven reply is
+    redelivered and schedules cleanup again.
+    """
+    for operation in (WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END):
+        try:
+            command = _worker_wait_cleanup_command(operation, path, arm, reply)
+            subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except (OSError, RuntimeError, ValueError):
+            # Delivery already crossed its output boundary. Missing cleanup
+            # evidence leaves the exact durable reply eligible for recovery;
+            # it must never turn a reported answer into a blocked wait.
+            pass
+
+
+def _run_worker_wait_cleanup(argv: list[str]) -> int:
+    """Run one detached cleanup operation to completion."""
+    if len(argv) != 7 or argv[0] != WORKER_WAIT_CLEANUP_MODE:
+        return 64
+    _mode, operation, raw_path, dispatch_id, wait_id, raw_arm_seq, raw_reply_seq = argv
+    try:
+        arm_seq = int(raw_arm_seq)
+        reply_seq = int(raw_reply_seq)
+    except (TypeError, ValueError, OverflowError):
+        return 64
+    path = Path(raw_path)
+    arm = {
+        "seq": arm_seq,
+        "dispatch_id": dispatch_id,
+        "question_id": wait_id,
+    }
+    reply = {
+        "seq": reply_seq,
+        "dispatch_id": dispatch_id,
+        "kind": WORKER_WAIT_REPLY_KIND,
+        "reply_to": wait_id,
+    }
+    try:
+        if operation == WORKER_WAIT_CLEANUP_RECEIPT:
+            _append_worker_wait_reply_receipt(
+                path,
+                reply,
+                lock_timeout_secs=None,
+            )
+        elif operation == WORKER_WAIT_CLEANUP_END:
+            append_worker_wait_ended(
+                path,
+                arm,
+                decision="reply",
+                reply_seq=reply_seq,
+                lock_timeout_secs=None,
+            )
+        else:
+            return 64
+    except (OSError, RuntimeError, TimeoutError, ValueError):
+        return 1
+    except Exception as exc:
+        if not is_carrier_error(exc):
+            raise
+        return 1
+    return 0
 
 
 def consumed_worker_wait_receipts(
@@ -808,8 +935,8 @@ def append_worker_wait_started(
                 and not isinstance(reply_seq, bool)
                 and (wait_id, reply_seq) in consumed_reply_receipts
             ):
-                # A watched-tail STEER-REPLY is the durable fallback when the
-                # best-effort worker_wait_ended append loses its short lock race.
+                # A watched-tail STEER-REPLY is the durable fallback while the
+                # independent worker_wait_ended operation is absent.
                 context["settled_prior_reply"] = {
                     "wait_id": wait_id,
                     "reply_seq": reply_seq,
@@ -1089,20 +1216,7 @@ def wait_for_worker_entries(
         # leaves no consumption evidence, so the same durable row is eligible
         # for at-least-once redelivery on the next wait.
         report(result)
-        record_worker_wait_reply_receipt(path, reply)
-        try:
-            append_worker_wait_ended(
-                path,
-                arm,
-                decision="reply",
-                reply_seq=int(reply["seq"]),
-                lock_timeout_secs=WORKER_WAIT_RECEIPT_LOCK_SECS,
-            )
-        except (OSError, RuntimeError, TimeoutError, ValueError):
-            # Both cleanup writes are bounded and best-effort. Losing them
-            # cannot permanently refuse renewal: the output receipt can prove
-            # consumption, or the typed reply is redelivered on a later wait.
-            pass
+        schedule_worker_wait_reply_cleanup(path, arm, reply)
         return result
 
     try:
@@ -1272,3 +1386,7 @@ def list_steer_messages(dispatch_id: str, record: dict) -> int:
             f"{entry.get('direction', TO_WORKER)}\t{entry.get('kind', STEERING_KIND)}"
         )
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_worker_wait_cleanup(sys.argv[1:]))
