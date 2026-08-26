@@ -161,15 +161,15 @@ The controller keeps the interactive session responsive by dispatching workers i
 the background. On a host whose persistent monitor turns each flushed stdout line
 into a wake, it arms one generation-bound `goalflight_messages.py follow
 --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>` through
-that monitor, never shell `&`, and keeps one tracked `listen --listener-slots 1
---report-pending` backup doorbell plus one separately tracked `listen --watch-follow`
+that monitor, never shell `&`, and keeps six tracked `listen --listener-slots 6
+--report-pending` backup doorbells plus one separately tracked `listen --watch-follow`
 watchdog. The watchdog holds its own generation lock, never consumes a doorbell slot,
 and reads durable record age; three missed heartbeat intervals make it emit
 `listener-dead` on stdout with the exact stream re-arm command. The backup checks the
 watchdog lock during its existing wait and emits `watchdog-dead` after a missing lock;
 this witnesses lone watchdog death and stream-plus-watchdog death, but not the backup's
 own death or host-reaping of every tracked task. Together they are persistent coverage
-`live/3`, detectable but not reap-proof.
+`live/8`, detectable but not reap-proof.
 On hosts without a persistent stdout
 monitor, a tracked generation-bound `listen` pool remains the portable path. A
 doorbell exit triggers `relay --new --json`; the controller processes chosen items,
@@ -297,11 +297,11 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `no-blocking-cursor-task-worker`
 - **name:** Arm the event wake without blocking
 - **category:** `worker-routing-defaults`
-- **controller_does:** The orchestrator auto-claims without stealing a live different lease, arms `follow` through a persistent stdout monitor where supported, arms one delivery-slot backup plus one independently locked `--watch-follow` watchdog that reads durable record age and emits channel death on stdout after three missed beats, lets the backup witness a missing watchdog lock while stating that all-tracked-task death remains unwitnessed, treats all three as persistent coverage `live/3`, and retains the portable tracked-listener pool on hosts without a monitor.
+- **controller_does:** The orchestrator auto-claims without stealing a live different lease, arms `follow` through a persistent stdout monitor where supported, arms a six-doorbell backup pool plus one independently locked `--watch-follow` watchdog that reads durable record age and emits channel death on stdout after three missed beats, lets the backup witness a missing watchdog lock while stating that all-tracked-task death remains unwitnessed, treats stream, backup pool, and watchdog as persistent coverage `live/8`, and retains the portable tracked-listener pool on hosts without a monitor.
 - **failure_mode:** The orchestrator blocks the interactive session or schedules a timer to ask whether a worker finished instead of arming the available event channel.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "On a host whose persistent monitor turns each flushed stdout line into a wake, arm one generation-bound `goalflight_messages.py follow --project-root \"$PWD\" --controller-label <label> --lease-nonce <nonce>` through that monitor, never shell `&`; then arm one tracked `listen --listener-slots 1 --report-pending` backup doorbell and one separately tracked `listen --watch-follow` watchdog. The watchdog holds its own generation lock, never consumes a delivery slot, reads durable record age, and treats three missed heartbeat intervals as channel death; the backup witnesses a missing watchdog lock, but all-tracked-task death remains unwitnessed"
+    - **pattern:** "On a host whose persistent monitor turns each flushed stdout line into a wake, arm one generation-bound `goalflight_messages.py follow --project-root \"$PWD\" --controller-label <label> --lease-nonce <nonce>` through that monitor, never shell `&`; then arm six tracked `listen --listener-slots 6 --report-pending` backup doorbells and one separately tracked `listen --watch-follow` watchdog. The watchdog holds its own generation lock, never consumes a delivery slot, reads durable record age, and treats three missed heartbeat intervals as channel death; the backup witnesses a missing watchdog lock, but all-tracked-task death remains unwitnessed"
     - **max_section_lines:** 55
 - **verifier:**
     - **kind:** behaviour-scenario

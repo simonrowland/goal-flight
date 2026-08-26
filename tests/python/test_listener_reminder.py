@@ -153,9 +153,9 @@ def test_controller_mail_exit_code_actions_and_skill_pool_instruction() -> None:
     )
     assert "goalflight_messages.py follow" in controller_entry
     assert "three missed heartbeat intervals" in controller_entry
-    assert "listen --listener-slots 1 --report-pending" in controller_entry
+    assert "listen --listener-slots 6 --report-pending" in controller_entry
     assert "listen --watch-follow" in controller_entry
     assert "never consumes a delivery slot" in controller_entry
-    assert "live/3" in controller_entry
+    assert "live/8" in controller_entry
     assert "portable pool of four" in controller_entry
     assert "restore depth" in controller_entry

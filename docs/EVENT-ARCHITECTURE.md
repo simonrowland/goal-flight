@@ -387,7 +387,7 @@ mechanisms safe rather than merely redundant.
 **Persistent is not immortal.** A streaming listener is a tracked background
 task, and this host reaps those — 149 exit-144 events since 2026-06-13 across
 many task kinds. The stream is cheaper per event than a pool; it is not more
-durable than one. That is an argument for keeping one backup doorbell, not
+durable than one. That is an argument for keeping a backup doorbell pool, not
 against the design.
 
 ### Implemented contract
@@ -407,14 +407,14 @@ indefinite deafness into a bounded failure. Production values are rejected outsi
 the 60-to-300-second range. On a box carrying six-plus concurrent
 workers, a 30-second grace fell inside normal scheduling jitter. The detector now
 requires three complete missed beats: 360 seconds at the default cadence. The
-stream durably records every successful stdout record. One separately tracked
-`listen --listener-slots 1 --report-pending` backup delivers mail, while an
+stream durably records every successful stdout record. Six separately tracked
+`listen --listener-slots 6 --report-pending` backup doorbells deliver mail, while an
 independently locked `listen --watch-follow` watchdog polls generation-bound state
 and emits `event`/`listener-dead` plus the persistent re-arm command when state is
 stale, faulted, missing, or invalid. The watchdog never claims a delivery slot or
-reads the mail cursor. This makes persistent coverage a shared three-component
-`live/3` fact. It stays persistent after stream death, so the surviving backup and
-watchdog report `2/3`, not portable `1/4`.
+reads the mail cursor. This makes persistent coverage a shared eight-component
+`live/8` fact. It stays persistent after stream death, so the surviving backup pool and
+watchdog report `7/8`, not portable `1/4`.
 Unchanged frontiers have a 15-minute floor and changed frontiers emit on the next
 idle beat. The host may batch lines produced within 200 ms, so every line is an
 independently parseable JSON object and consumers enumerate all records in a batch.
@@ -431,9 +431,10 @@ also carries projection `age_s`; an hour-old projection becomes `stale` even whe
 `tasks.jsonl` has not changed.
 
 `--listener-slots`, `GOALFLIGHT_LISTENER_SLOTS`, and
-`GOALFLIGHT_LISTENER_LOW_WATER` remain portable-pool controls. `follow` rejects
-the CLI knob and warns on the environment knobs; persistent depth comes only
-from the shared stream-plus-watchdog predicate.
+`GOALFLIGHT_LISTENER_LOW_WATER` remain portable-pool controls. Persistent backup
+depth is `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 6, max 32). `follow` rejects
+the CLI knob and warns on the portable environment knobs; persistent depth is
+the stream, the backup doorbell pool, and the watchdog.
 
 `follow` does not create a journal `listener_coverage` row, so it has no synthetic
 `EXITED/event` row to write. Its generation-bound monitor flock is the liveness

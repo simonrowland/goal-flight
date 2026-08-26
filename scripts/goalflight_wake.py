@@ -45,15 +45,20 @@ _PENDING_REPORT_FILE_VERSION = "pending-report-v1"
 _WATCHDOG_DEATH_REPORT_FILE_VERSION = "watchdog-death-report-v1"
 _MONITOR_STATE_FILE_VERSION = "monitor-state-v1"
 MONITOR_STATE_SCHEMA = "goalflight.monitor-state.v1"
-PERSISTENT_WAKE_TARGET = 3
 _OBSERVED_WAITERS_UNSET = object()
 _LEASE_EVENT_SCHEMA = "goalflight.lease-generation-event.v1"
 # Depth is resilience, not efficiency: one event wakes exactly one slot, so
 # the remaining slots are the margin for a controller that forgets to re-arm.
 # 4 survives three consecutive missed re-arms. Override with
 # GOALFLIGHT_LISTENER_SLOTS; MAX_LISTENER_SLOTS stays 32.
+# This knob is portable-pool only. Persistent backup depth is
+# DEFAULT_PERSISTENT_BACKUP_SLOTS / GOALFLIGHT_PERSISTENT_BACKUP_SLOTS.
 DEFAULT_LISTENER_SLOTS = 4
 MAX_LISTENER_SLOTS = 32
+# Persistent wake has three roles: 1 stream, N backup doorbells, 1 watchdog.
+# Only the doorbell is a pool. Override with GOALFLIGHT_PERSISTENT_BACKUP_SLOTS.
+DEFAULT_PERSISTENT_BACKUP_SLOTS = 6
+PERSISTENT_WAKE_TARGET = 1 + DEFAULT_PERSISTENT_BACKUP_SLOTS + 1
 
 
 class ListenerSlotsFull(BlockingIOError):
@@ -1220,6 +1225,30 @@ def listener_slot_count(value: object = None) -> int:
     return slots
 
 
+def persistent_backup_slot_count(value: object = None) -> int:
+    """Resolve and validate the persistent backup-doorbell pool size."""
+    raw = value
+    if raw is None:
+        raw = os.environ.get(
+            "GOALFLIGHT_PERSISTENT_BACKUP_SLOTS",
+            str(DEFAULT_PERSISTENT_BACKUP_SLOTS),
+        )
+    try:
+        slots = int(str(raw))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("persistent backup slots must be an integer") from exc
+    if not 1 <= slots <= MAX_LISTENER_SLOTS:
+        raise ValueError(
+            f"persistent backup slots must be between 1 and {MAX_LISTENER_SLOTS}"
+        )
+    return slots
+
+
+def persistent_wake_target() -> int:
+    """1 stream + backup doorbell pool + 1 watchdog."""
+    return 1 + persistent_backup_slot_count() + 1
+
+
 def register_listener_waiter(
     project_root: Path | str,
     *,
@@ -1718,7 +1747,7 @@ def coverage_status(
             or monitor_generation_seen
         )
         target_waiters = (
-            PERSISTENT_WAKE_TARGET if persistent else listener_slot_count()
+            persistent_wake_target() if persistent else listener_slot_count()
         )
         return {
             "covered": False,
@@ -1770,7 +1799,16 @@ def coverage_status(
             and durable_monitor is not None
             and durable_state not in {"fault", "stale"}
         )
-        backup_live = bool(portable_waiters)
+        backup_target = persistent_backup_slot_count()
+        backup_observed = len(portable_waiters)
+        backup_missing = max(0, backup_target - backup_observed)
+        if backup_observed >= backup_target:
+            backup_state = "live"
+        elif backup_observed > 0:
+            backup_state = "degraded"
+        else:
+            backup_state = "missing"
+        backup_role_present = backup_observed > 0
         watchdog_live = bool(watchdog_waiters)
         monitor_state = (
             "unavailable"
@@ -1784,7 +1822,7 @@ def coverage_status(
         missing_components = []
         if not monitor_healthy:
             missing_components.append("stream")
-        if not backup_live:
+        if backup_missing:
             missing_components.append("backup")
         if not watchdog_live:
             missing_components.append("watchdog")
@@ -1796,19 +1834,21 @@ def coverage_status(
             reason = "persistent-monitor-stale"
         elif not monitor_lock_live:
             reason = "persistent-monitor-missing"
-        elif not backup_live:
+        elif not backup_role_present:
             reason = "persistent-backup-missing"
         elif not watchdog_live:
             reason = "persistent-watchdog-missing"
+        elif backup_missing:
+            reason = "persistent-backup-degraded"
         else:
             reason = "persistent-covered"
         return {
-            "covered": monitor_healthy and backup_live and watchdog_live,
+            "covered": monitor_healthy and backup_role_present and watchdog_live,
             "reason": reason,
             "live_waiters": (
-                int(monitor_healthy) + int(backup_live) + int(watchdog_live)
+                int(monitor_healthy) + backup_observed + int(watchdog_live)
             ),
-            "target_waiters": PERSISTENT_WAKE_TARGET,
+            "target_waiters": persistent_wake_target(),
             "waiters": serialized_waiters,
             "monitor": {
                 "required": True,
@@ -1828,8 +1868,9 @@ def coverage_status(
             },
             "backup": {
                 "required": True,
-                "state": "live" if backup_live else "missing",
-                "observed": len(portable_waiters),
+                "state": backup_state,
+                "observed": backup_observed,
+                "target": backup_target,
             },
             "watchdog": {
                 "required": True,
@@ -1837,8 +1878,8 @@ def coverage_status(
                 "observed": len(watchdog_waiters),
             },
             "wake_mode": "persistent",
-            "portable_live_waiters": len(portable_waiters),
-            "portable_target_waiters": 1,
+            "portable_live_waiters": backup_observed,
+            "portable_target_waiters": backup_target,
             "missing_components": missing_components,
         }
     target_waiters = listener_slot_count()
@@ -1901,7 +1942,7 @@ def persistent_backup_start_command(
             "--lease-nonce",
             lease_nonce,
             "--listener-slots",
-            "1",
+            str(persistent_backup_slot_count()),
             "--report-pending",
         ]
     )
@@ -1933,6 +1974,76 @@ def follow_watchdog_start_command(
     )
 
 
+def _backup_shortfall(status: dict[str, object]) -> int:
+    """How many backup doorbells are missing from the persistent pool."""
+    backup = status.get("backup")
+    observed: int | None = None
+    target: int | None = None
+    if isinstance(backup, dict):
+        if isinstance(backup.get("observed"), int):
+            observed = int(backup["observed"])
+        if isinstance(backup.get("target"), int):
+            target = int(backup["target"])
+    if observed is None:
+        live = status.get("portable_live_waiters")
+        observed = int(live) if isinstance(live, int) else 0
+    if target is None:
+        portable_target = status.get("portable_target_waiters")
+        target = (
+            int(portable_target)
+            if isinstance(portable_target, int)
+            else persistent_backup_slot_count()
+        )
+    return max(0, target - observed)
+
+
+def _persistent_rearm_items(
+    status: dict[str, object],
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> list[tuple[str, str]]:
+    """(component, command) pairs; backup is repeated for each missing slot."""
+    items: list[tuple[str, str]] = []
+    backup_cmd: str | None = None
+    backup_needed = _backup_shortfall(status)
+    components = status.get("missing_components")
+    for component in components if isinstance(components, list) else []:
+        name = str(component)
+        if name == "stream":
+            items.append(
+                (
+                    "stream",
+                    follow_start_command(
+                        project_root,
+                        controller_label=controller_label,
+                        lease_nonce=lease_nonce,
+                    ),
+                )
+            )
+        elif name == "backup":
+            if backup_cmd is None:
+                backup_cmd = persistent_backup_start_command(
+                    project_root,
+                    controller_label=controller_label,
+                    lease_nonce=lease_nonce,
+                )
+            items.extend(("backup", backup_cmd) for _ in range(backup_needed))
+        elif name == "watchdog":
+            items.append(
+                (
+                    "watchdog",
+                    follow_watchdog_start_command(
+                        project_root,
+                        controller_label=controller_label,
+                        lease_nonce=lease_nonce,
+                    ),
+                )
+            )
+    return items
+
+
 def coverage_rearm_commands(
     status: dict[str, object],
     project_root: Path | str,
@@ -1953,34 +2064,15 @@ def coverage_rearm_commands(
     nonce = str(lease_nonce or "").strip()
     if not nonce:
         return []
-    commands: list[str] = []
-    components = status.get("missing_components")
-    for component in components if isinstance(components, list) else []:
-        if component == "stream":
-            commands.append(
-                follow_start_command(
-                    project_root,
-                    controller_label=controller_label,
-                    lease_nonce=nonce,
-                )
-            )
-        elif component == "backup":
-            commands.append(
-                persistent_backup_start_command(
-                    project_root,
-                    controller_label=controller_label,
-                    lease_nonce=nonce,
-                )
-            )
-        elif component == "watchdog":
-            commands.append(
-                follow_watchdog_start_command(
-                    project_root,
-                    controller_label=controller_label,
-                    lease_nonce=nonce,
-                )
-            )
-    return commands
+    return [
+        command
+        for _component, command in _persistent_rearm_items(
+            status,
+            project_root,
+            controller_label=controller_label,
+            lease_nonce=nonce,
+        )
+    ]
 
 
 def coverage_rearm_plan(
@@ -2015,9 +2107,21 @@ def coverage_rearm_plan(
     plan["reason"] = status.get("reason")
     if status.get("wake_mode") == "persistent":
         plan["commands"] = commands
-        plan["missing_components"] = list(
-            status.get("missing_components") or []
-        )
+        nonce = str(lease_nonce or "").strip()
+        if nonce:
+            plan["missing_components"] = [
+                component
+                for component, _command in _persistent_rearm_items(
+                    status,
+                    project_root,
+                    controller_label=controller_label,
+                    lease_nonce=nonce,
+                )
+            ]
+        else:
+            plan["missing_components"] = list(
+                status.get("missing_components") or []
+            )
     return plan
 
 
@@ -2038,7 +2142,7 @@ def coverage_rearm_hint(plan: dict[str, object]) -> str:
         )
     commands = [str(row) for row in plan.get("commands") or []]
     components = [str(row) for row in plan.get("missing_components") or []]
-    names = ", ".join(components) if components else "unknown"
+    names = ", ".join(dict.fromkeys(components)) if components else "unknown"
     header = f"persistent wake coverage {live}/{target} — missing {names}:"
     if not commands:
         return f"{header}\n(no safe re-arm command: controller lease unavailable)"
