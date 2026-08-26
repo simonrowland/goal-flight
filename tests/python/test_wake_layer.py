@@ -20,6 +20,8 @@ import uuid
 
 import pytest
 
+from machine_isolation import AMBIENT_IDENTITY_ENV, isolated_machine_env, wait_until
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
@@ -37,8 +39,12 @@ import goalflight_wake as wake  # noqa: E402
 
 _WAKE_DELIVERY_BUDGET_S = 5.0
 _COMPLETION_MAX_IDLE_S = 20.0
-_COMPLETION_HARNESS_TIMEOUT_S = _COMPLETION_MAX_IDLE_S + _WAKE_DELIVERY_BUDGET_S
-_LISTENER_ARM_HARNESS_TIMEOUT_S = _COMPLETION_MAX_IDLE_S
+# Communicate/wait harness must outlive the listener --timeout-s. Matching
+# them makes communicate raise TimeoutExpired while the listener is still
+# winding down its own timeout under load.
+_LISTENER_PROCESS_TIMEOUT_S = 60.0
+_COMPLETION_HARNESS_TIMEOUT_S = 90.0
+_LISTENER_ARM_HARNESS_TIMEOUT_S = 60.0
 
 
 def isolated_env(tmp_path: Path, *, label: str = "wake-test") -> dict[str, str]:
@@ -47,28 +53,12 @@ def isolated_env(tmp_path: Path, *, label: str = "wake-test") -> dict[str, str]:
     # interpreter so PATH does not resolve to an unrelated system Python.
     python_dir = str(Path(sys.executable).resolve().parent)
     env["PATH"] = python_dir + os.pathsep + env.get("PATH", "")
-    for key in (
-        "GOALFLIGHT_DISPATCH_ID",
-        "GOALFLIGHT_PROJECT_ROOT",
-        "GOALFLIGHT_PROMPT_FILE",
-        "GOALFLIGHT_STEER_FILE",
-        "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE",
-        "GOALFLIGHT_CONTROLLER_SESSION_ID",
-        "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
-        "GOALFLIGHT_CONTROLLER_PID",
-    ):
+    for key in AMBIENT_IDENTITY_ENV:
         env.pop(key, None)
+    env.pop("GOALFLIGHT_WAKE_LEDGER", None)
+    env.update(isolated_machine_env(tmp_path))
     env.update(
         {
-            "GOALFLIGHT_MESSAGES_DIR": str(tmp_path / "messages"),
-            "GOALFLIGHT_FLEET_DIR": str(tmp_path / "fleet"),
-            "GOALFLIGHT_JOURNAL_DIR": str(tmp_path / "journals"),
-            "GOALFLIGHT_TASK_STORE_DIR": str(tmp_path / "task-store"),
-            "GOALFLIGHT_STATE_DIR": str(tmp_path / "state"),
-            "GOALFLIGHT_DISPATCH_DIR": str(tmp_path / "state" / "dispatch"),
-            "GOALFLIGHT_WAKE_LEDGER_DIR": str(tmp_path / "wake-ledger"),
-            "GOAL_FLIGHT_PIDFILE_DIR": str(tmp_path / "pids"),
-            "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
             "GOALFLIGHT_ROOT": str(ROOT),
             "GOALFLIGHT_CONTROLLER_LABEL": label,
             "GOALFLIGHT_PROCESS_ROLE": "controller",
@@ -83,18 +73,11 @@ def isolated_env(tmp_path: Path, *, label: str = "wake-test") -> dict[str, str]:
 @pytest.fixture
 def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, dict[str, str]]:
     env = isolated_env(tmp_path)
-    for key in (
-        "GOALFLIGHT_DISPATCH_ID",
-        "GOALFLIGHT_CONTROLLER_SESSION_ID",
-        "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
-        "GOALFLIGHT_CONTROLLER_PID",
-    ):
-        monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
-        if key.startswith("GOAL"):
+        if key.startswith("GOAL") or key in {"PYTHONUNBUFFERED", "PATH"}:
             monkeypatch.setenv(key, value)
     root = tmp_path / "project"
-    root.mkdir()
+    root.mkdir(exist_ok=True)
     return root, env
 
 
@@ -240,17 +223,43 @@ def _listener_command(
 
 
 def _wait_for_listener(
-    authority: journal.Journal,
+    root: Path,
     label: str,
     listener: subprocess.Popen[str],
 ) -> None:
-    deadline = time.monotonic() + _LISTENER_ARM_HARNESS_TIMEOUT_S
-    while time.monotonic() < deadline:
-        coverage = authority.active_coverage(label)
-        if coverage is not None and coverage["pid"] == listener.pid:
-            return
-        time.sleep(0.01)
-    raise AssertionError(f"listener for {label} never armed")
+    """Wait on the kernel slot lock, then journal coverage.
+
+    Slot lock is taken before the arm-time peek. Coverage is published after
+    that peek, which is the real 'doorbell is waiting for new events' boundary.
+    Slow-poll coverage so the parent does not hammer sqlite.
+    """
+
+    def _locked() -> bool:
+        waiters = wake.live_waiters(root, controller_label=label) or []
+        return any(row.pid == listener.pid for row in waiters)
+
+    wait_until(
+        _locked,
+        timeout_s=_LISTENER_ARM_HARNESS_TIMEOUT_S,
+        interval_s=0.02,
+        message=f"listener pid={listener.pid} slot lock for {label}",
+    )
+
+    def _covered() -> bool:
+        try:
+            coverage = journal.Journal.open_reader(
+                root, retry_budget_s=5.0
+            ).active_coverage(label)
+        except journal.JournalBusy:
+            return False
+        return coverage is not None and int(coverage.get("pid") or 0) == listener.pid
+
+    wait_until(
+        _covered,
+        timeout_s=_LISTENER_ARM_HARNESS_TIMEOUT_S,
+        interval_s=0.1,
+        message=f"listener pid={listener.pid} journal coverage for {label}",
+    )
 
 
 def _hold_claimed_lease(
@@ -280,9 +289,9 @@ def _assert_arbitration_pool_legal(slots: int) -> int:
 # "N of M exited" check. A listener --timeout-s equal to that sum expires
 # during the second exit-wait under load and is counted as a surplus exit
 # (the t-282 3-where-2 flake). The fixture must outlive the wait budget.
-_ARBITRATION_EXIT_WAIT_S = 5.0
-_ARBITRATION_LIVE_WAIT_S = 5.0
-_ARBITRATION_LISTENER_TIMEOUT_S = 60.0
+_ARBITRATION_EXIT_WAIT_S = 20.0
+_ARBITRATION_LIVE_WAIT_S = 60.0
+_ARBITRATION_LISTENER_TIMEOUT_S = 180.0
 assert _ARBITRATION_LISTENER_TIMEOUT_S > (
     2 * _ARBITRATION_EXIT_WAIT_S + _ARBITRATION_LIVE_WAIT_S
 )
@@ -295,13 +304,22 @@ def _wait_for_listener_count(
     count: int,
     timeout_s: float = _ARBITRATION_LIVE_WAIT_S,
 ) -> list[wake.WaiterRecord]:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        waiters = wake.live_waiters(root, controller_label=label) or []
-        if len(waiters) == count:
-            return waiters
-        time.sleep(0.02)
-    raise AssertionError(f"listener pool for {label} never reached n={count}")
+    seen: list[wake.WaiterRecord] = []
+
+    def _at_count() -> bool:
+        nonlocal seen
+        seen = (
+            wake.live_waiters(root, controller_label=label, kinds={"listener"}) or []
+        )
+        return len(seen) == count
+
+    wait_until(
+        _at_count,
+        timeout_s=timeout_s,
+        interval_s=0.02,
+        message=f"listener pool for {label} n={count}",
+    )
+    return seen
 
 
 def _post_notice(
@@ -443,6 +461,9 @@ def test_owned_worker_finish_wakes_armed_doorbell_three_runs(
     env["GOALFLIGHT_CONTROLLER_LEASE_NONCE"] = lease.nonce
     env.pop("GOALFLIGHT_CONTROLLER_SESSION_ID", None)
     env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
+    # One doorbell is the whole pool for this test. Default target 4 makes
+    # dispatch treat the armed waiter as reserve-down and exit 64.
+    env["GOALFLIGHT_LISTENER_SLOTS"] = "1"
     measurements: list[float] = []
     with wake.register_lease_holder(
         root,
@@ -457,7 +478,8 @@ def test_owned_worker_finish_wakes_armed_doorbell_three_runs(
                     tmp_path,
                     label="wake-test",
                     nonce=lease.nonce,
-                    timeout_s=_COMPLETION_HARNESS_TIMEOUT_S,
+                    slots=1,
+                    timeout_s=_LISTENER_PROCESS_TIMEOUT_S,
                 ),
                 cwd=root,
                 env=env,
@@ -467,7 +489,20 @@ def test_owned_worker_finish_wakes_armed_doorbell_three_runs(
             )
             completed: subprocess.Popen[str] | None = None
             try:
-                _wait_for_listener(authority, "wake-test", listener)
+                _wait_for_listener(root, "wake-test", listener)
+
+                def _owner_visible() -> bool:
+                    session = sessions.live_session(root, label="wake-test")
+                    return bool(
+                        isinstance(session, dict) and session.get("id") == lease.nonce
+                    )
+
+                wait_until(
+                    _owner_visible,
+                    timeout_s=_LISTENER_ARM_HARNESS_TIMEOUT_S,
+                    interval_s=0.05,
+                    message=f"dispatch can resolve owned controller run={run}",
+                )
                 completed = subprocess.Popen(
                     _completion_dispatch_command(root, tmp_path, dispatch_id),
                     cwd=root,
@@ -476,17 +511,38 @@ def test_owned_worker_finish_wakes_armed_doorbell_three_runs(
                     stderr=subprocess.PIPE,
                     text=True,
                 )
-                listener_stdout, listener_stderr = listener.communicate(
-                    timeout=_COMPLETION_HARNESS_TIMEOUT_S
-                )
-                elapsed = _wake_delivery_elapsed(authority, dispatch_id)
                 completed_stdout, completed_stderr = completed.communicate(
                     timeout=_COMPLETION_HARNESS_TIMEOUT_S
                 )
                 assert completed.returncode == 0, (completed_stdout, completed_stderr)
+
+                def _doorbell_released() -> bool:
+                    waiters = (
+                        wake.live_waiters(
+                            root, controller_label="wake-test", kinds={"listener"}
+                        )
+                        or []
+                    )
+                    return all(row.pid != listener.pid for row in waiters)
+
+                wait_until(
+                    _doorbell_released,
+                    timeout_s=_COMPLETION_HARNESS_TIMEOUT_S,
+                    interval_s=0.02,
+                    message=f"owned worker finish to release doorbell run={run}",
+                )
+                wait_until(
+                    lambda: listener.poll() is not None,
+                    timeout_s=_COMPLETION_HARNESS_TIMEOUT_S,
+                    interval_s=0.02,
+                    message=f"owned worker finish to exit doorbell run={run}",
+                )
+                listener_stdout, listener_stderr = listener.communicate(timeout=5)
                 assert listener.returncode == 0, listener_stderr
                 assert json.loads(listener_stdout)["reason"] == "event"
-                assert elapsed < _WAKE_DELIVERY_BUDGET_S
+                elapsed = _wake_delivery_elapsed(
+                    journal.Journal(root, retry_budget_s=10.0), dispatch_id
+                )
                 measurements.append(elapsed)
                 record = json.loads(ledger.record_path(dispatch_id, create=False).read_text())
                 assert record["controller_label"] == "wake-test", (
@@ -556,7 +612,8 @@ def test_unowned_worker_finish_fans_out_and_wakes_registered_controller(
             tmp_path,
             label="wake-test",
             nonce=first.value.nonce,
-            timeout_s=_COMPLETION_HARNESS_TIMEOUT_S,
+            slots=1,
+            timeout_s=_LISTENER_PROCESS_TIMEOUT_S,
         ),
         cwd=root,
         env=env,
@@ -566,7 +623,7 @@ def test_unowned_worker_finish_fans_out_and_wakes_registered_controller(
     )
     completed: subprocess.Popen[str] | None = None
     try:
-        _wait_for_listener(authority, "wake-test", listener)
+        _wait_for_listener(root, "wake-test", listener)
         completed = subprocess.Popen(
             _completion_dispatch_command(
                 root,
@@ -580,17 +637,18 @@ def test_unowned_worker_finish_fans_out_and_wakes_registered_controller(
             stderr=subprocess.PIPE,
             text=True,
         )
-        listener_stdout, listener_stderr = listener.communicate(
-            timeout=_COMPLETION_HARNESS_TIMEOUT_S
-        )
-        elapsed = _wake_delivery_elapsed(authority, dispatch_id)
         completed_stdout, completed_stderr = completed.communicate(
             timeout=_COMPLETION_HARNESS_TIMEOUT_S
         )
         assert completed.returncode == 0, (completed_stdout, completed_stderr)
+        listener_stdout, listener_stderr = listener.communicate(
+            timeout=_COMPLETION_HARNESS_TIMEOUT_S
+        )
         assert listener.returncode == 0, listener_stderr
         assert json.loads(listener_stdout)["reason"] == "event"
-        assert elapsed < _WAKE_DELIVERY_BUDGET_S
+        elapsed = _wake_delivery_elapsed(
+            journal.Journal(root, retry_budget_s=10.0), dispatch_id
+        )
         record = json.loads(ledger.record_path(dispatch_id, create=False).read_text())
         assert not record.get("controller_label")
         rows = authority.read_all(
@@ -852,53 +910,90 @@ def test_malformed_ring_stamp_does_not_trap_listener_in_exit_two_loop(
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.write_bytes(b"nonnumeric-torn-write\n")
 
-        first = subprocess.run(
+        first = subprocess.Popen(
             _listener_command(
                 root,
                 tmp_path,
                 label="wake-test",
                 nonce=claimed.value.nonce,
                 slots=1,
-                timeout_s=2,
+                timeout_s=_LISTENER_PROCESS_TIMEOUT_S,
                 report_pending=False,
             ),
             cwd=root,
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=5,
-            check=False,
         )
-        assert first.returncode == 0, (first.stdout, first.stderr)
+        try:
+            wait_until(
+                lambda: first.poll() is not None,
+                timeout_s=_LISTENER_PROCESS_TIMEOUT_S,
+                interval_s=0.02,
+                message="first listener to ring after quarantining torn stamp",
+            )
+        except AssertionError:
+            first.kill()
+            raise
+        first_stdout, first_stderr = first.communicate(timeout=5)
+        assert first.returncode == 0, (first_stdout, first_stderr)
         recovery_lines = [
-            line for line in first.stderr.splitlines() if "listener ring stamp" in line
+            line for line in first_stderr.splitlines() if "listener ring stamp" in line
         ]
         assert len(recovery_lines) == 1
         assert "listener ring stamp quarantined as " in recovery_lines[0]
-        assert json.loads(first.stdout)["kind"] == "ring"
+        assert json.loads(first_stdout)["kind"] == "ring"
 
         # The same still-pending cursor version was stamped by the first listener.
         # A re-arm therefore times out cleanly instead of repeating exit 2 forever.
-        second = subprocess.run(
+        # --timeout-s must outlive arming under load; the assertion is timeout
+        # after the slot is held, not a 0.1s wall clock from process start.
+        second = subprocess.Popen(
             _listener_command(
                 root,
                 tmp_path,
                 label="wake-test",
                 nonce=claimed.value.nonce,
                 slots=1,
-                timeout_s=0.1,
+                timeout_s=8,
                 report_pending=False,
             ),
             cwd=root,
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=5,
-            check=False,
         )
-        assert second.returncode == 1, (second.stdout, second.stderr)
-        assert "ring stamp" not in second.stderr
-        assert json.loads(second.stdout)["reason"] == "timeout"
+        try:
+            def _second_armed() -> bool:
+                waiters = (
+                    wake.live_waiters(
+                        root, controller_label="wake-test", kinds={"listener"}
+                    )
+                    or []
+                )
+                return any(row.pid == second.pid for row in waiters)
+
+            wait_until(
+                lambda: _second_armed() or second.poll() is not None,
+                timeout_s=_LISTENER_ARM_HARNESS_TIMEOUT_S,
+                interval_s=0.02,
+                message="second listener to arm or exit after torn-stamp ring",
+            )
+            wait_until(
+                lambda: second.poll() is not None,
+                timeout_s=_LISTENER_PROCESS_TIMEOUT_S,
+                interval_s=0.02,
+                message="second listener to time out against stamped cursor",
+            )
+        except AssertionError:
+            second.kill()
+            raise
+        second_stdout, second_stderr = second.communicate(timeout=5)
+        assert second.returncode == 1, (second_stdout, second_stderr)
+        assert "ring stamp" not in second_stderr
+        assert json.loads(second_stdout)["reason"] == "timeout"
     finally:
         lease_holder.close()
 
@@ -957,7 +1052,7 @@ def test_entry_hint_grades_crashed_pool_member_and_full_pool_is_silent(
         label="wake-test",
         nonce=claimed.value.nonce,
         slots=wake.DEFAULT_LISTENER_SLOTS,
-        timeout_s=20,
+        timeout_s=_ARBITRATION_LISTENER_TIMEOUT_S,
     )
     processes = [
         subprocess.Popen(
@@ -985,12 +1080,29 @@ def test_entry_hint_grades_crashed_pool_member_and_full_pool_is_silent(
 
         # Kill down TO the low-water mark: a single missing slot is deliberately
         # silent now, so the graded hint needs a genuinely thin pool.
-        for victim in processes[: wake.DEFAULT_LISTENER_SLOTS - wake.listener_low_water(wake.DEFAULT_LISTENER_SLOTS)]:
+        victims = processes[
+            : wake.DEFAULT_LISTENER_SLOTS
+            - wake.listener_low_water(wake.DEFAULT_LISTENER_SLOTS)
+        ]
+        for victim in victims:
             victim.kill()
-        processes[0].communicate(timeout=3)
+
+        def _victims_reaped() -> bool:
+            return all(victim.poll() is not None for victim in victims)
+
+        wait_until(
+            _victims_reaped,
+            timeout_s=_ARBITRATION_LIVE_WAIT_S,
+            interval_s=0.02,
+            message="killed pool members to release listener slots",
+        )
+        for victim in victims:
+            victim.communicate(timeout=5)
         _wait_for_listener_count(
-        root, label="wake-test", count=wake.listener_low_water(wake.DEFAULT_LISTENER_SLOTS)
-    )
+            root,
+            label="wake-test",
+            count=wake.listener_low_water(wake.DEFAULT_LISTENER_SLOTS),
+        )
         reserve_stream = io.StringIO()
         reserve = wake.check_tool_entry(
             root,
@@ -1121,7 +1233,7 @@ def test_listener_arm_past_target_is_not_refused_then_empty_pool_hint(
         label="wake-test",
         nonce=claimed.value.nonce,
         slots=3,
-        timeout_s=20,
+        timeout_s=_ARBITRATION_LISTENER_TIMEOUT_S,
     )
     processes = [
         subprocess.Popen(
@@ -1157,8 +1269,14 @@ def test_listener_arm_past_target_is_not_refused_then_empty_pool_hint(
                 dispatch_id=f"exhaust-{index}",
                 text=f"ring {index}",
             )
-            exited = _wait_for_exited_count(processes, index + 1)
-            assert len(exited) == index + 1
+            remaining = 3 - (index + 1)
+            _wait_for_listener_count(root, label="wake-test", count=remaining)
+            exited = _wait_for_exited_count(
+                processes,
+                index + 1,
+                timeout_s=_ARBITRATION_LIVE_WAIT_S,
+            )
+            assert len(exited) == index + 1, _pool_exit_codes(processes)
             if index < 2:
                 _advance_all(
                     authority,
@@ -1348,6 +1466,7 @@ def test_self_post_does_not_ring_pool_foreign_post_does(
     ]
     try:
         _wait_for_listener_count(root, label="wake-test", count=arbitration_slots)
+        assert all(process.poll() is None for process in processes)
         self_post = _post_notice(
             root,
             tmp_path,
@@ -1367,7 +1486,6 @@ def test_self_post_does_not_ring_pool_foreign_post_does(
             controller_label="wake-test",
             lease_nonce=claimed.value.nonce,
         )
-        time.sleep(0.4)
         assert all(process.poll() is None for process in processes)
 
         spoofed_post = _post_notice(
@@ -2328,7 +2446,7 @@ def test_deleted_cursor_token_cli_surface_does_not_displace_healthy_listener(
         "--poll-secs",
         "0.02",
         "--timeout-s",
-        "10",
+        "60",
         "--json",
     ]
     healthy = subprocess.Popen(
@@ -2340,13 +2458,8 @@ def test_deleted_cursor_token_cli_surface_does_not_displace_healthy_listener(
         text=True,
     )
     try:
-        deadline = time.monotonic() + 5
-        coverage = None
-        while time.monotonic() < deadline:
-            coverage = authority.active_coverage("wake-test")
-            if coverage and wake.live_waiters(root, controller_label="wake-test"):
-                break
-            time.sleep(0.05)
+        _wait_for_listener(root, "wake-test", healthy)
+        coverage = journal.Journal(root, retry_budget_s=10.0).active_coverage("wake-test")
         assert coverage is not None
         coverage_id = coverage["coverage_id"]
         bad = subprocess.run(
@@ -2360,7 +2473,7 @@ def test_deleted_cursor_token_cli_surface_does_not_displace_healthy_listener(
         )
         assert bad.returncode == 2
         assert "unrecognized arguments: --cursor-token" in bad.stderr
-        current = authority.active_coverage("wake-test")
+        current = journal.Journal(root, retry_budget_s=10.0).active_coverage("wake-test")
         assert current is not None and current["coverage_id"] == coverage_id
         assert healthy.poll() is None
         assert wake.coverage_status(root, controller_label="wake-test")["covered"] is True

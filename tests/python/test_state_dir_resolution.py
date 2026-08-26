@@ -12,6 +12,10 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.live_machine_state
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 

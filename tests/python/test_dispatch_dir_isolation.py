@@ -15,6 +15,10 @@ from support import skip_posix_on_native_windows
 
 skip_posix_on_native_windows("dispatch launch isolation tests need POSIX workers")
 
+import pytest
+
+pytestmark = pytest.mark.live_machine_state
+
 import json
 import os
 import sqlite3

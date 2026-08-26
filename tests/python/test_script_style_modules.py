@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from machine_isolation import AMBIENT_IDENTITY_ENV, isolated_machine_env
+
 TEST_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TEST_DIR.parents[1]
 ISOLATED_TEST_FILE_ENV = "GOALFLIGHT_ISOLATED_TEST_FILE"
@@ -18,19 +20,7 @@ OUTCOME_PASS = "pass"
 OUTCOME_SKIP = "skip"
 OUTCOME_FLAKE = "flake"
 OUTCOME_FAIL = "fail"
-AMBIENT_RUNTIME_ENV = (
-    "GOALFLIGHT_DISPATCH_ID",
-    "GOALFLIGHT_DISPATCH_DIR",
-    "GOALFLIGHT_PROJECT_ROOT",
-    "GOALFLIGHT_PROMPT_FILE",
-    "GOALFLIGHT_STEER_FILE",
-    "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE",
-    "GOALFLIGHT_CONTROLLER_LABEL",
-    "GOALFLIGHT_CONTROLLER_SESSION_ID",
-    "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
-    "GOALFLIGHT_CONTROLLER_PID",
-    "GOALFLIGHT_PROCESS_ROLE",
-)
+AMBIENT_RUNTIME_ENV = AMBIENT_IDENTITY_ENV
 
 
 @dataclass(frozen=True)
@@ -157,13 +147,8 @@ def _isolated_env(root: Path, *, test_id: str) -> dict[str, str]:
     env = os.environ.copy()
     for key in AMBIENT_RUNTIME_ENV:
         env.pop(key, None)
-    env["GOALFLIGHT_CAPACITY_CONF"] = os.devnull
-    env["GOALFLIGHT_TASK_STORE_DIR"] = str(root / "task-store")
-    env["GOAL_FLIGHT_PIDFILE_DIR"] = str(root / "pids")
-    env["GOALFLIGHT_JOURNAL_DIR"] = str(root / "journals")
-    env["GOALFLIGHT_STATE_DIR"] = str(root / "state")
-    env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(root / "wake-ledger")
-    env["GOALFLIGHT_MESSAGES_DIR"] = str(root / "messages")
+    env.pop("GOALFLIGHT_WAKE_LEDGER", None)
+    env.update(isolated_machine_env(root))
     env[ISOLATED_TEST_FILE_ENV] = test_id
     return env
 
@@ -303,6 +288,10 @@ def test_isolated_env_scrubs_ambient_runtime_identity(
     assert all(key not in env for key in AMBIENT_RUNTIME_ENV)
     assert env[ISOLATED_TEST_FILE_ENV] == "test_probe.py"
     assert env["GOALFLIGHT_STATE_DIR"] == str(tmp_path / "state")
+    assert env["GOALFLIGHT_DISPATCH_DIR"] == str(tmp_path / "state" / "dispatch")
+    assert env["GOAL_FLIGHT_PIDFILE_DIR"] == env["GOALFLIGHT_PIDFILE_DIR"] == str(
+        tmp_path / "pids"
+    )
 
 
 def test_flake_report_is_visible_without_becoming_a_failure() -> None:

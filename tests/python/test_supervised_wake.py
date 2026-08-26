@@ -9,9 +9,10 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
-import tempfile
 
 import pytest
+
+from machine_isolation import AMBIENT_IDENTITY_ENV, isolated_machine_env
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -776,36 +777,25 @@ def test_supervise_cli_is_the_one_command_front_door(tmp_path: Path) -> None:
 
 
 @pytest.fixture()
-def isolated(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, str], journal.LeaseIdentity]:
-    td = Path(tempfile.mkdtemp(prefix="gf-supervise-"))
+def isolated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Path, dict[str, str], journal.LeaseIdentity]:
     label = "supervise-test"
-    env = {
-        "GOALFLIGHT_JOURNAL_DIR": str(td / "journals"),
-        "GOALFLIGHT_STATE_DIR": str(td / "state"),
-        "GOALFLIGHT_WAKE_LEDGER_DIR": str(td / "wake-ledger"),
-        "GOALFLIGHT_MESSAGES_DIR": str(td / "messages"),
-        "GOALFLIGHT_TASK_STORE_DIR": str(td / "task-store"),
-        "GOAL_FLIGHT_PIDFILE_DIR": str(td / "pids"),
-        "GOALFLIGHT_CAPACITY_CONF": os.devnull,
-        "GOALFLIGHT_TEST_MODE": "1",
-        "GOALFLIGHT_CONTROLLER_LABEL": label,
-        "GOALFLIGHT_PROCESS_ROLE": "controller",
-        "GOALFLIGHT_WAKE_ENTRY_POLL_S": "0",
-    }
-    for key in (
-        "GOALFLIGHT_DISPATCH_ID",
-        "GOALFLIGHT_PROMPT_FILE",
-        "GOALFLIGHT_STEER_FILE",
-        "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
-        "GOALFLIGHT_PERSISTENT_BACKUP_SLOTS",
-    ):
+    env = isolated_machine_env(tmp_path)
+    env.update(
+        {
+            "GOALFLIGHT_TEST_MODE": "1",
+            "GOALFLIGHT_CONTROLLER_LABEL": label,
+            "GOALFLIGHT_PROCESS_ROLE": "controller",
+            "GOALFLIGHT_WAKE_ENTRY_POLL_S": "0",
+        }
+    )
+    for key in AMBIENT_IDENTITY_ENV:
         monkeypatch.delenv(key, raising=False)
-    for value in env.values():
-        if value != os.devnull:
-            Path(value).mkdir(parents=True, exist_ok=True)
+    monkeypatch.delenv("GOALFLIGHT_WAKE_LEDGER", raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
-    project = td / "project"
+    project = tmp_path / "project"
     project.mkdir()
     authority = journal.open_or_create_journal(project)
     claimed = authority.claim_or_renew_lease(
