@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import errno
 import json
 import os
 from pathlib import Path
@@ -84,6 +85,9 @@ class FakeHost:
     _coverage_seen: int = 0
     _waits: int = 0
     _peer_checks: int = 0
+    _stdout_detector: supervise._PeerLossDetector = field(
+        default_factory=supervise._PeerLossDetector
+    )
 
     def running(self) -> bool:
         return not self.stop
@@ -143,6 +147,14 @@ class FakeHost:
             self.peer_gone_after_checks is not None
             and self._peer_checks >= self.peer_gone_after_checks
         )
+
+    def report_stdout_detector(
+        self, source: str, outcome: str, detail: str = "", error: str = ""
+    ) -> None:
+        self._stdout_detector.report(source, outcome, detail, error)
+
+    def stdout_detector_status(self) -> supervise._DetectorStatus:
+        return self._stdout_detector.status()
 
     def spawn(self, kind: str, command: str) -> FakeChild:
         self.spawns.append((kind, command))
@@ -1543,6 +1555,129 @@ def test_real_host_stdout_registration_failure_fails_closed_with_quiet_child(
     wrapped_stdout.valid_fd = False
 
     started = time.monotonic()
+    stdout_text = ""
+    try:
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            heartbeat_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            coverage_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            items=[
+                (
+                    "backup",
+                    _python_child("import time; time.sleep(5)"),
+                )
+            ],
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        stdout_text = os.read(reader_fd, 65536).decode("utf-8")
+        os.close(reader_fd)
+        host.kill_all()
+
+    assert elapsed < 1.0
+    assert code == supervise.SUPERVISE_STOP_EXIT
+    assert host._stdout_detector_failure == (
+        "stdout file descriptor registration failed"
+    )
+    assert not any(child.alive for child in host._children)
+    records = [json.loads(line) for line in stdout_text.splitlines()]
+    stop = next(record for record in records if record.get("type") == "stop")
+    assert stop["reason"] == "stdout-peer-detector-unavailable"
+    assert stop["scope"] == "supervisor"
+    assert stop["detector"] == "registration"
+    assert stop["error"] == "file-descriptor-registration-failed"
+    assert "goalflight_messages.py supervise" in stop["rearm"]
+    assert (
+        "stdout peer-gone detector unavailable; stopping: "
+        "registration: stdout file descriptor registration failed"
+    ) in capsys.readouterr().err
+
+
+def test_real_host_retries_transient_poll_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_poll = supervise.select.poll
+    calls: list[int | None] = []
+
+    class InterruptOncePoll:
+        def __init__(self) -> None:
+            self.inner = real_poll()
+
+        def register(self, fd: int, eventmask: int) -> None:
+            self.inner.register(fd, eventmask)
+
+        def poll(self, timeout: int | None = None) -> list[tuple[int, int]]:
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise InterruptedError(errno.EINTR, "interrupted")
+            return self.inner.poll(timeout)
+
+    monkeypatch.setattr(supervise.select, "poll", InterruptOncePoll)
+    reader_fd, writer_fd = os.pipe()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    host = supervise.RealHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    try:
+        result = host.wait([], timeout_s=0.01)
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        os.close(reader_fd)
+        host.kill_all()
+
+    assert len(calls) == 2
+    assert result.lines == []
+    assert result.exits == []
+    status = host.stdout_detector_status()
+    assert status.availability == "available"
+    assert status.failure is None
+    assert not status.peer_gone
+
+
+@pytest.mark.parametrize("poll_errno", [errno.ENOMEM, errno.EAGAIN])
+def test_real_host_persistent_poll_failure_emits_recovery_and_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    poll_errno: int,
+) -> None:
+    real_poll = supervise.select.poll
+    calls: list[int | None] = []
+
+    class PersistentlyFailingPoll:
+        def __init__(self) -> None:
+            self.inner = real_poll()
+
+        def register(self, fd: int, eventmask: int) -> None:
+            self.inner.register(fd, eventmask)
+
+        def poll(self, timeout: int | None = None) -> list[tuple[int, int]]:
+            calls.append(timeout)
+            raise OSError(poll_errno, os.strerror(poll_errno))
+
+    monkeypatch.setattr(supervise.select, "poll", PersistentlyFailingPoll)
+    reader_fd, writer_fd = os.pipe()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    host = _RecordingHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    started = time.monotonic()
     try:
         code = supervise.run_supervisor(
             project_root=tmp_path,
@@ -1566,15 +1701,21 @@ def test_real_host_stdout_registration_failure_fails_closed_with_quiet_child(
         host.kill_all()
 
     assert elapsed < 1.0
-    assert code == 0
-    assert host._stdout_detector_failure == (
-        "stdout file descriptor registration failed"
+    supervisor_calls = [timeout for timeout in calls if timeout and timeout > 1000]
+    assert len(supervisor_calls) == supervise.POLL_FAILURE_LIMIT
+    assert code == supervise.SUPERVISE_STOP_EXIT
+    status = host.stdout_detector_status()
+    assert status.availability == "unavailable"
+    assert status.failure is not None
+    assert status.failure.source == "poll"
+    assert errno.errorcode[poll_errno] in status.failure.detail
+    stop = next(
+        record for record in _records(host) if record.get("type") == "stop"
     )
-    assert not any(child.alive for child in host._children)
-    assert (
-        "stdout peer-gone detector unavailable; stopping: "
-        "stdout file descriptor registration failed"
-    ) in capsys.readouterr().err
+    assert stop["reason"] == "stdout-peer-detector-unavailable"
+    assert stop["detector"] == "poll"
+    assert stop["error"] == errno.errorcode[poll_errno]
+    assert "goalflight_messages.py supervise" in stop["rearm"]
 
 
 def test_pollnval_preempts_ready_child_output_before_forwarding(

@@ -41,6 +41,7 @@ BACKOFF_CAP_S = 120.0
 LONG_LIVED_S = 30.0
 STREAM_LINE_MAX_BYTES = 511
 PERMANENT_UNARMED_FAULTS = 3
+POLL_FAILURE_LIMIT = 3
 DEFAULT_SUPERVISOR_HEARTBEAT_S = 25.0 * 60.0
 MIN_SUPERVISOR_HEARTBEAT_S = 60.0
 MAX_SUPERVISOR_HEARTBEAT_S = 30.0 * 60.0
@@ -97,6 +98,66 @@ class UnreadableNonce:
 UNREADABLE_NONCE = UnreadableNonce()
 
 
+@dataclass(frozen=True)
+class _DetectorFailure:
+    source: str
+    error: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class _DetectorStatus:
+    availability: str
+    peer_gone: bool
+    failure: _DetectorFailure | None
+
+
+class _PeerLossDetector:
+    """One write-once choke point for every controlling-stdout detector.
+
+    Probes may be inconclusive without disproving the registered poll detector.
+    Positive availability observations never clear a terminal failure: once a
+    detector layer cannot operate, the supervisor must stop and advertise its
+    re-arm path rather than letting another layer mask the loss.
+    """
+
+    def __init__(self) -> None:
+        self._available = False
+        self._peer_gone = False
+        self._failure: _DetectorFailure | None = None
+
+    def report(
+        self,
+        source: str,
+        outcome: str,
+        detail: str = "",
+        error: str = "",
+    ) -> None:
+        if outcome == "available":
+            self._available = True
+        elif outcome == "peer-gone":
+            self._peer_gone = True
+        elif outcome == "unavailable":
+            if self._failure is None:
+                self._failure = _DetectorFailure(
+                    source=source,
+                    error=error or "unavailable",
+                    detail=detail,
+                )
+        elif outcome != "unknown":
+            raise ValueError(f"unknown peer-loss detector outcome: {outcome}")
+
+    def status(self) -> _DetectorStatus:
+        availability = "unavailable" if self._failure else (
+            "available" if self._available else "unknown"
+        )
+        return _DetectorStatus(
+            availability=availability,
+            peer_gone=self._peer_gone,
+            failure=self._failure,
+        )
+
+
 class SuperviseHost(Protocol):
     now: float
 
@@ -104,6 +165,10 @@ class SuperviseHost(Protocol):
     def live_nonce(self) -> str | None: ...
     def write_stdout(self, line: str) -> bool: ...
     def stdio_peer_gone(self) -> bool: ...
+    def report_stdout_detector(
+        self, source: str, outcome: str, detail: str = "", error: str = ""
+    ) -> None: ...
+    def stdout_detector_status(self) -> _DetectorStatus: ...
     def spawn(self, kind: str, command: str) -> Any: ...
     def wait(self, children: list[Any], timeout_s: float) -> WaitResult: ...
     def kill_all(self) -> None: ...
@@ -269,8 +334,61 @@ def _live_target(slots: list[_Slot]) -> tuple[int, int]:
     return live, len(slots)
 
 
+def _report_stdout_detector(
+    host: SuperviseHost,
+    *,
+    source: str,
+    outcome: str,
+    detail: str = "",
+    error: str = "",
+) -> None:
+    host.report_stdout_detector(source, outcome, detail, error)
+
+
+def _write_stdout(host: SuperviseHost, line: str, *, source: str) -> bool:
+    """Write once and report the write detector through the shared choke point."""
+    try:
+        written = host.write_stdout(line)
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        if isinstance(exc, OSError) and exc.errno == errno.EPIPE:
+            _report_stdout_detector(
+                host,
+                source=source,
+                outcome="peer-gone",
+                detail="controlling stdout closed during write",
+            )
+        else:
+            error_name = ""
+            if isinstance(exc, OSError) and exc.errno is not None:
+                error_name = errno.errorcode.get(exc.errno, str(exc.errno)) + ": "
+            _report_stdout_detector(
+                host,
+                source=source,
+                outcome="unavailable",
+                detail=f"stdout write failed: {error_name}{exc}",
+                error=(
+                    error_name.removesuffix(": ")
+                    if error_name
+                    else type(exc).__name__
+                ),
+            )
+        return False
+    _report_stdout_detector(
+        host,
+        source=source,
+        outcome="available" if written else "peer-gone",
+        detail="" if written else "controlling stdout closed during write",
+    )
+    return written
+
+
 def _emit(host: SuperviseHost, record: dict[str, object]) -> bool:
-    return host.write_stdout(_supervise_line(record))
+    record_type = str(record.get("type") or "record")
+    return _write_stdout(
+        host,
+        _supervise_line(record),
+        source=f"write-{record_type}",
+    )
 
 
 def _supervisor_rearm_command(
@@ -309,15 +427,33 @@ def _supervisor_rearm_command(
     return shlex.join(argv)
 
 
-def _host_stdio_peer_gone(host: SuperviseHost) -> bool:
-    """Return only positive peer-death evidence from the host's poll probe."""
+def _probe_stdout_detector(host: SuperviseHost, *, source: str) -> None:
+    """Report a pre/post probe without flattening inconclusive into healthy."""
     probe = getattr(host, "stdio_peer_gone", None)
     if not callable(probe):
-        return False
+        _report_stdout_detector(
+            host,
+            source=source,
+            outcome="unknown",
+            detail="stdout peer-gone probe is unavailable",
+        )
+        return
     try:
-        return bool(probe())
-    except (OSError, ValueError):
-        return False
+        peer_gone = bool(probe())
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        _report_stdout_detector(
+            host,
+            source=source,
+            outcome="unknown",
+            detail=f"stdout peer-gone probe was inconclusive: {exc}",
+        )
+        return
+    _report_stdout_detector(
+        host,
+        source=source,
+        outcome="peer-gone" if peer_gone else "unknown",
+        detail="controlling stdout closed" if peer_gone else "no closure evidence",
+    )
 
 
 def _signal_reason(signum: int) -> str:
@@ -471,6 +607,58 @@ def run_supervisor(
         for kind, command in items
     ]
 
+    def stop_for_stdout_detector() -> int | None:
+        """Define the one terminal policy for all peer-loss detector layers."""
+        status = host.stdout_detector_status()
+        failure = status.failure
+        if failure is not None:
+            live, target = _live_target(slots)
+            emit_stop(
+                reason="stdout-peer-detector-unavailable",
+                scope="supervisor",
+                detector=failure.source,
+                error=failure.error,
+                live=live,
+                target=target,
+                detail=failure.detail,
+            )
+            try:
+                sys.stderr.write(
+                    "goalflight supervise: stdout peer-gone detector unavailable; "
+                    f"stopping: {failure.source}: {failure.detail}\n"
+                )
+                sys.stderr.flush()
+            except (AttributeError, OSError, ValueError):
+                pass
+            host.kill_all()
+            return SUPERVISE_STOP_EXIT
+        if status.peer_gone:
+            host.kill_all()
+            return 0
+        # Unknown probe observations are allowed only while the registered
+        # poll detector or periodic write path remains available. Registration,
+        # poll use, and writes report terminal unavailability above.
+        return None
+
+    def stop_after_failed_write() -> int:
+        """Route every failed write through the same terminal policy."""
+        stopped = stop_for_stdout_detector()
+        if stopped is not None:
+            return stopped
+        # A host returning False without reporting it violates the protocol.
+        # Treat that unknown detector state as unavailable, then use the same
+        # stop-record/teardown/exit path rather than inventing a fallback here.
+        _report_stdout_detector(
+            host,
+            source="write",
+            outcome="unavailable",
+            detail="stdout write failed without a detector outcome",
+            error="missing-write-outcome",
+        )
+        stopped = stop_for_stdout_detector()
+        assert stopped is not None
+        return stopped
+
     def spawn_due() -> int | None:
         state = _nonce_state(host, nonce)
         if state == "dead":
@@ -548,31 +736,23 @@ def run_supervisor(
 
     coverage_ok, _coverage_emitted = emit_coverage(force=True)
     if not coverage_ok or (debug and not emit_heartbeat()):
-        host.kill_all()
-        return 0
+        return stop_after_failed_write()
     next_heartbeat = host.now + max(0.01, float(heartbeat_s))
     next_coverage = host.now + max(0.01, float(coverage_s))
 
     while host.running():
-        # Three detectors answer different questions. The probes around wait
-        # call goalflight_messages._stdio_peer_gone; False means either no
-        # HUP/ERR/NVAL evidence or an uninspectable fd, never a health verdict.
-        # RealHost.wait registers the same descriptor so explicit peer-gone
-        # events wake this loop independently of the scheduled deadline; no
-        # event is likewise only no evidence. The supervisor heartbeat asks
-        # the authoritative question with a real write: success proves the
-        # peer accepted it at that instant; EPIPE proves closure. If wait
-        # cannot establish its registered detector, it records a terminal
-        # detector failure and returns immediately: when none of the fast
-        # detectors can tell, the supervisor fails closed instead of sleeping
-        # until that heartbeat. The slow supervisor heartbeat is distinct from
-        # the forwarded stream child's 120-second heartbeat, which proves
-        # stream liveness to --watch-follow and drives its three-missed-
-        # interval death threshold. Slowing the supervisor beat must not
-        # change peer-gone or stream/watchdog detection.
-        if _host_stdio_peer_gone(host):
-            host.kill_all()
-            return 0
+        # Every detector reports to _PeerLossDetector; stop_for_stdout_detector
+        # is the sole terminal policy. The probes around wait are allowed to be
+        # inconclusive, while registration failure or persistently unusable
+        # poll means the fast detector is unavailable and fails closed. Every
+        # write is the authoritative point-in-time peer check. The 1500-second
+        # supervisor heartbeat remains distinct from the forwarded stream
+        # child's 120-second heartbeat, which proves stream liveness to
+        # --watch-follow and drives its three-missed-interval death threshold.
+        _probe_stdout_detector(host, source="probe-before-wait")
+        stopped = stop_for_stdout_detector()
+        if stopped is not None:
+            return stopped
         state = _nonce_state(host, nonce)
         if state == "dead":
             live, target = _live_target(slots)
@@ -597,9 +777,10 @@ def run_supervisor(
             if slot.child is not None and getattr(slot.child, "alive", True)
         ]
         result = host.wait(live_children, timeout_s)
-        if _host_stdio_peer_gone(host):
-            host.kill_all()
-            return 0
+        _probe_stdout_detector(host, source="probe-after-wait")
+        stopped = stop_for_stdout_detector()
+        if stopped is not None:
+            return stopped
         wait_signum = getattr(host, "stop_signum", None)
         if (
             not host.running()
@@ -609,9 +790,8 @@ def run_supervisor(
             break
         for child, line in result.lines:
             text = line if line.endswith("\n") else line + "\n"
-            if not host.write_stdout(text):
-                host.kill_all()
-                return 0
+            if not _write_stdout(host, text, source="write-child-output"):
+                return stop_after_failed_write()
         for event in result.exits:
             child = event.child
             slot = next((row for row in slots if row.child is child), None)
@@ -667,8 +847,7 @@ def run_supervisor(
                 )
                 coverage_ok, _coverage_emitted = emit_coverage()
                 if not coverage_ok:
-                    host.kill_all()
-                    return 0
+                    return stop_after_failed_write()
                 if scope == "supervisor":
                     host.kill_all()
                     return SUPERVISE_STOP_EXIT
@@ -689,24 +868,20 @@ def run_supervisor(
                     "target": target,
                 },
             ):
-                host.kill_all()
-                return 0
+                return stop_after_failed_write()
         coverage_ok, coverage_emitted = emit_coverage()
         if not coverage_ok:
-            host.kill_all()
-            return 0
+            return stop_after_failed_write()
         if host.now >= next_heartbeat:
             if not emit_heartbeat():
-                host.kill_all()
-                return 0
+                return stop_after_failed_write()
             next_heartbeat = host.now + max(0.01, float(heartbeat_s))
         if host.now >= next_coverage:
             coverage_ok, _debug_emitted = emit_coverage(
                 force=bool(debug and not coverage_emitted)
             )
             if not coverage_ok:
-                host.kill_all()
-                return 0
+                return stop_after_failed_write()
             next_coverage = host.now + max(0.01, float(coverage_s))
         stopped = spawn_due()
         if stopped is not None:
@@ -812,8 +987,7 @@ class RealHost:
         self._nonce_reader = nonce_reader
         self._children: list[RealChild] = []
         self._stop = False
-        self._stdout_peer_gone = False
-        self._stdout_detector_failure: str | None = None
+        self._stdout_detector = _PeerLossDetector()
         self.stop_signum: int | None = None
         self._prev_handlers: dict[int, object] = {}
         signal_rfd, signal_wfd = os.pipe()
@@ -931,26 +1105,26 @@ class RealHost:
             raise
 
     def stdio_peer_gone(self) -> bool:
-        if self._stdout_peer_gone or self._stdout_detector_failure is not None:
+        if self.stdout_detector_status().peer_gone:
             return True
         # Import lazily: goalflight_messages imports this module for the CLI.
         import goalflight_messages as messages  # type: ignore
 
         return bool(messages._stdio_peer_gone(sys.stdout))
 
-    def _fail_closed_stdout_detector(self, reason: str) -> None:
-        """Make an unavailable stdout closure detector terminal and visible."""
-        if self._stdout_detector_failure is not None:
-            return
-        self._stdout_detector_failure = reason
-        try:
-            sys.stderr.write(
-                "goalflight supervise: stdout peer-gone detector unavailable; "
-                f"stopping: {reason}\n"
-            )
-            sys.stderr.flush()
-        except (AttributeError, OSError, ValueError):
-            pass
+    def report_stdout_detector(
+        self, source: str, outcome: str, detail: str = "", error: str = ""
+    ) -> None:
+        self._stdout_detector.report(source, outcome, detail, error)
+
+    def stdout_detector_status(self) -> _DetectorStatus:
+        return self._stdout_detector.status()
+
+    @property
+    def _stdout_detector_failure(self) -> str | None:
+        """Compatibility view of the write-once detector failure latch."""
+        failure = self.stdout_detector_status().failure
+        return failure.detail if failure is not None else None
 
     def spawn(self, kind: str, command: str) -> RealChild:
         env = dict(self._env if self._env is not None else os.environ)
@@ -1086,23 +1260,33 @@ class RealHost:
         try:
             stdout_fd = sys.stdout.fileno()
         except (AttributeError, OSError, TypeError, ValueError):
-            self._fail_closed_stdout_detector(
-                "stdout has no inspectable file descriptor"
+            self.report_stdout_detector(
+                "registration",
+                "unavailable",
+                "stdout has no inspectable file descriptor",
+                "no-file-descriptor",
             )
         else:
             if stdout_fd in fdmap:
-                self._fail_closed_stdout_detector(
-                    "stdout file descriptor collides with another wait source"
+                self.report_stdout_detector(
+                    "registration",
+                    "unavailable",
+                    "stdout file descriptor collides with another wait source",
+                    "file-descriptor-collision",
                 )
             else:
                 try:
                     poller.register(stdout_fd, peer_gone_events)
                 except (OSError, TypeError, ValueError):
-                    self._fail_closed_stdout_detector(
-                        "stdout file descriptor registration failed"
+                    self.report_stdout_detector(
+                        "registration",
+                        "unavailable",
+                        "stdout file descriptor registration failed",
+                        "file-descriptor-registration-failed",
                     )
                 else:
                     fdmap[stdout_fd] = ("stdout", None)
+                    self.report_stdout_detector("registration", "available")
         # _stdio_peer_gone returns False both for no evidence and when it
         # cannot inspect stdout. Registration success adds an independent
         # detector whose no-event result is likewise only no evidence. If
@@ -1110,18 +1294,52 @@ class RealHost:
         # wake this wait, so fail closed now instead of using the heartbeat as
         # an implicit 25-minute fallback.
         remaining = max(0.0, deadline - time.monotonic())
-        if self._stdout_detector_failure is not None:
+        if self.stdout_detector_status().failure is not None:
             remaining = 0.0
         ready: list[int] = []
-        if fdmap:
-            try:
+        if fdmap and self.stdout_detector_status().failure is None:
+            poll_failures = 0
+            while True:
+                try:
+                    events_ready = poller.poll(
+                        math.ceil(
+                            max(0.0, deadline - time.monotonic()) * 1000.0
+                        )
+                    )
+                except (OSError, ValueError) as exc:
+                    poll_failures += 1
+                    error_number = getattr(exc, "errno", None)
+                    error_name = (
+                        errno.errorcode.get(error_number, str(error_number))
+                        if error_number is not None
+                        else type(exc).__name__
+                    )
+                    if poll_failures >= POLL_FAILURE_LIMIT:
+                        self.report_stdout_detector(
+                            "poll",
+                            "unavailable",
+                            "stdout poll failed persistently after "
+                            f"{poll_failures} attempts: {error_name}: {exc}",
+                            error_name,
+                        )
+                        break
+                    self.report_stdout_detector(
+                        "poll",
+                        "unknown",
+                        (
+                            "stdout poll interrupted; retrying"
+                            if error_number == errno.EINTR
+                            else "stdout poll failed transiently; retrying"
+                        ),
+                    )
+                    continue
+                self.report_stdout_detector("poll", "available")
                 ready = [
                     fd
-                    for fd, events in poller.poll(math.ceil(remaining * 1000.0))
+                    for fd, events in events_ready
                     if events & read_events
                 ]
-            except (InterruptedError, OSError):
-                ready = []
+                break
         elif remaining > 0:
             time.sleep(remaining)
         self.now = time.monotonic()
@@ -1130,7 +1348,9 @@ class RealHost:
         for fd in ready:
             which, child = fdmap[fd]
             if which == "stdout":
-                self._stdout_peer_gone = True
+                self.report_stdout_detector(
+                    "poll", "peer-gone", "controlling stdout poll reported closure"
+                )
                 continue
             if which == "signal":
                 while True:
