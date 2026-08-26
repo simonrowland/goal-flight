@@ -5135,6 +5135,17 @@ def _write_follow_record(
             raise
 
 
+def _emit_supervised_armed() -> None:
+    """Durable arming witness on stdout for the supervisor, not a controller wake.
+
+    Only supervised children emit this. The supervisor records it, then drops
+    the line so it does not flush a host wake on every re-arm.
+    """
+    if os.environ.get("GOALFLIGHT_SUPERVISED") != "1":
+        return
+    print('{"kind":"armed"}', flush=True)
+
+
 def _follow_stdout_refusal(stream: object) -> str | None:
     try:
         mode = os.fstat(stream.fileno()).st_mode  # type: ignore[attr-defined]
@@ -5469,6 +5480,7 @@ def cmd_follow(args) -> int:
             pass
         print(f"follow: durable monitor state unavailable: {exc}", file=sys.stderr)
         return 2 if stdout_alive else 0
+    _emit_supervised_armed()
 
     death_watch = _ListenerDeathWatch()
     death_watch.install()
@@ -5706,6 +5718,7 @@ def _cmd_watch_follow(
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"listen: watchdog registration failed: {exc}", file=sys.stderr)
         return 2
+    _emit_supervised_armed()
 
     started = time.monotonic()
     startup_state_stamp = goalflight_wake.monitor_state_stamp(
@@ -6035,6 +6048,7 @@ def cmd_listen(args) -> int:
         return 2
 
     coverage_id = str(coverage["coverage_id"])
+    _emit_supervised_armed()
     listener_started = time.monotonic()
     detached_grace = _listener_startup_grace_s()
     watchdog_start_grace = (

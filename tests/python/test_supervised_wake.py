@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_journal as journal  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
+import goalflight_session_status as sessions  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 import goalflight_wake_supervise as supervise  # noqa: E402
 
@@ -52,6 +54,7 @@ class FakeChild:
 @dataclass
 class FakeHost:
     nonce: str = "nonce-1"
+    lease_nonce: str = "nonce-1"
     now: float = 0.0
     lines: list[str] = field(default_factory=list)
     spawns: list[tuple[str, str]] = field(default_factory=list)
@@ -79,7 +82,7 @@ class FakeHost:
     def nonce_probe(self) -> str:
         if self.nonce_state == "unreadable":
             return "unreadable"
-        if not self.nonce:
+        if not self.nonce or str(self.nonce) != str(self.lease_nonce):
             return "dead"
         return "live"
 
@@ -239,6 +242,7 @@ def _run(
     coverage_s: float = 30.0,
     nonce: str = "nonce-1",
 ) -> int:
+    host.lease_nonce = nonce
     return supervise.run_supervisor(
         project_root="/tmp/supervise-test",
         controller_label="bugs",
@@ -586,7 +590,7 @@ def test_classify_exit_taxonomy() -> None:
         returncode=0,
         output="",
         armed=False,
-    ) == (supervise.ACTION_STOP, "did-not-arm")
+    ) == (supervise.ACTION_REARM, "rang")
     assert supervise.classify_child_exit(
         kind="stream",
         returncode=3,
@@ -933,3 +937,165 @@ def test_coverage_status_keeps_t322_sizing_after_supervise(
     assert status["backup"]["target"] == 6
     assert "target" in status["backup"]
     assert status["portable_target_waiters"] == 6
+
+
+class _RecordingHost(supervise.RealHost):
+    """RealHost that captures multiplexed stdout and stops on restart/stop."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.lines: list[str] = []
+
+    def write_stdout(self, line: str) -> bool:
+        text = line if line.endswith("\n") else line + "\n"
+        self.lines.append(text)
+        if '"type":"restart"' in text or '"type":"stop"' in text:
+            self._stop = True
+        return True
+
+
+def _python_child(script: str) -> str:
+    return shlex.join([sys.executable, "-c", script])
+
+
+def test_open_reader_success_live_session_none_does_not_kill_the_pool(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reviewer refutation: reader succeeds, live_session is None, pool stays up.
+
+    Exercises RealHost.nonce_probe, not a FakeHost that hands back the state.
+    """
+    project, env, lease = isolated
+    opened: list[object] = []
+    real_open_reader = journal.Journal.open_reader
+
+    def succeeding_open_reader(cls, project_root, **kwargs):  # type: ignore[no-untyped-def]
+        reader = real_open_reader(project_root, **kwargs)
+        opened.append(reader)
+        return reader
+
+    monkeypatch.setattr(
+        journal.Journal, "open_reader", classmethod(succeeding_open_reader)
+    )
+    monkeypatch.setattr(sessions, "live_session", lambda *args, **kwargs: None)
+
+    def busy_journal_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        raise journal.JournalUnavailable(
+            "journal connection remained busy after 1 attempts within 1.000s"
+        )
+
+    monkeypatch.setattr(journal.Journal, "__init__", busy_journal_init)
+
+    with wake.register_lease_holder(
+        project, controller_label=lease.label, lease_nonce=lease.nonce
+    ):
+        host = _RecordingHost(
+            project_root=project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+            env=env,
+        )
+        try:
+            assert sessions.live_session(project, label=lease.label) is None
+            assert host.nonce_probe() == "live"
+            assert opened, "nonce_probe must read through open_reader"
+            script = (
+                "import sys\n"
+                "print('listen: journal-unavailable: journal is busy', "
+                "file=sys.stderr)\n"
+                "sys.exit(2)\n"
+            )
+            code = supervise.run_supervisor(
+                project_root=project,
+                controller_label=lease.label,
+                lease_nonce=lease.nonce,
+                host=host,
+                heartbeat_s=100.0,
+                coverage_s=100.0,
+                items=[("backup", _python_child(script))],
+            )
+        finally:
+            host.kill_all()
+
+    records = _records(host)
+    reasons = [record.get("reason") for record in records]
+    assert "dead-lease-nonce" not in reasons
+    assert code != supervise.SUPERVISE_STOP_EXIT
+    restart = next(record for record in records if record.get("type") == "restart")
+    assert restart["reason"] == "journal-unreadable"
+    assert restart["child"] == "backup"
+
+
+def test_fast_ring_between_lock_samples_is_rearmed_not_stopped(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Child arms, rings, and exits 0 between lock samples must re-arm."""
+    project, env, lease = isolated
+    monkeypatch.setattr(supervise.wake, "live_waiters", lambda *args, **kwargs: [])
+    script = (
+        "import sys\n"
+        "print('{\"kind\":\"armed\"}', flush=True)\n"
+        "print('{\"kind\":\"ring\",\"reason\":\"event\"}', flush=True)\n"
+        "sys.exit(0)\n"
+    )
+    host = _RecordingHost(
+        project_root=project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        env=env,
+        nonce_reader=lambda: lease.nonce,
+    )
+    try:
+        code = supervise.run_supervisor(
+            project_root=project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+            host=host,
+            heartbeat_s=100.0,
+            coverage_s=100.0,
+            items=[("backup", _python_child(script))],
+        )
+    finally:
+        host.kill_all()
+
+    records = _records(host)
+    stops = [record for record in records if record.get("type") == "stop"]
+    assert all(record.get("reason") != "did-not-arm" for record in stops)
+    restart = next(record for record in records if record.get("type") == "restart")
+    assert restart["reason"] == "rang"
+    assert restart["child"] == "backup"
+    assert code != supervise.SUPERVISE_STOP_EXIT
+    assert any(
+        child.armed
+        for child in host._children
+        if isinstance(child, supervise.RealChild)
+    )
+
+
+def test_unreadable_startup_with_explicit_nonce_starts(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _env, lease = isolated
+    monkeypatch.setattr(
+        sessions, "probe_live_session", lambda *args, **kwargs: ("unreadable", None)
+    )
+    nonce, err, code = supervise.resolve_startup_lease_nonce(
+        project_root=project,
+        controller_label=lease.label,
+        explicit=lease.nonce,
+    )
+    assert nonce == lease.nonce
+    assert err is None
+    assert code is None
+    missing, missing_err, missing_code = supervise.resolve_startup_lease_nonce(
+        project_root=project,
+        controller_label=lease.label,
+        explicit="",
+    )
+    assert missing is None
+    assert missing_err is not None and "journal unreadable" in missing_err
+    assert missing_code == supervise.SUPERVISE_START_EXIT
+    assert "did-not-arm" not in str(missing_err)

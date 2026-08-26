@@ -29,8 +29,11 @@ incremented when meaningful skill behaviour changes.
   `--watch-follow` commands stay valid for hosts that arm them separately.
   Supervised children pin `--lease-nonce` under the listener role; journal
   unreadability stays retryable and is not a dead nonce; `live` counts armed
-  flocks; a unit did-not-arm or permanent unarmed exit-2 stops that slot
-  without killing siblings.
+  flocks or a durable child armed/ring line; a unit did-not-arm (explicit
+  leftover-lock / regular-file markers) or permanent unarmed exit-2 stops
+  that slot without killing siblings. A missed lock sample on a successful
+  ring re-arms. The nonce probe reads through the non-locking journal
+  reader, so a busy write constructor cannot be mistaken for a dead lease.
 
 ### Fixed
 

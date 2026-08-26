@@ -57,6 +57,17 @@ _DID_NOT_ARM_MARKERS = (
 _SLOT_STOP_REASONS = frozenset(
     {"did-not-arm", "permanent-exit-2"}
 )
+_ARMED_STDOUT_KINDS = frozenset(
+    {
+        "armed",
+        "ring",
+        "heartbeat",
+        "event",
+        "frontier",
+        "pending-at-arm",
+    }
+)
+SUPERVISED_ENV = "GOALFLIGHT_SUPERVISED"
 
 
 class SuperviseHost(Protocol):
@@ -106,12 +117,13 @@ def classify_child_exit(
 ) -> tuple[str, str]:
     """Map a child death onto re-arm, backoff, or stop-and-say-why.
 
-    ``armed`` is the production wake-lock predicate: the child PID was
-    observed holding a stream, doorbell, or watchdog flock. Exit 0 without
-    that lock is did-not-arm (b-230); journal unreadability is retryable
-    and is never collapsed into a dead nonce.
+    ``armed`` is a positive observation (child stdout or a sampled flock).
+    A missed sample is a false negative and must re-arm, never stop: exit 0
+    without an explicit did-not-arm marker is "rang". Journal unreadability
+    is retryable and is never collapsed into a dead nonce.
     """
     del kind
+    del armed
     text = str(output or "")
     lowered = text.lower()
     if any(marker in lowered for marker in _JOURNAL_UNREADABLE_MARKERS):
@@ -119,8 +131,6 @@ def classify_child_exit(
     if any(marker in lowered for marker in _DEAD_NONCE_MARKERS):
         return ACTION_STOP, "dead-lease-nonce"
     if any(marker in lowered for marker in _DID_NOT_ARM_MARKERS):
-        return ACTION_STOP, "did-not-arm"
-    if returncode == 0 and not armed:
         return ACTION_STOP, "did-not-arm"
     if returncode == 0:
         return ACTION_REARM, "rang"
@@ -196,20 +206,50 @@ def _emit(host: SuperviseHost, record: dict[str, object]) -> bool:
     return host.write_stdout(_supervise_line(record))
 
 
+def _line_signals_armed(line: str) -> bool:
+    """True when a child line is durable evidence it armed, not a lock sample."""
+    text = str(line or "").strip()
+    if not text:
+        return False
+    if text.startswith("advance:"):
+        return True
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return str(payload.get("kind") or "") in _ARMED_STDOUT_KINDS
+
+
+def _is_armed_control_line(line: str) -> bool:
+    """The dedicated armed witness is for the supervisor, not a controller wake."""
+    text = str(line or "").strip()
+    if not text:
+        return False
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and str(payload.get("kind") or "") == "armed"
+
+
 def _nonce_state(host: SuperviseHost, expected: str) -> str:
-    """Return live, dead, or unreadable. Unreadable is retryable."""
+    """Return live, dead, or unreadable. Unreadable is retryable.
+
+    The probe is the single source of truth. Do not re-derive via
+    ``live_nonce()`` after a live result: a second busy ``Journal()`` can
+    flip live to dead inside the same child-death.
+    """
     probe = getattr(host, "nonce_probe", None)
     if callable(probe):
         state = str(probe() or "").strip()
-        if state == "unreadable":
-            return "unreadable"
-        if state == "dead":
-            return "dead"
-        if state == "live":
-            live = host.live_nonce()
-            if bool(live) and str(live) == expected:
-                return "live"
-            return "dead"
+        if state in {"unreadable", "dead", "live"}:
+            return state
+        # Probe existed but could not tell. Do not fall through to
+        # live_nonce(): that API collapses unreadable into None, which
+        # this function would then treat as dead.
+        return "unreadable"
     live = host.live_nonce()
     if live is None:
         return "dead"
@@ -545,31 +585,39 @@ class RealHost:
             return self._nonce_reader()
         import goalflight_session_status as sessions  # type: ignore
 
-        session = sessions.live_session(
+        state, session = sessions.probe_live_session(
             self.project_root, label=self.controller_label
         )
-        if not isinstance(session, dict):
+        if state != "live" or not isinstance(session, dict):
             return None
         nonce = str(session.get("lease_nonce") or "").strip()
         return nonce or None
 
     def nonce_probe(self) -> str:
-        """Distinguish a readable dead lease from a journal we could not open."""
+        """Distinguish a readable dead lease from a journal we could not open.
+
+        Reads the nonce through ``probe_live_session`` (non-locking reader).
+        Never calls the write ``Journal()`` constructor, and never treats
+        ``live_session() is None`` as dead after a successful reader open.
+        """
         if self._nonce_reader is not None:
             live = self._nonce_reader()
             if live is None:
                 return "dead"
             return "live" if str(live) == self.lease_nonce else "dead"
-        import goalflight_journal  # type: ignore
+        import goalflight_session_status as sessions  # type: ignore
 
-        try:
-            goalflight_journal.Journal.open_reader(self.project_root)
-        except goalflight_journal.JournalUnavailable:
+        state, session = sessions.probe_live_session(
+            self.project_root, label=self.controller_label
+        )
+        if state == "unreadable":
             return "unreadable"
-        live = self.live_nonce()
-        if live is None:
+        if state != "live" or not isinstance(session, dict):
             return "dead"
-        return "live" if str(live) == self.lease_nonce else "dead"
+        live = str(session.get("lease_nonce") or "").strip()
+        if not live:
+            return "dead"
+        return "live" if live == self.lease_nonce else "dead"
 
     def _observe_locks(self, children: list[Any]) -> None:
         """Mark children armed only when their PID holds a wake flock."""
@@ -611,6 +659,7 @@ class RealHost:
         env = dict(self._env if self._env is not None else os.environ)
         env.pop("GOALFLIGHT_DISPATCH_ID", None)
         env["GOALFLIGHT_PROCESS_ROLE"] = "listener"
+        env[SUPERVISED_ENV] = "1"
         argv = shlex.split(command)
         proc = subprocess.Popen(
             argv,
@@ -650,15 +699,20 @@ class RealHost:
         else:
             child.stderr_buf += data
             lines, child.stderr_buf = _pop_lines(child.stderr_buf)
+        forwarded: list[str] = []
         for line in lines:
             child.output += line + "\n"
+            if _line_signals_armed(line):
+                child.armed = True
             if which == "err":
                 try:
                     sys.stderr.write(line + "\n")
                     sys.stderr.flush()
                 except OSError:
                     pass
-        return lines if which == "out" else []
+            elif not _is_armed_control_line(line):
+                forwarded.append(line)
+        return forwarded if which == "out" else []
 
     def _drain_exited(self, child: RealChild) -> list[str]:
         extra: list[str] = []
@@ -674,7 +728,13 @@ class RealHost:
             if buf:
                 leftover = buf.decode("utf-8", "replace")
                 child.output += leftover if leftover.endswith("\n") else leftover + "\n"
-                if which == "out" and leftover.strip():
+                if _line_signals_armed(leftover):
+                    child.armed = True
+                if (
+                    which == "out"
+                    and leftover.strip()
+                    and not _is_armed_control_line(leftover)
+                ):
                     extra.append(leftover.rstrip("\r\n"))
                 if which == "out":
                     child.stdout_buf = b""
@@ -775,6 +835,54 @@ class RealHost:
         self._prev_handlers.clear()
 
 
+def resolve_startup_lease_nonce(
+    *,
+    project_root: Path | str,
+    controller_label: str,
+    explicit: str,
+) -> tuple[str | None, str | None, int | None]:
+    """Pin the supervise nonce from a readable live session.
+
+    Unreadable is retryable: an explicit ``--lease-nonce`` is used as the pin
+    so the process can start and the runtime probe can retry. A missing
+    explicit nonce with an unreadable journal is a start fault, not
+    did-not-arm. Only a readable absent or changed session is did-not-arm.
+    """
+    import goalflight_session_status as sessions  # type: ignore
+
+    explicit_nonce = str(explicit or "").strip()
+    state, session = sessions.probe_live_session(
+        Path(project_root), label=controller_label
+    )
+    if state == "unreadable":
+        if explicit_nonce:
+            return explicit_nonce, None, None
+        return (
+            None,
+            "journal unreadable; cannot confirm a live lease nonce "
+            "and no --lease-nonce was given",
+            SUPERVISE_START_EXIT,
+        )
+    live = ""
+    if isinstance(session, dict):
+        live = str(session.get("lease_nonce") or "").strip()
+    if state != "live" or not live:
+        return (
+            None,
+            "did-not-arm: no live controller lease nonce "
+            "from goalflight_session_status",
+            SUPERVISE_STOP_EXIT,
+        )
+    if explicit_nonce and explicit_nonce != live:
+        return (
+            None,
+            "did-not-arm: --lease-nonce does not match live "
+            f"session nonce ({live[:12]}…)",
+            SUPERVISE_STOP_EXIT,
+        )
+    return live, None, None
+
+
 def cmd_supervise(args: Any) -> int:
     """CLI entry used by goalflight_messages.py supervise."""
     import goalflight_session_status as sessions  # type: ignore
@@ -800,27 +908,14 @@ def cmd_supervise(args: Any) -> int:
     if not label:
         print("supervise: controller label is unavailable", file=sys.stderr)
         return SUPERVISE_START_EXIT
-    session = sessions.live_session(project_root, label=label)
-    live_nonce = (
-        str(session.get("lease_nonce") or "").strip()
-        if isinstance(session, dict)
-        else ""
+    live_nonce, refusal, refusal_code = resolve_startup_lease_nonce(
+        project_root=project_root,
+        controller_label=label,
+        explicit=str(getattr(args, "lease_nonce", None) or ""),
     )
     if not live_nonce:
-        print(
-            "supervise: did-not-arm: no live controller lease nonce "
-            "from goalflight_session_status",
-            file=sys.stderr,
-        )
-        return SUPERVISE_STOP_EXIT
-    explicit = str(getattr(args, "lease_nonce", None) or "").strip()
-    if explicit and explicit != live_nonce:
-        print(
-            "supervise: did-not-arm: --lease-nonce does not match live "
-            f"session nonce ({live_nonce[:12]}…)",
-            file=sys.stderr,
-        )
-        return SUPERVISE_STOP_EXIT
+        print(f"supervise: {refusal}", file=sys.stderr)
+        return int(refusal_code or SUPERVISE_START_EXIT)
     test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
     heartbeat_s = float(getattr(args, "heartbeat_secs", 120.0) or 120.0)
     coverage_s = float(getattr(args, "coverage_secs", 0.0) or 0.0) or heartbeat_s
