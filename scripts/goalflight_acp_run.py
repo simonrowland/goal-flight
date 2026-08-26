@@ -655,10 +655,15 @@ def _tail_text(path: Path, *, chars: int) -> str | None:
 
 
 class AgentStderrCapture:
+    # Overlap kept so a secret split across reads is rematched. 4-char
+    # prefix plus 80 body chars covers the public shape; extra margin
+    # is cheap.
+    _REDACT_OVERLAP = 84
+
     def __init__(self, path: Path, *, max_bytes: int = AGENT_STDERR_CAPTURE_BYTES) -> None:
         self.path = path
         self.max_bytes = max(1, int(max_bytes))
-        self._buffer = bytearray()
+        self._text = ""
 
     async def attach(self, conn: AcpConnection) -> None:
         old_task = getattr(conn, "_stderr_task", None)
@@ -692,13 +697,26 @@ class AgentStderrCapture:
     def _append(self, chunk: bytes) -> None:
         if not chunk:
             return
-        self._buffer.extend(chunk)
-        if len(self._buffer) > self.max_bytes:
-            del self._buffer[: len(self._buffer) - self.max_bytes]
+        try:
+            import goalflight_output_redact
+
+            incoming = chunk.decode("utf-8", errors="replace")
+            overlap = self._text[-self._REDACT_OVERLAP :] if self._text else ""
+            combined = goalflight_output_redact.redact_text(overlap + incoming)
+            if overlap:
+                self._text = self._text[: -len(overlap)] + combined
+            else:
+                self._text = combined
+        except Exception:
+            self._text = "[redacted]"
+        encoded = self._text.encode("utf-8")
+        if len(encoded) > self.max_bytes:
+            encoded = encoded[-self.max_bytes :]
+            self._text = encoded.decode("utf-8", errors="replace")
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            tmp.write_bytes(bytes(self._buffer))
+            tmp.write_bytes(encoded)
             tmp.replace(self.path)
         except OSError:
             pass

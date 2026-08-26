@@ -1292,6 +1292,12 @@ def post_message(
     """Admit one monotonic stream envelope; shared by CLI, MCP, and tests."""
     _reject_steer_type_off_worker_mailbox(dispatch_id, msg_type)
     validate_payload(payload)
+    try:
+        import goalflight_output_redact
+
+        payload = goalflight_output_redact.redact_data(payload)
+    except Exception:
+        payload = {"text": "[redacted]"}
     path = inbox_path(messages_dir, dispatch_id)
     _require_carrier_path(path)
     provided_seq = require_positive_int_seq(seq, path="seq") if seq is not None else None
@@ -3880,6 +3886,12 @@ DRAIN_PATCH_TYPES = frozenset({"merge-request", "patch"})
 def sanitize_display(value: object, *, limit: int | None = None) -> str:
     """Render and optionally truncate untrusted mail text for human display."""
     text = value if isinstance(value, str) else str(value)
+    try:
+        import goalflight_output_redact
+
+        text = goalflight_output_redact.redact_text(text)
+    except Exception:
+        text = "[redacted]"
     safe: list[str] = []
     for char in text:
         codepoint = ord(char)
