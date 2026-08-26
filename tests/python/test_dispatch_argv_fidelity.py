@@ -339,9 +339,31 @@ def _write_codex_parent(
     return home
 
 
-def test_resume_preserves_os_sandbox_read_only_and_cwd(
+def _capture_resume(
+    monkeypatch: pytest.MonkeyPatch, child_id: str
+) -> list[list[str]]:
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda _agent, _base: child_id,
+    )
+    monkeypatch.setattr(
+        D,
+        "main",
+        lambda argv=None: captured.append(list(argv or [])) or 0,
+    )
+    return captured
+
+
+def test_resume_preserves_os_sandbox_and_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Legal recorded pair: --os-sandbox off, no --read-only.
+
+    The parser refuses --read-only with a non-read-only --os-sandbox; a fixture
+    that plants both would not round-trip through the real launch parser.
+    """
     main, worktree = _make_repo_with_worktree(tmp_path)
     parent_id = "resume-flags-parent"
     recorded = [
@@ -357,6 +379,57 @@ def test_resume_preserves_os_sandbox_read_only_and_cwd(
         str(worktree / "old.md"),
         "--os-sandbox",
         "off",
+        "--tail",
+        str(tmp_path / "parent.tail"),
+        "--status-json",
+        str(tmp_path / "parent.status.json"),
+        "--task",
+        "t-123",
+    ]
+    _write_codex_parent(
+        tmp_path,
+        dispatch_id=parent_id,
+        worktree=worktree,
+        dispatch_argv=recorded,
+        worker_cwd=str(worktree),
+    )
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("continue.\n", encoding="utf-8")
+    captured = _capture_resume(monkeypatch, "codex-resume-child")
+
+    assert (
+        D._cmd_resume(
+            [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+        )
+        == 0
+    )
+    launch = captured[0]
+    assert Path(_option_value(launch, "--cwd") or "").resolve() == worktree
+    assert Path(_option_value(launch, "--cwd") or "").resolve() != main
+    assert _option_value(launch, "--os-sandbox") == "off"
+    assert "--read-only" not in launch
+    assert "--tail" not in launch
+    assert "--status-json" not in launch
+    assert launch[launch.index("--parent-dispatch-id") + 1] == parent_id
+    assert launch[launch.index("--dispatch-id") + 1] == "codex-resume-child"
+
+
+def test_resume_preserves_read_only_without_os_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    main, worktree = _make_repo_with_worktree(tmp_path)
+    parent_id = "resume-readonly-parent"
+    recorded = [
+        "--agent",
+        "codex",
+        "--shape",
+        "bash",
+        "--dispatch-id",
+        parent_id,
+        "--cwd",
+        str(worktree),
+        "--prompt-file",
+        str(worktree / "old.md"),
         "--read-only",
         "--task",
         "t-123",
@@ -370,18 +443,7 @@ def test_resume_preserves_os_sandbox_read_only_and_cwd(
     )
     prompt = tmp_path / "revisions.md"
     prompt.write_text("continue.\n", encoding="utf-8")
-    captured: list[list[str]] = []
-    monkeypatch.setattr(
-        D,
-        "_reserve_auto_dispatch_id",
-        lambda _agent, _base: "codex-resume-child",
-    )
-    monkeypatch.setattr(
-        D,
-        "main",
-        lambda argv=None: captured.append(list(argv or [])) or 0,
-    )
-
+    captured = _capture_resume(monkeypatch, "codex-resume-ro-child")
     assert (
         D._cmd_resume(
             [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
@@ -389,18 +451,100 @@ def test_resume_preserves_os_sandbox_read_only_and_cwd(
         == 0
     )
     launch = captured[0]
+    assert "--read-only" in launch
+    assert "--os-sandbox" not in launch
+    assert Path(_option_value(launch, "--cwd") or "").resolve() == worktree
+
+
+def test_resume_refuses_old_record_without_cwd_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Real old-shape rows have project_root, not worker_cwd or dispatch_argv.
+
+    Falling back to the shared checkout is the hazard: a write-capable resume
+    rooted in the wrong tree can commit successfully before anyone notices.
+    """
+    main, worktree = _make_repo_with_worktree(tmp_path)
+    parent_id = "resume-old-shape-parent"
+    _write_codex_parent(
+        tmp_path,
+        dispatch_id=parent_id,
+        worktree=worktree,
+        os_sandbox={
+            "shape": "bash",
+            "requested_profile": "off",
+            "supported_profile": "off",
+            "enforced_profile": "off",
+        },
+    )
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("continue.\n", encoding="utf-8")
+    captured = _capture_resume(monkeypatch, "codex-resume-old-child")
+    rc = D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    )
+    assert rc == 64
+    assert captured == []
+    err = capsys.readouterr().err
+    assert "worker_cwd" in err
+    assert "dispatch_argv" in err
+    assert "--cwd" in err
+    with pytest.raises(D.DispatchUsageError) as raised:
+        D._resume_worker_cwd(
+            {
+                "project_root": str(main),
+                "os_sandbox": {"requested_profile": "off"},
+            }
+        )
+    message = str(raised.value)
+    assert "worker_cwd" in message
+    assert "dispatch_argv" in message
+    assert "--cwd" in message
+
+
+def test_resume_explicit_cwd_overrides_missing_cwd_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Operator --cwd is informed consent; the shared checkout is not."""
+    main, worktree = _make_repo_with_worktree(tmp_path)
+    parent_id = "resume-cwd-override-parent"
+    _write_codex_parent(
+        tmp_path,
+        dispatch_id=parent_id,
+        worktree=worktree,
+        os_sandbox={
+            "shape": "bash",
+            "requested_profile": "off",
+            "supported_profile": "off",
+            "enforced_profile": "off",
+        },
+    )
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("continue.\n", encoding="utf-8")
+    captured = _capture_resume(monkeypatch, "codex-resume-override-child")
+    assert (
+        D._cmd_resume(
+            [
+                parent_id,
+                "--prompt-file",
+                str(prompt),
+                "--unregistered-forced",
+                "--cwd",
+                str(worktree),
+            ]
+        )
+        == 0
+    )
+    launch = captured[0]
     assert Path(_option_value(launch, "--cwd") or "").resolve() == worktree
     assert Path(_option_value(launch, "--cwd") or "").resolve() != main
     assert _option_value(launch, "--os-sandbox") == "off"
-    assert "--read-only" in launch
-    assert launch[launch.index("--parent-dispatch-id") + 1] == parent_id
-    assert launch[launch.index("--dispatch-id") + 1] == "codex-resume-child"
 
 
-def test_resume_recovers_sandbox_and_cwd_from_record_metadata(
+def test_resume_binds_worker_cwd_without_dispatch_argv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Older records may lack dispatch_argv; posture + worker_cwd still bind."""
+    """Round-1 records store worker_cwd even when dispatch_argv is absent."""
     main, worktree = _make_repo_with_worktree(tmp_path)
     parent_id = "resume-meta-parent"
     _write_codex_parent(
@@ -417,17 +561,7 @@ def test_resume_recovers_sandbox_and_cwd_from_record_metadata(
     )
     prompt = tmp_path / "revisions.md"
     prompt.write_text("continue.\n", encoding="utf-8")
-    captured: list[list[str]] = []
-    monkeypatch.setattr(
-        D,
-        "_reserve_auto_dispatch_id",
-        lambda _agent, _base: "codex-resume-meta-child",
-    )
-    monkeypatch.setattr(
-        D,
-        "main",
-        lambda argv=None: captured.append(list(argv or [])) or 0,
-    )
+    captured = _capture_resume(monkeypatch, "codex-resume-meta-child")
     assert (
         D._cmd_resume(
             [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
@@ -502,6 +636,7 @@ def test_preserve_class_flags_survive_original_argv_replay(tmp_path: Path) -> No
         "--codex-session-id": "sess",
         "--codex-resume-home": "/tmp/home",
         "--codex-home-owner-dispatch-id": "parent",
+        "--session-label": "lab",
     }
     boolean_preserve = []
     for flag, cls in D.LAUNCH_ARGV_CLASS.items():
@@ -512,7 +647,6 @@ def test_preserve_class_flags_survive_original_argv_replay(tmp_path: Path) -> No
             "--dispatch-id",
             "--prompt-file",
             "--prompt",
-            "--session-label",
         }:
             continue
         action = parser._option_string_actions[flag]
@@ -534,8 +668,6 @@ def test_preserve_class_flags_survive_original_argv_replay(tmp_path: Path) -> No
         status_json=tmp_path / "t.status.json",
     )
     for flag in boolean_preserve:
-        if flag == "--readonly":
-            continue
         assert flag in replay, flag
     for flag, value in dummies.items():
         got = _option_value(replay, flag)
@@ -546,3 +678,133 @@ def test_preserve_class_flags_survive_original_argv_replay(tmp_path: Path) -> No
             assert got == value, (flag, got, value)
     assert "--submit" not in replay
     assert "--no-drain-on-submit" not in replay
+    assert "--readonly" in replay
+    assert "--session-label" in replay
+    assert _option_value(replay, "--session-label") == "lab"
+
+
+def test_reconstruct_consults_launch_argv_class() -> None:
+    """Classification, not a parallel caller list, is what reconstruction uses.
+
+    A mis-classified inject/strip flag used to survive because _reconstruct
+    only dropped what the caller remembered to pass.
+    """
+    inject_flags = [flag for flag, cls in D.LAUNCH_ARGV_CLASS.items() if cls == "inject"]
+    strip_flags = [flag for flag, cls in D.LAUNCH_ARGV_CLASS.items() if cls == "strip"]
+    ignore_flags = [
+        flag
+        for flag, cls in D.LAUNCH_ARGV_CLASS.items()
+        if cls == "ignore" and flag not in {"--help", "-h"}
+    ]
+    recorded = ["--agent", "codex"]
+    for flag in (*inject_flags, *strip_flags, *ignore_flags):
+        if flag in D._REPLAY_VALUE_OPTIONS or flag == "--stats":
+            recorded.extend([flag, "stale"])
+        else:
+            recorded.append(flag)
+    rebuilt = D._reconstruct_launch_argv(recorded)
+    for flag in (*inject_flags, *strip_flags, *ignore_flags):
+        assert flag not in rebuilt, flag
+    assert "--agent" in rebuilt
+
+
+def test_drain_strips_stale_inject_flags_before_replay(tmp_path: Path) -> None:
+    recorded = [
+        "--agent",
+        "codex",
+        "--dispatch-id",
+        "drain-double",
+        "--from-queue",
+        "--launch-detached",
+        "--queue-launch-token",
+        "stale-token",
+        "--queue-claim-path",
+        str(tmp_path / "stale.json"),
+    ]
+    rebuilt = D._drain_launch_argv(
+        recorded,
+        capacity_wait_s=0.0,
+        queue_launch_token="fresh-token",
+        queue_claim_path=tmp_path / "fresh.json",
+    )
+    assert rebuilt.count("--from-queue") == 1, rebuilt
+    assert rebuilt.count("--launch-detached") == 1, rebuilt
+    assert rebuilt.count("--queue-launch-token") == 1, rebuilt
+    assert rebuilt.count("--queue-claim-path") == 1, rebuilt
+    assert _option_value(rebuilt, "--queue-launch-token") == "fresh-token"
+    assert _option_value(rebuilt, "--queue-claim-path") == str(tmp_path / "fresh.json")
+
+
+def test_inert_os_sandbox_is_refused_per_combination() -> None:
+    refused = (
+        ("grok-code", "bash", "read-only"),
+        ("grok-code", "bash", "workspace-write"),
+        ("grok-code", "bash", "off"),
+        ("grok-research", "bash", "read-only"),
+        ("cursor", "bash", "read-only"),
+        ("cursor-agent", "bash", "workspace-write"),
+        ("claude", "bash", "read-only"),
+        ("claude", "acp", "read-only"),
+        ("claude-acp", "acp", "workspace-write"),
+    )
+    if sys.platform != "darwin":
+        refused += (
+            ("grok-acp", "acp", "read-only"),
+            ("codex-acp", "acp", "workspace-write"),
+            ("cursor", "acp", "read-only"),
+        )
+    for agent, shape, profile in refused:
+        args = argparse.Namespace(
+            agent=agent, shape=shape, os_sandbox=profile, read_only=False
+        )
+        with pytest.raises(D.DispatchUsageError) as raised:
+            D._validate_agent_os_sandbox(args)
+        message = str(raised.value)
+        assert "--os-sandbox" in message, (agent, shape, profile, message)
+        assert "--read-only" in message, (agent, shape, profile, message)
+        assert "codex" in message.lower(), (agent, shape, profile, message)
+
+
+def test_honored_os_sandbox_and_read_only_still_launch() -> None:
+    allowed = (
+        argparse.Namespace(agent="codex", shape="bash", os_sandbox="off", read_only=False),
+        argparse.Namespace(
+            agent="codex", shape="bash", os_sandbox="read-only", read_only=False
+        ),
+        argparse.Namespace(
+            agent="codex", shape="bash", os_sandbox="workspace-write", read_only=False
+        ),
+        argparse.Namespace(agent="codex", shape="bash", os_sandbox=None, read_only=True),
+        argparse.Namespace(
+            agent="grok-code", shape="bash", os_sandbox=None, read_only=True
+        ),
+        argparse.Namespace(
+            agent="grok-research", shape="bash", os_sandbox=None, read_only=True
+        ),
+        argparse.Namespace(
+            agent="moonshot", shape="bash", os_sandbox="off", read_only=False
+        ),
+        argparse.Namespace(
+            agent="grok-acp", shape="acp", os_sandbox="off", read_only=False
+        ),
+        argparse.Namespace(
+            agent="codex-acp", shape="acp", os_sandbox="off", read_only=False
+        ),
+    )
+    if sys.platform == "darwin":
+        allowed += (
+            argparse.Namespace(
+                agent="grok-acp", shape="acp", os_sandbox="read-only", read_only=False
+            ),
+            argparse.Namespace(
+                agent="codex-acp",
+                shape="acp",
+                os_sandbox="workspace-write",
+                read_only=False,
+            ),
+            argparse.Namespace(
+                agent="cursor", shape="acp", os_sandbox="read-only", read_only=False
+            ),
+        )
+    for args in allowed:
+        D._validate_agent_os_sandbox(args)

@@ -67,6 +67,7 @@ def _write_parent(
         "account": "default",
         "transport": "dispatch",
         "project_root": str(tmp_path),
+        "worker_cwd": str(tmp_path),
         "status_path": str(status_path),
         "state": state,
         "terminal_state": "blocked" if state == "blocked" else "unknown",

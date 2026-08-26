@@ -96,6 +96,7 @@ def _write_parent_record(
         "account": "old-seat",
         "transport": "dispatch",
         "project_root": str(tmp_path),
+        "worker_cwd": str(tmp_path),
         "status_path": str(status_path),
         "state": "blocked",
         "terminal_state": "blocked",

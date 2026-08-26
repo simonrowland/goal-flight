@@ -81,9 +81,16 @@ def case_off_is_logged() -> None:
     w = d._os_sandbox_warning(_args(os_sandbox="off"))
     assert w and "DISABLED" in w and "danger-full-access" in w, w
     assert d._os_sandbox_warning(_args()) is None
-    # Advisory (not a hard error) when the flag can't be honored by the worker.
-    w2 = d._os_sandbox_warning(_args(agent="grok-code", os_sandbox="off"))
-    assert w2 and "only affects bash-shape codex" in w2, w2
+    # Inert --os-sandbox is a refusal, not an advisory that still launches.
+    assert d._os_sandbox_warning(_args(agent="grok-code", os_sandbox="off")) is None
+    try:
+        d._validate_agent_os_sandbox(_args(agent="grok-code", os_sandbox="off"))
+    except d.DispatchUsageError as exc:
+        message = str(exc)
+        assert "--os-sandbox" in message, message
+        assert "--read-only" in message, message
+    else:
+        raise AssertionError("inert --os-sandbox for grok-code must refuse")
 
 
 def case_claude_acp_read_only_fallback_notice_is_pinned() -> None:
@@ -93,10 +100,18 @@ def case_claude_acp_read_only_fallback_notice_is_pinned() -> None:
         "SANDBOX FALLBACK: requested=read-only -> applied=off -> "
         "enforcement=acp-permissions"
     ), warning
+    d._validate_agent_os_sandbox(args)
     explicit = _args(
         agent="claude", shape="acp", read_only=False, os_sandbox="read-only"
     )
-    assert d._os_sandbox_warning(explicit) == warning
+    try:
+        d._validate_agent_os_sandbox(explicit)
+    except d.DispatchUsageError as exc:
+        message = str(exc)
+        assert "--os-sandbox" in message, message
+        assert "--read-only" in message, message
+    else:
+        raise AssertionError("inert --os-sandbox on claude ACP must refuse")
 
 
 def case_acp_supported_and_unrequested_warning_paths_are_unchanged() -> None:

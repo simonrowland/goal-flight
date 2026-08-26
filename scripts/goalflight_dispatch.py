@@ -529,24 +529,58 @@ def _validate_os_sandbox_boundary(args) -> None:
         ) from exc
 
 
+def _os_sandbox_enforced_by_launch(args) -> bool:
+    """True when an explicit --os-sandbox actually constrains this launch path.
+
+    Bash-shape grok/cursor/claude ignore the flag (no CLI/OS mapping). ACP
+    honours it only when the adapter and platform can wrap the worker.
+    An accepted-but-inert safety flag is worse than a refusal.
+    """
+    explicit = getattr(args, "os_sandbox", None)
+    if explicit not in OS_SANDBOX_PROFILES:
+        return True
+    agent = str(getattr(args, "agent", "") or "")
+    shape = getattr(args, "shape", "bash")
+    if shape == "acp":
+        from goalflight_adapter_readiness import validate_os_sandbox_request
+
+        return validate_os_sandbox_request(agent, explicit) is None
+    if agent == "codex":
+        return True
+    if agent == "moonshot":
+        return explicit == OS_SANDBOX_OFF
+    return False
+
+
 def _validate_agent_os_sandbox(args) -> None:
     profile = _effective_os_sandbox(args)
-    if str(getattr(args, "agent", "")) == "moonshot" and profile != OS_SANDBOX_OFF:
+    agent = str(getattr(args, "agent", "") or "")
+    shape = getattr(args, "shape", "bash")
+    if agent == "moonshot" and profile != OS_SANDBOX_OFF:
         raise UnsupportedAgentSandboxRequest(
             f"--agent moonshot supports only --os-sandbox {OS_SANDBOX_OFF}; "
             f"requested profile {profile!r} is not enforced and cannot be enforced; "
             "refusing before launch (b-079)"
         )
+    explicit = getattr(args, "os_sandbox", None)
+    if explicit in OS_SANDBOX_PROFILES and not _os_sandbox_enforced_by_launch(args):
+        raise DispatchUsageError(
+            f"--os-sandbox {explicit} is ignored for agent={agent} "
+            f"shape={shape}; refusing to launch with an inert safety flag. "
+            "Use --read-only instead (grok: deny rules for Write/Edit/Bash; "
+            "bash-shape codex: codex --sandbox read-only). --os-sandbox is "
+            "honoured by bash-shape codex and by ACP shapes whose adapter "
+            "and platform can enforce it."
+        )
 
 
 def _os_sandbox_warning(args) -> str | None:
-    """Dispatch-time advisory: log when 'off' is selected (required), and when an
-    explicit --os-sandbox is a no-op on a worker that can't honor it."""
-    explicit = getattr(args, "os_sandbox", None)
+    """Dispatch-time advisory: log when bash-shape codex selects 'off'."""
     profile = _effective_os_sandbox(args)
     if (
         getattr(args, "shape", "bash") == "acp"
         and _effective_read_only(args)
+        and getattr(args, "os_sandbox", None) not in OS_SANDBOX_PROFILES
         and str(getattr(args, "agent", "")) in {"claude", "claude-acp"}
     ):
         from goalflight_acp_run import acp_permission_read_only_supported
@@ -573,12 +607,6 @@ def _os_sandbox_warning(args) -> str | None:
             "(Metal/MPS reachable; linked-worktree git metadata writable to "
             "self-commit). Commit-guard (explicit pathspecs, no auto-push) + "
             "capacity/ledger tracking unchanged."
-        )
-    if explicit and not codex_bash:
-        return (
-            f"--os-sandbox {explicit} only affects bash-shape codex workers; "
-            f"ignored for agent={getattr(args, 'agent', '?')} "
-            f"shape={getattr(args, 'shape', '?')}."
         )
     return None
 
@@ -3119,6 +3147,14 @@ def _cmd_resume(argv: list[str]) -> int:
         action="store_true",
         help="Resume without a registered controller and keep NULL ownership.",
     )
+    parser.add_argument(
+        "--cwd",
+        help=(
+            "Worker tree for this resume. Required when the parent record "
+            "has no worker_cwd and no --cwd in dispatch_argv; the shared "
+            "checkout is not a fallback."
+        ),
+    )
     args = parser.parse_args(argv)
 
     prompt_path = Path(args.prompt_file).expanduser()
@@ -3130,19 +3166,21 @@ def _cmd_resume(argv: list[str]) -> int:
         return 64
     try:
         source = _validate_resume_source(args.dispatch_id)
+        _resume_worker_cwd(
+            source["record"], override=getattr(args, "cwd", None)
+        )
         child_dispatch_id = _reserve_auto_dispatch_id(
             f"{source['engine']}-resume", _dispatch_base_dir()
+        )
+        launch_argv = _resume_launch_argv(
+            source,
+            child_dispatch_id=child_dispatch_id,
+            prompt_path=prompt_path,
+            resume_args=args,
         )
     except DispatchUsageError as exc:
         print(f"goalflight_dispatch: {exc}", file=sys.stderr)
         return 64
-
-    launch_argv = _resume_launch_argv(
-        source,
-        child_dispatch_id=child_dispatch_id,
-        prompt_path=prompt_path,
-        resume_args=args,
-    )
     return main(launch_argv)
 
 
@@ -3158,7 +3196,7 @@ def _dispatch_argv_from_record(record: dict) -> list[str]:
     return []
 
 
-def _resume_worker_cwd(record: dict) -> Path:
+def _resume_cwd_from_record(record: dict) -> Path | None:
     envelope = (
         record.get("request_envelope")
         if isinstance(record.get("request_envelope"), dict)
@@ -3177,14 +3215,27 @@ def _resume_worker_cwd(record: dict) -> Path:
         from_argv,
         env_request.get("cwd"),
         request.get("cwd"),
-        record.get("project_root"),
     ):
         if raw:
             return Path(str(raw)).expanduser().resolve(strict=False)
-    return Path.cwd().resolve(strict=False)
+    return None
 
 
-def _synthesize_resume_base_argv(source: dict) -> list[str]:
+def _resume_worker_cwd(record: dict, *, override: str | None = None) -> Path:
+    if override:
+        return Path(str(override)).expanduser().resolve(strict=False)
+    path = _resume_cwd_from_record(record)
+    if path is not None:
+        return path
+    raise DispatchUsageError(
+        "resume refused: record has no worker cwd evidence "
+        "(missing worker_cwd and --cwd in dispatch_argv). "
+        "Pass --cwd <path> to resume at an explicit tree "
+        "(informed consent; the shared checkout is not a fallback)."
+    )
+
+
+def _synthesize_resume_base_argv(source: dict, *, cwd: Path) -> list[str]:
     """Fallback when an older record never stored dispatch_argv."""
     record = source["record"]
     shape = source["shape"] if source["shape"] in {"bash", "acp"} else "bash"
@@ -3194,7 +3245,7 @@ def _synthesize_resume_base_argv(source: dict) -> list[str]:
         "--shape",
         shape,
         "--cwd",
-        str(_resume_worker_cwd(record)),
+        str(cwd),
     ]
     posture = record.get("os_sandbox")
     if isinstance(posture, dict):
@@ -3218,13 +3269,16 @@ def _resume_launch_argv(
 ) -> list[str]:
     record = source["record"]
     recorded = _dispatch_argv_from_record(record)
-    base = recorded or _synthesize_resume_base_argv(source)
+    cwd = _resume_worker_cwd(
+        record, override=getattr(resume_args, "cwd", None)
+    )
+    base = recorded or _synthesize_resume_base_argv(source, cwd=cwd)
     replace = {
         "--dispatch-id": child_dispatch_id,
         "--prompt-file": str(prompt_path),
         "--parent-dispatch-id": str(resume_args.dispatch_id),
         "--engine-session-id": source["session_id"],
-        "--cwd": str(_resume_worker_cwd(record)),
+        "--cwd": str(cwd),
     }
     inject: list[str] = []
     if resume_args.unregistered_forced:
@@ -4902,9 +4956,18 @@ def _reconstruct_launch_argv(
     Preserve everything that is not stripped or replaced. Per-attempt identity
     (dispatch-id, tail, status-json) is replaced by the caller. Queue control
     flags are injected by the drain path, not inherited.
+
+    Classification in LAUNCH_ARGV_CLASS is authoritative: strip/inject/ignore
+    flags are dropped from the recorded argv before any caller inject/replace.
+    Drain therefore cannot double-inject on replay.
     """
     argv = list(recorded)
-    for flag in strip_flags:
+    classified_strip = _replay_strip_flags()
+    seen: set[str] = set()
+    for flag in (*classified_strip, *strip_flags):
+        if flag in seen:
+            continue
+        seen.add(flag)
         argv = _drop_option_before_worker_remainder(
             argv,
             flag,
@@ -11558,6 +11621,12 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         # (tests/python/test_acp_model_passthrough.py). Same lesson as the stale
         # model note above: grok flags drift; re-validate before trusting one.
         argv = ["grok", "--prompt-file", str(prompt_path)]
+        if _effective_read_only(args):
+            # Grok's bash CLI ignores --os-sandbox (refused above). --read-only
+            # is the surface that actually constrains grok: deny rules hold
+            # against the write tool, the editor, and the shell the model
+            # reaches for next. The broken --permission-mode flag stays omitted.
+            argv += ["--deny", "Write", "--deny", "Edit", "--deny", "Bash"]
         # Only pin a model when one is EXPLICITLY requested; otherwise omit the
         # flag entirely and let grok's CLI default (grok-4.5) apply.
         selected_model = str(model) if model else default_model
@@ -11978,6 +12047,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
                 raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
             _validate_os_sandbox_conflict(args)
+            _validate_agent_os_sandbox(args)
             _validate_os_sandbox_boundary(args)
             _guard_read_only_write_prompt(args)
             dispatch_warnings = _dispatch_warnings(args, raw)
