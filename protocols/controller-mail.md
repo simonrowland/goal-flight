@@ -104,6 +104,13 @@ python3 <skill-root>/scripts/goalflight_messages.py supervise \
   --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE"
 ```
 
+Arm the supervisor with **no timeout**. It must run for the life of the session.
+Do not set, tune, or reason about a timeout value: a bounded monitor is killed
+from outside, so the supervisor never writes a `type=stop` record and the
+controller goes deaf with no diagnostic at all. On Claude Code, set
+`persistent: true`; that makes `timeout_ms` inert, and where the host requires
+the field to be present it is a placeholder, never a knob.
+
 `supervise` spawns the stream, the configured backup doorbell pool, and the
 watchdog from the same `coverage_rearm_commands` generator used everywhere else,
 multiplexes every child's stdout line-by-line into its own stdout, restarts
@@ -124,9 +131,27 @@ Each flushed line is a wake. Child kinds pass through unchanged:
 - stream: compact JSON `{"kind":"heartbeat"| "event"|"frontier",...}`
 - backup: pending headlines plus one `advance: <command>` line, or a ring
 - watchdog: JSON `{"kind":"event",...}` with `listener-dead` / related payload
-- supervise: default output keeps actionable `restart` records with their reason
-  and `stop` records with the supervisor `rearm` command; chatty output also
-  restores `heartbeat` / `coverage` and `live` / `target` diagnostics
+- supervise: `{"kind":"supervise","type":"heartbeat"|"coverage"|"restart"|"stop"|"exit",...}`;
+  default output keeps actionable `restart` records with their reason and
+  `stop` / signal-driven `exit` records with the exact supervisor `rearm`
+  command while suppressing `live` / `target`. `--debug` independently restores
+  per-tick `heartbeat` / `coverage` emission, and chatty output restores
+  `live` / `target` diagnostics
+
+Supervisor coverage is state-driven: it emits at startup, whenever
+`(live,target)` changes, and immediately when a slot stops or restarts.
+Unchanged periodic coverage is silent unless `--debug` restores per-tick
+records. The supervisor's own heartbeat is different from the stream child's
+heartbeat below: it defaults to 1500 seconds (25 minutes), and its real stdout
+write is the authoritative fallback when the fast `_stdio_peer_gone` poll has
+no evidence. `RealHost.wait()` also watches stdout for
+`POLLERR|POLLHUP|POLLNVAL`, so positive closure evidence wakes the loop
+independently of that heartbeat. Production supervisor heartbeat values stay
+within 60–1800 seconds. The stream child's 120-second heartbeat and the watchdog's
+three-missed-interval threshold do not change. `restart` and `stop` remain
+unconditional. Receipt of `SIGTERM`, `SIGINT`, or `SIGHUP` emits `type=exit`
+before child teardown; SIGKILL cannot be caught and therefore cannot emit that
+recovery hint.
 
 The supervisor's child-exit taxonomy:
 
@@ -144,7 +169,8 @@ The supervisor's child-exit taxonomy:
 A dead lease nonce is re-read through `goalflight_session_status.probe_live_session`
 (the non-locking journal reader), never the write `Journal()` constructor and never
 hand-constructed. On mismatch or a vanished **readable** live session the supervisor
-emits `{"kind":"supervise","type":"stop","reason":"dead-lease-nonce"}` and exits 3.
+emits `{"kind":"supervise","type":"stop","reason":"dead-lease-nonce","rearm":"<cmd>"}`
+and exits 3.
 An unreadable journal is "I could not find out" and stays retryable at both startup
 and child-death. Under chatty output, `live` counts children observed holding a wake flock or that
 emitted a durable armed/ring line, not PIDs that merely exist. A missed lock sample

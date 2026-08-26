@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass, field
+import errno
 import json
 import os
 from pathlib import Path
+import select
 import shlex
+import signal
 import subprocess
 import sys
+import threading
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +29,7 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_journal as journal  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
+import goalflight_task  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 import goalflight_wake_supervise as supervise  # noqa: E402
 
@@ -68,9 +76,19 @@ class FakeHost:
     stop_on_stop_reason: str | None = None
     stop_when_lines_contain: tuple[str, ...] = ()
     stop_after_coverage: int | None = None
+    stop_after_waits: int | None = None
+    peer_gone_after_checks: int | None = None
+    fail_write_type: str | None = None
+    stop_signum: int | None = None
     nonce_state: str = "live"
     alive_by_kind_at_stop: dict[str, bool] = field(default_factory=dict)
+    actions: list[str] = field(default_factory=list)
     _coverage_seen: int = 0
+    _waits: int = 0
+    _peer_checks: int = 0
+    _stdout_detector: supervise._PeerLossDetector = field(
+        default_factory=supervise._PeerLossDetector
+    )
 
     def running(self) -> bool:
         return not self.stop
@@ -90,6 +108,13 @@ class FakeHost:
     def write_stdout(self, line: str) -> bool:
         text = line if line.endswith("\n") else line + "\n"
         self.lines.append(text)
+        try:
+            record_type = str(json.loads(text).get("type") or "line")
+        except (AttributeError, json.JSONDecodeError):
+            record_type = "line"
+        self.actions.append(f"write:{record_type}")
+        if record_type == self.fail_write_type:
+            return False
         if '"type":"coverage"' in text:
             self._coverage_seen += 1
             if (
@@ -116,6 +141,21 @@ class FakeHost:
             if all(part in joined for part in self.stop_when_lines_contain):
                 self.stop = True
         return True
+
+    def stdio_peer_gone(self) -> bool:
+        self._peer_checks += 1
+        return (
+            self.peer_gone_after_checks is not None
+            and self._peer_checks >= self.peer_gone_after_checks
+        )
+
+    def report_stdout_detector(
+        self, source: str, outcome: str, detail: str = "", error: str = ""
+    ) -> None:
+        self._stdout_detector.report(source, outcome, detail, error)
+
+    def stdout_detector_status(self) -> supervise._DetectorStatus:
+        return self._stdout_detector.status()
 
     def spawn(self, kind: str, command: str) -> FakeChild:
         self.spawns.append((kind, command))
@@ -165,6 +205,7 @@ class FakeHost:
         children: list[FakeChild],
         timeout_s: float,
     ) -> supervise.WaitResult:
+        self._waits += 1
         deadline = self.now + max(0.0, timeout_s)
         for child in children:
             if child.alive and child.will_arm:
@@ -181,6 +222,11 @@ class FakeHost:
                 times.append(child.exit_at)
         if not times:
             self.now = deadline
+            if (
+                self.stop_after_waits is not None
+                and self._waits >= self.stop_after_waits
+            ):
+                self.stop = True
             return supervise.WaitResult(lines=[], exits=[])
         self.now = min(times)
         lines: list[tuple[FakeChild, str]] = []
@@ -209,9 +255,15 @@ class FakeHost:
                         ran_s=max(0.0, self.now - child.started_at),
                     )
                 )
+        if (
+            self.stop_after_waits is not None
+            and self._waits >= self.stop_after_waits
+        ):
+            self.stop = True
         return supervise.WaitResult(lines=lines, exits=exits)
 
     def kill_all(self) -> None:
+        self.actions.append("kill")
         for child in self.children:
             child.alive = False
 
@@ -243,6 +295,7 @@ def _run(
     coverage_s: float = 30.0,
     nonce: str = "nonce-1",
     emit_depth: bool = False,
+    debug: bool = False,
 ) -> int:
     host.lease_nonce = nonce
     return supervise.run_supervisor(
@@ -254,6 +307,7 @@ def _run(
         coverage_s=coverage_s,
         items=items,
         emit_depth=emit_depth,
+        debug=debug,
     )
 
 
@@ -340,6 +394,374 @@ def test_supervisor_runs_the_configured_pool_size(backup_count: int) -> None:
     assert coverage["live"] == 0
 
 
+def test_stop_records_compute_a_faithful_rearm_from_invocation_inputs() -> None:
+    cases = [
+        (FakeHost(), [], "nonce-1"),
+        (FakeHost(nonce=""), _items("stream"), "nonce-1"),
+        (
+            FakeHost(
+                scripts={
+                    "watchdog": [
+                        PlannedExit(
+                            lifetime_s=0.1,
+                            returncode=3,
+                            output=(
+                                "listen: this controller generation already has "
+                                "a live follow watchdog"
+                            ),
+                        )
+                    ]
+                },
+                stop_on_stop_reason="did-not-arm",
+            ),
+            _items("stream", "watchdog"),
+            "nonce-1",
+        ),
+    ]
+    stops: list[dict[str, object]] = []
+    for host, items, nonce in cases:
+        _run(
+            host,
+            items,
+            nonce=nonce,
+            heartbeat_s=73.0,
+            coverage_s=91.0,
+        )
+        stops.extend(
+            record for record in _records(host) if record.get("type") == "stop"
+        )
+
+    assert len(stops) == len(cases)
+    for stop in stops:
+        argv = shlex.split(str(stop.get("rearm") or ""))
+        assert argv[0] == "python3"
+        assert Path(argv[1]).is_absolute()
+        assert Path(argv[1]).name == "goalflight_messages.py"
+        assert argv[2] == "supervise"
+        assert Path(argv[argv.index("--project-root") + 1]) == Path(
+            "/tmp/supervise-test"
+        ).resolve()
+        assert argv[argv.index("--controller-label") + 1] == "bugs"
+        assert argv[argv.index("--lease-nonce") + 1] == "nonce-1"
+        assert argv[argv.index("--heartbeat-secs") + 1] == "73"
+        assert argv[argv.index("--coverage-secs") + 1] == "91"
+
+
+def test_stop_rearm_record_trims_short_detail_without_losing_valid_json() -> None:
+    rearm = "python3 " + ("x" * 350)
+    line = supervise._supervise_line(
+        {
+            "kind": "supervise",
+            "type": "stop",
+            "reason": "dead-lease-nonce",
+            "scope": "supervisor",
+            "live": 0,
+            "target": 8,
+            "rearm": rearm,
+            "detail": "diagnostic-" * 18,
+        }
+    )
+    assert len(line.encode("utf-8")) <= supervise.STREAM_LINE_MAX_BYTES
+    payload = json.loads(line)
+    assert payload["rearm"] == rearm
+    assert payload["type"] == "stop"
+
+
+def test_production_oversized_exact_rearm_record_remains_valid_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", "11")
+    project_root = Path("/tmp") / ("long-project-root-" * 16)
+    controller_label = "c" * 64
+    lease_nonce = "n" * 32
+    rearm = supervise._supervisor_rearm_command(
+        project_root=project_root,
+        controller_label=controller_label,
+        lease_nonce=lease_nonce,
+        heartbeat_s=1800.0,
+        coverage_s=1800.0,
+        debug=True,
+    )
+    line = supervise._supervise_line(
+        {
+            "kind": "supervise",
+            "type": "stop",
+            "reason": "dead-lease-nonce",
+            "scope": "supervisor",
+            "live": 0,
+            "target": 8,
+            "rearm": rearm,
+        }
+    )
+    assert len(line.encode("utf-8")) > supervise.STREAM_LINE_MAX_BYTES
+    payload = json.loads(line)
+    assert payload["rearm"] == rearm
+    assert payload["type"] == "stop"
+    argv = shlex.split(rearm)
+    assert argv[:2] == ["env", "GOALFLIGHT_PERSISTENT_BACKUP_SLOTS=11"]
+    assert Path(argv[argv.index("--project-root") + 1]) == project_root.resolve()
+    assert argv[argv.index("--controller-label") + 1] == controller_label
+    assert argv[argv.index("--lease-nonce") + 1] == lease_nonce
+    assert argv[-1] == "--debug"
+
+
+def test_rearm_preserves_backup_depth_override_and_debug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", "11")
+    host = FakeHost()
+    _run(
+        host,
+        [],
+        heartbeat_s=61.0,
+        coverage_s=89.0,
+        debug=True,
+    )
+    stop = next(record for record in _records(host) if record.get("type") == "stop")
+    argv = shlex.split(str(stop["rearm"]))
+    assert argv[:2] == ["env", "GOALFLIGHT_PERSISTENT_BACKUP_SLOTS=11"]
+    assert argv[2] == "python3"
+    assert Path(argv[3]).is_absolute()
+    assert Path(argv[3]).name == "goalflight_messages.py"
+    assert argv[4] == "supervise"
+    assert argv[argv.index("--heartbeat-secs") + 1] == "61"
+    assert argv[argv.index("--coverage-secs") + 1] == "89"
+    assert argv[-1] == "--debug"
+
+
+def test_signal_exit_is_written_before_teardown_with_rearm() -> None:
+    host = FakeHost(stop_after_spawns=1, stop_signum=signal.SIGTERM)
+    code = _run(
+        host,
+        _items("stream"),
+        heartbeat_s=67.0,
+        coverage_s=83.0,
+        emit_depth=True,
+    )
+    assert code == 128 + signal.SIGTERM
+    exit_record = next(
+        record for record in _records(host) if record.get("type") == "exit"
+    )
+    assert exit_record["reason"] == "signal-SIGTERM"
+    assert exit_record["live"] == 0
+    assert exit_record["target"] == 1
+    assert "goalflight_messages.py supervise" in str(exit_record["rearm"])
+    assert host.actions.index("write:exit") < host.actions.index("kill")
+
+
+def test_unchanged_counts_are_silent_and_one_state_change_emits_once() -> None:
+    host = FakeHost(stop_after_waits=4)
+    _run(
+        host,
+        _items("stream"),
+        heartbeat_s=1.0,
+        coverage_s=0.05,
+        emit_depth=True,
+    )
+    coverages = [
+        record
+        for record in _records(host)
+        if record.get("type") == "coverage"
+    ]
+    assert [(record["live"], record["target"]) for record in coverages] == [
+        (0, 1),
+        (1, 1),
+    ]
+    assert not any(
+        record.get("type") == "heartbeat" for record in _records(host)
+    )
+
+
+def test_state_change_coverage_does_not_wait_for_slow_heartbeat() -> None:
+    host = FakeHost(
+        scripts={
+            "stream": [
+                PlannedExit(
+                    lifetime_s=20.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[(0.05, "STREAM-EVENT")],
+                )
+            ]
+        },
+        stop_when_lines_contain=("STREAM-EVENT",),
+    )
+    _run(
+        host,
+        _items("stream"),
+        heartbeat_s=10.0,
+        coverage_s=10.0,
+        emit_depth=True,
+    )
+    coverages = [
+        record for record in _records(host) if record.get("type") == "coverage"
+    ]
+    assert [(record["live"], record["target"]) for record in coverages] == [
+        (0, 1),
+        (1, 1),
+    ]
+    assert not any(
+        record.get("type") == "heartbeat" for record in _records(host)
+    )
+
+
+def test_debug_restores_unconditional_per_tick_counts() -> None:
+    host = FakeHost(stop_after_waits=3)
+    _run(
+        host,
+        _items("stream"),
+        heartbeat_s=1.0,
+        coverage_s=0.05,
+        debug=True,
+    )
+    counts = [
+        record
+        for record in _records(host)
+        if record.get("type") in {"heartbeat", "coverage"}
+    ]
+    assert len(counts) == 5
+    assert [record["type"] for record in counts[:2]] == ["coverage", "heartbeat"]
+    assert all("live" not in record and "target" not in record for record in counts)
+
+
+def test_slow_heartbeat_is_the_real_write_with_unchanged_state() -> None:
+    host = FakeHost(stop_after_waits=4)
+    _run(
+        host,
+        _items("stream"),
+        heartbeat_s=0.12,
+        coverage_s=0.05,
+        emit_depth=True,
+    )
+    heartbeats = [
+        record for record in _records(host) if record.get("type") == "heartbeat"
+    ]
+    assert heartbeats == [
+        {
+            "kind": "supervise",
+            "live": 1,
+            "seq": 1,
+            "target": 1,
+            "type": "heartbeat",
+        }
+    ]
+
+
+def test_failed_slow_heartbeat_write_tears_down_immediately() -> None:
+    host = FakeHost(stop_after_waits=6, fail_write_type="heartbeat")
+    code = _run(
+        host,
+        _items("stream"),
+        heartbeat_s=0.12,
+        coverage_s=0.05,
+    )
+    assert code == 0
+    assert host._waits < 6
+    heartbeat_index = host.actions.index("write:heartbeat")
+    assert host.actions[heartbeat_index + 1 :] == ["kill"]
+    assert sum(action == "write:heartbeat" for action in host.actions) == 1
+
+
+def test_positive_fast_peer_probe_stops_without_waiting_for_long_write() -> None:
+    host = FakeHost(peer_gone_after_checks=2)
+    _run(
+        host,
+        _items("stream"),
+        heartbeat_s=1.0,
+        coverage_s=0.05,
+    )
+    assert host._waits == 1
+    assert not any(
+        record.get("type") == "heartbeat" for record in _records(host)
+    )
+    assert host.actions[-1] == "kill"
+
+
+def test_slow_supervisor_heartbeat_does_not_change_stream_watchdog_cadence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", raising=False)
+    assert supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S == 1500.0
+    assert supervise.MAX_SUPERVISOR_HEARTBEAT_S == 1800.0
+    assert messages.FOLLOW_HEARTBEAT_SECS == 120.0
+    assert messages.FOLLOW_DEAD_AFTER_INTERVALS == 3
+    assert messages.FOLLOW_DEAD_AFTER_SECS == 360.0
+
+    host = FakeHost(stop_after_spawns=wake.persistent_wake_target())
+    code = supervise.run_supervisor(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        host=host,
+        heartbeat_s=1800.0,
+        coverage_s=1800.0,
+        items=None,
+    )
+    assert code == 0
+    assert len(host.spawns) == wake.persistent_wake_target() == 8
+    stream_command = next(command for kind, command in host.spawns if kind == "stream")
+    stream_argv = shlex.split(stream_command)
+    assert "follow" in stream_argv
+    assert "--heartbeat-secs" not in stream_argv
+    watchdog_command = next(
+        command for kind, command in host.spawns if kind == "watchdog"
+    )
+    watchdog_argv = shlex.split(watchdog_command)
+    assert "--watch-follow" in watchdog_argv
+    assert "--heartbeat-secs" not in watchdog_argv
+    assert messages.FOLLOW_HEARTBEAT_SECS == 120.0
+    assert messages.FOLLOW_DEAD_AFTER_INTERVALS == 3
+    assert messages.FOLLOW_DEAD_AFTER_SECS == 360.0
+
+
+def test_supervise_cli_accepts_new_heartbeat_ceiling_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
+    monkeypatch.delenv("GOALFLIGHT_TEST_MODE", raising=False)
+    monkeypatch.setattr(supervise, "_stdout_is_regular_file", lambda _stream: None)
+    monkeypatch.setattr(
+        goalflight_task, "resolve_project_root", lambda _value: tmp_path
+    )
+    monkeypatch.setattr(
+        sessions,
+        "resolve_controller_label",
+        lambda *_args, **_kwargs: "bugs",
+    )
+    monkeypatch.setattr(
+        supervise,
+        "resolve_startup_lease_nonce",
+        lambda **_kwargs: ("nonce-1", None, None),
+    )
+    monkeypatch.setattr(supervise, "RealHost", lambda **_kwargs: object())
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        supervise,
+        "run_supervisor",
+        lambda **kwargs: calls.append(kwargs) or 0,
+    )
+    args = SimpleNamespace(
+        project_root=str(tmp_path),
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        heartbeat_secs=1800.0,
+        coverage_secs=0.0,
+        debug=False,
+    )
+
+    assert supervise.cmd_supervise(args) == 0
+    assert calls[0]["heartbeat_s"] == 1800.0
+    assert calls[0]["coverage_s"] == 1800.0
+
+    args.heartbeat_secs = 1800.1
+    assert supervise.cmd_supervise(args) == supervise.SUPERVISE_START_EXIT
+    assert len(calls) == 1
+    assert "between 60 and 1800" in capsys.readouterr().err
+
+
 def test_dead_child_is_restarted() -> None:
     host = FakeHost(
         scripts={
@@ -360,6 +782,8 @@ def test_dead_child_is_restarted() -> None:
     assert restart["reason"] == "exit-2"
     assert "live" not in restart
     assert "target" not in restart
+    restart_index = host.actions.index("write:restart")
+    assert host.actions[restart_index + 1] == "write:coverage"
 
 
 def test_exit_3_unclassified_backoffs_instead_of_implying_contention() -> None:
@@ -405,11 +829,7 @@ def test_exit_0_without_arming_stops_with_distinct_reason() -> None:
     assert stop["child"] == "stream"
     assert "live" not in stop
     assert "target" not in stop
-    assert stop["rearm"] == wake.coverage_supervise_command(
-        "/tmp/supervise-test",
-        controller_label="bugs",
-        lease_nonce="nonce-1",
-    )
+    assert "goalflight_messages.py supervise" in str(stop["rearm"])
     assert len(host.spawns) == 1
 
 
@@ -442,6 +862,8 @@ def test_exit_0_watchdog_slot_held_without_arming_stops() -> None:
     assert "already has a live follow watchdog" in str(stop.get("detail") or "")
     assert host.alive_by_kind_at_stop.get("stream") is True
     assert [kind for kind, _command in host.spawns].count("stream") == 1
+    stop_index = host.actions.index("write:stop")
+    assert host.actions[stop_index + 1] == "write:coverage"
 
 
 def test_child_stdout_reaches_multiplexed_stdout() -> None:
@@ -664,7 +1086,12 @@ def test_default_supervisor_output_suppresses_depth_and_opt_in_restores_it() -> 
         heartbeat_s=100.0,
         coverage_s=100.0,
     )
-    assert _records(default_host) == []
+    default_records = _records(default_host)
+    assert [record["type"] for record in default_records] == ["coverage"]
+    assert all(
+        "live" not in record and "target" not in record
+        for record in default_records
+    )
 
     depth_host = FakeHost(stop_after_spawns=1)
     _run(
@@ -675,7 +1102,7 @@ def test_default_supervisor_output_suppresses_depth_and_opt_in_restores_it() -> 
         emit_depth=True,
     )
     records = _records(depth_host)
-    assert [record["type"] for record in records] == ["coverage", "heartbeat"]
+    assert [record["type"] for record in records] == ["coverage"]
     assert all(
         isinstance(record.get("live"), int)
         and isinstance(record.get("target"), int)
@@ -736,6 +1163,7 @@ def test_unreadable_journal_probe_does_not_stop_the_supervisor() -> None:
         heartbeat_s=100.0,
         coverage_s=0.05,
         emit_depth=True,
+        debug=True,
     )
     assert code != supervise.SUPERVISE_STOP_EXIT
     assert all(
@@ -776,11 +1204,7 @@ def test_permanent_unarmed_exit_2_is_visible_terminal_not_healthy() -> None:
     )
     assert "live" not in stop
     assert "target" not in stop
-    assert stop["rearm"] == wake.coverage_supervise_command(
-        "/tmp/supervise-test",
-        controller_label="bugs",
-        lease_nonce="nonce-1",
-    )
+    assert "goalflight_messages.py supervise" in str(stop["rearm"])
 
 
 def test_supervise_items_are_the_configured_persistent_pool(
@@ -808,6 +1232,54 @@ def test_controller_mail_documents_supervise_front_door() -> None:
     assert "goalflight_messages.py supervise" in doctrine
     assert "--lease-nonce" in doctrine
     assert "live/" in doctrine
+    assert "no timeout" in doctrine.lower()
+    assert "`persistent: true`" in doctrine
+    assert "`timeout_ms` inert" in doctrine
+
+
+def test_supervisor_signal_exit_contract_matches_installed_handlers(
+    tmp_path: Path,
+) -> None:
+    host = supervise.RealHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    try:
+        handled = {signal.Signals(signum).name for signum in host._prev_handlers}
+    finally:
+        host.kill_all()
+
+    assert handled == {"SIGTERM", "SIGINT", "SIGHUP"}
+    for relative in (
+        "protocols/controller-mail.md",
+        "docs/EVENT-ARCHITECTURE.md",
+        "CHANGELOG.md",
+    ):
+        doctrine = (ROOT / relative).read_text(encoding="utf-8")
+        for signame in handled:
+            assert f"`{signame}`" in doctrine
+        assert "catchable signal" not in doctrine.lower()
+        assert "catchable-signal" not in doctrine.lower()
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "SKILL.md",
+        "commands/execute.md",
+        "docs/EVENT-ARCHITECTURE.md",
+        "docs/controller-behaviours.md",
+    ],
+)
+def test_every_supervisor_arming_site_requires_session_lifetime_no_timeout(
+    relative: str,
+) -> None:
+    doctrine = (ROOT / relative).read_text(encoding="utf-8")
+    assert "no timeout" in doctrine.lower()
+    assert "`persistent: true`" in doctrine
+    assert "`timeout_ms` inert" in doctrine
 
 
 def test_supervise_cli_is_the_one_command_front_door(tmp_path: Path) -> None:
@@ -828,6 +1300,9 @@ def test_supervise_cli_is_the_one_command_front_door(tmp_path: Path) -> None:
     )
     assert help_text.returncode == 0
     assert "persistent wake pool" in help_text.stdout
+    assert "default 1500" in help_text.stdout
+    assert "production 60-1800" in help_text.stdout
+    assert "--debug" in help_text.stdout
     top = subprocess.run(
         [sys.executable, str(SCRIPTS / "goalflight_messages.py"), "--help"],
         check=False,
@@ -1043,6 +1518,698 @@ class _RecordingHost(supervise.RealHost):
         if '"type":"restart"' in text or '"type":"stop"' in text:
             self._stop = True
         return True
+
+
+def test_real_host_signal_wakes_blocking_wait(
+    tmp_path: Path,
+) -> None:
+    host = supervise.RealHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    timer = threading.Timer(
+        0.05, host._on_signal, args=(signal.SIGTERM, None)
+    )
+    started = time.monotonic()
+    timer.start()
+    try:
+        result = host.wait([], timeout_s=5.0)
+        elapsed = time.monotonic() - started
+    finally:
+        timer.cancel()
+        host.kill_all()
+
+    assert elapsed < 1.0
+    assert not host.running()
+    assert host.stop_signum == signal.SIGTERM
+    assert result.lines == []
+    assert result.exits == []
+
+
+def test_real_host_closed_stdout_wakes_wait_with_quiet_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = supervise.RealHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    child = host.spawn(
+        "backup",
+        _python_child("import time; time.sleep(5)"),
+    )
+    original_stdout = sys.stdout
+    reader_fd, writer_fd = os.pipe()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    timer = threading.Timer(0.05, os.close, args=(reader_fd,))
+    started = time.monotonic()
+    timer.start()
+    try:
+        result = host.wait([child], timeout_s=2.0)
+        elapsed = time.monotonic() - started
+    finally:
+        timer.cancel()
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        try:
+            os.close(reader_fd)
+        except OSError:
+            pass
+        host.kill_all()
+
+    assert elapsed < 0.5
+    monkeypatch.setattr(messages, "_stdio_peer_gone", lambda _stream: False)
+    assert host.stdio_peer_gone() is True
+    assert result.lines == []
+    assert result.exits == []
+
+
+def test_real_host_stdout_registration_failure_fails_closed_with_quiet_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class InvalidatedStdout:
+        def __init__(self, stream: object) -> None:
+            self.stream = stream
+            self.valid_fd = True
+
+        def fileno(self) -> int:
+            if not self.valid_fd:
+                return -1
+            return self.stream.fileno()  # type: ignore[attr-defined,no-any-return]
+
+        def write(self, text: str) -> int:
+            return self.stream.write(text)  # type: ignore[attr-defined,no-any-return]
+
+        def flush(self) -> None:
+            self.stream.flush()  # type: ignore[attr-defined]
+
+    host = supervise.RealHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    original_stdout = sys.stdout
+    reader_fd, writer_fd = os.pipe()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    wrapped_stdout = InvalidatedStdout(peer_stdout)
+    monkeypatch.setattr(sys, "stdout", wrapped_stdout)
+    assert supervise._stdout_is_regular_file(wrapped_stdout) is None
+    wrapped_stdout.valid_fd = False
+
+    started = time.monotonic()
+    stdout_text = ""
+    try:
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            heartbeat_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            coverage_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            items=[
+                (
+                    "backup",
+                    _python_child("import time; time.sleep(5)"),
+                )
+            ],
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        stdout_text = os.read(reader_fd, 65536).decode("utf-8")
+        os.close(reader_fd)
+        host.kill_all()
+
+    assert elapsed < 1.0
+    assert code == supervise.SUPERVISE_STOP_EXIT
+    assert host._stdout_detector_failure == (
+        "stdout file descriptor registration failed"
+    )
+    assert not any(child.alive for child in host._children)
+    records = [json.loads(line) for line in stdout_text.splitlines()]
+    stop = next(record for record in records if record.get("type") == "stop")
+    assert stop["reason"] == "stdout-peer-detector-unavailable"
+    assert stop["scope"] == "supervisor"
+    assert stop["detector"] == "registration"
+    assert stop["error"] == "file-descriptor-registration-failed"
+    assert "goalflight_messages.py supervise" in stop["rearm"]
+    assert (
+        "stdout peer-gone detector unavailable; stopping: "
+        "registration: stdout file descriptor registration failed"
+    ) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("text", ["¢", "€", "😀"])
+def test_utf8_completion_finishes_each_multibyte_split(text: str) -> None:
+    data = text.encode("utf-8")
+    for offset in range(1, len(data)):
+        completed = data[:offset] + supervise._utf8_completion(data, offset)
+        assert completed.decode("utf-8") == text
+
+
+def test_full_nonblocking_pipe_eagain_retries_then_keeps_children_alive(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reader_fd, writer_fd = os.pipe()
+    os.set_blocking(writer_fd, False)
+    while True:
+        try:
+            os.write(writer_fd, b"x" * 4096)
+        except BlockingIOError as exc:
+            assert exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}
+            break
+
+    class BackpressuredHost(FakeHost):
+        actual_errnos: list[int] = []
+        children_alive_after_retry = False
+
+        def write_stdout(self, line: str) -> bool:
+            try:
+                os.write(writer_fd, line.encode("utf-8"))
+            except BlockingIOError as exc:
+                self.actual_errnos.append(int(exc.errno))
+                os.read(reader_fd, 65536)
+                raise
+            self.children_alive_after_retry = bool(self.children) and all(
+                child.alive for child in self.children
+            )
+            return super().write_stdout(line)
+
+    host = BackpressuredHost(stop_after_coverage=1)
+    try:
+        code = _run(host, _items("stream"))
+    finally:
+        os.close(writer_fd)
+        os.close(reader_fd)
+
+    assert code == 0
+    assert host.actual_errnos == [errno.EAGAIN]
+    assert host.children_alive_after_retry
+    assert not any(
+        record.get("type") == "stop" for record in _records(host)
+    )
+    status = host.stdout_detector_status()
+    assert status.availability == "available"
+    assert status.failure is None
+    assert capsys.readouterr().err == ""
+
+
+def test_partial_nonblocking_write_resumes_without_duplicate_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader_fd, writer_fd = os.pipe()
+    os.set_blocking(writer_fd, False)
+    while True:
+        try:
+            os.write(writer_fd, b"x" * 4096)
+        except BlockingIOError as exc:
+            assert exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}
+            break
+    os.read(reader_fd, 4096)
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    relieved = bytearray()
+    relief_calls: list[float] = []
+
+    def relieve_pipe(delay_s: float) -> None:
+        relief_calls.append(delay_s)
+        relieved.extend(os.read(reader_fd, 4096))
+
+    monkeypatch.setattr(supervise.time, "sleep", relieve_pipe)
+    host = supervise.RealHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    line = "a" * 25000
+    try:
+        assert supervise._write_stdout(host, line, source="write-child-output")
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        host.kill_all()
+    remaining = bytearray()
+    while True:
+        chunk = os.read(reader_fd, 65536)
+        if not chunk:
+            break
+        remaining.extend(chunk)
+    os.close(reader_fd)
+
+    forwarded = bytes(relieved + remaining)
+    assert len(relief_calls) > supervise.TRANSIENT_DETECTOR_FAILURE_LIMIT
+    assert set(relief_calls) == {supervise.TRANSIENT_DETECTOR_RETRY_S}
+    assert forwarded.count(b"a") == len(line)
+    assert forwarded.endswith(b"\n")
+    assert host._stdout_pending is None
+    assert host.stdout_detector_status().failure is None
+
+
+def test_failed_recovery_stop_write_escalates_rearm_to_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reader_fd, writer_fd = os.pipe()
+    os.set_blocking(writer_fd, False)
+
+    class FailedStopHost(FakeHost):
+        pipe_filled = False
+        actual_errnos: list[int] = []
+
+        def write_stdout(self, line: str) -> bool:
+            try:
+                os.write(writer_fd, line.encode("utf-8"))
+            except BlockingIOError as exc:
+                self.actual_errnos.append(int(exc.errno))
+                raise
+            return super().write_stdout(line)
+
+        def stdio_peer_gone(self) -> bool:
+            if not self.pipe_filled:
+                self.report_stdout_detector(
+                    "poll",
+                    "unavailable",
+                    "stdout poll failed: ENOMEM: out of memory",
+                    "ENOMEM",
+                )
+                while True:
+                    try:
+                        os.write(writer_fd, b"x" * 4096)
+                    except BlockingIOError as exc:
+                        assert exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}
+                        break
+                self.pipe_filled = True
+            return False
+
+    host = FailedStopHost()
+    try:
+        code = _run(host, _items("stream"))
+    finally:
+        os.close(writer_fd)
+        os.close(reader_fd)
+
+    assert code == supervise.SUPERVISE_STOP_EXIT
+    assert host.actual_errnos == [errno.EAGAIN] * (
+        supervise.TRANSIENT_DETECTOR_FAILURE_LIMIT
+    )
+    assert not any(child.alive for child in host.children)
+    assert not any(
+        record.get("type") == "stop" for record in _records(host)
+    )
+    error = capsys.readouterr().err
+    assert "recovery record could not be written to stdout" in error
+    assert "stop: stdout-peer-detector-unavailable" in error
+    assert "re-arm with:" in error
+    assert "goalflight_messages.py supervise" in error
+
+
+def test_real_host_failed_write_clears_pending_before_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reader_fd, writer_fd = os.pipe()
+    os.set_blocking(writer_fd, False)
+    while True:
+        try:
+            os.write(writer_fd, b"x" * 4096)
+        except BlockingIOError as exc:
+            assert exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}
+            break
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    host = supervise.RealHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    try:
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            items=[
+                (
+                    "backup",
+                    _python_child("import time; time.sleep(5)"),
+                )
+            ],
+        )
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        os.close(reader_fd)
+        host.kill_all()
+
+    assert code == supervise.SUPERVISE_STOP_EXIT
+    assert host._stdout_pending is None
+    assert not any(child.alive for child in host._children)
+    error = capsys.readouterr().err
+    assert "recovery record could not be written to stdout" in error
+    assert "re-arm with:" in error
+    assert "Traceback" not in error
+
+
+def test_abandoned_partial_write_delimits_next_recovery_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader_fd, writer_fd = os.pipe()
+    os.set_blocking(writer_fd, False)
+    while True:
+        try:
+            os.write(writer_fd, b"x" * 4096)
+        except BlockingIOError:
+            break
+    os.read(reader_fd, 4096)
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    monkeypatch.setattr(supervise.time, "sleep", lambda _delay_s: None)
+    host = supervise.RealHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    wire = bytearray()
+    try:
+        assert not supervise._write_stdout(
+            host,
+            "a" * 4095 + "€" + "b" * 20000,
+            source="write-child-output",
+        )
+        assert host._stdout_pending is None
+        assert host._stdout_needs_delimiter
+        assert host._stdout_recovery_completion == "€".encode("utf-8")[1:]
+        os.set_blocking(reader_fd, False)
+        try:
+            while True:
+                wire.extend(os.read(reader_fd, 65536))
+        except BlockingIOError:
+            pass
+        finally:
+            os.set_blocking(reader_fd, True)
+        assert wire.endswith("€".encode("utf-8")[:1])
+        assert supervise._emit(
+            host,
+            {
+                "kind": "supervise",
+                "type": "stop",
+                "reason": "stdout-peer-detector-unavailable",
+                "rearm": "python3 goalflight_messages.py supervise",
+            },
+        )
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        host.kill_all()
+    while True:
+        chunk = os.read(reader_fd, 65536)
+        if not chunk:
+            break
+        wire.extend(chunk)
+    os.close(reader_fd)
+
+    decoded = wire.decode("utf-8")
+    assert "€\n{" in decoded
+    records = [
+        json.loads(line)
+        for line in decoded.splitlines()
+        if line.startswith("{")
+    ]
+    assert len(records) == 1
+    assert records[0]["type"] == "stop"
+    assert "goalflight_messages.py supervise" in records[0]["rearm"]
+    assert not host._stdout_needs_delimiter
+
+
+def test_real_host_retries_transient_poll_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_poll = supervise.select.poll
+    calls: list[int | None] = []
+    observed_errnos: list[int] = []
+    libc = ctypes.CDLL(None, use_errno=True)
+
+    class InterruptThreePoll:
+        def __init__(self) -> None:
+            self.inner = real_poll()
+
+        def register(self, fd: int, eventmask: int) -> None:
+            self.inner.register(fd, eventmask)
+
+        def poll(self, timeout: int | None = None) -> list[tuple[int, int]]:
+            calls.append(timeout)
+            if len(calls) <= 3:
+                ctypes.set_errno(0)
+                signal.setitimer(signal.ITIMER_REAL, 0.01)
+                try:
+                    result = libc.poll(None, 0, 1000)
+                    actual_errno = ctypes.get_errno()
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                assert result == -1
+                assert actual_errno == errno.EINTR
+                observed_errnos.append(actual_errno)
+                raise OSError(actual_errno, os.strerror(actual_errno))
+            return self.inner.poll(timeout)
+
+    class StopAfterSuccessfulPollHost(supervise.RealHost):
+        children_alive_after_poll = False
+
+        def wait(
+            self,
+            children: list[object],
+            timeout_s: float,
+        ) -> supervise.WaitResult:
+            result = super().wait(children, timeout_s)
+            self.children_alive_after_poll = bool(children) and all(
+                getattr(child, "alive", False) for child in children
+            )
+            self._stop = True
+            return result
+
+    monkeypatch.setattr(supervise.select, "poll", InterruptThreePoll)
+    monkeypatch.setattr(messages, "_stdio_peer_gone", lambda _stream: False)
+    reader_fd, writer_fd = os.pipe()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    old_alarm_handler = signal.signal(signal.SIGALRM, lambda *_args: None)
+    old_alarm_timer = signal.getitimer(signal.ITIMER_REAL)
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.siginterrupt(signal.SIGALRM, True)
+    host = StopAfterSuccessfulPollHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    try:
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            heartbeat_s=0.01,
+            coverage_s=0.01,
+            items=[
+                (
+                    "backup",
+                    _python_child("import time; time.sleep(5)"),
+                )
+            ],
+        )
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_alarm_handler)
+        signal.setitimer(signal.ITIMER_REAL, *old_alarm_timer)
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        os.close(reader_fd)
+        host.kill_all()
+
+    assert code == 0
+    assert observed_errnos == [errno.EINTR] * 3
+    assert len(calls) == 4
+    assert host.children_alive_after_poll
+    status = host.stdout_detector_status()
+    assert status.availability == "available"
+    assert status.failure is None
+    assert not status.peer_gone
+
+
+@pytest.mark.parametrize(
+    ("poll_errno", "expected_calls"),
+    [
+        (errno.ENOMEM, 1),
+        (errno.EINVAL, 1),
+        (errno.EAGAIN, supervise.TRANSIENT_DETECTOR_FAILURE_LIMIT),
+    ],
+)
+def test_real_host_persistent_poll_failure_emits_recovery_and_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    poll_errno: int,
+    expected_calls: int,
+) -> None:
+    real_poll = supervise.select.poll
+    calls: list[int | None] = []
+
+    class PersistentlyFailingPoll:
+        def __init__(self) -> None:
+            self.inner = real_poll()
+
+        def register(self, fd: int, eventmask: int) -> None:
+            self.inner.register(fd, eventmask)
+
+        def poll(self, timeout: int | None = None) -> list[tuple[int, int]]:
+            calls.append(timeout)
+            raise OSError(poll_errno, os.strerror(poll_errno))
+
+    monkeypatch.setattr(supervise.select, "poll", PersistentlyFailingPoll)
+    reader_fd, writer_fd = os.pipe()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    host = _RecordingHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    started = time.monotonic()
+    try:
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            heartbeat_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            coverage_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            items=[
+                (
+                    "backup",
+                    _python_child("import time; time.sleep(5)"),
+                )
+            ],
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        os.close(reader_fd)
+        host.kill_all()
+
+    assert elapsed < 1.0
+    supervisor_calls = [timeout for timeout in calls if timeout and timeout > 1000]
+    assert len(supervisor_calls) == expected_calls
+    assert code == supervise.SUPERVISE_STOP_EXIT
+    status = host.stdout_detector_status()
+    assert status.availability == "unavailable"
+    assert status.failure is not None
+    assert status.failure.source == "poll"
+    assert errno.errorcode[poll_errno] in status.failure.detail
+    stop = next(
+        record for record in _records(host) if record.get("type") == "stop"
+    )
+    assert stop["reason"] == "stdout-peer-detector-unavailable"
+    assert stop["detector"] == "poll"
+    assert stop["error"] == errno.errorcode[poll_errno]
+    assert "goalflight_messages.py supervise" in stop["rearm"]
+    if poll_errno == errno.EAGAIN:
+        assert (
+            f"{supervise.TRANSIENT_DETECTOR_FAILURE_LIMIT} consecutive EAGAIN"
+            in str(status.failure.detail)
+        )
+
+
+def test_pollnval_preempts_ready_child_output_before_forwarding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader_fd, writer_fd = os.pipe()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+
+    class InvalidatingHost(supervise.RealHost):
+        wait_lines: list[str] = []
+
+        def wait(
+            self,
+            children: list[object],
+            timeout_s: float,
+        ) -> supervise.WaitResult:
+            child = children[0]
+            child_stdout = child.popen.stdout  # type: ignore[attr-defined]
+            assert child_stdout is not None
+            readable, _writable, _exceptional = select.select(
+                [child_stdout.fileno()], [], [], 1.0
+            )
+            assert readable
+            os.close(writer_fd)
+            result = super().wait(children, timeout_s)
+            self.wait_lines = [line for _child, line in result.lines]
+            return result
+
+    host = InvalidatingHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    child_alive_after_run: list[bool] = []
+    signal_fds_after_run: tuple[int | None, int | None] = (-1, -1)
+    try:
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            heartbeat_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            coverage_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            items=[
+                (
+                    "backup",
+                    _python_child(
+                        "import os, time; "
+                        "os.write(1, b'ready\\n'); time.sleep(5)"
+                    ),
+                )
+            ],
+        )
+        child_alive_after_run = [child.alive for child in host._children]
+        signal_fds_after_run = (host._signal_rfd, host._signal_wfd)
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        try:
+            peer_stdout.close()
+        except OSError:
+            pass
+        os.close(reader_fd)
+        host.kill_all()
+
+    assert code == 0
+    assert host.wait_lines == ["ready"]
+    assert child_alive_after_run and not any(child_alive_after_run)
+    assert signal_fds_after_run == (None, None)
 
 
 def _python_child(script: str) -> str:

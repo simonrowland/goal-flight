@@ -161,8 +161,13 @@ The controller keeps the interactive session responsive by dispatching workers i
 the background. On a host whose persistent monitor turns each flushed stdout line
 into a wake, it prefers one generation-bound `goalflight_messages.py supervise`
 through that monitor, which owns the stream, backup pool, and watchdog as a
-single feed. In the decomposed fallback, only after supervisor absence is proven,
-arm one generation-bound
+single feed. Arm it with **no timeout** so it runs for the life of the session.
+Never set, tune, or reason about a timeout value: a bounded monitor is killed
+outside the supervisor, so no `type=stop` record appears and the controller
+goes deaf without a diagnostic. On Claude Code use `persistent: true`; that
+makes `timeout_ms` inert, and a host-required value is only a placeholder,
+never a knob. In the decomposed fallback, only after supervisor absence is
+proven, arm one generation-bound
 `goalflight_messages.py follow
 --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>` through
 that monitor, never shell `&`, and keep six tracked `listen --listener-slots 6
@@ -306,11 +311,11 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **id:** `no-blocking-cursor-task-worker`
 - **name:** Arm the event wake without blocking
 - **category:** `worker-routing-defaults`
-- **controller_does:** The orchestrator auto-claims without stealing a live different lease, prefers one `supervise` feed that owns the persistent set, and only after supervisor absence is proven arms `follow` through a persistent stdout monitor where supported, arms a six-doorbell backup pool plus one independently locked `--watch-follow` watchdog that reads durable record age and emits channel death on stdout after three missed beats, lets the backup witness a missing watchdog lock while stating that all-tracked-task death remains unwitnessed, treats stream, backup pool, and watchdog as persistent coverage `live/8`, and retains the portable tracked-listener pool on hosts without a monitor.
+- **controller_does:** The orchestrator auto-claims without stealing a live different lease, prefers one `supervise` feed that owns the persistent set and arms it with no timeout for the life of the session (`persistent: true` on Claude Code, with `timeout_ms` inert), and only after supervisor absence is proven arms `follow` through a persistent stdout monitor where supported, arms a six-doorbell backup pool plus one independently locked `--watch-follow` watchdog that reads durable record age and emits channel death on stdout after three missed beats, lets the backup witness a missing watchdog lock while stating that all-tracked-task death remains unwitnessed, treats stream, backup pool, and watchdog as persistent coverage `live/8`, and retains the portable tracked-listener pool on hosts without a monitor.
 - **failure_mode:** The orchestrator blocks the interactive session or schedules a timer to ask whether a worker finished instead of arming the available event channel.
 - **skill_md_compressed_form:**
     - **kind:** literal
-    - **pattern:** "In the decomposed fallback, only after supervisor absence is proven, arm one generation-bound `goalflight_messages.py follow --project-root \"$PWD\" --controller-label <label> --lease-nonce <nonce>` through the host's persistent monitor, never shell `&`; then arm six tracked `listen --listener-slots 6 --report-pending` backup doorbells and one separately tracked `listen --watch-follow` watchdog. The watchdog holds its own generation lock, never consumes a delivery slot, reads durable record age, and treats three missed heartbeat intervals as channel death; the backup witnesses a missing watchdog lock, but all-tracked-task death remains unwitnessed"
+    - **pattern:** "Prefer one persistent `goalflight_messages.py supervise` monitor that owns the stream, backup doorbell pool, and watchdog and multiplexes them into a single stdout feed, re-arming children itself. Arm it with **no timeout** so it runs for the life of the session. Never set, tune, or reason about a timeout value: a bounded monitor is killed outside the supervisor, so no `type=stop` record appears and the controller goes deaf without a diagnostic. On Claude Code use `persistent: true`; that makes `timeout_ms` inert, and a host-required value is only a placeholder, never a knob. In the decomposed fallback, only after supervisor absence is proven, arm one generation-bound `goalflight_messages.py follow --project-root \"$PWD\" --controller-label <label> --lease-nonce <nonce>` through the host's persistent monitor, never shell `&`; then arm six tracked `listen --listener-slots 6 --report-pending` backup doorbells and one separately tracked `listen --watch-follow` watchdog. The watchdog holds its own generation lock, never consumes a delivery slot, reads durable record age, and treats three missed heartbeat intervals as channel death; the backup witnesses a missing watchdog lock, but all-tracked-task death remains unwitnessed"
     - **max_section_lines:** 55
 - **verifier:**
     - **kind:** behaviour-scenario

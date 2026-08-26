@@ -399,8 +399,15 @@ remains the persistent JSON-line surface for hosts that still arm components
 separately. The host persistent monitor must own the tracked task's stdout
 directly; ordinary shell backgrounding, detaching, or a task surface that
 reports only at process exit produces no wakes.
-Only `event`, `heartbeat`, and `frontier` records go to stdout. Diagnostics go to
-stderr, which the measured host contract does not notify. Fatal journal, cursor,
+Arm the supervisor with **no timeout** so it runs for the life of the session.
+Never set, tune, or reason about a timeout value: a bounded monitor is killed
+outside the supervisor, so no `type=stop` record appears and the controller
+goes deaf without a diagnostic. On Claude Code use `persistent: true`; that
+makes `timeout_ms` inert, and a host-required value is only a placeholder,
+never a knob.
+`follow` sends only `event`, `heartbeat`, and `frontier` records to stdout; the
+supervisor multiplexes those and adds its tagged `kind=supervise` records.
+Diagnostics go to stderr, which the measured host contract does not notify. Fatal journal, cursor,
 ring, and durable-state failures are therefore structural `event` records on
 stdout as well as supplemental stderr diagnostics. A regular-file stdout is
 rejected before monitor coverage is claimed.
@@ -426,6 +433,19 @@ idle beat. The host may batch lines produced within 200 ms, so every line is an
 independently parseable JSON object and consumers enumerate all records in a batch.
 An event defers the next idle heartbeat, avoiding a contradictory event plus
 "nothing arrived" beat in the same batch.
+
+The supervisor's own heartbeat is a separate record and clock from the stream
+heartbeat above. It defaults to 1500 seconds, may be configured from 60–1800
+seconds, and is the real-write fallback that detects a closed controlling pipe
+when the fast per-tick poll has no evidence. The supervisor wait also watches
+stdout for `POLLERR|POLLHUP|POLLNVAL`, so positive closure evidence wakes it
+independently of the heartbeat. Supervisor coverage emits at startup, on each
+`(live,target)` change, and immediately on a slot stop or restart; unchanged
+periodic coverage is suppressed unless `--debug` is set. Every supervisor
+`type=stop` and every `type=exit` caused by `SIGTERM`, `SIGINT`, or `SIGHUP`
+carries the exact re-arm command. The stream stays at 120 seconds and the
+watchdog still declares stream death after three missed stream intervals.
+SIGKILL cannot be caught, so it cannot produce the supervisor exit hint.
 
 The heartbeat path never calls `goalflight_task.py next` or `TaskStore.next_frontier`:
 those surfaces may repair publishes, scan the global dispatch ledger, and emit task
