@@ -17,11 +17,11 @@ t-273 design (argued, not picked by habit):
     ordering rule. Pending mail becomes one report, not four exits.
 
     Two arms racing: an atomic per-lease claim fixes one immutable high-water.
-    Exactly one live owner emits, then fsyncs the ``reported`` phase. Losers
-    discard their later local high-water and adopt the claim boundary, so mail
-    arriving between peeks still rings. If the owner dies before reporting,
-    exactly one peer takes over the same boundary. Depth stays at target until
-    the genuinely new event wins one ring.
+    Exactly one live owner emits, then fsyncs the provisional ``reported``
+    phase. Losers discard their later local high-water and adopt the claim
+    boundary, so mail arriving between peeks still rings. If the owner dies
+    before cursor acknowledgement, exactly one peer takes over that boundary.
+    Depth stays at target until the genuinely new event wins one ring.
 
 (c) An arm-to-depth helper that drains once then forks N waiters. Rejected:
     one tracked parent of N children is the untracked-stray shape the
@@ -368,6 +368,35 @@ def test_claim_pending_report_first_writer_wins(
     )
     assert reported is not None
     assert reported.phase == "reported"
+    assert not wake.acknowledge_pending_report(
+        project,
+        controller_label="terse-ctl",
+        lease_nonce="nonce-a",
+        positions={"arm-backlog": 1},
+    )
+    assert wake.pending_report_state(
+        project, controller_label="terse-ctl", lease_nonce="nonce-a"
+    ) == reported
+    assert wake.acknowledge_pending_report(
+        project,
+        controller_label="terse-ctl",
+        lease_nonce="nonce-a",
+        positions={"arm-backlog": 2},
+    )
+    acknowledged = wake.pending_report_state(
+        project, controller_label="terse-ctl", lease_nonce="nonce-a"
+    )
+    assert acknowledged is not None
+    assert acknowledged.phase == "acknowledged"
+    assert wake.mark_pending_report_reported(
+        project,
+        controller_label="terse-ctl",
+        lease_nonce="nonce-a",
+        claim_token=claimed.claim_token,
+    )
+    assert wake.pending_report_state(
+        project, controller_label="terse-ctl", lease_nonce="nonce-a"
+    ) == acknowledged
     assert (
         wake.claim_pending_report(
             project, controller_label="terse-ctl", lease_nonce="nonce-b"
@@ -392,7 +421,7 @@ def test_partial_pending_report_state_fails_closed(
         lease_nonce="partial-state",
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('{"schema":"goalflight.pending-report.v2",', encoding="utf-8")
+    path.write_text('{"schema":"goalflight.pending-report.v3",', encoding="utf-8")
 
     with pytest.raises(wake.PendingReportStateError, match="incomplete"):
         wake.pending_report_high_water(
@@ -410,22 +439,74 @@ def test_partial_pending_report_state_fails_closed(
     assert path.read_text(encoding="utf-8").endswith(",")
 
 
-def test_ambiguous_v1_claim_cannot_suppress_v2_delivery(
+def test_listen_recovers_corrupt_pending_report_and_stays_armed(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    lease = _claim(project)
+    _post(env, project, lease.label, "recover corrupt listen state")
+    path = wake._pending_report_path(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"schema":"goalflight.pending-report.v3",', encoding="utf-8")
+
+    with wake.register_lease_holder(
+        project, controller_label=lease.label, lease_nonce=lease.nonce
+    ):
+        proc = subprocess.Popen(
+            _listen_cmd(
+                project,
+                label=lease.label,
+                nonce=lease.nonce,
+                timeout_s=10,
+                json_out=True,
+            ),
+            cwd=project,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _wait_live(project, lease.label, 1)
+            assert proc.poll() is None
+            assert proc.stdout is not None
+            report = json.loads(proc.stdout.readline())
+            assert report["kind"] == "pending-at-arm"
+            assert proc.poll() is None
+            coverage = journal.Journal(project).active_coverage(lease.label)
+            assert coverage is not None
+            assert coverage["state"] == "ARMED"
+            assert list(path.parent.glob(f".{path.name}.*.corrupt"))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_ambiguous_v2_report_cannot_suppress_v3_delivery(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
     project, _env = isolated
-    v2_path = wake._pending_report_path(
+    v3_path = wake._pending_report_path(
         project,
         controller_label="terse-ctl",
         lease_nonce="upgrade-state",
     )
-    v1_path = v2_path.with_name(
-        v2_path.name.replace("pending-report-v2", "pending-report-v1")
+    v2_path = v3_path.with_name(
+        v3_path.name.replace("pending-report-v3", "pending-report-v2")
     )
-    v1_path.parent.mkdir(parents=True, exist_ok=True)
-    v1_path.write_text('{"positions":{"old-boundary":77}}\n', encoding="utf-8")
+    v2_path.parent.mkdir(parents=True, exist_ok=True)
+    v2_path.write_text(
+        '{"schema":"goalflight.pending-report.v2","phase":"reported",'
+        '"positions":{"old-boundary":77}}\n',
+        encoding="utf-8",
+    )
 
-    # v1 never recorded delivery, so its high-water is deliberately not trusted.
+    # v2 recorded only a local flush, so its high-water is deliberately not trusted.
     assert wake.pending_report_high_water(
         project,
         controller_label="terse-ctl",

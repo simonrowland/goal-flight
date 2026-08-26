@@ -279,6 +279,42 @@ def test_live_lines_flush_before_exit_and_heartbeat_cadence_carries_mail(
         proc.wait(timeout=3)
 
 
+def test_follow_recovers_corrupt_pending_report_and_stays_armed(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    messages.post_message(
+        dispatch_id="follow-corrupt-state",
+        msg_type="controller-notice",
+        payload={"text": "recover corrupt follow state"},
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+        addressee=messages.controller_addressee(lease.label, project_root=project),
+    )
+    path = wake._pending_report_path(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"schema":"goalflight.pending-report.v3",', encoding="utf-8")
+
+    proc = _spawn_follow(project, env, lease, heartbeat_s=0.2)
+    assert proc.stdout is not None
+    reader = _JsonLineReader(proc.stdout)
+    try:
+        _wait_for_monitor_slot(project, lease.label, proc.pid)
+        _raw, record = reader.read()
+        assert record["kind"] == "event"
+        assert record["payload"]["dispatch_id"] == "follow-corrupt-state"
+        assert proc.poll() is None
+        assert list(path.parent.glob(f".{path.name}.*.corrupt"))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
 def test_epipe_exits_and_releases_persistent_monitor_slot(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
 ) -> None:

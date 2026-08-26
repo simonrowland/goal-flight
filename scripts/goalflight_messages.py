@@ -4189,6 +4189,17 @@ def cmd_relay(args: argparse.Namespace) -> int:
                 project_root=root, controller_label=controller_label
             )
             return 3
+        try:
+            goalflight_wake.acknowledge_pending_report(
+                root,
+                controller_label=controller_label,
+                lease_nonce=lease.nonce,
+                positions=positions,
+            )
+        except (OSError, RuntimeError, ValueError):
+            # The cursor commit is authoritative. A stale claim may duplicate a
+            # report, but acknowledgement cleanup must not turn success into loss.
+            pass
         previous_version = int(advanced.value["previous_cursor_version"])
         cursor_version = int(advanced.value["cursor_version"])
         if getattr(args, "json", False):
@@ -4391,6 +4402,17 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
     if not result.committed or result.value is None:
         print(f"advance: {result.reason or 'cursor CAS lost'}", file=sys.stderr)
         return 3
+    try:
+        goalflight_wake.acknowledge_pending_report(
+            project_root,
+            controller_label=label,
+            lease_nonce=nonce,
+            positions=advances,
+        )
+    except (OSError, RuntimeError, ValueError):
+        # The cursor already committed; preserving a provisional claim can
+        # duplicate a report but cannot revoke the acknowledged delivery.
+        pass
     if args.json:
         print(json.dumps(result.value, sort_keys=True))
     else:
@@ -5303,11 +5325,12 @@ def cmd_follow(args) -> int:
     next_heartbeat = time.monotonic()
     last_frontier_signature: str | None = None
     last_frontier_at = float("-inf")
-    arm_high = goalflight_wake.pending_report_high_water(
+    pending_report = goalflight_wake.recover_pending_report_state(
         project_root,
         controller_label=label,
         lease_nonce=nonce,
-    ) or {}
+    )
+    arm_high = dict(pending_report.positions) if pending_report is not None else {}
 
     def emit(record: dict[str, object]) -> bool:
         alive = _write_follow_record(record, stream=sys.stdout)
@@ -5782,18 +5805,18 @@ def cmd_listen(args) -> int:
                 arm_snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
             except goalflight_journal.JournalUnavailable:
                 arm_snapshot = None
-            persisted_state = goalflight_wake.pending_report_state(
+            persisted_state = goalflight_wake.recover_pending_report_state(
                 project_root,
                 controller_label=label,
                 lease_nonce=nonce,
             )
             if persisted_state is not None:
-                # Claimed and reported phases share one immutable boundary.
-                # A replacement may take ownership of an unreported dead claim,
-                # but it never substitutes its own later snapshot positions.
+                # Every phase shares one immutable boundary. A replacement may
+                # take ownership until cursor acknowledgement settles it, but it
+                # never substitutes its own later snapshot positions.
                 arm_high = dict(persisted_state.positions)
-                pending_report_settled = persisted_state.phase == "reported"
-                if persisted_state.phase == "claimed":
+                pending_report_settled = persisted_state.phase == "acknowledged"
+                if not pending_report_settled:
                     report_claim = goalflight_wake.acquire_pending_report(
                         project_root,
                         controller_label=label,
@@ -5812,7 +5835,7 @@ def cmd_listen(args) -> int:
                     cursor_version=arm_snapshot.cursor_version,
                     stream_snapshots=arm_snapshot.stream_snapshots,
                 )
-                winner_state = goalflight_wake.pending_report_state(
+                winner_state = goalflight_wake.recover_pending_report_state(
                     project_root,
                     controller_label=label,
                     lease_nonce=nonce,
@@ -5820,7 +5843,7 @@ def cmd_listen(args) -> int:
                 if winner_state is None:
                     raise MessageError("pending-report claim was not published")
                 arm_high = dict(winner_state.positions)
-                pending_report_settled = winner_state.phase == "reported"
+                pending_report_settled = winner_state.phase == "acknowledged"
 
         armed = authority.arm_listener(
             label,
@@ -6037,7 +6060,7 @@ def cmd_listen(args) -> int:
         claim: goalflight_wake.PendingReportState,
         snapshot,
     ) -> None:
-        """Flush one claimed boundary, then durably transition it to reported."""
+        """Flush one claimed boundary, then record the provisional report."""
         if snapshot is None:
             snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
         report_items = tuple(
@@ -6117,8 +6140,8 @@ def cmd_listen(args) -> int:
             raise MessageError("pending-report delivery claim was superseded")
 
     # Report the snapshot selected before coverage became externally visible.
-    # stdout alone is not durable: only after the complete output flushes does
-    # the claim transition atomically from claimed to reported.
+    # The reported phase proves only that this complete local write returned.
+    # It remains takeover-eligible after owner death until cursor acknowledgement.
     if report_claim is not None:
         try:
             emit_pending_report(report_claim, arm_snapshot)
@@ -6137,14 +6160,12 @@ def cmd_listen(args) -> int:
             return signal_result
         if getattr(args, "report_pending", False) and not pending_report_settled:
             try:
-                observed_report = goalflight_wake.pending_report_state(
+                observed_report = goalflight_wake.recover_pending_report_state(
                     project_root,
                     controller_label=label,
                     lease_nonce=nonce,
                 )
-                if observed_report is None:
-                    raise MessageError("pending-report claim disappeared")
-                if observed_report.phase == "reported":
+                if observed_report is None or observed_report.phase == "acknowledged":
                     pending_report_settled = True
                 else:
                     takeover = goalflight_wake.acquire_pending_report(

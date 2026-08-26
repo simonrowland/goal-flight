@@ -41,11 +41,11 @@ _LEGACY_FILE_VERSION = "v2"
 _GENERATION_FILE_VERSION = "generation-v1"
 _LISTENER_SLOT_FILE_VERSION = "listener-slot-v1"
 _RING_STAMP_FILE_VERSION = "ring-stamp-v1"
-# v1 could not distinguish claimed from delivered. Rotate the address so an
-# upgrade re-reports that generation's backlog once instead of trusting an
-# ambiguous high-water that may never have reached stdout.
-_PENDING_REPORT_FILE_VERSION = "pending-report-v2"
-PENDING_REPORT_STATE_SCHEMA = "goalflight.pending-report.v2"
+# v1 could not distinguish claimed from output. v2 made a complete local flush
+# durable but mistook it for controller receipt. Rotate each ambiguous address
+# so an upgrade re-reports once instead of trusting unacknowledged high-water.
+_PENDING_REPORT_FILE_VERSION = "pending-report-v3"
+PENDING_REPORT_STATE_SCHEMA = "goalflight.pending-report.v3"
 _WATCHDOG_DEATH_REPORT_FILE_VERSION = "watchdog-death-report-v1"
 _MONITOR_STATE_FILE_VERSION = "monitor-state-v1"
 MONITOR_STATE_SCHEMA = "goalflight.monitor-state.v1"
@@ -741,7 +741,7 @@ def _read_pending_report_state(path: Path) -> PendingReportState | None:
     if payload.get("schema") != PENDING_REPORT_STATE_SCHEMA:
         raise PendingReportStateError(f"pending-report state has unknown schema: {path}")
     phase = payload.get("phase")
-    if phase not in {"claimed", "reported"}:
+    if phase not in {"claimed", "reported", "acknowledged"}:
         raise PendingReportStateError(f"pending-report state has invalid phase: {path}")
     cursor_version = payload.get("cursor_version")
     if cursor_version is not None and (
@@ -807,6 +807,57 @@ def pending_report_state(
             lease_nonce=nonce,
         )
     )
+
+
+def recover_pending_report_state(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> PendingReportState | None:
+    """Read listener state, quarantining corruption so coverage can stay armed."""
+    label = str(controller_label or "").strip()
+    nonce = str(lease_nonce or "").strip()
+    if not label or not nonce:
+        raise ValueError("controller label and lease nonce are required")
+    path = _pending_report_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    try:
+        return _read_pending_report_state(path)
+    except PendingReportStateError:
+        pass
+
+    lock_path = _pending_report_lock_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    directory_fd = _open_ledger_directory_path(path.parent, create=True)
+    lock_fd = -1
+    try:
+        lock_fd = _acquire_pending_report_lock(lock_path, directory_fd=directory_fd)
+        try:
+            return _read_pending_report_state(path)
+        except PendingReportStateError:
+            quarantine = f".{path.name}.{uuid.uuid4().hex}.corrupt"
+            try:
+                os.replace(
+                    path.name,
+                    quarantine,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                return None
+            os.fsync(directory_fd)
+            return None
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(directory_fd)
 
 
 def _pending_report_owner() -> tuple[int, str]:
@@ -889,7 +940,7 @@ def acquire_pending_report(
     cursor_version: int | None = None,
     stream_snapshots: Mapping[str, str] | None = None,
 ) -> PendingReportState | None:
-    """Create or take over an unreported claim while preserving its boundary.
+    """Create or take over a provisional claim while preserving its boundary.
 
     A takeover is permitted only after PID/start-token evidence proves that the
     previous claimant is gone. Every rewrite is temp-file + fsync + replace +
@@ -934,7 +985,10 @@ def acquire_pending_report(
         lock_fd = _acquire_pending_report_lock(lock_path, directory_fd=directory_fd)
         current = _read_pending_report_state(path)
         if current is not None:
-            if current.phase == "reported" or _pending_report_owner_liveness(current) is not False:
+            if (
+                current.phase == "acknowledged"
+                or _pending_report_owner_liveness(current) is not False
+            ):
                 return None
             claim_positions = current.positions
             claim_cursor_version = current.cursor_version
@@ -968,6 +1022,7 @@ def acquire_pending_report(
                 "owner": {"pid": owner_pid, "start_token": owner_start_token},
                 "claimed_at_epoch": time.time(),
                 "reported_at_epoch": None,
+                "acknowledged_at_epoch": None,
             },
             directory_fd=directory_fd,
         )
@@ -985,7 +1040,7 @@ def mark_pending_report_reported(
     lease_nonce: str,
     claim_token: str,
 ) -> bool:
-    """Durably record that the complete pending-at-arm output was flushed."""
+    """Record a complete local flush; receipt remains provisional until ack."""
     label = str(controller_label or "").strip()
     nonce = str(lease_nonce or "").strip()
     token = str(claim_token or "").strip()
@@ -1010,7 +1065,7 @@ def mark_pending_report_reported(
             raise PendingReportStateError("pending-report claim disappeared before report")
         if current.claim_token != token:
             return False
-        if current.phase == "reported":
+        if current.phase in {"reported", "acknowledged"}:
             return True
         owner_pid, owner_start_token = _pending_report_owner()
         if (
@@ -1030,6 +1085,71 @@ def mark_pending_report_reported(
                 "owner": {"pid": owner_pid, "start_token": owner_start_token},
                 "claimed_at_epoch": None,
                 "reported_at_epoch": time.time(),
+                "acknowledged_at_epoch": None,
+            },
+            directory_fd=directory_fd,
+        )
+        return True
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(directory_fd)
+
+
+def acknowledge_pending_report(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+    positions: Mapping[str, int],
+) -> bool:
+    """Settle a claim after authoritative cursor positions prove acknowledgement."""
+    label = str(controller_label or "").strip()
+    nonce = str(lease_nonce or "").strip()
+    if not label or not nonce:
+        raise ValueError("controller label and lease nonce are required")
+    normalized = _normalize_pending_report_positions(positions, strict=False)
+    path = _pending_report_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    lock_path = _pending_report_lock_path(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    directory_fd = _open_ledger_directory_path(path.parent, create=True)
+    lock_fd = -1
+    try:
+        lock_fd = _acquire_pending_report_lock(lock_path, directory_fd=directory_fd)
+        try:
+            current = _read_pending_report_state(path)
+        except PendingReportStateError:
+            return False
+        if current is None or any(
+            normalized.get(stream_id, 0) < high_water
+            for stream_id, high_water in current.positions.items()
+        ):
+            return False
+        if current.phase == "acknowledged":
+            return True
+        _write_pending_report_state(
+            path,
+            {
+                "schema": PENDING_REPORT_STATE_SCHEMA,
+                "phase": "acknowledged",
+                "positions": current.positions,
+                "cursor_version": current.cursor_version,
+                "stream_snapshots": current.stream_snapshots,
+                "claim_token": current.claim_token,
+                "owner": {
+                    "pid": current.owner_pid,
+                    "start_token": current.owner_start_token,
+                },
+                "claimed_at_epoch": None,
+                "reported_at_epoch": None,
+                "acknowledged_at_epoch": time.time(),
             },
             directory_fd=directory_fd,
         )
@@ -1047,7 +1167,7 @@ def claim_pending_report(
     lease_nonce: str,
     positions: Mapping[str, int] | None = None,
 ) -> bool:
-    """Compatibility wrapper: claim an unreported generation boundary."""
+    """Compatibility wrapper: claim a provisional generation boundary."""
     return acquire_pending_report(
         project_root,
         controller_label=controller_label,
@@ -1062,7 +1182,7 @@ def pending_report_high_water(
     controller_label: str,
     lease_nonce: str,
 ) -> dict[str, int] | None:
-    """Return the fixed claim boundary for both claimed and reported phases."""
+    """Return the fixed claim boundary for every durable phase."""
     state = pending_report_state(
         project_root,
         controller_label=controller_label,

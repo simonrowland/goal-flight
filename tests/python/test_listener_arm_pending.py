@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -409,13 +410,107 @@ def test_report_pending_json_is_jsonl_through_ring(
                 proc.wait()
 
 
+def test_unread_reported_flush_is_re_reported_after_reporter_dies(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    """A local stdout flush is not evidence that its reader received the line."""
+    project, env = isolated
+    authority = journal.open_or_create_journal(project)
+    lease = authority.claim_or_renew_lease(
+        "armtest", principal={"principal_id": "arm-unread-report-test"}
+    ).value
+    assert lease is not None
+    listener_env = {
+        **env,
+        "GOALFLIGHT_CONTROLLER_LABEL": "armtest",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE": lease.nonce,
+    }
+
+    with wake.register_lease_holder(
+        project, controller_label="armtest", lease_nonce=lease.nonce
+    ):
+        _post(env, project, "unread backlog", dispatch_id="unread-report")
+        first = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPTS / "goalflight_messages.py"),
+                "listen",
+                "--project-root",
+                str(project),
+                "--controller-label",
+                "armtest",
+                "--report-pending",
+                "--json",
+                "--poll-secs",
+                "0.01",
+            ],
+            env=listener_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            # Deliberately never read first.stdout. Wait only for the writer's
+            # durable local-flush phase, then discard the unread pipe.
+            report_deadline = time.monotonic() + 5
+            while time.monotonic() < report_deadline:
+                state = wake.pending_report_state(
+                    project,
+                    controller_label="armtest",
+                    lease_nonce=lease.nonce,
+                )
+                if state is not None and state.phase == "reported":
+                    break
+                time.sleep(0.005)
+            else:
+                pytest.fail("unread pending-at-arm output never reached reported phase")
+            first.kill()
+            first.wait(timeout=5)
+            assert first.stdout is not None
+            first.stdout.close()
+
+            replacement = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "goalflight_messages.py"),
+                    "listen",
+                    "--project-root",
+                    str(project),
+                    "--controller-label",
+                    "armtest",
+                    "--report-pending",
+                    "--json",
+                    "--poll-secs",
+                    "0.01",
+                    "--timeout-s",
+                    "0.1",
+                ],
+                env=listener_env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        finally:
+            if first.poll() is None:
+                first.kill()
+                first.wait()
+
+    payloads = [
+        json.loads(line) for line in replacement.stdout.splitlines() if line.strip()
+    ]
+    assert replacement.returncode == 1, replacement.stderr
+    assert [payload["kind"] for payload in payloads] == ["pending-at-arm", "exit"]
+    assert [int(item["stream_seq"]) for item in payloads[0]["items"]] == [1]
+    assert payloads[-1]["reason"] == "timeout"
+
+
 def test_replacement_arm_rings_events_arriving_after_first_report(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
     """A superseded re-arm must not swallow mail that arrived after the report.
 
     --report-pending raises a high-water so the same backlog cannot pop the
-    whole pool. That water is the *reported* positions. A replacement arm
+    whole pool. That water is the fixed claim boundary. A replacement arm
     that peeks later must not raise it to the current backlog.
     """
     project, env = isolated
@@ -472,6 +567,27 @@ def test_replacement_arm_rings_events_arriving_after_first_report(
                 time.sleep(0.005)
             else:
                 pytest.fail("pending-at-arm output never became durably reported")
+            advance_argv = shlex.split(arm_payload["advance_command"])
+            acknowledged = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "goalflight_messages.py"),
+                    *advance_argv[2:],
+                ],
+                cwd=project,
+                env=listener_env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert acknowledged.returncode == 0, acknowledged.stderr
+            state = wake.pending_report_state(
+                project,
+                controller_label="armtest",
+                lease_nonce=lease.nonce,
+            )
+            assert state is not None
+            assert state.phase == "acknowledged"
             first.kill()
             first.wait(timeout=5)
 
@@ -544,9 +660,9 @@ def test_replacement_arm_rings_events_arriving_after_first_report(
         json.loads(line) for line in timeout_result.stdout.splitlines() if line.strip()
     ]
     assert timeout_result.returncode == 1, timeout_result.stderr
-    # Same lease generation already emitted the backlog. A later arm stays
-    # silent and only JSONL-exits on timeout; reprinting would spend the
-    # report (and, in a pool, the other doorbells) on mail already seen.
+        # Same lease generation already acknowledged the backlog. A later arm
+        # stays silent and only JSONL-exits on timeout; reprinting would spend
+        # the pool's output on mail already settled by the controller.
     assert [payload["kind"] for payload in timeout_payloads] == ["exit"]
     assert timeout_payloads[-1]["reason"] == "timeout"
 
