@@ -5268,20 +5268,7 @@ def _follow_frontier_record(row: dict[str, object] | None) -> dict[str, object]:
             },
         }
     derived = str(row.get("derived_status") or "pending")
-    state = (
-        derived
-        if derived
-        in {
-            "awaiting-review",
-            "blocked",
-            "decision",
-            "stale",
-            "waiting",
-            "worker-failed",
-            "working",
-        }
-        else "ready"
-    )
+    state = derived if derived in {"blocked", "stale"} else "ready"
     record: dict[str, object] = {
         "kind": "frontier",
         "payload": {
@@ -5294,65 +5281,46 @@ def _follow_frontier_record(row: dict[str, object] | None) -> dict[str, object]:
     return _fit_follow_record(record, shrink_fields=("title", "id"))
 
 
-def _follow_frontier_snapshot(task_store) -> dict[str, object]:
+def _follow_projection_rows(task_store) -> tuple[list[dict[str, object]], os.stat_result]:
     """Read the generated task projection without entering the store API.
 
     ``TaskStore.next_frontier()`` derives against the global dispatch ledger and
     can repair interrupted publishes. A heartbeat must not take that lock or
     mutate the store, so the stream consumes the already-materialized JS view.
     """
-    import goalflight_task  # type: ignore
+    projection_candidates = (
+        task_store.data_js_path,
+        task_store.export_dashboard_dir / "tasks-data.js",
+    )
+    projection_path = next(path for path in projection_candidates if path.is_file())
+    projection_stat = projection_path.stat()
+    text = projection_path.read_text(encoding="utf-8")
+    marker = "window.GF_ITEMS = "
+    offset = text.index(marker) + len(marker)
+    rows, _end = json.JSONDecoder().raw_decode(text[offset:])
+    if not isinstance(rows, list):
+        raise ValueError("materialized task projection is not an array")
+    return [row for row in rows if isinstance(row, dict)], projection_stat
 
-    try:
-        projection_candidates = (
-            task_store.data_js_path,
-            task_store.export_dashboard_dir / "tasks-data.js",
-        )
-        projection_path = next(path for path in projection_candidates if path.is_file())
-        projection_stat = projection_path.stat()
-        text = projection_path.read_text(encoding="utf-8")
-        marker = "window.GF_ITEMS = "
-        offset = text.index(marker) + len(marker)
-        rows, _end = json.JSONDecoder().raw_decode(text[offset:])
-        if not isinstance(rows, list):
-            raise ValueError("materialized task projection is not an array")
-        rows = [
-            row
-            for row in rows
-            if isinstance(row, dict)
-            and row.get("kind", "task") in {"task", "bug", "decision"}
-            and row.get("lane") not in goalflight_task.RESERVED_LANES
-        ]
-    except Exception as exc:
-        record: dict[str, object] = {
-            "kind": "frontier",
-            "payload": {
-                "state": "unavailable",
-                "detail": sanitize_display(str(exc), limit=180),
-                "advisory": "information-only",
-            },
-        }
-        return _fit_follow_record(record, shrink_fields=("detail",))
-    frontier = [
-        row
-        for row in rows
-        if row.get("derived_status") == "pending"
-        and goalflight_task._latest_dispatch_breadcrumb(row) is None
-    ]
-    active = [
-        row
-        for row in rows
-        if row.get("derived_status")
-        in {
-            "awaiting-review",
-            "blocked",
-            "decision",
-            "waiting",
-            "worker-failed",
-            "working",
-        }
-    ]
-    record = _follow_frontier_record((frontier or active or [None])[0])
+
+def _unavailable_follow_frontier(exc: BaseException) -> dict[str, object]:
+    record: dict[str, object] = {
+        "kind": "frontier",
+        "payload": {
+            "state": "unavailable",
+            "detail": sanitize_display(str(exc), limit=180),
+            "advisory": "information-only",
+        },
+    }
+    return _fit_follow_record(record, shrink_fields=("detail",))
+
+
+def _decorate_follow_frontier(
+    record: dict[str, object],
+    *,
+    task_store,
+    projection_stat: os.stat_result,
+) -> dict[str, object]:
     payload = record.get("payload")
     assert isinstance(payload, dict)
     payload["source"] = "materialized-projection"
@@ -5377,6 +5345,82 @@ def _follow_frontier_snapshot(task_store) -> dict[str, object]:
         payload["state"] = "stale"
         payload["stale_reason"] = "projection-age"
     return _fit_follow_record(record, shrink_fields=("title", "id"))
+
+
+def _follow_frontier_snapshot(task_store) -> dict[str, object]:
+    """Return the legacy child frontier emitted by ``follow`` itself."""
+    import goalflight_task  # type: ignore
+
+    try:
+        rows, projection_stat = _follow_projection_rows(task_store)
+        frontier = [
+            row
+            for row in rows
+            if row.get("kind", "task") in {"task", "bug"}
+            and row.get("derived_status") == "pending"
+            and row.get("lane") not in goalflight_task.RESERVED_LANES
+            and goalflight_task._latest_dispatch_breadcrumb(row) is None
+        ]
+    except Exception as exc:
+        return _unavailable_follow_frontier(exc)
+    return _decorate_follow_frontier(
+        _follow_frontier_record(frontier[0] if frontier else None),
+        task_store=task_store,
+        projection_stat=projection_stat,
+    )
+
+
+def _supervisor_frontier_snapshot(task_store) -> dict[str, object]:
+    """Select action-bearing rows for the supervisor's forwarded wake only."""
+    import goalflight_task  # type: ignore
+
+    try:
+        rows, projection_stat = _follow_projection_rows(task_store)
+        rows = [
+            row
+            for row in rows
+            if row.get("kind", "task") in {"task", "bug", "decision"}
+            and row.get("lane") not in goalflight_task.RESERVED_LANES
+        ]
+        frontier = [
+            row
+            for row in rows
+            if row.get("derived_status") == "pending"
+            and goalflight_task._latest_dispatch_breadcrumb(row) is None
+        ]
+        active = [
+            row
+            for row in rows
+            if row.get("derived_status")
+            in {
+                "awaiting-review",
+                "blocked",
+                "decision",
+                "waiting",
+                "worker-failed",
+                "working",
+            }
+        ]
+    except Exception as exc:
+        return _unavailable_follow_frontier(exc)
+    selected = (frontier or active or [None])[0]
+    record = _follow_frontier_record(selected)
+    payload = record.get("payload")
+    assert isinstance(payload, dict)
+    derived = str(selected.get("derived_status") or "") if selected else ""
+    if derived in {
+        "awaiting-review",
+        "decision",
+        "waiting",
+        "worker-failed",
+        "working",
+    }:
+        payload["state"] = derived
+    return _decorate_follow_frontier(
+        record,
+        task_store=task_store,
+        projection_stat=projection_stat,
+    )
 
 
 def _follow_frontier_signature(record: dict[str, object]) -> str:
@@ -7514,8 +7558,12 @@ def cmd_listen_auto(args) -> int:
 def cmd_supervise(args) -> int:
     """One tracked task that owns the persistent wake pool."""
     import goalflight_wake_supervise as supervise
+    import goalflight_task  # type: ignore
 
-    return supervise.cmd_supervise(args)
+    def forwarding_frontier(project_root: Path) -> dict[str, object]:
+        return _supervisor_frontier_snapshot(goalflight_task.TaskStore(project_root))
+
+    return supervise.cmd_supervise(args, forwarding_frontier=forwarding_frontier)
 
 
 def cmd_mirror(args: argparse.Namespace) -> int:

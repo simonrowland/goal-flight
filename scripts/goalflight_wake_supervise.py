@@ -18,6 +18,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from typing import Any, Protocol
@@ -343,6 +344,36 @@ def _actionable_stream_wake(
     return {"kind": "next", "payload": payload}
 
 
+@dataclass
+class _ForwardingFrontierRead:
+    done: threading.Event
+    record: dict[str, object] | None = None
+    expired: bool = False
+
+
+def _start_forwarding_frontier_read(
+    reader: Callable[[], dict[str, object]],
+) -> _ForwardingFrontierRead:
+    """Read the supervisor-only projection without blocking its wake deadline."""
+    state = _ForwardingFrontierRead(done=threading.Event())
+
+    def run() -> None:
+        try:
+            record = reader()
+        except Exception:
+            record = None
+        payload = record.get("payload") if isinstance(record, dict) else None
+        state.record = record if isinstance(payload, dict) else None
+        state.done.set()
+
+    threading.Thread(
+        target=run,
+        name="goalflight-forwarding-frontier",
+        daemon=True,
+    ).start()
+    return state
+
+
 def _structured_child_reason(line: str) -> str | None:
     """Extract a child-authored diagnostic reason from a JSON control line.
 
@@ -414,6 +445,7 @@ def run_supervisor(
     coverage_s: float = 120.0,
     items: list[tuple[str, str]] | None = None,
     chatty: bool = False,
+    forwarding_frontier: Callable[[], dict[str, object]] | None = None,
 ) -> int:
     """Run until the lease dies, stdout breaks, or the host asks to stop."""
     nonce = str(lease_nonce or "").strip()
@@ -508,19 +540,56 @@ def run_supervisor(
     latest_frontier: dict[str, object] | None = None
     pending_stream_heartbeat: dict[str, object] | None = None
     pending_stream_heartbeat_due = float("inf")
+    pending_stream_frontier: dict[str, object] | None = None
+    active_forwarding_read: _ForwardingFrontierRead | None = None
+    pending_forwarding_read: _ForwardingFrontierRead | None = None
 
     def emit_pending_stream_wake(*, paired_frontier: bool = False) -> bool:
+        nonlocal latest_frontier
+        nonlocal pending_forwarding_read, pending_stream_frontier
         nonlocal pending_stream_heartbeat, pending_stream_heartbeat_due
         if pending_stream_heartbeat is None:
             return True
+        frontier = latest_frontier
+        child_payload = (
+            pending_stream_frontier.get("payload")
+            if isinstance(pending_stream_frontier, dict)
+            else None
+        )
+        if forwarding_frontier is not None:
+            if (
+                isinstance(child_payload, dict)
+                and child_payload.get("state") != "empty"
+            ):
+                frontier = pending_stream_frontier
+                if (
+                    pending_forwarding_read is not None
+                    and not pending_forwarding_read.done.is_set()
+                ):
+                    pending_forwarding_read.expired = True
+            elif (
+                pending_forwarding_read is not None
+                and pending_forwarding_read.done.is_set()
+            ):
+                frontier = pending_forwarding_read.record
+            else:
+                # The richer selection did not complete within this beat's
+                # grace. Keep the cadence and preserve uncertainty.
+                frontier = None
+                if pending_forwarding_read is not None:
+                    pending_forwarding_read.expired = True
+        elif pending_stream_frontier is not None:
+            frontier = pending_stream_frontier
         pending_stream_heartbeat = None
         pending_stream_heartbeat_due = float("inf")
-        frontier = latest_frontier
+        pending_stream_frontier = None
+        pending_forwarding_read = None
         frontier_payload = (
             frontier.get("payload") if isinstance(frontier, dict) else None
         )
         if (
-            not paired_frontier
+            forwarding_frontier is None
+            and not paired_frontier
             and isinstance(frontier_payload, dict)
             and frontier_payload.get("state") == "empty"
         ):
@@ -528,6 +597,8 @@ def run_supervisor(
             # during a slow current refresh. Preserve the wake, but never turn
             # that ambiguity into a false idle directive.
             frontier = None
+        if isinstance(frontier, dict):
+            latest_frontier = frontier
         return _emit(host, _actionable_stream_wake(frontier))
 
     while host.running():
@@ -574,13 +645,41 @@ def run_supervisor(
                     pending_stream_heartbeat_due = (
                         host.now + STREAM_FRONTIER_GRACE_S
                     )
+                    pending_stream_frontier = None
+                    pending_forwarding_read = None
+                    if forwarding_frontier is not None:
+                        if (
+                            active_forwarding_read is None
+                            or active_forwarding_read.done.is_set()
+                        ):
+                            active_forwarding_read = (
+                                _start_forwarding_frontier_read(
+                                    forwarding_frontier
+                                )
+                            )
+                        if not active_forwarding_read.expired:
+                            pending_forwarding_read = active_forwarding_read
                     continue
                 frontier = _own_stream_record(child, line, kind="frontier")
                 if frontier is not None:
-                    latest_frontier = frontier
-                    if not emit_pending_stream_wake(paired_frontier=True):
-                        host.kill_all()
-                        return 0
+                    if pending_stream_heartbeat is None:
+                        latest_frontier = frontier
+                        continue
+                    pending_stream_frontier = frontier
+                    frontier_payload = frontier.get("payload")
+                    forwarding_ready = (
+                        pending_forwarding_read is not None
+                        and pending_forwarding_read.done.is_set()
+                    )
+                    if (
+                        forwarding_frontier is None
+                        or not isinstance(frontier_payload, dict)
+                        or frontier_payload.get("state") != "empty"
+                        or forwarding_ready
+                    ):
+                        if not emit_pending_stream_wake(paired_frontier=True):
+                            host.kill_all()
+                            return 0
                     continue
             text = line if line.endswith("\n") else line + "\n"
             if not host.write_stdout(text):
@@ -1106,7 +1205,11 @@ def resolve_startup_lease_nonce(
     return live, None, None
 
 
-def cmd_supervise(args: Any) -> int:
+def cmd_supervise(
+    args: Any,
+    *,
+    forwarding_frontier: Callable[[Path], dict[str, object]] | None = None,
+) -> int:
     """CLI entry used by goalflight_messages.py supervise."""
     import goalflight_session_status as sessions  # type: ignore
     import goalflight_task  # type: ignore
@@ -1166,4 +1269,9 @@ def cmd_supervise(args: Any) -> int:
         heartbeat_s=heartbeat_s,
         coverage_s=coverage_s,
         chatty=bool(getattr(args, "chatty", False)),
+        forwarding_frontier=(
+            (lambda: forwarding_frontier(project_root))
+            if forwarding_frontier is not None
+            else None
+        ),
     )

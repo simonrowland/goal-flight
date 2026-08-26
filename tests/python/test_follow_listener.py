@@ -796,10 +796,13 @@ def test_frontier_reads_only_materialized_projection_and_marks_stale(
         encoding="utf-8",
     )
     canonical.unlink()
-    working = messages._follow_frontier_snapshot(store)
-    assert working["payload"]["id"] == "t-working"
-    assert working["payload"]["state"] == "working"
-    assert working["payload"]["title"] == "worker remains in flight"
+    working_child = messages._follow_frontier_snapshot(store)
+    assert working_child["payload"]["state"] == "empty"
+    assert "id" not in working_child["payload"]
+    working_forwarded = messages._supervisor_frontier_snapshot(store)
+    assert working_forwarded["payload"]["id"] == "t-working"
+    assert working_forwarded["payload"]["state"] == "working"
+    assert working_forwarded["payload"]["title"] == "worker remains in flight"
 
     projection.write_text(
         "// generated\nwindow.GF_ITEMS = "
@@ -843,9 +846,12 @@ def test_frontier_reads_only_materialized_projection_and_marks_stale(
         + ";\n",
         encoding="utf-8",
     )
-    decision = messages._follow_frontier_snapshot(store)
-    assert decision["payload"]["id"] == "q-decision"
-    assert decision["payload"]["state"] == "decision"
+    decision_child = messages._follow_frontier_snapshot(store)
+    assert decision_child["payload"]["state"] == "empty"
+    assert "id" not in decision_child["payload"]
+    decision_forwarded = messages._supervisor_frontier_snapshot(store)
+    assert decision_forwarded["payload"]["id"] == "q-decision"
+    assert decision_forwarded["payload"]["state"] == "decision"
 
     projection.write_text(
         "// generated\nwindow.GF_ITEMS = [];\n",
