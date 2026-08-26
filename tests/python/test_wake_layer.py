@@ -70,6 +70,18 @@ def isolated_env(tmp_path: Path, *, label: str = "wake-test") -> dict[str, str]:
     return env
 
 
+def _env_with_empty_process_listing(
+    env: dict[str, str],
+    directory: Path,
+) -> dict[str, str]:
+    shim_dir = directory / "empty-process-listing"
+    shim_dir.mkdir(exist_ok=True)
+    ps_shim = shim_dir / "ps"
+    ps_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    ps_shim.chmod(0o755)
+    return {**env, "PATH": f"{shim_dir}:{env.get('PATH', '')}"}
+
+
 @pytest.fixture
 def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, dict[str, str]]:
     env = isolated_env(tmp_path)
@@ -1038,8 +1050,10 @@ def test_listener_reserve_hint_prints_one_command_per_missing_slot() -> None:
 def test_entry_hint_grades_crashed_pool_member_and_full_pool_is_silent(
     isolated: tuple[Path, dict[str, str]],
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, env = isolated
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     authority = journal.open_or_create_journal(root)
     claimed = authority.claim_or_renew_lease(
         "wake-test", principal={"principal_id": "pool-depth-hint"}
@@ -1219,8 +1233,10 @@ def test_cursor_advance_with_leftovers_pops_one_more_pool_member(
 def test_listener_arm_past_target_is_not_refused_then_empty_pool_hint(
     isolated: tuple[Path, dict[str, str]],
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, env = isolated
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     authority = journal.open_or_create_journal(root)
     claimed = authority.claim_or_renew_lease(
         "wake-test", principal={"principal_id": "pool-exhaustion"}
@@ -1539,6 +1555,7 @@ def test_detached_listener_refuses_ppid_one_with_distinct_code_and_one_line(
     try:
         monkeypatch.setenv("GOALFLIGHT_LISTENER_STARTUP_GRACE_S", "0.05")
         monkeypatch.setattr(messages.os, "getppid", lambda: 1)
+        monkeypatch.setattr(wake, "_process_listing", lambda: [])
         args = SimpleNamespace(
             project_root=str(root),
             controller_label="wake-test",
@@ -1572,6 +1589,130 @@ def test_detached_listener_refuses_ppid_one_with_distinct_code_and_one_line(
         lease_holder.close()
 
 
+@pytest.mark.parametrize("mode", ["direct-with-supervisor", "orphaned-child"])
+def test_detached_listener_uses_detected_supervisor_ownership(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mode: str,
+) -> None:
+    root, _env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test", principal={"principal_id": f"detached-{mode}"}
+    )
+    assert claimed.committed and claimed.value is not None
+    lease_holder = _hold_claimed_lease(root, claimed.value)
+    supervise_command = wake.coverage_supervise_command(
+        root,
+        controller_label="wake-test",
+        lease_nonce=claimed.value.nonce,
+    )
+    try:
+        monkeypatch.setenv("GOALFLIGHT_LISTENER_STARTUP_GRACE_S", "0.05")
+        monkeypatch.setattr(messages.os, "getppid", lambda: 1)
+        if mode == "direct-with-supervisor":
+            monkeypatch.delenv("GOALFLIGHT_SUPERVISED", raising=False)
+            monkeypatch.setattr(
+                wake,
+                "_process_listing",
+                lambda: [(4242, supervise_command)],
+            )
+        else:
+            monkeypatch.setenv("GOALFLIGHT_SUPERVISED", "1")
+            monkeypatch.setattr(wake, "_process_listing", lambda: [])
+        args = SimpleNamespace(
+            project_root=str(root),
+            controller_label="wake-test",
+            lease_nonce=claimed.value.nonce,
+            poll_secs=0.01,
+            listener_slots=1,
+            timeout_s=2,
+            json=False,
+            report_pending=False,
+        )
+
+        code = messages.cmd_listen(args)
+        captured = capsys.readouterr()
+
+        assert code == messages.DETACHED_LISTENER_EXIT_CODE
+        lines = captured.err.splitlines()
+        assert len(lines) == 1
+        assert "goalflight_messages.py listen" not in lines[0]
+        if mode == "direct-with-supervisor":
+            assert captured.out == ""
+            assert "supervisor owns replacement" in lines[0]
+            assert "Restart the supervisor" not in lines[0]
+        else:
+            assert json.loads(captured.out) == {"kind": "armed"}
+            assert "supervisor parent is gone" in lines[0]
+            assert "Restart the supervisor" in lines[0]
+            assert supervise_command in lines[0]
+    finally:
+        lease_holder.close()
+
+
+def test_supervised_listener_signal_during_orphan_grace_restarts_supervisor(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root, _env = isolated
+    authority = journal.open_or_create_journal(root)
+    assert authority.prepare_attempt("orphan-grace-listener").committed
+    claimed = authority.claim_or_renew_lease(
+        "wake-test", principal={"principal_id": "orphan-grace-listener"}
+    )
+    assert claimed.committed and claimed.value is not None
+    lease_holder = _hold_claimed_lease(root, claimed.value)
+
+    class FatalDeathWatch:
+        fatal_signum = int(signal.SIGTERM)
+        notices: list[int] = []
+
+        def install(self) -> None:
+            return None
+
+        def restore(self) -> None:
+            return None
+
+    try:
+        monkeypatch.setenv("GOALFLIGHT_SUPERVISED", "1")
+        monkeypatch.setenv("GOALFLIGHT_LISTENER_STARTUP_GRACE_S", "60")
+        monkeypatch.setattr(messages.os, "getppid", lambda: 1)
+        monkeypatch.setattr(wake, "_process_listing", lambda: [])
+        monkeypatch.setattr(messages, "_ListenerDeathWatch", FatalDeathWatch)
+        args = SimpleNamespace(
+            project_root=str(root),
+            controller_label="wake-test",
+            lease_nonce=claimed.value.nonce,
+            poll_secs=0.01,
+            listener_slots=1,
+            timeout_s=2,
+            json=True,
+            report_pending=False,
+        )
+
+        code = messages.cmd_listen(args)
+        captured = capsys.readouterr()
+        payloads = [json.loads(line) for line in captured.out.splitlines()]
+        exit_payload = next(row for row in payloads if row.get("kind") == "exit")
+        supervise_command = wake.coverage_supervise_command(
+            root,
+            controller_label="wake-test",
+            lease_nonce=claimed.value.nonce,
+        )
+
+        assert code == messages.listener_posix_signal_exit_code(signal.SIGTERM)
+        assert exit_payload["reason"] == "signal"
+        assert "rearm" not in exit_payload
+        assert "Restart the supervisor" in exit_payload["wake_recovery_hint"]
+        assert supervise_command in exit_payload["wake_recovery_hint"]
+        assert "goalflight_messages.py listen" not in json.dumps(exit_payload)
+    finally:
+        lease_holder.close()
+
+
 def test_shell_detached_listener_is_reaped_after_startup_grace_real_process(
     isolated: tuple[Path, dict[str, str]],
     tmp_path: Path,
@@ -1585,6 +1726,7 @@ def test_shell_detached_listener_is_reaped_after_startup_grace_real_process(
     lease_holder = _hold_claimed_lease(root, claimed.value)
     env = dict(env)
     env["GOALFLIGHT_LISTENER_STARTUP_GRACE_S"] = "0.2"
+    env = _env_with_empty_process_listing(env, tmp_path)
     # The re-arm hint now names the ADVERTISED install rather than the running
     # copy, so that a listener started from a development checkout does not tell
     # its reader to re-arm that checkout. Pin the advertised root to the code
@@ -1764,8 +1906,10 @@ def test_wake_ledger_symlink_policy_is_symmetric_and_real_dir_scan_holds_fd(
 
 def test_entry_notice_distinguishes_probe_unavailable_from_offline(
     isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, _env = isolated
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     unavailable_stream = io.StringIO()
     unavailable = wake.check_tool_entry(
         root,
@@ -1775,11 +1919,14 @@ def test_entry_notice_distinguishes_probe_unavailable_from_offline(
         stream=unavailable_stream,
     )
     assert unavailable["reason"] == "waiter-probe-unavailable"
-    assert unavailable_stream.getvalue().startswith(
-        "listener coverage UNKNOWN (probe unavailable); "
-        "if you have no listener, start: "
+    unavailable_text = unavailable_stream.getvalue()
+    assert unavailable_text.startswith(
+        "listener coverage UNKNOWN (probe unavailable)."
     )
-    assert "listener offline" not in unavailable_stream.getvalue()
+    assert "could not tell whether `supervise`" in unavailable_text
+    assert "If you are running `supervise`" in unavailable_text
+    assert "goalflight_messages.py listen" not in unavailable_text
+    assert "listener offline" not in unavailable_text
 
     wake.ledger_dir(root).mkdir(parents=True)
     offline_stream = io.StringIO()
@@ -1793,6 +1940,53 @@ def test_entry_notice_distinguishes_probe_unavailable_from_offline(
     assert offline["reason"] == "no-live-waiter-lock"
     assert offline_stream.getvalue().startswith("listener pool n=0; start: ")
     assert "coverage UNKNOWN" not in offline_stream.getvalue()
+
+
+def test_tool_entry_probe_failure_is_silent_when_detector_finds_supervisor(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test", principal={"principal_id": "running-entry-probe"}
+    )
+    assert claimed.committed and claimed.value is not None
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="wake-test",
+        lease_nonce=claimed.value.nonce,
+    )
+    supervise_command = wake.coverage_supervise_command(
+        root,
+        controller_label="wake-test",
+        lease_nonce=claimed.value.nonce,
+    )
+    try:
+        shutil.rmtree(wake.ledger_dir(root))
+        monkeypatch.setattr(
+            wake,
+            "_process_listing",
+            lambda: [(4242, supervise_command)],
+        )
+        stream = io.StringIO()
+        status = wake.check_tool_entry(
+            root,
+            controller_label="wake-test",
+            controller_lease_nonce=claimed.value.nonce,
+            controller_claimed=True,
+            mail_bearing=True,
+            stream=stream,
+        )
+
+        assert status["reason"] == "waiter-probe-unavailable"
+        assert status["rearm_plan"]["supervisor"] == wake.SUPERVISOR_RUNNING
+        assert not {"live", "target", "missing", "command"}.intersection(
+            status["rearm_plan"]
+        )
+        assert stream.getvalue() == ""
+    finally:
+        holder.close()
 
 
 def test_lockfile_content_never_claims_liveness(isolated: tuple[Path, dict[str, str]]) -> None:
@@ -2584,6 +2778,7 @@ def test_unclaimed_cli_entries_stay_quiet_and_claimed_mail_entries_warn_once(
     isolated: tuple[Path, dict[str, str]], tmp_path: Path
 ) -> None:
     root, env = isolated
+    env = _env_with_empty_process_listing(env, tmp_path)
     authority = journal.open_or_create_journal(root)
     commands = _entry_commands(root, tmp_path)
     for command, _mail_bearing in commands:
@@ -2694,6 +2889,7 @@ def test_ambient_capability_still_gets_mail_fallback_when_holder_is_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root, _env = isolated
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     authority = journal.open_or_create_journal(root)
     claimed = authority.claim_or_renew_lease(
         "wake-test",

@@ -242,6 +242,7 @@ def _run(
     heartbeat_s: float = 30.0,
     coverage_s: float = 30.0,
     nonce: str = "nonce-1",
+    emit_depth: bool = False,
 ) -> int:
     host.lease_nonce = nonce
     return supervise.run_supervisor(
@@ -252,6 +253,7 @@ def _run(
         heartbeat_s=heartbeat_s,
         coverage_s=coverage_s,
         items=items,
+        emit_depth=emit_depth,
     )
 
 
@@ -319,7 +321,13 @@ def test_supervisor_runs_the_configured_pool_size(backup_count: int) -> None:
     items.extend(("backup", f"cmd-backup-{index}") for index in range(backup_count))
     items.append(("watchdog", "cmd-watchdog"))
     host = FakeHost(stop_after_spawns=len(items))
-    code = _run(host, items, heartbeat_s=100.0, coverage_s=100.0)
+    code = _run(
+        host,
+        items,
+        heartbeat_s=100.0,
+        coverage_s=100.0,
+        emit_depth=True,
+    )
     assert code == 0
     assert len(host.spawns) == len(items)
     assert [kind for kind, _command in host.spawns].count("backup") == backup_count
@@ -350,6 +358,8 @@ def test_dead_child_is_restarted() -> None:
     assert restart["child"] == "backup"
     assert restart["exit"] == 2
     assert restart["reason"] == "exit-2"
+    assert "live" not in restart
+    assert "target" not in restart
 
 
 def test_exit_3_unclassified_backoffs_instead_of_implying_contention() -> None:
@@ -393,6 +403,13 @@ def test_exit_0_without_arming_stops_with_distinct_reason() -> None:
     stop = next(record for record in _records(host) if record.get("type") == "stop")
     assert stop["reason"] == "dead-lease-nonce"
     assert stop["child"] == "stream"
+    assert "live" not in stop
+    assert "target" not in stop
+    assert stop["rearm"] == wake.coverage_supervise_command(
+        "/tmp/supervise-test",
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+    )
     assert len(host.spawns) == 1
 
 
@@ -639,9 +656,42 @@ def test_classify_exit_taxonomy() -> None:
     ) == (supervise.ACTION_STOP, "dead-lease-nonce")
 
 
-def test_live_counts_armed_components_not_pids() -> None:
+def test_default_supervisor_output_suppresses_depth_and_opt_in_restores_it() -> None:
+    default_host = FakeHost(stop_after_spawns=1)
+    _run(
+        default_host,
+        _items("stream"),
+        heartbeat_s=100.0,
+        coverage_s=100.0,
+    )
+    assert _records(default_host) == []
+
+    depth_host = FakeHost(stop_after_spawns=1)
+    _run(
+        depth_host,
+        _items("stream"),
+        heartbeat_s=100.0,
+        coverage_s=100.0,
+        emit_depth=True,
+    )
+    records = _records(depth_host)
+    assert [record["type"] for record in records] == ["coverage", "heartbeat"]
+    assert all(
+        isinstance(record.get("live"), int)
+        and isinstance(record.get("target"), int)
+        for record in records
+    )
+
+
+def test_opt_in_live_counts_armed_components_not_pids() -> None:
     host = FakeHost(stop_after_coverage=2)
-    _run(host, _items("stream", "backup", "watchdog"), heartbeat_s=100.0, coverage_s=0.05)
+    _run(
+        host,
+        _items("stream", "backup", "watchdog"),
+        heartbeat_s=100.0,
+        coverage_s=0.05,
+        emit_depth=True,
+    )
     coverages = [record for record in _records(host) if record.get("type") == "coverage"]
     assert coverages[0]["live"] == 0
     assert coverages[0]["target"] == 3
@@ -680,7 +730,13 @@ def test_unreadable_journal_probe_does_not_stop_the_supervisor() -> None:
         return child
 
     host.spawn = spawn_then_unread  # type: ignore[method-assign]
-    code = _run(host, _items("stream"), heartbeat_s=100.0, coverage_s=0.05)
+    code = _run(
+        host,
+        _items("stream"),
+        heartbeat_s=100.0,
+        coverage_s=0.05,
+        emit_depth=True,
+    )
     assert code != supervise.SUPERVISE_STOP_EXIT
     assert all(
         record.get("reason") != "dead-lease-nonce" for record in _records(host)
@@ -718,7 +774,13 @@ def test_permanent_unarmed_exit_2_is_visible_terminal_not_healthy() -> None:
     assert [kind for kind, _command in host.spawns].count("backup") == (
         supervise.PERMANENT_UNARMED_FAULTS
     )
-    assert stop["live"] < stop["target"]
+    assert "live" not in stop
+    assert "target" not in stop
+    assert stop["rearm"] == wake.coverage_supervise_command(
+        "/tmp/supervise-test",
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+    )
 
 
 def test_supervise_items_are_the_configured_persistent_pool(

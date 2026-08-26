@@ -924,6 +924,8 @@ def _assert_controller_state(
     holder_mode: str,
     waiter_count: int,
     attempt_mode: str,
+    supervisor_mode: str = "absent",
+    controller_label: str = "console-test",
 ) -> None:
     """Exercise one classifier branch through real temp journal/flock inputs."""
     with tempfile.TemporaryDirectory() as td:
@@ -940,7 +942,7 @@ def _assert_controller_state(
                 else {}
             )
             claimed = authority.claim_or_renew_lease(
-                "console-test",
+                controller_label,
                 principal={"principal_id": f"console-{expected.lower()}"},
                 **claim_options,
             )
@@ -978,14 +980,14 @@ def _assert_controller_state(
                     locks.enter_context(
                         F.goalflight_wake.register_lease_holder(
                             project_root,
-                            controller_label="console-test",
+                            controller_label=controller_label,
                             lease_nonce=lease.nonce,
                         )
                     )
                 elif holder_mode == "released":
                     released = F.goalflight_wake.register_lease_holder(
                         project_root,
-                        controller_label="console-test",
+                        controller_label=controller_label,
                         lease_nonce=lease.nonce,
                     )
                     released.close()
@@ -996,7 +998,7 @@ def _assert_controller_state(
                     locks.enter_context(
                         F.goalflight_wake.register_waiter(
                             project_root,
-                            controller_label="console-test",
+                            controller_label=controller_label,
                             kind="listener",
                             generation_key=lease.nonce,
                         )
@@ -1004,12 +1006,12 @@ def _assert_controller_state(
 
                 holder_lock = F.goalflight_wake.lease_holder_alive(
                     project_root,
-                    controller_label="console-test",
+                    controller_label=controller_label,
                     lease_nonce=lease.nonce,
                 )
                 live_waiters = F.goalflight_wake.live_waiters(
                     project_root,
-                    controller_label="console-test",
+                    controller_label=controller_label,
                     prune_dead=False,
                 )
                 live_waiter_count = (
@@ -1019,7 +1021,7 @@ def _assert_controller_state(
                 dispatch_id = f"dispatch-{expected.lower()}"
                 in_flight_count = F._journal_in_flight_count(
                     reader,
-                    controller_label="console-test",
+                    controller_label=controller_label,
                 )
                 expected_inputs = {
                     "ALIVE": (True, 1, 1),
@@ -1068,6 +1070,21 @@ def _assert_controller_state(
                         "skill_version": "test",
                     }
                 ]
+                supervise_command = F.goalflight_wake.coverage_supervise_command(
+                    project_root,
+                    controller_label=controller_label,
+                    lease_nonce=lease.nonce,
+                )
+                if supervisor_mode == "running":
+                    process_listing = [(4242, supervise_command)]
+                elif supervisor_mode == "absent":
+                    process_listing = []
+                elif supervisor_mode == "unknown":
+                    process_listing = None
+                else:
+                    raise AssertionError(
+                        f"unknown supervisor mode: {supervisor_mode}"
+                    )
                 with (
                     mock.patch.object(F.goalflight_status, "status_payload", return_value=machine_status),
                     mock.patch.object(F.goalflight_fleet_status_cli, "build_fleet_status", return_value={}),
@@ -1076,6 +1093,11 @@ def _assert_controller_state(
                     mock.patch.object(F.goalflight_session_status, "aggregate_status", return_value={}),
                     mock.patch.object(F.goalflight_status, "milestone_status_payload", return_value={}),
                     mock.patch.object(F.goalflight_messages, "controller_mail_summary", return_value={"needs": []}),
+                    mock.patch.object(
+                        F.goalflight_wake,
+                        "_process_listing",
+                        return_value=process_listing,
+                    ),
                 ):
                     fleet = F.build_fleet_plane(generation_id=f"fleet-{expected.lower()}")
                     attention = F.build_attention_plane(
@@ -1092,36 +1114,72 @@ def _assert_controller_state(
                     item for item in attention["items"]
                     if item["kind"] == "controller_hung"
                 ]
+                expect_hung_item = (
+                    expected == "HUNG" and supervisor_mode != "running"
+                )
                 assert_true(
-                    "only HUNG enters attention",
-                    len(hung_items) == (1 if expected == "HUNG" else 0),
+                    "only unsupervised or indeterminate HUNG enters attention",
+                    len(hung_items) == (1 if expect_hung_item else 0),
                 )
                 if expected == "HUNG":
-                    assert_true(
-                        "HUNG carries the wake layer's exact listener command",
-                        hung_items[0]["action"]
-                        == F.goalflight_wake.listener_start_command(
-                            project_root,
-                            controller_label="console-test",
-                        ),
-                    )
-                    hung_context = F._controller_contexts_by_session(
+                    listener_command = F.goalflight_wake.listener_start_command(
                         project_root,
-                        machine_status["dispatch"]["records"],
-                        include_all=True,
-                        include_locked_ended=True,
-                        authority=reader,
-                        open_if_missing=False,
+                        controller_label=controller_label,
                     )
-                    last_seen = next(iter(hung_context.values())).get("last_seen")
-                    assert_true(
-                        "HUNG last_seen is a real journal timestamp",
-                        last_seen is not None,
-                    )
-                    assert_true(
-                        "HUNG observed_at is the normalised last_seen, not None",
-                        hung_items[0]["observed_at"] == F._iso_timestamp(last_seen),
-                    )
+                    if supervisor_mode == "running":
+                        assert_true(
+                            "supervised HUNG suppresses controller-facing depth",
+                            not hung_items,
+                        )
+                    elif supervisor_mode == "unknown":
+                        assert_true(
+                            "UNKNOWN HUNG says detection was inconclusive",
+                            "could not tell whether `supervise`"
+                            in hung_items[0]["action"],
+                        )
+                        assert_true(
+                            "UNKNOWN HUNG omits the direct listener",
+                            listener_command not in hung_items[0]["action"],
+                        )
+                        encoded_hung = json.dumps(hung_items[0], sort_keys=True)
+                        assert_true(
+                            "UNKNOWN HUNG guidance stays numberless",
+                            "0/" not in encoded_hung
+                            and "listener pool n=" not in encoded_hung,
+                        )
+                        assert_true(
+                            "UNKNOWN HUNG keeps numberless verification context",
+                            "wake ownership needs verification"
+                            in str(hung_items[0]["headline"]),
+                        )
+                        assert_true(
+                            "UNKNOWN HUNG does not assert zero coverage",
+                            "no live wake waiter"
+                            not in str(hung_items[0]["headline"]),
+                        )
+                    else:
+                        assert_true(
+                            "unsupervised HUNG carries the exact listener command",
+                            hung_items[0]["action"] == listener_command,
+                        )
+                    if hung_items:
+                        hung_context = F._controller_contexts_by_session(
+                            project_root,
+                            machine_status["dispatch"]["records"],
+                            include_all=True,
+                            include_locked_ended=True,
+                            authority=reader,
+                            open_if_missing=False,
+                        )
+                        last_seen = next(iter(hung_context.values())).get("last_seen")
+                        assert_true(
+                            "HUNG last_seen is a real journal timestamp",
+                            last_seen is not None,
+                        )
+                        assert_true(
+                            "HUNG observed_at is the normalised last_seen, not None",
+                            hung_items[0]["observed_at"] == F._iso_timestamp(last_seen),
+                        )
 
 
 def test_controller_state_alive_with_held_lease_and_one_live_waiter() -> None:
@@ -1130,6 +1188,93 @@ def test_controller_state_alive_with_held_lease_and_one_live_waiter() -> None:
         holder_mode="held",
         waiter_count=1,
         attempt_mode="running",
+    )
+
+
+def test_controller_state_hung_with_live_supervisor_suppresses_depth() -> None:
+    _assert_controller_state(
+        "HUNG",
+        holder_mode="held",
+        waiter_count=0,
+        attempt_mode="running",
+        supervisor_mode="running",
+    )
+
+
+def test_controller_state_hung_with_unknown_supervisor_omits_listener() -> None:
+    _assert_controller_state(
+        "HUNG",
+        holder_mode="held",
+        waiter_count=0,
+        attempt_mode="running",
+        supervisor_mode="unknown",
+    )
+
+
+def test_controller_state_hung_long_label_binds_live_supervisor() -> None:
+    _assert_controller_state(
+        "HUNG",
+        holder_mode="held",
+        waiter_count=0,
+        attempt_mode="running",
+        supervisor_mode="running",
+        controller_label="console-controller-" + ("x" * 80),
+    )
+
+
+def test_controller_state_hung_long_label_keeps_unsupervised_command() -> None:
+    _assert_controller_state(
+        "HUNG",
+        holder_mode="held",
+        waiter_count=0,
+        attempt_mode="running",
+        supervisor_mode="absent",
+        controller_label="console-controller-" + ("y" * 80),
+    )
+
+
+def test_hung_attention_samples_process_table_once_for_multiple_rows() -> None:
+    contexts = {
+        "nonce-one": {
+            "label": "controller-one",
+            "generation": 1,
+            "liveness_state": "HUNG",
+            "last_seen": None,
+        },
+        "nonce-two": {
+            "label": "controller-two",
+            "generation": 2,
+            "liveness_state": "HUNG",
+            "last_seen": None,
+        },
+    }
+    machine = {"capacity_state": {"leases": {}}, "dispatch": {"records": []}}
+    with tempfile.TemporaryDirectory() as td:
+        project_root = Path(td).resolve()
+        with (
+            mock.patch.object(
+                F,
+                "_controller_contexts_by_session",
+                return_value=contexts,
+            ),
+            mock.patch.object(
+                F.goalflight_wake,
+                "_process_listing",
+                return_value=[],
+            ) as process_probe,
+        ):
+            rows = F._controller_attention_rows([project_root], machine)
+    assert_true("both HUNG rows are projected", len(rows) == 2)
+    assert_true("process table is sampled once", process_probe.call_count == 1)
+    assert_true(
+        "process probe leaves most of the attention budget for publication",
+        F.HUNG_SUPERVISOR_PROBE_TIMEOUT_S
+        <= producer.DEFAULT_BUDGET_S["attention"] / 4,
+    )
+    assert_true(
+        "batch passes the bounded fleet timeout to the process probe",
+        process_probe.call_args
+        == mock.call(timeout_s=F.HUNG_SUPERVISOR_PROBE_TIMEOUT_S),
     )
 
 
@@ -2708,7 +2853,13 @@ def test_controller_panel_lists_live_first_and_shows_retire_command() -> None:
             == "python3 scripts/goalflight_session_status.py --retire battery-tool-v2",
         )
         assert_true("live row has no retire command", rows[0]["retire_command"] is None)
-        assert_true("listener depth is n/target scalars", rows[0]["listener_target"] == F.goalflight_wake.DEFAULT_LISTENER_SLOTS)
+        assert_true(
+            "normal controller output omits listener depth from every real row",
+            all(
+                "listener_live" not in row and "listener_target" not in row
+                for row in rows
+            ),
+        )
         encoded = json.dumps(fleet)
         assert_true("controller panel publishes no absolute paths", str(project_root) not in encoded)
         assert_true("constructed controller-panel fleet build stays under one second", elapsed < 1.0)
@@ -3010,8 +3161,6 @@ def test_controllers_aggregate_by_owner_label_across_repos_mutation_pair() -> No
             "in_flight_count": 1,
             "owned_live": 0,
             "last_seen": "2030-01-01T00:00:00+00:00",
-            "listener_live": 4,
-            "listener_target": 4,
             "generation": 1,
             "retire_command": None,
             "controller_key": "clone-a:webui",
@@ -3026,8 +3175,6 @@ def test_controllers_aggregate_by_owner_label_across_repos_mutation_pair() -> No
             "in_flight_count": 1,
             "owned_live": 0,
             "last_seen": "2030-01-02T00:00:00+00:00",
-            "listener_live": 4,
-            "listener_target": 4,
             "generation": 2,
             "retire_command": None,
             "controller_key": "kiln:webui",
@@ -3093,8 +3240,6 @@ def test_one_repo_several_controllers_keep_workers_partitioned_mutation_pair() -
             "in_flight_count": 1,
             "owned_live": 0,
             "last_seen": "2030-01-01T00:00:00+00:00",
-            "listener_live": 1,
-            "listener_target": 4,
             "generation": 1,
             "retire_command": None,
             "controller_key": f"battery-tool-v2:{label}",
@@ -3366,6 +3511,11 @@ def main() -> None:
     test_live_worker_count_ignores_permanent_terminal_history()
     test_controller_liveness_projection_rejects_unregistered_scalar()
     test_controller_state_alive_with_held_lease_and_one_live_waiter()
+    test_controller_state_hung_with_live_supervisor_suppresses_depth()
+    test_controller_state_hung_with_unknown_supervisor_omits_listener()
+    test_controller_state_hung_long_label_binds_live_supervisor()
+    test_controller_state_hung_long_label_keeps_unsupervised_command()
+    test_hung_attention_samples_process_table_once_for_multiple_rows()
     test_controller_state_hung_with_nonterminal_attempt()
     test_hung_attention_observed_at_follows_last_seen_or_stays_unknown()
     test_controller_state_waiting_on_user_with_terminal_attempt()

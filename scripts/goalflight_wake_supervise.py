@@ -355,6 +355,7 @@ def run_supervisor(
     heartbeat_s: float = 120.0,
     coverage_s: float = 120.0,
     items: list[tuple[str, str]] | None = None,
+    emit_depth: bool = False,
 ) -> int:
     """Run until the lease dies, stdout breaks, or the host asks to stop."""
     nonce = str(lease_nonce or "").strip()
@@ -375,6 +376,11 @@ def run_supervisor(
             controller_label=controller_label,
             lease_nonce=nonce,
         )
+    rearm_command = wake.coverage_supervise_command(
+        project_root,
+        controller_label=controller_label,
+        lease_nonce=nonce,
+    )
     if not items:
         _emit(
             host,
@@ -382,6 +388,7 @@ def run_supervisor(
                 "kind": "supervise",
                 "type": "stop",
                 "reason": "did-not-arm",
+                "rearm": rearm_command,
                 "detail": "coverage_rearm_commands returned no children",
             },
         )
@@ -395,17 +402,19 @@ def run_supervisor(
         state = _nonce_state(host, nonce)
         if state == "dead":
             live, target = _live_target(slots)
+            record: dict[str, object] = {
+                "kind": "supervise",
+                "type": "stop",
+                "reason": "dead-lease-nonce",
+                "scope": "supervisor",
+                "rearm": rearm_command,
+                "detail": "goalflight_session_status live nonce changed or vanished",
+            }
+            if emit_depth:
+                record.update(live=live, target=target)
             _emit(
                 host,
-                {
-                    "kind": "supervise",
-                    "type": "stop",
-                    "reason": "dead-lease-nonce",
-                    "scope": "supervisor",
-                    "live": live,
-                    "target": target,
-                    "detail": "goalflight_session_status live nonce changed or vanished",
-                },
+                record,
             )
             return SUPERVISE_STOP_EXIT
         if state == "unreadable":
@@ -429,6 +438,8 @@ def run_supervisor(
 
     def emit_counts(kind: str) -> bool:
         nonlocal seq
+        if not emit_depth:
+            return True
         live, target = _live_target(slots)
         record: dict[str, object] = {
             "kind": "supervise",
@@ -451,17 +462,19 @@ def run_supervisor(
         state = _nonce_state(host, nonce)
         if state == "dead":
             live, target = _live_target(slots)
+            record = {
+                "kind": "supervise",
+                "type": "stop",
+                "reason": "dead-lease-nonce",
+                "scope": "supervisor",
+                "rearm": rearm_command,
+                "detail": "goalflight_session_status live nonce changed or vanished",
+            }
+            if emit_depth:
+                record.update(live=live, target=target)
             _emit(
                 host,
-                {
-                    "kind": "supervise",
-                    "type": "stop",
-                    "reason": "dead-lease-nonce",
-                    "scope": "supervisor",
-                    "live": live,
-                    "target": target,
-                    "detail": "goalflight_session_status live nonce changed or vanished",
-                },
+                record,
             )
             host.kill_all()
             return SUPERVISE_STOP_EXIT
@@ -525,19 +538,21 @@ def run_supervisor(
                     "slot" if reason in _SLOT_STOP_REASONS else "supervisor"
                 )
                 slot.stopped_reason = reason
+                record = {
+                    "kind": "supervise",
+                    "type": "stop",
+                    "reason": reason,
+                    "scope": scope,
+                    "child": slot.kind,
+                    "exit": event.returncode,
+                    "rearm": rearm_command,
+                    "detail": str(event.output or "").strip()[:180],
+                }
+                if emit_depth:
+                    record.update(live=live, target=target)
                 _emit(
                     host,
-                    {
-                        "kind": "supervise",
-                        "type": "stop",
-                        "reason": reason,
-                        "scope": scope,
-                        "child": slot.kind,
-                        "exit": event.returncode,
-                        "live": live,
-                        "target": target,
-                        "detail": str(event.output or "").strip()[:180],
-                    },
+                    record,
                 )
                 if scope == "supervisor":
                     host.kill_all()
@@ -545,18 +560,19 @@ def run_supervisor(
                 continue
             delay = slot.backoff_s
             slot.next_start = host.now + delay
+            record = {
+                "kind": "supervise",
+                "type": "restart",
+                "child": slot.kind,
+                "exit": event.returncode,
+                "reason": reason,
+                "backoff_s": delay,
+            }
+            if emit_depth:
+                record.update(live=live, target=target)
             if not _emit(
                 host,
-                {
-                    "kind": "supervise",
-                    "type": "restart",
-                    "child": slot.kind,
-                    "exit": event.returncode,
-                    "reason": reason,
-                    "backoff_s": delay,
-                    "live": live,
-                    "target": target,
-                },
+                record,
             ):
                 host.kill_all()
                 return 0
@@ -1051,4 +1067,5 @@ def cmd_supervise(args: Any) -> int:
         host=host,
         heartbeat_s=heartbeat_s,
         coverage_s=coverage_s,
+        emit_depth=bool(getattr(args, "chatty", False)),
     )

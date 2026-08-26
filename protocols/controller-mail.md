@@ -109,7 +109,9 @@ watchdog from the same `coverage_rearm_commands` generator used everywhere else,
 multiplexes every child's stdout line-by-line into its own stdout, restarts
 deaths, and re-arms a doorbell after a ring. The host watches this one task.
 Individual `follow` / `listen` / `--watch-follow` commands remain valid for hosts
-that arm them separately; doctor and status still read those waiters.
+that arm them separately; they are only offered after supervisor absence is proven.
+If `supervise` is running, restart it; if detection is UNKNOWN, do not arm a
+component until supervision is resolved. Doctor and status still read those waiters.
 
 Do **not** run this with shell `&`, `nohup`, a detached dispatcher, or an ordinary
 background-task surface that reports output only when the process exits. The host
@@ -122,8 +124,9 @@ Each flushed line is a wake. Child kinds pass through unchanged:
 - stream: compact JSON `{"kind":"heartbeat"| "event"|"frontier",...}`
 - backup: pending headlines plus one `advance: <command>` line, or a ring
 - watchdog: JSON `{"kind":"event",...}` with `listener-dead` / related payload
-- supervise: `{"kind":"supervise","type":"heartbeat"|"coverage"|"restart"|"stop",...}`
-  carrying `live`/`target` so silence and deafness never look the same
+- supervise: default output keeps actionable `restart` records with their reason
+  and `stop` records with the supervisor `rearm` command; chatty output also
+  restores `heartbeat` / `coverage` and `live` / `target` diagnostics
 
 The supervisor's child-exit taxonomy:
 
@@ -143,7 +146,7 @@ A dead lease nonce is re-read through `goalflight_session_status.probe_live_sess
 hand-constructed. On mismatch or a vanished **readable** live session the supervisor
 emits `{"kind":"supervise","type":"stop","reason":"dead-lease-nonce"}` and exits 3.
 An unreadable journal is "I could not find out" and stays retryable at both startup
-and child-death. `live` counts children observed holding a wake flock or that
+and child-death. Under chatty output, `live` counts children observed holding a wake flock or that
 emitted a durable armed/ring line, not PIDs that merely exist. A missed lock sample
 on a successful ring re-arms; it does not stop the slot. Child-exit classification
 reads the child's diagnostic channel (stderr plus structured child-exit JSON
@@ -195,8 +198,9 @@ scheduling jitter, so death requires three full missed heartbeat intervals (360
 seconds at the default cadence). Every successful stdout record updates generation-
 bound durable liveness state. The separately tracked watchdog below reads that state on
 each poll; stale, faulted, missing, or invalid state makes it emit a structural
-`event`/`listener-dead` record on stdout and exit, so the tracked task wakes the
-controller with the exact persistent re-arm command. Any event is also liveness
+`event`/`listener-dead` record on stdout and exit. In the decomposed unsupervised
+path that record carries the exact persistent re-arm command; under `supervise` it
+keeps the reason but omits the component action, and recovery is a supervisor restart. Any event is also liveness
 evidence and defers the next idle heartbeat, so a batched heartbeat never claims "no
 mail" beside an event. An unchanged frontier emits only every 15 minutes; a change
 emits on the next idle beat.
@@ -206,8 +210,10 @@ that failure detectable. Keep **six** backup doorbells as separate tracked
 tasks, each `--listener-slots 6`. During its existing bounded mail wait, a doorbell
 also checks the generation-scoped watchdog lock. Once it has observed the watchdog,
 or after the same 15-second startup grace used for persistent state, a missing
-watchdog lock makes the doorbell release its own lock, flush a structural
-`event`/`watchdog-dead` record with the exact watchdog re-arm command, and exit:
+watchdog lock makes the doorbell release its own lock and flush a structural
+`event`/`watchdog-dead` record. The unsupervised path includes the exact watchdog
+re-arm command; `supervise` forwards the reason without that action, so restart the
+supervisor instead. In the decomposed unsupervised path, arm the backup pool with:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py listen \

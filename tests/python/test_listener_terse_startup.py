@@ -73,7 +73,8 @@ LISTEN_EXIT_THIN_HINT_SNAPSHOT = (
 # every-startup machine surface.  Compact wake state is different: the later
 # persistent-listener contract needs ``wake_mode`` to choose pool versus
 # stream/backup/watchdog arming, and ``reason`` distinguishes healthy, missing,
-# stale, faulted, and unavailable coverage.  Keep this an exact set so that
+# stale, faulted, and unavailable coverage. ``supervisor`` is a compact enum
+# (running/absent/unknown) with no extra path. Keep this an exact set so that
 # operational additions remain deliberate rather than turning into key sprawl.
 LISTENER_DEPTH_KEYS = {
     "live",
@@ -84,6 +85,7 @@ LISTENER_DEPTH_KEYS = {
     "separate_tracked_tasks",
     "wake_mode",
     "reason",
+    "supervisor",
 }
 
 
@@ -115,6 +117,18 @@ def _claim(project: Path, label: str = "terse-ctl") -> journal.LeaseIdentity:
     )
     assert claimed.committed and claimed.value is not None
     return claimed.value
+
+
+def _env_with_empty_process_listing(
+    env: dict[str, str],
+    directory: Path,
+) -> dict[str, str]:
+    shim_dir = directory / "empty-process-listing"
+    shim_dir.mkdir(exist_ok=True)
+    ps_shim = shim_dir / "ps"
+    ps_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    ps_shim.chmod(0o755)
+    return {**env, "PATH": f"{shim_dir}:{env.get('PATH', '')}"}
 
 
 def _post(env: dict[str, str], project: Path, label: str, text: str) -> None:
@@ -200,6 +214,7 @@ def test_controller_startup_stdout_is_json_without_preprocessing(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
     project, env = isolated
+    env = _env_with_empty_process_listing(env, project.parent)
     authority = journal.open_or_create_journal(project)
     assert authority.prepare_attempt("terse-startup-work").committed
     host = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
@@ -255,6 +270,7 @@ def test_controller_startup_json_is_terse_with_work_in_flight(
         "_controller_process_identity",
         lambda pid: {"pid": pid, "start_token": "terse-claim-token"},
     )
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
     result = sessions.claim_controller_startup(
         project, pid=81001, label="terse-ctl", role="controller"
     )

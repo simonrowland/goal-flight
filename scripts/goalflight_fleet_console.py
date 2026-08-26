@@ -3,9 +3,11 @@
 
 This module consumes the aggregate status authority, then uses bounded
 read-only journal and status-sidecar evidence to explain or reconcile authority
-disagreements. It does not inspect tails, marker bodies, or process tables, and
-it does not invent a worker classification. Fleet and attention samples remain
-independent so a fast mailbox refresh never pretends to refresh worker liveness.
+disagreements. It does not inspect tails or marker bodies, and it does not invent
+a worker classification. The attention plane samples the process table once when
+HUNG controllers need supervision-aware recovery advice. Fleet and attention
+samples remain independent so a fast mailbox refresh never pretends to refresh
+worker liveness.
 """
 
 from __future__ import annotations
@@ -66,6 +68,10 @@ GENERIC_PROJECT_BASENAMES = frozenset({"project", "proj"})
 # Bound even malformed/multi-active history to the newest eight per label;
 # ended generations remain available through immutable slow history.
 CONTROLLER_GENERATION_PROBE_LIMIT = 8
+# The attention producer has a 3s wall budget and an observed 1.12s baseline.
+# A stuck process-table read must degrade to UNKNOWN without preserving a stale
+# ABSENT/direct-listener action from the prior sample.
+HUNG_SUPERVISOR_PROBE_TIMEOUT_S = 0.5
 
 # The short-poll mirror keeps a small warm terminal window for continuity.
 # Permanent immutable rows live in history-data.js instead: per project the
@@ -298,8 +304,6 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             "parent_project_id": None,
             "parent_name": None,
             "controller_liveness_state": None,
-            "listener_live": None,
-            "listener_target": None,
             "wake_mode": None,
             "in_flight_count": None,
             "owned_live": None,
@@ -1307,8 +1311,6 @@ def _empty_controller_context() -> dict[str, object | None]:
         "label": None,
         "generation": None,
         "liveness_state": "UNKNOWN",
-        "listener_live": None,
-        "listener_target": None,
         "wake_mode": None,
         "in_flight_count": 0,
         "last_seen": None,
@@ -1327,8 +1329,6 @@ def _controller_panel_row(
         state = "UNKNOWN"
     generation = context.get("generation")
     in_flight = context.get("in_flight_count")
-    listener_live = context.get("listener_live")
-    listener_target = context.get("listener_target")
     wake_mode = context.get("wake_mode")
     retire = (
         _controller_retire_command(label)
@@ -1360,8 +1360,6 @@ def _controller_panel_row(
         "parent_project_id": parent["parent_project_id"],
         "parent_name": parent["parent_name"],
         "controller_liveness_state": state,
-        "listener_live": listener_live if isinstance(listener_live, int) and not isinstance(listener_live, bool) else None,
-        "listener_target": listener_target if isinstance(listener_target, int) and not isinstance(listener_target, bool) else None,
         "wake_mode": wake_mode if wake_mode in {"persistent", "portable"} else None,
         "in_flight_count": in_flight if isinstance(in_flight, int) and not isinstance(in_flight, bool) and in_flight >= 0 else 0,
         "owned_live": 0,
@@ -1431,8 +1429,6 @@ def _aggregate_controller_rows(
         )
         if new_rank < current_rank:
             current["controller_liveness_state"] = row.get("controller_liveness_state")
-            current["listener_live"] = row.get("listener_live")
-            current["listener_target"] = row.get("listener_target")
             current["wake_mode"] = row.get("wake_mode")
             current["generation"] = row.get("generation")
             current["retire_command"] = row.get("retire_command")
@@ -1449,6 +1445,8 @@ def _aggregate_controller_rows(
         if new_seen > current_seen:
             current["last_seen"] = row.get("last_seen")
     for label, row in grouped.items():
+        row.pop("listener_live", None)
+        row.pop("listener_target", None)
         row["owned_live"] = owned.get(label, 0)
         row["controller_key"] = _display(label, limit=128)
         if row.get("controller_liveness_state") != "DEAD":
@@ -1726,20 +1724,6 @@ def _controller_contexts_by_session(
             last_seen = generation_rows[0].get("renewed_at") or generation_rows[0].get(
                 "claimed_at"
             )
-        listener_live = (
-            wake_coverage.get("live_waiters")
-            if isinstance(wake_coverage, dict)
-            else None
-        )
-        if not isinstance(listener_live, int) or isinstance(listener_live, bool):
-            listener_live = None
-        listener_target = (
-            wake_coverage.get("target_waiters")
-            if isinstance(wake_coverage, dict)
-            else None
-        )
-        if not isinstance(listener_target, int) or isinstance(listener_target, bool):
-            listener_target = None
         wake_mode = (
             wake_coverage.get("wake_mode")
             if isinstance(wake_coverage, dict)
@@ -1753,8 +1737,6 @@ def _controller_contexts_by_session(
                 live_waiter_count,
                 in_flight_count,
             ),
-            "listener_live": listener_live,
-            "listener_target": listener_target,
             "wake_mode": (
                 wake_mode if wake_mode in {"persistent", "portable"} else None
             ),
@@ -2918,6 +2900,7 @@ def _controller_attention_rows(
 ) -> list[dict[str, Any]]:
     """Project only HUNG controllers into operator attention."""
     rows: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     seen_roots: set[str] = set()
     for supplied_root in project_roots:
         root = _canonical_root(str(supplied_root))
@@ -2944,33 +2927,92 @@ def _controller_attention_rows(
         for session_id, context in sorted(contexts.items()):
             if context.get("liveness_state") != "HUNG":
                 continue
-            label = _display(context.get("label"), limit=64)
-            if label is None:
-                label = _controller_session_digest(session_id) or "unknown"
+            raw_label_value = context.get("label")
+            raw_label = (
+                raw_label_value.strip()
+                if isinstance(raw_label_value, str) and raw_label_value.strip()
+                else ""
+            )
+            display_label = _display(raw_label, limit=64)
+            if display_label is None:
+                display_label = _controller_session_digest(session_id) or "unknown"
             generation = context.get("generation")
             generation_text = (
                 f" generation {generation}" if isinstance(generation, int) else ""
             )
-            rows.append(
+            candidates.append(
                 {
-                    "dispatch_id": _display(
-                        f"{_project_id(root)}:controller:{label}:generation-{generation}",
-                        limit=128,
-                    ),
-                    "seq": None,
-                    "kind": "controller_hung",
-                    "action": goalflight_wake.listener_start_command(
-                        root,
-                        controller_label=label,
-                    ),
-                    "observed_at": _iso_timestamp(context.get("last_seen")),
-                    "headline": _display(
-                        f"Controller {label}{generation_text} is HUNG: "
-                        "in-flight work has no live wake waiter",
-                        limit=96,
-                    ),
+                    "root": root,
+                    "session_id": session_id,
+                    "context": context,
+                    "raw_label": raw_label,
+                    "display_label": display_label,
+                    "generation": generation,
+                    "generation_text": generation_text,
                 }
             )
+
+    supervisor_states = (
+        goalflight_wake.supervisor_generation_states(
+            (
+                (
+                    candidate["root"],
+                    candidate["raw_label"],
+                    candidate["session_id"],
+                )
+                for candidate in candidates
+            ),
+            process_timeout_s=HUNG_SUPERVISOR_PROBE_TIMEOUT_S,
+        )
+        if candidates
+        else []
+    )
+    for candidate, supervisor in zip(candidates, supervisor_states):
+        if supervisor == goalflight_wake.SUPERVISOR_RUNNING:
+            # The supervisor owns, measures, and repairs this generation's wake
+            # pool. Its coverage-change record is authoritative; repeating a
+            # controller-side HUNG/depth alarm here is a false action surface.
+            continue
+        root = str(candidate["root"])
+        context = candidate["context"]
+        raw_label = str(candidate["raw_label"])
+        display_label = str(candidate["display_label"])
+        generation = candidate["generation"]
+        generation_text = str(candidate["generation_text"])
+        component_command = goalflight_wake.listener_start_command(
+            root,
+            controller_label=raw_label,
+        )
+        action_policy = goalflight_wake.supervisor_operator_action(
+            supervisor,
+            component_command=component_command,
+        )
+        headline = (
+            f"Controller {display_label}{generation_text} wake ownership "
+            "needs verification while work remains in flight"
+            if supervisor == goalflight_wake.SUPERVISOR_UNKNOWN
+            else (
+                f"Controller {display_label}{generation_text} is HUNG: "
+                "in-flight work has no live wake waiter"
+            )
+        )
+        rows.append(
+            {
+                "dispatch_id": _display(
+                    f"{_project_id(root)}:controller:"
+                    f"{display_label}:generation-{generation}",
+                    limit=128,
+                ),
+                "seq": None,
+                "kind": "controller_hung",
+                "action": (
+                    action_policy["command"]
+                    or action_policy["instruction"]
+                ),
+                "observed_at": _iso_timestamp(context.get("last_seen")),
+                "headline": _display(headline, limit=96),
+            }
+        )
     # Same key as mail rows and the merged attention plane: dated first,
     # then by observed_at, then dispatch_id. Leaving this on dispatch_id
     # alone would re-sort HUNG rows away from their timestamps the moment

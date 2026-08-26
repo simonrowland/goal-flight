@@ -1302,11 +1302,10 @@
     var label = el("div", "controller-label");
     var project = el("div", "controller-project");
     var health = el("div", "controller-health unknown");
-    var pool = el("div", "controller-pool");
     var inflight = el("div", "controller-inflight");
     var seen = el("div", "controller-seen");
     var action = el("div", "controller-action");
-    [expand, label, project, health, pool, inflight, seen, action].forEach(function (node) {
+    [expand, label, project, health, inflight, seen, action].forEach(function (node) {
       row.appendChild(node);
     });
     var owned = el("div", "controller-owned");
@@ -1314,7 +1313,7 @@
     wrap.appendChild(owned);
     wrap._gf = {
       row: row, expand: expand, label: label, project: project, health: health,
-      pool: pool, inflight: inflight, seen: seen, action: action, owned: owned,
+      inflight: inflight, seen: seen, action: action, owned: owned,
       ownedNodes: Object.create(null), ownerKey: null
     };
     expand.addEventListener("click", function () {
@@ -1336,10 +1335,6 @@
     refs.project.textContent = textValue(item.parent_name || item.project_name);
     refs.health.className = "controller-health " + state.toLowerCase();
     refs.health.textContent = state;
-    var live = item.listener_live;
-    var target = item.listener_target;
-    refs.pool.textContent = (live == null ? "?" : String(live)) +
-      "/" + (target == null ? "?" : String(target));
     var ownedCount = item.owned_live == null ? item.in_flight_count : item.owned_live;
     refs.inflight.textContent = ownedCount == null ? "0" : String(ownedCount);
     refs.seen.textContent = ageFrom(item.last_seen, now);
@@ -1486,8 +1481,6 @@
       parent_project_id: null,
       parent_name: "no recorded owner",
       controller_liveness_state: "UNKNOWN",
-      listener_live: null,
-      listener_target: null,
       wake_mode: null,
       in_flight_count: liveCount,
       owned_live: liveCount,

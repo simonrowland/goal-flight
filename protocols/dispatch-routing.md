@@ -193,8 +193,10 @@ python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file 
 
 The dispatcher prints `DISPATCH-LAUNCHED` with the dispatch id, status JSON,
 tail path, and worker PID, then returns immediately. Controller entry auto-claims
-the canonical-project lease without stealing a live different generation. Arm one
-generation-bound listener in the background using the returned label and nonce:
+the canonical-project lease without stealing a live different generation. When
+supervisor absence is proven, arm one generation-bound listener in the background
+using the returned label and nonce. Restart a live supervisor instead; on UNKNOWN,
+resolve supervision before arming a direct component:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py listen \
