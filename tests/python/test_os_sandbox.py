@@ -182,6 +182,135 @@ def case_adapter_os_sandbox_is_platform_scoped() -> None:
         goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
 
 
+def _supporting_os_sandbox_manifest() -> dict:
+    return {
+        "agent_id": "grok",
+        "permission_surface": {
+            "os_sandbox": {
+                "supported_profiles": ["off", "read-only", "workspace-write"],
+                "default_profile": "off",
+                "implementation": "runner:sandbox-exec",
+                "platform_supported_profiles": {
+                    "darwin": ["off", "read-only", "workspace-write"],
+                    "linux": ["off"],
+                    "wsl": ["off"],
+                    "windows": ["off"],
+                },
+            }
+        },
+    }
+
+
+def case_os_sandbox_request_distinguishes_manifest_read_failures() -> None:
+    """Unreadable/invalid are retryable; missing file and missing capability are not.
+
+    Classification must run the real reader against real bytes and modes, not a
+    pre-made verdict handed to the gate.
+    """
+    old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
+    try:
+        with tempfile.TemporaryDirectory(prefix="gf-os-sandbox-read-") as tmp:
+            tmp_path = Path(tmp)
+            goalflight_adapter_readiness.ADAPTERS_DIR = tmp_path
+
+            missing, missing_reason = goalflight_adapter_readiness.load_manifest_with_reason(
+                "grok-acp"
+            )
+            assert missing is None, missing
+            assert missing_reason == "adapter_manifest_missing", missing_reason
+            missing_gate = goalflight_adapter_readiness.validate_os_sandbox_request(
+                "grok-acp", OS_SANDBOX_READ_ONLY
+            )
+            assert missing_gate is not None
+            assert missing_gate["reason"] == "adapter_manifest_missing", missing_gate
+            assert missing_gate["retryable"] is False, missing_gate
+            assert not goalflight_adapter_readiness.os_sandbox_refusal_is_retryable(
+                missing_gate
+            )
+
+            invalid_path = tmp_path / "grok.json"
+            invalid_path.write_bytes(b"{not-json")
+            invalid, invalid_reason = goalflight_adapter_readiness.load_manifest_with_reason(
+                "grok-acp"
+            )
+            assert invalid is None, invalid
+            assert invalid_reason == "adapter_manifest_invalid", invalid_reason
+            invalid_gate = goalflight_adapter_readiness.validate_os_sandbox_request(
+                "grok-acp", OS_SANDBOX_READ_ONLY
+            )
+            assert invalid_gate is not None
+            assert invalid_gate["reason"] == "adapter_manifest_invalid", invalid_gate
+            assert invalid_gate["retryable"] is True, invalid_gate
+            assert goalflight_adapter_readiness.os_sandbox_refusal_is_retryable(
+                invalid_gate
+            )
+            invalid_path.unlink()
+
+            (tmp_path / "grok.json").write_text(
+                json.dumps({"agent_id": "grok", "permission_surface": {}})
+            )
+            undeclared = goalflight_adapter_readiness.validate_os_sandbox_request(
+                "grok-acp", OS_SANDBOX_READ_ONLY
+            )
+            assert undeclared is not None
+            assert undeclared["reason"] == "os_sandbox_undeclared", undeclared
+            assert undeclared["retryable"] is False, undeclared
+            assert not goalflight_adapter_readiness.os_sandbox_refusal_is_retryable(
+                undeclared
+            )
+
+            (tmp_path / "grok.json").write_text(
+                json.dumps(
+                    {
+                        "agent_id": "grok",
+                        "permission_surface": {
+                            "os_sandbox": {
+                                "supported_profiles": ["off"],
+                                "default_profile": "off",
+                            }
+                        },
+                    }
+                )
+            )
+            unsupported = goalflight_adapter_readiness.validate_os_sandbox_request(
+                "grok-acp", OS_SANDBOX_READ_ONLY
+            )
+            assert unsupported is not None
+            assert unsupported["reason"] == "os_sandbox_unsupported", unsupported
+            assert unsupported["retryable"] is False, unsupported
+            assert unsupported["supported_profiles"] == ["off"], unsupported
+
+            readable = tmp_path / "grok.json"
+            readable.write_text(json.dumps(_supporting_os_sandbox_manifest()))
+            readable.chmod(0)
+            try:
+                unread, unread_reason = (
+                    goalflight_adapter_readiness.load_manifest_with_reason("grok-acp")
+                )
+                assert unread is None, unread
+                assert unread_reason == "adapter_manifest_unreadable", unread_reason
+                unread_gate = goalflight_adapter_readiness.validate_os_sandbox_request(
+                    "grok-acp", OS_SANDBOX_READ_ONLY
+                )
+                assert unread_gate is not None
+                assert unread_gate["reason"] == "adapter_manifest_unreadable", unread_gate
+                assert unread_gate["retryable"] is True, unread_gate
+                assert goalflight_adapter_readiness.os_sandbox_refusal_is_retryable(
+                    unread_gate
+                )
+            finally:
+                readable.chmod(0o644)
+
+            restored = goalflight_adapter_readiness.validate_os_sandbox_request(
+                "grok-acp", OS_SANDBOX_READ_ONLY
+            )
+            assert not goalflight_adapter_readiness.os_sandbox_refusal_is_retryable(
+                restored
+            ), restored
+    finally:
+        goalflight_adapter_readiness.ADAPTERS_DIR = old_adapters_dir
+
+
 def case_repo_runner_sandbox_adapters_are_platform_scoped() -> None:
     expected = {
         "darwin": ["off", "read-only", "workspace-write"],
@@ -1366,6 +1495,7 @@ def main() -> None:
     case_canonical_profiles()
     case_requested_sandbox_fails_closed_on_unsupported_hosts()
     case_adapter_os_sandbox_is_platform_scoped()
+    case_os_sandbox_request_distinguishes_manifest_read_failures()
     case_repo_runner_sandbox_adapters_are_platform_scoped()
     case_dispatch_acp_cfg_preserves_existing_codex_platform_behavior()
     case_claude_read_only_requests_profile_on_unsupported_platform()

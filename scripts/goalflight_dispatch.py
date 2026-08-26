@@ -590,7 +590,34 @@ def _validate_agent_os_sandbox(args) -> None:
             "refusing before launch (b-079)"
         )
     explicit = getattr(args, "os_sandbox", None)
-    if explicit in OS_SANDBOX_PROFILES and not _os_sandbox_enforced_by_launch(args):
+    if explicit not in OS_SANDBOX_PROFILES:
+        return
+    if shape == "acp":
+        from goalflight_adapter_readiness import (
+            os_sandbox_refusal_is_retryable,
+            validate_os_sandbox_request,
+        )
+
+        gate = validate_os_sandbox_request(agent, explicit)
+        if os_sandbox_refusal_is_retryable(gate):
+            reason = str((gate or {}).get("reason") or "adapter_manifest_unreadable")
+            raise DispatchUsageError(
+                f"--os-sandbox {explicit} is undetermined for agent={agent} "
+                f"shape={shape} ({reason}); not a permanent refusal — retry when "
+                "the adapter manifest is readable"
+            )
+        if gate is not None:
+            raise UnsupportedAgentSandboxRequest(
+                f"--os-sandbox {explicit} is ignored for agent={agent} "
+                f"shape={shape} ({gate.get('reason')}); refusing to launch "
+                "with an inert safety flag. "
+                "Use --read-only instead (grok: deny rules for Write/Edit/Bash; "
+                "bash-shape codex: codex --sandbox read-only). --os-sandbox is "
+                "honoured by bash-shape codex and by ACP shapes whose adapter "
+                "and platform can enforce it."
+            )
+        return
+    if not _os_sandbox_enforced_by_launch(args):
         raise UnsupportedAgentSandboxRequest(
             f"--os-sandbox {explicit} is ignored for agent={agent} "
             f"shape={shape}; refusing to launch with an inert safety flag. "
@@ -611,12 +638,16 @@ def _os_sandbox_warning(args) -> str | None:
         and str(getattr(args, "agent", "")) in {"claude", "claude-acp"}
     ):
         from goalflight_acp_run import acp_permission_read_only_supported
-        from goalflight_adapter_readiness import validate_os_sandbox_request
+        from goalflight_adapter_readiness import (
+            os_sandbox_refusal_is_retryable,
+            validate_os_sandbox_request,
+        )
 
+        sandbox_gate = validate_os_sandbox_request(getattr(args, "agent", None), profile)
         if (
             acp_permission_read_only_supported(getattr(args, "agent", None))
-            and validate_os_sandbox_request(getattr(args, "agent", None), profile)
-            is not None
+            and sandbox_gate is not None
+            and not os_sandbox_refusal_is_retryable(sandbox_gate)
         ):
             return (
                 "SANDBOX FALLBACK: requested=read-only -> applied=off -> "

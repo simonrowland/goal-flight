@@ -62,6 +62,11 @@ incremented when meaningful skill behaviour changes.
   (capacity, a missing controller) still restore-and-retry; a permanent
   inert combo is terminalized with the child's own refusal text so an
   operator can read why rather than re-deriving it.
+- An unreadable or unparseable adapter manifest is not a permanent
+  `--os-sandbox` refusal. Drain restores the queued row and retries;
+  a readable manifest that genuinely lacks the profile still
+  terminalizes with `os_sandbox_unsupported` / `os_sandbox_undeclared`
+  in the recorded reason.
 - `--os-sandbox` on a raw `-- <cmd>` argv is refused when the launch path
   cannot honour it. Preset-only guards still skip for raw workers; the
   safety flag does not.
