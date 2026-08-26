@@ -34,13 +34,6 @@ USER_CONFIRM_DECISIONS = frozenset({"yes", "no"})
 DEFAULT_WORKER_WAIT_TIMEOUT_SECS = 3600.0
 MAX_WORKER_WAIT_TIMEOUT_SECS = 4 * 3600.0
 DEFAULT_WORKER_WAIT_POLL_SECS = 0.25
-# The post-deadline final read must outlast one admitted reply writer's
-# critical section: a writer that can still land a reply has already passed
-# the in-lock deadline check, so it holds the mailbox lock and owes one short
-# append plus fsync. Budgeting the final read at one poll interval could
-# expire mid-fsync on a loaded host and report deadline for a reply that was
-# admitted.
-WORKER_WAIT_FINAL_READ_LOCK_SECS = 5.0
 # Best-effort budget for persisting one consumed reply's durable receipt.
 WORKER_WAIT_RECEIPT_LOCK_SECS = 0.5
 LEGACY_STEER_KIND_ALIASES = {
@@ -49,14 +42,28 @@ LEGACY_STEER_KIND_ALIASES = {
 }
 
 
+class WorkerWaitReplyPending(ValueError):
+    """An earlier wait owns one durable typed reply not yet delivered."""
+
+    def __init__(self, arm: dict, reply: dict):
+        self.arm = arm
+        self.reply = reply
+        super().__init__(
+            f"worker wait {str(arm.get('question_id') or '')!r} has a durable "
+            "controller reply pending delivery"
+        )
+
+
 def worker_wait_reply_output_lines(entry: dict) -> tuple[str, str]:
-    """Return a bounded receipt marker plus an unparsed human-readable payload.
+    """Return an unparsed payload followed by its bounded receipt marker.
 
     Only an exact typed wait reply may carry the STEER-REPLY prefix: the
     watcher matches that label against the armed wait id and reply sequence,
     and the renewal fallback collects it as the consumption receipt. Generic
     backlog rows are controller messages, not confirmations, so they report
-    under a distinct backlog label that no consumer parses as a reply.
+    under a distinct backlog label that no consumer parses as a reply. The
+    human payload precedes the receipt so a partial output failure cannot
+    durably claim consumption before delivering the answer.
     """
     detail = {
         "decision": entry.get("decision"),
@@ -73,9 +80,9 @@ def worker_wait_reply_output_lines(entry: dict) -> tuple[str, str]:
             "seq": entry.get("seq"),
         }
         return (
+            message_line,
             "STEER-REPLY: "
             + json.dumps(receipt, ensure_ascii=False, sort_keys=True),
-            message_line,
         )
     backlog = {
         "kind": entry.get("kind"),
@@ -574,6 +581,65 @@ def _worker_wait_replies(
     ]
 
 
+def _recoverable_worker_wait_reply(
+    entries: list[dict],
+    *,
+    dispatch_id: str,
+    consumed_reply_receipts: set[tuple[str, int]],
+) -> tuple[dict, dict] | None:
+    """Return the newest wait's exact durable reply when delivery is unproven.
+
+    The writer's typed reply row is the admission record: it is appended and
+    fsynced while the mailbox lock still protects the one-reply validation.
+    A worker_wait_ended row or exact output receipt proves later consumption;
+    without either, a subsequent wait must redeliver this row before it may
+    create a new arm.
+    """
+    arm = _latest_worker_wait_arm(entries, dispatch_id)
+    if arm is None:
+        return None
+    wait_id = str(arm.get("question_id") or "").strip()
+    try:
+        arm_seq = int(arm["seq"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    if not wait_id or _worker_wait_settlement(
+        entries,
+        wait_id=wait_id,
+        after_seq=arm_seq,
+    ) is not None:
+        return None
+    replies = _worker_wait_replies(
+        entries,
+        dispatch_id=dispatch_id,
+        wait_id=wait_id,
+        after_seq=arm_seq,
+    )
+    if len(replies) != 1:
+        return None
+    reply = replies[0]
+    reply_seq = reply.get("seq")
+    if (
+        not isinstance(reply_seq, int)
+        or isinstance(reply_seq, bool)
+        or reply_seq <= 0
+        or (wait_id, reply_seq) in consumed_reply_receipts
+    ):
+        return None
+    context = arm.get("context")
+    question_kind = context.get("question_kind") if isinstance(context, dict) else None
+    decision = reply.get("decision")
+    if question_kind == "USER-CONFIRM":
+        if decision not in USER_CONFIRM_DECISIONS:
+            return None
+    elif question_kind == "USER-NEED":
+        if decision is not None and decision not in USER_CONFIRM_DECISIONS:
+            return None
+    else:
+        return None
+    return arm, reply
+
+
 def append_worker_wait_reply(
     path: Path,
     *,
@@ -583,7 +649,12 @@ def append_worker_wait_reply(
     decision: str | None = None,
     lock_timeout_secs: float | None = None,
 ) -> dict:
-    """Append one typed, exactly-correlated reply to one active worker wait."""
+    """Durably admit one typed, exactly-correlated reply to one active wait.
+
+    The deadline, one-reply, and type checks run under the mailbox lock. The
+    carrier then fsyncs the typed reply before this writer returns, making that
+    row the durable admission authority even when the original waiter is late.
+    """
     wait_id = str(wait_id or "").strip()
     text = str(text or "").strip()
     if not wait_id:
@@ -717,6 +788,13 @@ def append_worker_wait_started(
             after_seq=prior_seq,
         ) is not None:
             return
+        recoverable = _recoverable_worker_wait_reply(
+            entries,
+            dispatch_id=dispatch_id,
+            consumed_reply_receipts=consumed_reply_receipts,
+        )
+        if recoverable is not None:
+            raise WorkerWaitReplyPending(*recoverable)
         replies = _worker_wait_replies(
             entries,
             dispatch_id=dispatch_id,
@@ -980,6 +1058,7 @@ def wait_for_worker_entries(
         maximum=MAX_WORKER_WAIT_TIMEOUT_SECS,
     )
     question_text = _validate_worker_question(question_kind, question_text)
+    consumed_reply_receipts = consumed_reply_receipts or set()
 
     def report(event: dict) -> None:
         if notify is not None:
@@ -997,17 +1076,52 @@ def wait_for_worker_entries(
     def remaining_secs() -> float:
         return max(0.0, deadline - active_monotonic())
 
-    try:
-        pending = pending_worker_entries(
-            read_steer_entries(
+    def deliver_reply(arm: dict, reply: dict, *, recovered: bool) -> dict:
+        result = {
+            "state": "messages",
+            "entries": [reply],
+            "arm_time_backlog": False,
+            "wait_id": arm["question_id"],
+            "recovered_admitted_reply": recovered,
+        }
+        # Reporting is the delivery boundary. In the CLI this flushes the
+        # human payload before the exact STEER-REPLY marker. A failed report
+        # leaves no consumption evidence, so the same durable row is eligible
+        # for at-least-once redelivery on the next wait.
+        report(result)
+        record_worker_wait_reply_receipt(path, reply)
+        try:
+            append_worker_wait_ended(
                 path,
-                lock_timeout_secs=remaining_secs(),
-                quarantine_errors=False,
-            ),
-            acked_seqs,
+                arm,
+                decision="reply",
+                reply_seq=int(reply["seq"]),
+                lock_timeout_secs=WORKER_WAIT_RECEIPT_LOCK_SECS,
+            )
+        except (OSError, RuntimeError, TimeoutError, ValueError):
+            # Both cleanup writes are bounded and best-effort. Losing them
+            # cannot permanently refuse renewal: the output receipt can prove
+            # consumption, or the typed reply is redelivered on a later wait.
+            pass
+        return result
+
+    try:
+        initial_entries = read_steer_entries(
+            path,
+            lock_timeout_secs=remaining_secs(),
+            quarantine_errors=False,
         )
     except TimeoutError:
         return deadline_result()
+    recoverable = _recoverable_worker_wait_reply(
+        initial_entries,
+        dispatch_id=dispatch_id,
+        consumed_reply_receipts=consumed_reply_receipts,
+    )
+    if recoverable is not None:
+        recovered_arm, recovered_reply = recoverable
+        return deliver_reply(recovered_arm, recovered_reply, recovered=True)
+    pending = pending_worker_entries(initial_entries, acked_seqs)
     if pending:
         result = {"state": "messages", "entries": pending, "arm_time_backlog": True}
         report(result)
@@ -1032,100 +1146,72 @@ def wait_for_worker_entries(
             lock_timeout_secs=remaining,
             consumed_reply_receipts=consumed_reply_receipts,
         )
+    except WorkerWaitReplyPending as pending_reply:
+        return deliver_reply(
+            pending_reply.arm,
+            pending_reply.reply,
+            recovered=True,
+        )
     except TimeoutError:
         return deadline_result()
-    decision = "error"
-    try:
-        report(
-            {
-                "state": "armed",
-                "arm": arm,
-                "timeout_secs": timeout_secs,
-                "question_kind": question_kind,
-                "question_marker_text": worker_wait_question_marker_text(
-                    dispatch_id,
-                    question_text,
-                    str(arm["question_id"]),
-                ),
-            }
-        )
-        carrier_read_error_reported = False
-        while True:
-            remaining = remaining_secs()
-            final_deadline_read = remaining <= 0
-            try:
-                current_entries = read_steer_entries(
-                    path,
-                    lock_timeout_secs=(
-                        WORKER_WAIT_FINAL_READ_LOCK_SECS
-                        if final_deadline_read
-                        else remaining
-                    ),
-                    quarantine_errors=False,
-                )
-            except TimeoutError:
-                decision = "deadline"
-                return deadline_result(str(arm["question_id"]))
-            except Exception as exc:
-                if not isinstance(exc, OSError) and not is_carrier_error(exc):
-                    raise
-                # A transient carrier read failure must not fail the wait: the
-                # reply may already be durable, and escaping here emits no
-                # receipt and no end row, so every later wait stays refused.
-                if not carrier_read_error_reported:
-                    print(
-                        "WARNING: steer mailbox read failed; retrying until "
-                        f"the wait deadline: {exc}",
-                        file=sys.stderr,
-                    )
-                    carrier_read_error_reported = True
-                if final_deadline_read:
-                    decision = "deadline"
-                    return deadline_result(str(arm["question_id"]))
-                time.sleep(min(poll_secs, remaining))
-                continue
-            replies = _worker_wait_replies(
-                current_entries,
-                dispatch_id=dispatch_id,
-                wait_id=str(arm["question_id"]),
-                after_seq=int(arm["seq"]),
+    report(
+        {
+            "state": "armed",
+            "arm": arm,
+            "timeout_secs": timeout_secs,
+            "question_kind": question_kind,
+            "question_marker_text": worker_wait_question_marker_text(
+                dispatch_id,
+                question_text,
+                str(arm["question_id"]),
+            ),
+        }
+    )
+    carrier_read_error_reported = False
+    while True:
+        remaining = remaining_secs()
+        if remaining <= 0:
+            return deadline_result(str(arm["question_id"]))
+        try:
+            current_entries = read_steer_entries(
+                path,
+                lock_timeout_secs=remaining,
+                quarantine_errors=False,
             )
-            if replies:
-                decision = "reply"
-                # Persist the consumption receipt before the reply is
-                # reported: it must be durable before the worker can observe
-                # the stream, and it must survive tail aging when the
-                # best-effort end row below loses its short lock race.
-                record_worker_wait_reply_receipt(path, replies[0])
-                result = {
-                    "state": "messages",
-                    "entries": replies,
-                    "arm_time_backlog": False,
-                    "wait_id": arm["question_id"],
-                }
-                report(result)
-                return result
-            if final_deadline_read:
-                decision = "deadline"
-                return deadline_result(str(arm["question_id"]))
+        except TimeoutError:
+            return deadline_result(str(arm["question_id"]))
+        except Exception as exc:
+            if not isinstance(exc, OSError) and not is_carrier_error(exc):
+                raise
+            # A transient carrier read failure may hide a reply that is already
+            # durable. Retry only while this invocation owns time; on deadline
+            # return without writing any refusal, so a later wait can recover.
+            if not carrier_read_error_reported:
+                print(
+                    "WARNING: steer mailbox read failed; retrying until "
+                    f"the wait deadline: {exc}",
+                    file=sys.stderr,
+                )
+                carrier_read_error_reported = True
             remaining = remaining_secs()
             if remaining <= 0:
-                continue
+                return deadline_result(str(arm["question_id"]))
             time.sleep(min(poll_secs, remaining))
-    finally:
-        if decision == "reply":
-            try:
-                append_worker_wait_ended(
-                    path,
-                    arm,
-                    decision=decision,
-                    reply_seq=int(replies[0]["seq"]),
-                    lock_timeout_secs=min(0.05, remaining_secs()),
-                )
-            except (OSError, RuntimeError, TimeoutError, ValueError):
-                # The arm's own deadline is authoritative. Cleanup must never
-                # mask an already-reported reply or strand the worker.
-                pass
+            continue
+        replies = _worker_wait_replies(
+            current_entries,
+            dispatch_id=dispatch_id,
+            wait_id=str(arm["question_id"]),
+            after_seq=int(arm["seq"]),
+        )
+        if len(replies) == 1:
+            return deliver_reply(arm, replies[0], recovered=False)
+        if len(replies) > 1:
+            raise ValueError("worker wait has multiple correlated replies")
+        remaining = remaining_secs()
+        if remaining <= 0:
+            return deadline_result(str(arm["question_id"]))
+        time.sleep(min(poll_secs, remaining))
 
 
 def acked_steer_seqs(record: dict) -> set[int]:

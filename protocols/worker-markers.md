@@ -65,7 +65,9 @@ Rules:
   bounded by the independent wait deadline. A controller replies with
   `python3 "$GOALFLIGHT_DISPATCH_SCRIPT" steer "$GOALFLIGHT_DISPATCH_ID" --reply-to <wait-id> [--decision yes|no] '<reply>'`; `USER-CONFIRM` requires the
   explicit decision. Generic steers, foreign wait ids, and duplicate replies do
-  not settle the wait. While a correlated reply is durably pending consumption,
+  not settle the wait. The writer's fsynced typed reply row is the durable
+  admission record; admission does not depend on the original waiter observing
+  it. While a correlated reply is durably pending consumption,
   the watcher preserves the validated arm across transient mailbox-lock failures
   until the waiter records its end, emits its typed `STEER-REPLY` consumption
   line (which the watcher checks against the same wait id and reply sequence),
@@ -74,19 +76,22 @@ Rules:
   steer can answer or redirect the need and carries no authorization. For
   `USER-CONFIRM`, it surfaces the backlog but still emits and arms the exact
   question; only a correlated typed reply with an explicit decision succeeds.
-  Only a typed reply prints `STEER-REPLY`; generic backlog rows report as
-  `STEER-BACKLOG` plus `STEER-MESSAGE`, never as a confirmation-looking reply.
+  Only a typed reply prints `STEER-REPLY`; its human `STEER-MESSAGE` is flushed
+  first so partial output cannot claim consumption before delivery. Generic
+  backlog rows report as `STEER-BACKLOG` plus `STEER-MESSAGE`, never as a
+  confirmation-looking reply.
   A watched-tail typed reply receipt also settles renewal when the waiter's
   best-effort end-row append loses its short mailbox-lock race, and each
   consumed reply's receipt is also persisted to the mailbox's append-only
   receipts sidecar so renewal evidence does not age out of the status marker
   window or the bounded stdout rescan. Transient mailbox read failures inside
-  the wait are retried until the deadline rather than failing the command, and
-  the post-deadline final read waits out one admitted writer's append/fsync
-  before reporting deadline.
-  An unresolved or expired arm is non-renewable; another wait is refused until a
-  reply is consumed or the dispatch terminally settles. On deadline the command
-  returns nonzero and ordinary idle accounting resumes.
+  the wait are retried until the deadline. A lock-holding admitted writer may
+  outlive that deadline, and the current wait may therefore return nonzero;
+  deadline writes no settlement or lasting refusal. Before creating another
+  arm, the next wait redelivers the prior exact typed reply when consumption is
+  unproven. A genuinely unresolved arm with no typed reply remains
+  non-renewable, so repeated waits cannot re-arm forever. On deadline ordinary
+  idle accounting resumes.
 - Bash-tail otherwise keeps `USER-CONFIRM` terminal. Unattended ACP routes it to the
   controller without cancelling the turn, preserves partial output, and waits
   at the next turn boundary for a correlated steer reply. The guarded action

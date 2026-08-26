@@ -162,7 +162,7 @@ def test_wait_returns_promptly_at_its_independent_deadline(tmp_path: Path) -> No
     assert steer.active_worker_wait(entries, dispatch_id="deadline") is None
 
 
-def test_wait_consumes_reply_written_during_final_sleep(
+def test_next_wait_recovers_reply_written_during_final_sleep(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -193,7 +193,7 @@ def test_wait_consumes_reply_written_during_final_sleep(
         clock[0] += seconds / 2
 
     monkeypatch.setattr(steer.time, "sleep", sleep_through_deadline)
-    result = steer.wait_for_worker_entries(
+    first = steer.wait_for_worker_entries(
         mailbox,
         dispatch_id="final-sleep",
         acked_seqs=set(),
@@ -205,11 +205,29 @@ def test_wait_consumes_reply_written_during_final_sleep(
     )
 
     assert reply_written
-    assert result["state"] == "messages"
-    assert result["entries"][0]["text"] == "accepted before the deadline"
+    assert first["state"] == "deadline"
+
+    second = steer.wait_for_worker_entries(
+        mailbox,
+        dispatch_id="final-sleep",
+        acked_seqs=set(),
+        question_kind="USER-NEED",
+        question_text="recover the boundary answer",
+        timeout_secs=1.0,
+        poll_secs=0.05,
+    )
+
+    assert second["state"] == "messages"
+    assert second["entries"][0]["text"] == "accepted before the deadline"
+    assert second["wait_id"] == first["wait_id"]
+    assert second["recovered_admitted_reply"] is True
+    entries = steer.read_steer_entries(mailbox)
+    assert sum(
+        entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND for entry in entries
+    ) == 1
     assert any(
         entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND
-        for entry in steer.read_steer_entries(mailbox)
+        for entry in entries
     )
 
 
@@ -1344,6 +1362,168 @@ def test_consumed_receipt_allows_second_wait_when_end_row_write_fails(
     )
 
 
+def test_report_failure_does_not_record_reply_as_consumed(
+    tmp_path: Path,
+) -> None:
+    """Delivery evidence must follow successful reply output, never precede it."""
+    dispatch_id = "report-failure"
+    mailbox = tmp_path / "report-failure.steer.jsonl"
+    posted_reply: list[dict] = []
+
+    def broken_report(event: dict) -> None:
+        if event["state"] == "armed":
+            posted_reply.append(
+                steer.append_worker_wait_reply(
+                    mailbox,
+                    dispatch_id=dispatch_id,
+                    wait_id=str(event["arm"]["question_id"]),
+                    text="must be redelivered",
+                )
+            )
+        elif event["state"] == "messages":
+            raise BrokenPipeError("simulated worker output failure")
+
+    with pytest.raises(BrokenPipeError, match="worker output failure"):
+        steer.wait_for_worker_entries(
+            mailbox,
+            dispatch_id=dispatch_id,
+            acked_seqs=set(),
+            question_kind="USER-NEED",
+            question_text="first delivery attempt",
+            timeout_secs=1.0,
+            poll_secs=0.05,
+            notify=broken_report,
+        )
+
+    entries = steer.read_steer_entries(mailbox)
+    assert not any(
+        entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND for entry in entries
+    ), entries
+    assert steer.consumed_worker_wait_receipts({}, mailbox_path=mailbox) == set()
+
+    recovered = steer.wait_for_worker_entries(
+        mailbox,
+        dispatch_id=dispatch_id,
+        acked_seqs=set(),
+        question_kind="USER-NEED",
+        question_text="retry delivery",
+        timeout_secs=1.0,
+        poll_secs=0.05,
+    )
+
+    assert recovered["entries"] == posted_reply
+    assert recovered["recovered_admitted_reply"] is True
+
+
+def test_bounded_consumption_cleanup_miss_redelivers_instead_of_refusing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing both best-effort receipts may duplicate, but cannot strand."""
+    dispatch_id = "cleanup-miss-redelivery"
+    mailbox = tmp_path / "cleanup-miss-redelivery.steer.jsonl"
+
+    monkeypatch.setattr(
+        steer,
+        "record_worker_wait_reply_receipt",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def missed_end_write(*_args, **_kwargs):
+        raise TimeoutError("forced bounded cleanup miss")
+
+    monkeypatch.setattr(steer, "append_worker_wait_ended", missed_end_write)
+
+    def report(event: dict) -> None:
+        if event["state"] == "armed":
+            steer.append_worker_wait_reply(
+                mailbox,
+                dispatch_id=dispatch_id,
+                wait_id=str(event["arm"]["question_id"]),
+                text="deliver at least once",
+            )
+
+    first = steer.wait_for_worker_entries(
+        mailbox,
+        dispatch_id=dispatch_id,
+        acked_seqs=set(),
+        question_kind="USER-NEED",
+        question_text="first attempt",
+        timeout_secs=1.0,
+        poll_secs=0.05,
+        notify=report,
+    )
+    second = steer.wait_for_worker_entries(
+        mailbox,
+        dispatch_id=dispatch_id,
+        acked_seqs=set(),
+        question_kind="USER-NEED",
+        question_text="recover without cleanup evidence",
+        timeout_secs=1.0,
+        poll_secs=0.05,
+    )
+
+    assert first["state"] == second["state"] == "messages"
+    assert second["entries"] == first["entries"]
+    assert second["wait_id"] == first["wait_id"]
+    assert second["recovered_admitted_reply"] is True
+    entries = steer.read_steer_entries(mailbox)
+    assert sum(
+        entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND for entry in entries
+    ) == 1, entries
+
+
+def test_reply_landing_between_initial_read_and_rearm_is_recovered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The arm-time compare-and-append race must deliver, not refuse or re-arm."""
+    dispatch_id = "reply-before-rearm"
+    mailbox = tmp_path / "reply-before-rearm.steer.jsonl"
+    prior = steer.append_worker_wait_started(
+        mailbox,
+        dispatch_id=dispatch_id,
+        timeout_secs=2.0,
+        question_kind="USER-CONFIRM",
+        question_text="approve the original action?",
+    )
+    real_read = steer.read_steer_entries
+    posted_reply: list[dict] = []
+
+    def stale_read_then_reply(*args, **kwargs):
+        stale_entries = real_read(*args, **kwargs)
+        if not posted_reply:
+            posted_reply.append(
+                steer.append_worker_wait_reply(
+                    mailbox,
+                    dispatch_id=dispatch_id,
+                    wait_id=str(prior["question_id"]),
+                    text="approved once",
+                    decision="yes",
+                )
+            )
+        return stale_entries
+
+    monkeypatch.setattr(steer, "read_steer_entries", stale_read_then_reply)
+    result = steer.wait_for_worker_entries(
+        mailbox,
+        dispatch_id=dispatch_id,
+        acked_seqs=set(),
+        question_kind="USER-CONFIRM",
+        question_text="do not create a replacement arm",
+        timeout_secs=1.0,
+        poll_secs=0.05,
+    )
+
+    assert result["entries"] == posted_reply
+    assert result["wait_id"] == prior["question_id"]
+    assert result["recovered_admitted_reply"] is True
+    entries = real_read(mailbox)
+    assert sum(
+        entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND for entry in entries
+    ) == 1, entries
+
+
 def test_genuinely_wedged_worker_without_question_still_idle_times_out(
     tmp_path: Path,
 ) -> None:
@@ -1411,74 +1591,82 @@ def test_generic_backlog_rows_do_not_wear_the_reply_receipt_label() -> None:
         "text": "approved",
     }
     reply_lines = steer.worker_wait_reply_output_lines(reply)
-    assert reply_lines[0].startswith("STEER-REPLY: "), reply_lines
-    receipt = json.loads(reply_lines[0][len("STEER-REPLY: "):])
+    assert reply_lines[0].startswith("STEER-MESSAGE: "), reply_lines
+    assert reply_lines[1].startswith("STEER-REPLY: "), reply_lines
+    receipt = json.loads(reply_lines[1][len("STEER-REPLY: "):])
     assert receipt == {
         "kind": steer.WORKER_WAIT_REPLY_KIND,
         "reply_to": "wait-9",
         "seq": 7,
     }
-    assert steer._worker_wait_receipt_identity(reply_lines[0][len("STEER-REPLY: "):]) == (
+    assert steer._worker_wait_receipt_identity(reply_lines[1][len("STEER-REPLY: "):]) == (
         "wait-9",
         7,
     )
-    assert reply_lines[1].startswith("STEER-MESSAGE: "), reply_lines
 
 
-def test_wait_final_read_outlasts_admitted_writers_fsync_stall(
+def test_next_wait_recovers_reply_from_writer_admitted_before_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A reply admitted before the deadline must survive its own slow fsync.
 
     The writer validates inside the mailbox lock before the deadline, then
-    stalls in append/fsync well past one poll interval. The waiter's final
-    read must wait out that critical section instead of reporting deadline
-    for a reply that was admitted.
+    remains in append/fsync while the waiter's ordinary pre-deadline read
+    exhausts its lock budget. The first waiter may be late and report its
+    deadline, but the next wait must recover the durable typed reply instead
+    of permanently refusing renewal.
     """
-    mailbox = tmp_path / "final-read-race.steer.jsonl"
-    dispatch_id = "final-read-race"
-    timeout_secs = 1.0
-    stall_secs = 0.8  # >3x the pre-fix final-read budget of one poll interval
-    clock = [100.0]
+    mailbox = tmp_path / "admitted-writer-race.steer.jsonl"
+    dispatch_id = "admitted-writer-race"
+    timeout_secs = 0.25
+    stall_secs = 0.8
     stall_started = threading.Event()
     stall_state = {"used": False}
     writers: list[threading.Thread] = []
-
-    monkeypatch.setattr(steer, "active_monotonic", lambda: clock[0])
+    writer_errors: list[BaseException] = []
+    wait_started_at = time.monotonic()
+    stall_started_at = [0.0]
 
     real_append_fsync = messages._append_fsync
 
     def stalled_append_fsync(path, data):
         if b"worker_wait_reply" in data and not stall_state["used"]:
             stall_state["used"] = True
-            # The writer is admitted: it passed the in-lock deadline check
-            # above. The deadline passes while its fsync stalls.
-            clock[0] += timeout_secs + 1.0
+            stall_started_at[0] = time.monotonic()
+            # Validation already admitted the writer inside the mailbox lock.
+            # Keep that lock held until well after the real waiter deadline.
             stall_started.set()
             time.sleep(stall_secs)
         real_append_fsync(path, data)
 
     monkeypatch.setattr(messages, "_append_fsync", stalled_append_fsync)
 
+    def write_reply(wait_id: str) -> None:
+        try:
+            steer.append_worker_wait_reply(
+                mailbox,
+                dispatch_id=dispatch_id,
+                wait_id=wait_id,
+                text="admitted before the deadline",
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            writer_errors.append(exc)
+
     def report(event: dict) -> None:
         if event["state"] != "armed":
             return
         writer = threading.Thread(
-            target=lambda: steer.append_worker_wait_reply(
-                mailbox,
-                dispatch_id=dispatch_id,
-                wait_id=str(event["arm"]["question_id"]),
-                text="admitted before the deadline",
-            ),
+            target=write_reply,
+            args=(str(event["arm"]["question_id"]),),
         )
         writer.start()
         writers.append(writer)
-        # Hold the waiter inside notify until the admitted writer is stalled
-        # in its fsync, so the waiter's next loop iteration is the final read.
+        # Return while the real deadline is still ahead. The ordinary read,
+        # not the post-deadline branch, must lose its remaining lock budget.
         assert stall_started.wait(timeout=10)
 
-    result = steer.wait_for_worker_entries(
+    first = steer.wait_for_worker_entries(
         mailbox,
         dispatch_id=dispatch_id,
         acked_seqs=set(),
@@ -1488,18 +1676,43 @@ def test_wait_final_read_outlasts_admitted_writers_fsync_stall(
         poll_secs=0.05,
         notify=report,
     )
+    assert stall_started_at[0] - wait_started_at < timeout_secs
+    assert writers[0].is_alive(), "writer did not remain in fsync across the deadline"
+    assert first["state"] == "deadline", first
+
     for writer in writers:
         writer.join(timeout=10)
 
     assert stall_state["used"], "the writer never reached its fsync stall"
-    assert result["state"] == "messages", result
-    assert result["entries"][0]["text"] == "admitted before the deadline"
-    # The reply landed after the deadline, so the best-effort end row has no
-    # lock budget left; the durable receipt sidecar carries the consumption
-    # evidence instead.
-    reply_seq = result["entries"][0]["seq"]
+    assert not writer_errors, writer_errors
+    durable_entries = steer.read_steer_entries(mailbox)
+    durable_reply = next(
+        entry
+        for entry in durable_entries
+        if entry.get("kind") == steer.WORKER_WAIT_REPLY_KIND
+    )
+
+    second = steer.wait_for_worker_entries(
+        mailbox,
+        dispatch_id=dispatch_id,
+        acked_seqs=set(),
+        question_kind="USER-NEED",
+        question_text="recover the prior boundary answer",
+        timeout_secs=1.0,
+        poll_secs=0.05,
+    )
+
+    assert second["state"] == "messages", second
+    assert second["entries"] == [durable_reply]
+    assert second["wait_id"] == first["wait_id"]
+    assert second["recovered_admitted_reply"] is True
+    entries = steer.read_steer_entries(mailbox)
+    assert sum(
+        entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND for entry in entries
+    ) == 1, entries
+    reply_seq = durable_reply["seq"]
     receipts = steer.consumed_worker_wait_receipts({}, mailbox_path=mailbox)
-    assert receipts == {(result["wait_id"], reply_seq)}
+    assert receipts == {(first["wait_id"], reply_seq)}
 
 
 @pytest.mark.parametrize("failure_kind", ["oserror", "messageerror"])
@@ -1509,9 +1722,8 @@ def test_wait_tolerates_transient_carrier_read_errors(
     failure_kind: str,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A transient carrier read failure after the reply is durable must not
-    fail the wait: escaping emits no receipt and no end row, which refuses
-    every later wait."""
+    """A transient carrier read failure after the reply is durable is retried
+    within the same wait; a deadline would leave the row recoverable later."""
     mailbox = tmp_path / f"transient-{failure_kind}.steer.jsonl"
     dispatch_id = f"transient-{failure_kind}"
     armed = threading.Event()
@@ -1561,33 +1773,46 @@ def test_wait_tolerates_transient_carrier_read_errors(
     assert err.count("WARNING: steer mailbox read failed") == 1, err
 
 
-def test_wait_reports_deadline_when_carrier_stays_unreadable(
+@pytest.mark.parametrize("failure_kind", ["oserror", "messageerror"])
+def test_next_wait_recovers_durable_reply_after_errors_through_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A persistent carrier read failure ends at the bounded deadline with an
-    observable warning, not an escaping exception that fails the CLI."""
-    mailbox = tmp_path / "unreadable.steer.jsonl"
-    armed = threading.Event()
+    """Carrier errors through the deadline must not strand a durable reply."""
+    mailbox = tmp_path / f"durable-unreadable-{failure_kind}.steer.jsonl"
+    dispatch_id = f"durable-unreadable-{failure_kind}"
+    unreadable = threading.Event()
+    posted_reply: list[dict] = []
 
     real_read = steer.read_steer_entries
 
-    def unreadable(*args, **kwargs):
-        if armed.is_set():
+    def failing_read(*args, **kwargs):
+        if unreadable.is_set():
+            if failure_kind == "oserror":
+                raise OSError("carrier temporarily unreadable")
             raise messages.MessageError("carrier identity changed")
         return real_read(*args, **kwargs)
 
-    monkeypatch.setattr(steer, "read_steer_entries", unreadable)
+    monkeypatch.setattr(steer, "read_steer_entries", failing_read)
 
     def report(event: dict) -> None:
         if event["state"] == "armed":
-            armed.set()
+            posted_reply.append(
+                steer.append_worker_wait_reply(
+                    mailbox,
+                    dispatch_id=dispatch_id,
+                    wait_id=str(event["arm"]["question_id"]),
+                    text="durable before carrier errors",
+                )
+            )
+            unreadable.set()
 
     started = time.monotonic()
-    result = steer.wait_for_worker_entries(
+    first = steer.wait_for_worker_entries(
         mailbox,
-        dispatch_id="unreadable",
+        dispatch_id=dispatch_id,
         acked_seqs=set(),
         question_kind="USER-NEED",
         question_text="need an answer",
@@ -1597,8 +1822,29 @@ def test_wait_reports_deadline_when_carrier_stays_unreadable(
     )
     elapsed = time.monotonic() - started
 
-    assert result["state"] == "deadline", result
+    assert posted_reply, "reply was not durable before carrier errors began"
+    assert first["state"] == "deadline", first
     assert elapsed < 5.0, f"unbounded unreadable wait: {elapsed:.3f}s"
+    unreadable.clear()
+
+    second = steer.wait_for_worker_entries(
+        mailbox,
+        dispatch_id=dispatch_id,
+        acked_seqs=set(),
+        question_kind="USER-NEED",
+        question_text="recover the durable answer",
+        timeout_secs=1.0,
+        poll_secs=0.05,
+    )
+
+    assert second["state"] == "messages", second
+    assert second["entries"] == posted_reply
+    assert second["wait_id"] == first["wait_id"]
+    assert second["recovered_admitted_reply"] is True
+    entries = steer.read_steer_entries(mailbox)
+    assert sum(
+        entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND for entry in entries
+    ) == 1, entries
     err = capsys.readouterr().err
     assert err.count("WARNING: steer mailbox read failed") == 1, err
 
