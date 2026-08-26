@@ -11248,6 +11248,20 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         # (tests/python/test_acp_model_passthrough.py). Same lesson as the stale
         # model note above: grok flags drift; re-validate before trusting one.
         argv = ["grok", "--prompt-file", str(prompt_path)]
+        if _effective_read_only(args):
+            # Grok has no OS sandbox here (--os-sandbox is a codex-bash knob) and
+            # its ACP adapter bypasses the permission gate for writes, so until
+            # 2026-08-25 a "read-only" grok review was enforced by nothing but
+            # brief discipline. --deny rules are the mechanism the CLI actually
+            # honours, and they hold against the model's own bypass attempts:
+            # probed on grok 1.0.0 (write prompt, seat `info`) the worker tried
+            # the write tool, then a shell command, then a relative path, and
+            # reported honestly that writes were blocked. The broken
+            # --permission-mode flag documented above stays omitted — deny rules
+            # are a different, measured surface. If a new write-capable tool
+            # ships, the deny list must grow with it; the probe in
+            # tests/python/test_grok_read_only_deny.py is the tripwire.
+            argv += ["--deny", "Write", "--deny", "Edit", "--deny", "Bash"]
         # Only pin a model when one is EXPLICITLY requested; otherwise omit the
         # flag entirely and let grok's CLI default (grok-4.5) apply.
         selected_model = str(model) if model else default_model
