@@ -225,7 +225,7 @@
   .controllers-panel { margin-bottom:14px; }
   .controller-row {
     display:grid;
-    grid-template-columns:22px minmax(120px,.9fr) minmax(88px,.7fr) minmax(110px,.7fr) minmax(56px,.4fr) minmax(56px,.4fr) minmax(72px,.5fr) minmax(180px,1.4fr);
+    grid-template-columns:22px minmax(120px,.9fr) minmax(88px,.7fr) minmax(110px,.7fr) minmax(56px,.4fr) minmax(72px,.5fr) minmax(180px,1.4fr);
     gap:10px; align-items:center; padding:8px 12px; border-top:1px solid var(--edge-soft);
     font-size:11px;
   }
@@ -233,7 +233,7 @@
   .controller-row.dead { background:var(--ground-2); }
   .controller-label { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .controller-row.dead .controller-label { text-decoration:line-through; color:var(--ink-3); }
-  .controller-project, .controller-pool, .controller-inflight, .controller-seen { color:var(--ink-2); }
+  .controller-project, .controller-inflight, .controller-seen { color:var(--ink-2); }
   .controller-action { font-size:10px; color:var(--amber); overflow:hidden; text-overflow:ellipsis; white-space:normal; }
   .controller-error { color:var(--clay); }
   .controller-probe { color:var(--amber); }

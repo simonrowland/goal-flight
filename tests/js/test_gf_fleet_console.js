@@ -264,8 +264,6 @@ function controllerRow(overrides) {
     parent_project_id: "p",
     parent_name: "battery-tool-v2",
     controller_liveness_state: "ALIVE",
-    listener_live: 1,
-    listener_target: 4,
     in_flight_count: 1,
     owned_live: 1,
     last_seen: "2030-01-01T00:02:00Z",
@@ -1758,8 +1756,6 @@ async function testInteractiveHistoryAndKeyedRows() {
             parent_project_id: "p",
             parent_name: "battery",
             controller_liveness_state: "DEAD",
-            listener_live: 0,
-            listener_target: 4,
             in_flight_count: 0,
             owned_live: 0,
             last_seen: "2026-01-01T00:00:00Z",
@@ -1774,8 +1770,6 @@ async function testInteractiveHistoryAndKeyedRows() {
             parent_project_id: "p",
             parent_name: "battery",
             controller_liveness_state: "ALIVE",
-            listener_live: 4,
-            listener_target: 4,
             in_flight_count: 2,
             owned_live: 2,
             last_seen: "2030-01-01T00:02:00Z",
@@ -1819,8 +1813,6 @@ async function testInteractiveHistoryAndKeyedRows() {
           parent_project_id: "pm2",
           parent_name: "pm2",
           controller_liveness_state: "UNKNOWN",
-          listener_live: 0,
-          listener_target: 4,
           in_flight_count: 0,
           owned_live: 0,
           generation: 11,
@@ -1853,11 +1845,10 @@ async function testInteractiveHistoryAndKeyedRows() {
       attentionPayload({ items: [] })
     );
     const streamController = controllerEntry(byId["fleet-section"], "stream-controller");
-    assert("persistent controller shows the required backup shortage", [
+    assert("normal controller row ignores legacy listener depth", [
       streamController != null,
-      descendants(streamController).some((node) =>
-        node.className === "controller-pool" && node.textContent === "1/3"
-      ),
+      !descendants(streamController).some((node) => node.className === "controller-pool"),
+      !streamController.textContent.includes("1/3"),
       !streamController.textContent.includes("1/4"),
     ].every(Boolean));
   }
@@ -1899,8 +1890,6 @@ async function testInteractiveHistoryAndKeyedRows() {
           parent_project_id: "battery",
           parent_name: "battery-tool-v2",
           controller_liveness_state: "ALIVE",
-          listener_live: 4,
-          listener_target: 4,
           in_flight_count: 2,
           owned_live: 2,
           last_seen: "2030-01-01T00:02:00Z",

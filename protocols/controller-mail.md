@@ -124,8 +124,9 @@ Each flushed line is a wake. Child kinds pass through unchanged:
 - stream: compact JSON `{"kind":"heartbeat"| "event"|"frontier",...}`
 - backup: pending headlines plus one `advance: <command>` line, or a ring
 - watchdog: JSON `{"kind":"event",...}` with `listener-dead` / related payload
-- supervise: `{"kind":"supervise","type":"heartbeat"|"coverage"|"restart"|"stop",...}`
-  carrying `live`/`target` so silence and deafness never look the same
+- supervise: default output keeps actionable `restart` records with their reason
+  and `stop` records with the supervisor `rearm` command; chatty output also
+  restores `heartbeat` / `coverage` and `live` / `target` diagnostics
 
 The supervisor's child-exit taxonomy:
 
@@ -145,7 +146,7 @@ A dead lease nonce is re-read through `goalflight_session_status.probe_live_sess
 hand-constructed. On mismatch or a vanished **readable** live session the supervisor
 emits `{"kind":"supervise","type":"stop","reason":"dead-lease-nonce"}` and exits 3.
 An unreadable journal is "I could not find out" and stays retryable at both startup
-and child-death. `live` counts children observed holding a wake flock or that
+and child-death. Under chatty output, `live` counts children observed holding a wake flock or that
 emitted a durable armed/ring line, not PIDs that merely exist. A missed lock sample
 on a successful ring re-arms; it does not stop the slot. Child-exit classification
 reads the child's diagnostic channel (stderr plus structured child-exit JSON

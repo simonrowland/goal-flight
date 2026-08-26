@@ -304,8 +304,6 @@ FLEET_FIELD_ALLOWLIST: dict[str, Any] = {
             "parent_project_id": None,
             "parent_name": None,
             "controller_liveness_state": None,
-            "listener_live": None,
-            "listener_target": None,
             "wake_mode": None,
             "in_flight_count": None,
             "owned_live": None,
@@ -1313,8 +1311,6 @@ def _empty_controller_context() -> dict[str, object | None]:
         "label": None,
         "generation": None,
         "liveness_state": "UNKNOWN",
-        "listener_live": None,
-        "listener_target": None,
         "wake_mode": None,
         "in_flight_count": 0,
         "last_seen": None,
@@ -1333,8 +1329,6 @@ def _controller_panel_row(
         state = "UNKNOWN"
     generation = context.get("generation")
     in_flight = context.get("in_flight_count")
-    listener_live = context.get("listener_live")
-    listener_target = context.get("listener_target")
     wake_mode = context.get("wake_mode")
     retire = (
         _controller_retire_command(label)
@@ -1366,8 +1360,6 @@ def _controller_panel_row(
         "parent_project_id": parent["parent_project_id"],
         "parent_name": parent["parent_name"],
         "controller_liveness_state": state,
-        "listener_live": listener_live if isinstance(listener_live, int) and not isinstance(listener_live, bool) else None,
-        "listener_target": listener_target if isinstance(listener_target, int) and not isinstance(listener_target, bool) else None,
         "wake_mode": wake_mode if wake_mode in {"persistent", "portable"} else None,
         "in_flight_count": in_flight if isinstance(in_flight, int) and not isinstance(in_flight, bool) and in_flight >= 0 else 0,
         "owned_live": 0,
@@ -1437,8 +1429,6 @@ def _aggregate_controller_rows(
         )
         if new_rank < current_rank:
             current["controller_liveness_state"] = row.get("controller_liveness_state")
-            current["listener_live"] = row.get("listener_live")
-            current["listener_target"] = row.get("listener_target")
             current["wake_mode"] = row.get("wake_mode")
             current["generation"] = row.get("generation")
             current["retire_command"] = row.get("retire_command")
@@ -1455,6 +1445,8 @@ def _aggregate_controller_rows(
         if new_seen > current_seen:
             current["last_seen"] = row.get("last_seen")
     for label, row in grouped.items():
+        row.pop("listener_live", None)
+        row.pop("listener_target", None)
         row["owned_live"] = owned.get(label, 0)
         row["controller_key"] = _display(label, limit=128)
         if row.get("controller_liveness_state") != "DEAD":
@@ -1732,20 +1724,6 @@ def _controller_contexts_by_session(
             last_seen = generation_rows[0].get("renewed_at") or generation_rows[0].get(
                 "claimed_at"
             )
-        listener_live = (
-            wake_coverage.get("live_waiters")
-            if isinstance(wake_coverage, dict)
-            else None
-        )
-        if not isinstance(listener_live, int) or isinstance(listener_live, bool):
-            listener_live = None
-        listener_target = (
-            wake_coverage.get("target_waiters")
-            if isinstance(wake_coverage, dict)
-            else None
-        )
-        if not isinstance(listener_target, int) or isinstance(listener_target, bool):
-            listener_target = None
         wake_mode = (
             wake_coverage.get("wake_mode")
             if isinstance(wake_coverage, dict)
@@ -1759,8 +1737,6 @@ def _controller_contexts_by_session(
                 live_waiter_count,
                 in_flight_count,
             ),
-            "listener_live": listener_live,
-            "listener_target": listener_target,
             "wake_mode": (
                 wake_mode if wake_mode in {"persistent", "portable"} else None
             ),

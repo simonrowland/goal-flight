@@ -2853,7 +2853,13 @@ def test_controller_panel_lists_live_first_and_shows_retire_command() -> None:
             == "python3 scripts/goalflight_session_status.py --retire battery-tool-v2",
         )
         assert_true("live row has no retire command", rows[0]["retire_command"] is None)
-        assert_true("listener depth is n/target scalars", rows[0]["listener_target"] == F.goalflight_wake.DEFAULT_LISTENER_SLOTS)
+        assert_true(
+            "normal controller output omits listener depth from every real row",
+            all(
+                "listener_live" not in row and "listener_target" not in row
+                for row in rows
+            ),
+        )
         encoded = json.dumps(fleet)
         assert_true("controller panel publishes no absolute paths", str(project_root) not in encoded)
         assert_true("constructed controller-panel fleet build stays under one second", elapsed < 1.0)
@@ -3155,8 +3161,6 @@ def test_controllers_aggregate_by_owner_label_across_repos_mutation_pair() -> No
             "in_flight_count": 1,
             "owned_live": 0,
             "last_seen": "2030-01-01T00:00:00+00:00",
-            "listener_live": 4,
-            "listener_target": 4,
             "generation": 1,
             "retire_command": None,
             "controller_key": "clone-a:webui",
@@ -3171,8 +3175,6 @@ def test_controllers_aggregate_by_owner_label_across_repos_mutation_pair() -> No
             "in_flight_count": 1,
             "owned_live": 0,
             "last_seen": "2030-01-02T00:00:00+00:00",
-            "listener_live": 4,
-            "listener_target": 4,
             "generation": 2,
             "retire_command": None,
             "controller_key": "kiln:webui",
@@ -3238,8 +3240,6 @@ def test_one_repo_several_controllers_keep_workers_partitioned_mutation_pair() -
             "in_flight_count": 1,
             "owned_live": 0,
             "last_seen": "2030-01-01T00:00:00+00:00",
-            "listener_live": 1,
-            "listener_target": 4,
             "generation": 1,
             "retire_command": None,
             "controller_key": f"battery-tool-v2:{label}",

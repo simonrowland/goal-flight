@@ -5664,11 +5664,16 @@ def _follow_dead_record(
     )
     if action["kind"] == "arm-component":
         payload["rearm_command"] = rearm_command
+    elif action["kind"] == "verify-supervisor":
+        payload["wake_recovery_hint"] = str(action["instruction"])
     record: dict[str, object] = {
         "kind": "event",
         "payload": payload,
     }
-    return _fit_follow_record(record, shrink_fields=("reason", "rearm_command"))
+    return _fit_follow_record(
+        record,
+        shrink_fields=("wake_recovery_hint", "reason", "rearm_command"),
+    )
 
 
 def _watchdog_dead_record(
@@ -5697,13 +5702,15 @@ def _watchdog_dead_record(
         payload["live"] = status.get("live_waiters")
         payload["target"] = status.get("target_waiters")
         payload["rearm_command"] = rearm_command
+    elif action["kind"] == "verify-supervisor":
+        payload["wake_recovery_hint"] = str(action["instruction"])
     record: dict[str, object] = {
         "kind": "event",
         "payload": payload,
     }
     return _fit_follow_record(
         record,
-        shrink_fields=("rearm_command",),
+        shrink_fields=("wake_recovery_hint", "rearm_command"),
     )
 
 

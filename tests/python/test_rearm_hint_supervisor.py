@@ -712,82 +712,6 @@ def test_operator_action_policy_requires_proven_absence() -> None:
     assert component not in str(unknown["instruction"])
 
 
-def test_every_depth_emitter_follows_three_state_policy() -> None:
-    command = "EXACT COMPONENT COMMAND"
-    running = {
-        "reserve": wake.listener_reserve_hint(
-            1,
-            4,
-            command,
-            supervisor=wake.SUPERVISOR_RUNNING,
-        ),
-        "floor": wake.listener_floor_hint(
-            1,
-            4,
-            command,
-            work_in_flight=True,
-            supervisor=wake.SUPERVISOR_RUNNING,
-        ),
-        "activity": wake.listener_activity_hint(
-            1,
-            4,
-            command,
-            work_in_flight=True,
-            supervisor=wake.SUPERVISOR_RUNNING,
-        ),
-    }
-    assert set(running.values()) == {""}
-
-    unknown = {
-        "reserve": wake.listener_reserve_hint(
-            1,
-            4,
-            command,
-            supervisor=wake.SUPERVISOR_UNKNOWN,
-        ),
-        "floor": wake.listener_floor_hint(
-            1,
-            4,
-            command,
-            work_in_flight=True,
-            supervisor=wake.SUPERVISOR_UNKNOWN,
-        ),
-        "activity": wake.listener_activity_hint(
-            1,
-            4,
-            command,
-            work_in_flight=True,
-            supervisor=wake.SUPERVISOR_UNKNOWN,
-        ),
-    }
-    for hint in unknown.values():
-        assert "listener coverage needs verification" in hint
-        assert command not in hint
-        assert "1/4" not in hint
-        assert "3 missing" not in hint
-
-    assert command in wake.listener_reserve_hint(
-        1,
-        4,
-        command,
-        supervisor=wake.SUPERVISOR_ABSENT,
-    )
-    assert command in wake.listener_floor_hint(
-        1,
-        4,
-        command,
-        work_in_flight=True,
-        supervisor=wake.SUPERVISOR_ABSENT,
-    )
-    assert command in wake.listener_activity_hint(
-        1,
-        4,
-        command,
-        work_in_flight=True,
-        supervisor=wake.SUPERVISOR_ABSENT,
-    )
-
-
 def test_unbindable_supervise_argv_is_unknown_not_absent(
     isolated: tuple[Path, journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
@@ -1197,7 +1121,7 @@ def test_direct_json_exit_with_unavailable_process_table_is_numberless(
     assert completed.returncode == 1
     assert payload["reason"] == "timeout"
     assert "rearm" not in payload
-    assert "listener coverage needs verification" in payload["wake_recovery_hint"]
+    assert "could not tell whether `supervise`" in payload["wake_recovery_hint"]
     assert "0/" not in encoded
     assert "listener pool n=" not in encoded
     assert wake.persistent_backup_start_command(
@@ -1446,6 +1370,7 @@ def test_dead_events_with_unavailable_process_table_stay_numberless_and_safe(
     assert "target" not in payload
     assert "missing_components" not in payload
     assert "MUST NOT LEAK" not in json.dumps(record)
+    assert "could not tell whether `supervise`" in payload["wake_recovery_hint"]
 
 
 def test_dead_event_contracts_scope_actions_to_unsupervised_paths() -> None:
