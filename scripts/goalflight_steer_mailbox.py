@@ -5,6 +5,7 @@ Deploy this lock convention only after REV 5's zero-live-dispatch cutover gate.
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
@@ -125,6 +126,34 @@ def worker_wait_receipts_path(path: Path) -> Path:
     return path.with_name(f"{Path(path).stem}.receipts.jsonl")
 
 
+def worker_wait_cleanup_slot_path(
+    path: Path,
+    operation: str,
+    wait_id: str,
+    reply_seq: int,
+) -> Path:
+    """Return the flock file that bounds one in-flight cleanup helper.
+
+    The bound is one live process per ``(wait_id, reply_seq, operation)``, so
+    at most two live cleanup helpers for one exact typed reply.
+    """
+    if operation not in {WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END}:
+        raise ValueError("worker wait cleanup slot requires a known operation")
+    token = str(wait_id or "").strip()
+    if (
+        not token
+        or not token.isalnum()
+        or len(token) > 128
+    ):
+        raise ValueError("worker wait cleanup slot requires a bounded wait id")
+    if not isinstance(reply_seq, int) or isinstance(reply_seq, bool) or reply_seq <= 0:
+        raise ValueError("worker wait cleanup slot requires a positive reply_seq")
+    mailbox = Path(path)
+    return mailbox.with_name(
+        f".{mailbox.stem}.cleanup.{operation}.{token}.{reply_seq}.lock"
+    )
+
+
 def _append_worker_wait_reply_receipt(
     path: Path,
     reply: dict,
@@ -177,6 +206,118 @@ def record_worker_wait_reply_receipt(
             raise
 
 
+class _WorkerWaitCleanupSlot:
+    """Held non-blocking flock for one cleanup helper identity."""
+
+    def __init__(self, fd: int):
+        self._fd = fd
+
+    def release(self) -> None:
+        if self._fd < 0:
+            return
+        fd = self._fd
+        self._fd = -1
+        try:
+            goalflight_compat.flock(fd, goalflight_compat.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _try_acquire_worker_wait_cleanup_slot(
+    path: Path,
+    operation: str,
+    wait_id: str,
+    reply_seq: int,
+) -> _WorkerWaitCleanupSlot | None:
+    """Claim the exclusive in-flight slot, or None if a sibling already holds it."""
+    lock_path = worker_wait_cleanup_slot_path(path, operation, wait_id, reply_seq)
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if lock_path.is_symlink():
+        raise ValueError(f"{lock_path}: symlinked cleanup slot refused")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise OSError(f"{lock_path}: cannot open cleanup slot: {exc}") from exc
+    try:
+        goalflight_compat.flock(
+            fd,
+            goalflight_compat.LOCK_EX | goalflight_compat.LOCK_NB,
+        )
+    except (BlockingIOError, OSError) as exc:
+        os.close(fd)
+        if isinstance(exc, BlockingIOError) or getattr(exc, "errno", None) in {
+            errno.EACCES,
+            errno.EAGAIN,
+            errno.EWOULDBLOCK,
+        }:
+            return None
+        raise
+    return _WorkerWaitCleanupSlot(fd)
+
+
+def _worker_wait_cleanup_slot_held(
+    path: Path,
+    operation: str,
+    wait_id: str,
+    reply_seq: int,
+) -> bool:
+    """Best-effort probe used to skip a spawn while a helper is already live."""
+    slot = _try_acquire_worker_wait_cleanup_slot(path, operation, wait_id, reply_seq)
+    if slot is None:
+        return True
+    slot.release()
+    return False
+
+
+def _cleanup_arm_and_reply_from_mailbox(
+    path: Path,
+    *,
+    dispatch_id: str,
+    wait_id: str,
+    arm_seq: int,
+    reply_seq: int,
+) -> tuple[dict, dict]:
+    """Confirm argv names the mailbox's exact typed reply without taking its lock.
+
+    End-row re-validates under the mailbox write lock because it appends there.
+    Receipt writes a different carrier; waiting on the mailbox lock would let a
+    wedged end-row fsync stall the sidecar and recouple the two evidence paths.
+    An unlocked read is enough to refuse a forged receipt: renewal still needs
+    the real typed reply, and this check keeps the sidecar from recording one
+    that the mailbox does not contain.
+    """
+    try:
+        data = Path(path).read_bytes()
+    except OSError as exc:
+        raise ValueError("worker wait cleanup cannot read mailbox") from exc
+    entries = _parse_steer_carrier(path, data, quarantine_errors=False)
+    arm = next(
+        (
+            entry
+            for entry in entries
+            if entry.get("seq") == arm_seq
+            and entry.get("kind") == WORKER_WAIT_STARTED_KIND
+            and entry.get("dispatch_id") == dispatch_id
+            and entry.get("question_id") == wait_id
+        ),
+        None,
+    )
+    if arm is None:
+        raise ValueError("worker wait cleanup does not match one durable arm")
+    replies = _worker_wait_replies(
+        entries,
+        dispatch_id=dispatch_id,
+        wait_id=wait_id,
+        after_seq=arm_seq,
+    )
+    if len(replies) != 1 or replies[0].get("seq") != reply_seq:
+        raise ValueError("worker wait cleanup does not match one consumed typed reply")
+    return arm, replies[0]
+
+
 def _worker_wait_cleanup_command(
     operation: str,
     path: Path,
@@ -194,6 +335,7 @@ def _worker_wait_cleanup_command(
     if (
         operation not in {WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END}
         or not wait_id
+        or not wait_id.isalnum()
         or not dispatch_id
         or arm_seq <= 0
         or reply_seq <= 0
@@ -224,10 +366,20 @@ def schedule_worker_wait_reply_cleanup(path: Path, arm: dict, reply: dict) -> No
     wait command's exit. If launch or host failure loses an attempt, the
     fsynced typed reply remains the durable recovery job: an unproven reply is
     redelivered and schedules cleanup again.
+
+    Redelivery while a helper is still running does not spawn another process
+    for the same ``(wait_id, reply_seq, operation)``. The bound is one live
+    helper per operation, so at most two live cleanup processes per exact
+    reply. A later redelivery after both helpers have exited may spawn again
+    if evidence is still missing.
     """
     for operation in (WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END):
         try:
             command = _worker_wait_cleanup_command(operation, path, arm, reply)
+            wait_id = str(arm.get("question_id") or "").strip()
+            reply_seq = int(reply["seq"])
+            if _worker_wait_cleanup_slot_held(path, operation, wait_id, reply_seq):
+                continue
             subprocess.Popen(
                 command,
                 stdin=subprocess.DEVNULL,
@@ -253,26 +405,37 @@ def _run_worker_wait_cleanup(argv: list[str]) -> int:
         reply_seq = int(raw_reply_seq)
     except (TypeError, ValueError, OverflowError):
         return 64
+    if operation not in {WORKER_WAIT_CLEANUP_RECEIPT, WORKER_WAIT_CLEANUP_END}:
+        return 64
     path = Path(raw_path)
-    arm = {
-        "seq": arm_seq,
-        "dispatch_id": dispatch_id,
-        "question_id": wait_id,
-    }
-    reply = {
-        "seq": reply_seq,
-        "dispatch_id": dispatch_id,
-        "kind": WORKER_WAIT_REPLY_KIND,
-        "reply_to": wait_id,
-    }
     try:
+        slot = _try_acquire_worker_wait_cleanup_slot(
+            path,
+            operation,
+            wait_id,
+            reply_seq,
+        )
+    except ValueError:
+        return 64
+    except OSError:
+        return 1
+    if slot is None:
+        return 0
+    try:
+        arm, reply = _cleanup_arm_and_reply_from_mailbox(
+            path,
+            dispatch_id=dispatch_id,
+            wait_id=wait_id,
+            arm_seq=arm_seq,
+            reply_seq=reply_seq,
+        )
         if operation == WORKER_WAIT_CLEANUP_RECEIPT:
             _append_worker_wait_reply_receipt(
                 path,
                 reply,
                 lock_timeout_secs=None,
             )
-        elif operation == WORKER_WAIT_CLEANUP_END:
+        else:
             append_worker_wait_ended(
                 path,
                 arm,
@@ -280,14 +443,14 @@ def _run_worker_wait_cleanup(argv: list[str]) -> int:
                 reply_seq=reply_seq,
                 lock_timeout_secs=None,
             )
-        else:
-            return 64
     except (OSError, RuntimeError, TimeoutError, ValueError):
         return 1
     except Exception as exc:
         if not is_carrier_error(exc):
             raise
         return 1
+    finally:
+        slot.release()
     return 0
 
 

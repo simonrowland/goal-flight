@@ -118,6 +118,73 @@ def _wait_for_cleanup_evidence(
     return entries, receipts
 
 
+def _cleanup_helper_lines(mailbox: Path) -> list[str]:
+    output = subprocess.check_output(["ps", "-axo", "pid=,args="], text=True)
+    mailbox_s = str(mailbox)
+    return [
+        line
+        for line in output.splitlines()
+        if steer.WORKER_WAIT_CLEANUP_MODE in line and mailbox_s in line
+    ]
+
+
+def _hold_cleanup_slot(
+    tmp_path: Path,
+    mailbox: Path,
+    operation: str,
+    wait_id: str,
+    reply_seq: int,
+) -> subprocess.Popen:
+    ready = tmp_path / f"hold-{operation}-{reply_seq}.ready"
+    env = _env(tmp_path)
+    env.update(
+        {
+            "TEST_STEER_FILE": str(mailbox),
+            "TEST_OPERATION": operation,
+            "TEST_WAIT_ID": wait_id,
+            "TEST_REPLY_SEQ": str(reply_seq),
+            "TEST_READY_FILE": str(ready),
+        }
+    )
+    holder_code = r'''
+import os
+import time
+from pathlib import Path
+import goalflight_steer_mailbox as steer
+
+slot = steer._try_acquire_worker_wait_cleanup_slot(
+    Path(os.environ["TEST_STEER_FILE"]),
+    os.environ["TEST_OPERATION"],
+    os.environ["TEST_WAIT_ID"],
+    int(os.environ["TEST_REPLY_SEQ"]),
+)
+if slot is None:
+    raise SystemExit("slot already held")
+Path(os.environ["TEST_READY_FILE"]).write_text("ready", encoding="utf-8")
+try:
+    time.sleep(30)
+finally:
+    slot.release()
+'''
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_code],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 2
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not ready.exists():
+        holder.kill()
+        out, err = holder.communicate(timeout=2)
+        raise AssertionError(
+            f"cleanup slot holder did not become ready: {out}{err}"
+        )
+    return holder
+
+
 def _watcher_command(
     *,
     dispatch_id: str,
@@ -1800,6 +1867,480 @@ print("WAIT-RETURNED", flush=True)
     assert any(
         entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND for entry in entries
     ), entries
+
+
+def test_end_row_fsync_stall_does_not_hold_waiter_return(tmp_path: Path) -> None:
+    """A worker_wait_ended fsync runs after delivery and cannot hold --wait.
+
+    The site hook is inherited by the real wait process and any detached
+    cleanup process it launches. It stalls only the end-row payload's actual
+    os.fsync, after the typed reply has already been flushed to worker output.
+    A receipts-only stall would still pass if end-row were put back on the
+    synchronous return path, because that write uses the mailbox, not the
+    sidecar.
+    """
+    mailbox = tmp_path / "end-row-stall.steer.jsonl"
+    dispatch_id = "end-row-stall"
+    stall_started = tmp_path / "end-row-fsync.started"
+    release_stall = tmp_path / "end-row-fsync.release"
+    hook_dir = tmp_path / "python-hook"
+    hook_dir.mkdir()
+    hook_dir.joinpath("sitecustomize.py").write_text(
+        """
+import os
+import time
+from pathlib import Path
+
+import goalflight_messages as messages
+
+real_append_fsync = messages._append_fsync
+stall_started = Path(os.environ["TEST_CLEANUP_FSYNC_STARTED"])
+release_stall = Path(os.environ["TEST_CLEANUP_FSYNC_RELEASE"])
+
+def stalled_end_row_fsync(path, data):
+    if b"worker_wait_ended" not in data:
+        return real_append_fsync(path, data)
+    real_fsync = messages.os.fsync
+    stalled = False
+
+    def fsync_with_barrier(fd):
+        nonlocal stalled
+        if not stalled:
+            stalled = True
+            stall_started.write_text(str(path), encoding="utf-8")
+            while not release_stall.exists():
+                time.sleep(0.01)
+        return real_fsync(fd)
+
+    messages.os.fsync = fsync_with_barrier
+    try:
+        return real_append_fsync(path, data)
+    finally:
+        messages.os.fsync = real_fsync
+
+messages._append_fsync = stalled_end_row_fsync
+""",
+        encoding="utf-8",
+    )
+    worker_code = r'''
+import os
+from pathlib import Path
+
+import goalflight_steer_mailbox as steer
+
+def report(event):
+    if event["state"] == "armed":
+        print(f"ARMED: {event['arm']['question_id']}", flush=True)
+    elif event["state"] == "messages":
+        for entry in event["entries"]:
+            for line in steer.worker_wait_reply_output_lines(entry):
+                print(line, flush=True)
+
+result = steer.wait_for_worker_entries(
+    Path(os.environ["TEST_STEER_FILE"]),
+    dispatch_id=os.environ["TEST_DISPATCH_ID"],
+    acked_seqs=set(),
+    question_kind="USER-NEED",
+    question_text="prove end-row fsync cannot hold my return",
+    timeout_secs=4.0,
+    poll_secs=0.02,
+    notify=report,
+)
+if result["state"] != "messages":
+    raise SystemExit(1)
+print("WAIT-RETURNED", flush=True)
+'''
+    env = _env(tmp_path)
+    env.update(
+        {
+            "PYTHONPATH": str(hook_dir) + os.pathsep + env["PYTHONPATH"],
+            "TEST_CLEANUP_FSYNC_STARTED": str(stall_started),
+            "TEST_CLEANUP_FSYNC_RELEASE": str(release_stall),
+            "TEST_DISPATCH_ID": dispatch_id,
+            "TEST_STEER_FILE": str(mailbox),
+        }
+    )
+    waiter = subprocess.Popen(
+        [sys.executable, "-c", worker_code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+    )
+    waiter_out = ""
+    waiter_err = ""
+    try:
+        deadline = time.monotonic() + 5.0
+        arm = None
+        while time.monotonic() < deadline:
+            try:
+                arm = next(
+                    entry
+                    for entry in steer.read_steer_entries(mailbox)
+                    if entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND
+                )
+            except (FileNotFoundError, StopIteration):
+                time.sleep(0.01)
+            else:
+                break
+        assert arm is not None, "waiter never durably armed"
+        reply = steer.append_worker_wait_reply(
+            mailbox,
+            dispatch_id=dispatch_id,
+            wait_id=str(arm["question_id"]),
+            text="end-row may finish later",
+        )
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not stall_started.exists():
+            time.sleep(0.01)
+        assert stall_started.exists(), "the end-row fsync never stalled"
+        assert stall_started.read_text(encoding="utf-8") == str(mailbox)
+
+        waiter_out, waiter_err = waiter.communicate(timeout=2.0)
+        assert waiter.returncode == 0, waiter_out + waiter_err
+        assert "STEER-REPLY:" in waiter_out, waiter_out
+        assert "WAIT-RETURNED" in waiter_out, waiter_out
+        receipts = steer.consumed_worker_wait_receipts({}, mailbox_path=mailbox)
+        assert receipts == {(str(arm["question_id"]), int(reply["seq"]))}, receipts
+    finally:
+        release_stall.write_text("release\n", encoding="utf-8")
+        if waiter.poll() is None:
+            waiter.kill()
+            waiter_out, waiter_err = waiter.communicate(timeout=5.0)
+
+    expected_receipt = (str(arm["question_id"]), int(reply["seq"]))
+    entries, receipts = _wait_for_cleanup_evidence(
+        mailbox,
+        wait_id=expected_receipt[0],
+        reply_seq=expected_receipt[1],
+    )
+    assert receipts == {expected_receipt}, receipts
+    assert any(
+        entry.get("kind") == steer.WORKER_WAIT_ENDED_KIND for entry in entries
+    ), entries
+
+
+def test_schedule_cleanup_skips_spawn_when_slot_is_held(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At most one live helper per (wait_id, reply_seq, operation)."""
+    mailbox = tmp_path / "coalesce-spawn.steer.jsonl"
+    dispatch_id = "coalesce-spawn"
+    arm = steer.append_worker_wait_started(
+        mailbox,
+        dispatch_id=dispatch_id,
+        timeout_secs=2.0,
+        question_kind="USER-NEED",
+        question_text="coalesce the cleanup spawn",
+    )
+    reply = steer.append_worker_wait_reply(
+        mailbox,
+        dispatch_id=dispatch_id,
+        wait_id=str(arm["question_id"]),
+        text="answer",
+    )
+    spawned: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def fake_popen(command, **kwargs):
+        if (
+            isinstance(command, (list, tuple))
+            and len(command) > 3
+            and command[2] == steer.WORKER_WAIT_CLEANUP_MODE
+        ):
+            spawned.append(list(command))
+            return subprocess.CompletedProcess(command, 0)
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(steer.subprocess, "Popen", fake_popen)
+    wait_id = str(arm["question_id"])
+    reply_seq = int(reply["seq"])
+    holders = [
+        _hold_cleanup_slot(
+            tmp_path,
+            mailbox,
+            steer.WORKER_WAIT_CLEANUP_RECEIPT,
+            wait_id,
+            reply_seq,
+        ),
+        _hold_cleanup_slot(
+            tmp_path,
+            mailbox,
+            steer.WORKER_WAIT_CLEANUP_END,
+            wait_id,
+            reply_seq,
+        ),
+    ]
+    try:
+        steer.schedule_worker_wait_reply_cleanup(mailbox, arm, reply)
+        assert spawned == [], spawned
+    finally:
+        for holder in holders:
+            holder.terminate()
+            holder.wait(timeout=5)
+
+    steer.schedule_worker_wait_reply_cleanup(mailbox, arm, reply)
+    operations = [command[3] for command in spawned]
+    assert operations == [
+        steer.WORKER_WAIT_CLEANUP_RECEIPT,
+        steer.WORKER_WAIT_CLEANUP_END,
+    ], spawned
+
+
+def test_cleanup_helper_exits_when_sibling_holds_slot(tmp_path: Path) -> None:
+    mailbox = tmp_path / "coalesce-helper.steer.jsonl"
+    dispatch_id = "coalesce-helper"
+    arm = steer.append_worker_wait_started(
+        mailbox,
+        dispatch_id=dispatch_id,
+        timeout_secs=2.0,
+        question_kind="USER-NEED",
+        question_text="sibling owns the slot",
+    )
+    reply = steer.append_worker_wait_reply(
+        mailbox,
+        dispatch_id=dispatch_id,
+        wait_id=str(arm["question_id"]),
+        text="answer",
+    )
+    wait_id = str(arm["question_id"])
+    reply_seq = int(reply["seq"])
+    command = steer._worker_wait_cleanup_command(
+        steer.WORKER_WAIT_CLEANUP_RECEIPT,
+        mailbox,
+        arm,
+        reply,
+    )
+    holder = _hold_cleanup_slot(
+        tmp_path,
+        mailbox,
+        steer.WORKER_WAIT_CLEANUP_RECEIPT,
+        wait_id,
+        reply_seq,
+    )
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=2)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert steer.consumed_worker_wait_receipts({}, mailbox_path=mailbox) == set()
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
+
+
+def test_redelivery_does_not_accumulate_cleanup_helpers(tmp_path: Path) -> None:
+    """A wedged cleanup plus polling redelivery stays at two live helpers."""
+    mailbox = tmp_path / "cleanup-bound.steer.jsonl"
+    dispatch_id = "cleanup-bound"
+    stall_started = tmp_path / "cleanup-bound.started"
+    release_stall = tmp_path / "cleanup-bound.release"
+    hook_dir = tmp_path / "python-hook"
+    hook_dir.mkdir()
+    hook_dir.joinpath("sitecustomize.py").write_text(
+        """
+import os
+import time
+from pathlib import Path
+
+import goalflight_messages as messages
+
+real_append_fsync = messages._append_fsync
+stall_started = Path(os.environ["TEST_CLEANUP_FSYNC_STARTED"])
+release_stall = Path(os.environ["TEST_CLEANUP_FSYNC_RELEASE"])
+
+def stalled_cleanup_fsync(path, data):
+    target = Path(path)
+    if target.name.endswith(".receipts.jsonl") or b"worker_wait_ended" in data:
+        marker = stall_started
+        if marker.exists():
+            marker.write_text(
+                marker.read_text(encoding="utf-8") + "\\n" + str(path),
+                encoding="utf-8",
+            )
+        else:
+            marker.write_text(str(path), encoding="utf-8")
+        while not release_stall.exists():
+            time.sleep(0.01)
+    return real_append_fsync(path, data)
+
+messages._append_fsync = stalled_cleanup_fsync
+""",
+        encoding="utf-8",
+    )
+    env = _env(tmp_path)
+    hook_pythonpath = str(hook_dir) + os.pathsep + env["PYTHONPATH"]
+    env.update(
+        {
+            "PYTHONPATH": hook_pythonpath,
+            "TEST_CLEANUP_FSYNC_STARTED": str(stall_started),
+            "TEST_CLEANUP_FSYNC_RELEASE": str(release_stall),
+            "TEST_DISPATCH_ID": dispatch_id,
+            "TEST_STEER_FILE": str(mailbox),
+        }
+    )
+    worker_code = r'''
+import os
+from pathlib import Path
+import goalflight_steer_mailbox as steer
+
+result = steer.wait_for_worker_entries(
+    Path(os.environ["TEST_STEER_FILE"]),
+    dispatch_id=os.environ["TEST_DISPATCH_ID"],
+    acked_seqs=set(),
+    question_kind="USER-NEED",
+    question_text="bound the helpers",
+    timeout_secs=4.0,
+    poll_secs=0.02,
+)
+if result["state"] != "messages":
+    raise SystemExit(1)
+print(result["wait_id"], result["entries"][0]["seq"], flush=True)
+'''
+    waiter = subprocess.Popen(
+        [sys.executable, "-c", worker_code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        arm = None
+        while time.monotonic() < deadline:
+            try:
+                arm = next(
+                    entry
+                    for entry in steer.read_steer_entries(mailbox)
+                    if entry.get("kind") == steer.WORKER_WAIT_STARTED_KIND
+                )
+            except (FileNotFoundError, StopIteration):
+                time.sleep(0.01)
+            else:
+                break
+        assert arm is not None, "waiter never durably armed"
+        reply = steer.append_worker_wait_reply(
+            mailbox,
+            dispatch_id=dispatch_id,
+            wait_id=str(arm["question_id"]),
+            text="keep the helpers wedged",
+        )
+        waiter_out, waiter_err = waiter.communicate(timeout=5.0)
+        assert waiter.returncode == 0, waiter_out + waiter_err
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and len(_cleanup_helper_lines(mailbox)) < 2:
+            time.sleep(0.01)
+        live = _cleanup_helper_lines(mailbox)
+        assert len(live) == 2, live
+        # Helpers become visible in ps before they take the slot flock.
+        time.sleep(0.1)
+
+        # deliver_reply schedules cleanup again on every redelivery of this
+        # exact reply. A new wait is the wrong hammer here: the wedged end-row
+        # helper already holds the mailbox lock, so a bounded read may deadline
+        # without reaching schedule. Call the spawn path directly.
+        for _ in range(8):
+            steer.schedule_worker_wait_reply_cleanup(mailbox, arm, reply)
+        deadline = time.monotonic() + 2.0
+        live = _cleanup_helper_lines(mailbox)
+        while time.monotonic() < deadline and len(live) > 2:
+            time.sleep(0.01)
+            live = _cleanup_helper_lines(mailbox)
+        assert live and len(live) == 2, live
+        assert int(reply["seq"]) == int(waiter_out.split()[1]), waiter_out
+    finally:
+        release_stall.write_text("release\n", encoding="utf-8")
+        if waiter.poll() is None:
+            waiter.kill()
+            waiter.communicate(timeout=5.0)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and _cleanup_helper_lines(mailbox):
+            time.sleep(0.01)
+
+
+def test_receipt_helper_rereads_mailbox_instead_of_trusting_argv(
+    tmp_path: Path,
+) -> None:
+    mailbox = tmp_path / "forged-receipt.steer.jsonl"
+    dispatch_id = "forged-receipt"
+    arm = steer.append_worker_wait_started(
+        mailbox,
+        dispatch_id=dispatch_id,
+        timeout_secs=2.0,
+        question_kind="USER-NEED",
+        question_text="real arm without a matching reply",
+    )
+    forged = [
+        sys.executable,
+        str(Path(steer.__file__).resolve()),
+        steer.WORKER_WAIT_CLEANUP_MODE,
+        steer.WORKER_WAIT_CLEANUP_RECEIPT,
+        str(mailbox),
+        dispatch_id,
+        str(arm["question_id"]),
+        str(arm["seq"]),
+        "99",
+    ]
+    result = subprocess.run(forged, capture_output=True, text=True, timeout=2)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert steer.consumed_worker_wait_receipts({}, mailbox_path=mailbox) == set()
+    assert not steer.worker_wait_receipts_path(mailbox).exists()
+
+
+def test_receipt_helper_does_not_wait_on_mailbox_lock(tmp_path: Path) -> None:
+    """Receipt re-read is unlocked so a wedged end-row cannot stall the sidecar."""
+    mailbox = tmp_path / "receipt-unlocked.steer.jsonl"
+    dispatch_id = "receipt-unlocked"
+    arm = steer.append_worker_wait_started(
+        mailbox,
+        dispatch_id=dispatch_id,
+        timeout_secs=2.0,
+        question_kind="USER-NEED",
+        question_text="receipt must not take the mailbox lock",
+    )
+    reply = steer.append_worker_wait_reply(
+        mailbox,
+        dispatch_id=dispatch_id,
+        wait_id=str(arm["question_id"]),
+        text="durable reply",
+    )
+    ready = tmp_path / "mailbox-lock-ready"
+    holder_code = r'''
+import os
+import time
+from pathlib import Path
+import goalflight_messages as messages
+
+with messages.mail_lock(Path(os.environ["TEST_STEER_FILE"])):
+    Path(os.environ["TEST_READY_FILE"]).write_text("ready", encoding="utf-8")
+    time.sleep(8)
+'''
+    env = _env(tmp_path)
+    env.update({"TEST_STEER_FILE": str(mailbox), "TEST_READY_FILE": str(ready)})
+    holder = subprocess.Popen([sys.executable, "-c", holder_code], env=env)
+    try:
+        deadline = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "mailbox lock holder did not become ready"
+        command = steer._worker_wait_cleanup_command(
+            steer.WORKER_WAIT_CLEANUP_RECEIPT,
+            mailbox,
+            arm,
+            reply,
+        )
+        started = time.monotonic()
+        result = subprocess.run(command, capture_output=True, text=True, timeout=2)
+        elapsed = time.monotonic() - started
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert elapsed < 1.0, f"receipt helper blocked on mailbox lock for {elapsed:.3f}s"
+        assert steer.consumed_worker_wait_receipts({}, mailbox_path=mailbox) == {
+            (str(arm["question_id"]), int(reply["seq"]))
+        }
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
 
 
 def test_next_wait_recovers_reply_from_writer_admitted_before_deadline(
