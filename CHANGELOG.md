@@ -6,6 +6,19 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- Drain no longer restores a queued dispatch whose launch argv is now a
+  permanently inert `--os-sandbox` combination. Transient refusals
+  (capacity, a missing controller) still restore-and-retry; a permanent
+  inert combo is terminalized with the child's own refusal text so an
+  operator can read why rather than re-deriving it.
+- `--os-sandbox` on a raw `-- <cmd>` argv is refused when the launch path
+  cannot honour it. Preset-only guards still skip for raw workers; the
+  safety flag does not.
+- `--os-sandbox` help names ACP honouring as a refusal axis, not
+  bash-codex-only.
+
 ## [1.5.1] - 2026-08-23
 
 ### Changed

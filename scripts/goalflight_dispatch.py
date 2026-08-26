@@ -564,7 +564,7 @@ def _validate_agent_os_sandbox(args) -> None:
         )
     explicit = getattr(args, "os_sandbox", None)
     if explicit in OS_SANDBOX_PROFILES and not _os_sandbox_enforced_by_launch(args):
-        raise DispatchUsageError(
+        raise UnsupportedAgentSandboxRequest(
             f"--os-sandbox {explicit} is ignored for agent={agent} "
             f"shape={shape}; refusing to launch with an inert safety flag. "
             "Use --read-only instead (grok: deny rules for Write/Edit/Bash; "
@@ -2343,30 +2343,32 @@ def _guard_grok_code_research_prompt(args) -> None:
 
 
 def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
-    if raw_argv:
-        return
-    retired = RETIRED_AGENT_LABELS.get(args.agent)
-    if retired:
-        raise DispatchUsageError(
-            f"--agent {args.agent!r} is retired — {retired}"
-        )
-    if args.agent not in PRESET_AGENTS:
-        raise DispatchUsageError(
-            "no worker preset for --agent "
-            f"{args.agent!r} — use --agent codex|grok-code|grok-research|moonshot|cursor|claude with "
-            "--prompt/--prompt-file, or pass a raw worker after `-- <cmd...>`"
-        )
-    if args.agent in STDIN_PROMPT_AGENTS and not _prompt_requested(args):
-        raise DispatchUsageError(
-            f"--agent {args.agent} requires --prompt or --prompt-file; refusing to feed empty stdin"
-        )
-    if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
-        raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
+    if not raw_argv:
+        retired = RETIRED_AGENT_LABELS.get(args.agent)
+        if retired:
+            raise DispatchUsageError(
+                f"--agent {args.agent!r} is retired — {retired}"
+            )
+        if args.agent not in PRESET_AGENTS:
+            raise DispatchUsageError(
+                "no worker preset for --agent "
+                f"{args.agent!r} — use --agent codex|grok-code|grok-research|moonshot|cursor|claude with "
+                "--prompt/--prompt-file, or pass a raw worker after `-- <cmd...>`"
+            )
+        if args.agent in STDIN_PROMPT_AGENTS and not _prompt_requested(args):
+            raise DispatchUsageError(
+                f"--agent {args.agent} requires --prompt or --prompt-file; refusing to feed empty stdin"
+            )
+        if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
+            raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
+        _guard_read_only_write_prompt(args)
+        _guard_grok_code_research_prompt(args)
+    # `--os-sandbox` is a dispatch-level safety claim even when `-- <cmd>`
+    # overrides the preset. Skipping it here made a raw grok argv with an
+    # inert profile launch as if the flag were honoured.
     _validate_os_sandbox_conflict(args)
     _validate_agent_os_sandbox(args)
     _validate_os_sandbox_boundary(args)
-    _guard_read_only_write_prompt(args)
-    _guard_grok_code_research_prompt(args)
 
 
 def _nonterminal_dispatch_reuse_reason(
@@ -4722,53 +4724,116 @@ def _record_queued_status(args, *, project_root: Path, status_json: Path, tail: 
     _start_dashboard_refresh_for_project(project_root)
 
 
+DISPATCH_REFUSED_PREFIX = "DISPATCH-REFUSED "
+
+
+def _permanent_sandbox_refusal_payload(
+    args, error: UnsupportedAgentSandboxRequest
+) -> dict:
+    return {
+        "dispatch_id": getattr(args, "dispatch_id", None),
+        "permanent": True,
+        "reason": str(error),
+        "state": "blocked_os_sandbox",
+    }
+
+
+def _emit_permanent_sandbox_refusal(
+    args, error: UnsupportedAgentSandboxRequest
+) -> None:
+    """Tell drain this refusal cannot become valid by waiting."""
+    print(
+        DISPATCH_REFUSED_PREFIX
+        + json.dumps(_permanent_sandbox_refusal_payload(args, error), sort_keys=True),
+        flush=True,
+    )
+
+
+def _permanent_pre_spawn_refusal_reason(
+    proc: subprocess.CompletedProcess,
+) -> str | None:
+    """Child's own permanent-refusal text, or None for a transient pre-spawn miss.
+
+    Capacity and busy restore-and-retry. An inert flag combination cannot.
+    Drain must terminalize the latter; restoring it is the b-215/b-219 stick.
+    """
+    blob = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    prefix = DISPATCH_REFUSED_PREFIX
+    for line in blob.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(prefix):
+            continue
+        try:
+            payload = json.loads(stripped[len(prefix) :])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or not payload.get("permanent"):
+            continue
+        reason = str(payload.get("reason") or "").strip()
+        if reason:
+            return reason
+    return None
+
+
 def _record_unsupported_sandbox_rejection(
     args, error: UnsupportedAgentSandboxRequest
 ) -> int:
     """Persist an honest terminal audit row without launching or taking capacity."""
+    _emit_permanent_sandbox_refusal(args, error)
+    reason = str(error)
+    print(f"goalflight_dispatch: {reason}", file=sys.stderr)
     base = _dispatch_base_dir()
     if not args.dispatch_id:
         args.dispatch_id = _reserve_auto_dispatch_id(args.agent, base)
-    _refuse_reused_dispatch_id_for_launch(args.dispatch_id)
-    tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
-    status_json = (
-        Path(args.status_json)
-        if args.status_json
-        else base / f"{args.dispatch_id}.status.json"
-    )
-    project_root = _project_root(args)
-    reason = str(error)
-    posture = _os_sandbox_posture(args, worker_pid=None)
-    write_status(
-        status_json,
-        {
-            "dispatch_id": args.dispatch_id,
-            "agent": args.agent,
-            "state": "blocked_os_sandbox",
-            "reason": reason,
-            "project_root": str(project_root),
-            "worker_pid": None,
-            "worker_alive": False,
-            "tail_path": str(tail),
-            "os_sandbox": posture,
-            "updated_at": int(time.time()),
-        },
-    )
-    _record_ledger(
-        args,
-        project_root=project_root,
-        prompt_path=(
-            str(Path(args.prompt_file).expanduser()) if args.prompt_file else None
-        ),
-        status_json=status_json,
-        tail=tail,
-        lease_id=None,
-        worker_pid=None,
-        state="blocked_os_sandbox",
-    )
-    _finish_ledger(args.dispatch_id, "blocked_os_sandbox", reason, elapsed_s=0.0)
-    _export_dashboard_status_for_project(project_root)
-    print(f"goalflight_dispatch: {reason}", file=sys.stderr)
+    try:
+        _refuse_reused_dispatch_id_for_launch(
+            args.dispatch_id,
+            allow_queued=bool(
+                getattr(args, "from_queue", False) or getattr(args, "submit", False)
+            ),
+        )
+        tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
+        status_json = (
+            Path(args.status_json)
+            if args.status_json
+            else base / f"{args.dispatch_id}.status.json"
+        )
+        project_root = _project_root(args)
+        posture = _os_sandbox_posture(args, worker_pid=None)
+        write_status(
+            status_json,
+            {
+                "dispatch_id": args.dispatch_id,
+                "agent": args.agent,
+                "state": "blocked_os_sandbox",
+                "reason": reason,
+                "project_root": str(project_root),
+                "worker_pid": None,
+                "worker_alive": False,
+                "tail_path": str(tail),
+                "os_sandbox": posture,
+                "updated_at": int(time.time()),
+            },
+        )
+        _record_ledger(
+            args,
+            project_root=project_root,
+            prompt_path=(
+                str(Path(args.prompt_file).expanduser()) if args.prompt_file else None
+            ),
+            status_json=status_json,
+            tail=tail,
+            lease_id=None,
+            worker_pid=None,
+            state="blocked_os_sandbox",
+        )
+        _finish_ledger(args.dispatch_id, "blocked_os_sandbox", reason, elapsed_s=0.0)
+        _export_dashboard_status_for_project(project_root)
+    except (DispatchUsageError, OSError, RuntimeError):
+        # Token + stderr already carry the child's refusal. Drain still
+        # terminalizes the claim from DISPATCH-REFUSED even if this audit row
+        # cannot land (queued id already present, journal busy, ...).
+        return 64
     return 64
 
 
@@ -10543,6 +10608,22 @@ def _drain_queue_once(args) -> dict:
             and observed_claim.get("queue_launch_token") == launch_token
             and _entry_pre_spawn(observed_claim)
         ):
+            permanent_reason = _permanent_pre_spawn_refusal_reason(proc)
+            if permanent_reason:
+                # Inert flag combo / unsupported sandbox: waiting cannot
+                # make it valid. Restore-to-queued is the silent stick.
+                failed += 1
+                committed = _mark_claim_failed(
+                    claim, entry, reason=permanent_reason
+                )
+                details.append(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": "failed" if committed else "claimed",
+                        "reason": permanent_reason,
+                    }
+                )
+                continue
             restored, decision = _restore_claim_if_incomplete(
                 claim,
                 entry,
@@ -11753,14 +11834,14 @@ def _build_launch_parser() -> argparse.ArgumentParser:
                              "--os-sandbox read-only.")
     parser.add_argument("--os-sandbox", type=_parse_os_sandbox_arg, default=None,
                         metavar="{workspace-write,read-only,off}",
-                        help="Opt-in OS sandbox profile for the bash-shape codex worker. Unset = "
-                             "workspace-write (the unchanged default; existing dispatches are "
-                             "unaffected). 'off' disables codex's Seatbelt sandbox "
-                             "(codex --sandbox danger-full-access) for TRUSTED LOCAL GPU/perf work — "
-                             "lets the worker reach Metal/MPS and write .git/worktrees/<name> to "
-                             "self-commit. Sanctioned adapter profile, DISTINCT from the always-"
-                             "forbidden --dangerously-*/--no-sandbox bypass flags. Commit-guard "
-                             "(explicit pathspecs, no auto-push) + capacity/ledger tracking unchanged.")
+                        help="OS sandbox profile. Honoured by bash-shape codex (maps to "
+                             "codex --sandbox) and by ACP shapes whose adapter and platform "
+                             "can wrap the worker (macOS sandbox-exec). Unset = workspace-write "
+                             "for bash-shape codex. An accepted-but-inert request is refused; "
+                             "grok bash should pass --read-only instead. 'off' disables codex's "
+                             "Seatbelt sandbox (codex --sandbox danger-full-access) for TRUSTED "
+                             "LOCAL GPU/perf work. Sanctioned adapter profile, DISTINCT from the "
+                             "always-forbidden --dangerously-*/--no-sandbox bypass flags.")
     parser.add_argument("--priority", choices=["critical", "normal", "bulk"], default="normal",
                         help="Capacity lane. bulk = review storms / batch work (reserves the last "
                              "machine+pool slots for others); critical = fix dispatches (may borrow "
@@ -12091,6 +12172,12 @@ def main(argv: list[str] | None = None) -> int:
                 ]
             _mark_queue_claim_launch_started(args)
             return _run_acp_shape(args, base=base, account_env=account_env)
+        except UnsupportedAgentSandboxRequest as e:
+            try:
+                return _record_unsupported_sandbox_rejection(args, e)
+            except DispatchUsageError as record_error:
+                print(f"goalflight_dispatch: {record_error}", file=sys.stderr)
+                return 64
         except DispatchUsageError as e:
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64

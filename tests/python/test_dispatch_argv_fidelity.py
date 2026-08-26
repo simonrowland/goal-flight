@@ -757,12 +757,14 @@ def test_inert_os_sandbox_is_refused_per_combination() -> None:
         args = argparse.Namespace(
             agent=agent, shape=shape, os_sandbox=profile, read_only=False
         )
-        with pytest.raises(D.DispatchUsageError) as raised:
+        with pytest.raises(D.UnsupportedAgentSandboxRequest) as raised:
             D._validate_agent_os_sandbox(args)
         message = str(raised.value)
         assert "--os-sandbox" in message, (agent, shape, profile, message)
+        assert f"agent={agent}" in message, (agent, shape, profile, message)
+        assert f"shape={shape}" in message, (agent, shape, profile, message)
+        # Names a working alternative without pinning a canned vendor sentence.
         assert "--read-only" in message, (agent, shape, profile, message)
-        assert "codex" in message.lower(), (agent, shape, profile, message)
 
 
 def test_honored_os_sandbox_and_read_only_still_launch() -> None:
@@ -797,6 +799,12 @@ def test_honored_os_sandbox_and_read_only_still_launch() -> None:
                 agent="grok-acp", shape="acp", os_sandbox="read-only", read_only=False
             ),
             argparse.Namespace(
+                agent="grok-acp",
+                shape="acp",
+                os_sandbox="workspace-write",
+                read_only=False,
+            ),
+            argparse.Namespace(
                 agent="codex-acp",
                 shape="acp",
                 os_sandbox="workspace-write",
@@ -808,3 +816,183 @@ def test_honored_os_sandbox_and_read_only_still_launch() -> None:
         )
     for args in allowed:
         D._validate_agent_os_sandbox(args)
+
+
+def test_os_sandbox_help_names_acp_honouring() -> None:
+    help_text = D._build_launch_parser().format_help()
+    assert "ACP" in help_text
+    assert "inert" in help_text.lower()
+
+
+def test_raw_remainder_still_refuses_inert_os_sandbox() -> None:
+    """`-- <cmd>` skips preset guards, not the dispatch-level safety flag."""
+    args = argparse.Namespace(
+        agent="grok-code",
+        shape="bash",
+        os_sandbox="read-only",
+        read_only=False,
+        cwd=None,
+    )
+    with pytest.raises(D.UnsupportedAgentSandboxRequest) as raised:
+        D._validate_before_side_effects(args, [sys.executable, "-c", "print(1)"])
+    message = str(raised.value)
+    assert "--os-sandbox" in message
+    assert "agent=grok-code" in message
+
+
+def test_permanent_refusal_parser_reads_child_text_not_capacity() -> None:
+    refused = subprocess.CompletedProcess(
+        args=["dispatch"],
+        returncode=64,
+        stdout=(
+            D.DISPATCH_REFUSED_PREFIX
+            + json.dumps(
+                {
+                    "dispatch_id": "inert-queued",
+                    "permanent": True,
+                    "reason": (
+                        "--os-sandbox read-only is ignored for "
+                        "agent=grok-code shape=bash; refusing to launch "
+                        "with an inert safety flag."
+                    ),
+                    "state": "blocked_os_sandbox",
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        ),
+        stderr="goalflight_dispatch: --os-sandbox read-only is ignored\n",
+    )
+    reason = D._permanent_pre_spawn_refusal_reason(refused)
+    assert reason is not None
+    assert "--os-sandbox read-only" in reason
+    assert "agent=grok-code" in reason
+
+    capacity = subprocess.CompletedProcess(
+        args=["dispatch"],
+        returncode=2,
+        stdout='DISPATCH-BLOCKED {"state": "blocked_capacity"}\n',
+        stderr="",
+    )
+    assert D._permanent_pre_spawn_refusal_reason(capacity) is None
+
+    usage = subprocess.CompletedProcess(
+        args=["dispatch"],
+        returncode=64,
+        stdout="",
+        stderr="goalflight_dispatch: label in use; rerun with --takeover\n",
+    )
+    assert D._permanent_pre_spawn_refusal_reason(usage) is None
+
+
+def test_drain_terminalizes_permanently_inert_queued_argv(
+    tmp_path: Path,
+) -> None:
+    """A queued grok --os-sandbox combo recorded before the refusal existed
+    must not restore-to-queued. Stays red if that restore branch returns.
+    """
+    prompt = tmp_path / "prompt.md"
+    prompt.write_text("Review the change.\n", encoding="utf-8")
+    dispatch_id = "inert-queued-grok"
+    queue = D._dispatch_queue_dir()
+    queue.mkdir(parents=True, exist_ok=True)
+    queue_path = queue / f"{dispatch_id}.json"
+    argv = [
+        "--agent",
+        "grok-code",
+        "--os-sandbox",
+        "read-only",
+        "--prompt-file",
+        str(prompt),
+        "--dispatch-id",
+        dispatch_id,
+        "--cwd",
+        str(tmp_path),
+        "--unregistered-forced",
+        "--no-orientation",
+        "--ignore-git-warn",
+        "--tail",
+        str(tmp_path / f"{dispatch_id}.tail"),
+        "--status-json",
+        str(tmp_path / f"{dispatch_id}.status.json"),
+    ]
+    D._write_json_atomic(
+        queue_path,
+        {
+            "schema": D.DISPATCH_QUEUE_SCHEMA,
+            "state": "queued",
+            "dispatch_id": dispatch_id,
+            "agent": "grok-code",
+            "shape": "bash",
+            "project_root": str(tmp_path),
+            "process_cwd": str(tmp_path),
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "queue_path": str(queue_path),
+            "dispatch_argv": argv,
+            "request": {
+                "agent": "grok-code",
+                "cwd": str(tmp_path),
+                "os_sandbox": "read-only",
+                "prompt_file": str(prompt),
+                "tail": str(tmp_path / f"{dispatch_id}.tail"),
+                "status_json": str(tmp_path / f"{dispatch_id}.status.json"),
+            },
+        },
+    )
+    L.write_record(
+        {
+            "schema": L.SCHEMA,
+            "dispatch_id": dispatch_id,
+            "agent": "grok-code",
+            "engine": "grok",
+            "shape": "bash",
+            "transport": "dispatch",
+            "project_root": str(tmp_path),
+            "state": "queued",
+            "started_at": L.utc_now(),
+            "dispatch_argv": argv,
+        }
+    )
+    payload = D._drain_queue_once(
+        argparse.Namespace(
+            queue_dir=str(queue),
+            capacity_wait_s=0.0,
+            claim_stale_s=D.QUEUE_CLAIM_STALE_S,
+            limit=0,
+            remote_node=None,
+        )
+    )
+    detail = next(
+        row for row in payload["details"] if row.get("dispatch_id") == dispatch_id
+    )
+    assert detail["state"] != "queued", detail
+    assert not str(detail.get("reason") or "").startswith(
+        "launch_refused_pre_spawn:"
+    ), detail
+    assert payload["left_queued"] == 0, payload
+    assert queue_path.exists() is False, "restore-to-queued returned"
+    failed_records = list(queue.glob(f"{dispatch_id}.json.claimed-*.failed"))
+    assert failed_records, (payload, list(queue.iterdir()))
+    failed = json.loads(failed_records[0].read_text(encoding="utf-8"))
+    assert failed["state"] == "failed", failed
+    child_reason = str(failed.get("reason") or "")
+    assert "--os-sandbox" in child_reason, failed
+    assert "inert" in child_reason.lower() or "ignored" in child_reason.lower(), failed
+    assert detail["reason"] == child_reason, (detail, failed)
+    assert payload["failed"] >= 1, payload
+    ledger = json.loads(L.record_path(dispatch_id).read_text(encoding="utf-8"))
+    assert ledger.get("state") == "blocked_os_sandbox", ledger
+    assert child_reason in str(ledger.get("reason") or ledger.get("error") or ""), ledger
+    second = D._drain_queue_once(
+        argparse.Namespace(
+            queue_dir=str(queue),
+            capacity_wait_s=0.0,
+            claim_stale_s=D.QUEUE_CLAIM_STALE_S,
+            limit=0,
+            remote_node=None,
+        )
+    )
+    assert second["launched"] == 0, second
+    assert second["left_queued"] == 0, second
+    assert not queue_path.exists()
