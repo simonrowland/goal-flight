@@ -1006,7 +1006,7 @@ def test_nested_shutdown_handlers_remain_visible_and_mutation_sensitive() -> Non
     assert "except OSError:" in inspect.getsource(
         dispatch._start_dashboard_refresh_for_project
     )
-    assert "except (ImportError, OSError):" in inspect.getsource(
+    assert "except (ImportError, OSError, goalflight_task.TaskError):" in inspect.getsource(
         dispatch._linked_task_truth_detail
     )
     assert "except OSError as exc:" in inspect.getsource(

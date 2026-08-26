@@ -117,6 +117,17 @@ MAX_COMPLETION_AUTHORITY_DEFERRALS = 1
 # not be read. Recovery re-evaluates completion authority on every pass; a
 # readable authority either restores for launch, supersedes, or parks again.
 COMPLETION_AUTHORITY_UNPARK_EVENT = "completion_authority_readable"
+# Missing/unparseable completion times cannot become readable on their own.
+# First pass parks out loud; the next still-unreadable pass terminalizes to
+# this blocked state instead of sitting in queued/claimed forever.
+COMPLETION_AUTHORITY_TIMESTAMP_UNREADABLE = "completion_authority_timestamp_unreadable"
+BLOCKED_COMPLETION_AUTHORITY_STATE = "blocked_completion_authority"
+COMPLETION_AUTHORITY_PARK_REASONS = frozenset(
+    {
+        "completion_authority_unavailable",
+        COMPLETION_AUTHORITY_TIMESTAMP_UNREADABLE,
+    }
+)
 RECONCILE_DOWNSTREAM_LOCK_BUDGET_S = 0.100
 RECONCILE_LOCK_POLL_S = 0.010
 PRELAUNCH_CANDIDATE_STATES = frozenset(
@@ -361,8 +372,7 @@ class _ClaimReconcileResult:
             "dispatch_id": dispatch_id,
             "reason": reason,
         }
-        if reason == "completion_authority_unavailable":
-            detail["unpark_event"] = COMPLETION_AUTHORITY_UNPARK_EVENT
+        detail.update(_completion_authority_park_fields(reason))
         return detail
 
 # --os-sandbox: opt-in, per-dispatch OS sandbox profile for the bash-shape codex
@@ -4947,6 +4957,7 @@ def _report_why_this_entry_did_not_launch(args, payload: dict) -> None:
             or entry.get("not_before")
             or entry.get("detail")
             or entry.get("unpark_event")
+            or entry.get("park_exit_state")
             or ""
         )
         suffix = f" [{detail}]" if detail else ""
@@ -6708,6 +6719,8 @@ def _reap_quota_stuck_before_bash_launch() -> None:
 def _dispatch_record_is_terminal(record: dict | None) -> bool:
     if not record:
         return False
+    if goalflight_ledger.record_is_unreadable(record):
+        return False
     terminal = record.get("terminal_state") or goalflight_ledger.terminal_state_for(
         record.get("state"),
         record.get("reason") or record.get("error"),
@@ -6966,6 +6979,10 @@ def _ledger_task_ids_advanced(
     for record in records:
         if not isinstance(record, dict):
             continue
+        if goalflight_ledger.record_is_unreadable(record):
+            # Placeholder has no task_ids. Skipping it would treat a corrupt
+            # prior completion as "no completion" and launch a duplicate.
+            return 0, 0, "ledger_unavailable"
         if str(record.get("dispatch_id") or "") == self_dispatch_id:
             continue
         rec_ids = set(_entry_task_ids(None, record))
@@ -7037,7 +7054,6 @@ def _linked_task_truth_detail(
         root = SCRIPT_DIR.parent
         if str(root) not in sys.path:
             sys.path.insert(0, str(root))
-        import goalflight_task  # type: ignore
 
         store = goalflight_task.TaskStore(project_root)
         if task_store_locked and store.publish_marker_path.exists():
@@ -7063,10 +7079,10 @@ def _linked_task_truth_detail(
                     store_issue = "timestamp_indeterminate"
                 elif completion_order == "after":
                     store_complete += 1
-    except (ImportError, OSError):
-        # Missing/unavailable task-store bytes make completion indeterminate.
-        # Invalid store schemas and publish preconditions are permanent and
-        # must not masquerade as a retryable authority result.
+    except (ImportError, OSError, goalflight_task.TaskError):
+        # Missing bytes, or a corrupt/invalid tasks.jsonl row: we could not
+        # find out. That is unavailable, not a settled complete/none verdict.
+        # TaskError must not escape — one bad line used to abort the drain.
         store_complete = 0
         store_seen = 0
         store_issue = "task_store_unavailable"
@@ -7222,6 +7238,33 @@ def _entry_completion_authority(
             # fixed timestamp can make the next read more decisive, so restore
             # for launch: duplicate work is recoverable; a lost follow-up is not.
             return None
+        if indeterminate_cause == "timestamp_indeterminate":
+            # Missing/unparseable times are not equality: they have no bounded
+            # restore, and they never become readable on their own. Park once
+            # (visible, distinct reason). The next still-unreadable pass
+            # terminalizes to blocked_completion_authority rather than stalling.
+            if (
+                str(entry.get("completion_authority_reason") or "")
+                == COMPLETION_AUTHORITY_TIMESTAMP_UNREADABLE
+            ):
+                return {
+                    "state": BLOCKED_COMPLETION_AUTHORITY_STATE,
+                    "reason": COMPLETION_AUTHORITY_TIMESTAMP_UNREADABLE,
+                    "marker": None,
+                    "source": "authority",
+                    "indeterminate_cause": indeterminate_cause,
+                    "indeterminate_sources": list(indeterminate_sources),
+                    "bounded_deferral": False,
+                }
+            return {
+                "state": "deferred",
+                "reason": COMPLETION_AUTHORITY_TIMESTAMP_UNREADABLE,
+                "marker": None,
+                "source": "authority",
+                "indeterminate_cause": indeterminate_cause,
+                "indeterminate_sources": list(indeterminate_sources),
+                "bounded_deferral": False,
+            }
         # An unreadable authority never consumes equality's escape budget. Its
         # carrier remains parked, and the unavailable reason is written onto the
         # claim, the status sidecar, and drain details. The park lifts when the
@@ -7260,6 +7303,7 @@ def _completion_decision_blocks_restore(decision: dict | None) -> bool:
         "superseded",
         "worker_dead",
         "deferred",
+        BLOCKED_COMPLETION_AUTHORITY_STATE,
     } | set(goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES)
 
 
@@ -7530,9 +7574,11 @@ def _sanitize_restore_envelope(entry: dict, *, increment_recovery_count: bool) -
         "completion_authority_reason",
         "completion_authority_parked_at",
         "unpark_event",
+        "park_exit_state",
+        "status_write_failed",
     ):
         restored.pop(key, None)
-    if restored.get("reason") == "completion_authority_unavailable":
+    if restored.get("reason") in COMPLETION_AUTHORITY_PARK_REASONS:
         restored.pop("reason", None)
     if increment_recovery_count:
         restored["claim_recovery_count"] = _claim_recovery_count(entry) + 1
@@ -7542,14 +7588,16 @@ def _sanitize_restore_envelope(entry: dict, *, increment_recovery_count: bool) -
 def _completion_authority_park_fields(reason: str | None) -> dict:
     if reason == "completion_authority_unavailable":
         return {"unpark_event": COMPLETION_AUTHORITY_UNPARK_EVENT}
+    if reason == COMPLETION_AUTHORITY_TIMESTAMP_UNREADABLE:
+        return {"park_exit_state": BLOCKED_COMPLETION_AUTHORITY_STATE}
     return {}
 
 
-def _write_parked_status(entry: dict, decision: dict) -> None:
-    """Best-effort status sidecar for a parked, still-unlaunched carrier."""
+def _write_parked_status(entry: dict, decision: dict) -> bool:
+    """Write the parked-carrier status sidecar. False means the write did not land."""
     dispatch_id = str(entry.get("dispatch_id") or "")
     if not dispatch_id:
-        return
+        return False
     request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
     args = _queued_args_for_status(entry)
     status_json = Path(
@@ -7562,7 +7610,7 @@ def _write_parked_status(entry: dict, decision: dict) -> None:
         str(request.get("tail") or _dispatch_base_dir() / f"{dispatch_id}.tail")
     )
     reason = str(decision.get("reason") or "completion_authority_unavailable")
-    with contextlib.suppress(Exception):
+    try:
         write_status(
             status_json,
             {
@@ -7584,6 +7632,9 @@ def _write_parked_status(entry: dict, decision: dict) -> None:
                 **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
             },
         )
+    except OSError:
+        return False
+    return True
 
 
 def _persist_completion_authority_park(
@@ -7591,11 +7642,12 @@ def _persist_completion_authority_park(
     entry: dict,
     decision: dict,
 ) -> bool:
-    """Persist an unreadable-authority park onto the claim the operator reads.
+    """Persist an authority park onto the claim the operator reads.
 
     This is not equality's bounded deferral: it never consumes that budget.
-    The next recovery pass that can read the store or ledger releases the park
-    (`unpark_event=completion_authority_readable`).
+    Unreadable store/ledger parks lift when those bytes can be read again
+    (`unpark_event=completion_authority_readable`). Missing/unparseable times
+    park once, then terminalize (`park_exit_state=blocked_completion_authority`).
     """
     reason = str(decision.get("reason") or "completion_authority_unavailable")
     staged = dict(entry)
@@ -7608,9 +7660,14 @@ def _persist_completion_authority_park(
         _write_json_atomic(claim, staged)
     except OSError:
         return False
+    if not _write_parked_status(staged, decision):
+        staged["status_write_failed"] = True
+        try:
+            _write_json_atomic(claim, staged)
+        except OSError:
+            pass
     entry.clear()
     entry.update(staged)
-    _write_parked_status(staged, decision)
     return True
 
 
@@ -7652,7 +7709,7 @@ def _commit_restore_transaction(
     if _completion_decision_is_deferred(decision):
         if not _completion_decision_uses_bounded_deferral(decision):
             persisted = False
-            if str(decision.get("reason") or "") == "completion_authority_unavailable":
+            if str(decision.get("reason") or "") in COMPLETION_AUTHORITY_PARK_REASONS:
                 persisted = _persist_completion_authority_park(claim, fresh, decision)
             return None, {**decision, "deferral_persisted": persisted}
         persisted_count = _persist_completion_authority_deferral(claim, fresh)
@@ -7926,7 +7983,10 @@ def _commit_claim_terminal_in_txn(
         ignore_prefix_lines=_ignore_prefix_lines(prompt_path),
         agent=args.agent,
     )
-    if force_state in {"complete", "superseded"} and state == "worker_dead":
+    if (
+        force_state in {"complete", "superseded", BLOCKED_COMPLETION_AUTHORITY_STATE}
+        and state == "worker_dead"
+    ):
         state = force_state
         final_reason = reason
     result = commit_reconciled_terminal(
@@ -8263,7 +8323,7 @@ def _reconcile_claim_transaction(
         if _completion_decision_blocks_restore(decision):
             if _completion_decision_is_deferred(decision):
                 if not _completion_decision_uses_bounded_deferral(decision):
-                    if str(decision.get("reason") or "") == "completion_authority_unavailable":
+                    if str(decision.get("reason") or "") in COMPLETION_AUTHORITY_PARK_REASONS:
                         _persist_completion_authority_park(claim, fresh, decision)
                     return _ClaimReconcileResult(
                         "pending",
@@ -8416,17 +8476,27 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
             continue
         if not isinstance(entry, dict):
             continue
-        outcome = _reconcile_claim_transaction(
-            claim,
-            entry,
-            queue_dir=queue_dir,
-            reason=(
-                "stale_claim_pre_spawn"
-                if _entry_pre_spawn(entry)
-                else "stale_claim_launch_token_lost"
-            ),
-            stale_s=stale_s,
-        )
+        try:
+            outcome = _reconcile_claim_transaction(
+                claim,
+                entry,
+                queue_dir=queue_dir,
+                reason=(
+                    "stale_claim_pre_spawn"
+                    if _entry_pre_spawn(entry)
+                    else "stale_claim_launch_token_lost"
+                ),
+                stale_s=stale_s,
+            )
+        except Exception as exc:
+            pending_launch += 1
+            pending_reasons.append(
+                {
+                    "dispatch_id": str(entry.get("dispatch_id") or claim.name),
+                    "reason": f"reconcile_fault:{type(exc).__name__}",
+                }
+            )
+            continue
         action = outcome.action
         if action == "restored":
             restored += 1
@@ -8438,6 +8508,13 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
             pending_launch += 1
             detail = outcome.pending_detail(str(entry.get("dispatch_id") or claim.name))
             if detail is not None:
+                if claim.exists():
+                    try:
+                        parked = json.loads(claim.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        parked = None
+                    if isinstance(parked, dict) and parked.get("status_write_failed"):
+                        detail["status_write_failed"] = True
                 pending_reasons.append(detail)
 
     ledger_stats = _reconcile_ledger_prelaunch_orphans(queue_dir, stale_s=stale_s, now=time.time())
@@ -9851,7 +9928,10 @@ def _mark_claim_worker_dead(
     # Prefer a real SUCCESS tail scan over a forced state. Allow force_state for
     # complete/superseded only when the tail did not already produce a terminal
     # success (ladder proved task-store / system-owned outcome).
-    if force_state in {"complete", "superseded"} and state == "worker_dead":
+    if (
+        force_state in {"complete", "superseded", BLOCKED_COMPLETION_AUTHORITY_STATE}
+        and state == "worker_dead"
+    ):
         state = force_state
         final_reason = reason
     queue_dir = (

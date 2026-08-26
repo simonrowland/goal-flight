@@ -362,6 +362,21 @@ class AttemptIdentity:
     lifecycle_state: str
 
 
+def journal_terminal_at(value: object) -> str:
+    """Project a journal ``terminal_at`` column without inventing the token ``None``.
+
+    An idempotent reread of a NULL column used ``str(existing["terminal_at"])``,
+    which becomes ``"None"``. Projectors then froze that string as ``ended_at``,
+    and completion ordering treated a real terminal as timestamp-indeterminate.
+    """
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text in {"", "None", "null"}:
+        return ""
+    return str(value)
+
+
 @dataclass(frozen=True)
 class TerminalCommit:
     attempt_id: str
@@ -4300,7 +4315,7 @@ class Journal:
                     event_uuid=str(existing["event_uuid"]),
                     event_type=str(existing["event_type"]),
                     observation=json.loads(str(existing["terminal_outcome_json"])),
-                    terminal_at=str(existing["terminal_at"]),
+                    terminal_at=journal_terminal_at(existing["terminal_at"]),
                     idempotent=True,
                 )
             if str(existing["lifecycle_state"]) not in ATTEMPT_LIVE_STATES:
