@@ -80,6 +80,7 @@ _PYTEST_COUNT_RE = re.compile(
     r"(?<![\w.])(?P<count>\d+) "
     r"(?P<outcome>passed|skipped|xfailed|xpassed)(?![\w.])"
 )
+_PYTEST_DURATION_RE = re.compile(r"\bin (?:< )?\d+(?:\.\d+)?s(?: \([\d:]+\))?$")
 
 
 class PytestExecutionSummary(NamedTuple):
@@ -100,7 +101,12 @@ def _test_command(test: Path, interpreter: str) -> tuple[list[str], bool]:
 
 def _pytest_execution_summary(stdout: str, stderr: str) -> PytestExecutionSummary | None:
     for line in reversed((stdout + "\n" + stderr).splitlines()):
-        matches = list(_PYTEST_COUNT_RE.finditer(line))
+        description = line.strip("= ")
+        if not _PYTEST_DURATION_RE.search(description):
+            continue
+        if description.startswith("no tests ran in "):
+            return PytestExecutionSummary(0, 0, description)
+        matches = list(_PYTEST_COUNT_RE.finditer(description))
         executed = sum(int(match.group("count")) for match in matches)
         if executed > 0:
             skipped = sum(
@@ -108,7 +114,7 @@ def _pytest_execution_summary(stdout: str, stderr: str) -> PytestExecutionSummar
                 for match in matches
                 if match.group("outcome") == "skipped"
             )
-            return PytestExecutionSummary(executed, skipped, line.strip("= "))
+            return PytestExecutionSummary(executed, skipped, description)
     return None
 
 
@@ -159,9 +165,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"      invalid test requirement declaration: {type(exc).__name__}: {exc}")
             continue
         print(f"RUN   {label}", flush=True)
-        used_pytest = False
+        pytest_result_required = False
         if proc is None:
-            command, used_pytest = _test_command(test, py)
+            command, pytest_result_required = _test_command(test, py)
             child_env = os.environ.copy()
             for key in AMBIENT_IDENTITY_ENV:
                 child_env.pop(key, None)
@@ -195,10 +201,13 @@ def main(argv: list[str] | None = None) -> int:
                 continue
         pytest_summary = (
             _pytest_execution_summary(proc.stdout, proc.stderr)
-            if used_pytest and proc.returncode == 0
+            if proc.returncode == 0
             else None
         )
-        if used_pytest and proc.returncode == 0 and pytest_summary is None:
+        if proc.returncode == 0 and (
+            (pytest_result_required and pytest_summary is None)
+            or (pytest_summary is not None and pytest_summary.executed == 0)
+        ):
             proc = subprocess.CompletedProcess(
                 args=proc.args,
                 returncode=1,
@@ -209,8 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
         if (
-            used_pytest
-            and proc.returncode == 0
+            proc.returncode == 0
             and pytest_summary is not None
             and pytest_summary.all_skipped
         ):

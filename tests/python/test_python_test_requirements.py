@@ -216,6 +216,105 @@ def test_all_skipped_pytest_module_is_skip_with_reason() -> None:
         assert "===== 0 passed, 1 skipped, 0 failed =====" in output, output
 
 
+def test_guarded_module_delegating_to_pytest_is_skip_with_reason() -> None:
+    test = ROOT / "tests" / "python" / "test_codex_dispatch_seams.py"
+    assert has_main_driver(test), "real delegating module must remain script-routed"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        plugin_dir = Path(tmp)
+        (plugin_dir / "force_all_skipped.py").write_text(
+            "import pytest\n"
+            "def pytest_collection_modifyitems(items):\n"
+            "    marker = pytest.mark.skip(\n"
+            "        reason='per-dispatch worker homes are local POSIX-only'\n"
+            "    )\n"
+            "    for item in items:\n"
+            "        item.add_marker(marker)\n",
+            encoding="utf-8",
+        )
+        pythonpath = os.pathsep.join(
+            part
+            for part in (str(plugin_dir), os.environ.get("PYTHONPATH", ""))
+            if part
+        )
+        stdout = io.StringIO()
+        with (
+            patch.object(run_python, "_test_files", return_value=[test]),
+            patch.dict(
+                os.environ,
+                {
+                    "PYTHONPATH": pythonpath,
+                    "PYTEST_ADDOPTS": "-p force_all_skipped -rs",
+                },
+            ),
+            contextlib.redirect_stdout(stdout),
+        ):
+            exit_code = run_python.main(["--timeout", "120"])
+        output = stdout.getvalue()
+
+    assert exit_code == 0, output
+    assert "SKIP  tests/python/test_codex_dispatch_seams.py" in output, output
+    assert "per-dispatch worker homes are local POSIX-only" in output, output
+    assert "PASS  tests/python/test_codex_dispatch_seams.py" not in output, output
+    assert "===== 0 passed, 1 skipped, 0 failed =====" in output, output
+
+
+def test_guarded_module_with_zero_pytest_cases_is_not_pass() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        test_dir = root / "tests" / "python"
+        test_dir.mkdir(parents=True)
+        test = test_dir / "test_empty_delegate.py"
+        test.write_text(
+            "import pytest\n"
+            "if __name__ == '__main__':\n"
+            "    pytest.main([__file__, '-q'])\n",
+            encoding="utf-8",
+        )
+        stdout = io.StringIO()
+        with (
+            patch.object(run_python, "ROOT", root),
+            patch.object(run_python, "TEST_DIR", test_dir),
+            patch.object(run_python, "_test_files", return_value=[test]),
+            contextlib.redirect_stdout(stdout),
+        ):
+            exit_code = run_python.main(["--timeout", "120"])
+        output = stdout.getvalue()
+
+    assert exit_code == 1, output
+    assert "FAIL  tests/python/test_empty_delegate.py" in output, output
+    assert "pytest exited 0 without a nonzero executed-test count" in output, output
+    assert "PASS  tests/python/test_empty_delegate.py" not in output, output
+    assert "===== 0 passed, 0 skipped, 1 failed =====" in output, output
+
+
+def test_script_outcome_words_are_not_a_pytest_summary() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        test_dir = root / "tests" / "python"
+        test_dir.mkdir(parents=True)
+        test = test_dir / "test_custom_summary.py"
+        test.write_text(
+            "if __name__ == '__main__':\n"
+            "    print('1 skipped in custom probe output')\n",
+            encoding="utf-8",
+        )
+        stdout = io.StringIO()
+        with (
+            patch.object(run_python, "ROOT", root),
+            patch.object(run_python, "TEST_DIR", test_dir),
+            patch.object(run_python, "_test_files", return_value=[test]),
+            contextlib.redirect_stdout(stdout),
+        ):
+            exit_code = run_python.main(["--timeout", "120"])
+        output = stdout.getvalue()
+
+    assert exit_code == 0, output
+    assert "PASS  tests/python/test_custom_summary.py" in output, output
+    assert "SKIP  tests/python/test_custom_summary.py" not in output, output
+    assert "===== 1 passed, 0 skipped, 0 failed =====" in output, output
+
+
 def test_shared_driver_uses_declared_interpreter_for_pytest_module() -> None:
     if os.name == "nt":
         return
@@ -278,6 +377,9 @@ def main() -> None:
     test_unrunnable_pytest_file_is_not_reported_as_pass()
     test_meta_driver_is_excluded_and_each_leaf_executes_once()
     test_all_skipped_pytest_module_is_skip_with_reason()
+    test_guarded_module_delegating_to_pytest_is_skip_with_reason()
+    test_guarded_module_with_zero_pytest_cases_is_not_pass()
+    test_script_outcome_words_are_not_a_pytest_summary()
     test_shared_driver_uses_declared_interpreter_for_pytest_module()
     print("OK: Python test requirement tests pass")
 
