@@ -30,7 +30,7 @@ Derived copies written alongside a ledger/journal mutation, checked this round
 | history projection ``project_terminal`` | ledger record via ``_is_terminal`` / ``history_worker_row`` (`scripts/goalflight_ledger.py:1110`; `scripts/goalflight_fleet_console_history.py:114-118`, `:147-166`, `:318-340`) | no; JS history, not markdown |
 | ``_wait_for_detached_watcher`` | polls sidecar ``state`` until watcher-terminal or watcher death (`scripts/goalflight_dispatch.py:1315-1344`) | sidecar, by design (watcher liveness of this launch, not ``cmd_finish``) |
 | fleet-launch receipt / duplicate | sidecar + launch marker for pid liveness (`scripts/goalflight_fleet_launch_detached.py:439`, `:499-513`, `:563-577`) | different fact |
-| ``reconcile_terminal_outbox`` sidecar | terminal sidecar promotes only when the recorded worker identity is dead; live/unknown holds and the disagreement is recorded as a ``sidecar_terminal_overruled`` journal attention item (`scripts/goalflight_ledger.py:1361-1413`, `:391-408`) | gated this round |
+| ``reconcile_terminal_outbox`` sidecar | terminal sidecar promotes only when the recorded worker identity is dead; live/unknown holds; unknown re-probes (not age) until identity is determinable; ``held: live`` / ``held: unknown`` on status/fleet; overrule items resolve on converge (`scripts/goalflight_ledger.py` sidecar_terminal_hold / reconcile_terminal_outbox) | gated this round |
 | wake ``coverage_status`` | waiter/doorbell registration (`scripts/goalflight_wake.py:2380-2396`) | not a copy |
 | task-store exports | task completion, not dispatch lifecycle (`scripts/goalflight_fleet_console.py:2880`) | not a copy |
 | markdown mirrors of dispatch lifecycle | none found (history writes ``history-data.js`` from the ledger) | none |
