@@ -261,20 +261,34 @@ pgroup_cpu_pct() {
 
 # Live descendants of a worker pid, excluding itself. "unknown" when the
 # sample is unavailable. A quiet-but-working child (pytest, sleep, a
-# compiler) must veto idle-timeout even at 0% CPU.
+# compiler) must veto idle-timeout even at 0% CPU. Zombie/defunct children
+# are not live work. Keep in sync with goalflight_watch.PS_LIVE_DESCENDANT_FORMAT
+# (pid=,ppid=,state=). A missing state token is counted live, never inferred
+# dead; a failed/unparsable sample stays unknown, never zero.
 live_descendant_count() {
   local root="$1"
+  local table
   if [ -z "$root" ]; then
     echo "unknown"
     return 0
   fi
-  ps -axo pid=,ppid= 2>/dev/null | awk -v root="$root" '
+  if ! table=$(ps -axo pid=,ppid=,state= 2>/dev/null); then
+    echo "unknown"
+    return 0
+  fi
+  if [ -z "$table" ]; then
+    echo "unknown"
+    return 0
+  fi
+  printf '%s\n' "$table" | awk -v root="$root" '
     BEGIN { root = root + 0 }
     NF >= 2 {
       c = $1 + 0
       p = $2 + 0
-      kids[p] = kids[p] " " c
+      st = (NF >= 3) ? $3 : ""
       parsed++
+      if (st ~ /^[Zz]/ || tolower(st) ~ /defunct/) next
+      kids[p] = kids[p] " " c
     }
     END {
       if (parsed + 0 < 1) {

@@ -99,9 +99,9 @@ def _watcher_cmd(
 def _descendant_ps_fail_bindir(tmp: Path) -> Path:
     """PATH prefix whose `ps` fails the descendant walk and proxies the rest.
 
-    The walk is `ps -axo pid=,ppid=`. CPU sampling uses a different format
-    (`ps -A -o pgid=,pid=,time=`), so this is a real enumeration failure,
-    not a double that returns "no children".
+    The walk is `ps -axo pid=,ppid=,state=`. CPU sampling uses a different
+    format (`ps -A -o pgid=,pid=,time=`), so this is a real enumeration
+    failure, not a double that returns "no children".
     """
     bindir = tmp / "ps-fail-bin"
     bindir.mkdir()
@@ -110,10 +110,12 @@ def _descendant_ps_fail_bindir(tmp: Path) -> Path:
     stub.write_text(
         "#!/bin/sh\n"
         "for arg in \"$@\"; do\n"
-        "  if [ \"$arg\" = \"pid=,ppid=\" ]; then\n"
-        "    echo 'ps: enumeration failed' >&2\n"
-        "    exit 1\n"
-        "  fi\n"
+        "  case \"$arg\" in\n"
+        "    pid=,ppid=*)\n"
+        "      echo 'ps: enumeration failed' >&2\n"
+        "      exit 1\n"
+        "      ;;\n"
+        "  esac\n"
         "done\n"
         f"exec {real_ps} \"$@\"\n",
         encoding="utf-8",
@@ -131,10 +133,12 @@ def _descendant_ps_table_bindir(tmp: Path, table: Path) -> Path:
     stub.write_text(
         "#!/bin/sh\n"
         "for arg in \"$@\"; do\n"
-        "  if [ \"$arg\" = \"pid=,ppid=\" ]; then\n"
-        f"    cat {str(table)!r}\n"
-        "    exit $?\n"
-        "  fi\n"
+        "  case \"$arg\" in\n"
+        "    pid=,ppid=*)\n"
+        f"      cat {str(table)!r}\n"
+        "      exit $?\n"
+        "      ;;\n"
+        "  esac\n"
         "done\n"
         f"exec {real_ps} \"$@\"\n",
         encoding="utf-8",
@@ -151,8 +155,13 @@ def test_live_descendant_count_none_when_ps_unavailable() -> None:
 
 
 def test_live_descendant_count_none_when_ps_nonzero() -> None:
+    """Failed ps stays unknown even when stdout looks like a process table.
+
+    This must fail if a later zombie-filter simplification treats unparsable
+    or failed samples as no-children.
+    """
     class _Result:
-        stdout = "10 1\n11 10\n"
+        stdout = "10 1 S\n11 10 Z\n"
         returncode = 1
 
     def _runner(*_args, **_kwargs):
@@ -225,15 +234,128 @@ def _make_newest_unstatable_file(root: Path) -> Path:
     return broken
 
 
-def test_live_descendant_count_walks_grandchildren() -> None:
+def _ps_count_runner(stdout: str, returncode: int = 0):
     class _Result:
-        stdout = "10 1\n11 10\n12 11\n13 2\n"
-        returncode = 0
+        def __init__(self) -> None:
+            self.stdout = stdout
+            self.returncode = returncode
 
     def _runner(*_args, **_kwargs):
         return _Result()
 
-    assert goalflight_watch.live_descendant_count(10, ps_runner=_runner) == 2
+    return _runner
+
+
+def test_live_descendant_count_walks_grandchildren() -> None:
+    stdout = "10 1 S\n11 10 S\n12 11 S\n13 2 R\n"
+    assert goalflight_watch.live_descendant_count(
+        10, ps_runner=_ps_count_runner(stdout)
+    ) == 2
+
+
+def test_live_descendant_count_requests_state_in_the_same_sample() -> None:
+    seen: dict[str, object] = {}
+
+    class _Result:
+        stdout = "10 1 S\n11 10 Z\n"
+        returncode = 0
+
+    def _runner(argv, **_kwargs):
+        seen["argv"] = argv
+        return _Result()
+
+    assert goalflight_watch.live_descendant_count(10, ps_runner=_runner) == 0
+    argv = seen["argv"]
+    assert isinstance(argv, list)
+    assert argv[-1] == goalflight_watch.PS_LIVE_DESCENDANT_FORMAT
+    assert "state=" in str(argv[-1])
+
+
+def test_live_descendant_count_none_when_ps_unparsable() -> None:
+    """Garbage stdout must stay unknown, not simplify to zero children."""
+    assert (
+        goalflight_watch.live_descendant_count(
+            10, ps_runner=_ps_count_runner("not-a-process-table\n")
+        )
+        is None
+    )
+
+
+def test_live_descendant_count_missing_state_is_not_a_zombie() -> None:
+    # Absent state token is not evidence of death: count the child as live.
+    stdout = "10 1\n11 10\n"
+    assert goalflight_watch.live_descendant_count(
+        10, ps_runner=_ps_count_runner(stdout)
+    ) == 1
+
+
+def test_live_descendant_count_filters_zombie_rows_at_ps_seam() -> None:
+    zombie_only = "10 1 S\n11 10 Z\n12 2 R\n"
+    assert goalflight_watch.live_descendant_count(
+        10, ps_runner=_ps_count_runner(zombie_only)
+    ) == 0
+    defunct_token = "10 1 S\n11 10 <defunct>\n"
+    assert goalflight_watch.live_descendant_count(
+        10, ps_runner=_ps_count_runner(defunct_token)
+    ) == 0
+    mixed = "10 1 S\n11 10 S\n12 11 Z\n"
+    assert goalflight_watch.live_descendant_count(
+        10, ps_runner=_ps_count_runner(mixed)
+    ) == 1
+
+
+def _spawn_worker_with_zombie_child() -> tuple[subprocess.Popen, int]:
+    """Fork a child that exits without being reaped so it is a real Z."""
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os, sys, time\n"
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            "    os._exit(0)\n"
+            "print(child, flush=True)\n"
+            "time.sleep(60)\n",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    assert worker.stdout is not None
+    raw = worker.stdout.readline()
+    try:
+        zombie_pid = int(raw.strip())
+    except ValueError as exc:
+        worker.kill()
+        worker.wait(timeout=5)
+        raise AssertionError(f"zombie fixture did not print a pid: {raw!r}") from exc
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if goalflight_compat.pid_is_zombie(zombie_pid) is True:
+            return worker, zombie_pid
+        time.sleep(0.05)
+    worker.kill()
+    worker.wait(timeout=5)
+    raise AssertionError(
+        f"precondition failed: child {zombie_pid} of worker {worker.pid} "
+        "never became a zombie"
+    )
+
+
+def test_zombie_descendant_counts_as_zero_live_work() -> None:
+    worker = None
+    try:
+        worker, zombie_pid = _spawn_worker_with_zombie_child()
+        assert goalflight_compat.pid_is_zombie(zombie_pid) is True, zombie_pid
+        count = goalflight_watch.live_descendant_count(worker.pid)
+        assert count == 0, (
+            f"zombie-only tree must count as zero live descendants "
+            f"(count={count}, worker={worker.pid}, zombie={zombie_pid})"
+        )
+    finally:
+        if worker is not None and worker.poll() is None:
+            worker.kill()
+            worker.wait(timeout=5)
 
 
 def _read_status(path: Path) -> dict:
@@ -528,6 +650,59 @@ def test_quiet_worker_without_children_still_idle_times_out(tmp_path: Path) -> N
     finally:
         worker.kill()
         worker.wait(timeout=5)
+
+
+def test_zombie_descendant_reaches_idle_timeout(tmp_path: Path) -> None:
+    """A zombie-only tree is not live work: take the ordinary idle path.
+
+    The worktree mtime sample must still run (a positive zombie count used to
+    skip it). Empty measured tree + idle CPU + zero live descendants = idle.
+    """
+    project_root = tmp_path / "repo"
+    worker_cwd = tmp_path / "worktree"
+    project_root.mkdir()
+    worker_cwd.mkdir()
+    tail = tmp_path / "worker.tail"
+    tail.write_text("worker started\n", encoding="utf-8")
+    status = tmp_path / "worker.status.json"
+    worker = None
+    try:
+        worker, zombie_pid = _spawn_worker_with_zombie_child()
+        assert goalflight_compat.pid_is_zombie(zombie_pid) is True, zombie_pid
+        count = goalflight_watch.live_descendant_count(worker.pid)
+        assert count == 0, (
+            f"precondition failed: zombie-only tree counted as live "
+            f"(count={count}, worker={worker.pid}, zombie={zombie_pid})"
+        )
+        env = _watcher_env(tmp_path)
+        env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
+        proc = subprocess.run(
+            _watcher_cmd(
+                tail=tail,
+                status=status,
+                worker_pid=worker.pid,
+                dispatch_id="zombie-descendant",
+                project_root=project_root,
+                worker_cwd=worker_cwd,
+            ),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+        payload = _read_status(status)
+        assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr, payload)
+        assert payload.get("state") == "idle_timeout", payload
+        assert payload.get("live_descendants") == 0, payload
+        assert payload.get("tree_probe") == "measured", payload
+        assert payload.get("liveness_state") != "running_quiet", payload
+        unknown = payload.get("liveness_unknown_probes") or []
+        assert "descendants" not in unknown, payload
+        assert "tree_mtime" not in unknown, payload
+    finally:
+        if worker is not None and worker.poll() is None:
+            worker.kill()
+            worker.wait(timeout=5)
 
 
 def _run_quiet_sleeper(tmp_path: Path) -> subprocess.Popen:
