@@ -104,7 +104,7 @@ def _assert_no_live_row_carries_retire(payload: dict) -> None:
     for row in payload["controllers"]:
         assert controllers.live_row_may_not_retire(row)
         assert controllers.retire_command_is_canonical(row)
-        if row.get("state") == "live":
+        if row.get("state") in {"live", "live-overdue"}:
             assert row.get("retire_command") is None
         if row.get("bucket") == "unknown":
             assert row.get("retire_command") is None
@@ -251,6 +251,7 @@ def test_json_keys_are_stable() -> None:
         "occupies",
         "retire_command",
         "unknown_reason",
+        "renew_hint",
         "retirement_eligible",
         "retirement_reason",
     )
@@ -268,20 +269,40 @@ def test_json_keys_are_stable() -> None:
 
 def test_holder_state_never_collapses_unknown_into_dead() -> None:
     assert controllers.holder_state("live-lock") == "live"
-    assert controllers.holder_state("live-overdue") == "live"
+    assert controllers.holder_state("live-overdue") == "live-overdue"
+    assert controllers.holder_state("live-overdue") != "unknown"
+    assert controllers.holder_state("live-overdue") != "dead"
     assert controllers.holder_state("dead-lock") == "dead"
     assert controllers.holder_state("ended") == "dead"
     assert controllers.holder_state("unknown-lock") == "unknown"
     assert controllers.holder_state("garbled") == "unknown"
     assert controllers.holder_state(None) == "unknown"
+    assert controllers.is_live_state("live")
+    assert controllers.is_live_state("live-overdue")
+    assert not controllers.is_live_state("unknown")
+    assert not controllers.is_live_state("dead")
 
 
 def test_classify_bucket_splits_unknown_from_stale() -> None:
     live = {"incarnation_state": "live-lock", "retired": False, "wake_armed": True, "idle_seconds": 10}
+    overdue = {
+        "incarnation_state": "live-overdue",
+        "retired": False,
+        "wake_armed": True,
+        "idle_seconds": 10,
+    }
+    overdue_idle = {
+        "incarnation_state": "live-overdue",
+        "retired": False,
+        "wake_armed": True,
+        "idle_seconds": 5 * 3600,
+    }
     dead = {"incarnation_state": "dead-lock", "retired": False, "wake_armed": False, "idle_seconds": 10}
     unknown = {"incarnation_state": "unknown-lock", "retired": False, "wake_armed": None, "idle_seconds": None}
     ended = {"incarnation_state": "ended", "retired": True, "wake_armed": False, "idle_seconds": 10}
     assert controllers.classify_bucket(live, idle_hours=4) == "connected"
+    assert controllers.classify_bucket(overdue, idle_hours=4) == "connected"
+    assert controllers.classify_bucket(overdue_idle, idle_hours=4) == "idle"
     assert controllers.classify_bucket(dead, idle_hours=4) == "stale"
     assert controllers.classify_bucket(unknown, idle_hours=4) == "unknown"
     assert controllers.classify_bucket(ended, idle_hours=4) is None
@@ -320,6 +341,52 @@ def test_live_armed_renders_connected_with_raw_idle_age(
     assert "connected" in text
     assert "idle 23m" in text
     assert "alice" in text
+
+
+def test_live_overdue_holder_renders_live_overdue_with_renew_hint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Passed renewal horizon + live holder is live-overdue, not unknown/dead."""
+    _isolate(monkeypatch, tmp_path)
+    root = _git_project(tmp_path, "alpha")
+    _registered, holder, nonce = _hold_registered_lease(root, "alice", "alice-nonce")
+    waiter = _arm_listener(root, "alice", nonce)
+    past = datetime.now(timezone.utc) - timedelta(minutes=70)
+    _set_lease_times(
+        root,
+        "alice",
+        renewed_at=past,
+        renew_deadline_at=past,
+    )
+    try:
+        roster = sessions.controller_roster(root, ledger_records=[])
+        assert roster["controllers"][0]["incarnation_state"] == "live-overdue"
+        code, text = _run(["--idle-hours", "4"])
+        json_code, json_text = _run(["--json", "--idle-hours", "4"])
+    finally:
+        waiter.close()
+        holder.close()
+    assert code == 0
+    assert json_code == 0
+    payload = json.loads(json_text)
+    row = _row_for(payload, "alice")
+    assert row["state"] == "live-overdue"
+    assert row["state"] != "unknown"
+    assert row["state"] != "dead"
+    assert row["bucket"] in {"connected", "idle"}
+    assert row["bucket"] != "unknown"
+    assert row["bucket"] != "stale"
+    assert row["renew_hint"] == controllers.RENEW_HINT
+    assert "renew" in row["renew_hint"]
+    assert "--join" in row["renew_hint"]
+    assert row["retire_command"] is None
+    assert "live-overdue" in text
+    assert "lease overdue" in text
+    assert "renew (--join)" in text
+    assert "retire (proof of death):" not in text
+    _assert_no_live_row_carries_retire(payload)
+    del _registered
+    del nonce
 
 
 def test_live_quiet_renders_idle_with_the_same_raw_age(

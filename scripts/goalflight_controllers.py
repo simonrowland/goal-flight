@@ -66,6 +66,7 @@ JSON_ROW_KEYS = (
     "occupies",
     "retire_command",
     "unknown_reason",
+    "renew_hint",
     "retirement_eligible",
     "retirement_reason",
 )
@@ -78,7 +79,9 @@ BUCKET_ORDER = {
 }
 HOLDER_LIVE = frozenset({"live-lock", "live-overdue"})
 HOLDER_DEAD = frozenset({"dead-lock", "ended"})
+LIVE_DISPLAY_STATES = frozenset({"live", "live-overdue"})
 UNKNOWN_PROJECT = "unknown"
+RENEW_HINT = "lease overdue — renew (--join)"
 
 
 def _utc_now() -> datetime:
@@ -169,12 +172,24 @@ def project_identity(raw: Path | str | None) -> tuple[str, Path | None, str]:
 
 
 def holder_state(incarnation_state: object) -> str:
+    """Map roster incarnation to the fleet STATE column.
+
+    ``live-overdue`` is a live holder whose renewal horizon has passed.
+    Keep it distinct from ``live`` (the operator action is renew, not
+    investigate) and never collapse it into ``unknown`` or ``dead``.
+    """
     token = str(incarnation_state or "")
+    if token == "live-overdue":
+        return "live-overdue"
     if token in HOLDER_LIVE:
         return "live"
     if token in HOLDER_DEAD:
         return "dead"
     return "unknown"
+
+
+def is_live_state(state: object) -> bool:
+    return str(state or "") in LIVE_DISPLAY_STATES
 
 
 def supervisor_display(*, armed: bool | None, supervisor: object) -> str:
@@ -207,7 +222,7 @@ def classify_bucket(
     threshold_s = idle_hours * 3600.0
     if retired or not occupies:
         return None
-    if state == "live" and armed is True:
+    if is_live_state(state) and armed is True:
         if idle_s is None:
             # Live and armed, but the idle classifier cannot run. Connected
             # with IDLE=unknown, never a fake idle verdict.
@@ -215,8 +230,9 @@ def classify_bucket(
         if idle_s > threshold_s:
             return "idle"
         return "connected"
-    if state == "live":
-        # Holder is live; supervisor may be absent or unknown. Not stale.
+    if is_live_state(state):
+        # Holder is live (including live-overdue); supervisor may be
+        # absent or unknown. Not stale, not unknown.
         return "connected"
     if state == "unknown":
         return "unknown"
@@ -291,7 +307,7 @@ def _idle_cell(record: dict[str, Any], *, bucket: str | None) -> str:
 
 def live_row_may_not_retire(row: dict[str, Any]) -> bool:
     """Hard invariant: a live current generation never carries retire."""
-    return not (row.get("state") == "live" and row.get("retire_command"))
+    return not (is_live_state(row.get("state")) and row.get("retire_command"))
 
 
 def retire_command_is_canonical(row: dict[str, Any]) -> bool:
@@ -328,7 +344,7 @@ def _may_emit_retire(
 ) -> bool:
     if canonical is None:
         return False
-    if state == "live":
+    if is_live_state(state):
         return False
     if bucket != "stale" or state != "dead" or not occupies:
         return False
@@ -376,6 +392,7 @@ def fleet_row(
                 else f"{extra}; retirement refused until it resolves"
             )
     display = _project_display_name(canonical)
+    renew_hint = RENEW_HINT if state == "live-overdue" else None
     return {
         "bucket": bucket if bucket is not None else "unknown",
         "label": label,
@@ -400,6 +417,7 @@ def fleet_row(
             else None
         ),
         "unknown_reason": unknown_reason,
+        "renew_hint": renew_hint,
         "retirement_eligible": record.get("retirement_eligible"),
         "retirement_reason": record.get("retirement_reason"),
         "_source": journal_name,
@@ -436,6 +454,7 @@ def unknown_project_row(
         "occupies": None,
         "retire_command": None,
         "unknown_reason": reason,
+        "renew_hint": None,
         "retirement_eligible": None,
         "retirement_reason": error,
         "_source": source,
@@ -491,6 +510,7 @@ def _disagreement_row(items: list[dict[str, Any]]) -> dict[str, Any]:
         "unknown_reason": (
             f"journals disagree ({named}); retirement refused until it resolves"
         ),
+        "renew_hint": None,
         "retirement_eligible": None,
         "retirement_reason": "journals_disagree",
         "_source": named,
@@ -694,6 +714,17 @@ def render_table(rows: list[dict[str, Any]]) -> str:
     if unknown_lines:
         lines.append("unknown (retirement refused):")
         lines.extend(unknown_lines)
+    renew_lines = []
+    for row in rows:
+        hint = row.get("renew_hint")
+        if not hint:
+            continue
+        label = row.get("label") or "—"
+        project = row.get("project") or "unknown"
+        renew_lines.append(f"  {label} @ {project}: {hint}")
+    if renew_lines:
+        lines.append("renew (lease overdue):")
+        lines.extend(renew_lines)
     return "\n".join(lines)
 
 
