@@ -3755,6 +3755,21 @@ class _ControllerSessionLookup:
     unreadable_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class _ControllerDispatchIdentity:
+    """One three-state registry snapshot for a single dispatch attempt.
+
+    Stamp, resolve, prepare, and waiting_capacity record all thread this
+    object so they cannot disagree about live / dead / unknown.
+    """
+
+    lookup: _ControllerSessionLookup
+    self_resolved: dict | None = None
+
+
+_CONTROLLER_DISPATCH_IDENTITY_ATTR = "_controller_dispatch_identity"
+
+
 def _journal_unavailable_reason(
     exc: goalflight_journal.JournalUnavailable,
 ) -> str:
@@ -3786,11 +3801,9 @@ def _kernel_live_controller_sessions(
                 continue
             if not label or not nonce:
                 continue
-            probe_state, session = goalflight_session_status.probe_live_session(
-                root,
-                label=label,
-                pid=pid,
-            )
+            # Use the row this reader already returned. probe_live_session would
+            # open the journal again at 0.05s and flap a still-held lease unknown.
+            probe_state, session = _controller_lease_row_liveness(row, pid=pid)
             if probe_state == "unreadable":
                 # Callers need to know whether any lease can own the dispatch.
                 # Omitting one unreadable lease could turn an incumbent into a
@@ -3836,6 +3849,26 @@ def _kernel_live_controller_sessions(
         )
 
 
+def _controller_lease_row_liveness(
+    row: dict[str, object],
+    *,
+    pid: int,
+) -> tuple[str, dict | None]:
+    """Classify one already-read ACTIVE lease without opening the journal again."""
+    lease = goalflight_journal.Journal._lease_identity(row)
+    liveness = goalflight_session_status._lease_holder_liveness(lease)
+    if liveness is None or liveness.alive is None:
+        return "unreadable", None
+    if liveness.alive is not True:
+        return "dead", None
+    session = goalflight_session_status._session_dict_from_lease(lease, pid=pid)
+    if not isinstance(session, dict):
+        return "dead", None
+    if str(session.get("id") or "") != str(lease.nonce):
+        return "dead", None
+    return "live", dict(session)
+
+
 def _requested_controller_pid(args) -> int | None:
     for value in (
         getattr(args, "controller_pid", None),
@@ -3878,16 +3911,16 @@ def _controller_session_is_in_ancestry(session: dict) -> bool:
     )
 
 
-def _self_resolved_controller_session(
+def _self_resolved_from_lookup(
     args,
     project_root: Path,
+    lookup: _ControllerSessionLookup,
 ) -> dict | None:
-    """Resolve one ancestry-proven live holder matching declared identity."""
-    label = _declared_controller_label(args, project_root)
-    pid = _requested_controller_pid(args)
-    lookup = _kernel_live_controller_sessions(project_root)
+    """Resolve one ancestry-proven live holder from an already-taken snapshot."""
     if lookup.sessions is None:
         return None
+    label = _declared_controller_label(args, project_root)
+    pid = _requested_controller_pid(args)
     matches = [
         session
         for session in lookup.sessions
@@ -3895,7 +3928,110 @@ def _self_resolved_controller_session(
         and (pid is None or int(session.get("pid") or 0) == pid)
         and _controller_session_is_in_ancestry(session)
     ]
-    return matches[0] if len(matches) == 1 else None
+    return dict(matches[0]) if len(matches) == 1 else None
+
+
+def _self_resolved_controller_session(
+    args,
+    project_root: Path,
+) -> dict | None:
+    """Resolve one ancestry-proven live holder matching declared identity."""
+    return _controller_dispatch_identity(args, project_root).self_resolved
+
+
+def _controller_dispatch_identity(
+    args,
+    project_root: Path,
+) -> _ControllerDispatchIdentity:
+    """Return the one fused three-state lookup for this dispatch attempt."""
+    cached = getattr(args, _CONTROLLER_DISPATCH_IDENTITY_ATTR, None)
+    if isinstance(cached, _ControllerDispatchIdentity):
+        return cached
+    root = goalflight_task.resolve_project_root(str(project_root))
+    lookup = _kernel_live_controller_sessions(root)
+    ident = _ControllerDispatchIdentity(
+        lookup=lookup,
+        self_resolved=_self_resolved_from_lookup(args, root, lookup),
+    )
+    setattr(args, _CONTROLLER_DISPATCH_IDENTITY_ATTR, ident)
+    return ident
+
+
+def _remember_identified_controller_session(
+    args,
+    session: dict,
+) -> None:
+    """Keep prepare/record on the same snapshot after stamp identifies a holder."""
+    current = getattr(args, _CONTROLLER_DISPATCH_IDENTITY_ATTR, None)
+    session_copy = dict(session)
+    sessions: list[dict]
+    if (
+        isinstance(current, _ControllerDispatchIdentity)
+        and current.lookup.sessions is not None
+    ):
+        sessions = [dict(item) for item in current.lookup.sessions]
+        session_id = str(session_copy.get("id") or "")
+        if session_id and not any(
+            str(item.get("id") or "") == session_id for item in sessions
+        ):
+            sessions.append(session_copy)
+    else:
+        sessions = [session_copy]
+    self_resolved = (
+        current.self_resolved
+        if isinstance(current, _ControllerDispatchIdentity)
+        else None
+    )
+    setattr(
+        args,
+        _CONTROLLER_DISPATCH_IDENTITY_ATTR,
+        _ControllerDispatchIdentity(
+            lookup=_ControllerSessionLookup(sessions=sessions),
+            self_resolved=self_resolved,
+        ),
+    )
+
+
+def _session_from_fused_lookup(
+    lookup: _ControllerSessionLookup,
+    *,
+    label: str | None,
+    pid: int | None,
+    session_id: str | None = None,
+) -> tuple[str, dict | None]:
+    """Match a holder in the fused snapshot; unreadable stays unknown."""
+    if lookup.sessions is None:
+        return "unreadable", None
+    candidates = list(lookup.sessions)
+    if label is not None:
+        candidates = [
+            session
+            for session in candidates
+            if str(session.get("label") or "") == label
+        ]
+    if pid is not None:
+        candidates = [
+            session
+            for session in candidates
+            if int(session.get("pid") or 0) == pid
+        ]
+    if session_id is not None:
+        candidates = [
+            session
+            for session in candidates
+            if str(session.get("id") or "") == session_id
+        ]
+    if len(candidates) != 1:
+        return "dead", None
+    return "live", dict(candidates[0])
+
+
+def _controller_child_role(args) -> bool:
+    return bool(
+        getattr(args, "from_queue", False)
+        or getattr(args, "launch_detached", False)
+        or getattr(args, "acp_detached_child", False)
+    )
 
 
 def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
@@ -3936,15 +4072,12 @@ def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
         }
     if ambient_lease_nonce is not None:
         requested_session_id = ambient_lease_nonce
-    child_role = bool(
-        getattr(args, "from_queue", False)
-        or getattr(args, "launch_detached", False)
-        or getattr(args, "acp_detached_child", False)
-    )
+    child_role = _controller_child_role(args)
+    ident = _controller_dispatch_identity(args, root)
     session: dict | None = None
     claim_result: dict[str, object]
     self_resolved = (
-        _self_resolved_controller_session(args, root)
+        ident.self_resolved
         if requested_session_id is None and not child_role
         else None
     )
@@ -3968,16 +4101,13 @@ def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
             if explicit_session_id is not None and ambient_lease_nonce is None
             else requested_pid
         )
-        candidate = (
-            goalflight_session_status.live_session(
-                root,
-                label=requested_label,
-                pid=verification_pid,
-            )
-            if verification_pid is not None
-            else goalflight_session_status.live_session(root, label=requested_label)
+        probe_state, candidate = _session_from_fused_lookup(
+            ident.lookup,
+            label=requested_label,
+            pid=verification_pid,
+            session_id=requested_session_id,
         )
-        if isinstance(candidate, dict) and candidate.get("id") == requested_session_id:
+        if probe_state == "live" and isinstance(candidate, dict):
             session = candidate
             claim_result = {
                 "claimed": False,
@@ -3987,6 +4117,12 @@ def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
                     else "verified_controller_capability"
                 ),
                 "inherited": True,
+            }
+        elif probe_state == "unreadable":
+            # Unknown is not a capability miss. Prepare refuses with retry advice.
+            claim_result = {
+                "claimed": False,
+                "reason": "controller_registry_unreadable",
             }
         else:
             claim_result = {
@@ -4027,19 +4163,13 @@ def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
             "role": "drainer" if child_role else "controller",
         }
         if requested_label and requested_session_id is not None:
-            candidate = (
-                goalflight_session_status.live_session(
-                    root,
-                    label=requested_label,
-                    pid=requested_pid,
-                )
-                if requested_pid is not None
-                else goalflight_session_status.live_session(root, label=requested_label)
+            probe_state, candidate = _session_from_fused_lookup(
+                ident.lookup,
+                label=requested_label,
+                pid=requested_pid,
+                session_id=requested_session_id,
             )
-            if (
-                isinstance(candidate, dict)
-                and candidate.get("id") == requested_session_id
-            ):
+            if probe_state == "live" and isinstance(candidate, dict):
                 session = candidate
     session_id = session.get("id") if isinstance(session, dict) else None
     session_pid = session.get("pid") if isinstance(session, dict) else None
@@ -4055,6 +4185,8 @@ def _stamp_controller_session(args, project_root: Path) -> dict[str, object]:
     args.controller_session_id = str(session_id) if session_id is not None else None
     args._controller_beacon_pid = session_pid
     args.controller_label = str(session_label) if session_label is not None else None
+    if isinstance(session, dict) and session_id and session_label:
+        _remember_identified_controller_session(args, session)
     return claim_result
 
 
@@ -4084,12 +4216,14 @@ def _resolve_controller_dispatch_owner(
     label = _controller_label(args)
     if nonce is None or pid is None or label is None:
         return None
-    session = goalflight_session_status.live_session(
-        project_root,
+    ident = _controller_dispatch_identity(args, project_root)
+    probe_state, session = _session_from_fused_lookup(
+        ident.lookup,
         label=label,
         pid=pid,
+        session_id=nonce,
     )
-    if not isinstance(session, dict):
+    if probe_state != "live" or not isinstance(session, dict):
         return None
     try:
         session_pid = int(session.get("pid"))
@@ -4198,7 +4332,7 @@ def _controller_registration_warning(
     lookup: _ControllerSessionLookup | None = None,
 ) -> str:
     if lookup is None:
-        lookup = _kernel_live_controller_sessions(project_root)
+        lookup = _controller_dispatch_identity(args, project_root).lookup
     if lookup.sessions is None:
         return _controller_registry_unreadable_warning(
             lookup.unreadable_reason or "unclassified registry read failure"
@@ -4305,9 +4439,10 @@ def _prepare_attempt_controller_registration(
     project_root: Path,
 ) -> str | None:
     """Refuse an unowned attempt, or return the forced-path warning to emit."""
+    ident = _controller_dispatch_identity(args, project_root)
     if _resolve_controller_dispatch_owner(args, project_root) is not None:
         return None
-    lookup = _kernel_live_controller_sessions(project_root)
+    lookup = ident.lookup
     warning = _controller_registration_warning(args, project_root, lookup=lookup)
     if lookup.sessions is None:
         # Default path: unknown is not "unregistered". Retry is the right
@@ -4928,9 +5063,9 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                    codex_home: str | None = None,
                    request_envelope: dict | None = None) -> None:
     if state == "waiting_capacity":
-        # This is the dispatch attempt's prepare boundary. Re-resolve here so
-        # argument parsing, prompt materialization, and account setup cannot
-        # turn a stale controller capability into an owned journal attempt.
+        # Re-check the fused snapshot from stamp/prepare. Do not take a second
+        # registry read: a later contended open is what turned an already
+        # identified owner into "did not identify it" / unknown.
         _prepare_attempt_controller_registration(args, project_root)
     with contextlib.redirect_stdout(io.StringIO()):
         record_code = goalflight_ledger.cmd_record(
