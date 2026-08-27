@@ -398,6 +398,60 @@ def test_startup_context_preserves_nonbusy_journal_failure_type(
     assert calls == ["connect", "connect"], "failure did not bind at schema startup"
 
 
+def test_construction_shares_one_busy_deadline_across_lock_and_open_stages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Integrity and bootstrap cannot each restart the writer construction budget."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    journal.Journal.create(project)
+    clock = [100.0]
+    observed: dict[str, float] = {}
+
+    class AcquiredLock:
+        def release(self) -> None:
+            observed["released_at"] = clock[0]
+
+    def fake_try_acquire(
+        _cls: type,
+        _path: Path,
+        *,
+        deadline_s: float,
+        poll_s: float = 0.010,
+    ) -> AcquiredLock:
+        del poll_s
+        observed["lock_deadline"] = deadline_s
+        clock[0] = 102.0
+        return AcquiredLock()
+
+    connect_deadlines: list[float | None] = []
+    real_connect = journal.Journal._connect
+
+    def tracking_connect(
+        current: journal.Journal, *, busy_deadline_s: float | None = None
+    ):
+        connect_deadlines.append(busy_deadline_s)
+        if len(connect_deadlines) == 1:
+            return real_connect(current, busy_deadline_s=busy_deadline_s)
+        raise journal.JournalBusy("startup stayed busy after the lock wait")
+
+    monkeypatch.setattr(journal.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        journal.goalflight_task.FileLock,
+        "try_acquire",
+        classmethod(fake_try_acquire),
+    )
+    monkeypatch.setattr(journal.Journal, "_connect", tracking_connect)
+
+    with pytest.raises(journal.JournalBusy, match="startup stayed busy"):
+        journal.Journal(project)
+
+    assert observed["lock_deadline"] == 105.0
+    assert connect_deadlines[:2] == [105.0, 105.0]
+    assert observed["released_at"] == 102.0
+
+
 def test_domain_write_shares_lock_and_connect_busy_deadline(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -4453,7 +4453,10 @@ def cmd_relay(args: argparse.Namespace) -> int:
         import goalflight_task  # type: ignore
 
         root = goalflight_task.resolve_project_root(str(project_root))
-        authority = goalflight_journal.Journal(root)
+        if drain:
+            authority = goalflight_journal.Journal(root)
+        else:
+            authority = goalflight_journal.Journal.open_reader(root)
         controller_label = _require_relay_controller_label(authority)
         lease = authority.active_lease(controller_label)
         if lease is None:
@@ -4786,7 +4789,7 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
             controller_label=label,
             lease_nonce=nonce,
             cursor_positions=_journal_cursor_positions(
-                goalflight_journal.Journal(project_root),
+                goalflight_journal.Journal.open_reader(project_root),
                 label,
             ),
         )
@@ -5093,9 +5096,9 @@ FOLLOW_STATE_START_GRACE_SECS = 15.0
 # the default 1.0s flat-jitter busy budget in 34 connect attempts and exited 2
 # while the journal stayed healthy — coverage silently read 0/3. Listener-owned
 # Journal clients get a wider per-operation busy budget so ordinary multi-writer
-# contention never reaches the poll loops. One-shot CLI readers keep the 1.0s
-# Journal default: they want to fail fast, and widening the global default
-# would touch every caller of Journal.
+# contention never reaches the poll loops. One-shot CLI readers use
+# Journal.open_reader (1.0s): they want to fail fast. The writer-capable
+# Journal() default is a separate 5.0s contract and must not be the peek path.
 LISTENER_JOURNAL_BUSY_BUDGET_S = 10.0
 # Continuous journal-busy failure past this window is no longer transient.
 # The journal's own open budget (goalflight_journal.JOURNAL_OPEN_RETRY_BUDGET_S,

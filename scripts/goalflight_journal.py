@@ -135,6 +135,17 @@ OUTBOX_RETRY_BASE_S = 1.0
 JOURNAL_OPEN_RETRY_BUDGET_S = 75.0
 JOURNAL_OPEN_RETRY_INITIAL_S = 0.050
 JOURNAL_OPEN_RETRY_MAX_S = 5.0
+# Writer-capable clients sit on durable launch, lifecycle, and cursor-CAS paths:
+# failing them can poison an id or replay acknowledged-looking mail.  Under 64
+# concurrent writers, successful *construction* measured 0.024-3.725s (N=7,
+# median 0.202s); 5s covers that one observed tail plus 1.275s of load margin.
+# N=7 makes p95 equal the max by construction — the 3.725s point is a single
+# trial, not a distribution. Journal.write and post-open _read_with_retry on a
+# writer instance inherit this default; those paths were not timed. General
+# read clients retain the 1s responsiveness contract; stricter liveness probes
+# opt into 0.05s.
+JOURNAL_WRITER_RETRY_BUDGET_S = 5.0
+JOURNAL_READER_RETRY_BUDGET_S = 1.0
 ALLOW_MIGRATION_ENV = "GOALFLIGHT_ALLOW_JOURNAL_MIGRATION"
 _SQL_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _STATE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
@@ -264,7 +275,7 @@ class JournalUnavailable(JournalError):
 
 
 class JournalBusy(JournalUnavailable):
-    """SQLite contention exhausted one journal operation's retry budget."""
+    """Contention exhausted one journal operation's retry budget."""
 
 
 class JournalDisappeared(JournalUnavailable):
@@ -901,7 +912,7 @@ class Journal:
         *,
         client_epochs: ClientEpochs | None = None,
         allow_migration: bool | None = None,
-        retry_budget_s: float = 1.0,
+        retry_budget_s: float = JOURNAL_WRITER_RETRY_BUDGET_S,
         open_retry_budget_s: float = JOURNAL_OPEN_RETRY_BUDGET_S,
         transaction_budget_s: float = 1.0,
         jitter_min_s: float = 0.005,
@@ -918,9 +929,12 @@ class Journal:
             jitter_max_s=jitter_max_s,
         )
         self._require_existing_database()
-        with goalflight_task.FileLock(journal_write_lock_path(self.path)):
+        write_lock, deadline = self._acquire_construction_lock()
+        try:
             self._require_existing_database()
-            self._open_validated(created_here=False)
+            self._open_validated(created_here=False, busy_deadline_s=deadline)
+        finally:
+            write_lock.release()
 
     @classmethod
     def create(
@@ -928,7 +942,7 @@ class Journal:
         project_root: Path | str,
         *,
         client_epochs: ClientEpochs | None = None,
-        retry_budget_s: float = 1.0,
+        retry_budget_s: float = JOURNAL_WRITER_RETRY_BUDGET_S,
         open_retry_budget_s: float = JOURNAL_OPEN_RETRY_BUDGET_S,
         transaction_budget_s: float = 1.0,
         jitter_min_s: float = 0.005,
@@ -947,7 +961,8 @@ class Journal:
             jitter_max_s=jitter_max_s,
         )
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with goalflight_task.FileLock(journal_write_lock_path(self.path)):
+        write_lock, deadline = self._acquire_construction_lock()
+        try:
             if os.path.lexists(self.path):
                 raise JournalError(
                     f"journal init refused because the database already exists: {self.path}; "
@@ -955,7 +970,7 @@ class Journal:
                 )
             self._claim_fresh_database_path()
             try:
-                self._open_validated(created_here=True)
+                self._open_validated(created_here=True, busy_deadline_s=deadline)
             except BaseException:
                 for candidate in (
                     self.path,
@@ -964,6 +979,8 @@ class Journal:
                 ):
                     candidate.unlink(missing_ok=True)
                 raise
+        finally:
+            write_lock.release()
         return self
 
     @classmethod
@@ -972,7 +989,7 @@ class Journal:
         project_root: Path | str,
         *,
         client_epochs: ClientEpochs | None = None,
-        retry_budget_s: float = 1.0,
+        retry_budget_s: float = JOURNAL_READER_RETRY_BUDGET_S,
         open_retry_budget_s: float = JOURNAL_OPEN_RETRY_BUDGET_S,
         transaction_budget_s: float = 1.0,
         jitter_min_s: float = 0.005,
@@ -1013,8 +1030,8 @@ class Journal:
         jitter_min_s: float,
         jitter_max_s: float,
     ) -> None:
-        if retry_budget_s < 0:
-            raise ValueError("retry_budget_s must be >= 0")
+        if not 0 <= retry_budget_s < float("inf"):
+            raise ValueError("retry_budget_s must be finite and >= 0")
         if not 0 <= open_retry_budget_s < float("inf"):
             raise ValueError("open_retry_budget_s must be finite and >= 0")
         if transaction_budget_s <= 0:
@@ -1036,6 +1053,27 @@ class Journal:
         self.jitter_max_s = jitter_max_s
         self._read_only_client = False
         self._file_identity: tuple[int, int] | None = None
+
+    def _acquire_construction_lock(self) -> tuple[goalflight_task.FileLock, float]:
+        """Bound construction flock to the same retry budget as the open stages.
+
+        ``Journal.write`` already uses ``FileLock.try_acquire`` against one
+        absolute deadline. Construction used a blocking ``LOCK_EX`` and then
+        started a fresh busy window per integrity / bootstrap / epoch-fence
+        stage, so the error text's ``within {retry_budget_s}s`` was not a
+        wall-clock bound and queued constructors stacked behind the holder.
+        """
+        deadline = time.monotonic() + self.retry_budget_s
+        write_lock = goalflight_task.FileLock.try_acquire(
+            journal_write_lock_path(self.path),
+            deadline_s=deadline,
+        )
+        if write_lock is None:
+            raise JournalBusy(
+                f"journal construction lock timeout within "
+                f"{self.retry_budget_s:.3f}s: {self.path}"
+            )
+        return write_lock, deadline
 
     def _require_existing_database(self) -> None:
         if not os.path.lexists(self.path):
@@ -1070,14 +1108,19 @@ class Journal:
                 "different database cannot inherit this client's authority."
             )
 
-    def _open_validated(self, *, created_here: bool) -> None:
-        self._startup_integrity_check()
-        self._bootstrap_schema(created_here=created_here)
+    def _open_validated(
+        self, *, created_here: bool, busy_deadline_s: float | None = None
+    ) -> None:
+        self._startup_integrity_check(busy_deadline_s=busy_deadline_s)
+        self._bootstrap_schema(
+            created_here=created_here, busy_deadline_s=busy_deadline_s
+        )
         # Enforced on open even though P1 has only epoch 1.  Reads repeat the
         # fence so a long-lived client cannot outlive a migration unnoticed.
         self._read_with_retry(
             "journal open epoch fence",
             lambda connection: self._assert_epoch_fence(connection, for_write=False),
+            busy_deadline_s=busy_deadline_s,
         )
 
     def _claim_fresh_database_path(self) -> None:
@@ -1182,21 +1225,26 @@ class Journal:
                         f"within {self.retry_budget_s:.3f}s: {self.path}"
                     ) from exc
 
-    def _startup_integrity_check(self) -> None:
+    def _startup_integrity_check(self, *, busy_deadline_s: float | None = None) -> None:
         started = time.monotonic()
+        deadline = (
+            started + self.retry_budget_s
+            if busy_deadline_s is None
+            else busy_deadline_s
+        )
         attempts = 0
         while True:
             attempts += 1
             try:
                 with contextlib.closing(
-                    self._connect()
+                    self._connect(busy_deadline_s=deadline)
                 ) as connection:
                     rows = [
                         str(row[0])
                         for row in connection.execute("PRAGMA integrity_check")
                     ]
             except sqlite3.DatabaseError as exc:
-                if _is_busy(exc) and self._retry_delay(started):
+                if _is_busy(exc) and self._retry_delay(started, deadline_s=deadline):
                     continue
                 if _is_busy(exc):
                     raise JournalBusy(
@@ -1216,13 +1264,20 @@ class Journal:
             "are unsupported."
         )
 
-    def _bootstrap_schema(self, *, created_here: bool) -> None:
+    def _bootstrap_schema(
+        self, *, created_here: bool, busy_deadline_s: float | None = None
+    ) -> None:
         started = time.monotonic()
+        deadline = (
+            started + self.retry_budget_s
+            if busy_deadline_s is None
+            else busy_deadline_s
+        )
         attempts = 0
         while True:
             attempts += 1
             try:
-                connection = self._connect()
+                connection = self._connect(busy_deadline_s=deadline)
             except JournalBusy:
                 raise
             except (JournalDisappeared, JournalIOError) as exc:
@@ -1254,7 +1309,7 @@ class Journal:
                     return
                 if not created_here:
                     connection.rollback()
-                    if self._retry_delay(started):
+                    if self._retry_delay(started, deadline_s=deadline):
                         continue
                     missing = ", ".join(sorted(required - tables)) or "required rows"
                     self._raise_integrity_failure(
@@ -1323,7 +1378,9 @@ class Journal:
             except sqlite3.OperationalError as exc:
                 if connection.in_transaction:
                     connection.rollback()
-                if not _is_busy(exc) or not self._retry_delay(started):
+                if not _is_busy(exc) or not self._retry_delay(
+                    started, deadline_s=deadline
+                ):
                     if _is_busy(exc):
                         raise JournalBusy(
                             f"journal startup remained busy after {attempts} attempts "
@@ -1998,10 +2055,16 @@ class Journal:
         self,
         operation: str,
         action: Callable[[sqlite3.Connection], T],
+        *,
+        busy_deadline_s: float | None = None,
     ) -> T:
         """Run every SQL read stage within one bounded busy-classification path."""
         started = time.monotonic()
-        deadline = started + self.retry_budget_s
+        deadline = (
+            started + self.retry_budget_s
+            if busy_deadline_s is None
+            else busy_deadline_s
+        )
         attempts = 0
         while True:
             attempts += 1
@@ -2018,7 +2081,7 @@ class Journal:
                 if not _is_busy(exc):
                     self._raise_disappeared_if_absent(exc)
                     raise
-                if self._retry_delay(started):
+                if self._retry_delay(started, deadline_s=deadline):
                     continue
                 raise JournalBusy(
                     f"{operation} remained busy after {attempts} attempts "
@@ -5344,9 +5407,15 @@ def main(argv: list[str] | None = None) -> int:
             migrated = Journal(args.project_root, allow_migration=True)
             print(json.dumps(migrated.inspect(), indent=2, sort_keys=True))
         elif args.command == "inspect":
-            print(json.dumps(Journal(args.project_root).inspect(), indent=2, sort_keys=True))
+            print(
+                json.dumps(
+                    Journal.open_reader(args.project_root).inspect(),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
         elif args.command == "dump":
-            print("\n".join(Journal(args.project_root).dump_sql()))
+            print("\n".join(Journal.open_reader(args.project_root).dump_sql()))
         elif args.command == "snapshot":
             print(Journal(args.project_root).snapshot(args.output))
         else:

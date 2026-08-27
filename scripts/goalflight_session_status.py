@@ -193,41 +193,41 @@ def _registered_controller_records(
 ) -> list[dict]:
     try:
         root = goalflight_task.resolve_project_root(str(project_root))
-        authority = goalflight_journal.Journal(root)
+        authority = goalflight_journal.Journal.open_reader(root)
+        records = []
+        for row in authority.lease_records(include_ended=include_retired):
+            state = str(row.get("state") or "")
+            principal = json.loads(str(row.get("principal_json") or "{}"))
+            record = {
+                "controller_registry": True,
+                "label": row.get("label"),
+                "id": row.get("nonce"),
+                "lease_nonce": row.get("nonce"),
+                "generation": row.get("generation"),
+                "created_at": row.get("claimed_at"),
+                "started_at": row.get("claimed_at"),
+                "heartbeat_at": row.get("renewed_at"),
+                "renew_deadline_at": row.get("renew_deadline_at"),
+                "hostname": principal.get("hostname"),
+                "pid": row.get("pid"),
+                "process_identity": (
+                    {"pid": row.get("pid"), "start_token": row.get("start_token")}
+                    if row.get("pid") is not None
+                    else None
+                ),
+                "lease_state": state,
+            }
+            if state != goalflight_journal.LEASE_ACTIVE:
+                record["retired_at"] = row.get("ended_at")
+                record["retired_by"] = row.get("ended_reason")
+            records.append(record)
+        return records
     except (
         goalflight_journal.JournalBusy,
         goalflight_journal.JournalDisappeared,
         goalflight_journal.JournalIOError,
     ):
         return []
-    records = []
-    for row in authority.lease_records(include_ended=include_retired):
-        state = str(row.get("state") or "")
-        principal = json.loads(str(row.get("principal_json") or "{}"))
-        record = {
-            "controller_registry": True,
-            "label": row.get("label"),
-            "id": row.get("nonce"),
-            "lease_nonce": row.get("nonce"),
-            "generation": row.get("generation"),
-            "created_at": row.get("claimed_at"),
-            "started_at": row.get("claimed_at"),
-            "heartbeat_at": row.get("renewed_at"),
-            "renew_deadline_at": row.get("renew_deadline_at"),
-            "hostname": principal.get("hostname"),
-            "pid": row.get("pid"),
-            "process_identity": (
-                {"pid": row.get("pid"), "start_token": row.get("start_token")}
-                if row.get("pid") is not None
-                else None
-            ),
-            "lease_state": state,
-        }
-        if state != goalflight_journal.LEASE_ACTIVE:
-            record["retired_at"] = row.get("ended_at")
-            record["retired_by"] = row.get("ended_reason")
-        records.append(record)
-    return records
 
 
 def registered_controller_labels(project_root: Path) -> set[str]:
@@ -1079,7 +1079,9 @@ def claim_controller_startup(
                 pid=resolved_pid,
             )
         else:
-            lease = goalflight_journal.Journal(project_root).active_lease(effective_label)
+            lease = goalflight_journal.Journal.open_reader(project_root).active_lease(
+                effective_label
+            )
             live = (
                 {"id": lease.nonce}
                 if lease is not None and lease.principal.get("pid") == resolved_pid
@@ -1426,7 +1428,7 @@ def _addressed_unread_counts(
     fleet_dir: Path | None = None,
 ) -> tuple[dict[str, int] | None, str | None]:
     try:
-        authority = goalflight_journal.Journal(project_root)
+        authority = goalflight_journal.Journal.open_reader(project_root)
         counts = {
             str(record["label"]): len(
                 authority.pending_delivery_events(
