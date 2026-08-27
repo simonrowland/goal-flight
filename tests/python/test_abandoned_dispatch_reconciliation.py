@@ -581,6 +581,71 @@ def test_unreadable_controller_probe_does_not_reclaim(
     assert entry["reason"] == "controller_indeterminate"
     assert entry["controller_evidence"] == "controller_indeterminate"
     assert result["kept_reasons"] == {"controller_indeterminate": 1}
+    detail = entry["detail"]
+    assert "--retire" in detail
+    assert "--acknowledge-retirement" in detail
+    assert "t-238" in detail
+
+
+def test_unexpected_controller_probe_state_does_not_reclaim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "controller-busy"
+    _record(
+        tmp_path,
+        dispatch_id,
+        controller_pid=os.getpid(),
+        controller_session_id="controller-session",
+    )
+    _stub_controller_probe(monkeypatch, state="busy", session=None)
+
+    result = _run(tmp_path)
+    entry = result["entries"][0]
+
+    assert result["closed"] == 0
+    assert _read(dispatch_id)["state"] == "running"
+    assert entry["eligible"] is False
+    assert entry["reason"] == "controller_live_or_indeterminate"
+    assert entry["controller_evidence"] == "controller_beacon_error:unexpected_probe_state:busy"
+    assert result["kept_reasons"] == {"controller_live_or_indeterminate": 1}
+
+
+def test_reconcile_abandoned_text_print_includes_kept_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dispatch_id = "controller-unreadable-print"
+    _record(
+        tmp_path,
+        dispatch_id,
+        controller_pid=os.getpid(),
+        controller_session_id="controller-session",
+        controller_label="engine",
+    )
+    _stub_controller_probe(
+        monkeypatch,
+        state="unreadable",
+        session=None,
+        expected_label="engine",
+    )
+    queue_dir = tmp_path / "state" / "dispatch-queue"
+    queue_dir.mkdir(parents=True, exist_ok=True)
+
+    rc = D._cmd_reconcile_abandoned(
+        ["--queue-dir", str(queue_dir), "--stale-s", "0"]
+    )
+    captured = capsys.readouterr().out.strip()
+
+    assert rc == 0
+    assert captured.startswith("RECONCILE-ABANDONED ")
+    payload = json.loads(captured.split(" ", 1)[1])
+    assert payload["kept_reasons"] == {"controller_indeterminate": 1}
+    assert payload["would_close"] == 0
+    assert payload["kept"] == 1
+    assert "controller_indeterminate" in captured
+    assert _read(dispatch_id)["state"] == "running"
 
 
 def test_dead_controller_probe_still_reclaims(
