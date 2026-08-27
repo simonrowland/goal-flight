@@ -75,6 +75,14 @@ PERSISTENT_BACKUP_SLOTS_ENV = "GOALFLIGHT_PERSISTENT_BACKUP_SLOTS"
 # bound preserves anti-stall if projection work hangs; a late frontier is cached
 # for the next beat and remains advisory-only.
 STREAM_FRONTIER_GRACE_S = 1.0
+# Follow already withholds an unchanged frontier until
+# FOLLOW_FRONTIER_FLOOR_SECS (15 min). Terse mode used to re-emit that
+# cached frontier as kind=next on every 120s keepalive, so a verbatim-
+# identical payload cost a full controller wake (b-271). Keep the
+# keepalive cadence for CHANGED content; suppress unchanged repeats
+# until this floor so the anti-stall beat still exists. --chatty
+# restores the raw heartbeat/frontier feed and therefore the raw cadence.
+DEFAULT_NEXT_REPEAT_FLOOR_S = 15.0 * 60.0
 _DEAD_NONCE_MARKERS = (
     "controller-capability-mismatch",
     "lease-nonce-not-live",
@@ -709,6 +717,11 @@ def _actionable_stream_wake(
     return {"kind": "next", "payload": payload}
 
 
+def _next_payload_key(record: dict[str, object]) -> str:
+    """Stable identity of a terse kind=next payload for repeat suppression."""
+    return json.dumps(record.get("payload"), sort_keys=True, default=str)
+
+
 @dataclass
 class _ForwardingFrontierRead:
     done: threading.Event
@@ -813,6 +826,7 @@ def run_supervisor(
     debug: bool = False,
     chatty: bool = False,
     forwarding_frontier: Callable[[], dict[str, object]] | None = None,
+    next_repeat_floor_s: float = DEFAULT_NEXT_REPEAT_FLOOR_S,
 ) -> int:
     """Run until the lease dies, stdout breaks, or the host asks to stop."""
     nonce = str(lease_nonce or "").strip()
@@ -1037,11 +1051,15 @@ def run_supervisor(
     pending_stream_frontier: dict[str, object] | None = None
     active_forwarding_read: _ForwardingFrontierRead | None = None
     pending_forwarding_read: _ForwardingFrontierRead | None = None
+    last_next_key: str | None = None
+    last_next_at = float("-inf")
+    repeat_floor_s = max(0.0, float(next_repeat_floor_s))
 
     def emit_pending_stream_wake(*, paired_frontier: bool = False) -> bool:
         nonlocal latest_frontier
         nonlocal pending_forwarding_read, pending_stream_frontier
         nonlocal pending_stream_heartbeat, pending_stream_heartbeat_due
+        nonlocal last_next_key, last_next_at
         if pending_stream_heartbeat is None:
             return True
         frontier = latest_frontier
@@ -1093,7 +1111,17 @@ def run_supervisor(
             frontier = None
         if isinstance(frontier, dict):
             latest_frontier = frontier
-        return _emit(host, _actionable_stream_wake(frontier))
+        record = _actionable_stream_wake(frontier)
+        key = _next_payload_key(record)
+        if (
+            last_next_key is not None
+            and key == last_next_key
+            and host.now - last_next_at < repeat_floor_s
+        ):
+            return True
+        last_next_key = key
+        last_next_at = host.now
+        return _emit(host, record)
 
     while host.running():
         # Every detector reports to _PeerLossDetector; stop_for_stdout_detector

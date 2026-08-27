@@ -300,6 +300,7 @@ def _run(
     debug: bool = False,
     chatty: bool = False,
     forwarding_frontier: Callable[[], dict[str, object]] | None = None,
+    next_repeat_floor_s: float = supervise.DEFAULT_NEXT_REPEAT_FLOOR_S,
 ) -> int:
     host.lease_nonce = nonce
     return supervise.run_supervisor(
@@ -314,6 +315,7 @@ def _run(
         debug=debug,
         chatty=chatty,
         forwarding_frontier=forwarding_frontier,
+        next_repeat_floor_s=next_repeat_floor_s,
     )
 
 
@@ -1031,6 +1033,93 @@ def test_terse_supervisor_replaces_only_own_stream_heartbeat() -> None:
         record.get("kind") == "supervise" and record.get("type") == "heartbeat"
         for record in _records(host)
     )
+
+
+def test_terse_supervisor_suppresses_verbatim_next_until_floor() -> None:
+    """Unchanged next payloads are silent inside the floor; the beat still fires."""
+    assert supervise.DEFAULT_NEXT_REPEAT_FLOOR_S == 900.0
+    assert messages.FOLLOW_FRONTIER_FLOOR_SECS == 900.0
+    assert messages.FOLLOW_HEARTBEAT_SECS == 120.0
+    same = (
+        '{"kind":"frontier","payload":{"id":"t-022","state":"projected",'
+        '"title":"Useful next task"}}'
+    )
+    changed = (
+        '{"kind":"frontier","payload":{"id":"t-023","state":"projected",'
+        '"title":"Moved on"}}'
+    )
+    floor_s = 5.0
+    host = FakeHost(
+        scripts={
+            "stream": [
+                PlannedExit(
+                    lifetime_s=20.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (0.0, '{"kind":"heartbeat","payload":{"seq":1}}'),
+                        (0.01, same),
+                        (1.5, '{"kind":"heartbeat","payload":{"seq":2}}'),
+                        (1.51, same),
+                        (1.5 + floor_s + 1.0, '{"kind":"heartbeat","payload":{"seq":3}}'),
+                        (1.5 + floor_s + 1.01, same),
+                        (1.5 + floor_s + 2.5, '{"kind":"heartbeat","payload":{"seq":4}}'),
+                        (1.5 + floor_s + 2.51, changed),
+                    ],
+                )
+            ]
+        },
+        stop_when_lines_contain=('"id":"t-023"',),
+    )
+    _run(
+        host,
+        _items("stream"),
+        heartbeat_s=100.0,
+        coverage_s=100.0,
+        next_repeat_floor_s=floor_s,
+    )
+    actionable = [record for record in _records(host) if record.get("kind") == "next"]
+    assert [record["payload"].get("id") for record in actionable] == [
+        "t-022",
+        "t-022",
+        "t-023",
+    ]
+    assert all(
+        record["payload"]["directive"] == "goal-flight next" for record in actionable
+    )
+    assert not any(record.get("kind") == "heartbeat" for record in _records(host))
+    assert not any(record.get("kind") == "frontier" for record in _records(host))
+
+    chatty_host = FakeHost(
+        scripts={
+            "stream": [
+                PlannedExit(
+                    lifetime_s=1.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (0.0, '{"kind":"heartbeat","payload":{"seq":1}}'),
+                        (0.01, same),
+                        (0.5, '{"kind":"heartbeat","payload":{"seq":2}}'),
+                        (0.51, same),
+                    ],
+                )
+            ]
+        },
+        stop_after_spawns=2,
+    )
+    _run(
+        chatty_host,
+        _items("stream"),
+        heartbeat_s=100.0,
+        coverage_s=100.0,
+        chatty=True,
+        next_repeat_floor_s=floor_s,
+    )
+    chatty_records = _records(chatty_host)
+    assert sum(record.get("kind") == "heartbeat" for record in chatty_records) == 2
+    assert sum(record.get("kind") == "frontier" for record in chatty_records) == 2
+    assert not any(record.get("kind") == "next" for record in chatty_records)
 
 
 def test_failed_actionable_wake_uses_detector_stop_and_rearm() -> None:
@@ -2780,6 +2869,7 @@ def test_actual_follow_child_emits_one_actionable_wake_per_idle_beat(
                 heartbeat_s=100.0,
                 coverage_s=100.0,
                 items=[("stream", command)],
+                next_repeat_floor_s=0.0,
             )
         finally:
             host.kill_all()
@@ -3183,7 +3273,7 @@ def test_subprocess_stream_pairs_keep_timing_and_quoted_heartbeats_structural(
         lease_nonce=lease.nonce,
         env=env,
         nonce_reader=lambda: lease.nonce,
-        next_target=4,
+        next_target=3,
     )
     try:
         code = supervise.run_supervisor(
@@ -3204,10 +3294,9 @@ def test_subprocess_stream_pairs_keep_timing_and_quoted_heartbeats_structural(
     records = _records(host)  # type: ignore[arg-type]
     actionable = [record for record in records if record.get("kind") == "next"]
     assert code == 0
-    assert len(actionable) == 4
+    assert len(actionable) == 3
     assert [record["payload"].get("id") for record in actionable] == [
         "t-001",
-        "t-002",
         "t-002",
         None,
     ]
