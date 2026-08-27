@@ -386,13 +386,24 @@ def test_unreadable_live_lease_makes_whole_registry_lookup_unknown(
     )
     monkeypatch.setattr(
         dispatch.goalflight_session_status,
-        "probe_live_session",
-        lambda *_args, **_kwargs: ("unreadable", None),
+        "_lease_holder_liveness",
+        lambda lease: journal.LeaseLivenessEvidence(
+            generation=lease.generation,
+            nonce=lease.nonce,
+            alive=None,
+        ),
     )
     monkeypatch.setattr(
         dispatch.goalflight_session_status,
         "live_session",
         lambda *_args, **_kwargs: pytest.fail("legacy collapsing wrapper was used"),
+    )
+    monkeypatch.setattr(
+        dispatch.goalflight_session_status,
+        "probe_live_session",
+        lambda *_args, **_kwargs: pytest.fail(
+            "identify lookup re-opened the journal via probe_live_session"
+        ),
     )
     try:
         lookup = dispatch._kernel_live_controller_sessions(project)
@@ -429,7 +440,7 @@ def test_resolve_owner_none_falls_through_to_three_state_lookup(
     monkeypatch.setattr(
         dispatch.goalflight_session_status,
         "live_session",
-        lambda *_args, **_kwargs: None,
+        lambda *_args, **_kwargs: pytest.fail("legacy collapsing wrapper was used"),
     )
     args = argparse.Namespace(
         controller_session_id="stamped-nonce",
@@ -1124,3 +1135,166 @@ def test_help_documents_unregistered_override() -> None:
     assert "--controller-label" in resume_help.stdout
     assert "--controller-pid" in resume_help.stdout
     assert "--controller-session-id" in resume_help.stdout
+
+
+def _stamp_args(**overrides) -> argparse.Namespace:
+    values = {
+        "controller_label": None,
+        "controller_beacon_pid": None,
+        "controller_pid": None,
+        "controller_session_id": None,
+        "from_queue": False,
+        "launch_detached": False,
+        "acp_detached_child": False,
+        "takeover": False,
+        "unregistered_forced": False,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def _tripwire_collapsing_live_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        dispatch.goalflight_session_status,
+        "live_session",
+        lambda *_args, **_kwargs: pytest.fail("legacy collapsing wrapper was used"),
+    )
+
+
+def _count_kernel_live_reads(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    real = dispatch._kernel_live_controller_sessions
+    calls: list[object] = []
+
+    def wrapped(project_root):
+        if calls:
+            raise AssertionError("controller registry was read more than once")
+        calls.append(project_root)
+        return real(project_root)
+
+    monkeypatch.setattr(dispatch, "_kernel_live_controller_sessions", wrapped)
+    return calls
+
+
+def test_fused_identify_survives_journal_contention_after_first_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Live ancestry owner stays identified when a later journal open would busy.
+
+    Reverting the fused snapshot makes prepare take a second registry read.
+    Under exclusive lock that second read is unknown / "did not identify it"
+    even though stamp already adopted this process.
+    """
+    env, project, _advertised = _isolated_env(monkeypatch, tmp_path)
+    _tripwire_collapsing_live_session(monkeypatch)
+    calls = _count_kernel_live_reads(monkeypatch)
+    authority, holder, nonce = _register_controller(
+        project,
+        env,
+        export_identity=False,
+    )
+    args = _stamp_args()
+    try:
+        stamped = dispatch._stamp_controller_session(args, project)
+        assert stamped["reason"] == "resolved_kernel_live_controller"
+        assert args.controller_session_id == nonce
+        assert args.controller_label == "registered-test"
+        assert args._controller_beacon_pid == os.getpid()
+        with sqlite3.connect(
+            authority.path,
+            timeout=0,
+            isolation_level=None,
+        ) as blocker:
+            assert blocker.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == (
+                "delete"
+            )
+            blocker.execute("BEGIN EXCLUSIVE")
+            warning = dispatch._prepare_attempt_controller_registration(args, project)
+            assert warning is None
+            dispatch._prepare_attempt_controller_registration(args, project)
+    finally:
+        holder.close()
+    assert len(calls) == 1
+
+
+def test_matching_capability_stays_unknown_not_mismatch_when_registry_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    env, project, _advertised = _isolated_env(monkeypatch, tmp_path)
+    _authority, holder, nonce = _register_controller(
+        project,
+        env,
+        export_identity=False,
+    )
+    _tripwire_collapsing_live_session(monkeypatch)
+    monkeypatch.setattr(
+        dispatch,
+        "_kernel_live_controller_sessions",
+        lambda _root: dispatch._ControllerSessionLookup(
+            sessions=None,
+            unreadable_reason=(
+                f"controller lease 'registered-test' for pid {os.getpid()} "
+                "was unreadable within the liveness probe budget"
+            ),
+        ),
+    )
+    args = _stamp_args(
+        controller_label="registered-test",
+        controller_pid=os.getpid(),
+        controller_session_id=nonce,
+    )
+    try:
+        stamped = dispatch._stamp_controller_session(args, project)
+        with pytest.raises(dispatch.DispatchUsageError) as error:
+            dispatch._prepare_attempt_controller_registration(args, project)
+    finally:
+        holder.close()
+
+    assert stamped["reason"] == "controller_registry_unreadable"
+    assert stamped.get("visible_warning") is not True
+    assert "controller_capability_mismatch" not in str(stamped)
+    assert "controller registry could not be read" in str(error.value)
+    assert "Retry the dispatch" in str(error.value)
+    assert "controller is not registered" not in str(error.value)
+
+
+def test_fused_unknown_forced_still_launches_unowned(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    env, project, _advertised = _isolated_env(monkeypatch, tmp_path)
+    _tripwire_collapsing_live_session(monkeypatch)
+    calls = _count_kernel_live_reads(monkeypatch)
+    journal.open_or_create_journal(project)
+    args = _stamp_args(unregistered_forced=True)
+    with sqlite3.connect(
+        journal.resolve_journal_path(project),
+        timeout=0,
+        isolation_level=None,
+    ) as blocker:
+        assert blocker.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+        blocker.execute("BEGIN EXCLUSIVE")
+        dispatch._stamp_controller_session(args, project)
+        warning = dispatch._prepare_attempt_controller_registration(args, project)
+    assert warning is not None
+    assert "ownership could not be determined" in warning
+    assert "--unregistered-forced accepted" in warning
+    assert "controller is not registered" not in warning
+    assert len(calls) == 1
+
+
+def test_fused_absent_controller_still_refuses_unforced(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _env, project, _advertised = _isolated_env(monkeypatch, tmp_path)
+    _tripwire_collapsing_live_session(monkeypatch)
+    calls = _count_kernel_live_reads(monkeypatch)
+    args = _stamp_args()
+    dispatch._stamp_controller_session(args, project)
+    with pytest.raises(dispatch.DispatchUsageError) as error:
+        dispatch._prepare_attempt_controller_registration(args, project)
+    assert "controller is not registered" in str(error.value)
+    assert "could not be read" not in str(error.value)
+    assert len(calls) == 1
