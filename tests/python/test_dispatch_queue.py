@@ -37,12 +37,18 @@ import goalflight_wake as wake  # noqa: E402
 
 def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
-    env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+    state = tmp / "state"
+    env["GOALFLIGHT_STATE_DIR"] = str(state)
+    # Autouse isolation pins GOALFLIGHT_DISPATCH_DIR to pytest's tmp_path.
+    # Tests here own a separate TemporaryDirectory; without this override the
+    # watcher writes pytest's tree and shutdown waits on an empty file.
+    env["GOALFLIGHT_DISPATCH_DIR"] = str(state / "dispatch")
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal-state")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
     env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
+    env["GOALFLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
     env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
     return env
@@ -125,7 +131,10 @@ def _wait_for_dispatch_shutdown(
     if not watcher:
         return
 
-    watcher_log = Path(env["GOALFLIGHT_STATE_DIR"]) / "dispatch" / f"{dispatch_id}.watcher.log"
+    dispatch_dir = (env.get("GOALFLIGHT_DISPATCH_DIR") or "").strip()
+    watcher_log = (
+        Path(dispatch_dir) if dispatch_dir else Path(env["GOALFLIGHT_STATE_DIR"]) / "dispatch"
+    ) / f"{dispatch_id}.watcher.log"
     last_watcher: dict = {}
 
     def watcher_finished() -> bool:
