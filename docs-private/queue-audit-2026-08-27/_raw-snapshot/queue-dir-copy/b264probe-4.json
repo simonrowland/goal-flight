@@ -1,0 +1,37 @@
+{
+  "agent": "grok-code",
+  "claim_recovery_count": 1,
+  "dispatch_argv": [
+    "--agent",
+    "grok-code",
+    "--dispatch-id",
+    "b264probe-4",
+    "--cwd",
+    "/Users/simonrowland/Repos/pm2",
+    "--tail",
+    "/tmp/goal-flight-501/dispatch/b264probe-4.tail",
+    "--status-json",
+    "/tmp/goal-flight-501/dispatch/b264probe-4.status.json",
+    "--prompt-file",
+    "/private/tmp/claude-501/-Users-simonrowland-Repos-pm2/d9989eb0-0cdd-4ccc-be80-cc86a4d2a55f/scratchpad/layermap-harvest.md",
+    "--shape",
+    "bash"
+  ],
+  "dispatch_id": "b264probe-4",
+  "orphan_first_seen_at": null,
+  "project_root": "/Users/simonrowland/Repos/pm2",
+  "request": {
+    "agent": "grok-code",
+    "cwd": "/Users/simonrowland/Repos/pm2",
+    "status_json": "/tmp/goal-flight-501/dispatch/b264probe-4.status.json",
+    "tail": "/tmp/goal-flight-501/dispatch/b264probe-4.tail",
+    "task_ids": []
+  },
+  "restore_reason": "stale_claim_pre_spawn",
+  "restore_txn_id": "b65d760b09fb489283fc2c37d663c9f0",
+  "shape": "bash",
+  "started_at": "2026-08-27T05:00:12+00:00",
+  "state": "restore_prepared",
+  "task_ids": [],
+  "updated_at": "2026-08-27T05:07:10+00:00"
+}

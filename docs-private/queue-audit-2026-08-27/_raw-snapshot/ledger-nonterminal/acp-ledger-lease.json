@@ -1,0 +1,23 @@
+{
+  "agent": "codex-acp",
+  "base_sha": "0123456789abcdef0123456789abcdef01234567",
+  "dispatch_id": "acp-ledger-lease",
+  "hostname": "Simon-MacBookPro-M5",
+  "launch_unconfirmed": false,
+  "launch_unconfirmed_error": null,
+  "lease_id": null,
+  "project_root": "/Users/simonrowland/Repos/goal-flight",
+  "prompt_path": "chunk.md",
+  "remote_launch_receipt": {
+    "dispatch_id": "acp-ledger-lease",
+    "remote_pid": 4242
+  },
+  "remote_lease_id": null,
+  "remote_lease_id_superseded_by": "launch_receipt",
+  "remote_preflight": null,
+  "schema": "goalflight.dispatch.v1",
+  "started_at": "2026-08-26T12:00:07+00:00",
+  "state": "running",
+  "transport": "fleet-ssh",
+  "updated_at": "2026-08-26T12:00:07+00:00"
+}

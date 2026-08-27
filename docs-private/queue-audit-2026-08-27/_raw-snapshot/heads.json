@@ -1,0 +1,2546 @@
+[
+  {
+    "id": "acp-async-launch",
+    "project": "goal-flight",
+    "slug": "goal-flight",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "codex-acp",
+    "owner": "None",
+    "age": "1d 2h 53m",
+    "created_at": "2026-08-26T12:00:07+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/goal-flight",
+    "prompt_kind": "prompt-file-missing",
+    "prompt_file": "chunk.md",
+    "prompt_file_exists": false,
+    "pin": "missing",
+    "chars": 0,
+    "claim": [],
+    "tasks": null,
+    "hints": [
+      "HINT: prompt-file is gone \u2014 premise cannot be re-checked; honest default is abandon"
+    ],
+    "headline": null,
+    "head": ""
+  },
+  {
+    "id": "acp-launch-retry",
+    "project": "goal-flight",
+    "slug": "goal-flight",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "codex-acp",
+    "owner": "None",
+    "age": "1d 2h 53m",
+    "created_at": "2026-08-26T12:00:07+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/goal-flight",
+    "prompt_kind": "prompt-file-missing",
+    "prompt_file": "chunk.md",
+    "prompt_file_exists": false,
+    "pin": "missing",
+    "chars": 0,
+    "claim": [],
+    "tasks": null,
+    "hints": [
+      "HINT: prompt-file is gone \u2014 premise cannot be re-checked; honest default is abandon"
+    ],
+    "headline": null,
+    "head": ""
+  },
+  {
+    "id": "acp-launch-unconfirmed",
+    "project": "goal-flight",
+    "slug": "goal-flight",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "launch_unconfirmed",
+    "ledger_state": "launch_unconfirmed",
+    "agent": "codex-acp",
+    "owner": "None",
+    "age": "1d 2h 53m",
+    "created_at": "2026-08-26T12:00:07+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/goal-flight",
+    "prompt_kind": "prompt-file-missing",
+    "prompt_file": "chunk.md",
+    "prompt_file_exists": false,
+    "pin": "missing",
+    "chars": 0,
+    "claim": [],
+    "tasks": null,
+    "hints": [
+      "HINT: prompt-file is gone \u2014 premise cannot be re-checked; honest default is abandon"
+    ],
+    "headline": null,
+    "head": ""
+  },
+  {
+    "id": "acp-ledger-lease",
+    "project": "goal-flight",
+    "slug": "goal-flight",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "codex-acp",
+    "owner": "None",
+    "age": "1d 2h 53m",
+    "created_at": "2026-08-26T12:00:07+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/goal-flight",
+    "prompt_kind": "prompt-file-missing",
+    "prompt_file": "chunk.md",
+    "prompt_file_exists": false,
+    "pin": "missing",
+    "chars": 0,
+    "claim": [],
+    "tasks": null,
+    "hints": [
+      "HINT: prompt-file is gone \u2014 premise cannot be re-checked; honest default is abandon"
+    ],
+    "headline": null,
+    "head": ""
+  },
+  {
+    "id": "acp-live-runner",
+    "project": "goal-flight",
+    "slug": "goal-flight",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "codex-acp",
+    "owner": "None",
+    "age": "1d 2h 53m",
+    "created_at": "2026-08-26T12:00:07+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/goal-flight",
+    "prompt_kind": "prompt-file-missing",
+    "prompt_file": "chunk.md",
+    "prompt_file_exists": false,
+    "pin": "missing",
+    "chars": 0,
+    "claim": [],
+    "tasks": null,
+    "hints": [
+      "HINT: prompt-file is gone \u2014 premise cannot be re-checked; honest default is abandon"
+    ],
+    "headline": null,
+    "head": ""
+  },
+  {
+    "id": "acp-node-ssh",
+    "project": "goal-flight",
+    "slug": "goal-flight",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "codex-acp",
+    "owner": "None",
+    "age": "1d 2h 53m",
+    "created_at": "2026-08-26T12:00:07+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/goal-flight",
+    "prompt_kind": "prompt-file-missing",
+    "prompt_file": "chunk.md",
+    "prompt_file_exists": false,
+    "pin": "missing",
+    "chars": 0,
+    "claim": [],
+    "tasks": null,
+    "hints": [
+      "HINT: prompt-file is gone \u2014 premise cannot be re-checked; honest default is abandon"
+    ],
+    "headline": null,
+    "head": ""
+  },
+  {
+    "id": "b13-1-reverse-mass-drivers",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "grok-code",
+    "owner": "pm2-main",
+    "age": "18m",
+    "created_at": "2026-08-27T14:35:24+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/b13-1-reverse-mass-drivers.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 6994,
+    "claim": [],
+    "tasks": null,
+    "hints": [],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and you have nothing to do until the controller answers, use `python3 \"$GOALFLIGHT_DISPATCH_SCRIPT\" steer \"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question and wait under a separate bounded deadline.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nWorker execution contract:\n- Use your available tools to actually perform the requested filesystem, shell, research, or analysis actions before answering. Do not only plan, summarize, or describe commands.\n- For successful completion, emit a final line outside any Markdown fence in this exact shape supplied by the dispatch-specific identity contra"
+  },
+  {
+    "id": "b234-mre-scope",
+    "project": "regolith",
+    "slug": "regolith",
+    "pops": [
+      "bare-json",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "moonshot",
+    "owner": "regolith-main",
+    "age": "21h 41m",
+    "created_at": "2026-08-26T17:12:09+00:00",
+    "cwd": "/Users/simonrowland/Repos/rps-b234",
+    "root": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Library-CloudStorage-Dropbox-Starship-Mission-Design-Regolith-Processing-regolith-pyrolysis-simulator/70f1d3c1-4b7e-4455-bf2d-31eabd2ee767/scratchpad/b234.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 3524,
+    "claim": [],
+    "tasks": [
+      "b-234"
+    ],
+    "hints": [],
+    "headline": null,
+    "head": "Scope a fail-open in the MRE charge accounting: find out whether it actually fires on any golden feedstock. Repo root: /Users/simonrowland/Repos/rps-b234 (branch work-b234, HEAD 236553f9). Read AGENTS.md and CLAUDE.md FIRST.\n\nTHE DEFECT (b-234). simulator/extraction.py around 2113-2118, inside the MRE interval commit:\n    n_e = charge_electrons.get(oxide, ELECTRONS_PER_OXIDE.get(oxide, 2))\n    total_charge_C += moles_ox * n_e * FARADAY\nELECTRONS_PER_OXIDE covers exactly twelve oxides (NiO, Na2O, K2O, FeO 2; Fe2O3, Cr2O3, Al2O3 6; MnO 2; SiO2, TiO2 4; MgO, CaO 2). The loop iterates lot.species_moles_for(...) over EVERY oxide in the cleaned-melt lot, so anything outside those twelve silently contributes moles_ox * 2 * FARADAY. That total sets _mre_effective_current_A, which gates C5 / MRE_BASELINE rung advancement.\n\nAssuming n=2 for an unknown oxide is not a conservative default \u2014 it is a fabricated measurement in an accounting channel, and it is wrong in both directions (6 for sesquioxides, 4 for dioxides).\n\n\u2605 THE SAME EXPRESSION EXISTS IN simulator/electrolysis.py AND WAS CORRECTLY FIXED THERE BY RAISING. DO NOT COPY THAT FIX HERE. There the oxide is CALLER-CHOSEN so an unlisted on"
+  },
+  {
+    "id": "b264probe-1",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-terminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "complete",
+    "agent": "grok-code",
+    "owner": "None",
+    "age": "9h 55m",
+    "created_at": "2026-08-27T04:58:44+00:00",
+    "cwd": "/Users/simonrowland/Repos/pm2",
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-pm2/d9989eb0-0cdd-4ccc-be80-cc86a4d2a55f/scratchpad/layermap-harvest.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 5796,
+    "claim": [
+      [
+        5987,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [
+      "HINT: ledger already records terminal state `complete` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# layermap-harvest \u2014 collect every owed LAYER-MAP declaration-need (t-763) \u2014 id layermap-harvest\n\nRepo /Users/simonrowland/Repos/pm2, HEAD 590b1ae, tree CLEAN. GOAL-LOOP apply; NO stage/commit/push.\nThe repo root IS the `pm2` package. This repo's pytest has NO `--timeout` plugin.\n\n## THIS IS A HARVEST, NOT AN EDIT\n**You must NOT edit `docs/LAYER-MAP.md`.** That rule is why this backlog exists and it still binds:\nLAYER-MAP is declared canon, changed deliberately in a credit-rich window, never by accretion. The\ncontroller lands every map edit. Your product is a single consolidated, verified, deduplicated LIST\nthat the controller can land in one sitting. A worker who \"helpfully\" edits the map has destroyed the\none property the rule protects.\n\n## WHY THIS IS OWED\nEvery worker brief this arc said \"do NOT edit LAYER-MAP \u2014 state the declaration-need in your notes;\nthe controller lands it.\" The workers complied. The controller never did the pass. So the needs are\nscattered across review notes, and nobody can currently answer \"what does the map still owe?\"\n\n## WHERE THEY ARE (t-763 names these; VERIFY rather than trust the list)\n- `docs-private/reviews/2026-08-24-ceremony-recheck/pb-laws-no"
+  },
+  {
+    "id": "b264probe-2",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-terminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "complete",
+    "agent": "grok-code",
+    "owner": "None",
+    "age": "9h 54m",
+    "created_at": "2026-08-27T04:59:18+00:00",
+    "cwd": "/Users/simonrowland/Repos/pm2",
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-pm2/d9989eb0-0cdd-4ccc-be80-cc86a4d2a55f/scratchpad/layermap-harvest.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 5796,
+    "claim": [
+      [
+        26544,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [
+      "HINT: ledger already records terminal state `complete` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# layermap-harvest \u2014 collect every owed LAYER-MAP declaration-need (t-763) \u2014 id layermap-harvest\n\nRepo /Users/simonrowland/Repos/pm2, HEAD 590b1ae, tree CLEAN. GOAL-LOOP apply; NO stage/commit/push.\nThe repo root IS the `pm2` package. This repo's pytest has NO `--timeout` plugin.\n\n## THIS IS A HARVEST, NOT AN EDIT\n**You must NOT edit `docs/LAYER-MAP.md`.** That rule is why this backlog exists and it still binds:\nLAYER-MAP is declared canon, changed deliberately in a credit-rich window, never by accretion. The\ncontroller lands every map edit. Your product is a single consolidated, verified, deduplicated LIST\nthat the controller can land in one sitting. A worker who \"helpfully\" edits the map has destroyed the\none property the rule protects.\n\n## WHY THIS IS OWED\nEvery worker brief this arc said \"do NOT edit LAYER-MAP \u2014 state the declaration-need in your notes;\nthe controller lands it.\" The workers complied. The controller never did the pass. So the needs are\nscattered across review notes, and nobody can currently answer \"what does the map still owe?\"\n\n## WHERE THEY ARE (t-763 names these; VERIFY rather than trust the list)\n- `docs-private/reviews/2026-08-24-ceremony-recheck/pb-laws-no"
+  },
+  {
+    "id": "b264probe-4",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-terminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "complete",
+    "agent": "grok-code",
+    "owner": "None",
+    "age": "9h 53m",
+    "created_at": "2026-08-27T05:00:12+00:00",
+    "cwd": "/Users/simonrowland/Repos/pm2",
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-pm2/d9989eb0-0cdd-4ccc-be80-cc86a4d2a55f/scratchpad/layermap-harvest.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 5796,
+    "claim": [
+      [
+        92483,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [
+      "HINT: ledger already records terminal state `complete` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# layermap-harvest \u2014 collect every owed LAYER-MAP declaration-need (t-763) \u2014 id layermap-harvest\n\nRepo /Users/simonrowland/Repos/pm2, HEAD 590b1ae, tree CLEAN. GOAL-LOOP apply; NO stage/commit/push.\nThe repo root IS the `pm2` package. This repo's pytest has NO `--timeout` plugin.\n\n## THIS IS A HARVEST, NOT AN EDIT\n**You must NOT edit `docs/LAYER-MAP.md`.** That rule is why this backlog exists and it still binds:\nLAYER-MAP is declared canon, changed deliberately in a credit-rich window, never by accretion. The\ncontroller lands every map edit. Your product is a single consolidated, verified, deduplicated LIST\nthat the controller can land in one sitting. A worker who \"helpfully\" edits the map has destroyed the\none property the rule protects.\n\n## WHY THIS IS OWED\nEvery worker brief this arc said \"do NOT edit LAYER-MAP \u2014 state the declaration-need in your notes;\nthe controller lands it.\" The workers complied. The controller never did the pass. So the needs are\nscattered across review notes, and nobody can currently answer \"what does the map still owe?\"\n\n## WHERE THEY ARE (t-763 names these; VERIFY rather than trust the list)\n- `docs-private/reviews/2026-08-24-ceremony-recheck/pb-laws-no"
+  },
+  {
+    "id": "b285-ring-coherence-adjudication",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "bare-json",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "queued",
+    "ledger_state": "running",
+    "agent": "grok-code",
+    "owner": "pm2-main",
+    "age": "4m",
+    "created_at": "2026-08-27T14:49:23+00:00",
+    "cwd": "/private/tmp/pm2-b285/pm2",
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file-missing",
+    "prompt_file": "docs-private/dispatch/b285-ring-coherence-adjudication.md",
+    "prompt_file_exists": false,
+    "pin": "missing",
+    "chars": 0,
+    "claim": [],
+    "tasks": [
+      "b-285"
+    ],
+    "hints": [
+      "HINT: prompt-file is gone \u2014 premise cannot be re-checked; honest default is abandon"
+    ],
+    "headline": null,
+    "head": ""
+  },
+  {
+    "id": "bugs-b277a",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "grok-code",
+    "owner": "pm2-bugs",
+    "age": "16m",
+    "created_at": "2026-08-27T14:37:19+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/bugs-b277a.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 8673,
+    "claim": [],
+    "tasks": null,
+    "hints": [],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and you have nothing to do until the controller answers, use `python3 \"$GOALFLIGHT_DISPATCH_SCRIPT\" steer \"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question and wait under a separate bounded deadline.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nWorker execution contract:\n- Use your available tools to actually perform the requested filesystem, shell, research, or analysis actions before answering. Do not only plan, summarize, or describe commands.\n- For successful completion, emit a final line outside any Markdown fence in this exact shape supplied by the dispatch-specific identity contra"
+  },
+  {
+    "id": "codex-20873-1787795343",
+    "project": "battery-tool-v2 (worktree bt-b2080)",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "claim-marker",
+      "ledger-nonterminal"
+    ],
+    "state": "claimed",
+    "ledger_state": "starting",
+    "agent": "codex",
+    "owner": "battery-engine",
+    "age": "13h 5m",
+    "created_at": "2026-08-27T01:49:03+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-b2080",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/seam-test-brief.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 20186,
+    "claim": [
+      [
+        20873,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "codex-21996-1787791668",
+    "project": "battery-tool-v2 (worktree bt-warm)",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "codex",
+    "owner": "None",
+    "age": "14h 6m",
+    "created_at": "2026-08-27T00:47:48+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-warm",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/b2690-split-brief.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 19723,
+    "claim": [
+      [
+        44163,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "codex-320-1787529559",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-main"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 14h",
+    "created_at": "2026-08-23T23:59:19+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/2ee708ed-cae0-44ff-be85-9cf833e8930f/scratchpad/briefs/mpcap.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 26933,
+    "claim": [],
+    "tasks": [
+      "b-2043"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-35329-1787794960",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "claim-marker",
+      "ledger-nonterminal"
+    ],
+    "state": "claimed",
+    "ledger_state": "queued",
+    "agent": "codex",
+    "owner": "battery-engine",
+    "age": "13h 11m",
+    "created_at": "2026-08-27T01:42:40+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/seam-test-brief.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 20186,
+    "claim": [
+      [
+        4701,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "codex-356-1787583341-retry-03e74ab8",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "bare-json",
+      "queue-top"
+    ],
+    "state": "queued",
+    "ledger_state": null,
+    "agent": "codex",
+    "owner": "battery-bugs",
+    "age": "2d 21h",
+    "created_at": "2026-08-24T17:03:23+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/B-b2181.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 27412,
+    "claim": [],
+    "tasks": [
+      "t-556"
+    ],
+    "hints": [],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-36951-1787795932",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "codex",
+    "owner": "None",
+    "age": "12h 55m",
+    "created_at": "2026-08-27T01:58:52+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/seam-test-brief.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 20186,
+    "claim": [
+      [
+        25513,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "codex-38168-1787588171-retry-ae50e9f1",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "bare-json",
+      "queue-top"
+    ],
+    "state": "queued",
+    "ledger_state": null,
+    "agent": "codex",
+    "owner": "battery-bugs",
+    "age": "2d 21h",
+    "created_at": "2026-08-24T17:03:25+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/B-t558.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 27309,
+    "claim": [],
+    "tasks": [
+      "t-556"
+    ],
+    "hints": [],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-38318-1787793995",
+    "project": "battery-tool-v2 (worktree bt-b2702)",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "claim-marker",
+      "ledger-nonterminal"
+    ],
+    "state": "claimed",
+    "ledger_state": "starting",
+    "agent": "codex",
+    "owner": "battery-bugs",
+    "age": "13h 27m",
+    "created_at": "2026-08-27T01:26:35+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-b2702",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/14146fbb-321f-44b3-8014-c2faa22b0e32/scratchpad/b2702-brief.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 16791,
+    "claim": [
+      [
+        31779,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [
+      "HINT: worker_cwd does not exist on disk: `/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-b2702`"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-43969-1787541709",
+    "project": "audit-0001",
+    "slug": "audit-0001",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-bugs"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 11h",
+    "created_at": "2026-08-24T03:21:49+00:00",
+    "cwd": "/private/tmp/goal-flight-501/audit-0001",
+    "root": "/private/tmp/goal-flight-501/audit-0001",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/B-audit-0001.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12821,
+    "claim": [],
+    "tasks": [
+      "b-2130"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-44655-1787541714",
+    "project": "audit-0401",
+    "slug": "audit-0401",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-bugs"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 11h",
+    "created_at": "2026-08-24T03:21:54+00:00",
+    "cwd": "/private/tmp/goal-flight-501/audit-0401",
+    "root": "/private/tmp/goal-flight-501/audit-0401",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/B-audit-0401.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12821,
+    "claim": [],
+    "tasks": [
+      "b-2130"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-45162-1787541720",
+    "project": "audit-0801",
+    "slug": "audit-0801",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-bugs"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 11h",
+    "created_at": "2026-08-24T03:22:00+00:00",
+    "cwd": "/private/tmp/goal-flight-501/audit-0801",
+    "root": "/private/tmp/goal-flight-501/audit-0801",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/B-audit-0801.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12821,
+    "claim": [],
+    "tasks": [
+      "b-2130"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-45427-1787794032",
+    "project": "battery-tool-v2 (worktree bt-warm)",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "claim-marker",
+      "ledger-nonterminal"
+    ],
+    "state": "claimed",
+    "ledger_state": "queued",
+    "agent": "codex",
+    "owner": "battery-engine",
+    "age": "13h 26m",
+    "created_at": "2026-08-27T01:27:12+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-warm",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/guard-test-brief.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 9175,
+    "claim": [
+      [
+        45427,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "codex-45667-1787541726",
+    "project": "audit-1201",
+    "slug": "audit-1201",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-bugs"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 11h",
+    "created_at": "2026-08-24T03:22:06+00:00",
+    "cwd": "/private/tmp/goal-flight-501/audit-1201",
+    "root": "/private/tmp/goal-flight-501/audit-1201",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/B-audit-1201.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12821,
+    "claim": [],
+    "tasks": [
+      "b-2130"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-46279-1787541732",
+    "project": "audit-1501",
+    "slug": "audit-1501",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-bugs"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 11h",
+    "created_at": "2026-08-24T03:22:12+00:00",
+    "cwd": "/private/tmp/goal-flight-501/audit-1501",
+    "root": "/private/tmp/goal-flight-501/audit-1501",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/B-audit-1501.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12821,
+    "claim": [],
+    "tasks": [
+      "b-2130"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-46804-1787541738",
+    "project": "audit-1801",
+    "slug": "audit-1801",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-bugs"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 11h",
+    "created_at": "2026-08-24T03:22:18+00:00",
+    "cwd": "/private/tmp/goal-flight-501/audit-1801",
+    "root": "/private/tmp/goal-flight-501/audit-1801",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/B-audit-1801.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12821,
+    "claim": [],
+    "tasks": [
+      "b-2130"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-48669-1787557501",
+    "project": "audit-0001",
+    "slug": "audit-0001",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-bugs"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 7h",
+    "created_at": "2026-08-24T07:45:01+00:00",
+    "cwd": "/private/tmp/goal-flight-501/audit-0001",
+    "root": "/private/tmp/goal-flight-501/audit-0001",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/B-audit-0001.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12821,
+    "claim": [],
+    "tasks": [
+      "b-2130"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-49282-1787557506",
+    "project": "audit-0401",
+    "slug": "audit-0401",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-bugs"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 7h",
+    "created_at": "2026-08-24T07:45:06+00:00",
+    "cwd": "/private/tmp/goal-flight-501/audit-0401",
+    "root": "/private/tmp/goal-flight-501/audit-0401",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/B-audit-0401.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12821,
+    "claim": [],
+    "tasks": [
+      "b-2130"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-50159-1787557511",
+    "project": "audit-0801",
+    "slug": "audit-0801",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-bugs"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 7h",
+    "created_at": "2026-08-24T07:45:12+00:00",
+    "cwd": "/private/tmp/goal-flight-501/audit-0801",
+    "root": "/private/tmp/goal-flight-501/audit-0801",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/B-audit-0801.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12821,
+    "claim": [],
+    "tasks": [
+      "b-2130"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-52033-1787557524",
+    "project": "audit-1201",
+    "slug": "audit-1201",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-bugs"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 7h",
+    "created_at": "2026-08-24T07:45:24+00:00",
+    "cwd": "/private/tmp/goal-flight-501/audit-1201",
+    "root": "/private/tmp/goal-flight-501/audit-1201",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/B-audit-1201.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12821,
+    "claim": [],
+    "tasks": [
+      "b-2130"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-53248-1787557530",
+    "project": "audit-1501",
+    "slug": "audit-1501",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-bugs"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 7h",
+    "created_at": "2026-08-24T07:45:30+00:00",
+    "cwd": "/private/tmp/goal-flight-501/audit-1501",
+    "root": "/private/tmp/goal-flight-501/audit-1501",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/B-audit-1501.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12821,
+    "claim": [],
+    "tasks": [
+      "b-2130"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-53956-1787557536",
+    "project": "audit-1801",
+    "slug": "audit-1801",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-bugs"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 7h",
+    "created_at": "2026-08-24T07:45:36+00:00",
+    "cwd": "/private/tmp/goal-flight-501/audit-1801",
+    "root": "/private/tmp/goal-flight-501/audit-1801",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/B-audit-1801.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12821,
+    "claim": [],
+    "tasks": [
+      "b-2130"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-55395-1787799489",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "codex",
+    "owner": "battery-bugs",
+    "age": "11h 55m",
+    "created_at": "2026-08-27T02:58:09+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/codex-55395-1787799489.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 15784,
+    "claim": [],
+    "tasks": null,
+    "hints": [],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and you have nothing to do until the controller answers, use `python3 \"$GOALFLIGHT_DISPATCH_SCRIPT\" steer \"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question and wait under a separate bounded deadline.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nTerminal evidence identity contract:\n- Every terminal marker payload starts with the exact dispatch id `codex-55395-1787799489`.\n- Successful final shape: `!COMPLETE: codex-55395-1787799489 \u2014 <summary>`.\n- Use the same id prefix for READY, RESULT, FAILED, USER-NEED, USER-CONFIRM, or BLOCKED. A generic or foreign marker is ignored.\n\n# Mandate \u2014 Nor"
+  },
+  {
+    "id": "codex-56849-1787443719-retry-63523187",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "bare-json",
+      "queue-top",
+      "retired-by-main"
+    ],
+    "state": "queued",
+    "ledger_state": null,
+    "agent": "codex",
+    "owner": "battery-main",
+    "age": "3d 9h",
+    "created_at": "2026-08-24T05:41:41+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file-missing",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/2ee708ed-cae0-44ff-be85-9cf833e8930f/scratchpad/briefs/b-1977.md",
+    "prompt_file_exists": false,
+    "pin": "missing",
+    "chars": 0,
+    "claim": [],
+    "tasks": [
+      "b-1977"
+    ],
+    "hints": [
+      "HINT: prompt-file is gone \u2014 premise cannot be re-checked; honest default is abandon"
+    ],
+    "headline": null,
+    "head": ""
+  },
+  {
+    "id": "codex-60942-1787841540",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "codex",
+    "owner": "battery-bugs",
+    "age": "15m",
+    "created_at": "2026-08-27T14:39:00+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/codex-60942-1787841540.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12331,
+    "claim": [],
+    "tasks": null,
+    "hints": [],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and you have nothing to do until the controller answers, use `python3 \"$GOALFLIGHT_DISPATCH_SCRIPT\" steer \"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question and wait under a separate bounded deadline.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nTerminal evidence identity contract:\n- Every terminal marker payload starts with the exact dispatch id `codex-60942-1787841540`.\n- Successful final shape: `!COMPLETE: codex-60942-1787841540 \u2014 <summary>`.\n- Use the same id prefix for READY, RESULT, FAILED, USER-NEED, USER-CONFIRM, or BLOCKED. A generic or foreign marker is ignored.\n\n# Mandate \u2014 Nor"
+  },
+  {
+    "id": "codex-62503-1787807410",
+    "project": "battery-tool-v2 (worktree bt-b2696)",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "claim-marker",
+      "ledger-nonterminal"
+    ],
+    "state": "claimed",
+    "ledger_state": "queued",
+    "agent": "codex",
+    "owner": "battery-bugs",
+    "age": "9h 43m",
+    "created_at": "2026-08-27T05:10:10+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-b2696",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/14146fbb-321f-44b3-8014-c2faa22b0e32/scratchpad/b2696-brief.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 15595,
+    "claim": [
+      [
+        53562,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [
+      "HINT: worker_cwd does not exist on disk: `/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-b2696`"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "codex-62720-1787530305",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-webui"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 14h",
+    "created_at": "2026-08-24T00:11:45+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/claude-501/brief-b2101.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 7948,
+    "claim": [],
+    "tasks": [
+      "b-2101"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "codex-63597-1787530311",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-webui"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 14h",
+    "created_at": "2026-08-24T00:11:51+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/claude-501/brief-declseed.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 7071,
+    "claim": [],
+    "tasks": [
+      "t-554"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "codex-64518-1787530317",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-webui"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 14h",
+    "created_at": "2026-08-24T00:11:57+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/claude-501/brief-sweep-sitemodel.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 5617,
+    "claim": [],
+    "tasks": [
+      "t-555"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "codex-69648-1787841595",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "codex",
+    "owner": "battery-bugs",
+    "age": "14m",
+    "created_at": "2026-08-27T14:39:56+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/codex-69648-1787841595.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12388,
+    "claim": [],
+    "tasks": null,
+    "hints": [],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and you have nothing to do until the controller answers, use `python3 \"$GOALFLIGHT_DISPATCH_SCRIPT\" steer \"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question and wait under a separate bounded deadline.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nTerminal evidence identity contract:\n- Every terminal marker payload starts with the exact dispatch id `codex-69648-1787841595`.\n- Successful final shape: `!COMPLETE: codex-69648-1787841595 \u2014 <summary>`.\n- Use the same id prefix for READY, RESULT, FAILED, USER-NEED, USER-CONFIRM, or BLOCKED. A generic or foreign marker is ignored.\n\n# Mandate \u2014 Nor"
+  },
+  {
+    "id": "codex-72685-1787777565",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "codex",
+    "owner": "battery-main",
+    "age": "18h 1m",
+    "created_at": "2026-08-26T20:52:47+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/codex-72685-1787777565.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 7187,
+    "claim": [],
+    "tasks": null,
+    "hints": [],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and you have nothing to do until the controller answers, use `python3 \"$GOALFLIGHT_DISPATCH_SCRIPT\" steer \"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question and wait under a separate bounded deadline.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nTerminal evidence identity contract:\n- Every terminal marker payload starts with the exact dispatch id `codex-72685-1787777565`.\n- Successful final shape: `!COMPLETE: codex-72685-1787777565 \u2014 <summary>`.\n- Use the same id prefix for READY, RESULT, FAILED, USER-NEED, USER-CONFIRM, or BLOCKED. A generic or foreign marker is ignored.\n\n# Mandate \u2014 Nor"
+  },
+  {
+    "id": "codex-73102-1787700838-retry-c2f707cf",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "bare-json",
+      "queue-top"
+    ],
+    "state": "queued",
+    "ledger_state": null,
+    "agent": "codex",
+    "owner": "battery-webui",
+    "age": "1d 14h 40m",
+    "created_at": "2026-08-26T00:13:20+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/9a67b5a3-991f-4854-b2a4-60cae5c8328a/scratchpad/b2482-brief.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 9844,
+    "claim": [],
+    "tasks": [
+      "b-2484"
+    ],
+    "hints": [],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "codex-73527-1787842274",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "codex",
+    "owner": "battery-engine",
+    "age": "2m",
+    "created_at": "2026-08-27T14:51:14+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/codex-73527-1787842274.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 22146,
+    "claim": [],
+    "tasks": null,
+    "hints": [],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and you have nothing to do until the controller answers, use `python3 \"$GOALFLIGHT_DISPATCH_SCRIPT\" steer \"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question and wait under a separate bounded deadline.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nTerminal evidence identity contract:\n- Every terminal marker payload starts with the exact dispatch id `codex-73527-1787842274`.\n- Successful final shape: `!COMPLETE: codex-73527-1787842274 \u2014 <summary>`.\n- Use the same id prefix for READY, RESULT, FAILED, USER-NEED, USER-CONFIRM, or BLOCKED. A generic or foreign marker is ignored.\n\n# Mandate \u2014 Nor"
+  },
+  {
+    "id": "codex-74265-1787791956",
+    "project": "battery-tool-v2 (worktree bt-cat)",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "claim-marker",
+      "ledger-nonterminal"
+    ],
+    "state": "claimed",
+    "ledger_state": "queued",
+    "agent": "codex",
+    "owner": "None",
+    "age": "14h 1m",
+    "created_at": "2026-08-27T00:52:36+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-cat",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/ifc-equip-brief.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 9694,
+    "claim": [
+      [
+        27400,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "codex-75378-1787688360",
+    "project": "battery-tool-v2 (worktree bt-b2154)",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "bare-json",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "codex",
+    "owner": "None",
+    "age": "1d 18h 48m",
+    "created_at": "2026-08-25T20:06:00+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-b2154",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-b2154",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/9a67b5a3-991f-4854-b2a4-60cae5c8328a/scratchpad/b2426-brief.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 9109,
+    "claim": [],
+    "tasks": [
+      "b-2426"
+    ],
+    "hints": [
+      "HINT: worker_cwd does not exist on disk: `/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-b2154`",
+      "HINT: project_root does not exist on disk: `/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-b2154`"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "codex-80486-1787414845-retry-d69b4bc9",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "bare-json",
+      "queue-top",
+      "retired-by-main"
+    ],
+    "state": "queued",
+    "ledger_state": null,
+    "agent": "codex",
+    "owner": "battery-bugs",
+    "age": "3d 9h",
+    "created_at": "2026-08-24T05:41:43+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file-missing",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/c6fb7200-a974-44ea-87a1-0a95d1cfa471/scratchpad/brief-sfring3.md",
+    "prompt_file_exists": false,
+    "pin": "missing",
+    "chars": 0,
+    "claim": [],
+    "tasks": [
+      "b-1940"
+    ],
+    "hints": [
+      "HINT: prompt-file is gone \u2014 premise cannot be re-checked; honest default is abandon"
+    ],
+    "headline": null,
+    "head": ""
+  },
+  {
+    "id": "codex-86585-1787546556",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-main"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "3d 10h",
+    "created_at": "2026-08-24T04:42:36+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/2ee708ed-cae0-44ff-be85-9cf833e8930f/scratchpad/briefs/b2148.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 11821,
+    "claim": [],
+    "tasks": [
+      "b-2148"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The figure of merit (what the tool is FOR)\n\n**ROOFTOP COVERAGE = megapack square footage \u00f7 buildable rooftop square footage.** That fraction is the\nCENTRE figure of merit and the thing every design is judged by. Revenue is electricity sales **per\nmegapack**, so an under-tiled roof is directly lost money \u2014 under-placement is a product defect, not a\ntuning shortfall. The roof is the thing b"
+  },
+  {
+    "id": "fr-d1-r3-retry-b8fa0aba",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "bare-json",
+      "queue-top"
+    ],
+    "state": "queued",
+    "ledger_state": null,
+    "agent": "codex",
+    "owner": "pm2-main",
+    "age": "1d 20h 48m",
+    "created_at": "2026-08-25T18:05:26+00:00",
+    "cwd": "/Users/simonrowland/Repos/pm2",
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-pm2/d9989eb0-0cdd-4ccc-be80-cc86a4d2a55f/scratchpad/fr-d1-r3.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 5349,
+    "claim": [],
+    "tasks": [
+      "t-742"
+    ],
+    "hints": [],
+    "headline": null,
+    "head": "# fr-d1 \u2014 force-rail carrier D1 (device-plasma carrier) \u2014 id fr-d1-r3\n\nRepo /Users/simonrowland/Repos/pm2, HEAD 10d2a00, tree CLEAN. GOAL-LOOP apply; NO stage/commit/push.\nEnv: UV_CACHE_DIR=/tmp/pm2-d1-uv PYTHONPATH=/Users/simonrowland/Repos uv run --with numpy --with scipy --with pytest --with numba --with matplotlib --with pydantic python -m pytest ...\n\nAUTHORITY: the D1 atom in docs-private/design/FORCE-RAIL-CHUNKS-2026-08-24.md (read YOUR atom\nsection in full, plus its acceptance clause), and the structures it references in the companion\ndocs-private/design/FORCE-RAIL-REPRESENTATION-2026-08-24.md. The design is FROZEN (03ccb2e plus\nfour committed amendments). X0 has LANDED at 49995a3 \u2014 read force_rail_envelope.py and its guards\nfirst; you build on that spine and do not re-litigate it.\n\nFOUR SIBLINGS RUN CONCURRENTLY on the other carrier lanes (A1 field, E1 encounter, P1 power,\nI1 injection, D1 device-plasma). Lanes are disjoint BY DESIGN: each carrier lands as its own\nmodule and NO carrier edits shared aggregate declarations \u2014 X1 later owns public traversal. If\nyou find yourself needing to edit a shared aggregate declaration or another lane's file, STOP and\nreport it as an out-"
+  },
+  {
+    "id": "fuzzspoke",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "ledger-terminal",
+      "retired-by-main",
+      "retired-by-main/claim-marker"
+    ],
+    "state": "claimed",
+    "ledger_state": "inconclusive_no_final",
+    "agent": "codex",
+    "owner": "None",
+    "age": "1d 15h 7m",
+    "created_at": "2026-08-25T23:46:55+00:00",
+    "cwd": "/Users/simonrowland/Repos/pm2",
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-pm2/d9989eb0-0cdd-4ccc-be80-cc86a4d2a55f/scratchpad/fuzzspoke.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 2899,
+    "claim": [
+      [
+        12979,
+        "dead",
+        "retired-by-main"
+      ]
+    ],
+    "tasks": [],
+    "hints": [
+      "HINT: ledger already records terminal state `inconclusive_no_final` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# fuzzspoke \u2014 teach the fuzzer generator the SPOKE aggregate ceiling \u2014 id fuzzspoke\n\nRepo /Users/simonrowland/Repos/pm2, HEAD 8f4e98d. GOAL-LOOP apply; NO stage/commit/push.\nEnv: UV_CACHE_DIR=/tmp/pm2-fuzz-uv PYTHONPATH=/Users/simonrowland/Repos uv run --with numpy --with scipy --with pytest --with numba --with matplotlib --with pydantic python -m pytest ...\nTESTING DISCIPLINE: targeted/owning suites ONLY. Do NOT run the full tree and do NOT build a\nclean-HEAD archive \u2014 several lanes are uncommitted in this shared tree so full-tree numbers are\nneither attributable nor cheap. The controller measures added-red at commit time.\nLANE: the fuzzer sampling path (surrogate/fuzzing/sampling.py or wherever random/LHS generation\nderives its per-carrier ceilings) and surrogate/tests/test_fuzzer.py. Other lanes own\nforce_rail_*.py, environment.py, simulation_point.py, evaluators/batch.py \u2014 do not touch.\n\nTHE DEFECT (reproduce it first): surrogate/tests/test_fuzzer.py::TestFuzzOne::\ntest_single_eval_succeeds and ::test_invariants_pass_on_good_config fail with\nStatorCurrentEnvelopeRefusal `carrier=I_DC_A*N_spokes requested_A=500000 limit_A=60000`.\ngenerate_random(...) emits a SPOKE config whose a"
+  },
+  {
+    "id": "grok-code-21722-1787778673",
+    "project": "battery-tool-v2 (worktree bt-b2630)",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "bare-json",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "grok-code",
+    "owner": "battery-main",
+    "age": "17h 42m",
+    "created_at": "2026-08-26T21:11:13+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-b2630",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/2ee708ed-cae0-44ff-be85-9cf833e8930f/scratchpad/brief-b2630-cache.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 7174,
+    "claim": [],
+    "tasks": [
+      "b-2630",
+      "b-2619"
+    ],
+    "hints": [],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "grok-code-28489-1787781619",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "claim-marker",
+      "ledger-terminal"
+    ],
+    "state": "claimed",
+    "ledger_state": "failed",
+    "agent": "grok-code",
+    "owner": "battery-main",
+    "age": "16h 53m",
+    "created_at": "2026-08-26T22:00:19+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/2ee708ed-cae0-44ff-be85-9cf833e8930f/scratchpad/brief-t602-scoutA.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 5427,
+    "claim": [
+      [
+        34323,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [
+      "t-602"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `failed` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "grok-code-34851-1787725369",
+    "project": "battery-tool-v2 (worktree bt-d013)",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "grok-code",
+    "owner": "None",
+    "age": "1d 8h 31m",
+    "created_at": "2026-08-26T06:22:49+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-d013",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-d013",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/9a67b5a3-991f-4854-b2a4-60cae5c8328a/scratchpad/offer-review-brief.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 6373,
+    "claim": [
+      [
+        27995,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [
+      "HINT: worker_cwd does not exist on disk: `/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-d013`",
+      "HINT: project_root does not exist on disk: `/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-d013`"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "grok-code-58307-1787790827",
+    "project": "battery-tool-v2 (worktree bt-t605)",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "claim-marker",
+      "ledger-nonterminal"
+    ],
+    "state": "claimed",
+    "ledger_state": "starting",
+    "agent": "grok-code",
+    "owner": "battery-main",
+    "age": "14h 20m",
+    "created_at": "2026-08-27T00:33:47+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-t605",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/2ee708ed-cae0-44ff-be85-9cf833e8930f/scratchpad/brief-t605.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 7480,
+    "claim": [
+      [
+        57031,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [
+      "t-605"
+    ],
+    "hints": [],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "grok-code-70915-1787842258",
+    "project": "battery-tool-v2 (worktree bt-sc150-3)",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "claim-marker",
+      "ledger-nonterminal"
+    ],
+    "state": "claimed",
+    "ledger_state": "running",
+    "agent": "grok-code",
+    "owner": "battery-bugs",
+    "age": "3m",
+    "created_at": "2026-08-27T14:50:58+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-sc150-3",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/14146fbb-321f-44b3-8014-c2faa22b0e32/scratchpad/sc150/STORED-VERDICT.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 10883,
+    "claim": [
+      [
+        69178,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "grok-code-77178-1787729728",
+    "project": "battery-tool-v2 (worktree bt-d013)",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "grok-code",
+    "owner": "None",
+    "age": "1d 7h 18m",
+    "created_at": "2026-08-26T07:35:28+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-d013",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-d013",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-battery-tool-v2/9a67b5a3-991f-4854-b2a4-60cae5c8328a/scratchpad/offer-review-brief.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 6373,
+    "claim": [
+      [
+        84166,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [
+      "HINT: worker_cwd does not exist on disk: `/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-d013`",
+      "HINT: project_root does not exist on disk: `/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-d013`"
+    ],
+    "headline": null,
+    "head": "# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q79+, authoritative) and `CORE-CONCEPT.md`.\n\n## The mission\nBuild a **P.Eng-stampable, filing-grade** engineering tool: given a leased NYC rooftop, find diverse, **buildable**\nways to mount Tesla Megapacks on steel dunnage over an existing (often unreinforced-masonry) building, optimized for\ncapacity \u00d7 fabricated cost, with a structural-engineer-runnable FEA handoff. The output goes to a Professional Engineer\nwho **opens it, runs it, and stamps it.** Build for that bar.\n\n## The north star (non-negotiable)\n- **Physics-correct, first-principles.** Real analytic mechanics \u2014 statics, strength-of-materials, code-reduced\n  allowables \u2014 never proxies, curve-fits, or fudge factors. Every structural number must be **derivable and provable**\n  against a closed-form result or an independent oracle (PyNite/CalculiX).\n- **Maximum truth-seeking / no-bullshit.** The tool *"
+  },
+  {
+    "id": "grok-code-84519-1787841683",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "grok-code",
+    "owner": "battery-bugs",
+    "age": "12m",
+    "created_at": "2026-08-27T14:41:23+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/grok-code-84519-1787841683.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 12670,
+    "claim": [],
+    "tasks": null,
+    "hints": [],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and you have nothing to do until the controller answers, use `python3 \"$GOALFLIGHT_DISPATCH_SCRIPT\" steer \"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question and wait under a separate bounded deadline.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nWorker execution contract:\n- Use your available tools to actually perform the requested filesystem, shell, research, or analysis actions before answering. Do not only plan, summarize, or describe commands.\n- For successful completion, emit a final line outside any Markdown fence in this exact shape supplied by the dispatch-specific identity contra"
+  },
+  {
+    "id": "layermap-harvest",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "codex",
+    "owner": "None",
+    "age": "12h 8m",
+    "created_at": "2026-08-27T02:45:10+00:00",
+    "cwd": "/Users/simonrowland/Repos/pm2",
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-pm2/d9989eb0-0cdd-4ccc-be80-cc86a4d2a55f/scratchpad/layermap-harvest.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 5796,
+    "claim": [
+      [
+        8209,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "# layermap-harvest \u2014 collect every owed LAYER-MAP declaration-need (t-763) \u2014 id layermap-harvest\n\nRepo /Users/simonrowland/Repos/pm2, HEAD 590b1ae, tree CLEAN. GOAL-LOOP apply; NO stage/commit/push.\nThe repo root IS the `pm2` package. This repo's pytest has NO `--timeout` plugin.\n\n## THIS IS A HARVEST, NOT AN EDIT\n**You must NOT edit `docs/LAYER-MAP.md`.** That rule is why this backlog exists and it still binds:\nLAYER-MAP is declared canon, changed deliberately in a credit-rich window, never by accretion. The\ncontroller lands every map edit. Your product is a single consolidated, verified, deduplicated LIST\nthat the controller can land in one sitting. A worker who \"helpfully\" edits the map has destroyed the\none property the rule protects.\n\n## WHY THIS IS OWED\nEvery worker brief this arc said \"do NOT edit LAYER-MAP \u2014 state the declaration-need in your notes;\nthe controller lands it.\" The workers complied. The controller never did the pass. So the needs are\nscattered across review notes, and nobody can currently answer \"what does the map still owe?\"\n\n## WHERE THEY ARE (t-763 names these; VERIFY rather than trust the list)\n- `docs-private/reviews/2026-08-24-ceremony-recheck/pb-laws-no"
+  },
+  {
+    "id": "layermap-harvest-d",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "claim-marker",
+      "ledger-nonterminal"
+    ],
+    "state": "claimed",
+    "ledger_state": "queued",
+    "agent": "grok-code",
+    "owner": "None",
+    "age": "9h 59m",
+    "created_at": "2026-08-27T04:55:01+00:00",
+    "cwd": "/Users/simonrowland/Repos/pm2",
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-pm2/d9989eb0-0cdd-4ccc-be80-cc86a4d2a55f/scratchpad/layermap-harvest.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 5796,
+    "claim": [
+      [
+        41095,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "# layermap-harvest \u2014 collect every owed LAYER-MAP declaration-need (t-763) \u2014 id layermap-harvest\n\nRepo /Users/simonrowland/Repos/pm2, HEAD 590b1ae, tree CLEAN. GOAL-LOOP apply; NO stage/commit/push.\nThe repo root IS the `pm2` package. This repo's pytest has NO `--timeout` plugin.\n\n## THIS IS A HARVEST, NOT AN EDIT\n**You must NOT edit `docs/LAYER-MAP.md`.** That rule is why this backlog exists and it still binds:\nLAYER-MAP is declared canon, changed deliberately in a credit-rich window, never by accretion. The\ncontroller lands every map edit. Your product is a single consolidated, verified, deduplicated LIST\nthat the controller can land in one sitting. A worker who \"helpfully\" edits the map has destroyed the\none property the rule protects.\n\n## WHY THIS IS OWED\nEvery worker brief this arc said \"do NOT edit LAYER-MAP \u2014 state the declaration-need in your notes;\nthe controller lands it.\" The workers complied. The controller never did the pass. So the needs are\nscattered across review notes, and nobody can currently answer \"what does the map still owe?\"\n\n## WHERE THEY ARE (t-763 names these; VERIFY rather than trust the list)\n- `docs-private/reviews/2026-08-24-ceremony-recheck/pb-laws-no"
+  },
+  {
+    "id": "layermap-harvest-g",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "grok-code",
+    "owner": "pm2-main",
+    "age": "11h 50m",
+    "created_at": "2026-08-27T03:03:09+00:00",
+    "cwd": "/Users/simonrowland/Repos/pm2",
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-pm2/d9989eb0-0cdd-4ccc-be80-cc86a4d2a55f/scratchpad/layermap-harvest.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 5796,
+    "claim": [
+      [
+        11354,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "# layermap-harvest \u2014 collect every owed LAYER-MAP declaration-need (t-763) \u2014 id layermap-harvest\n\nRepo /Users/simonrowland/Repos/pm2, HEAD 590b1ae, tree CLEAN. GOAL-LOOP apply; NO stage/commit/push.\nThe repo root IS the `pm2` package. This repo's pytest has NO `--timeout` plugin.\n\n## THIS IS A HARVEST, NOT AN EDIT\n**You must NOT edit `docs/LAYER-MAP.md`.** That rule is why this backlog exists and it still binds:\nLAYER-MAP is declared canon, changed deliberately in a credit-rich window, never by accretion. The\ncontroller lands every map edit. Your product is a single consolidated, verified, deduplicated LIST\nthat the controller can land in one sitting. A worker who \"helpfully\" edits the map has destroyed the\none property the rule protects.\n\n## WHY THIS IS OWED\nEvery worker brief this arc said \"do NOT edit LAYER-MAP \u2014 state the declaration-need in your notes;\nthe controller lands it.\" The workers complied. The controller never did the pass. So the needs are\nscattered across review notes, and nobody can currently answer \"what does the map still owe?\"\n\n## WHERE THEY ARE (t-763 names these; VERIFY rather than trust the list)\n- `docs-private/reviews/2026-08-24-ceremony-recheck/pb-laws-no"
+  },
+  {
+    "id": "magemin-status-review",
+    "project": "regolith",
+    "slug": "regolith",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-nonterminal",
+      "queue-top",
+      "retired-by-engine"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "codex",
+    "owner": "None",
+    "age": "21h 58m",
+    "created_at": "2026-08-26T16:55:16+00:00",
+    "cwd": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "root": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "prompt_kind": "inline",
+    "prompt_file": null,
+    "prompt_file_exists": null,
+    "pin": "pinnable",
+    "chars": 4127,
+    "claim": [
+      [
+        21784,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "REVIEW AN UNCOMMITTED BUGFIX. Repo: /Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator, branch engine-2026-08-16.\n\nORIENTATION FIRST (both gitignored - read from the working tree, not git): AGENTS.md and CLAUDE.md at the repo root.\n\nSCOPE: the uncommitted working-tree diff only. Run git diff to see it. It touches engines/magemin/provider.py, simulator/chemistry/kernel/__init__.py and tests/chemistry/test_magemin_shadow.py. Do NOT run git checkout, git stash or git restore - the working tree holds the unstaged fix you are reviewing and a checkout would destroy it. git diff, git show and plain file reads only.\n\nWHAT THE FIX CLAIMS TO DO. A milestone audit found that engines/magemin/provider.py kept a private allowlist of four status tokens and mapped every other adapter status to ok, which turned an unrecognised engine answer into an affirmative one. That matters because MAGEMinShadowProvider is the registered fallback for the authoritative GATE_LIQUID_FRACTION intent, and the freeze-gate consumer in simulator/evaporation.py prefers IntentResult.status over the diagnostic backend status when deciding whether to ac"
+  },
+  {
+    "id": "raw-b2753-studio-e02ec9816-r2",
+    "project": "battery-tool-v2 (worktree bt-b2753)",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "codex",
+    "owner": "None",
+    "age": "32m",
+    "created_at": "2026-08-27T14:21:10+00:00",
+    "cwd": "/Users/simonrowland/Repos/battery-tool-v2/.cache/worktrees/bt-b2753",
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "missing",
+    "prompt_file": null,
+    "prompt_file_exists": null,
+    "pin": "missing",
+    "chars": 0,
+    "claim": [
+      [
+        26932,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": ""
+  },
+  {
+    "id": "rev-t371",
+    "project": "goal-flight",
+    "slug": "goal-flight",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "grok-code",
+    "owner": "goal-flight",
+    "age": "8m",
+    "created_at": "2026-08-27T14:45:22+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/goal-flight",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/rev-t371.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 5248,
+    "claim": [],
+    "tasks": null,
+    "hints": [],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and you have nothing to do until the controller answers, use `python3 \"$GOALFLIGHT_DISPATCH_SCRIPT\" steer \"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question and wait under a separate bounded deadline.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nWorker execution contract:\n- Use your available tools to actually perform the requested filesystem, shell, research, or analysis actions before answering. Do not only plan, summarize, or describe commands.\n- For successful completion, emit a final line outside any Markdown fence in this exact shape supplied by the dispatch-specific identity contra"
+  },
+  {
+    "id": "sr2-closure",
+    "project": "regolith",
+    "slug": "regolith",
+    "pops": [
+      "claim-marker",
+      "ledger-nonterminal"
+    ],
+    "state": "claimed",
+    "ledger_state": "queued",
+    "agent": "codex",
+    "owner": "regolith-engine",
+    "age": "21h 17m",
+    "created_at": "2026-08-26T17:36:35+00:00",
+    "cwd": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "root": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "prompt_kind": "inline",
+    "prompt_file": null,
+    "prompt_file_exists": null,
+    "pin": "pinnable",
+    "chars": 3915,
+    "claim": [
+      [
+        32218,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "CLOSURE REVIEW of a round-2 bugfix. Repo: /Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator, branch engine-2026-08-16.\n\nDO NOT run git checkout, git stash or git restore - the working tree holds the unstaged changeset and a checkout would DESTROY it. git diff, git show and plain file reads only.\n\nSCOPE: the uncommitted working-tree diff PLUS the untracked file tests/chemistry/test_provider_status_vocabulary_guard.py, which git diff does NOT show. Run git status and read it explicitly.\n\nYOUR JOB IS CLOSURE, NOT RE-LITIGATION. A review of round 1 returned CHANGES REQUIRED with four items. Round 2 claims to address all four. For EACH, decide CLOSED / PARTIALLY CLOSED / NOT CLOSED and say what remains:\n\n1. P1 - AlphaMELTS turned an absent adapter status into ok, at engines/alphamelts/parser.py and the equilibrium-crystallization path in engines/alphamelts/provider.py. Round 2 makes absent or empty mean unavailable at both. The required change also asked for an authoritative gate-path regression test. Is one present, and does it exercise the AUTHORITATIVE gate path rather than only the projection?\n\n2. P1 - the redox"
+  },
+  {
+    "id": "status-r2-closure",
+    "project": "regolith",
+    "slug": "regolith",
+    "pops": [
+      "ledger-terminal",
+      "quarantine"
+    ],
+    "state": "quarantined",
+    "ledger_state": "failed",
+    "agent": "codex",
+    "owner": "regolith-engine",
+    "age": "21h 19m",
+    "created_at": "2026-08-26T17:34:21+00:00",
+    "cwd": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "root": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/status-r2-closure.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 5044,
+    "claim": [
+      [
+        6554,
+        "dead",
+        "quarantine"
+      ]
+    ],
+    "tasks": [],
+    "hints": [
+      "HINT: ledger already records terminal state `failed` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and you have nothing to do until the controller answers, use `python3 \"$GOALFLIGHT_DISPATCH_SCRIPT\" steer \"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question and wait under a separate bounded deadline.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nTerminal evidence identity contract:\n- Every terminal marker payload starts with the exact dispatch id `status-r2-closure`.\n- Successful final shape: `!COMPLETE: status-r2-closure \u2014 <summary>`.\n- Use the same id prefix for READY, RESULT, FAILED, USER-NEED, USER-CONFIRM, or BLOCKED. A generic or foreign marker is ignored.\n\nCLOSURE REVIEW of a round"
+  },
+  {
+    "id": "status-r2-notfixed",
+    "project": "regolith",
+    "slug": "regolith",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-nonterminal",
+      "queue-top",
+      "retired-by-engine"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "grok-code",
+    "owner": "None",
+    "age": "21h 20m",
+    "created_at": "2026-08-26T17:33:45+00:00",
+    "cwd": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "root": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "prompt_kind": "inline",
+    "prompt_file": null,
+    "prompt_file_exists": null,
+    "pin": "pinnable",
+    "chars": 3982,
+    "claim": [
+      [
+        97635,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "ADVERSARIAL NOT-FIXED REVIEW, round 2. Repo: /Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator, branch engine-2026-08-16.\n\nDO NOT run git checkout, git stash or git restore - the working tree holds the unstaged changeset you are reviewing and a checkout would DESTROY it. git diff, git show and plain file reads only.\n\nSCOPE: the uncommitted working-tree diff PLUS the untracked file tests/chemistry/test_provider_status_vocabulary_guard.py, which git diff does NOT show - read it explicitly. Run git status to see it.\n\nBACKGROUND. Round 1 fixed a fail-open in the MAGEMin provider: it kept a private four-token status allowlist and mapped every other adapter status to ok. A review of round 1 returned CHANGES REQUIRED with two P1 and two P2. Round 2, which you are reviewing, addressed all four:\n1. simulator/core.py now RE-RAISES IntentResultStatusError instead of letting a generic handler catch it. That handler classified by SUBSTRING MATCH on the exception message and turned an unrecognised engine status into unavailable, which routed to a floor fallback declaring the melt fully liquid above 1200 C and could commit an"
+  },
+  {
+    "id": "t292-relativistic-gathered-mass",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "grok-code",
+    "owner": "pm2-main",
+    "age": "13m",
+    "created_at": "2026-08-27T14:40:53+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/t292-relativistic-gathered-mass.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 7742,
+    "claim": [],
+    "tasks": null,
+    "hints": [],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and you have nothing to do until the controller answers, use `python3 \"$GOALFLIGHT_DISPATCH_SCRIPT\" steer \"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question and wait under a separate bounded deadline.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nWorker execution contract:\n- Use your available tools to actually perform the requested filesystem, shell, research, or analysis actions before answering. Do not only plan, summarize, or describe commands.\n- For successful completion, emit a final line outside any Markdown fence in this exact shape supplied by the dispatch-specific identity contra"
+  },
+  {
+    "id": "t372-w1",
+    "project": "goal-flight",
+    "slug": "goal-flight",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "grok-code",
+    "owner": "goal-flight",
+    "age": "5m",
+    "created_at": "2026-08-27T14:49:05+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/goal-flight",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/t372-w1.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 6917,
+    "claim": [],
+    "tasks": null,
+    "hints": [
+      "HINT: this is the in-flight inventory worker itself (t372-w1), not a stuck queue entry"
+    ],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and you have nothing to do until the controller answers, use `python3 \"$GOALFLIGHT_DISPATCH_SCRIPT\" steer \"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question and wait under a separate bounded deadline.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nWorker execution contract:\n- Use your available tools to actually perform the requested filesystem, shell, research, or analysis actions before answering. Do not only plan, summarize, or describe commands.\n- For successful completion, emit a final line outside any Markdown fence in this exact shape supplied by the dispatch-specific identity contra"
+  },
+  {
+    "id": "t481-registry-decide",
+    "project": "regolith",
+    "slug": "regolith",
+    "pops": [
+      "bare-json",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "moonshot",
+    "owner": "regolith-main",
+    "age": "21h 42m",
+    "created_at": "2026-08-26T17:11:20+00:00",
+    "cwd": "/Users/simonrowland/Repos/rps-t481",
+    "root": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Library-CloudStorage-Dropbox-Starship-Mission-Design-Regolith-Processing-regolith-pyrolysis-simulator/70f1d3c1-4b7e-4455-bf2d-31eabd2ee767/scratchpad/t481.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 2838,
+    "claim": [],
+    "tasks": [
+      "t-481"
+    ],
+    "hints": [],
+    "headline": null,
+    "head": "Decide the fate of a registry this project built completely and then never read. Repo root: /Users/simonrowland/Repos/rps-t481 (branch work-t481, HEAD 236553f9). Read AGENTS.md and CLAUDE.md FIRST.\n\nt-481 is a scout finding: the project has a PHASE-AWARE VOLATILE-PROPERTY REGISTRY that is FULLY BUILT AND COMPLETELY EMPTY. This is the SC-50 consumption lens \u2014 produced-but-never-read is a dead feature, and a dead feature is worse than a missing one because it looks like coverage.\n\nTHE DECISION IS FILL OR RETIRE, and it must be made on evidence, not preference.\n\nSTEP 1 \u2014 FIND IT AND ESTABLISH THE FACTS. Locate the registry (schema, storage, accessors). Then answer precisely: is it empty of DATA, empty of CONSUMERS, or both? Those are different diseases. Trace every reader. If something reads it and gets nothing, that consumer is currently running on a silent default \u2014 name it and say what the default is, because that is a live correctness question, not a cleanup one.\n\nSTEP 2 \u2014 ESTABLISH WHAT IT WOULD BE FOR. Read the design intent from wherever it is recorded. A phase-aware volatile-property registry in THIS project would plausibly serve the condensation train (which phase a species i"
+  },
+  {
+    "id": "t697-dunite",
+    "project": "regolith",
+    "slug": "regolith",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-nonterminal",
+      "queue-top",
+      "retired-by-engine"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "grok-code",
+    "owner": "None",
+    "age": "22h 7m",
+    "created_at": "2026-08-26T16:47:05+00:00",
+    "cwd": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "root": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "prompt_kind": "inline",
+    "prompt_file": null,
+    "prompt_file_exists": null,
+    "pin": "pinnable",
+    "chars": 3621,
+    "claim": [
+      [
+        11223,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "DIAGNOSE AN UNEXPLAINED RESIDUAL. Repo: /Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator.\n\nORIENTATION FIRST (both gitignored - read from the working tree, not git): AGENTS.md and CLAUDE.md at the repo root. Read docs-private/research/2026-08-26-t697-na-family/findings.md for context, and treat its conclusions as claims to test rather than premises to build on.\n\nTHE FACT TO EXPLAIN. In benchmarks/results/melt_activity/reference-anchor-results.csv at 2000 K, the SF04-dun sheet records imcc_residual_dex = -1.0132 for Na and -1.4649 for K, while VapoRock scores -0.1673 and +0.7921 on the same reference numbers. reference_difference_dex is essentially zero, so both engines were scored against the same references and the gap is ours.\n\nA mechanism that accounts for tholeiite and komatiite does NOT account for dunite. Suppressing the four nu(Na2O)=0.5 Na-aluminosilicate complexes moves log10 a(Na2O) by +1.766 dex on tholeiite but only +0.405 on dunite, and on dunite the nu=1.0 group actually dominates at +0.725. Even suppressing every Na complex in the pack could not close dunite 1.013 dex. Something else is operatin"
+  },
+  {
+    "id": "t702-rev-seam",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "grok-code",
+    "owner": "pm2-engine",
+    "age": "14h 21m",
+    "created_at": "2026-08-27T00:32:28+00:00",
+    "cwd": "/Users/simonrowland/Repos/pm2",
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file-missing",
+    "prompt_file": "docs-private/task-prompts/2026-08-26-engine/t702-rev-seam.md",
+    "prompt_file_exists": false,
+    "pin": "missing",
+    "chars": 0,
+    "claim": [
+      [
+        15085,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [
+      "HINT: prompt-file is gone \u2014 premise cannot be re-checked; honest default is abandon"
+    ],
+    "headline": null,
+    "head": ""
+  },
+  {
+    "id": "t743-exclusion-audit",
+    "project": "regolith",
+    "slug": "regolith",
+    "pops": [
+      "bare-json",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "moonshot",
+    "owner": "regolith-main",
+    "age": "21h 14m",
+    "created_at": "2026-08-26T17:39:38+00:00",
+    "cwd": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "root": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Library-CloudStorage-Dropbox-Starship-Mission-Design-Regolith-Processing-regolith-pyrolysis-simulator/70f1d3c1-4b7e-4455-bf2d-31eabd2ee767/scratchpad/briefs/t743-selection.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 8702,
+    "claim": [],
+    "tasks": [
+      "t-754"
+    ],
+    "hints": [],
+    "headline": null,
+    "head": "# EXCLUSION AUDIT \u2014 does our validation battery only ever discard data in the direction that flatters the model?\n\nRepo: /Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator\nRead AGENTS.md and CLAUDE.md (the pyrolysis mandate) first. The relevant clause: \"silent suppression\nof literature disagreement\" is named as corruption, on a par with parameter-tuning.\n\n## Why this audit exists\n\nWe are about to consider excluding a KEMS dataset (Apollo sample 12065) from the observations that\nscore our Na vapour-pressure rail, on the argument that its disagreement with us is an apparatus /\nsample-split artifact rather than a model error. That may well be correct -- a separate worker is\nattacking that argument on its own merits, and you should NOT re-litigate it.\n\nYour question is structural and you can answer it without deciding whether 12065 is right:\n\n  \u2605 ACROSS THE WHOLE VALIDATION BATTERY, IS THE EXCLUSION MACHINERY SYMMETRIC?\n\nA principled filter removes bad evidence regardless of which way it cuts. A fitted filter -- one that\nhas been grown, one exclusion at a time, each locally defensible -- removes only evidence that ma"
+  },
+  {
+    "id": "t746-r2-retry-15cc828e",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "bare-json",
+      "queue-top"
+    ],
+    "state": "queued",
+    "ledger_state": null,
+    "agent": "codex",
+    "owner": "pm2-main",
+    "age": "1d 20h 42m",
+    "created_at": "2026-08-25T18:11:32+00:00",
+    "cwd": "/Users/simonrowland/Repos/pm2",
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Repos-pm2/d9989eb0-0cdd-4ccc-be80-cc86a4d2a55f/scratchpad/t746.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 3406,
+    "claim": [],
+    "tasks": [
+      "t-746"
+    ],
+    "hints": [],
+    "headline": null,
+    "head": "# t746 \u2014 the lossy numeric environment vector \u2014 id t746\n\nRepo /Users/simonrowland/Repos/pm2, HEAD 06e62d2. GOAL-LOOP apply; NO stage/commit/push.\nEnv: UV_CACHE_DIR=/tmp/pm2-t746-uv PYTHONPATH=/Users/simonrowland/Repos uv run --with numpy --with scipy --with pytest --with numba --with matplotlib --with pydantic python -m pytest ...\nCONCURRENT LANES \u2014 do not touch: docs-private/design/FORCE-RAIL-*.md (two design workers),\nthe untracked force_rail_*.py carrier modules and their tests (blocked carrier lanes),\nforce_rail_envelope.py and the X0 guard surfaces, and the t-752/755/757 red nodes (a cleanup\nworker owns those). Your lane is environment.py's numeric vector and its consumers.\n\nMANDATE: store ticket t-746. environment.py:638-681 serializes EncounterEnvironment to a numeric\nvector that DROPS information the object carries \u2014 regime_class and body, some neutral/collision\noverrides, and species labels/roles.\n\nWHY THIS IS CORRECTNESS, NOT TIDINESS (the operator's framing, and the reason this is worth\ndoing): the whole claim-reproduction design pins a case by its INPUT columns and expects two rows\nwith identical inputs to MEAN the same thing. If the numeric vector is lossy against the "
+  },
+  {
+    "id": "t748-stage-pressures",
+    "project": "regolith",
+    "slug": "regolith",
+    "pops": [
+      "bare-json",
+      "ledger-terminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "worker_dead",
+    "agent": "moonshot",
+    "owner": "regolith-main",
+    "age": "22h 10m",
+    "created_at": "2026-08-26T16:43:32+00:00",
+    "cwd": "/Users/simonrowland/Repos/rps-b236",
+    "root": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/claude-501/-Users-simonrowland-Library-CloudStorage-Dropbox-Starship-Mission-Design-Regolith-Processing-regolith-pyrolysis-simulator/70f1d3c1-4b7e-4455-bf2d-31eabd2ee767/scratchpad/t748.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 4750,
+    "claim": [],
+    "tasks": [
+      "t-748"
+    ],
+    "hints": [
+      "HINT: ledger already records terminal state `worker_dead` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "Derive the per-species STAGE partial pressure in this project's condensation train, then settle whether each condenser actually captures its species. Repo root: /Users/simonrowland/Repos/rps-b236 (branch work-b236). Read AGENTS.md and CLAUDE.md at that root FIRST \u2014 CLAUDE.md is the physics mandate: maximum truth-seeking, first-principles accuracy, no tuning to taste.\n\nREAD THIS FIRST, it is half your job already done and it tells you where the difficulty is:\n  /Users/simonrowland/Repos/rps-b236/docs-private/research/2026-08-26-condensation-grounding/findings.md\n  /Users/simonrowland/Repos/rps-b236/docs-private/research/2026-08-26-wall-temperature-table/   (the GATED method + its script)\n\nSTATE OF PLAY. Eleven condensation-train routing setpoints (data/setpoints.yaml condensation_train.condensation_temperatures_C: Fe 1250, SiO 1050, CrO2 1250, Mg 580, Na 480, K 420, Ca 780, Mn 1000, Cr 1280, Al 1180, Ti 1500) are all uncited operator estimates \u2014 the data file says so in its own source strings. The controller computed dew points against them and found the result is DOMINATED by the assumed partial pressure:\n\n  at 1 mbar        : K +88, Na -6, Ca -81, Al -83, Fe -525, Mn -224, Cr -311"
+  },
+  {
+    "id": "t750-r2-notfixed",
+    "project": "regolith",
+    "slug": "regolith",
+    "pops": [
+      "bare-json",
+      "claim-marker",
+      "ledger-nonterminal",
+      "queue-top"
+    ],
+    "state": "restore_prepared",
+    "ledger_state": "queued",
+    "agent": "grok-code",
+    "owner": "None",
+    "age": "18h 56m",
+    "created_at": "2026-08-26T19:57:57+00:00",
+    "cwd": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "root": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "prompt_kind": "inline",
+    "prompt_file": null,
+    "prompt_file_exists": null,
+    "pin": "pinnable",
+    "chars": 2199,
+    "claim": [
+      [
+        28414,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [],
+    "headline": null,
+    "head": "You are reviewing an UNCOMMITTED changeset in the regolith-pyrolysis-simulator repo at /Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator.\n\nORIENTATION FIRST: read AGENTS.md at the repo root and CLAUDE.md (Simon pyrolysis mandate) before judging anything.\n\nTHE CHANGESET: a unified diff plus the two new files is written to docs-private/review/t750/changeset.diff. The live working tree has the changes applied. Use git diff and git show to inspect history. Do NOT run git checkout or git stash - other controllers share this repo and a checkout will disturb their state.\n\nYOUR LENS: NOT-FIXED. Adopt the null hypothesis that this changeset does NOT actually fix what it claims to fix, and try hard to establish that. The stated intent is that a duplicated rule now has exactly one owner and one definition. Attack that claim directly.\n\nSpecific things worth trying to prove: that a copy of the rule still survives somewhere the author did not look, in any form - a different spelling, an inlined loop, a comprehension, a constant defined elsewhere, a test helper, a serialized artifact, a config file, anything outside the direc"
+  },
+  {
+    "id": "t800-pulse",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "claim-marker",
+      "ledger-terminal"
+    ],
+    "state": "claimed",
+    "ledger_state": "failed",
+    "agent": "codex",
+    "owner": "pm2-engine",
+    "age": "5h 40m",
+    "created_at": "2026-08-27T09:13:11+00:00",
+    "cwd": "/Users/simonrowland/Repos/pm2",
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/private/tmp/pm2-engine-t800/BRIEF-t800.md",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 5384,
+    "claim": [
+      [
+        43430,
+        "dead",
+        "queue-top"
+      ]
+    ],
+    "tasks": [],
+    "hints": [
+      "HINT: ledger already records terminal state `failed` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "# t-800: pulse/reactive adequacy \u2014 the store can be joule-rich and still unable to source the chirp edge\n\n## Who/where\nYou are a codex implementation worker for controller pm2-engine.\nWorktree: /private/tmp/pm2-engine-t800/pm2  (branch engine-t800-pulse, base origin/main 51c0ad1).\nThe repo root IS the `pm2` package. NEVER cd out; NEVER touch /Users/simonrowland/Repos/pm2\nor other /private/tmp/pm2-engine-* trees.\n\n## Gate command (the ONLY test form \u2014 no `uv`, no bare pytest)\nPM2_KILN_REPO=/Users/simonrowland/Repos/kiln PYTHONPATH=/private/tmp/pm2-engine-t800 \\\n  /Users/simonrowland/Repos/pm2/.venv/bin/python -u -m pytest -q -p no:randomly <targets>\n\n## Required reading (in worktree, before coding)\n- docs-private/SIMONS_PM2_MANDATE.md + RF-APWP-COUPLING-FRAMEWORK-PLAN-v2-2026-06-15.md\n  + AMENDMENT (copied in; gitignored, do NOT commit them).\n- rf/coupling/force_rail_power.py \u2014 the WHOLE lifecycle P(t) machinery (Operator Decision 1\n  = Option A is LANDED: LifecyclePowerTimeAuthority is the sole P(t); laws CONSTANT /\n  LINEAR / NORMALIZED_WAVEFORM; peak/avg/energy DERIVED; SCALAR poisoned;\n  segment_law_slope_W_s exists \u2014 consume it, do not re-derive slopes).\n  ResolvedStorageAuthor"
+  },
+  {
+    "id": "t801-fix1",
+    "project": "pm2",
+    "slug": "pm2",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "codex",
+    "owner": "pm2-engine",
+    "age": "45m",
+    "created_at": "2026-08-27T14:08:18+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/pm2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/t801-fix1.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 3800,
+    "claim": [],
+    "tasks": null,
+    "hints": [],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and you have nothing to do until the controller answers, use `python3 \"$GOALFLIGHT_DISPATCH_SCRIPT\" steer \"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question and wait under a separate bounded deadline.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nTerminal evidence identity contract:\n- Every terminal marker payload starts with the exact dispatch id `t801-fix1`.\n- Successful final shape: `!COMPLETE: t801-fix1 \u2014 <summary>`.\n- Use the same id prefix for READY, RESULT, FAILED, USER-NEED, USER-CONFIRM, or BLOCKED. A generic or foreign marker is ignored.\n\n# t-801 FIX ROUND: physics FAIL (3P1/1P2)"
+  },
+  {
+    "id": "webqa-D-leaderboard-0827",
+    "project": "regolith",
+    "slug": "regolith",
+    "pops": [
+      "ledger-terminal",
+      "quarantine"
+    ],
+    "state": "quarantined",
+    "ledger_state": "failed",
+    "agent": "grok-research",
+    "owner": "regolith-engine",
+    "age": "12h 18m",
+    "created_at": "2026-08-27T02:35:51+00:00",
+    "cwd": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "root": "/Users/simonrowland/Library/CloudStorage/Dropbox/Starship Mission Design/Regolith Processing/regolith-pyrolysis-simulator",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/webqa-D-leaderboard-0827.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 5308,
+    "claim": [
+      [
+        73159,
+        "dead",
+        "quarantine"
+      ]
+    ],
+    "tasks": [],
+    "hints": [
+      "HINT: ledger already records terminal state `failed` (not a queue-purge verdict)"
+    ],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it. If `$GOALFLIGHT_DISPATCH_SCRIPT` is set and you have nothing to do until the controller answers, use `python3 \"$GOALFLIGHT_DISPATCH_SCRIPT\" steer \"$GOALFLIGHT_DISPATCH_ID\" --wait --question-kind USER-NEED --timeout-secs <seconds> '<question>'` (or USER-CONFIRM) to emit the question and wait under a separate bounded deadline.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nWorker execution contract:\n- Use your available tools to actually perform the requested filesystem, shell, research, or analysis actions before answering. Do not only plan, summarize, or describe commands.\n- For successful completion, emit a final line outside any Markdown fence in this exact shape supplied by the dispatch-specific identity contra"
+  },
+  {
+    "id": "zw-aw31",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "running",
+    "ledger_state": "running",
+    "agent": "codex",
+    "owner": "battery-bugs",
+    "age": "1d 21h 35m",
+    "created_at": "2026-08-25T17:18:30+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/zw-aw31.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 20961,
+    "claim": [],
+    "tasks": null,
+    "hints": [],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nTerminal evidence identity contract:\n- Every terminal marker payload starts with the exact dispatch id `zw-aw31`.\n- Successful final shape: `!COMPLETE: zw-aw31 \u2014 <summary>`.\n- Use the same id prefix for READY, RESULT, FAILED, USER-NEED, USER-CONFIRM, or BLOCKED. A generic or foreign marker is ignored.\n\n# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-Q86+, authoritative) and `CORE-CONCEPT.md`"
+  },
+  {
+    "id": "zw-fix_other_cross-layer__b1",
+    "project": "battery-tool-v2",
+    "slug": "battery-tool-v2",
+    "pops": [
+      "ledger-nonterminal"
+    ],
+    "state": "waiting_capacity",
+    "ledger_state": "waiting_capacity",
+    "agent": "codex",
+    "owner": "battery-bugs",
+    "age": "2d 18h",
+    "created_at": "2026-08-24T20:42:44+00:00",
+    "cwd": null,
+    "root": "/Users/simonrowland/Repos/battery-tool-v2",
+    "prompt_kind": "prompt-file",
+    "prompt_file": "/tmp/goal-flight-501/dispatch/zw-fix_other_cross-layer__b1.assembled.prompt",
+    "prompt_file_exists": true,
+    "pin": "pinnable",
+    "chars": 23892,
+    "claim": [],
+    "tasks": null,
+    "hints": [],
+    "headline": null,
+    "head": "You have a steer mailbox at `$GOALFLIGHT_STEER_FILE`. Read it AT THE TOP OF EACH ITERATION and IMMEDIATELY BEFORE ANY git commit/push. Incorporate new messages into your plan; ack each with `!STEER-ACK: <seq>` on its own line; a steer may redirect or HALT you \u2014 honor it.\n\nYour FULL original brief is at `$GOALFLIGHT_PROMPT_FILE`. Re-read it after any internal compaction/summarization, at the start of each long-run goal-loop iteration, and before final commit/exit; the disk file is authoritative over summarized memory.\n\nTerminal evidence identity contract:\n- Every terminal marker payload starts with the exact dispatch id `zw-fix_other_cross-layer__b1`.\n- Successful final shape: `!COMPLETE: zw-fix_other_cross-layer__b1 \u2014 <summary>`.\n- Use the same id prefix for READY, RESULT, FAILED, USER-NEED, USER-CONFIRM, or BLOCKED. A generic or foreign marker is ignored.\n\n# Mandate \u2014 North Star for Battery-Tool-v2\n\n> **Prepend this to every worker dispatch.** It is the standing charge \u2014 the situational frame every\n> executor reads before touching the work. Short by design so it travels on each dispatch without bloat.\n> Canonical north-star; faithful to `specs/decision-lock-2026-06-21.md` (D-Q1\u2026D-"
+  }
+]

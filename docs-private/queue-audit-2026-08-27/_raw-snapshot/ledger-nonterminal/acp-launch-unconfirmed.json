@@ -1,0 +1,79 @@
+{
+  "agent": "codex-acp",
+  "base_sha": "0123456789abcdef0123456789abcdef01234567",
+  "dispatch_id": "acp-launch-unconfirmed",
+  "hostname": "Simon-MacBookPro-M5",
+  "launch_unconfirmed": true,
+  "launch_unconfirmed_error": "remote launch_detached failed (exit 1)\nssh argv: ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new localhost -- /bin/zsh -c 'HOME=${HOME:-$(eval echo ~${USER:-$(whoami)})}; PATH=$HOME/.local/bin:$HOME/.grok/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH; exec python3 /Users/simonrowland/Repos/goal-flight/scripts/goalflight_fleet_launch_detached.py launch --repo-root /Users/simonrowland/Repos/goal-flight --node-id localhost --dispatch-id acp-launch-unconfirmed --agent codex-acp --prompt-b64 <redacted> --state-dir /tmp/goal-flight-dispatch-test --status-json /tmp/goal-flight-dispatch-test/dispatches/acp-launch-unconfirmed/status.json --json --base-sha 0123456789abcdef0123456789abcdef01234567'\nstderr:\nssh connection reset after launch command was issued",
+  "lease_id": null,
+  "project_root": "/Users/simonrowland/Repos/goal-flight",
+  "prompt_path": "chunk.md",
+  "remote_launch_receipt": null,
+  "remote_lease_id": null,
+  "remote_lease_id_superseded_by": "launch_receipt",
+  "remote_preflight": {
+    "agent": "codex-acp",
+    "cores": 24,
+    "decision": "allow",
+    "expected_hostname": "fixture-host",
+    "fresh": true,
+    "gpu_lock_path": "/tmp/warpx-gpu-lock",
+    "gpu_lock_state": "available",
+    "hostname": "fixture-host",
+    "load_1m": 2.0,
+    "load_per_core": 0.08333333333333333,
+    "measured_at": "2026-08-22T12:00:00+00:00",
+    "measurement_age_s": 0.0001961669186130166,
+    "measurements": {
+      "age_s": 0.0001961669186130166,
+      "gpu": {
+        "lock_held": false,
+        "lock_path": "/tmp/warpx-gpu-lock",
+        "lock_state": "available"
+      },
+      "identity": {
+        "answering_hostname": "fixture-host",
+        "expected_hostname": "fixture-host"
+      },
+      "load": {
+        "cores": 24,
+        "one_minute": 2.0,
+        "per_core": 0.08333333333333333
+      },
+      "memory": {
+        "controller_reserve_mb": 2048,
+        "gpu_extra_reserve_mb": 0,
+        "incoming_worker_rss_mb": 386,
+        "predicted_post_launch_headroom_mb": 95870.0,
+        "pressure_available_mb": 98304.0,
+        "pressure_available_percent": 75.0
+      },
+      "swap": {
+        "observed": false,
+        "used_mb": 0.0
+      }
+    },
+    "memory_pressure_available_percent": 75.0,
+    "node_alias": "localhost",
+    "ok": true,
+    "predicted_post_launch_headroom_mb": 95870.0,
+    "pressure_available_mb": 98304.0,
+    "reasons": [],
+    "schema": "goalflight.fleet.preflight.v1",
+    "swap_used_mb": 0.0,
+    "thresholds": {
+      "controller_reserve_mb": 2048,
+      "gpu_extra_reserve_mb": 0,
+      "hard_load_per_core": 0.85,
+      "hard_required_available_mb": 2434,
+      "incoming_worker_rss_mb": 386
+    },
+    "timeout_s": 8.0,
+    "total_ram_mb": 131072.0
+  },
+  "schema": "goalflight.dispatch.v1",
+  "started_at": "2026-08-26T12:00:07+00:00",
+  "state": "launch_unconfirmed",
+  "transport": "fleet-ssh",
+  "updated_at": "2026-08-26T12:00:07+00:00"
+}

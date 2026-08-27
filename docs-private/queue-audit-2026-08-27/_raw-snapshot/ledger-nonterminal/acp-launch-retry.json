@@ -1,0 +1,96 @@
+{
+  "agent": "codex-acp",
+  "base_sha": "0123456789abcdef0123456789abcdef01234567",
+  "dispatch_id": "acp-launch-retry",
+  "hostname": "Simon-MacBookPro-M5",
+  "launch_unconfirmed": false,
+  "launch_unconfirmed_error": null,
+  "lease_id": null,
+  "project_root": "/Users/simonrowland/Repos/goal-flight",
+  "prompt_path": "chunk.md",
+  "remote_launch_receipt": {
+    "dispatch_id": "acp-launch-retry",
+    "launcher_log_path": "/tmp/goal-flight-dispatch-test/dispatches/acp-launch-retry/dispatcher.log",
+    "node_id": "localhost",
+    "remote_identity": {
+      "comm": "python3",
+      "lstart": "Thu Jun 11 12:00:00 2026",
+      "pid": 4242
+    },
+    "remote_lstart": "Thu Jun 11 12:00:00 2026",
+    "remote_pid": 4242,
+    "remote_state_dir": "/tmp/goal-flight-dispatch-test",
+    "remote_status_path": "/tmp/goal-flight-dispatch-test/dispatches/acp-launch-retry/status.json",
+    "schema": "goalflight.fleet.launch_receipt.v1",
+    "started_at": "2026-06-11T12:00:00+00:00",
+    "worktree_base_sha": "0123456789abcdef0123456789abcdef01234567",
+    "worktree_path": "/tmp/goal-flight-dispatch-test/worktrees/wt-1"
+  },
+  "remote_lease_id": null,
+  "remote_lease_id_superseded_by": "launch_receipt",
+  "remote_preflight": {
+    "agent": "codex-acp",
+    "cores": 24,
+    "decision": "allow",
+    "expected_hostname": "fixture-host",
+    "fresh": true,
+    "gpu_lock_path": "/tmp/warpx-gpu-lock",
+    "gpu_lock_state": "available",
+    "hostname": "fixture-host",
+    "load_1m": 2.0,
+    "load_per_core": 0.08333333333333333,
+    "measured_at": "2026-08-22T12:00:00+00:00",
+    "measurement_age_s": 0.00019641604740172625,
+    "measurements": {
+      "age_s": 0.00019641604740172625,
+      "gpu": {
+        "lock_held": false,
+        "lock_path": "/tmp/warpx-gpu-lock",
+        "lock_state": "available"
+      },
+      "identity": {
+        "answering_hostname": "fixture-host",
+        "expected_hostname": "fixture-host"
+      },
+      "load": {
+        "cores": 24,
+        "one_minute": 2.0,
+        "per_core": 0.08333333333333333
+      },
+      "memory": {
+        "controller_reserve_mb": 2048,
+        "gpu_extra_reserve_mb": 0,
+        "incoming_worker_rss_mb": 386,
+        "predicted_post_launch_headroom_mb": 95870.0,
+        "pressure_available_mb": 98304.0,
+        "pressure_available_percent": 75.0
+      },
+      "swap": {
+        "observed": false,
+        "used_mb": 0.0
+      }
+    },
+    "memory_pressure_available_percent": 75.0,
+    "node_alias": "localhost",
+    "ok": true,
+    "predicted_post_launch_headroom_mb": 95870.0,
+    "pressure_available_mb": 98304.0,
+    "reasons": [],
+    "schema": "goalflight.fleet.preflight.v1",
+    "swap_used_mb": 0.0,
+    "thresholds": {
+      "controller_reserve_mb": 2048,
+      "gpu_extra_reserve_mb": 0,
+      "hard_load_per_core": 0.85,
+      "hard_required_available_mb": 2434,
+      "incoming_worker_rss_mb": 386
+    },
+    "timeout_s": 8.0,
+    "total_ram_mb": 131072.0
+  },
+  "schema": "goalflight.dispatch.v1",
+  "started_at": "2026-08-26T12:00:07+00:00",
+  "state": "running",
+  "transport": "fleet-ssh",
+  "updated_at": "2026-08-26T12:00:07+00:00"
+}
