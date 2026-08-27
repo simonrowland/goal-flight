@@ -692,6 +692,12 @@ def _newest_trace_file(root: Path, roots: tuple[Path, ...]) -> Path | None:
         return None
 
 
+# One sample for the descendant walk: pid, parent, and run-state together.
+# ``state=`` is the BSD/procps first-character run-state field (Z = zombie).
+# A failed sample must stay unknown; a missing state token is not a zombie.
+PS_LIVE_DESCENDANT_FORMAT = "pid=,ppid=,state="
+
+
 def _parse_ppid_children(ps_output: str) -> dict[int, list[int]]:
     children: dict[int, list[int]] = {}
     for line in ps_output.splitlines():
@@ -703,6 +709,38 @@ def _parse_ppid_children(ps_output: str) -> dict[int, list[int]]:
         except ValueError:
             continue
     return children
+
+
+def _is_zombie_or_defunct_state(state: str | None) -> bool:
+    """True only when the sampled state token is Z/defunct.
+
+    A missing or empty token is not evidence of death. Callers must not treat
+    an absent field as "no live child".
+    """
+    if not state:
+        return False
+    token = state.strip()
+    if not token:
+        return False
+    if token[0] in {"Z", "z"}:
+        return True
+    return "defunct" in token.lower()
+
+
+def _parse_descendant_ps_rows(ps_output: str) -> list[tuple[int, int, str | None]]:
+    rows: list[tuple[int, int, str | None]] = []
+    for line in ps_output.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            child_pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        state = parts[2] if len(parts) >= 3 else None
+        rows.append((child_pid, ppid, state))
+    return rows
 
 
 def _walk_process_tree(pid: int, children: dict[int, list[int]]) -> tuple[int, ...]:
@@ -737,12 +775,13 @@ def live_descendant_count(pid: int, *, ps_runner=None) -> int | None:
     """Live descendants of ``pid``, excluding itself.
 
     None means the sample was unavailable. 0 means the walk ran and found
-    no children. Callers must not treat None as idle.
+    no *live* children. Zombie/defunct rows are not live work. Callers must
+    not treat None as idle: a failed ``ps`` must stay unknown, never zero.
     """
     runner = ps_runner or subprocess.run
     try:
         proc = runner(
-            ["ps", "-axo", "pid=,ppid="],
+            ["ps", "-axo", PS_LIVE_DESCENDANT_FORMAT],
             capture_output=True,
             text=True,
             timeout=2.0,
@@ -753,7 +792,17 @@ def live_descendant_count(pid: int, *, ps_runner=None) -> int | None:
         stdout = proc.stdout or ""
         if not stdout.strip():
             return None
-        tree = _walk_process_tree(pid, _parse_ppid_children(stdout))
+        rows = _parse_descendant_ps_rows(stdout)
+        if not rows:
+            # Non-empty stdout that parsed to nothing is a failed sample, not
+            # "no children". Filtering zombies must not turn garbage into 0.
+            return None
+        children: dict[int, list[int]] = {}
+        for child_pid, ppid, state in rows:
+            if _is_zombie_or_defunct_state(state):
+                continue
+            children.setdefault(ppid, []).append(child_pid)
+        tree = _walk_process_tree(pid, children)
         return max(0, len(tree) - 1)
     except (OSError, subprocess.TimeoutExpired, TypeError, ValueError):
         return None
@@ -4088,6 +4137,8 @@ def main() -> int:
             cpu_confirmed_idle(cpu_pct, args.cpu_epsilon) or cpu_pct is None
         ):
             live_descendants = live_descendant_count(args.pid)
+            # Zombie-only trees return 0, so mtime still runs. Skip only when
+            # a live (non-Z) child already vetoes idle.
             if not (isinstance(live_descendants, int) and live_descendants > 0):
                 if (
                     tree_leg.get("kind") == WEDGE_TREE_LEG_WORKER_CWD

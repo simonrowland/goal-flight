@@ -578,8 +578,9 @@ def classify_liveness(
     buffered, or writing the worktree without narrating. Extra signals, when
     measured, veto a wedge:
 
-    - ``live_descendants > 0``: a child still exists (pytest, a compiler, a
-      tool that sleeps without printing).
+    - ``live_descendants > 0``: a live (non-zombie) child still exists
+      (pytest, a compiler, a tool that sleeps without printing). Zombie
+      rows are filtered by the sampler; this count is already live work.
     - ``tree_age_s < idle_timeout``: the worker's own tree was written inside
       the idle window.
     - process-group CPU above epsilon: already-busy work, even with no children

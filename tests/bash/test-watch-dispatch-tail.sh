@@ -327,7 +327,7 @@ REAL_PS=$(command -v ps)
 cat > "$PS_FAIL_DIR/ps" <<EOF
 #!/bin/sh
 case " \$* " in
-  *" pid=,ppid= "*)
+  *" pid=,ppid="*)
     echo 'ps: enumeration failed' >&2
     exit 1
     ;;
@@ -343,7 +343,7 @@ esac
 exec "$REAL_PS" "\$@"
 EOF
 chmod +x "$PS_FAIL_DIR/ps"
-PATH="$PS_FAIL_DIR:$PATH" ps -axo pid=,ppid= >/dev/null 2>&1
+PATH="$PS_FAIL_DIR:$PATH" ps -axo pid=,ppid=,state= >/dev/null 2>&1
 expect_eq "case-1s descendant probe really fails" "1" "$?"
 WORKER_PID=$(start_isolated_sleep 60)
 PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
@@ -385,8 +385,8 @@ mkdir -p "$PS_ZERO_DIR"
 cat > "$PS_ZERO_DIR/ps" <<'EOF'
 #!/bin/sh
 case " $* " in
-  *" pid=,ppid= "*)
-    echo "${GOALFLIGHT_TEST_WORKER_PID:-0} 1"
+  *" pid=,ppid="*)
+    echo "${GOALFLIGHT_TEST_WORKER_PID:-0} 1 S"
     exit 0
     ;;
   *" pgid=,pid=,time= "*)
@@ -403,8 +403,8 @@ EOF
 chmod +x "$PS_ZERO_DIR/ps"
 WORKER_PID=$(start_isolated_sleep 60)
 PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
-known_idle_rows=$(PATH="$PS_ZERO_DIR:$PATH" GOALFLIGHT_TEST_WORKER_PID="$WORKER_PID" ps -axo pid=,ppid=)
-expect_eq "case-1t measured-zero descendant precondition" "$WORKER_PID 1" "$known_idle_rows"
+known_idle_rows=$(PATH="$PS_ZERO_DIR:$PATH" GOALFLIGHT_TEST_WORKER_PID="$WORKER_PID" ps -axo pid=,ppid=,state=)
+expect_eq "case-1t measured-zero descendant precondition" "$WORKER_PID 1 S" "$known_idle_rows"
 PATH="$PS_ZERO_DIR:$PATH" GOALFLIGHT_TEST_WORKER_PID="$WORKER_PID" \
   GOALFLIGHT_WATCH_TOTAL_RUNTIME_SECS=2 bash "$WATCHER" \
   --pid "$WORKER_PID" --tail "$TAIL" \
@@ -981,6 +981,99 @@ fi
 kill "$WORKER_PID" 2>/dev/null
 wait "$WORKER_PID" 2>/dev/null
 rm -f "$TAIL" /tmp/watcher-out-idle-child-$$.txt
+cleanup_pidfile "$PIDFILE_STEM"
+
+# ---- Case 3d: a zombie-only descendant is not live work; idle-timeout ----
+TAIL=/tmp/test-watch-idle-zombie-$$.txt
+ZOMBIE_PID_FILE=/tmp/test-watch-idle-zombie-child-$$.txt
+: > "$TAIL"
+export GOALFLIGHT_TEST_ZOMBIE_PID_FILE="$ZOMBIE_PID_FILE"
+WORKER_PID="$(python3 - <<'PY'
+import os
+import subprocess
+import sys
+import time
+
+proc = subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        "import os, sys, time\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    os._exit(0)\n"
+        "print(child, flush=True)\n"
+        "time.sleep(30)\n",
+    ],
+    start_new_session=True,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+)
+raw = proc.stdout.readline() if proc.stdout is not None else ""
+zombie_pid = int(raw.strip())
+deadline = time.monotonic() + 5.0
+state = ""
+while time.monotonic() < deadline:
+    probe = subprocess.run(
+        ["ps", "-o", "state=", "-p", str(zombie_pid)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    state = (probe.stdout or "").strip()
+    if state[:1] in {"Z", "z"}:
+        break
+    time.sleep(0.05)
+else:
+    proc.kill()
+    proc.wait(timeout=5)
+    raise SystemExit(f"zombie fixture never reached Z: pid={zombie_pid} state={state!r}")
+open(os.environ["GOALFLIGHT_TEST_ZOMBIE_PID_FILE"], "w", encoding="utf-8").write(
+    str(zombie_pid)
+)
+print(proc.pid)
+PY
+)"
+PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
+if [ -s "$ZOMBIE_PID_FILE" ]; then
+  zpid=$(cat "$ZOMBIE_PID_FILE")
+  zstate=$(ps -o state= -p "$zpid" 2>/dev/null | tr -d ' ')
+  case "$zstate" in
+    Z*|z*) expect_eq "case-3d real zombie precondition" "Z" "Z" ;;
+    *) expect_eq "case-3d real zombie precondition" "Z" "${zstate:-empty}" ;;
+  esac
+else
+  expect_eq "case-3d real zombie precondition" "Z" "missing"
+fi
+bash "$WATCHER" \
+  --pid "$WORKER_PID" --tail "$TAIL" \
+  --controller-pid "$$" --agent test-bashtail \
+  --session-id "test-idle-zombie" \
+  --poll-secs 1 --max-idle-secs 2 \
+  > /tmp/watcher-out-idle-zombie-$$.txt 2>&1
+watcher_exit=$?
+expect_eq "case-3d zombie-only idle-timeout exit code" "2" "$watcher_exit"
+if grep -q "WATCHER-EXIT: idle-timeout exit_code=2" /tmp/watcher-out-idle-zombie-$$.txt; then
+  expect_eq "case-3d zombie-only takes idle path" "yes" "yes"
+else
+  expect_eq "case-3d zombie-only takes idle path" "yes" "no"
+fi
+if grep -q "live child; tail-quiet is not idle" /tmp/watcher-out-idle-zombie-$$.txt; then
+  expect_eq "case-3d zombie is not a live-child veto" "absent" "present"
+else
+  expect_eq "case-3d zombie is not a live-child veto" "absent" "absent"
+fi
+if grep -q "WATCHER-EXIT: liveness_indeterminate" /tmp/watcher-out-idle-zombie-$$.txt; then
+  expect_eq "case-3d zombie is not indeterminate" "absent" "present"
+else
+  expect_eq "case-3d zombie is not indeterminate" "absent" "absent"
+fi
+kill "$WORKER_PID" 2>/dev/null
+wait "$WORKER_PID" 2>/dev/null
+rm -f "$TAIL" "$ZOMBIE_PID_FILE" /tmp/watcher-out-idle-zombie-$$.txt
+unset GOALFLIGHT_TEST_ZOMBIE_PID_FILE
 cleanup_pidfile "$PIDFILE_STEM"
 
 # ---- Case 3b: CPU-busy silence → running_quiet, not exit 2 ----

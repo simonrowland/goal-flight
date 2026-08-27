@@ -359,10 +359,12 @@ def _descendant_ps_fail_bindir(tmp: Path) -> Path:
     stub.write_text(
         "#!/bin/sh\n"
         "for arg in \"$@\"; do\n"
-        "  if [ \"$arg\" = \"pid=,ppid=\" ]; then\n"
-        "    echo 'ps: enumeration failed' >&2\n"
-        "    exit 1\n"
-        "  fi\n"
+        "  case \"$arg\" in\n"
+        "    pid=,ppid=*)\n"
+        "      echo 'ps: enumeration failed' >&2\n"
+        "      exit 1\n"
+        "      ;;\n"
+        "  esac\n"
         "done\n"
         f"exec {shlex.quote(real_ps)} \"$@\"\n",
         encoding="utf-8",
@@ -379,10 +381,12 @@ def _descendant_ps_table_bindir(tmp: Path, table: Path) -> Path:
     stub.write_text(
         "#!/bin/sh\n"
         "for arg in \"$@\"; do\n"
-        "  if [ \"$arg\" = \"pid=,ppid=\" ]; then\n"
-        f"    cat {shlex.quote(str(table))}\n"
-        "    exit $?\n"
-        "  fi\n"
+        "  case \"$arg\" in\n"
+        "    pid=,ppid=*)\n"
+        f"      cat {shlex.quote(str(table))}\n"
+        "      exit $?\n"
+        "      ;;\n"
+        "  esac\n"
         "done\n"
         f"exec {shlex.quote(real_ps)} \"$@\"\n",
         encoding="utf-8",
@@ -2163,7 +2167,7 @@ def case_runner_unknown_descendants_cannot_override_hard_wall() -> None:
         env = os.environ.copy()
         env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
         probe = subprocess.run(
-            ["ps", "-axo", "pid=,ppid="],
+            ["ps", "-axo", "pid=,ppid=,state="],
             capture_output=True,
             text=True,
             env=env,
