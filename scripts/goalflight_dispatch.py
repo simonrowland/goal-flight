@@ -5178,16 +5178,20 @@ def _attempt_claiming_worker_argv(
     dispatch_id: str,
     worker_argv: list[str],
 ) -> tuple[list[str], bool]:
-    if not os.path.lexists(goalflight_journal.resolve_journal_path(project_root)):
+    try:
+        # Peek-only: the RUNNING CAS lives in the unsandboxed watcher. A writer
+        # Journal() would take the construction write lock on the launch path.
+        # Only a genuine FileNotFoundError (JournalDisappeared) is "no journal".
+        # An unreadable present journal raises JournalIOError and must not skip
+        # attempt fencing.
+        attempt = goalflight_journal.Journal.open_reader(
+            project_root
+        ).attempt_for_dispatch(dispatch_id)
+    except goalflight_journal.JournalDisappeared:
         # Embedders can replace the ledger-recording seam when they own launch
         # tracking. Preserve that pre-P2 seam without bootstrapping authority
         # behind the embedding's back.
         return worker_argv, False
-    # Peek-only: the RUNNING CAS lives in the unsandboxed watcher. A writer
-    # Journal() would take the construction write lock on the launch path.
-    attempt = goalflight_journal.Journal.open_reader(project_root).attempt_for_dispatch(
-        dispatch_id
-    )
     if attempt is None:
         if _record_ledger is not _NATIVE_RECORD_LEDGER:
             # Controller registration can create the journal independently of
@@ -6051,22 +6055,25 @@ def _queue_launch_token(entry: dict | None = None) -> str:
         project_root = entry.get("project_root") or request.get("cwd")
         if dispatch_id and project_root:
             resolved_root = goalflight_task.resolve_project_root(str(project_root))
-            if os.path.lexists(goalflight_journal.resolve_journal_path(resolved_root)):
+            try:
                 # Peek-only reuse of a still-PREPARED attempt. Read errors must
                 # still escape before the carrier is claimed; open_reader does.
+                # Only JournalDisappeared is absent; unreadable is JournalIOError.
                 attempt = goalflight_journal.Journal.open_reader(
                     resolved_root
                 ).attempt_for_dispatch(dispatch_id)
-                if (
-                    attempt is not None
-                    and attempt.lifecycle_state == goalflight_journal.ATTEMPT_PREPARED
-                ):
-                    # A queue child refused before spawn. The durable claim
-                    # was restored, but its journal preparation is still the
-                    # same attempt. Reuse that fencing token so the next
-                    # drain can continue PREPARED -> STARTING. A journal read
-                    # error must escape before the carrier is claimed.
-                    return attempt.launch_token
+            except goalflight_journal.JournalDisappeared:
+                attempt = None
+            if (
+                attempt is not None
+                and attempt.lifecycle_state == goalflight_journal.ATTEMPT_PREPARED
+            ):
+                # A queue child refused before spawn. The durable claim
+                # was restored, but its journal preparation is still the
+                # same attempt. Reuse that fencing token so the next
+                # drain can continue PREPARED -> STARTING. A journal read
+                # error must escape before the carrier is claimed.
+                return attempt.launch_token
     return uuid.uuid4().hex
 
 
