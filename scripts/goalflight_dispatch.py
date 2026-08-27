@@ -12,6 +12,7 @@ Easy path (agent preset — the common case):
     python3 goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .      # background/default
     python3 goalflight_dispatch.py --agent codex --prompt-file p.md --read-only   # review/analysis
     python3 goalflight_dispatch.py --agent grok-code --prompt-file p.md --cwd .
+    python3 goalflight_dispatch.py --agent grok-code --prompt-file p.md --cwd . --worktree HEAD  # pooled seat
     python3 goalflight_dispatch.py --agent codex --prompt-file p.md --cwd . --foreground  # synchronous scripts/tests
 
 After launch, stderr is one line (dispatch id + status path). DISPATCH-LAUNCHED
@@ -1044,7 +1045,7 @@ def _cmd_spawn_daemon() -> int:
                     stderr=stderr_f,
                     start_new_session=True,
                     close_fds=True,
-                    pass_fds=goalflight_worktree_pool.inherited_worktree_lock_fds(),
+                    pass_fds=goalflight_worktree_pool.pass_worktree_lock_fds(),
                 )
             except Exception:
                 if filter_proc is not None and filter_proc.stdin is not None:
@@ -1079,7 +1080,7 @@ def _spawn_daemonized_process(
         "stderr": stderr,
         "serialize_stdout": bool(stdout_path and serialize_stdout),
     }
-    inherited_lock_fds = goalflight_worktree_pool.inherited_worktree_lock_fds()
+    inherited_lock_fds = goalflight_worktree_pool.pass_worktree_lock_fds(env)
     helper = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), DAEMON_SPAWN_ARG],
         input=json.dumps(spec, sort_keys=True),
@@ -1491,6 +1492,39 @@ def _worker_cwd(args) -> Path:
     if raw:
         return Path(str(raw)).expanduser().resolve(strict=False)
     return Path.cwd().resolve(strict=False)
+
+
+def _requested_worktree_base(args) -> str | None:
+    raw = getattr(args, "worktree", None)
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease | None:
+    """Acquire a pooled seat when ``--worktree`` is set. Never falls back to add.
+
+    The seat lock fd is left open on the returned lease. The caller must put
+    ``GOALFLIGHT_WORKTREE_LOCK_FD`` in the worker env and pass that fd through
+    spawn, then ``release()`` this process's copy so the worker's lifetime is
+    the lease lifetime.
+    """
+    base = _requested_worktree_base(args)
+    if base is None:
+        return None
+    if goalflight_worktree_pool.inherited_worktree_lock_fds():
+        # Fleet / parent already leased a seat and passed the fd. Re-acquire
+        # would LOCK_EX-succeed in this process (flock is per-process) and
+        # reset a tree the worker is already in.
+        return None
+    lease = goalflight_worktree_pool.acquire_worktree_seat(
+        _project_root(args),
+        str(args.dispatch_id),
+        base=base,
+    )
+    args.cwd = str(lease.path)
+    return lease
 
 
 def _parse_task_ids(values: list[str] | None) -> list[str]:
@@ -5490,6 +5524,7 @@ LAUNCH_ARGV_CLASS: dict[str, str] = {
     "--prompt": "preserve",
     "--task": "preserve",
     "--cwd": "preserve",
+    "--worktree": "preserve",
     "--model": "preserve",
     "--read-only": "preserve",
     "--readonly": "preserve",
@@ -5549,6 +5584,7 @@ _REPLAY_VALUE_OPTIONS = {
     "--prompt",
     "--task",
     "--cwd",
+    "--worktree",
     "--model",
     "--os-sandbox",
     "--priority",
@@ -5713,6 +5749,9 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv.append("--ignore-git-warn")
     if getattr(args, "no_orientation", False):
         argv.append("--no-orientation")
+    worktree_base = _requested_worktree_base(args)
+    if worktree_base:
+        argv += ["--worktree", worktree_base]
     if args.capacity_wait_s is not None:
         argv += ["--capacity-wait-s", str(args.capacity_wait_s)]
     if args.account:
@@ -12743,8 +12782,13 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         model=getattr(args, "model", None),
         install_slot=None,
         account=getattr(args, "account", None),
-        cwd=str(_worker_cwd(args)),
-        worktree="off",
+        cwd=str(
+            _project_root(args)
+            if _requested_worktree_base(args)
+            else _worker_cwd(args)
+        ),
+        worktree="create" if _requested_worktree_base(args) else "off",
+        worktree_base=_requested_worktree_base(args) or "HEAD",
         session_id=_resolved_engine_session_id(args),
         resume_session_id=(
             _resolved_engine_session_id(args)
@@ -13644,6 +13688,17 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         help="Comma-separated linked task/bug ids (t-/b-). May be repeated.",
     )
     parser.add_argument("--cwd", help="Worker working directory")
+    parser.add_argument(
+        "--worktree",
+        metavar="BASE",
+        help=(
+            "Acquire one pooled worktree seat prepared at git ref BASE "
+            "(HEAD, main, a commit) and run the worker there. The seat lease "
+            "fd is inherited by the worker; exhaustion refuses with every held "
+            "seat named and never falls back to `git worktree add`. Additive: "
+            "omit this flag and --cwd behaves as before."
+        ),
+    )
     parser.add_argument("--model", default=None,
                         help="Worker model id (grok-code/grok-research/moonshot/codex --model passthrough). "
                              "Default = agent label's own default.")
@@ -14116,6 +14171,7 @@ def main(argv: list[str] | None = None) -> int:
     caffeinate_pid = None
     pidfile = None
     lease_id = None
+    worktree_seat = None
     ledger_recorded = False
     queue_capacity_refused = False
     detached_launched = False
@@ -14327,6 +14383,12 @@ def main(argv: list[str] | None = None) -> int:
                 except BaseException:
                     codex_dispatch_home, effective_account = None, None
         request_envelope = _queue_request_envelope(args)
+        worktree_seat = _bind_dispatch_worktree(args)
+        if worktree_seat is not None:
+            worker_argv, stdin_path = build_worker(args, prompt_path, raw)
+            summary_head["worktree_seat"] = worktree_seat.seat_name
+            summary_head["worktree_path"] = str(worktree_seat.path)
+            summary_head["worktree_base"] = _requested_worktree_base(args)
         _record_ledger(
             args,
             project_root=project_root,
@@ -14359,6 +14421,10 @@ def main(argv: list[str] | None = None) -> int:
         # envelope with goalflight_messages.py while still writing prose to its
         # log for the human reading the tail.
         env["GOALFLIGHT_DISPATCH_ID"] = str(args.dispatch_id)
+        if worktree_seat is not None:
+            env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
+                worktree_seat.fileno()
+            )
         if original_prompt_path:
             env["GOALFLIGHT_PROMPT_FILE"] = str(original_prompt_path)
         else:
@@ -14429,6 +14495,11 @@ def main(argv: list[str] | None = None) -> int:
             serialize_stdout=True,
             label="worker",
         )
+        if worktree_seat is not None:
+            # Worker inherited the fd. Drop this process's copy so the seat
+            # lifetime is the worker's, not the launcher's.
+            worktree_seat.release()
+            worktree_seat = None
         _mark_queue_claim_worker_spawned(args, worker_pid)
         started = time.time()
         registration_errors = []
@@ -14690,6 +14761,21 @@ def main(argv: list[str] | None = None) -> int:
         return watch_rc
     except SystemExit:
         raise
+    except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
+        final_state = "failed_worktree"
+        final_reason = str(e)
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        print(
+            "goalflight_dispatch: refusing to git worktree add; "
+            "wait for a seat or raise GOALFLIGHT_WORKTREE_SEATS",
+            file=sys.stderr,
+        )
+        return 2
+    except goalflight_worktree_pool.WorktreeSeatError as e:
+        final_state = "failed_worktree"
+        final_reason = str(e)
+        print(f"goalflight_dispatch: worktree seat error: {e}", file=sys.stderr)
+        return 1
     except DispatchUsageError as e:
         final_state = "failed"
         final_reason = str(e)
@@ -14701,6 +14787,9 @@ def main(argv: list[str] | None = None) -> int:
         print("DISPATCH-ERROR " + json.dumps({"state": final_state, "reason": final_reason}, sort_keys=True), file=sys.stderr, flush=True)
         return 1
     finally:
+        if worktree_seat is not None:
+            worktree_seat.release()
+            worktree_seat = None
         final_worker_alive = worker_alive
         if final_worker_alive is None and worker_pid:
             final_worker_alive = goalflight_compat.pid_alive(worker_pid)
