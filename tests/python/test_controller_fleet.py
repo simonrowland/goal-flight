@@ -1434,23 +1434,58 @@ def test_permanently_busy_journal_reports_retry_exhausted(
 def test_retry_deadline_checked_before_subsequent_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A first read that spends the budget must not start attempt 2."""
+    """An under-budget first attempt plus a deadline-crossing backoff sleep
+    must not start attempt 2.
+
+    Bug shape (t-368): attempt 1 returns busy UNDER the budget, the loop
+    sleeps ``min(backoff, remaining)``, and that sleep crosses the deadline —
+    the pre-sleep check cannot see it, only the post-sleep re-check can.
+    This test's predecessor slept 50ms INSIDE attempt 1 against a 40ms
+    budget, which trips the post-attempt deadline check that predated the
+    fix, so it passed on the buggy code too and protected nothing.
+
+    The clock is fake, so the construction is immune to machine load (this
+    box runs many concurrent workers): ``sleep(d)`` advances the clock by
+    exactly d, matching real ``time.sleep`` semantics (PEP 475 retries
+    signal-interrupted sleeps, so a real sleep never returns early).
+    Arithmetic: budget 40ms (the constant the original fix was reviewed
+    against); attempt 1 costs a modeled 5ms, ending UNDER budget at t=5ms;
+    remaining = 35ms < FLEET_JOURNAL_BUSY_BACKOFF_S (50ms), so the backoff
+    sleep consumes exactly the remaining budget and lands ON the deadline at
+    t=40ms; the post-sleep re-check must fire. The outcome is independent of
+    the 5ms choice: any attempt cost in (0, 40ms) leaves a remaining under
+    50ms, so the sleep always lands on the deadline — the only premise is
+    "attempt 1 finishes under budget". Sanity check against a known value:
+    the real-timed reproduction of this exact shape (25ms first attempt
+    against the 40ms budget) finished in 43ms with "busy after 1 attempts".
+    """
     monkeypatch.setattr(journal, "JOURNAL_READER_RETRY_BUDGET_S", 0.04)
+    clock = [100.0]  # arbitrary epoch; only deltas matter
+    sleeps: list[float] = []
     calls: list[float] = []
 
+    def fake_monotonic() -> float:
+        return clock[0]
+
+    def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += seconds
+
     def read_once() -> tuple[object, str | None]:
-        calls.append(time.monotonic())
-        time.sleep(0.05)
+        calls.append(clock[0])
+        clock[0] += 0.005  # attempt completes under the 40ms budget
         return None, controllers._BUSY_ERROR
 
-    started = time.monotonic()
+    monkeypatch.setattr(controllers.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(controllers.time, "sleep", fake_sleep)
+
     value, error = controllers._retry_journal_busy(read_once)
-    elapsed = time.monotonic() - started
+
     assert value is None
     assert error is not None
     assert error.startswith("busy after 1 attempts")
-    assert len(calls) == 1
-    assert elapsed < 0.2
+    assert calls == [100.0]  # no second attempt was started
+    assert sleeps == [pytest.approx(0.035)]  # min(50ms backoff, 35ms remaining)
 
 
 def test_transient_lock_probe_busy_then_live(
