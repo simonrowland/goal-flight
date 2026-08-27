@@ -44,6 +44,9 @@ incremented when meaningful skill behaviour changes.
 - `--worktree` no longer passes a closed seat-lock fd into the post-spawn
   caffeinate helper. Sidecars get an env without `GOALFLIGHT_WORKTREE_LOCK_FD`
   so Darwin `caffeinate -w` starts after the launcher releases its copy.
+- The worker daemon helper now starts the child with Popen cwd set to the
+  leased seat (or `--cwd`). Claude `-p` has no `--cwd` flag and raw `--`
+  has none either; both inherit the seat as process cwd.
 - Default worktree seat count is 24 (was 4). This is a per-repository
   checkout ceiling, not a per-controller worker cap; there is none.
 - `goalflight_ledger.py reconcile-outbox` no longer promotes a sidecar's

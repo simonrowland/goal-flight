@@ -1037,6 +1037,9 @@ def _cmd_spawn_daemon() -> int:
             stderr_f = (
                 subprocess.STDOUT if stderr_mode == "stdout" else subprocess.DEVNULL
             )
+            child_cwd = spec.get("cwd")
+            if not isinstance(child_cwd, str) or not child_cwd.strip():
+                child_cwd = None
             try:
                 child = subprocess.Popen(
                     argv,
@@ -1045,6 +1048,7 @@ def _cmd_spawn_daemon() -> int:
                     stderr=stderr_f,
                     start_new_session=True,
                     close_fds=True,
+                    cwd=child_cwd,
                     pass_fds=goalflight_worktree_pool.pass_worktree_lock_fds(),
                 )
             except Exception:
@@ -1070,6 +1074,7 @@ def _spawn_daemonized_process(
     stderr: str = "stdout",
     serialize_stdout: bool = False,
     label: str,
+    cwd: str | None = None,
 ) -> int:
     """Spawn a child through the private daemon helper and return the child's pid."""
     spec = {
@@ -1079,6 +1084,7 @@ def _spawn_daemonized_process(
         "stdout_mode": stdout_mode,
         "stderr": stderr,
         "serialize_stdout": bool(stdout_path and serialize_stdout),
+        "cwd": cwd,
     }
     inherited_lock_fds = goalflight_worktree_pool.pass_worktree_lock_fds(env)
     helper = subprocess.run(
@@ -13652,6 +13658,9 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
             )
         if model:
             argv += ["--model", str(model)]
+        # claude -p has no --cwd flag. The daemon helper Popen cwd is the
+        # leased seat (or --cwd) so the process inherits it; raw `--` uses
+        # the same path.
         return argv, prompt_path
     return None, None  # unknown preset + no raw command
 
@@ -14507,6 +14516,7 @@ def main(argv: list[str] | None = None) -> int:
             stderr="stdout",
             serialize_stdout=True,
             label="worker",
+            cwd=str(_worker_cwd(args)),
         )
         if worktree_seat is not None:
             # Worker inherited the fd. Drop this process's copy so the seat
