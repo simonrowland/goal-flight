@@ -731,8 +731,6 @@ def test_slow_supervisor_heartbeat_does_not_change_stream_watchdog_cadence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", raising=False)
-    assert supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S == 1500.0
-    assert supervise.MAX_SUPERVISOR_HEARTBEAT_S == 1800.0
     assert messages.FOLLOW_HEARTBEAT_SECS == 120.0
     assert messages.FOLLOW_DEAD_AFTER_INTERVALS == 3
     assert messages.FOLLOW_DEAD_AFTER_SECS == 360.0
@@ -743,8 +741,8 @@ def test_slow_supervisor_heartbeat_does_not_change_stream_watchdog_cadence(
         controller_label="bugs",
         lease_nonce="nonce-1",
         host=host,
-        heartbeat_s=1800.0,
-        coverage_s=1800.0,
+        heartbeat_s=3600.0,
+        coverage_s=3600.0,
         items=None,
     )
     assert code == 0
@@ -764,7 +762,7 @@ def test_slow_supervisor_heartbeat_does_not_change_stream_watchdog_cadence(
     assert messages.FOLLOW_DEAD_AFTER_SECS == 360.0
 
 
-def test_supervise_cli_accepts_new_heartbeat_ceiling_only(
+def test_supervise_cli_default_heartbeat_lands_and_bounds_refuse(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -792,23 +790,60 @@ def test_supervise_cli_accepts_new_heartbeat_ceiling_only(
         "run_supervisor",
         lambda **kwargs: calls.append(kwargs) or 0,
     )
+
+    parsed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "goalflight_messages.py"),
+            "supervise",
+            "--help",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert parsed.returncode == 0
+    assert "default 3600" in parsed.stdout
+    assert "production 60-14400" in parsed.stdout
+
     args = SimpleNamespace(
         project_root=str(tmp_path),
         controller_label="bugs",
         lease_nonce="nonce-1",
-        heartbeat_secs=1800.0,
+        heartbeat_secs=3600.0,
         coverage_secs=0.0,
         debug=False,
     )
-
     assert supervise.cmd_supervise(args) == 0
-    assert calls[0]["heartbeat_s"] == 1800.0
-    assert calls[0]["coverage_s"] == 1800.0
+    assert calls[0]["heartbeat_s"] == 3600.0
+    assert calls[0]["coverage_s"] == 3600.0
+    rearm = supervise._supervisor_rearm_command(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        heartbeat_s=3600.0,
+        coverage_s=3600.0,
+    )
+    assert "--heartbeat-secs 3600" in rearm
 
-    args.heartbeat_secs = 1800.1
+    # Old explicit values from the previous 60–1800 window stay valid.
+    args.heartbeat_secs = 300.0
+    assert supervise.cmd_supervise(args) == 0
+    assert calls[1]["heartbeat_s"] == 300.0
+
+    args.heartbeat_secs = 14400.0
+    assert supervise.cmd_supervise(args) == 0
+    assert calls[2]["heartbeat_s"] == 14400.0
+
+    args.heartbeat_secs = 14400.1
     assert supervise.cmd_supervise(args) == supervise.SUPERVISE_START_EXIT
-    assert len(calls) == 1
-    assert "between 60 and 1800" in capsys.readouterr().err
+    assert len(calls) == 3
+    assert "between 60 and 14400" in capsys.readouterr().err
+
+    args.heartbeat_secs = 59.0
+    assert supervise.cmd_supervise(args) == supervise.SUPERVISE_START_EXIT
+    assert len(calls) == 3
+    assert "between 60 and 14400" in capsys.readouterr().err
 
 
 def test_dead_child_is_restarted() -> None:
@@ -1573,8 +1608,8 @@ def test_supervise_cli_is_the_one_command_front_door(tmp_path: Path) -> None:
     )
     assert help_text.returncode == 0
     assert "persistent wake pool" in help_text.stdout
-    assert "default 1500" in help_text.stdout
-    assert "production 60-1800" in help_text.stdout
+    assert "default 3600" in help_text.stdout
+    assert "production 60-14400" in help_text.stdout
     assert "--debug" in help_text.stdout
     assert "--chatty" in help_text.stdout
     assert "restore raw stream keepalives" in help_text.stdout

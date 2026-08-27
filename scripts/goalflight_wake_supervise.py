@@ -51,13 +51,24 @@ TRANSIENT_DETECTOR_RETRY_S = 0.01
 # typically raises POLLHUP/closed stdout (the b-248 detectors). Bound
 # consecutive no-progress EAGAIN by wall clock: 5s is above a 2s
 # scheduling pause and far below the follow-child 120s death detector
-# and the 1500s supervisor heartbeat, so a live reader can drain without
+# and the 3600s supervisor heartbeat, so a live reader can drain without
 # delaying genuine peer-loss past existing watchdog bounds. False from
 # _stdio_peer_gone remains no evidence, never proof of liveness.
 STDOUT_BACKPRESSURE_BUDGET_S = 5.0
-DEFAULT_SUPERVISOR_HEARTBEAT_S = 25.0 * 60.0
+# Controllers never act on the supervisor's own heartbeat — real worker
+# events and kind=next wake them — so after the b-248 rounds its only
+# load-bearing role is the periodic AUTHORITATIVE peer-probe write.
+# Prompt peer-gone detection is selector/POLLHUP-based with the
+# fail-closed detector choke point. This write still protects the
+# all-poll-detectors-fail-silent fallback, where EPIPE on the next write
+# is the last detector. Worst-case detection delay is one heartbeat
+# period (now 3600s). That is acceptable for an already-multiply-degraded
+# case: the fast poll path and POLLHUP already failed silent, so waiting
+# one hour for the last-ditch write is better than waking the controller
+# every 25 minutes for a record it never acts on.
+DEFAULT_SUPERVISOR_HEARTBEAT_S = 3600.0
 MIN_SUPERVISOR_HEARTBEAT_S = 60.0
-MAX_SUPERVISOR_HEARTBEAT_S = 30.0 * 60.0
+MAX_SUPERVISOR_HEARTBEAT_S = 4.0 * 3600
 PERSISTENT_BACKUP_SLOTS_ENV = "GOALFLIGHT_PERSISTENT_BACKUP_SLOTS"
 # ``follow`` writes a heartbeat before computing a possibly changed frontier.
 # Hold the beat briefly so one pipe-read split does not create two wakes. The
@@ -1089,7 +1100,7 @@ def run_supervisor(
         # is the sole terminal policy. The probes around wait are allowed to be
         # inconclusive, while registration failure or persistently unusable
         # poll means the fast detector is unavailable and fails closed. Every
-        # write is the authoritative point-in-time peer check. The 1500-second
+        # write is the authoritative point-in-time peer check. The 3600-second
         # supervisor heartbeat remains distinct from the forwarded stream
         # child's 120-second heartbeat, which proves stream liveness to
         # --watch-follow and drives its three-missed-interval death threshold.
@@ -1417,7 +1428,7 @@ class RealHost:
     def _on_signal(self, signum: int, _frame: object) -> None:
         self.stop_signum = signum
         self._stop = True
-        # Flagging alone can leave select() asleep for the 25-minute heartbeat
+        # Flagging alone can leave select() asleep for the 3600-second heartbeat
         # because Python may restart interrupted syscalls. The self-pipe makes
         # SIGTERM/SIGINT/SIGHUP recovery output prompt; a full pipe is awake.
         signal_wfd = self._signal_wfd
@@ -1765,7 +1776,7 @@ class RealHost:
         # detector whose no-event result is likewise only no evidence. If
         # registration cannot be established, no detector can be trusted to
         # wake this wait, so fail closed now instead of using the heartbeat as
-        # an implicit 25-minute fallback.
+        # an implicit 3600-second fallback.
         remaining = max(0.0, deadline - time.monotonic())
         if self.stdout_detector_status().failure is not None:
             remaining = 0.0
