@@ -362,8 +362,14 @@ def journal_activity(repo_root: str, cwd: str) -> bool:
 
         root = goalflight_task.resolve_project_root(cwd)
         # Peek-only: must not take the write lock or inherit the 5s writer
-        # budget. SessionStart fail-open prefers a fast False over a stall.
-        authority = goalflight_journal.Journal.open_reader(root)
+        # budget. Open retries default to JOURNAL_OPEN_RETRY_BUDGET_S (75s);
+        # cap them to the same 3s SessionStart wall as the subprocess calls.
+        # Busy stays at the 1.0s reader default. Fail-open prefers a fast
+        # False over a stall.
+        authority = goalflight_journal.Journal.open_reader(
+            root,
+            open_retry_budget_s=3.0,
+        )
         if authority.attention_items():
             return True
         return bool(

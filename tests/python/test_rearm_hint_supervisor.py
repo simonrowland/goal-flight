@@ -179,6 +179,14 @@ def _minimal_doctor_payload(wake_coverage: dict[str, object]) -> dict[str, objec
     }
 
 
+def _session_start_embedded_python() -> str:
+    text = SESSION_START_HOOK.read_text(encoding="utf-8")
+    marker = "python3 - <<'PY' 2>/dev/null || true\n"
+    start = text.index(marker) + len(marker)
+    end = text.index("\nPY\n", start)
+    return text[start:end]
+
+
 def _run_session_start_hook(
     project: Path,
     env: dict[str, str],
@@ -402,6 +410,46 @@ def test_session_start_hook_startup_and_resume_use_live_supervisor_policy(
             supervisor.stdout.close()
         if supervisor.stderr is not None:
             supervisor.stderr.close()
+
+
+def test_session_start_journal_activity_bounds_open_retry_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SessionStart journal peek must not inherit the 75s open budget."""
+    recorded: dict[str, object] = {}
+
+    def fake_open_reader(cls, project_root, **kwargs):  # type: ignore[no-untyped-def]
+        recorded["root"] = project_root
+        recorded["kwargs"] = kwargs
+        raise journal.JournalBusy("seam")
+
+    monkeypatch.setattr(
+        journal.Journal, "open_reader", classmethod(fake_open_reader)
+    )
+    code = _session_start_embedded_python().replace(
+        "try:\n    main()\nexcept Exception:\n    pass",
+        "",
+        1,
+    )
+    ns: dict[str, object] = {}
+    exec(compile(code, str(SESSION_START_HOOK), "exec"), ns)
+    journal_activity = ns["journal_activity"]
+    assert callable(journal_activity)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "SKILL.md").write_text("hook open-budget seam\n", encoding="utf-8")
+    assert journal_activity(str(ROOT), str(project)) is False  # type: ignore[operator]
+    kwargs = recorded["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert "open_retry_budget_s" in kwargs
+    open_budget = float(kwargs["open_retry_budget_s"])
+    assert 0 <= open_budget <= 3.0
+    assert open_budget < journal.JOURNAL_OPEN_RETRY_BUDGET_S
+    retry_budget = float(
+        kwargs.get("retry_budget_s", journal.JOURNAL_READER_RETRY_BUDGET_S)
+    )
+    assert retry_budget <= journal.JOURNAL_READER_RETRY_BUDGET_S
 
 
 def test_real_process_table_with_spaced_root_never_proves_absence(
