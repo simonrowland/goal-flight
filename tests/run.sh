@@ -13,12 +13,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Isolate every machine-global writable default. A test that omits an explicit
-# messages_dir/fleet_dir must never migrate or append to the operator's live
-# ~/.goal-flight state merely because the production helper supplies defaults.
+# messages_dir/journal_dir/fleet_dir must never migrate or append to the
+# operator's live ~/.goal-flight or ~/.local/state/goal-flight merely because
+# the production helper supplies defaults. Journal isolation is its own knob
+# (GOALFLIGHT_JOURNAL_DIR); TASK_STORE_DIR only isolates journals incidentally
+# and a test that pops the store override would otherwise write the live XDG
+# journals index.
 _GF_TEST_ENV_BASE="$(mktemp -d "${TMPDIR:-/tmp}/gf-test-env-XXXXXX")"
 trap 'rm -rf "$_GF_TEST_ENV_BASE" 2>/dev/null || true' EXIT
 _GF_TASK_STORE_BASE="${GOALFLIGHT_TASK_STORE_DIR:-$_GF_TEST_ENV_BASE/task-store}"
 _GF_MESSAGES_BASE="${GOALFLIGHT_MESSAGES_DIR:-$_GF_TEST_ENV_BASE/messages}"
+_GF_JOURNAL_BASE="${GOALFLIGHT_JOURNAL_DIR:-$_GF_TEST_ENV_BASE/journal}"
 
 pass=0
 fail=0
@@ -40,6 +45,7 @@ run_isolated_test_env() {
     -u GOALFLIGHT_ISOLATED_TEST_FILE \
     GOALFLIGHT_CAPACITY_CONF="${GOALFLIGHT_CAPACITY_CONF:-/dev/null}" \
     GOALFLIGHT_MESSAGES_DIR="$_GF_MESSAGES_BASE" \
+    GOALFLIGHT_JOURNAL_DIR="$_GF_JOURNAL_BASE" \
     GOALFLIGHT_TASK_STORE_DIR="${GOALFLIGHT_TASK_STORE_DIR:-$_GF_TASK_STORE_BASE}" "$@"
 }
 
@@ -105,6 +111,26 @@ if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
     fi
     rm -f /tmp/goal-flight-collect-$$.out
 
+    # Snapshot live XDG project-<10-hex> journal slugs so a suite leak cannot
+    # hide behind incidental TASK_STORE_DIR isolation of the test's own slug.
+    _GF_LIVE_SLUG_SNAP="$(mktemp "${TMPDIR:-/tmp}/gf-live-journal-slugs-XXXXXX")"
+    env -u GOALFLIGHT_JOURNAL_DIR -u GOALFLIGHT_TASK_STORE_DIR python3 - "$_GF_LIVE_SLUG_SNAP" <<'PY'
+import os, re, sys
+from pathlib import Path
+xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+index = base / "goal-flight" / "journals"
+pat = re.compile(r"^project-[0-9a-f]{10}$")
+names = []
+if index.is_dir():
+    for child in index.iterdir():
+        try:
+            if child.is_dir() and pat.match(child.name):
+                names.append(child.name)
+        except OSError:
+            continue
+Path(sys.argv[1]).write_text("\n".join(sorted(names)), encoding="utf-8")
+PY
     if run_isolated_test_env python3 -m pytest tests/python -q > /tmp/goal-flight-test-$$.out 2>&1; then
       grep '^FLAKE  ' /tmp/goal-flight-test-$$.out | sed 's/^/      /' || true
       echo "PASS  tests/python (isolated pytest directory suite)"
@@ -117,6 +143,39 @@ if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
       failed_tests+=("tests/python")
     fi
     rm -f /tmp/goal-flight-test-$$.out
+    if ! env -u GOALFLIGHT_JOURNAL_DIR -u GOALFLIGHT_TASK_STORE_DIR python3 - "$_GF_LIVE_SLUG_SNAP" <<'PY'
+import os, re, sys
+from pathlib import Path
+before = {
+    line.strip()
+    for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+}
+xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+index = base / "goal-flight" / "journals"
+pat = re.compile(r"^project-[0-9a-f]{10}$")
+after = set()
+if index.is_dir():
+    for child in index.iterdir():
+        try:
+            if child.is_dir() and pat.match(child.name):
+                after.add(child.name)
+        except OSError:
+            continue
+leaked = sorted(after - before)
+if leaked:
+    print("live journals index gained project-<10-hex> children:", ", ".join(leaked))
+    raise SystemExit(1)
+PY
+    then
+      :
+    else
+      echo "FAIL  live journals index gained project-<10-hex> children during python suite"
+      fail=$((fail + 1))
+      failed_tests+=("live-journal-isolation")
+    fi
+    rm -f "$_GF_LIVE_SLUG_SNAP"
   fi
 fi
 
