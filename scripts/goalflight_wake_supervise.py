@@ -921,6 +921,13 @@ def run_supervisor(
 
     def emit_coverage(*, force: bool = False) -> tuple[bool, bool]:
         nonlocal reported_counts, reported_revision
+        if not emit_depth:
+            # Option A: coverage carries only listener depth, so terse mode has
+            # no informational record to emit. Its depth/revision suppression
+            # key therefore applies only when those values are in the payload.
+            # Startup uses an explicit probe below for the required peer write;
+            # restart and stop paths already attempt their own meaningful write.
+            return True, False
         live, target = _live_target(slots)
         counts = (live, target)
         if (
@@ -932,9 +939,9 @@ def run_supervisor(
         record: dict[str, object] = {
             "kind": "supervise",
             "type": "coverage",
+            "live": live,
+            "target": target,
         }
-        if emit_depth:
-            record.update(live=live, target=target)
         emitted = _emit(host, record)
         if emitted:
             reported_counts = counts
@@ -954,8 +961,21 @@ def run_supervisor(
             record.update(live=live, target=target)
         return _emit(host, record)
 
-    coverage_ok, _coverage_emitted = emit_coverage(force=True)
-    if not coverage_ok or (debug and not emit_heartbeat()):
+    if emit_depth:
+        startup_probe_ok, _coverage_emitted = emit_coverage(force=True)
+    else:
+        # Terse startup still needs an actual stdout write to detect a dead
+        # controller. Name that operational write instead of emitting empty
+        # coverage or changing the scheduled heartbeat interval.
+        startup_probe_ok = _emit(
+            host,
+            {
+                "kind": "supervise",
+                "type": "probe",
+                "reason": "stdout-peer-liveness",
+            },
+        )
+    if not startup_probe_ok or (debug and not emit_heartbeat()):
         return stop_after_failed_write()
     next_heartbeat = host.now + max(0.01, float(heartbeat_s))
     next_coverage = host.now + max(0.01, float(coverage_s))

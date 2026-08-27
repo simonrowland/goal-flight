@@ -619,6 +619,7 @@ def test_debug_restores_unconditional_per_tick_counts() -> None:
         _items("stream"),
         heartbeat_s=1.0,
         coverage_s=0.05,
+        emit_depth=True,
         debug=True,
     )
     counts = [
@@ -628,7 +629,11 @@ def test_debug_restores_unconditional_per_tick_counts() -> None:
     ]
     assert len(counts) == 5
     assert [record["type"] for record in counts[:2]] == ["coverage", "heartbeat"]
-    assert all("live" not in record and "target" not in record for record in counts)
+    assert all(
+        isinstance(record.get("live"), int)
+        and isinstance(record.get("target"), int)
+        for record in counts
+    )
 
 
 def test_slow_heartbeat_is_the_real_write_with_unchanged_state() -> None:
@@ -667,6 +672,19 @@ def test_failed_slow_heartbeat_write_tears_down_immediately() -> None:
     heartbeat_index = host.actions.index("write:heartbeat")
     assert host.actions[heartbeat_index + 1 :] == ["kill"]
     assert sum(action == "write:heartbeat" for action in host.actions) == 1
+
+
+def test_default_startup_probe_write_failure_tears_down() -> None:
+    host = FakeHost(fail_write_type="probe", stop_after_waits=1)
+    code = _run(
+        host,
+        _items("stream"),
+        heartbeat_s=100.0,
+        coverage_s=100.0,
+    )
+    assert code == 0
+    assert host.actions == ["write:probe", "kill"]
+    assert host.children and not any(child.alive for child in host.children)
 
 
 def test_positive_fast_peer_probe_stops_without_waiting_for_long_write() -> None:
@@ -790,7 +808,7 @@ def test_dead_child_is_restarted() -> None:
     assert "live" not in restart
     assert "target" not in restart
     restart_index = host.actions.index("write:restart")
-    assert host.actions[restart_index + 1] == "write:coverage"
+    assert host.actions[restart_index + 1 :] == ["kill"]
 
 
 def test_exit_3_unclassified_backoffs_instead_of_implying_contention() -> None:
@@ -870,7 +888,7 @@ def test_exit_0_watchdog_slot_held_without_arming_stops() -> None:
     assert host.alive_by_kind_at_stop.get("stream") is True
     assert [kind for kind, _command in host.spawns].count("stream") == 1
     stop_index = host.actions.index("write:stop")
-    assert host.actions[stop_index + 1] == "write:coverage"
+    assert host.actions[stop_index + 1 :] == ["kill"]
 
 
 def test_terse_supervisor_replaces_only_own_stream_heartbeat() -> None:
@@ -1288,19 +1306,22 @@ def test_classify_exit_taxonomy() -> None:
 
 
 def test_default_supervisor_output_suppresses_depth_and_opt_in_restores_it() -> None:
-    default_host = FakeHost(stop_after_spawns=1)
+    default_host = FakeHost(stop_after_waits=1)
     _run(
         default_host,
         _items("stream"),
         heartbeat_s=100.0,
-        coverage_s=100.0,
+        coverage_s=0.05,
     )
     default_records = _records(default_host)
-    assert [record["type"] for record in default_records] == ["coverage"]
-    assert all(
-        "live" not in record and "target" not in record
-        for record in default_records
-    )
+    assert default_records == [
+        {
+            "kind": "supervise",
+            "type": "probe",
+            "reason": "stdout-peer-liveness",
+        }
+    ]
+    assert {"kind": "supervise", "type": "coverage"} not in default_records
 
     depth_host = FakeHost(stop_after_spawns=1)
     _run(
@@ -1317,6 +1338,25 @@ def test_default_supervisor_output_suppresses_depth_and_opt_in_restores_it() -> 
         and isinstance(record.get("target"), int)
         for record in records
     )
+
+
+def test_debug_without_depth_keeps_meaningful_startup_diagnostics() -> None:
+    host = FakeHost(stop_after_spawns=1)
+    _run(
+        host,
+        _items("stream"),
+        heartbeat_s=100.0,
+        coverage_s=100.0,
+        debug=True,
+    )
+    assert _records(host) == [
+        {
+            "kind": "supervise",
+            "type": "probe",
+            "reason": "stdout-peer-liveness",
+        },
+        {"kind": "supervise", "type": "heartbeat", "seq": 1},
+    ]
 
 
 def test_opt_in_live_counts_armed_components_not_pids() -> None:
@@ -1915,7 +1955,9 @@ def test_full_nonblocking_pipe_eagain_retries_then_keeps_children_alive(
             )
             return super().write_stdout(line)
 
-    host = BackpressuredHost(stop_after_coverage=1)
+    host = BackpressuredHost(
+        stop_when_lines_contain=('"type":"probe"',)
+    )
     try:
         code = _run(host, _items("stream"))
     finally:
