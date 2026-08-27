@@ -1394,6 +1394,19 @@ def _wait_for_detached_watcher(
         return 130, last_payload, "foreground_wait_interrupted"
 
 
+def _sidecar_env(env: dict[str, str]) -> dict[str, str]:
+    """Env for helpers that must not inherit the worker's seat lock fd.
+
+    After the launcher releases its copy, ``GOALFLIGHT_WORKTREE_LOCK_FD`` in
+    the worker env names a closed descriptor. Passing that dict to caffeinate
+    (or any other sidecar) makes the daemon helper raise WorktreeSeatError
+    instead of starting.
+    """
+    out = dict(env)
+    out.pop(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, None)
+    return out
+
+
 def _start_caffeinate(worker_pid: int, *, env: dict[str, str], stdout_path: Path) -> tuple[int | None, str | None]:
     if sys.platform != "darwin":
         return None, "not_darwin"
@@ -1403,7 +1416,7 @@ def _start_caffeinate(worker_pid: int, *, env: dict[str, str], stdout_path: Path
     try:
         pid = _spawn_daemonized_process(
             [caffeinate, "-dimsu", "-w", str(worker_pid)],
-            env=env,
+            env=_sidecar_env(env),
             stdout_path=stdout_path,
             stdout_mode="wb",
             stderr="stdout",
@@ -14497,9 +14510,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         if worktree_seat is not None:
             # Worker inherited the fd. Drop this process's copy so the seat
-            # lifetime is the worker's, not the launcher's.
+            # lifetime is the worker's, not the launcher's. Sidecars must not
+            # see the now-closed fd number in their environment.
             worktree_seat.release()
             worktree_seat = None
+            env.pop(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, None)
         _mark_queue_claim_worker_spawned(args, worker_pid)
         started = time.time()
         registration_errors = []

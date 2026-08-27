@@ -38,6 +38,9 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- `--worktree` no longer passes a closed seat-lock fd into the post-spawn
+  caffeinate helper. Sidecars get an env without `GOALFLIGHT_WORKTREE_LOCK_FD`
+  so Darwin `caffeinate -w` starts after the launcher releases its copy.
 - Default worktree seat count is 24 (was 4). This is a per-repository
   checkout ceiling, not a per-controller worker cap; there is none.
 - `goalflight_ledger.py reconcile-outbox` no longer promotes a sidecar's
