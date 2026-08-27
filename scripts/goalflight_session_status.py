@@ -195,11 +195,18 @@ def _heartbeat_age_s(record: dict, *, now: datetime | None = None) -> float | No
     return (measured_now.astimezone(timezone.utc) - heartbeat).total_seconds()
 
 
-def _registered_controller_records(
+def _probe_registered_controller_records(
     project_root: Path,
     *,
     include_retired: bool = False,
-) -> list[dict]:
+) -> tuple[list[dict] | None, str | None]:
+    """Return ``(records, error)`` for one registry read.
+
+    A disappeared journal is an honest empty roster. Busy or IO failures are
+    unreadable: ``records`` is None and ``error`` is the exception type. Do not
+    collapse those into ``[]`` — that is indistinguishable from nothing
+    registered.
+    """
     try:
         root = goalflight_task.resolve_project_root(str(project_root))
         authority = goalflight_journal.Journal.open_reader(root)
@@ -230,13 +237,23 @@ def _registered_controller_records(
                 record["retired_at"] = row.get("ended_at")
                 record["retired_by"] = row.get("ended_reason")
             records.append(record)
-        return records
-    except (
-        goalflight_journal.JournalBusy,
-        goalflight_journal.JournalDisappeared,
-        goalflight_journal.JournalIOError,
-    ):
-        return []
+        return records, None
+    except goalflight_journal.JournalDisappeared:
+        return [], None
+    except (goalflight_journal.JournalBusy, goalflight_journal.JournalIOError) as exc:
+        return None, type(exc).__name__
+
+
+def _registered_controller_records(
+    project_root: Path,
+    *,
+    include_retired: bool = False,
+) -> list[dict]:
+    records, _error = _probe_registered_controller_records(
+        project_root,
+        include_retired=include_retired,
+    )
+    return list(records or [])
 
 
 def registered_controller_labels(project_root: Path) -> set[str]:
@@ -1405,18 +1422,22 @@ def _format_idle_duration(age_s: float | None) -> str:
 def _incarnation_state(
     record: dict,
     *,
-    lease_lock_live: bool,
+    lease_lock_live: bool | None,
     now: datetime | None = None,
-) -> tuple[str, bool]:
+) -> tuple[str, bool | None]:
     """Classify one lease for holder-visible reporting.
 
     ``live-lock`` / ``dead-lock`` are facts about the kernel lock, not a
-    health verdict. A held lock whose ``renew_deadline_at`` is in the past is
+    health verdict. ``unknown-lock`` is the third token when the lock probe
+    could not tell. A held lock whose ``renew_deadline_at`` is in the past is
     ``live-overdue``: the process may still be working, and another controller
-    may legitimately reclaim. Do not map overdue onto ``dead-lock``.
+    may legitimately reclaim. ``live-overdue`` requires a proven live lock; do
+    not map overdue or unreadable onto ``dead-lock``.
     """
     if record.get("retired_at"):
         return "ended", False
+    if lease_lock_live is None:
+        return "unknown-lock", None
     if not lease_lock_live:
         return "dead-lock", False
     deadline = _parse_utc(record.get("renew_deadline_at"))
@@ -1505,14 +1526,24 @@ def controller_roster(
         project_root,
         records=ledger_records,
     )
+    records, registry_error = _probe_registered_controller_records(
+        project_root,
+        include_retired=include_retired,
+    )
     controllers = []
-    for record in _registered_controller_records(project_root, include_retired=include_retired):
+    for record in records or []:
         label = str(record.get("label") or "")
         idle_s = _heartbeat_age_s(record, now=measured_now)
-        live = live_session(project_root, label=label)
+        probe_state, live = probe_live_session(project_root, label=label)
+        if probe_state == "live":
+            lock_live: bool | None = True
+        elif probe_state == "dead":
+            lock_live = False
+        else:
+            lock_live = None
         incarnation_state, lease_lock_live = _incarnation_state(
             record,
-            lease_lock_live=live is not None,
+            lease_lock_live=lock_live,
             now=measured_now,
         )
         conflicting_beacons = (
@@ -1551,12 +1582,25 @@ def controller_roster(
         "measurements": {
             "unread_addressed_mail": {"measured": unread is not None, "error": unread_error},
             "nonterminal_owned_dispatches": {"measured": owned is not None, "error": owned_error},
+            "controller_registry": {
+                "measured": records is not None,
+                "error": registry_error,
+            },
         },
         "controllers": controllers,
     }
 
 
 def controller_roster_lines(roster: dict) -> list[str]:
+    measurements = roster.get("measurements")
+    registry = (
+        measurements.get("controller_registry")
+        if isinstance(measurements, dict)
+        else None
+    )
+    if isinstance(registry, dict) and registry.get("measured") is False:
+        error = str(registry.get("error") or "unreadable").strip() or "unreadable"
+        return [f"controllers unreadable ({error})"]
     lines = []
     for record in roster.get("controllers") or []:
         unread = record.get("unread_addressed_mail")
