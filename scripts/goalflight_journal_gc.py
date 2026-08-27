@@ -10,7 +10,7 @@ absence:
 
   live        recorded project_root exists
   root-gone   recorded project_root is absent (FileNotFoundError only)
-  empty       journal holds no domain data (created eagerly)
+  empty       journal holds no domain data AND its recorded root is gone
   unknown     root or contents unverifiable; NEVER reclaimed
 
 A journal may be dead by root and still referenced. An ACTIVE lease with a
@@ -411,16 +411,9 @@ def classify(journal_dir: Path) -> dict:
             "journal sqlite unreadable, so absence and references are unverifiable",
         )
 
-    if domain_rows == 0:
-        return _entry(
-            journal_dir,
-            state="empty",
-            why="journal holds no data",
-            reclaimable=True,
-        )
-
-    # Union across tables. `lease or attempt` would hide a live attempt root
-    # whenever any lease recorded a (possibly gone) project_root.
+    # Union across tables, then classify the root, before treating an
+    # empty sqlite as reclaimable. A create-only journal has no recorded
+    # project_root: that is unknown, not empty.
     roots = _union_distinct_roots(lease_roots, attempt_roots)
     if not roots:
         return _keep_unknown(
@@ -449,6 +442,16 @@ def classify(journal_dir: Path) -> dict:
         )
     if state == "unknown":
         return _keep_unknown(journal_dir, why, root=root, roots=roots)
+
+    if domain_rows == 0:
+        return _entry(
+            journal_dir,
+            state="empty",
+            why="journal holds no data",
+            root=root,
+            roots=roots,
+            reclaimable=True,
+        )
 
     # root-gone: still refuse if referenced.
     if references:

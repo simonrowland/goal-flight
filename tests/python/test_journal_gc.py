@@ -103,14 +103,25 @@ def test_missing_root_is_root_gone(tmp_path: Path) -> None:
     assert "no longer exists" in entry["why"]
 
 
-def test_empty_journal_is_reclaimable(tmp_path: Path) -> None:
+def test_create_only_journal_with_unrecorded_root_is_unknown(tmp_path: Path) -> None:
     project = _project(tmp_path, "empty-repo")
     authority = _create(project)
     entry = gc.classify(_journal_dir(authority))
+    assert entry["state"] == "unknown"
+    assert entry["reclaimable"] is False
+    assert "no recorded project_root" in entry["why"]
+    assert project.is_dir()
+
+
+def test_orphan_journal_dir_without_sqlite_is_empty(tmp_path: Path) -> None:
+    store = gc.journals_store()
+    store.mkdir(parents=True, exist_ok=True)
+    orphan = store / "orphan-empty"
+    orphan.mkdir()
+    entry = gc.classify(orphan)
     assert entry["state"] == "empty"
     assert entry["reclaimable"] is True
     assert "holds no data" in entry["why"]
-    assert project.is_dir()
 
 
 def test_unreadable_journal_is_unknown_never_reclaimed(tmp_path: Path) -> None:
@@ -241,14 +252,19 @@ def test_report_only_deletes_nothing(tmp_path: Path) -> None:
     project = _project(tmp_path, "empty-kept")
     authority = _create(project)
     journal_dir = _journal_dir(authority)
+    orphan = gc.journals_store() / "orphan-empty"
+    orphan.mkdir(parents=True, exist_ok=True)
     payload = _run_json()
-    entry = _entry_for(payload, journal_dir)
-    assert entry["state"] == "empty"
-    assert entry["reclaimable"] is True
+    created = _entry_for(payload, journal_dir)
+    assert created["reclaimable"] is False
+    reported_orphan = _entry_for(payload, orphan)
+    assert reported_orphan["state"] == "empty"
+    assert reported_orphan["reclaimable"] is True
     assert payload["applied"] is False
     assert payload["deleted"] == 0
     assert journal_dir.is_dir()
     assert authority.path.is_file()
+    assert orphan.is_dir()
 
 
 def test_apply_deletes_only_reclaimable(tmp_path: Path) -> None:
@@ -263,9 +279,12 @@ def test_apply_deletes_only_reclaimable(tmp_path: Path) -> None:
     gone_dir = _journal_dir(gone_auth)
     shutil.rmtree(gone)
 
-    empty = _project(tmp_path, "reap-empty")
+    empty = _project(tmp_path, "keep-empty-live")
     empty_auth = _create(empty)
     empty_dir = _journal_dir(empty_auth)
+
+    orphan = gc.journals_store() / "orphan-empty"
+    orphan.mkdir(parents=True, exist_ok=True)
 
     locked = _project(tmp_path, "keep-unreadable")
     locked_auth = _create(locked)
@@ -277,12 +296,27 @@ def test_apply_deletes_only_reclaimable(tmp_path: Path) -> None:
         assert payload["applied"] is True
         assert live_dir.is_dir()
         assert locked_dir.is_dir()
+        assert empty_dir.is_dir()
+        assert empty.is_dir()
         assert not gone_dir.exists()
-        assert not empty_dir.exists()
+        assert not orphan.exists()
         assert payload["deleted"] >= 2
     finally:
         if locked_auth.path.exists():
             os.chmod(locked_auth.path, 0o644)
+
+
+def test_apply_does_not_delete_create_only_journal_of_live_project(tmp_path: Path) -> None:
+    project = _project(tmp_path, "fresh-repo")
+    authority = _create(project)
+    journal_dir = _journal_dir(authority)
+    payload = _run_json("--apply")
+    entry = _entry_for(payload, journal_dir)
+    assert entry["reclaimable"] is False
+    assert payload["deleted"] == 0
+    assert journal_dir.is_dir()
+    assert authority.path.is_file()
+    assert project.is_dir()
 
 
 def test_reverification_refuses_a_root_that_came_back(
@@ -441,8 +475,8 @@ def test_cli_json_four_state_counts(tmp_path: Path) -> None:
     _claim(gone_auth)
     shutil.rmtree(gone)
 
-    empty = _project(tmp_path, "count-empty")
-    _create(empty)
+    empty = gc.journals_store() / "count-empty"
+    empty.mkdir(parents=True, exist_ok=True)
 
     locked = _project(tmp_path, "count-unknown")
     locked_auth = _create(locked)
