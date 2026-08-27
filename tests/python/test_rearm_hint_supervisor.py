@@ -891,6 +891,110 @@ def test_other_generation_supervise_is_absent(
     ) in hint
 
 
+def _matching_supervise_tail(project: Path, lease: journal.LeaseIdentity) -> list[str]:
+    return [
+        "scripts/goalflight_messages.py",
+        "supervise",
+        "--project-root",
+        str(project),
+        "--controller-label",
+        lease.label,
+        "--lease-nonce",
+        lease.nonce,
+    ]
+
+
+def _state_from_listing(
+    project: Path,
+    lease: journal.LeaseIdentity,
+    listing: list[tuple[int | None, str]] | None,
+) -> str:
+    return wake._supervisor_generation_state_from_listing(
+        listing,
+        project_root=project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+
+
+def test_foreign_python_c_carrying_supervise_argv_is_not_running(
+    isolated: tuple[Path, journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trailing supervise tokens on python3 -c are not a live supervisor."""
+    project, lease = isolated
+    foreign = (
+        'python3 -c "import time; time.sleep(3600)" '
+        + shlex.join(_matching_supervise_tail(project, lease))
+    )
+    listing = [(4242, foreign)]
+    state = _state_from_listing(project, lease, listing)
+    assert state != wake.SUPERVISOR_RUNNING
+    assert state == wake.SUPERVISOR_ABSENT
+    plan = _persistent_shortfall_plan(project, lease, monkeypatch, listing)
+    assert plan["supervisor"] == wake.SUPERVISOR_ABSENT
+    action = wake.supervisor_operator_action(
+        str(plan["supervisor"]),
+        component_command=str(plan.get("command") or ""),
+        supervise_command=str(plan.get("supervise_command") or ""),
+    )
+    assert action["kind"] == "arm-component"
+
+
+def test_genuine_supervise_argv_still_running(
+    isolated: tuple[Path, journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Executable-position supervise still binds as running."""
+    project, lease = isolated
+    genuine = wake.coverage_supervise_command(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    listing = [(4242, genuine)]
+    assert _state_from_listing(project, lease, listing) == wake.SUPERVISOR_RUNNING
+    with_u_parts = shlex.split(genuine)
+    with_u_parts.insert(1, "-u")
+    assert (
+        _state_from_listing(project, lease, [(4243, shlex.join(with_u_parts))])
+        == wake.SUPERVISOR_RUNNING
+    )
+    shebang = shlex.join(shlex.split(genuine)[1:])
+    assert (
+        _state_from_listing(project, lease, [(4244, shebang)])
+        == wake.SUPERVISOR_RUNNING
+    )
+    assert (
+        _state_from_listing(project, lease, [(4245, "env " + genuine)])
+        == wake.SUPERVISOR_RUNNING
+    )
+    plan = _persistent_shortfall_plan(project, lease, monkeypatch, listing)
+    assert plan["supervisor"] == wake.SUPERVISOR_RUNNING
+
+
+def test_unparsable_or_truncated_supervise_listing_is_unknown(
+    isolated: tuple[Path, journal.LeaseIdentity],
+) -> None:
+    """Unreadable executable position is UNKNOWN, never running or absent."""
+    project, lease = isolated
+    tail = shlex.join(_matching_supervise_tail(project, lease))
+    unparsable = (
+        "python3 scripts/goalflight_messages.py supervise "
+        f"--project-root {project} --controller-label {lease.label} "
+        f'--lease-nonce "{lease.nonce}'
+    )
+    truncated_python = "python3 --not-a-real-flag " + tail
+    wrapper = "mystery-wrapper " + tail
+    for command in (unparsable, truncated_python, wrapper):
+        state = _state_from_listing(project, lease, [(8, command)])
+        assert state == wake.SUPERVISOR_UNKNOWN, command
+        action = wake.supervisor_operator_action(state, component_command="MUST-NOT")
+        assert action["kind"] == "verify-supervisor"
+        assert action["command"] is None
+        assert "MUST-NOT" not in str(action["instruction"])
+
+
 def test_reminder_and_activity_surfaces_follow_the_plan(
     isolated: tuple[Path, journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
