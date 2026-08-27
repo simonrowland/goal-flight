@@ -16,7 +16,7 @@ auditable rather than a bulk delete.
 | battery-tool-v2 | battery-engine | — | | awaiting (notified late, see correction) |
 | battery-tool-v2 | battery-webui | — | | awaiting (notified late) |
 | pm2 | pm2-engine | **KEEP 1 · ABANDON 2** | 2026-08-27 | ★ KEEP = `t801-fix1` — LIVE AND RUNNING at reply time (do not drain; it is mid-fix-round on commit b1b0a9c). ABANDON `t800-pulse` (superseded id; the work ran as `t800-pulse2`, converged through a 3-round review arc, and MERGED to main at afdd67d — nothing lost) and `t702-rev-seam` (t-702 shipped in the engine-lane merge f2aa933 with its review set converged; the missing prompt file confirms it predates the current arc; re-derive from the store if ever wanted, never re-fire). |
-| pm2 | pm2-reports | — | | awaiting (notified late) |
+| pm2 | pm2-reports | **NOTHING TO CLAIM** | 2026-08-27 | Zero of the 16 pm2 rows carry their label. Verified their own live work by `ps` rather than by the status file, per the caveat. A clean nil return — distinct from silence, and recorded as an answer. |
 | regolith | regolith-engine | — | | awaiting (notified late) |
 | regolith | regolith-main | — | | awaiting |
 | goal-flight/kiln | kiln | — | | awaiting |
@@ -85,3 +85,12 @@ Corollary worth keeping: the two ALL-ABANDON replies received so far are
 honest for their OWN labels and must NOT be read as project-wide verdicts,
 however they are phrased. When recording a reply, record WHICH LABEL it speaks
 for, not which project it came from.
+
+
+## Note on nil returns
+
+`pm2-reports` answered NOTHING TO CLAIM after checking. That is an ANSWER, not
+silence, and it counts as consent for their label. Record nil returns
+explicitly — otherwise a later reader cannot distinguish "checked, owns none"
+from "never replied", and those have opposite implications for whether the
+window may close.
