@@ -11,8 +11,13 @@ auditable rather than a bulk delete.
 |---|---|---|---|---|
 | pm2 | pm2-bugs | **ALL ABANDON** | 2026-08-27 | Already re-submitted the one item they wanted as `bugs-b277b` (fresh id, current HEAD) — the intended shape: re-derive rather than re-fire. Their `bugs-b277a` queue record is therefore superseded, not lost. |
 | pm2 | pm2-main | — | | awaiting |
+| battery-tool-v2 | battery-bugs | **KEEP 2 · ABANDON 8 + 12 retired slices** | 2026-08-27 | Answered ONLY for rows carrying their own label; explicitly declined to speak for the other 34 rows. ★ KEEP = `codex-60942-1787841540` and `grok-code-70915-1787842258` — **LIVE AND RUNNING** at reply time. 2 more (`codex-69648`, `grok-code-84519`) already COMPLETE and harvested. Three abandons confirmed the thesis by measurement: the work LANDED after the record was queued. |
 | battery-tool-v2 | battery-main | — | | awaiting |
-| battery-tool-v2 | battery-bugs | — | | awaiting |
+| battery-tool-v2 | battery-engine | — | | awaiting (notified late, see correction) |
+| battery-tool-v2 | battery-webui | — | | awaiting (notified late) |
+| pm2 | pm2-engine | — | | awaiting (notified late) |
+| pm2 | pm2-reports | — | | awaiting (notified late) |
+| regolith | regolith-engine | — | | awaiting (notified late) |
 | regolith | regolith-main | — | | awaiting |
 | goal-flight/kiln | kiln | — | | awaiting |
 
@@ -31,3 +36,33 @@ auditable rather than a bulk delete.
    the text.
 5. The `_raw-snapshot/` copy is retained after the purge. It is the only
    durable record once `/tmp` is cleared, and it costs nothing to keep.
+
+
+## ★ PROCESS CORRECTION 2026-08-27 — I used the wrong unit of consent
+
+I sent the audit to one or two controllers PER PROJECT and wrote purge rule 1 as
+"purgeable once every controller notified for that project has responded". But
+the rows carry PER-CONTROLLER ownership: `battery-tool-v2.md` alone spans four
+controllers (main, engine, webui, bugs), and 34 of its 46 rows did not belong to
+either controller I notified. Under my own rule those rows would have expired on
+a sibling's silence — for work whose premise the responder could not even see.
+
+battery-bugs caught it by answering only for their own label and saying so.
+CORRECTED: battery-engine, battery-webui, pm2-engine, pm2-reports and
+regolith-engine were notified (5/5 delivered) with the correction stated.
+**Purge rule 1 is amended: the unit of consent is the OWNING CONTROLLER LABEL,
+not the project.** A label that was never notified cannot expire by silence.
+
+## ★★ THE LIVENESS CAVEAT EARNED ITS KEEP — A NEAR MISS
+
+battery-bugs reports that BOTH entries they kept (`codex-60942-1787841540`,
+`grok-code-70915-1787842258`) were inventoried with **claim-pid dead or none
+while the WORKER WAS ACTIVELY RUNNING** — one carrying ~390KB of tail and a
+steered lead, the other with a tail that moved 12s before they checked. Exactly
+caveat (2): filename-pid liveness is not worker liveness. Had we purged on the
+inventory's apparent liveness, we would have destroyed live work mid-flight.
+They add a durable operational fact: in their fleet the status file routinely
+reads `queued`/`pid=None` for a worker's ENTIRE run, and the only reliable check
+they have found is walking `ps` for the codex/grok `--cwd` argument and counting
+distinct PGIDs. (That status-file unreliability is another instance of the
+duplicated-authority class, t-373.)
