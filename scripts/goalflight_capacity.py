@@ -565,19 +565,30 @@ def _indeterminate_retention_open(
 ) -> bool:
     """True while an unprobeable holder is still inside the 7200s window.
 
-    Simplest correct bound (vs stamping indeterminate-since on first sight):
-    ``prune_state`` also feeds the non-persisted status VIEW, so a first-seen
-    stamp would reset on every poll and never elapse. Reuse the watcher stamp
-    ``accounted_live_until`` when ``retain_indeterminate_live_lease`` already
-    wrote it; otherwise derive the same window from ``expires_at`` (or
-    ``started_at``) plus ``INDETERMINATE_LIVE_RETENTION_S``. Those clocks are
-    already durable. A probe that cannot decide must not confer indefinite
-    protection; with no clock at all the hold is refused rather than infinite.
+    Premise: a probe of None is not death (must not reclaim a live worker)
+    and not life-forever (EPERM / foreign-pid reuse must not park a slot).
+    Confirmed-live never consults this helper.
+
+    Arithmetic: reuse the persisted watcher stamp ``accounted_live_until``
+    when present. Otherwise the origin is ``started_at`` (falling back to
+    ``expires_at`` only if the claim clock is missing) plus
+    ``INDETERMINATE_LIVE_RETENTION_S``. Those clocks are durable, so
+    ``prune_state``'s non-persisted status VIEW cannot refresh the window
+    the way a first-seen-at-now stamp would.
+
+    Foreign-pid-reuse cost: the slot is parked until claim+7200s (2h), not
+    claim+TTL+7200s (~10h at the 8h default), and
+    ``extend_active_lease_expiry`` cannot push the bound because it only
+    moves ``expires_at``.
+
+    Live-worker case: ``pid_liveness`` True holds until death; this bound
+    is never applied. A same-uid live worker probes True on POSIX. With no
+    clock at all the hold is refused rather than infinite.
     """
     until = parse_iso(lease.get("accounted_live_until"))
     if until is None:
-        origin = parse_iso(lease.get("expires_at")) or parse_iso(
-            lease.get("started_at")
+        origin = parse_iso(lease.get("started_at")) or parse_iso(
+            lease.get("expires_at")
         )
         if origin is None:
             return False
@@ -602,8 +613,8 @@ def _pid_holds_capacity(
 
     Confirmed live holds until death (boolean ``pid_alive`` stays conservative
     for kill/reap). Confirmed dead does not hold. Indeterminate holds only
-    inside ``INDETERMINATE_LIVE_RETENTION_S`` so EPERM/foreign-pid reuse cannot
-    park a slot for that process's lifetime.
+    inside the 7200s window derived by ``_indeterminate_retention_open`` so
+    EPERM/foreign-pid reuse cannot park a slot for that process's lifetime.
     """
     live = _probe_pid_liveness(pid)
     if live is True:
