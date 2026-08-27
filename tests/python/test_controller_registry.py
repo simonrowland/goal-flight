@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 
@@ -23,6 +24,7 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_journal as journal  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
+import goalflight_task as task  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 
 
@@ -208,6 +210,13 @@ def test_incarnation_state_names_live_overdue_without_calling_it_dead() -> None:
     missing = sessions._incarnation_state({}, lease_lock_live=True, now=now)
     assert missing == ("live-lock", True)
 
+    state, live = sessions._incarnation_state(overdue, lease_lock_live=None, now=now)
+    assert (state, live) == ("unknown-lock", None)
+    state, live = sessions._incarnation_state(healthy, lease_lock_live=None, now=now)
+    assert (state, live) == ("unknown-lock", None)
+    state, live = sessions._incarnation_state(ended, lease_lock_live=None, now=now)
+    assert (state, live) == ("ended", False)
+
 
 def test_list_controllers_shows_overdue_live_lock_and_names_renew(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -269,10 +278,12 @@ def test_list_controllers_dead_lock_stays_dead_when_deadline_elapsed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root = _isolate(monkeypatch, tmp_path)
-    registered = sessions.register_controller(root, "engine", session_id="engine-nonce")
-    assert registered["registered"] is True
+    _registered, holder = _hold_registered_lease(root, "engine", "engine-nonce")
+    holder.close()
     past = datetime.now(timezone.utc) - timedelta(minutes=70)
     _set_renew_deadline(root, "engine", past)
+    probe_state, _session = sessions.probe_live_session(root, label="engine")
+    assert probe_state == "dead"
     roster = sessions.controller_roster(root, ledger_records=[])
     record = roster["controllers"][0]
     assert record["incarnation_state"] == "dead-lock"
@@ -285,6 +296,120 @@ def test_list_controllers_dead_lock_stays_dead_when_deadline_elapsed(
     assert "dead-lock" in text
     assert "live-overdue" not in text
     assert "renew" not in text
+
+
+def test_roster_unreadable_lock_probe_is_unknown_not_dead(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """open_reader succeeds; probe_live_session is unreadable → unknown-lock.
+
+    Reverting the roster to ``live_session(...) is not None`` maps this
+    fixture to ``dead-lock``. An overdue live holder must not become
+    ``live-overdue`` either — that token requires a proven live lock.
+    """
+    root = _isolate(monkeypatch, tmp_path)
+    registered, holder = _hold_registered_lease(root, "engine", "engine-nonce")
+    nonce = registered["session"]["lease_nonce"]
+    lock_path = None
+    try:
+        past = datetime.now(timezone.utc) - timedelta(minutes=70)
+        _set_renew_deadline(root, "engine", past)
+        lock_path = _make_generation_lock_unreadable(root, "engine", nonce)
+        authority = journal.Journal.open_reader(root)
+        with task.FileLock(journal.journal_write_lock_path(authority.path)):
+            probe_state, session = sessions.probe_live_session(root, label="engine")
+            assert probe_state == "unreadable"
+            assert session is None
+            assert authority.lease_records()
+            roster = sessions.controller_roster(root, ledger_records=[])
+            text = _list_controllers_text(root)
+            json_buf = io.StringIO()
+            with redirect_stdout(json_buf):
+                code = sessions.main(
+                    ["--project-root", str(root), "--list-controllers", "--json"]
+                )
+        assert code == 0
+        assert roster["controllers"], "registry read must succeed under the write lock"
+        record = roster["controllers"][0]
+        assert record["incarnation_state"] == "unknown-lock"
+        assert record["lease_lock_live"] is None
+        assert record["incarnation_state"] != "dead-lock"
+        assert record["incarnation_state"] != "live-overdue"
+        line = sessions.controller_roster_lines(roster)[0]
+        assert "unknown-lock" in line
+        assert "dead-lock" not in line
+        assert "live-overdue" not in line
+        assert "unknown-lock" in text
+        assert "dead-lock" not in text
+        assert "no known controllers" not in text
+        payload = json.loads(json_buf.getvalue())
+        assert payload["controllers"][0]["incarnation_state"] == "unknown-lock"
+        assert payload["controllers"][0]["lease_lock_live"] is None
+    finally:
+        if lock_path is not None:
+            lock_path.chmod(0o600)
+        holder.close()
+
+
+def test_roster_busy_registry_is_unreadable_not_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Busy registry read must not render as an empty / 'no controllers' roster."""
+    root = _isolate(monkeypatch, tmp_path)
+    _registered, holder = _hold_registered_lease(root, "engine", "engine-nonce")
+    try:
+        authority = journal.Journal.open_reader(root)
+        with sqlite3.connect(
+            authority.path,
+            timeout=0,
+            isolation_level=None,
+        ) as blocker:
+            assert blocker.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+            blocker.execute("BEGIN EXCLUSIVE")
+            roster = sessions.controller_roster(root, ledger_records=[])
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = sessions.main(
+                    ["--project-root", str(root), "--list-controllers"]
+                )
+            text = buf.getvalue()
+            json_buf = io.StringIO()
+            with redirect_stdout(json_buf):
+                json_code = sessions.main(
+                    ["--project-root", str(root), "--list-controllers", "--json"]
+                )
+        assert code == 0
+        assert json_code == 0
+        registry = roster["measurements"]["controller_registry"]
+        assert registry["measured"] is False
+        assert registry["error"] == "JournalBusy"
+        lines = sessions.controller_roster_lines(roster)
+        assert lines
+        assert "unreadable" in lines[0]
+        assert "no known controllers" not in lines[0]
+        assert "no known controllers" not in text
+        assert "unreadable" in text
+        payload = json.loads(json_buf.getvalue())
+        assert payload["measurements"]["controller_registry"]["measured"] is False
+        assert payload["measurements"]["controller_registry"]["error"] == "JournalBusy"
+        assert "no known controllers" not in json_buf.getvalue()
+    finally:
+        holder.close()
+
+
+def test_roster_disappeared_journal_is_honest_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _isolate(monkeypatch, tmp_path)
+    roster = sessions.controller_roster(root, ledger_records=[])
+    assert roster["controllers"] == []
+    registry = roster["measurements"]["controller_registry"]
+    assert registry["measured"] is True
+    assert registry["error"] is None
+    assert sessions.controller_roster_lines(roster) == []
+    text = _list_controllers_text(root)
+    assert "no known controllers" in text
+    assert "unreadable" not in text
 
 
 def _reaped_principal() -> dict:
