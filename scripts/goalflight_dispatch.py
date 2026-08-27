@@ -5009,7 +5009,11 @@ def _attempt_claiming_worker_argv(
         # tracking. Preserve that pre-P2 seam without bootstrapping authority
         # behind the embedding's back.
         return worker_argv, False
-    attempt = goalflight_journal.Journal(project_root).attempt_for_dispatch(dispatch_id)
+    # Peek-only: the RUNNING CAS lives in the unsandboxed watcher. A writer
+    # Journal() would take the construction write lock on the launch path.
+    attempt = goalflight_journal.Journal.open_reader(project_root).attempt_for_dispatch(
+        dispatch_id
+    )
     if attempt is None:
         if _record_ledger is not _NATIVE_RECORD_LEDGER:
             # Controller registration can create the journal independently of
@@ -5874,9 +5878,11 @@ def _queue_launch_token(entry: dict | None = None) -> str:
         if dispatch_id and project_root:
             resolved_root = goalflight_task.resolve_project_root(str(project_root))
             if os.path.lexists(goalflight_journal.resolve_journal_path(resolved_root)):
-                attempt = goalflight_journal.Journal(resolved_root).attempt_for_dispatch(
-                    dispatch_id
-                )
+                # Peek-only reuse of a still-PREPARED attempt. Read errors must
+                # still escape before the carrier is claimed; open_reader does.
+                attempt = goalflight_journal.Journal.open_reader(
+                    resolved_root
+                ).attempt_for_dispatch(dispatch_id)
                 if (
                     attempt is not None
                     and attempt.lifecycle_state == goalflight_journal.ATTEMPT_PREPARED

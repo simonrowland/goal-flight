@@ -298,6 +298,81 @@ def test_native_ledger_missing_attempt_still_refuses_worker_launch(
         )
 
 
+def _forbid_writer_journal(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    recorded: list[dict] = []
+    real_open_reader = D.goalflight_journal.Journal.open_reader
+
+    def tracking_open_reader(cls, project_root, **kwargs):  # type: ignore[no-untyped-def]
+        recorded.append(dict(kwargs))
+        return real_open_reader(project_root, **kwargs)
+
+    def forbid_writer(*_args, **_kwargs):
+        raise AssertionError("launch peek used writer Journal()")
+
+    monkeypatch.setattr(
+        D.goalflight_journal.Journal,
+        "open_reader",
+        classmethod(tracking_open_reader),
+    )
+    monkeypatch.setattr(D.goalflight_journal.Journal, "__init__", forbid_writer)
+    return recorded
+
+
+def _assert_reader_peek_budget(kwargs: dict) -> None:
+    retry = float(
+        kwargs.get(
+            "retry_budget_s",
+            D.goalflight_journal.JOURNAL_READER_RETRY_BUDGET_S,
+        )
+    )
+    assert retry <= D.goalflight_journal.JOURNAL_READER_RETRY_BUDGET_S
+    assert retry < D.goalflight_journal.JOURNAL_WRITER_RETRY_BUDGET_S
+
+
+def test_attempt_claiming_worker_argv_peeks_through_open_reader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    authority = D.goalflight_journal.open_or_create_journal(tmp_path)
+    prepared = authority.prepare_attempt("peek-start")
+    assert prepared.committed and prepared.value is not None
+    started = authority.start_attempt(
+        prepared.value.attempt_id,
+        prepared.value.launch_token,
+        expected_launch_epoch=prepared.value.launch_epoch,
+    )
+    assert started.committed
+    recorded = _forbid_writer_journal(monkeypatch)
+    argv, claimed = D._attempt_claiming_worker_argv(
+        tmp_path,
+        "peek-start",
+        [sys.executable, "-c", "pass"],
+    )
+    assert claimed is True
+    assert argv == [sys.executable, "-c", "pass"]
+    assert recorded
+    _assert_reader_peek_budget(recorded[0])
+
+
+def test_queue_launch_token_peeks_through_open_reader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    authority = D.goalflight_journal.open_or_create_journal(tmp_path)
+    prepared = authority.prepare_attempt("peek-queue")
+    assert prepared.committed and prepared.value is not None
+    recorded = _forbid_writer_journal(monkeypatch)
+    token = D._queue_launch_token(
+        {
+            "dispatch_id": "peek-queue",
+            "project_root": str(tmp_path),
+        }
+    )
+    assert token == prepared.value.launch_token
+    assert recorded
+    _assert_reader_peek_budget(recorded[0])
+
+
 def test_bash_resolve_none_preserves_inherited_environment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

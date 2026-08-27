@@ -580,6 +580,55 @@ def case_unprobeable_retained_scope_reclaims_after_until() -> None:
     assert open_data["leases"][still_open["lease_id"]]["state"] == "active"
 
 
+def case_in_ttl_indeterminate_holder_is_bounded_from_started_at() -> None:
+    """In-TTL EPERM holder uses started_at+7200s, not expires_at+7200s.
+
+    Default-TTL lease, foreign-pid reuse while expires_at is still future:
+    the hold must elapse at claim+7200s even after sleep-extend pushes
+    expires_at. prune_state must not TTL-expire the still-in-TTL row.
+    """
+    foreign = _indeterminate_foreign_pid()
+    dead_controller = _dead_pid()
+    now = cap.utc_now()
+    retention = cap.INDETERMINATE_LIVE_RETENTION_S
+
+    inside = {
+        "lease_id": "in-ttl-inside-window",
+        "agent": "codex",
+        "state": "active",
+        "worker_pid": foreign,
+        "controller_pid": dead_controller,
+        "mem_mb": 386,
+        "started_at": cap.iso(now - dt.timedelta(seconds=30)),
+        "expires_at": cap.iso(now + dt.timedelta(hours=8)),
+    }
+    inside_data = {"leases": {inside["lease_id"]: inside}, "cooldowns": {}}
+    assert inside not in cap.stale_active_leases(inside_data), (
+        "in-TTL indeterminate holder inside started_at+retention was stale"
+    )
+
+    aged = {
+        "lease_id": "in-ttl-past-window",
+        "agent": "codex",
+        "state": "active",
+        "worker_pid": foreign,
+        "controller_pid": dead_controller,
+        "mem_mb": 386,
+        "started_at": cap.iso(now - dt.timedelta(seconds=retention + 120)),
+        # Sleep-extend has already pushed TTL further into the future.
+        "expires_at": cap.iso(now + dt.timedelta(hours=10)),
+    }
+    aged_data = {"leases": {aged["lease_id"]: aged}, "cooldowns": {}}
+    assert aged in cap.stale_active_leases(aged_data), (
+        "in-TTL indeterminate holder past started_at+retention was not stale"
+    )
+    cap.prune_state(aged_data)
+    survivor = aged_data["leases"].get(aged["lease_id"])
+    assert survivor is not None and survivor["state"] == "active", (
+        "in-TTL lease was TTL-expired by the non-persisted prune view"
+    )
+
+
 def case_dead_worker_reclaimed_inside_indeterminate_retention() -> None:
     """ESRCH / confirmed-dead is still reclaimed promptly, not after 7200s."""
     lease = _past_ttl_lease(worker_pid=_dead_pid(), controller_pid=_dead_pid())
@@ -1649,6 +1698,7 @@ def main() -> None:
     case_indeterminate_holder_bounded_not_indefinite()
     case_live_worker_survives_past_indeterminate_retention()
     case_unprobeable_retained_scope_reclaims_after_until()
+    case_in_ttl_indeterminate_holder_is_bounded_from_started_at()
     case_dead_worker_reclaimed_inside_indeterminate_retention()
     case_stale_active_leases_live_worker_not_stale_with_dead_controller()
     case_empty_state_dir_falls_back_not_cwd()
