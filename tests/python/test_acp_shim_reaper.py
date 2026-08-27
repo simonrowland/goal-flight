@@ -312,7 +312,7 @@ def case_process_state_timeout_fails_closed() -> None:
         "goalflight_acp_client.subprocess.run",
         side_effect=goalflight_acp_client.subprocess.TimeoutExpired("ps", 5.0),
     ), patch("goalflight_compat.pid_alive", return_value=False), patch(
-        "goalflight_acp_client._pgid_alive", return_value=True
+        "goalflight_acp_client._pgid_liveness", return_value=True
     ):
         assert goalflight_acp_client._termination_targets_live(pid=101, pgid=101)
 

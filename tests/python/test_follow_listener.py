@@ -60,7 +60,7 @@ def isolated(
     ps_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     ps_shim.chmod(0o755)
     env["PATH"] = f"{ps_dir}:{env.get('PATH', '')}"
-    monkeypatch.setattr(wake, "_process_listing", lambda: [])
+    monkeypatch.setattr(wake, "_process_listing", lambda **_kwargs: [])
     for key, value in env.items():
         if key.startswith("GOAL") or key in {"PYTHONUNBUFFERED", "PATH"}:
             monkeypatch.setenv(key, value)
@@ -687,7 +687,7 @@ def test_every_record_is_structural_and_below_pipe_buf_with_long_frontier(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(wake, "_process_listing", lambda: [])
+    monkeypatch.setattr(wake, "_process_listing", lambda **_kwargs: [])
     frontier = messages._follow_frontier_record(
         {
             "id": "t-very-long-frontier",
@@ -1917,11 +1917,11 @@ def test_detached_watchdog_uses_detected_supervisor_ownership(
         monkeypatch.setattr(
             wake,
             "_process_listing",
-            lambda: [(4242, supervise_command)],
+            lambda **_kwargs: [(4242, supervise_command)],
         )
     else:
         monkeypatch.setenv("GOALFLIGHT_SUPERVISED", "1")
-        monkeypatch.setattr(wake, "_process_listing", lambda: [])
+        monkeypatch.setattr(wake, "_process_listing", lambda **_kwargs: [])
 
     code = messages._cmd_watch_follow(
         SimpleNamespace(timeout_s=2),
@@ -1974,7 +1974,7 @@ def test_supervised_watchdog_stdout_loss_during_orphan_grace_restarts_supervisor
     def register_tracked(*args, **kwargs):
         return TrackedWaiter(real_register(*args, **kwargs))
 
-    def listing_after_release():
+    def listing_after_release(**_kwargs):
         assert released, "watchdog recovery was emitted before lock release"
         return []
 
