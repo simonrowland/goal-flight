@@ -856,6 +856,16 @@ def _authority_snapshot(
             )
         )
 
+    # Sidecar state is a watcher heartbeat, not a second lifecycle authority.
+    # Once the ledger row is structurally terminal, ignore sidecar lifecycle
+    # fields the same way status overlay and --wait already do. Recency of a
+    # heartbeat means the watcher is alive, not that finished work reopened.
+    # pid / heartbeat / trace still come from the sidecar elsewhere.
+    ledger_terminal = any(
+        goalflight_dispatch_states.is_terminal_state(record.get(key))
+        for key in ("state", "terminal_state", "classification")
+    )
+
     status_field = None
     status_value = None
     status_matches = (
@@ -863,7 +873,7 @@ def _authority_snapshot(
         and bool(record.get("dispatch_id"))
         and status.get("dispatch_id") == record.get("dispatch_id")
     )
-    if status_matches:
+    if status_matches and not ledger_terminal:
         assert isinstance(status, dict)
         for field in ("terminal_pending_state", "terminal_state", "state"):
             if _state_evidence(status.get(field)) is not None:
@@ -927,7 +937,9 @@ def _authority_snapshot(
 
     # A status sidecar is structurally newer only when both sources carry an
     # observation time and the sidecar's is later. Otherwise disagreement is
-    # honestly unresolved rather than guessed away.
+    # honestly unresolved rather than guessed away. This branch is already
+    # gated on a non-terminal ledger: a newer heartbeat must not reopen
+    # finished work.
     if status_field is not None:
         assert isinstance(status, dict)
         status_time = _parse_timestamp((status or {}).get("heartbeat_at"))
