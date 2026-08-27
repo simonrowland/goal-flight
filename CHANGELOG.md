@@ -8,6 +8,22 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- `goalflight_ledger.py reconcile-outbox` no longer promotes a sidecar's
+  terminal verdict (`failed` / `idle_timeout` / `complete`) into journal and
+  ledger terminal authority while the recorded worker identity (pid + start
+  token, never pid alone) still matches a live process. A terminal sidecar is
+  a statement about the dispatch channel, not the worker; terminalizing a live
+  worker frees its capacity lease and makes its worktree look unowned to GC.
+  When liveness cannot be determined (no recorded identity fields, unreadable
+  process table) the verdict is UNKNOWN and also holds — terminalizing is the
+  destructive direction, so doubt resolves against the write (deliberately the
+  opposite default from admission control). A held verdict is never silent:
+  reconcile records a durable `sidecar_terminal_overruled` journal attention
+  item (reason `worker_identity_live` / `worker_identity_unknown`) and lists
+  it in the result JSON's new `overruled` field. A genuinely dead worker —
+  identity gone, or the pid now belongs to a different process — terminalizes
+  exactly as before, and records or journal attempts that are already terminal
+  still re-commit idempotently so the repair path is not stranded.
 - `goalflight_journal_gc.py` no longer retains a proven-root-gone journal
   forever just because it holds non-terminal dispatch records that can never
   reconcile (reconciliation runs from the project root). Such journals are now

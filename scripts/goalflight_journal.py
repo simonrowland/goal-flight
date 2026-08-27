@@ -4186,6 +4186,96 @@ class Journal:
         )
         return [dict(row) for row in rows]
 
+    def record_system_attention(
+        self,
+        *,
+        item_type: str,
+        reason: str,
+        dedupe_namespace: str,
+        dedupe_key: str,
+        payload: Mapping[str, object],
+    ) -> WriteResult[dict[str, object]]:
+        """Record one operator-visible system anomaly, idempotently.
+
+        The durable surface for journal-observed faults that are not tied to a
+        controller lease; the outbox projector's ``terminal_outbox_quarantined``
+        item is the in-module precedent. ``dedupe_namespace``/``dedupe_key``
+        pin the item id, so a repeated observation lands exactly one OPEN row
+        plus one quiet attention-stream delivery event. The delivery stays
+        quiet on purpose: a waking ``*`` broadcast would pop a sibling's live
+        slot, and operator surfaces read ``attention_items()`` rather than the
+        wake class.
+        """
+        item_type = self._state_token(item_type, label="attention item_type")
+        reason = self._identity_token(reason, label="attention reason")
+        namespace = self._identity_token(dedupe_namespace, label="dedupe_namespace")
+        key = str(dedupe_key or "")
+        if not key or len(key) > 512:
+            raise ValueError("dedupe_key must be non-empty and bounded")
+        item_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"goalflight:{namespace}:{key}"))
+        payload_json = self._json_object(
+            {**dict(payload), "item_id": item_id, "type": item_type},
+            label="system_attention_payload",
+        )
+        now = utc_now()
+
+        def action(connection: sqlite3.Connection) -> dict[str, object]:
+            inserted = connection.execute(
+                """
+                INSERT OR IGNORE INTO system_attention_items (
+                    item_id, project_root, item_type, state, reason,
+                    payload_json, wake_class, created_at
+                ) VALUES (?, ?, ?, 'OPEN', ?, ?, 'waking', ?)
+                """,
+                (
+                    item_id,
+                    str(self.project_root),
+                    item_type,
+                    reason,
+                    payload_json,
+                    now,
+                ),
+            )
+            next_seq = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(stream_seq), 0) + 1
+                    FROM delivery_events
+                    WHERE project_root = ? AND recipient_label = '*'
+                      AND stream_id = 'attention'
+                    """,
+                    (str(self.project_root),),
+                ).fetchone()[0]
+            )
+            delivered = connection.execute(
+                """
+                INSERT OR IGNORE INTO delivery_events (
+                    project_root, recipient_label, origin_node, event_uuid,
+                    stream_id, stream_seq, carrier_path, event_type,
+                    wake_class, created_at, projected_at
+                ) VALUES (?, '*', 'journal', ?, 'attention', ?, ?,
+                          'controller_attention', 'quiet', ?, ?)
+                """,
+                (
+                    str(self.project_root),
+                    item_id,
+                    next_seq,
+                    f"journal:{namespace}:{item_id}",
+                    now,
+                    now,
+                ),
+            )
+            if delivered.rowcount == 1:
+                self._invalidate_delivery_cursor_snapshots(
+                    connection,
+                    project_root=str(self.project_root),
+                    recipient_label="*",
+                    updated_at=now,
+                )
+            return {"item_id": item_id, "created": bool(inserted.rowcount == 1)}
+
+        return self._domain_write(action)
+
     def attempt_for_dispatch(self, dispatch_id: str) -> AttemptIdentity | None:
         dispatch = self._identity_token(dispatch_id, label="dispatch_id")
         rows = self.read_all(

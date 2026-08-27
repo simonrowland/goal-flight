@@ -388,6 +388,25 @@ def identity_matches(record: dict) -> tuple[bool, str]:
     return False, reason
 
 
+def worker_identity_liveness(record: dict) -> tuple[str, str]:
+    """Three-state worker liveness: ``live`` / ``dead`` / ``unknown``, plus reason.
+
+    ``identity_matches`` already collapses every maybe-live reading (coarse
+    identity, a missing lstart side) to ``live``. What remains genuinely
+    indeterminate is an absent recorded identity (``no_pid``) or a failed
+    process-table probe (``identity_indeterminate``); those map to ``unknown``,
+    never to ``dead`` -- "could not find out" is not non-existence. A pid that
+    now belongs to a different process (``pid_reused_*``) is ``dead``: the
+    recorded worker is gone even though the pid number survives.
+    """
+    matched, reason = identity_matches(record)
+    if reason in {"no_pid", "identity_indeterminate"}:
+        return "unknown", reason
+    if matched:
+        return "live", reason
+    return "dead", reason
+
+
 def _is_detached_controller_dead_record(record: dict) -> bool:
     if not record.get("detached"):
         return False
@@ -1150,6 +1169,63 @@ def cmd_finish(args: argparse.Namespace) -> int:
     return 0
 
 
+def _record_sidecar_overrule(
+    authority: goalflight_journal.Journal,
+    record: dict,
+    *,
+    state: str,
+    reason: object,
+    terminal_state: str,
+    liveness: str,
+    liveness_reason: str,
+    observed_at: str,
+) -> dict[str, object]:
+    """Surface a held sidecar verdict as a durable journal attention item.
+
+    The sidecar said terminal and the recorded worker identity disagreed (or
+    could not be read). The reconciler holds journal/ledger non-terminal; this
+    is the visible half of that decision, so a sidecar verdict is never
+    silently dropped. One OPEN item per (dispatch, sidecar state, liveness)
+    via the deterministic item id; repeat reconciles do not pile up rows.
+    """
+    dispatch_id = str(record.get("dispatch_id") or "")
+    payload = goalflight_output_redact.redact_data(
+        {
+            "dispatch_id": dispatch_id,
+            "sidecar_state": state,
+            "terminal_state": terminal_state,
+            "sidecar_reason": reason,
+            "liveness": liveness,
+            "liveness_reason": liveness_reason,
+            "worker_pid": record.get("worker_pid"),
+            "observed_at": observed_at,
+            "text": (
+                f"sidecar verdict '{terminal_state}' for {dispatch_id} not "
+                f"promoted: worker identity is {liveness} ({liveness_reason}); "
+                "journal and ledger left non-terminal"
+            ),
+        }
+    )
+    write = authority.record_system_attention(
+        item_type="sidecar_terminal_overruled",
+        reason=f"worker_identity_{liveness}",
+        dedupe_namespace="sidecar-terminal-overruled",
+        dedupe_key=f"{dispatch_id}:{state}:{liveness}",
+        payload=payload,
+    )
+    return {
+        "dispatch_id": dispatch_id,
+        "sidecar_state": state,
+        "terminal_state": terminal_state,
+        "liveness": liveness,
+        "liveness_reason": liveness_reason,
+        "worker_pid": record.get("worker_pid"),
+        "attention_item_id": (
+            str(write.value["item_id"]) if write.committed and write.value else None
+        ),
+    }
+
+
 def reconcile_terminal_outbox(
     project_root: Path | str,
     *,
@@ -1185,6 +1261,7 @@ def reconcile_terminal_outbox(
     already_terminal = 0
     retryable = 0
     cas_lost = 0
+    overruled: list[dict[str, object]] = []
     history_records: list[dict] = []
     records = read_records()
     known_dispatch_ids = {
@@ -1287,7 +1364,61 @@ def reconcile_terminal_outbox(
                 or status_observation.get("state")
             )
             reason = status_observation.get("reason") or status_observation.get("error")
+            record_terminal_key = terminal_state
             terminal_state = terminal_state_for(state, reason)
+            # Process identity outranks a sidecar verdict. A terminal sidecar
+            # (failed / idle_timeout / complete) is a statement about the
+            # dispatch channel, not about the worker: watchers write
+            # idle_timeout after the worker already did its work, and a
+            # status-write-error mirror says failed while the worker runs on.
+            # While the recorded identity (pid AND start token, never pid
+            # alone) still matches a live process, promoting the sidecar would
+            # terminalize a running worker -- first-terminal-wins poisons the
+            # journal, frees the capacity lease, and the worktree-GC ownership
+            # predicate (keyed on non-terminal ledger state) would read the
+            # tree as unowned. Hold instead, and surface the disagreement as
+            # an attention item: a silently ignored sidecar is its own defect.
+            #
+            # Three-state: when liveness cannot be determined (no recorded
+            # identity fields, unreadable process table) the verdict is
+            # UNKNOWN and UNKNOWN holds. Terminalizing is the destructive
+            # direction, so doubt resolves against the write. This is
+            # deliberately the opposite default from admission control, which
+            # treats an unproven worker as not reusable: there the cheap error
+            # is a blocked reuse, here the expensive error is a terminal write
+            # over live work. A genuinely dead worker -- identity gone, or the
+            # pid now belongs to a different process -- still terminalizes
+            # below, exactly as before.
+            #
+            # The gate applies only to the FIRST terminal write. When the
+            # record or the journal attempt is already terminal, the terminal
+            # authority has already fired: the re-commit below is idempotent
+            # and first-terminal-wins keeps the original verdict, so a
+            # disagreeing sidecar cannot overwrite it. Gating that path would
+            # strand the ledger/journal repair this reconciler exists to do.
+            if record_terminal_key in {"", "unknown", "watcher_stopped"}:
+                attempt = authority.attempt_for_dispatch(str(record["dispatch_id"]))
+                attempt_final = (
+                    attempt is not None
+                    and attempt.lifecycle_state
+                    in goalflight_journal.ATTEMPT_FINAL_STATES
+                )
+                if not attempt_final:
+                    liveness, liveness_reason = worker_identity_liveness(record)
+                    if liveness != "dead":
+                        overruled.append(
+                            _record_sidecar_overrule(
+                                authority,
+                                record,
+                                state=state,
+                                reason=reason,
+                                terminal_state=terminal_state,
+                                liveness=liveness,
+                                liveness_reason=liveness_reason,
+                                observed_at=reconcile_at,
+                            )
+                        )
+                        continue
         elif expired_launch:
             state = "abandoned"
             terminal_state = "abandoned"
@@ -1385,6 +1516,7 @@ def reconcile_terminal_outbox(
         "already_terminal": already_terminal,
         "cas_lost": cas_lost,
         "retryable": retryable,
+        "overruled": overruled,
         "projected": len(projected),
     }
 
