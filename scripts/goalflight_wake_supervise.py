@@ -44,6 +44,17 @@ STREAM_LINE_MAX_BYTES = 511
 PERMANENT_UNARMED_FAULTS = 3
 TRANSIENT_DETECTOR_FAILURE_LIMIT = 3
 TRANSIENT_DETECTOR_RETRY_S = 0.01
+# EAGAIN/EWOULDBLOCK on a nonblocking stdout write is "no current pipe
+# capacity", not peer loss. A live controller can pause 100ms–2s while
+# scheduling another turn; two 10ms sleeps (~20ms) cannot tell that pause
+# from a dead reader. A dead reader keeps the pipe full forever AND
+# typically raises POLLHUP/closed stdout (the b-248 detectors). Bound
+# consecutive no-progress EAGAIN by wall clock: 5s is above a 2s
+# scheduling pause and far below the follow-child 120s death detector
+# and the 1500s supervisor heartbeat, so a live reader can drain without
+# delaying genuine peer-loss past existing watchdog bounds. False from
+# _stdio_peer_gone remains no evidence, never proof of liveness.
+STDOUT_BACKPRESSURE_BUDGET_S = 5.0
 DEFAULT_SUPERVISOR_HEARTBEAT_S = 25.0 * 60.0
 MIN_SUPERVISOR_HEARTBEAT_S = 60.0
 MAX_SUPERVISOR_HEARTBEAT_S = 30.0 * 60.0
@@ -415,7 +426,7 @@ def _abandon_stdout_write(host: SuperviseHost) -> None:
 
 def _write_stdout(host: SuperviseHost, line: str, *, source: str) -> bool:
     """Write through the shared detector, retrying only known transients."""
-    bounded_failures = 0
+    backpressure_started: float | None = None
     while True:
         progress_before = getattr(host, "stdout_write_progress", None)
         try:
@@ -437,17 +448,47 @@ def _write_stdout(host: SuperviseHost, line: str, *, source: str) -> bool:
                     and isinstance(progress_after, int)
                     and progress_after > progress_before
                 ):
-                    bounded_failures = 0
-                bounded_failures += 1
-                if bounded_failures < TRANSIENT_DETECTOR_FAILURE_LIMIT:
+                    backpressure_started = None
+                now = time.monotonic()
+                if backpressure_started is None:
+                    backpressure_started = now
+                # Positive peer-gone evidence is terminal immediately.
+                # False from stdio_peer_gone is no evidence, not liveness.
+                peer_gone = False
+                probe = getattr(host, "stdio_peer_gone", None)
+                if callable(probe):
+                    try:
+                        peer_gone = bool(probe())
+                    except (
+                        AttributeError,
+                        OSError,
+                        TypeError,
+                        ValueError,
+                    ):
+                        peer_gone = False
+                if peer_gone:
+                    _report_stdout_detector(
+                        host,
+                        source=source,
+                        outcome="peer-gone",
+                        detail=(
+                            "controlling stdout closed during "
+                            "backpressured write"
+                        ),
+                    )
+                    _abandon_stdout_write(host)
+                    return False
+                elapsed = now - backpressure_started
+                if elapsed < STDOUT_BACKPRESSURE_BUDGET_S:
                     _report_stdout_detector(
                         host,
                         source=source,
                         outcome="unknown",
                         detail=(
-                            "stdout write temporarily unavailable; retrying "
-                            f"({bounded_failures}/"
-                            f"{TRANSIENT_DETECTOR_FAILURE_LIMIT})"
+                            "stdout write has no current capacity "
+                            f"({error_name}); retrying "
+                            f"({elapsed:.3f}s/"
+                            f"{STDOUT_BACKPRESSURE_BUDGET_S:.3f}s)"
                         ),
                     )
                     time.sleep(TRANSIENT_DETECTOR_RETRY_S)
@@ -457,9 +498,9 @@ def _write_stdout(host: SuperviseHost, line: str, *, source: str) -> bool:
                     source=source,
                     outcome="unavailable",
                     detail=(
-                        "stdout write failed after "
-                        f"{bounded_failures} consecutive {error_name} attempts: "
-                        f"{exc}"
+                        "stdout write stalled for "
+                        f"{elapsed:.3f}s under consecutive {error_name} "
+                        f"with no peer-gone evidence: {exc}"
                     ),
                     error=error_name,
                 )
