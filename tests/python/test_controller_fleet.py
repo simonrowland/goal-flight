@@ -16,6 +16,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -1275,3 +1277,123 @@ def test_peek_labels_in_two_named_journals_stay_two_rows(
         assert row["label"] == "armtest"
     _assert_no_live_row_carries_retire(payload)
     del a_reg, b_reg, a_nonce, b_nonce
+
+
+def test_transient_journal_busy_renders_controllers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A lock that covers the first peek(s) must not collapse the project."""
+    _isolate(monkeypatch, tmp_path)
+    root = _git_project(tmp_path, "namedproj")
+    registered, holder, nonce = _hold_registered_lease(root, "alice", "alice-nonce")
+    waiter = _arm_listener(root, "alice", nonce)
+    journal_path = journal.resolve_journal_path(root)
+    release = threading.Event()
+    started = threading.Event()
+    errors: list[BaseException] = []
+
+    def hold_until_release() -> None:
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                journal_path,
+                timeout=0,
+                isolation_level=None,
+            )
+            mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+            assert mode is not None and mode[0] == "delete"
+            connection.execute("BEGIN EXCLUSIVE")
+            started.set()
+            if not release.wait(timeout=10):
+                raise TimeoutError("fleet reader never signalled release")
+            connection.execute("COMMIT")
+        except BaseException as exc:
+            errors.append(exc)
+            started.set()
+        finally:
+            if connection is not None:
+                connection.close()
+
+    holder_thread = threading.Thread(target=hold_until_release)
+    holder_thread.start()
+    assert started.wait(timeout=5)
+    result: dict[str, object] = {}
+
+    def run_tool() -> None:
+        result["code"], result["text"] = _run(["--json"])
+
+    runner = threading.Thread(target=run_tool)
+    runner.start()
+    # First peek(s) must observe the genuine exclusive lock; then free it.
+    time.sleep(0.05)
+    release.set()
+    runner.join(timeout=10)
+    holder_thread.join(timeout=5)
+    waiter.close()
+    holder.close()
+    assert errors == []
+    assert runner.is_alive() is False
+    assert result.get("code") == 0
+    payload = json.loads(str(result["text"]))
+    row = _row_for(payload, "alice")
+    assert row["project"] == "namedproj"
+    assert row["label"] == "alice"
+    assert row["state"] in {"live", "live-overdue"}
+    assert row["bucket"] != "unknown"
+    unlabeled = [
+        item
+        for item in payload["controllers"]
+        if item.get("project") == "namedproj" and not item.get("label")
+    ]
+    assert unlabeled == []
+    _assert_no_live_row_carries_retire(payload)
+    del registered
+    del nonce
+
+
+def test_permanently_busy_journal_reports_retry_exhausted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A lock that never drops must terminate with the retry-exhausted reason."""
+    _isolate(monkeypatch, tmp_path)
+    root = _git_project(tmp_path, "namedproj")
+    registered, holder, nonce = _hold_registered_lease(root, "alice", "alice-nonce")
+    busy_journal = journal.resolve_journal_path(root)
+    try:
+        with sqlite3.connect(
+            busy_journal,
+            timeout=0,
+            isolation_level=None,
+        ) as blocker:
+            assert blocker.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+            blocker.execute("BEGIN EXCLUSIVE")
+            started = time.monotonic()
+            json_code, json_text = _run(["--json"])
+            elapsed = time.monotonic() - started
+        assert json_code == 0
+        assert elapsed < 2.0
+        payload = json.loads(json_text)
+        rows = payload["controllers"]
+        named = [row for row in rows if row.get("project") == "namedproj"]
+        assert len(named) == 1
+        row = named[0]
+        assert row["label"] is None
+        assert row["state"] == "unknown"
+        assert row["bucket"] == "unknown"
+        assert row["retire_command"] is None
+        reason = row["unknown_reason"] or ""
+        match = re.search(
+            r"busy after (\d+) attempts over (\d+)ms",
+            reason,
+        )
+        assert match is not None, reason
+        assert int(match.group(1)) == controllers.FLEET_JOURNAL_BUSY_ATTEMPTS
+        assert int(match.group(2)) >= 1
+        assert "JournalUpgradeRequired" not in reason
+        assert "JournalBusy" not in reason.split(" at ", 1)[0]
+        assert "retirement refused" in reason
+        assert not controllers.is_contentless_row(row)
+    finally:
+        holder.close()
+    del registered
+    del nonce

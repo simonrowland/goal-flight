@@ -28,6 +28,8 @@ import re
 import shlex
 import sqlite3
 import sys
+import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -92,6 +94,20 @@ _RETIREMENT_REFUSED = "; retirement refused until it resolves"
 _JOURNAL_SLUG_HASH = re.compile(r"^(.+)-([0-9a-f]{10})$")
 _GENERIC_JOURNAL_SLUGS = frozenset({"project", "root", "repo", "tmp", "Users", "user"})
 _CONTENTLESS_LABELS = frozenset({"", "unknown", "—"})
+_BUSY_ERROR = "JournalBusy"
+# b-241 measured writer construction under 64-way contention on this
+# machine: median 0.202s, tail 3.725s (N=7, so p95 equals the max by
+# construction — the 3.7s point is a single trial, not a distribution).
+# This fleet reader retries at most 6 times with 50ms sleeps
+# (JOURNAL_OPEN_RETRY_INITIAL_S): 250ms of backoff covers the median
+# hold plus one extra sample. It does not take the journal write lock
+# and does not widen JOURNAL_READER_RETRY_BUDGET_S (1.0s) or
+# JOURNAL_WRITER_RETRY_BUDGET_S (5.0s); those ceilings were sized from
+# the same sweep. Chasing the 3.7s tail would stall the table on the
+# projects that contend most. A still-busy journal then terminates with
+# an honest retry-exhausted reason instead of hanging.
+FLEET_JOURNAL_BUSY_ATTEMPTS = 6
+FLEET_JOURNAL_BUSY_BACKOFF_S = 0.050
 
 
 def _utc_now() -> datetime:
@@ -112,10 +128,43 @@ def peek_journal_project_roots(path: Path) -> tuple[list[str] | None, str | None
     return roots, None
 
 
-def peek_active_lease_identities(
+def _busy_retry_exhausted_reason(attempts: int, started: float) -> str:
+    elapsed_ms = max(1, int(round((time.monotonic() - started) * 1000)))
+    return f"busy after {attempts} attempts over {elapsed_ms}ms"
+
+
+def _retry_journal_busy(
+    read_once: Callable[[], tuple[Any, str | None]],
+) -> tuple[Any, str | None]:
+    """Retry a fleet journal read through a short bounded busy window.
+
+    Structural errors (``JournalUpgradeRequired``, ``OperationalError``,
+    disappearance, I/O) return on the first attempt. ``JournalBusy`` is
+    the only retryable class. The loop is capped by both attempt count
+    and ``JOURNAL_READER_RETRY_BUDGET_S`` so a fenced roster whose inner
+    reader already spent that 1s budget cannot stack another window.
+    """
+    started = time.monotonic()
+    deadline = started + goalflight_journal.JOURNAL_READER_RETRY_BUDGET_S
+    attempts = 0
+    while True:
+        attempts += 1
+        value, error = read_once()
+        if error != _BUSY_ERROR:
+            return value, error
+        now = time.monotonic()
+        if attempts >= FLEET_JOURNAL_BUSY_ATTEMPTS or now >= deadline:
+            return None, _busy_retry_exhausted_reason(attempts, started)
+        remaining = deadline - now
+        if remaining <= 0:
+            return None, _busy_retry_exhausted_reason(attempts, started)
+        time.sleep(min(FLEET_JOURNAL_BUSY_BACKOFF_S, remaining))
+
+
+def _peek_active_lease_identities_once(
     path: Path,
 ) -> tuple[list[tuple[str, str]] | None, str | None]:
-    """Read-only sqlite peek of current-generation (project_root, label) pairs."""
+    """One read-only sqlite peek. ``JournalBusy`` is retryable at the caller."""
     connection: sqlite3.Connection | None = None
     try:
         connection = goalflight_journal._open_readonly_connection(
@@ -137,13 +186,13 @@ def peek_active_lease_identities(
                 pairs.append((root, label))
         return pairs, None
     except goalflight_journal.JournalBusy:
-        return None, "JournalBusy"
+        return None, _BUSY_ERROR
     except goalflight_journal.JournalError as exc:
         return None, type(exc).__name__
     except sqlite3.OperationalError as exc:
         message = str(exc).lower()
         if any(marker in message for marker in ("locked", "busy")):
-            return None, "JournalBusy"
+            return None, _BUSY_ERROR
         return None, type(exc).__name__
     except sqlite3.Error as exc:
         return None, type(exc).__name__
@@ -152,6 +201,45 @@ def peek_active_lease_identities(
     finally:
         if connection is not None:
             connection.close()
+
+
+def peek_active_lease_identities(
+    path: Path,
+) -> tuple[list[tuple[str, str]] | None, str | None]:
+    """Read-only sqlite peek of current-generation (project_root, label) pairs."""
+    return _retry_journal_busy(lambda: _peek_active_lease_identities_once(path))
+
+
+def _fenced_roster_once(
+    probe_root: Path,
+    ledger_records: list[dict] | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """One fenced roster read. ``JournalBusy`` is retryable at the caller."""
+    try:
+        roster = sessions.controller_roster(
+            probe_root,
+            include_retired=False,
+            ledger_records=ledger_records,
+        )
+    except goalflight_journal.JournalBusy:
+        return None, _BUSY_ERROR
+    except (
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+        goalflight_journal.JournalUpgradeRequired,
+        goalflight_journal.JournalError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
+        return None, type(exc).__name__
+    registry = (roster.get("measurements") or {}).get("controller_registry") or {}
+    if registry.get("measured") is False:
+        error = str(registry.get("error") or "unreadable").strip() or "unreadable"
+        if error == _BUSY_ERROR:
+            return None, _BUSY_ERROR
+        return roster, error
+    return roster, None
 
 
 def canonical_project_root(raw: Path | str | None) -> Path | None:
@@ -794,7 +882,7 @@ def collect_controller_rows(
     ledger_records: list[dict] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    roster_cache: dict[str, dict[str, Any] | BaseException] = {}
+    roster_cache: dict[str, dict[str, Any] | str] = {}
     files = goalflight_journal.iter_journal_files()
     for path in files:
         pairs, peek_error = peek_active_lease_identities(path)
@@ -844,31 +932,23 @@ def collect_controller_rows(
         probe_token = str(probe_root)
         cached = roster_cache.get(probe_token)
         if cached is None:
-            try:
-                cached = sessions.controller_roster(
-                    probe_root,
-                    include_retired=False,
-                    ledger_records=ledger_records,
-                )
-            except (
-                goalflight_journal.JournalBusy,
-                goalflight_journal.JournalDisappeared,
-                goalflight_journal.JournalIOError,
-                goalflight_journal.JournalUpgradeRequired,
-                goalflight_journal.JournalError,
-                OSError,
-                RuntimeError,
-                ValueError,
-            ) as exc:
-                cached = exc
+            roster, roster_error = _retry_journal_busy(
+                lambda: _fenced_roster_once(probe_root, ledger_records)
+            )
+            if roster_error:
+                cached = roster_error
+            elif roster is None:
+                cached = "unreadable"
+            else:
+                cached = roster
             roster_cache[probe_token] = cached
-        if isinstance(cached, BaseException):
+        if isinstance(cached, str):
             rows.extend(
                 _peeked_label_unknown_rows(
                     pairs,
                     project_root=canonical,
                     journal_path=path,
-                    reason=f"journal unreadable ({type(cached).__name__})",
+                    reason=f"journal unreadable ({cached})",
                 )
             )
             continue
