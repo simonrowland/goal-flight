@@ -314,7 +314,7 @@ def test_lstart_without_comm_remains_a_recorded_identity() -> None:
 def test_fine_start_token_survives_snapshot_and_watcher_projection(monkeypatch) -> None:
     goalflight_compat = goalflight_ledger.goalflight_compat
     monkeypatch.setattr(goalflight_compat, "is_windows", lambda: False)
-    monkeypatch.setattr(goalflight_compat, "pid_alive", lambda _pid: True)
+    monkeypatch.setattr(goalflight_compat, "pid_liveness", lambda _pid: True)
     monkeypatch.setattr(
         goalflight_compat,
         "process_start_identity",

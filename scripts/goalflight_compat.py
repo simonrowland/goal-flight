@@ -65,6 +65,7 @@ __all__ = [
     "LOCK_NB",
     "LOCK_UN",
     "flock",
+    "pid_liveness",
     "pid_alive",
     "pid_is_zombie",
     "process_identity_matches",
@@ -946,8 +947,12 @@ def resolve_gstack_browse_bin() -> Path | None:
 # POSIX: os.kill(pid, 0) (unchanged). Windows: OpenProcess +                  #
 # GetExitCodeProcess -- NEVER os.kill(pid, 0). ctypes, zero wheels.          #
 # --------------------------------------------------------------------------- #
-def pid_alive(pid) -> bool:
-    """True if ``pid`` is a live process. Non-destructive on every platform."""
+def pid_liveness(pid) -> bool | None:
+    """Probe ``pid`` without collapsing an unavailable probe into death.
+
+    ``True`` means the process is live, ``False`` means it is known not to
+    exist, and ``None`` means the platform probe could not decide.
+    """
     try:
         pid = int(pid)
     except (TypeError, ValueError):
@@ -956,15 +961,14 @@ def pid_alive(pid) -> bool:
         return False
 
     if not is_windows():
-        # Any OSError (ProcessLookupError, PermissionError, ...) -> not alive.
-        # This matches the historical per-site `except OSError: return False`
-        # behavior exactly, so POSIX liveness stays byte-identical to the
-        # pre-port code (goal-flight pids are same-user, so PermissionError does
-        # not arise here in practice).
         try:
             os.kill(pid, 0)
-        except OSError:
+        except ProcessLookupError:
             return False
+        except OSError as exc:
+            if exc.errno == errno.ESRCH:
+                return False
+            return None
         return True
 
     # Windows: query-only handle + exit code. A handle can still open a
@@ -1004,6 +1008,17 @@ def pid_alive(pid) -> bool:
         return code.value == STILL_ACTIVE
     finally:  # pragma: no cover
         kernel32.CloseHandle(handle)
+
+
+def pid_alive(pid) -> bool:
+    """Boolean compatibility view of :func:`pid_liveness`.
+
+    Existing callers retain their ``bool`` contract. An indeterminate probe is
+    conservatively live here so a boolean-only caller cannot authorize cleanup
+    from missing evidence. Liveness code that needs the distinction uses
+    :func:`pid_liveness` directly.
+    """
+    return pid_liveness(pid) is not False
 
 
 def _darwin_process_bsd_info(pid: int) -> dict[str, int] | None:
