@@ -31,8 +31,10 @@ ROOT = Path(__file__).resolve().parents[2]
 # here leaks into later modules in the same pytest process.
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import goalflight_acp_run as A  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
+import goalflight_review_job as R  # noqa: E402
 
 
 pytestmark = pytest.mark.skipif(
@@ -177,6 +179,78 @@ def _status_payload(tmp_path: Path, dispatch_id: str) -> dict:
 
 def _ledger_record(dispatch_id: str) -> dict:
     return json.loads(L.record_path(dispatch_id).read_text(encoding="utf-8"))
+
+
+def _acp_cfg(dispatch_id: str) -> argparse.Namespace:
+    return argparse.Namespace(
+        prompt_id=None,
+        prompt=None,
+        task_ids=[],
+        agent="codex",
+        account="default",
+        request_envelope=None,
+        session_id=dispatch_id,
+        engine_session_id=None,
+        queue_launch_token=None,
+    )
+
+
+def _record_acp(
+    cfg: argparse.Namespace,
+    project: Path,
+    tmp_path: Path,
+    *,
+    dispatch_id: str,
+    worker_pid,
+    state: str,
+    payload: dict | None = None,
+) -> dict | None:
+    body = payload if payload is not None else {"dispatch_id": dispatch_id, "state": state}
+    return A._record_acp_ledger_state(
+        cfg,
+        dispatch_id=dispatch_id,
+        project_root=project,
+        controller_pid=None,
+        controller_session_id=None,
+        controller_label=None,
+        status_path=tmp_path / f"{dispatch_id}.status.json",
+        payload=body,
+        effective_account=None,
+        lease_id=None,
+        worker_pid=worker_pid,
+        state=state,
+    )
+
+
+def _review_args(project: Path, tmp_path: Path, name: str) -> argparse.Namespace:
+    prompt = tmp_path / f"{name}.prompt.md"
+    prompt.write_text("review this\n", encoding="utf-8")
+    return argparse.Namespace(
+        agent="codex",
+        name=name,
+        repo=str(project),
+        prompt=str(prompt),
+    )
+
+
+def _record_review(
+    args: argparse.Namespace,
+    tmp_path: Path,
+    *,
+    dispatch_id: str,
+    worker_pid,
+    state: str,
+) -> dict | None:
+    return R._record_review_ledger_state(
+        args,
+        dispatch_id=dispatch_id,
+        lease_id=None,
+        stdout_path=tmp_path / f"{dispatch_id}.stdout.jsonl",
+        stderr_path=tmp_path / f"{dispatch_id}.stderr.log",
+        status_path=tmp_path / f"{dispatch_id}.status.json",
+        state=state,
+        worker_pid=worker_pid,
+    )
 
 
 def test_worker_spawn_state_none_is_not_unknown() -> None:
@@ -438,6 +512,143 @@ def test_indeterminate_spawn_state_takes_the_safe_branch(
     assert "DISPATCH-LEDGER-WARN" in capsys.readouterr().err
     assert "export" in export_calls
     assert "registry" in export_calls
+
+
+def test_acp_spawned_worker_genuine_refusal_writes_status_and_warns(
+    tmp_path: Path,
+    spawned_worker: subprocess.Popen,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """ACP copy of the spawn split: post-spawn refusal warns and writes status."""
+    project = tmp_path / "project"
+    project.mkdir()
+    dispatch_id = "t377-acp-genuine-refusal"
+    cfg = _acp_cfg(dispatch_id)
+    _record_acp(
+        cfg, project, tmp_path, dispatch_id=dispatch_id, worker_pid=None, state="starting"
+    )
+    capsys.readouterr()
+
+    cfg.queue_launch_token = "bogus-token"
+    warning = _record_acp(
+        cfg,
+        project,
+        tmp_path,
+        dispatch_id=dispatch_id,
+        worker_pid=spawned_worker.pid,
+        state="running",
+    )
+
+    assert warning is not None
+    assert warning["disposition"] == "cas_lost"
+    assert warning["spawn_state"] == "spawned"
+    status = _status_payload(tmp_path, dispatch_id)
+    assert status["ledger_record_warning"]["disposition"] == "cas_lost"
+    assert status["spawn_state"] == "spawned"
+    err = capsys.readouterr().err
+    assert "goalflight_acp_run: WARN:" in err
+    assert "cas_lost" in err
+    assert f"pid {spawned_worker.pid}" in err
+    assert str(tmp_path / f"{dispatch_id}.status.json") in err
+
+
+def test_acp_no_worker_spawned_refusal_still_raises(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """ACP copy: no worker + refusal still raises and skips the status write."""
+    project = tmp_path / "project"
+    project.mkdir()
+    dispatch_id = "t377-acp-no-worker"
+    cfg = _acp_cfg(dispatch_id)
+    _record_acp(
+        cfg, project, tmp_path, dispatch_id=dispatch_id, worker_pid=None, state="starting"
+    )
+    capsys.readouterr()
+
+    cfg.queue_launch_token = "bogus-token"
+    with pytest.raises(RuntimeError, match="journal attempt transition refused"):
+        _record_acp(
+            cfg,
+            project,
+            tmp_path,
+            dispatch_id=dispatch_id,
+            worker_pid=None,
+            state="running",
+        )
+
+    assert not (tmp_path / f"{dispatch_id}.status.json").exists()
+    assert "goalflight_acp_run: WARN:" not in capsys.readouterr().err
+
+
+def test_review_spawned_worker_genuine_refusal_warns_without_raising(
+    tmp_path: Path,
+    spawned_worker: subprocess.Popen,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Review copy: post-spawn refusal warns and returns; the caller writes status.
+
+    The helper itself does not write status.json (unlike ACP/dispatch). That is
+    the production split: main() folds the warning into the status payload it
+    writes immediately after spawn. Equivalence is the spawn_state branch, not
+    which frame performs the write.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    dispatch_id = "t377-review-genuine-refusal"
+    args = _review_args(project, tmp_path, "t377-review-genuine")
+    _record_review(
+        args, tmp_path, dispatch_id=dispatch_id, worker_pid=None, state="starting"
+    )
+    capsys.readouterr()
+
+    # Real CAS loss: a second record with a different engine is refused by the
+    # journal, not by a stubbed helper.
+    args.agent = "claude"
+    warning = _record_review(
+        args,
+        tmp_path,
+        dispatch_id=dispatch_id,
+        worker_pid=spawned_worker.pid,
+        state="running",
+    )
+
+    assert warning is not None
+    assert warning["disposition"] == "cas_lost"
+    assert warning["spawn_state"] == "spawned"
+    assert not (tmp_path / f"{dispatch_id}.status.json").exists()
+    stdout_path = tmp_path / f"{dispatch_id}.stdout.jsonl"
+    stderr_path = tmp_path / f"{dispatch_id}.stderr.log"
+    err = capsys.readouterr().err
+    assert "goalflight_review_job: WARN:" in err
+    assert "cas_lost" in err
+    assert f"pid {spawned_worker.pid}" in err
+    assert str(stdout_path) in err
+    assert str(stderr_path) in err
+
+
+def test_review_no_worker_spawned_refusal_still_raises(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Review copy: no worker + refusal still raises."""
+    project = tmp_path / "project"
+    project.mkdir()
+    dispatch_id = "t377-review-no-worker"
+    args = _review_args(project, tmp_path, "t377-review-none")
+    _record_review(
+        args, tmp_path, dispatch_id=dispatch_id, worker_pid=None, state="starting"
+    )
+    capsys.readouterr()
+
+    args.agent = "claude"
+    with pytest.raises(RuntimeError, match="journal attempt transition refused"):
+        _record_review(
+            args, tmp_path, dispatch_id=dispatch_id, worker_pid=None, state="running"
+        )
+
+    assert not (tmp_path / f"{dispatch_id}.status.json").exists()
+    assert "goalflight_review_job: WARN:" not in capsys.readouterr().err
 
 
 def test_importing_this_module_does_not_mutate_acp_python_env(

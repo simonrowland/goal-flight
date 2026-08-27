@@ -527,6 +527,113 @@ def _failure_error_with_stderr(state: str, stderr: str) -> dict[str, str] | None
     }
 
 
+def _record_review_ledger_state(
+    args: argparse.Namespace,
+    *,
+    dispatch_id: str,
+    lease_id: str | None,
+    stdout_path: Path,
+    stderr_path: Path,
+    status_path: Path,
+    state: str,
+    worker_pid: int | None = None,
+) -> dict | None:
+    """Record one review lifecycle state through the journal authority.
+
+    Returns None when the record committed. When the journal refuses the
+    transition but a worker process was spawned, the refusal is a
+    bookkeeping problem, not evidence about the worker: the refusal is
+    surfaced LOUDLY on stderr and the warning payload is returned so the
+    caller can fold it into the status file it writes next. Only when no
+    worker was spawned does a refusal raise, unchanged.
+    """
+
+    spawn_state = goalflight_ledger.worker_spawn_state(worker_pid)
+
+    def _record_once() -> tuple[int, dict | None]:
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            code = goalflight_ledger.cmd_record(
+                argparse.Namespace(
+                    dispatch_id=dispatch_id,
+                    prompt_id=args.name,
+                    prompt_path=args.prompt,
+                    agent=args.agent,
+                    transport="file-backed-review",
+                    project_root=args.repo,
+                    controller_pid=os.getpid(),
+                    controller_session_id=None,
+                    controller_label=None,
+                    worker_pid=worker_pid if spawn_state == "spawned" else None,
+                    acp_session_id=None,
+                    logical_session_id=None,
+                    lease_id=lease_id,
+                    stdout_path=str(stdout_path),
+                    stderr_path=str(stderr_path),
+                    status_path=str(status_path),
+                    state=state,
+                    json=True,
+                )
+            )
+        return code, goalflight_ledger.parse_record_refusal(capture.getvalue())
+
+    record_code, refusal = _record_once()
+    if (
+        record_code != 0
+        and spawn_state != "none"
+        and goalflight_ledger.is_retryable_startup_race(refusal)
+    ):
+        # The worker claims RUNNING asynchronously after spawn, so "not
+        # yet" becomes "yes" on its own within the worker's startup.
+        # Re-record against a bounded deadline BEFORE deciding anything
+        # else. Budget derivation:
+        # goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S.
+        record_code, refusal = goalflight_ledger.retry_record_after_startup_race(
+            _record_once,
+            record_code,
+            refusal,
+            project_root=args.repo,
+            dispatch_id=dispatch_id,
+            timeout_s=goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S,
+        )
+    if record_code != 0:
+        if spawn_state == "none":
+            # No worker process exists, so a refused transition is a
+            # genuine launch failure. Unchanged behaviour.
+            raise RuntimeError(
+                f"journal attempt transition refused for {dispatch_id}: exit {record_code}"
+            )
+        # A worker was spawned (or spawn state is indeterminate, which
+        # takes the same safe branch): warn loudly and let the caller's
+        # status write proceed, carrying the refusal with it.
+        warning = {
+            "kind": "journal_attempt_transition_refused",
+            "exit_code": record_code,
+            "disposition": (refusal or {}).get("disposition"),
+            "retryable": (refusal or {}).get("retryable"),
+            "error": (refusal or {}).get("error"),
+            "state": state,
+            "spawn_state": spawn_state,
+            "detail": (
+                "worker process was spawned but the journal transition was "
+                "refused; bookkeeping is incomplete, the worker may be "
+                "alive — do not blind-retry this dispatch"
+            ),
+        }
+        print(
+            "goalflight_review_job: WARN: journal attempt transition "
+            f"refused for {dispatch_id} after worker spawn "
+            f"(pid {worker_pid}, stdout {stdout_path}, stderr {stderr_path}): "
+            f"disposition={warning['disposition']} "
+            f"error={warning['error']}; worker may be alive; bookkeeping "
+            "incomplete",
+            file=sys.stderr,
+            flush=True,
+        )
+        return warning
+    return None
+
+
 def command_for(args: argparse.Namespace) -> list[str]:
     if args.agent == "codex":
         final = Path(args.output_dir) / f"{args.name}.final.md"
@@ -756,100 +863,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     def record_review_state(state: str, worker_pid: int | None = None) -> dict | None:
-        """Record one review lifecycle state through the journal authority.
-
-        Returns None when the record committed. When the journal refuses the
-        transition but a worker process was spawned, the refusal is a
-        bookkeeping problem, not evidence about the worker: the refusal is
-        surfaced LOUDLY on stderr and the warning payload is returned so the
-        caller can fold it into the status file it writes next. Only when no
-        worker was spawned does a refusal raise, unchanged.
-        """
-
-        spawn_state = goalflight_ledger.worker_spawn_state(worker_pid)
-
-        def _record_once() -> tuple[int, dict | None]:
-            capture = io.StringIO()
-            with contextlib.redirect_stdout(capture):
-                code = goalflight_ledger.cmd_record(
-                    argparse.Namespace(
-                        dispatch_id=dispatch_id,
-                        prompt_id=args.name,
-                        prompt_path=args.prompt,
-                        agent=args.agent,
-                        transport="file-backed-review",
-                        project_root=args.repo,
-                        controller_pid=os.getpid(),
-                        controller_session_id=None,
-                        controller_label=None,
-                        worker_pid=worker_pid if spawn_state == "spawned" else None,
-                        acp_session_id=None,
-                        logical_session_id=None,
-                        lease_id=lease_id,
-                        stdout_path=str(stdout_path),
-                        stderr_path=str(stderr_path),
-                        status_path=str(status_path),
-                        state=state,
-                        json=True,
-                    )
-                )
-            return code, goalflight_ledger.parse_record_refusal(capture.getvalue())
-
-        record_code, refusal = _record_once()
-        if (
-            record_code != 0
-            and spawn_state != "none"
-            and goalflight_ledger.is_retryable_startup_race(refusal)
-        ):
-            # The worker claims RUNNING asynchronously after spawn, so "not
-            # yet" becomes "yes" on its own within the worker's startup.
-            # Re-record against a bounded deadline BEFORE deciding anything
-            # else. Budget derivation:
-            # goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S.
-            record_code, refusal = goalflight_ledger.retry_record_after_startup_race(
-                _record_once,
-                record_code,
-                refusal,
-                project_root=args.repo,
-                dispatch_id=dispatch_id,
-                timeout_s=goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S,
-            )
-        if record_code != 0:
-            if spawn_state == "none":
-                # No worker process exists, so a refused transition is a
-                # genuine launch failure. Unchanged behaviour.
-                raise RuntimeError(
-                    f"journal attempt transition refused for {dispatch_id}: exit {record_code}"
-                )
-            # A worker was spawned (or spawn state is indeterminate, which
-            # takes the same safe branch): warn loudly and let the caller's
-            # status write proceed, carrying the refusal with it.
-            warning = {
-                "kind": "journal_attempt_transition_refused",
-                "exit_code": record_code,
-                "disposition": (refusal or {}).get("disposition"),
-                "retryable": (refusal or {}).get("retryable"),
-                "error": (refusal or {}).get("error"),
-                "state": state,
-                "spawn_state": spawn_state,
-                "detail": (
-                    "worker process was spawned but the journal transition was "
-                    "refused; bookkeeping is incomplete, the worker may be "
-                    "alive — do not blind-retry this dispatch"
-                ),
-            }
-            print(
-                "goalflight_review_job: WARN: journal attempt transition "
-                f"refused for {dispatch_id} after worker spawn "
-                f"(pid {worker_pid}, stdout {stdout_path}, stderr {stderr_path}): "
-                f"disposition={warning['disposition']} "
-                f"error={warning['error']}; worker may be alive; bookkeeping "
-                "incomplete",
-                file=sys.stderr,
-                flush=True,
-            )
-            return warning
-        return None
+        return _record_review_ledger_state(
+            args,
+            dispatch_id=dispatch_id,
+            lease_id=lease_id,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            status_path=status_path,
+            state=state,
+            worker_pid=worker_pid,
+        )
 
     def finish_review_state(state: str, reason: object) -> int:
         code = 2
