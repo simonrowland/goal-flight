@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+import textwrap
 
 import pytest
 
@@ -541,43 +542,288 @@ def test_connect_stops_after_one_attempt_when_shared_deadline_is_spent(
     assert attempts == [100.0]
 
 
+def _exception_names(node: ast.expr | None) -> list[str]:
+    if isinstance(node, ast.Name):
+        return [node.id]
+    if isinstance(node, ast.Attribute):
+        return [node.attr]
+    if isinstance(node, ast.Tuple):
+        return [name for item in node.elts for name in _exception_names(item)]
+    return []
+
+
+def _expr_is_none(node: ast.expr) -> bool:
+    return isinstance(node, ast.Constant) and node.value is None
+
+
+def _expr_is_empty_list(node: ast.expr) -> bool:
+    return isinstance(node, ast.List) and not node.elts
+
+
+def _expr_is_false(node: ast.expr) -> bool:
+    return isinstance(node, ast.Constant) and node.value is False
+
+
+def _call_direct_values(call: ast.Call) -> list[ast.expr]:
+    values: list[ast.expr] = []
+    for arg in call.args:
+        if not isinstance(arg, ast.Starred):
+            values.append(arg)
+    for keyword in call.keywords:
+        if keyword.arg is not None:
+            values.append(keyword.value)
+    return values
+
+
+def _uses_name(tree: ast.AST, name: str) -> bool:
+    return any(
+        isinstance(node, ast.Name) and node.id == name for node in ast.walk(tree)
+    )
+
+
+def _handler_maps_unavailable_to_unknown(handler: ast.ExceptHandler) -> bool:
+    """True when the handler fails closed into unknown, or re-raises.
+
+    The exemption is earned by what the body *does*, not by a comment,
+    decorator, or helper name. Safe shapes:
+
+    - a single ``raise`` / ``raise <bound name>`` (propagate)
+    - a single ``return <call>(..., None, ...)`` that threads the bound
+      exception into that result and does not also pass ``[]`` or ``False``
+
+    ``return []``, ``return False``, ``return None``, ``pass``, ``continue``,
+    and ``return fail_closed_unknown(exc)`` (a name with no unknown slot)
+    do not qualify: they invent a definite outcome or hide the mapping
+    behind a convention the next author can copy blindly.
+    """
+    if len(handler.body) != 1:
+        return False
+    stmt = handler.body[0]
+    if isinstance(stmt, ast.Raise):
+        if stmt.exc is None:
+            return True
+        return (
+            handler.name is not None
+            and isinstance(stmt.exc, ast.Name)
+            and stmt.exc.id == handler.name
+        )
+    if not isinstance(stmt, ast.Return) or stmt.value is None:
+        return False
+    value = stmt.value
+    if not isinstance(value, ast.Call):
+        return False
+    if handler.name is None or not _uses_name(value, handler.name):
+        return False
+    direct_values = _call_direct_values(value)
+    has_unknown_slot = any(_expr_is_none(item) for item in direct_values)
+    has_definite_answer = any(
+        _expr_is_empty_list(item) or _expr_is_false(item) for item in direct_values
+    )
+    return has_unknown_slot and not has_definite_answer
+
+
+def availability_handler_violations(tree: ast.AST, *, path_name: str) -> list[str]:
+    """AST scan: handlers must name concrete availability subtypes.
+
+    Catching ``JournalUnavailable`` is forbidden unless the handler's shape
+    maps the ABC to an indeterminate result so a *future subclass* fails
+    closed into unknown rather than escaping. Returning a definite answer
+    (empty list, False, None-as-absent, or pass) still violates. The
+    JournalError-widening rule is separate and has no such exemption:
+    a handler naming ``JournalError`` must still already name Busy,
+    Disappeared, and IOError.
+    """
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try):
+            named_before: set[str] = set()
+            for handler in node.handlers:
+                names = set(_exception_names(handler.type))
+                if "JournalError" in names and not {
+                    "JournalBusy",
+                    "JournalDisappeared",
+                    "JournalIOError",
+                } <= named_before | names:
+                    violations.append(
+                        f"{path_name}:{handler.lineno}: JournalError widens availability"
+                    )
+                named_before.update(names)
+        elif isinstance(node, ast.ExceptHandler):
+            if "JournalUnavailable" in _exception_names(node.type):
+                if not _handler_maps_unavailable_to_unknown(node):
+                    violations.append(
+                        f"{path_name}:{node.lineno}: except JournalUnavailable"
+                    )
+        elif isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+            if "JournalUnavailable" in _exception_names(node.exc.func):
+                violations.append(f"{path_name}:{node.lineno}: raise JournalUnavailable")
+    return violations
+
+
 def test_journal_unavailable_handlers_name_concrete_subclasses() -> None:
-    """No handler or producer may flatten the three availability outcomes."""
+    """No handler or producer may flatten the three availability outcomes.
 
-    def exception_names(node: ast.expr | None) -> list[str]:
-        if isinstance(node, ast.Name):
-            return [node.id]
-        if isinstance(node, ast.Attribute):
-            return [node.attr]
-        if isinstance(node, ast.Tuple):
-            return [name for item in node.elts for name in exception_names(item)]
-        return []
-
+    The one production exemption is a fail-closed ABC catch whose body
+    returns unknown (see availability_handler_violations). A definite
+    answer at such a site must still fail this test.
+    """
     violations: list[str] = []
     for path in sorted(SCRIPTS.glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Try):
-                named_before: set[str] = set()
-                for handler in node.handlers:
-                    names = set(exception_names(handler.type))
-                    if "JournalError" in names and not {
-                        "JournalBusy",
-                        "JournalDisappeared",
-                        "JournalIOError",
-                    } <= named_before | names:
-                        violations.append(
-                            f"{path.name}:{handler.lineno}: JournalError widens availability"
-                        )
-                    named_before.update(names)
-            elif isinstance(node, ast.ExceptHandler):
-                if "JournalUnavailable" in exception_names(node.type):
-                    violations.append(f"{path.name}:{node.lineno}: except JournalUnavailable")
-            elif isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
-                if "JournalUnavailable" in exception_names(node.exc.func):
-                    violations.append(f"{path.name}:{node.lineno}: raise JournalUnavailable")
-
+        violations.extend(
+            availability_handler_violations(tree, path_name=path.name)
+        )
     assert violations == []
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_needle"),
+    (
+        (
+            """
+            def fn():
+                try:
+                    read()
+                except JournalUnavailable as exc:
+                    return Lookup(sessions=None, unreadable_reason=str(exc))
+            """,
+            None,
+        ),
+        (
+            """
+            def fn():
+                try:
+                    read()
+                except JournalUnavailable:
+                    raise
+            """,
+            None,
+        ),
+        (
+            """
+            def fn():
+                try:
+                    read()
+                except JournalUnavailable as exc:
+                    raise exc
+            """,
+            None,
+        ),
+        (
+            """
+            def fn():
+                try:
+                    read()
+                except JournalUnavailable:
+                    pass
+            """,
+            "except JournalUnavailable",
+        ),
+        (
+            """
+            def fn():
+                try:
+                    read()
+                except JournalUnavailable:
+                    return []
+            """,
+            "except JournalUnavailable",
+        ),
+        (
+            """
+            def fn():
+                try:
+                    read()
+                except JournalUnavailable:
+                    return False
+            """,
+            "except JournalUnavailable",
+        ),
+        (
+            """
+            def fn():
+                try:
+                    read()
+                except JournalUnavailable:
+                    return None
+            """,
+            "except JournalUnavailable",
+        ),
+        (
+            """
+            def fn():
+                try:
+                    read()
+                except JournalUnavailable as exc:
+                    return Lookup(sessions=[])
+            """,
+            "except JournalUnavailable",
+        ),
+        (
+            """
+            def fn():
+                try:
+                    read()
+                except JournalUnavailable as exc:
+                    return Lookup(sessions=None)
+            """,
+            "except JournalUnavailable",
+        ),
+        (
+            """
+            def fn():
+                try:
+                    read()
+                except JournalUnavailable as exc:
+                    return Lookup(sessions=[], unreadable_reason=str(exc))
+            """,
+            "except JournalUnavailable",
+        ),
+        (
+            """
+            def fn():
+                try:
+                    read()
+                except JournalUnavailable as exc:
+                    return fail_closed_unknown(exc)
+            """,
+            "except JournalUnavailable",
+        ),
+        (
+            """
+            def fn():
+                while True:
+                    try:
+                        read()
+                    except JournalUnavailable:
+                        continue
+            """,
+            "except JournalUnavailable",
+        ),
+        (
+            """
+            def fn():
+                try:
+                    read()
+                except JournalError as exc:
+                    return Lookup(sessions=None, unreadable_reason=str(exc))
+            """,
+            "JournalError widens availability",
+        ),
+    ),
+)
+def test_journal_unavailable_abc_exemption_is_earned_by_unknown_shape(
+    source: str,
+    expected_needle: str | None,
+) -> None:
+    """A definite ABC catch still violates; only unknown/propagate is exempt."""
+    tree = ast.parse(textwrap.dedent(source), filename="snippet.py")
+    violations = availability_handler_violations(tree, path_name="snippet.py")
+    if expected_needle is None:
+        assert violations == []
+    else:
+        assert violations, f"expected a violation containing {expected_needle!r}"
+        assert any(expected_needle in item for item in violations), violations
 
 
 def test_attention_items_use_one_bounded_journal_read(
