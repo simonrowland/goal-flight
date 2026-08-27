@@ -7,10 +7,17 @@ Rules:
 - one leased worktree seat per concurrent chunk
 - local ACP dispatch uses `scripts/goalflight_acp_run.py --worktree create`
   for `execute --parallel N` when `N >= 2`
+- `goalflight_dispatch.py --worktree <base>` acquires a pooled seat prepared
+  at git ref `<base>` and runs the worker there (bash and ACP). `--cwd` is
+  unchanged when `--worktree` is omitted
 - sequential dispatch (`--parallel 1` or no flag) stays in the project root
 - seats are the lazy, fixed range `worktrees/wt-1` … `worktrees/wt-N`; `N`
-  defaults to 4 and is set deliberately per repository with
-  `GOALFLIGHT_WORKTREE_SEATS`
+  defaults to 24 and is a per-repository checkout ceiling, not a
+  per-controller worker cap. Override with `GOALFLIGHT_WORKTREE_SEATS`
+- after a worker branch is merged into the integration branch, reclaim
+  ad-hoc (non-pool) worktrees with
+  `python3 scripts/goalflight_worktree_gc.py --into main` (report) or
+  `--apply` (remove). `wt-N` pool seats are never litter.
 - the configured range is a hard ceiling: a dispatch fails with every held
   seat and occupant dispatch id named when no kernel lock is available; there
   is no force-new escape hatch

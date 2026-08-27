@@ -322,6 +322,21 @@ def test_parent_release_keeps_inherited_worker_lease_until_worker_dies() -> None
                 proc.wait(timeout=10)
 
 
+def test_default_seat_count_is_not_a_per_controller_cap() -> None:
+    assert_true(
+        "default is the documented checkout ceiling",
+        goalflight_worktree_pool.DEFAULT_WORKTREE_SEATS == 24,
+    )
+    assert_true(
+        "wt-1 is a pool seat",
+        goalflight_worktree_pool.is_pool_seat_path("/repo/worktrees/wt-1"),
+    )
+    assert_true(
+        "ad-hoc task tree is not a pool seat",
+        not goalflight_worktree_pool.is_pool_seat_path("/repo/worktrees/t-353-live"),
+    )
+
+
 def main() -> None:
     tests = [
         test_hard_ceiling_is_lazy_and_reuses_seats,
@@ -329,6 +344,7 @@ def main() -> None:
         test_dirty_seat_is_quarantined_then_reset_on_acquire,
         test_sigkill_releases_kernel_lease_without_cleanup,
         test_parent_release_keeps_inherited_worker_lease_until_worker_dies,
+        test_default_seat_count_is_not_a_per_controller_cap,
     ]
     for test in tests:
         test()

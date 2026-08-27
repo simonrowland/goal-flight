@@ -1259,6 +1259,13 @@ def cmd_finish(args: argparse.Namespace) -> int:
         # Like the terminal outbox projection, history is derived and repaired
         # by the producer's slow catch-up sweep.
         pass
+    try:
+        import goalflight_trace_archive
+
+        goalflight_trace_archive.archive_finished_dispatch(record, apply=True)
+    except Exception:
+        # Archive is best-effort. A full disk must not fail a terminal commit.
+        pass
     print(json.dumps({
         "ok": True,
         "dispatch_id": args.dispatch_id,

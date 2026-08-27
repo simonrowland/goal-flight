@@ -612,6 +612,7 @@ def test_preserve_class_flags_survive_original_argv_replay(tmp_path: Path) -> No
     ]
     dummies = {
         "--cwd": "/tmp/class-cwd",
+        "--worktree": "HEAD",
         "--os-sandbox": "off",
         "--model": "gpt-test",
         "--priority": "bulk",
