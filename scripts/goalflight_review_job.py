@@ -841,7 +841,8 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "goalflight_review_job: WARN: journal attempt transition "
                 f"refused for {dispatch_id} after worker spawn "
-                f"(pid {worker_pid}): disposition={warning['disposition']} "
+                f"(pid {worker_pid}, stdout {stdout_path}, stderr {stderr_path}): "
+                f"disposition={warning['disposition']} "
                 f"error={warning['error']}; worker may be alive; bookkeeping "
                 "incomplete",
                 file=sys.stderr,

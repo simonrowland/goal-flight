@@ -715,7 +715,8 @@ def _record_acp_ledger_state(
         payload["spawn_state"] = spawn_state
         print(
             "goalflight_acp_run: WARN: journal attempt transition refused for "
-            f"{dispatch_id} after worker spawn (pid {worker_pid}): "
+            f"{dispatch_id} after worker spawn (pid {worker_pid}, "
+            f"status {status_path}): "
             f"disposition={warning['disposition']} error={warning['error']}; "
             "worker may be alive; bookkeeping incomplete",
             file=sys.stderr,
