@@ -7249,13 +7249,16 @@ def _abandoned_controller_evidence(record: dict) -> tuple[bool, str]:
     if not isinstance(project_root, str) or not project_root:
         return False, "controller_owner_project_indeterminate"
     try:
-        live = goalflight_session_status.live_session(
+        state, live = goalflight_session_status.probe_live_session(
             Path(project_root).expanduser(),
             label=str(controller_label) if controller_label else None,
         )
     except Exception as exc:
         return False, f"controller_beacon_error:{type(exc).__name__}"
-    if not isinstance(live, dict):
+    if state == "unreadable":
+        # A busy or lock-indeterminate registry is not "controller gone".
+        return False, "controller_indeterminate"
+    if state != "live" or not isinstance(live, dict):
         return True, "controller_beacon_absent"
     if live.get("conflicting_beacons"):
         return False, "controller_beacon_conflict"
@@ -7334,7 +7337,11 @@ def _evaluate_abandoned_dispatch(
         return {
             **result,
             "eligible": False,
-            "reason": "controller_live_or_indeterminate",
+            "reason": (
+                "controller_indeterminate"
+                if controller_evidence == "controller_indeterminate"
+                else "controller_live_or_indeterminate"
+            ),
             "controller_evidence": controller_evidence,
         }
     latest_progress_s, progress_fingerprint = _abandoned_progress_snapshot(record, status)
