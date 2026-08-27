@@ -5,11 +5,20 @@ Report-only by default. ``--apply`` is required to remove anything, and every
 survivor is printed with the reason it was retained — the reason is how an
 operator confirms the tool understood the tree rather than guessed.
 
+Routine merge-down command (run from the repo after integrating a worker branch)::
+
+    python3 scripts/goalflight_worktree_gc.py --into main
+    python3 scripts/goalflight_worktree_gc.py --into main --apply
+
+Pool seats (``worktrees/wt-N``) are maintained by ``goalflight_worktree_pool``
+and are never reclaimed as litter.
+
 Removal requires the CONJUNCTION of all four conditions:
 
   1. the worktree's branch is merged into the integration branch; AND
   2. the worktree is clean (``git status --porcelain`` empty); AND
-  3. no non-terminal dispatch records that path as its ``worker_cwd``; AND
+  3. no non-terminal dispatch records that path as its ``worker_cwd``, and no
+     identity-live worker whose ledger row carries a liveness verdict; AND
   4. it is not the currently-checked-out path (nor the main worktree).
 
 Why the conjunction, and why "merged" alone is not a predicate
@@ -61,8 +70,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+import goalflight_compat  # noqa: E402
 import goalflight_dispatch_states  # noqa: E402
 import goalflight_ledger  # noqa: E402
+import goalflight_worktree_pool  # noqa: E402
 
 SCHEMA = "goalflight.worktree-gc.v1"
 
@@ -71,6 +82,21 @@ NO = "no"
 UNKNOWN = "unknown"
 
 _GIT_TIMEOUT = 30
+
+# Ledger rows whose ``state`` / ``terminal_state`` looks settled but may still
+# name a live process. ``idle_timeout`` in particular has been observed on a
+# worker that stayed identity-live and mid-gate for tens of minutes.
+LIVENESS_VERDICTS = frozenset(
+    {
+        "idle_timeout",
+        "worker_dead",
+        "blocked",
+        "wedged",
+        "liveness_indeterminate",
+        "inconclusive_timeout",
+        "watcher_stopped",
+    }
+)
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -287,22 +313,82 @@ def read_ledger_records(ledger_dir: Path) -> tuple[list[dict[str, Any]], list[st
     return records, unreadable
 
 
-def _record_owns_path(record: dict[str, Any], path: str) -> bool:
-    """True when a non-terminal dispatch records this path as its worker cwd.
-
-    A missing state is treated as non-terminal: we did not observe the record
-    settle, so we do not get to assume it did. A cwd recorded inside the
-    worktree (a worker that cd'd deeper) still means the tree is in use.
-    """
-    state = record.get("state")
-    if goalflight_dispatch_states.is_terminal_state(state if isinstance(state, str) else None):
-        return False
+def _record_cwd_matches(record: dict[str, Any], path: str) -> bool:
     raw_cwd = record.get("worker_cwd")
     if not isinstance(raw_cwd, str) or not raw_cwd.strip():
         return False
     cwd = _resolve(raw_cwd)
     target = _resolve(path)
     return cwd == target or cwd.startswith(target + os.sep)
+
+
+def _record_states(record: dict[str, Any]) -> list[str]:
+    states: list[str] = []
+    for key in ("state", "terminal_state"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            states.append(value)
+    return states
+
+
+def _is_liveness_verdict(record: dict[str, Any]) -> bool:
+    for state in _record_states(record):
+        if state in LIVENESS_VERDICTS or state.startswith("blocked"):
+            return True
+    return False
+
+
+def _identity_live(record: dict[str, Any]) -> bool | None:
+    """pid + start_token liveness. Never pgrep, never pid alone.
+
+    True: the recorded generation is still that process.
+    False: no pid was recorded, or the generation is proven gone/replaced.
+    None: a pid exists but the check could not complete — fail closed.
+    """
+    identity = record.get("worker_identity")
+    pid = None
+    start_token = ""
+    if isinstance(identity, dict):
+        raw_pid = identity.get("pid")
+        if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) and raw_pid > 0:
+            pid = raw_pid
+        token = identity.get("start_token")
+        if isinstance(token, str) and token:
+            start_token = token
+    if pid is None:
+        raw_pid = record.get("worker_pid")
+        if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) and raw_pid > 0:
+            pid = raw_pid
+        else:
+            return False
+    if not start_token:
+        return None
+    return goalflight_compat.process_identity_matches(pid, start_token)
+
+
+def _record_owns_path(record: dict[str, Any], path: str) -> bool:
+    """True when a dispatch still owns this path as its worker cwd.
+
+    A missing state is treated as non-terminal: we did not observe the record
+    settle, so we do not get to assume it did. A cwd recorded inside the
+    worktree (a worker that cd'd deeper) still means the tree is in use.
+
+    A liveness verdict (``idle_timeout``, ``worker_dead``, ``blocked``, …) is
+    not proof the process is gone. Observed: a worker sat in ``idle_timeout``
+    for 35 minutes while identity-live and mid-gate. If the recorded pid +
+    start_token still match, the row owns the path.
+    """
+    if not _record_cwd_matches(record, path):
+        return False
+    live = _identity_live(record)
+    if live is True:
+        return True
+    if live is None and _is_liveness_verdict(record):
+        return True
+    for state in _record_states(record):
+        if goalflight_dispatch_states.is_terminal_state(state):
+            return False
+    return True
 
 
 def check_unowned(path: str, ledger_dir: Path) -> dict[str, str]:
@@ -392,6 +478,15 @@ def classify(
     if main_path is not None and _resolve(path) == main_path:
         result["decision"] = "retain"
         result["reason"] = "main worktree is never a removal candidate"
+        result["conditions"] = {}
+        return result
+
+    if goalflight_worktree_pool.is_pool_seat_path(path):
+        result["decision"] = "retain"
+        result["reason"] = (
+            "managed pool seat "
+            f"{Path(path).name} is maintained by the worktree pool, not litter"
+        )
         result["conditions"] = {}
         return result
 
@@ -598,7 +693,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Report (or with --apply, remove) git worktrees that are merged, "
-            "clean, unowned by a non-terminal dispatch, and not checked out."
+            "clean, unowned by a live dispatch, and not checked out. "
+            "Managed wt-N pool seats are never reclaimed. Run after merging "
+            "a worker branch into the integration branch."
         )
     )
     parser.add_argument(

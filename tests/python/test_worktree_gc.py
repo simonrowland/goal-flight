@@ -72,7 +72,7 @@ def _merge_into_main(repo: Path, branch: str) -> None:
     _git(repo, "merge", "-q", "--ff-only", branch)
 
 
-def _write_ledger(dispatch_id: str, state: str, worker_cwd: Path) -> None:
+def _write_ledger(dispatch_id: str, state: str, worker_cwd: Path, **extra: object) -> None:
     runs = goalflight_ledger.runs_dir(create=True)
     record = {
         "dispatch_id": dispatch_id,
@@ -80,6 +80,7 @@ def _write_ledger(dispatch_id: str, state: str, worker_cwd: Path) -> None:
         "worker_cwd": str(worker_cwd),
         "project_root": str(worker_cwd),
     }
+    record.update(extra)
     name = goalflight_compat.safe_dispatch_filename(dispatch_id)
     (runs / f"{name}.json").write_text(json.dumps(record), encoding="utf-8")
 
@@ -326,3 +327,71 @@ def test_non_repository_exits_nonzero(tmp_path: Path) -> None:
     )
     assert done.returncode == 1
     assert "cannot list worktrees" in done.stderr
+
+
+def test_pool_seat_is_never_reclaimed_as_litter(tmp_path: Path, repo: Path) -> None:
+    """wt-N seats are maintained. A merged+clean+unowned wt-1 must still stay."""
+    wt = _add_worktree(repo, tmp_path, "wt-1")
+    _commit_in(wt)
+    _merge_into_main(repo, "wt-1")
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert "pool seat" in entry["reason"]
+    assert wt.is_dir()
+
+    done, report = _run(repo, "--apply")
+    assert done.returncode == 0
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert wt.is_dir()
+    assert os.path.realpath(wt) in _worktree_paths(repo)
+
+
+def test_idle_timeout_identity_live_worker_is_not_reclaimed(
+    tmp_path: Path, repo: Path
+) -> None:
+    """idle_timeout is a liveness verdict, not proof the process is gone."""
+    wt = _add_worktree(repo, tmp_path, "idle-live")
+    _commit_in(wt)
+    _merge_into_main(repo, "idle-live")
+    identity = goalflight_compat.process_start_identity(os.getpid())
+    assert identity and identity.get("start_token"), identity
+    _write_ledger(
+        "idle-live-w1",
+        "idle_timeout",
+        wt,
+        terminal_state="idle_timeout",
+        worker_pid=os.getpid(),
+        worker_identity=identity,
+    )
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "no", entry
+    assert "idle-live-w1" in entry["conditions"]["unowned"]["reason"]
+    assert wt.is_dir()
+
+
+def test_idle_timeout_dead_identity_does_not_own_the_tree(
+    tmp_path: Path, repo: Path
+) -> None:
+    """Once pid+start_token prove the generation is gone, idle_timeout does not retain."""
+    wt = _add_worktree(repo, tmp_path, "idle-dead")
+    _commit_in(wt)
+    _merge_into_main(repo, "idle-dead")
+    _write_ledger(
+        "idle-dead-w1",
+        "idle_timeout",
+        wt,
+        terminal_state="idle_timeout",
+        worker_pid=2**30,
+        worker_identity={"pid": 2**30, "start_token": "missing:generation"},
+    )
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "remove", entry
+    assert entry["conditions"]["unowned"]["verdict"] == "yes", entry
