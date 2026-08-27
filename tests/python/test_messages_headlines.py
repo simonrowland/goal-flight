@@ -10,15 +10,26 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "goalflight_messages.py"
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import goalflight_messages as msg  # noqa: E402
 import goalflight_journal as journal  # noqa: E402
+import goalflight_quota_stuck as quota  # noqa: E402
+import goalflight_status as status  # noqa: E402
 
 
 CONTROLLER_LABEL = "headlines"
+LEFTOVER_DISPATCH_IDS = (None, "leftover-worker-id")
+
+
+def _expected_declared_label(leftover_dispatch_id: str | None) -> str:
+    # A leftover worker id cannot establish a controller name; the stamp is
+    # UNKNOWN rather than an omitted field or an inherited label.
+    return "UNKNOWN" if leftover_dispatch_id else CONTROLLER_LABEL
 
 
 def _project(tmp_path: Path) -> Path:
@@ -27,23 +38,47 @@ def _project(tmp_path: Path) -> Path:
     return project
 
 
-def _test_env(tmp_path: Path) -> dict[str, str]:
+def _test_env(
+    tmp_path: Path, *, leftover_dispatch_id: str | None = None
+) -> dict[str, str]:
     env = os.environ.copy()
+    journal_dir = tmp_path / "journals"
+    state_dir = tmp_path / "state"
+    wake_dir = tmp_path / "wake-ledger"
+    messages_dir = tmp_path / "messages"
+    tasks_dir = tmp_path / "tasks"
+    pid_dir = tmp_path / "pids"
+    gf_pid_dir = tmp_path / "gf-pids"
+    for path in (
+        journal_dir,
+        state_dir,
+        wake_dir,
+        messages_dir,
+        tasks_dir,
+        pid_dir,
+        gf_pid_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
     env.update(
         {
-            "GOALFLIGHT_MESSAGES_DIR": str(tmp_path / "messages"),
-            "GOALFLIGHT_JOURNAL_DIR": str(tmp_path / "journals"),
-            "GOALFLIGHT_TASK_STORE_DIR": str(tmp_path / "tasks"),
-            "GOAL_FLIGHT_PIDFILE_DIR": str(tmp_path / "pids"),
+            "GOALFLIGHT_MESSAGES_DIR": str(messages_dir),
+            "GOALFLIGHT_JOURNAL_DIR": str(journal_dir),
+            "GOALFLIGHT_STATE_DIR": str(state_dir),
+            "GOALFLIGHT_WAKE_LEDGER": str(tmp_path / "wake-ledger.json"),
+            "GOALFLIGHT_WAKE_LEDGER_DIR": str(wake_dir),
+            "GOALFLIGHT_TASK_STORE": str(tasks_dir),
+            "GOALFLIGHT_TASK_STORE_DIR": str(tasks_dir),
+            "GOALFLIGHT_PIDFILE_DIR": str(pid_dir),
+            "GOAL_FLIGHT_PIDFILE_DIR": str(gf_pid_dir),
             "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
             "GOALFLIGHT_CONTROLLER_LABEL": CONTROLLER_LABEL,
             "GOALFLIGHT_TEST_MODE": "1",
         }
     )
-    # Controller posts must not inherit a leftover worker dispatch id from
-    # the ambient process; that identity makes ingress refuse to stamp a
-    # controller label even when GOALFLIGHT_CONTROLLER_LABEL is set.
-    env.pop("GOALFLIGHT_DISPATCH_ID", None)
+    if leftover_dispatch_id:
+        env["GOALFLIGHT_DISPATCH_ID"] = leftover_dispatch_id
+    else:
+        env.pop("GOALFLIGHT_DISPATCH_ID", None)
     return env
 
 
@@ -67,6 +102,7 @@ def _post_env(
     dispatch_id: str = "d1",
     msg_type: str = "controller-notice",
     adapter: str = "codex",
+    leftover_dispatch_id: str | None = None,
 ) -> dict:
     _ensure_controller(tmp_path)
     project = _project(tmp_path)
@@ -99,7 +135,7 @@ def _post_env(
     posted = subprocess.run(
         argv,
         cwd=project,
-        env=_test_env(tmp_path),
+        env=_test_env(tmp_path, leftover_dispatch_id=leftover_dispatch_id),
         text=True,
         capture_output=True,
         check=False,
@@ -153,7 +189,12 @@ def _post_env_raw(
     )
 
 
-def _run_relay(tmp_path: Path, *, bodies: bool = False) -> subprocess.CompletedProcess[str]:
+def _run_relay(
+    tmp_path: Path,
+    *,
+    bodies: bool = False,
+    leftover_dispatch_id: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     fleet_dir = tmp_path / "fleet"
     fleet_dir.mkdir(exist_ok=True)
     argv = [
@@ -171,7 +212,7 @@ def _run_relay(tmp_path: Path, *, bodies: bool = False) -> subprocess.CompletedP
     return subprocess.run(
         argv,
         cwd=_project(tmp_path),
-        env=_test_env(tmp_path),
+        env=_test_env(tmp_path, leftover_dispatch_id=leftover_dispatch_id),
         text=True,
         capture_output=True,
         check=False,
@@ -352,10 +393,9 @@ def test_preexisting_unlabelled_record_renders_unknown_without_crashing(
 ) -> None:
     # Journals written before this fix hold controller mail with no
     # source.controller_label at all. Relay must keep the row visible, render
-    # the sender as UNKNOWN (never a node/inbox guess), and exit 0. The legacy
-    # record is written by the real admission path: post_message with the
-    # exact source dict the pre-fix CLI built. Stamping lives at the CLI/MCP
-    # ingress, so the library call still produces the legacy shape.
+    # the sender as UNKNOWN (never a node/inbox guess, never a pid or repo
+    # name), and exit 0. New posts stamp; this test strips the field after
+    # admission so the reader seam is exercised on the legacy shape.
     _ensure_controller(tmp_path)
     project = _project(tmp_path)
     with mock.patch.dict(os.environ, _test_env(tmp_path), clear=False):
@@ -367,12 +407,24 @@ def test_preexisting_unlabelled_record_renders_unknown_without_crashing(
             source={"node": "local", "adapter": "unknown", "transport": "controller"},
             addressee=msg.controller_addressee(CONTROLLER_LABEL, project_root=project),
         )
-    assert "controller_label" not in result["envelope"]["source"]  # legacy-shaped
+    path = msg.inbox_path(tmp_path / "messages", "legacy-topic")
+
+    def _strip(existing: list[dict]):
+        for item in existing:
+            source = item.get("source")
+            if isinstance(source, dict):
+                source.pop("controller_label", None)
+        return existing, None
+
+    msg.update_envelopes(path, _strip)
+    planted = msg.read_envelopes(path)
+    assert planted and "controller_label" not in planted[0]["source"]
 
     relay = _run_relay(tmp_path)
     assert relay.returncode == 0, relay.stderr
     first = relay.stdout.splitlines()[0]
     assert first.startswith("legacy-topic #1 [finding] from UNKNOWN: ")
+    assert "headlines" not in first.split(":", 1)[0]
 
 
 def test_mcp_ingress_stamps_the_same_attribution(tmp_path: Path) -> None:
@@ -437,6 +489,143 @@ def test_mcp_ingress_stamps_the_same_attribution(tmp_path: Path) -> None:
     assert headlines.stdout.splitlines()[0].startswith(
         f"mcp-topic #1 [finding] from {CONTROLLER_LABEL}: "
     )
+
+
+@pytest.mark.parametrize("leftover_dispatch_id", LEFTOVER_DISPATCH_IDS)
+def test_cli_post_under_dispatch_id_stamps_and_round_trips(
+    tmp_path: Path, leftover_dispatch_id: str | None
+) -> None:
+    # Incident shape: leftover GOALFLIGHT_DISPATCH_ID used to skip the stamp
+    # and omit the field. The field must be present either way.
+    expected = _expected_declared_label(leftover_dispatch_id)
+    envelope = _post_env(
+        tmp_path,
+        "incident-shaped leftover dispatch id",
+        subject="cli leftover",
+        dispatch_id="cli-leftover",
+        msg_type="finding",
+        adapter="unknown",
+        leftover_dispatch_id=leftover_dispatch_id,
+    )
+    assert envelope["source"]["controller_label"] == expected
+    headlines = _run_relay(tmp_path, leftover_dispatch_id=leftover_dispatch_id)
+    assert headlines.returncode == 0, headlines.stderr
+    assert headlines.stdout.splitlines()[0].startswith(
+        f"cli-leftover #1 [finding] from {expected}: "
+    )
+
+
+@pytest.mark.parametrize("leftover_dispatch_id", LEFTOVER_DISPATCH_IDS)
+def test_post_message_primitive_stamps_and_round_trips(
+    tmp_path: Path, leftover_dispatch_id: str | None
+) -> None:
+    expected = _expected_declared_label(leftover_dispatch_id)
+    _ensure_controller(tmp_path)
+    project = _project(tmp_path)
+    with mock.patch.dict(
+        os.environ,
+        _test_env(tmp_path, leftover_dispatch_id=leftover_dispatch_id),
+        clear=True,
+    ):
+        result = msg.post_message(
+            dispatch_id="primitive-topic",
+            msg_type="finding",
+            payload={"text": "library admit path", "subject": "primitive stamp"},
+            messages_dir=tmp_path / "messages",
+            addressee=msg.controller_addressee(CONTROLLER_LABEL, project_root=project),
+        )
+    assert result["envelope"]["source"]["controller_label"] == expected
+    headlines = _run_relay(tmp_path, leftover_dispatch_id=leftover_dispatch_id)
+    assert headlines.returncode == 0, headlines.stderr
+    assert headlines.stdout.splitlines()[0].startswith(
+        f"primitive-topic #1 [finding] from {expected}: "
+    )
+
+
+@pytest.mark.parametrize("leftover_dispatch_id", LEFTOVER_DISPATCH_IDS)
+def test_write_steering_envelope_stamps_and_round_trips(
+    tmp_path: Path, leftover_dispatch_id: str | None
+) -> None:
+    expected = _expected_declared_label(leftover_dispatch_id)
+    with mock.patch.dict(
+        os.environ,
+        _test_env(tmp_path, leftover_dispatch_id=leftover_dispatch_id),
+        clear=True,
+    ):
+        envelope = msg.write_steering_envelope(
+            tmp_path / "fleet",
+            audit_id="audit-1",
+            proposal_id="prop-1",
+            patch=[{"op": "replace", "path": "/n", "value": 1}],
+            after_hash="abc",
+            messages_dir=tmp_path / "messages",
+        )
+    assert envelope["source"]["transport"] == "controller"
+    assert envelope["source"]["adapter"] == "fleet"
+    assert envelope["source"]["controller_label"] == expected
+    rendered = msg.format_envelope_headlines([envelope])
+    who = msg.envelope_from(envelope)
+    assert f" from {who}:" in rendered
+    assert expected in json.dumps(envelope["source"])
+    assert " from local:" not in rendered
+    assert who != "local"
+
+
+@pytest.mark.parametrize("leftover_dispatch_id", LEFTOVER_DISPATCH_IDS)
+def test_quota_advisory_stamps_and_round_trips(
+    tmp_path: Path, leftover_dispatch_id: str | None
+) -> None:
+    expected = _expected_declared_label(leftover_dispatch_id)
+    payload = {
+        "schema": "goalflight.status.aggregate.v1",
+        "scope": {"project_root": str(tmp_path), "machine_active_leases": 0},
+        "capacity": {"operating_cap": 10},
+        "capacity_state": {"leases": {}, "cooldowns": {}},
+        "dispatch": {"records": []},
+        "rate_pressure": {
+            "providers_under_pressure": [
+                {
+                    "scope": "provider",
+                    "provider": "xai",
+                    "budget_key": "provider:xai",
+                    "labels": ["grok-code"],
+                    "count": 3,
+                    "threshold": 3,
+                    "quota_hard_stop": True,
+                    "effective_caps": {"grok-code": 0},
+                    "stuck_worker_count": 1,
+                    "stuck_workers": [
+                        {
+                            "dispatch_id": "quota-mail",
+                            "agent": "grok-code",
+                            "signature": "usage balance exhausted",
+                            "limit_kind": "exhausted",
+                        }
+                    ],
+                }
+            ],
+            "window_seconds": 600,
+        },
+    }
+    with mock.patch.dict(
+        os.environ,
+        _test_env(tmp_path, leftover_dispatch_id=leftover_dispatch_id),
+        clear=True,
+    ):
+        status._post_quota_advisories(payload)
+        inbox = msg.inbox_path(
+            tmp_path / "messages", quota.QUOTA_STUCK_CONTROLLER_DISPATCH_ID
+        )
+        envelopes = msg.read_envelopes(inbox)
+    assert len(envelopes) == 1
+    assert envelopes[0]["source"]["controller_label"] == expected
+    assert envelopes[0]["source"]["adapter"] == "goalflight_status"
+    rendered = msg.format_envelope_headlines(envelopes)
+    who = msg.envelope_from(envelopes[0])
+    assert f" from {who}:" in rendered
+    assert expected in json.dumps(envelopes[0]["source"])
+    assert " from local:" not in rendered
+    assert who != "local"
 
 
 def test_default_and_bodies_cli_paths_round_trip_subject(tmp_path: Path) -> None:
@@ -580,6 +769,17 @@ def main() -> None:
         with tempfile.TemporaryDirectory() as td:
             test(Path(td))
         print(f"PASS {test.__name__}")
+    parametrized = (
+        test_cli_post_under_dispatch_id_stamps_and_round_trips,
+        test_post_message_primitive_stamps_and_round_trips,
+        test_write_steering_envelope_stamps_and_round_trips,
+        test_quota_advisory_stamps_and_round_trips,
+    )
+    for test in parametrized:
+        for leftover in LEFTOVER_DISPATCH_IDS:
+            with tempfile.TemporaryDirectory() as td:
+                test(Path(td), leftover)
+            print(f"PASS {test.__name__} leftover={leftover!r}")
 
 
 if __name__ == "__main__":

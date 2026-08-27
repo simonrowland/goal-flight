@@ -1324,6 +1324,11 @@ def post_message(
         raise MessageError("source must be an object")
     if source:
         base_source.update(source)
+    # Controller-transport mail is attributed here, at the shared admit path,
+    # so CLI leftover-dispatch-id, library callers, and quota advisories cannot
+    # omit the field. Producers that bypass post_message (write_steering_envelope)
+    # stamp the same way. Non-controller transports are unchanged.
+    _stamp_controller_source_label(base_source)
     envelope = {
         "schema": "goalflight.message.v1",
         "schema_version": 1,
@@ -2500,12 +2505,13 @@ def cmd_post(args: argparse.Namespace) -> int:
     # must not pay for a doorbell wake. The descriptive label remains source
     # metadata; proof is stamped separately from the capability this process
     # actually carried. Workers cannot inherit authorship from a leftover label.
-    # Controller shells stamp an attribution on controller-transport mail: the
-    # resolved label, or the explicit UNKNOWN sentinel when none can be
-    # established — an absent field reads as "guess the sender".
+    # Stamp even when GOALFLIGHT_DISPATCH_ID is set: that leftover is the
+    # incident shape, and skipping the stamp omitted the field. A worker id
+    # cannot establish a controller name, so the stamp writes UNKNOWN.
+    # post_message stamps again (idempotent) for library callers.
+    _stamp_controller_source_label(source)
     author_capability = None
     if not os.environ.get("GOALFLIGHT_DISPATCH_ID"):
-        _stamp_controller_source_label(source)
         author_capability = _presented_ambient_controller_capability()
     addressee = None
     if getattr(args, "to_controller", None):
@@ -4908,6 +4914,8 @@ def write_steering_envelope(
     resolved_messages_dir = messages_dir or default_messages_dir()
 
     def update(existing: list[dict]) -> tuple[list[dict], dict]:
+        source = {"node": "local", "adapter": "fleet", "transport": "controller"}
+        _stamp_controller_source_label(source)
         envelope = {
             "schema": "goalflight.message.v1",
             "schema_version": 1,
@@ -4915,7 +4923,7 @@ def write_steering_envelope(
             "dispatch_id": STEERING_DISPATCH_ID,
             "seq": max((int(item.get("seq", 0)) for item in existing), default=0) + 1,
             "ts": utc_now(),
-            "source": {"node": "local", "adapter": "fleet", "transport": "controller"},
+            "source": source,
             "type": "steering",
             "priority": "normal",
             "payload": {
