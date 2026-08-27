@@ -103,7 +103,20 @@ def test_terminal_rate_limit_numbers_require_token_boundaries() -> None:
     assert terminal.rate_limit_signature_in_text("ordinary log line 5290") is None
 
 
-def test_attention_marker_helper_is_shared_by_status() -> None:
+def test_attention_marker_helper_is_shared_by_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # t-367: the foreign-id rule is a ledger lookup, not a shape guess —
+    # record the foreign id FOR REAL so its marker names a known foreign
+    # dispatch and must not bind.
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": "foreign-attention-marker",
+            "state": "running",
+        }
+    )
     for kind in terminal.ATTENTION_MARKERS:
         marker = {"kind": kind, "text": "attention-marker — needs controller"}
         assert terminal.attention_marker_present(marker), kind
@@ -124,18 +137,28 @@ def test_attention_marker_helper_is_shared_by_status() -> None:
         assert not terminal.attention_marker_present(marker), kind
 
 
-def test_attention_marker_ceremony_free_binds_named_foreign_does_not() -> None:
+def test_attention_marker_ceremony_free_binds_named_foreign_does_not(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Bare and prose attention still bind; a named foreign dispatch does not.
 
     The identity contract emits ``<KIND>: <dispatch-id> — <summary>``. A
     ceremony-free ``BLOCKED:`` (empty payload) is the property the attention
-    exemption exists to protect. A hyphenated live-shaped id followed by an
-    em dash is the instructed foreign form and must not bind. Ordinary
+    exemption exists to protect. A ledger-known live id followed by an em
+    dash is the instructed foreign form and must not bind. Ordinary
     first-word prose, including the brief's ``foreign package unavailable``
     case, must still bind.
+
+    Since t-367 the foreign rule is a ledger lookup, not a shape guess:
+    ``other-live-id`` only counts as a foreign dispatch because the test
+    writes a real ledger record for it; an unknown hyphenated token binds.
     """
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
     own_id = "attention-marker"
     live_foreign = "other-live-id"
+    ledger.write_record(
+        {"schema": ledger.SCHEMA, "dispatch_id": live_foreign, "state": "running"}
+    )
     for kind in terminal.ATTENTION_MARKERS:
         assert status._record_has_attention_marker(
             {"dispatch_id": own_id, "terminal_marker": {"kind": kind, "text": ""}}
