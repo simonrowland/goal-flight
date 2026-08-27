@@ -14654,7 +14654,10 @@ def _ensure_acp_sdk_interpreter(argv: list[str] | None = None) -> None:
 
     Done at __main__ entry, before main() parses args or takes any lease, so
     the execv restart repeats no side effects. Only fires for acp-shaped
-    invocations, so bash-shape dispatch is untouched.
+    invocations, so bash-shape dispatch is untouched. UNAVAILABLE is not
+    fail-closed here: main() must still queue, refuse a permanent os-sandbox
+    mismatch, and honour the test ACP seam. Spawn-time require_acp_sdk is
+    the fail-closed gate for a real ACP session.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -14678,7 +14681,13 @@ def _ensure_acp_sdk_interpreter(argv: list[str] | None = None) -> None:
         return
     try:
         import goalflight_acp_run  # noqa: PLC0415
+        from goalflight_acp_client import ACP_SDK_REEXEC  # noqa: PLC0415
     except BaseException:
+        return
+    # Re-exec here so a later SDK import sees the venv. Do not fail-close on
+    # UNAVAILABLE: main() still has submit, the test ACP seam, and permanent
+    # os-sandbox refusal to handle. Spawn-time require_acp_sdk fail-closes.
+    if goalflight_acp_run._acp_reexec_target().state != ACP_SDK_REEXEC:
         return
     goalflight_acp_run._ensure_acp_sdk_python()
 
