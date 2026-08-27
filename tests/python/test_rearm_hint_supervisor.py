@@ -1584,3 +1584,36 @@ def test_doctor_unknown_machine_payload_is_numberless(
     assert "1/8" not in encoded
     for component_command in _component_commands(project, lease):
         assert component_command not in encoded
+
+
+def test_doctor_unknown_supervisor_json_verdict_is_not_ok(
+    isolated: tuple[Path, journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreadable process listing must not certify the session green."""
+    project, lease = isolated
+    _persistent_shortfall_plan(project, lease, monkeypatch, None)
+    result = doctor.check_wake_coverage(project)
+    assert result["present"] is True
+    pool = result["pools"][0]
+    assert pool["supervisor"] == wake.SUPERVISOR_UNKNOWN
+    assert pool["ok"] is None
+    assert result["ok"] is None
+    for field in (
+        "covered",
+        "live_waiters",
+        "target_waiters",
+        "missing_components",
+    ):
+        assert field not in pool
+    payload = _minimal_doctor_payload(result)  # type: ignore[arg-type]
+    lines = doctor.collect_human_lines(payload)
+    line = next(line for line in lines if f"wake coverage {lease.label}" in line)
+    parsed = doctor.parse_status_line(line)
+    assert parsed["level"] == "warn"
+    assert "coverage=unknown" in parsed["detail"]
+    assert "supervisor=unknown" in parsed["detail"]
+    assert "0/" not in parsed["detail"]
+    summary = doctor.verdict_summary(payload)
+    assert summary["verdict"] != "ok"
+    assert summary["verdict"] == "warn"

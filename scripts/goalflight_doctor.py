@@ -3558,9 +3558,16 @@ def collect_human_lines(payload: dict) -> list[str]:
                 )
             if hint:
                 detail = f"{detail}; {hint}"
+            # Machine payload keeps ok=None for unknown (not a shortfall).
+            # Human/JSON verdict is binary warn|ok and ignores INFO, and
+            # doctor always emits unrelated INFO, so unknown must WARN the
+            # way unknown controller-lease holders already do.
+            line_ok = pool.get("ok")
+            if line_ok is None:
+                line_ok = False
             lines.append(
                 status_line(
-                    pool.get("ok"),
+                    line_ok,
                     f"wake coverage {pool.get('label')}",
                     detail,
                 )
