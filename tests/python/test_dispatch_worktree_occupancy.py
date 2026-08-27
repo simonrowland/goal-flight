@@ -32,6 +32,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 DISPATCH = ROOT / "scripts" / "goalflight_dispatch.py"
@@ -316,7 +317,8 @@ def test_second_writer_refused_naming_incumbent_then_override_launches() -> None
         _wait_until_terminal(tmp, "occ-incumbent")
 
 
-def test_read_only_reviewer_allowed_into_occupied_worktree() -> None:
+def test_declared_read_only_raw_worker_is_refused_into_occupied_worktree() -> None:
+    """--read-only on a `--` worker is a declaration; occupancy still applies."""
     with _temp_dir() as td, _non_temp_tree("gf-occ-ro-tree-") as tree_td:
         tmp = Path(td)
         tree = Path(tree_td).resolve()
@@ -329,22 +331,51 @@ def test_read_only_reviewer_allowed_into_occupied_worktree() -> None:
         assert incumbent.returncode == 0, (incumbent.stdout, incumbent.stderr)
         try:
             _wait_until_running(tmp, "ro-incumbent")
-            reviewer = _run(
+            declared = _run(
                 _dispatch_cmd(
                     tmp,
                     tree,
-                    "ro-reviewer",
-                    _quick_writer("ro-reviewer"),
+                    "ro-declared",
+                    _quick_writer("ro-declared"),
                     extra=["--read-only"],
                     foreground=True,
                 ),
                 env,
             )
-            assert reviewer.returncode == 0, (reviewer.stdout, reviewer.stderr)
-            assert "DISPATCH-END" in reviewer.stdout, reviewer.stdout
+            assert declared.returncode == 64, (declared.returncode, declared.stdout, declared.stderr)
+            assert "ro-incumbent" in declared.stderr, declared.stderr
+            assert not _ledger_record(tmp, "ro-declared"), declared.stderr
         finally:
             release_incumbent.write_text("release", encoding="utf-8")
         _wait_until_terminal(tmp, "ro-incumbent")
+
+
+def test_enforced_read_only_reviewer_skips_occupancy() -> None:
+    grok = SimpleNamespace(
+        read_only=True,
+        agent="grok-code",
+        worker=[],
+        shape="bash",
+        os_sandbox=None,
+        cwd=".",
+        dispatch_id="ro-grok",
+        occupied_worktree_forced=False,
+        from_queue=False,
+    )
+    assert dispatch._occupancy_exempt_read_only(grok) is True
+    assert dispatch._prepare_attempt_worktree_occupancy(grok) is None
+    raw = SimpleNamespace(
+        read_only=True,
+        agent="test",
+        worker=["--", sys.executable, "-c", "pass"],
+        shape="bash",
+        os_sandbox=None,
+        cwd=".",
+        dispatch_id="ro-raw",
+        occupied_worktree_forced=False,
+        from_queue=False,
+    )
+    assert dispatch._occupancy_exempt_read_only(raw) is False
 
 
 def test_terminal_incumbent_vacates_the_tree() -> None:
@@ -607,7 +638,22 @@ def test_supported_profile_alone_does_not_mark_a_writer_read_only() -> None:
     )
     assert (
         dispatch._record_declared_read_only(
-            {"os_sandbox": {"requested_profile": "read-only"}}
+            {
+                "read_only": True,
+                "os_sandbox": {"requested_profile": "workspace-write"},
+            }
+        )
+        is False
+    )
+    assert (
+        dispatch._record_declared_read_only(
+            {"os_sandbox": {"requested_profile": "read-only"}, "agent": "test"}
+        )
+        is False
+    )
+    assert (
+        dispatch._record_declared_read_only(
+            {"os_sandbox": {"requested_profile": "read-only"}, "agent": "grok-code"}
         )
         is True
     )
@@ -846,23 +892,24 @@ def test_concurrent_submit_does_not_dual_queue() -> None:
         assert 64 in {pa.returncode, pb.returncode}, (pa.returncode, pb.returncode, err_a, err_b)
 
 
-def test_read_only_incumbent_does_not_block_a_writer() -> None:
+def test_declared_read_only_raw_incumbent_occupies_the_tree() -> None:
+    """A write-capable `--` worker that declared --read-only still occupies."""
     with _temp_dir() as td, _non_temp_tree("gf-occ-rohold-tree-") as tree_td:
         tmp = Path(td)
         tree = Path(tree_td).resolve()
         env = _env(tmp)
-        release_reviewer = tmp / "release-reviewer"
-        reviewer = _run(
+        release_holder = tmp / "release-holder"
+        holder = _run(
             _dispatch_cmd(
                 tmp,
                 tree,
                 "ro-holder",
-                _blocking_worker(release_reviewer, "ro-holder"),
+                _blocking_worker(release_holder, "ro-holder"),
                 extra=["--read-only"],
             ),
             env,
         )
-        assert reviewer.returncode == 0, (reviewer.stdout, reviewer.stderr)
+        assert holder.returncode == 0, (holder.stdout, holder.stderr)
         try:
             record = _wait_until_running(tmp, "ro-holder")
             posture = record.get("os_sandbox") or {}
@@ -871,16 +918,43 @@ def test_read_only_incumbent_does_not_block_a_writer() -> None:
                 _dispatch_cmd(tmp, tree, "rw-writer", _quick_writer("rw-writer"), foreground=True),
                 env,
             )
-            assert writer.returncode == 0, (writer.stdout, writer.stderr)
-            assert "DISPATCH-END" in writer.stdout, writer.stdout
+            assert writer.returncode == 64, (writer.returncode, writer.stdout, writer.stderr)
+            assert "ro-holder" in writer.stderr, writer.stderr
         finally:
-            release_reviewer.write_text("release", encoding="utf-8")
+            release_holder.write_text("release", encoding="utf-8")
         _wait_until_terminal(tmp, "ro-holder")
+
+
+def test_enforced_read_only_incumbent_does_not_block_a_writer() -> None:
+    with _temp_dir() as td:
+        tmp = Path(td)
+        tree = tmp / "tree"
+        tree.mkdir()
+        env = _env(tmp)
+        runs = tmp / "state" / "runs.d"
+        runs.mkdir(parents=True)
+        record = {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": "ro-grok-holder",
+            "agent": "grok-code",
+            "shape": "bash",
+            "state": "running",
+            "worker_cwd": str(tree.resolve()),
+            "os_sandbox": {"requested_profile": "read-only"},
+        }
+        (runs / "ro-grok-holder.json").write_text(json.dumps(record), encoding="utf-8")
+        writer = _run(
+            _dispatch_cmd(tmp, tree, "rw-after-reviewer", _quick_writer("rw-after-reviewer"), foreground=True),
+            env,
+        )
+        assert writer.returncode == 0, (writer.stdout, writer.stderr)
+        assert "DISPATCH-END" in writer.stdout, writer.stdout
 
 
 if __name__ == "__main__":
     test_second_writer_refused_naming_incumbent_then_override_launches()
-    test_read_only_reviewer_allowed_into_occupied_worktree()
+    test_declared_read_only_raw_worker_is_refused_into_occupied_worktree()
+    test_enforced_read_only_reviewer_skips_occupancy()
     test_terminal_incumbent_vacates_the_tree()
     test_queued_incumbent_owns_tree_before_any_worker_spawns()
     test_unreadable_ledger_record_is_unknown_not_unoccupied()
@@ -891,7 +965,8 @@ if __name__ == "__main__":
     test_fleet_ssh_incumbent_does_not_occupy_local_cwd()
     test_supported_profile_alone_does_not_mark_a_writer_read_only()
     test_help_documents_occupied_worktree_override()
-    test_read_only_incumbent_does_not_block_a_writer()
+    test_declared_read_only_raw_incumbent_occupies_the_tree()
+    test_enforced_read_only_incumbent_does_not_block_a_writer()
     test_concurrent_second_writer_is_refused_on_every_trial()
     test_worker_inherits_occupancy_lock_fd()
     test_sigkill_of_worker_releases_occupancy_lock()

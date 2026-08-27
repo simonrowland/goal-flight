@@ -2648,26 +2648,51 @@ def _refuse_reused_dispatch_id_for_launch(dispatch_id: str, *, allow_queued: boo
 
 
 def _record_declared_read_only(record: dict) -> bool:
-    """True when the incumbent's own recorded launch posture is read-only.
+    """True when the incumbent's own recorded launch posture cannot write.
 
-    Write-capability is the dispatch's declared sandbox, not a process scan.
-    The posture dict is written at launch from --read-only/--os-sandbox, and
-    the launch path refuses an accepted-but-inert read-only request before any
-    record is written. A recorded read-only profile is therefore a worker that
-    CANNOT write, not merely one that was asked not to.
-
-    Trust requested_profile / enforced_profile (what was asked / applied) and
-    the recorded read_only flag. Do not consult supported_profile: that field
-    names what the launch path knows how to support, and can say read-only
-    even for a writer.
+    Write-capability is the dispatch's enforced sandbox, not a process scan
+    and not a bare --read-only declaration. A ``--`` worker that was asked
+    to be read-only can still write; treating it as a reviewer would let a
+    second writer in. Do not consult supported_profile: that field names
+    what the launch path knows how to support, and can say read-only even
+    for a writer. A top-level read_only flag with requested_profile
+    workspace-write is a writer.
     """
     posture = record.get("os_sandbox")
+    requested = None
+    enforced = None
     if isinstance(posture, dict):
-        if posture.get("requested_profile") == "read-only":
+        requested = posture.get("requested_profile")
+        enforced = posture.get("enforced_profile")
+        if requested == "workspace-write":
+            return False
+        if enforced == "read-only":
             return True
-        if posture.get("enforced_profile") == "read-only":
-            return True
-    return bool(record.get("read_only"))
+    if requested != "read-only":
+        return False
+    agent = str(record.get("agent") or "")
+    shape = str(record.get("shape") or "bash")
+    if shape == "acp":
+        return False
+    return agent in {"grok-code", "grok-research", "codex"}
+
+
+def _occupancy_exempt_read_only(args) -> bool:
+    """True when this launch cannot write the tree, so occupancy does not apply.
+
+    --read-only on a ``-- <cmd>`` worker is a declaration only: the command
+    can still write. Occupancy skips only launch paths that actually enforce
+    the posture (bash-shape grok deny-rules, bash-shape codex --sandbox).
+    """
+    if not _effective_read_only(args):
+        return False
+    if _raw_worker_args(args):
+        return False
+    agent = str(getattr(args, "agent", "") or "")
+    shape = getattr(args, "shape", "bash")
+    if shape == "acp":
+        return False
+    return agent in {"grok-code", "grok-research", "codex"}
 
 
 def _same_worker_tree(record_cwd: object, target: Path) -> bool:
@@ -2823,11 +2848,12 @@ def _prepare_attempt_worktree_occupancy(args) -> str | None:
     worktree, inherited by the worker so the claim outlives this dispatcher
     and is released by the kernel on crash. The ledger is diagnostic: it
     names the incumbent and fail-closes on unlistable/unreadable records.
-    A read-only dispatch never writes, so it is never refused here.
-    --occupied-worktree-forced converts either refusal into a visible
-    warning, matching the --unregistered-forced hatch.
+    A launch that actually cannot write (enforced read-only) is never
+    refused here. --read-only on a write-capable ``--`` worker is not
+    enough. --occupied-worktree-forced converts either refusal into a
+    visible warning, matching the --unregistered-forced hatch.
     """
-    if _effective_read_only(args):
+    if _occupancy_exempt_read_only(args):
         return None
 
     occupied, unknown = _worktree_incumbent_reason(args)
