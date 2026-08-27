@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import sqlite3
 import subprocess
@@ -526,6 +527,11 @@ def test_unreadable_project_does_not_drop_other_projects(
         ]
         assert unknown_rows
         assert all(row["retire_command"] is None for row in unknown_rows)
+        assert all(not controllers.is_contentless_row(row) for row in unknown_rows)
+        assert all(
+            row.get("project") and row.get("project") != "unknown"
+            for row in unknown_rows
+        )
         assert "alice" in text
         assert "unknown" in text
     finally:
@@ -893,3 +899,168 @@ def test_same_label_in_two_real_projects_stays_two_rows(
     assert projects == {"alpha", "beta"}
     _assert_no_live_row_carries_retire(payload)
     del a_reg, b_reg
+
+
+def test_journal_display_name_strips_store_hash() -> None:
+    path = Path("/state/journals/battery-tool-v2-97744ef01d/state-journal.sqlite3")
+    assert controllers.journal_display_name(path) == "battery-tool-v2"
+    generic = Path("/state/journals/project-0bbb2d1844/state-journal.sqlite3")
+    assert controllers.journal_display_name(generic) == "project-0bbb2d1844"
+    assert controllers.journal_display_name(None) is None
+
+
+def test_contentless_row_predicate() -> None:
+    empty = controllers.unknown_project_row(
+        project_root=None,
+        journal_path=None,
+        error="unreadable",
+    )
+    assert controllers.is_contentless_row(empty)
+    named = controllers.unknown_project_row(
+        project_root=None,
+        journal_path=Path("/state/journals/namedproj-0123456789/state-journal.sqlite3"),
+        error="JournalBusy",
+    )
+    assert named["project"] == "namedproj"
+    assert named["label"] is None
+    assert not controllers.is_contentless_row(named)
+    labeled = dict(empty)
+    labeled["label"] = "alice"
+    assert not controllers.is_contentless_row(labeled)
+
+
+def test_unreadable_journal_yields_exactly_one_named_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate(monkeypatch, tmp_path)
+    root = _git_project(tmp_path, "namedproj")
+    registered, holder, nonce = _hold_registered_lease(root, "alice", "alice-nonce")
+    busy_journal = journal.resolve_journal_path(root)
+    try:
+        with sqlite3.connect(
+            busy_journal,
+            timeout=0,
+            isolation_level=None,
+        ) as blocker:
+            assert blocker.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+            blocker.execute("BEGIN EXCLUSIVE")
+            json_code, json_text = _run(["--json"])
+            table_code, table = _run([])
+        assert json_code == table_code == 0
+        payload = json.loads(json_text)
+        rows = payload["controllers"]
+        named = [row for row in rows if row.get("project") == "namedproj"]
+        assert len(named) == 1
+        row = named[0]
+        assert row["project"] != "unknown"
+        assert row["state"] == "unknown"
+        assert row["bucket"] == "unknown"
+        assert row["retire_command"] is None
+        assert row["unknown_reason"]
+        assert "namedproj" in (row["unknown_reason"] or "") or row["project"] == "namedproj"
+        assert not controllers.is_contentless_row(row)
+        assert all(not controllers.is_contentless_row(item) for item in rows)
+        assert "namedproj" in table
+        contentless_line = re.compile(
+            r"^unknown\s+(?:—|unknown)\s+unknown\s+unknown\s+idle unknown\s+unknown\s+unknown\s+unknown\s*$"
+        )
+        assert not any(contentless_line.match(line) for line in table.splitlines())
+    finally:
+        holder.close()
+    del registered
+    del nonce
+
+
+def test_never_emits_contentless_unknown_label_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate(monkeypatch, tmp_path)
+    live_root = _git_project(tmp_path, "liveproj")
+    busy_root = _git_project(tmp_path, "busyproj")
+    registered, holder, nonce = _hold_registered_lease(
+        live_root, "alice", "alice-nonce"
+    )
+    waiter = _arm_listener(live_root, "alice", nonce)
+    _claim_lease(busy_root, "bob", _reaped_principal(), "bob-nonce")
+    busy_journal = journal.resolve_journal_path(busy_root)
+    try:
+        with sqlite3.connect(
+            busy_journal,
+            timeout=0,
+            isolation_level=None,
+        ) as blocker:
+            assert blocker.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+            blocker.execute("BEGIN EXCLUSIVE")
+            payload = json.loads(_run(["--json"])[1])
+            table = _run([])[1]
+        for row in payload["controllers"]:
+            assert not controllers.is_contentless_row(row)
+            if row.get("label") in {None, "", "unknown"}:
+                assert row.get("project") not in {None, "", "unknown"}
+        assert "alice" in table
+        assert all(
+            not (
+                line.split()[:8] == ["unknown", "—", "unknown", "unknown", "idle", "unknown", "unknown", "unknown"]
+                or line.startswith("unknown  —  unknown  unknown")
+            )
+            for line in table.splitlines()
+            if line.startswith("unknown")
+        )
+    finally:
+        waiter.close()
+        holder.close()
+    del registered
+
+
+def test_unresolvable_sibling_root_uses_journal_project(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A junk stored project_root must not hide the journal's known project."""
+    _isolate(monkeypatch, tmp_path)
+    root = _git_project(tmp_path, "alpha")
+    registered, holder, nonce = _hold_registered_lease(root, "alice", "a-nonce")
+    waiter = _arm_listener(root, "alice", nonce)
+    gone = tmp_path / "gone-root"
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    authority = journal.Journal(root)
+    written = authority.write(
+        journal.RowOperation.insert(
+            "controller_leases",
+            {
+                "project_root": str(gone),
+                "label": "carol",
+                "generation": 1,
+                "nonce": "carol-nonce",
+                "principal_json": "{}",
+                "state": journal.LEASE_ACTIVE,
+                "claimed_at": now,
+                "renewed_at": now,
+                "renew_deadline_at": now,
+                "ended_at": None,
+                "ended_reason": None,
+            },
+        )
+    )
+    assert written.committed
+    try:
+        payload = json.loads(_run(["--json"])[1])
+        table = _run([])[1]
+    finally:
+        waiter.close()
+        holder.close()
+    alice = _row_for(payload, "alice")
+    carol = _row_for(payload, "carol")
+    assert alice["project"] == "alpha"
+    assert carol["project"] == "alpha"
+    assert carol["project"] != "unknown"
+    assert carol["project"] != "gone-root"
+    assert "gone-root" not in " ".join(
+        line.split()[2] for line in table.splitlines() if "carol" in line
+    )
+    canonical = controllers.canonical_project_root(root)
+    assert canonical is not None
+    assert carol["project_root"] == str(canonical)
+    assert carol["label"] == "carol"
+    _assert_no_live_row_carries_retire(payload)
+    del registered
+    del nonce

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 import sqlite3
 import sys
@@ -82,6 +83,9 @@ HOLDER_DEAD = frozenset({"dead-lock", "ended"})
 LIVE_DISPLAY_STATES = frozenset({"live", "live-overdue"})
 UNKNOWN_PROJECT = "unknown"
 RENEW_HINT = "lease overdue — renew (--join)"
+_JOURNAL_SLUG_HASH = re.compile(r"^(.+)-([0-9a-f]{10})$")
+_GENERIC_JOURNAL_SLUGS = frozenset({"project", "root", "repo", "tmp", "Users", "user"})
+_CONTENTLESS_LABELS = frozenset({"", "unknown", "—"})
 
 
 def _utc_now() -> datetime:
@@ -169,6 +173,67 @@ def project_identity(raw: Path | str | None) -> tuple[str, Path | None, str]:
     resolved = canonical.resolve(strict=False)
     name = resolved.name.strip() or UNKNOWN_PROJECT
     return f"project:{resolved}", resolved, name
+
+
+def journal_display_name(journal_path: Path | None) -> str | None:
+    """Index-folder identity: ``<repo-slug>-<10-hex>`` without inventing a path segment."""
+    if journal_path is None:
+        return None
+    folder = journal_path.parent.name.strip()
+    if not folder:
+        return None
+    match = _JOURNAL_SLUG_HASH.fullmatch(folder)
+    if match:
+        slug = match.group(1)
+        if slug in _GENERIC_JOURNAL_SLUGS:
+            return folder
+        return slug
+    return folder or None
+
+
+def resolve_journal_project(
+    pairs: list[tuple[str, str]],
+) -> tuple[Path | None, Path | str | None]:
+    """Pick one project for a journal from its ACTIVE lease identities.
+
+    A resolvable git root wins so every label in the journal shares that
+    project, including leases whose stored ``project_root`` is junk. A
+    directory that exists is the fallback probe target when nothing
+    canonicalizes.
+    """
+    any_fallback: Path | str | None = None
+    dir_fallback: Path | str | None = None
+    for raw_root, _label in pairs:
+        if any_fallback is None:
+            any_fallback = raw_root
+        path = Path(str(raw_root)).expanduser()
+        if dir_fallback is None and path.is_dir():
+            dir_fallback = raw_root
+        _key, canonical, _display = project_identity(raw_root)
+        if canonical is not None:
+            return canonical, raw_root
+    if dir_fallback is not None:
+        return None, dir_fallback
+    return None, any_fallback
+
+
+def is_contentless_row(row: dict[str, Any]) -> bool:
+    """True when the row names no controller and no project.
+
+    An identified unknown (named journal/project, unknown measurements) is
+    information. An anonymous all-unknown row is noise and must not emit.
+    """
+    label = row.get("label")
+    if isinstance(label, str) and label.strip() and label.strip() not in _CONTENTLESS_LABELS:
+        return False
+    project = row.get("project")
+    if (
+        isinstance(project, str)
+        and project.strip()
+        and project.strip() != UNKNOWN_PROJECT
+    ):
+        return False
+    return True
 
 
 def holder_state(incarnation_state: object) -> str:
@@ -432,6 +497,10 @@ def unknown_project_row(
 ) -> dict[str, Any]:
     canonical = canonical_project_root(project_root)
     display = _project_display_name(canonical)
+    if display == UNKNOWN_PROJECT:
+        named = journal_display_name(journal_path)
+        if named:
+            display = named
     source = journal_path.parent.name if journal_path is not None else None
     where = f" at {journal_path}" if journal_path is not None else ""
     reason = (
@@ -459,6 +528,22 @@ def unknown_project_row(
         "retirement_reason": error,
         "_source": source,
     }
+
+
+def labeled_unknown_row(
+    label: str,
+    *,
+    project_root: Path | str | None,
+    journal_path: Path | None,
+    error: str,
+) -> dict[str, Any]:
+    row = unknown_project_row(
+        project_root=project_root,
+        journal_path=journal_path,
+        error=error,
+    )
+    row["label"] = label
+    return row
 
 
 def _row_group_key(row: dict[str, Any]) -> tuple[str, str] | None:
@@ -580,68 +665,96 @@ def collect_controller_rows(
         if not pairs:
             # No ACTIVE generation — not a fleet member, not disconnected.
             continue
-        seen_probe: set[str] = set()
-        for raw_root, _label in pairs:
-            _key, canonical, _display = project_identity(raw_root)
-            probe_root = canonical if canonical is not None else Path(raw_root)
-            probe_token = str(probe_root)
-            if probe_token in seen_probe:
-                continue
-            seen_probe.add(probe_token)
-            cached = roster_cache.get(probe_token)
-            if cached is None:
-                try:
-                    cached = sessions.controller_roster(
-                        probe_root,
-                        include_retired=False,
-                        ledger_records=ledger_records,
-                    )
-                except (
-                    goalflight_journal.JournalBusy,
-                    goalflight_journal.JournalDisappeared,
-                    goalflight_journal.JournalIOError,
-                    OSError,
-                    RuntimeError,
-                    ValueError,
-                ) as exc:
-                    cached = exc
-                roster_cache[probe_token] = cached
-            if isinstance(cached, BaseException):
-                rows.append(
-                    unknown_project_row(
-                        project_root=canonical,
-                        journal_path=path,
-                        error=type(cached).__name__,
-                    )
+        canonical, recorded_root = resolve_journal_project(pairs)
+        probe_root: Path | None
+        if canonical is not None:
+            probe_root = canonical
+        elif recorded_root is not None:
+            probe_root = Path(str(recorded_root))
+        else:
+            rows.append(
+                unknown_project_row(
+                    project_root=None,
+                    journal_path=path,
+                    error="unresolvable",
                 )
-                continue
-            roster = cached
-            measurements = roster.get("measurements") or {}
-            registry = measurements.get("controller_registry") or {}
-            if registry.get("measured") is False:
-                rows.append(
-                    unknown_project_row(
-                        project_root=canonical,
-                        journal_path=path,
-                        error=str(registry.get("error") or "unreadable"),
-                    )
+            )
+            continue
+        probe_token = str(probe_root)
+        cached = roster_cache.get(probe_token)
+        if cached is None:
+            try:
+                cached = sessions.controller_roster(
+                    probe_root,
+                    include_retired=False,
+                    ledger_records=ledger_records,
                 )
-                continue
-            for record in roster.get("controllers") or []:
-                if not isinstance(record, dict):
-                    continue
-                if record.get("retired"):
-                    continue
-                rows.append(
-                    fleet_row(
-                        record,
-                        canonical=canonical,
-                        idle_hours=idle_hours,
-                        journal_name=path.parent.name,
-                        recorded_root=raw_root,
-                    )
+            except (
+                goalflight_journal.JournalBusy,
+                goalflight_journal.JournalDisappeared,
+                goalflight_journal.JournalIOError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as exc:
+                cached = exc
+            roster_cache[probe_token] = cached
+        if isinstance(cached, BaseException):
+            rows.append(
+                unknown_project_row(
+                    project_root=canonical,
+                    journal_path=path,
+                    error=type(cached).__name__,
                 )
+            )
+            continue
+        roster = cached
+        measurements = roster.get("measurements") or {}
+        registry = measurements.get("controller_registry") or {}
+        if registry.get("measured") is False:
+            rows.append(
+                unknown_project_row(
+                    project_root=canonical,
+                    journal_path=path,
+                    error=str(registry.get("error") or "unreadable"),
+                )
+            )
+            continue
+        seen_labels: set[str] = set()
+        for record in roster.get("controllers") or []:
+            if not isinstance(record, dict):
+                continue
+            if record.get("retired"):
+                continue
+            rows.append(
+                fleet_row(
+                    record,
+                    canonical=canonical,
+                    idle_hours=idle_hours,
+                    journal_name=path.parent.name,
+                    recorded_root=recorded_root,
+                )
+            )
+            label = str(record.get("label") or "")
+            if label:
+                seen_labels.add(label)
+        for raw_root, label in pairs:
+            if not label or label in seen_labels:
+                continue
+            # ACTIVE in this journal, but the roster keyed on the
+            # canonical root missed it (stored project_root diverged).
+            # Keep the label under the journal's known project.
+            rows.append(
+                labeled_unknown_row(
+                    label,
+                    project_root=canonical,
+                    journal_path=path,
+                    error=f"stored root {raw_root} unresolvable",
+                )
+            )
+            seen_labels.add(label)
     rows = merge_controller_rows(rows)
+    rows = [row for row in rows if not is_contentless_row(row)]
     _sanitize_retire_commands(rows)
     return _sort_rows(rows)
 
