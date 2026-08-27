@@ -94,18 +94,34 @@ def _entry(
     why: str,
     root: str | None = None,
     reclaimable: bool = False,
+    roots: list[str] | None = None,
 ) -> dict:
-    return {
+    payload = {
         "journal": str(journal_dir),
         "root": root,
         "state": state,
         "reclaimable": reclaimable,
         "why": why,
     }
+    if roots is not None:
+        payload["roots"] = list(roots)
+    return payload
 
 
-def _keep_unknown(journal_dir: Path, why: str, root: str | None = None) -> dict:
-    return _entry(journal_dir, state="unknown", why=why, root=root, reclaimable=False)
+def _keep_unknown(
+    journal_dir: Path,
+    why: str,
+    root: str | None = None,
+    roots: list[str] | None = None,
+) -> dict:
+    return _entry(
+        journal_dir,
+        state="unknown",
+        why=why,
+        root=root,
+        roots=roots,
+        reclaimable=False,
+    )
 
 
 def _is_casualty_name(name: str) -> bool:
@@ -154,6 +170,42 @@ def _distinct_roots(connection: sqlite3.Connection, table: str) -> list[str] | N
             seen.add(value)
             roots.append(value)
     return roots
+
+
+def _union_distinct_roots(*groups: list[str] | None) -> list[str] | None:
+    """Union recorded project_root values across tables. None if any group failed."""
+    if any(group is None for group in groups):
+        return None
+    seen: set[str] = set()
+    roots: list[str] = []
+    for group in groups:
+        for value in group:
+            if value not in seen:
+                seen.add(value)
+                roots.append(value)
+    return roots
+
+
+def _considered_roots(entry: dict) -> list[str]:
+    """Distinct project_root values this classification considered."""
+    raw = entry.get("roots")
+    if not isinstance(raw, list):
+        raw = [entry["root"]] if entry.get("root") else []
+    seen: set[str] = set()
+    roots: list[str] = []
+    for item in raw:
+        value = "" if item is None else str(item).strip()
+        if value and value not in seen:
+            seen.add(value)
+            roots.append(value)
+    return roots
+
+
+def _roots_annotation(entry: dict) -> str:
+    considered = _considered_roots(entry)
+    if considered:
+        return "  roots=" + ", ".join(considered)
+    return ""
 
 
 def _domain_row_count(connection: sqlite3.Connection, tables: set[str]) -> int | None:
@@ -367,26 +419,36 @@ def classify(journal_dir: Path) -> dict:
             reclaimable=True,
         )
 
-    roots = lease_roots or attempt_roots
+    # Union across tables. `lease or attempt` would hide a live attempt root
+    # whenever any lease recorded a (possibly gone) project_root.
+    roots = _union_distinct_roots(lease_roots, attempt_roots)
     if not roots:
         return _keep_unknown(
             journal_dir,
             "no recorded project_root - root unknown, so absence is unverifiable",
         )
-    if len(roots) > 1:
+    if len(roots) != 1:
         return _keep_unknown(
             journal_dir,
-            "multiple recorded project_root values, so the live root is unverifiable",
+            "multiple recorded project_root values ("
+            + ", ".join(roots)
+            + "), so the live root is unverifiable",
+            roots=roots,
         )
 
     root = roots[0]
     state, why = _classify_root(root)
     if state == "live":
         return _entry(
-            journal_dir, state="live", why=why, root=root, reclaimable=False
+            journal_dir,
+            state="live",
+            why=why,
+            root=root,
+            roots=roots,
+            reclaimable=False,
         )
     if state == "unknown":
-        return _keep_unknown(journal_dir, why, root=root)
+        return _keep_unknown(journal_dir, why, root=root, roots=roots)
 
     # root-gone: still refuse if referenced.
     if references:
@@ -395,6 +457,7 @@ def classify(journal_dir: Path) -> dict:
             state="root_gone",
             why="; ".join(references),
             root=root,
+            roots=roots,
             reclaimable=False,
         )
     return _entry(
@@ -402,6 +465,7 @@ def classify(journal_dir: Path) -> dict:
         state="root_gone",
         why=why,
         root=root,
+        roots=roots,
         reclaimable=True,
     )
 
@@ -484,12 +548,22 @@ def apply_deletes(entries: list[dict], *, limit: int) -> tuple[int, list[dict]]:
         # Re-verify immediately before deleting: the listing above is a
         # snapshot, and a root that reappeared must not be reaped.
         current = classify(path)
-        if not current["reclaimable"]:
+        considered = _considered_roots(current)
+        # Re-verify the cross-table union here, not only at scan: a stale
+        # listing that named one gone root must not delete while another
+        # recorded root is still live. Zero roots is the empty-journal case.
+        if len(considered) > 1 or not current["reclaimable"]:
             failed.append(
                 {
                     "journal": entry["journal"],
                     "error": "no longer reclaimable",
-                    "why": current["why"],
+                    "why": (
+                        "multiple recorded project_root values ("
+                        + ", ".join(considered)
+                        + "), so the live root is unverifiable"
+                        if len(considered) > 1
+                        else current["why"]
+                    ),
                 }
             )
             continue
@@ -525,14 +599,14 @@ def format_human(
     if reclaimable:
         lines.append("\n  reclaimable journals:")
         for entry in reclaimable:
-            root = f"  root={entry['root']}" if entry["root"] else ""
+            root = _roots_annotation(entry)
             lines.append(
                 f"    {entry['state']:<10} {entry['journal']}{root}  why={entry['why']}"
             )
     if retained:
         lines.append("\n  retained:")
         for entry in retained:
-            root = f"  root={entry['root']}" if entry["root"] else ""
+            root = _roots_annotation(entry)
             lines.append(
                 f"    {entry['state']:<10} {entry['journal']}{root}  why={entry['why']}"
             )

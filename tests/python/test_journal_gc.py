@@ -321,6 +321,116 @@ def test_negative_limit_is_refused(tmp_path: Path) -> None:
     assert journal_dir.is_dir()
 
 
+def _expire_lease_at(authority: journal.Journal, root: Path | str) -> None:
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute(
+            "UPDATE controller_leases SET project_root = ?, state = ?, "
+            "ended_at = ?, ended_reason = ?",
+            (str(root), journal.LEASE_EXPIRED, "2026-01-01T00:00:00+00:00", "expired"),
+        )
+        connection.commit()
+
+
+def _terminal_attempt(
+    authority: journal.Journal, dispatch_id: str, *, project_root: Path | str | None = None
+) -> None:
+    prepared = authority.prepare_attempt(dispatch_id)
+    assert prepared.committed and prepared.value is not None, prepared.reason
+    committed = authority.commit_terminal(
+        prepared.value.attempt_id,
+        terminal_state="complete",
+        observation={"state": "complete"},
+    )
+    assert committed.committed, committed.reason
+    if project_root is None:
+        return
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute(
+            "UPDATE dispatch_attempts SET project_root = ?",
+            (str(project_root),),
+        )
+        connection.commit()
+
+
+def test_cross_table_gone_lease_and_live_attempt_is_unknown(tmp_path: Path) -> None:
+    """EXPIRED lease at a missing path plus TERMINAL attempt at a live path.
+
+    A worktree-stripped slug shares one journal across checkouts. Leases from a
+    since-deleted worktree must not hide the still-live main-tree attempt root.
+    """
+    live = _project(tmp_path, "live-main")
+    gone = _project(tmp_path, "gone-worktree")
+    gone_root = str(gone)
+    authority = _create(live)
+    _claim(authority)
+    _expire_lease_at(authority, gone_root)
+    shutil.rmtree(gone)
+    _terminal_attempt(authority, "cross-table-live")
+    journal_dir = _journal_dir(authority)
+    live_root = str(authority.project_root)
+
+    entry = gc.classify(journal_dir)
+    assert entry["state"] == "unknown", entry
+    assert entry["reclaimable"] is False
+    assert gone_root in entry["roots"]
+    assert live_root in entry["roots"]
+    assert "multiple recorded project_root" in entry["why"]
+
+    stale = {
+        "journal": str(journal_dir),
+        "root": gone_root,
+        "state": "root_gone",
+        "reclaimable": True,
+        "why": "root no longer exists",
+    }
+    deleted, failed = gc.apply_deletes([stale], limit=0)
+    assert deleted == 0
+    assert failed
+    assert journal_dir.is_dir()
+    assert live.is_dir()
+
+    payload = _run_json("--apply")
+    reported = _entry_for(payload, journal_dir)
+    assert reported["state"] == "unknown"
+    assert reported["reclaimable"] is False
+    assert gone_root in reported["roots"]
+    assert live_root in reported["roots"]
+    assert journal_dir.is_dir()
+    assert live.is_dir()
+
+    proc = _run()
+    assert proc.returncode == 0, proc.stderr
+    assert gone_root in proc.stdout
+    assert live_root in proc.stdout
+    assert "roots=" in proc.stdout
+
+
+def test_cross_table_live_lease_and_gone_attempt_is_unknown(tmp_path: Path) -> None:
+    """The reverse shape: lease root still exists, attempt root is gone."""
+    live = _project(tmp_path, "live-main-rev")
+    gone = _project(tmp_path, "gone-worktree-rev")
+    gone_root = str(gone)
+    authority = _create(live)
+    _claim(authority)
+    _expire_lease_at(authority, authority.project_root)
+    _terminal_attempt(authority, "cross-table-gone", project_root=gone_root)
+    shutil.rmtree(gone)
+    journal_dir = _journal_dir(authority)
+    live_root = str(authority.project_root)
+
+    entry = gc.classify(journal_dir)
+    assert entry["state"] == "unknown", entry
+    assert entry["reclaimable"] is False
+    assert gone_root in entry["roots"]
+    assert live_root in entry["roots"]
+
+    payload = _run_json("--apply")
+    reported = _entry_for(payload, journal_dir)
+    assert reported["reclaimable"] is False
+    assert journal_dir.is_dir()
+    assert live.is_dir()
+
+
 def test_cli_json_four_state_counts(tmp_path: Path) -> None:
     live = _project(tmp_path, "count-live")
     live_auth = _create(live)
