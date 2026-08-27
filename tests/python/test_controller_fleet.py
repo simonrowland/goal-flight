@@ -652,7 +652,7 @@ def test_empty_index_is_honest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     payload = json.loads(json_text)
     assert payload["schema"] == controllers.SCHEMA
     assert payload["controllers"] == []
-    assert payload["last_drain_available"] is True
+    assert payload["last_drain_available"] is False
     assert payload["idle_hours"] == 4.0
 
 
@@ -672,9 +672,11 @@ def test_last_drain_comes_from_journal_cursor(
         addressee=messages.controller_addressee("alice", project_root=root),
     )
     try:
-        before = _row_for(json.loads(_run(["--json"])[1]), "alice")
+        before_payload = json.loads(_run(["--json"])[1])
+        before = _row_for(before_payload, "alice")
         assert before["unread"] == 1
         assert before["last_drain_at"] is None
+        assert before_payload["last_drain_available"] is False
         authority = journal.Journal(root)
         lease = authority.active_lease("alice")
         peek = authority.cursor_peek("alice", nonce=lease.nonce, limit=10)
@@ -686,10 +688,12 @@ def test_last_drain_comes_from_journal_cursor(
             advances={"fleet-mail": 1},
             actor="alice",
         ).committed
-        after = _row_for(json.loads(_run(["--json"])[1]), "alice")
+        after_payload = json.loads(_run(["--json"])[1])
+        after = _row_for(after_payload, "alice")
         assert after["unread"] == 0
         assert after["last_drain_at"]
         assert after["last_drain_seconds"] is not None
+        assert after_payload["last_drain_available"] is True
         assert set(after.keys()) == set(controllers.JSON_ROW_KEYS)
     finally:
         waiter.close()

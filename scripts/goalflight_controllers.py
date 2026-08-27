@@ -1026,7 +1026,9 @@ def build_payload(
         "schema": SCHEMA,
         "generated_at": _utc_now().isoformat(),
         "idle_hours": idle_hours,
-        "last_drain_available": True,
+        "last_drain_available": any(
+            row.get("last_drain_at") is not None for row in rows
+        ),
         "controllers": [
             {key: row.get(key) for key in JSON_ROW_KEYS} for row in rows
         ],
