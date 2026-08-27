@@ -439,6 +439,31 @@ def test_terminal_marker_dispatch_identity_poison_pairs() -> None:
                 expected,
             ),
         )
+        assert_true(
+            f"empty {kind} still belongs (ceremony-free escalation)",
+            goalflight_watch._terminal_marker_matches_dispatch(
+                {"kind": kind, "text": ""}, expected
+            ),
+        )
+        assert_true(
+            f"ordinary-word {kind} still belongs",
+            goalflight_watch._terminal_marker_matches_dispatch(
+                {"kind": kind, "text": "foreign package unavailable"}, expected
+            ),
+        )
+        assert_true(
+            f"hyphenated prose {kind} still belongs without an identity dash",
+            goalflight_watch._terminal_marker_matches_dispatch(
+                {"kind": kind, "text": "pre-commit hook failed"}, expected
+            ),
+        )
+        assert_true(
+            f"named foreign {kind} does not bind",
+            not goalflight_watch._terminal_marker_matches_dispatch(
+                {"kind": kind, "text": "other-live-id — needs controller"},
+                expected,
+            ),
+        )
 
     with tempfile.TemporaryDirectory() as tmp:
         tail = Path(tmp) / "identity.tail"
@@ -464,6 +489,22 @@ def test_terminal_marker_dispatch_identity_poison_pairs() -> None:
         )
 
     with tempfile.TemporaryDirectory() as tmp:
+        bare = Path(tmp) / "bare-blocked.tail"
+        bare.write_text("work stalled\nBLOCKED:\n", encoding="utf-8")
+        bare_marker = goalflight_watch._final_terminal_marker(
+            bare, expected_dispatch_id=expected
+        )
+        assert_true("bare BLOCKED reconciles", bare_marker is not None)
+        assert_eq("bare BLOCKED kind", bare_marker["kind"], "BLOCKED")
+        assert_true(
+            "bare BLOCKED is last-line terminal",
+            goalflight_watch._last_line_is_terminal_marker(
+                bare, expected_dispatch_id=expected
+            )
+            is not None,
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
         blocked = Path(tmp) / "blocked.tail"
         blocked.write_text(
             "work stalled\nBLOCKED: cannot write sandbox path\n",
@@ -484,6 +525,27 @@ def test_terminal_marker_dispatch_identity_poison_pairs() -> None:
         )
         assert_true("unbound BLOCKED is last-line terminal", last is not None)
         assert_eq("last-line unbound BLOCKED kind", last["kind"], "BLOCKED")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        foreign = Path(tmp) / "foreign-blocked.tail"
+        foreign.write_text(
+            "work stalled\nBLOCKED: other-live-id — needs controller\n",
+            encoding="utf-8",
+        )
+        assert_true(
+            "named foreign BLOCKED does not reconcile",
+            goalflight_watch._final_terminal_marker(
+                foreign, expected_dispatch_id=expected
+            )
+            is None,
+        )
+        assert_true(
+            "named foreign BLOCKED is not last-line terminal",
+            goalflight_watch._last_line_is_terminal_marker(
+                foreign, expected_dispatch_id=expected
+            )
+            is None,
+        )
 
 
 def test_false_death_marker_poison_pairs() -> None:

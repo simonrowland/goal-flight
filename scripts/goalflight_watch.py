@@ -1478,6 +1478,16 @@ def _marker_survives_unbalanced_fence(marker: dict | None) -> bool:
     return bool(marker and marker.get("kind") in SUCCESS_TERMINAL_MARKERS)
 
 
+# Identity-payload terminator set shared by own-id binding and foreign-id
+# detection. Must stay in lockstep with the suffix check in
+# ``_payload_binds_to_dispatch``.
+_IDENTITY_PAYLOAD_SEPARATORS = ":;|\N{EM DASH}\N{EN DASH}"
+# Journal identity tokens are ``[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}``. Auto
+# dispatch ids are ``{agent}-{pid}-{timestamp}``; instructed ids are kebab-case.
+# Hyphen is the extra constraint that keeps ordinary English out.
+_DISPATCH_ID_SHAPE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}\Z")
+
+
 def _payload_binds_to_dispatch(
     marker: dict,
     expected: str,
@@ -1496,7 +1506,59 @@ def _payload_binds_to_dispatch(
     if not text.startswith(expected):
         return False
     suffix = text[len(expected) :]
-    return bool(suffix and (suffix[0].isspace() or suffix[0] in ":;|\N{EM DASH}\N{EN DASH}"))
+    return bool(suffix and (suffix[0].isspace() or suffix[0] in _IDENTITY_PAYLOAD_SEPARATORS))
+
+
+def _payload_leading_token(text: str) -> tuple[str, str]:
+    """Split an identity-style payload into ``(leading_token, remainder)``.
+
+    Remainder includes the terminator. Same terminator set as
+    ``_payload_binds_to_dispatch`` so own-signal and foreign-signal agree
+    on where the id ends.
+    """
+    for index, char in enumerate(text):
+        if char.isspace() or char in _IDENTITY_PAYLOAD_SEPARATORS:
+            return text[:index], text[index:]
+    return text, ""
+
+
+def _token_looks_like_dispatch_id(token: str) -> bool:
+    return "-" in token and bool(_DISPATCH_ID_SHAPE_RE.fullmatch(token))
+
+
+def _attention_payload_names_foreign_dispatch(text: str, expected: str) -> bool:
+    """True when an attention payload names a different dispatch.
+
+    Production workers are instructed to emit
+    ``<KIND>: <dispatch-id> — <summary>`` (the identity contract injected by
+    ``_materialize_steer_prompt`` and documented in
+    ``protocols/worker-markers.md``). After parse, that is the marker
+    ``text``: a leading token, optionally followed by an em/en dash summary.
+
+    Distinguishing "names a different dispatch" from "prose that starts with
+    a word" cannot be a charset check alone. ``BLOCKED: foreign package
+    unavailable`` and ``BLOCKED: cannot write sandbox path`` start with
+    tokens that match the journal identity charset. This helper therefore
+    fails toward binding (returns False, meaning "not foreign") unless both:
+
+    1. The leading token looks like a dispatch id — journal identity charset
+       AND at least one hyphen. Unhyphenated tokens are treated as prose even
+       though an operator could pass ``--dispatch-id stuck``.
+    2. The remainder, after optional horizontal whitespace, begins with an
+       em or en dash — the identity-contract summary separator. Space-then-
+       prose is not enough: ``BLOCKED: pre-commit hook failed`` must still
+       bind. Id-only payloads (``BLOCKED: file-not-found`` vs
+       ``BLOCKED: other-live-id``) are syntactically identical, so they also
+       fail toward binding rather than drop a hyphenated one-word escalation.
+
+    A lost escalation parks a worker until timeout; an extra wake costs one
+    status read. Prefer the extra wake.
+    """
+    token, remainder = _payload_leading_token(text)
+    if not token or token == expected or not _token_looks_like_dispatch_id(token):
+        return False
+    stripped = remainder.lstrip(" \t")
+    return stripped[:1] in {"\N{EM DASH}", "\N{EN DASH}"}
 
 
 def _terminal_marker_matches_dispatch(
@@ -1508,9 +1570,12 @@ def _terminal_marker_matches_dispatch(
     """Bind scraped terminal evidence to the dispatch that owns the tail.
 
     Success markers (COMPLETE/READY/RESULT) must carry this dispatch's id.
-    Attention markers (BLOCKED, USER-NEED, USER-CONFIRM, FAILED) bind without
-    that prefix so a deliberate escalation is not dropped as a missing sign-off.
-    Empty sign-offs remain usable only when the caller has no expected id.
+    Attention markers (BLOCKED, USER-NEED, USER-CONFIRM, FAILED) bind when
+    they carry no dispatch id (ceremony-free escalation) or this dispatch's
+    id. They do not bind when they name a different dispatch. See
+    ``_attention_payload_names_foreign_dispatch`` for how "names a different
+    dispatch" is distinguished from prose. Empty sign-offs remain usable
+    only when the caller has no expected id.
     """
     expected = str(expected_dispatch_id or "").strip()
     if not expected:
@@ -1521,7 +1586,15 @@ def _terminal_marker_matches_dispatch(
         marker, expected, require_terminated=require_terminated
     ):
         return True
-    return marker.get("kind") in goalflight_terminal.ATTENTION_MARKERS
+    if marker.get("kind") not in goalflight_terminal.ATTENTION_MARKERS:
+        return False
+    embedded = str(marker.get("dispatch_id") or "").strip()
+    if embedded:
+        # Own embedded id already returned True above. A populated foreign
+        # field is an explicit other-dispatch name, not missing ceremony.
+        return False
+    text = _strip_marker_decoration(str(marker.get("text") or "")).strip()
+    return not _attention_payload_names_foreign_dispatch(text, expected)
 
 
 def _final_terminal_marker_from_line(
