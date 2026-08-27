@@ -4130,20 +4130,30 @@ def envelope_headline(envelope: dict) -> str:
 def envelope_from(envelope: dict) -> str:
     """Who sent it, rendered so an unknown sender reads as unknown.
 
-    Order: an informative adapter, then the stamped controller label, then —
-    for controller-transport mail only — the explicit UNKNOWN sentinel, because
-    falling through to the node ("local") or the inbox id reads as a
-    determination and has already invited one wrong guess in production.
-    Non-controller mail keeps the historical node/inbox fallback.
+    For controller-transport mail a real (non-UNKNOWN) ``controller_label``
+    outranks adapter: adapter is a host/tool name (``codex``, ``fleet``,
+    ``goalflight_status``) shared by many controllers, not which controller
+    posted. UNKNOWN is not a real identity, so an informative adapter still
+    wins over the sentinel — quota/fleet posts that could not establish a
+    controller keep naming their producer. Adapter ``unknown`` is
+    uninformative and never wins. Non-controller mail keeps the historical
+    adapter/node/inbox fallback. Falling through to the node ("local") on
+    controller mail reads as a determination and has already invited one
+    wrong guess in production.
     """
     source = envelope.get("source")
     source = source if isinstance(source, dict) else {}
+    label = source.get("controller_label")
+    real_label = (
+        isinstance(label, str)
+        and label.strip()
+        and label.strip() != UNKNOWN_CONTROLLER_LABEL
+    )
+    if real_label:
+        return sanitize_display(label)
     adapter = source.get("adapter")
     if isinstance(adapter, str) and adapter.strip() and adapter.strip() != "unknown":
         return sanitize_display(adapter)
-    label = source.get("controller_label")
-    if isinstance(label, str) and label.strip():
-        return sanitize_display(label)
     if str(source.get("transport") or "") == "controller":
         return UNKNOWN_CONTROLLER_LABEL
     node = source.get("node")

@@ -69,12 +69,14 @@ incremented when meaningful skill behaviour changes.
   `GOALFLIGHT_CONTROLLER_LABEL` or a caller-supplied field — never a pid
   and never the git directory name. A leftover `GOALFLIGHT_DISPATCH_ID`
   stamps `UNKNOWN` rather than omitting the field. When no label can be
-  established the record carries the explicit `UNKNOWN` sentinel, and relay
-  renders unattributed controller mail `from UNKNOWN` rather than guessing
-  from the node (`from local`) or inbox id. Pre-existing journal records
-  without the field still read and render `UNKNOWN`. The field is additive,
-  trusted addressing metadata, and never proves authorship — the
-  capability-derived author digest remains the only self-authorship proof.
+  established the record carries the explicit `UNKNOWN` sentinel, and
+  relay renders a real label as `from` ahead of a shared adapter name
+  (`codex`, `fleet`, `goalflight_status`). Unattributed controller mail
+  says `from UNKNOWN` rather than guessing from the node (`from local`)
+  or inbox id. Pre-existing journal records without the field still read
+  and render `UNKNOWN`. The field is additive, trusted addressing
+  metadata, and never proves authorship — the capability-derived author
+  digest remains the only self-authorship proof.
 - Persistent shortfall hints no longer tell operators to arm `follow` /
   `listen` / `--watch-follow` beside a live `supervise`. Status, next,
   relay, reminder, tool-entry, and doctor reuse one three-state detector

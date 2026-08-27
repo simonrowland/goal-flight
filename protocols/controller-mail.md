@@ -76,10 +76,12 @@ label is stamped into `source.controller_label` at the shared admit path
 `UNKNOWN` when no identity can be established — including a leftover
 `GOALFLIGHT_DISPATCH_ID`, a bash-tool shell that dropped the session
 variables, or a PID-only environment. A pid or git directory name is never
-a sender. Relay renders that field as the `from` party, so an unattributed
-record says `from UNKNOWN` — read it as "sender not establishable", never as a
-license to infer one. The label is trusted descriptive metadata, not
-lease-validated; authorship proof remains the capability-derived author digest.
+a sender. Relay renders a real label as the `from` party even when an
+informative adapter is also present (adapter is a host/tool name shared by
+many controllers). Unattributed controller mail says `from UNKNOWN` — read
+it as "sender not establishable", never as a license to infer one. The label
+is trusted descriptive metadata, not lease-validated; authorship proof
+remains the capability-derived author digest.
 
 ## Patch flow — mail is how work leaves a controller
 

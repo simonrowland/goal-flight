@@ -265,7 +265,9 @@ def test_listing_carries_size_without_dumping_body(tmp_path: Path) -> None:
         dispatch_id="proj",
     )
     out = msg.format_envelope_headlines([envelope])
-    assert out == "proj #1 [controller-notice] from codex: Big one  (2048c)"
+    assert out == (
+        f"proj #1 [controller-notice] from {CONTROLLER_LABEL}: Big one  (2048c)"
+    )
     assert fragment not in out
 
 
@@ -277,7 +279,9 @@ def test_malformed_entries_do_not_break_the_listing(tmp_path: Path) -> None:
 
 def test_from_prefers_recorded_source_over_inbox_id(tmp_path: Path) -> None:
     envelope = _post_env(tmp_path, "body", dispatch_id="proj-inbox")
-    assert msg.envelope_from(envelope) == "codex"
+    # A real controller_label outranks a shared adapter name (codex is a host,
+    # not which of nine controllers posted).
+    assert msg.envelope_from(envelope) == CONTROLLER_LABEL
 
     envelope["source"]["adapter"] = "unknown"
     # The stamped controller label outranks an uninformative node: "local"
@@ -302,12 +306,25 @@ def test_from_renders_unknown_for_unattributed_controller_mail(tmp_path: Path) -
         "source": {"node": "worker-box", "adapter": "unknown", "transport": "tail_file"},
     }
     assert msg.envelope_from(worker) == "worker-box"
-    # An informative adapter still wins over everything below it.
+    # An informative adapter still wins over UNKNOWN / an absent label:
+    # quota and fleet posts that could not name a controller keep naming
+    # their producer. A real controller_label outranks adapter (see
+    # test_from_prefers_controller_label_over_shared_adapter).
     fleet = {
         "dispatch_id": "d",
         "source": {"node": "local", "adapter": "fleet", "transport": "controller"},
     }
     assert msg.envelope_from(fleet) == "fleet"
+    fleet_unknown = {
+        "dispatch_id": "d",
+        "source": {
+            "node": "local",
+            "adapter": "fleet",
+            "transport": "controller",
+            "controller_label": "UNKNOWN",
+        },
+    }
+    assert msg.envelope_from(fleet_unknown) == "fleet"
 
 
 def test_labelled_controller_post_round_trips_label_to_relay(tmp_path: Path) -> None:
@@ -730,6 +747,23 @@ def test_supplied_label_is_trusted_not_lease_validated(
     )
 
 
+def test_from_prefers_controller_label_over_shared_adapter() -> None:
+    envelope = {
+        "dispatch_id": "d",
+        "type": "finding",
+        "seq": 1,
+        "payload": {"text": "body"},
+        "source": {
+            "node": "local",
+            "adapter": "codex",
+            "transport": "controller",
+            "controller_label": "probe-ctl",
+        },
+    }
+    assert msg.envelope_from(envelope) == "probe-ctl"
+    assert "from probe-ctl:" in msg.format_envelope_headlines([envelope])
+
+
 def test_default_and_bodies_cli_paths_round_trip_subject(tmp_path: Path) -> None:
     fragment = "CLI-BODY-LEAK-SENTINEL:"
     body = fragment + ("z" * (2048 - len(fragment)))
@@ -743,7 +777,7 @@ def test_default_and_bodies_cli_paths_round_trip_subject(tmp_path: Path) -> None
     headlines = _run_relay(tmp_path)
     assert headlines.returncode == 0, headlines.stderr
     assert headlines.stdout.splitlines() == [
-        "kiln #1 [controller-notice] from codex: Gate green  (2048c)",
+        f"kiln #1 [controller-notice] from {CONTROLLER_LABEL}: Gate green  (2048c)",
         "bodies: re-run with --bodies",
         "pending counts: kiln=1",
     ]
@@ -768,7 +802,7 @@ def test_default_cli_sanitizes_source_and_body_controls(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "\x1b" not in result.stdout
-    assert "from codex FORGED:" in result.stdout
+    assert f"from {CONTROLLER_LABEL}:" in result.stdout
     assert r"\x1b[2J" in result.stdout
     assert "FORGED\n" not in result.stdout
 
@@ -790,7 +824,7 @@ def test_relay_new_sanitizes_full_stdout_structure(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [
         (
-            r"safe #1 [controller-notice] from codex: "
+            rf"safe #1 [controller-notice] from {CONTROLLER_LABEL}: "
             rf"first line / FORGED-BODY\x1b[2J\x9b31m  ({len(body)}c)"
         ),
         "bodies: re-run with --bodies",
@@ -884,6 +918,8 @@ def main() -> None:
             with tempfile.TemporaryDirectory() as td:
                 test(Path(td), leftover)
             print(f"PASS {test.__name__} leftover={leftover!r}")
+    test_from_prefers_controller_label_over_shared_adapter()
+    print("PASS test_from_prefers_controller_label_over_shared_adapter")
 
 
 if __name__ == "__main__":
