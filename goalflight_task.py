@@ -286,17 +286,44 @@ def _require_no_symlink_components(path: Path, *, base: Path | None = None) -> N
         raise TaskError(f"{symlink}: refusing symlink path component")
 
 
+# Bound for the store lock, so a contended store fails with a reason instead of
+# hanging until the caller's own wall kills it.
+#
+# Derivation. A legitimate store mutation is a small JSON rewrite plus an
+# os.replace -- sub-millisecond to a few ms. Waiting is therefore never for our
+# own work; it is for sibling writers (other controllers and their workers share
+# one store per project). 30s is ~1000x the cost of any single legitimate write,
+# so it rides out a burst of siblings without ever tripping on honest traffic.
+# The upper constraint is the caller: an operator invoking `capture` runs under a
+# 120s command wall, and a lock that outlives that wall converts a busy store
+# into SIGTERM -- indistinguishable from a crash, which is the failure this bound
+# exists to remove. 30s sits well inside it, so the honest "store busy" error
+# always surfaces first. Sanity check: at 30s a caller waiting on one stuck
+# holder still returns a diagnosable error four times inside that 120s wall.
+STORE_LOCK_BUDGET_S = 30.0
+
+
 class FileLock:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, budget_s: float | None = None):
         self.path = path
         self._fh = None
+        self._budget_s = STORE_LOCK_BUDGET_S if budget_s is None else float(budget_s)
 
     def __enter__(self) -> "FileLock":
         if self._fh is None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            require_regular_or_absent(self.path)
-            self._fh = self.path.open("a+", encoding="utf-8")
-            fcntl.flock(self._fh, fcntl.LOCK_EX)
+            acquired = FileLock.try_acquire(
+                self.path,
+                deadline_s=time.monotonic() + self._budget_s,
+            )
+            if acquired is None:
+                raise TaskError(
+                    f"task store busy after {self._budget_s:g}s: {self.path}; "
+                    "another writer holds the store lock -- retry, and read the "
+                    "store back before re-running a mutation that may have "
+                    "already landed"
+                )
+            self._fh = acquired._fh
+            acquired._fh = None
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
