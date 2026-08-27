@@ -941,13 +941,30 @@ def cmd_record(args: argparse.Namespace) -> int:
             identity = started.value
         elif args.state == "running":
             if identity.lifecycle_state != goalflight_journal.ATTEMPT_RUNNING:
+                # NOT a CAS loss. Nothing lost a compare-and-swap here: the
+                # attempt simply has not reached RUNNING yet, because the worker
+                # claims RUNNING asynchronously after it is spawned. This branch
+                # previously reported the fabricated disposition "cas_lost",
+                # which sent readers hunting for contention that never happened
+                # and, worse, made a launch race indistinguishable from a real
+                # concurrent-writer loss (:920 and :940, which are genuine).
+                #
+                # Callers must be able to tell "not yet" from "lost", because
+                # the correct responses differ: "not yet" is retryable against
+                # the worker's own startup, a genuine loss is not. Keep exit 3
+                # for compatibility with existing callers, but say what happened.
                 print(
                     json.dumps(
                         {
                             "ok": False,
                             "dispatch_id": dispatch_id,
-                            "disposition": "cas_lost",
-                            "error": f"attempt state is {identity.lifecycle_state}, worker has not claimed RUNNING",
+                            "disposition": "attempt_not_yet_running",
+                            "retryable": True,
+                            "error": (
+                                f"attempt state is {identity.lifecycle_state}, worker has not "
+                                "claimed RUNNING yet; this is a startup race, not a lost CAS, "
+                                "and the worker may already be alive"
+                            ),
                         },
                         sort_keys=True,
                     )
