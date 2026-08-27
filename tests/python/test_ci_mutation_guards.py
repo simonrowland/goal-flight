@@ -124,6 +124,42 @@ def test_attention_marker_helper_is_shared_by_status() -> None:
         assert not terminal.attention_marker_present(marker), kind
 
 
+def test_attention_marker_ceremony_free_binds_named_foreign_does_not() -> None:
+    """Bare and prose attention still bind; a named foreign dispatch does not.
+
+    The identity contract emits ``<KIND>: <dispatch-id> — <summary>``. A
+    ceremony-free ``BLOCKED:`` (empty payload) is the property the attention
+    exemption exists to protect. A hyphenated live-shaped id followed by an
+    em dash is the instructed foreign form and must not bind. Ordinary
+    first-word prose, including the brief's ``foreign package unavailable``
+    case, must still bind.
+    """
+    own_id = "attention-marker"
+    live_foreign = "other-live-id"
+    for kind in terminal.ATTENTION_MARKERS:
+        assert status._record_has_attention_marker(
+            {"dispatch_id": own_id, "terminal_marker": {"kind": kind, "text": ""}}
+        ), kind
+        assert not status._record_has_attention_marker(
+            {
+                "dispatch_id": own_id,
+                "terminal_marker": {
+                    "kind": kind,
+                    "text": f"{live_foreign} — needs controller",
+                },
+            }
+        ), kind
+        assert status._record_has_attention_marker(
+            {
+                "dispatch_id": own_id,
+                "terminal_marker": {
+                    "kind": kind,
+                    "text": "foreign package unavailable",
+                },
+            }
+        ), kind
+
+
 def test_stale_cpu_sample_forces_a_fresh_pair(monkeypatch: pytest.MonkeyPatch) -> None:
     pgid = 4242
     snapshots = iter(({7: 10.0}, {7: 10.6}))
