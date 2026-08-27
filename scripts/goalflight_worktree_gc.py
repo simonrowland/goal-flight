@@ -415,25 +415,36 @@ def check_unowned(path: str, ledger_dir: Path) -> dict[str, str]:
             + ", ".join(unreadable)
             + "); cannot prove no live dispatch owns this path",
         )
-    owners = [
-        str(record.get("dispatch_id") or "<unknown>")
-        for record in records
-        if _record_owns_path(record, path)
-    ]
-    if owners:
-        states = {
-            str(record.get("state") or "<none>")
-            for record in records
-            if _record_owns_path(record, path)
-        }
-        return _condition(
-            NO,
-            "non-terminal dispatch "
-            + ", ".join(sorted(owners))
-            + " (state="
-            + ", ".join(sorted(states))
-            + ") records this path as worker_cwd",
-        )
+    owned = [record for record in records if _record_owns_path(record, path)]
+    if owned:
+        running: list[str] = []
+        identity_live: list[str] = []
+        for record in owned:
+            dispatch_id = str(record.get("dispatch_id") or "<unknown>")
+            state = str(record.get("state") or "<none>")
+            terminal = any(
+                goalflight_dispatch_states.is_terminal_state(item)
+                for item in _record_states(record)
+            )
+            label = f"{dispatch_id} (state={state})"
+            if terminal:
+                identity_live.append(label)
+            else:
+                running.append(label)
+        parts: list[str] = []
+        if running:
+            parts.append(
+                "non-terminal dispatch "
+                + ", ".join(sorted(running))
+                + " records this path as worker_cwd"
+            )
+        if identity_live:
+            parts.append(
+                "identity-live dispatch "
+                + ", ".join(sorted(identity_live))
+                + " still owns this path"
+            )
+        return _condition(NO, "; ".join(parts))
     return _condition(YES, "no non-terminal dispatch records this path")
 
 

@@ -430,6 +430,8 @@ def test_idle_timeout_identity_live_worker_is_not_reclaimed(
     assert entry["decision"] == "retain", entry
     assert entry["conditions"]["unowned"]["verdict"] == "no", entry
     assert "idle-live-w1" in entry["conditions"]["unowned"]["reason"]
+    assert "identity-live" in entry["conditions"]["unowned"]["reason"]
+    assert "non-terminal" not in entry["conditions"]["unowned"]["reason"]
     assert wt.is_dir()
 
 

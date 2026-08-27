@@ -20,7 +20,8 @@ incremented when meaningful skill behaviour changes.
   `python3 scripts/goalflight_worktree_gc.py --into main` (report) or
   `--apply`. Exemption is by seat registration (managed path + lock file),
   not basename: an ad-hoc tree named `wt-N` is litter. Unknown registration
-  retains.
+  retains. A retain reason for an identity-live terminal row says
+  identity-live, not "non-terminal".
 - `goalflight_trace_archive.py` copies selected finished-dispatch tails from
   volatile `/tmp` dispatch state into gitignored
   `docs-private/traces/<YYYY-MM-DD>/<dispatch-id>/`. Policy keeps runs that
