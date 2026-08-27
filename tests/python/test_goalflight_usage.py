@@ -584,6 +584,8 @@ def test_every_report_row_carries_probe_source_and_observation_time(
         },
         "dispatch": None,
         "conflict": False,
+        "verdict": "unknown",
+        "winner": None,
     }
 
 
@@ -700,6 +702,9 @@ def test_probe_wall_and_newer_served_dispatch_render_as_timestamped_conflict(
 ):
     """Reproduces the 2026-08-05 incident: the seat probe reports every Codex
     seat walled, while ledger evidence proves cf9f50 served after probed_at.
+
+    The newer source wins: served-after-probe is HEALTHY via dispatch, not a
+    0% wall with a CONFLICT banner.
     """
     probed_at = "2026-08-05T18:28:00+00:00"
     served_at = "2026-08-05T18:29:00+00:00"
@@ -757,14 +762,22 @@ def test_probe_wall_and_newer_served_dispatch_render_as_timestamped_conflict(
     legacy = next(row for row in rows if row["account"] == "4c9435")
 
     assert all(tuple(row) == usage.REPORT_ROW_KEYS for row in rows)
-    assert served["remaining"] == "0%"
+    assert served["remaining"] == "ok"
     assert served["evidence"]["probe"]["state"] == "walled"
     assert served["evidence"]["dispatch"]["state"] == "served"
-    assert served["evidence"]["conflict"] is True
+    assert served["evidence"]["verdict"] == "healthy"
+    assert served["evidence"]["winner"] == "dispatch"
+    assert served["evidence"]["conflict"] is False
+    assert "walled" not in served["flags"]
     assert exhausted["evidence"]["dispatch"]["state"] == "quota_exhausted"
     assert exhausted["evidence"]["dispatch"]["reset_at"] == "2026-08-08T17:17:00+00:00"
+    assert exhausted["evidence"]["verdict"] == "exhausted"
+    assert exhausted["evidence"]["winner"] == "dispatch"
     assert legacy["evidence"]["dispatch"]["state"] == "limit_unknown"
-    assert "⚠CONFLICT" in rendered
+    assert legacy["evidence"]["verdict"] == "exhausted"
+    assert legacy["evidence"]["winner"] == "quota_probe"
+    assert "⚠CONFLICT" not in rendered
+    assert "winner: dispatch → healthy" in rendered
     assert "probe: walled" in rendered
     assert "dispatch: served" in rendered
     assert "Aug 05 14:28" in rendered
@@ -817,8 +830,11 @@ def test_stale_served_dispatch_shows_without_false_conflict(
     seat = rows[0]
     assert seat["evidence"]["probe"]["state"] == "walled"
     assert seat["evidence"]["dispatch"]["state"] == "served"
+    assert seat["evidence"]["verdict"] == "exhausted"
+    assert seat["evidence"]["winner"] == "quota_probe"
     assert seat["evidence"]["conflict"] is False
     assert "⚠CONFLICT" not in rendered
+    assert "winner: probe → exhausted" in rendered
     # Both readings stay visible with their own timestamps either way.
     assert "probe: walled" in rendered
     assert "dispatch: served" in rendered
@@ -828,20 +844,30 @@ def test_conflict_requires_dispatch_evidence_newer_than_probe():
     walled = {"state": "walled", "observed_at": 1_787_000_000.0}
     older_served = {"state": "served", "observed_at": 1_786_999_000.0}
     newer_served = {"state": "served", "observed_at": 1_787_000_001.0}
+    # Freshness names a winner, so these are not CONFLICT banners.
     assert usage._evidence_conflicts(walled, older_served) is False
-    assert usage._evidence_conflicts(walled, newer_served) is True
+    assert usage._evidence_conflicts(walled, newer_served) is False
     # Unmeasured ordering cannot be proven coherent: stays loud.
     assert usage._evidence_conflicts({"state": "walled"}, {"state": "served"}) is True
 
     reported = {"state": "reported", "observed_at": 1_787_000_000.0}
     newer_exhausted = {"state": "quota_exhausted", "observed_at": 1_787_000_001.0}
     older_exhausted = {"state": "quota_exhausted", "observed_at": 1_786_999_000.0}
-    assert usage._evidence_conflicts(reported, newer_exhausted) is True
+    assert usage._evidence_conflicts(reported, newer_exhausted) is False
     assert usage._evidence_conflicts(reported, older_exhausted) is False
     # Agreement kinds never conflict, in either direction of staleness.
     assert usage._evidence_conflicts(walled, newer_exhausted) is False
     unknown = {"state": "limit_unknown", "observed_at": 1_787_000_001.0}
     assert usage._evidence_conflicts(walled, unknown) is False
+
+    assert usage.headroom_verdict(walled, newer_served)["winner"] == "dispatch"
+    assert usage.headroom_verdict(walled, newer_served)["verdict"] == "healthy"
+    assert usage.headroom_verdict(walled, older_served)["winner"] == "quota_probe"
+    assert usage.headroom_verdict(walled, older_served)["verdict"] == "exhausted"
+    assert usage.headroom_verdict(reported, newer_exhausted)["winner"] == "dispatch"
+    assert usage.headroom_verdict(reported, newer_exhausted)["verdict"] == "exhausted"
+    assert usage.headroom_verdict(reported, older_exhausted)["winner"] == "quota_probe"
+    assert usage.headroom_verdict(reported, older_exhausted)["verdict"] == "healthy"
 
 
 def test_claude_reader_invoked_with_skip_tui(tmp_path):
@@ -1261,3 +1287,193 @@ def test_grok_absent_percent_renders_unknown_not_a_number():
 def test_grok_is_registered_in_readers_and_normalizers():
     assert "grok" in usage.NORMALIZERS
     assert any(spec.key == "grok" for spec in usage.READERS)
+
+
+def _codex_reader(tmp_path: Path, records: list[dict]) -> None:
+    _write_reader(
+        tmp_path,
+        "codex_usage.py",
+        "import json\nprint(json.dumps(" + repr(records) + "))\n",
+    )
+
+
+def test_fresh_healthy_probe_outranks_stale_exhaustion_record(
+    tmp_path: Path,
+    new_york_tz,
+) -> None:
+    """A probe taken after a dispatch wall is HEALTHY and names the probe."""
+    now = datetime.fromisoformat("2026-08-27T18:00:00+00:00").timestamp()
+    _codex_reader(
+        tmp_path,
+        [
+            {
+                "seat": "25ca6b",
+                "used_percent": 0.0,
+                "reset_at": None,
+                "probed_at": "2026-08-27T18:00:00+00:00",
+                "ok": True,
+            }
+        ],
+    )
+    rows = usage.collect_usage(
+        readers_dir=tmp_path,
+        reader_specs=(usage.ReaderSpec("codex", "codex", "codex_usage.py"),),
+        now=now,
+        ledger_records=[
+            {
+                "dispatch_id": "stale-wall",
+                "agent": "codex",
+                "effective_account": "25ca6b",
+                "state": "quota_exhausted",
+                "limit_kind": "exhausted",
+                "reset_at": "2026-09-01T11:44:00+00:00",
+                "ended_at": "2026-08-26T00:48:00+00:00",
+            }
+        ],
+    )
+    rendered = usage.render_table(rows, now=now)
+    seat = rows[0]
+    assert seat["remaining"] == "100%"
+    assert "walled" not in seat["flags"]
+    assert seat["evidence"]["verdict"] == "healthy"
+    assert seat["evidence"]["winner"] == "quota_probe"
+    assert "winner: probe → healthy" in rendered
+    assert "dispatch: quota_exhausted" in rendered
+    assert usage.not_before_still_gates(
+        datetime.fromisoformat("2026-09-01T11:44:00+00:00").timestamp(),
+        now=now,
+        headroom=seat["evidence"],
+    ) is False
+
+
+def test_fresh_exhaustion_probe_outranks_stale_healthy_record(
+    tmp_path: Path,
+    new_york_tz,
+) -> None:
+    """The reverse: a newer wall probe beats an older served dispatch."""
+    now = datetime.fromisoformat("2026-08-27T18:00:00+00:00").timestamp()
+    _codex_reader(
+        tmp_path,
+        [
+            {
+                "seat": "25ca6b",
+                "used_percent": 100.0,
+                "reset_at": "2026-09-01T11:44:00+00:00",
+                "probed_at": "2026-08-27T18:00:00+00:00",
+                "ok": True,
+            }
+        ],
+    )
+    rows = usage.collect_usage(
+        readers_dir=tmp_path,
+        reader_specs=(usage.ReaderSpec("codex", "codex", "codex_usage.py"),),
+        now=now,
+        ledger_records=[
+            {
+                "dispatch_id": "stale-ok",
+                "agent": "codex",
+                "effective_account": "25ca6b",
+                "state": "complete",
+                "ended_at": "2026-08-26T00:48:00+00:00",
+            }
+        ],
+    )
+    rendered = usage.render_table(rows, now=now)
+    seat = rows[0]
+    assert seat["remaining"] == "0%"
+    assert seat["flags"] == ["walled"]
+    assert seat["evidence"]["verdict"] == "exhausted"
+    assert seat["evidence"]["winner"] == "quota_probe"
+    assert "winner: probe → exhausted" in rendered
+    assert "dispatch: served" in rendered
+
+
+def test_fresh_dispatch_exhaustion_outranks_stale_healthy_probe(
+    tmp_path: Path,
+    new_york_tz,
+) -> None:
+    """Both directions: a newer dispatch wall beats an older healthy probe."""
+    now = datetime.fromisoformat("2026-08-27T18:00:00+00:00").timestamp()
+    _codex_reader(
+        tmp_path,
+        [
+            {
+                "seat": "25ca6b",
+                "used_percent": 8.0,
+                "reset_at": None,
+                "probed_at": "2026-08-27T12:00:00+00:00",
+                "ok": True,
+            }
+        ],
+    )
+    rows = usage.collect_usage(
+        readers_dir=tmp_path,
+        reader_specs=(usage.ReaderSpec("codex", "codex", "codex_usage.py"),),
+        now=now,
+        ledger_records=[
+            {
+                "dispatch_id": "fresh-wall",
+                "agent": "codex",
+                "effective_account": "25ca6b",
+                "state": "quota_exhausted",
+                "limit_kind": "exhausted",
+                "reset_at": "2026-09-01T11:44:00+00:00",
+                "ended_at": "2026-08-27T17:50:00+00:00",
+            }
+        ],
+    )
+    rendered = usage.render_table(rows, now=now)
+    seat = rows[0]
+    assert seat["remaining"] == "exhausted"
+    assert "walled" in seat["flags"]
+    assert seat["evidence"]["verdict"] == "exhausted"
+    assert seat["evidence"]["winner"] == "dispatch"
+    assert "winner: dispatch → exhausted" in rendered
+
+
+def test_unavailable_probe_renders_unknown_not_stale_exhaustion(
+    tmp_path: Path,
+    new_york_tz,
+) -> None:
+    """A probe that cannot be taken is UNKNOWN. The stale wall is not truth."""
+    now = datetime.fromisoformat("2026-08-27T18:00:00+00:00").timestamp()
+    _codex_reader(
+        tmp_path,
+        [
+            {
+                "seat": "seat-a",
+                "ok": False,
+                "error": "billing endpoint unreachable",
+                "probed_at": "2026-08-27T18:00:00+00:00",
+            }
+        ],
+    )
+    rows = usage.collect_usage(
+        readers_dir=tmp_path,
+        reader_specs=(usage.ReaderSpec("codex", "codex", "codex_usage.py"),),
+        now=now,
+        ledger_records=[
+            {
+                "dispatch_id": "stale-wall",
+                "agent": "codex",
+                "effective_account": "seat-a",
+                "state": "quota_exhausted",
+                "limit_kind": "exhausted",
+                "reset_at": "2026-09-01T11:44:00+00:00",
+                "ended_at": "2026-08-26T00:48:00+00:00",
+            }
+        ],
+    )
+    rendered = usage.render_table(rows, now=now)
+    seat = rows[0]
+    assert seat["evidence"]["verdict"] == "unknown"
+    assert seat["evidence"]["winner"] is None
+    assert "walled" not in seat["flags"]
+    assert seat["remaining"] not in {"exhausted", "0%", "ok"}
+    assert "winner: none → unknown" in rendered
+    # Unknown keeps a stored not_before: the wall flag is the only evidence.
+    assert usage.not_before_still_gates(
+        datetime.fromisoformat("2026-09-01T11:44:00+00:00").timestamp(),
+        now=now,
+        headroom=seat["evidence"],
+    ) is True

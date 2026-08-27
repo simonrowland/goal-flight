@@ -10604,6 +10604,258 @@ def _queue_entry_not_before_ts(entry: dict | None) -> float | None:
     return parsed.timestamp() if parsed is not None else None
 
 
+# Tests inject usage-shaped probe rows so drain re-derives not_before without
+# touching a billing endpoint. None means "load seat-state / live usage".
+_NOT_BEFORE_PROBE_ROWS: list | None = None
+
+
+def _queue_entry_provider_account(
+    entry: dict | None,
+) -> tuple[str | None, str | None]:
+    """Billing identity for a queued entry, used to re-derive not_before."""
+    if not isinstance(entry, dict):
+        return None, None
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    argv = list(entry.get("dispatch_argv") or [])
+    agent = None
+    for raw in (
+        entry.get("agent"),
+        request.get("agent"),
+        _option_value_before_worker_remainder(argv, "--agent"),
+    ):
+        if isinstance(raw, str) and raw.strip():
+            agent = raw.strip()
+            break
+    account = None
+    for raw in (
+        entry.get("effective_account"),
+        request.get("effective_account"),
+        entry.get("account"),
+        request.get("account"),
+        _option_value_before_worker_remainder(argv, "--account"),
+    ):
+        if isinstance(raw, str) and raw.strip() and raw.strip() != "default":
+            account = raw.strip()
+            break
+    if account is None:
+        requeued_from = entry.get("requeued_from") or request.get("requeued_from")
+        if isinstance(requeued_from, str) and requeued_from:
+            try:
+                payload = json.loads(
+                    goalflight_ledger.record_path(
+                        requeued_from, create=False
+                    ).read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict):
+                for key in ("effective_account", "account"):
+                    raw = payload.get(key)
+                    if isinstance(raw, str) and raw.strip() and raw.strip() != "default":
+                        account = raw.strip()
+                        break
+                if agent is None:
+                    raw = payload.get("agent")
+                    if isinstance(raw, str) and raw.strip():
+                        agent = raw.strip()
+    if not agent:
+        return None, account
+    import goalflight_usage as usage
+
+    provider = usage._record_provider({"agent": agent})
+    return (str(provider) if provider else None), account
+
+
+def _seat_entry_probe_row(
+    provider: str,
+    account: str | None,
+    entry: dict,
+    observed_at: float | None,
+):
+    """Turn one seat-state record into a usage row. Cooldown-only is not a probe."""
+    import goalflight_usage as usage
+
+    used = entry.get("used_percent")
+    remaining_percent = entry.get("remaining_percent")
+    flags: tuple[str, ...] = ()
+    probe_state = None
+    remaining_text = "unknown"
+    if isinstance(used, (int, float)) and not isinstance(used, bool):
+        remaining_value = max(0.0, 100.0 - float(used))
+        remaining_text = f"{usage._format_number(remaining_value)}%"
+        if float(used) >= 100 or remaining_value <= 0:
+            flags = ("walled",)
+            probe_state = "walled"
+        else:
+            probe_state = "reported"
+    elif isinstance(remaining_percent, (int, float)) and not isinstance(
+        remaining_percent, bool
+    ):
+        remaining_text = f"{usage._format_number(float(remaining_percent))}%"
+        if float(remaining_percent) <= 0:
+            flags = ("walled",)
+            probe_state = "walled"
+        else:
+            probe_state = "reported"
+    elif entry.get("ok") is False:
+        remaining_text = "unavailable"
+        flags = ("unavailable",)
+        probe_state = "unavailable"
+    else:
+        return None
+    row = usage._row(
+        provider,
+        account=account,
+        remaining=remaining_text,
+        reset_at=usage.parse_reset(entry.get("reset_at")),
+        flags=flags,
+    )
+    row["evidence"] = {
+        "probe": {
+            "source": usage.SOURCE_PROBE,
+            "state": probe_state,
+            "observed_at": observed_at,
+        },
+        "dispatch": None,
+        "conflict": False,
+        "verdict": usage.HEADROOM_UNKNOWN,
+        "winner": None,
+    }
+    return row
+
+
+def _quota_state_roots() -> list[Path]:
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for raw in (
+        os.environ.get("GOALFLIGHT_CODEX_STATE_DIR"),
+        os.environ.get("GOALFLIGHT_STATE_DIR"),
+    ):
+        if raw:
+            path = Path(raw).expanduser()
+            key = str(path)
+            if key not in seen:
+                seen.add(key)
+                roots.append(path)
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return roots
+    home_state = Path.home() / ".goal-flight"
+    key = str(home_state)
+    if key not in seen:
+        roots.append(home_state)
+    return roots
+
+
+def _seat_state_as_usage_rows() -> list[dict]:
+    rows: list[dict] = []
+    for root in _quota_state_roots():
+        for filename, provider in (
+            ("grok-seat-states.json", "grok"),
+            ("codex-seat-states.json", "codex"),
+        ):
+            path = root / filename
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(document, dict) or not isinstance(
+                document.get("seats"), dict
+            ):
+                continue
+            observed_at = document.get("updated_at")
+            if not isinstance(observed_at, (int, float)):
+                observed_at = None
+            for key, entry in document["seats"].items():
+                if not isinstance(entry, dict):
+                    continue
+                seat_observed = entry.get("probed_at") or entry.get("updated_at")
+                if isinstance(seat_observed, (int, float)):
+                    observed = float(seat_observed)
+                else:
+                    observed = float(observed_at) if observed_at is not None else None
+                account = None if key in ("", None) else str(key)
+                row = _seat_entry_probe_row(provider, account, entry, observed)
+                if row is not None:
+                    rows.append(row)
+    return rows
+
+
+def _probe_rows_for_not_before(*, providers: set[str] | None = None) -> list[dict]:
+    if _NOT_BEFORE_PROBE_ROWS is not None:
+        return list(_NOT_BEFORE_PROBE_ROWS)
+    rows = _seat_state_as_usage_rows()
+    # Tests inject rows or seat-state files. Never hit a billing endpoint
+    # from drain under pytest — the autouse fixture does not isolate HOME,
+    # so a live reader would use the operator login.
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return rows
+    try:
+        import goalflight_usage as usage
+
+        specs = tuple(
+            spec
+            for spec in usage.READERS
+            if providers is None or spec.provider in providers
+        )
+        live = usage.collect_usage(
+            timeout_s=min(usage.DEFAULT_TIMEOUT_S, 8.0),
+            reader_specs=specs or usage.READERS,
+            ledger_records=[],
+        )
+        if live:
+            return list(live)
+    except Exception:
+        pass
+    return rows
+
+
+def _headroom_for_queue_entry(
+    entry: dict | None,
+    *,
+    now: float,
+    probe_rows: list[dict],
+    ledger_records: list,
+) -> dict:
+    import goalflight_usage as usage
+
+    provider, account = _queue_entry_provider_account(entry)
+    if not provider:
+        return {"verdict": usage.HEADROOM_UNKNOWN, "winner": None}
+    account_key = usage._label(account) or ""
+    row = None
+    for candidate in probe_rows:
+        if str(candidate.get("provider") or "") != provider:
+            continue
+        if (usage._label(candidate.get("account")) or "") == account_key:
+            row = dict(candidate)
+            break
+    if row is None:
+        row = usage._row(
+            provider,
+            account=account,
+            remaining="unavailable",
+            reset_at=None,
+            flags=("unavailable",),
+        )
+        row["evidence"] = {
+            "probe": {
+                "source": usage.SOURCE_PROBE,
+                "state": "unavailable",
+                "observed_at": now,
+            },
+            "dispatch": None,
+            "conflict": False,
+            "verdict": usage.HEADROOM_UNKNOWN,
+            "winner": None,
+        }
+    overlaid = usage.overlay_dispatch_evidence([row], ledger_records)
+    evidence = overlaid[0].get("evidence") if overlaid else None
+    return evidence if isinstance(evidence, dict) else {
+        "verdict": usage.HEADROOM_UNKNOWN,
+        "winner": None,
+    }
+
+
 def _queue_entry_drain_candidate(path: Path) -> tuple[tuple[int, float, str], Path, dict | None, str | None]:
     entry: dict | None = None
     read_error: str | None = None
@@ -12047,14 +12299,67 @@ def _drain_queue_once(args) -> dict:
             launch_candidates.append(candidate)
     entries = sorted(launch_candidates)
     now_s = time.time()
-    deferred_entries = [
+    # Re-derive not_before against current probe vs dispatch evidence rather
+    # than freezing the reset predicted at requeue. A seat that now probes
+    # healthy (and that probe is newer than the exhaustion record) is
+    # eligible this pass; the queue file is not mutated.
+    stored_gated = [
         candidate
         for candidate in entries
         if (
             _queue_entry_not_before_ts(candidate[2]) is not None
-            and _queue_entry_not_before_ts(candidate[2]) > now_s
+            and (_queue_entry_not_before_ts(candidate[2]) or 0) > now_s
         )
     ]
+    deferred_entries: list = []
+    if stored_gated:
+        import goalflight_usage as usage
+
+        probe_rows: list | None = None
+        ledger_records: list | None = None
+        headroom_cache: dict[tuple[str | None, str | None], dict] = {}
+
+        def _entry_headroom(entry: dict | None) -> dict:
+            nonlocal probe_rows, ledger_records
+            key = _queue_entry_provider_account(entry)
+            cached = headroom_cache.get(key)
+            if cached is not None:
+                return cached
+            if probe_rows is None:
+                providers = {
+                    provider
+                    for provider, _account in (
+                        _queue_entry_provider_account(item[2])
+                        for item in stored_gated
+                    )
+                    if provider
+                }
+                probe_rows = _probe_rows_for_not_before(
+                    providers=providers or None
+                )
+            if ledger_records is None:
+                try:
+                    ledger_records = goalflight_ledger.read_records()
+                except (OSError, ValueError):
+                    ledger_records = []
+            verdict = _headroom_for_queue_entry(
+                entry,
+                now=now_s,
+                probe_rows=probe_rows,
+                ledger_records=ledger_records,
+            )
+            headroom_cache[key] = verdict
+            return verdict
+
+        deferred_entries = [
+            candidate
+            for candidate in stored_gated
+            if usage.not_before_still_gates(
+                _queue_entry_not_before_ts(candidate[2]),
+                now=now_s,
+                headroom=_entry_headroom(candidate[2]),
+            )
+        ]
     entries = [candidate for candidate in entries if candidate not in deferred_entries]
     left_queued += len(deferred_entries)
     not_before_until: str | None = None

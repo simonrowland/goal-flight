@@ -85,6 +85,23 @@ FLAG_TEXT = {
     "timeout": "⚠timeout",
 }
 
+# Three-state headroom. The fresher measurable source wins; an unmeasurable
+# probe is UNKNOWN even when a dispatch exhaustion record exists.
+HEADROOM_HEALTHY = "healthy"
+HEADROOM_EXHAUSTED = "exhausted"
+HEADROOM_UNKNOWN = "unknown"
+SOURCE_PROBE = "quota_probe"
+SOURCE_DISPATCH = "dispatch"
+
+_PROBE_HEADROOM = {
+    "reported": HEADROOM_HEALTHY,
+    "walled": HEADROOM_EXHAUSTED,
+}
+_DISPATCH_HEADROOM = {
+    "served": HEADROOM_HEALTHY,
+    goalflight_dispatch_states.QUOTA_EXHAUSTED_STATE: HEADROOM_EXHAUSTED,
+}
+
 
 def _number(value: object) -> float | None:
     if isinstance(value, bool) or value is None:
@@ -837,12 +854,14 @@ def collect_usage(
                 probed_at = current_time
             row["evidence"] = {
                 "probe": {
-                    "source": "quota_probe",
+                    "source": SOURCE_PROBE,
                     "state": _probe_state(row),
                     "observed_at": probed_at,
                 },
                 "dispatch": None,
                 "conflict": False,
+                "verdict": HEADROOM_UNKNOWN,
+                "winner": None,
             }
             rows.append(row)
     if ledger_records is None:
@@ -933,35 +952,156 @@ def _dispatch_outcome(record: Mapping[str, object]) -> dict[str, object] | None:
     }
 
 
+def _measurable_probe_claim(probe: Mapping[str, object] | None) -> str | None:
+    """Healthy/exhausted from a taken probe, or None if the probe could not run.
+
+    reported → healthy, walled → exhausted. unavailable / timeout / auth
+    failure mean the probe was not a headroom measurement.
+    """
+    if not isinstance(probe, Mapping):
+        return None
+    return _PROBE_HEADROOM.get(str(probe.get("state") or ""))
+
+
+def _measurable_dispatch_claim(dispatch: Mapping[str, object] | None) -> str | None:
+    if not isinstance(dispatch, Mapping):
+        return None
+    return _DISPATCH_HEADROOM.get(str(dispatch.get("state") or ""))
+
+
+def headroom_verdict(
+    probe: Mapping[str, object] | None,
+    dispatch: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Pick healthy / exhausted / unknown from probe vs dispatch.
+
+    The newer measurable source wins. Freshness is compared explicitly on
+    ``observed_at``. Equal timestamps prefer the probe (it is the attempt to
+    measure the present).
+
+    If the probe cannot be taken (network down, endpoint unreachable, timeout),
+    the verdict is UNKNOWN even when a dispatch exhaustion record exists.
+    Promoting that record would freeze a prediction a later probe may already
+    have contradicted — the stall this function exists to prevent. The
+    dispatch row stays attached as evidence; it is not the verdict. Fail-open
+    for DISPLAY (do not render healthy, do not render exhausted). Drain
+    gating fails the other way: an unknown probe keeps a stored not_before
+    because the wall flag is then the only remaining evidence.
+    """
+    probe_claim = _measurable_probe_claim(probe)
+    dispatch_claim = _measurable_dispatch_claim(dispatch)
+    probe_at = parse_reset(
+        probe.get("observed_at") if isinstance(probe, Mapping) else None
+    )
+    dispatch_at = parse_reset(
+        dispatch.get("observed_at") if isinstance(dispatch, Mapping) else None
+    )
+
+    if probe_claim is None:
+        return {
+            "verdict": HEADROOM_UNKNOWN,
+            "winner": None,
+            "observed_at": probe_at,
+        }
+    if dispatch_claim is None:
+        return {
+            "verdict": probe_claim,
+            "winner": SOURCE_PROBE,
+            "observed_at": probe_at,
+        }
+    if probe_at is None or dispatch_at is None:
+        # Ordering cannot be proven. Trust the probe that was taken rather
+        # than a dispatch record of unknown age.
+        return {
+            "verdict": probe_claim,
+            "winner": SOURCE_PROBE,
+            "observed_at": probe_at,
+        }
+    if dispatch_at > probe_at:
+        return {
+            "verdict": dispatch_claim,
+            "winner": SOURCE_DISPATCH,
+            "observed_at": dispatch_at,
+        }
+    return {
+        "verdict": probe_claim,
+        "winner": SOURCE_PROBE,
+        "observed_at": probe_at,
+    }
+
+
+def _apply_headroom_to_row(
+    row: dict[str, object],
+    verdict_info: Mapping[str, object],
+    dispatch: Mapping[str, object] | None,
+) -> None:
+    """Make remaining/flags follow the winning source, not the stale one."""
+    verdict = verdict_info.get("verdict")
+    winner = verdict_info.get("winner")
+    flags = (
+        list(row.get("flags") or []) if isinstance(row.get("flags"), list) else []
+    )
+    if verdict == HEADROOM_EXHAUSTED:
+        if "walled" not in flags:
+            flags.append("walled")
+        if winner == SOURCE_DISPATCH:
+            row["remaining"] = "exhausted"
+            reset_at = parse_reset(
+                dispatch.get("reset_at") if isinstance(dispatch, Mapping) else None
+            )
+            if reset_at is not None:
+                row["reset_at"] = reset_at
+    elif verdict == HEADROOM_HEALTHY:
+        flags = [flag for flag in flags if flag != "walled"]
+        if winner == SOURCE_DISPATCH:
+            remaining = str(row.get("remaining") or "")
+            if remaining.startswith("0%") or remaining in {"exhausted", "0"}:
+                row["remaining"] = "ok"
+    elif verdict == HEADROOM_UNKNOWN:
+        # Do not inherit a wall from a dispatch record we refused to promote,
+        # and do not invent a healthy percentage.
+        flags = [flag for flag in flags if flag != "walled"]
+    row["flags"] = flags
+
+
 def _evidence_conflicts(
     probe: Mapping[str, object],
     dispatch: Mapping[str, object],
 ) -> bool:
-    """True only when the two sources disagree about the PRESENT.
+    """True only when claims disagree AND freshness cannot be compared.
 
-    A conflict requires (a) incompatible claims and (b) the dispatch evidence
-    being newer than the probe observation. A seat that served at 14:29 and
-    was probed walled at 16:36 is not a conflict — time alone explains it
-    (it walled in between), and shouting there teaches the operator to ignore
-    the banner. When either timestamp is unmeasured the ordering cannot be
-    proven coherent, so the disagreement stays loud.
+    When both timestamps exist, ``headroom_verdict`` already names the newer
+    source. Shouting CONFLICT in that case taught operators to ignore the
+    banner. Loud disagreement remains only when ordering cannot be proven.
     """
-    probe_state = probe.get("state")
-    dispatch_state = dispatch.get("state")
-    disagree = False
-    if probe_state == "walled":
-        disagree = dispatch_state in {
-            "served",
-            goalflight_dispatch_states.TRANSIENT_THROTTLE_STATE,
-        }
-    elif probe_state == "reported":
-        disagree = dispatch_state == goalflight_dispatch_states.QUOTA_EXHAUSTED_STATE
-    if not disagree:
+    probe_claim = _measurable_probe_claim(probe)
+    dispatch_claim = _measurable_dispatch_claim(dispatch)
+    if probe_claim is None or dispatch_claim is None or probe_claim == dispatch_claim:
         return False
-    probed_at = parse_reset(probe.get("observed_at"))
-    dispatched_at = parse_reset(dispatch.get("observed_at"))
-    if probed_at is not None and dispatched_at is not None:
-        return dispatched_at > probed_at
+    probe_at = parse_reset(probe.get("observed_at"))
+    dispatch_at = parse_reset(dispatch.get("observed_at"))
+    return probe_at is None or dispatch_at is None
+
+
+def not_before_still_gates(
+    stored_ts: float | None,
+    *,
+    now: float,
+    headroom: Mapping[str, object] | None,
+) -> bool:
+    """Whether a frozen not_before still holds against current evidence.
+
+    Re-derived at drain time rather than by mutating the queue: a healthy
+    reading taken after the exhaustion that produced the timestamp means the
+    prediction is already contradicted, so the entry is eligible this pass.
+    The queue file keeps its not_before. Unknown (probe could not be taken)
+    keeps the gate — the exhaustion record is then the only remaining
+    evidence, and a wall flag is real while it lasts.
+    """
+    if stored_ts is None or stored_ts <= now:
+        return False
+    if isinstance(headroom, Mapping) and headroom.get("verdict") == HEADROOM_HEALTHY:
+        return False
     return True
 
 
@@ -992,18 +1132,26 @@ def overlay_dispatch_evidence(
         if not isinstance(evidence, dict):
             evidence = {
                 "probe": {
-                    "source": "quota_probe",
+                    "source": SOURCE_PROBE,
                     "state": _probe_state(row),
                     "observed_at": None,
                 },
                 "dispatch": None,
                 "conflict": False,
+                "verdict": HEADROOM_UNKNOWN,
+                "winner": None,
             }
         account = _label(row.get("account"))
         dispatch = latest.get((str(row.get("provider") or ""), account or ""))
         evidence["dispatch"] = dispatch
         probe = evidence.get("probe") if isinstance(evidence.get("probe"), Mapping) else {}
-        evidence["conflict"] = bool(dispatch and _evidence_conflicts(probe, dispatch))
+        verdict_info = headroom_verdict(probe, dispatch)
+        evidence["verdict"] = verdict_info["verdict"]
+        evidence["winner"] = verdict_info["winner"]
+        evidence["conflict"] = bool(
+            dispatch and _evidence_conflicts(probe, dispatch)
+        )
+        _apply_headroom_to_row(row, verdict_info, dispatch)
         row["evidence"] = evidence
         out.append(row)
     return out
@@ -1041,12 +1189,25 @@ def _observed_text(value: object, *, now: float) -> str:
     return f"{local}, age {humanize_delta(now - observed_at)}"
 
 
+def _winner_text(evidence: Mapping[str, object]) -> str:
+    verdict = evidence.get("verdict") or HEADROOM_UNKNOWN
+    winner = evidence.get("winner")
+    if winner == SOURCE_PROBE:
+        source = "probe"
+    elif winner == SOURCE_DISPATCH:
+        source = "dispatch"
+    else:
+        source = "none"
+    return f"winner: {source} → {verdict}"
+
+
 def _evidence_text(row: Mapping[str, object], *, now: float) -> str:
     evidence = row.get("evidence") if isinstance(row.get("evidence"), Mapping) else {}
     probe = evidence.get("probe") if isinstance(evidence.get("probe"), Mapping) else {}
     probe_state = probe.get("state") or _probe_state(row)
     parts = [
-        f"probe: {probe_state} (as of {_observed_text(probe.get('observed_at'), now=now)})"
+        _winner_text(evidence),
+        f"probe: {probe_state} (as of {_observed_text(probe.get('observed_at'), now=now)})",
     ]
     dispatch = evidence.get("dispatch") if isinstance(evidence.get("dispatch"), Mapping) else None
     if dispatch:

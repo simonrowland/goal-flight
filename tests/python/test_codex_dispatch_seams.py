@@ -1350,6 +1350,90 @@ def test_future_requeue_not_before_is_left_queued(tmp_path: Path) -> None:
     ]
 
 
+def test_not_before_contradicted_by_newer_healthy_probe_no_longer_gates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A frozen reset prediction must not hold a seat that now probes healthy.
+
+    Re-derived at drain time; the queue file is not mutated. Injected probe
+    rows stand in for the usage reader so this never hits a billing endpoint.
+    """
+    queue_dir = tmp_path / "queue"
+    queue_dir.mkdir()
+    queue_path = queue_dir / "healthy-retry.json"
+    D._write_json_atomic(
+        queue_path,
+        {
+            "schema": D.DISPATCH_QUEUE_SCHEMA,
+            "state": "queued",
+            "dispatch_id": "healthy-retry",
+            "agent": "codex",
+            "created_at": L.utc_now(),
+            "not_before": "2026-09-01T11:44:00Z",
+            "request": {
+                "not_before": "2026-09-01T11:44:00Z",
+                "account": "25ca6b",
+                "agent": "codex",
+            },
+            "dispatch_argv": ["--agent", "codex", "--account", "25ca6b"],
+        },
+    )
+    monkeypatch.setattr(
+        D,
+        "_NOT_BEFORE_PROBE_ROWS",
+        [
+            {
+                "provider": "codex",
+                "account": "25ca6b",
+                "remaining": "100%",
+                "reset_at": None,
+                "flags": [],
+                "evidence": {
+                    "probe": {
+                        "source": "quota_probe",
+                        "state": "reported",
+                        "observed_at": datetime.fromisoformat(
+                            "2026-08-27T18:00:00+00:00"
+                        ).timestamp(),
+                    },
+                    "dispatch": None,
+                    "conflict": False,
+                },
+            }
+        ],
+    )
+    L.write_record(
+        {
+            "schema": L.SCHEMA,
+            "dispatch_id": "stale-wall",
+            "agent": "codex",
+            "effective_account": "25ca6b",
+            "state": "quota_exhausted",
+            "limit_kind": "exhausted",
+            "reset_at": "2026-09-01T11:44:00Z",
+            "ended_at": "2026-08-26T00:48:00+00:00",
+        }
+    )
+    monkeypatch.setattr(D, "_claim_queue_entry", lambda path: None)
+    payload = D._drain_queue_once(
+        argparse.Namespace(
+            queue_dir=str(queue_dir),
+            remote_node=None,
+            capacity_wait_s=0.0,
+            claim_stale_s=D.QUEUE_CLAIM_STALE_S,
+            limit=0,
+        )
+    )
+    not_before_holds = [
+        row
+        for row in payload.get("details") or []
+        if row.get("reason") == "not_before"
+    ]
+    assert not_before_holds == [], payload
+    leftover = json.loads(queue_path.read_text(encoding="utf-8"))
+    assert leftover["not_before"] == "2026-09-01T11:44:00Z"
+
+
 def test_requeue_child_ledger_evidence_prevents_duplicate(
     tmp_path: Path,
 ) -> None:
