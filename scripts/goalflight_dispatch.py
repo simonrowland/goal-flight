@@ -3729,47 +3729,91 @@ def _reserve_auto_dispatch_id(agent: str, base: Path) -> str:
     raise DispatchUsageError(f"could not reserve a dispatch id for stem {stem!r}")
 
 
-def _kernel_live_controller_sessions(project_root: Path) -> list[dict]:
-    """Return controller leases whose kernel slot lock is held now."""
+@dataclass(frozen=True)
+class _ControllerSessionLookup:
+    sessions: list[dict] | None
+    unreadable_reason: str | None = None
+
+
+def _journal_unavailable_reason(
+    exc: goalflight_journal.JournalUnavailable,
+) -> str:
+    if isinstance(exc, goalflight_journal.JournalBusy):
+        kind = "journal busy"
+    elif isinstance(exc, goalflight_journal.JournalIOError):
+        kind = "journal I/O error"
+    else:
+        kind = f"journal unavailable ({type(exc).__name__})"
+    detail = str(exc).strip()
+    return f"{kind}: {detail}" if detail else kind
+
+
+def _kernel_live_controller_sessions(
+    project_root: Path,
+) -> _ControllerSessionLookup:
+    """Return kernel-live controller leases, preserving unreadable as unknown."""
     root = goalflight_task.resolve_project_root(str(project_root))
     try:
-        authority = goalflight_journal.Journal(root)
-    except (
-        goalflight_journal.JournalBusy,
-        goalflight_journal.JournalDisappeared,
-        goalflight_journal.JournalIOError,
-    ):
-        return []
-    sessions: list[dict] = []
-    seen: set[tuple[str, int, str]] = set()
-    for row in authority.lease_records():
-        label = str(row.get("label") or "")
-        nonce = str(row.get("nonce") or "")
-        try:
-            pid = int(row.get("pid"))
-        except (TypeError, ValueError):
-            continue
-        if not label or not nonce:
-            continue
-        session = goalflight_session_status.live_session(
-            root,
-            label=label,
-            pid=pid,
+        authority = goalflight_journal.Journal.open_reader(root)
+        sessions: list[dict] = []
+        seen: set[tuple[str, int, str]] = set()
+        for row in authority.lease_records():
+            label = str(row.get("label") or "")
+            nonce = str(row.get("nonce") or "")
+            try:
+                pid = int(row.get("pid"))
+            except (TypeError, ValueError):
+                continue
+            if not label or not nonce:
+                continue
+            probe_state, session = goalflight_session_status.probe_live_session(
+                root,
+                label=label,
+                pid=pid,
+            )
+            if probe_state == "unreadable":
+                # Callers need to know whether any lease can own the dispatch.
+                # Omitting one unreadable lease could turn an incumbent into a
+                # false "none" or a false unique match, so the whole lookup is
+                # unknown rather than a knowingly incomplete list.
+                return _ControllerSessionLookup(
+                    sessions=None,
+                    unreadable_reason=(
+                        f"controller lease {label!r} for pid {pid} was unreadable "
+                        "within the liveness probe budget"
+                    ),
+                )
+            if probe_state == "dead":
+                continue
+            if probe_state != "live":
+                raise RuntimeError(
+                    f"unexpected controller liveness probe state: {probe_state!r}"
+                )
+            if not isinstance(session, dict):
+                raise RuntimeError("live controller liveness probe returned no session")
+            if str(session.get("id") or "") != nonce:
+                continue
+            key = (label, pid, nonce)
+            if key in seen:
+                continue
+            seen.add(key)
+            sessions.append(dict(session))
+        return _ControllerSessionLookup(
+            sessions=sorted(
+                sessions,
+                key=lambda session: (
+                    str(session.get("label") or ""),
+                    int(session.get("pid") or 0),
+                ),
+            )
         )
-        if not isinstance(session, dict) or str(session.get("id") or "") != nonce:
-            continue
-        key = (label, pid, nonce)
-        if key in seen:
-            continue
-        seen.add(key)
-        sessions.append(dict(session))
-    return sorted(
-        sessions,
-        key=lambda session: (
-            str(session.get("label") or ""),
-            int(session.get("pid") or 0),
-        ),
-    )
+    except goalflight_journal.JournalDisappeared:
+        return _ControllerSessionLookup(sessions=[])
+    except goalflight_journal.JournalUnavailable as exc:
+        return _ControllerSessionLookup(
+            sessions=None,
+            unreadable_reason=_journal_unavailable_reason(exc),
+        )
 
 
 def _requested_controller_pid(args) -> int | None:
@@ -3821,10 +3865,12 @@ def _self_resolved_controller_session(
     """Resolve one ancestry-proven live holder matching declared identity."""
     label = _declared_controller_label(args, project_root)
     pid = _requested_controller_pid(args)
-    sessions = _kernel_live_controller_sessions(project_root)
+    lookup = _kernel_live_controller_sessions(project_root)
+    if lookup.sessions is None:
+        return None
     matches = [
         session
-        for session in sessions
+        for session in lookup.sessions
         if (label is None or str(session.get("label") or "") == label)
         and (pid is None or int(session.get("pid") or 0) == pid)
         and _controller_session_is_in_ancestry(session)
@@ -4058,6 +4104,17 @@ def _unregistered_controller_warning() -> str:
     )
 
 
+def _controller_registry_unreadable_warning(reason: str) -> str:
+    return "\n".join(
+        [
+            "controller registry could not be read; controller registration state "
+            f"is unknown ({reason}).",
+            "This is a transient registry-read failure. Retry the dispatch; refusing "
+            "before record or launch.",
+        ]
+    )
+
+
 def _remove_option_before_worker_remainder(argv: list[str], flag: str) -> list[str]:
     return _drop_option_before_worker_remainder(argv, flag, takes_value=True)
 
@@ -4104,8 +4161,19 @@ def _controller_not_in_ancestry_warning(session: dict) -> str:
     )
 
 
-def _controller_registration_warning(args, project_root: Path) -> str:
-    sessions = _kernel_live_controller_sessions(project_root)
+def _controller_registration_warning(
+    args,
+    project_root: Path,
+    *,
+    lookup: _ControllerSessionLookup | None = None,
+) -> str:
+    if lookup is None:
+        lookup = _kernel_live_controller_sessions(project_root)
+    if lookup.sessions is None:
+        return _controller_registry_unreadable_warning(
+            lookup.unreadable_reason or "unclassified registry read failure"
+        )
+    sessions = lookup.sessions
     if not sessions:
         return _unregistered_controller_warning()
 
@@ -4209,7 +4277,13 @@ def _prepare_attempt_controller_registration(
     """Refuse an unowned attempt, or return the forced-path warning to emit."""
     if _resolve_controller_dispatch_owner(args, project_root) is not None:
         return None
-    warning = _controller_registration_warning(args, project_root)
+    lookup = _kernel_live_controller_sessions(project_root)
+    warning = _controller_registration_warning(args, project_root, lookup=lookup)
+    if lookup.sessions is None:
+        # A forced unregistered dispatch is valid only after proving there is no
+        # usable owner. An unreadable registry is inconclusive, so fail closed
+        # and make retry the only path instead of manufacturing unowned fan-out.
+        raise DispatchUsageError(warning)
     if getattr(args, "unregistered_forced", False):
         return warning
     raise DispatchUsageError(warning)

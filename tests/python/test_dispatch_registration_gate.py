@@ -14,8 +14,10 @@ import multiprocessing
 import os
 from pathlib import Path
 import shlex
+import sqlite3
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -26,9 +28,15 @@ sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_capacity as capacity  # noqa: E402
 import goalflight_acp_run as acp  # noqa: E402
+import goalflight_dispatch as dispatch  # noqa: E402
 import goalflight_journal as journal  # noqa: E402
 import goalflight_ledger as ledger  # noqa: E402
+import goalflight_task as task  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
+
+
+class _FutureJournalUnavailable(journal.JournalUnavailable):
+    pass
 
 
 def _hold_sibling_controller(
@@ -260,6 +268,159 @@ def _attempt_owner(authority: journal.Journal, dispatch_id: str) -> dict:
     )[0]
 
 
+def _unowned_registration_args(*, forced: bool = False) -> argparse.Namespace:
+    return argparse.Namespace(
+        controller_session_id=None,
+        _controller_beacon_pid=None,
+        controller_label=None,
+        _requested_controller_label=None,
+        _requested_controller_pid=None,
+        unregistered_forced=forced,
+    )
+
+
+def test_controller_registry_lookup_does_not_take_journal_write_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    env, project, _advertised = _isolated_env(monkeypatch, tmp_path)
+    authority, holder, nonce = _register_controller(
+        project,
+        env,
+        export_identity=False,
+    )
+    outcome: dict[str, object] = {}
+
+    def read_registry() -> None:
+        try:
+            outcome["lookup"] = dispatch._kernel_live_controller_sessions(project)
+        except BaseException as exc:  # pragma: no cover - asserted below
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=read_registry)
+    try:
+        with task.FileLock(journal.journal_write_lock_path(authority.path)):
+            thread.start()
+            thread.join(timeout=0.5)
+            completed_while_locked = not thread.is_alive()
+    finally:
+        holder.close()
+    thread.join(timeout=5)
+
+    assert completed_while_locked, "controller registry lookup took the write lock"
+    assert not thread.is_alive()
+    assert "error" not in outcome
+    lookup = outcome["lookup"]
+    assert isinstance(lookup, dispatch._ControllerSessionLookup)
+    assert lookup.unreadable_reason is None
+    assert lookup.sessions is not None
+    assert [session["id"] for session in lookup.sessions] == [nonce]
+
+
+def test_busy_controller_registry_refuses_with_retry_even_when_forced(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _env, project, _advertised = _isolated_env(monkeypatch, tmp_path)
+    authority = journal.open_or_create_journal(project)
+
+    with sqlite3.connect(
+        authority.path,
+        timeout=0,
+        isolation_level=None,
+    ) as blocker:
+        assert blocker.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+        blocker.execute("BEGIN EXCLUSIVE")
+        with pytest.raises(dispatch.DispatchUsageError) as error:
+            dispatch._prepare_attempt_controller_registration(
+                _unowned_registration_args(forced=True),
+                project,
+            )
+
+    message = str(error.value)
+    assert "controller registry could not be read" in message
+    assert "journal busy" in message
+    assert "Retry the dispatch" in message
+    assert "controller is not registered" not in message
+    assert "--unregistered-forced" not in message
+
+
+def test_unreadable_live_lease_makes_whole_registry_lookup_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    env, project, _advertised = _isolated_env(monkeypatch, tmp_path)
+    _authority, holder, _nonce = _register_controller(
+        project,
+        env,
+        export_identity=False,
+    )
+    monkeypatch.setattr(
+        dispatch.goalflight_session_status,
+        "probe_live_session",
+        lambda *_args, **_kwargs: ("unreadable", None),
+    )
+    monkeypatch.setattr(
+        dispatch.goalflight_session_status,
+        "live_session",
+        lambda *_args, **_kwargs: pytest.fail("legacy collapsing wrapper was used"),
+    )
+    try:
+        lookup = dispatch._kernel_live_controller_sessions(project)
+    finally:
+        holder.close()
+
+    assert lookup.sessions is None
+    assert "registered-test" in str(lookup.unreadable_reason)
+    assert "unreadable" in str(lookup.unreadable_reason)
+
+
+@pytest.mark.parametrize(
+    ("failure_type", "expected_reason"),
+    [
+        (journal.JournalIOError, "journal I/O error"),
+        (_FutureJournalUnavailable, "journal unavailable (_FutureJournalUnavailable)"),
+    ],
+)
+def test_all_non_disappeared_journal_unavailability_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_type: type[journal.JournalUnavailable],
+    expected_reason: str,
+) -> None:
+    _env, project, _advertised = _isolated_env(monkeypatch, tmp_path)
+    journal.open_or_create_journal(project)
+
+    def unavailable(_cls, _project_root):
+        raise failure_type("injected registry read failure")
+
+    monkeypatch.setattr(journal.Journal, "open_reader", classmethod(unavailable))
+
+    lookup = dispatch._kernel_live_controller_sessions(project)
+
+    assert lookup.sessions is None
+    assert expected_reason in str(lookup.unreadable_reason)
+
+
+def test_absent_controller_registry_remains_definitely_unregistered(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _env, project, _advertised = _isolated_env(monkeypatch, tmp_path)
+
+    lookup = dispatch._kernel_live_controller_sessions(project)
+    warning = dispatch._controller_registration_warning(
+        _unowned_registration_args(),
+        project,
+        lookup=lookup,
+    )
+
+    assert lookup.sessions == []
+    assert lookup.unreadable_reason is None
+    assert "controller is not registered" in warning
+    assert "controller registry could not be read" not in warning
+
+
 def test_registered_controller_launch_is_unchanged(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -332,6 +493,12 @@ def test_dead_sql_active_lease_does_not_make_live_owner_ambiguous(
         principal=dead_principal,
     )
     assert dead.committed and dead.value is not None
+    dead_holder = wake.register_lease_holder(
+        project,
+        controller_label="dead-sql-active",
+        lease_nonce=dead.value.nonce,
+    )
+    dead_holder.close()
     authority, holder, nonce = _register_controller(
         project,
         env,
