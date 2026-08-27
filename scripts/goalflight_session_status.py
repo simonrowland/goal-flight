@@ -1391,10 +1391,32 @@ def _format_idle_duration(age_s: float | None) -> str:
     return f"idle {days} day{'s' if days != 1 else ''}"
 
 
-def _incarnation_state(record: dict, *, lease_lock_live: bool) -> tuple[str, bool]:
+def _incarnation_state(
+    record: dict,
+    *,
+    lease_lock_live: bool,
+    now: datetime | None = None,
+) -> tuple[str, bool]:
+    """Classify one lease for holder-visible reporting.
+
+    ``live-lock`` / ``dead-lock`` are facts about the kernel lock, not a
+    health verdict. A held lock whose ``renew_deadline_at`` is in the past is
+    ``live-overdue``: the process may still be working, and another controller
+    may legitimately reclaim. Do not map overdue onto ``dead-lock``.
+    """
     if record.get("retired_at"):
         return "ended", False
-    return ("live-lock", True) if lease_lock_live else ("dead-lock", False)
+    if not lease_lock_live:
+        return "dead-lock", False
+    deadline = _parse_utc(record.get("renew_deadline_at"))
+    if deadline is None:
+        return "live-lock", True
+    measured_now = now or datetime.now(timezone.utc)
+    if measured_now.tzinfo is None:
+        measured_now = measured_now.replace(tzinfo=timezone.utc)
+    if deadline <= measured_now.astimezone(timezone.utc):
+        return "live-overdue", True
+    return "live-lock", True
 
 
 def _addressed_unread_counts(
@@ -1480,6 +1502,7 @@ def controller_roster(
         incarnation_state, lease_lock_live = _incarnation_state(
             record,
             lease_lock_live=live is not None,
+            now=measured_now,
         )
         conflicting_beacons = (
             int(live.get("conflicting_beacons") or 0)
@@ -1535,11 +1558,17 @@ def controller_roster_lines(roster: dict) -> list[str]:
         state = str(record.get("incarnation_state") or "unknown")
         if conflict > 1:
             state = f"{state}, conflict {conflict}"
+        renew_note = (
+            " | lease overdue — renew (--join)"
+            if record.get("incarnation_state") == "live-overdue"
+            else ""
+        )
         lines.append(
             f"{label} | {record.get('idle')} | "
             f"{state} | "
             f"unread {unread if unread is not None else 'unknown'} | "
             f"owned {owned if owned is not None else 'unknown'}"
+            f"{renew_note}"
         )
     return lines
 
