@@ -635,6 +635,30 @@ def test_debug_restores_unconditional_per_tick_counts() -> None:
         for record in counts
     )
 
+    # Discriminating half: the assertions above hold on the parent commit too,
+    # because it already attached live/target whenever emit_depth was true. What
+    # this change actually does is stop the TERSE path emitting a coverage
+    # record whose entire payload was those two fields. Pin that here, or the
+    # suppression can be reverted without the suite noticing.
+    terse_host = FakeHost(stop_after_waits=3)
+    _run(
+        terse_host,
+        _items("stream"),
+        heartbeat_s=1.0,
+        coverage_s=0.05,
+        emit_depth=False,
+        debug=True,
+    )
+    terse_records = _records(terse_host)
+    assert [
+        record for record in terse_records if record.get("type") == "coverage"
+    ] == [], "terse mode must emit no coverage record, empty or otherwise"
+    assert not any(
+        record.get("kind") == "supervise"
+        and set(record) == {"kind", "type"}
+        for record in terse_records
+    ), "no supervise record may reach a controller carrying only kind+type"
+
 
 def test_slow_heartbeat_is_the_real_write_with_unchanged_state() -> None:
     host = FakeHost(stop_after_waits=4)

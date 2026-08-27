@@ -147,12 +147,23 @@ follows:
   `frontier` pair becomes one actionable `kind=next` record
 - backup: pending headlines plus one `advance: <command>` line, or a ring
 - watchdog: JSON `{"kind":"event",...}` with `listener-dead` / related payload
-- supervise: `{"kind":"supervise","type":"heartbeat"|"coverage"|"restart"|"stop"|"exit",...}`;
+- supervise: `{"kind":"supervise","type":"heartbeat"|"coverage"|"probe"|"restart"|"stop"|"exit",...}`;
   default output keeps actionable `restart` records with their reason and
   `stop` / signal-driven `exit` records with the exact supervisor `rearm`
   command while suppressing `live` / `target`. `--debug` independently restores
-  per-tick `heartbeat` / `coverage` emission, and chatty output restores
-  `live` / `target` diagnostics
+  per-tick `heartbeat` emission, and chatty output restores `live` / `target`
+  diagnostics
+
+`coverage` carries only `live` / `target`, so it is emitted **only** when those
+are enabled. Suppressing the fields would leave a record with nothing in it,
+and every record reaching a controller costs that controller a turn — so the
+record goes, not just the fields.
+
+Startup still needs one real stdout write to detect a controller that is
+already gone. When `coverage` is suppressed that write is a
+`{"kind":"supervise","type":"probe","reason":"stdout-peer-liveness"}` record,
+emitted once per supervisor start. It is named rather than empty so the wake it
+costs is explicable.
 
 Supervisor coverage is state-driven: it emits at startup, whenever
 `(live,target)` changes, and immediately when a slot stops or restarts.
