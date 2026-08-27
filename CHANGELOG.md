@@ -8,6 +8,16 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- Drain no longer mints unadoptable `restore_prepared` queue envelopes when
+  releasing a pre-worker claim whose ledger is already `queued`. The second
+  DrainClaimGuard restore used to write a new `restore_prepared` txn, abort
+  because the ledger still named the previous txn, and leave a file drain
+  will never launch (`awaiting_owner_reconcile` + `unlinked_quarantine_deferred`).
+  A queued ledger row now republishes as `queued`; an existing `restore_prepared`
+  envelope is finished by the same restore transaction (or dropped if the
+  ledger is already terminal); new ledger rows copy `controller_label` /
+  `controller_pid` from the envelope so the entry is attributable.
+
 - `goalflight_ledger.py reconcile-outbox` no longer promotes a sidecar's
   terminal verdict (`failed` / `idle_timeout` / `complete`) into journal and
   ledger terminal authority while the recorded worker identity (pid + start

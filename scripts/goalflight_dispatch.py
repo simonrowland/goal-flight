@@ -9077,6 +9077,86 @@ def _claim_is_recovery_restorable(entry: dict, record: dict | None) -> bool:
     return _entry_pre_worker(entry) and _ledger_is_capacity_refusal(record)
 
 
+def _controller_attribution_from_entry(
+    entry: dict, record: dict | None = None
+) -> dict:
+    """Owner fields for a restored envelope or ledger row.
+
+    Restore sanitizes claimer/launcher/worker identity. Drain's
+    restore_prepared owner check and consent-based cleanup both read the
+    ledger's controller_* fields, so dropping them mints an unattributable
+    (hence immortal) queue entry.
+    """
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    src = record if isinstance(record, dict) else {}
+
+    def _first(*values: object) -> object:
+        for value in values:
+            if value is None:
+                continue
+            if isinstance(value, str) and not str(value).strip():
+                continue
+            return value
+        return None
+
+    label = _first(
+        src.get("controller_label"),
+        entry.get("controller_label"),
+        request.get("controller_label"),
+    )
+    pid = _first(
+        src.get("controller_pid"),
+        entry.get("controller_pid"),
+        request.get("controller_pid"),
+        request.get("controller_beacon_pid"),
+    )
+    session = _first(
+        src.get("controller_session_id"),
+        entry.get("controller_session_id"),
+        request.get("controller_session_id"),
+    )
+    identity = _first(
+        src.get("controller_identity"),
+        entry.get("controller_identity"),
+        request.get("controller_identity"),
+    )
+    out: dict = {}
+    if label is not None:
+        out["controller_label"] = str(label)
+    if pid is not None:
+        try:
+            out["controller_pid"] = int(pid)
+        except (TypeError, ValueError):
+            pass
+    if session is not None:
+        out["controller_session_id"] = str(session)
+    if isinstance(identity, dict):
+        out["controller_identity"] = identity
+    return out
+
+
+def _unlink_matching_restore_target(target: Path, fresh: dict) -> bool:
+    """Drop a mid-restore or queued envelope for this dispatch. False on I/O conflict."""
+    if not target.exists():
+        return True
+    try:
+        abandoned = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not (
+        isinstance(abandoned, dict)
+        and abandoned.get("state") in {"restore_prepared", "queued"}
+        and abandoned.get("dispatch_id") == fresh.get("dispatch_id")
+        and abandoned.get("restore_txn_id")
+    ):
+        return True
+    try:
+        target.unlink()
+    except OSError:
+        return False
+    return True
+
+
 def _sanitize_restore_envelope(entry: dict, *, increment_recovery_count: bool) -> dict:
     restored = dict(entry)
     for key in (
@@ -9109,6 +9189,9 @@ def _sanitize_restore_envelope(entry: dict, *, increment_recovery_count: bool) -
         restored.pop(key, None)
     if restored.get("reason") in COMPLETION_AUTHORITY_PARK_REASONS:
         restored.pop("reason", None)
+    attribution = _controller_attribution_from_entry(restored)
+    if attribution.get("controller_label"):
+        restored["controller_label"] = attribution["controller_label"]
     if increment_recovery_count:
         restored["claim_recovery_count"] = _claim_recovery_count(entry) + 1
     return restored
@@ -9248,27 +9331,16 @@ def _commit_restore_transaction(
             "deferral_persisted": persisted_count is not None,
         }
     if _completion_decision_blocks_restore(decision):
-        if target.exists():
-            try:
-                abandoned = json.loads(target.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                return None, None
-            if (
-                isinstance(abandoned, dict)
-                and abandoned.get("state") in {"restore_prepared", "queued"}
-                and abandoned.get("dispatch_id") == fresh.get("dispatch_id")
-                and abandoned.get("restore_txn_id")
-            ):
-                try:
-                    target.unlink()
-                except OSError:
-                    return None, None
+        if not _unlink_matching_restore_target(target, fresh):
+            return None, None
         return None, decision
     if (
         record is not None
         and _dispatch_record_is_terminal(record)
         and str(record.get("state") or "") not in {"blocked_capacity"}
     ):
+        if not _unlink_matching_restore_target(target, fresh):
+            return None, None
         return None, {
             "state": str(record.get("state") or record.get("terminal_state") or "complete"),
             "reason": "existing_terminal_record",
@@ -9291,12 +9363,59 @@ def _commit_restore_transaction(
             if not record or record.get("restore_txn_id") != restore_txn_id or record.get("state") != "queued":
                 return None, None
             try:
-                claim.unlink()
+                if claim.exists():
+                    claim.unlink()
             except OSError:
                 return None, None
             return target, None
         if prepared.get("state") != "restore_prepared":
             return None, None
+    elif record is not None and str(record.get("state") or "") == "queued":
+        # Ledger already names queued work: the restore commit point landed
+        # (submit, or a previous release). Publishing restore_prepared here
+        # is unadoptable — drain skips those files, and a new txn id used
+        # to abort without flipping them to queued. Republish as queued.
+        restore_txn_id = str(record.get("restore_txn_id") or "") or uuid.uuid4().hex
+        prepared = _sanitize_restore_envelope(
+            fresh,
+            increment_recovery_count=increment_recovery_count,
+        )
+        prepared.update(
+            {
+                "state": "queued",
+                "restore_txn_id": restore_txn_id,
+                "restore_reason": reason,
+                "updated_at": goalflight_ledger.utc_now(),
+            }
+        )
+        try:
+            _write_json_atomic(target, prepared)
+        except OSError:
+            return None, None
+        if record.get("restore_txn_id") != restore_txn_id:
+            ledger_record = dict(record)
+            ledger_record.update(
+                {
+                    "restore_txn_id": restore_txn_id,
+                    "restore_reason": reason,
+                    "queue_path": str(target),
+                    "claim_recovery_count": int(prepared.get("claim_recovery_count") or 0),
+                }
+            )
+            for key, value in _controller_attribution_from_entry(fresh, record).items():
+                if not ledger_record.get(key):
+                    ledger_record[key] = value
+            try:
+                goalflight_ledger.write_record(ledger_record)
+            except OSError:
+                # Envelope is already launchable; the txn stamp can retry.
+                pass
+        try:
+            if claim.exists():
+                claim.unlink()
+        except OSError:
+            return target, None
+        return target, None
     else:
         restore_txn_id = uuid.uuid4().hex
         prepared = _sanitize_restore_envelope(
@@ -9317,8 +9436,10 @@ def _commit_restore_transaction(
             return None, None
 
     # A prepared queue envelope is resumable. If a crash happened before the
-    # ledger commit point, complete that same transaction id now. A different
-    # queued transaction is not ours and must remain untouched.
+    # ledger commit point, complete that same transaction id now. Under Q+L
+    # this restorer owns the dispatch: a queued ledger row with a different
+    # restore_txn_id is a *previous* restore of the same work, not a
+    # concurrent foreign transaction, and must be advanced to queued.
     if not record or record.get("restore_txn_id") != restore_txn_id or record.get("state") != "queued":
         ledger_record = record or _new_reconciliation_record(fresh)
         if (
@@ -9332,8 +9453,6 @@ def _commit_restore_transaction(
                 "reason": "existing_terminal_record",
                 "source": "ledger",
             }
-        if record is not None and record.get("state") == "queued" and record.get("restore_txn_id"):
-            return None, None
         ledger_record.update(
             {
                 "state": "queued",
@@ -9347,6 +9466,9 @@ def _commit_restore_transaction(
                 "claim_recovery_count": int(prepared.get("claim_recovery_count") or 0),
             }
         )
+        for key, value in _controller_attribution_from_entry(fresh, ledger_record).items():
+            if not ledger_record.get(key):
+                ledger_record[key] = value
         try:
             goalflight_ledger.write_record(ledger_record)
         except OSError:
@@ -9361,8 +9483,13 @@ def _commit_restore_transaction(
             return None, None
         published["state"] = "queued"
         published["updated_at"] = goalflight_ledger.utc_now()
+        if not published.get("controller_label"):
+            label = _controller_attribution_from_entry(fresh, record).get("controller_label")
+            if label:
+                published["controller_label"] = label
         _write_json_atomic(target, published)
-        claim.unlink()
+        if claim.exists():
+            claim.unlink()
     except (OSError, json.JSONDecodeError):
         return None, None
     return target, None
@@ -9969,10 +10096,29 @@ def _reconcile_claim_transaction(
         target = queue_dir / claim.name.split(".claimed-", 1)[0]
         if target.exists():
             try:
-                claim.unlink()
-            except OSError:
-                return _ClaimReconcileResult("pending", pending_reason="duplicate_target_unlink_deferred")
-            return _ClaimReconcileResult("cleared")
+                existing_target = json.loads(target.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return _ClaimReconcileResult(
+                    "pending", pending_reason="duplicate_target_unreadable"
+                )
+            # A published queued envelope is a true duplicate of this claim.
+            # restore_prepared is a mid-restore transaction: unlinking the
+            # claim would leave an envelope drain will never launch.
+            if (
+                isinstance(existing_target, dict)
+                and existing_target.get("state") == "queued"
+                and existing_target.get("dispatch_id") == fresh.get("dispatch_id")
+            ):
+                try:
+                    claim.unlink()
+                except OSError:
+                    return _ClaimReconcileResult(
+                        "pending", pending_reason="duplicate_target_unlink_deferred"
+                    )
+                return _ClaimReconcileResult("cleared")
+            return _ClaimReconcileResult(
+                "pending", pending_reason="restore_prepared_in_progress"
+            )
 
         terminal_reason = (
             "claim_recovery_exhausted"
@@ -10013,6 +10159,85 @@ def _act_on_orphan_claim(
         reason=reason,
         stale_s=0.0,
     ).action
+
+
+def _resume_restore_prepared_envelopes(queue_dir: Path) -> dict:
+    """Finish mid-restore queue envelopes whose claim is gone.
+
+    ``_commit_restore_transaction`` writes ``restore_prepared`` to the
+    unclaimed path before the ledger commit. Drain skips those files as
+    launch candidates, waiting for the claim-side retry. If the claim was
+    cleared, that retry never runs. Completing the same transaction is not
+    expiry: a queued ledger row is the commit point, a terminal ledger row
+    drops the envelope, and an unreadable or incomplete authority still holds.
+    """
+    restored = 0
+    cleared = 0
+    pending = 0
+    pending_reasons: list[dict] = []
+    for path in sorted(queue_dir.glob("*.json")):
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(entry, dict) or entry.get("state") != "restore_prepared":
+            continue
+        dispatch_id = str(entry.get("dispatch_id") or path.stem)
+        if not list(entry.get("dispatch_argv") or []):
+            continue
+        begin = _begin_reconcile_transaction(
+            entry,
+            queue_dir=queue_dir,
+            stale_s=0.0,
+            need_queue=True,
+            need_task_store=True,
+            need_ledger=True,
+        )
+        txn = begin.transaction
+        if txn is None:
+            pending += 1
+            pending_reasons.append(
+                {
+                    "dispatch_id": dispatch_id,
+                    "reason": "restore_prepared_resume_deferred",
+                }
+            )
+            continue
+        restored_path: Path | None = None
+        decision: dict | None = None
+        try:
+            resume_claim = path.parent / f"{path.name}.claimed-resume"
+            restored_path, decision = _commit_restore_transaction(
+                txn,
+                resume_claim,
+                entry,
+                increment_recovery_count=False,
+                reason="restore_prepared_resume",
+            )
+        finally:
+            txn.release()
+        if restored_path is not None:
+            restored += 1
+            _restore_queued_record_from_entry(entry, restored_path)
+        elif not path.exists():
+            cleared += 1
+        else:
+            pending += 1
+            pending_reasons.append(
+                {
+                    "dispatch_id": dispatch_id,
+                    "reason": str(
+                        (decision or {}).get("reason")
+                        or "restore_prepared_resume_uncommitted"
+                    ),
+                }
+            )
+    return {
+        "restored": restored,
+        "cleared": cleared,
+        "pending": pending,
+        "pending_reasons": pending_reasons,
+    }
 
 
 def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
@@ -10078,6 +10303,11 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
     pending_launch += int(ledger_stats.get("pending") or 0)
     quarantined += int(ledger_stats.get("quarantined") or 0)
     pending_reasons.extend(ledger_stats.get("pending_reasons") or [])
+    resume_stats = _resume_restore_prepared_envelopes(queue_dir)
+    restored += int(resume_stats.get("restored") or 0)
+    cleared += int(resume_stats.get("cleared") or 0)
+    pending_launch += int(resume_stats.get("pending") or 0)
+    pending_reasons.extend(resume_stats.get("pending_reasons") or [])
     # cleared includes carriers removed after terminalization; quarantined is
     # reported separately so callers can distinguish park-vs-delete without
     # breaking older exact-dict assertions that only key restored/cleared/pending.
@@ -11168,7 +11398,7 @@ def _resolve_claim_terminal_outcome(
 def _new_reconciliation_record(entry: dict) -> dict:
     request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
     dispatch_id = str(entry.get("dispatch_id") or "")
-    return {
+    record = {
         "schema": goalflight_ledger.SCHEMA,
         "dispatch_id": dispatch_id,
         "agent": entry.get("agent") or request.get("agent") or "unknown",
@@ -11190,6 +11420,8 @@ def _new_reconciliation_record(entry: dict) -> dict:
         ),
         "started_at": entry.get("started_at") or entry.get("created_at") or goalflight_ledger.utc_now(),
     }
+    record.update(_controller_attribution_from_entry(entry))
+    return record
 
 
 def commit_reconciled_terminal(
