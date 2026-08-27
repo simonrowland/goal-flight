@@ -272,6 +272,11 @@ RFC3339_RE = re.compile(
 )
 MESSAGE_PRIORITIES = frozenset({"normal", "urgent"})
 MAX_SOURCE_VALUE_LENGTH = 128
+# Stamped as source.controller_label when controller-transport mail is posted
+# by a process whose controller identity genuinely cannot be established. An
+# absent field invites the reader to guess a sender; the explicit sentinel
+# states that attribution is unknown. Never a fallback label.
+UNKNOWN_CONTROLLER_LABEL = "UNKNOWN"
 MAX_PROJECT_ROOT_LENGTH = 4096
 QUARANTINE_BYTES_LIMIT = 256
 MAX_JSON_DEPTH = 32
@@ -651,6 +656,15 @@ def validate_envelope(
             raise MessageError(f"{path}.source: missing {key}")
         _bounded_nonblank_string(
             source.get(key), path=f"{path}.source.{key}", limit=MAX_SOURCE_VALUE_LENGTH
+        )
+    # Optional attribution. Additive: records predating the field simply omit
+    # it; when present it must be a real bounded value (or the explicit
+    # UNKNOWN sentinel), never a blank placeholder.
+    if "controller_label" in source:
+        _bounded_nonblank_string(
+            source.get("controller_label"),
+            path=f"{path}.source.controller_label",
+            limit=MAX_SOURCE_VALUE_LENGTH,
         )
     author_digest = envelope.get("author_digest")
     if author_digest is not None and (
@@ -1921,6 +1935,36 @@ def _presented_ambient_controller_capability() -> str | None:
     return next(iter(capabilities)) if len(capabilities) == 1 else None
 
 
+def _controller_post_source_label() -> str | None:
+    """Resolve the declared controller identity behind an outbound post.
+
+    Worker shells (``GOALFLIGHT_DISPATCH_ID``) never inherit a controller
+    label. Beyond the label variable itself, the session-status resolver also
+    covers the controller-PID-declared repo identity, so a shell that dropped
+    only ``GOALFLIGHT_CONTROLLER_LABEL`` still attributes. Anything we cannot
+    establish stays ``None`` and the caller stamps ``UNKNOWN`` — never a
+    probable-sender guess.
+    """
+    if str(os.environ.get("GOALFLIGHT_DISPATCH_ID") or "").strip():
+        return None
+    try:
+        import goalflight_session_status  # type: ignore
+
+        return goalflight_session_status.resolve_controller_label()
+    except _EXPECTED_OPTIONAL_ERRORS:
+        return None
+
+
+def _stamp_controller_source_label(source: dict) -> None:
+    """Attribute controller-transport mail in place: label, else UNKNOWN."""
+    if str(source.get("transport") or "") != "controller":
+        return
+    if str(source.get("controller_label") or "").strip():
+        return
+    label = _controller_post_source_label()
+    source["controller_label"] = label if label else UNKNOWN_CONTROLLER_LABEL
+
+
 def _controller_sender_session_id(dispatch_id: str) -> str | None:
     """Return the declared live controller that authored an outbound steer.
 
@@ -2019,12 +2063,21 @@ def goalflight_post_message_tool(
     source = arguments.get("source")
     if source is not None and not isinstance(source, dict):
         raise MessageError("source must be an object when provided")
+    # The MCP server posts on the controller's behalf; attribute controller-
+    # transport mail the same way the CLI does, so the bytes match a file
+    # append from an identically-identified shell. post_message's base source
+    # defaults the transport to "controller", so an unspecified transport is
+    # controller mail too.
+    stamped_source = dict(source) if source else {}
+    if "transport" not in stamped_source:
+        stamped_source["transport"] = "controller"
+    _stamp_controller_source_label(stamped_source)
     return post_message(
         dispatch_id=str(dispatch_id),
         msg_type=str(msg_type),
         payload=payload,
         messages_dir=messages_dir,
-        source=source,
+        source=stamped_source,
         seq=arguments.get("seq"),
         priority=arguments.get("priority"),
         addressee=arguments.get("addressee"),
@@ -2447,11 +2500,12 @@ def cmd_post(args: argparse.Namespace) -> int:
     # must not pay for a doorbell wake. The descriptive label remains source
     # metadata; proof is stamped separately from the capability this process
     # actually carried. Workers cannot inherit authorship from a leftover label.
+    # Controller shells stamp an attribution on controller-transport mail: the
+    # resolved label, or the explicit UNKNOWN sentinel when none can be
+    # established — an absent field reads as "guess the sender".
     author_capability = None
     if not os.environ.get("GOALFLIGHT_DISPATCH_ID"):
-        source_label = os.environ.get("GOALFLIGHT_CONTROLLER_LABEL", "").strip()
-        if source_label:
-            source["controller_label"] = source_label
+        _stamp_controller_source_label(source)
         author_capability = _presented_ambient_controller_capability()
     addressee = None
     if getattr(args, "to_controller", None):
@@ -4054,13 +4108,27 @@ def envelope_headline(envelope: dict) -> str:
 
 
 def envelope_from(envelope: dict) -> str:
-    """Who sent it: the source node/adapter when recorded, else the inbox id."""
+    """Who sent it, rendered so an unknown sender reads as unknown.
+
+    Order: an informative adapter, then the stamped controller label, then —
+    for controller-transport mail only — the explicit UNKNOWN sentinel, because
+    falling through to the node ("local") or the inbox id reads as a
+    determination and has already invited one wrong guess in production.
+    Non-controller mail keeps the historical node/inbox fallback.
+    """
     source = envelope.get("source")
     source = source if isinstance(source, dict) else {}
-    for key in ("adapter", "node"):
-        value = source.get(key)
-        if isinstance(value, str) and value.strip() and value.strip() != "unknown":
-            return sanitize_display(value)
+    adapter = source.get("adapter")
+    if isinstance(adapter, str) and adapter.strip() and adapter.strip() != "unknown":
+        return sanitize_display(adapter)
+    label = source.get("controller_label")
+    if isinstance(label, str) and label.strip():
+        return sanitize_display(label)
+    if str(source.get("transport") or "") == "controller":
+        return UNKNOWN_CONTROLLER_LABEL
+    node = source.get("node")
+    if isinstance(node, str) and node.strip() and node.strip() != "unknown":
+        return sanitize_display(node)
     return sanitize_display(envelope.get("dispatch_id") or "?")
 
 

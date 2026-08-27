@@ -62,6 +62,17 @@ incremented when meaningful skill behaviour changes.
 
 ### Fixed
 
+- Controller mail is now attributed end to end. `post` and the MCP
+  `goalflight_post_message` tool stamp `source.controller_label` at ingress
+  for controller-transport mail, resolving the declared label through
+  `goalflight_session_status.resolve_controller_label()` rather than only the
+  `GOALFLIGHT_CONTROLLER_LABEL` variable that bash-tool shells drop. When no
+  label can be established the record carries the explicit `UNKNOWN` sentinel
+  instead of omitting the field, and relay renders unattributed controller
+  mail `from UNKNOWN` rather than guessing from the node (`from local`) or
+  inbox id. Pre-existing journal records without the field still read and
+  render `UNKNOWN`; the field is additive and never proves authorship — the
+  capability-derived author digest remains the only self-authorship proof.
 - Persistent shortfall hints no longer tell operators to arm `follow` /
   `listen` / `--watch-follow` beside a live `supervise`. Status, next,
   relay, reminder, tool-entry, and doctor reuse one three-state detector

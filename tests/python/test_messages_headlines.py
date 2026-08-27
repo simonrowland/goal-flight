@@ -40,6 +40,10 @@ def _test_env(tmp_path: Path) -> dict[str, str]:
             "GOALFLIGHT_TEST_MODE": "1",
         }
     )
+    # Controller posts must not inherit a leftover worker dispatch id from
+    # the ambient process; that identity makes ingress refuse to stamp a
+    # controller label even when GOALFLIGHT_CONTROLLER_LABEL is set.
+    env.pop("GOALFLIGHT_DISPATCH_ID", None)
     return env
 
 
@@ -80,18 +84,16 @@ def _post_env(
         msg_type,
         "--text",
         text,
-        "--node",
-        "local",
-        "--adapter",
-        adapter,
-        "--transport",
-        "controller",
         "--to-controller",
         CONTROLLER_LABEL,
         "--controller-project-root",
         str(project),
         "--json",
     ]
+    # Omit flags that match CLI defaults so adapter="unknown" is the
+    # documented send command (no --adapter), not a lookalike.
+    if adapter != "unknown":
+        argv.extend(["--adapter", adapter])
     if subject is not None:
         argv.extend(["--subject", subject])
     posted = subprocess.run(
@@ -237,9 +239,204 @@ def test_from_prefers_recorded_source_over_inbox_id(tmp_path: Path) -> None:
     assert msg.envelope_from(envelope) == "codex"
 
     envelope["source"]["adapter"] = "unknown"
-    assert msg.envelope_from(envelope) == "local"
+    # The stamped controller label outranks an uninformative node: "local"
+    # says nothing about which controller posted.
+    assert msg.envelope_from(envelope) == CONTROLLER_LABEL
     envelope["source"] = {}
     assert msg.envelope_from(envelope) == "proj-inbox"
+
+
+def test_from_renders_unknown_for_unattributed_controller_mail(tmp_path: Path) -> None:
+    del tmp_path
+    # Pre-attribution records carry no label; controller mail must render the
+    # explicit sentinel rather than read the node ("local") as the sender.
+    legacy = {
+        "dispatch_id": "d",
+        "source": {"node": "local", "adapter": "unknown", "transport": "controller"},
+    }
+    assert msg.envelope_from(legacy) == msg.UNKNOWN_CONTROLLER_LABEL == "UNKNOWN"
+    # Non-controller transports keep the node/inbox fallback chain.
+    worker = {
+        "dispatch_id": "d",
+        "source": {"node": "worker-box", "adapter": "unknown", "transport": "tail_file"},
+    }
+    assert msg.envelope_from(worker) == "worker-box"
+    # An informative adapter still wins over everything below it.
+    fleet = {
+        "dispatch_id": "d",
+        "source": {"node": "local", "adapter": "fleet", "transport": "controller"},
+    }
+    assert msg.envelope_from(fleet) == "fleet"
+
+
+def test_labelled_controller_post_round_trips_label_to_relay(tmp_path: Path) -> None:
+    # The documented send command (no --adapter flag) from a shell carrying
+    # the controller label: stamped at ingress, then survives validation,
+    # canonical serialization, carrier append, and the relay readback -- the
+    # same normalization production uses, not a constructed envelope.
+    envelope = _post_env(
+        tmp_path,
+        "pass-1 vs pass-2 queue counts disagree",
+        subject="dispatch-queue finding",
+        dispatch_id="queue-audit",
+        msg_type="finding",
+        adapter="unknown",
+    )
+    assert envelope["source"]["controller_label"] == CONTROLLER_LABEL
+
+    bodies = _run_relay(tmp_path, bodies=True)
+    assert bodies.returncode == 0, bodies.stderr
+    round_tripped = json.loads(bodies.stdout.splitlines()[0])
+    assert round_tripped[0]["source"]["controller_label"] == CONTROLLER_LABEL
+
+    headlines = _run_relay(tmp_path)
+    assert headlines.returncode == 0, headlines.stderr
+    assert headlines.stdout.splitlines()[0].startswith(
+        f"queue-audit #1 [finding] from {CONTROLLER_LABEL}: "
+    )
+
+
+def test_unestablishable_sender_is_stamped_and_rendered_unknown(tmp_path: Path) -> None:
+    # A controller bash-tool shell drops the session identity variables (the
+    # relay side documents the same drop). The post must still attribute:
+    # explicitly UNKNOWN, never absent. Presence of the field with the
+    # sentinel value is what distinguishes this from the absent-field defect
+    # being fixed.
+    _ensure_controller(tmp_path)
+    project = _project(tmp_path)
+    send_env = {
+        key: value
+        for key, value in _test_env(tmp_path).items()
+        if not key.startswith("GOALFLIGHT_CONTROLLER")
+    }
+    send_env.pop("GOALFLIGHT_DISPATCH_ID", None)
+    posted = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--messages-dir",
+            str(tmp_path / "messages"),
+            "--fleet-dir",
+            str(tmp_path / "fleet"),
+            "post",
+            "--dispatch-id",
+            "attr-topic",
+            "--type",
+            "finding",
+            "--text",
+            "unattributed shell post",
+            "--to-controller",
+            CONTROLLER_LABEL,
+            "--controller-project-root",
+            str(project),
+            "--json",
+        ],
+        cwd=project,
+        env=send_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert posted.returncode == 0, posted.stderr
+    envelope = json.loads(posted.stdout)["envelope"]
+    assert envelope["source"]["controller_label"] == "UNKNOWN"
+
+    relay = _run_relay(tmp_path)
+    assert relay.returncode == 0, relay.stderr
+    first = relay.stdout.splitlines()[0]
+    assert first.startswith("attr-topic #1 [finding] from UNKNOWN: ")
+
+
+def test_preexisting_unlabelled_record_renders_unknown_without_crashing(
+    tmp_path: Path,
+) -> None:
+    # Journals written before this fix hold controller mail with no
+    # source.controller_label at all. Relay must keep the row visible, render
+    # the sender as UNKNOWN (never a node/inbox guess), and exit 0. The legacy
+    # record is written by the real admission path: post_message with the
+    # exact source dict the pre-fix CLI built. Stamping lives at the CLI/MCP
+    # ingress, so the library call still produces the legacy shape.
+    _ensure_controller(tmp_path)
+    project = _project(tmp_path)
+    with mock.patch.dict(os.environ, _test_env(tmp_path), clear=False):
+        result = msg.post_message(
+            dispatch_id="legacy-topic",
+            msg_type="finding",
+            payload={"text": "pre-attribution record"},
+            messages_dir=tmp_path / "messages",
+            source={"node": "local", "adapter": "unknown", "transport": "controller"},
+            addressee=msg.controller_addressee(CONTROLLER_LABEL, project_root=project),
+        )
+    assert "controller_label" not in result["envelope"]["source"]  # legacy-shaped
+
+    relay = _run_relay(tmp_path)
+    assert relay.returncode == 0, relay.stderr
+    first = relay.stdout.splitlines()[0]
+    assert first.startswith("legacy-topic #1 [finding] from UNKNOWN: ")
+
+
+def test_mcp_ingress_stamps_the_same_attribution(tmp_path: Path) -> None:
+    # The MCP tool is the same post through a second ingress; given the same
+    # identity environment it must stamp the same bytes as the CLI, and the
+    # label must survive relay the same way.
+    _ensure_controller(tmp_path)
+    project = _project(tmp_path)
+    addressee = msg.controller_addressee(CONTROLLER_LABEL, project_root=project)
+    # Replace the process env: patch.dict(clear=False) cannot drop an ambient
+    # worker GOALFLIGHT_DISPATCH_ID, and that identity refuses to stamp.
+    with mock.patch.dict(os.environ, _test_env(tmp_path), clear=True):
+        result = msg.goalflight_post_message_tool(
+            {
+                "dispatch_id": "mcp-topic",
+                "type": "finding",
+                "payload": {"text": "via mcp"},
+                "addressee": addressee,
+            },
+            messages_dir=tmp_path / "messages",
+        )
+        assert result["envelope"]["source"]["controller_label"] == CONTROLLER_LABEL
+        assert result["envelope"]["source"]["adapter"] == "unknown"
+        assert result["envelope"]["source"]["transport"] == "controller"
+
+        # Non-controller transports are not controller mail: no stamp.
+        tail = msg.goalflight_post_message_tool(
+            {
+                "dispatch_id": "mcp-tail",
+                "type": "controller-notice",
+                "payload": {"text": "worker harvest"},
+                "source": {"node": "local", "adapter": "acp", "transport": "tail_file"},
+            },
+            messages_dir=tmp_path / "messages",
+        )
+        assert "controller_label" not in tail["envelope"]["source"]
+
+        # A caller-supplied label is descriptive metadata but must still be a
+        # bounded string; junk is refused at ingress like any source field.
+        try:
+            msg.goalflight_post_message_tool(
+                {
+                    "dispatch_id": "mcp-junk",
+                    "type": "controller-notice",
+                    "payload": {"text": "junk"},
+                    "source": {
+                        "node": "local",
+                        "adapter": "acp",
+                        "transport": "controller",
+                        "controller_label": 137,
+                    },
+                },
+                messages_dir=tmp_path / "messages",
+            )
+        except msg.MessageError:
+            pass
+        else:
+            raise AssertionError("non-string controller_label must be refused")
+
+    headlines = _run_relay(tmp_path)
+    assert headlines.returncode == 0, headlines.stderr
+    assert headlines.stdout.splitlines()[0].startswith(
+        f"mcp-topic #1 [finding] from {CONTROLLER_LABEL}: "
+    )
 
 
 def test_default_and_bodies_cli_paths_round_trip_subject(tmp_path: Path) -> None:
@@ -367,6 +564,11 @@ def main() -> None:
         test_listing_carries_size_without_dumping_body,
         test_malformed_entries_do_not_break_the_listing,
         test_from_prefers_recorded_source_over_inbox_id,
+        test_from_renders_unknown_for_unattributed_controller_mail,
+        test_labelled_controller_post_round_trips_label_to_relay,
+        test_unestablishable_sender_is_stamped_and_rendered_unknown,
+        test_preexisting_unlabelled_record_renders_unknown_without_crashing,
+        test_mcp_ingress_stamps_the_same_attribution,
         test_default_and_bodies_cli_paths_round_trip_subject,
         test_default_cli_sanitizes_source_and_body_controls,
         test_relay_new_sanitizes_full_stdout_structure,
