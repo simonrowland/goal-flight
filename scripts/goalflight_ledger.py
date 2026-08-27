@@ -1091,6 +1091,10 @@ def cmd_finish(args: argparse.Namespace) -> int:
         record["transition_id"] = winner.transition_id
         record["terminal_event_uuid"] = winner.event_uuid
         write_record(record)
+        # status.json is a watcher heartbeat copy, not a second lifecycle
+        # home. Readers derive running/terminal from this ledger/journal
+        # write. Updating the sidecar here would mint a third writer of
+        # the same fact.
     try:
         import goalflight_messages
 
