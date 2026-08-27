@@ -11889,6 +11889,56 @@ class _DrainClaimGuard:
         return False
 
 
+def _drain_project_key(entry: dict | None) -> str:
+    """Stable project identity for per-pass journal isolation.
+
+    Empty when the envelope has no project root: a skip then applies to that
+    entry only, not to every other rootless envelope.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    raw = entry.get("project_root") or request.get("cwd")
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    try:
+        return str(goalflight_task.resolve_project_root(raw))
+    except Exception:
+        return raw
+
+
+def _note_drain_journal_skip(
+    acc: dict,
+    *,
+    dispatch_id: str,
+    project_key: str,
+    kind: str,
+    exc: BaseException | None = None,
+) -> None:
+    """Record a per-project journal skip. Does not mutate queue files."""
+    if kind == "busy":
+        acc["skipped_busy"] += 1
+        if project_key:
+            acc["skipped_projects_busy"].add(project_key)
+        reason = "journal_busy"
+    else:
+        acc["skipped_error"] += 1
+        if project_key:
+            acc["skipped_projects_error"].add(project_key)
+        reason = (
+            f"journal_error:{type(exc).__name__}" if exc is not None else "journal_error"
+        )
+    acc["left_queued"] += 1
+    detail = {
+        "dispatch_id": dispatch_id,
+        "state": "queued",
+        "reason": reason,
+    }
+    if project_key:
+        detail["project_root"] = project_key
+    acc["details"].append(detail)
+
+
 def _drain_queue_once(args) -> dict:
     queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else _dispatch_queue_dir()
     queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -11971,12 +12021,60 @@ def _drain_queue_once(args) -> dict:
         "left_queued": left_queued,
         "failed": failed,
         "pending_claims": pending_claims,
+        "skipped_busy": 0,
+        "skipped_error": 0,
+        "skipped_projects_busy": set(),
+        "skipped_projects_error": set(),
         "details": details,
     }
     for _sort_key, path, _scan_entry, _scan_read_error in entries:
         claim_error: Exception | None = None
         entry: dict | None = None
-        launch_token = _queue_launch_token(_scan_entry)
+        project_key = _drain_project_key(_scan_entry)
+        dispatch_id = (
+            str(_scan_entry.get("dispatch_id") or path.stem)
+            if isinstance(_scan_entry, dict)
+            else path.stem
+        )
+        if project_key and project_key in drain_acc["skipped_projects_busy"]:
+            _note_drain_journal_skip(
+                drain_acc,
+                dispatch_id=dispatch_id,
+                project_key=project_key,
+                kind="busy",
+            )
+            continue
+        if project_key and project_key in drain_acc["skipped_projects_error"]:
+            _note_drain_journal_skip(
+                drain_acc,
+                dispatch_id=dispatch_id,
+                project_key=project_key,
+                kind="error",
+            )
+            continue
+        try:
+            launch_token = _queue_launch_token(_scan_entry)
+        except goalflight_journal.JournalBusy as exc:
+            # Busy is retryable and per-project. Skipping this project for the
+            # rest of the pass keeps one contended journal from denying every
+            # other project's queued work.
+            _note_drain_journal_skip(
+                drain_acc,
+                dispatch_id=dispatch_id,
+                project_key=project_key,
+                kind="busy",
+                exc=exc,
+            )
+            continue
+        except goalflight_journal.JournalError as exc:
+            _note_drain_journal_skip(
+                drain_acc,
+                dispatch_id=dispatch_id,
+                project_key=project_key,
+                kind="error",
+                exc=exc,
+            )
+            continue
         _test_signal_file(
             "GOALFLIGHT_TEST_DRAIN_BEFORE_CLAIM_FILE",
             str(path),
@@ -12189,6 +12287,8 @@ def _drain_queue_once(args) -> dict:
         "failed": drain_acc["failed"],
         "remaining": remaining,
         "pending_claims": drain_acc["pending_claims"],
+        "skipped_busy": drain_acc["skipped_busy"],
+        "skipped_error": drain_acc["skipped_error"],
         "dead_claimer": claimer_counts["dead_claimer"],
         "unknown_claimer": claimer_counts["unknown_claimer"],
         "live_claimer": claimer_counts["live_claimer"],
@@ -12208,6 +12308,8 @@ def _drain_error_payload(args, exc: BaseException) -> dict:
         "failed": 1,
         "remaining": 0,
         "pending_claims": 0,
+        "skipped_busy": 0,
+        "skipped_error": 0,
         "dead_claimer": 0,
         "unknown_claimer": 0,
         "live_claimer": 0,
@@ -12261,6 +12363,8 @@ def _cmd_drain(argv: list[str]) -> int:
                     "left_queued": payload["left_queued"],
                     "failed": payload["failed"],
                     "remaining": payload["remaining"],
+                    "skipped_busy": payload.get("skipped_busy", 0),
+                    "skipped_error": payload.get("skipped_error", 0),
                     "dead_claimer": payload.get("dead_claimer", 0),
                     "unknown_claimer": payload.get("unknown_claimer", 0),
                     "live_claimer": payload.get("live_claimer", 0),
