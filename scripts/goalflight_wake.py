@@ -1584,7 +1584,8 @@ def listener_reserve_hint(
     target_waiters: int,
     command: str,
     *,
-    supervisor: str = SUPERVISOR_ABSENT,
+    # An omitted probe result is not evidence that no supervisor is running.
+    supervisor: str = SUPERVISOR_UNKNOWN,
     supervise_command: str | None = None,
 ) -> str:
     """Operator hint when the listener pool is short of its configured depth.
@@ -1661,7 +1662,8 @@ def listener_floor_hint(
     command: str,
     *,
     work_in_flight: bool,
-    supervisor: str = SUPERVISOR_ABSENT,
+    # An omitted probe result is not evidence that no supervisor is running.
+    supervisor: str = SUPERVISOR_UNKNOWN,
     supervise_command: str | None = None,
 ) -> str:
     """Exact remaining-depth commands after a listen exit or lease claim.
@@ -1841,7 +1843,8 @@ def consume_listener_activity_signal(
             str(plan["supervisor"]) if plan.get("supervisor") else None
         )
         if "supervisor" in plan
-        else SUPERVISOR_ABSENT,
+        # A missing plan field carries no evidence of supervisor absence.
+        else SUPERVISOR_UNKNOWN,
         supervise_command=(
             str(plan["supervise_command"])
             if plan.get("supervise_command")

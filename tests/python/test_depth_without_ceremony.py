@@ -200,7 +200,13 @@ def _write_ready_task(project: Path) -> None:
 
 def test_listen_exit_numbered_hint_is_frozen() -> None:
     assert (
-        wake.listener_floor_hint(0, 4, "CMD", work_in_flight=True)
+        wake.listener_floor_hint(
+            0,
+            4,
+            "CMD",
+            work_in_flight=True,
+            supervisor=wake.SUPERVISOR_ABSENT,
+        )
         == LISTEN_EXIT_HINT_SNAPSHOT
     )
 
@@ -640,13 +646,26 @@ def test_activity_signal_emits_once_per_transition(
 ) -> None:
     project, _env = isolated
     plan = wake.listener_depth_plan(0, 4, "CMD", work_in_flight=True)
-    first = wake.consume_listener_activity_signal(project, "depth-ctl", plan)
-    second = wake.consume_listener_activity_signal(project, "depth-ctl", plan)
+    unknown = wake.consume_listener_activity_signal(project, "depth-ctl", plan)
+    assert "listener coverage needs verification" in unknown
+    assert "CMD" not in unknown
+    assert wake.consume_listener_activity_signal(project, "depth-ctl", plan) == ""
+
+    absent = {**plan, "supervisor": wake.SUPERVISOR_ABSENT}
+    first = wake.consume_listener_activity_signal(project, "depth-ctl", absent)
+    second = wake.consume_listener_activity_signal(project, "depth-ctl", absent)
     assert first.startswith("listener depth 0/4 — 4 missing;")
+    assert first.endswith("; CMD")
     assert second == ""
-    recovered = wake.listener_depth_plan(4, 4, "CMD", work_in_flight=True)
+    recovered = {
+        **wake.listener_depth_plan(4, 4, "CMD", work_in_flight=True),
+        "supervisor": wake.SUPERVISOR_ABSENT,
+    }
     assert wake.consume_listener_activity_signal(project, "depth-ctl", recovered) == ""
-    dropped = wake.listener_depth_plan(0, 4, "CMD", work_in_flight=True)
+    dropped = {
+        **wake.listener_depth_plan(0, 4, "CMD", work_in_flight=True),
+        "supervisor": wake.SUPERVISOR_ABSENT,
+    }
     assert wake.consume_listener_activity_signal(
         project, "depth-ctl", dropped
     ).startswith("listener depth 0/4")

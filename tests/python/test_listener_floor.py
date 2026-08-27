@@ -130,7 +130,16 @@ def _post(env: dict[str, str], project: Path, label: str, text: str) -> None:
 
 def test_floor_hint_names_missing_slots_as_separate_tracked_calls() -> None:
     command = "python3 scripts/goalflight_messages.py listen --report-pending"
-    hint = wake.listener_floor_hint(0, 4, command, work_in_flight=True)
+    unknown = wake.listener_floor_hint(0, 4, command, work_in_flight=True)
+    assert "listener coverage needs verification" in unknown
+    assert command not in unknown
+    hint = wake.listener_floor_hint(
+        0,
+        4,
+        command,
+        work_in_flight=True,
+        supervisor=wake.SUPERVISOR_ABSENT,
+    )
     assert "live=0/4" in hint
     assert "4 slots missing" in hint
     assert wake.SEPARATE_TRACKED_ARM_RULE in hint
@@ -139,7 +148,13 @@ def test_floor_hint_names_missing_slots_as_separate_tracked_calls() -> None:
     assert "&" in hint
     assert wake.listener_floor_hint(0, 4, command, work_in_flight=False) == ""
     assert wake.listener_floor_hint(4, 4, command, work_in_flight=True) == ""
-    thin = wake.listener_floor_hint(1, 4, command, work_in_flight=True)
+    thin = wake.listener_floor_hint(
+        1,
+        4,
+        command,
+        work_in_flight=True,
+        supervisor=wake.SUPERVISOR_ABSENT,
+    )
     assert thin.startswith("listener pool n=1/4 — 3 slots missing")
     assert thin.count(command) == 3
 

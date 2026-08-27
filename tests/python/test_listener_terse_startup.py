@@ -199,11 +199,23 @@ def _wait_live(project: Path, label: str, count: int, *, timeout_s: float = 60) 
 
 def test_listen_exit_numbered_hint_is_unchanged() -> None:
     assert (
-        wake.listener_floor_hint(0, 4, "CMD", work_in_flight=True)
+        wake.listener_floor_hint(
+            0,
+            4,
+            "CMD",
+            work_in_flight=True,
+            supervisor=wake.SUPERVISOR_ABSENT,
+        )
         == LISTEN_EXIT_HINT_SNAPSHOT
     )
     assert (
-        wake.listener_floor_hint(1, 4, "CMD", work_in_flight=True)
+        wake.listener_floor_hint(
+            1,
+            4,
+            "CMD",
+            work_in_flight=True,
+            supervisor=wake.SUPERVISOR_ABSENT,
+        )
         == LISTEN_EXIT_THIN_HINT_SNAPSHOT
     )
     assert wake.listener_floor_hint(0, 4, "CMD", work_in_flight=False) == ""
@@ -318,6 +330,7 @@ def test_listen_exit_still_prints_the_numbered_hint(
                 wake.DEFAULT_LISTENER_SLOTS,
                 shlex.join(cmd),
                 work_in_flight=True,
+                supervisor=wake.SUPERVISOR_ABSENT,
             )
             assert expected
             assert expected in stderr

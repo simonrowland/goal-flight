@@ -1025,13 +1025,26 @@ def test_listener_pool_defaults_to_the_configured_depth(
     assert not hasattr(wake, "ListenerSlotsFull")
 
 
-def test_listener_reserve_hint_prints_one_command_per_missing_slot() -> None:
+def test_listener_reserve_hint_requires_proven_absence_for_commands() -> None:
     target = wake.DEFAULT_LISTENER_SLOTS
     command = "python3 scripts/goalflight_messages.py listen --report-pending"
-    assert wake.listener_reserve_hint(0, target, command) == (
+    unknown = wake.listener_reserve_hint(0, target, command)
+    assert "listener coverage needs verification" in unknown
+    assert command not in unknown
+    assert wake.listener_reserve_hint(
+        0,
+        target,
+        command,
+        supervisor=wake.SUPERVISOR_ABSENT,
+    ) == (
         f"listener pool n=0; start: {command}"
     )
-    one_live = wake.listener_reserve_hint(1, target, command)
+    one_live = wake.listener_reserve_hint(
+        1,
+        target,
+        command,
+        supervisor=wake.SUPERVISOR_ABSENT,
+    )
     assert one_live.startswith(
         f"listener pool n=1/{target} — reserve down; re-arm: {command}"
     )
@@ -1040,9 +1053,19 @@ def test_listener_reserve_hint_prints_one_command_per_missing_slot() -> None:
     # news (operator ruling 2026-08-16). Only at or below the low-water mark
     # does the hint speak.
     if target >= 2:
-        assert wake.listener_reserve_hint(target - 1, target, command) == ""
+        assert wake.listener_reserve_hint(
+            target - 1,
+            target,
+            command,
+            supervisor=wake.SUPERVISOR_ABSENT,
+        ) == ""
         low = wake.listener_low_water(target)
-        at_low = wake.listener_reserve_hint(low, target, command)
+        at_low = wake.listener_reserve_hint(
+            low,
+            target,
+            command,
+            supervisor=wake.SUPERVISOR_ABSENT,
+        )
         assert at_low.startswith(f"listener pool n={low}/{target}")
         assert at_low.count(command) == target - low
 
@@ -3161,14 +3184,29 @@ def test_hint_stays_quiet_until_the_pool_runs_low() -> None:
     assert 1 <= low < target, "low water must leave healthy depth silent"
 
     for healthy in range(low + 1, target + 1):
-        assert wake.listener_reserve_hint(healthy, target, "CMD") == "", (
+        assert wake.listener_reserve_hint(
+            healthy,
+            target,
+            "CMD",
+            supervisor=wake.SUPERVISOR_ABSENT,
+        ) == "", (
             f"pool n={healthy}/{target} should be silent"
         )
     for thin in range(1, low + 1):
-        hint = wake.listener_reserve_hint(thin, target, "CMD")
+        hint = wake.listener_reserve_hint(
+            thin,
+            target,
+            "CMD",
+            supervisor=wake.SUPERVISOR_ABSENT,
+        )
         assert hint.startswith(f"listener pool n={thin}/{target}")
         assert hint.count("CMD") == target - thin
-    assert wake.listener_reserve_hint(0, target, "CMD").startswith("listener pool n=0;")
+    assert wake.listener_reserve_hint(
+        0,
+        target,
+        "CMD",
+        supervisor=wake.SUPERVISOR_ABSENT,
+    ).startswith("listener pool n=0;")
 
 
 def test_low_water_override_is_honored_and_bounded(
@@ -3176,7 +3214,13 @@ def test_low_water_override_is_honored_and_bounded(
 ) -> None:
     monkeypatch.setenv("GOALFLIGHT_LISTENER_LOW_WATER", "3")
     assert wake.listener_low_water(4) == 3
-    assert wake.listener_reserve_hint(3, 4, "CMD") != ""
+    hint = wake.listener_reserve_hint(
+        3,
+        4,
+        "CMD",
+        supervisor=wake.SUPERVISOR_ABSENT,
+    )
+    assert "CMD" in hint
     monkeypatch.setenv("GOALFLIGHT_LISTENER_LOW_WATER", "99")
     assert wake.listener_low_water(4) == 4, "override cannot exceed the target"
     monkeypatch.setenv("GOALFLIGHT_LISTENER_LOW_WATER", "nonsense")
