@@ -839,6 +839,11 @@ def _decorate_trace_status(record: dict) -> dict:
     for key in ("trace_path", "trace_mtime", "trace_active"):
         if key in sidecar:
             out[key] = sidecar[key]
+    # status.json.state is a heartbeat copy, not a second lifecycle
+    # authority. A finished ledger/journal row must not be resurrected as
+    # live salvage or trace-running by a sidecar frozen at running/stalled.
+    if _record_is_structurally_terminal(record):
+        return out
     if sidecar.get("liveness_state") == "running_via_trace":
         out["liveness_state"] = "running_via_trace"
     if sidecar.get("state") in {"long_running", "long_running_review"}:
@@ -1542,11 +1547,14 @@ def _wait_record_from_snapshots(
         for key in ("terminal_state", "terminal_marker", "last_marker", "markers"):
             record.pop(key, None)
     else:
-        # Compatibility for pre-journal/tmp seams: bind state and terminal
-        # marker to the single sidecar generation already read this cycle.
-        if sidecar.get("state"):
+        # Pre-journal/tmp seams. Sidecar state is a heartbeat copy of
+        # lifecycle, not a second authority. A finished ledger must not be
+        # resurrected by a sidecar frozen at running (the ledger-finish
+        # path does not, and must not, rewrite status.json).
+        ledger_terminal = _record_is_structurally_terminal(record)
+        if sidecar.get("state") and not ledger_terminal:
             record["state"] = sidecar["state"]
-        if sidecar.get("terminal_state"):
+        if sidecar.get("terminal_state") and not ledger_terminal:
             record["terminal_state"] = sidecar["terminal_state"]
         marker = _validated_terminal_marker(sidecar, expected_dispatch_id=dispatch_id)
         if marker is not None:

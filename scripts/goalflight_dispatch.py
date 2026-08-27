@@ -1324,6 +1324,12 @@ def _wait_for_detached_watcher(
     pgid: int | None,
     prompt_path: str | None,
 ) -> tuple[int, dict, str | None]:
+    """Join this launch's watcher until it writes a terminal sidecar or dies.
+
+    Sidecar ``state`` here is watcher liveness of the current launch, not
+    dispatch lifecycle authority. ``cmd_finish`` does not write status.json;
+    this wait is for the process the launcher spawned.
+    """
     sleep_s = min(max(float(poll_secs or 1.0), 0.2), 2.0)
     last_payload: dict = {}
     project_root = _project_root(args)

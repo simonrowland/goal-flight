@@ -2547,14 +2547,43 @@ def test_authority_detail_names_sources_and_journal_reconciles() -> None:
                 "status_path": str(status_path),
             }
         )
+        sampled_at = F._parse_timestamp("2030-01-01T00:00:10+00:00")
+        heartbeat_row = F._worker_row(
+            {
+                "dispatch_id": "newer-status-conflict",
+                "state": "complete",
+                "classification": "complete",
+                "terminal_state": "complete",
+                "updated_at": "2030-01-01T00:00:00+00:00",
+                "status_path": str(status_path),
+            },
+            sampled_at=sampled_at,
+        )
     assert_true(
-        "newer running status sidecar reopens a stale terminal ledger presentation",
-        newer_status["display_state"] == "running"
-        and newer_status["is_terminal"] is False
+        "newer running sidecar cannot reopen a structurally terminal ledger",
+        newer_status["display_state"] == "complete"
+        and newer_status["is_terminal"] is True
         and newer_status["classification_conflict"] is False
-        and newer_status["authority_resolution"] == "status.json:newer"
-        and "reconciled by newer status.json observation"
-        in str(newer_status["authority_detail"]),
+        and newer_status["authority_resolution"] is None,
+    )
+    assert_true(
+        "sidecar heartbeat/liveness still surfaces after ignoring sidecar lifecycle",
+        heartbeat_row["is_terminal"] is True
+        and heartbeat_row["display_state"] == "complete"
+        and heartbeat_row["observed_live"] is True
+        and heartbeat_row["observed_live_source"] == "fresh_status",
+    )
+    live_row = F._worker_row(
+        {
+            "dispatch_id": "live-no-terminal",
+            "state": "running",
+            "classification": "expected_live",
+            "worker_still_alive": True,
+        }
+    )
+    assert_true(
+        "running ledger with no terminal row still renders running",
+        live_row["display_state"] == "running" and live_row["is_terminal"] is False,
     )
     with tempfile.TemporaryDirectory() as td:
         mismatched_path = Path(td) / "status.json"

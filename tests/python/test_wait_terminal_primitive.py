@@ -441,6 +441,57 @@ def test_live_journal_attempt_suppresses_torn_terminal_sidecar() -> None:
     assert_true("torn terminal does not finish wait", status.done_code(record) != 0)
 
 
+def test_finished_ledger_is_not_resurrected_by_stale_running_sidecar() -> None:
+    """Ledger finish is the lifecycle authority; status.json is a heartbeat copy.
+
+    A pre-journal/--wait snapshot must not overlay sidecar ``state: running``
+    onto a ledger row that is already terminal. Believing the sidecar is how
+    corpses keep counting as live work after the sanctioned repair.
+    """
+    record = status._wait_record_from_snapshots(
+        "ledger-done",
+        {
+            "dispatch_id": "ledger-done",
+            "state": "complete",
+            "terminal_state": "complete",
+            "worker_pid": 2147480000,
+        },
+        {
+            "dispatch_id": "ledger-done",
+            "state": "running",
+            "worker_pid": 2147480000,
+            "worker_alive": True,
+        },
+        None,
+    )
+    assert_true("snapshot exists", isinstance(record, dict))
+    assert_eq("ledger terminal state survives stale sidecar", record.get("state"), "complete")
+    assert_eq(
+        "finished dispatch is not reported running",
+        status.done_code(record),
+        0,
+    )
+
+
+def test_live_sidecar_still_overlays_nonterminal_ledger() -> None:
+    record = status._wait_record_from_snapshots(
+        "ledger-live",
+        {
+            "dispatch_id": "ledger-live",
+            "state": "running",
+            "worker_pid": os.getpid(),
+        },
+        {
+            "dispatch_id": "ledger-live",
+            "state": "running_quiet",
+            "worker_pid": os.getpid(),
+        },
+        None,
+    )
+    assert_true("live snapshot exists", isinstance(record, dict))
+    assert_eq("live sidecar substate still overlays", record.get("state"), "running_quiet")
+
+
 def test_terminal_journal_outbox_wins_live_ledger() -> None:
     record = status._wait_record_from_snapshots(
         "journal-need",
@@ -657,6 +708,8 @@ def main() -> None:
         test_status_marker_fallback_rejects_nonterminal_and_wrong_dispatch,
         test_wait_heartbeat_emits_progress_line_at_cadence,
         test_live_journal_attempt_suppresses_torn_terminal_sidecar,
+        test_finished_ledger_is_not_resurrected_by_stale_running_sidecar,
+        test_live_sidecar_still_overlays_nonterminal_ledger,
         test_terminal_journal_outbox_wins_live_ledger,
         test_journal_terminal_supersedes_contradictory_sidecar_marker,
         test_unreadable_journal_never_promotes_file_terminal,
