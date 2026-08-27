@@ -29,7 +29,12 @@ incremented when meaningful skill behaviour changes.
   logs, empty/capacity-blocked noise, and the unattended 7.1 GB `/tmp`
   backlog. Tails are untrusted; this tool never `git add`s. Going-forward
   hook is `goalflight_ledger.cmd_finish`. Sweep a backlog with
-  `--source-dir --apply`.
+  `--source-dir --apply`. Archived tails are unreviewed worker output.
+  Credential-shaped material is redacted at copy time with a named marker
+  and a per-tail count; this tool refuses to `git add`. The drop list
+  (unmarked/capacity, steer, watcher, caffeinate, pidfile, prompt,
+  tail-middle, historical `/tmp` backlog) is in the module docstring and
+  CLI help.
 
 ### Changed
 
