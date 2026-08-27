@@ -1397,3 +1397,25 @@ def test_permanently_busy_journal_reports_retry_exhausted(
         holder.close()
     del registered
     del nonce
+
+
+def test_retry_deadline_checked_before_subsequent_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first read that spends the budget must not start attempt 2."""
+    monkeypatch.setattr(journal, "JOURNAL_READER_RETRY_BUDGET_S", 0.04)
+    calls: list[float] = []
+
+    def read_once() -> tuple[object, str | None]:
+        calls.append(time.monotonic())
+        time.sleep(0.05)
+        return None, controllers._BUSY_ERROR
+
+    started = time.monotonic()
+    value, error = controllers._retry_journal_busy(read_once)
+    elapsed = time.monotonic() - started
+    assert value is None
+    assert error is not None
+    assert error.startswith("busy after 1 attempts")
+    assert len(calls) == 1
+    assert elapsed < 0.2

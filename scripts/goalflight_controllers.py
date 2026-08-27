@@ -140,25 +140,32 @@ def _retry_journal_busy(
 
     Structural errors (``JournalUpgradeRequired``, ``OperationalError``,
     disappearance, I/O) return on the first attempt. ``JournalBusy`` is
-    the only retryable class. The loop is capped by both attempt count
-    and ``JOURNAL_READER_RETRY_BUDGET_S`` so a fenced roster whose inner
-    reader already spent that 1s budget cannot stack another window.
+    the only retryable class. The first attempt always runs. Attempt 2+
+    is not started once ``JOURNAL_READER_RETRY_BUDGET_S`` has elapsed, so
+    a fenced roster whose inner reader already spent that 1s budget
+    cannot stack another roster call. Peek probes that return immediately
+    still consume the remaining window as 50ms-spaced attempts, capped
+    by ``FLEET_JOURNAL_BUSY_ATTEMPTS``.
     """
     started = time.monotonic()
     deadline = started + goalflight_journal.JOURNAL_READER_RETRY_BUDGET_S
     attempts = 0
     while True:
+        now = time.monotonic()
+        if attempts > 0:
+            if attempts >= FLEET_JOURNAL_BUSY_ATTEMPTS or now >= deadline:
+                return None, _busy_retry_exhausted_reason(attempts, started)
+            remaining = deadline - now
+            if remaining <= 0:
+                return None, _busy_retry_exhausted_reason(attempts, started)
+            time.sleep(min(FLEET_JOURNAL_BUSY_BACKOFF_S, remaining))
+            now = time.monotonic()
+            if now >= deadline:
+                return None, _busy_retry_exhausted_reason(attempts, started)
         attempts += 1
         value, error = read_once()
         if error != _BUSY_ERROR:
             return value, error
-        now = time.monotonic()
-        if attempts >= FLEET_JOURNAL_BUSY_ATTEMPTS or now >= deadline:
-            return None, _busy_retry_exhausted_reason(attempts, started)
-        remaining = deadline - now
-        if remaining <= 0:
-            return None, _busy_retry_exhausted_reason(attempts, started)
-        time.sleep(min(FLEET_JOURNAL_BUSY_BACKOFF_S, remaining))
 
 
 def _peek_active_lease_identities_once(
