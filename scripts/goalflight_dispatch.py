@@ -6133,6 +6133,40 @@ def _queue_claim_identity_status(
 # Removed _queue_claim_worker_alive: boolean liveness treated indeterminate identity as dead instead of evidence.
 
 
+def _restore_prepared_owner_state(entry: dict, record: dict | None) -> tuple[str, str]:
+    """Tri-state liveness of the controller generation owning a restore_prepared entry.
+
+    Returns ``(state, reason)`` with state in {"live", "dead", "unknown"}.
+    The entry envelope itself carries no owner identity (the restore sanitize
+    strips claimer fields), so the proof channel is the ledger record's
+    ``controller_pid``/``controller_identity`` — the generation that submitted
+    and owns this dispatch. Adjudication REUSES the claim-identity classifier,
+    so proof-of-death is exactly as strict as everywhere else: only a gone pid
+    or a start-token/lstart mismatch reports "dead". Anything that cannot be
+    determined — no ledger record, no controller pid, no stored identity, a
+    probe error — is "unknown", and unknown HOLDS: it is never evidence for
+    expiry or attention.
+    """
+    if not isinstance(record, dict):
+        return "unknown", "no_ledger_record"
+    pid = record.get("controller_pid")
+    identity = record.get("controller_identity")
+    status, reason = _queue_claim_identity_status(pid, identity)
+    if status == "dead":
+        # A gone pid is proof of death even without a stored token.
+        return "dead", reason
+    if not isinstance(identity, dict) or not str(identity.get("start_token") or ""):
+        # No stored generation token: a live pid cannot be told from a
+        # recycled one — the same standard the claim-marker adjudicator
+        # applies ("claim_identity_unavailable"). Only the dead branch above
+        # is proof without it.
+        return "unknown", "no_controller_pid" if status == "no_pid" else "controller_identity_unavailable"
+    if status == "live":
+        return "live", reason
+    # Indeterminate probes fail closed to unknown: hold, never expire.
+    return "unknown", reason
+
+
 def _queue_claim_worker_status(entry: dict) -> tuple[str, str]:
     return _queue_claim_identity_status(
         entry.get("queue_worker_pid"),
@@ -11995,15 +12029,23 @@ def _drain_queue_once(args) -> dict:
         row.setdefault("state", "claimed")
         row.update(_completion_authority_park_fields(str(row.get("reason") or "")))
         details.append(row)
-    entries = sorted(
-        candidate
-        for path in queue_dir.glob("*.json")
-        for candidate in (_queue_entry_drain_candidate(path),)
-        if not (
+    # restore_prepared envelopes are mid-restore transactions: only the
+    # reconcile path (which owns the T→Q→S→L ordering) may complete them, so
+    # they are never launch candidates. But dropping them SILENTLY was t-345:
+    # a queue full of them reported launched:0 with no cause. Partition them
+    # out and report each one with its owner-generation adjudication below.
+    restore_prepared_candidates: list[tuple] = []
+    launch_candidates: list[tuple] = []
+    for path in queue_dir.glob("*.json"):
+        candidate = _queue_entry_drain_candidate(path)
+        if (
             isinstance(candidate[2], dict)
             and candidate[2].get("state") == "restore_prepared"
-        )
-    )
+        ):
+            restore_prepared_candidates.append(candidate)
+        else:
+            launch_candidates.append(candidate)
+    entries = sorted(launch_candidates)
     now_s = time.time()
     deferred_entries = [
         candidate
@@ -12015,7 +12057,19 @@ def _drain_queue_once(args) -> dict:
     ]
     entries = [candidate for candidate in entries if candidate not in deferred_entries]
     left_queued += len(deferred_entries)
+    not_before_until: str | None = None
+    not_before_until_ts: float | None = None
     for _sort_key, path, entry, _read_error in deferred_entries:
+        not_before_ts = _queue_entry_not_before_ts(entry)
+        if (
+            isinstance(entry, dict)
+            and not_before_ts is not None
+            and (not_before_until_ts is None or not_before_ts < not_before_until_ts)
+        ):
+            not_before_until_ts = not_before_ts
+            not_before_until = entry.get("not_before") or (
+                entry.get("request") if isinstance(entry.get("request"), dict) else {}
+            ).get("not_before")
         details.append(
             {
                 "dispatch_id": (
@@ -12032,6 +12086,75 @@ def _drain_queue_once(args) -> dict:
                 ),
             }
         )
+    # Hold-reason aggregation (t-345): the summary must say WHY entries are
+    # held, not only THAT launched:0. `until` is the EARLIEST pending
+    # not_before — when this queue next becomes eligible to make progress.
+    holds: dict = {
+        "not_before": {"count": len(deferred_entries), "until": not_before_until},
+        "restore_prepared": {
+            "count": len(restore_prepared_candidates),
+            "owner_live": 0,
+            "owner_dead": 0,
+            "owner_unknown": 0,
+        },
+        "reconcile_pending": {},
+        "quarantined": int(recovery.get("quarantined") or 0),
+    }
+    for pending in recovery.get("pending_reasons") or []:
+        if isinstance(pending, dict):
+            reason = str(pending.get("reason") or "unspecified")
+            holds["reconcile_pending"][reason] = holds["reconcile_pending"].get(reason, 0) + 1
+    attention: list[dict] = []
+    if restore_prepared_candidates:
+        # One ledger scan per pass, not per entry. The record is the only
+        # owner-identity channel: the restore envelope itself carries none.
+        # An unreadable ledger fails closed: every entry reports unknown.
+        try:
+            records_by_id: dict[str, dict] | None = {
+                str(record.get("dispatch_id") or ""): record
+                for record in goalflight_ledger.read_records()
+                if isinstance(record, dict)
+            }
+        except Exception:
+            records_by_id = None
+        for _sort_key, path, entry, _read_error in restore_prepared_candidates:
+            dispatch_id = (
+                str(entry.get("dispatch_id"))
+                if isinstance(entry, dict) and entry.get("dispatch_id")
+                else path.stem
+            )
+            owner_state, owner_reason = _restore_prepared_owner_state(
+                entry if isinstance(entry, dict) else {},
+                records_by_id.get(dispatch_id) if records_by_id is not None else None,
+            )
+            left_queued += 1
+            holds["restore_prepared"][f"owner_{owner_state}"] += 1
+            details.append(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "restore_prepared",
+                    "reason": "awaiting_owner_reconcile",
+                    "owner_state": owner_state,
+                    "detail": f"owner_{owner_state}:{owner_reason}",
+                }
+            )
+            if owner_state == "dead":
+                # Proof-gated attention item (never an expiry): the owning
+                # controller generation is provably dead, so no live pass will
+                # complete this restore transaction. Surfaced for the operator;
+                # the queue file itself is left untouched.
+                item = {
+                    "dispatch_id": dispatch_id,
+                    "state": "restore_prepared",
+                    "attention": "owner_generation_dead",
+                    "owner_reason": owner_reason,
+                }
+                if isinstance(entry, dict):
+                    if entry.get("project_root"):
+                        item["project_root"] = str(entry.get("project_root"))
+                    if entry.get("updated_at"):
+                        item["updated_at"] = str(entry.get("updated_at"))
+                attention.append(item)
     if args.limit and args.limit > 0:
         entries = entries[: args.limit]
     if not remote_node and entries:
@@ -12322,6 +12445,8 @@ def _drain_queue_once(args) -> dict:
         "dead_claimer": claimer_counts["dead_claimer"],
         "unknown_claimer": claimer_counts["unknown_claimer"],
         "live_claimer": claimer_counts["live_claimer"],
+        "holds": holds,
+        "attention": attention,
         "recovered_claims": recovery,
         "abandoned_reconciliation": abandoned_reconciliation,
         "details": details,
@@ -12343,6 +12468,8 @@ def _drain_error_payload(args, exc: BaseException) -> dict:
         "dead_claimer": 0,
         "unknown_claimer": 0,
         "live_claimer": 0,
+        "holds": {},
+        "attention": [],
         "recovered_claims": {"restored": 0, "failed": 0},
         "details": [],
         "error": f"{type(exc).__name__}: {exc}",
@@ -12385,6 +12512,11 @@ def _cmd_drain(argv: list[str]) -> int:
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     else:
+        holds = payload.get("holds") if isinstance(payload.get("holds"), dict) else {}
+        not_before_hold = holds.get("not_before") if isinstance(holds.get("not_before"), dict) else {}
+        restore_hold = (
+            holds.get("restore_prepared") if isinstance(holds.get("restore_prepared"), dict) else {}
+        )
         print(
             "DRAIN "
             + json.dumps(
@@ -12398,6 +12530,12 @@ def _cmd_drain(argv: list[str]) -> int:
                     "dead_claimer": payload.get("dead_claimer", 0),
                     "unknown_claimer": payload.get("unknown_claimer", 0),
                     "live_claimer": payload.get("live_claimer", 0),
+                    "waiting_not_before": not_before_hold.get("count", 0),
+                    "waiting_not_before_until": not_before_hold.get("until"),
+                    "awaiting_owner_reconcile": restore_hold.get("count", 0),
+                    "owner_generation_dead": restore_hold.get("owner_dead", 0),
+                    "quarantined": holds.get("quarantined", 0),
+                    "attention": len(payload.get("attention") or []),
                     "queue_dir": payload["queue_dir"],
                 },
                 sort_keys=True,
