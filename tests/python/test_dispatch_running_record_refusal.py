@@ -26,8 +26,10 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+# Import path only. Do not mutate process env at module scope: collection
+# imports every selected file before any fixture runs, so an os.environ write
+# here leaks into later modules in the same pytest process.
 sys.path.insert(0, str(ROOT / "scripts"))
-os.environ["GOALFLIGHT_ACP_PYTHON"] = str(ROOT / ".missing-acp-test-python")
 
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
@@ -57,6 +59,9 @@ def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", "/dev/null")
     monkeypatch.setenv("GOALFLIGHT_CAPACITY_WAIT_S", "0")
     monkeypatch.setenv("GOALFLIGHT_DISABLE_NUDGES", "1")
+    monkeypatch.setenv(
+        "GOALFLIGHT_ACP_PYTHON", str(ROOT / ".missing-acp-test-python")
+    )
     for key in (
         "GOALFLIGHT_CONTROLLER_LABEL",
         "GOALFLIGHT_CONTROLLER_PID",
@@ -427,3 +432,46 @@ def test_indeterminate_spawn_state_takes_the_safe_branch(
     assert "DISPATCH-LEDGER-WARN" in capsys.readouterr().err
     assert "export" in export_calls
     assert "registry" in export_calls
+
+
+def test_importing_this_module_does_not_mutate_acp_python_env(
+    tmp_path: Path,
+) -> None:
+    """Collection must not pin GOALFLIGHT_ACP_PYTHON on the process.
+
+    An import-time os.environ write leaks into every later module in the same
+    pytest process via env.copy() child launches. Keep the pin inside the
+    autouse fixture so teardown restores it.
+    """
+    env = os.environ.copy()
+    env.pop("GOALFLIGHT_ACP_PYTHON", None)
+    env["GOALFLIGHT_STATE_DIR"] = str(tmp_path / "state")
+    env["GOALFLIGHT_DISPATCH_DIR"] = str(tmp_path / "dispatch")
+    env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp_path / "journals")
+    env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp_path / "messages")
+    env["GOALFLIGHT_TASK_STORE"] = str(tmp_path / "task-store")
+    env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp_path / "task-store")
+    env["GOALFLIGHT_WAKE_LEDGER"] = str(tmp_path / "wake-ledger")
+    env["GOALFLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+    env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
+    env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
+    env["PYTHONPATH"] = str(ROOT / "scripts")
+    probe = (
+        "import os, sys\n"
+        f"sys.path.insert(0, {str(ROOT / 'tests' / 'python')!r})\n"
+        "assert os.environ.get('GOALFLIGHT_ACP_PYTHON') is None\n"
+        "import test_dispatch_running_record_refusal as m\n"
+        "print('after=' + repr(os.environ.get('GOALFLIGHT_ACP_PYTHON')))\n"
+        "print('module=' + m.__name__)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=str(ROOT),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "after=None" in proc.stdout
