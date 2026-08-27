@@ -46,10 +46,10 @@ This checked-in `SKILL.md` is compiled from `docs/controller-behaviours.md` and 
 
 **Is goal-flight active in this project?** Run
 `python3 <skill-root>/scripts/goalflight_session_status.py --text` before
-auto-loading the rest of this skill. If the verdict is "no active
-goal-flight session", you are NOT in a goal-flight run — do regular coding
-without loading the back half. Only load end-to-end when the verdict is
-"active" or when the user explicitly invokes `/goal-flight <command>`.
+auto-loading the rest of this skill. Verdict "no active goal-flight session"
+→ you are NOT in a goal-flight run; do regular coding without loading the
+back half. Load end-to-end only when the verdict is "active" or the user
+explicitly invokes `/goal-flight <command>`.
 
 `<skill-root>` = this repo when working in goal-flight itself; for downstream projects it is the installed skill checkout (see per-host pointers) — resolve it before running scripts.
 
@@ -76,13 +76,12 @@ host wrapper first, then root `SKILL.md` as canonical workflow:
 
 **Stale-wrapper warning:** non-native hosts hold a *copy* of `SKILL.md`. If
 the source repo updated and `./install.sh <host>` was not re-run, the
-installed copy is stale. The repository `SKILL.md` is canonical — when the
-installed wrapper and the repo wrapper disagree, trust the repo. Doctor
-probes the divergence; re-run install to resync.
+installed copy is stale. Repository `SKILL.md` is canonical — when wrappers
+disagree, trust the repo. Doctor probes the divergence; re-run install to resync.
 
 **Windows (native host):** read/plan only — native worker dispatch (ACP / bash-tail)
 is POSIX/WSL-only; use the `bin/goalflight.cmd` / `bin/goalflight.ps1` launchers and
-see `docs/hosts/windows.md` (including the WSL path for worker dispatch).
+see `docs/hosts/windows.md`.
 
 Load order: `AGENTS.md` -> installed host wrapper -> repository `SKILL.md` ->
 only the invoked `commands/*.md` plus referenced `protocols/*.md`.
@@ -236,14 +235,12 @@ codex exec --sandbox read-only \
   2> docs-private/reviews/<date>-<slug>/codex-review.stderr.log
 ```
 
-**`< /dev/null` is load-bearing.** Without it, `codex exec` reads stdin to EOF
-and the bash-tail invocation blocks forever (observed wedge 2026-05-27).
-**`-c approval_policy=never`** is the canonical non-interactive form (per
-`protocols/legacy/bash-tail.md` worker recipe). Do NOT substitute the
-deprecated `--dangerously-bypass-approvals-and-sandbox` flag — it is
-rejected by classifiers and explicitly forbidden in adapter manifests
-(`adapters/codex.json` `forbidden_args`). Apply P3-safe-easy findings
-inline; fix P0/P1/P2 before commit.
+**`< /dev/null` is load-bearing** — without it, `codex exec` reads stdin to EOF
+and bash-tail wedges (observed 2026-05-27). **`-c approval_policy=never`** is
+the canonical non-interactive form (`protocols/legacy/bash-tail.md`). Do NOT
+substitute `--dangerously-bypass-approvals-and-sandbox` — classifiers reject
+it; `adapters/codex.json` `forbidden_args` forbids it. Apply P3-safe-easy
+findings inline; fix P0/P1/P2 before commit.
 
 ## Hard Invariants
 
@@ -309,8 +306,7 @@ Hard caps are RAM/process safeguards, not provider truth. Learn rate pressure fr
 ledger failures and emits fallback/halved-cap recommendations after clustered
 provider pressure.
 
-Probe workers upward; keep orchestrator provider conservative. Orchestrator budget
-loss can end the interactive session; worker-provider pressure can be rerouted.
+Probe workers upward; keep orchestrator provider conservative.
 Bound dispatch hangs with idle and quiet timeouts. Terminal leases leave active capacity after completion.
 
 ## Autonomous throughput
@@ -366,7 +362,7 @@ A dead worker is not automatically a lost worker: resume when its accumulated co
 Dispatch defaults detached; `--foreground` only for sync scripts/tests. Queue: `--submit --drain-on-submit`.
 Do not hand-iterate (>~3 edit/test cycles) what a goal-loop should converge.
 
-Controller entry auto-claims without stealing a live different lease. Prefer one persistent `goalflight_messages.py supervise` monitor that owns the stream, backup doorbell pool, and watchdog and multiplexes them into a single stdout feed, re-arming children itself. By default it replaces each stream keepalive plus its already-materialized advisory frontier with one actionable `kind=next` record and suppresses a verbatim-identical payload until the 15-minute floor (a content change still wakes immediately): only a freshly empty projection says `Nothing pending`, while unavailable or not-yet-observed state retains `goal-flight next`. Default terse mode emits no coverage record and suppresses `live` / `target`; startup writes the named `{"type":"probe","reason":"stdout-peer-liveness"}` peer-liveness probe. The CLI wires `--chatty` into both the raw-forwarding `chatty` control and the distinct `emit_depth` control; `--debug` restores per-tick heartbeat records only. Arm it with **no timeout** so it runs for the life of the session. Never set, tune, or reason about a timeout value: a bounded monitor is killed outside the supervisor, so no `type=stop` record appears and the controller goes deaf without a diagnostic. On Claude Code use `persistent: true`; that makes `timeout_ms` inert, and a host-required value is only a placeholder, never a knob. In the decomposed fallback, only after supervisor absence is proven, arm one generation-bound `goalflight_messages.py follow --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>` through the host's persistent monitor, never shell `&`; then arm two tracked `listen --listener-slots 2 --report-pending` backup doorbells and one separately tracked `listen --watch-follow` watchdog. The watchdog holds its own generation lock, never consumes a delivery slot, reads durable record age, and treats three missed heartbeat intervals as channel death; the backup witnesses a missing watchdog lock, but all-tracked-task death remains unwitnessed. In the decomposed unsupervised path, `listener-dead` and `watchdog-dead` records carry the exact component re-arm command. Under `supervise`, they keep the reason but omit the component action; recovery is a supervisor restart. Persistent coverage is the shared four-component `live/4` fact and is detectable, not reap-proof. On codex, grok, cursor, opencode, or any host without such a monitor, retain the portable pool of four `listen --report-pending` calls; on each ring (exit 0), process reported or authoritative mail, cursor-CAS settled server-known positions, then restore depth. Exit 5 is settled did-not-arm (dead or mismatched lease nonce): do not treat it as a ring and do not re-arm that nonce. Exit 2 is retryable journal unreadability, not a dead nonce. Background fixed-id `goalflight_status.py --wait <ids>` only for an unclaimed join; exit 3 is mail, not completion. Timers cover non-notifiable external state, never worker completion. Full arming and JSON-line contracts: `protocols/controller-mail.md`.
+Controller entry auto-claims without stealing a live different lease. Prefer one persistent `goalflight_messages.py supervise` monitor that owns the stream, backup doorbell pool, and watchdog and multiplexes them into a single stdout feed, re-arming children itself. By default it replaces each stream keepalive plus already-materialized advisory frontier with one actionable `kind=next` record and suppresses a verbatim-identical payload until the 15-minute floor (content change still wakes immediately): only a freshly empty projection says `Nothing pending`; unavailable or not-yet-observed state retains `goal-flight next`. Default terse mode emits no coverage record and suppresses `live` / `target`; startup writes `{"type":"probe","reason":"stdout-peer-liveness"}`. `--chatty` wires both the raw-forwarding `chatty` control and the distinct `emit_depth` control; `--debug` restores per-tick heartbeat records only. Arm it with **no timeout** for the session life. Never set, tune, or reason about a timeout: a bounded monitor is killed outside the supervisor (no `type=stop`; controller goes deaf without a diagnostic). On Claude Code use `persistent: true` (`timeout_ms` inert; a host-required value is a placeholder, never a knob). In the decomposed fallback, only after supervisor absence is proven, arm one generation-bound `goalflight_messages.py follow --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>` through the host's persistent monitor, never shell `&`; then arm two tracked `listen --listener-slots 2 --report-pending` backup doorbells and one separately tracked `listen --watch-follow` watchdog. The watchdog holds its own generation lock, never consumes a delivery slot, reads durable record age, and treats three missed heartbeat intervals as channel death; the backup witnesses a missing watchdog lock, but all-tracked-task death remains unwitnessed. In the decomposed unsupervised path, `listener-dead` and `watchdog-dead` records carry the exact component re-arm command. Under `supervise`, they keep the reason but omit the component action; recovery is a supervisor restart. Persistent coverage is the shared four-component `live/4` fact and is detectable, not reap-proof. On codex, grok, cursor, opencode, or any host without such a monitor, retain the portable pool of four `listen --report-pending` calls; on each ring (exit 0), process reported or authoritative mail, cursor-CAS settled server-known positions, then restore depth. Exit 5 is settled did-not-arm (dead or mismatched lease nonce): do not treat it as a ring and do not re-arm that nonce. Exit 2 is retryable journal unreadability, not a dead nonce. Background fixed-id `goalflight_status.py --wait <ids>` only for an unclaimed join; exit 3 is mail, not completion. Timers cover non-notifiable external state, never worker completion. Full arming and JSON-line contracts: `protocols/controller-mail.md`.
 Controller-direct: held context, fully stateable edit, clean Axis 2; plan marks do not waive it.
 Routing detail: typed dispatch roles; five-layer prompts; parallel forbid lists; split broad chunks; host tool maps; same-provider review policy. See `protocols/dispatch-routing.md`.
 Triggered lanes need pinned context and the execute pre-wave check (`worker-context-package.md`).
@@ -377,19 +373,16 @@ Orchestrator dispatch waits for declared readiness requirements. Orchestrator li
 ## Worker Routing
 
 **Permission-pattern warning** (controller-side, when dispatching ACP workers):
-**Always use precise patterns** scoped to the dispatched chunk's authorized
-shapes (e.g. `^./tests/run\.sh$` for a chunk whose acceptance criteria
-include running the test sweep). `--permission-allow-tool-title-pattern`
-fast-paths matching titles BUT only for the safe subset — hard gates
-(outside-cwd writes, kind=execute, kind=fetch without sandbox, write with
-no in-cwd locations, unknown kinds) always run first, so a broad `.*`
-"YOLO" pattern CAN'T silently authorize destructive operations. **OS
-sandbox is a defense-in-depth backstop, not a permission-design substitute**
-— pair `--os-sandbox=read-only` (or `workspace-write` when commits are
-expected) with precise patterns. The runner emits a startup warning when a
-broad pattern is paired with sandbox-off. See
-`scripts/goalflight_acp_run.py` `make_title_allow_policy` for the full
-layering rationale (sweep B P1 + follow-ups).
+**Always use precise patterns** scoped to the chunk's authorized shapes
+(e.g. `^./tests/run\.sh$` when the chunk runs the test sweep).
+`--permission-allow-tool-title-pattern` fast-paths matching titles only for
+the safe subset — hard gates (outside-cwd writes, kind=execute, kind=fetch
+without sandbox, write with no in-cwd locations, unknown kinds) always run
+first, so a broad `.*` cannot silently authorize destructive ops. OS sandbox
+is a defense-in-depth backstop, not a permission-design substitute — pair
+`--os-sandbox=read-only` (or `workspace-write` when commits are expected)
+with precise patterns. The runner warns at startup when a broad pattern is
+paired with sandbox-off. See `scripts/goalflight_acp_run.py` `make_title_allow_policy`.
 
 Default routing by task:
 
@@ -420,15 +413,13 @@ unless that chunk explicitly needs the vendor. ACP SDK dispatch uses the managed
 
 ### Hard caps
 
-`DEFAULT_AGENT_CAPS` lives in `scripts/goalflight_agent_limits.py` and is
-imported by `goalflight_capacity.py`. Capacity checks apply default per-agent caps.
-Per-machine overrides come from `$GOALFLIGHT_CAPACITY_CONF` else
-`~/.goal-flight/capacity.local.json`; `agent_caps` merge over defaults.
-Hard caps are placeholders, not laws; provider budgets may be shared by labels.
+Capacity checks apply default per-agent caps. Per-machine overrides come from
+`$GOALFLIGHT_CAPACITY_CONF` else `~/.goal-flight/capacity.local.json`;
+`agent_caps` merge over defaults. Hard caps are placeholders, not laws;
+provider budgets may be shared by labels.
 
 ### Adaptive walkback
 
-Adaptive walkback reads the ledger through `scripts/goalflight_rate_pressure.py`.
 If one provider shows repeated recent rate-limit signatures, re-route next work,
 surface status, or reduce effective cap. No autonomous capacity mutation in v1.
 
@@ -450,7 +441,7 @@ For each Golden Master entry, SKILL.md contains the entry's compressed-form text
 
 ## Worker Markers
 
-Long worker and review jobs require a ledger/status path. Status contract requires heartbeat markers for live workers. Heartbeats are files; wake only on transitions. Stale workers trip on manifest stale-after thresholds. Terminal states are closed manifest values. Worker markers use goalflight dispatch transport sequence grammar.
+Status contract requires heartbeat markers for live workers. Heartbeats are files; wake only on transitions. Stale workers trip on manifest stale-after thresholds. Terminal states are closed manifest values. Worker markers use goalflight dispatch transport sequence grammar.
 
 Workers communicate with one-line markers:
 - `STATUS:`
@@ -507,13 +498,11 @@ Active run + compaction: if already in play, invoke `/goal-flight resume` for fr
 **Canonical post-compaction reload order:**
 1. Read `AGENTS.md` (entry point).
 2. `python3 <skill-root>/scripts/goalflight_session_status.py --text` —
-   single command, definitive verdict. If "no active goal-flight session",
-   stop here; you are NOT in a goal-flight run.
+   if "no active goal-flight session", stop; you are NOT in a goal-flight run.
 3. Read repository `SKILL.md` end-to-end (this file).
 4. Find newest RESUME-NOTES:
    `ls -1 docs-private/RESUME-NOTES-*.md | sort | tail -1`
-   (canonical pattern: `RESUME-NOTES-<YYYY-MM-DD>[-rev<N>].md` — ISO 8601
-   date so lexicographic sort = chronological; no topic prefixes).
+   (canonical: `RESUME-NOTES-<YYYY-MM-DD>[-rev<N>].md`; ISO 8601 date so lexicographic sort is chronological; no topic prefixes).
 5. Run store baseline: `python3 scripts/goalflight_status.py` + `python3
    goalflight_task.py list`; if degraded, use the handoff's last store command.
 6. Read handoff prose for environment, ideas/decisions, facts, and carriers;
@@ -523,8 +512,7 @@ Active run + compaction: if already in play, invoke `/goal-flight resume` for fr
 
 ## Context Discipline
 
-Read for edits narrowly. Analyze/search/count/filter with procedural code or
-context-mode. Store long artifacts in files and return paths plus summaries.
+Read for edits narrowly. Store long artifacts in files and return paths plus summaries.
 Prebuild corpus; do not inline landscape per dispatch. Keep worker-context optional when canonical docs fit; triggered lanes are the exception — they REQUIRE a pinned context package (`protocols/worker-context-package.md`).
 
 When in doubt, move deterministic logic into `scripts/goalflight_*.py`; keep the
