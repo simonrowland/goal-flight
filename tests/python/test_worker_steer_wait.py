@@ -762,7 +762,7 @@ def test_tracked_worker_arm_without_exact_marker_does_not_suspend_idle(
     dispatch_id = "markerless-worker-arm"
     env = _env(tmp_path)
     mailbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.steer.jsonl"
-    mailbox.parent.mkdir(parents=True)
+    mailbox.parent.mkdir(parents=True, exist_ok=True)
     tail = tmp_path / "markerless.tail"
     tail.write_text("!STATUS: about to ask\n", encoding="utf-8")
     status = tmp_path / "markerless.status.json"
@@ -820,7 +820,7 @@ def test_live_foreign_process_group_cannot_arm_tracked_worker(tmp_path: Path) ->
     dispatch_id = "foreign-helper-arm"
     env = _env(tmp_path)
     mailbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.steer.jsonl"
-    mailbox.parent.mkdir(parents=True)
+    mailbox.parent.mkdir(parents=True, exist_ok=True)
     tail = tmp_path / "foreign-helper.tail"
     status = tmp_path / "foreign-helper.status.json"
     worker = subprocess.Popen(
@@ -901,7 +901,7 @@ def test_worker_wait_longer_than_idle_then_reply_completes(tmp_path: Path) -> No
     dispatch_id = "worker-wait-acceptance"
     env = _env(tmp_path)
     mailbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.steer.jsonl"
-    mailbox.parent.mkdir(parents=True)
+    mailbox.parent.mkdir(parents=True, exist_ok=True)
     tail = tmp_path / "worker.tail"
     status = tmp_path / "worker.status.json"
     worker_code = r'''
@@ -1049,7 +1049,7 @@ def test_reply_pending_survives_consumption_delay_and_transient_lock_failure(
     dispatch_id = "reply-pending-delay"
     env = _env(tmp_path)
     mailbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.steer.jsonl"
-    mailbox.parent.mkdir(parents=True)
+    mailbox.parent.mkdir(parents=True, exist_ok=True)
     tail = tmp_path / "reply-pending.tail"
     status = tmp_path / "reply-pending.status.json"
     worker_code = r'''
@@ -1188,7 +1188,7 @@ def test_reply_before_watcher_first_scan_remains_pending_until_consumed(
     dispatch_id = "reply-before-first-scan"
     env = _env(tmp_path)
     mailbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.steer.jsonl"
-    mailbox.parent.mkdir(parents=True)
+    mailbox.parent.mkdir(parents=True, exist_ok=True)
     tail = tmp_path / "reply-before-scan.tail"
     status = tmp_path / "reply-before-scan.status.json"
     worker_code = r'''
@@ -1300,7 +1300,7 @@ def test_post_reply_output_tombstones_wait_when_end_row_write_fails(
     dispatch_id = "reply-output-tombstone"
     env = _env(tmp_path)
     mailbox = Path(env["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.steer.jsonl"
-    mailbox.parent.mkdir(parents=True)
+    mailbox.parent.mkdir(parents=True, exist_ok=True)
     tail = tmp_path / "reply-output.tail"
     status = tmp_path / "reply-output.status.json"
     worker_code = r'''

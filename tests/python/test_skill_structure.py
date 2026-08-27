@@ -909,6 +909,14 @@ def test_runner_invokes_skill_structure() -> None:
         shutil.copy2(ROOT / "tests/run.sh", fake_root / "tests/run.sh")
         shutil.copy2(ROOT / "tests/python/conftest.py", fake_root / "tests/python/conftest.py")
         shutil.copy2(
+            ROOT / "tests/python/machine_isolation.py",
+            fake_root / "tests/python/machine_isolation.py",
+        )
+        shutil.copy2(
+            ROOT / "tests/python/support.py",
+            fake_root / "tests/python/support.py",
+        )
+        shutil.copy2(
             ROOT / "tests/python/test_script_style_modules.py",
             fake_root / "tests/python/test_script_style_modules.py",
         )
@@ -940,6 +948,14 @@ def test_runner_invokes_skill_structure() -> None:
         (fake_root / "tests/python").mkdir(parents=True)
         shutil.copy2(ROOT / "tests/run.sh", fake_root / "tests/run.sh")
         shutil.copy2(ROOT / "tests/python/conftest.py", fake_root / "tests/python/conftest.py")
+        shutil.copy2(
+            ROOT / "tests/python/machine_isolation.py",
+            fake_root / "tests/python/machine_isolation.py",
+        )
+        shutil.copy2(
+            ROOT / "tests/python/support.py",
+            fake_root / "tests/python/support.py",
+        )
         shutil.copy2(
             ROOT / "tests/python/test_script_style_modules.py",
             fake_root / "tests/python/test_script_style_modules.py",

@@ -891,7 +891,7 @@ def test_stream_traversal_final_and_parent_symlinks_and_mismatch_are_refused(
     for malformed in ("../escape", str(tmp_path / "absolute")):
         with pytest.raises(messages.MessageError, match="stream token"):
             messages.inbox_path(messages_dir, malformed)
-    messages_dir.mkdir()
+    messages_dir.mkdir(exist_ok=True)
     final_link = messages_dir / "linked.jsonl"
     final_link.symlink_to(tmp_path / "target.jsonl")
     with pytest.raises(messages.MessageError, match="symlinked inbox refused"):
@@ -1141,7 +1141,7 @@ def test_first_carrier_append_fsyncs_file_and_parent_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     parent = tmp_path / "messages"
-    parent.mkdir()
+    parent.mkdir(exist_ok=True)
     path = messages.inbox_path(parent, "first-append")
     real_fsync = messages.os.fsync
     fsync_targets: list[str] = []
