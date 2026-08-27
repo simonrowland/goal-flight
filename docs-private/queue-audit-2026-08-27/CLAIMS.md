@@ -10,7 +10,7 @@ auditable rather than a bulk delete.
 | project | controller | response | date | notes |
 |---|---|---|---|---|
 | pm2 | pm2-bugs | **ALL ABANDON** | 2026-08-27 | Already re-submitted the one item they wanted as `bugs-b277b` (fresh id, current HEAD) — the intended shape: re-derive rather than re-fire. Their `bugs-b277a` queue record is therefore superseded, not lost. |
-| pm2 | pm2-main | — | | awaiting |
+| pm2 | pm2-main | **CLAIM 3 (live) · ABANDON 11 · REFER 2** | 2026-08-27 | Checked the STORE state behind each stale entry rather than judging from the queue record. CLAIM = `b13-1-reverse-mass-drivers` (pid 33893), `b285-ring-coherence-adjudication` (pid 60600), `t292-relativistic-gathered-mass` (pid 86778) — all live in their own worktrees, all mid-flight at inventory time. |
 | battery-tool-v2 | battery-bugs | **KEEP 2 · ABANDON 8 + 12 retired slices** | 2026-08-27 | Answered ONLY for rows carrying their own label; explicitly declined to speak for the other 34 rows. ★ KEEP = `codex-60942-1787841540` and `grok-code-70915-1787842258` — **LIVE AND RUNNING** at reply time. 2 more (`codex-69648`, `grok-code-84519`) already COMPLETE and harvested. Three abandons confirmed the thesis by measurement: the work LANDED after the record was queued. |
 | battery-tool-v2 | battery-main | — | | awaiting |
 | battery-tool-v2 | battery-engine | — | | awaiting (notified late, see correction) |
@@ -94,3 +94,37 @@ silence, and it counts as consent for their label. Record nil returns
 explicitly — otherwise a later reader cannot distinguish "checked, owns none"
 from "never replied", and those have opposite implications for whether the
 window may close.
+
+
+## ★ AUDIT CORRECTION FROM pm2-main — `b285` prompt-MISSING was a SNAPSHOT FALSE POSITIVE
+
+The inventory recorded `b285-ring-coherence-adjudication` as prompt-missing.
+It is not: it is a LIVE dispatch (pid 60600) whose entry left the live queue dir
+DURING the inventory — the INDEX itself documented that record moving between
+passes. So a moving-target artifact was written into a per-row verdict.
+
+This matters because "prompt missing" was defined as decision-relevant: no
+premise to re-check, so the honest default is abandon. A false positive there
+points at exactly the wrong answer. **Correction recorded; do not abandon
+`b285` on the audit's say-so.** Generally: a row whose evidence was gathered
+while the queue was moving needs re-checking against the live dir before it is
+used as grounds for anything.
+
+## ★★ DOCTRINE REFINEMENT — abandon the RECORD is not abandon the QUESTION
+
+pm2-main's most useful contribution. Their 11 abandons include:
+- SIX DUPLICATE records of ONE prompt (t-763 layermap declaration pass) all
+  pinned to a stale pm2 HEAD 590b1ae: `layermap-harvest`, `-d`, `-g`,
+  `b264probe-1/2/4`. All dead-pid; three ledgers already read complete; `-d`
+  has no surviving bare json. **ABANDON ALL SIX RECORDS — but t-763 is
+  `done=False` in the store, so THE QUESTION IS STILL WANTED** and will be
+  re-submitted as ONE fresh dispatch against current HEAD (2217cbf).
+- `fr-d1-r3-retry-b8fa0aba` (1d20h, old HEAD): abandon the record; t-742 is
+  `done=False` and self-describes as blocking the force rail — fresh id.
+- `t746-r2-retry-...`: abandon, and the work is already DONE.
+
+So a purge decision has TWO independent parts: is this RECORD still valid
+(premise, pin, prompt) and is the underlying QUESTION still open (store state)?
+Conflating them loses real work — and the store, not the queue record, is the
+authority on the second. Six identical probes against a pinned HEAD is also its
+own small lesson about re-fire habits.
