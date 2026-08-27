@@ -2734,9 +2734,11 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None]:
         )
         if terminal != "unknown":
             # Settled vocabulary (complete/failed/blocked/...) vacates the tree.
-            # watcher_stopped resolves to its own terminal label here -- the same
-            # reading the resume source gate and the reused-id guard apply.
-            continue
+            # watcher_stopped is terminal in the ledger vocabulary, but a live
+            # worker under that label is still writing -- reuse the resume
+            # liveness reading instead of treating the tree as free.
+            if not _is_live_watcher_stopped(state, record.get("worker_alive")):
+                continue
         if record.get("transport") == "fleet-ssh":
             continue  # remote worker: its cwd is a path on another node's disk
         record_host = record.get("hostname")

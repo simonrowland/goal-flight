@@ -597,6 +597,58 @@ def test_unreadable_ledger_dir_is_unknown_not_unoccupied() -> None:
         assert not _ledger_record(tmp, "unk-dir-writer"), refused.stderr
 
 
+def test_live_watcher_stopped_incumbent_still_occupies() -> None:
+    with _temp_dir() as td:
+        tmp = Path(td)
+        tree = tmp / "tree"
+        tree.mkdir()
+        env = _env(tmp)
+        runs = tmp / "state" / "runs.d"
+        runs.mkdir(parents=True)
+        record = {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": "ws-live",
+            "agent": "test",
+            "shape": "bash",
+            "state": "watcher_stopped",
+            "worker_alive": True,
+            "worker_cwd": str(tree.resolve()),
+            "os_sandbox": {"requested_profile": "workspace-write"},
+        }
+        (runs / "ws-live.json").write_text(json.dumps(record), encoding="utf-8")
+        refused = _run(_dispatch_cmd(tmp, tree, "ws-second", _quick_writer("ws-second")), env)
+        assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
+        assert "ws-live" in refused.stderr, refused.stderr
+        assert not _ledger_record(tmp, "ws-second"), refused.stderr
+
+
+def test_dead_watcher_stopped_incumbent_vacates_the_tree() -> None:
+    with _temp_dir() as td:
+        tmp = Path(td)
+        tree = tmp / "tree"
+        tree.mkdir()
+        env = _env(tmp)
+        runs = tmp / "state" / "runs.d"
+        runs.mkdir(parents=True)
+        record = {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": "ws-dead",
+            "agent": "test",
+            "shape": "bash",
+            "state": "watcher_stopped",
+            "worker_alive": False,
+            "worker_cwd": str(tree.resolve()),
+            "os_sandbox": {"requested_profile": "workspace-write"},
+        }
+        (runs / "ws-dead.json").write_text(json.dumps(record), encoding="utf-8")
+        launched = _run(
+            _dispatch_cmd(tmp, tree, "ws-after-dead", _quick_writer("ws-after-dead"), foreground=True),
+            env,
+        )
+        assert launched.returncode == 0, (launched.stdout, launched.stderr)
+        assert "DISPATCH-END" in launched.stdout, launched.stdout
+
+
 def test_fleet_ssh_incumbent_does_not_occupy_local_cwd() -> None:
     """A remote worker's cwd is a path on another node's disk."""
     with _temp_dir() as td:
@@ -962,6 +1014,8 @@ if __name__ == "__main__":
     test_submit_into_occupied_tree_is_refused()
     test_preset_bash_writer_refused_into_occupied_worktree()
     test_acp_writer_refused_into_occupied_worktree()
+    test_live_watcher_stopped_incumbent_still_occupies()
+    test_dead_watcher_stopped_incumbent_vacates_the_tree()
     test_fleet_ssh_incumbent_does_not_occupy_local_cwd()
     test_supported_profile_alone_does_not_mark_a_writer_read_only()
     test_help_documents_occupied_worktree_override()
