@@ -407,6 +407,77 @@ def worker_identity_liveness(record: dict) -> tuple[str, str]:
     return "dead", reason
 
 
+def _terminal_sidecar_observation(
+    record: dict,
+    sidecar: dict | None = None,
+) -> dict | None:
+    """Return the matching sidecar when it carries a terminal verdict."""
+    candidate = sidecar
+    if not (
+        isinstance(candidate, dict)
+        and candidate.get("dispatch_id") == record.get("dispatch_id")
+    ):
+        status_path_value = record.get("status_path")
+        if not (isinstance(status_path_value, str) and status_path_value):
+            return None
+        try:
+            loaded = json.loads(Path(status_path_value).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not (
+            isinstance(loaded, dict)
+            and loaded.get("dispatch_id") == record.get("dispatch_id")
+        ):
+            return None
+        candidate = loaded
+    state = candidate.get("terminal_pending_state") or candidate.get("state")
+    terminal = terminal_state_for(
+        state, candidate.get("reason") or candidate.get("error")
+    )
+    if terminal in {"", "unknown", "watcher_stopped"}:
+        return None
+    return candidate
+
+
+def sidecar_terminal_hold(
+    record: dict,
+    *,
+    sidecar: dict | None = None,
+) -> dict[str, str] | None:
+    """Describe a held terminal sidecar, or None when there is no hold.
+
+    A hold exists when the ledger row is not already structurally terminal, a
+    matching sidecar carries a terminal verdict, and worker identity is not
+    dead (``live`` or ``unknown``). Identity is re-probed on every call.
+    Age is never consulted: a timer that terminalizes an indeterminate
+    record is the blind sweeper this reconciler forbids.
+
+    Unknown stays a hold until a later probe can determine identity (the
+    record gains a pid, a RUNNING journal instance is copied onto it, or
+    the process table becomes readable) or a human / higher-authority pass
+    acts. Dead identity is not a hold -- the sidecar may be committed.
+    """
+    if _terminal_key(record) not in {"", "unknown", "watcher_stopped"}:
+        return None
+    observation = _terminal_sidecar_observation(record, sidecar)
+    if observation is None:
+        return None
+    liveness, reason = worker_identity_liveness(record)
+    if liveness == "dead":
+        return None
+    state = str(
+        observation.get("terminal_pending_state") or observation.get("state") or ""
+    )
+    return {
+        "liveness": liveness,
+        "reason": reason,
+        "sidecar_state": state,
+        "terminal_state": terminal_state_for(
+            state, observation.get("reason") or observation.get("error")
+        ),
+    }
+
+
 def _is_detached_controller_dead_record(record: dict) -> bool:
     if not record.get("detached"):
         return False
@@ -508,6 +579,37 @@ def write_record(record: dict) -> Path:
     finally:
         os.close(dir_fd)
     return path
+
+
+def _stamp_nonterminal_fields(record: dict, fields: dict) -> None:
+    """Persist derived fields onto a still-non-terminal ledger row.
+
+    Used to durably copy a RUNNING journal identity onto the record (the
+    unknown-hold resolution path: the record gains a pid) and to stamp a
+    sidecar hold so operator surfaces can name ``held: live`` vs
+    ``held: unknown``. Never writes over an already-terminal row.
+    """
+    dispatch_id = str(record.get("dispatch_id") or "")
+    if not dispatch_id or not fields:
+        return
+    with StateLock():
+        current_path = record_path(dispatch_id)
+        if current_path.exists():
+            try:
+                current = json.loads(current_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                current = dict(record)
+        else:
+            current = dict(record)
+        if not isinstance(current, dict):
+            current = dict(record)
+        if _terminal_key(current) not in {"", "unknown", "watcher_stopped"}:
+            return
+        current.update(fields)
+        write_record(current)
+        record.update(fields)
+        if current.get("updated_at"):
+            record["updated_at"] = current["updated_at"]
 
 
 def record_engine_session_id(dispatch_id: str, session_id: str) -> Path:
@@ -1203,6 +1305,14 @@ def _record_sidecar_overrule(
                 f"sidecar verdict '{terminal_state}' for {dispatch_id} not "
                 f"promoted: worker identity is {liveness} ({liveness_reason}); "
                 "journal and ledger left non-terminal"
+                + (
+                    ". Held until a later reconcile can determine identity "
+                    "(the record gains a pid, a RUNNING journal instance is "
+                    "copied onto it, or the process table becomes readable) "
+                    "or a human/higher-authority pass acts; not resolved by age"
+                    if liveness == "unknown"
+                    else ""
+                )
             ),
         }
     )
@@ -1313,14 +1423,24 @@ def reconcile_terminal_outbox(
             }
             records.append(record)
         if not record.get("worker_pid"):
-            record["worker_pid"] = worker_instance["pid"]
-            record["worker_identity"] = worker_instance
-            record["worker_pgid"] = worker_instance.get("pgid")
-            record["attempt_id"] = str(row["attempt_id"])
-            record["launch_token"] = str(row["launch_token"])
-            record["launch_epoch"] = int(row["launch_epoch"])
+            # Re-probe path for an unknown hold: a RUNNING journal instance
+            # is trusted identity (the worker claimed itself). Copy it onto
+            # the in-memory record AND the durable ledger row so the record
+            # actually gains a pid. The next identity check in this pass
+            # (and later reconciles / operator surfaces) can then resolve
+            # live vs dead. Age is not consulted.
+            hydrated = {
+                "worker_pid": worker_instance["pid"],
+                "worker_identity": worker_instance,
+                "worker_pgid": worker_instance.get("pgid"),
+                "attempt_id": str(row["attempt_id"]),
+                "launch_token": str(row["launch_token"]),
+                "launch_epoch": int(row["launch_epoch"]),
+            }
             if _terminal_key(record) in {"", "unknown", "watcher_stopped"}:
-                record["state"] = "running"
+                hydrated["state"] = "running"
+            record.update(hydrated)
+            _stamp_nonterminal_fields(record, hydrated)
     for record in records:
         if not isinstance(record, dict) or not record.get("dispatch_id"):
             continue
@@ -1337,21 +1457,7 @@ def reconcile_terminal_outbox(
         terminal_state = _terminal_key(record)
         state = str(record.get("state") or "")
         reason: object = record.get("reason") or record.get("error")
-        status_observation: dict | None = None
-        status_path_value = record.get("status_path")
-        if isinstance(status_path_value, str) and status_path_value:
-            try:
-                candidate = json.loads(Path(status_path_value).read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                candidate = None
-            if (
-                isinstance(candidate, dict)
-                and candidate.get("dispatch_id") == record.get("dispatch_id")
-            ):
-                candidate_state = candidate.get("terminal_pending_state") or candidate.get("state")
-                candidate_terminal = terminal_state_for(candidate_state, candidate.get("reason") or candidate.get("error"))
-                if candidate_terminal not in {"", "unknown", "watcher_stopped"}:
-                    status_observation = candidate
+        status_observation = _terminal_sidecar_observation(record)
         expired_launch = str(record["dispatch_id"]) in expired_launches
         needs_ledger_projection = status_observation is not None or expired_launch or terminal_state in {
             "",
@@ -1390,6 +1496,17 @@ def reconcile_terminal_outbox(
             # pid now belongs to a different process -- still terminalizes
             # below, exactly as before.
             #
+            # Unknown is a hold, not a swallow, and it is not age-based. Each
+            # reconcile re-probes identity. The resolution path is: a RUNNING
+            # journal instance copied onto the record (the record gains a
+            # pid), or the process table becoming readable again. Either makes
+            # liveness determinable -- live keeps holding, dead terminalizes.
+            # A timer that terminalizes an indeterminate record would
+            # terminalize live workers whose identity was merely unreadable
+            # at one moment. Still-unknown stays held until that re-probe
+            # succeeds or a human / higher-authority pass acts, and the hold
+            # is stamped on the ledger so operator surfaces can name it.
+            #
             # The gate applies only to the FIRST terminal write. When the
             # record or the journal attempt is already terminal, the terminal
             # authority has already fired: the re-commit below is idempotent
@@ -1406,6 +1523,11 @@ def reconcile_terminal_outbox(
                 if not attempt_final:
                     liveness, liveness_reason = worker_identity_liveness(record)
                     if liveness != "dead":
+                        authority.resolve_system_attention(
+                            item_type="sidecar_terminal_overruled",
+                            dispatch_id=str(record["dispatch_id"]),
+                            keep_reason=f"worker_identity_{liveness}",
+                        )
                         overruled.append(
                             _record_sidecar_overrule(
                                 authority,
@@ -1418,7 +1540,18 @@ def reconcile_terminal_outbox(
                                 observed_at=reconcile_at,
                             )
                         )
+                        _stamp_nonterminal_fields(
+                            record,
+                            {
+                                "sidecar_hold": liveness,
+                                "sidecar_hold_reason": liveness_reason,
+                            },
+                        )
                         continue
+                authority.resolve_system_attention(
+                    item_type="sidecar_terminal_overruled",
+                    dispatch_id=str(record["dispatch_id"]),
+                )
         elif expired_launch:
             state = "abandoned"
             terminal_state = "abandoned"
@@ -1469,6 +1602,8 @@ def reconcile_terminal_outbox(
                         if current_path.exists()
                         else dict(record)
                     )
+                    current.pop("sidecar_hold", None)
+                    current.pop("sidecar_hold_reason", None)
                     current.update(
                         {
                             "state": str(
@@ -1592,6 +1727,10 @@ def status_payload() -> dict:
             "result_path": r.get("result_path"),
             "result_paths": r.get("result_paths"),
         }
+        hold = sidecar_terminal_hold(r)
+        if hold is not None:
+            row["sidecar_hold"] = hold["liveness"]
+            row["sidecar_hold_reason"] = hold["reason"]
         rows.append(row)
     return {
         "schema": SCHEMA,
