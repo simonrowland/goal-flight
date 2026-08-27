@@ -1419,6 +1419,26 @@ def _format_idle_duration(age_s: float | None) -> str:
     return f"idle {days} day{'s' if days != 1 else ''}"
 
 
+def _format_idle_compact(age_s: float | None) -> str:
+    """Compact age for aligned tables: ``23m``, ``5h``, ``12d``; never a verdict."""
+    if age_s is None:
+        return "unknown"
+    if age_s < -CONTROLLER_HEARTBEAT_MAX_FUTURE_S:
+        return "clock-skew"
+    age_s = max(0.0, age_s)
+    minutes = int(age_s // 60)
+    if minutes < 1:
+        return "<1m"
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    remainder = minutes % 60
+    if hours < 48:
+        return f"{hours}h" if remainder == 0 else f"{hours}h{remainder}m"
+    days = hours // 24
+    return f"{days}d"
+
+
 def _incarnation_state(
     record: dict,
     *,
@@ -1451,27 +1471,173 @@ def _incarnation_state(
     return "live-lock", True
 
 
+def _controller_mail_snapshots(
+    project_root: Path,
+    *,
+    include_retired: bool = False,
+) -> tuple[dict[str, int] | None, dict[str, str | None] | None, str | None]:
+    """Unread counts and last cursor-drain timestamps from one reader pass.
+
+    ``advanced_at`` is the journal's last successful drain, not a new probe.
+    A missing cursor or null ``advanced_at`` is ``None`` (never drained),
+    distinct from an unreadable journal (``error`` set, both maps None).
+    """
+    try:
+        authority = goalflight_journal.Journal.open_reader(project_root)
+        unread: dict[str, int] = {}
+        drain: dict[str, str | None] = {}
+        for record in authority.lease_records(include_ended=include_retired):
+            label = str(record["label"])
+            unread[label] = len(
+                authority.pending_delivery_events(
+                    label,
+                    waking_only=False,
+                    limit=10_000,
+                )
+            )
+            cursor = authority.cursor_status(label)
+            if cursor is None:
+                drain[label] = None
+            else:
+                advanced = cursor.get("advanced_at")
+                drain[label] = str(advanced) if advanced else None
+        return unread, drain, None
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
+        return None, None, type(exc).__name__
+
+
 def _addressed_unread_counts(
     project_root: Path,
     *,
     messages_dir: Path | None = None,
     fleet_dir: Path | None = None,
 ) -> tuple[dict[str, int] | None, str | None]:
+    del messages_dir, fleet_dir
+    unread, _drain, error = _controller_mail_snapshots(project_root)
+    return unread, error
+
+
+def _wake_supervisor_fields(
+    project_root: Path,
+    *,
+    label: str,
+    lease_nonce: str | None,
+) -> dict:
+    """Coverage + supervisor generation, without collapsing unknown to absent."""
+    if not lease_nonce:
+        return {
+            "supervisor": goalflight_wake.SUPERVISOR_UNKNOWN,
+            "wake_covered": None,
+            "wake_armed": None,
+        }
+    try:
+        supervisor = goalflight_wake.supervisor_generation_state(
+            project_root,
+            controller_label=label,
+            lease_nonce=lease_nonce,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        supervisor = goalflight_wake.SUPERVISOR_UNKNOWN
+    if supervisor not in {
+        goalflight_wake.SUPERVISOR_RUNNING,
+        goalflight_wake.SUPERVISOR_ABSENT,
+        goalflight_wake.SUPERVISOR_UNKNOWN,
+    }:
+        supervisor = goalflight_wake.SUPERVISOR_UNKNOWN
+    covered: bool | None
+    try:
+        coverage = goalflight_wake.coverage_status(
+            project_root,
+            controller_label=label,
+            lease_nonce=lease_nonce,
+        )
+        if coverage.get("live_waiters") is None:
+            covered = None
+        else:
+            covered = bool(coverage.get("covered"))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        covered = None
+    if supervisor == goalflight_wake.SUPERVISOR_RUNNING or covered is True:
+        armed: bool | None = True
+    elif (
+        supervisor == goalflight_wake.SUPERVISOR_ABSENT
+        and covered is False
+    ):
+        armed = False
+    else:
+        armed = None
+    return {
+        "supervisor": supervisor,
+        "wake_covered": covered,
+        "wake_armed": armed,
+    }
+
+
+def _active_leases_by_label(
+    project_root: Path,
+) -> tuple[dict[str, goalflight_journal.LeaseIdentity] | None, str | None]:
     try:
         authority = goalflight_journal.Journal.open_reader(project_root)
-        counts = {
-            str(record["label"]): len(
-                authority.pending_delivery_events(
-                    str(record["label"]),
-                    waking_only=False,
-                    limit=10_000,
-                )
-            )
-            for record in authority.lease_records()
-        }
-        return counts, None
+        leases = {}
+        for row in authority.lease_records():
+            label = str(row.get("label") or "")
+            if not label:
+                continue
+            lease = authority.active_lease(label)
+            if lease is not None:
+                leases[label] = lease
+        return leases, None
     except _EXPECTED_OPTIONAL_ERRORS as exc:
         return None, type(exc).__name__
+
+
+def _retirement_fields(
+    project_root: Path,
+    *,
+    label: str,
+    retired: bool,
+    lease: goalflight_journal.LeaseIdentity | None,
+    leases_error: str | None,
+    ledger_records: list[dict] | None,
+) -> dict:
+    """Read-only t-338 proof. Never calls release."""
+    if retired:
+        return {
+            "retirement_eligible": False,
+            "retirement_reason": "already_retired",
+            "retirement_message": None,
+        }
+    if leases_error is not None:
+        return {
+            "retirement_eligible": None,
+            "retirement_reason": leases_error,
+            "retirement_message": (
+                "retirement refused until the active lease is readable"
+            ),
+        }
+    if lease is None:
+        return {
+            "retirement_eligible": False,
+            "retirement_reason": "controller_not_registered",
+            "retirement_message": None,
+        }
+    refusal = _dead_holder_retirement_gate(
+        lease,
+        project_root,
+        label=label,
+        ledger_records=ledger_records,
+    )
+    if refusal is None:
+        return {
+            "retirement_eligible": True,
+            "retirement_reason": None,
+            "retirement_message": None,
+        }
+    return {
+        "retirement_eligible": False,
+        "retirement_reason": refusal.get("reason"),
+        "retirement_message": refusal.get("message"),
+    }
 
 
 def _nonterminal_owned_dispatches(
@@ -1516,11 +1682,11 @@ def controller_roster(
     ledger_records: list[dict] | None = None,
 ) -> dict:
     """Return measured durable controller state for human and console consumers."""
+    del messages_dir, fleet_dir
     measured_now = now or datetime.now(timezone.utc)
-    unread, unread_error = _addressed_unread_counts(
+    unread, drain, mail_error = _controller_mail_snapshots(
         project_root,
-        messages_dir=messages_dir,
-        fleet_dir=fleet_dir,
+        include_retired=include_retired,
     )
     owned, owned_error = _nonterminal_owned_dispatches(
         project_root,
@@ -1530,6 +1696,7 @@ def controller_roster(
         project_root,
         include_retired=include_retired,
     )
+    leases, leases_error = _active_leases_by_label(project_root)
     controllers = []
     for record in records or []:
         label = str(record.get("label") or "")
@@ -1556,12 +1723,36 @@ def controller_roster(
             if idle_s is not None and idle_s < -CONTROLLER_HEARTBEAT_MAX_FUTURE_S
             else "trusted"
         )
+        drain_at = drain.get(label) if drain is not None else None
+        drain_s = None
+        if drain_at:
+            parsed_drain = _parse_utc(drain_at)
+            if parsed_drain is not None:
+                drain_s = (
+                    measured_now.astimezone(timezone.utc) - parsed_drain
+                ).total_seconds()
+        nonce = record.get("id") if isinstance(record.get("id"), str) else None
+        wake = _wake_supervisor_fields(
+            project_root,
+            label=label,
+            lease_nonce=nonce,
+        )
+        retired = bool(record.get("retired_at"))
+        retirement = _retirement_fields(
+            project_root,
+            label=label,
+            retired=retired,
+            lease=None if leases is None else leases.get(label),
+            leases_error=leases_error,
+            ledger_records=ledger_records,
+        )
         controllers.append(
             {
                 "label": label,
                 "last_heartbeat_at": record.get("heartbeat_at"),
                 "idle_seconds": round(idle_s, 3) if idle_s is not None else None,
                 "idle": _format_idle_duration(idle_s),
+                "idle_compact": _format_idle_compact(idle_s),
                 "heartbeat_clock_state": heartbeat_clock_state,
                 "incarnation_state": incarnation_state,
                 "conflicting_beacons": conflicting_beacons,
@@ -1570,9 +1761,18 @@ def controller_roster(
                 "lease_lock_live": lease_lock_live,
                 "session_id": record.get("id"),
                 "unread_addressed_mail": unread.get(label, 0) if unread is not None else None,
+                "last_drain_at": drain_at if drain is not None else None,
+                "last_drain_seconds": (
+                    round(drain_s, 3) if drain is not None and drain_s is not None else None
+                ),
                 "nonterminal_owned_dispatches": len(owned.get(label, [])) if owned is not None else None,
-                "retired": bool(record.get("retired_at")),
+                "supervisor": wake["supervisor"],
+                "wake_covered": wake["wake_covered"],
+                "wake_armed": wake["wake_armed"],
+                "renew_deadline_at": record.get("renew_deadline_at"),
+                "retired": retired,
                 "retired_at": record.get("retired_at"),
+                **retirement,
             }
         )
     return {
@@ -1580,11 +1780,16 @@ def controller_roster(
         "generated_at": measured_now.astimezone(timezone.utc).isoformat(),
         "heartbeat_recency_seconds": CONTROLLER_HEARTBEAT_RECENCY_S,
         "measurements": {
-            "unread_addressed_mail": {"measured": unread is not None, "error": unread_error},
+            "unread_addressed_mail": {"measured": unread is not None, "error": mail_error},
+            "last_drain": {"measured": drain is not None, "error": mail_error},
             "nonterminal_owned_dispatches": {"measured": owned is not None, "error": owned_error},
             "controller_registry": {
                 "measured": records is not None,
                 "error": registry_error,
+            },
+            "dead_holder_retirement": {
+                "measured": leases is not None,
+                "error": leases_error,
             },
         },
         "controllers": controllers,
@@ -2718,7 +2923,10 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument(
         "--list-controllers",
         action="store_true",
-        help="print the durable controller roster; combine with --json for machine output",
+        help=(
+            "print the durable controller roster; combine with --json for "
+            "machine output, or --all-projects for the fleet table"
+        ),
     )
     mode.add_argument("--join", metavar="NAME", help="join an existing durable controller name")
     mode.add_argument("--register", metavar="NAME", help="register a new durable controller name")
@@ -2745,6 +2953,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--reason", default="user-exit")
     parser.add_argument("--include-retired", action="store_true")
+    parser.add_argument(
+        "--all-projects",
+        action="store_true",
+        help="with --list-controllers, scan every journal in the state-dir index",
+    )
+    parser.add_argument(
+        "--idle-hours",
+        type=float,
+        default=4.0,
+        help="with --list-controllers --all-projects, idle-bucket threshold (hours)",
+    )
     parser.add_argument("--acknowledge-controller-conflict", action="store_true")
     parser.add_argument("--acknowledge-retirement", action="store_true")
     parser.add_argument(
@@ -2758,6 +2977,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.takeover and not (args.controller_startup or args.claim_session):
         parser.error("--takeover requires --controller-startup or --claim-session")
+    if args.all_projects and not args.list_controllers:
+        parser.error("--all-projects requires --list-controllers")
+    if args.list_controllers and args.all_projects:
+        import goalflight_controllers
+
+        argv_out = ["--idle-hours", str(args.idle_hours)]
+        if args.json:
+            argv_out.append("--json")
+        return goalflight_controllers.main(argv_out)
     project_root = goalflight_task.resolve_project_root(args.project_root)
 
     if args.hold_controller_lock:
