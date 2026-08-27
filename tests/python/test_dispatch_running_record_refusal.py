@@ -364,6 +364,15 @@ def test_spawned_worker_genuine_refusal_writes_status_and_warns(
     assert "DISPATCH-LEDGER-WARN" in err
     assert "cas_lost" in err
     assert args.dispatch_id in err
+    warn_line = next(
+        line for line in err.splitlines() if line.startswith("DISPATCH-LEDGER-WARN ")
+    )
+    warn_payload = json.loads(warn_line[len("DISPATCH-LEDGER-WARN ") :])
+    assert warn_payload["dispatch_id"] == args.dispatch_id
+    assert warn_payload["worker_pid"] == spawned_worker.pid
+    assert warn_payload["spawn_state"] == "spawned"
+    assert warn_payload["tail"] == str(tmp_path / f"{args.dispatch_id}.tail")
+    assert warn_payload["status_json"] == str(tmp_path / f"{args.dispatch_id}.status.json")
 
     assert "export" in export_calls
     assert "registry" in export_calls
@@ -455,6 +464,13 @@ def test_startup_race_budget_exhausted_still_warns_and_writes_status(
     err = capsys.readouterr().err
     assert "DISPATCH-LEDGER-WARN" in err
     assert "attempt_not_yet_running" in err
+    warn_line = next(
+        line for line in err.splitlines() if line.startswith("DISPATCH-LEDGER-WARN ")
+    )
+    warn_payload = json.loads(warn_line[len("DISPATCH-LEDGER-WARN ") :])
+    assert warn_payload["worker_pid"] == spawned_worker.pid
+    assert warn_payload["spawn_state"] == "spawned"
+    assert warn_payload["tail"] == str(tmp_path / f"{args.dispatch_id}.tail")
 
     assert "export" in export_calls
     assert "registry" in export_calls
@@ -509,7 +525,15 @@ def test_indeterminate_spawn_state_takes_the_safe_branch(
     assert status["ledger_record_warning"]["spawn_state"] == "unknown"
     assert status["spawn_state"] == "unknown"
     assert status["worker_alive"] is None  # honestly unknown
-    assert "DISPATCH-LEDGER-WARN" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "DISPATCH-LEDGER-WARN" in err
+    warn_line = next(
+        line for line in err.splitlines() if line.startswith("DISPATCH-LEDGER-WARN ")
+    )
+    warn_payload = json.loads(warn_line[len("DISPATCH-LEDGER-WARN ") :])
+    assert warn_payload["worker_pid"] == "not-a-pid"
+    assert warn_payload["spawn_state"] == "unknown"
+    assert warn_payload["tail"] == str(tmp_path / f"{args.dispatch_id}.tail")
     assert "export" in export_calls
     assert "registry" in export_calls
 
