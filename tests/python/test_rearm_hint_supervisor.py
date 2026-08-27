@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -1429,31 +1430,133 @@ def test_doctor_wake_coverage_reports_supervisor_state(
     pool = result["pools"][0]
     assert pool["label"] == lease.label
     assert pool["supervisor"] == wake.SUPERVISOR_RUNNING
-    assert "hint" not in pool
-    assert "reason" not in pool
-    assert pool["ok"] is True
-    assert result["ok"] is True
-    for field in (
-        "covered",
-        "live_waiters",
-        "target_waiters",
-        "missing_components",
-    ):
-        assert field not in pool
-    assert wake.follow_start_command(
-        project, controller_label=lease.label, lease_nonce=lease.nonce
-    ) not in json.dumps(pool)
+    assert pool["ok"] is False
+    assert result["ok"] is False
+    assert isinstance(pool["live_waiters"], int)
+    assert isinstance(pool["target_waiters"], int)
+    assert int(pool["live_waiters"]) < int(pool["target_waiters"])
+    assert pool["missing_components"]
+    assert pool["reason"]
+    hint = str(pool["hint"])
+    assert "Restart the supervisor" in hint
+    assert supervise_cmd in hint
+    encoded = json.dumps(pool)
+    for component_command in _component_commands(project, lease):
+        assert component_command not in encoded
+        assert component_command not in hint
     lines = doctor.collect_human_lines(
         _minimal_doctor_payload(result)  # type: ignore[arg-type]
     )
     line = next(line for line in lines if "wake coverage hint-ctl" in line)
     assert "wake coverage hint-ctl" in line
     assert "supervisor=running" in line
-    assert "Restart the supervisor" not in line
-    assert supervise_cmd not in line
-    assert "/8" not in line
+    assert "Restart the supervisor" in line
+    assert supervise_cmd in line
     parsed = doctor.parse_status_line(line)
-    assert parsed["detail"] == "supervisor=running"
+    assert parsed["level"] == "warn"
+    assert "Restart the supervisor" in parsed["detail"]
+    for component_command in _component_commands(project, lease):
+        assert component_command not in line
+
+
+def test_stopped_slot_is_not_healthy(
+    isolated: tuple[Path, journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live supervisor that will not respawn a slot is not doctor-green."""
+    project, lease = isolated
+    supervise_cmd = wake.coverage_supervise_command(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    _persistent_shortfall_plan(
+        project, lease, monkeypatch, [(4242, supervise_cmd)]
+    )
+    result = doctor.check_wake_coverage(project)
+    pool = result["pools"][0]
+    assert pool["ok"] is False
+    assert result["ok"] is False
+    assert pool["supervisor"] == wake.SUPERVISOR_RUNNING
+    action = wake.supervisor_operator_action(
+        wake.SUPERVISOR_RUNNING,
+        supervise_command=supervise_cmd,
+    )
+    assert action["kind"] == "restart-supervisor"
+    assert str(action["instruction"]) == str(pool["hint"])
+    assert supervise_cmd in str(pool["hint"])
+    encoded = json.dumps(pool)
+    for component_command in _component_commands(project, lease):
+        assert component_command not in encoded
+
+
+def test_doctor_supervised_full_pool_stays_green(
+    isolated: tuple[Path, journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, lease = isolated
+    supervise_cmd = wake.coverage_supervise_command(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    monkeypatch.setattr(wake, "_process_listing", lambda: [(4242, supervise_cmd)])
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=120,
+        dead_after_s=360,
+    )
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            wake.register_waiter(
+                project,
+                controller_label=lease.label,
+                kind=wake.MONITOR_KIND,
+                generation_key=lease.nonce,
+            )
+        )
+        backup_slots = wake.persistent_backup_slot_count()
+        for _index in range(backup_slots):
+            stack.enter_context(
+                wake.register_listener_waiter(
+                    project,
+                    controller_label=lease.label,
+                    generation_key=lease.nonce,
+                    slots=backup_slots,
+                )
+            )
+        stack.enter_context(
+            wake.register_watchdog_waiter(
+                project,
+                controller_label=lease.label,
+                generation_key=lease.nonce,
+            )
+        )
+        result = doctor.check_wake_coverage(project)
+        pool = result["pools"][0]
+        assert pool["supervisor"] == wake.SUPERVISOR_RUNNING
+        assert pool["ok"] is True
+        assert result["ok"] is True
+        assert "hint" not in pool
+        assert "reason" not in pool
+        for field in (
+            "covered",
+            "live_waiters",
+            "target_waiters",
+            "missing_components",
+        ):
+            assert field not in pool
+        lines = doctor.collect_human_lines(
+            _minimal_doctor_payload(result)  # type: ignore[arg-type]
+        )
+        line = next(line for line in lines if "wake coverage hint-ctl" in line)
+        assert "supervisor=running" in line
+        assert "Restart the supervisor" not in line
+        parsed = doctor.parse_status_line(line)
+        assert parsed["detail"] == "supervisor=running"
+        assert parsed["level"] == "ok"
 
 
 def test_doctor_unknown_machine_payload_is_numberless(

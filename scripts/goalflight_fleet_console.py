@@ -467,6 +467,35 @@ def _is_listener_start_action(value: str) -> bool:
     )
 
 
+def _is_supervise_restart_action(value: str) -> bool:
+    """Exact supervisor restart command: the only safe HUNG action under a live supervisor."""
+    try:
+        argv = shlex.split(value)
+    except ValueError:
+        return False
+    if len(argv) != 9:
+        return False
+    advertised = goalflight_compat.advertised_script(
+        "goalflight_messages.py",
+        running_file=goalflight_wake.__file__,
+    )
+    if not (
+        argv[0] == "python3"
+        and Path(argv[1]).is_absolute()
+        and Path(os.path.abspath(argv[1])) == advertised
+        and argv[2:4] == ["supervise", "--project-root"]
+        and Path(argv[4]).is_absolute()
+        and argv[5] == "--controller-label"
+        and argv[7] == "--lease-nonce"
+    ):
+        return False
+    return value == goalflight_wake.coverage_supervise_command(
+        argv[4],
+        controller_label=argv[6],
+        lease_nonce=argv[8],
+    )
+
+
 def _validate_no_absolute_paths(value: Any, *, path: str = "$") -> None:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -477,10 +506,14 @@ def _validate_no_absolute_paths(value: Any, *, path: str = "$") -> None:
     elif (
         isinstance(value, str)
         and path.endswith(".action")
-        and _is_listener_start_action(value)
+        and (
+            _is_listener_start_action(value)
+            or _is_supervise_restart_action(value)
+        )
     ):
-        # HUNG recovery is intentionally an exact wake-layer command. This is
-        # the one narrow shareable-boundary exception to path redaction.
+        # HUNG recovery is intentionally an exact wake-layer command. Listen
+        # is the unsupervised path; supervise restart is the live-supervisor
+        # path. Both are the one narrow shareable-boundary exception.
         return
     elif isinstance(value, str) and _ABSOLUTE_PATH.search(value):
         raise ProjectionSecurityError(f"{path}: absolute path denied")
@@ -2968,34 +3001,62 @@ def _controller_attention_rows(
         else []
     )
     for candidate, supervisor in zip(candidates, supervisor_states):
-        if supervisor == goalflight_wake.SUPERVISOR_RUNNING:
-            # The supervisor owns, measures, and repairs this generation's wake
-            # pool. Its coverage-change record is authoritative; repeating a
-            # controller-side HUNG/depth alarm here is a false action surface.
-            continue
         root = str(candidate["root"])
         context = candidate["context"]
         raw_label = str(candidate["raw_label"])
         display_label = str(candidate["display_label"])
         generation = candidate["generation"]
         generation_text = str(candidate["generation_text"])
+        session_id = str(candidate["session_id"])
         component_command = goalflight_wake.listener_start_command(
             root,
             controller_label=raw_label,
         )
+        supervise_command = goalflight_wake.coverage_supervise_command(
+            root,
+            controller_label=raw_label,
+            lease_nonce=session_id,
+        )
         action_policy = goalflight_wake.supervisor_operator_action(
             supervisor,
             component_command=component_command,
+            supervise_command=supervise_command,
         )
-        headline = (
-            f"Controller {display_label}{generation_text} wake ownership "
-            "needs verification while work remains in flight"
-            if supervisor == goalflight_wake.SUPERVISOR_UNKNOWN
-            else (
+        if supervisor == goalflight_wake.SUPERVISOR_UNKNOWN:
+            headline = (
+                f"Controller {display_label}{generation_text} wake ownership "
+                "needs verification while work remains in flight"
+            )
+        elif supervisor == goalflight_wake.SUPERVISOR_RUNNING:
+            # spawn_due will not respawn a permanently stopped slot, so a
+            # live supervisor plus HUNG is an unrepairable shortfall. The
+            # only safe action is the supervisor restart (b-244/b-260);
+            # a direct listen beside it permanently stops that slot.
+            status = goalflight_wake.coverage_status(
+                root,
+                controller_label=raw_label,
+                lease_nonce=session_id,
+            )
+            missing = ",".join(
+                str(name)
+                for name in (status.get("missing_components") or [])
+            )
+            reason = str(status.get("reason") or "").strip()
+            detail_bits = []
+            if missing:
+                detail_bits.append(f"missing={missing}")
+            if reason:
+                detail_bits.append(f"reason={reason}")
+            extra = f" ({'; '.join(detail_bits)})" if detail_bits else ""
+            headline = (
+                f"Controller {display_label}{generation_text} is HUNG: "
+                f"live supervisor will not repair a stopped slot{extra}"
+            )
+        else:
+            headline = (
                 f"Controller {display_label}{generation_text} is HUNG: "
                 "in-flight work has no live wake waiter"
             )
-        )
         rows.append(
             {
                 "dispatch_id": _display(

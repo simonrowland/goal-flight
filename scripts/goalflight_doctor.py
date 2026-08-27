@@ -718,9 +718,36 @@ def check_wake_coverage(project_root: Path) -> dict:
             "wake_mode": status.get("wake_mode"),
         }
         if supervisor == goalflight_wake.SUPERVISOR_RUNNING:
-            # The supervisor owns, measures, and repairs its pool. A sampled
-            # shortfall is neither a controller action nor a doctor failure.
-            pool["ok"] = True
+            # A live supervisor repairs transient deaths, but spawn_due
+            # never respawns a slot with stopped_reason. live < target is
+            # the outside view of that permanent shortfall. live is None
+            # is "could not tell", never proof the pool is short.
+            if (
+                isinstance(live, int)
+                and isinstance(target, int)
+                and live < target
+            ):
+                action = goalflight_wake.supervisor_operator_action(
+                    supervisor,
+                    supervise_command=str(
+                        plan.get("supervise_command") or ""
+                    ),
+                )
+                pool.update(
+                    {
+                        "covered": covered,
+                        "live_waiters": live,
+                        "target_waiters": target,
+                        "missing_components": list(
+                            status.get("missing_components") or []
+                        ),
+                        "reason": status.get("reason"),
+                        "hint": action["instruction"],
+                        "ok": False,
+                    }
+                )
+            else:
+                pool["ok"] = True
         elif supervisor == goalflight_wake.SUPERVISOR_UNKNOWN or live is None:
             # UNKNOWN remains numberless: inability to bind a supervisor is
             # not proof that a zero-depth pool or direct re-arm is real.
@@ -3512,7 +3539,15 @@ def collect_human_lines(payload: dict) -> list[str]:
             )
             reason = str(pool.get("reason") or "").strip()
             if supervisor == goalflight_wake.SUPERVISOR_RUNNING:
-                detail = "supervisor=running"
+                if pool.get("ok") is False:
+                    detail = (
+                        f"{live}/{target} supervisor={supervisor} "
+                        f"missing={missing}"
+                    )
+                    if reason:
+                        detail = f"{detail} reason={reason}"
+                else:
+                    detail = "supervisor=running"
             elif supervisor == goalflight_wake.SUPERVISOR_UNKNOWN or live is None:
                 detail = f"coverage=unknown supervisor={supervisor}"
                 if reason:
