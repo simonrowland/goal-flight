@@ -689,7 +689,7 @@ def wait_attempt_running(
     *,
     timeout_s: float = 10.0,
 ) -> goalflight_journal.AttemptIdentity:
-    authority = goalflight_journal.Journal(project_root)
+    authority = goalflight_journal.Journal.open_reader(project_root)
     deadline = time.monotonic() + timeout_s
     while True:
         attempt = authority.attempt_for_dispatch(dispatch_id)

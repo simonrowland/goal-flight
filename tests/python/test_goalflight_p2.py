@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -59,6 +60,7 @@ def _start_sqlite_write_holder(
     *,
     hold_s: float | None = None,
     release: Path | None = None,
+    begin_sql: str = "BEGIN IMMEDIATE",
 ) -> subprocess.Popen[str]:
     if (hold_s is None) == (release is None):
         raise ValueError("choose exactly one holder release condition")
@@ -74,8 +76,9 @@ database = Path(sys.argv[1]).resolve()
 ready = Path(sys.argv[2])
 hold_s = None if sys.argv[3] == "-" else float(sys.argv[3])
 release = None if sys.argv[4] == "-" else Path(sys.argv[4])
+begin_sql = sys.argv[5]
 connection = sqlite3.connect(database, timeout=30.0, isolation_level=None)
-connection.execute("BEGIN IMMEDIATE")
+connection.execute(begin_sql)
 cursor = connection.execute(
     "UPDATE dispatch_attempts SET state_updated_at = state_updated_at "
     "WHERE dispatch_id = 'contention-seed'"
@@ -103,6 +106,7 @@ connection.close()
             str(ready),
             "-" if hold_s is None else str(hold_s),
             "-" if release is None else str(release),
+            begin_sql,
         ],
         cwd=project,
         env=env,
@@ -130,6 +134,54 @@ def _finish_sqlite_write_holder(
         release.write_text("release\n", encoding="utf-8")
     stdout, stderr = child.communicate(timeout=15.0)
     assert child.returncode == 0, stderr or stdout
+
+
+def _start_file_lock_holder(
+    env: dict[str, str],
+    lock_path: Path,
+    ready: Path,
+    *,
+    hold_s: float,
+) -> subprocess.Popen[str]:
+    code = """
+import fcntl
+from pathlib import Path
+import sys
+import time
+
+path = Path(sys.argv[1])
+ready = Path(sys.argv[2])
+hold_s = float(sys.argv[3])
+path.parent.mkdir(parents=True, exist_ok=True)
+fh = path.open("a+", encoding="utf-8")
+fcntl.flock(fh, fcntl.LOCK_EX)
+ready.write_text("ready\\n", encoding="utf-8")
+time.sleep(hold_s)
+fcntl.flock(fh, fcntl.LOCK_UN)
+fh.close()
+"""
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(lock_path),
+            str(ready),
+            str(hold_s),
+        ],
+        cwd=str(lock_path.parent),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 15.0
+    while not ready.exists() and child.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.005)
+    if not ready.exists():
+        stdout, stderr = child.communicate(timeout=10.0)
+        raise AssertionError(stderr or stdout or "file-lock holder did not become ready")
+    return child
 
 
 def test_writer_default_acquires_after_real_contention_outlasts_old_budget(
@@ -169,15 +221,16 @@ def test_writer_default_still_fails_when_contention_never_releases(
         tmp_path / "indefinite-holder-ready",
         release=release,
     )
+    started = time.monotonic()
     try:
         with pytest.raises(journal.JournalBusy) as exc_info:
             journal.Journal(project)
+        elapsed = time.monotonic() - started
     finally:
         _finish_sqlite_write_holder(holder, release=release)
-    assert (
-        f"within {journal.JOURNAL_WRITER_RETRY_BUDGET_S:.3f}s"
-        in str(exc_info.value)
-    )
+    message = str(exc_info.value)
+    assert "within 5.000s" in message
+    assert 4.0 <= elapsed < 6.5
 
 
 def test_retry_budget_rejects_infinite_wait(
@@ -190,15 +243,58 @@ def test_retry_budget_rejects_infinite_wait(
         journal.Journal(project, retry_budget_s=float("inf"))
 
 
-def test_retry_budget_defaults_are_caller_specific(
+def test_reader_default_fails_when_contention_never_releases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """WAL readers are not blocked by BEGIN IMMEDIATE; inject busy instead.
+
+    A 2s exclusive-hold attempt still completed the read. This pin is the
+    reader default's busy window: revert to 5.0s overruns 1.8s, revert of
+    the message to the constant still fails the 1.000s literal.
+    """
     _set_state_env(monkeypatch, tmp_path)
     project = _project(tmp_path)
-    writer = journal.Journal.create(project)
-    reader = journal.Journal.open_reader(project)
-    assert writer.retry_budget_s == journal.JOURNAL_WRITER_RETRY_BUDGET_S == 5.0
-    assert reader.retry_budget_s == journal.JOURNAL_READER_RETRY_BUDGET_S == 1.0
+    journal.Journal.create(project)
+    reader = journal.Journal.open_reader(
+        project,
+        jitter_min_s=0,
+        jitter_max_s=0,
+    )
+
+    def always_busy(*_args: object, **_kwargs: object) -> sqlite3.Connection:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(journal, "_open_readonly_connection", always_busy)
+    started = time.monotonic()
+    with pytest.raises(journal.JournalBusy) as exc_info:
+        reader.read_all("SELECT 1")
+    elapsed = time.monotonic() - started
+    assert "within 1.000s" in str(exc_info.value)
+    assert 0.7 <= elapsed < 1.8
+
+
+def test_construction_write_lock_timeout_is_bounded_by_retry_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.Journal.create(project)
+    holder = _start_file_lock_holder(
+        env,
+        journal.journal_write_lock_path(authority.path),
+        tmp_path / "flock-ready",
+        hold_s=2.0,
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(
+            journal.JournalBusy, match="construction lock timeout within 0.200s"
+        ):
+            journal.Journal(project, retry_budget_s=0.2)
+        elapsed = time.monotonic() - started
+    finally:
+        _finish_sqlite_write_holder(holder)
+    assert elapsed < 1.0
 
 
 def _ledger_record(

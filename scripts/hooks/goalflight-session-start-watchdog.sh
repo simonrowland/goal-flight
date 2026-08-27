@@ -276,6 +276,9 @@ def session_status_active(repo_root: str) -> bool:
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            # SessionStart fail-open wall: observability must never block work.
+            # Intentionally tighter than JOURNAL_WRITER_RETRY_BUDGET_S (5s),
+            # which is the in-process durable-writer contract, not this hook.
             timeout=3,
             check=False,
         )
@@ -302,6 +305,9 @@ def claim_controller_entry(repo_root: str, cwd: str) -> dict:
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            # Same 3s SessionStart wall as session_status_active. A 5s writer
+            # budget cannot complete inside this kill; fail-open via timeout
+            # rather than stretching SessionStart to the in-process writer bound.
             timeout=3,
             check=False,
         )
@@ -355,7 +361,9 @@ def journal_activity(repo_root: str, cwd: str) -> bool:
         import goalflight_task
 
         root = goalflight_task.resolve_project_root(cwd)
-        authority = goalflight_journal.Journal(root)
+        # Peek-only: must not take the write lock or inherit the 5s writer
+        # budget. SessionStart fail-open prefers a fast False over a stall.
+        authority = goalflight_journal.Journal.open_reader(root)
         if authority.attention_items():
             return True
         return bool(
