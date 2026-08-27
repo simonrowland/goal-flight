@@ -113,6 +113,27 @@ def test_create_only_journal_with_unrecorded_root_is_unknown(tmp_path: Path) -> 
     assert project.is_dir()
 
 
+def test_write_lock_without_sqlite_is_unknown(tmp_path: Path) -> None:
+    project = _project(tmp_path, "creating-repo")
+    authority = _create(project)
+    journal_dir = _journal_dir(authority)
+    sqlite_path = authority.path
+    lock_path = journal.journal_write_lock_path(sqlite_path)
+    sqlite_path.unlink()
+    Path(f"{sqlite_path}-wal").unlink(missing_ok=True)
+    Path(f"{sqlite_path}-shm").unlink(missing_ok=True)
+    lock_path.write_bytes(b"")
+    entry = gc.classify(journal_dir)
+    assert entry["state"] == "unknown", entry
+    assert entry["reclaimable"] is False
+    assert "write lock" in entry["why"]
+    payload = _run_json("--apply")
+    reported = _entry_for(payload, journal_dir)
+    assert reported["reclaimable"] is False
+    assert journal_dir.is_dir()
+    assert lock_path.is_file()
+
+
 def test_orphan_journal_dir_without_sqlite_is_empty(tmp_path: Path) -> None:
     store = gc.journals_store()
     store.mkdir(parents=True, exist_ok=True)

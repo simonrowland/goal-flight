@@ -368,6 +368,18 @@ def classify(journal_dir: Path) -> dict:
                 journal_dir,
                 "sqlite file absent but WAL/SHM present, contents unknown",
             )
+        lock_path = journal.journal_write_lock_path(sqlite_path)
+        lock_state = _presence(lock_path)
+        if lock_state == "unknown":
+            return _keep_unknown(
+                journal_dir,
+                "journal write-lock presence unverifiable",
+            )
+        if lock_state == "present":
+            return _keep_unknown(
+                journal_dir,
+                "sqlite file absent but write lock present, create in progress",
+            )
         return _entry(
             journal_dir,
             state="empty",
