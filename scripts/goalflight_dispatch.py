@@ -766,20 +766,30 @@ RETIRED_AGENT_LABELS = {
 # scanning for bare hex read one of those citations as the intended base and
 # warned GIT BASE PIN MISMATCH against a correct cwd HEAD -- pure noise that
 # trained controllers to reach for --ignore-git-warn. The recognized markers,
-# both observed in real briefs:
-#   - a frontmatter-style `base: <sha>` line (a markdown bullet and backticks
-#     around the sha are tolerated)
-#   - the `branch <name> @ <sha>` header convention
+# observed in real briefs:
+#   - a frontmatter-style `base: <sha>` line (quoted YAML, `Base SHA:`,
+#     markdown `**base:**`, bullets, and backticks around the sha are tolerated)
+#   - the `branch <name> @ <sha>` header convention, and a line-level
+#     `<name> @ <sha>` pin without the word `branch`
 # Every other hex-shaped token in the text is prose.
 GIT_BASE_PIN_BASE_LINE_RE = re.compile(
-    r"^[ \t]*(?:[-#>*]+[ \t]*)*base\s*:\s*`?([0-9A-Fa-f]{7,40})`?(?![0-9A-Za-z])",
+    r"^[ \t]*(?:[-#>*]+[ \t]*)*(?:\*\*)?base(?:\s+sha)?\s*:\s*(?:\*\*)?\s*"
+    r"[`'\"]?([0-9A-Fa-f]{7,40})[`'\"]?(?![0-9A-Za-z])",
     re.IGNORECASE | re.MULTILINE,
 )
 GIT_BASE_PIN_BRANCH_AT_RE = re.compile(
     r"\bbranch\s+\S+?\s+@\s+`?([0-9A-Fa-f]{7,40})`?(?![0-9A-Za-z])",
     re.IGNORECASE,
 )
-GIT_BASE_PIN_MARKER_RES = (GIT_BASE_PIN_BASE_LINE_RE, GIT_BASE_PIN_BRANCH_AT_RE)
+GIT_BASE_PIN_NAME_AT_RE = re.compile(
+    r"^[ \t]*(?:[-#>*]+[ \t]*)*\S+\s+@\s+`?([0-9A-Fa-f]{7,40})`?(?![0-9A-Za-z])",
+    re.IGNORECASE | re.MULTILINE,
+)
+GIT_BASE_PIN_MARKER_RES = (
+    GIT_BASE_PIN_BASE_LINE_RE,
+    GIT_BASE_PIN_BRANCH_AT_RE,
+    GIT_BASE_PIN_NAME_AT_RE,
+)
 TASK_ID_RE = re.compile(r"^[tb]-\d+$")
 LOWER_BASE_SHA_RE = re.compile(r"[0-9a-f]{40}")
 READ_ONLY_INLINE_RETURN_PROMPT_PATTERNS = (

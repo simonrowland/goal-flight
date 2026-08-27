@@ -371,6 +371,22 @@ def test_git_pin_warning() -> None:
             "a 41-hex token after base: is not a truncated pin",
             D._extract_git_base_pins("base: " + "a" * 41) == [],
         )
+        check(
+            "quoted YAML base: is a pin",
+            D._extract_git_base_pins('base: "e82f6a5"\n') == ["e82f6a5"],
+        )
+        check(
+            "Base SHA: line is a pin",
+            D._extract_git_base_pins("Base SHA: e82f6a5\n") == ["e82f6a5"],
+        )
+        check(
+            "markdown **base:** is a pin",
+            D._extract_git_base_pins("**base:** `e82f6a5`\n") == ["e82f6a5"],
+        )
+        check(
+            "name @ sha line without the word branch is a pin",
+            D._extract_git_base_pins("t375-dispatch-guards @ e82f6a5\n") == ["e82f6a5"],
+        )
 
         tail = Path(td) / "dispatch.tail"
         with contextlib.redirect_stderr(io.StringIO()):
