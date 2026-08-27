@@ -124,7 +124,10 @@ The default supervised feed is terse but remains anti-stall. On each stream
 keepalive it emits exactly one actionable
 `{"kind":"next","payload":{"directive":"goal-flight next","id":"...","state":"projected","title":"..."}}`
 record using the stream's already-materialized frontier, instead of forwarding
-the bare keepalive plus its `information-only` frontier. If no ready frontier
+the bare keepalive plus its `information-only` frontier. A verbatim-identical
+`kind=next` payload is then suppressed until the 15-minute frontier floor, so
+an unchanged projection does not cost a controller wake on every 120-second
+keepalive; a content change still wakes immediately. If no ready frontier
 exists but work is in flight, awaiting review, failed, waiting, or needs a
 decision, that item's id, title, and state occupy the same record. Only a
 freshly paired, genuinely empty projection emits
@@ -144,7 +147,9 @@ Each flushed line is a wake. In default terse mode, child kinds pass through as
 follows:
 
 - stream: events/faults/exits unchanged; each bare `heartbeat` plus advisory
-  `frontier` pair becomes one actionable `kind=next` record
+  `frontier` pair becomes one actionable `kind=next` record unless that payload
+  is verbatim-identical to the last emitted next and the 15-minute floor has
+  not elapsed
 - backup: pending headlines plus one `advance: <command>` line, or a ring
 - watchdog: JSON `{"kind":"event",...}` with `listener-dead` / related payload
 - supervise: `{"kind":"supervise","type":"heartbeat"|"coverage"|"probe"|"restart"|"stop"|"exit",...}`;
@@ -168,13 +173,13 @@ costs is explicable.
 Supervisor coverage is state-driven: it emits at startup, whenever
 `(live,target)` changes, and immediately when a slot stops or restarts.
 Unchanged periodic coverage is silent unless `--debug` restores per-tick
-records. The supervisor's own heartbeat is different from the stream child's
-heartbeat below: it defaults to 1500 seconds (25 minutes), and its real stdout
+heartbeat records. The supervisor's own heartbeat is different from the stream child's
+heartbeat below: it defaults to 3600 seconds (60 minutes), and its real stdout
 write is the authoritative fallback when the fast `_stdio_peer_gone` poll has
 no evidence. `RealHost.wait()` also watches stdout for
 `POLLERR|POLLHUP|POLLNVAL`, so positive closure evidence wakes the loop
 independently of that heartbeat. Production supervisor heartbeat values stay
-within 60–1800 seconds. The stream child's 120-second heartbeat and the watchdog's
+within 60–14400 seconds. The stream child's 120-second heartbeat and the watchdog's
 three-missed-interval threshold do not change. `restart` and `stop` remain
 unconditional. Receipt of `SIGTERM`, `SIGINT`, or `SIGHUP` emits `type=exit`
 before child teardown; SIGKILL cannot be caught and therefore cannot emit that
@@ -264,8 +269,8 @@ mail" beside an event. An unchanged frontier emits only every 15 minutes; a chan
 emits on the next idle beat.
 
 The monitor is tracked, not immortal. The host may reap it; stopped heartbeats make
-that failure detectable. Keep **six** backup doorbells as separate tracked
-tasks, each `--listener-slots 6`. During its existing bounded mail wait, a doorbell
+that failure detectable. Keep **two** backup doorbells as separate tracked
+tasks, each `--listener-slots 2`. During its existing bounded mail wait, a doorbell
 also checks the generation-scoped watchdog lock. Once it has observed the watchdog,
 or after the same 15-second startup grace used for persistent state, a missing
 watchdog lock makes the doorbell release its own lock and flush a structural
@@ -278,7 +283,7 @@ python3 <skill-root>/scripts/goalflight_messages.py listen \
   --project-root "$PWD" \
   --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
   --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE" \
-  --listener-slots 6 \
+  --listener-slots 2 \
   --report-pending
 ```
 
@@ -297,11 +302,11 @@ Arm the stream first, then the backup pool and watchdog. `--watch-follow` allows
 for the stream's durable state to appear, preventing an invalid or missing state file
 from becoming silent death. It is observer-only: `--listener-slots` and
 `--report-pending` are ignored with a warning, and the diagnostic prints the separate
-backup command. Persistent coverage is eight required slots: one live, healthy
-monitor stream, six backup doorbells, and one watchdog. Status, entry hints, and fleet
-output use that shared `live/8` predicate; after stream loss the surviving backup pool
-and watchdog report persistent coverage `7/8`, never a portable `1/4` pool. Override
-with `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 6; target depth, not a
+backup command. Persistent coverage is four required slots: one live, healthy
+monitor stream, two backup doorbells, and one watchdog. Status, entry hints, and fleet
+output use that shared `live/4` predicate; after stream loss the surviving backup pool
+and watchdog report persistent coverage `3/4`, never a portable `1/4` pool. Override
+with `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 2; target depth, not a
 ceiling). A shortfall is degraded, not binary-dead: a controller with some
 doorbells still covered should top the pool up.
 
@@ -342,7 +347,7 @@ connect may spend the absolute deadline and correctly stop after one attempt.
 
 `--listener-slots`, `GOALFLIGHT_LISTENER_SLOTS`, and
 `GOALFLIGHT_LISTENER_LOW_WATER` tune only portable `listen`. Persistent backup
-depth is `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 6). `follow` rejects the
+depth is `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 2). `follow` rejects the
 CLI flag and warns when either portable pool environment variable is present; an inert
 accepted knob is not a valid stream configuration.
 

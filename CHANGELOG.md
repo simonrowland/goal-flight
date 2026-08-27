@@ -13,20 +13,25 @@ incremented when meaningful skill behaviour changes.
   inert in that mode and any host-required value is a placeholder, not a knob.
   On 2026-08-26 every controller on one machine used a bounded monitor and lost
   its whole pool at the same one-hour wall (`listener depth 0/8 - 8 missing`).
-- The supervisor's own heartbeat now defaults to 1500 seconds and accepts
-  60–1800 seconds. It remains the authoritative real-write peer check, while
+- The supervisor's own heartbeat now defaults to 3600 seconds and accepts
+  60–14400 seconds. It remains the authoritative real-write peer check, while
   the distinct `follow` stream heartbeat remains 120 seconds and the watchdog
   still declares death after three missed stream beats. Coverage emits on
   startup and immediately for live/target or slot-state changes; unchanged
-  periodic coverage is quiet unless `--debug` is set.
+  periodic coverage is quiet unless `--debug` restores per-tick heartbeat
+  records. Default terse mode emits no coverage record; startup writes a
+  named `{"type":"probe","reason":"stdout-peer-liveness"}` peer-liveness probe.
 
-- Persistent wake coverage defaults to eight slots: one `follow` stream, six
-  `listen --listener-slots 6 --report-pending` backup doorbells, and one
-  `listen --watch-follow` watchdog (`live/8`). The backup pool is
-  `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 6, target depth not a
+- Persistent wake coverage defaults to four slots: one `follow` stream, two
+  `listen --listener-slots 2 --report-pending` backup doorbells, and one
+  `listen --watch-follow` watchdog (`live/4`). The backup pool is
+  `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 2, target depth not a
   ceiling); portable `DEFAULT_LISTENER_SLOTS = 4` is a different knob. A
   decayed backup pool reports `degraded` with observed-vs-target and
   re-arms the missing count rather than reading "live" at any depth ≥ 1.
+- Default terse `kind=next` wakes suppress a verbatim-identical payload
+  until the 15-minute frontier floor. A content change still wakes
+  immediately. `--chatty` restores the raw keepalive and frontier feed.
 - Listener and persistent-backup slot counts have no upper bound.
   `MAX_LISTENER_SLOTS` and `ListenerSlotsFull` are gone. Arming past the
   configured target takes the next free slot; `--listener-slots` /

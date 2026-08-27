@@ -78,15 +78,15 @@ value is only a placeholder, never a knob. In the decomposed fallback, only
 after supervisor absence is proven, arm one generation-bound
 `goalflight_messages.py follow --project-root
 "$PWD" --controller-label <label> --lease-nonce <nonce>` through that monitor —
-never through ordinary shell backgrounding — and keep six tracked `listen
---listener-slots 6 --report-pending` backup doorbells plus one separately tracked
+never through ordinary shell backgrounding — and keep two tracked `listen
+--listener-slots 2 --report-pending` backup doorbells plus one separately tracked
 `listen --watch-follow` watchdog. The watchdog holds its own generation lock and
 never consumes a doorbell slot. It reads the stream's durable successful-record age;
 three missed heartbeat intervals emit `listener-dead` on stdout. The decomposed
 unsupervised path includes the exact monitor re-arm command; under `supervise` the
 record keeps the reason but omits that component action, and recovery is a supervisor
 restart. Treat stream, backup pool, and watchdog as shared persistent coverage
-`live/8`. On hosts without that
+`live/4`. On hosts without that
 monitor (codex, grok, cursor, opencode), keep the portable tracked `listen` pool:
 when one exits 0, peek with `relay --new --json`, process the items, cursor-CAS their
 server-known positions with `advance`, then re-arm. Exit 5 is settled did-not-arm
