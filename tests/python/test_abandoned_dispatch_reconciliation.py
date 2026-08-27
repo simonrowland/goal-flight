@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -18,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_capacity as C  # noqa: E402
+import goalflight_compat  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
 
@@ -31,8 +34,28 @@ def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(state))
     monkeypatch.setenv("GOALFLIGHT_CODEX_STATE_DIR", str(state))
     monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
+    monkeypatch.setenv("GOALFLIGHT_TASK_STORE", str(tmp_path / "task-store"))
+    monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("GOALFLIGHT_MESSAGES_DIR", str(tmp_path / "messages"))
+    monkeypatch.setenv("GOALFLIGHT_WAKE_LEDGER", str(tmp_path / "wake-ledger.json"))
+    monkeypatch.setenv("GOALFLIGHT_PIDFILE_DIR", str(tmp_path / "pidfiles"))
+    monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", os.devnull)
     monkeypatch.setattr(D, "_export_dashboard_status_for_project", lambda *_args: None)
     monkeypatch.setattr(D, "_start_dashboard_refresh_for_project", lambda *_args: None)
+
+
+def _spawn_sleeping_worker() -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=5)
 
 
 def _future_now(seconds: float = 900.0) -> dt.datetime:
@@ -53,6 +76,7 @@ def _record(
     controller_session_id: str | None = None,
     controller_label: str | None = None,
     state: str = "running",
+    **extra: object,
 ) -> dict:
     tail = tmp_path / f"{dispatch_id}.tail"
     tail.write_text(tail_text, encoding="utf-8")
@@ -91,6 +115,11 @@ def _record(
                 "codex_home_owner_dispatch_id": codex_home.name,
             }
         )
+    if "worker_pgid" not in extra and isinstance(worker_identity, dict):
+        pgid = worker_identity.get("pgid")
+        if pgid is not None:
+            extra = {**extra, "worker_pgid": pgid}
+    payload.update(extra)
     L.write_record(payload)
     return payload
 
@@ -248,6 +277,303 @@ def test_status_worker_alive_without_pid_is_never_closed(tmp_path: Path) -> None
     assert result["closed"] == 0
     assert _read(dispatch_id)["state"] == "running"
     assert result["kept_reasons"] == {"worker_live_or_indeterminate": 1}
+
+
+def test_stale_worker_alive_true_with_dead_pid_is_eligible(tmp_path: Path) -> None:
+    proc = _spawn_sleeping_worker()
+    try:
+        identity = L.process_identity(proc.pid)
+        assert identity is not None
+        pid = proc.pid
+    finally:
+        _reap(proc)
+    assert L.identity_matches({"worker_pid": pid, "worker_identity": identity}) == (
+        False,
+        "dead",
+    )
+
+    dispatch_id = "stale-alive-dead-pid"
+    _record(tmp_path, dispatch_id, worker_pid=pid, worker_identity=identity)
+    _write_status(
+        tmp_path,
+        dispatch_id,
+        worker_alive=True,
+        worker_pid=pid,
+        expected_worker_identity=identity,
+    )
+
+    result = _run(tmp_path)
+    closed = _read(dispatch_id)
+
+    assert result["closed"] == 1
+    assert closed["state"] == "inconclusive_no_final"
+    process_evidence = closed["outcome"]["reconciliation"]["process_evidence"]
+    assert "dead" in process_evidence
+    assert "status_worker_alive:true" not in process_evidence
+
+
+def test_worker_alive_true_with_live_pid_is_not_eligible(tmp_path: Path) -> None:
+    proc = _spawn_sleeping_worker()
+    try:
+        identity = L.process_identity(proc.pid)
+        assert identity is not None
+        dispatch_id = "alive-flag-live-pid"
+        _record(
+            tmp_path,
+            dispatch_id,
+            worker_pid=proc.pid,
+            worker_identity=identity,
+        )
+        _write_status(
+            tmp_path,
+            dispatch_id,
+            worker_alive=True,
+            worker_pid=proc.pid,
+            expected_worker_identity=identity,
+        )
+
+        result = _run(tmp_path)
+
+        assert result["closed"] == 0
+        assert _read(dispatch_id)["state"] == "running"
+        assert result["kept_reasons"] == {"worker_live_or_indeterminate": 1}
+        assert "live" in str(result["entries"][0].get("process_evidence", ""))
+    finally:
+        _reap(proc)
+
+
+def test_eperm_probe_with_stale_worker_alive_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    proc: subprocess.Popen | None = None
+    try:
+        if goalflight_compat.pid_liveness(1) is None:
+            pid = 1
+            identity = L.process_identity(pid) or {
+                "pid": pid,
+                "identity_available": False,
+                "identity_probe_error": True,
+                "identity_source": "pid_probe_error",
+            }
+        else:
+            proc = _spawn_sleeping_worker()
+            identity = L.process_identity(proc.pid)
+            assert identity is not None
+            pid = proc.pid
+            real_kill = goalflight_compat.os.kill
+
+            def _kill(probe_pid: int, sig: int) -> None:
+                if int(probe_pid) == int(pid):
+                    raise PermissionError(errno.EPERM, "Operation not permitted")
+                return real_kill(probe_pid, sig)
+
+            monkeypatch.setattr(goalflight_compat.os, "kill", _kill)
+
+        dispatch_id = "eperm-stale-alive"
+        _record(tmp_path, dispatch_id, worker_pid=pid, worker_identity=identity)
+        _write_status(
+            tmp_path,
+            dispatch_id,
+            worker_alive=True,
+            worker_pid=pid,
+            expected_worker_identity=identity,
+        )
+
+        result = _run(tmp_path)
+
+        assert result["closed"] == 0
+        assert _read(dispatch_id)["state"] == "running"
+        assert result["kept_reasons"] == {"worker_live_or_indeterminate": 1}
+        evidence = str(result["entries"][0].get("process_evidence", ""))
+        assert "indeterminate" in evidence
+    finally:
+        if proc is not None:
+            _reap(proc)
+
+
+def _dead_worker_identity() -> tuple[int, dict]:
+    proc = _spawn_sleeping_worker()
+    try:
+        identity = L.process_identity(proc.pid)
+        assert identity is not None
+        pid = proc.pid
+    finally:
+        _reap(proc)
+    assert L.identity_matches({"worker_pid": pid, "worker_identity": identity}) == (
+        False,
+        "dead",
+    )
+    return pid, identity
+
+
+def _indeterminate_group_leader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[int, dict, subprocess.Popen | None]:
+    """Return a pid whose liveness probe is genuinely unreadable (EPERM)."""
+    if goalflight_compat.pid_liveness(1) is None:
+        identity = L.process_identity(1) or {
+            "pid": 1,
+            "identity_available": False,
+            "identity_probe_error": True,
+            "identity_source": "pid_probe_error",
+        }
+        return 1, identity, None
+    proc = _spawn_sleeping_worker()
+    identity = L.process_identity(proc.pid)
+    assert identity is not None
+    pid = proc.pid
+    real_kill = goalflight_compat.os.kill
+
+    def _kill(probe_pid: int, sig: int) -> None:
+        if int(probe_pid) == int(pid):
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+        return real_kill(probe_pid, sig)
+
+    monkeypatch.setattr(goalflight_compat.os, "kill", _kill)
+    return pid, identity, proc
+
+
+def test_dead_pids_without_group_contract_are_eligible(tmp_path: Path) -> None:
+    pid, identity = _dead_worker_identity()
+    dispatch_id = "dead-no-group-contract"
+    _record(
+        tmp_path,
+        dispatch_id,
+        worker_pid=pid,
+        worker_identity=identity,
+        worker_pgid=pid,
+        queue_launch_token="launch-token-absent-contract",
+    )
+    _write_status(
+        tmp_path,
+        dispatch_id,
+        worker_alive=True,
+        worker_pid=pid,
+        expected_worker_identity=identity,
+    )
+
+    result = _run(tmp_path)
+    closed = _read(dispatch_id)
+    entry = result["entries"][0]
+
+    assert result["closed"] == 1
+    assert entry["eligible"] is True
+    assert entry["reason"] == D._ELIGIBLE_NO_GROUP_CONTRACT
+    assert D._PRODUCER_SET_STRUCTURALLY_ABSENT in str(entry.get("process_evidence", ""))
+    assert "producer_set:indeterminate:" not in str(entry.get("process_evidence", ""))
+    assert closed["state"] == "inconclusive_no_final"
+    assert closed["outcome"]["reconciliation"]["reason"] == D._ELIGIBLE_NO_GROUP_CONTRACT
+
+
+def test_dead_pids_with_unreadable_group_contract_are_not_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pid, identity = _dead_worker_identity()
+    group_pid, group_identity, extra = _indeterminate_group_leader(monkeypatch)
+    try:
+        dispatch_id = "dead-unreadable-contract"
+        _record(
+            tmp_path,
+            dispatch_id,
+            worker_pid=pid,
+            worker_identity=identity,
+            worker_pgid=group_pid,
+            worker_group_leader_identity=group_identity,
+            producer_group_contract=True,
+            producer_group_contract_enforced=True,
+            queue_launch_token="launch-token-present-unread",
+        )
+        _write_status(
+            tmp_path,
+            dispatch_id,
+            worker_alive=True,
+            worker_pid=pid,
+            expected_worker_identity=identity,
+        )
+
+        result = _run(tmp_path)
+        evidence = str(result["entries"][0].get("process_evidence", ""))
+
+        assert result["closed"] == 0
+        assert _read(dispatch_id)["state"] == "running"
+        assert result["kept_reasons"] == {"worker_live_or_indeterminate": 1}
+        assert "producer_set:indeterminate:" in evidence
+        assert D._PRODUCER_SET_STRUCTURALLY_ABSENT not in evidence
+    finally:
+        if extra is not None:
+            _reap(extra)
+
+
+def test_indeterminate_pid_without_group_contract_is_not_eligible(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    group_pid, group_identity, extra = _indeterminate_group_leader(monkeypatch)
+    try:
+        dispatch_id = "indeterminate-no-group-contract"
+        _record(
+            tmp_path,
+            dispatch_id,
+            worker_pid=group_pid,
+            worker_identity=group_identity,
+            worker_pgid=group_pid,
+            queue_launch_token="launch-token-absent-contract",
+        )
+        _write_status(
+            tmp_path,
+            dispatch_id,
+            worker_alive=True,
+            worker_pid=group_pid,
+            expected_worker_identity=group_identity,
+        )
+
+        result = _run(tmp_path)
+        evidence = str(result["entries"][0].get("process_evidence", ""))
+
+        assert result["closed"] == 0
+        assert _read(dispatch_id)["state"] == "running"
+        assert result["kept_reasons"] == {"worker_live_or_indeterminate": 1}
+        assert "indeterminate" in evidence
+        assert D._PRODUCER_SET_STRUCTURALLY_ABSENT not in evidence
+        assert result["entries"][0]["reason"] != D._ELIGIBLE_NO_GROUP_CONTRACT
+    finally:
+        if extra is not None:
+            _reap(extra)
+
+
+def test_live_worker_without_group_contract_is_not_eligible(tmp_path: Path) -> None:
+    proc = _spawn_sleeping_worker()
+    try:
+        identity = L.process_identity(proc.pid)
+        assert identity is not None
+        dispatch_id = "live-no-group-contract"
+        _record(
+            tmp_path,
+            dispatch_id,
+            worker_pid=proc.pid,
+            worker_identity=identity,
+            worker_pgid=proc.pid,
+            queue_launch_token="launch-token-absent-contract",
+        )
+        _write_status(
+            tmp_path,
+            dispatch_id,
+            worker_alive=True,
+            worker_pid=proc.pid,
+            expected_worker_identity=identity,
+        )
+
+        result = _run(tmp_path)
+
+        assert result["closed"] == 0
+        assert _read(dispatch_id)["state"] == "running"
+        assert result["kept_reasons"] == {"worker_live_or_indeterminate": 1}
+        assert "live" in str(result["entries"][0].get("process_evidence", ""))
+        assert result["entries"][0]["reason"] != D._ELIGIBLE_NO_GROUP_CONTRACT
+    finally:
+        _reap(proc)
 
 
 def test_live_persisted_descendant_is_never_closed(
@@ -640,11 +966,38 @@ def test_reconcile_abandoned_text_print_includes_kept_reasons(
 
     assert rc == 0
     assert captured.startswith("RECONCILE-ABANDONED ")
-    payload = json.loads(captured.split(" ", 1)[1])
+    payload = json.loads(captured[captured.index("{") :])
     assert payload["kept_reasons"] == {"controller_indeterminate": 1}
     assert payload["would_close"] == 0
     assert payload["kept"] == 1
+    assert payload["mode"] == "dry-run"
     assert "controller_indeterminate" in captured
+    assert _read(dispatch_id)["state"] == "running"
+
+
+def test_reconcile_abandoned_dry_run_text_states_no_record_changed(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dispatch_id = "dry-run-would-close"
+    _record(tmp_path, dispatch_id)
+    queue_dir = tmp_path / "state" / "dispatch-queue"
+    queue_dir.mkdir(parents=True, exist_ok=True)
+
+    rc = D._cmd_reconcile_abandoned(
+        ["--queue-dir", str(queue_dir), "--stale-s", "0"]
+    )
+    captured = capsys.readouterr().out.strip()
+    payload = json.loads(captured[captured.index("{") :])
+
+    assert rc == 0
+    assert "dry-run" in captured
+    assert "no ledger record was changed" in captured
+    assert "no apply flag" in captured
+    assert "only drain writes" in captured
+    assert payload["mode"] == "dry-run"
+    assert payload["would_close"] == 1
+    assert payload["kept"] == 0
     assert _read(dispatch_id)["state"] == "running"
 
 
