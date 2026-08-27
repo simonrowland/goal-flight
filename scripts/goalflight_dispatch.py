@@ -7276,10 +7276,13 @@ def _abandoned_process_evidence(record: dict, status: dict) -> tuple[bool, str]:
 
     ``True`` means no recorded process can still own the dispatch. Identity
     provider errors and weak/unknown identities fail closed.
+
+    Status ``worker_alive`` may corroborate, never short-circuit. Probe each
+    recorded pid and start-token first. Only a confirmed-dead identity
+    overrides a stale ``worker_alive: true``; a true flag with no pid to
+    measure, or any live/indeterminate probe, stays not-abandoned.
     """
 
-    if status.get("worker_alive") is True:
-        return False, "status_worker_alive:true"
     if "worker_alive" in status and status.get("worker_alive") not in {True, False, None}:
         return False, "status_worker_alive:indeterminate"
 
@@ -7345,6 +7348,10 @@ def _abandoned_process_evidence(record: dict, status: dict) -> tuple[bool, str]:
         if producer_set.state not in {ProducerSetState.DEAD, ProducerSetState.PID_REUSED}:
             return False, ",".join(evidence)
     if not evidence:
+        # No identity was measured. A true flag cannot be overridden without
+        # confirmed death, so fail closed rather than treating absence as death.
+        if status.get("worker_alive") is True:
+            return False, "status_worker_alive:true"
         return True, "no_recorded_pid"
     return True, ",".join(evidence)
 

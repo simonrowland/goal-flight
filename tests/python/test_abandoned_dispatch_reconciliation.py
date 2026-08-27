@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -18,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_capacity as C  # noqa: E402
+import goalflight_compat  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
 
@@ -31,8 +34,28 @@ def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(state))
     monkeypatch.setenv("GOALFLIGHT_CODEX_STATE_DIR", str(state))
     monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
+    monkeypatch.setenv("GOALFLIGHT_TASK_STORE", str(tmp_path / "task-store"))
+    monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("GOALFLIGHT_MESSAGES_DIR", str(tmp_path / "messages"))
+    monkeypatch.setenv("GOALFLIGHT_WAKE_LEDGER", str(tmp_path / "wake-ledger.json"))
+    monkeypatch.setenv("GOALFLIGHT_PIDFILE_DIR", str(tmp_path / "pidfiles"))
+    monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", os.devnull)
     monkeypatch.setattr(D, "_export_dashboard_status_for_project", lambda *_args: None)
     monkeypatch.setattr(D, "_start_dashboard_refresh_for_project", lambda *_args: None)
+
+
+def _spawn_sleeping_worker() -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _reap(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=5)
 
 
 def _future_now(seconds: float = 900.0) -> dt.datetime:
@@ -248,6 +271,119 @@ def test_status_worker_alive_without_pid_is_never_closed(tmp_path: Path) -> None
     assert result["closed"] == 0
     assert _read(dispatch_id)["state"] == "running"
     assert result["kept_reasons"] == {"worker_live_or_indeterminate": 1}
+
+
+def test_stale_worker_alive_true_with_dead_pid_is_eligible(tmp_path: Path) -> None:
+    proc = _spawn_sleeping_worker()
+    try:
+        identity = L.process_identity(proc.pid)
+        assert identity is not None
+        pid = proc.pid
+    finally:
+        _reap(proc)
+    assert L.identity_matches({"worker_pid": pid, "worker_identity": identity}) == (
+        False,
+        "dead",
+    )
+
+    dispatch_id = "stale-alive-dead-pid"
+    _record(tmp_path, dispatch_id, worker_pid=pid, worker_identity=identity)
+    _write_status(
+        tmp_path,
+        dispatch_id,
+        worker_alive=True,
+        worker_pid=pid,
+        expected_worker_identity=identity,
+    )
+
+    result = _run(tmp_path)
+    closed = _read(dispatch_id)
+
+    assert result["closed"] == 1
+    assert closed["state"] == "inconclusive_no_final"
+    process_evidence = closed["outcome"]["reconciliation"]["process_evidence"]
+    assert "dead" in process_evidence
+    assert "status_worker_alive:true" not in process_evidence
+
+
+def test_worker_alive_true_with_live_pid_is_not_eligible(tmp_path: Path) -> None:
+    proc = _spawn_sleeping_worker()
+    try:
+        identity = L.process_identity(proc.pid)
+        assert identity is not None
+        dispatch_id = "alive-flag-live-pid"
+        _record(
+            tmp_path,
+            dispatch_id,
+            worker_pid=proc.pid,
+            worker_identity=identity,
+        )
+        _write_status(
+            tmp_path,
+            dispatch_id,
+            worker_alive=True,
+            worker_pid=proc.pid,
+            expected_worker_identity=identity,
+        )
+
+        result = _run(tmp_path)
+
+        assert result["closed"] == 0
+        assert _read(dispatch_id)["state"] == "running"
+        assert result["kept_reasons"] == {"worker_live_or_indeterminate": 1}
+        assert "live" in str(result["entries"][0].get("process_evidence", ""))
+    finally:
+        _reap(proc)
+
+
+def test_eperm_probe_with_stale_worker_alive_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    proc: subprocess.Popen | None = None
+    try:
+        if goalflight_compat.pid_liveness(1) is None:
+            pid = 1
+            identity = L.process_identity(pid) or {
+                "pid": pid,
+                "identity_available": False,
+                "identity_probe_error": True,
+                "identity_source": "pid_probe_error",
+            }
+        else:
+            proc = _spawn_sleeping_worker()
+            identity = L.process_identity(proc.pid)
+            assert identity is not None
+            pid = proc.pid
+            real_kill = goalflight_compat.os.kill
+
+            def _kill(probe_pid: int, sig: int) -> None:
+                if int(probe_pid) == int(pid):
+                    raise PermissionError(errno.EPERM, "Operation not permitted")
+                return real_kill(probe_pid, sig)
+
+            monkeypatch.setattr(goalflight_compat.os, "kill", _kill)
+
+        dispatch_id = "eperm-stale-alive"
+        _record(tmp_path, dispatch_id, worker_pid=pid, worker_identity=identity)
+        _write_status(
+            tmp_path,
+            dispatch_id,
+            worker_alive=True,
+            worker_pid=pid,
+            expected_worker_identity=identity,
+        )
+
+        result = _run(tmp_path)
+
+        assert result["closed"] == 0
+        assert _read(dispatch_id)["state"] == "running"
+        assert result["kept_reasons"] == {"worker_live_or_indeterminate": 1}
+        evidence = str(result["entries"][0].get("process_evidence", ""))
+        assert "indeterminate" in evidence
+    finally:
+        if proc is not None:
+            _reap(proc)
 
 
 def test_live_persisted_descendant_is_never_closed(
