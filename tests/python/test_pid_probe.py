@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -58,9 +60,101 @@ def case_windows_access_denied_means_alive() -> None:
         assert goalflight_compat.pid_alive(4242) is True
 
 
+def case_posix_pid_probe_error_is_indeterminate() -> None:
+    with patch("goalflight_compat.is_windows", return_value=False), \
+        patch(
+            "goalflight_compat.os.kill",
+            side_effect=OSError(errno.ENFILE, "file table full"),
+        ):
+        assert goalflight_compat.pid_liveness(os.getpid()) is None
+        assert goalflight_compat.pid_alive(os.getpid()) is True
+
+
+def case_live_pid_probe_error_classifies_indeterminate() -> None:
+    pid = os.getpid()
+    prior = goalflight_ledger.process_identity(pid)
+    assert prior is not None
+    record = {"worker_pid": pid, "worker_identity": prior}
+    with patch(
+        "goalflight_compat.os.kill",
+        side_effect=OSError(errno.ENFILE, "file table full"),
+    ):
+        current = goalflight_ledger.process_identity(pid)
+        assert current is not None
+        assert current["identity_available"] is False
+        assert current["identity_probe_error"] is True
+        assert goalflight_ledger.identity_matches(record) == (
+            True,
+            "identity_indeterminate",
+        )
+        assert goalflight_ledger.classify(record) == "identity_indeterminate"
+
+
+def case_live_ps_probe_error_classifies_indeterminate() -> None:
+    pid = os.getpid()
+    prior = goalflight_ledger.process_identity(pid)
+    assert prior is not None
+    record = {"worker_pid": pid, "worker_identity": prior}
+    with patch(
+        "goalflight_ledger.subprocess.check_output",
+        side_effect=OSError(errno.ENFILE, "file table full"),
+    ), patch("goalflight_ledger._posix_ps_available", return_value=True):
+        current = goalflight_ledger.process_identity(pid)
+        assert current is not None
+        assert current["identity_available"] is False
+        assert current["identity_probe_error"] is True
+        assert current["identity_source"] == "ps_probe_error"
+        assert goalflight_ledger.compare_process_identities(pid, prior, current) == (
+            True,
+            "identity_indeterminate",
+        )
+        assert goalflight_ledger.compare_fine_process_identities(
+            pid, prior, current
+        ) == (False, "identity_indeterminate")
+        assert goalflight_ledger.classify(record) == "identity_indeterminate"
+
+
+def case_live_ps_missing_lstart_classifies_indeterminate() -> None:
+    pid = os.getpid()
+    prior = goalflight_ledger.process_identity(pid)
+    assert prior is not None
+    record = {"worker_pid": pid, "worker_identity": prior}
+
+    def ps_without_lstart(args, **_kwargs):
+        return "" if args[-1] == "lstart=" else "1"
+
+    with patch(
+        "goalflight_ledger.subprocess.check_output",
+        side_effect=ps_without_lstart,
+    ), patch("goalflight_ledger._posix_ps_available", return_value=True), patch(
+        "goalflight_ledger.time.sleep", return_value=None
+    ):
+        current = goalflight_ledger.process_identity(pid)
+        assert current is not None
+        assert current["identity_available"] is False
+        assert current["identity_probe_error"] is True
+        assert current["identity_source"] == "ps_identity_incomplete"
+        assert goalflight_ledger.classify(record) == "identity_indeterminate"
+
+
+def case_reaped_pid_still_classifies_dead() -> None:
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.1)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    prior = goalflight_ledger.process_identity(proc.pid)
+    assert prior is not None
+    proc.wait(timeout=5)
+    record = {"worker_pid": proc.pid, "worker_identity": prior}
+    assert goalflight_compat.pid_liveness(proc.pid) is False
+    assert goalflight_ledger.identity_matches(record) == (False, "dead")
+    assert goalflight_ledger.classify(record) == "stale_dead"
+
+
 def case_ledger_windows_identity_indeterminate_not_expected_live() -> None:
     with patch("goalflight_compat.is_windows", return_value=True), \
-        patch("goalflight_compat.pid_alive", return_value=True):
+        patch("goalflight_compat.pid_liveness", return_value=True):
         ident = goalflight_ledger.process_identity(os.getpid())
         assert ident is not None
         assert ident["identity_available"] is False
@@ -73,6 +167,11 @@ def case_ledger_windows_identity_indeterminate_not_expected_live() -> None:
 def main() -> None:
     case_windows_pid_alive_does_not_call_os_kill()
     case_windows_access_denied_means_alive()
+    case_posix_pid_probe_error_is_indeterminate()
+    case_live_pid_probe_error_classifies_indeterminate()
+    case_live_ps_probe_error_classifies_indeterminate()
+    case_live_ps_missing_lstart_classifies_indeterminate()
+    case_reaped_pid_still_classifies_dead()
     case_ledger_windows_identity_indeterminate_not_expected_live()
     print("OK: pid probe tests pass")
 

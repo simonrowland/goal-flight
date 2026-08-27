@@ -157,7 +157,7 @@ def sha256_file(path: str | None) -> str | None:
     return h.hexdigest()
 
 
-def _ps_field(pid: int, field: str) -> str | None:
+def _ps_field(pid: int, field: str) -> tuple[str | None, bool]:
     try:
         out = subprocess.check_output(
             ["ps", "-p", str(pid), "-o", f"{field}="],
@@ -167,8 +167,8 @@ def _ps_field(pid: int, field: str) -> str | None:
             stderr=subprocess.DEVNULL,
         ).strip()
     except (OSError, subprocess.CalledProcessError):
-        return None
-    return out or None
+        return None, False
+    return out or None, True
 
 
 def _posix_ps_available() -> bool:
@@ -190,6 +190,16 @@ def _posix_ps_available() -> bool:
 def process_identity(pid: int | None) -> dict | None:
     if not pid:
         return None
+    liveness = goalflight_compat.pid_liveness(pid)
+    if liveness is False:
+        return None
+    if liveness is None:
+        return {
+            "pid": pid,
+            "identity_available": False,
+            "identity_probe_error": True,
+            "identity_source": "pid_probe_error",
+        }
     start_identity = goalflight_compat.process_start_identity(pid)
     start_token = (
         start_identity.get("start_token") if isinstance(start_identity, dict) else None
@@ -198,8 +208,6 @@ def process_identity(pid: int | None) -> dict | None:
         # Reject dead PIDs on Windows too, else a dead worker reads as
         # 'identity_indeterminate' instead of 'dead'. Windows lacks the ps
         # probe, so return the probe-only token only for a live PID.
-        if not goalflight_compat.pid_alive(pid):
-            return None
         ident = {
             "pid": pid,
             "identity_available": False,
@@ -209,8 +217,6 @@ def process_identity(pid: int | None) -> dict | None:
             ident["start_token"] = start_token
         return ident
     if not _posix_ps_available():
-        if not goalflight_compat.pid_alive(pid):
-            return None
         ident = {
             "pid": pid,
             "identity_available": False,
@@ -221,22 +227,55 @@ def process_identity(pid: int | None) -> dict | None:
         return ident
     ident = None
     for attempt in range(20):
-        if not goalflight_compat.pid_alive(pid):
+        liveness = goalflight_compat.pid_liveness(pid)
+        if liveness is False:
             return None
+        if liveness is None:
+            ident = {
+                "pid": pid,
+                "identity_available": False,
+                "identity_probe_error": True,
+                "identity_source": "pid_probe_error",
+            }
+            if start_token:
+                ident["start_token"] = start_token
+            return ident
+        fields = {
+            field: _ps_field(pid, field)
+            for field in ("ppid", "pgid", "lstart", "comm", "args")
+        }
         ident = {
             "pid": pid,
-            "ppid": _ps_field(pid, "ppid"),
-            "pgid": _ps_field(pid, "pgid"),
-            "lstart": _ps_field(pid, "lstart"),
-            "comm": _ps_field(pid, "comm"),
-            "args": _ps_field(pid, "args"),
+            **{field: result[0] for field, result in fields.items()},
         }
         if start_token:
             ident["start_token"] = start_token
+        if not all(result[1] for result in fields.values()):
+            liveness = goalflight_compat.pid_liveness(pid)
+            if liveness is False:
+                return None
+            ident.update(
+                {
+                    "identity_available": False,
+                    "identity_probe_error": True,
+                    "identity_source": (
+                        "ps_probe_error" if liveness is True else "pid_probe_error"
+                    ),
+                }
+            )
+            return ident
         if ident.get("lstart"):
             return ident
         if attempt < 19:
             time.sleep(0.1)
+    if ident is not None:
+        ident.update(
+            {
+                "identity_available": False,
+                "identity_probe_error": True,
+                "identity_source": "ps_identity_incomplete",
+            }
+        )
     return ident
 
 
@@ -248,6 +287,11 @@ def compare_process_identities(
     """Pure worker identity comparison shared by verdict and reap paths."""
     if current_identity is None:
         return False, "dead"
+    if current_identity.get("identity_probe_error"):
+        # A failed probe is absence of evidence. Keep boolean consumers on the
+        # conservative maybe-live side while carrying the explicit reason to
+        # classifiers that implement bounded indeterminate handling.
+        return True, "identity_indeterminate"
     if expected_identity:
         if expected_identity.get("pid") and int(expected_identity["pid"]) != int(pid):
             return False, "identity_pid_mismatch"
@@ -294,6 +338,8 @@ def compare_fine_process_identities(
     """Require the fine start token before authorizing a destructive action."""
     if current_identity is None:
         return False, "dead"
+    if current_identity.get("identity_probe_error"):
+        return False, "identity_indeterminate"
     if not expected_identity:
         return False, "identity_indeterminate"
     if not expected_identity.get("start_token") or not current_identity.get(
@@ -335,6 +381,8 @@ def identity_matches(record: dict) -> tuple[bool, str]:
     ):
         return True, "identity_indeterminate"
     matched, reason = compare_process_identities(int(pid), prior, current)
+    if reason == "identity_indeterminate":
+        return matched, reason
     if matched:
         return True, "live"
     return False, reason
@@ -352,14 +400,14 @@ def classify(record: dict) -> str:
     state = record.get("state", "running")
     if _is_detached_controller_dead_record(record):
         ok, reason = identity_matches(record)
+        if reason == "identity_indeterminate":
+            return "identity_indeterminate"
         if ok:
             return "expected_live"
         if reason == "dead":
             return "worker_dead"
         if reason == "no_pid":
             return "unknown_no_pid"
-        if reason == "identity_indeterminate":
-            return "identity_indeterminate"
         return f"stale_{reason}"
     if goalflight_dispatch_states.is_terminal_state(state):
         return state
@@ -369,16 +417,14 @@ def classify(record: dict) -> str:
         # expected phase of dispatch (bounded by the capacity-wait deadline).
         return "queued_capacity"
     ok, reason = identity_matches(record)
+    if reason == "identity_indeterminate":
+        return "identity_indeterminate"
     if ok:
         return "expected_live"
     if state == "watcher_stopped":
-        if reason == "identity_indeterminate":
-            return "identity_indeterminate"
         return "watcher_stopped"
     if reason == "no_pid":
         return "unknown_no_pid"
-    if reason == "identity_indeterminate":
-        return "identity_indeterminate"
     return f"stale_{reason}"
 
 

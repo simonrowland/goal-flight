@@ -558,6 +558,61 @@ def _process_group_liveness(pgid: object) -> bool | None:
         return None
 
 
+def _indeterminate_retention_open(
+    lease: dict,
+    *,
+    now: dt.datetime | None = None,
+) -> bool:
+    """True while an unprobeable holder is still inside the 7200s window.
+
+    Simplest correct bound (vs stamping indeterminate-since on first sight):
+    ``prune_state`` also feeds the non-persisted status VIEW, so a first-seen
+    stamp would reset on every poll and never elapse. Reuse the watcher stamp
+    ``accounted_live_until`` when ``retain_indeterminate_live_lease`` already
+    wrote it; otherwise derive the same window from ``expires_at`` (or
+    ``started_at``) plus ``INDETERMINATE_LIVE_RETENTION_S``. Those clocks are
+    already durable. A probe that cannot decide must not confer indefinite
+    protection; with no clock at all the hold is refused rather than infinite.
+    """
+    until = parse_iso(lease.get("accounted_live_until"))
+    if until is None:
+        origin = parse_iso(lease.get("expires_at")) or parse_iso(
+            lease.get("started_at")
+        )
+        if origin is None:
+            return False
+        until = origin + dt.timedelta(seconds=float(INDETERMINATE_LIVE_RETENTION_S))
+    return (now or utc_now()) < until
+
+
+def _probe_pid_liveness(pid: object) -> bool | None:
+    """Tri-state pid probe for reclaim. Missing/invalid pid is confirmed dead."""
+    if not pid:
+        return False
+    return goalflight_compat.pid_liveness(pid)
+
+
+def _pid_holds_capacity(
+    pid: object,
+    lease: dict,
+    *,
+    now: dt.datetime | None = None,
+) -> bool:
+    """Whether this pid still protects the lease against reclaim.
+
+    Confirmed live holds until death (boolean ``pid_alive`` stays conservative
+    for kill/reap). Confirmed dead does not hold. Indeterminate holds only
+    inside ``INDETERMINATE_LIVE_RETENTION_S`` so EPERM/foreign-pid reuse cannot
+    park a slot for that process's lifetime.
+    """
+    live = _probe_pid_liveness(pid)
+    if live is True:
+        return True
+    if live is False:
+        return False
+    return _indeterminate_retention_open(lease, now=now)
+
+
 def retained_live_scope_holds_capacity(
     lease: dict,
     *,
@@ -565,16 +620,22 @@ def retained_live_scope_holds_capacity(
 ) -> bool:
     """Keep an unresolved worker scope accounted until death is confirmed.
 
-    ``accounted_live_until`` is a reap/recheck horizon, not permission to stop
-    accounting. A live or unprobeable group remains capacity-bearing after it;
-    only a negative process-group liveness probe releases the retained scope.
+    A confirmed-live group remains capacity-bearing after ``accounted_live_until``
+    (that stamp is still a recheck horizon while we can see the group). An
+    unprobeable group cannot use the horizon as infinite protection: the same
+    7200s constant becomes a reclaim deadline. Only a negative process-group
+    probe, or an elapsed indeterminate window, releases the retained scope.
     """
     if lease.get("reason") != INDETERMINATE_LIVE_REASON:
         return False
-    del now  # retained for call compatibility and deterministic older tests
     # A historical PGID is never signaled here; reuse can delay capacity, not
-    # hurt a process. Unknown is conservative because release requires proof.
-    return _process_group_liveness(lease.get("accounted_live_pgid")) is not False
+    # hurt a process. Confirmed-live still wins over an elapsed stamp.
+    group_alive = _process_group_liveness(lease.get("accounted_live_pgid"))
+    if group_alive is True:
+        return True
+    if group_alive is False:
+        return False
+    return _indeterminate_retention_open(lease, now=now)
 
 
 def retain_indeterminate_live_lease(
@@ -610,12 +671,14 @@ def attached_worker_group_holds_capacity(lease: dict) -> bool:
     """Keep an attached worker accounted until its full group is confirmed gone."""
     if not lease.get("worker_pgid"):
         return False
-    # Unknown is the third state: it retains capacity. A deadline or a dead
-    # group leader is not proof that descendants have left the recorded group.
+    # Confirmed-live group: hold (descendants may outlive a dead leader).
+    # Unprobeable group: the same 7200s bound as pid reclaim, not infinite.
     group_alive = _process_group_liveness(lease.get("worker_pgid"))
-    if group_alive is not False:
+    if group_alive is True:
         return True
-    return pid_alive(lease.get("worker_pid"))
+    if group_alive is None:
+        return _indeterminate_retention_open(lease)
+    return _pid_holds_capacity(lease.get("worker_pid"), lease)
 
 
 def _lease_pids_dead(lease: dict) -> bool:
@@ -625,6 +688,9 @@ def _lease_pids_dead(lease: dict) -> bool:
     one with a live pid is still consuming RAM and must not be evicted by a
     clock-only TTL check (capacity.json is shared across sibling projects, so a
     TTL eviction here would over-subscribe the machine while the lease is LIVE).
+    An indeterminate probe is not treated as dead immediately (that reclaims a
+    live worker on EPERM) and not as live forever (that parks the slot for a
+    foreign pid's lifetime). Consult pid_liveness; None is bounded.
     """
     if (
         retained_live_scope_holds_capacity(lease)
@@ -634,9 +700,9 @@ def _lease_pids_dead(lease: dict) -> bool:
     worker_pid = lease.get("worker_pid")
     claimant_pid = lease.get("claimant_pid") if worker_pid is None else None
     return (
-        not pid_alive(worker_pid)
-        and not pid_alive(lease.get("controller_pid"))
-        and not pid_alive(claimant_pid)
+        not _pid_holds_capacity(worker_pid, lease)
+        and not _pid_holds_capacity(lease.get("controller_pid"), lease)
+        and not _pid_holds_capacity(claimant_pid, lease)
     )
 
 
@@ -1100,6 +1166,11 @@ def cmd_cooldown(args: argparse.Namespace) -> int:
     return 0
 
 
+def pid_liveness(pid: int | None) -> bool | None:
+    """Tri-state wrapper used by reclaim; missing pid is confirmed dead."""
+    return _probe_pid_liveness(pid)
+
+
 def pid_alive(pid: int | None) -> bool:
     if not pid:
         return False
@@ -1120,11 +1191,14 @@ def stale_active_leases(data: dict) -> list[dict]:
                     continue
                 stale.append(lease)
                 continue
-            if pid_alive(worker_pid):
+            if _pid_holds_capacity(worker_pid, lease):
                 continue
             stale.append(lease)
             continue
-        if not pid_alive(controller_pid) and not pid_alive(lease.get("claimant_pid")):
+        if (
+            not _pid_holds_capacity(controller_pid, lease)
+            and not _pid_holds_capacity(lease.get("claimant_pid"), lease)
+        ):
             stale.append(lease)
     return stale
 
