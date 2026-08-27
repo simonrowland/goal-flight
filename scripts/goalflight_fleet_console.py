@@ -933,7 +933,38 @@ def _authority_snapshot(
             }
         if detail:
             detail += "; reconciled by journal authority"
+        hold = record.get("sidecar_hold")
+        if (
+            hold in {"live", "unknown"}
+            and not goalflight_dispatch_states.is_terminal_state(journal_value)
+        ):
+            hold_label = f"held: {hold}"
+            hold_reason = record.get("sidecar_hold_reason")
+            hold_text = (
+                f"{hold_label} ({hold_reason})" if hold_reason else hold_label
+            )
+            resolution = hold_label
+            detail = f"{detail}; {hold_text}" if detail else hold_text
         return verdict, detail, resolution
+
+    hold = record.get("sidecar_hold")
+    if hold in {"live", "unknown"}:
+        hold_label = f"held: {hold}"
+        hold_reason = record.get("sidecar_hold_reason")
+        hold_text = f"{hold_label} ({hold_reason})" if hold_reason else hold_label
+        if detail:
+            detail += f"; {hold_text}"
+        else:
+            detail = hold_text
+        return (
+            {
+                "display_state": "running",
+                "is_terminal": False,
+                "classification_conflict": False,
+            },
+            detail,
+            hold_label,
+        )
 
     # A status sidecar is structurally newer only when both sources carry an
     # observation time and the sidecar's is later. Otherwise disagreement is
