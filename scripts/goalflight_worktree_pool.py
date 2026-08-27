@@ -14,7 +14,22 @@ from typing import TextIO
 
 WORKTREE_SEATS_ENV = "GOALFLIGHT_WORKTREE_SEATS"
 WORKTREE_LOCK_FD_ENV = "GOALFLIGHT_WORKTREE_LOCK_FD"
-DEFAULT_WORKTREE_SEATS = 4
+# Seats bound how many worktrees EXIST, not how much work may run: seats are
+# reused, so N seats sustains N CONCURRENT workers per project indefinitely
+# rather than N total dispatches. 4 was therefore acting as a de-facto
+# per-controller worker cap, which was never intended -- several controllers
+# share one project root (battery-tool-v2 currently has five), so four seats
+# starved the whole project between them.
+#
+# Derivation. The binding constraints are RAM and the machine concurrency cap,
+# not disk: a seat is one git worktree, and the checkout is ~40MB here, so 24
+# seats is under 1GB per project. The machine cap is 120 concurrent workers
+# across ~5 active projects, i.e. ~24 per project if every project ran flat out
+# simultaneously -- which is the number that stops seats from binding before
+# the real capacity gate does. Sanity check: today's busiest project ran ~12
+# concurrent workers, so 24 leaves 2x headroom and still cannot, by itself,
+# reach the 120 machine cap.
+DEFAULT_WORKTREE_SEATS = 24
 WORKTREE_SEAT_PREFIX = "wt-"
 QUARANTINE_REF_PREFIX = "goalflight/quarantine"
 

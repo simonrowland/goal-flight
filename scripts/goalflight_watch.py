@@ -1526,8 +1526,27 @@ def _token_looks_like_dispatch_id(token: str) -> bool:
     return "-" in token and bool(_DISPATCH_ID_SHAPE_RE.fullmatch(token))
 
 
+def _token_is_known_dispatch_id(token: str) -> bool:
+    """True when *token* names a dispatch id with a run-ledger record.
+
+    This turns "names a foreign dispatch" into a lookup, not a guess: a
+    token with no ledger record (``read-only``, ``utf-8``,
+    ``t999-never-ran``) is prose and the marker BINDS. The asymmetry is
+    deliberate — the rule fails toward binding. A lost escalation parks a
+    worker until timeout; an extra wake costs one status read. Any ledger
+    failure (state dir unresolvable, record raced away mid-stat) therefore
+    returns False; an unreadable ledger must never classify every
+    hyphenated token as foreign. Do not "balance" this into a symmetric
+    check: the expensive direction is the dropped escalation.
+    """
+    try:
+        return goalflight_ledger.record_path(token, create=False).is_file()
+    except (OSError, RuntimeError):
+        return False
+
+
 def _attention_payload_names_foreign_dispatch(text: str, expected: str) -> bool:
-    """True when an attention payload names a different dispatch.
+    """True when an attention payload names a different KNOWN dispatch.
 
     Production workers are instructed to emit
     ``<KIND>: <dispatch-id> — <summary>`` (the identity contract injected by
@@ -1539,7 +1558,8 @@ def _attention_payload_names_foreign_dispatch(text: str, expected: str) -> bool:
     a word" cannot be a charset check alone. ``BLOCKED: foreign package
     unavailable`` and ``BLOCKED: cannot write sandbox path`` start with
     tokens that match the journal identity charset. This helper therefore
-    fails toward binding (returns False, meaning "not foreign") unless both:
+    fails toward binding (returns False, meaning "not foreign") unless ALL
+    of:
 
     1. The leading token looks like a dispatch id — journal identity charset
        AND at least one hyphen. Unhyphenated tokens are treated as prose even
@@ -1550,6 +1570,10 @@ def _attention_payload_names_foreign_dispatch(text: str, expected: str) -> bool:
        bind. Id-only payloads (``BLOCKED: file-not-found`` vs
        ``BLOCKED: other-live-id``) are syntactically identical, so they also
        fail toward binding rather than drop a hyphenated one-word escalation.
+    3. The token names a KNOWN dispatch id — ``_token_is_known_dispatch_id``
+       finds its ledger record. A hyphenated technical term abutting the
+       dash (``BLOCKED: read-only — cannot write``) has no record, is
+       prose, and BINDS. Stopping at (2) dropped exactly those escalations.
 
     A lost escalation parks a worker until timeout; an extra wake costs one
     status read. Prefer the extra wake.
@@ -1558,7 +1582,9 @@ def _attention_payload_names_foreign_dispatch(text: str, expected: str) -> bool:
     if not token or token == expected or not _token_looks_like_dispatch_id(token):
         return False
     stripped = remainder.lstrip(" \t")
-    return stripped[:1] in {"\N{EM DASH}", "\N{EN DASH}"}
+    if stripped[:1] not in {"\N{EM DASH}", "\N{EN DASH}"}:
+        return False
+    return _token_is_known_dispatch_id(token)
 
 
 def _terminal_marker_matches_dispatch(

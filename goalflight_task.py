@@ -3709,13 +3709,67 @@ def _split_csv(values: list[str] | None) -> list[str]:
     return out
 
 
-def _create_item(store: TaskStore, args: argparse.Namespace, actor: str) -> str:
-    """Reserve an id and append a new item from args. Shared by `new` and `capture`."""
+def _capture_content_key(kind: str, lane: str, severity: Any, project_root: Path, title: str) -> str:
+    """Content identity of one `capture` invocation, for idempotent minting.
+
+    Derivation — what the hash is over, and why:
+    - ``_norm_key(title)``: the captured text IS the identity. Normalized
+      (case/whitespace-folded) so a retry typed with trivially different
+      spacing still resolves to the item the first attempt minted.
+    - ``kind``: ``capture "X"`` (task) and ``capture "X" --severity P2`` (bug)
+      file different items; collapsing them would report a task id for a bug
+      filing.
+    - ``severity``: two bug captures of the same text at P1 vs P2 assert
+      different things about the same finding; neither is a retry of the other.
+    - ``lane``: the same text filed into different lanes is a different
+      placement decision, made explicit by the caller.
+    - ``project_root``: constant within one store (the store is per project
+      root), so it changes no collision behavior here; it keeps the key
+      self-describing and the collision scope explicit if stores ever merge.
+
+    Excluded, deliberately:
+    - any timestamp, actor, or attempt counter: differs between the original
+      attempt and its retry, which would defeat the entire mechanism.
+    - ``source`` (raw cwd): a retry run from another directory of the SAME
+      project would double-mint — the exact ambiguous-retry failure this key
+      exists to remove. The item keeps the raw ``source`` for provenance.
+    - tags/links/blocked_by/acceptance/prompt/pattern: annotations of a filing,
+      not its identity; a retry carries them identically, so hashing them adds
+      no protection and would only fork one finding into two items.
+    - ``id_family``: id shape, not content.
+    """
+    return f"capture:{_short_hash([kind, lane, severity or '', str(project_root), _norm_key(title)])}"
+
+
+def _create_item(
+    store: TaskStore,
+    args: argparse.Namespace,
+    actor: str,
+    *,
+    capture_key: str | None = None,
+) -> tuple[str, bool]:
+    """Reserve an id and append a new item from args. Shared by `new` and `capture`.
+
+    Returns ``(item_id, minted)``. With ``capture_key`` the mint is
+    content-idempotent: a live (not ``done``) item already carrying the same
+    key is proof this exact capture already landed, so the call writes NOTHING
+    and returns ``(existing_id, False)`` — the ambiguous-timeout retry learns
+    the mint succeeded instead of double-minting. The check runs under the
+    store lock so a concurrent duplicate cannot slip between check and append,
+    and the id is reserved only on the mint path so retries do not burn
+    sequence numbers. Lock order store→seq matches `_cmd_import`.
+
+    Collision scope is the whole live store with NO time window: a window
+    would reintroduce the very ambiguity this removes (a retry after the
+    window double-mints invisibly). The deliberate-duplicate escape is
+    ``--allow-duplicate`` (skips the check; the new item still carries the
+    key). A ``done`` item no longer matches: a finding that recurs after
+    resolution must file fresh, not point at the closed item.
+    """
     _validate_lane_arg(args.lane)
     family = args.id_family or FAMILY_PREFIX_BY_KIND[args.kind]
-    item_id = store.reserve_id(family)
 
-    def update(items: list[dict[str, Any]]) -> str:
+    def append_item(items: list[dict[str, Any]], item_id: str) -> str:
         if any(item.get("id") == item_id for item in items):
             raise TaskError(f"{store.tasks_path}: id {item_id} already exists; .task-seq is stale")
         item = _make_item(
@@ -3732,14 +3786,33 @@ def _create_item(store: TaskStore, args: argparse.Namespace, actor: str) -> str:
             value = getattr(args, key, None)
             if value not in (None, "", [], {}):
                 item[key] = value
+        if capture_key is not None:
+            item["capture_key"] = capture_key
         items.append(item)
         return item_id
 
-    return store.mutate_items(update)
+    if capture_key is None:
+        # Reserve BEFORE the mutation: seq-file guards (non-regular .task-seq,
+        # stale counters) must fire before the mutation's store validation.
+        item_id = store.reserve_id(family)
+        return store.mutate_items(lambda items: append_item(items, item_id)), True
+
+    store._ensure_store_ready()
+    with store.store_lock():
+        store._recover_interrupted_publish_locked()
+        store._snapshot_last_good(require_valid=True)
+        items = store.load_items(recover_publish=False)
+        if not getattr(args, "allow_duplicate", False):
+            for item in items:
+                if not item.get("done") and item.get("capture_key") == capture_key:
+                    return str(item["id"]), False
+        item_id = append_item(items, store.reserve_id(family))
+        store.save_items_atomic(items)
+        return item_id, True
 
 
 def _cmd_new(store: TaskStore, args: argparse.Namespace) -> int:
-    created = _create_item(store, args, _actor(args))
+    created, _minted = _create_item(store, args, _actor(args))
     if args.json:
         print(json.dumps({"id": created}, sort_keys=True))
     else:
@@ -3756,16 +3829,28 @@ def _cmd_capture(store: TaskStore, args: argparse.Namespace) -> int:
         args.lane = "deferred"
     if not getattr(args, "source", None):
         args.source = os.getcwd()
-    created = _create_item(store, args, _actor(args))
+    # Content-hash idempotence (see _capture_content_key): a retry after an
+    # ambiguous timeout/crash collides with the landed mint, exits 0, and
+    # reports the EXISTING id — the caller learns the capture already landed
+    # instead of minting a duplicate it then cannot distinguish.
+    capture_key = _capture_content_key(args.kind, args.lane, getattr(args, "severity", None), store.project_root, args.title)
+    created, minted = _create_item(store, args, _actor(args), capture_key=capture_key)
     if args.json:
-        print(json.dumps({"id": created}, sort_keys=True))
+        print(json.dumps({"id": created, "already_captured": not minted}, sort_keys=True))
     else:
         print(created)
     # One next-step hint to STDERR (keeps stdout / `--json | jq` clean; never an interrupt).
-    print(
-        f"captured {created} ({args.lane}). promote: python3 goalflight_task.py lane {created} <name>",
-        file=sys.stderr,
-    )
+    if minted:
+        print(
+            f"captured {created} ({args.lane}). promote: python3 goalflight_task.py lane {created} <name>",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"already captured as {created} ({args.lane}); not re-minted. "
+            "use --allow-duplicate to file the same text as a new item",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -5210,6 +5295,12 @@ def build_parser() -> argparse.ArgumentParser:
     capture.add_argument("--pattern")
     capture.add_argument("--severity")
     capture.add_argument("--source", help="Default: the current working directory.")
+    capture.add_argument(
+        "--allow-duplicate",
+        action="store_true",
+        help="Mint a new item even when an identical live capture exists. Default: a repeat of the "
+        "same text/kind/lane/severity reports the existing id and exits 0 (idempotent retry).",
+    )
     capture.add_argument("--json", action="store_true")
     capture.set_defaults(func=_cmd_capture)
 
