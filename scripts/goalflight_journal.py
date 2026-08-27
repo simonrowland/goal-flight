@@ -811,6 +811,24 @@ def journal_write_lock_path(journal_path: Path) -> Path:
     return journal_path.with_name(f".{journal_path.name}.write.lock")
 
 
+def _lstat_presence(path: Path) -> str:
+    """Return ``present`` / ``absent`` / ``unknown``. Never ``lexists`` here.
+
+    ``os.path.lexists`` is ``lstat`` wrapped in ``except (OSError, ValueError):
+    return False``, so it answers False for both "not there" and "I could not
+    look". Only FileNotFoundError is evidence of absence; any other OSError
+    means presence could not be verified. Same contract as journal_gc's
+    ``_presence``.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unknown"
+    return "present"
+
+
 def _is_busy(exc: BaseException) -> bool:
     return isinstance(exc, sqlite3.OperationalError) and any(
         marker in str(exc).lower() for marker in ("locked", "busy")
@@ -1128,11 +1146,20 @@ class Journal:
         return write_lock, deadline
 
     def _require_existing_database(self) -> None:
-        if not os.path.lexists(self.path):
+        presence = _lstat_presence(self.path)
+        if presence == "absent":
             raise JournalDisappeared(
                 f"journal database is absent: {self.path}. Failing closed because streams "
                 "cannot rebuild journal authority. Restore a validated WAL-safe backup; "
                 "use the init verb only for an intentional first bootstrap."
+            )
+        if presence == "unknown":
+            # Unreadable is not absent: disappearance is unverified, and the
+            # callers' unknown handling (probe "unreadable", roster error,
+            # controller_indeterminate) keeps every gate shut.
+            raise JournalIOError(
+                f"journal path presence is unreadable, so disappearance is unverified: "
+                f"{self.path}"
             )
         if self.path.is_symlink():
             raise JournalIntegrityError(
@@ -1213,7 +1240,7 @@ class Journal:
                     )
             except (JournalDisappeared, JournalIOError) as exc:
                 open_failures += 1
-                self._raise_disappeared_if_absent(exc)
+                self._raise_disappeared_or_unverified(exc)
                 if self._open_retry_delay(open_started, open_failures):
                     continue
                 raise self._open_io_failure(open_started, open_failures, exc) from exc
@@ -1234,7 +1261,7 @@ class Journal:
                     self._raise_integrity_failure(f"journal reader parse failed: {exc}")
                 if _is_cantopen(exc):
                     open_failures += 1
-                    self._raise_disappeared_if_absent(exc)
+                    self._raise_disappeared_or_unverified(exc)
                     if self._open_retry_delay(open_started, open_failures):
                         continue
                     raise self._open_io_failure(open_started, open_failures, exc) from exc
@@ -1258,13 +1285,13 @@ class Journal:
                 if not _is_busy(exc):
                     if _is_cantopen(exc):
                         open_failures += 1
-                        self._raise_disappeared_if_absent(exc)
+                        self._raise_disappeared_or_unverified(exc)
                         if self._open_retry_delay(open_started, open_failures):
                             continue
                         raise self._open_io_failure(
                             open_started, open_failures, exc
                         ) from exc
-                    self._raise_disappeared_if_absent(exc)
+                    self._raise_disappeared_or_unverified(exc)
                     if self._read_only_client:
                         raise JournalIOError(
                             f"journal readonly probe unavailable/unreadable for {self.path}: "
@@ -1983,10 +2010,23 @@ class Journal:
             time.sleep(delay)
         return time.monotonic() < deadline
 
-    def _raise_disappeared_if_absent(self, cause: BaseException) -> None:
-        if not os.path.lexists(self.path):
+    def _raise_disappeared_or_unverified(self, cause: BaseException) -> None:
+        """Reclassify a low-level open/read failure by path presence.
+
+        Present: return, so the caller keeps its own retry/IO-failure path.
+        Genuinely absent: JournalDisappeared. Unverifiable (unreadable):
+        JournalIOError — an unreadable path is not absence, and the IO
+        verdict is what the caller's budget-exhausted path would raise anyway.
+        """
+        presence = _lstat_presence(self.path)
+        if presence == "absent":
             raise JournalDisappeared(
                 f"journal database vanished without creating a replacement: {self.path}"
+            ) from cause
+        if presence == "unknown":
+            raise JournalIOError(
+                f"journal path is unreadable after a failure, so disappearance is "
+                f"unverified: {self.path}"
             ) from cause
 
     def _open_retry_delay(self, started: float, failures: int) -> bool:
@@ -2131,7 +2171,7 @@ class Journal:
                 raise
             except sqlite3.OperationalError as exc:
                 if not _is_busy(exc):
-                    self._raise_disappeared_if_absent(exc)
+                    self._raise_disappeared_or_unverified(exc)
                     raise
                 if self._retry_delay(started, deadline_s=deadline):
                     continue
@@ -5165,7 +5205,15 @@ def open_or_create_journal(
 ) -> Journal:
     """Open authority, explicitly bootstrapping only a truly absent path."""
     path = resolve_journal_path(project_root)
-    if os.path.lexists(path):
+    presence = _lstat_presence(path)
+    if presence == "unknown":
+        # An unreadable present path must not fall through to create: the
+        # bootstrap attempt would fail (or worse, partially claim) against a
+        # database that may be live.
+        raise JournalIOError(
+            f"journal path presence is unreadable, so absence is unverified: {path}"
+        )
+    if presence == "present":
         return Journal(project_root, allow_migration=allow_migration)
     try:
         return Journal.create(project_root)
@@ -5173,9 +5221,15 @@ def open_or_create_journal(
         # Availability failures are not a create race. Preserve their concrete
         # operator verdict instead of retrying them merely because a path exists.
         raise
-    except JournalError:
-        if not os.path.lexists(path):
+    except JournalError as exc:
+        presence = _lstat_presence(path)
+        if presence == "absent":
             raise
+        if presence == "unknown":
+            raise JournalIOError(
+                f"journal create failed and the path is unreadable, so absence is "
+                f"unverified: {path}"
+            ) from exc
         return Journal(project_root, allow_migration=allow_migration)
 
 
