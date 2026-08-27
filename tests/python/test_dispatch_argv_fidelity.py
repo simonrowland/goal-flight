@@ -611,7 +611,7 @@ def test_preserve_class_flags_survive_original_argv_replay(tmp_path: Path) -> No
         "--no-drain-on-submit",
     ]
     dummies = {
-        "--cwd": "/tmp/class-cwd",
+        "--cwd": str(tmp_path),
         "--os-sandbox": "off",
         "--model": "gpt-test",
         "--priority": "bulk",

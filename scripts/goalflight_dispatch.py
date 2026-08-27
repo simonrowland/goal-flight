@@ -13477,6 +13477,25 @@ _SUBCOMMAND_HELP: tuple[tuple[str, str], ...] = (
 )
 
 
+def _existing_cwd_arg(value: str) -> str:
+    """--cwd must name a real directory at argument-parse time (t-349).
+
+    A nonexistent --cwd used to flow into resolve_project_root, whose
+    not-a-checkout fallback renders the path as its own project root. The
+    dispatch then landed on an empty controller registry and refused with
+    "controller is not registered", recommending --unregistered-forced -- an
+    operator following that advice launched an unowned dispatch into a phantom
+    project root for what was actually a path typo (t337-w3/w4/w5). Refusing
+    here fires before any registry lookup, so that advice is never reached.
+    """
+    expanded = Path(str(value)).expanduser()
+    if not expanded.exists():
+        raise argparse.ArgumentTypeError(f"cwd does not exist: {value}")
+    if not expanded.is_dir():
+        raise argparse.ArgumentTypeError(f"cwd is not a directory: {value}")
+    return value
+
+
 def _build_launch_parser() -> argparse.ArgumentParser:
     parser = _TerseArgumentParser(
         description=(
@@ -13505,7 +13524,7 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         default=[],
         help="Comma-separated linked task/bug ids (t-/b-). May be repeated.",
     )
-    parser.add_argument("--cwd", help="Worker working directory")
+    parser.add_argument("--cwd", type=_existing_cwd_arg, help="Worker working directory")
     parser.add_argument("--model", default=None,
                         help="Worker model id (grok-code/grok-research/moonshot/codex --model passthrough). "
                              "Default = agent label's own default.")
