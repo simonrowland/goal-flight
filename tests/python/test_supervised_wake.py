@@ -270,6 +270,53 @@ class FakeHost:
             child.alive = False
 
 
+@dataclass
+class RealCrashHost(FakeHost):
+    """Execute slot commands for real; schedule the observed exit on the virtual clock.
+
+    Wall-clock duration is used as ``ran_s`` unless ``force_ran_s`` injects one,
+    so a fast-crash test does not sleep the backoff curve and a long-run test
+    does not wait 30s.
+    """
+
+    force_ran_s: float | None = None
+
+    def spawn(self, kind: str, command: str) -> FakeChild:
+        self.spawns.append((kind, command))
+        started_wall = time.monotonic()
+        proc = subprocess.run(
+            shlex.split(command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+        wall_ran = max(0.0, time.monotonic() - started_wall)
+        ran_s = wall_ran if self.force_ran_s is None else float(self.force_ran_s)
+        pid = self.next_pid
+        self.next_pid += 1
+        stderr = (proc.stderr or b"").decode("utf-8", "replace")
+        child = FakeChild(
+            name=f"{kind}:{pid}",
+            kind=kind,
+            command=command,
+            pid=pid,
+            started_at=self.now,
+            exit_at=self.now + ran_s,
+            returncode=int(proc.returncode),
+            output=stderr,
+            armed=False,
+            will_arm=True,
+            stdout_lines=[],
+        )
+        self.children.append(child)
+        if (
+            self.stop_after_spawns is not None
+            and len(self.spawns) >= self.stop_after_spawns
+        ):
+            self.stop = True
+        return child
+
+
 def _items(*kinds: str) -> list[tuple[str, str]]:
     return [(kind, f"cmd-{kind}-{index}") for index, kind in enumerate(kinds)]
 
@@ -1294,12 +1341,32 @@ def test_batched_heartbeat_frontier_pairs_keep_their_own_state() -> None:
     assert [record["payload"]["id"] for record in actionable] == ["t-one", "t-two"]
 
 
+def _fast_failure_backoff_curve(failures: int) -> list[float]:
+    current = 0.0
+    delays: list[float] = []
+    for _ in range(failures):
+        current = supervise.next_backoff(
+            current, ran_s=0.05, action=supervise.ACTION_BACKOFF
+        )
+        delays.append(current)
+    return delays
+
+
 def test_backoff_resets_after_long_lived_and_escalates_after_fast_failure() -> None:
-    assert supervise.next_backoff(0.0, ran_s=0.1, action=supervise.ACTION_BACKOFF) == 1.0
-    assert supervise.next_backoff(1.0, ran_s=0.1, action=supervise.ACTION_BACKOFF) == 2.0
-    assert supervise.next_backoff(64.0, ran_s=0.1, action=supervise.ACTION_BACKOFF) == 120.0
+    assert _fast_failure_backoff_curve(9) == [
+        1.0,
+        2.0,
+        4.0,
+        8.0,
+        16.0,
+        32.0,
+        64.0,
+        120.0,
+        120.0,
+    ]
     assert supervise.next_backoff(64.0, ran_s=30.0, action=supervise.ACTION_BACKOFF) == 1.0
     assert supervise.next_backoff(8.0, ran_s=0.2, action=supervise.ACTION_REARM) == 0.0
+    assert supervise.next_backoff(8.0, ran_s=0.2, action=supervise.ACTION_STOP) == 0.0
 
     host = FakeHost(
         scripts={
@@ -1323,6 +1390,146 @@ def test_backoff_resets_after_long_lived_and_escalates_after_fast_failure() -> N
     assert delays[0] == 1.0
     assert delays[1] == 2.0
     assert delays[2] == 1.0
+
+
+def test_repeat_gate_collapses_identical_keys_inside_the_floor() -> None:
+    """Same mechanism as kind=next: first copy emits, repeats wait for the floor."""
+    gate = supervise._RepeatGate()
+    assert gate.should_emit("k", now=0.0, floor_s=10.0) is True
+    assert gate.should_emit("k", now=1.0, floor_s=10.0) is False
+    assert gate.should_emit("k", now=9.9, floor_s=10.0) is False
+    assert gate.should_emit("k", now=10.0, floor_s=10.0) is True
+    assert gate.should_emit("other", now=10.1, floor_s=10.0) is True
+
+
+def test_real_fast_crash_escalates_backoff_and_caps(
+    tmp_path: Path,
+) -> None:
+    crash = _python_child("raise SystemExit(1)")
+    proved = subprocess.run(shlex.split(crash), capture_output=True, timeout=5)
+    assert proved.returncode == 1
+
+    failures = 9
+    host = RealCrashHost(stop_after_spawns=failures + 1)
+    _run(
+        host,
+        [("backup", crash)],
+        heartbeat_s=10_000.0,
+        coverage_s=10_000.0,
+        next_repeat_floor_s=0.0,
+    )
+    restarts = [record for record in _records(host) if record.get("type") == "restart"]
+    delays = [float(record["backoff_s"]) for record in restarts]
+    assert delays == _fast_failure_backoff_curve(failures)
+    assert delays[-1] == supervise.BACKOFF_CAP_S
+    assert all(record.get("reason") == "exit-1" for record in restarts)
+    assert all(record.get("exit") == 1 for record in restarts)
+    assert [kind for kind, _command in host.spawns] == ["backup"] * (failures + 1)
+
+
+def test_successful_run_resets_failure_backoff(tmp_path: Path) -> None:
+    counter = tmp_path / "runs"
+    counter.write_text("0")
+    script = tmp_path / "seq.py"
+    script.write_text(
+        "import pathlib, sys\n"
+        "p = pathlib.Path(sys.argv[1])\n"
+        "n = int(p.read_text() or '0')\n"
+        "p.write_text(str(n + 1))\n"
+        "sys.exit(0 if n == 1 else 1)\n"
+    )
+    command = shlex.join([sys.executable, str(script), str(counter)])
+    host = RealCrashHost(stop_after_spawns=4)
+    _run(
+        host,
+        [("backup", command)],
+        heartbeat_s=10_000.0,
+        coverage_s=10_000.0,
+    )
+    restarts = [record for record in _records(host) if record.get("type") == "restart"]
+    assert [int(record["exit"]) for record in restarts] == [1, 0, 1]
+    assert [record.get("reason") for record in restarts] == [
+        "exit-1",
+        "rang",
+        "exit-1",
+    ]
+    assert [float(record["backoff_s"]) for record in restarts] == [1.0, 0.0, 1.0]
+    # Four spawns: the last one trips stop_after_spawns and is not waited on.
+    assert counter.read_text() == "4"
+
+
+def test_long_running_exit_does_not_escalate_like_a_fast_crash() -> None:
+    crash = _python_child("raise SystemExit(1)")
+    host = RealCrashHost(
+        force_ran_s=supervise.LONG_LIVED_S + 1.0,
+        stop_after_spawns=4,
+    )
+    _run(
+        host,
+        [("backup", crash)],
+        heartbeat_s=10_000.0,
+        coverage_s=10_000.0,
+        next_repeat_floor_s=0.0,
+    )
+    restarts = [record for record in _records(host) if record.get("type") == "restart"]
+    delays = [float(record["backoff_s"]) for record in restarts]
+    assert delays == [1.0, 1.0, 1.0]
+    assert all(record.get("reason") == "exit-1" for record in restarts)
+
+
+def test_exit_0_rearms_at_zero_backoff() -> None:
+    success = _python_child("raise SystemExit(0)")
+    proved = subprocess.run(shlex.split(success), capture_output=True, timeout=5)
+    assert proved.returncode == 0
+    host = RealCrashHost(stop_after_spawns=3)
+    _run(
+        host,
+        [("backup", success)],
+        heartbeat_s=10_000.0,
+        coverage_s=10_000.0,
+        next_repeat_floor_s=0.0,
+    )
+    restarts = [record for record in _records(host) if record.get("type") == "restart"]
+    assert len(restarts) == 2
+    assert all(record.get("reason") == "rang" for record in restarts)
+    assert all(record.get("exit") == 0 for record in restarts)
+    assert all(float(record["backoff_s"]) == 0.0 for record in restarts)
+
+
+def test_identical_restart_records_are_collapsed_until_the_next_floor() -> None:
+    crash = _python_child("raise SystemExit(1)")
+    # 8 failures reach the cap; further cap restarts are verbatim-identical.
+    # Floor 200s is longer than one cap interval (120s) and shorter than two,
+    # so the first extra copy collapses and the copy after the floor emits.
+    failures_to_cap = 8
+    extra_at_cap = 3
+    failures = failures_to_cap + extra_at_cap
+    host = RealCrashHost(stop_after_spawns=failures + 1)
+    _run(
+        host,
+        [("backup", crash)],
+        heartbeat_s=10_000.0,
+        coverage_s=10_000.0,
+        next_repeat_floor_s=200.0,
+    )
+    restarts = [record for record in _records(host) if record.get("type") == "restart"]
+    delays = [float(record["backoff_s"]) for record in restarts]
+    assert delays == [
+        1.0,
+        2.0,
+        4.0,
+        8.0,
+        16.0,
+        32.0,
+        64.0,
+        120.0,
+        120.0,
+    ]
+    cap_records = [
+        record for record in restarts if float(record["backoff_s"]) == 120.0
+    ]
+    assert len(cap_records) == 2
+    assert extra_at_cap + 1 > len(cap_records)
 
 
 def test_dead_nonce_from_session_status_stops_before_respawn() -> None:

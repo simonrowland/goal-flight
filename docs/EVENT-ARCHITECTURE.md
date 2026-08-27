@@ -431,7 +431,10 @@ watchdog report `3/4`, not portable `1/4`.
 Unchanged frontiers have a 15-minute floor and changed frontiers emit on the next
 idle beat. Terse `supervise` then suppresses a verbatim-identical `kind=next`
 payload until that same floor; a content change still wakes immediately, and
-`--chatty` restores the raw keepalive and frontier feed. The host may batch
+`--chatty` restores the raw keepalive and frontier feed. Failure restarts
+escalate 1s → 2 → 4 … to 120s (reset on a successful or long-lived run; exit 0
+stays at zero delay) and reuse that floor so a crash loop does not emit the
+same `type=restart` line on every retry. The host may batch
 lines produced within 200 ms, so every line is an independently parseable JSON
 object and consumers enumerate all records in a batch.
 An event defers the next idle heartbeat, avoiding a contradictory event plus

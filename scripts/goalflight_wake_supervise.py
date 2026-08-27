@@ -8,7 +8,7 @@ child's stdout line-by-line, restarts deaths, and stops on a dead lease nonce.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import errno
 import json
 import math
@@ -37,6 +37,39 @@ ACTION_BACKOFF = "backoff"
 ACTION_STOP = "stop"
 SUPERVISE_STOP_EXIT = 3
 SUPERVISE_START_EXIT = 2
+# Failure-restart backoff. Exit 0 / rang stays at zero delay and is not
+# this curve.
+#
+# Premise: a persistent resource fault (disk full, journal I/O) does not
+# recover in one second. Three children restarting at 1 Hz is 180 attempts
+# per minute against the failing filesystem, plus 180 identical wake
+# records that drown real doorbells.
+#
+# Arithmetic: the first consecutive fast failure waits BACKOFF_INITIAL_S
+# (1s). Each further fast failure doubles: 1, 2, 4, 8, 16, 32, 64, then
+# the cap. Time to first cap from a crash loop:
+# 1+2+4+8+16+32+64 = 127s.
+#
+# Cap BACKOFF_CAP_S = 120s. The supervisor's job is to notice recovery
+# and re-arm, so the ceiling belongs in minutes, not hours. 120s matches
+# the stream child's keepalive, so a failed slot never retries slower
+# than a healthy stream proves liveness. The 3600s supervisor heartbeat
+# is a last-ditch peer probe, not a recovery SLA — waiting an hour to
+# retry would make the wake channel deaf. Sanity: three children at cap
+# restart 1.5 times per minute total, versus 180/min at a flat 1s.
+#
+# Fast vs long-run: ran_s < LONG_LIVED_S (30s) escalates; a child that
+# already ran 30s+ did useful work, so a later non-zero exit is one
+# incident, not a crash loop — reset to INITIAL. 30s is far above
+# spawn-and-die (tens of ms) and far below a healthy doorbell wait.
+# ACTION_REARM (including exit 0 / rang) resets to 0 so a recovered
+# child is immediately responsive and one transient failure does not
+# leave the slot slow.
+#
+# Give-up: not on generic failures. A silently-stopped listener is worse
+# than a quiet retry. Cap the delay and collapse identical restart
+# records instead. PERMANENT_UNARMED_FAULTS remains the slot-stop for
+# repeated never-armed exit-2, where that slot cannot work.
 BACKOFF_INITIAL_S = 1.0
 BACKOFF_CAP_S = 120.0
 LONG_LIVED_S = 30.0
@@ -344,7 +377,7 @@ def classify_child_exit(
 
 
 def next_backoff(current: float, *, ran_s: float, action: str) -> float:
-    """Reset after a long-lived child; escalate fast faults up to two minutes."""
+    """Exponential failure delay; zero for re-arm; reset after a long-lived run."""
     if action != ACTION_BACKOFF:
         return 0.0
     base = 0.0 if ran_s >= LONG_LIVED_S else max(0.0, float(current))
@@ -722,6 +755,47 @@ def _next_payload_key(record: dict[str, object]) -> str:
     return json.dumps(record.get("payload"), sort_keys=True, default=str)
 
 
+def _restart_record_key(record: dict[str, object]) -> str:
+    """Stable identity of a restart record, ignoring live/target churn."""
+    return json.dumps(
+        {
+            "backoff_s": record.get("backoff_s"),
+            "child": record.get("child"),
+            "exit": record.get("exit"),
+            "kind": record.get("kind"),
+            "reason": record.get("reason"),
+            "type": record.get("type"),
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+
+@dataclass
+class _RepeatGate:
+    """Emit the first copy of a key; suppress identical copies until floor_s.
+
+    kind=next uses this so an unchanged idle frontier does not wake the
+    controller every keepalive. Restart records reuse it so a crash loop
+    at a fixed backoff does not flood the same channel. One instance per
+    stream (next) or per child (restart); a changed key emits immediately.
+    """
+
+    last_key: str | None = None
+    last_at: float = field(default=-math.inf)
+
+    def should_emit(self, key: str, *, now: float, floor_s: float) -> bool:
+        if (
+            self.last_key is not None
+            and key == self.last_key
+            and now - self.last_at < floor_s
+        ):
+            return False
+        self.last_key = key
+        self.last_at = now
+        return True
+
+
 @dataclass
 class _ForwardingFrontierRead:
     done: threading.Event
@@ -1051,15 +1125,14 @@ def run_supervisor(
     pending_stream_frontier: dict[str, object] | None = None
     active_forwarding_read: _ForwardingFrontierRead | None = None
     pending_forwarding_read: _ForwardingFrontierRead | None = None
-    last_next_key: str | None = None
-    last_next_at = float("-inf")
+    next_gate = _RepeatGate()
+    restart_gates: dict[str, _RepeatGate] = {}
     repeat_floor_s = max(0.0, float(next_repeat_floor_s))
 
     def emit_pending_stream_wake(*, paired_frontier: bool = False) -> bool:
         nonlocal latest_frontier
         nonlocal pending_forwarding_read, pending_stream_frontier
         nonlocal pending_stream_heartbeat, pending_stream_heartbeat_due
-        nonlocal last_next_key, last_next_at
         if pending_stream_heartbeat is None:
             return True
         frontier = latest_frontier
@@ -1113,14 +1186,16 @@ def run_supervisor(
             latest_frontier = frontier
         record = _actionable_stream_wake(frontier)
         key = _next_payload_key(record)
-        if (
-            last_next_key is not None
-            and key == last_next_key
-            and host.now - last_next_at < repeat_floor_s
-        ):
+        if not next_gate.should_emit(key, now=host.now, floor_s=repeat_floor_s):
             return True
-        last_next_key = key
-        last_next_at = host.now
+        return _emit(host, record)
+
+    def emit_restart(record: dict[str, object]) -> bool:
+        child = str(record.get("child") or "")
+        gate = restart_gates.setdefault(child, _RepeatGate())
+        key = _restart_record_key(record)
+        if not gate.should_emit(key, now=host.now, floor_s=repeat_floor_s):
+            return True
         return _emit(host, record)
 
     while host.running():
@@ -1309,10 +1384,7 @@ def run_supervisor(
             }
             if emit_depth:
                 record.update(live=live, target=target)
-            if not _emit(
-                host,
-                record,
-            ):
+            if not emit_restart(record):
                 return stop_after_failed_write()
         coverage_ok, coverage_emitted = emit_coverage()
         if not coverage_ok:
