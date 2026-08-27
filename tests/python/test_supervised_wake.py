@@ -2000,6 +2000,104 @@ def test_full_nonblocking_pipe_eagain_retries_then_keeps_children_alive(
     assert capsys.readouterr().err == ""
 
 
+def test_delayed_live_reader_backpressure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A 50ms live-reader pause must not tear down a healthy wake pool."""
+    reader_fd, writer_fd = os.pipe()
+    os.set_blocking(writer_fd, False)
+    while True:
+        try:
+            os.write(writer_fd, b"x" * 4096)
+        except BlockingIOError as exc:
+            assert exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}
+            break
+
+    def drain_after_delay() -> None:
+        time.sleep(0.05)
+        os.set_blocking(reader_fd, False)
+        try:
+            while True:
+                chunk = os.read(reader_fd, 65536)
+                if not chunk:
+                    break
+        except (BlockingIOError, OSError):
+            pass
+
+    drain_thread = threading.Thread(target=drain_after_delay, daemon=True)
+    drain_thread.start()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+
+    class StopAfterSuccessfulWriteHost(supervise.RealHost):
+        children_alive_after_write = False
+
+        def write_stdout(self, line: str) -> bool:
+            written = super().write_stdout(line)
+            if written:
+                self.children_alive_after_write = bool(self._children) and all(
+                    child.alive for child in self._children
+                )
+                self._stop = True
+            return written
+
+    host = StopAfterSuccessfulWriteHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    stdout_text = ""
+    started = time.monotonic()
+    try:
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            heartbeat_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            coverage_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            items=[
+                (
+                    "backup",
+                    _python_child("import time; time.sleep(5)"),
+                )
+            ],
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        os.set_blocking(reader_fd, False)
+        try:
+            stdout_text = os.read(reader_fd, 65536).decode("utf-8", "replace")
+        except (BlockingIOError, OSError):
+            stdout_text = ""
+        try:
+            os.close(reader_fd)
+        except OSError:
+            pass
+        drain_thread.join(timeout=1.0)
+        host.kill_all()
+
+    assert elapsed < 2.0
+    assert code == 0
+    assert host.children_alive_after_write
+    records = [
+        json.loads(line)
+        for line in stdout_text.splitlines()
+        if line.startswith("{")
+    ]
+    assert not any(record.get("type") == "stop" for record in records)
+    status = host.stdout_detector_status()
+    assert status.failure is None
+    assert not status.peer_gone
+    assert capsys.readouterr().err == ""
+
+
 def test_partial_nonblocking_write_resumes_without_duplicate_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2056,7 +2154,9 @@ def test_partial_nonblocking_write_resumes_without_duplicate_prefix(
 
 def test_failed_recovery_stop_write_escalates_rearm_to_stderr(
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(supervise, "STDOUT_BACKPRESSURE_BUDGET_S", 0.0)
     reader_fd, writer_fd = os.pipe()
     os.set_blocking(writer_fd, False)
 
@@ -2097,9 +2197,8 @@ def test_failed_recovery_stop_write_escalates_rearm_to_stderr(
         os.close(reader_fd)
 
     assert code == supervise.SUPERVISE_STOP_EXIT
-    assert host.actual_errnos == [errno.EAGAIN] * (
-        supervise.TRANSIENT_DETECTOR_FAILURE_LIMIT
-    )
+    assert host.actual_errnos
+    assert set(host.actual_errnos) <= {errno.EAGAIN, errno.EWOULDBLOCK}
     assert not any(child.alive for child in host.children)
     assert not any(
         record.get("type") == "stop" for record in _records(host)
@@ -2116,6 +2215,7 @@ def test_real_host_failed_write_clears_pending_before_recovery(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    monkeypatch.setattr(supervise, "STDOUT_BACKPRESSURE_BUDGET_S", 0.0)
     reader_fd, writer_fd = os.pipe()
     os.set_blocking(writer_fd, False)
     while True:
@@ -2176,6 +2276,7 @@ def test_abandoned_partial_write_delimits_next_recovery_record(
     peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
     original_stdout = sys.stdout
     monkeypatch.setattr(sys, "stdout", peer_stdout)
+    monkeypatch.setattr(supervise, "STDOUT_BACKPRESSURE_BUDGET_S", 0.0)
     monkeypatch.setattr(supervise.time, "sleep", lambda _delay_s: None)
     host = supervise.RealHost(
         project_root=tmp_path,

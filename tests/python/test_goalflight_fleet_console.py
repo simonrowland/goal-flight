@@ -1114,11 +1114,9 @@ def _assert_controller_state(
                     item for item in attention["items"]
                     if item["kind"] == "controller_hung"
                 ]
-                expect_hung_item = (
-                    expected == "HUNG" and supervisor_mode != "running"
-                )
+                expect_hung_item = expected == "HUNG"
                 assert_true(
-                    "only unsupervised or indeterminate HUNG enters attention",
+                    "HUNG enters attention for every supervisor probe state",
                     len(hung_items) == (1 if expect_hung_item else 0),
                 )
                 if expected == "HUNG":
@@ -1128,8 +1126,26 @@ def _assert_controller_state(
                     )
                     if supervisor_mode == "running":
                         assert_true(
+                            "supervised HUNG keeps a supervisor-restart surface",
+                            bool(hung_items),
+                        )
+                        assert_true(
+                            "supervised HUNG action is the supervise restart",
+                            hung_items[0]["action"] == supervise_command,
+                        )
+                        assert_true(
                             "supervised HUNG suppresses controller-facing depth",
-                            not hung_items,
+                            listener_command not in str(hung_items[0]["action"]),
+                        )
+                        encoded_hung = json.dumps(hung_items[0], sort_keys=True)
+                        assert_true(
+                            "supervised HUNG does not emit a direct listener",
+                            listener_command not in encoded_hung,
+                        )
+                        headline = str(hung_items[0]["headline"])
+                        assert_true(
+                            "supervised HUNG names the unrepairable slot",
+                            "stopped slot" in headline or headline.endswith("..."),
                         )
                     elif supervisor_mode == "unknown":
                         assert_true(
