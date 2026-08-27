@@ -704,6 +704,7 @@ def _record_acp_ledger_state(
             "retryable": (refusal or {}).get("retryable"),
             "error": (refusal or {}).get("error"),
             "state": state,
+            "spawn_state": spawn_state,
             "detail": (
                 "worker process was spawned but the journal transition was "
                 "refused; bookkeeping is incomplete, the worker may be alive "
@@ -711,6 +712,7 @@ def _record_acp_ledger_state(
             ),
         }
         payload["ledger_record_warning"] = warning
+        payload["spawn_state"] = spawn_state
         print(
             "goalflight_acp_run: WARN: journal attempt transition refused for "
             f"{dispatch_id} after worker spawn (pid {worker_pid}): "

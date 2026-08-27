@@ -831,6 +831,7 @@ def main(argv: list[str] | None = None) -> int:
                 "retryable": (refusal or {}).get("retryable"),
                 "error": (refusal or {}).get("error"),
                 "state": state,
+                "spawn_state": spawn_state,
                 "detail": (
                     "worker process was spawned but the journal transition was "
                     "refused; bookkeeping is incomplete, the worker may be "
@@ -967,6 +968,7 @@ def main(argv: list[str] | None = None) -> int:
             # The review worker is alive; only the bookkeeping was refused.
             # Keep the refusal visible in the status file operators poll.
             payload["ledger_record_warning"] = ledger_record_warning
+            payload["spawn_state"] = ledger_record_warning.get("spawn_state")
         write_status(status_path, payload)
         monitor_payload = _monitor_process(
             proc=proc,

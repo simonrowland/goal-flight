@@ -5214,6 +5214,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
             "retryable": (refusal or {}).get("retryable"),
             "error": (refusal or {}).get("error"),
             "state": state,
+            "spawn_state": spawn_state,
             "detail": (
                 "worker process was spawned but the journal transition was "
                 "refused; bookkeeping is incomplete, the worker may be alive "
@@ -5231,6 +5232,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                     "dispatch_id": args.dispatch_id,
                     "worker_pid": worker_pid,
                     "worker_alive": worker_alive,
+                    "spawn_state": spawn_state,
                     "tail": str(tail),
                     "status_json": str(status_json),
                     "warning": warning,
@@ -5247,6 +5249,7 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                     **_prelaunch_status_metadata(args),
                     "worker_pid": worker_pid,
                     "worker_alive": worker_alive,
+                    "spawn_state": spawn_state,
                     "tail_path": str(tail),
                     "state": state,
                     "reason": "ledger_transition_refused",

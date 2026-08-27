@@ -281,7 +281,9 @@ def test_spawned_worker_genuine_refusal_writes_status_and_warns(
     assert status["state"] == "running"  # the worker, not the bookkeeping
     assert status["worker_pid"] == spawned_worker.pid
     assert status["worker_alive"] is True
+    assert status["spawn_state"] == "spawned"
     assert status["ledger_record_warning"]["disposition"] == "cas_lost"
+    assert status["ledger_record_warning"]["spawn_state"] == "spawned"
     assert "do not blind-retry" in status["ledger_record_warning"]["detail"]
 
     err = capsys.readouterr().err
@@ -371,6 +373,7 @@ def test_startup_race_budget_exhausted_still_warns_and_writes_status(
     status = _status_payload(tmp_path, args.dispatch_id)
     assert status["state"] == "running"
     assert status["worker_alive"] is True
+    assert status["spawn_state"] == "spawned"
     assert (
         status["ledger_record_warning"]["disposition"] == "attempt_not_yet_running"
     )
@@ -426,8 +429,11 @@ def test_indeterminate_spawn_state_takes_the_safe_branch(
     warning = _record(args, project, tmp_path, worker_pid="not-a-pid", state="running")
 
     assert warning is not None
+    assert warning["spawn_state"] == "unknown"
     status = _status_payload(tmp_path, args.dispatch_id)
     assert status["ledger_record_warning"]["disposition"] == "cas_lost"
+    assert status["ledger_record_warning"]["spawn_state"] == "unknown"
+    assert status["spawn_state"] == "unknown"
     assert status["worker_alive"] is None  # honestly unknown
     assert "DISPATCH-LEDGER-WARN" in capsys.readouterr().err
     assert "export" in export_calls
