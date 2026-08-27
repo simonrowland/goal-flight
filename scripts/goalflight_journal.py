@@ -135,6 +135,14 @@ OUTBOX_RETRY_BASE_S = 1.0
 JOURNAL_OPEN_RETRY_BUDGET_S = 75.0
 JOURNAL_OPEN_RETRY_INITIAL_S = 0.050
 JOURNAL_OPEN_RETRY_MAX_S = 5.0
+# Writer-capable clients sit on durable launch, lifecycle, and cursor-CAS paths:
+# failing them can poison an id or replay acknowledged-looking mail.  Under 64
+# concurrent writers, successful startup acquisition measured 0.024-3.725s
+# (N=7, median 0.202s); 5s covers the observed maximum plus 1.275s of load
+# margin while preserving a finite failure bound.  General read clients retain
+# the 1s responsiveness contract; stricter liveness probes opt into 0.05s.
+JOURNAL_WRITER_RETRY_BUDGET_S = 5.0
+JOURNAL_READER_RETRY_BUDGET_S = 1.0
 ALLOW_MIGRATION_ENV = "GOALFLIGHT_ALLOW_JOURNAL_MIGRATION"
 _SQL_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _STATE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
@@ -901,7 +909,7 @@ class Journal:
         *,
         client_epochs: ClientEpochs | None = None,
         allow_migration: bool | None = None,
-        retry_budget_s: float = 1.0,
+        retry_budget_s: float = JOURNAL_WRITER_RETRY_BUDGET_S,
         open_retry_budget_s: float = JOURNAL_OPEN_RETRY_BUDGET_S,
         transaction_budget_s: float = 1.0,
         jitter_min_s: float = 0.005,
@@ -928,7 +936,7 @@ class Journal:
         project_root: Path | str,
         *,
         client_epochs: ClientEpochs | None = None,
-        retry_budget_s: float = 1.0,
+        retry_budget_s: float = JOURNAL_WRITER_RETRY_BUDGET_S,
         open_retry_budget_s: float = JOURNAL_OPEN_RETRY_BUDGET_S,
         transaction_budget_s: float = 1.0,
         jitter_min_s: float = 0.005,
@@ -972,7 +980,7 @@ class Journal:
         project_root: Path | str,
         *,
         client_epochs: ClientEpochs | None = None,
-        retry_budget_s: float = 1.0,
+        retry_budget_s: float = JOURNAL_READER_RETRY_BUDGET_S,
         open_retry_budget_s: float = JOURNAL_OPEN_RETRY_BUDGET_S,
         transaction_budget_s: float = 1.0,
         jitter_min_s: float = 0.005,
@@ -1013,8 +1021,8 @@ class Journal:
         jitter_min_s: float,
         jitter_max_s: float,
     ) -> None:
-        if retry_budget_s < 0:
-            raise ValueError("retry_budget_s must be >= 0")
+        if not 0 <= retry_budget_s < float("inf"):
+            raise ValueError("retry_budget_s must be finite and >= 0")
         if not 0 <= open_retry_budget_s < float("inf"):
             raise ValueError("open_retry_budget_s must be finite and >= 0")
         if transaction_budget_s <= 0:
