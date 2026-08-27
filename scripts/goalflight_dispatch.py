@@ -4109,8 +4109,18 @@ def _controller_registry_unreadable_warning(reason: str) -> str:
         [
             "controller registry could not be read; controller registration state "
             f"is unknown ({reason}).",
-            "This is a transient registry-read failure. Retry the dispatch; refusing "
-            "before record or launch.",
+            "Retry the dispatch; refusing before record or launch.",
+        ]
+    )
+
+
+def _controller_registry_unknown_forced_warning(reason: str) -> str:
+    return "\n".join(
+        [
+            "controller registry could not be read; ownership could not be "
+            f"determined ({reason}).",
+            "--unregistered-forced accepted: recording this dispatch with no "
+            "owner. Its terminal event will wake every controller in the project.",
         ]
     )
 
@@ -4280,9 +4290,18 @@ def _prepare_attempt_controller_registration(
     lookup = _kernel_live_controller_sessions(project_root)
     warning = _controller_registration_warning(args, project_root, lookup=lookup)
     if lookup.sessions is None:
-        # A forced unregistered dispatch is valid only after proving there is no
-        # usable owner. An unreadable registry is inconclusive, so fail closed
-        # and make retry the only path instead of manufacturing unowned fan-out.
+        # Default path: unknown is not "unregistered". Retry is the right
+        # advice for a contended journal. --unregistered-forced still means
+        # "launch with no recorded owner" when the registry cannot be read,
+        # including a persistent unknown (ACTIVE SQL lease whose generation
+        # lock cannot be opened). Distinguishing transient busy from that
+        # persistent unknown would need a second classification path; the
+        # existing flag already names the consent, so only the unforced path
+        # refuses.
+        if getattr(args, "unregistered_forced", False):
+            return _controller_registry_unknown_forced_warning(
+                lookup.unreadable_reason or "unclassified registry read failure"
+            )
         raise DispatchUsageError(warning)
     if getattr(args, "unregistered_forced", False):
         return warning
