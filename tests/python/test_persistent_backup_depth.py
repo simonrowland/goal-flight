@@ -1,4 +1,4 @@
-"""t-322: persistent backup doorbells are a pool of 6, total coverage 8."""
+"""Persistent backup doorbells are a pool of 2, total coverage 4."""
 
 from __future__ import annotations
 
@@ -82,17 +82,17 @@ def _backups(project: Path, lease: journal.LeaseIdentity, count: int) -> ExitSta
     return stack
 
 
-def test_persistent_wake_target_defaults_to_eight(
+def test_persistent_wake_target_defaults_to_four(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", raising=False)
     monkeypatch.delenv("GOALFLIGHT_LISTENER_SLOTS", raising=False)
     assert wake.DEFAULT_LISTENER_SLOTS == 4
-    assert wake.DEFAULT_PERSISTENT_BACKUP_SLOTS == 6
+    assert wake.DEFAULT_PERSISTENT_BACKUP_SLOTS == 2
     assert not hasattr(wake, "MAX_LISTENER_SLOTS")
-    assert wake.PERSISTENT_WAKE_TARGET == 8
-    assert wake.persistent_backup_slot_count() == 6
-    assert wake.persistent_wake_target() == 8
+    assert wake.PERSISTENT_WAKE_TARGET == 4
+    assert wake.persistent_backup_slot_count() == 2
+    assert wake.persistent_wake_target() == 4
     assert wake.PERSISTENT_WAKE_TARGET == (
         1 + wake.DEFAULT_PERSISTENT_BACKUP_SLOTS + 1
     )
@@ -102,7 +102,7 @@ def test_persistent_backup_slots_env_override_and_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", raising=False)
-    assert wake.persistent_backup_slot_count() == 6
+    assert wake.persistent_backup_slot_count() == 2
     monkeypatch.setenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", "8")
     assert wake.persistent_backup_slot_count() == 8
     assert wake.persistent_wake_target() == 10
@@ -137,8 +137,8 @@ def test_portable_listener_slots_remain_a_different_knob(
     monkeypatch.delenv("GOALFLIGHT_PERSISTENT_BACKUP_SLOTS", raising=False)
     monkeypatch.setenv("GOALFLIGHT_LISTENER_SLOTS", "2")
     assert wake.listener_slot_count() == 2
-    assert wake.persistent_backup_slot_count() == 6
-    assert wake.persistent_wake_target() == 8
+    assert wake.persistent_backup_slot_count() == 2
+    assert wake.persistent_wake_target() == 4
 
 
 def test_decayed_backup_pool_is_degraded_not_live(
@@ -161,11 +161,11 @@ def test_decayed_backup_pool_is_degraded_not_live(
     assert status["covered"] is True
     assert status["backup"]["state"] == "degraded"
     assert status["backup"]["observed"] == 1
-    assert status["backup"]["target"] == 6
+    assert status["backup"]["target"] == 2
     assert status["portable_live_waiters"] == 1
-    assert status["portable_target_waiters"] == 6
+    assert status["portable_target_waiters"] == 2
     assert status["live_waiters"] == 3
-    assert status["target_waiters"] == 8
+    assert status["target_waiters"] == 4
     assert "backup" in status["missing_components"]
     assert status["reason"] == "persistent-backup-degraded"
 
@@ -188,9 +188,9 @@ def test_zero_backup_is_missing_not_live(
     assert status["covered"] is False
     assert status["backup"]["state"] == "missing"
     assert status["backup"]["observed"] == 0
-    assert status["backup"]["target"] == 6
+    assert status["backup"]["target"] == 2
     assert status["live_waiters"] == 2
-    assert status["target_waiters"] == 8
+    assert status["target_waiters"] == 4
     assert status["missing_components"] == ["backup"]
     assert status["reason"] == "persistent-backup-missing"
 
@@ -200,7 +200,7 @@ def test_full_backup_pool_is_live(
 ) -> None:
     project, lease = isolated
     with _arm_stream(project, lease):
-        with _backups(project, lease, 6):
+        with _backups(project, lease, 2):
             with wake.register_watchdog_waiter(
                 project,
                 controller_label=lease.label,
@@ -213,9 +213,9 @@ def test_full_backup_pool_is_live(
                 )
     assert status["covered"] is True
     assert status["backup"]["state"] == "live"
-    assert status["backup"]["observed"] == 6
-    assert status["backup"]["target"] == 6
-    assert status["live_waiters"] == status["target_waiters"] == 8
+    assert status["backup"]["observed"] == 2
+    assert status["backup"]["target"] == 2
+    assert status["live_waiters"] == status["target_waiters"] == 4
     assert status["missing_components"] == []
     assert status["reason"] == "persistent-covered"
 
@@ -255,13 +255,13 @@ def test_rearm_commands_restore_backup_shortfall(
         lease_nonce=lease.nonce,
     )
     assert "--listener-slots" in backup_cmd
-    assert backup_cmd.split()[backup_cmd.split().index("--listener-slots") + 1] == "6"
-    assert commands == [backup_cmd] * 5
-    assert plan["missing"] == 5
+    assert backup_cmd.split()[backup_cmd.split().index("--listener-slots") + 1] == "2"
+    assert commands == [backup_cmd]
+    assert plan["missing"] == 1
     assert plan["commands"] == commands
     hint = wake.coverage_rearm_hint(plan)
-    assert "persistent wake coverage 3/8" in hint
-    assert hint.count(backup_cmd) == 5
+    assert "persistent wake coverage 3/4" in hint
+    assert hint.count(backup_cmd) == 1
 
 
 def test_healthy_full_pool_emits_no_nag(
@@ -269,7 +269,7 @@ def test_healthy_full_pool_emits_no_nag(
 ) -> None:
     project, lease = isolated
     with _arm_stream(project, lease):
-        with _backups(project, lease, 6):
+        with _backups(project, lease, 2):
             with wake.register_watchdog_waiter(
                 project,
                 controller_label=lease.label,
@@ -331,7 +331,7 @@ def test_shortfall_is_silent_without_work_in_flight(
                 work_in_flight=False,
             )
     assert plan["live"] == 2
-    assert plan["missing"] == 6
+    assert plan["missing"] == 2
     assert wake.coverage_rearm_hint(plan) == ""
     assert wake.listener_floor_hint(
         int(status["portable_live_waiters"]),

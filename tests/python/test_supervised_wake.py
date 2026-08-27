@@ -347,8 +347,8 @@ def test_supervise_commands_call_the_rearm_generator(
     assert isinstance(status, dict)
     assert status["wake_mode"] == "persistent"
     assert status["live_waiters"] == 0
-    assert status["target_waiters"] == wake.persistent_wake_target() == 8
-    assert status["backup"]["target"] == wake.persistent_backup_slot_count() == 6
+    assert status["target_waiters"] == wake.persistent_wake_target() == 4
+    assert status["backup"]["target"] == wake.persistent_backup_slot_count() == 2
     assert status["missing_components"] == ["stream", "backup", "watchdog"]
     assert seen["lease_nonce"] == "nonce-from-session"
     assert seen["controller_label"] == "bugs"
@@ -748,7 +748,7 @@ def test_slow_supervisor_heartbeat_does_not_change_stream_watchdog_cadence(
         items=None,
     )
     assert code == 0
-    assert len(host.spawns) == wake.persistent_wake_target() == 8
+    assert len(host.spawns) == wake.persistent_wake_target() == 4
     stream_command = next(command for kind, command in host.spawns if kind == "stream")
     stream_argv = shlex.split(stream_command)
     assert "follow" in stream_argv
@@ -1491,9 +1491,9 @@ def test_supervise_items_are_the_configured_persistent_pool(
     )
     kinds = [kind for kind, _command in items]
     assert kinds.count("stream") == 1
-    assert kinds.count("backup") == wake.persistent_backup_slot_count() == 6
+    assert kinds.count("backup") == wake.persistent_backup_slot_count() == 2
     assert kinds.count("watchdog") == 1
-    assert len(items) == wake.persistent_wake_target() == 8
+    assert len(items) == wake.persistent_wake_target() == 4
     backup = next(command for kind, command in items if kind == "backup")
     assert f"--listener-slots {wake.persistent_backup_slot_count()}" in backup
     assert "--report-pending" in backup
@@ -1774,10 +1774,10 @@ def test_coverage_status_keeps_t322_sizing_after_supervise(
                     controller_label=lease.label,
                     lease_nonce=lease.nonce,
                 )
-    assert status["target_waiters"] == 8
-    assert status["backup"]["target"] == 6
+    assert status["target_waiters"] == 4
+    assert status["backup"]["target"] == 2
     assert "target" in status["backup"]
-    assert status["portable_target_waiters"] == 6
+    assert status["portable_target_waiters"] == 2
 
 
 class _RecordingHost(supervise.RealHost):
