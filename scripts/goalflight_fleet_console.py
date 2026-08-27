@@ -1328,9 +1328,15 @@ def _active_controller_roots_from_journals() -> set[str]:
     if base is None:
         return roots
     try:
-        paths = list(base.glob(f"*/{goalflight_journal.JOURNAL_FILE_NAME}"))
-    except OSError:
-        return roots
+        # glob swallows PermissionError and yields nothing — the empty-fleet
+        # rendering 8df3081 closed on iter_journal_files. Use that primitive.
+        paths = goalflight_journal.iter_journal_files()
+    except goalflight_journal.JournalIOError:
+        raise
+    except OSError as exc:
+        raise OSError(
+            f"journals index unreadable, controller roots unknown: {base}: {exc}"
+        ) from exc
     for path in paths:
         try:
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)

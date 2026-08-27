@@ -5757,12 +5757,26 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
 
 
 def _existing_queue_entry_paths(queue_path: Path) -> list[Path]:
-    paths = [queue_path] if queue_path.exists() else []
-    paths.extend(
-        path
-        for path in sorted(queue_path.parent.glob(f"{queue_path.name}.claimed-*"))
-        if not path.name.endswith(".failed")
-    )
+    """Live envelope and claim paths. Unreadable parent is not empty."""
+    parent = queue_path.parent
+    try:
+        entries = list(parent.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise OSError(
+            f"queue dir unreadable while looking for {queue_path.name}: "
+            f"{type(exc).__name__}"
+        ) from exc
+    name = queue_path.name
+    paths: list[Path] = []
+    for path in sorted(entries):
+        if path.name == name:
+            paths.append(path)
+        elif path.name.startswith(f"{name}.claimed-") and not path.name.endswith(
+            ".failed"
+        ):
+            paths.append(path)
     return paths
 
 
@@ -5789,6 +5803,8 @@ def _cleanup_partial_submit(queue_path: Path, status_json: Path) -> None:
             prompt_sidecar.unlink()
     with contextlib.suppress(OSError):
         status_json.with_suffix(status_json.suffix + ".tmp").unlink()
+    # glob-empty here only skips leftover ``*.tmp.*`` cleanup; it does not
+    # delete live envelopes. Unreadable parent leaves tmps in place.
     for tmp in queue_path.parent.glob(f"{queue_path.name}.tmp.*"):
         with contextlib.suppress(OSError):
             tmp.unlink()
@@ -8228,8 +8244,8 @@ def _summarize_claim_markers(queue_dir: Path) -> dict[str, int | str]:
     carries ``listing_error`` instead of pretending no markers exist.
     """
     summary: dict[str, int | str] = {"dead": 0, "unknown": 0, "live": 0}
-    if not queue_dir.is_dir():
-        return summary
+    # Do not probe with ``is_dir()``: Path.is_dir returns False on OSError, so a
+    # parent-unreadable queue would look absent (all-zero, no listing_error).
     try:
         entries = _queue_dir_listing(queue_dir)
     except OSError as exc:
@@ -8285,8 +8301,9 @@ def _claim_has_active_carrier(queue_dir: Path, dispatch_id: str) -> ClaimCarrier
     """
     if not dispatch_id:
         return ClaimCarrierStatus()
-    if not queue_dir.is_dir():
-        return ClaimCarrierStatus()
+    # Do not probe with ``is_dir()``: Path.is_dir returns False on OSError, so a
+    # parent-unreadable queue would look NONE while the envelope is still on
+    # disk. Listing raises; FileNotFoundError is the absent/NONE path.
     safe = goalflight_compat.safe_dispatch_filename(dispatch_id)
     statuses: list[ClaimCarrierStatus] = []
     try:
@@ -11487,9 +11504,11 @@ def _write_json_exclusive(path: Path, payload: dict) -> bool:
 
 def _requeue_child_exists(queue_dir: Path, child_id: str) -> bool:
     queue_path = _queue_entry_path(child_id, queue_dir=queue_dir)
-    if queue_path.exists() or any(
-        queue_path.parent.glob(f"{queue_path.name}.claimed-*")
-    ):
+    try:
+        if _existing_queue_entry_paths(queue_path):
+            return True
+    except OSError:
+        # Unreadable queue is not "child gone". Keep: refuse to mint a duplicate.
         return True
     return goalflight_ledger.record_path(child_id, create=False).exists()
 

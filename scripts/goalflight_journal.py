@@ -1030,13 +1030,25 @@ class Journal:
             jitter_min_s=jitter_min_s,
             jitter_max_s=jitter_max_s,
         )
+        presence = _lstat_presence(self.path)
+        if presence == "unknown":
+            raise JournalIOError(
+                f"journal init refused because path presence is unreadable, so "
+                f"absence is unverified: {self.path}"
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         write_lock, deadline = self._acquire_construction_lock()
         try:
-            if os.path.lexists(self.path):
+            presence = _lstat_presence(self.path)
+            if presence == "present":
                 raise JournalError(
                     f"journal init refused because the database already exists: {self.path}; "
                     "open it with Journal(...) instead"
+                )
+            if presence == "unknown":
+                raise JournalIOError(
+                    f"journal init refused because path presence is unreadable, so "
+                    f"absence is unverified: {self.path}"
                 )
             self._claim_fresh_database_path()
             try:
@@ -5306,10 +5318,16 @@ def restore_snapshot(
 ) -> Path:
     source = Path(os.path.abspath(os.fspath(Path(snapshot).expanduser())))
     destination = resolve_journal_path(project_root)
-    if not os.path.lexists(destination):
+    presence = _lstat_presence(destination)
+    if presence == "absent":
         raise JournalDisappeared(
             f"restore target journal is absent: {destination}. Failing closed; use init only "
             "for an intentional bootstrap, then retry restore from the validated snapshot."
+        )
+    if presence == "unknown":
+        raise JournalIOError(
+            f"restore target journal is unreadable, so absence is unverified: "
+            f"{destination}. Do not init over an unreadable live journal."
         )
     if not i_understand:
         raise JournalError(
@@ -5321,9 +5339,14 @@ def restore_snapshot(
         raise JournalError("restore snapshot must differ from the live journal")
 
     with goalflight_task.FileLock(journal_write_lock_path(destination)):
-        if not os.path.lexists(destination):
+        locked_presence = _lstat_presence(destination)
+        if locked_presence == "absent":
             raise JournalDisappeared(
                 f"restore target journal disappeared before exclusion was acquired: {destination}"
+            )
+        if locked_presence == "unknown":
+            raise JournalIOError(
+                f"restore target journal is unreadable after exclusion: {destination}"
             )
         if destination.is_symlink() or not destination.is_file():
             raise JournalIntegrityError(f"restore target is not a regular non-symlink file: {destination}")
