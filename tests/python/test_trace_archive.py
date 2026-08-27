@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -15,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import goalflight_ledger as ledger  # noqa: E402
 import goalflight_output_redact as redact  # noqa: E402
 import goalflight_trace_archive as archive  # noqa: E402
 
@@ -237,6 +242,69 @@ def test_archive_refuses_git_add_and_source_has_no_git_add_argv() -> None:
             raise AssertionError("trace archive source must not construct git add")
         if "subprocess" in code and "git" in code and "add" in code:
             raise AssertionError("trace archive source must not subprocess git add")
+
+
+def test_cmd_finish_archives_going_forward_tails(tmp_path: Path) -> None:
+    """Deleting the cmd_finish archive hook must turn this test red."""
+    project = tmp_path / "repo"
+    project.mkdir()
+    dispatch_id = "finish-archive-hook"
+    dispatch_dir = Path(os.environ["GOALFLIGHT_DISPATCH_DIR"])
+    dispatch_dir.mkdir(parents=True, exist_ok=True)
+    tail = dispatch_dir / f"{dispatch_id}.tail"
+    tail.write_text("COMPLETE: finish-archive-hook — done\n", encoding="utf-8")
+    status_path = dispatch_dir / f"{dispatch_id}.status.json"
+    status_path.write_text(
+        json.dumps(
+            {"dispatch_id": dispatch_id, "state": "running", "worker_pid": 4242}
+        ),
+        encoding="utf-8",
+    )
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": dispatch_id,
+            "prompt_id": dispatch_id,
+            "agent": "codex",
+            "engine": "codex",
+            "shape": "bash",
+            "account": "default",
+            "transport": "dispatch",
+            "project_root": str(project),
+            "worker_pid": 4242,
+            "status_path": str(status_path),
+            "stdout_path": str(tail),
+            "state": "running",
+            "started_at": ledger.utc_now(),
+        }
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+        code = ledger.cmd_finish(
+            argparse.Namespace(
+                dispatch_id=dispatch_id,
+                state="complete",
+                reason=None,
+                terminal_state=None,
+                elapsed_s=None,
+                worker_still_alive=False,
+            )
+        )
+    assert code == 0, buf.getvalue()
+    dests = list((project / "docs-private" / "traces").glob(f"*/{dispatch_id}"))
+    assert dests, (
+        "cmd_finish must archive a keepable tail into docs-private/traces; "
+        "the going-forward hook is missing if this list is empty"
+    )
+    stored = (dests[0] / "tail.log").read_text(encoding="utf-8")
+    assert "COMPLETE: finish-archive-hook" in stored
+
+
+def test_cmd_finish_source_invokes_archive_hook() -> None:
+    source = Path(ledger.__file__).read_text(encoding="utf-8")
+    finish = source.split("def cmd_finish", 1)[1].split("\ndef ", 1)[0]
+    assert "goalflight_trace_archive" in finish
+    assert "archive_finished_dispatch" in finish
 
 
 def test_drop_list_is_visible_in_cli_help() -> None:

@@ -38,6 +38,9 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- `goalflight_ledger.cmd_finish` archives going-forward dispatch tails
+  (pinned: deleting the hook turns `test_cmd_finish_archives_going_forward_tails`
+  red).
 - `--worktree` no longer passes a closed seat-lock fd into the post-spawn
   caffeinate helper. Sidecars get an env without `GOALFLIGHT_WORKTREE_LOCK_FD`
   so Darwin `caffeinate -w` starts after the launcher releases its copy.
