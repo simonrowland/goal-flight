@@ -4276,6 +4276,82 @@ class Journal:
 
         return self._domain_write(action)
 
+    def resolve_system_attention(
+        self,
+        *,
+        item_type: str,
+        dispatch_id: str,
+        keep_reason: str | None = None,
+    ) -> WriteResult[dict[str, object]]:
+        """Resolve OPEN system attention items for one dispatch.
+
+        Matches ``payload_json.dispatch_id``. When ``keep_reason`` is set,
+        OPEN items whose reason still matches stay OPEN so a live hold is
+        not collapsed while an earlier unknown hold for the same dispatch
+        is retired. Withdraws the quiet attention-stream delivery event
+        so a resolved item does not keep paging.
+        """
+        item_type = self._state_token(item_type, label="attention item_type")
+        dispatch = str(dispatch_id or "")
+        if not dispatch or len(dispatch) > 512:
+            raise ValueError("dispatch_id must be non-empty and bounded")
+        keep_reason_token = (
+            self._identity_token(keep_reason, label="attention reason")
+            if keep_reason is not None
+            else None
+        )
+        now = utc_now()
+
+        def action(connection: sqlite3.Connection) -> dict[str, object]:
+            rows = connection.execute(
+                """
+                SELECT item_id, reason, payload_json
+                FROM system_attention_items
+                WHERE project_root = ? AND item_type = ? AND state = 'OPEN'
+                """,
+                (str(self.project_root), item_type),
+            ).fetchall()
+            resolved: list[str] = []
+            for row in rows:
+                if (
+                    keep_reason_token is not None
+                    and str(row["reason"]) == keep_reason_token
+                ):
+                    continue
+                try:
+                    payload = json.loads(str(row["payload_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                if str(payload.get("dispatch_id") or "") != dispatch:
+                    continue
+                item_id = str(row["item_id"])
+                updated = connection.execute(
+                    """
+                    UPDATE system_attention_items
+                    SET state = 'RESOLVED', resolved_at = ?
+                    WHERE item_id = ? AND state = 'OPEN'
+                    """,
+                    (now, item_id),
+                )
+                if updated.rowcount != 1:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE delivery_events
+                    SET withdrawn_at = ?
+                    WHERE project_root = ? AND origin_node = 'journal'
+                      AND event_uuid = ? AND event_type = 'controller_attention'
+                      AND withdrawn_at IS NULL
+                    """,
+                    (now, str(self.project_root), item_id),
+                )
+                resolved.append(item_id)
+            return {"resolved_item_ids": resolved, "resolved_at": now}
+
+        return self._domain_write(action)
+
     def attempt_for_dispatch(self, dispatch_id: str) -> AttemptIdentity | None:
         dispatch = self._identity_token(dispatch_id, label="dispatch_id")
         rows = self.read_all(
