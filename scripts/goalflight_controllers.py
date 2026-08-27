@@ -195,7 +195,11 @@ def _peek_active_lease_identities_once(
         return pairs, None
     except goalflight_journal.JournalBusy:
         return None, _BUSY_ERROR
-    except goalflight_journal.JournalError as exc:
+    except (
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+        goalflight_journal.JournalError,
+    ) as exc:
         return None, type(exc).__name__
     except sqlite3.OperationalError as exc:
         message = str(exc).lower()

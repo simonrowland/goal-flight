@@ -3843,6 +3843,10 @@ def _kernel_live_controller_sessions(
     except goalflight_journal.JournalDisappeared:
         return _ControllerSessionLookup(sessions=[])
     except goalflight_journal.JournalUnavailable as exc:
+        # Catch the ABC so a future subclass fails closed into unknown
+        # rather than escaping. The reader-rule exemption is earned by
+        # returning sessions=None with a reason derived from the exception,
+        # not by this comment.
         return _ControllerSessionLookup(
             sessions=None,
             unreadable_reason=_journal_unavailable_reason(exc),
