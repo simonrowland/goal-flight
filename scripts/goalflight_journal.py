@@ -744,6 +744,36 @@ def listener_exit_reason(
     return None
 
 
+def journals_index_dir() -> Path:
+    """Directory that holds per-project journal folders.
+
+    ``GOALFLIGHT_JOURNAL_DIR`` is the state base (same as ``resolve_journal_path``),
+    not the journals folder itself. Default is the durable state base.
+    """
+    override = os.environ.get("GOALFLIGHT_JOURNAL_DIR", "").strip()
+    state_base = (
+        Path(override).expanduser()
+        if override
+        else goalflight_task.resolve_state_base_dir()
+    )
+    return (state_base / "journals").resolve(strict=False)
+
+
+def iter_journal_files() -> list[Path]:
+    """Return every journal sqlite path under the journals index.
+
+    A listing failure is an empty list, not a crash. Callers must treat an
+    unreadable *file* as its own unknown row rather than skipping the index.
+    """
+    base = journals_index_dir()
+    try:
+        # Do not filter with is_file(): a permission error would silently drop
+        # an unreadable journal. Peek it and let the caller emit unknown.
+        return sorted(base.glob(f"*/{JOURNAL_FILE_NAME}"))
+    except OSError:
+        return []
+
+
 def resolve_journal_path(project_root: Path | str) -> Path:
     """Resolve the journal with the task store's exact canonical project key."""
     root = goalflight_task.resolve_project_root(str(project_root))
