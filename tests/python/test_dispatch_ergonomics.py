@@ -226,23 +226,73 @@ def test_git_pin_warning() -> None:
         check("git no-pin warns", no_pin is not None and "prompt carries no git base pin" in no_pin)
         check("git no-pin warning carries HEAD", no_pin is not None and short_head in no_pin)
         check("git no-pin warning names opt-out", no_pin is not None and "--ignore-git-warn" in no_pin)
+        check("git no-pin warning names the explicit markers", no_pin is not None and "base:" in no_pin)
 
-        matching = D._git_pin_warning(_args(cwd=str(repo), prompt=f"Verify HEAD is {short_head} before edits."))
-        check("matching short HEAD pin is silent", matching is None)
+        # t-356: only explicit markers are pins. A bare "verify HEAD is <sha>"
+        # line is prose now -- it produces the no-pin advisory, not silence.
+        legacy_advice = D._git_pin_warning(
+            _args(cwd=str(repo), prompt=f"Verify HEAD is {short_head} before edits.")
+        )
+        check(
+            "bare verify-HEAD prose is not a pin",
+            legacy_advice is not None and "prompt carries no git base pin" in legacy_advice,
+        )
 
-        full_matching = D._git_pin_warning(_args(cwd=str(repo), prompt=f"Verify HEAD is {head} before edits."))
-        check("matching full HEAD pin is silent", full_matching is None)
+        matching_base = D._git_pin_warning(
+            _args(cwd=str(repo), prompt=f"---\nbase: {short_head}\n---\nImplement the change.")
+        )
+        check("matching base: line pin is silent", matching_base is None)
+
+        matching_branch = D._git_pin_warning(
+            _args(cwd=str(repo), prompt=f"# chunk (branch feat-x @ {head})\n\nImplement the change.")
+        )
+        check("matching branch @ sha header pin is silent", matching_branch is None)
 
         mismatch_pin = "deadbee" if not head.startswith("deadbee") else "cafebab"
-        mismatch = D._git_pin_warning(_args(cwd=str(repo), prompt=f"Verify HEAD is {mismatch_pin} before edits."))
-        check("mismatching pin warns", mismatch is not None and "GIT BASE PIN MISMATCH" in mismatch)
+        mismatch = D._git_pin_warning(
+            _args(cwd=str(repo), prompt=f"base: {mismatch_pin}\nImplement the change.")
+        )
+        check("mismatching base: pin warns", mismatch is not None and "GIT BASE PIN MISMATCH" in mismatch)
         check("mismatching pin names prompt pin", mismatch is not None and mismatch_pin in mismatch)
         check("mismatching pin names cwd HEAD", mismatch is not None and short_head in mismatch)
+        check(
+            "genuine mismatch is advisory (launch continues)",
+            mismatch is not None and "launch continues" in mismatch,
+        )
+
+        mismatch_branch = D._git_pin_warning(
+            _args(cwd=str(repo), prompt=f"branch feat-x @ {mismatch_pin}\nImplement.")
+        )
+        check(
+            "mismatching branch @ sha pin warns",
+            mismatch_branch is not None and "GIT BASE PIN MISMATCH" in mismatch_branch,
+        )
 
         mixed = D._git_pin_warning(
-            _args(cwd=str(repo), prompt=f"Verify HEAD is {short_head} and compare {mismatch_pin} before edits")
+            _args(cwd=str(repo), prompt=f"base: {short_head}\nbranch feat-x @ {mismatch_pin}\nImplement.")
         )
         check("mixed fresh and stale pins warn", mixed is not None and "GIT BASE PIN MISMATCH" in mixed)
+        check("mixed warning names stale pin", mixed is not None and mismatch_pin in mixed)
+
+        # t-356 receipt: a brief whose measurement table cites three evidence
+        # commits as prose must NOT warn MISMATCH against a correct cwd HEAD.
+        receipt = (
+            "## Evidence\n\n"
+            "| change | commit | SKILL.md bytes |\n"
+            "| --- | --- | --- |\n"
+            f"| one | `{mismatch_pin}` | 1000 |\n"
+            "| two | `c0ffee1` | 1200 |\n"
+            "| three | `f00d42a` | 1400 |\n"
+        )
+        receipt_warning = D._git_pin_warning(_args(cwd=str(repo), prompt=receipt))
+        check(
+            "prose evidence SHAs produce no mismatch warning",
+            receipt_warning is None or "MISMATCH" not in receipt_warning,
+        )
+        check(
+            "prose-only brief still gets the no-pin advisory",
+            receipt_warning is not None and "prompt carries no git base pin" in receipt_warning,
+        )
 
         # b-052: the check must measure --cwd (the tree the worker runs in),
         # not the launching shell's tree.  Build a WORKTREE of the same repo,
@@ -268,21 +318,20 @@ def test_git_pin_warning() -> None:
         ).stdout.strip()
         assert wt_head != head, "worktree did not advance"
         wt_pin_ok = D._git_pin_warning(
-            _args(cwd=str(worktree), prompt=f"Verify HEAD is {wt_head[:7]} before edits.")
+            _args(cwd=str(worktree), prompt=f"base: {wt_head[:7]}\nImplement.")
         )
         check("correct worktree pin is silent (measures --cwd, not project root)", wt_pin_ok is None)
         wt_pin_stale = D._git_pin_warning(
-            _args(cwd=str(worktree), prompt=f"Verify HEAD is {head[:7]} before edits.")
+            _args(cwd=str(worktree), prompt=f"branch b052 @ {head[:7]}\nImplement.")
         )
         check(
             "primary-checkout pin against advanced worktree still warns",
             wt_pin_stale is not None and "GIT BASE PIN MISMATCH" in wt_pin_stale,
         )
-        check("mixed warning names stale pin", mixed is not None and mismatch_pin in mixed)
 
         ignored_no_pin = D._git_pin_warning(_args(cwd=str(repo), prompt="Implement.", ignore_git_warn=True))
         ignored_mismatch = D._git_pin_warning(
-            _args(cwd=str(repo), prompt=f"Verify HEAD is {mismatch_pin}.", ignore_git_warn=True)
+            _args(cwd=str(repo), prompt=f"base: {mismatch_pin}", ignore_git_warn=True)
         )
         check("--ignore-git-warn silences no-pin", ignored_no_pin is None)
         check("--ignore-git-warn silences mismatch", ignored_mismatch is None)
@@ -298,8 +347,30 @@ def test_git_pin_warning() -> None:
         check("slash-adjacent hex path is not a SHA pin", D._extract_git_base_pins("research/deadbeef") == [])
         check("dot-adjacent hex path is not a SHA pin", D._extract_git_base_pins("fixture.deadbeef01") == [])
         check("colon-adjacent hex host token is not a SHA pin", D._extract_git_base_pins("host:deadbeef") == [])
-        check("bare quoted SHA pin matches", D._extract_git_base_pins("'deadbee'") == ["deadbee"])
-        check("spaced SHA pin matches", D._extract_git_base_pins("verify HEAD is deadbee before edits") == ["deadbee"])
+        check("bare quoted SHA is prose, not a pin", D._extract_git_base_pins("'deadbee'") == [])
+        check("verify-HEAD prose is not a pin", D._extract_git_base_pins("verify HEAD is deadbee before edits") == [])
+        check("base: line is a pin", D._extract_git_base_pins("base: deadbee\n") == ["deadbee"])
+        check("base: line is case-insensitive", D._extract_git_base_pins("Base: DEADBEE") == ["deadbee"])
+        check(
+            "bulleted backticked base line is a pin",
+            D._extract_git_base_pins("- Base: `c93f4f4`") == ["c93f4f4"],
+        )
+        check(
+            "branch @ sha header is a pin",
+            D._extract_git_base_pins("# t-055 fix round 2 (branch t055-blockers @ 5d6a856)") == ["5d6a856"],
+        )
+        check(
+            "branch @ sha tolerates a backticked branch name",
+            D._extract_git_base_pins("branch `wip/thing` @ 675cbaf, worktree") == ["675cbaf"],
+        )
+        check(
+            "markers keep document order across forms",
+            D._extract_git_base_pins("branch a @ 5d6a856\nbase: c93f4f4") == ["5d6a856", "c93f4f4"],
+        )
+        check(
+            "a 41-hex token after base: is not a truncated pin",
+            D._extract_git_base_pins("base: " + "a" * 41) == [],
+        )
 
         tail = Path(td) / "dispatch.tail"
         with contextlib.redirect_stderr(io.StringIO()):

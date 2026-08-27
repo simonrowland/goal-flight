@@ -761,7 +761,25 @@ ACCOUNT_ENGINE_BY_AGENT = {
 RETIRED_AGENT_LABELS = {
     "grok": "use --agent grok-code (coding) or --agent grok-research (web search)",
 }
-GIT_BASE_PIN_RE = re.compile(r"(?<![A-Za-z0-9_./:-])([0-9A-Fa-f]{7,40})(?![A-Za-z0-9_./:-])")
+# t-356: a git base pin is an EXPLICIT marker, never a bare hex token. Briefs
+# legitimately cite evidence commits as prose (measurement tables, receipts);
+# scanning for bare hex read one of those citations as the intended base and
+# warned GIT BASE PIN MISMATCH against a correct cwd HEAD -- pure noise that
+# trained controllers to reach for --ignore-git-warn. The recognized markers,
+# both observed in real briefs:
+#   - a frontmatter-style `base: <sha>` line (a markdown bullet and backticks
+#     around the sha are tolerated)
+#   - the `branch <name> @ <sha>` header convention
+# Every other hex-shaped token in the text is prose.
+GIT_BASE_PIN_BASE_LINE_RE = re.compile(
+    r"^[ \t]*(?:[-#>*]+[ \t]*)*base\s*:\s*`?([0-9A-Fa-f]{7,40})`?(?![0-9A-Za-z])",
+    re.IGNORECASE | re.MULTILINE,
+)
+GIT_BASE_PIN_BRANCH_AT_RE = re.compile(
+    r"\bbranch\s+\S+?\s+@\s+`?([0-9A-Fa-f]{7,40})`?(?![0-9A-Za-z])",
+    re.IGNORECASE,
+)
+GIT_BASE_PIN_MARKER_RES = (GIT_BASE_PIN_BASE_LINE_RE, GIT_BASE_PIN_BRANCH_AT_RE)
 TASK_ID_RE = re.compile(r"^[tb]-\d+$")
 LOWER_BASE_SHA_RE = re.compile(r"[0-9a-f]{40}")
 READ_ONLY_INLINE_RETURN_PROMPT_PATTERNS = (
@@ -2347,7 +2365,15 @@ def _read_prompt_for_guard(args) -> str:
 
 
 def _extract_git_base_pins(text: str) -> list[str]:
-    return [m.group(1).lower() for m in GIT_BASE_PIN_RE.finditer(text or "")]
+    """Explicitly-marked git base pins, in document order. Bare SHAs are prose."""
+    text = text or ""
+    marked = [
+        (match.start(), match.group(1).lower())
+        for pattern in GIT_BASE_PIN_MARKER_RES
+        for match in pattern.finditer(text)
+    ]
+    marked.sort()
+    return [sha for _pos, sha in marked]
 
 
 def _git_head_for_cwd(cwd: Path) -> str | None:
@@ -2375,6 +2401,16 @@ def _valid_lower_base_sha(value: object) -> str | None:
 
 
 def _git_pin_warning(args) -> str | None:
+    """Advisory git-base-pin check. A genuine mismatch WARNS and still launches.
+
+    Refusing would be the stricter reading of the 2026-08-27 sweep (warn then
+    start). Keep it advisory: a stale worktree base is sometimes intentional
+    (reproduce a bug; finish a chunk started on an older merge), and
+    --ignore-git-warn already exists as the silence hatch. Two writers in one
+    tree (t-375) corrupt the filesystem; a mismatched pin does not. After
+    t-356 this warning only fires on explicit markers, so it can be trusted
+    instead of trained-ignored.
+    """
     if getattr(args, "ignore_git_warn", False) or not _prompt_requested(args):
         return None
     # b-052: measure the tree the worker will actually run in (--cwd), not the
@@ -2393,7 +2429,8 @@ def _git_pin_warning(args) -> str | None:
         return (
             "WARN: prompt carries no git base pin; "
             f"HEAD is {short_head} - workers on stale clones will build on the wrong base; "
-            f"add 'verify HEAD is {short_head}' or pass --ignore-git-warn"
+            f"mark the base explicitly with a 'base: {short_head}' line or a "
+            f"'branch <name> @ {short_head}' header, or pass --ignore-git-warn"
         )
     mismatched_pins = [pin for pin in pins if not head.startswith(pin)]
     if not mismatched_pins:
@@ -2402,6 +2439,7 @@ def _git_pin_warning(args) -> str | None:
         "WARN: GIT BASE PIN MISMATCH: "
         f"prompt pin {mismatched_pins[0]} does not match cwd HEAD {short_head}; "
         "stale brief or wrong repo state - workers on stale clones will build on the wrong base; "
+        "advisory only, launch continues (a stale base is sometimes intentional); "
         "update the pin or pass --ignore-git-warn"
     )
 
