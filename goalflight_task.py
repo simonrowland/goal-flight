@@ -2014,6 +2014,39 @@ def _is_done_reviewed(item: dict[str, Any]) -> bool:
     return item.get("kind") == "decision" and item.get("done") is True
 
 
+def _blocker_is_satisfied(row: dict[str, Any]) -> bool:
+    """True when a resolved blocker row is closed and must not gate.
+
+    ``blocked_by`` is a historical dependency record. Closed done, done-reviewed,
+    and tombstoned-as-done (legacy ``done=True`` migrated to ``done_reviewed``)
+    are satisfied. Open rows still gate.
+    """
+    return row.get("done") is True or _is_done_reviewed(row)
+
+
+def unsatisfied_blockers(item: dict[str, Any], store: dict[str, dict[str, Any]]) -> list[str]:
+    """Return blocker ids that still gate *item*.
+
+    A blocker id that resolves to a closed row is satisfied. A blocker id that
+    resolves to an open row gates. A blocker id that does not resolve
+    (missing/foreign) gates — could-not-verify is not satisfied.
+    """
+    blockers = item.get("blocked_by")
+    if not isinstance(blockers, LIST_TYPE) or not blockers:
+        return []
+    unsatisfied: list[str] = []
+    seen: set[str] = set()
+    for raw in blockers:
+        blocker_id = str(raw)
+        if not blocker_id or blocker_id in seen:
+            continue
+        seen.add(blocker_id)
+        row = store.get(blocker_id)
+        if row is None or not _blocker_is_satisfied(row):
+            unsatisfied.append(blocker_id)
+    return unsatisfied
+
+
 def _matches_canned_status(row: dict[str, Any], status: str | None) -> bool:
     if not status:
         return True
@@ -2701,11 +2734,8 @@ class TaskStore:
             return "awaiting-review" if latest == "worker-finished" else latest
         if item.get("kind") == "decision":
             return "decision"
-        blockers = item.get("blocked_by")
-        if isinstance(blockers, LIST_TYPE) and blockers:
-            unresolved = any(not _is_done_reviewed(by_id.get(str(blocker), {})) for blocker in blockers)
-            if unresolved:
-                return "waiting"
+        if unsatisfied_blockers(item, by_id):
+            return "waiting"
         return "pending"
 
     def generated_markdown(self, items: list[dict[str, Any]]) -> dict[str, str]:
@@ -4207,8 +4237,12 @@ def _cmd_done(store: TaskStore, args: argparse.Namespace) -> int:
             raise TaskError(f"{store.tasks_path}: item not found: {args.item_id}")
         if item.get("done") is True:
             raise TaskError(f"{args.item_id}: already done")
-        if item.get("blocked_by") and not args.force:
-            raise TaskError(f"{args.item_id}: blocked_by is non-empty; use --force to close anyway")
+        live = unsatisfied_blockers(item, by_id)
+        if live and not args.force:
+            raise TaskError(
+                f"{args.item_id}: blocked_by has unsatisfied blocker(s): {', '.join(live)}; "
+                "use --force to close anyway"
+            )
         note_text = str(getattr(args, "note", "") or "").strip()
         if note_text:
             notes = item.setdefault("notes", [])
