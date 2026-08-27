@@ -8,6 +8,14 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- `goalflight_journal_gc.py` no longer retains a proven-root-gone journal
+  forever just because it holds non-terminal dispatch records that can never
+  reconcile (reconciliation runs from the project root). Such journals are now
+  classified `orphaned` and reported in their own "stuck" section — distinct
+  from both reclaimable and live-reference-retained, and never deleted. Roots
+  that cannot be stat'd remain `unknown`, never folded into gone. The JSON
+  report schema is now `goalflight.journal-gc.v2` (new `orphaned` count;
+  `retained` no longer includes orphaned journals).
 - Supervisor arming now explicitly requires no timeout and session-lifetime
   monitoring. On Claude Code this means `persistent: true`; `timeout_ms` is
   inert in that mode and any host-required value is a placeholder, not a knob.
