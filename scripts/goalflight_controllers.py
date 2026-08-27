@@ -7,8 +7,13 @@ lease rows (EXPIRED / SUPERSEDED / RETIRED) are history, not members.
 row, and an ACTIVE-but-holder-dead generation is ``stale``.
 
 ``unknown`` is the could-not-tell bucket (unreadable probes, unresolvable
-roots, or two journals naming the same member differently). It never
-carries a retire command. ``stale`` is the action-bearing alarm.
+roots, a label found only in a non-official journal file, or two journals
+naming the same member differently). It never carries a retire command.
+``stale`` is the action-bearing alarm.
+
+Identity for a current fleet member is ``(official journal path, label)``.
+A second index folder that git-canonicalizes to a live checkout is not
+that project's roster.
 
     python3 scripts/goalflight_controllers.py
     python3 scripts/goalflight_controllers.py --json
@@ -83,6 +88,7 @@ HOLDER_DEAD = frozenset({"dead-lock", "ended"})
 LIVE_DISPLAY_STATES = frozenset({"live", "live-overdue"})
 UNKNOWN_PROJECT = "unknown"
 RENEW_HINT = "lease overdue — renew (--join)"
+_RETIREMENT_REFUSED = "; retirement refused until it resolves"
 _JOURNAL_SLUG_HASH = re.compile(r"^(.+)-([0-9a-f]{10})$")
 _GENERIC_JOURNAL_SLUGS = frozenset({"project", "root", "repo", "tmp", "Users", "user"})
 _CONTENTLESS_LABELS = frozenset({"", "unknown", "—"})
@@ -189,6 +195,30 @@ def journal_display_name(journal_path: Path | None) -> str | None:
             return folder
         return slug
     return folder or None
+
+
+def official_journal_path(project_root: Path | str | None) -> Path | None:
+    """The journal ``resolve_journal_path`` names for this project, if any."""
+    if project_root is None:
+        return None
+    try:
+        return goalflight_journal.resolve_journal_path(project_root)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def journal_file_is_official(
+    path: Path, project_root: Path | str | None
+) -> bool:
+    """True when ``path`` is the journal the project resolver names.
+
+    Discovery lists every ``*/state-journal.sqlite3``. Official membership
+    is that resolver, not a folder-name heuristic.
+    """
+    official = official_journal_path(project_root)
+    if official is None:
+        return True
+    return path.resolve(strict=False) == official.resolve(strict=False)
 
 
 def resolve_journal_project(
@@ -489,12 +519,25 @@ def fleet_row(
     }
 
 
-def unknown_project_row(
+def _with_retirement_refused(reason: str) -> str:
+    if reason.endswith(_RETIREMENT_REFUSED):
+        return reason
+    return reason + _RETIREMENT_REFUSED
+
+
+def _journal_where(journal_path: Path | None) -> str:
+    return f" at {journal_path}" if journal_path is not None else ""
+
+
+def unknown_member_row(
     *,
+    label: str | None,
     project_root: Path | str | None,
     journal_path: Path | None,
-    error: str,
+    reason: str,
+    retirement_reason: str | None = None,
 ) -> dict[str, Any]:
+    """Could-not-tell row. ``reason`` must state what was actually true."""
     canonical = canonical_project_root(project_root)
     display = _project_display_name(canonical)
     if display == UNKNOWN_PROJECT:
@@ -502,13 +545,9 @@ def unknown_project_row(
         if named:
             display = named
     source = journal_path.parent.name if journal_path is not None else None
-    where = f" at {journal_path}" if journal_path is not None else ""
-    reason = (
-        f"journal unreadable ({error}){where}; retirement refused until it resolves"
-    )
     return {
         "bucket": "unknown",
-        "label": None,
+        "label": label,
         "project": display,
         "project_root": str(canonical) if canonical is not None else None,
         "state": "unknown",
@@ -522,12 +561,28 @@ def unknown_project_row(
         "wake_armed": None,
         "occupies": None,
         "retire_command": None,
-        "unknown_reason": reason,
+        "unknown_reason": _with_retirement_refused(reason),
         "renew_hint": None,
         "retirement_eligible": None,
-        "retirement_reason": error,
+        "retirement_reason": retirement_reason,
         "_source": source,
     }
+
+
+def unknown_project_row(
+    *,
+    project_root: Path | str | None,
+    journal_path: Path | None,
+    error: str,
+) -> dict[str, Any]:
+    where = _journal_where(journal_path)
+    return unknown_member_row(
+        label=None,
+        project_root=project_root,
+        journal_path=journal_path,
+        reason=f"journal unreadable ({error}){where}",
+        retirement_reason=error,
+    )
 
 
 def labeled_unknown_row(
@@ -535,24 +590,39 @@ def labeled_unknown_row(
     *,
     project_root: Path | str | None,
     journal_path: Path | None,
-    error: str,
+    reason: str,
 ) -> dict[str, Any]:
-    row = unknown_project_row(
+    """Keep a peeked label with an honest could-not-tell reason.
+
+    Do not wrap a readable journal or a resolved root in the
+    ``journal unreadable`` / ``unresolvable`` template.
+    """
+    where = _journal_where(journal_path)
+    text = reason if not where or reason.endswith(where) else f"{reason}{where}"
+    return unknown_member_row(
+        label=label,
         project_root=project_root,
         journal_path=journal_path,
-        error=error,
+        reason=text,
+        retirement_reason=reason,
     )
-    row["label"] = label
-    return row
 
 
 def _row_group_key(row: dict[str, Any]) -> tuple[str, str] | None:
+    """Identity is canonical root + label, else named journal + label.
+
+    Two unresolvable journals that both render PROJECT ``unknown`` still
+    collapse (same member, could-not-tell). Named leftover journals keep
+    their folder identity so a peeked label is not dropped.
+    """
     label = row.get("label")
     if not label:
         return None
     root = row.get("project_root")
-    identity = str(root) if root else UNKNOWN_PROJECT
-    return identity, str(label)
+    if root:
+        return str(root), str(label)
+    project = str(row.get("project") or UNKNOWN_PROJECT)
+    return project, str(label)
 
 
 def _row_facts(row: dict[str, Any]) -> tuple[object, object, object, object]:
@@ -643,6 +713,81 @@ def _sort_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
+def _peeked_label_unknown_rows(
+    pairs: list[tuple[str, str]],
+    *,
+    project_root: Path | str | None,
+    journal_path: Path,
+    reason: str,
+) -> list[dict[str, Any]]:
+    """Emit each peeked label instead of one unlabeled unknown row."""
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for _raw_root, label in pairs:
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        rows.append(
+            labeled_unknown_row(
+                label,
+                project_root=project_root,
+                journal_path=journal_path,
+                reason=reason,
+            )
+        )
+    if not rows:
+        rows.append(
+            unknown_project_row(
+                project_root=project_root,
+                journal_path=journal_path,
+                error="unreadable",
+            )
+        )
+    return rows
+
+
+def _non_official_journal_rows(
+    pairs: list[tuple[str, str]],
+    *,
+    journal_path: Path,
+    official_root: Path | str,
+    skip_labels: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Labels that exist only in a non-official sibling journal.
+
+    Official labels stay on the resolver's journal. Extra labels keep the
+    source folder as PROJECT and never inherit the live checkout's name.
+    """
+    official_labels: set[str] = set(skip_labels or ())
+    official = official_journal_path(official_root)
+    if official is not None:
+        official_pairs, _error = peek_active_lease_identities(official)
+        if official_pairs:
+            official_labels.update(label for _root, label in official_pairs)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for _raw_root, label in pairs:
+        if not label or label in seen or label in official_labels:
+            continue
+        seen.add(label)
+        rows.append(
+            labeled_unknown_row(
+                label,
+                project_root=None,
+                journal_path=journal_path,
+                reason="label found in a non-official journal file",
+            )
+        )
+    return rows
+
+
+def _official_extra_label_reason(raw_root: str) -> str:
+    _key, label_canonical, _display = project_identity(raw_root)
+    if label_canonical is None:
+        return f"stored root {raw_root} did not resolve"
+    return "label not in official roster"
+
+
 def collect_controller_rows(
     *,
     idle_hours: float,
@@ -680,6 +825,22 @@ def collect_controller_rows(
                 )
             )
             continue
+        if not journal_file_is_official(path, probe_root):
+            already = {
+                str(row.get("label"))
+                for row in rows
+                if row.get("label")
+                and row.get("project_root") == str(probe_root)
+            }
+            rows.extend(
+                _non_official_journal_rows(
+                    pairs,
+                    journal_path=path,
+                    official_root=probe_root,
+                    skip_labels=already,
+                )
+            )
+            continue
         probe_token = str(probe_root)
         cached = roster_cache.get(probe_token)
         if cached is None:
@@ -693,6 +854,8 @@ def collect_controller_rows(
                 goalflight_journal.JournalBusy,
                 goalflight_journal.JournalDisappeared,
                 goalflight_journal.JournalIOError,
+                goalflight_journal.JournalUpgradeRequired,
+                goalflight_journal.JournalError,
                 OSError,
                 RuntimeError,
                 ValueError,
@@ -700,11 +863,12 @@ def collect_controller_rows(
                 cached = exc
             roster_cache[probe_token] = cached
         if isinstance(cached, BaseException):
-            rows.append(
-                unknown_project_row(
+            rows.extend(
+                _peeked_label_unknown_rows(
+                    pairs,
                     project_root=canonical,
                     journal_path=path,
-                    error=type(cached).__name__,
+                    reason=f"journal unreadable ({type(cached).__name__})",
                 )
             )
             continue
@@ -712,11 +876,15 @@ def collect_controller_rows(
         measurements = roster.get("measurements") or {}
         registry = measurements.get("controller_registry") or {}
         if registry.get("measured") is False:
-            rows.append(
-                unknown_project_row(
+            rows.extend(
+                _peeked_label_unknown_rows(
+                    pairs,
                     project_root=canonical,
                     journal_path=path,
-                    error=str(registry.get("error") or "unreadable"),
+                    reason=(
+                        "journal unreadable "
+                        f"({registry.get('error') or 'unreadable'})"
+                    ),
                 )
             )
             continue
@@ -741,15 +909,13 @@ def collect_controller_rows(
         for raw_root, label in pairs:
             if not label or label in seen_labels:
                 continue
-            # ACTIVE in this journal, but the roster keyed on the
-            # canonical root missed it (stored project_root diverged).
-            # Keep the label under the journal's known project.
+            # ACTIVE in this official journal, missing from the roster.
             rows.append(
                 labeled_unknown_row(
                     label,
                     project_root=canonical,
                     journal_path=path,
-                    error=f"stored root {raw_root} unresolvable",
+                    reason=_official_extra_label_reason(raw_root),
                 )
             )
             seen_labels.add(label)

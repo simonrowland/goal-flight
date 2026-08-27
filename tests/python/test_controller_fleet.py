@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -1061,6 +1062,212 @@ def test_unresolvable_sibling_root_uses_journal_project(
     assert canonical is not None
     assert carol["project_root"] == str(canonical)
     assert carol["label"] == "carol"
+    reason = carol["unknown_reason"] or ""
+    diagnosis = reason.split(" at ", 1)[0]
+    assert diagnosis.startswith("stored root ") and diagnosis.endswith(" did not resolve")
+    assert str(gone) in diagnosis
+    assert "journal unreadable" not in reason.split(" at ", 1)[0]
     _assert_no_live_row_carries_retire(payload)
     del registered
     del nonce
+
+
+def _copy_journal_folder(official: Path, suffix: str) -> Path:
+    src_dir = official.parent
+    dst_dir = src_dir.parent / f"{src_dir.name}{suffix}"
+    dst_dir.mkdir()
+    for name in (official.name, official.name + "-wal", official.name + "-shm"):
+        src = src_dir / name
+        if src.exists():
+            shutil.copy2(src, dst_dir / name)
+    return dst_dir / official.name
+
+
+def _clone_active_label(db_path: Path, *, source_label: str, new_label: str) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM controller_leases WHERE label = ? AND state = 'ACTIVE'",
+            (source_label,),
+        ).fetchone()
+        assert row is not None, f"no ACTIVE {source_label} in {db_path}"
+        data = {key: row[key] for key in row.keys()}
+        data["label"] = new_label
+        data["nonce"] = f"{new_label}-nonce"
+        keys = list(data.keys())
+        conn.execute(
+            f"INSERT INTO controller_leases ({', '.join(keys)}) "
+            f"VALUES ({', '.join('?' for _ in keys)})",
+            [data[key] for key in keys],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _force_reader_upgrade_required(journal_path: Path) -> None:
+    with sqlite3.connect(journal_path) as conn:
+        conn.execute(
+            """UPDATE journal_epochs
+               SET schema_epoch = 7, minimum_reader_epoch = 99999
+               WHERE singleton = 1"""
+        )
+        conn.commit()
+
+
+def test_journal_file_is_official_uses_resolver(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate(monkeypatch, tmp_path)
+    root = _git_project(tmp_path, "alpha")
+    journal.open_or_create_journal(root)
+    official = journal.resolve_journal_path(root)
+    sibling = (
+        official.parent.parent
+        / f"{official.parent.name}.snapshot-copy"
+        / official.name
+    )
+    sibling.parent.mkdir()
+    sibling.write_bytes(b"")
+    assert controllers.journal_file_is_official(official, root) is True
+    assert controllers.journal_file_is_official(sibling, root) is False
+    assert controllers.official_journal_path(root) == official.resolve(strict=False)
+
+
+def test_non_official_journal_does_not_join_live_project(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A sibling journal sharing a canonical root is not the live roster."""
+    _isolate(monkeypatch, tmp_path)
+    root = _git_project(tmp_path, "alpha")
+    registered, holder, nonce = _hold_registered_lease(root, "alice", "alice-nonce")
+    waiter = _arm_listener(root, "alice", nonce)
+    official = journal.resolve_journal_path(root)
+    copy = _copy_journal_folder(official, ".dev-casualty-20260814-062226")
+    _clone_active_label(copy, source_label="alice", new_label="alice-fix")
+    peek_pairs, peek_error = controllers.peek_active_lease_identities(copy)
+    assert peek_error is None
+    assert peek_pairs is not None
+    copy_labels = {label for _raw, label in peek_pairs}
+    assert "alice" in copy_labels
+    assert "alice-fix" in copy_labels
+    assert controllers.journal_file_is_official(copy, root) is False
+    try:
+        payload = json.loads(_run(["--json"])[1])
+        table = _run([])[1]
+    finally:
+        waiter.close()
+        holder.close()
+    alice_rows = [
+        row for row in payload["controllers"] if row.get("label") == "alice"
+    ]
+    assert len(alice_rows) == 1
+    alice = alice_rows[0]
+    assert alice["project"] == "alpha"
+    assert alice["state"] in {"live", "live-overdue"}
+    fix_rows = [
+        row for row in payload["controllers"] if row.get("label") == "alice-fix"
+    ]
+    canonical = controllers.canonical_project_root(root)
+    assert canonical is not None
+    for row in fix_rows:
+        assert row["project"] != "alpha"
+        assert row["project_root"] != str(canonical)
+        assert row["retire_command"] is None
+        reason = row["unknown_reason"] or ""
+        assert "non-official" in reason
+        assert "journal unreadable" not in reason
+        assert "unresolvable" not in reason
+        assert row["project"] == copy.parent.name
+    alpha_labels = {
+        row["label"]
+        for row in payload["controllers"]
+        if row.get("project") == "alpha"
+    }
+    assert alpha_labels == {"alice"}
+    assert "alice-fix @ alpha:" not in table
+    for line in table.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == "alice-fix":
+            assert parts[2] != "alpha"
+    _assert_no_live_row_carries_retire(payload)
+    del registered
+    del nonce
+
+
+def test_peek_success_roster_fail_keeps_labels(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Raw peek can succeed while the fenced roster raises UpgradeRequired."""
+    _isolate(monkeypatch, tmp_path)
+    root = _git_project(tmp_path, "namedproj")
+    registered, holder, nonce = _hold_registered_lease(root, "alice", "alice-nonce")
+    waiter = _arm_listener(root, "alice", nonce)
+    path = journal.resolve_journal_path(root)
+    _force_reader_upgrade_required(path)
+    pairs, peek_error = controllers.peek_active_lease_identities(path)
+    assert peek_error is None
+    assert pairs is not None
+    assert any(label == "alice" for _root, label in pairs)
+    with pytest.raises(journal.JournalUpgradeRequired):
+        sessions.controller_roster(root, ledger_records=[])
+    try:
+        payload = json.loads(_run(["--json"])[1])
+        table = _run([])[1]
+    finally:
+        waiter.close()
+        holder.close()
+    row = _row_for(payload, "alice")
+    assert row["label"] == "alice"
+    assert row["project"] == "namedproj"
+    assert row["state"] == "unknown"
+    assert row["bucket"] == "unknown"
+    assert row["retire_command"] is None
+    reason = row["unknown_reason"] or ""
+    assert "JournalUpgradeRequired" in reason
+    assert "journal unreadable" in reason
+    assert "unresolvable" not in reason
+    unlabeled = [
+        item
+        for item in payload["controllers"]
+        if item.get("project") == "namedproj" and not item.get("label")
+    ]
+    assert unlabeled == []
+    assert "alice" in table
+    _assert_no_live_row_carries_retire(payload)
+    del registered
+    del nonce
+
+
+def test_peek_labels_in_two_named_journals_stay_two_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Same peeked label in two fenced leftover journals must not collapse."""
+    _isolate(monkeypatch, tmp_path)
+    first = _project(tmp_path, "leftover-a")
+    second = _project(tmp_path, "leftover-b")
+    a_reg, a_holder, a_nonce = _hold_registered_lease(first, "armtest", "a-nonce")
+    b_reg, b_holder, b_nonce = _hold_registered_lease(second, "armtest", "b-nonce")
+    _force_reader_upgrade_required(journal.resolve_journal_path(first))
+    _force_reader_upgrade_required(journal.resolve_journal_path(second))
+    try:
+        with pytest.raises(journal.JournalUpgradeRequired):
+            sessions.controller_roster(first, ledger_records=[])
+        payload = json.loads(_run(["--json"])[1])
+    finally:
+        a_holder.close()
+        b_holder.close()
+    matches = [
+        row for row in payload["controllers"] if row.get("label") == "armtest"
+    ]
+    assert len(matches) == 2
+    projects = {row["project"] for row in matches}
+    assert projects == {"leftover-a", "leftover-b"}
+    for row in matches:
+        assert row["state"] == "unknown"
+        assert row["retire_command"] is None
+        assert "JournalUpgradeRequired" in (row["unknown_reason"] or "")
+        assert row["label"] == "armtest"
+    _assert_no_live_row_carries_retire(payload)
+    del a_reg, b_reg, a_nonce, b_nonce
