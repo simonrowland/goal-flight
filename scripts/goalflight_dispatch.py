@@ -7850,9 +7850,11 @@ def _cmd_reconcile_abandoned(argv: list[str]) -> int:
         print(json.dumps(payload, sort_keys=True))
     else:
         print(
-            "RECONCILE-ABANDONED "
+            "RECONCILE-ABANDONED dry-run: no ledger record was changed. "
+            "This command has no apply flag; only drain writes. "
             + json.dumps(
                 {
+                    "mode": "dry-run",
                     "would_close": payload["would_close"],
                     "kept": payload["kept"],
                     "scanned": payload["scanned"],
@@ -13048,7 +13050,7 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
 _SUBCOMMAND_HELP: tuple[tuple[str, str], ...] = (
     ("steer", "append, list, or wait on a live worker's mailbox"),
     ("resume", "continue a recorded worker session as a tracked dispatch"),
-    ("reconcile-abandoned", "reconcile dispatches whose controller died"),
+    ("reconcile-abandoned", "dry-run report of abandoned dispatches; drain writes"),
     ("drain", "launch queued dispatch requests"),
     ("dashboard-refresh", "rebuild the dashboard projection"),
 )

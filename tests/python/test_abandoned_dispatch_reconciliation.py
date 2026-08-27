@@ -776,11 +776,38 @@ def test_reconcile_abandoned_text_print_includes_kept_reasons(
 
     assert rc == 0
     assert captured.startswith("RECONCILE-ABANDONED ")
-    payload = json.loads(captured.split(" ", 1)[1])
+    payload = json.loads(captured[captured.index("{") :])
     assert payload["kept_reasons"] == {"controller_indeterminate": 1}
     assert payload["would_close"] == 0
     assert payload["kept"] == 1
+    assert payload["mode"] == "dry-run"
     assert "controller_indeterminate" in captured
+    assert _read(dispatch_id)["state"] == "running"
+
+
+def test_reconcile_abandoned_dry_run_text_states_no_record_changed(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dispatch_id = "dry-run-would-close"
+    _record(tmp_path, dispatch_id)
+    queue_dir = tmp_path / "state" / "dispatch-queue"
+    queue_dir.mkdir(parents=True, exist_ok=True)
+
+    rc = D._cmd_reconcile_abandoned(
+        ["--queue-dir", str(queue_dir), "--stale-s", "0"]
+    )
+    captured = capsys.readouterr().out.strip()
+    payload = json.loads(captured[captured.index("{") :])
+
+    assert rc == 0
+    assert "dry-run" in captured
+    assert "no ledger record was changed" in captured
+    assert "no apply flag" in captured
+    assert "only drain writes" in captured
+    assert payload["mode"] == "dry-run"
+    assert payload["would_close"] == 1
+    assert payload["kept"] == 0
     assert _read(dispatch_id)["state"] == "running"
 
 
