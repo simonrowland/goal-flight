@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import sqlite3
@@ -136,16 +137,16 @@ def _busy_retry_exhausted_reason(attempts: int, started: float) -> str:
 def _retry_journal_busy(
     read_once: Callable[[], tuple[Any, str | None]],
 ) -> tuple[Any, str | None]:
-    """Retry a fleet journal read through a short bounded busy window.
+    """Retry a fleet journal or lock read through a short bounded busy window.
 
     Structural errors (``JournalUpgradeRequired``, ``OperationalError``,
-    disappearance, I/O) return on the first attempt. ``JournalBusy`` is
-    the only retryable class. The first attempt always runs. Attempt 2+
-    is not started once ``JOURNAL_READER_RETRY_BUDGET_S`` has elapsed, so
-    a fenced roster whose inner reader already spent that 1s budget
-    cannot stack another roster call. Peek probes that return immediately
-    still consume the remaining window as 50ms-spaced attempts, capped
-    by ``FLEET_JOURNAL_BUSY_ATTEMPTS``.
+    ``PermissionError``, disappearance, I/O) return on the first attempt.
+    ``JournalBusy`` is the only retryable class. The first attempt always
+    runs. Attempt 2+ is not started once ``JOURNAL_READER_RETRY_BUDGET_S``
+    has elapsed, so a fenced roster whose inner reader already spent that
+    1s budget cannot stack another roster call. Peek and lock probes that
+    return immediately still consume the remaining window as 50ms-spaced
+    attempts, capped by ``FLEET_JOURNAL_BUSY_ATTEMPTS``.
     """
     started = time.monotonic()
     deadline = started + goalflight_journal.JOURNAL_READER_RETRY_BUDGET_S
@@ -247,6 +248,87 @@ def _fenced_roster_once(
             return None, _BUSY_ERROR
         return roster, error
     return roster, None
+
+
+def _lock_liveness_once(
+    project_root: Path,
+    label: str,
+    nonce: str,
+) -> tuple[bool | None, str | None]:
+    """One read-only lock probe. ``JournalBusy`` is retryable at the caller.
+
+    Always calls the real liveness probe first. A ``None`` answer is then
+    classified from the lock path: missing/racy addresses retry as busy;
+    permission and other structural OS errors return on the first attempt.
+    """
+    alive = goalflight_wake.lease_holder_alive(
+        project_root,
+        controller_label=label,
+        lease_nonce=nonce,
+    )
+    if alive is not None:
+        return alive, None
+    path = goalflight_wake._generation_lock_path(
+        project_root,
+        kind=goalflight_wake.LEASE_KIND,
+        label=goalflight_wake._lease_lock_identity(label, nonce),
+        generation_key=nonce,
+    )
+    try:
+        directory_fd = goalflight_wake._open_ledger_directory_path(
+            path.parent, create=False
+        )
+    except FileNotFoundError:
+        return None, _BUSY_ERROR
+    except OSError as exc:
+        return None, type(exc).__name__
+    try:
+        fd = os.open(path.name, goalflight_wake._open_flags(), dir_fd=directory_fd)
+    except FileNotFoundError:
+        return None, _BUSY_ERROR
+    except PermissionError:
+        return None, "PermissionError"
+    except OSError as exc:
+        return None, type(exc).__name__
+    else:
+        os.close(fd)
+        return None, _BUSY_ERROR
+    finally:
+        os.close(directory_fd)
+
+
+def _with_retried_lock_liveness(
+    record: dict[str, Any],
+    *,
+    project_root: Path | None,
+) -> dict[str, Any]:
+    """Re-probe an ``unknown-lock`` row through the same bounded busy window."""
+    if str(record.get("incarnation_state") or "") != "unknown-lock":
+        return record
+    if project_root is None:
+        return record
+    label = str(record.get("label") or "")
+    nonce = record.get("session_id")
+    if not label or not isinstance(nonce, str) or not nonce:
+        return record
+    alive, error = _retry_journal_busy(
+        lambda: _lock_liveness_once(project_root, label, nonce)
+    )
+    patched = dict(record)
+    if error:
+        patched["lock_probe_error"] = error
+        patched["incarnation_state"] = "unknown-lock"
+        patched["lease_lock_live"] = None
+        return patched
+    if alive is None:
+        return record
+    incarnation, lease_lock_live = sessions._incarnation_state(
+        record,
+        lease_lock_live=alive,
+    )
+    patched["incarnation_state"] = incarnation
+    patched["lease_lock_live"] = lease_lock_live
+    return patched
 
 
 def canonical_project_root(raw: Path | str | None) -> Path | None:
@@ -466,7 +548,11 @@ def _unknown_reason(record: dict[str, Any], *, state: str, bucket: str | None) -
     parts: list[str] = []
     incarnation = str(record.get("incarnation_state") or "")
     if state == "unknown":
-        parts.append(f"holder {incarnation or 'unknown-lock'}")
+        probe_error = record.get("lock_probe_error")
+        if isinstance(probe_error, str) and probe_error.strip():
+            parts.append(f"holder {probe_error.strip()}")
+        else:
+            parts.append(f"holder {incarnation or 'unknown-lock'}")
     if record.get("wake_armed") is None:
         supervisor = str(record.get("supervisor") or "unknown")
         covered = record.get("wake_covered")
@@ -981,6 +1067,9 @@ def collect_controller_rows(
                 continue
             if record.get("retired"):
                 continue
+            record = _with_retried_lock_liveness(
+                record, project_root=probe_root
+            )
             rows.append(
                 fleet_row(
                     record,
