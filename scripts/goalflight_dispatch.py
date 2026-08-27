@@ -2634,6 +2634,151 @@ def _refuse_reused_dispatch_id_for_launch(dispatch_id: str, *, allow_queued: boo
         _refuse_reused_nonterminal_dispatch_id(dispatch_id)
 
 
+def _record_declared_read_only(record: dict) -> bool:
+    """True when the incumbent's own recorded launch posture is read-only.
+
+    Write-capability is the dispatch's declared sandbox, not a process scan.
+    The posture dict is written at launch from --read-only/--os-sandbox, and
+    the launch path refuses an accepted-but-inert read-only request before any
+    record is written. A recorded read-only profile is therefore a worker that
+    CANNOT write, not merely one that was asked not to.
+
+    Trust requested_profile / enforced_profile (what was asked / applied) and
+    the recorded read_only flag. Do not consult supported_profile: that field
+    names what the launch path knows how to support, and can say read-only
+    even for a writer.
+    """
+    posture = record.get("os_sandbox")
+    if isinstance(posture, dict):
+        if posture.get("requested_profile") == "read-only":
+            return True
+        if posture.get("enforced_profile") == "read-only":
+            return True
+    return bool(record.get("read_only"))
+
+
+def _same_worker_tree(record_cwd: object, target: Path) -> bool:
+    try:
+        candidate = os.path.realpath(str(record_cwd).strip())
+    except (OSError, ValueError):
+        return False
+    return bool(candidate) and candidate == os.path.realpath(str(target))
+
+
+def _worktree_incumbent_reason(args) -> tuple[str | None, str | None]:
+    """(occupied_reason, unknown_reason) for the tree this dispatch would write.
+
+    Occupancy is judged from the ledger's non-terminal set -- the lifecycle
+    authority -- never from a process scan: a queued/starting dispatch owns its
+    tree before any worker process exists for pgrep to see, and pid liveness
+    cannot tell a searcher from a worker.
+    """
+    target = _worker_cwd(args)
+    try:
+        records = goalflight_ledger.read_records()
+    except OSError as exc:
+        return None, f"dispatch ledger could not be read ({type(exc).__name__}: {exc})"
+    own_id = getattr(args, "dispatch_id", None)
+    host = socket.gethostname()
+    unknown: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        record_id = record.get("dispatch_id")
+        if own_id and record_id == own_id:
+            continue  # the drained/resumed launch re-enters with its own queued record
+        if goalflight_ledger.record_is_unreadable(record):
+            unknown.append(f"ledger record {record.get('path') or record_id} is unreadable")
+            continue
+        state = record.get("state")
+        terminal = goalflight_ledger.terminal_state_for(
+            state, record.get("reason") or record.get("error")
+        )
+        if terminal != "unknown":
+            # Settled vocabulary (complete/failed/blocked/...) vacates the tree.
+            # watcher_stopped resolves to its own terminal label here -- the same
+            # reading the resume source gate and the reused-id guard apply.
+            continue
+        if record.get("transport") == "fleet-ssh":
+            continue  # remote worker: its cwd is a path on another node's disk
+        record_host = record.get("hostname")
+        if isinstance(record_host, str) and record_host and record_host != host:
+            continue  # recorded by a dispatch launched on another machine
+        record_cwd = _resume_cwd_from_record(record)
+        if record_cwd is None:
+            unknown.append(
+                f"non-terminal dispatch {record_id} (state={state or 'running'}) "
+                "has no worker cwd evidence"
+            )
+            continue
+        if not _same_worker_tree(record_cwd, target):
+            continue
+        if _record_declared_read_only(record):
+            continue  # a reviewer shares the tree legitimately; it is not a writer
+        return (
+            f"worktree {target} is already owned by non-terminal dispatch "
+            f"{record_id} (state={state or 'running'}); a second writer would "
+            "share one filesystem tree with no merge discipline",
+            None,
+        )
+    if unknown:
+        detail = "; ".join(unknown[:3])
+        if len(unknown) > 3:
+            detail += f"; and {len(unknown) - 3} more"
+        return None, detail
+    return None, None
+
+
+def _prepare_attempt_worktree_occupancy(args) -> str | None:
+    """Refuse a second writer into an occupied worktree, or return the forced-path warning.
+
+    A read-only dispatch never writes, so it is never refused here. When the
+    ledger cannot prove occupancy either way (unreadable ledger/record, or a
+    non-terminal record with no cwd evidence), unknown REFUSES by default with
+    retry advice -- an unreadable ledger must not silently become a green
+    light. --occupied-worktree-forced converts either refusal into a visible
+    warning, matching the --unregistered-forced hatch.
+    """
+    if _effective_read_only(args):
+        return None
+    occupied, unknown = _worktree_incumbent_reason(args)
+    if occupied is None and unknown is None:
+        return None
+    if occupied is not None:
+        refusal = "\n".join(
+            [
+                occupied + ".",
+                "Use --occupied-worktree-forced to override and launch a "
+                "concurrent writer.",
+            ]
+        )
+        forced_warning = "\n".join(
+            [
+                f"--occupied-worktree-forced accepted: {occupied}; the two "
+                "writers now share one filesystem tree with no merge discipline.",
+            ]
+        )
+    else:
+        refusal = "\n".join(
+            [
+                f"worktree occupancy of {_worker_cwd(args)} is unknown ({unknown}).",
+                "Retry the dispatch; refusing before record or launch.",
+                "Use --occupied-worktree-forced to override and launch without "
+                "occupancy evidence.",
+            ]
+        )
+        forced_warning = "\n".join(
+            [
+                f"--occupied-worktree-forced accepted: worktree occupancy of "
+                f"{_worker_cwd(args)} is unknown ({unknown}); launching without "
+                "occupancy evidence.",
+            ]
+        )
+    if getattr(args, "occupied_worktree_forced", False):
+        return forced_warning
+    raise DispatchUsageError(refusal)
+
+
 def _write_windows_dispatch_refusal(args) -> tuple[dict, Path]:
     dispatch_id = args.dispatch_id or _default_dispatch_id(args.agent)
     args.dispatch_id = dispatch_id
@@ -2682,7 +2827,14 @@ def _refuse_windows_dispatch(args) -> int:
 
 
 def _find_dispatch_record(dispatch_id: str) -> dict | None:
-    for record in goalflight_ledger.read_records():
+    try:
+        records = goalflight_ledger.read_records()
+    except OSError:
+        # Unlistable ledger is occupancy UNKNOWN, not "this id is free". The
+        # occupancy gate refuses (or the --occupied-worktree-forced hatch
+        # consents). Do not crash the reused-id lookup with a traceback.
+        return None
+    for record in records:
         if record.get("dispatch_id") == dispatch_id:
             return record
     return None
@@ -3679,7 +3831,7 @@ def _resume_launch_argv(
         base,
         replace=replace,
         inject=inject,
-        strip_flags=_replay_strip_flags() + ("--unregistered-forced",),
+        strip_flags=_replay_strip_flags() + ("--unregistered-forced", "--occupied-worktree-forced"),
         strip_options=("--tail", "--status-json", "--prompt"),
     )
     if source["engine"] == "codex":
@@ -5554,6 +5706,7 @@ LAUNCH_ARGV_CLASS: dict[str, str] = {
     "--controller-label": "preserve",
     "--session-label": "preserve",
     "--unregistered-forced": "preserve",
+    "--occupied-worktree-forced": "preserve",
     "--controller-beacon-pid": "preserve",
     "--controller-session-id": "preserve",
     "--parent-dispatch-id": "preserve",
@@ -5707,6 +5860,9 @@ def _canonical_replay_argv_from_original(
     if getattr(args, "unregistered_forced", False):
         if "--unregistered-forced" not in argv:
             argv = _insert_before_worker_remainder(argv, ["--unregistered-forced"])
+    if getattr(args, "occupied_worktree_forced", False):
+        if "--occupied-worktree-forced" not in argv:
+            argv = _insert_before_worker_remainder(argv, ["--occupied-worktree-forced"])
     if raw_argv and "--" not in argv:
         argv += ["--", *raw_argv]
     return argv
@@ -5780,6 +5936,8 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv += ["--controller-session-id", controller_session_id]
     if getattr(args, "unregistered_forced", False):
         argv.append("--unregistered-forced")
+    if getattr(args, "occupied_worktree_forced", False):
+        argv.append("--occupied-worktree-forced")
     engine_session_id = _resolved_engine_session_id(args)
     if engine_session_id is not None:
         argv += ["--engine-session-id", engine_session_id]
@@ -12876,6 +13034,11 @@ def _acp_detached_child_argv(args) -> list[str]:
         and "--unregistered-forced" not in argv
     ):
         argv = _insert_before_worker_remainder(argv, ["--unregistered-forced"])
+    if (
+        getattr(args, "occupied_worktree_forced", False)
+        and "--occupied-worktree-forced" not in argv
+    ):
+        argv = _insert_before_worker_remainder(argv, ["--occupied-worktree-forced"])
     if "--acp-detached-child" not in argv:
         argv = _insert_before_worker_remainder(argv, ["--acp-detached-child"])
     return argv
@@ -13716,6 +13879,16 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--occupied-worktree-forced",
+        action="store_true",
+        help=(
+            "Override the occupied-worktree launch refusal: launch even though a "
+            "non-terminal dispatch already owns --cwd (the two writers then share "
+            "one filesystem tree with no merge discipline), or when the ledger "
+            "cannot prove the tree is free."
+        ),
+    )
+    parser.add_argument(
         "--takeover",
         action="store_true",
         help=(
@@ -13881,6 +14054,12 @@ def main(argv: list[str] | None = None) -> int:
                 args.dispatch_id,
                 allow_queued=args.from_queue or args.submit,
             )
+            occupancy_warning = _prepare_attempt_worktree_occupancy(args)
+            if occupancy_warning is not None:
+                args.dispatch_warnings = [
+                    *getattr(args, "dispatch_warnings", []),
+                    occupancy_warning,
+                ]
             account_env = (
                 {} if goalflight_compat.is_windows() else _resolve_launch_account_env(args)
             )
@@ -13926,8 +14105,6 @@ def main(argv: list[str] | None = None) -> int:
         _apply_max_idle_default(args)
         _validate_before_side_effects(args, raw)
         dispatch_warnings = _dispatch_warnings(args, raw)
-        account_env = _resolve_launch_account_env(args)
-        _validate_claude_auth_before_attempt(args, account_env)
     except UnsupportedAgentSandboxRequest as e:
         try:
             return _record_unsupported_sandbox_rejection(args, e)
@@ -13951,6 +14128,24 @@ def main(argv: list[str] | None = None) -> int:
             args.dispatch_id,
             allow_queued=args.from_queue or args.submit,
         )
+        occupancy_warning = _prepare_attempt_worktree_occupancy(args)
+        if occupancy_warning is not None:
+            dispatch_warnings = [*dispatch_warnings, occupancy_warning]
+    except DispatchUsageError as e:
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        return 64
+    # Occupancy is the filesystem-corruption gate; it must refuse a second
+    # writer before account/auth work that could spawn or misdirect the
+    # operator. Same order as the ACP branch.
+    try:
+        account_env = _resolve_launch_account_env(args)
+        _validate_claude_auth_before_attempt(args, account_env)
+    except UnsupportedAgentSandboxRequest as e:
+        try:
+            return _record_unsupported_sandbox_rejection(args, e)
+        except DispatchUsageError as record_error:
+            print(f"goalflight_dispatch: {record_error}", file=sys.stderr)
+            return 64
     except DispatchUsageError as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64
