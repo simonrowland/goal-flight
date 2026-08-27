@@ -31,6 +31,7 @@ required_fragments = (
     "-u GOALFLIGHT_ISOLATED_TEST_FILE",
     'GOALFLIGHT_MESSAGES_DIR="$_GF_MESSAGES_BASE"',
     'GOALFLIGHT_JOURNAL_DIR="$_GF_JOURNAL_BASE"',
+    "project-<10-hex>",
 )
 for fragment in required_fragments:
     if fragment not in runner_text:

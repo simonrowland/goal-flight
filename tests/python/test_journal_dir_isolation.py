@@ -79,11 +79,11 @@ def test_unscoped_resolver_still_points_at_live_xdg(tmp_path: Path) -> None:
 
 
 def test_isolated_create_does_not_touch_live_journals(tmp_path: Path) -> None:
-    """A real create under isolation must not mint a live XDG slug.
+    """pop TASK_STORE_DIR, keep JOURNAL_DIR: create stays under the journal override.
 
-    Fails if GOALFLIGHT_JOURNAL_DIR / TASK_STORE_DIR isolation is lost: the
-    resolver would point at ~/.local/state/goal-flight/journals/project-<hash>
-    and Journal.create would write the operator's store.
+    This is the measured leak shape. TASK_STORE_DIR only isolates journals
+    incidentally; without JOURNAL_DIR the resolver would mint
+    ~/.local/state/goal-flight/journals/project-<hash>.
     """
     project = tmp_path / "project"
     project.mkdir()
@@ -93,14 +93,41 @@ def test_isolated_create_does_not_touch_live_journals(tmp_path: Path) -> None:
     live_slug = live_index / slug
     assert not live_slug.exists()
 
-    resolved = journal.resolve_journal_path(project)
-    isolated_root = tmp_path.resolve()
-    assert resolved.resolve().is_relative_to(isolated_root), resolved
+    journal_override = Path(os.environ["GOALFLIGHT_JOURNAL_DIR"])
+    with env_cleared("GOALFLIGHT_TASK_STORE_DIR"):
+        resolved = journal.resolve_journal_path(project)
+        authority = journal.Journal.create(project)
+    assert resolved.resolve().is_relative_to(journal_override.resolve()), resolved
     assert not resolved.resolve().is_relative_to(live_index.resolve()), resolved
-
-    authority = journal.Journal.create(project)
     assert authority.path.resolve() == resolved.resolve()
     assert resolved.is_file()
+    assert not live_slug.exists(), f"leaked live journal dir: {live_slug}"
+
+
+def test_journal_dir_loss_is_isolated_only_incidentally_by_task_store(
+    tmp_path: Path,
+) -> None:
+    """pop only JOURNAL_DIR: live XDG is missed because TASK_STORE_DIR remains.
+
+    This does not credit the JOURNAL_DIR pin. Losing JOURNAL_DIR while the
+    store override is still set lands under the isolated task-store journals
+    index. A pin that only checks its own live_slug stays green for that
+    shape even though JOURNAL_DIR did no work.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    live_index = _live_journals_index()
+    with env_cleared("GOALFLIGHT_JOURNAL_DIR", "GOALFLIGHT_TASK_STORE_DIR"):
+        slug = task.resolve_task_store_dir(project).name
+    live_slug = live_index / slug
+    assert not live_slug.exists()
+
+    task_store = Path(os.environ["GOALFLIGHT_TASK_STORE_DIR"])
+    with env_cleared("GOALFLIGHT_JOURNAL_DIR"):
+        created = journal.Journal.create(project).path.resolve()
+    assert created.is_file()
+    assert created.is_relative_to(task_store.resolve()), created
+    assert not created.is_relative_to(live_index.resolve()), created
     assert not live_slug.exists(), f"leaked live journal dir: {live_slug}"
 
 

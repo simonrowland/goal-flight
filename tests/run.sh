@@ -111,6 +111,26 @@ if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
     fi
     rm -f /tmp/goal-flight-collect-$$.out
 
+    # Snapshot live XDG project-<10-hex> journal slugs so a suite leak cannot
+    # hide behind incidental TASK_STORE_DIR isolation of the test's own slug.
+    _GF_LIVE_SLUG_SNAP="$(mktemp "${TMPDIR:-/tmp}/gf-live-journal-slugs-XXXXXX")"
+    env -u GOALFLIGHT_JOURNAL_DIR -u GOALFLIGHT_TASK_STORE_DIR python3 - "$_GF_LIVE_SLUG_SNAP" <<'PY'
+import os, re, sys
+from pathlib import Path
+xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+index = base / "goal-flight" / "journals"
+pat = re.compile(r"^project-[0-9a-f]{10}$")
+names = []
+if index.is_dir():
+    for child in index.iterdir():
+        try:
+            if child.is_dir() and pat.match(child.name):
+                names.append(child.name)
+        except OSError:
+            continue
+Path(sys.argv[1]).write_text("\n".join(sorted(names)), encoding="utf-8")
+PY
     if run_isolated_test_env python3 -m pytest tests/python -q > /tmp/goal-flight-test-$$.out 2>&1; then
       grep '^FLAKE  ' /tmp/goal-flight-test-$$.out | sed 's/^/      /' || true
       echo "PASS  tests/python (isolated pytest directory suite)"
@@ -123,6 +143,39 @@ if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
       failed_tests+=("tests/python")
     fi
     rm -f /tmp/goal-flight-test-$$.out
+    if ! env -u GOALFLIGHT_JOURNAL_DIR -u GOALFLIGHT_TASK_STORE_DIR python3 - "$_GF_LIVE_SLUG_SNAP" <<'PY'
+import os, re, sys
+from pathlib import Path
+before = {
+    line.strip()
+    for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+}
+xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+index = base / "goal-flight" / "journals"
+pat = re.compile(r"^project-[0-9a-f]{10}$")
+after = set()
+if index.is_dir():
+    for child in index.iterdir():
+        try:
+            if child.is_dir() and pat.match(child.name):
+                after.add(child.name)
+        except OSError:
+            continue
+leaked = sorted(after - before)
+if leaked:
+    print("live journals index gained project-<10-hex> children:", ", ".join(leaked))
+    raise SystemExit(1)
+PY
+    then
+      :
+    else
+      echo "FAIL  live journals index gained project-<10-hex> children during python suite"
+      fail=$((fail + 1))
+      failed_tests+=("live-journal-isolation")
+    fi
+    rm -f "$_GF_LIVE_SLUG_SNAP"
   fi
 fi
 
