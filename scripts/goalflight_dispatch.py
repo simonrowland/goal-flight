@@ -7271,16 +7271,63 @@ def _abandoned_changed_progress_keys(before: tuple, after: tuple) -> set[str]:
     }
 
 
+_PRODUCER_CONTRACT_FIELDS = (
+    "worker_pgid",
+    "worker_group_leader_identity",
+    "producer_group_contract",
+    "producer_group_contract_enforced",
+)
+_PRODUCER_SET_STRUCTURALLY_ABSENT = "producer_set:structurally_absent:no_group_contract"
+_ELIGIBLE_NO_GROUP_CONTRACT = "worker_provably_gone:no_group_contract"
+
+
+def _producer_set_contract_enumerable(record: dict) -> bool:
+    """True when the record asserted a complete producer-set group contract.
+
+    ``enumerate_token_producers`` can probe only when launch token, enforced
+    group contract, pgid, group-leader identity, and worker pid are all
+    present. Anything less is structurally unresolvable: those fields will
+    not appear later, so a missing-contract INDETERMINATE can never clear.
+    Bare ``worker_pgid`` is not a contract — typical launch writes the pgid
+    from worker identity and never writes the contract flags.
+    """
+
+    if not record.get("queue_launch_token"):
+        return False
+    if not bool(record.get("producer_group_contract")):
+        return False
+    if not bool(record.get("producer_group_contract_enforced")):
+        return False
+    if not isinstance(record.get("worker_group_leader_identity"), dict):
+        return False
+    try:
+        pgid = int(record.get("worker_pgid") or 0)
+        worker_pid = int(record.get("worker_pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    return pgid > 0 and worker_pid > 0
+
+
 def _abandoned_process_evidence(record: dict, status: dict) -> tuple[bool, str]:
     """Prove every locally recorded worker/claimant identity inactive.
 
     ``True`` means no recorded process can still own the dispatch. Identity
     provider errors and weak/unknown identities fail closed.
 
-    Status ``worker_alive`` may corroborate, never short-circuit. Probe each
-    recorded pid and start-token first. Only a confirmed-dead identity
-    overrides a stale ``worker_alive: true``; a true flag with no pid to
-    measure, or any live/indeterminate probe, stays not-abandoned.
+    Probe each recorded pid and start-token before treating a boolean
+    ``worker_alive: true`` as authority. Confirmed-dead overrides that stale
+    flag; a true flag with no pid to measure, or any live/indeterminate
+    probe, stays not-abandoned. Status values outside ``{True, False, None}``
+    are unreadable and fail closed before probes.
+
+    A producer-set group contract is enumerated only when the record
+    asserted a complete one (launch token, enforced contract, pgid, group
+    leader identity, and worker pid). Bare ``worker_pgid`` or any other
+    incomplete subset is structurally absent — those fields will not appear
+    later — and does not veto once every pid-backed identity is confirmed
+    dead. A present contract whose probe is unreadable still fails closed.
+    Missing contract fields never rescue an unproven (absent or
+    indeterminate) death.
     """
 
     if "worker_alive" in status and status.get("worker_alive") not in {True, False, None}:
@@ -7335,18 +7382,24 @@ def _abandoned_process_evidence(record: dict, status: dict) -> tuple[bool, str]:
         if state in {"live", "indeterminate"}:
             return False, ",".join(evidence)
 
-    producer_contract_fields = (
-        "worker_pgid",
-        "worker_group_leader_identity",
-        "producer_group_contract",
-        "producer_group_contract_enforced",
-    )
-    if any(record.get(key) for key in producer_contract_fields):
-        producer_entry = _entry_with_record_identity({}, record, prefer_record=True)
-        producer_set = enumerate_token_producers(producer_entry)
-        evidence.append(f"producer_set:{producer_set.state.value}:{producer_set.reason}")
-        if producer_set.state not in {ProducerSetState.DEAD, ProducerSetState.PID_REUSED}:
-            return False, ",".join(evidence)
+    has_producer_fields = any(record.get(key) for key in _PRODUCER_CONTRACT_FIELDS)
+    if has_producer_fields:
+        if _producer_set_contract_enumerable(record):
+            producer_entry = _entry_with_record_identity({}, record, prefer_record=True)
+            producer_set = enumerate_token_producers(producer_entry)
+            evidence.append(f"producer_set:{producer_set.state.value}:{producer_set.reason}")
+            if producer_set.state not in {ProducerSetState.DEAD, ProducerSetState.PID_REUSED}:
+                return False, ",".join(evidence)
+        elif evidence:
+            # Structurally absent contract. Every measured pid-backed identity
+            # is already confirmed dead; the producer set cannot add
+            # information those probes have not settled.
+            evidence.append(_PRODUCER_SET_STRUCTURALLY_ABSENT)
+        else:
+            # Missing contract must never rescue an unproven death.
+            if status.get("worker_alive") is True:
+                return False, "status_worker_alive:true"
+            return False, "producer_set:structurally_absent:unproven_pids"
     if not evidence:
         # No identity was measured. A true flag cannot be overridden without
         # confirmed death, so fail closed rather than treating absence as death.
@@ -7528,10 +7581,15 @@ def _evaluate_abandoned_dispatch(
             "reason": "recent_progress",
             "progress_age_s": round(progress_age_s, 3),
         }
+    eligible_reason = "worker_provably_gone"
+    if _PRODUCER_SET_STRUCTURALLY_ABSENT in {
+        part.strip() for part in str(process_evidence).split(",")
+    }:
+        eligible_reason = _ELIGIBLE_NO_GROUP_CONTRACT
     return {
         **result,
         "eligible": True,
-        "reason": "worker_provably_gone",
+        "reason": eligible_reason,
         "process_evidence": process_evidence,
         "status_evidence": status_evidence,
         "output_evidence": output_evidence,
