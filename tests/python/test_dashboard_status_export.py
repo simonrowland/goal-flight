@@ -523,3 +523,61 @@ def test_foreground_dispatch_refreshes_dashboard_status_data() -> None:
         assert row["tail_last_line"] == "COMPLETE: dashboard-watch — dashboard worker done"
         assert payload["counts"]["worker_finished"] == 1
         assert any(item["project_root"] == str(project.resolve()) for item in projects_index["projects"])
+
+
+def test_kill_switch_stops_spawning_and_drains_running_refreshers(
+    tmp_path, monkeypatch
+) -> None:
+    """The operator kill switch must both prevent spawn and end a live loop.
+
+    Killing the daemons by pid is not enough on its own: any controller that
+    dispatches next respawns one. The flag is checked in both places so an
+    already-running refresher exits at its next cycle without being hunted.
+    """
+    project_root = tmp_path / "proj"
+    (project_root / "dashboard").mkdir(parents=True)
+    flag = tmp_path / "disabled"
+    monkeypatch.setattr(D, "_DASHBOARD_REFRESH_DISABLE_FLAG", flag)
+
+    spawned: list[list[str]] = []
+    real_popen = D.subprocess.Popen
+
+    class _FakeProc:
+        pid = 424242
+
+    def _fake_popen(argv, *a, **k):
+        # Intercept only the refresher spawn. Other Popen users run underneath
+        # this code path (process_identity shells out to ps), and swallowing
+        # those would make the test pass for the wrong reason.
+        if list(argv)[2:3] == [D._DASHBOARD_REFRESH_SUBCOMMAND]:
+            spawned.append(list(argv))
+            return _FakeProc()
+        return real_popen(argv, *a, **k)
+
+    monkeypatch.setattr(D.subprocess, "Popen", _fake_popen)
+
+    # Absent flag: the spawn path is reached (it gets as far as Popen).
+    D._start_dashboard_refresh_for_project(project_root)
+    assert spawned, "expected a refresher spawn attempt while the flag is absent"
+
+    # Present flag: no new refresher is started.
+    spawned.clear()
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text("off\n", encoding="utf-8")
+    D._start_dashboard_refresh_for_project(project_root)
+    assert spawned == [], "kill switch must prevent a refresher spawn"
+
+    # Present flag: a loop that is already running returns instead of working.
+    exported: list[Path] = []
+    monkeypatch.setattr(
+        D, "_export_dashboard_status_for_project", lambda root: exported.append(root)
+    )
+    rc = D._dashboard_refresh_loop(project_root, interval_s=15.0)
+    assert rc == 0
+    assert exported == [], "a running refresher must drain without another export"
+
+    # Removing the flag restores the loop's normal work.
+    flag.unlink()
+    monkeypatch.setattr(D, "_dashboard_project_has_live_dispatch", lambda root: False)
+    assert D._dashboard_refresh_loop(project_root, interval_s=15.0) == 0
+    assert exported == [project_root], "clearing the flag must restore exports"

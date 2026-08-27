@@ -184,6 +184,10 @@ _DASHBOARD_REFRESH_MARKER = "goalflight-dashboard-refresh-v1"
 _DASHBOARD_REFRESH_QUEUED_GRACE_S = 60 * 60
 _DASHBOARD_REFRESH_MAX_LIFETIME_S = 4 * 60 * 60
 _DASHBOARD_REFRESH_CLAIM_STALE_S = 30.0
+# Operator kill switch. Remove the file to re-enable the refresher fleet-wide.
+_DASHBOARD_REFRESH_DISABLE_FLAG = (
+    Path.home() / ".goal-flight" / "dashboard-refresh.disabled"
+)
 # Code writers read a corpus before their first edit, so their quiet periods are
 # the longest in the fleet and the most often mistaken for death. One hour is a
 # backstop for a genuinely wedged process, not a guess at how long thinking
@@ -1712,6 +1716,18 @@ def _dashboard_project_has_live_dispatch(project_root: Path) -> bool:
     )
 
 
+def _dashboard_refresh_disabled() -> bool:
+    """True while the operator kill switch file exists.
+
+    A file rather than an environment variable: the refresher is spawned
+    detached by whichever controller session happens to dispatch next, so an
+    env var set in one session would not reach the others. Checking a path
+    also lets daemons that are already running exit at their next cycle
+    instead of having to be hunted down by pid.
+    """
+    return _DASHBOARD_REFRESH_DISABLE_FLAG.exists()
+
+
 def _dashboard_refresh_loop(
     project_root: Path,
     *,
@@ -1723,6 +1739,8 @@ def _dashboard_refresh_loop(
     interval = min(max(float(interval_s or 15.0), 1.0), 15.0)
     started = time.monotonic()
     while True:
+        if _dashboard_refresh_disabled():
+            return 0
         _export_dashboard_status_for_project(project_root)
         if time.monotonic() - started >= float(max_lifetime_s):
             return 0
@@ -1749,6 +1767,8 @@ def _cmd_dashboard_refresh(argv: list[str]) -> int:
 
 def _start_dashboard_refresh_for_project(project_root: Path | None) -> None:
     if project_root is None or not (project_root / "dashboard").is_dir():
+        return
+    if _dashboard_refresh_disabled():
         return
     pidfile, log_path = _dashboard_refresh_paths(project_root)
     claim_path = _dashboard_refresh_claim_path(pidfile)
