@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Journal GC must never reclaim an unverified absence.
 
-Four states, not three: live / root-gone / empty / unknown. Unknown is never
+States: live / root-gone / orphaned / empty / unknown. Unknown is never
 reclaimed. Root-gone journals that still hold an ACTIVE lease with a live
-holder, or a non-terminal dispatch, are retained with the reason printed.
-Casualty sidecars are their own category. Report-only is the default.
+(or indeterminate) holder are retained with the reason printed. Root-gone
+journals retained ONLY by non-terminal dispatch records are ``orphaned`` —
+stuck, not busy: reconciliation runs from the project root, so a proven-gone
+root means nothing can ever transition those records. Orphaned journals are
+surfaced in their own report section and never reclaimed. Casualty sidecars
+are their own category. Report-only is the default.
 """
 
 from __future__ import annotations
@@ -77,6 +81,28 @@ def _entry_for(payload: dict, journal_dir: Path) -> dict:
         if entry["journal"] == target:
             return entry
     raise AssertionError(f"no entry for {target} in {payload['entries']}")
+
+
+def _human_section(stdout: str, header: str) -> str:
+    """Return one report section's body ("" when the section is absent)."""
+    lines = stdout.splitlines()
+    start = next(
+        (i for i, line in enumerate(lines) if header in line),
+        None,
+    )
+    if start is None:
+        return ""
+    body = lines[start + 1 :]
+    end = len(body)
+    for i, line in enumerate(body):
+        if (
+            line.startswith("  ")
+            and not line.startswith("    ")
+            and line.strip().endswith(":")
+        ):
+            end = i
+            break
+    return "\n".join(body[:end])
 
 
 def test_live_root_is_kept(tmp_path: Path) -> None:
@@ -236,18 +262,131 @@ def test_active_lease_with_live_holder_is_retained(tmp_path: Path) -> None:
         holder.close()
 
 
-def test_non_terminal_dispatch_is_retained(tmp_path: Path) -> None:
+def test_live_root_with_non_terminal_dispatch_is_retained(tmp_path: Path) -> None:
+    """Root exists + non-terminal record: retained, unchanged behavior."""
+    project = _project(tmp_path, "busy-repo")
+    authority = _create(project)
+    prepared = authority.prepare_attempt("live-dispatch")
+    assert prepared.committed
+    entry = gc.classify(_journal_dir(authority))
+    assert entry["state"] == "live"
+    assert entry["reclaimable"] is False
+    assert entry["root"] == str(project)
+    payload = _run_json("--apply")
+    reported = _entry_for(payload, _journal_dir(authority))
+    assert reported["state"] == "live"
+    assert reported["reclaimable"] is False
+    assert payload["deleted"] == 0
+    assert _journal_dir(authority).is_dir()
+
+
+def test_root_gone_non_terminal_dispatch_is_orphaned(tmp_path: Path) -> None:
+    """Root proven gone + ONLY non-terminal records: the orphan category.
+
+    Not reclaimable-silently, not retained-forever-as-busy: visibly stuck in
+    its own report section, and --apply leaves it on disk.
+    """
     project = _project(tmp_path, "running-repo")
     authority = _create(project)
     prepared = authority.prepare_attempt("still-running")
     assert prepared.committed
+    second = authority.prepare_attempt("also-prepared")
+    assert second.committed
     journal_dir = _journal_dir(authority)
     shutil.rmtree(project)
+
     entry = gc.classify(journal_dir)
-    assert entry["state"] == "root_gone"
+    assert entry["state"] == "orphaned", entry
     assert entry["reclaimable"] is False
-    assert "non-terminal dispatch" in entry["why"]
+    assert "root gone with 2 orphaned non-terminal dispatch record(s)" in entry["why"]
     assert "still-running" in entry["why"]
+    assert "also-prepared" in entry["why"]
+
+    payload = _run_json()
+    assert payload["orphaned"] >= 1
+    reported = _entry_for(payload, journal_dir)
+    assert reported["state"] == "orphaned"
+    assert reported["reclaimable"] is False
+
+    # The report must show this journal as stuck, never as reclaimable, and
+    # never lumped with journals retained because live work references them.
+    proc = _run()
+    assert proc.returncode == 0, proc.stderr
+    stuck = _human_section(
+        proc.stdout, "stuck - root gone with orphaned non-terminal records"
+    )
+    assert str(journal_dir) in stuck
+    assert "2 orphaned non-terminal dispatch record(s)" in stuck
+    for header in ("reclaimable journals:", "  retained:"):
+        assert str(journal_dir) not in _human_section(proc.stdout, header)
+
+    applied = _run_json("--apply")
+    assert applied["deleted"] == 0
+    assert journal_dir.is_dir(), "orphaned journals are surfaced, not deleted"
+
+
+def test_indeterminate_root_with_non_terminal_dispatch_is_unknown(
+    tmp_path: Path,
+) -> None:
+    """A root that cannot be stat'd is UNKNOWN, never orphaned or gone.
+
+    The orphan category must not fire on 'could not determine': only
+    FileNotFoundError is proof of absence.
+    """
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    project = locked / "real-repo"
+    project.mkdir()
+    authority = _create(project)
+    prepared = authority.prepare_attempt("indeterminate-dispatch")
+    assert prepared.committed
+    journal_dir = _journal_dir(authority)
+    os.chmod(locked, 0o000)
+    try:
+        entry = gc.classify(journal_dir)
+        assert entry["state"] == "unknown", entry
+        assert entry["reclaimable"] is False
+        assert "unverified" in entry["why"], entry
+        payload = _run_json("--apply")
+        reported = _entry_for(payload, journal_dir)
+        assert reported["state"] == "unknown"
+        assert reported["reclaimable"] is False
+        assert payload["deleted"] == 0
+        assert journal_dir.is_dir()
+    finally:
+        os.chmod(locked, 0o755)
+
+
+def test_orphaned_dispatch_with_live_holder_is_retained(tmp_path: Path) -> None:
+    """Root gone + non-terminal record + proven-live lease holder: retained.
+
+    Live-work evidence dominates the orphan category; the retention guard is
+    unchanged whenever a holder is proven alive.
+    """
+    project = _project(tmp_path, "held-running-repo")
+    authority = _create(project)
+    lease = _claim(authority, "alice")
+    holder = wake.register_lease_holder(
+        project, controller_label=lease.label, lease_nonce=lease.nonce
+    )
+    prepared = authority.prepare_attempt("held-dispatch")
+    assert prepared.committed
+    journal_dir = _journal_dir(authority)
+    try:
+        shutil.rmtree(project)
+        entry = gc.classify(journal_dir)
+        assert entry["state"] == "root_gone", entry
+        assert entry["reclaimable"] is False
+        assert "live holder" in entry["why"]
+        assert "held-dispatch" in entry["why"]
+        payload = _run_json()
+        reported = _entry_for(payload, journal_dir)
+        assert reported["state"] == "root_gone"
+        assert reported["reclaimable"] is False
+        assert payload["orphaned"] == 0
+        assert journal_dir.is_dir()
+    finally:
+        holder.close()
 
 
 def test_casualty_sidecar_is_its_own_category(tmp_path: Path) -> None:
@@ -486,7 +625,7 @@ def test_cross_table_live_lease_and_gone_attempt_is_unknown(tmp_path: Path) -> N
     assert live.is_dir()
 
 
-def test_cli_json_four_state_counts(tmp_path: Path) -> None:
+def test_cli_json_state_counts(tmp_path: Path) -> None:
     live = _project(tmp_path, "count-live")
     live_auth = _create(live)
     _claim(live_auth)
@@ -495,6 +634,12 @@ def test_cli_json_four_state_counts(tmp_path: Path) -> None:
     gone_auth = _create(gone)
     _claim(gone_auth)
     shutil.rmtree(gone)
+
+    orphaned_project = _project(tmp_path, "count-orphaned")
+    orphaned_auth = _create(orphaned_project)
+    prepared = orphaned_auth.prepare_attempt("count-stuck")
+    assert prepared.committed
+    shutil.rmtree(orphaned_project)
 
     empty = gc.journals_store() / "count-empty"
     empty.mkdir(parents=True, exist_ok=True)
@@ -505,12 +650,18 @@ def test_cli_json_four_state_counts(tmp_path: Path) -> None:
     os.chmod(locked_auth.path, 0o000)
     try:
         payload = _run_json()
-        assert payload["schema"] == "goalflight.journal-gc.v1"
+        assert payload["schema"] == "goalflight.journal-gc.v2"
         assert payload["live"] >= 1
         assert payload["root_gone"] >= 1
+        assert payload["orphaned"] >= 1
         assert payload["empty"] >= 1
         assert payload["unknown"] >= 1
         assert payload["applied"] is False
         assert payload["deleted"] == 0
+        # reclaimable / orphaned / retained partition the entries.
+        assert (
+            payload["reclaimable"] + payload["orphaned"] + payload["retained"]
+            == len(payload["entries"])
+        )
     finally:
         os.chmod(locked_auth.path, 0o644)

@@ -3,20 +3,48 @@
 
 Report-only by default. ``--apply`` is required to delete anything.
 
-Four states, not three — the codedb reaper originally conflated "the marker
+Five states, not three — the codedb reaper originally conflated "the marker
 is not there" with "the marker is there and I could not read it" via a bare
 ``except OSError`` / ``Path.exists()``. Absence of proof is never proof of
 absence:
 
   live        recorded project_root exists
   root-gone   recorded project_root is absent (FileNotFoundError only)
+  orphaned    root-gone AND retained only by non-terminal dispatch records
+              that can never reconcile (see below); NOT reclaimed
   empty       journal holds no domain data AND its recorded root is gone
   unknown     root or contents unverifiable; NEVER reclaimed
 
 A journal may be dead by root and still referenced. An ACTIVE lease with a
-live holder, or a non-terminal dispatch, retains it. An unreadable journal is
-unknown: we cannot prove it is unreferenced. Quarantine sidecars matching
-``.dev-casualty-<stamp>`` are their own category and are never deleted.
+live holder retains it, as does a lease whose holder liveness we cannot
+determine. An unreadable journal is unknown: we cannot prove it is
+unreferenced. Quarantine sidecars matching ``.dev-casualty-<stamp>`` are
+their own category and are never deleted.
+
+Orphaned non-terminal dispatch records: dispatch reconciliation is driven
+from the project root, so once the root is *proven* gone the workers are
+dead, nothing will ever transition PREPARED/STARTING/RUNNING records, and a
+plain retention guard would pin the journal forever — circularly
+unreclaimable. Those journals are surfaced as ``orphaned``: visibly stuck,
+distinct from both "reclaimable" and "retained because live work references
+it". They are NOT deleted: the records are history, and the guard against
+deleting referenced journals is unchanged whenever the root still exists (or
+cannot be proven gone — ``_classify_root`` returns ``unknown`` for any
+OSError that is not FileNotFoundError, so "cannot tell" never folds into
+"gone").
+
+DECISION (terminalizing orphans): the diagnosis above is not the cure. The
+cure is a reconcile pass that transitions these records to ATTEMPT_ABANDONED
+via the journal's existing ``commit_terminal(..., terminal="abandoned")``
+path, gated on the same FileNotFoundError-only proof of a gone root. That
+pass must run from the journal side, not the project root. It is NOT
+implemented here: terminalizing writes domain state (outbox events, ledger
+transitions) that shared-machine controllers and the fleet ledger drain, and
+choosing the terminal token and observation payload is a controller-level
+decision, new authority this report/reclaim tool does not hold. Recommended:
+add an opt-in ``--terminalize-orphans`` (or fleet-reconciler equivalent) that
+only touches records whose root is proven gone, then the journal ages into
+the ordinary root-gone/reclaimable path.
 
 Re-verify the classification immediately before deleting. The scan is a
 snapshot; state can move between listing and acting.
@@ -44,7 +72,7 @@ import goalflight_journal as journal  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 
 
-SCHEMA = "goalflight.journal-gc.v1"
+SCHEMA = "goalflight.journal-gc.v2"
 CASUALTY_MARKER = ".dev-casualty-"
 _UNSTABLE_PREFIXES = ("/Volumes/", "/net/", "/mnt/", "/media/")
 _BOOKKEEPING_TABLES = frozenset(
@@ -263,9 +291,18 @@ def _holder_retain_reason(root: str, label: str, nonce: str) -> str | None:
     return None
 
 
-def _reference_reasons(connection: sqlite3.Connection, tables: set[str]) -> list[str] | None:
-    """Return retain-reasons for live references, or None if unverifiable."""
-    reasons: list[str] = []
+def _reference_reasons(
+    connection: sqlite3.Connection, tables: set[str]
+) -> dict[str, list[str]] | None:
+    """Return retain-reasons by kind, or None if unverifiable.
+
+    ``lease`` reasons are live-holder or liveness-indeterminate evidence:
+    they retain regardless of root state. ``dispatch`` reasons are
+    non-terminal dispatch records; when the root is *proven* gone those are
+    orphans (reconciliation runs from the project root, so nothing can ever
+    transition them), not evidence of live work.
+    """
+    reasons: dict[str, list[str]] = {"lease": [], "dispatch": []}
     if "controller_leases" in tables:
         try:
             rows = connection.execute(
@@ -281,7 +318,7 @@ def _reference_reasons(connection: sqlite3.Connection, tables: set[str]) -> list
             lease_nonce = "" if nonce is None else str(nonce)
             reason = _holder_retain_reason(root, lease_label, lease_nonce)
             if reason:
-                reasons.append(reason)
+                reasons["lease"].append(reason)
     if "dispatch_attempts" in tables:
         try:
             rows = connection.execute(
@@ -292,7 +329,7 @@ def _reference_reasons(connection: sqlite3.Connection, tables: set[str]) -> list
         for dispatch_id, lifecycle_state in rows:
             state = "" if lifecycle_state is None else str(lifecycle_state)
             if state in _LIVE_ATTEMPT_STATES:
-                reasons.append(
+                reasons["dispatch"].append(
                     f"non-terminal dispatch "
                     f"(dispatch_id={dispatch_id}, state={state})"
                 )
@@ -466,11 +503,32 @@ def classify(journal_dir: Path) -> dict:
         )
 
     # root-gone: still refuse if referenced.
-    if references:
+    lease_reasons = references["lease"]
+    dispatch_reasons = references["dispatch"]
+    if lease_reasons:
+        # A live holder, or a holder whose liveness we cannot determine, is
+        # live-work evidence (or can't-tell): retain, unchanged.
         return _entry(
             journal_dir,
             state="root_gone",
-            why="; ".join(references),
+            why="; ".join(lease_reasons + dispatch_reasons),
+            root=root,
+            roots=roots,
+            reclaimable=False,
+        )
+    if dispatch_reasons:
+        # The root is proven gone and the ONLY references are non-terminal
+        # dispatch records. Reconciliation is driven from the project root,
+        # so these records can never transition: they are orphans, and
+        # retaining under a live-work reason would pin the journal forever.
+        # Surface as stuck — not reclaimable, not "retained because busy".
+        return _entry(
+            journal_dir,
+            state="orphaned",
+            why=(
+                f"root gone with {len(dispatch_reasons)} orphaned "
+                "non-terminal dispatch record(s): " + "; ".join(dispatch_reasons)
+            ),
             root=root,
             roots=roots,
             reclaimable=False,
@@ -532,9 +590,13 @@ def scan(store: Path) -> list[dict]:
 
 
 def _counts(entries: list[dict]) -> dict[str, int]:
+    # reclaimable / orphaned / retained partition the entries: orphaned
+    # journals are stuck (never reclaimed, never busy) and are counted apart
+    # from retained so the totals always add up at a glance.
     counts = {
         "live": 0,
         "root_gone": 0,
+        "orphaned": 0,
         "empty": 0,
         "unknown": 0,
         "casualty": 0,
@@ -547,7 +609,7 @@ def _counts(entries: list[dict]) -> dict[str, int]:
             counts[state] += 1
         if entry["reclaimable"]:
             counts["reclaimable"] += 1
-        else:
+        elif state != "orphaned":
             counts["retained"] += 1
     return counts
 
@@ -603,6 +665,7 @@ def format_human(
         f"journal store: {store}",
         f"  live        : {counts['live']}",
         f"  root-gone   : {counts['root_gone']}",
+        f"  orphaned    : {counts['orphaned']}",
         f"  empty       : {counts['empty']}",
         f"  unknown     : {counts['unknown']}",
         f"  casualty    : {counts['casualty']}",
@@ -610,10 +673,23 @@ def format_human(
         f"  retained    : {counts['retained']}",
     ]
     reclaimable = [e for e in entries if e["reclaimable"]]
-    retained = [e for e in entries if not e["reclaimable"]]
+    orphaned = [e for e in entries if e["state"] == "orphaned"]
+    retained = [
+        e for e in entries if not e["reclaimable"] and e["state"] != "orphaned"
+    ]
     if reclaimable:
         lines.append("\n  reclaimable journals:")
         for entry in reclaimable:
+            root = _roots_annotation(entry)
+            lines.append(
+                f"    {entry['state']:<10} {entry['journal']}{root}  why={entry['why']}"
+            )
+    if orphaned:
+        lines.append(
+            "\n  stuck - root gone with orphaned non-terminal records"
+            " (never reclaimed; nothing left to reconcile them):"
+        )
+        for entry in orphaned:
             root = _roots_annotation(entry)
             lines.append(
                 f"    {entry['state']:<10} {entry['journal']}{root}  why={entry['why']}"
@@ -662,6 +738,7 @@ def main(argv: list[str] | None = None) -> int:
             "store": str(store),
             "live": 0,
             "root_gone": 0,
+            "orphaned": 0,
             "empty": 0,
             "unknown": 0,
             "casualty": 0,
@@ -698,7 +775,12 @@ def main(argv: list[str] | None = None) -> int:
 
     entries = scan(store)
     for entry in entries:
-        if entry["reclaimable"] or entry["state"] in {"root_gone", "empty", "casualty"}:
+        if entry["reclaimable"] or entry["state"] in {
+            "root_gone",
+            "orphaned",
+            "empty",
+            "casualty",
+        }:
             entry["bytes"] = dir_bytes(Path(entry["journal"]))
 
     deleted = 0
