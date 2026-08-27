@@ -14,7 +14,14 @@ from typing import TextIO
 
 WORKTREE_SEATS_ENV = "GOALFLIGHT_WORKTREE_SEATS"
 WORKTREE_LOCK_FD_ENV = "GOALFLIGHT_WORKTREE_LOCK_FD"
-DEFAULT_WORKTREE_SEATS = 4
+# Per-repository checkout ceiling, not a per-controller worker cap. There is
+# no such cap and none is wanted. The old default of 4 became a de-facto fan-out
+# limit and pushed every extra dispatch onto ad-hoc `git worktree add` (SC-06).
+# ~9 controllers across 5 projects share a machine; 24 seats lets one repo host
+# several controllers' concurrent workers without manufacturing unbounded trees.
+# Raise via GOALFLIGHT_WORKTREE_SEATS when a single repo needs more concurrent
+# seats. Never lower this default to "shape" concurrency.
+DEFAULT_WORKTREE_SEATS = 24
 WORKTREE_SEAT_PREFIX = "wt-"
 QUARANTINE_REF_PREFIX = "goalflight/quarantine"
 
@@ -97,6 +104,44 @@ def inherited_worktree_lock_fds() -> tuple[int, ...]:
             f"{WORKTREE_LOCK_FD_ENV} does not name an open descriptor: {raw!r}"
         ) from exc
     return (fd,)
+
+
+def pass_worktree_lock_fds(env: dict[str, str] | None = None) -> tuple[int, ...]:
+    """Descriptors a child must inherit to keep holding this process's seat.
+
+    ``inherited_worktree_lock_fds`` reads this process's ``os.environ``. A
+    parent that acquired a *new* seat puts the fd in the child env dict
+    without exporting it on itself; that fd still has to be in ``pass_fds``
+    or the helper exec closes it and the seat frees while the worker runs.
+    """
+    fds: list[int] = []
+    seen: set[int] = set()
+    for fd in inherited_worktree_lock_fds():
+        if fd not in seen:
+            fds.append(fd)
+            seen.add(fd)
+    raw = ""
+    if env is not None:
+        raw = str(env.get(WORKTREE_LOCK_FD_ENV) or "").strip()
+    if not raw:
+        return tuple(fds)
+    try:
+        fd = int(raw)
+        os.fstat(fd)
+    except (ValueError, OSError):
+        return tuple(fds)
+    if fd not in seen:
+        fds.append(fd)
+    return tuple(fds)
+
+
+def is_pool_seat_path(path: str | Path) -> bool:
+    """True when ``path`` is a maintained ``wt-N`` pool seat, not ad-hoc litter."""
+    name = Path(path).name
+    if not name.startswith(WORKTREE_SEAT_PREFIX):
+        return False
+    rest = name[len(WORKTREE_SEAT_PREFIX) :]
+    return rest.isdigit() and int(rest) >= 1
 
 
 def _git(
