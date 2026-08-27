@@ -275,6 +275,33 @@ Synchronous scripts/tests that need the worker exit code must opt in:
 python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd . --foreground
 ```
 
+## Event wake arming (the supervisor owns it)
+
+The controller's event wake is ONE `goalflight_messages.py supervise` process
+armed through the HOST'S PERSISTENT MONITOR — on Claude Code, the Monitor tool
+with `persistent: true`; never a bounded monitor, never shell `&`:
+
+```bash
+GOALFLIGHT_PERSISTENT_BACKUP_SLOTS=2 python3 <skill-root>/scripts/goalflight_messages.py \
+  supervise --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>
+```
+
+- **Arm it with NO timeout.** Do not set, tune, or reason about a timeout
+  value: a bounded monitor is killed outside the supervisor, no `type=stop`
+  record appears, and the controller goes deaf without a diagnostic (the
+  fleet-wide one-hour coverage drop, b-248).
+- **Stop any old direct listeners FIRST**, then arm supervise (b-242):
+  starting it alongside running listeners permanently stops its slots.
+- `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS=2` is the recommended doorbell depth
+  under a supervisor (b-243) while the shipped default is higher.
+- If you filter the supervise stream, the allowlist must pass `kind=next` and
+  the `stop`/`exit`/`restart` records carrying `rearm` — a narrow filter
+  re-creates the silent death the supervisor exists to prevent.
+- Arm a bare component (`follow`/`listen`) only on a host with no persistent
+  monitor, or after supervisor absence is proven — never against a live
+  supervisor. Full arming order and JSON-line contracts:
+  `protocols/controller-mail.md`.
+
 ## Durable dispatch queue
 
 - `goalflight_dispatch.py --submit` enqueues without blocking. `dispatch_id` is

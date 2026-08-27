@@ -421,7 +421,13 @@ def main() -> None:
     else:
         wake_preamble = (
             "ARM THE EVENT WAKE FIRST as a background task per "
-            "`protocols/dispatch-routing.md` and `commands/execute.md`: "
+            "`protocols/dispatch-routing.md` and `commands/execute.md` — "
+            "prefer ONE `goalflight_messages.py supervise` process armed "
+            "through the host's persistent monitor (Claude Code: the Monitor "
+            "tool with `persistent: true`, NO timeout — never a bounded "
+            "monitor, never shell `&`), stopping any old direct listeners "
+            "first; arm a bare component only where no persistent monitor "
+            "exists: "
         )
     claimed_instruction = (
         f"For a claimed controller: {wake_instruction} "
