@@ -2015,21 +2015,24 @@ def _is_done_reviewed(item: dict[str, Any]) -> bool:
 
 
 def _blocker_is_satisfied(row: dict[str, Any]) -> bool:
-    """True when a resolved blocker row is closed and must not gate.
+    """True when a blocker row is done-reviewed and must not gate.
 
-    ``blocked_by`` is a historical dependency record. Closed done, done-reviewed,
-    and tombstoned-as-done (legacy ``done=True`` migrated to ``done_reviewed``)
-    are satisfied. Open rows still gate.
+    ``blocked_by`` is a historical dependency record. Satisfaction is the
+    done-reviewed bar: ``done_reviewed is True``, a closed decision, or a
+    tombstone whose migrate-on-read path stamped ``done_reviewed``. Bare
+    ``done=True`` (awaiting-review) still gates — missing review is
+    inconclusive, not clean.
     """
-    return row.get("done") is True or _is_done_reviewed(row)
+    return _is_done_reviewed(row)
 
 
 def unsatisfied_blockers(item: dict[str, Any], store: dict[str, dict[str, Any]]) -> list[str]:
     """Return blocker ids that still gate *item*.
 
-    A blocker id that resolves to a closed row is satisfied. A blocker id that
-    resolves to an open row gates. A blocker id that does not resolve
-    (missing/foreign) gates — could-not-verify is not satisfied.
+    A blocker id that resolves to a done-reviewed row is satisfied. A blocker
+    id that resolves to an open or awaiting-review row gates. A blocker id
+    that does not resolve (missing/foreign/empty) gates — could-not-verify is
+    not satisfied.
     """
     blockers = item.get("blocked_by")
     if not isinstance(blockers, LIST_TYPE) or not blockers:
@@ -2038,13 +2041,33 @@ def unsatisfied_blockers(item: dict[str, Any], store: dict[str, dict[str, Any]])
     seen: set[str] = set()
     for raw in blockers:
         blocker_id = str(raw)
-        if not blocker_id or blocker_id in seen:
+        if blocker_id in seen:
             continue
         seen.add(blocker_id)
         row = store.get(blocker_id)
         if row is None or not _blocker_is_satisfied(row):
             unsatisfied.append(blocker_id)
     return unsatisfied
+
+
+def _done_guard_refusal_message(
+    item_id: str,
+    live: list[str],
+    by_id: dict[str, dict[str, Any]],
+) -> str:
+    labels: list[str] = []
+    awaiting = False
+    for blocker_id in live:
+        row = by_id.get(blocker_id)
+        name = blocker_id if blocker_id else "''"
+        if row is not None and row.get("done") is True and not _is_done_reviewed(row):
+            labels.append(f"{name} (done but awaiting review)")
+            awaiting = True
+        else:
+            labels.append(name)
+    named = ", ".join(labels)
+    hint = "accept/review it, or --force" if awaiting else "use --force to close anyway"
+    return f"{item_id}: blocked_by has unsatisfied blocker(s): {named}; {hint}"
 
 
 def _matches_canned_status(row: dict[str, Any], status: str | None) -> bool:
@@ -4239,10 +4262,7 @@ def _cmd_done(store: TaskStore, args: argparse.Namespace) -> int:
             raise TaskError(f"{args.item_id}: already done")
         live = unsatisfied_blockers(item, by_id)
         if live and not args.force:
-            raise TaskError(
-                f"{args.item_id}: blocked_by has unsatisfied blocker(s): {', '.join(live)}; "
-                "use --force to close anyway"
-            )
+            raise TaskError(_done_guard_refusal_message(args.item_id, live, by_id))
         note_text = str(getattr(args, "note", "") or "").strip()
         if note_text:
             notes = item.setdefault("notes", [])
