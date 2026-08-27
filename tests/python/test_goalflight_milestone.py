@@ -188,7 +188,7 @@ def test_malformed_marker_json_is_treated_as_no_marker(tmp_path: Path) -> None:
     run(repo, "checkout", "-b", "feature")
     commit_file(repo, "one", "one")
     state = tmp_path / "state"
-    state.mkdir()
+    state.mkdir(exist_ok=True)
     M.marker_path(state, project_root=repo).parent.mkdir(parents=True, exist_ok=True)
     M.marker_path(state, project_root=repo).write_text("{not-json", encoding="utf-8")
     queue = write_queue(tmp_path / "queue.md", cadence=5)
@@ -211,7 +211,7 @@ def test_legacy_marker_without_verdict_still_anchors_as_clean(tmp_path: Path) ->
     commit_file(repo, "one", "one")
     commit_file(repo, "two", "two")
     state = tmp_path / "state"
-    state.mkdir()
+    state.mkdir(exist_ok=True)
     M.marker_path(state, project_root=repo).parent.mkdir(parents=True, exist_ok=True)
     M.marker_path(state, project_root=repo).write_text(
         json.dumps({"commit": base, "ts": "2026-06-15T00:00:00Z"}) + "\n",

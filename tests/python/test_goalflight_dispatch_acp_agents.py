@@ -732,6 +732,7 @@ def _capacity_env(state_dir: Path, **extra: str) -> dict[str, str]:
     env = os.environ.copy()
     isolation_root = state_dir.parent
     env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
+    env["GOALFLIGHT_DISPATCH_DIR"] = str(state_dir / "dispatch")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(isolation_root / "journal")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(isolation_root / "task-store")
     env["GOALFLIGHT_MESSAGES_DIR"] = str(isolation_root / "messages")

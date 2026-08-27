@@ -55,7 +55,7 @@ def isolated(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict[str, str]]:
     )
     ps_shim.chmod(0o755)
     env["PATH"] = f"{ps_dir}:{os.environ.get('PATH', '')}"
-    monkeypatch.setattr(wake, "_process_listing", lambda: [])
+    monkeypatch.setattr(wake, "_process_listing", lambda **_kwargs: [])
     for key, value in env.items():
         if key != "PATH":
             monkeypatch.setenv(key, value)
@@ -385,45 +385,48 @@ def test_detached_single_call_is_refused_not_a_floor(
     stdout_path = project.parent / "detached.stdout"
     stderr_path = project.parent / "detached.stderr"
     pid_path = project.parent / "detached.pid"
-    launcher = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import subprocess; from pathlib import Path; "
-                f"out=open({str(stdout_path)!r},'w'); err=open({str(stderr_path)!r},'w'); "
-                f"p=subprocess.Popen({cmd!r},cwd={str(project)!r},stdout=out,stderr=err,"
-                "text=True,start_new_session=True); "
-                f"Path({str(pid_path)!r}).write_text(str(p.pid)); out.close(); err.close()"
-            ),
-        ],
-        cwd=project,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=5,
-        check=False,
-    )
-    assert launcher.returncode == 0, launcher.stderr
-    listener_pid = int(pid_path.read_text(encoding="utf-8"))
-    try:
-        deadline = time.monotonic() + 5
-        lines: list[str] = []
-        while time.monotonic() < deadline:
-            if stderr_path.exists():
-                lines = stderr_path.read_text(encoding="utf-8").splitlines()
-                if lines:
-                    break
-            time.sleep(0.05)
-        assert len(lines) == 1
-        assert lines[0].startswith("DETACHED LISTENER:")
-        assert "tracked background task" in lines[0]
-        _wait_live(project, "floor-ctl", 0)
-    finally:
+    with wake.register_lease_holder(
+        project, controller_label="floor-ctl", lease_nonce=lease.nonce
+    ):
+        launcher = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import subprocess; from pathlib import Path; "
+                    f"out=open({str(stdout_path)!r},'w'); err=open({str(stderr_path)!r},'w'); "
+                    f"p=subprocess.Popen({cmd!r},cwd={str(project)!r},stdout=out,stderr=err,"
+                    "text=True,start_new_session=True); "
+                    f"Path({str(pid_path)!r}).write_text(str(p.pid)); out.close(); err.close()"
+                ),
+            ],
+            cwd=project,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert launcher.returncode == 0, launcher.stderr
+        listener_pid = int(pid_path.read_text(encoding="utf-8"))
         try:
-            os.kill(listener_pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+            deadline = time.monotonic() + 5
+            lines: list[str] = []
+            while time.monotonic() < deadline:
+                if stderr_path.exists():
+                    lines = stderr_path.read_text(encoding="utf-8").splitlines()
+                    if lines:
+                        break
+                time.sleep(0.05)
+            assert len(lines) == 1
+            assert lines[0].startswith("DETACHED LISTENER:")
+            assert "tracked background task" in lines[0]
+            _wait_live(project, "floor-ctl", 0)
+        finally:
+            try:
+                os.kill(listener_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_arming_past_target_is_not_refused(
@@ -482,7 +485,7 @@ def test_lease_claim_emits_remaining_depth_when_work_is_in_flight(
         "_controller_process_identity",
         lambda pid: {"pid": pid, "start_token": "claim-floor-token"},
     )
-    monkeypatch.setattr(wake, "_process_listing", lambda: [])
+    monkeypatch.setattr(wake, "_process_listing", lambda **_kwargs: [])
     result = sessions.claim_controller_startup(
         project, pid=71001, label="floor-ctl", role="controller"
     )
@@ -506,7 +509,7 @@ def test_lease_claim_stays_silent_without_in_flight_work(
         "_controller_process_identity",
         lambda pid: {"pid": pid, "start_token": "quiet-claim-token"},
     )
-    monkeypatch.setattr(wake, "_process_listing", lambda: [])
+    monkeypatch.setattr(wake, "_process_listing", lambda **_kwargs: [])
     result = sessions.claim_controller_startup(
         project, pid=71002, label="floor-ctl", role="controller"
     )

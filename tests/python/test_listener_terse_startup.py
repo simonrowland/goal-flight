@@ -282,7 +282,7 @@ def test_controller_startup_json_is_terse_with_work_in_flight(
         "_controller_process_identity",
         lambda pid: {"pid": pid, "start_token": "terse-claim-token"},
     )
-    monkeypatch.setattr(wake, "_process_listing", lambda: [])
+    monkeypatch.setattr(wake, "_process_listing", lambda **_kwargs: [])
     result = sessions.claim_controller_startup(
         project, pid=81001, label="terse-ctl", role="controller"
     )

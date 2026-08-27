@@ -170,31 +170,34 @@ def test_sigurg_keeps_listener_alive_and_holds_slot(
     label = "signal-ctl"
     claimed = _claim(project, label)
     authority = journal.open_or_create_journal(project)
-    proc = _spawn_listener(project, env, label=label, nonce=claimed.nonce)
-    try:
-        _wait_armed(authority, proc, label=label)
-        assert wake.listener_slot_holder_pids(project, controller_label=label) == [
-            proc.pid
-        ]
-        os.kill(proc.pid, signal.SIGURG)
-        err = _read_nonblocking(proc.stderr)
-        assert proc.poll() is None
-        assert "SIGURG" in err
-        assert "staying alive" in err
-        assert wake.listener_slot_holder_pids(project, controller_label=label) == [
-            proc.pid
-        ]
-        coverage = authority.active_coverage(label)
-        assert coverage is not None
-        assert coverage.get("pid") == proc.pid
-    finally:
-        if proc.poll() is None:
-            proc.send_signal(signal.SIGTERM)
-            try:
-                proc.communicate(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.communicate(timeout=2)
+    with wake.register_lease_holder(
+        project, controller_label=label, lease_nonce=claimed.nonce
+    ):
+        proc = _spawn_listener(project, env, label=label, nonce=claimed.nonce)
+        try:
+            _wait_armed(authority, proc, label=label)
+            assert wake.listener_slot_holder_pids(project, controller_label=label) == [
+                proc.pid
+            ]
+            os.kill(proc.pid, signal.SIGURG)
+            err = _read_nonblocking(proc.stderr)
+            assert proc.poll() is None
+            assert "SIGURG" in err
+            assert "staying alive" in err
+            assert wake.listener_slot_holder_pids(project, controller_label=label) == [
+                proc.pid
+            ]
+            coverage = authority.active_coverage(label)
+            assert coverage is not None
+            assert coverage.get("pid") == proc.pid
+        finally:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+                try:
+                    proc.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate(timeout=2)
 
 
 def test_sigterm_dies_loudly_releases_slot_and_exits_128_plus_signal(
@@ -204,29 +207,34 @@ def test_sigterm_dies_loudly_releases_slot_and_exits_128_plus_signal(
     label = "signal-ctl"
     claimed = _claim(project, label)
     authority = journal.open_or_create_journal(project)
-    proc = _spawn_listener(project, env, label=label, nonce=claimed.nonce)
-    _wait_armed(authority, proc, label=label)
-    os.kill(proc.pid, signal.SIGTERM)
-    try:
-        stdout, stderr = proc.communicate(timeout=4)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout, stderr = proc.communicate(timeout=2)
-        raise AssertionError(f"listener did not exit on SIGTERM stdout={stdout!r} stderr={stderr!r}")
-    expected = messages.listener_posix_signal_exit_code(signal.SIGTERM)
-    assert proc.returncode == expected, (proc.returncode, stdout, stderr)
-    assert "SIGTERM" in stderr
-    assert "releasing slot" in stderr
-    assert wake.listener_slot_holder_pids(project, controller_label=label) == []
-    coverage = authority.active_coverage(label)
-    assert coverage is None
-    rows = authority.read_all(
-        "SELECT state, exit_reason FROM listener_coverage WHERE pid = ?",
-        (proc.pid,),
-    )
-    assert rows
-    assert str(rows[0]["state"]) == "EXITED"
-    assert str(rows[0]["exit_reason"]) == "signal"
+    with wake.register_lease_holder(
+        project, controller_label=label, lease_nonce=claimed.nonce
+    ):
+        proc = _spawn_listener(project, env, label=label, nonce=claimed.nonce)
+        _wait_armed(authority, proc, label=label)
+        os.kill(proc.pid, signal.SIGTERM)
+        try:
+            stdout, stderr = proc.communicate(timeout=4)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate(timeout=2)
+            raise AssertionError(
+                f"listener did not exit on SIGTERM stdout={stdout!r} stderr={stderr!r}"
+            )
+        expected = messages.listener_posix_signal_exit_code(signal.SIGTERM)
+        assert proc.returncode == expected, (proc.returncode, stdout, stderr)
+        assert "SIGTERM" in stderr
+        assert "releasing slot" in stderr
+        assert wake.listener_slot_holder_pids(project, controller_label=label) == []
+        coverage = authority.active_coverage(label)
+        assert coverage is None
+        rows = authority.read_all(
+            "SELECT state, exit_reason FROM listener_coverage WHERE pid = ?",
+            (proc.pid,),
+        )
+        assert rows
+        assert str(rows[0]["state"]) == "EXITED"
+        assert str(rows[0]["exit_reason"]) == "signal"
 
 
 def test_sigkill_releases_slot_lock_without_journal_exit(
@@ -236,23 +244,26 @@ def test_sigkill_releases_slot_lock_without_journal_exit(
     label = "signal-ctl"
     claimed = _claim(project, label)
     authority = journal.open_or_create_journal(project)
-    proc = _spawn_listener(project, env, label=label, nonce=claimed.nonce)
-    _wait_armed(authority, proc, label=label)
-    os.kill(proc.pid, signal.SIGKILL)
-    _, raw = os.waitpid(proc.pid, 0)
-    proc.returncode = -os.WTERMSIG(raw)
-    assert os.WIFSIGNALED(raw)
-    assert os.WTERMSIG(raw) == int(signal.SIGKILL)
-    assert messages.LISTENER_POSIX_SIGNAL_EXIT_BASE + int(signal.SIGKILL) == 137
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        if not wake.listener_slot_holder_pids(project, controller_label=label):
-            break
-        time.sleep(0.02)
-    assert wake.listener_slot_holder_pids(project, controller_label=label) == []
-    coverage = authority.active_coverage(label)
-    assert coverage is not None
-    assert coverage.get("pid") == proc.pid
+    with wake.register_lease_holder(
+        project, controller_label=label, lease_nonce=claimed.nonce
+    ):
+        proc = _spawn_listener(project, env, label=label, nonce=claimed.nonce)
+        _wait_armed(authority, proc, label=label)
+        os.kill(proc.pid, signal.SIGKILL)
+        _, raw = os.waitpid(proc.pid, 0)
+        proc.returncode = -os.WTERMSIG(raw)
+        assert os.WIFSIGNALED(raw)
+        assert os.WTERMSIG(raw) == int(signal.SIGKILL)
+        assert messages.LISTENER_POSIX_SIGNAL_EXIT_BASE + int(signal.SIGKILL) == 137
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if not wake.listener_slot_holder_pids(project, controller_label=label):
+                break
+            time.sleep(0.02)
+        assert wake.listener_slot_holder_pids(project, controller_label=label) == []
+        coverage = authority.active_coverage(label)
+        assert coverage is not None
+        assert coverage.get("pid") == proc.pid
 
 
 def test_controller_mail_documents_144_is_not_detached() -> None:
