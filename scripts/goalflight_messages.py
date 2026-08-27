@@ -1941,27 +1941,41 @@ def _presented_ambient_controller_capability() -> str | None:
 
 
 def _controller_post_source_label() -> str | None:
-    """Resolve the declared controller identity behind an outbound post.
+    """Return the declared outbound controller label, or None.
 
     Worker shells (``GOALFLIGHT_DISPATCH_ID``) never inherit a controller
-    label. Beyond the label variable itself, the session-status resolver also
-    covers the controller-PID-declared repo identity, so a shell that dropped
-    only ``GOALFLIGHT_CONTROLLER_LABEL`` still attributes. Anything we cannot
-    establish stays ``None`` and the caller stamps ``UNKNOWN`` — never a
-    probable-sender guess.
+    name. The only real source is the operator-declared
+    ``GOALFLIGHT_CONTROLLER_LABEL``. ``resolve_controller_label``'s PID /
+    repo-name fallback is a worktree-invariant *session* identity — not a
+    sender. Using it here would stamp a from-line the poster did not declare
+    (a pid or a directory name), which is the original incident with the
+    tool's authority behind the guess. Unestablishable stays ``None``; the
+    caller stamps the explicit ``UNKNOWN`` sentinel.
     """
     if str(os.environ.get("GOALFLIGHT_DISPATCH_ID") or "").strip():
         return None
-    try:
-        import goalflight_session_status  # type: ignore
-
-        return goalflight_session_status.resolve_controller_label()
-    except _EXPECTED_OPTIONAL_ERRORS:
-        return None
+    raw = str(os.environ.get("GOALFLIGHT_CONTROLLER_LABEL") or "").strip()
+    return raw[:64] or None
 
 
 def _stamp_controller_source_label(source: dict) -> None:
-    """Attribute controller-transport mail in place: label, else UNKNOWN."""
+    """Attribute controller-transport mail in place: label, else UNKNOWN.
+
+    Trusted, not lease-validated. Labels are addressing metadata. A poster
+    already had to hold a lease to admit controller mail, but several
+    controllers can hold leases on one journal at once, and MCP / status /
+    fleet posters may not carry a unique lease nonce in-process. Checking the
+    declared name against "the" held lease is therefore ambiguous, and
+    treating an unvalidatable name as UNKNOWN would blank those producers
+    while still not proving authorship. Proof remains ``author_digest`` from
+    a presented capability (see ``envelope_authored_by_controller``).
+
+    Consequence: ``from`` on relay is a self-asserted name. A process that
+    sets ``GOALFLIGHT_CONTROLLER_LABEL`` or passes ``source.controller_label``
+    is believed. Readers must not treat the field as authenticated identity.
+    An unestablishable name is the explicit sentinel UNKNOWN — never omitted,
+    never a pid, never a repo or directory name.
+    """
     if str(source.get("transport") or "") != "controller":
         return
     if str(source.get("controller_label") or "").strip():

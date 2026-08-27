@@ -628,6 +628,108 @@ def test_quota_advisory_stamps_and_round_trips(
     assert who != "local"
 
 
+@pytest.mark.parametrize("leftover_dispatch_id", LEFTOVER_DISPATCH_IDS)
+def test_pid_without_label_stamps_unknown_not_repo_name(
+    tmp_path: Path, leftover_dispatch_id: str | None
+) -> None:
+    # The inventing fallback: PID present, LABEL dropped, resolver used to
+    # stamp the git directory name as the sender. Must be UNKNOWN, never
+    # that name, never the pid.
+    repo_name = "probable-sender-repo"
+    project = tmp_path / repo_name
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    fake_pid = "424242"
+    with mock.patch.dict(os.environ, _test_env(tmp_path), clear=False):
+        authority = journal.open_or_create_journal(project)
+        active = authority.active_lease(CONTROLLER_LABEL)
+        result = authority.claim_or_renew_lease(
+            CONTROLLER_LABEL,
+            principal={"principal_id": "headline-test-controller"},
+            nonce=active.nonce if active is not None else None,
+        )
+    assert result.committed, result.reason
+    send_env = _test_env(tmp_path, leftover_dispatch_id=leftover_dispatch_id)
+    for key in list(send_env):
+        if key.startswith("GOALFLIGHT_CONTROLLER"):
+            send_env.pop(key, None)
+    send_env["GOALFLIGHT_CONTROLLER_PID"] = fake_pid
+    posted = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--messages-dir",
+            str(tmp_path / "messages"),
+            "--fleet-dir",
+            str(tmp_path / "fleet"),
+            "post",
+            "--dispatch-id",
+            "pid-fallback",
+            "--type",
+            "finding",
+            "--text",
+            "pid without label",
+            "--to-controller",
+            CONTROLLER_LABEL,
+            "--controller-project-root",
+            str(project),
+            "--json",
+        ],
+        cwd=project,
+        env=send_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert posted.returncode == 0, posted.stderr
+    envelope = json.loads(posted.stdout)["envelope"]
+    label = envelope["source"]["controller_label"]
+    assert label == "UNKNOWN"
+    assert label != repo_name
+    assert fake_pid not in label
+    rendered = msg.envelope_from(envelope)
+    assert rendered == "UNKNOWN"
+    assert rendered != repo_name
+    assert fake_pid not in rendered
+
+
+@pytest.mark.parametrize("leftover_dispatch_id", LEFTOVER_DISPATCH_IDS)
+def test_supplied_label_is_trusted_not_lease_validated(
+    tmp_path: Path, leftover_dispatch_id: str | None
+) -> None:
+    # Deliberate policy: a caller-supplied label is believed. The lease
+    # holder here is CONTROLLER_LABEL; the supplied name is not that
+    # holder. Proof remains author_digest, which this post does not mint.
+    _ensure_controller(tmp_path)
+    project = _project(tmp_path)
+    impostor = "NOT-THE-LEASE-HOLDER"
+    with mock.patch.dict(
+        os.environ,
+        _test_env(tmp_path, leftover_dispatch_id=leftover_dispatch_id),
+        clear=True,
+    ):
+        result = msg.post_message(
+            dispatch_id="trust-topic",
+            msg_type="finding",
+            payload={"text": "impostor label", "subject": "trusted stamp"},
+            messages_dir=tmp_path / "messages",
+            source={
+                "node": "local",
+                "adapter": "unknown",
+                "transport": "controller",
+                "controller_label": impostor,
+            },
+            addressee=msg.controller_addressee(CONTROLLER_LABEL, project_root=project),
+        )
+    assert result["envelope"]["source"]["controller_label"] == impostor
+    assert "author_digest" not in result["envelope"]
+    headlines = _run_relay(tmp_path, leftover_dispatch_id=leftover_dispatch_id)
+    assert headlines.returncode == 0, headlines.stderr
+    assert headlines.stdout.splitlines()[0].startswith(
+        f"trust-topic #1 [finding] from {impostor}: "
+    )
+
+
 def test_default_and_bodies_cli_paths_round_trip_subject(tmp_path: Path) -> None:
     fragment = "CLI-BODY-LEAK-SENTINEL:"
     body = fragment + ("z" * (2048 - len(fragment)))
@@ -774,6 +876,8 @@ def main() -> None:
         test_post_message_primitive_stamps_and_round_trips,
         test_write_steering_envelope_stamps_and_round_trips,
         test_quota_advisory_stamps_and_round_trips,
+        test_pid_without_label_stamps_unknown_not_repo_name,
+        test_supplied_label_is_trusted_not_lease_validated,
     )
     for test in parametrized:
         for leftover in LEFTOVER_DISPATCH_IDS:
