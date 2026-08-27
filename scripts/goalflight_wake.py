@@ -42,6 +42,15 @@ _SUPERVISE_FLAG_KEYS = {
     "--controller-label": "controller_label",
     "--lease-nonce": "lease_nonce",
 }
+_SUPERVISE_ARGV_MATCH = "match"
+_SUPERVISE_ARGV_SKIP = "skip"
+_SUPERVISE_ARGV_UNKNOWN = "unknown"
+_ENV_ARGV_NAMES = frozenset({"env", "env.exe"})
+_SHELL_ARGV_NAMES = frozenset(
+    {"sh", "bash", "dash", "zsh", "ksh", "csh", "tcsh", "fish"}
+)
+_PYTHON_SHORT_PROGRAM = {"c": "command", "m": "module"}
+_PYTHON_SHORT_TAKES_ARG = frozenset({"c", "m", "W", "X", "Q"})
 LEASE_KIND = "lease"
 LOCK_KINDS = WAITER_KINDS | {LEASE_KIND}
 ENTRY_POLL_WINDOW_S = 1.0
@@ -2884,22 +2893,51 @@ def _process_listing(*, timeout_s: float = 2.0) -> list[tuple[int | None, str]] 
     return rows
 
 
-def _supervise_argv_fields(command: str) -> dict[str, str] | None:
-    """Flag fields for a ``goalflight_messages … supervise`` argv, else None."""
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        parts = command.split()
-    supervise_at: int | None = None
+def _argv_basename(token: str) -> str:
+    name = Path(token).name
+    if name.lower().endswith(".exe"):
+        return name[:-4]
+    return name
+
+
+def _is_python_interpreter(token: str) -> bool:
+    lowered = _argv_basename(token).lower()
+    if lowered in {"python", "pythonw"}:
+        return True
+    for prefix in ("python3", "pythonw3"):
+        if not lowered.startswith(prefix):
+            continue
+        rest = lowered[len(prefix) :]
+        if rest == "":
+            return True
+        if rest.startswith(".") and rest[1:].replace(".", "").isdigit():
+            return True
+    return False
+
+
+def _is_env_binary(token: str) -> bool:
+    return Path(token).name.lower() in _ENV_ARGV_NAMES
+
+
+def _is_shell_binary(token: str) -> bool:
+    return _argv_basename(token).lower() in _SHELL_ARGV_NAMES
+
+
+def _is_messages_argv_name(token: str) -> bool:
+    return Path(token).name in _MESSAGES_ARGV_NAMES
+
+
+def _messages_supervise_index(parts: list[str]) -> int | None:
     for index, part in enumerate(parts):
-        if Path(part).name in _MESSAGES_ARGV_NAMES:
+        if _is_messages_argv_name(part):
             if index + 1 < len(parts) and parts[index + 1] == "supervise":
-                supervise_at = index + 1
-                break
-    if supervise_at is None:
-        return None
+                return index
+    return None
+
+
+def _supervise_flag_fields(parts: list[str], start: int) -> dict[str, str]:
     fields: dict[str, str] = {}
-    index = supervise_at + 1
+    index = start
     while index < len(parts):
         key = _SUPERVISE_FLAG_KEYS.get(parts[index])
         if key is None:
@@ -2910,6 +2948,222 @@ def _supervise_argv_fields(command: str) -> dict[str, str] | None:
         fields[key] = parts[index + 1]
         index += 2
     return fields
+
+
+def _after_env_wrapper(parts: list[str]) -> list[str] | None:
+    """Strip a leading env(1) invocation, or None if its argv is truncated."""
+    if not parts or not _is_env_binary(parts[0]):
+        return parts
+    index = 1
+    while index < len(parts):
+        part = parts[index]
+        if part == "--":
+            index += 1
+            break
+        if part in {"-i", "-0", "-v", "--ignore-environment", "--null"}:
+            index += 1
+            continue
+        if part in {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}:
+            if index + 1 >= len(parts):
+                return None
+            index += 2
+            continue
+        if (
+            part.startswith("--unset=")
+            or part.startswith("--chdir=")
+            or part.startswith("--split-string=")
+        ):
+            index += 1
+            continue
+        if "=" in part and not part.startswith("-"):
+            index += 1
+            continue
+        break
+    if index >= len(parts):
+        return None
+    return parts[index:]
+
+
+def _consume_python_short_option(
+    parts: list[str], index: int
+) -> tuple[int | None, str | None, int | None]:
+    """Step over one Python short-option token.
+
+    Returns ``(program_index, kind, next_index)``. ``kind`` is set when this
+    token introduces ``-c``/``-m``; ``next_index`` is set when the token is
+    only an option. ``None, 'unknown', None`` means the option is truncated.
+    """
+    letters = parts[index][1:]
+    cursor = 0
+    while cursor < len(letters):
+        letter = letters[cursor]
+        if letter in _PYTHON_SHORT_TAKES_ARG:
+            rest = letters[cursor + 1 :]
+            kind = _PYTHON_SHORT_PROGRAM.get(letter)
+            if rest:
+                if kind is None:
+                    return None, None, index + 1
+                return index, kind, None
+            if index + 1 >= len(parts):
+                return None, "unknown", None
+            if kind is None:
+                return None, None, index + 2
+            return index + 1, kind, None
+        cursor += 1
+    return None, None, index + 1
+
+
+def _locate_python_program(
+    parts: list[str], start: int
+) -> tuple[int | None, str]:
+    """Index and kind of the program a Python interpreter is running.
+
+    Kind is ``script``, ``command`` (``-c``), ``module`` (``-m``), ``stdin``,
+    or ``unknown`` when options are truncated or unrecognized.
+    """
+    index = start
+    while index < len(parts):
+        part = parts[index]
+        if part == "--":
+            index += 1
+            if index >= len(parts):
+                return None, "unknown"
+            return index, "script"
+        if part == "-":
+            return index, "stdin"
+        if not part.startswith("-"):
+            return index, "script"
+        if part == "--check-hash-based-pycs":
+            if index + 1 >= len(parts):
+                return None, "unknown"
+            index += 2
+            continue
+        if part.startswith("--"):
+            if part in {
+                "--help",
+                "--version",
+                "--help-env",
+                "--help-xoptions",
+                "--help-all",
+            }:
+                index += 1
+                continue
+            return None, "unknown"
+        program_index, kind, next_index = _consume_python_short_option(parts, index)
+        if kind == "unknown":
+            return None, "unknown"
+        if kind is not None and program_index is not None:
+            return program_index, kind
+        if next_index is None:
+            return None, "unknown"
+        index = next_index
+    return None, "unknown"
+
+
+def _python_program_token(token: str, kind: str) -> str:
+    if kind == "module" and token.startswith("-m") and token != "-m":
+        return token[2:]
+    return token
+
+
+def _probe_unknown_if_supervise(
+    parts: list[str],
+) -> tuple[str, dict[str, str] | None]:
+    if _messages_supervise_index(parts) is not None:
+        return _SUPERVISE_ARGV_UNKNOWN, None
+    return _SUPERVISE_ARGV_SKIP, None
+
+
+def _match_messages_supervise(
+    parts: list[str], program_index: int
+) -> tuple[str, dict[str, str] | None]:
+    if program_index >= len(parts):
+        return _SUPERVISE_ARGV_SKIP, None
+    if not _is_messages_argv_name(parts[program_index]):
+        return _SUPERVISE_ARGV_SKIP, None
+    if program_index + 1 >= len(parts) or parts[program_index + 1] != "supervise":
+        return _SUPERVISE_ARGV_SKIP, None
+    return (
+        _SUPERVISE_ARGV_MATCH,
+        _supervise_flag_fields(parts, program_index + 2),
+    )
+
+
+def _probe_shell_supervise_argv(
+    parts: list[str],
+) -> tuple[str, dict[str, str] | None]:
+    index = 1
+    while index < len(parts):
+        part = parts[index]
+        if part == "-c":
+            if index + 1 >= len(parts):
+                return _probe_unknown_if_supervise(parts)
+            return _SUPERVISE_ARGV_SKIP, None
+        if part in {"-o", "-O"}:
+            if index + 1 >= len(parts):
+                return _probe_unknown_if_supervise(parts)
+            index += 2
+            continue
+        if part == "--":
+            index += 1
+            break
+        if part.startswith("-"):
+            index += 1
+            continue
+        break
+    return _SUPERVISE_ARGV_SKIP, None
+
+
+def _probe_supervise_argv(
+    command: str,
+) -> tuple[str, dict[str, str] | None]:
+    """Classify one process command as supervise, foreign, or unreadable.
+
+    ``match`` means the process is executing ``goalflight_messages … supervise``
+    in executable position. ``skip`` means it is not. ``unknown`` means argv
+    cannot establish that distinction (unparsable, truncated, or an
+    unfamiliar wrapper carrying supervise-shaped tokens).
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return _probe_unknown_if_supervise(command.split())
+    if not parts:
+        return _SUPERVISE_ARGV_SKIP, None
+    unwrapped = _after_env_wrapper(parts)
+    if unwrapped is None:
+        return _probe_unknown_if_supervise(parts)
+    parts = unwrapped
+    if not parts:
+        return _SUPERVISE_ARGV_SKIP, None
+    if _is_messages_argv_name(parts[0]):
+        return _match_messages_supervise(parts, 0)
+    if _is_python_interpreter(parts[0]):
+        program_index, kind = _locate_python_program(parts, 1)
+        if kind == "unknown" or program_index is None:
+            return _probe_unknown_if_supervise(parts)
+        if kind not in {"script", "module"}:
+            return _SUPERVISE_ARGV_SKIP, None
+        token = _python_program_token(parts[program_index], kind)
+        if not _is_messages_argv_name(token):
+            return _SUPERVISE_ARGV_SKIP, None
+        if program_index + 1 >= len(parts) or parts[program_index + 1] != "supervise":
+            return _SUPERVISE_ARGV_SKIP, None
+        return (
+            _SUPERVISE_ARGV_MATCH,
+            _supervise_flag_fields(parts, program_index + 2),
+        )
+    if _is_shell_binary(parts[0]):
+        return _probe_shell_supervise_argv(parts)
+    return _probe_unknown_if_supervise(parts)
+
+
+def _supervise_argv_fields(command: str) -> dict[str, str] | None:
+    """Flag fields for an executable-position supervise argv, else None."""
+    kind, fields = _probe_supervise_argv(command)
+    if kind == _SUPERVISE_ARGV_MATCH:
+        return fields
+    return None
 
 
 def _bind_supervise_to_generation(
@@ -2980,14 +3234,19 @@ def supervisor_generation_state(
     """Whether ``supervise`` is live for this controller generation.
 
     Uses process identity (``ps`` argv): a matching
-    ``goalflight_messages.py supervise --lease-nonce <this nonce>`` (and
-    matching ``--project-root`` / ``--controller-label`` when those flags
-    are present). Returns ``running``, ``absent``, or ``unknown``.
+    ``goalflight_messages.py supervise --lease-nonce <this nonce>`` in
+    executable position (and matching ``--project-root`` /
+    ``--controller-label`` when those flags are present). Trailing tokens
+    that merely contain a supervise command line are not a supervisor.
+    Returns ``running``, ``absent``, or ``unknown``.
 
-    ``unknown`` when the process table cannot be read, a supervise argv
-    cannot be bound to this generation (missing nonce, truncated flags),
-    or the project root cannot be resolved. Callers must not print a
-    confident supervised or unsupervised re-arm in that case.
+    ``unknown`` when the process table cannot be read, executable position
+    cannot be established (unparsable argv, truncated ``ps`` output, or an
+    unfamiliar wrapper), a supervise argv cannot be bound to this
+    generation (missing nonce, truncated flags), or the project root
+    cannot be resolved. Callers must not print a confident supervised or
+    unsupervised re-arm in that case. On Windows the listing helper
+    returns ``None``, so this is always ``unknown``.
     """
     if supervised_child:
         if not str(controller_label or "").strip() or not str(
@@ -3020,8 +3279,11 @@ def _supervisor_generation_state_from_listing(
         return SUPERVISOR_UNKNOWN
     saw_unknown = False
     for _pid, command in listing:
-        fields = _supervise_argv_fields(command)
-        if fields is None:
+        kind, fields = _probe_supervise_argv(command)
+        if kind == _SUPERVISE_ARGV_SKIP:
+            continue
+        if kind == _SUPERVISE_ARGV_UNKNOWN or fields is None:
+            saw_unknown = True
             continue
         bound = _bind_supervise_to_generation(
             fields,
