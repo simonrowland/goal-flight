@@ -267,6 +267,35 @@ class ProducerSetResult:
     reason: str = ""
 
 
+class ClaimCarrierKind(Enum):
+    """Liveness of a queue envelope or its claimer, never inferred from PID alone."""
+
+    NONE = "none"
+    QUEUED = "queued"
+    LIVE = "live"
+    DEAD = "dead"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class ClaimCarrierStatus:
+    """Carrier presence plus claimer adjudication.
+
+    Truthy when any ``.json`` / ``.claimed-*`` envelope exists, so mutation
+    gates that only asked "is a carrier present?" keep failing closed. The
+    kind distinguishes a live claimer from a dead one from one the marker
+    cannot identify. PID-only markers are UNKNOWN: a recycled PID is not
+    live, and an absent PID is not proof of death.
+    """
+
+    kind: ClaimCarrierKind = ClaimCarrierKind.NONE
+    reason: str = ""
+    path: str | None = None
+
+    def __bool__(self) -> bool:
+        return self.kind is not ClaimCarrierKind.NONE
+
+
 class TerminalCommitKind(Enum):
     CREATED_TERMINAL = "created_terminal"
     UPDATED_TERMINAL = "updated_terminal"
@@ -7524,8 +7553,16 @@ def _evaluate_abandoned_dispatch(
     hostname = record.get("hostname")
     if not isinstance(hostname, str) or hostname != socket.gethostname():
         return {**result, "eligible": False, "reason": "nonlocal_or_unknown_host"}
-    if _claim_has_active_carrier(queue_dir, dispatch_id):
-        return {**result, "eligible": False, "reason": "active_queue_carrier"}
+    carrier = _claim_has_active_carrier(queue_dir, dispatch_id)
+    keep_reason = _abandoned_carrier_keep_reason(carrier)
+    if keep_reason is not None:
+        return {
+            **result,
+            "eligible": False,
+            "reason": keep_reason,
+            "claimer_status": carrier.kind.value,
+            "claimer_evidence": carrier.reason,
+        }
 
     status, status_evidence = _abandoned_status_payload(record)
     if status is None:
@@ -7869,6 +7906,7 @@ def reconcile_abandoned_dispatches(
             continue
         key = str(entry.get("reason") or "unknown")
         kept_reasons[key] = kept_reasons.get(key, 0) + 1
+    claimer_counts = _claimer_report_fields(resolved_queue_dir)
     return {
         "schema": ABANDONED_RECONCILIATION_SCHEMA,
         "mode": "dry-run" if dry_run else "automatic",
@@ -7878,6 +7916,9 @@ def reconcile_abandoned_dispatches(
         "would_close": len(would_close),
         "kept": len(entries) - len(closed) - len(would_close),
         "kept_reasons": kept_reasons,
+        "dead_claimer": claimer_counts["dead_claimer"],
+        "unknown_claimer": claimer_counts["unknown_claimer"],
+        "live_claimer": claimer_counts["live_claimer"],
         "entries": entries,
     }
 
@@ -7921,6 +7962,9 @@ def _cmd_reconcile_abandoned(argv: list[str]) -> int:
                     "kept": payload["kept"],
                     "scanned": payload["scanned"],
                     "kept_reasons": payload["kept_reasons"],
+                    "dead_claimer": payload["dead_claimer"],
+                    "unknown_claimer": payload["unknown_claimer"],
+                    "live_claimer": payload["live_claimer"],
                 },
                 sort_keys=True,
             )
@@ -8001,11 +8045,168 @@ def _dispatch_has_terminal_record(dispatch_id: str) -> bool:
     return _dispatch_record_is_terminal(_find_dispatch_record(dispatch_id))
 
 
-def _claim_has_active_carrier(queue_dir: Path, dispatch_id: str) -> bool:
-    """True if a canonical queue envelope or live claim still exists for dispatch_id."""
+_CLAIMED_NAME_RE = re.compile(r"^(?P<stem>.+)\.json\.claimed-(?P<rest>.*)$")
+_CLAIM_CARRIER_PREFERENCE = (
+    ClaimCarrierKind.LIVE,
+    ClaimCarrierKind.QUEUED,
+    ClaimCarrierKind.UNKNOWN,
+    ClaimCarrierKind.DEAD,
+)
+
+
+def _parse_claimed_filename_pid(name: str) -> int | None:
+    """Best-effort PID from ``<id>.json.claimed-<pid>[-<ts>...]``.
+
+    The filename PID is never identity. Callers that lack a start token must
+    report UNKNOWN rather than treating this number as live or dead.
+    """
+    match = _CLAIMED_NAME_RE.match(name)
+    if match is None:
+        return None
+    rest = str(match.group("rest") or "")
+    if rest.endswith(".failed"):
+        return None
+    head = rest.split("-", 1)[0]
+    try:
+        pid = int(head)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def _claim_payload_or_none(path: Path) -> dict | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _adjudicate_claim_marker(claim: Path, payload: dict | None = None) -> ClaimCarrierStatus:
+    """Classify one claim marker as live, dead, or unknown.
+
+    Start-token identity is required for LIVE or DEAD. Existing markers carry
+    only ``claimed-<pid>-<ts>`` in the filename; that is UNKNOWN.
+    """
+    observed = payload if payload is not None else _claim_payload_or_none(claim)
+    probes: list[tuple[object, object]] = []
+    if isinstance(observed, dict):
+        if observed.get("queue_claimer_pid") not in (None, ""):
+            probes.append(
+                (observed.get("queue_claimer_pid"), observed.get("queue_claimer_identity"))
+            )
+        if observed.get("queue_launcher_pid") not in (None, ""):
+            probes.append(
+                (observed.get("queue_launcher_pid"), observed.get("queue_launcher_identity"))
+            )
+    if not probes:
+        probes.append((_parse_claimed_filename_pid(claim.name), None))
+
+    saw_dead: ClaimCarrierStatus | None = None
+    saw_unknown: ClaimCarrierStatus | None = None
+    for pid_value, identity in probes:
+        try:
+            pid = int(pid_value or 0)
+        except (TypeError, ValueError):
+            saw_unknown = ClaimCarrierStatus(
+                ClaimCarrierKind.UNKNOWN,
+                "claim_pid_unparsable",
+                str(claim),
+            )
+            continue
+        if pid <= 0:
+            saw_unknown = ClaimCarrierStatus(
+                ClaimCarrierKind.UNKNOWN,
+                "claim_pid_unparsable",
+                str(claim),
+            )
+            continue
+        if not isinstance(identity, dict) or not str(identity.get("start_token") or ""):
+            saw_unknown = ClaimCarrierStatus(
+                ClaimCarrierKind.UNKNOWN,
+                "claim_identity_unavailable",
+                str(claim),
+            )
+            continue
+        status, reason = _queue_claim_identity_status(pid, identity)
+        if status == "live":
+            return ClaimCarrierStatus(ClaimCarrierKind.LIVE, reason, str(claim))
+        if status == "dead":
+            saw_dead = ClaimCarrierStatus(ClaimCarrierKind.DEAD, reason, str(claim))
+            continue
+        saw_unknown = ClaimCarrierStatus(ClaimCarrierKind.UNKNOWN, reason, str(claim))
+    if saw_unknown is not None:
+        return saw_unknown
+    if saw_dead is not None:
+        return saw_dead
+    return ClaimCarrierStatus(
+        ClaimCarrierKind.UNKNOWN,
+        "claim_identity_unavailable",
+        str(claim),
+    )
+
+
+def _prefer_claim_carrier(statuses: list[ClaimCarrierStatus]) -> ClaimCarrierStatus:
+    if not statuses:
+        return ClaimCarrierStatus()
+    for kind in _CLAIM_CARRIER_PREFERENCE:
+        for status in statuses:
+            if status.kind is kind:
+                return status
+    return statuses[0]
+
+
+def _summarize_claim_markers(queue_dir: Path) -> dict[str, int]:
+    """Count leftover claim markers by claimer adjudication. Read-only."""
+    summary = {"dead": 0, "unknown": 0, "live": 0}
+    if not queue_dir.is_dir():
+        return summary
+    for claim in queue_dir.glob("*.json.claimed-*"):
+        if claim.name.endswith(".failed"):
+            continue
+        kind = _adjudicate_claim_marker(claim).kind
+        if kind is ClaimCarrierKind.DEAD:
+            summary["dead"] += 1
+        elif kind is ClaimCarrierKind.LIVE:
+            summary["live"] += 1
+        else:
+            summary["unknown"] += 1
+    return summary
+
+
+def _claimer_report_fields(queue_dir: Path) -> dict[str, int]:
+    summary = _summarize_claim_markers(queue_dir)
+    return {
+        "dead_claimer": summary["dead"],
+        "unknown_claimer": summary["unknown"],
+        "live_claimer": summary["live"],
+    }
+
+
+def _abandoned_carrier_keep_reason(carrier: ClaimCarrierStatus) -> str | None:
+    if not carrier:
+        return None
+    if carrier.kind is ClaimCarrierKind.DEAD:
+        return "dead_claimer"
+    if carrier.kind is ClaimCarrierKind.UNKNOWN:
+        return "unknown_claimer"
+    return "active_queue_carrier"
+
+
+def _claim_has_active_carrier(queue_dir: Path, dispatch_id: str) -> ClaimCarrierStatus:
+    """Adjudicate whether a queue envelope still exists for dispatch_id.
+
+    A bare ``.json`` is a queued envelope (healthy carrier). A ``.claimed-*``
+    marker is a claimer: LIVE, DEAD, or UNKNOWN via pid+start-token identity.
+    The result is truthy whenever any matching file exists, so restore/close
+    paths that used this as a presence gate still refuse to mutate.
+    """
     if not dispatch_id:
-        return False
+        return ClaimCarrierStatus()
+    if not queue_dir.is_dir():
+        return ClaimCarrierStatus()
     safe = goalflight_compat.safe_dispatch_filename(dispatch_id)
+    statuses: list[ClaimCarrierStatus] = []
     # Canonical name is usually "<dispatch_id>.json" but may be priority-prefixed.
     for path in queue_dir.glob("*.json"):
         if path.name.endswith(".failed"):
@@ -8014,10 +8215,18 @@ def _claim_has_active_carrier(queue_dir: Path, dispatch_id: str) -> bool:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             if path.stem == dispatch_id or path.stem == safe:
-                return True
+                statuses.append(
+                    ClaimCarrierStatus(
+                        ClaimCarrierKind.QUEUED,
+                        "queued_envelope_unreadable",
+                        str(path),
+                    )
+                )
             continue
         if isinstance(payload, dict) and str(payload.get("dispatch_id") or "") == dispatch_id:
-            return True
+            statuses.append(
+                ClaimCarrierStatus(ClaimCarrierKind.QUEUED, "queued_envelope", str(path))
+            )
     for claim in queue_dir.glob("*.json.claimed-*"):
         if claim.name.endswith(".failed"):
             continue
@@ -8025,11 +8234,11 @@ def _claim_has_active_carrier(queue_dir: Path, dispatch_id: str) -> bool:
             payload = json.loads(claim.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             if claim.name.split(".claimed-", 1)[0].removesuffix(".json") == dispatch_id:
-                return True
+                statuses.append(_adjudicate_claim_marker(claim, None))
             continue
         if isinstance(payload, dict) and str(payload.get("dispatch_id") or "") == dispatch_id:
-            return True
-    return False
+            statuses.append(_adjudicate_claim_marker(claim, payload))
+    return _prefer_claim_carrier(statuses)
 
 
 def _scan_entry_completion_marker(entry: dict) -> dict | None:
@@ -8834,6 +9043,8 @@ def _sanitize_restore_envelope(entry: dict, *, increment_recovery_count: bool) -
         "queue_launch_token",
         "queue_launch_started",
         "queue_launch_started_at",
+        "queue_claimer_pid",
+        "queue_claimer_identity",
         "queue_launcher_pid",
         "queue_launcher_identity",
         "queue_worker_spawn_intent",
@@ -11789,6 +12000,10 @@ def _drain_queue_once(args) -> dict:
                     entry = payload
                     entry["state"] = "claimed"
                     entry["queue_launch_token"] = launch_token
+                    entry["queue_claimer_pid"] = os.getpid()
+                    claimer_identity = goalflight_ledger.process_identity(os.getpid())
+                    if isinstance(claimer_identity, dict):
+                        entry["queue_claimer_identity"] = claimer_identity
                     entry["updated_at"] = goalflight_ledger.utc_now()
                     try:
                         _write_json_atomic(claim, entry)
@@ -11965,6 +12180,7 @@ def _drain_queue_once(args) -> dict:
                 continue
             lease.release_reason = f"launch_failed_pending_ledger:{proc.returncode}"
     remaining = len(list(queue_dir.glob("*.json")))
+    claimer_counts = _claimer_report_fields(queue_dir)
     return {
         "schema": f"{DISPATCH_QUEUE_SCHEMA}.drain.v1",
         "queue_dir": str(queue_dir),
@@ -11973,6 +12189,9 @@ def _drain_queue_once(args) -> dict:
         "failed": drain_acc["failed"],
         "remaining": remaining,
         "pending_claims": drain_acc["pending_claims"],
+        "dead_claimer": claimer_counts["dead_claimer"],
+        "unknown_claimer": claimer_counts["unknown_claimer"],
+        "live_claimer": claimer_counts["live_claimer"],
         "recovered_claims": recovery,
         "abandoned_reconciliation": abandoned_reconciliation,
         "details": details,
@@ -11989,6 +12208,9 @@ def _drain_error_payload(args, exc: BaseException) -> dict:
         "failed": 1,
         "remaining": 0,
         "pending_claims": 0,
+        "dead_claimer": 0,
+        "unknown_claimer": 0,
+        "live_claimer": 0,
         "recovered_claims": {"restored": 0, "failed": 0},
         "details": [],
         "error": f"{type(exc).__name__}: {exc}",
@@ -12039,6 +12261,9 @@ def _cmd_drain(argv: list[str]) -> int:
                     "left_queued": payload["left_queued"],
                     "failed": payload["failed"],
                     "remaining": payload["remaining"],
+                    "dead_claimer": payload.get("dead_claimer", 0),
+                    "unknown_claimer": payload.get("unknown_claimer", 0),
+                    "live_claimer": payload.get("live_claimer", 0),
                     "queue_dir": payload["queue_dir"],
                 },
                 sort_keys=True,
