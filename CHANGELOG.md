@@ -18,7 +18,9 @@ incremented when meaningful skill behaviour changes.
   owning its tree even when the ledger row carries a liveness verdict such as
   `idle_timeout`. After merging a worker branch, run
   `python3 scripts/goalflight_worktree_gc.py --into main` (report) or
-  `--apply`.
+  `--apply`. Exemption is by seat registration (managed path + lock file),
+  not basename: an ad-hoc tree named `wt-N` is litter. Unknown registration
+  retains.
 - `goalflight_trace_archive.py` copies selected finished-dispatch tails from
   volatile `/tmp` dispatch state into gitignored
   `docs-private/traces/<YYYY-MM-DD>/<dispatch-id>/`. Policy keeps runs that

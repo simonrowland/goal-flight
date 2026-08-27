@@ -17,7 +17,9 @@ Rules:
 - after a worker branch is merged into the integration branch, reclaim
   ad-hoc (non-pool) worktrees with
   `python3 scripts/goalflight_worktree_gc.py --into main` (report) or
-  `--apply` (remove). `wt-N` pool seats are never litter.
+  `--apply` (remove). Registered pool seats (`<repo>/worktrees/wt-N` with a
+  matching seat lock) are never litter. A worktree merely *named* `wt-N` is
+  reclaimable. If registration cannot be determined, GC retains.
 - the configured range is a hard ceiling: a dispatch fails with every held
   seat and occupant dispatch id named when no kernel lock is available; there
   is no force-new escape hatch

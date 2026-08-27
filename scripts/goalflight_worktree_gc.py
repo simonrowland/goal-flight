@@ -10,8 +10,11 @@ Routine merge-down command (run from the repo after integrating a worker branch)
     python3 scripts/goalflight_worktree_gc.py --into main
     python3 scripts/goalflight_worktree_gc.py --into main --apply
 
-Pool seats (``worktrees/wt-N``) are maintained by ``goalflight_worktree_pool``
-and are never reclaimed as litter.
+Registered pool seats (``<repo>/worktrees/wt-N`` with a matching seat lock)
+are maintained by ``goalflight_worktree_pool`` and are never reclaimed as
+litter. A directory merely *named* ``wt-N`` is ordinary litter: exemption is
+by registration, not basename. If registration cannot be determined, the
+verdict is UNKNOWN and the tree is retained.
 
 Removal requires the CONJUNCTION of all four conditions:
 
@@ -481,13 +484,26 @@ def classify(
         result["conditions"] = {}
         return result
 
-    if goalflight_worktree_pool.is_pool_seat_path(path):
+    seat_verdict, seat_reason = goalflight_worktree_pool.registered_pool_seat_verdict(
+        path, project_root=repo
+    )
+    if seat_verdict == YES:
         result["decision"] = "retain"
         result["reason"] = (
             "managed pool seat "
             f"{Path(path).name} is maintained by the worktree pool, not litter"
         )
         result["conditions"] = {}
+        result["pool_seat"] = {"verdict": seat_verdict, "reason": seat_reason}
+        return result
+    if seat_verdict == UNKNOWN:
+        result["decision"] = "retain"
+        result["reason"] = (
+            "pool-seat registration unknown ("
+            f"{seat_reason}); cannot prove this path is not a maintained seat"
+        )
+        result["conditions"] = {}
+        result["pool_seat"] = {"verdict": seat_verdict, "reason": seat_reason}
         return result
 
     conditions = {
@@ -694,7 +710,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Report (or with --apply, remove) git worktrees that are merged, "
             "clean, unowned by a live dispatch, and not checked out. "
-            "Managed wt-N pool seats are never reclaimed. Run after merging "
+            "Registered wt-N pool seats are never reclaimed; a directory "
+            "merely named wt-N is ordinary litter. Run after merging "
             "a worker branch into the integration branch."
         )
     )
