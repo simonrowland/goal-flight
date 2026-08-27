@@ -37,12 +37,18 @@ import goalflight_wake as wake  # noqa: E402
 
 def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
-    env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
+    state = tmp / "state"
+    env["GOALFLIGHT_STATE_DIR"] = str(state)
+    # Autouse isolation pins GOALFLIGHT_DISPATCH_DIR to pytest's tmp_path.
+    # Tests here own a separate TemporaryDirectory; without this override the
+    # watcher writes pytest's tree and shutdown waits on an empty file.
+    env["GOALFLIGHT_DISPATCH_DIR"] = str(state / "dispatch")
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal-state")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
     env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
+    env["GOALFLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
     env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
     return env
@@ -125,7 +131,10 @@ def _wait_for_dispatch_shutdown(
     if not watcher:
         return
 
-    watcher_log = Path(env["GOALFLIGHT_STATE_DIR"]) / "dispatch" / f"{dispatch_id}.watcher.log"
+    dispatch_dir = (env.get("GOALFLIGHT_DISPATCH_DIR") or "").strip()
+    watcher_log = (
+        Path(dispatch_dir) if dispatch_dir else Path(env["GOALFLIGHT_STATE_DIR"]) / "dispatch"
+    ) / f"{dispatch_id}.watcher.log"
     last_watcher: dict = {}
 
     def watcher_finished() -> bool:
@@ -6562,3 +6571,52 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def test_acp_reexec_probe_names_an_indeterminate_failure_but_stays_silent_on_absence() -> None:
+    """The re-exec probe must distinguish "SDK absent" from "probe broke".
+
+    Both used to be swallowed by a bare `except BaseException: return`, so an
+    OSError from a half-broken import rendered as "no re-exec needed" -- the
+    error-swallowing-lookup shape, sitting on the launch path every controller
+    on this machine dispatches through. Absence is a real answer and stays
+    silent by design; anything else means the probe could not find out, and an
+    operator must be told rather than left to infer it from behaviour.
+    """
+    import builtins
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import goalflight_dispatch as dispatch_mod
+
+    argv = ["goalflight_dispatch.py", "--shape", "acp", "--agent", "claude-acp"]
+    real_import = builtins.__import__
+    targets = ("goalflight_acp_run", "goalflight_acp_client")
+
+    def _raise(exc: BaseException):
+        def _hook(name, *a, **k):
+            if name in targets:
+                raise exc
+            return real_import(name, *a, **k)
+        return _hook
+
+    # Indeterminate probe failure -> proceed, but SAY SO.
+    err = io.StringIO()
+    builtins.__import__ = _raise(OSError("simulated import probe failure"))
+    try:
+        with contextlib.redirect_stderr(err):
+            dispatch_mod._ensure_acp_sdk_interpreter(argv)
+    finally:
+        builtins.__import__ = real_import
+    noisy = err.getvalue()
+    assert "could not complete" in noisy, noisy
+    assert "OSError" in noisy, noisy
+
+    # Genuine absence -> silent, deliberately.
+    err2 = io.StringIO()
+    builtins.__import__ = _raise(ImportError("no module named goalflight_acp_run"))
+    try:
+        with contextlib.redirect_stderr(err2):
+            dispatch_mod._ensure_acp_sdk_interpreter(argv)
+    finally:
+        builtins.__import__ = real_import
+    assert err2.getvalue().strip() == "", err2.getvalue()
