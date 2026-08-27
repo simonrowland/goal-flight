@@ -1314,6 +1314,20 @@ def test_transient_journal_busy_renders_controllers(
             if connection is not None:
                 connection.close()
 
+    busy_seen = threading.Event()
+    original_peek = controllers._peek_active_lease_identities_once
+
+    def peek_observing_busy(
+        path: Path,
+    ) -> tuple[list[tuple[str, str]] | None, str | None]:
+        value, error = original_peek(path)
+        if error == controllers._BUSY_ERROR:
+            busy_seen.set()
+        return value, error
+
+    monkeypatch.setattr(
+        controllers, "_peek_active_lease_identities_once", peek_observing_busy
+    )
     holder_thread = threading.Thread(target=hold_until_release)
     holder_thread.start()
     assert started.wait(timeout=5)
@@ -1324,8 +1338,7 @@ def test_transient_journal_busy_renders_controllers(
 
     runner = threading.Thread(target=run_tool)
     runner.start()
-    # First peek(s) must observe the genuine exclusive lock; then free it.
-    time.sleep(0.05)
+    assert busy_seen.wait(timeout=5), "peek never observed JournalBusy"
     release.set()
     runner.join(timeout=10)
     holder_thread.join(timeout=5)
