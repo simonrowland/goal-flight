@@ -11771,6 +11771,7 @@ class _DrainClaimGuard:
         self.acc = acc
         self.consumed = False
         self.allow_restore = True
+        self.launch_attempted = False
         self.release_reason = "claim_released_pre_worker"
 
     def consume(
@@ -11816,9 +11817,16 @@ class _DrainClaimGuard:
                 }
             )
             return False
-        # TimeoutExpired SIGKILLs the child. Any other exception may leave a
-        # live launcher; restoring would replay it.
-        if exc_type is not None and exc_type is not subprocess.TimeoutExpired:
+        # TimeoutExpired SIGKILLs the child, so it can still restore a
+        # pre-worker claim. Any other exception AFTER launch_attempted may
+        # leave a live launcher; restoring that would replay it. Pre-worker
+        # claims with no launch attempt must be released so a dead drain
+        # cannot strand them.
+        if (
+            exc_type is not None
+            and exc_type is not subprocess.TimeoutExpired
+            and self.launch_attempted
+        ):
             self.acc["pending_claims"] += 1
             self.acc["failed"] += 1
             self.acc["details"].append(
@@ -11907,6 +11915,17 @@ def _drain_project_key(entry: dict | None) -> str:
         return raw
 
 
+def _remember_drain_journal_skip(acc: dict, project_key: str, kind: str) -> None:
+    if kind == "busy":
+        acc["skipped_busy"] += 1
+        if project_key:
+            acc["skipped_projects_busy"].add(project_key)
+    else:
+        acc["skipped_error"] += 1
+        if project_key:
+            acc["skipped_projects_error"].add(project_key)
+
+
 def _note_drain_journal_skip(
     acc: dict,
     *,
@@ -11916,15 +11935,10 @@ def _note_drain_journal_skip(
     exc: BaseException | None = None,
 ) -> None:
     """Record a per-project journal skip. Does not mutate queue files."""
+    _remember_drain_journal_skip(acc, project_key, kind)
     if kind == "busy":
-        acc["skipped_busy"] += 1
-        if project_key:
-            acc["skipped_projects_busy"].add(project_key)
         reason = "journal_busy"
     else:
-        acc["skipped_error"] += 1
-        if project_key:
-            acc["skipped_projects_error"].add(project_key)
         reason = (
             f"journal_error:{type(exc).__name__}" if exc is not None else "journal_error"
         )
@@ -12129,12 +12143,21 @@ def _drain_queue_once(args) -> dict:
             dispatch_id=dispatch_id,
             acc=drain_acc,
         ) as lease:
-            launch_argv = _drain_launch_argv(
-                list(entry.get("dispatch_argv") or []),
-                capacity_wait_s=args.capacity_wait_s,
-                queue_launch_token=launch_token,
-                queue_claim_path=claim,
-            )
+            try:
+                launch_argv = _drain_launch_argv(
+                    list(entry.get("dispatch_argv") or []),
+                    capacity_wait_s=args.capacity_wait_s,
+                    queue_launch_token=launch_token,
+                    queue_claim_path=claim,
+                )
+            except goalflight_journal.JournalBusy:
+                lease.release_reason = "journal_busy"
+                _remember_drain_journal_skip(drain_acc, project_key, "busy")
+                continue
+            except goalflight_journal.JournalError as exc:
+                lease.release_reason = f"journal_error:{type(exc).__name__}"
+                _remember_drain_journal_skip(drain_acc, project_key, "error")
+                continue
             if not launch_argv:
                 committed = _mark_claim_failed(claim, entry, reason="missing_dispatch_argv")
                 # Every other refusal in this loop appends a detail; this one did
@@ -12152,6 +12175,7 @@ def _drain_queue_once(args) -> dict:
                 continue
             timeout_s = max(20.0, float(args.capacity_wait_s or 0.0) + 45.0)
             try:
+                lease.launch_attempted = True
                 if remote_node:
                     proc = _drain_launch_remote_claim(
                         args,
