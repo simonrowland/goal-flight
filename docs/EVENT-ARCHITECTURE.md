@@ -418,30 +418,36 @@ indefinite deafness into a bounded failure. Production values are rejected outsi
 the 60-to-300-second range. On a box carrying six-plus concurrent
 workers, a 30-second grace fell inside normal scheduling jitter. The detector now
 requires three complete missed beats: 360 seconds at the default cadence. The
-stream durably records every successful stdout record. Six separately tracked
-`listen --listener-slots 6 --report-pending` backup doorbells deliver mail, while an
+stream durably records every successful stdout record. Two separately tracked
+`listen --listener-slots 2 --report-pending` backup doorbells deliver mail, while an
 independently locked `listen --watch-follow` watchdog polls generation-bound state
 and emits `event`/`listener-dead` when state is stale, faulted, missing, or invalid.
 The decomposed unsupervised path includes the exact re-arm command; under `supervise`
 the record keeps the reason but omits that action, and recovery is a supervisor restart.
 The watchdog never claims a delivery slot or
-reads the mail cursor. This makes persistent coverage a shared eight-component
-`live/8` fact. It stays persistent after stream death, so the surviving backup pool and
-watchdog report `7/8`, not portable `1/4`.
+reads the mail cursor. This makes persistent coverage a shared four-component
+`live/4` fact. It stays persistent after stream death, so the surviving backup pool and
+watchdog report `3/4`, not portable `1/4`.
 Unchanged frontiers have a 15-minute floor and changed frontiers emit on the next
-idle beat. The host may batch lines produced within 200 ms, so every line is an
-independently parseable JSON object and consumers enumerate all records in a batch.
+idle beat. Terse `supervise` then suppresses a verbatim-identical `kind=next`
+payload until that same floor; a content change still wakes immediately, and
+`--chatty` restores the raw keepalive and frontier feed. The host may batch
+lines produced within 200 ms, so every line is an independently parseable JSON
+object and consumers enumerate all records in a batch.
 An event defers the next idle heartbeat, avoiding a contradictory event plus
 "nothing arrived" beat in the same batch.
 
 The supervisor's own heartbeat is a separate record and clock from the stream
-heartbeat above. It defaults to 1500 seconds, may be configured from 60–1800
+heartbeat above. It defaults to 3600 seconds, may be configured from 60–14400
 seconds, and is the real-write fallback that detects a closed controlling pipe
 when the fast per-tick poll has no evidence. The supervisor wait also watches
 stdout for `POLLERR|POLLHUP|POLLNVAL`, so positive closure evidence wakes it
-independently of the heartbeat. Supervisor coverage emits at startup, on each
-`(live,target)` change, and immediately on a slot stop or restart; unchanged
-periodic coverage is suppressed unless `--debug` is set. Every supervisor
+independently of the heartbeat. When `live` / `target` are enabled, coverage
+emits at startup, on each `(live,target)` change, and immediately on a slot
+stop or restart; unchanged periodic coverage is suppressed unless `--debug`
+restores per-tick heartbeat records. Default terse mode emits no coverage
+record; startup writes a named
+`{"type":"probe","reason":"stdout-peer-liveness"}` peer-liveness probe. Every supervisor
 `type=stop` and every `type=exit` caused by `SIGTERM`, `SIGINT`, or `SIGHUP`
 carries the exact re-arm command. The stream stays at 120 seconds and the
 watchdog still declares stream death after three missed stream intervals.
@@ -458,7 +464,7 @@ also carries projection `age_s`; an hour-old projection becomes `stale` even whe
 
 `--listener-slots`, `GOALFLIGHT_LISTENER_SLOTS`, and
 `GOALFLIGHT_LISTENER_LOW_WATER` remain portable-pool controls. Persistent backup
-depth is `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 6; target depth, not a
+depth is `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 2; target depth, not a
 ceiling). `follow` rejects
 the CLI knob and warns on the portable environment knobs; persistent depth is
 the stream, the backup doorbell pool, and the watchdog.

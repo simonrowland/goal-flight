@@ -282,7 +282,7 @@ armed through the HOST'S PERSISTENT MONITOR — on Claude Code, the Monitor tool
 with `persistent: true`; never a bounded monitor, never shell `&`:
 
 ```bash
-GOALFLIGHT_PERSISTENT_BACKUP_SLOTS=2 python3 <skill-root>/scripts/goalflight_messages.py \
+python3 <skill-root>/scripts/goalflight_messages.py \
   supervise --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>
 ```
 
@@ -292,8 +292,8 @@ GOALFLIGHT_PERSISTENT_BACKUP_SLOTS=2 python3 <skill-root>/scripts/goalflight_mes
   fleet-wide one-hour coverage drop, b-248).
 - **Stop any old direct listeners FIRST**, then arm supervise (b-242):
   starting it alongside running listeners permanently stops its slots.
-- `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS=2` is the recommended doorbell depth
-  under a supervisor (b-243) while the shipped default is higher.
+- `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` is optional at the shipped default of 2;
+  set it only to override doorbell depth.
 - If you filter the supervise stream, the allowlist must pass `kind=next` and
   the `stop`/`exit`/`restart` records carrying `rearm` — a narrow filter
   re-creates the silent death the supervisor exists to prevent.

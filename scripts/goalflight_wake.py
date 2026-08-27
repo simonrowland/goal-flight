@@ -71,7 +71,13 @@ _LEASE_EVENT_SCHEMA = "goalflight.lease-generation-event.v1"
 DEFAULT_LISTENER_SLOTS = 4
 # Persistent wake has three roles: 1 stream, N backup doorbells, 1 watchdog.
 # Only the doorbell is a pool. Override with GOALFLIGHT_PERSISTENT_BACKUP_SLOTS.
-DEFAULT_PERSISTENT_BACKUP_SLOTS = 6
+# Default N=2 (live/4), not 6 (live/8): the extra depth was margin for a
+# controller that forgets to re-arm. The supervisor cannot forget (b-243),
+# and the measured constraint is shared-journal SQLite contention, not
+# descriptors — 26 listeners were observed piling on one journal. Backup
+# doorbells are expirable margin: their stop/expiry under a live supervisor
+# is not an operator-attention fault (the supervisor re-arms on ring).
+DEFAULT_PERSISTENT_BACKUP_SLOTS = 2
 PERSISTENT_WAKE_TARGET = 1 + DEFAULT_PERSISTENT_BACKUP_SLOTS + 1
 
 
