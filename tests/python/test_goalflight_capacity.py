@@ -81,6 +81,26 @@ def _dead_pid() -> int:
     return proc.pid
 
 
+def _indeterminate_foreign_pid() -> int:
+    """A pid whose probe is the real non-ESRCH failure this host produces.
+
+    Non-root Darwin: os.kill(1, 0) raises PermissionError / EPERM, so
+    pid_liveness(1) is None while pid_alive(1) stays True. Signal 0 only —
+    this does not kill or signal pid 1. Fail loudly if this host cannot
+    induce the condition; a patched OSError would not exercise F1.
+    """
+    pid = 1
+    live = compat.pid_liveness(pid)
+    assert live is None, (
+        f"pid {pid} liveness is {live!r}; need a real indeterminate (EPERM) "
+        "probe to exercise bounded reclaim"
+    )
+    assert cap.pid_alive(pid) is True, (
+        "boolean pid_alive must still treat indeterminate as live (kill/reap)"
+    )
+    return pid
+
+
 def _past_ttl_lease(*, worker_pid: int | None, controller_pid: int | None) -> dict:
     """Build an ACTIVE lease whose expires_at is far in the past."""
     expired = cap.iso(cap.utc_now() - dt.timedelta(hours=12))
@@ -444,6 +464,140 @@ def case_status_still_reclaims_dead_lease_in_view(state_dir: Path) -> None:
     payload = json.loads(out)
     assert payload["active"] == [], (
         "status view still reported a dead past-TTL lease as active"
+    )
+
+
+def case_indeterminate_holder_bounded_not_indefinite() -> None:
+    """F1: EPERM worker_pid is protected only inside INDETERMINATE_LIVE_RETENTION_S.
+
+    Induces the real condition (worker_pid=1, expires_at in the past). Both
+    halves: not reclaimed immediately, reclaimed after the bound. Boolean
+    pid_alive stays True for the same pid; reclaim consults pid_liveness.
+    """
+    foreign = _indeterminate_foreign_pid()
+    dead_controller = _dead_pid()
+    now = cap.utc_now()
+
+    recent = _past_ttl_lease(worker_pid=foreign, controller_pid=dead_controller)
+    recent["started_at"] = cap.iso(now - dt.timedelta(seconds=30))
+    recent["expires_at"] = cap.iso(now - dt.timedelta(seconds=1))
+    recent_data = {"leases": {recent["lease_id"]: recent}, "cooldowns": {}}
+    cap.prune_state(recent_data)
+    kept = recent_data["leases"].get(recent["lease_id"])
+    assert kept is not None and kept["state"] == "active", (
+        f"indeterminate holder inside {cap.INDETERMINATE_LIVE_RETENTION_S}s "
+        f"was reclaimed immediately (state={None if kept is None else kept.get('state')!r})"
+    )
+    assert recent not in cap.stale_active_leases(recent_data), (
+        "indeterminate holder inside the retention window was classified stale"
+    )
+    assert len(cap.active_leases(recent_data)) == 1
+
+    aged = _past_ttl_lease(worker_pid=foreign, controller_pid=dead_controller)
+    aged["started_at"] = cap.iso(
+        now - dt.timedelta(seconds=cap.INDETERMINATE_LIVE_RETENTION_S + 120)
+    )
+    aged["expires_at"] = cap.iso(
+        now - dt.timedelta(seconds=cap.INDETERMINATE_LIVE_RETENTION_S + 60)
+    )
+    aged_for_stale = dict(aged)
+    aged_data = {"leases": {aged["lease_id"]: aged}, "cooldowns": {}}
+    assert aged_for_stale in cap.stale_active_leases(
+        {"leases": {aged_for_stale["lease_id"]: aged_for_stale}, "cooldowns": {}}
+    ), "indeterminate holder past the retention window was not classified stale"
+    cap.prune_state(aged_data)
+    survivor = aged_data["leases"].get(aged["lease_id"])
+    if survivor is not None:
+        assert survivor["state"] == "expired", (
+            f"indeterminate holder past retention not expired "
+            f"(state={survivor['state']!r})"
+        )
+    assert cap.active_leases(aged_data) == [], (
+        "indeterminate holder past retention still counted active"
+    )
+
+
+def case_live_worker_survives_past_indeterminate_retention() -> None:
+    """Confirmed-live worker is never reclaimed by the indeterminate bound."""
+    worker = _spawn_live_worker()
+    try:
+        lease = _past_ttl_lease(worker_pid=worker.pid, controller_pid=_dead_pid())
+        now = cap.utc_now()
+        lease["expires_at"] = cap.iso(
+            now - dt.timedelta(seconds=cap.INDETERMINATE_LIVE_RETENTION_S + 60)
+        )
+        data = {"leases": {lease["lease_id"]: lease}, "cooldowns": {}}
+        cap.prune_state(data)
+        survived = data["leases"].get(lease["lease_id"])
+        assert survived is not None and survived["state"] == "active", (
+            "confirmed-live worker was reclaimed after the indeterminate bound"
+        )
+        assert lease not in cap.stale_active_leases(data), (
+            "confirmed-live worker was classified stale after the bound"
+        )
+    finally:
+        _kill_if_alive(worker.pid)
+        worker.wait()
+
+
+def case_unprobeable_retained_scope_reclaims_after_until() -> None:
+    """Watcher retain path: elapsed until + unprobeable pgid is reclaimable.
+
+    ``accounted_live_pgid=1`` is not a stubbed None: ``_process_group_liveness``
+    refuses pgid<=1. Combined with a past ``accounted_live_until``, the existing
+    retain predicate must stop holding. A still-open until keeps the hold.
+    Confirmed-live groups still hold after the same until (watch idle tests).
+    """
+    now = cap.utc_now()
+    lease = {
+        "lease_id": "retained-unprobeable",
+        "agent": "codex",
+        "state": "active",
+        "reason": cap.INDETERMINATE_LIVE_REASON,
+        "worker_pid": _indeterminate_foreign_pid(),
+        "controller_pid": None,
+        "accounted_live_pgid": 1,
+        "accounted_live_until": "1970-01-01T00:00:00Z",
+        "started_at": cap.iso(now - dt.timedelta(hours=20)),
+        "expires_at": cap.iso(now - dt.timedelta(hours=12)),
+    }
+    assert not cap.retained_live_scope_holds_capacity(lease)
+    data = {"leases": {lease["lease_id"]: lease}, "cooldowns": {}}
+    assert lease in cap.stale_active_leases(data), lease
+    cap.prune_state(data)
+    survivor = data["leases"].get(lease["lease_id"])
+    if survivor is not None:
+        assert survivor["state"] == "expired", survivor
+    assert cap.active_leases(data) == []
+
+    still_open = dict(lease)
+    still_open["state"] = "active"
+    still_open["accounted_live_until"] = cap.iso(now + dt.timedelta(hours=1))
+    assert cap.retained_live_scope_holds_capacity(still_open)
+    open_data = {"leases": {still_open["lease_id"]: still_open}, "cooldowns": {}}
+    assert still_open not in cap.stale_active_leases(open_data)
+    cap.prune_state(open_data)
+    assert open_data["leases"][still_open["lease_id"]]["state"] == "active"
+
+
+def case_dead_worker_reclaimed_inside_indeterminate_retention() -> None:
+    """ESRCH / confirmed-dead is still reclaimed promptly, not after 7200s."""
+    lease = _past_ttl_lease(worker_pid=_dead_pid(), controller_pid=_dead_pid())
+    now = cap.utc_now()
+    lease["started_at"] = cap.iso(now - dt.timedelta(seconds=30))
+    lease["expires_at"] = cap.iso(now - dt.timedelta(seconds=1))
+    data = {"leases": {lease["lease_id"]: lease}, "cooldowns": {}}
+    assert lease in cap.stale_active_leases(data), (
+        "confirmed-dead worker inside the retention window was not stale"
+    )
+    cap.prune_state(data)
+    survivor = data["leases"].get(lease["lease_id"])
+    if survivor is not None:
+        assert survivor["state"] == "expired", (
+            f"confirmed-dead past-TTL lease not expired (state={survivor['state']!r})"
+        )
+    assert cap.active_leases(data) == [], (
+        "confirmed-dead worker still counted active inside the retention window"
     )
 
 
@@ -1492,6 +1646,10 @@ def main() -> None:
     case_dead_lease_past_ttl_is_reclaimed()
     case_dead_lease_no_ttl_not_expired()
     case_rate_limited_retained_lease_pruned()
+    case_indeterminate_holder_bounded_not_indefinite()
+    case_live_worker_survives_past_indeterminate_retention()
+    case_unprobeable_retained_scope_reclaims_after_until()
+    case_dead_worker_reclaimed_inside_indeterminate_retention()
     case_stale_active_leases_live_worker_not_stale_with_dead_controller()
     case_empty_state_dir_falls_back_not_cwd()
     case_capacity_wait_resolution_precedence()
