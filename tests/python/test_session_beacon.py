@@ -503,7 +503,7 @@ def test_release_requires_exact_process_generation(
     )
     sessions.claim_session(root, pid=71001, label="controller")
     token["value"] = "generation-b"
-    assert sessions.release_session(root, pid=71001) is False
+    assert sessions.release_session(root, pid=71001)["released"] is False
     token["value"] = "generation-a"
-    assert sessions.release_session(root, pid=71001) is True
+    assert sessions.release_session(root, pid=71001)["released"] is True
     assert journal.Journal(root).active_lease("controller") is None

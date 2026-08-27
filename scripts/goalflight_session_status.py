@@ -1669,14 +1669,27 @@ def _dead_holder_retirement_gate(
     if live_state == "live":
         return _incumbent_nonce_refusal()
     expired, deadline = _renew_deadline_expired_for_dead_holder(lease)
+    if deadline is None:
+        return {
+            "retired": False,
+            "reason": "renew_deadline_unreadable",
+            "message": (
+                "stored renew_deadline_at is missing or unparseable; "
+                "nonce-less retirement cannot prove the deadline is past "
+                f"one full lease horizon ({int(DEAD_HOLDER_RETIRE_MARGIN_S)}s). "
+                "Repair the journal manually (t-238) or retire with the "
+                "active lease nonce."
+            ),
+            "renew_deadline_at": lease.renew_deadline_at,
+            "required_margin_s": DEAD_HOLDER_RETIRE_MARGIN_S,
+        }
     if not expired:
-        deadline_text = deadline.isoformat() if deadline is not None else "unparseable"
         return {
             "retired": False,
             "reason": "renew_deadline_not_past_horizon",
             "message": (
-                f"stored renew_deadline_at {deadline_text} is not past by one "
-                f"full lease horizon ({int(DEAD_HOLDER_RETIRE_MARGIN_S)}s). "
+                f"stored renew_deadline_at {deadline.isoformat()} is not past "
+                f"by one full lease horizon ({int(DEAD_HOLDER_RETIRE_MARGIN_S)}s). "
                 "Nonce-less retirement needs that margin so a merely-overdue "
                 "or clock-skewed live holder cannot qualify."
             ),
@@ -1733,9 +1746,15 @@ def retire_controller(
         authority = goalflight_journal.Journal(project_root)
     except (
         goalflight_journal.JournalBusy,
-        goalflight_journal.JournalDisappeared,
         goalflight_journal.JournalIOError,
-    ):
+    ) as exc:
+        return {
+            "retired": False,
+            "reason": "registry_unreadable",
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
+    except goalflight_journal.JournalDisappeared:
         return {"retired": False, "reason": "controller_not_registered"}
     lease = authority.active_lease(label)
     if lease is None:
@@ -1814,19 +1833,25 @@ def retire_controller(
     }
 
 
-def release_session(project_root: Path, *, pid: int) -> bool:
+def release_session(project_root: Path, *, pid: int) -> dict:
     """Release the active lease owned by this exact process generation."""
     try:
         authority = goalflight_journal.Journal(project_root)
     except (
         goalflight_journal.JournalBusy,
-        goalflight_journal.JournalDisappeared,
         goalflight_journal.JournalIOError,
-    ):
-        return False
+    ) as exc:
+        return {
+            "released": False,
+            "reason": "registry_unreadable",
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
+    except goalflight_journal.JournalDisappeared:
+        return {"released": False, "reason": "controller_not_registered"}
     measured = _controller_process_identity(pid)
     if measured is None:
-        return False
+        return {"released": False}
     for row in authority.lease_records():
         principal = json.loads(str(row.get("principal_json") or "{}"))
         if principal.get("pid") != pid or principal.get("start_token") != measured.get("start_token"):
@@ -1842,8 +1867,8 @@ def release_session(project_root: Path, *, pid: int) -> bool:
                 released.value,
                 only_if_present=True,
             )
-        return released.committed
-    return False
+        return {"released": bool(released.committed)}
+    return {"released": False}
 
 
 def ensure_session(project_root: Path, *, pid: int | None = None) -> dict:
@@ -2889,9 +2914,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.release_session:
-        removed = release_session(project_root, pid=args.session_pid or os.getpid())
-        print(json.dumps({"released": removed}))
-        return 0 if removed else 1
+        result = release_session(project_root, pid=args.session_pid or os.getpid())
+        print(json.dumps(result))
+        return 0 if result.get("released") else 1
 
     if args.claim:
         if not args.queue:
