@@ -128,3 +128,27 @@ So a purge decision has TWO independent parts: is this RECORD still valid
 Conflating them loses real work — and the store, not the queue record, is the
 authority on the second. Six identical probes against a pinned HEAD is also its
 own small lesson about re-fire habits.
+
+
+## Blast radius of the snapshot artifact — CHECKED, and it is small
+
+I audited the audit rather than assuming b285 was the only case. Only TWO rows
+carry a prompt-MISSING verdict at all:
+
+1. `b285-ring-coherence-adjudication` — CONFIRMED FALSE POSITIVE. Live (pid
+   60600), claimed by pm2-main. Do not abandon on the audit's say-so.
+2. `codex-80486-1787414845-retry-d69b4bc9` — battery-bugs' row, 3d 9h old,
+   present both in the live queue and in `retired-by-main`. battery-bugs has
+   already answered ABANDON for their label, so this row is covered by an
+   owner decision rather than by the audit's default.
+
+Zero pinned prompt files are empty or stubs, so the pinning itself is sound.
+
+**The structural lesson, and it is the familiar one:** the audit ALREADY
+RECORDED the disconfirming evidence — the b285 TLDR literally says "Bare json
+was in the first snapshot then vanished" — and still rendered the verdict as a
+definite **MISSING**. The evidence of a moving target was captured and then not
+allowed to soften the conclusion. When the evidence says the thing moved while
+you were looking, the honest verdict is UNKNOWN / re-check, not a definite
+absence. Same shape as every could-not-tell-rendered-as-definite finding today,
+committed inside the very document written to prevent bad purges.
