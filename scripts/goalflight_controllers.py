@@ -980,7 +980,18 @@ def collect_controller_rows(
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     roster_cache: dict[str, dict[str, Any] | str] = {}
-    files = goalflight_journal.iter_journal_files()
+    try:
+        files = goalflight_journal.iter_journal_files()
+    except goalflight_journal.JournalIOError as exc:
+        # An unreadable journals index is UNKNOWN, not an empty fleet: emit a
+        # could-not-tell row rather than reporting zero controllers.
+        return [
+            unknown_project_row(
+                project_root=None,
+                journal_path=goalflight_journal.journals_index_dir(),
+                error=f"journals index unreadable ({type(exc).__name__})",
+            )
+        ]
     for path in files:
         pairs, peek_error = peek_active_lease_identities(path)
         if pairs is None:

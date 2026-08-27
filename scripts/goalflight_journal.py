@@ -762,16 +762,38 @@ def journals_index_dir() -> Path:
 def iter_journal_files() -> list[Path]:
     """Return every journal sqlite path under the journals index.
 
-    A listing failure is an empty list, not a crash. Callers must treat an
-    unreadable *file* as its own unknown row rather than skipping the index.
+    Raises ``JournalIOError`` when the index exists but cannot be listed:
+    an unreadable index is UNKNOWN, not an empty fleet. A genuinely absent
+    index is an empty list. Callers must treat an unreadable *file* as its
+    own unknown row rather than skipping the index.
     """
     base = journals_index_dir()
+    # pathlib glob swallows PermissionError and yields nothing; iterdir
+    # raises, keeping unreadable distinct from absent.
     try:
-        # Do not filter with is_file(): a permission error would silently drop
-        # an unreadable journal. Peek it and let the caller emit unknown.
-        return sorted(base.glob(f"*/{JOURNAL_FILE_NAME}"))
-    except OSError:
+        children = list(base.iterdir())
+    except FileNotFoundError:
         return []
+    except OSError as exc:
+        raise JournalIOError(
+            f"journals index is unreadable, so the fleet roster is unknown: "
+            f"{base}: {exc}"
+        ) from exc
+    files: list[Path] = []
+    for child in children:
+        if not child.is_dir():
+            continue
+        candidate = child / JOURNAL_FILE_NAME
+        try:
+            names = {entry.name for entry in child.iterdir()}
+        except OSError:
+            # Unreadable per-project dir: the journal path is conventional,
+            # so include it and let the caller's peek emit an unknown row.
+            files.append(candidate)
+            continue
+        if JOURNAL_FILE_NAME in names:
+            files.append(candidate)
+    return sorted(files)
 
 
 def resolve_journal_path(project_root: Path | str) -> Path:

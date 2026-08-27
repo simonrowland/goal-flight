@@ -7913,7 +7913,7 @@ def reconcile_abandoned_dispatches(
         key = str(entry.get("reason") or "unknown")
         kept_reasons[key] = kept_reasons.get(key, 0) + 1
     claimer_counts = _claimer_report_fields(resolved_queue_dir)
-    return {
+    report = {
         "schema": ABANDONED_RECONCILIATION_SCHEMA,
         "mode": "dry-run" if dry_run else "automatic",
         "stale_seconds": stale_s,
@@ -7927,6 +7927,9 @@ def reconcile_abandoned_dispatches(
         "live_claimer": claimer_counts["live_claimer"],
         "entries": entries,
     }
+    if claimer_counts.get("queue_listing_error"):
+        report["queue_listing_error"] = str(claimer_counts["queue_listing_error"])
+    return report
 
 
 def _reconcile_abandoned_for_drain(queue_dir: Path) -> dict:
@@ -8162,12 +8165,38 @@ def _prefer_claim_carrier(statuses: list[ClaimCarrierStatus]) -> ClaimCarrierSta
     return statuses[0]
 
 
-def _summarize_claim_markers(queue_dir: Path) -> dict[str, int]:
-    """Count leftover claim markers by claimer adjudication. Read-only."""
-    summary = {"dead": 0, "unknown": 0, "live": 0}
+def _queue_dir_listing(queue_dir: Path) -> list[Path]:
+    """List queue-dir entries, raising on a failed listing.
+
+    ``Path.glob`` swallows ``PermissionError`` and yields nothing, which
+    renders an unreadable queue as an empty one — the collapse that licensed
+    ``worker_provably_gone`` for an envelope still on disk. ``iterdir``
+    raises. A directory that vanished between the ``is_dir`` probe and the
+    listing is genuinely absent: no entries.
+    """
+    try:
+        return list(queue_dir.iterdir())
+    except FileNotFoundError:
+        return []
+
+
+def _summarize_claim_markers(queue_dir: Path) -> dict[str, int | str]:
+    """Count leftover claim markers by claimer adjudication. Read-only.
+
+    An unreadable queue dir is UNKNOWN, not all-zero counts: the report
+    carries ``listing_error`` instead of pretending no markers exist.
+    """
+    summary: dict[str, int | str] = {"dead": 0, "unknown": 0, "live": 0}
     if not queue_dir.is_dir():
         return summary
-    for claim in queue_dir.glob("*.json.claimed-*"):
+    try:
+        entries = _queue_dir_listing(queue_dir)
+    except OSError as exc:
+        summary["listing_error"] = f"queue_dir_unreadable:{type(exc).__name__}"
+        return summary
+    for claim in entries:
+        if ".json.claimed-" not in claim.name:
+            continue
         if claim.name.endswith(".failed"):
             continue
         kind = _adjudicate_claim_marker(claim).kind
@@ -8180,13 +8209,17 @@ def _summarize_claim_markers(queue_dir: Path) -> dict[str, int]:
     return summary
 
 
-def _claimer_report_fields(queue_dir: Path) -> dict[str, int]:
+def _claimer_report_fields(queue_dir: Path) -> dict[str, int | str]:
     summary = _summarize_claim_markers(queue_dir)
-    return {
+    fields: dict[str, int | str] = {
         "dead_claimer": summary["dead"],
         "unknown_claimer": summary["unknown"],
         "live_claimer": summary["live"],
     }
+    listing_error = summary.get("listing_error")
+    if listing_error:
+        fields["queue_listing_error"] = str(listing_error)
+    return fields
 
 
 def _abandoned_carrier_keep_reason(carrier: ClaimCarrierStatus) -> str | None:
@@ -8205,7 +8238,9 @@ def _claim_has_active_carrier(queue_dir: Path, dispatch_id: str) -> ClaimCarrier
     A bare ``.json`` is a queued envelope (healthy carrier). A ``.claimed-*``
     marker is a claimer: LIVE, DEAD, or UNKNOWN via pid+start-token identity.
     The result is truthy whenever any matching file exists, so restore/close
-    paths that used this as a presence gate still refuse to mutate.
+    paths that used this as a presence gate still refuse to mutate. A queue
+    dir that cannot be listed is UNKNOWN, never NONE: unreadable is not
+    absent, and the abandoned gate must keep what it cannot verify.
     """
     if not dispatch_id:
         return ClaimCarrierStatus()
@@ -8213,8 +8248,18 @@ def _claim_has_active_carrier(queue_dir: Path, dispatch_id: str) -> ClaimCarrier
         return ClaimCarrierStatus()
     safe = goalflight_compat.safe_dispatch_filename(dispatch_id)
     statuses: list[ClaimCarrierStatus] = []
+    try:
+        entries = _queue_dir_listing(queue_dir)
+    except OSError as exc:
+        return ClaimCarrierStatus(
+            ClaimCarrierKind.UNKNOWN,
+            f"queue_dir_unreadable:{type(exc).__name__}",
+            str(queue_dir),
+        )
     # Canonical name is usually "<dispatch_id>.json" but may be priority-prefixed.
-    for path in queue_dir.glob("*.json"):
+    for path in entries:
+        if not path.name.endswith(".json"):
+            continue
         if path.name.endswith(".failed"):
             continue
         try:
@@ -8233,7 +8278,9 @@ def _claim_has_active_carrier(queue_dir: Path, dispatch_id: str) -> ClaimCarrier
             statuses.append(
                 ClaimCarrierStatus(ClaimCarrierKind.QUEUED, "queued_envelope", str(path))
             )
-    for claim in queue_dir.glob("*.json.claimed-*"):
+    for claim in entries:
+        if ".json.claimed-" not in claim.name:
+            continue
         if claim.name.endswith(".failed"):
             continue
         try:
@@ -9988,7 +10035,23 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
     pending_launch = 0
     quarantined = 0
     pending_reasons: list[dict] = []
-    for claim in sorted(queue_dir.glob("*.json.claimed-*")):
+    try:
+        entries = _queue_dir_listing(queue_dir)
+    except OSError as exc:
+        # An unreadable queue is not an empty queue. Republish/terminalize
+        # decisions need the carrier listing, so refuse the whole pass and
+        # surface the failure instead of reconciling blind.
+        listing_error = f"queue_dir_unreadable:{type(exc).__name__}"
+        return {
+            "restored": 0,
+            "cleared": 0,
+            "pending_launch": 0,
+            "quarantined": 0,
+            "ledger_terminalized": 0,
+            "pending_reasons": [{"dispatch_id": "", "reason": listing_error}],
+            "listing_error": listing_error,
+        }
+    for claim in sorted(path for path in entries if ".json.claimed-" in path.name):
         if claim.name.endswith(".failed"):
             continue
         try:
@@ -11982,6 +12045,13 @@ def _drain_queue_once(args) -> dict:
         _release_stale_capacity_for_drain()
         abandoned_reconciliation = _reconcile_abandoned_for_drain(queue_dir)
     recovery = _recover_claimed_queue_entries(queue_dir, stale_s=args.claim_stale_s)
+    if recovery.get("listing_error"):
+        # The queue could not be listed: every candidate is invisible, so a
+        # "0 launched, 0 remaining" pass would be a false green. Fail the
+        # drain with the listing error instead of reporting an empty queue.
+        raise OSError(
+            f"dispatch queue listing failed for {queue_dir}: {recovery['listing_error']}"
+        )
     launched = 0
     left_queued = 0
     failed = 0
@@ -11997,7 +12067,8 @@ def _drain_queue_once(args) -> dict:
         details.append(row)
     entries = sorted(
         candidate
-        for path in queue_dir.glob("*.json")
+        for path in _queue_dir_listing(queue_dir)
+        if path.name.endswith(".json")
         for candidate in (_queue_entry_drain_candidate(path),)
         if not (
             isinstance(candidate[2], dict)
@@ -12307,9 +12378,20 @@ def _drain_queue_once(args) -> dict:
                 lease.release_reason = f"launch_refused_pre_spawn:{proc.returncode}"
                 continue
             lease.release_reason = f"launch_failed_pending_ledger:{proc.returncode}"
-    remaining = len(list(queue_dir.glob("*.json")))
+    # Launches already happened, so a listing failure here must not become the
+    # error payload (which reports launched=0): report the count as unknown.
+    queue_listing_error: str | None = None
+    try:
+        remaining: int | None = sum(
+            1 for path in _queue_dir_listing(queue_dir) if path.name.endswith(".json")
+        )
+    except OSError as exc:
+        remaining = None
+        queue_listing_error = f"queue_dir_unreadable:{type(exc).__name__}"
     claimer_counts = _claimer_report_fields(queue_dir)
-    return {
+    if queue_listing_error is None and claimer_counts.get("queue_listing_error"):
+        queue_listing_error = str(claimer_counts["queue_listing_error"])
+    payload = {
         "schema": f"{DISPATCH_QUEUE_SCHEMA}.drain.v1",
         "queue_dir": str(queue_dir),
         "launched": drain_acc["launched"],
@@ -12326,6 +12408,9 @@ def _drain_queue_once(args) -> dict:
         "abandoned_reconciliation": abandoned_reconciliation,
         "details": details,
     }
+    if queue_listing_error is not None:
+        payload["queue_listing_error"] = queue_listing_error
+    return payload
 
 
 def _drain_error_payload(args, exc: BaseException) -> dict:
