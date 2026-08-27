@@ -7252,10 +7252,10 @@ def _release_stale_capacity_for_drain() -> None:
 def _read_capacity_state_for_reconciliation() -> dict:
     """Read capacity state without converting corruption into an empty lease set."""
 
-    path = goalflight_capacity.state_path()
-    if not path.exists():
-        return {"schema": goalflight_capacity.SCHEMA, "leases": {}}
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = goalflight_capacity.load_state()
+    except goalflight_capacity.CapacityStateUnreadable as exc:
+        raise ValueError(str(exc)) from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("leases"), dict):
         raise ValueError("capacity state has no readable lease map")
     return payload
@@ -12056,6 +12056,26 @@ def _note_drain_journal_skip(
     acc["details"].append(detail)
 
 
+def _drain_launch_capacity_reason(
+    returncode: int, stdout: str, stderr: str
+) -> str | None:
+    """Classify a drain-launch capacity refusal.
+
+    Unreadable capacity state and genuine cap-reached both exit 2, and the
+    launch stdout can carry ``blocked_capacity`` for both. Prefer
+    ``capacity_state_unreadable`` so this cannot surface as
+    ``capacity_unavailable`` (t-068).
+    """
+    if returncode != 2:
+        return None
+    launch_output = f"{stdout}{stderr}"
+    if "capacity_state_unreadable" in launch_output:
+        return "capacity_state_unreadable"
+    if "blocked_capacity" in launch_output:
+        return "capacity_unavailable"
+    return None
+
+
 def _drain_queue_once(args) -> dict:
     queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else _dispatch_queue_dir()
     queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -12412,7 +12432,9 @@ def _drain_queue_once(args) -> dict:
                 dispatch_id,
                 queue_launch_token=launch_token,
             )
-            no_capacity = proc.returncode == 2 and "blocked_capacity" in (proc.stdout + proc.stderr)
+            capacity_reason = _drain_launch_capacity_reason(
+                proc.returncode, proc.stdout, proc.stderr
+            )
             if stdout_launched and ledger_confirmed:
                 carrier_cleanup = _positive_live_carrier_cleanup(
                     claim,
@@ -12439,8 +12461,8 @@ def _drain_queue_once(args) -> dict:
                 else:
                     lease.consume(state="launched", launched=True)
                 continue
-            if no_capacity:
-                lease.release_reason = "capacity_unavailable"
+            if capacity_reason:
+                lease.release_reason = capacity_reason
                 continue
             if stdout_launched and not ledger_confirmed:
                 # Stdout is not launch proof. Keep the carrier pending until a
