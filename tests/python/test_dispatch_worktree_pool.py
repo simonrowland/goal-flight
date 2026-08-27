@@ -10,6 +10,7 @@ skip_posix_on_native_windows("worktree seat leases require POSIX fcntl locks")
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -302,3 +303,112 @@ def test_cwd_without_worktree_does_not_acquire_a_seat(
         time.sleep(0.05)
     assert marker.exists()
     assert not (repo / "worktrees").exists()
+
+
+def test_sidecar_env_drops_closed_worktree_lock_fd() -> None:
+    import goalflight_dispatch as D
+
+    env = {"PATH": "/usr/bin", goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV: "5"}
+    sidecar = D._sidecar_env(env)
+    assert goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV not in sidecar
+    assert env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] == "5"
+    assert sidecar["PATH"] == "/usr/bin"
+
+
+def test_worktree_launch_does_not_fail_caffeinate_on_stale_lock_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, seats=1)
+    marker = tmp_path / "caf-ready"
+    worker = (
+        "from pathlib import Path; import os; "
+        "os.fstat(int(os.environ['GOALFLIGHT_WORKTREE_LOCK_FD'])); "
+        f"Path({str(marker)!r}).write_text('ok'); "
+        "print('COMPLETE: caffeinate-sidecar — ok', flush=True)"
+    )
+    proc = subprocess.run(
+        _dispatch_cmd(
+            tmp_path,
+            repo,
+            "caf-sidecar",
+            sys.executable,
+            "-c",
+            worker,
+        ),
+        cwd=str(ROOT),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, combined
+    deadline = time.time() + 10
+    while time.time() < deadline and not marker.exists():
+        time.sleep(0.05)
+    assert marker.exists(), combined
+    assert "does not name an open descriptor" not in combined
+    assert '"step": "caffeinate"' not in combined or "WorktreeSeatError" not in combined
+    launched = _launched_payload(proc.stdout)
+    if sys.platform == "darwin" and shutil.which("caffeinate"):
+        assert launched.get("caffeinate_pid"), combined
+
+
+def test_raw_worker_process_cwd_is_the_leased_seat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, seats=1)
+    marker = tmp_path / "raw-cwd"
+    worker = (
+        "from pathlib import Path; import os; "
+        f"Path({str(marker)!r}).write_text(os.getcwd())"
+    )
+    proc = subprocess.run(
+        _dispatch_cmd(
+            tmp_path,
+            repo,
+            "raw-seat-cwd",
+            sys.executable,
+            "-c",
+            worker,
+        ),
+        cwd=str(ROOT),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, combined
+    deadline = time.time() + 10
+    while time.time() < deadline and not marker.exists():
+        time.sleep(0.05)
+    assert marker.exists(), combined
+    launched = _launched_payload(proc.stdout)
+    seat = Path(launched["worktree_path"]).resolve()
+    assert Path(marker.read_text(encoding="utf-8")).resolve() == seat
+
+
+def test_claude_preset_has_no_cwd_flag_seat_is_process_cwd() -> None:
+    import argparse
+    import goalflight_dispatch as D
+
+    argv, _stdin = D.build_worker(
+        argparse.Namespace(
+            agent="claude",
+            cwd="/repo/worktrees/wt-1",
+            model=None,
+            parent_dispatch_id=None,
+        ),
+        "/tmp/prompt.md",
+        [],
+    )
+    assert argv[:1] == ["claude"]
+    assert "--cwd" not in argv
+    assert "-C" not in argv

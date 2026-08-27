@@ -12,9 +12,12 @@ and the measured backlog was ~7.1 GB across ~1955 tails.
 
 This tool copies a *subset* of those files into the project's gitignored
 ``docs-private/traces/<YYYY-MM-DD>/<dispatch-id>/`` so a later operator can
-grep them. It never ``git add``s. Tail text is untrusted and possibly
-sensitive (file contents, paths, error text). Committing an archive is an
-operator decision, not part of this command.
+grep them. It never ``git add``s — there is no git-add path, and
+``refuse_git_add`` raises if one is attempted. Tail text is untrusted
+worker output, unreviewed, and possibly sensitive (file contents, paths,
+error text, credential-shaped material). Credential-shaped spans are
+redacted at copy time; the archived file is not verbatim. Committing an
+archive is an operator decision, not part of this command.
 
 What is KEPT
 ------------
@@ -23,25 +26,34 @@ A run is archived only when it produced a worker marker
 (``COMPLETE`` / ``RESULT`` / ``FAILED`` / ``BLOCKED`` / ``READY`` /
 ``USER-NEED`` / ``USER-CONFIRM``) or names a findings/review path. Then:
 
-- the tail, capped (first 64 KiB + last 192 KiB; dropped middle recorded)
+- the tail, capped (first 64 KiB + last 192 KiB; dropped middle recorded),
+  with credential-shaped material replaced by a named marker
 - ``status.json`` if it is at most 256 KiB
-- a ``MANIFEST.json`` naming every kept, capped, and dropped input
+- a ``MANIFEST.json`` naming every kept, capped, dropped, and redacted input
 
 What is DROPPED
 ---------------
 
-- runs that never spawned and never emitted a worker marker (capacity
-  blocks, queued-never-launched, empty tails)
-- steer mailboxes (operator text, possibly sensitive)
-- watcher / caffeinate logs, pidfiles, prompt copies
-- bytes from the middle of an oversized tail (counted in the manifest)
-- the historical ``/tmp`` backlog: this command implements the going-forward
-  path and an opt-in scanner. It does **not** copy 7.1 GB unattended. Sweep
-  existing tails with ``--source-dir`` ``--apply`` when an operator wants it.
+A silent drop reads as "we kept everything". This command does **not**.
+It drops:
 
-Going-forward: ``goalflight_dispatch`` calls ``archive_finished_dispatch``
-from ledger finish. Failure there is swallowed; a dispatch must not fail
-because the archive disk is full.
+- unmarked runs: no worker marker and no findings path (capacity-blocked,
+  never spawned, empty tails)
+- steer mailboxes (operator text, possibly sensitive)
+- watcher logs
+- caffeinate logs
+- pidfiles
+- prompt copies
+- middle bytes of an oversized tail (64 KiB head + 192 KiB tail; count in
+  the manifest and a marker in ``tail.log``)
+- the historical ~7.1 GB ``/tmp`` backlog, unless an operator passes
+  ``--source-dir --apply`` (CLI without ``--source-dir`` exits 64 and says so)
+
+Nothing is force-added to git.
+
+Going-forward: ``goalflight_ledger.cmd_finish`` calls
+``archive_finished_dispatch``. Failure there is swallowed; a dispatch must
+not fail because the archive disk is full.
 """
 
 from __future__ import annotations
@@ -55,8 +67,24 @@ import re
 import sys
 from typing import Any
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+import goalflight_output_redact  # noqa: E402
+
 
 SCHEMA = "goalflight.trace-archive.v1"
+DROP_LIST = (
+    "unmarked / capacity-blocked / never-spawned / empty tails",
+    "steer mailbox",
+    "watcher log",
+    "caffeinate log",
+    "pidfile",
+    "prompt copy",
+    "tail middle bytes",
+    "historical /tmp backlog (unless --source-dir --apply)",
+)
 HEAD_BYTES = 64 * 1024
 TAIL_BYTES = 192 * 1024
 STATUS_MAX_BYTES = 256 * 1024
@@ -80,6 +108,36 @@ _SKIP_STATES = frozenset(
         "claimed",
     }
 )
+
+
+def refuse_git_add(path: Path | str | None = None) -> None:
+    """Hard refuse. Archived tails are unreviewed worker output."""
+    detail = f" {path}" if path is not None else ""
+    raise RuntimeError(
+        "archived tails are unreviewed worker output; this tool never git-adds"
+        + detail
+    )
+
+
+def git_add_is_forbidden(argv: list[str] | tuple[str, ...]) -> bool:
+    """True when ``argv`` is a ``git add`` (including ``git -C … add``)."""
+    words = [str(part) for part in argv]
+    if not words:
+        return False
+    head = Path(words[0]).name
+    if head != "git":
+        return False
+    i = 1
+    while i < len(words):
+        token = words[i]
+        if token in {"-C", "--git-dir", "--work-tree"}:
+            i += 2
+            continue
+        if token.startswith("-"):
+            i += 1
+            continue
+        return token == "add"
+    return False
 
 
 def _archive_root(project_root: Path) -> Path:
@@ -225,6 +283,18 @@ def archive_finished_dispatch(
         "tail middle bytes" if decision.get("dropped_bytes") else None,
     ]
     result["dropped"] = [item for item in result["dropped"] if item]
+    payload = decision["payload"]
+    redacted, redaction_count, redaction_kinds = (
+        goalflight_output_redact.redact_archive_bytes(payload)
+    )
+    if redaction_count:
+        header = (
+            f"[goalflight-trace-archive: {redaction_count} redaction(s) applied; "
+            "this file is not verbatim]\n"
+        ).encode("ascii")
+        redacted = header + redacted
+    result["redactions"] = redaction_count
+    result["redaction_kinds"] = redaction_kinds
     if not apply:
         result["ok"] = True
         return result
@@ -232,7 +302,7 @@ def archive_finished_dispatch(
     try:
         dest.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(dest, 0o700)
-        (dest / "tail.log").write_bytes(decision["payload"])
+        (dest / "tail.log").write_bytes(redacted)
         os.chmod(dest / "tail.log", 0o600)
         status_copied = False
         status_raw = record.get("status_path")
@@ -256,8 +326,13 @@ def archive_finished_dispatch(
         )
         manifest["git"] = (
             "docs-private/traces is gitignored. This tool never git-adds. "
-            "Tails are untrusted and possibly sensitive."
+            "Archived tails are unreviewed worker output, untrusted, and "
+            "possibly sensitive. Credential-shaped material is redacted; "
+            "the file is not verbatim."
         )
+        manifest["redactions"] = redaction_count
+        manifest["redaction_kinds"] = redaction_kinds
+        manifest["drop_list"] = list(DROP_LIST)
         (dest / "MANIFEST.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -296,9 +371,15 @@ def _iter_source_records(source_dir: Path) -> list[dict[str, Any]]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Selectively archive finished dispatch tails from volatile dispatch "
-            "state into gitignored docs-private/traces. Never git-adds."
+            "state into gitignored docs-private/traces. Never git-adds. "
+            "Archived tails are unreviewed worker output.\n\n"
+            "DROPPED: unmarked/capacity-blocked/empty tails, steer mailboxes, "
+            "watcher logs, caffeinate logs, pidfiles, prompt copies, "
+            "oversized-tail middle bytes, and the historical /tmp backlog "
+            "unless --source-dir --apply."
         )
     )
     parser.add_argument(

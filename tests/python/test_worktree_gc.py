@@ -31,6 +31,7 @@ if str(SCRIPTS) not in sys.path:
 
 import goalflight_compat  # noqa: E402
 import goalflight_ledger  # noqa: E402
+import goalflight_worktree_pool  # noqa: E402
 
 SCRIPT = SCRIPTS / "goalflight_worktree_gc.py"
 
@@ -329,16 +330,73 @@ def test_non_repository_exits_nonzero(tmp_path: Path) -> None:
     assert "cannot list worktrees" in done.stderr
 
 
-def test_pool_seat_is_never_reclaimed_as_litter(tmp_path: Path, repo: Path) -> None:
-    """wt-N seats are maintained. A merged+clean+unowned wt-1 must still stay."""
-    wt = _add_worktree(repo, tmp_path, "wt-1")
-    _commit_in(wt)
-    _merge_into_main(repo, "wt-1")
+def test_pool_seat_is_never_reclaimed_as_litter(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registered seat is retained even when merged+clean+unowned."""
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", os.devnull)
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "register-seat")
+    wt = lease.path
+    lease.release()
+    assert wt.name == "wt-1"
 
     _done, report = _run(repo)
     entry = _entry(report, wt)
     assert entry["decision"] == "retain", entry
     assert "pool seat" in entry["reason"]
+    assert entry.get("pool_seat", {}).get("verdict") == "yes", entry
+    assert wt.is_dir()
+
+    done, report = _run(repo, "--apply")
+    assert done.returncode == 0
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert wt.is_dir()
+    assert os.path.realpath(wt) in _worktree_paths(repo)
+
+
+def test_adhoc_worktree_named_wt_n_is_reclaimable(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Basename wt-9 without a seat lock is litter, not an immortal pool seat."""
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", os.devnull)
+    wt = _add_worktree(repo, tmp_path, "wt-9")
+    _commit_in(wt)
+    _merge_into_main(repo, "wt-9")
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "remove", entry
+    assert "pool seat" not in entry["reason"]
+
+    done, report = _run(repo, "--apply")
+    assert done.returncode == 0
+    entry = _entry(report, wt)
+    assert entry.get("outcome") == "removed", entry
+    assert not wt.is_dir()
+    assert os.path.realpath(wt) not in _worktree_paths(repo)
+
+
+def test_unknown_pool_seat_registration_retains(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the pool cannot say whether a managed-looking path is registered, retain."""
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "not-a-number")
+    monkeypatch.setenv("GOALFLIGHT_CAPACITY_CONF", os.devnull)
+    managed = repo / "worktrees"
+    managed.mkdir()
+    wt = managed / "wt-1"
+    _git(repo, "worktree", "add", "-q", "-b", "unknown-reg-wt1", str(wt))
+    _commit_in(wt)
+    _merge_into_main(repo, "unknown-reg-wt1")
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    assert "registration unknown" in entry["reason"]
+    assert entry.get("pool_seat", {}).get("verdict") == "unknown", entry
     assert wt.is_dir()
 
     done, report = _run(repo, "--apply")
@@ -372,6 +430,8 @@ def test_idle_timeout_identity_live_worker_is_not_reclaimed(
     assert entry["decision"] == "retain", entry
     assert entry["conditions"]["unowned"]["verdict"] == "no", entry
     assert "idle-live-w1" in entry["conditions"]["unowned"]["reason"]
+    assert "identity-live" in entry["conditions"]["unowned"]["reason"]
+    assert "non-terminal" not in entry["conditions"]["unowned"]["reason"]
     assert wt.is_dir()
 
 

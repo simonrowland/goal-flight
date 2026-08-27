@@ -10,8 +10,11 @@ Routine merge-down command (run from the repo after integrating a worker branch)
     python3 scripts/goalflight_worktree_gc.py --into main
     python3 scripts/goalflight_worktree_gc.py --into main --apply
 
-Pool seats (``worktrees/wt-N``) are maintained by ``goalflight_worktree_pool``
-and are never reclaimed as litter.
+Registered pool seats (``<repo>/worktrees/wt-N`` with a matching seat lock)
+are maintained by ``goalflight_worktree_pool`` and are never reclaimed as
+litter. A directory merely *named* ``wt-N`` is ordinary litter: exemption is
+by registration, not basename. If registration cannot be determined, the
+verdict is UNKNOWN and the tree is retained.
 
 Removal requires the CONJUNCTION of all four conditions:
 
@@ -412,25 +415,36 @@ def check_unowned(path: str, ledger_dir: Path) -> dict[str, str]:
             + ", ".join(unreadable)
             + "); cannot prove no live dispatch owns this path",
         )
-    owners = [
-        str(record.get("dispatch_id") or "<unknown>")
-        for record in records
-        if _record_owns_path(record, path)
-    ]
-    if owners:
-        states = {
-            str(record.get("state") or "<none>")
-            for record in records
-            if _record_owns_path(record, path)
-        }
-        return _condition(
-            NO,
-            "non-terminal dispatch "
-            + ", ".join(sorted(owners))
-            + " (state="
-            + ", ".join(sorted(states))
-            + ") records this path as worker_cwd",
-        )
+    owned = [record for record in records if _record_owns_path(record, path)]
+    if owned:
+        running: list[str] = []
+        identity_live: list[str] = []
+        for record in owned:
+            dispatch_id = str(record.get("dispatch_id") or "<unknown>")
+            state = str(record.get("state") or "<none>")
+            terminal = any(
+                goalflight_dispatch_states.is_terminal_state(item)
+                for item in _record_states(record)
+            )
+            label = f"{dispatch_id} (state={state})"
+            if terminal:
+                identity_live.append(label)
+            else:
+                running.append(label)
+        parts: list[str] = []
+        if running:
+            parts.append(
+                "non-terminal dispatch "
+                + ", ".join(sorted(running))
+                + " records this path as worker_cwd"
+            )
+        if identity_live:
+            parts.append(
+                "identity-live dispatch "
+                + ", ".join(sorted(identity_live))
+                + " still owns this path"
+            )
+        return _condition(NO, "; ".join(parts))
     return _condition(YES, "no non-terminal dispatch records this path")
 
 
@@ -481,13 +495,26 @@ def classify(
         result["conditions"] = {}
         return result
 
-    if goalflight_worktree_pool.is_pool_seat_path(path):
+    seat_verdict, seat_reason = goalflight_worktree_pool.registered_pool_seat_verdict(
+        path, project_root=repo
+    )
+    if seat_verdict == YES:
         result["decision"] = "retain"
         result["reason"] = (
             "managed pool seat "
             f"{Path(path).name} is maintained by the worktree pool, not litter"
         )
         result["conditions"] = {}
+        result["pool_seat"] = {"verdict": seat_verdict, "reason": seat_reason}
+        return result
+    if seat_verdict == UNKNOWN:
+        result["decision"] = "retain"
+        result["reason"] = (
+            "pool-seat registration unknown ("
+            f"{seat_reason}); cannot prove this path is not a maintained seat"
+        )
+        result["conditions"] = {}
+        result["pool_seat"] = {"verdict": seat_verdict, "reason": seat_reason}
         return result
 
     conditions = {
@@ -694,7 +721,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Report (or with --apply, remove) git worktrees that are merged, "
             "clean, unowned by a live dispatch, and not checked out. "
-            "Managed wt-N pool seats are never reclaimed. Run after merging "
+            "Registered wt-N pool seats are never reclaimed; a directory "
+            "merely named wt-N is ordinary litter. Run after merging "
             "a worker branch into the integration branch."
         )
     )
