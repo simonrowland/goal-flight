@@ -12327,7 +12327,14 @@ def _drain_queue_once(args) -> dict:
                 exc=exc,
             )
             continue
-        except goalflight_journal.JournalError as exc:
+        except (
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+            goalflight_journal.JournalError,
+        ) as exc:
+            # Name the availability subtypes: a bare JournalError catch flattens
+            # unreadable vs disappeared. Unreadable still fails closed here
+            # (do not launch); the reason string keeps the concrete class.
             _note_drain_journal_skip(
                 drain_acc,
                 dispatch_id=dispatch_id,
@@ -12401,7 +12408,11 @@ def _drain_queue_once(args) -> dict:
                 lease.release_reason = "journal_busy"
                 _remember_drain_journal_skip(drain_acc, project_key, "busy")
                 continue
-            except goalflight_journal.JournalError as exc:
+            except (
+                goalflight_journal.JournalDisappeared,
+                goalflight_journal.JournalIOError,
+                goalflight_journal.JournalError,
+            ) as exc:
                 lease.release_reason = f"journal_error:{type(exc).__name__}"
                 _remember_drain_journal_skip(drain_acc, project_key, "error")
                 continue
