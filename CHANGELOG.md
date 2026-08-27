@@ -6,8 +6,33 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Added
+
+- `goalflight_dispatch.py --worktree <base>` acquires a pooled `wt-N` seat
+  prepared at git ref `<base>` and runs the worker there. The seat lock fd is
+  inherited by the worker (same contract as `acp_run`). Exhaustion refuses
+  with every held seat named and never falls back to `git worktree add`.
+  Existing `--cwd` is unchanged when the flag is omitted.
+- `goalflight_worktree_gc.py` now exempts maintained `wt-N` pool seats from
+  reclamation and treats an identity-live worker (pid + start_token) as still
+  owning its tree even when the ledger row carries a liveness verdict such as
+  `idle_timeout`. After merging a worker branch, run
+  `python3 scripts/goalflight_worktree_gc.py --into main` (report) or
+  `--apply`.
+- `goalflight_trace_archive.py` copies selected finished-dispatch tails from
+  volatile `/tmp` dispatch state into gitignored
+  `docs-private/traces/<YYYY-MM-DD>/<dispatch-id>/`. Policy keeps runs that
+  emitted a worker marker or named a findings path, caps oversized tails
+  (head+tail, dropped middle recorded), and drops steer mailboxes, watcher
+  logs, empty/capacity-blocked noise, and the unattended 7.1 GB `/tmp`
+  backlog. Tails are untrusted; this tool never `git add`s. Going-forward
+  hook is `goalflight_ledger.cmd_finish`. Sweep a backlog with
+  `--source-dir --apply`.
+
 ### Changed
 
+- Default worktree seat count is 24 (was 4). This is a per-repository
+  checkout ceiling, not a per-controller worker cap; there is none.
 - `goalflight_journal_gc.py` no longer retains a proven-root-gone journal
   forever just because it holds non-terminal dispatch records that can never
   reconcile (reconciliation runs from the project root). Such journals are now
