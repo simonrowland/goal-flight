@@ -4,10 +4,11 @@
 The 2026-08-27 incident: two task ids dispatched three times each into the
 same worktrees; the occupancy warning never blocked, so three concurrent
 workers edited one filesystem tree apiece with no merge discipline. The guard
-must REFUSE (non-zero exit) naming the incumbent, consult the ledger's
-non-terminal set (never a process scan), exempt genuinely read-only
-dispatches, and treat an unreadable ledger as UNKNOWN (refuse + retry advice)
-rather than as "unoccupied".
+must REFUSE (non-zero exit) naming the incumbent. Enforcement is an exclusive
+non-blocking kernel lock on the target worktree, inherited by the worker so
+the claim cannot be raced and is released by the kernel on crash. The ledger
+is diagnostic (names the incumbent, fail-closes when unlistable). Exempt
+genuinely read-only dispatches.
 
 Every precondition here is built for real (b-235): incumbents are genuine
 dispatched workers with genuine ledger records, read by the real reader; the
@@ -16,6 +17,8 @@ queued-owner case is a genuine ``--submit`` that never spawns a worker.
 
 from __future__ import annotations
 
+import contextlib
+
 from support import skip_posix_on_native_windows
 
 skip_posix_on_native_windows("worktree occupancy tests launch POSIX workers")
@@ -23,6 +26,7 @@ skip_posix_on_native_windows("worktree occupancy tests launch POSIX workers")
 import json
 import os
 import pwd
+import signal
 import subprocess
 import sys
 import tempfile
@@ -59,6 +63,7 @@ def _env(tmp: Path) -> dict[str, str]:
     env["GOALFLIGHT_DISPATCH_DIR"] = str(tmp / "state" / "dispatch")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
+    env["GOALFLIGHT_TASK_STORE"] = str(tmp / "task-store")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
     env["GOALFLIGHT_WAKE_LEDGER_DIR"] = str(tmp / "wake-ledger")
     env["GOALFLIGHT_WAKE_LEDGER"] = str(tmp / "wake-ledger" / "wake.jsonl")
@@ -614,6 +619,233 @@ def test_help_documents_occupied_worktree_override() -> None:
     assert "--occupied-worktree-forced" in proc.stdout, proc.stdout
 
 
+def _reap(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is None:
+        with contextlib.suppress(OSError):
+            proc.kill()
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=5)
+
+
+def _popen(cmd: list[str], env: dict[str, str]) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        cmd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _communicate(
+    proc: subprocess.Popen[str], *, timeout: float = 60.0
+) -> tuple[str, str]:
+    try:
+        return proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _reap(proc)
+        raise
+
+
+def test_concurrent_second_writer_is_refused_on_every_trial() -> None:
+    """The occupancy lock, not the ledger read, serializes two overlapping launches."""
+    trials = 8
+    both_wrote = 0
+    refused_one = 0
+    for i in range(trials):
+        with _temp_dir(prefix=f"gf-occ-conc-{i}-") as td:
+            tmp = Path(td)
+            tree = tmp / "tree"
+            tree.mkdir()
+            env = _env(tmp)
+            marker_a = tree / "wrote-by-w-a"
+            marker_b = tree / "wrote-by-w-b"
+            writer_a = (
+                "from pathlib import Path\n"
+                f"Path({str(marker_a)!r}).write_text('wrote-by-w-a', encoding='utf-8')\n"
+                "print('COMPLETE: conc-a — wrote', flush=True)\n"
+            )
+            writer_b = (
+                "from pathlib import Path\n"
+                f"Path({str(marker_b)!r}).write_text('wrote-by-w-b', encoding='utf-8')\n"
+                "print('COMPLETE: conc-b — wrote', flush=True)\n"
+            )
+            pa = _popen(
+                _dispatch_cmd(tmp, tree, f"conc-a-{i}", writer_a, foreground=True),
+                env,
+            )
+            pb = _popen(
+                _dispatch_cmd(tmp, tree, f"conc-b-{i}", writer_b, foreground=True),
+                env,
+            )
+            try:
+                out_a, err_a = _communicate(pa)
+                out_b, err_b = _communicate(pb)
+            finally:
+                _reap(pa)
+                _reap(pb)
+            wrote_pair = marker_a.exists() and marker_b.exists()
+            if wrote_pair:
+                both_wrote += 1
+            rcs = {pa.returncode, pb.returncode}
+            if 64 in rcs:
+                refused_one += 1
+            assert not wrote_pair, (
+                f"trial {i}: concurrent dual-write "
+                f"rc=({pa.returncode},{pb.returncode}) err_a={err_a[-400:]!r} "
+                f"err_b={err_b[-400:]!r}"
+            )
+            assert 64 in rcs, (
+                f"trial {i}: expected one rc 64, got ({pa.returncode},{pb.returncode}) "
+                f"err_a={err_a[-400:]!r} err_b={err_b[-400:]!r}"
+            )
+    assert both_wrote == 0, f"concurrent dual-write on {both_wrote}/{trials} trials"
+    assert refused_one == trials, f"rc 64 on {refused_one}/{trials} trials"
+
+
+def test_worker_inherits_occupancy_lock_fd() -> None:
+    with _temp_dir() as td:
+        tmp = Path(td)
+        tree = tmp / "tree"
+        tree.mkdir()
+        env = _env(tmp)
+        held = tmp / "held-fd"
+        worker = (
+            "import os\n"
+            "from pathlib import Path\n"
+            "fd = int(os.environ['GOALFLIGHT_OCCUPANCY_LOCK_FD'])\n"
+            "os.fstat(fd)\n"
+            f"Path({str(held)!r}).write_text(str(fd), encoding='utf-8')\n"
+            "print('COMPLETE: occ-inherit — held', flush=True)\n"
+        )
+        launched = _run(
+            _dispatch_cmd(tmp, tree, "occ-inherit", worker, foreground=True),
+            env,
+        )
+        assert launched.returncode == 0, (launched.stdout, launched.stderr)
+        assert held.exists(), launched.stderr
+        assert int(held.read_text(encoding="utf-8")) >= 0
+
+
+def test_sigkill_of_worker_releases_occupancy_lock() -> None:
+    with _temp_dir() as td:
+        tmp = Path(td)
+        tree = tmp / "tree"
+        tree.mkdir()
+        env = _env(tmp)
+        release = tmp / "release-incumbent"
+        incumbent = _run(
+            _dispatch_cmd(tmp, tree, "occ-kill", _blocking_worker(release, "occ-kill")),
+            env,
+        )
+        assert incumbent.returncode == 0, (incumbent.stdout, incumbent.stderr)
+        record = _wait_until_running(tmp, "occ-kill")
+        worker_pid = int(record["worker_pid"])
+        os.kill(worker_pid, signal.SIGKILL)
+        assert _wait_for(lambda: _pid_gone(worker_pid), timeout=10.0), worker_pid
+        # Kernel release is immediate; watcher must not keep the claim.
+        second = _run(
+            _dispatch_cmd(
+                tmp, tree, "occ-after-kill", _quick_writer("occ-after-kill"), foreground=True
+            ),
+            env,
+        )
+        assert second.returncode == 0, (second.stdout, second.stderr)
+        assert "DISPATCH-END" in second.stdout, second.stdout
+        watcher_pid = record.get("watcher_pid")
+        if watcher_pid:
+            _wait_for(lambda pid=watcher_pid: _pid_gone(pid), timeout=5.0)
+
+
+def test_concurrent_dispatches_into_different_trees_both_run() -> None:
+    with _temp_dir() as td:
+        tmp = Path(td)
+        tree_a = tmp / "tree-a"
+        tree_b = tmp / "tree-b"
+        tree_a.mkdir()
+        tree_b.mkdir()
+        env = _env(tmp)
+        marker_a = tree_a / "wrote-a"
+        marker_b = tree_b / "wrote-b"
+        writer_a = (
+            "from pathlib import Path\n"
+            "import time\n"
+            f"Path({str(marker_a)!r}).write_text('a', encoding='utf-8')\n"
+            "time.sleep(0.3)\n"
+            "print('COMPLETE: tree-a — wrote', flush=True)\n"
+        )
+        writer_b = (
+            "from pathlib import Path\n"
+            "import time\n"
+            f"Path({str(marker_b)!r}).write_text('b', encoding='utf-8')\n"
+            "time.sleep(0.3)\n"
+            "print('COMPLETE: tree-b — wrote', flush=True)\n"
+        )
+        pa = _popen(
+            _dispatch_cmd(tmp, tree_a, "diff-a", writer_a, foreground=True),
+            env,
+        )
+        pb = _popen(
+            _dispatch_cmd(tmp, tree_b, "diff-b", writer_b, foreground=True),
+            env,
+        )
+        try:
+            out_a, err_a = _communicate(pa)
+            out_b, err_b = _communicate(pb)
+        finally:
+            _reap(pa)
+            _reap(pb)
+        assert 64 not in {pa.returncode, pb.returncode}, (
+            pa.returncode, pb.returncode, err_a[-400:], err_b[-400:]
+        )
+        assert marker_a.exists() and marker_b.exists(), (out_a[-400:], out_b[-400:])
+        # Occupancy must not serialize distinct trees: both writers launched.
+        assert "DISPATCH-START" in out_a and "DISPATCH-START" in out_b, (out_a, out_b)
+
+
+def test_concurrent_submit_does_not_dual_queue() -> None:
+    with _temp_dir() as td:
+        tmp = Path(td)
+        tree = tmp / "tree"
+        tree.mkdir()
+        env = _env(tmp)
+        cmd_a = _dispatch_cmd(
+            tmp,
+            tree,
+            "sub-a",
+            _quick_writer("sub-a"),
+            extra=["--submit", "--no-drain-on-submit"],
+        )
+        cmd_b = _dispatch_cmd(
+            tmp,
+            tree,
+            "sub-b",
+            _quick_writer("sub-b"),
+            extra=["--submit", "--no-drain-on-submit"],
+        )
+        pa = _popen(cmd_a, env)
+        pb = _popen(cmd_b, env)
+        try:
+            out_a, err_a = _communicate(pa)
+            out_b, err_b = _communicate(pb)
+        finally:
+            _reap(pa)
+            _reap(pb)
+        queued = [
+            did
+            for did in ("sub-a", "sub-b")
+            if _ledger_record(tmp, did).get("state") == "queued"
+        ]
+        assert len(queued) == 1, (
+            queued,
+            pa.returncode,
+            pb.returncode,
+            err_a[-400:],
+            err_b[-400:],
+        )
+        assert 64 in {pa.returncode, pb.returncode}, (pa.returncode, pb.returncode, err_a, err_b)
+
+
 def test_read_only_incumbent_does_not_block_a_writer() -> None:
     with _temp_dir() as td, _non_temp_tree("gf-occ-rohold-tree-") as tree_td:
         tmp = Path(td)
@@ -660,4 +892,9 @@ if __name__ == "__main__":
     test_supported_profile_alone_does_not_mark_a_writer_read_only()
     test_help_documents_occupied_worktree_override()
     test_read_only_incumbent_does_not_block_a_writer()
+    test_concurrent_second_writer_is_refused_on_every_trial()
+    test_worker_inherits_occupancy_lock_fd()
+    test_sigkill_of_worker_releases_occupancy_lock()
+    test_concurrent_dispatches_into_different_trees_both_run()
+    test_concurrent_submit_does_not_dual_queue()
     print("PASS: test_dispatch_worktree_occupancy")

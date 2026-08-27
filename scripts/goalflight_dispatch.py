@@ -1087,6 +1087,7 @@ def _spawn_daemonized_process(
     stderr: str = "stdout",
     serialize_stdout: bool = False,
     label: str,
+    inherit_occupancy_lock: bool = False,
 ) -> int:
     """Spawn a child through the private daemon helper and return the child's pid."""
     spec = {
@@ -1097,7 +1098,19 @@ def _spawn_daemonized_process(
         "stderr": stderr,
         "serialize_stdout": bool(stdout_path and serialize_stdout),
     }
+    child_env = dict(env)
     inherited_lock_fds = goalflight_worktree_pool.inherited_worktree_lock_fds()
+    if not inherit_occupancy_lock:
+        occupancy_raw = os.environ.get(
+            goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, ""
+        ).strip()
+        if occupancy_raw:
+            with contextlib.suppress(ValueError):
+                occupancy_fd = int(occupancy_raw)
+                inherited_lock_fds = tuple(
+                    fd for fd in inherited_lock_fds if fd != occupancy_fd
+                )
+        child_env.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
     helper = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), DAEMON_SPAWN_ARG],
         input=json.dumps(spec, sort_keys=True),
@@ -1105,7 +1118,7 @@ def _spawn_daemonized_process(
         text=True,
         encoding="utf-8",
         errors="replace",
-        env=env,
+        env=child_env,
         timeout=30,
         pass_fds=inherited_lock_fds,
         **_detached_popen_kwargs(),
@@ -2729,54 +2742,169 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None]:
     return None, None
 
 
+class _InheritedOccupancyLock:
+    """A lock fd inherited from the parent launcher; this process must not close it."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def release(self) -> None:
+        return None
+
+
+def _bind_worktree_occupancy_lock(args, lock) -> None:
+    """Keep the lock alive in this process and publish the fd for worker inherit."""
+    args._worktree_occupancy_lock = lock
+    fd = lock.fileno()
+    os.set_inheritable(fd, True)
+    os.environ[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] = str(fd)
+
+
+def _inherited_occupancy_lock():
+    raw = os.environ.get(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, "").strip()
+    if not raw:
+        return None, None
+    try:
+        fd = int(raw)
+        os.fstat(fd)
+    except (ValueError, OSError) as exc:
+        return None, (
+            f"{goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV} does not name an "
+            f"open descriptor: {raw!r} ({type(exc).__name__}: {exc})"
+        )
+    return _InheritedOccupancyLock(fd), None
+
+
+def _occupancy_occupied_messages(reason: str) -> tuple[str, str]:
+    refusal = "\n".join(
+        [
+            reason.rstrip(".") + ".",
+            "Use --occupied-worktree-forced to override and launch a "
+            "concurrent writer.",
+        ]
+    )
+    forced_warning = (
+        f"--occupied-worktree-forced accepted: {reason.rstrip('.')}; the two "
+        "writers now share one filesystem tree with no merge discipline."
+    )
+    return refusal, forced_warning
+
+
+def _occupancy_unknown_messages(args, detail: str) -> tuple[str, str]:
+    target = _worker_cwd(args)
+    refusal = "\n".join(
+        [
+            f"worktree occupancy of {target} is unknown ({detail}).",
+            "Retry the dispatch; refusing before record or launch.",
+            "Use --occupied-worktree-forced to override and launch without "
+            "occupancy evidence.",
+        ]
+    )
+    forced_warning = (
+        f"--occupied-worktree-forced accepted: worktree occupancy of "
+        f"{target} is unknown ({detail}); launching without occupancy evidence."
+    )
+    return refusal, forced_warning
+
+
+def _finish_worktree_occupancy(args, *, refusal: str, forced_warning: str) -> str | None:
+    if getattr(args, "occupied_worktree_forced", False):
+        return forced_warning
+    raise DispatchUsageError(refusal)
+
+
 def _prepare_attempt_worktree_occupancy(args) -> str | None:
     """Refuse a second writer into an occupied worktree, or return the forced-path warning.
 
-    A read-only dispatch never writes, so it is never refused here. When the
-    ledger cannot prove occupancy either way (unreadable ledger/record, or a
-    non-terminal record with no cwd evidence), unknown REFUSES by default with
-    retry advice -- an unreadable ledger must not silently become a green
-    light. --occupied-worktree-forced converts either refusal into a visible
+    Enforcement is an exclusive non-blocking kernel lock on the target
+    worktree, inherited by the worker so the claim outlives this dispatcher
+    and is released by the kernel on crash. The ledger is diagnostic: it
+    names the incumbent and fail-closes on unlistable/unreadable records.
+    A read-only dispatch never writes, so it is never refused here.
+    --occupied-worktree-forced converts either refusal into a visible
     warning, matching the --unregistered-forced hatch.
     """
     if _effective_read_only(args):
         return None
+
     occupied, unknown = _worktree_incumbent_reason(args)
-    if occupied is None and unknown is None:
-        return None
-    if occupied is not None:
-        refusal = "\n".join(
-            [
-                occupied + ".",
-                "Use --occupied-worktree-forced to override and launch a "
-                "concurrent writer.",
-            ]
-        )
-        forced_warning = "\n".join(
-            [
-                f"--occupied-worktree-forced accepted: {occupied}; the two "
-                "writers now share one filesystem tree with no merge discipline.",
-            ]
-        )
+    lock = None
+    lock_busy = None
+    lock_unknown = None
+    inherited, inherited_unknown = _inherited_occupancy_lock()
+    if inherited_unknown:
+        lock_unknown = inherited_unknown
+    elif inherited is not None:
+        lock = inherited
     else:
-        refusal = "\n".join(
-            [
-                f"worktree occupancy of {_worker_cwd(args)} is unknown ({unknown}).",
-                "Retry the dispatch; refusing before record or launch.",
-                "Use --occupied-worktree-forced to override and launch without "
-                "occupancy evidence.",
-            ]
+        target = _worker_cwd(args)
+        dispatch_id = str(getattr(args, "dispatch_id", None) or "unknown-dispatch")
+        try:
+            lock = goalflight_worktree_pool.try_acquire_worktree_path_lock(
+                target, dispatch_id
+            )
+        except goalflight_worktree_pool.WorktreePathLockBusy as exc:
+            lock_busy = str(exc)
+        except goalflight_worktree_pool.WorktreePathLockUnknown as exc:
+            lock_unknown = str(exc)
+        except OSError as exc:
+            lock_unknown = f"{type(exc).__name__}: {exc}"
+
+    forced = bool(getattr(args, "occupied_worktree_forced", False))
+
+    if lock is None:
+        if lock_unknown is not None:
+            detail = unknown or lock_unknown
+            refusal, forced_warning = _occupancy_unknown_messages(args, detail)
+            return _finish_worktree_occupancy(
+                args, refusal=refusal, forced_warning=forced_warning
+            )
+        reason = occupied or lock_busy
+        if reason is None:
+            reason = (
+                f"worktree {_worker_cwd(args)} is already owned by a live "
+                "dispatch holding the worktree lock; a second writer would "
+                "share one filesystem tree with no merge discipline"
+            )
+        refusal, forced_warning = _occupancy_occupied_messages(reason)
+        return _finish_worktree_occupancy(
+            args, refusal=refusal, forced_warning=forced_warning
         )
-        forced_warning = "\n".join(
-            [
-                f"--occupied-worktree-forced accepted: worktree occupancy of "
-                f"{_worker_cwd(args)} is unknown ({unknown}); launching without "
-                "occupancy evidence.",
-            ]
+
+    # Kernel lock is held. Ledger unknown still fail-closes: an unlistable
+    # ledger must not become a green light. A recorded occupant other than
+    # this drain/resume id is the queued-owner case (no process holds a
+    # lock). Drain of our own queued row skips own_id; a leftover sibling
+    # queued row must not deadlock the holder of the live lock.
+    if unknown is not None and occupied is None:
+        if not forced:
+            lock.release()
+        refusal, forced_warning = _occupancy_unknown_messages(args, unknown)
+        if forced:
+            _bind_worktree_occupancy_lock(args, lock)
+            return forced_warning
+        return _finish_worktree_occupancy(
+            args, refusal=refusal, forced_warning=forced_warning
         )
-    if getattr(args, "occupied_worktree_forced", False):
+    if occupied is not None and not getattr(args, "from_queue", False):
+        if not forced:
+            lock.release()
+        refusal, forced_warning = _occupancy_occupied_messages(occupied)
+        if forced:
+            _bind_worktree_occupancy_lock(args, lock)
+            return forced_warning
+        return _finish_worktree_occupancy(
+            args, refusal=refusal, forced_warning=forced_warning
+        )
+
+    _bind_worktree_occupancy_lock(args, lock)
+    if occupied is not None and forced:
+        refusal, forced_warning = _occupancy_occupied_messages(occupied)
         return forced_warning
-    raise DispatchUsageError(refusal)
+    return None
 
 
 def _write_windows_dispatch_refusal(args) -> tuple[dict, Path]:
@@ -13233,6 +13361,7 @@ def _run_acp_detached_launcher(
         stderr="stdout",
         serialize_stdout=True,
         label="acp",
+        inherit_occupancy_lock=True,
     )
     _mark_queue_claim_worker_spawned(args, child_pid)
 
@@ -14021,9 +14150,9 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Override the occupied-worktree launch refusal: launch even though a "
-            "non-terminal dispatch already owns --cwd (the two writers then share "
-            "one filesystem tree with no merge discipline), or when the ledger "
-            "cannot prove the tree is free."
+            "kernel lock or a non-terminal dispatch already owns --cwd (the two "
+            "writers then share one filesystem tree with no merge discipline), "
+            "or when occupancy cannot be evaluated."
         ),
     )
     parser.add_argument(
@@ -14680,6 +14809,7 @@ def main(argv: list[str] | None = None) -> int:
             stderr="stdout",
             serialize_stdout=True,
             label="worker",
+            inherit_occupancy_lock=True,
         )
         _mark_queue_claim_worker_spawned(args, worker_pid)
         started = time.time()
