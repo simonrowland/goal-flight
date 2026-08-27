@@ -9,6 +9,7 @@ skip_posix_on_native_windows("dispatch registration gate launches POSIX workers"
 
 import argparse
 import asyncio
+import contextlib
 import json
 import multiprocessing
 import os
@@ -1175,6 +1176,112 @@ def _count_kernel_live_reads(monkeypatch: pytest.MonkeyPatch) -> list[object]:
     return calls
 
 
+def _count_open_reader_calls(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    real = journal.Journal.open_reader
+    calls: list[object] = []
+
+    def wrapped(_cls, project_root, **kwargs):
+        calls.append(project_root)
+        return real(project_root, **kwargs)
+
+    monkeypatch.setattr(journal.Journal, "open_reader", classmethod(wrapped))
+    return calls
+
+
+def _tripwire_probe_live_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        dispatch.goalflight_session_status,
+        "probe_live_session",
+        lambda *_args, **_kwargs: pytest.fail(
+            "identify lookup re-opened the journal via probe_live_session"
+        ),
+    )
+
+
+def _ledger_consumer_args(project: Path, dispatch_id: str, **overrides):
+    return _stamp_args(
+        dispatch_id=dispatch_id,
+        agent="codex",
+        shape="bash",
+        account="default",
+        cwd=str(project),
+        priority="normal",
+        billing="auto",
+        poll_secs=0.1,
+        max_idle_secs=5,
+        prompt_file=None,
+        prompt=None,
+        model=None,
+        read_only=False,
+        web_research_ok=False,
+        ignore_git_warn=False,
+        capacity_wait_s=0.0,
+        interactive=False,
+        permission_mode=None,
+        permission_dir=None,
+        permission_inline_timeout_s=None,
+        permission_user_timeout_s=None,
+        task_ids=[],
+        worker=None,
+        os_sandbox=None,
+        **overrides,
+    )
+
+
+def _silence_waiting_capacity_side_effects(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Isolate the waiting_capacity re-check from the later journal write. An
+    # exclusive lock that proves identify does not re-open would otherwise make
+    # cmd_record's writer busy for an unrelated reason.
+    monkeypatch.setattr(dispatch.goalflight_ledger, "cmd_record", lambda *_a, **_k: 0)
+    monkeypatch.setattr(
+        dispatch, "_export_dashboard_status_for_project", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        dispatch, "_upsert_project_registry_for_dispatch", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        dispatch, "_start_dashboard_refresh_for_project", lambda *_a, **_k: None
+    )
+
+
+def _checkpoint_away_wal_sidecars(path: Path) -> None:
+    with contextlib.closing(
+        sqlite3.connect(path, timeout=0, isolation_level=None)
+    ) as connection:
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    assert checkpoint == (0, 0, 0)
+    for suffix in ("-shm", "-wal"):
+        sidecar = Path(f"{path}{suffix}")
+        sidecar.unlink(missing_ok=True)
+        assert not sidecar.exists()
+
+
+def _force_readonly_cantopen(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    calls: list[str] = []
+    real_connect = journal._sqlite_connect
+
+    def injected_connect(
+        database: str | Path,
+        *,
+        uri: bool = False,
+        timeout: float = 5.0,
+        isolation_level: str | None = "",
+    ) -> sqlite3.Connection:
+        location = os.fspath(database)
+        calls.append(location)
+        if "?mode=ro" in location:
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_connect(
+            database,
+            uri=uri,
+            timeout=timeout,
+            isolation_level=isolation_level,
+        )
+
+    monkeypatch.setattr(journal, "_sqlite_connect", injected_connect)
+    return calls
+
+
 def test_fused_identify_survives_journal_contention_after_first_read(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1183,17 +1290,22 @@ def test_fused_identify_survives_journal_contention_after_first_read(
 
     Reverting the fused snapshot makes prepare take a second registry read.
     Under exclusive lock that second read is unknown / "did not identify it"
-    even though stamp already adopted this process.
+    even though stamp already adopted this process. Resolve and waiting_capacity
+    record must reuse the same snapshot; a forgotten cache around record is
+    the same later-open failure as prepare.
     """
     env, project, _advertised = _isolated_env(monkeypatch, tmp_path)
     _tripwire_collapsing_live_session(monkeypatch)
-    calls = _count_kernel_live_reads(monkeypatch)
+    _tripwire_probe_live_session(monkeypatch)
+    _silence_waiting_capacity_side_effects(monkeypatch)
     authority, holder, nonce = _register_controller(
         project,
         env,
         export_identity=False,
     )
-    args = _stamp_args()
+    kernel_calls = _count_kernel_live_reads(monkeypatch)
+    reader_calls = _count_open_reader_calls(monkeypatch)
+    args = _ledger_consumer_args(project, "fused-identify-waiting-capacity")
     try:
         stamped = dispatch._stamp_controller_session(args, project)
         assert stamped["reason"] == "resolved_kernel_live_controller"
@@ -1209,54 +1321,94 @@ def test_fused_identify_survives_journal_contention_after_first_read(
                 "delete"
             )
             blocker.execute("BEGIN EXCLUSIVE")
+            owner = dispatch._resolve_controller_dispatch_owner(args, project)
+            assert owner == (nonce, os.getpid(), "registered-test")
             warning = dispatch._prepare_attempt_controller_registration(args, project)
             assert warning is None
             dispatch._prepare_attempt_controller_registration(args, project)
+            dispatch._record_ledger(
+                args,
+                project_root=project,
+                prompt_path=None,
+                status_json=tmp_path / "fused.status.json",
+                tail=tmp_path / "fused.tail",
+                lease_id=None,
+                worker_pid=None,
+                state="waiting_capacity",
+            )
     finally:
         holder.close()
-    assert len(calls) == 1
+    assert len(kernel_calls) == 1
+    assert len(reader_calls) == 1
 
 
 def test_matching_capability_stays_unknown_not_mismatch_when_registry_unreadable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """Matching triple + busy journal is unknown; a wrong nonce is mismatch.
+
+    A stubbed `_kernel_live` returning sessions=None would keep passing if
+    stamp mapped a real unreadable registry to controller_capability_mismatch.
+    """
     env, project, _advertised = _isolated_env(monkeypatch, tmp_path)
-    _authority, holder, nonce = _register_controller(
+    authority, holder, nonce = _register_controller(
         project,
         env,
         export_identity=False,
     )
     _tripwire_collapsing_live_session(monkeypatch)
+    _tripwire_probe_live_session(monkeypatch)
     monkeypatch.setattr(
-        dispatch,
-        "_kernel_live_controller_sessions",
-        lambda _root: dispatch._ControllerSessionLookup(
-            sessions=None,
-            unreadable_reason=(
-                f"controller lease 'registered-test' for pid {os.getpid()} "
-                "was unreadable within the liveness probe budget"
-            ),
+        dispatch.goalflight_session_status,
+        "claim_controller_startup",
+        lambda *_args, **_kwargs: pytest.fail(
+            "capability verify attempted to claim under matching or mismatch"
         ),
     )
-    args = _stamp_args(
+    matching = _stamp_args(
         controller_label="registered-test",
         controller_pid=os.getpid(),
         controller_session_id=nonce,
     )
+    mismatched = _stamp_args(
+        controller_label="registered-test",
+        controller_pid=os.getpid(),
+        controller_session_id="foreign-capability",
+    )
     try:
-        stamped = dispatch._stamp_controller_session(args, project)
-        with pytest.raises(dispatch.DispatchUsageError) as error:
-            dispatch._prepare_attempt_controller_registration(args, project)
+        with sqlite3.connect(
+            authority.path,
+            timeout=0,
+            isolation_level=None,
+        ) as blocker:
+            assert blocker.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == (
+                "delete"
+            )
+            blocker.execute("BEGIN EXCLUSIVE")
+            stamped_unknown = dispatch._stamp_controller_session(matching, project)
+            with pytest.raises(dispatch.DispatchUsageError) as unknown_error:
+                dispatch._prepare_attempt_controller_registration(matching, project)
+        stamped_mismatch = dispatch._stamp_controller_session(mismatched, project)
+        with pytest.raises(dispatch.DispatchUsageError) as mismatch_error:
+            dispatch._prepare_attempt_controller_registration(mismatched, project)
     finally:
         holder.close()
 
-    assert stamped["reason"] == "controller_registry_unreadable"
-    assert stamped.get("visible_warning") is not True
-    assert "controller_capability_mismatch" not in str(stamped)
-    assert "controller registry could not be read" in str(error.value)
-    assert "Retry the dispatch" in str(error.value)
-    assert "controller is not registered" not in str(error.value)
+    unknown_message = str(unknown_error.value)
+    mismatch_message = str(mismatch_error.value)
+    assert stamped_unknown["reason"] == "controller_registry_unreadable"
+    assert stamped_unknown.get("visible_warning") is not True
+    assert "controller_capability_mismatch" not in str(stamped_unknown)
+    assert "controller registry could not be read" in unknown_message
+    assert "Retry the dispatch" in unknown_message
+    assert "controller is not registered" not in unknown_message
+    assert stamped_mismatch["reason"] == "controller_capability_mismatch"
+    assert stamped_mismatch.get("visible_warning") is True
+    assert stamped_unknown["reason"] != stamped_mismatch["reason"]
+    assert "controller registry could not be read" not in mismatch_message
+    assert "Retry the dispatch" not in mismatch_message
+    assert "kernel-live controller exists" in mismatch_message
 
 
 def test_fused_unknown_forced_still_launches_unowned(
@@ -1298,3 +1450,40 @@ def test_fused_absent_controller_still_refuses_unforced(
     assert "controller is not registered" in str(error.value)
     assert "could not be read" not in str(error.value)
     assert len(calls) == 1
+
+
+def test_fused_identify_survives_quiesced_wal_via_one_open_reader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Identify uses open_reader's rw fallback after WAL sidecars are gone.
+
+    Exclusive-lock tests prove fusion against a later busy open. They do not
+    pin the measured quiesced-WAL CANTOPEN path that rematerializes -shm.
+    """
+    env, project, _advertised = _isolated_env(monkeypatch, tmp_path)
+    _tripwire_collapsing_live_session(monkeypatch)
+    _tripwire_probe_live_session(monkeypatch)
+    authority, holder, nonce = _register_controller(
+        project,
+        env,
+        export_identity=False,
+    )
+    try:
+        _checkpoint_away_wal_sidecars(authority.path)
+        connect_calls = _force_readonly_cantopen(monkeypatch)
+        kernel_calls = _count_kernel_live_reads(monkeypatch)
+        reader_calls = _count_open_reader_calls(monkeypatch)
+        args = _stamp_args()
+        stamped = dispatch._stamp_controller_session(args, project)
+        warning = dispatch._prepare_attempt_controller_registration(args, project)
+    finally:
+        holder.close()
+
+    assert stamped["reason"] == "resolved_kernel_live_controller"
+    assert args.controller_session_id == nonce
+    assert warning is None
+    assert len(kernel_calls) == 1
+    assert len(reader_calls) == 1
+    assert any("?mode=ro" in call for call in connect_calls)
+    assert any("?mode=rw" in call for call in connect_calls)
