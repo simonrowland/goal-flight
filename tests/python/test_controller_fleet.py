@@ -212,13 +212,17 @@ def _expire_past_dead_holder_margin(root: Path, label: str) -> None:
     )
 
 
-def _make_generation_lock_unreadable(root: Path, label: str, nonce: str) -> Path:
-    path = wake._generation_lock_path(
+def _lease_lock_path(root: Path, label: str, nonce: str) -> Path:
+    return wake._generation_lock_path(
         root,
         kind=wake.LEASE_KIND,
         label=wake._lease_lock_identity(label, nonce),
         generation_key=nonce,
     )
+
+
+def _make_generation_lock_unreadable(root: Path, label: str, nonce: str) -> Path:
+    path = _lease_lock_path(root, label, nonce)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"")
     path.chmod(0o000)
@@ -474,6 +478,16 @@ def test_unreadable_lease_renders_unknown_without_retire_command(
     root = _project(tmp_path, "alpha")
     registered, holder, nonce = _hold_registered_lease(root, "alice", "alice-nonce")
     lock_path = None
+    probe_calls = {"n": 0}
+    original_probe = controllers._lock_liveness_once
+
+    def counting_probe(
+        project_root: Path, label: str, probe_nonce: str
+    ) -> tuple[bool | None, str | None]:
+        probe_calls["n"] += 1
+        return original_probe(project_root, label, probe_nonce)
+
+    monkeypatch.setattr(controllers, "_lock_liveness_once", counting_probe)
     try:
         lock_path = _make_generation_lock_unreadable(root, "alice", nonce)
         authority = journal.Journal.open_reader(root)
@@ -488,7 +502,12 @@ def test_unreadable_lease_renders_unknown_without_retire_command(
         assert row["bucket"] == "unknown"
         assert row["retire_command"] is None
         assert row["unknown_reason"]
-        assert "retirement refused" in row["unknown_reason"]
+        reason = row["unknown_reason"] or ""
+        assert "retirement refused" in reason
+        assert "PermissionError" in reason
+        assert "busy after" not in reason
+        # Two tool invocations (table + json); structural errors must not retry.
+        assert probe_calls["n"] == 2
         assert "unknown" in text
         assert "retire (proof of death):" not in text
         assert "--retire" not in text
@@ -1314,6 +1333,20 @@ def test_transient_journal_busy_renders_controllers(
             if connection is not None:
                 connection.close()
 
+    busy_seen = threading.Event()
+    original_peek = controllers._peek_active_lease_identities_once
+
+    def peek_observing_busy(
+        path: Path,
+    ) -> tuple[list[tuple[str, str]] | None, str | None]:
+        value, error = original_peek(path)
+        if error == controllers._BUSY_ERROR:
+            busy_seen.set()
+        return value, error
+
+    monkeypatch.setattr(
+        controllers, "_peek_active_lease_identities_once", peek_observing_busy
+    )
     holder_thread = threading.Thread(target=hold_until_release)
     holder_thread.start()
     assert started.wait(timeout=5)
@@ -1324,8 +1357,7 @@ def test_transient_journal_busy_renders_controllers(
 
     runner = threading.Thread(target=run_tool)
     runner.start()
-    # First peek(s) must observe the genuine exclusive lock; then free it.
-    time.sleep(0.05)
+    assert busy_seen.wait(timeout=5), "peek never observed JournalBusy"
     release.set()
     runner.join(timeout=10)
     holder_thread.join(timeout=5)
@@ -1394,6 +1426,131 @@ def test_permanently_busy_journal_reports_retry_exhausted(
         assert "retirement refused" in reason
         assert not controllers.is_contentless_row(row)
     finally:
+        holder.close()
+    del registered
+    del nonce
+
+
+def test_retry_deadline_checked_before_subsequent_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first read that spends the budget must not start attempt 2."""
+    monkeypatch.setattr(journal, "JOURNAL_READER_RETRY_BUDGET_S", 0.04)
+    calls: list[float] = []
+
+    def read_once() -> tuple[object, str | None]:
+        calls.append(time.monotonic())
+        time.sleep(0.05)
+        return None, controllers._BUSY_ERROR
+
+    started = time.monotonic()
+    value, error = controllers._retry_journal_busy(read_once)
+    elapsed = time.monotonic() - started
+    assert value is None
+    assert error is not None
+    assert error.startswith("busy after 1 attempts")
+    assert len(calls) == 1
+    assert elapsed < 0.2
+
+
+def test_transient_lock_probe_busy_then_live(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Hide the lock file until the fleet probe sees busy, then restore it."""
+    _isolate(monkeypatch, tmp_path)
+    root = _git_project(tmp_path, "namedproj")
+    registered, holder, nonce = _hold_registered_lease(root, "alice", "alice-nonce")
+    waiter = _arm_listener(root, "alice", nonce)
+    lock_path = _lease_lock_path(root, "alice", nonce)
+    hidden = lock_path.with_name(lock_path.name + ".hidden")
+    busy_seen = threading.Event()
+    original_probe = controllers._lock_liveness_once
+
+    def probe_observing_busy(
+        project_root: Path, label: str, probe_nonce: str
+    ) -> tuple[bool | None, str | None]:
+        value, error = original_probe(project_root, label, probe_nonce)
+        if error == controllers._BUSY_ERROR:
+            busy_seen.set()
+        return value, error
+
+    monkeypatch.setattr(controllers, "_lock_liveness_once", probe_observing_busy)
+    lock_path.rename(hidden)
+    assert (
+        wake.lease_holder_alive(root, controller_label="alice", lease_nonce=nonce)
+        is None
+    )
+    result: dict[str, object] = {}
+
+    def run_tool() -> None:
+        result["code"], result["text"] = _run(["--json"])
+
+    runner = threading.Thread(target=run_tool)
+    runner.start()
+    try:
+        assert busy_seen.wait(timeout=5), "lock probe never observed busy"
+        hidden.rename(lock_path)
+        runner.join(timeout=10)
+    finally:
+        if hidden.exists() and not lock_path.exists():
+            hidden.rename(lock_path)
+        if runner.is_alive():
+            runner.join(timeout=5)
+        waiter.close()
+        holder.close()
+    assert runner.is_alive() is False
+    assert result.get("code") == 0
+    payload = json.loads(str(result["text"]))
+    row = _row_for(payload, "alice")
+    assert row["project"] == "namedproj"
+    assert row["state"] in {"live", "live-overdue"}
+    assert row["bucket"] != "unknown"
+    assert row["retire_command"] is None
+    reason = row.get("unknown_reason") or ""
+    assert "busy after" not in reason
+    _assert_no_live_row_carries_retire(payload)
+    del registered
+    del nonce
+
+
+def test_permanently_busy_lock_reports_retry_exhausted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A lock path that never reappears must terminate with retry-exhausted."""
+    _isolate(monkeypatch, tmp_path)
+    root = _git_project(tmp_path, "namedproj")
+    registered, holder, nonce = _hold_registered_lease(root, "alice", "alice-nonce")
+    lock_path = _lease_lock_path(root, "alice", nonce)
+    hidden = lock_path.with_name(lock_path.name + ".hidden")
+    lock_path.rename(hidden)
+    try:
+        started = time.monotonic()
+        json_code, json_text = _run(["--json"])
+        elapsed = time.monotonic() - started
+        assert json_code == 0
+        assert elapsed < 2.0
+        payload = json.loads(json_text)
+        row = _row_for(payload, "alice")
+        assert row["project"] == "namedproj"
+        assert row["label"] == "alice"
+        assert row["state"] == "unknown"
+        assert row["bucket"] == "unknown"
+        assert row["retire_command"] is None
+        reason = row["unknown_reason"] or ""
+        match = re.search(
+            r"busy after (\d+) attempts over (\d+)ms",
+            reason,
+        )
+        assert match is not None, reason
+        assert int(match.group(1)) == controllers.FLEET_JOURNAL_BUSY_ATTEMPTS
+        assert int(match.group(2)) >= 1
+        assert "PermissionError" not in reason
+        assert "JournalBusy" not in reason.split(" at ", 1)[0]
+        assert "retirement refused" in reason
+        _assert_no_live_row_carries_retire(payload)
+    finally:
+        if hidden.exists() and not lock_path.exists():
+            hidden.rename(lock_path)
         holder.close()
     del registered
     del nonce
