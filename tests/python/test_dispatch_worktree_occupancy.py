@@ -26,6 +26,7 @@ skip_posix_on_native_windows("worktree occupancy tests launch POSIX workers")
 import json
 import os
 import pwd
+import shutil
 import signal
 import subprocess
 import sys
@@ -193,14 +194,37 @@ def _prompt_writer_cmd(
     return cmd
 
 
-def _temp_dir(prefix: str | None = None, *, dir: Path | None = None) -> tempfile.TemporaryDirectory:
-    """Temp dir that does not fail the test if a dying watcher still holds a file."""
-    kwargs: dict = {"ignore_cleanup_errors": True}
-    if prefix:
-        kwargs["prefix"] = prefix
-    if dir is not None:
-        kwargs["dir"] = str(dir)
-    return tempfile.TemporaryDirectory(**kwargs)
+class _ReapingTempDir:
+    """Temp dir that retries rmtree after workers/watchers release files.
+
+    Occupancy tests spawn watchers that can still hold a dirent at assertion
+    time. Swallowing every rmtree error hid leaked fds; retry first, and only
+    ignore leftover dirents after a second pass.
+    """
+
+    def __init__(self, prefix: str | None = None, *, dir: Path | None = None) -> None:
+        self.name = tempfile.mkdtemp(
+            prefix=prefix or "tmp",
+            dir=str(dir) if dir is not None else None,
+        )
+
+    def __enter__(self) -> str:
+        return self.name
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        path = Path(self.name)
+        for attempt in range(3):
+            try:
+                shutil.rmtree(path)
+                return None
+            except OSError:
+                time.sleep(0.2 * (attempt + 1))
+        shutil.rmtree(path, ignore_errors=True)
+        return None
+
+
+def _temp_dir(prefix: str | None = None, *, dir: Path | None = None) -> _ReapingTempDir:
+    return _ReapingTempDir(prefix=prefix, dir=dir)
 
 
 def _non_temp_tree(prefix: str) -> tempfile.TemporaryDirectory:
