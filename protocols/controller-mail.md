@@ -70,6 +70,19 @@ current canonical git project and is needed only for explicit cross-project mail
 Producers record the journal assignment before projecting the JSONL carrier; retry
 heals an unprojected assignment rather than creating a second store.
 
+Every controller-transport post is attributed: the sender's declared controller
+label is stamped into `source.controller_label` at the shared admit path
+(`post_message`) and at producers that bypass it, or the explicit sentinel
+`UNKNOWN` when no identity can be established — including a leftover
+`GOALFLIGHT_DISPATCH_ID`, a bash-tool shell that dropped the session
+variables, or a PID-only environment. A pid or git directory name is never
+a sender. Relay renders a real label as the `from` party even when an
+informative adapter is also present (adapter is a host/tool name shared by
+many controllers). Unattributed controller mail says `from UNKNOWN` — read
+it as "sender not establishable", never as a license to infer one. The label
+is trusted descriptive metadata, not lease-validated; authorship proof
+remains the capability-derived author digest.
+
 ## Patch flow — mail is how work leaves a controller
 
 Do not push to the remote to land a branch. Post typed mail; the receiving

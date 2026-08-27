@@ -15,12 +15,23 @@ from typing import TextIO
 WORKTREE_SEATS_ENV = "GOALFLIGHT_WORKTREE_SEATS"
 WORKTREE_LOCK_FD_ENV = "GOALFLIGHT_WORKTREE_LOCK_FD"
 # Per-repository checkout ceiling, not a per-controller worker cap. There is
-# no such cap and none is wanted. The old default of 4 became a de-facto fan-out
-# limit and pushed every extra dispatch onto ad-hoc `git worktree add` (SC-06).
-# ~9 controllers across 5 projects share a machine; 24 seats lets one repo host
-# several controllers' concurrent workers without manufacturing unbounded trees.
-# Raise via GOALFLIGHT_WORKTREE_SEATS when a single repo needs more concurrent
-# seats. Never lower this default to "shape" concurrency.
+# no such cap and none is wanted. Seats bound how many worktrees EXIST, not
+# how much work may run: seats are reused, so N seats sustains N CONCURRENT
+# workers per project indefinitely rather than N total dispatches. The old
+# default of 4 became a de-facto fan-out limit and pushed every extra dispatch
+# onto ad-hoc `git worktree add` (SC-06); several controllers share one project
+# root, so four seats starved the whole project between them.
+#
+# Derivation. The binding constraints are RAM and the machine concurrency cap,
+# not disk: a seat is one git worktree, and the checkout is ~40MB here, so 24
+# seats is under 1GB per project. The machine cap is 120 concurrent workers
+# across ~5 active projects, i.e. ~24 per project if every project ran flat out
+# simultaneously -- which is the number that stops seats from binding before
+# the real capacity gate does. Sanity check: today's busiest project ran ~12
+# concurrent workers, so 24 leaves 2x headroom and still cannot, by itself,
+# reach the 120 machine cap. Raise via GOALFLIGHT_WORKTREE_SEATS when a single
+# repo needs more concurrent seats. Never lower this default to "shape"
+# concurrency.
 DEFAULT_WORKTREE_SEATS = 24
 WORKTREE_SEAT_PREFIX = "wt-"
 QUARANTINE_REF_PREFIX = "goalflight/quarantine"
