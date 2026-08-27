@@ -6571,3 +6571,52 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def test_acp_reexec_probe_names_an_indeterminate_failure_but_stays_silent_on_absence() -> None:
+    """The re-exec probe must distinguish "SDK absent" from "probe broke".
+
+    Both used to be swallowed by a bare `except BaseException: return`, so an
+    OSError from a half-broken import rendered as "no re-exec needed" -- the
+    error-swallowing-lookup shape, sitting on the launch path every controller
+    on this machine dispatches through. Absence is a real answer and stays
+    silent by design; anything else means the probe could not find out, and an
+    operator must be told rather than left to infer it from behaviour.
+    """
+    import builtins
+
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import goalflight_dispatch as dispatch_mod
+
+    argv = ["goalflight_dispatch.py", "--shape", "acp", "--agent", "claude-acp"]
+    real_import = builtins.__import__
+    targets = ("goalflight_acp_run", "goalflight_acp_client")
+
+    def _raise(exc: BaseException):
+        def _hook(name, *a, **k):
+            if name in targets:
+                raise exc
+            return real_import(name, *a, **k)
+        return _hook
+
+    # Indeterminate probe failure -> proceed, but SAY SO.
+    err = io.StringIO()
+    builtins.__import__ = _raise(OSError("simulated import probe failure"))
+    try:
+        with contextlib.redirect_stderr(err):
+            dispatch_mod._ensure_acp_sdk_interpreter(argv)
+    finally:
+        builtins.__import__ = real_import
+    noisy = err.getvalue()
+    assert "could not complete" in noisy, noisy
+    assert "OSError" in noisy, noisy
+
+    # Genuine absence -> silent, deliberately.
+    err2 = io.StringIO()
+    builtins.__import__ = _raise(ImportError("no module named goalflight_acp_run"))
+    try:
+        with contextlib.redirect_stderr(err2):
+            dispatch_mod._ensure_acp_sdk_interpreter(argv)
+    finally:
+        builtins.__import__ = real_import
+    assert err2.getvalue().strip() == "", err2.getvalue()

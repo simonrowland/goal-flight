@@ -14682,7 +14682,30 @@ def _ensure_acp_sdk_interpreter(argv: list[str] | None = None) -> None:
     try:
         import goalflight_acp_run  # noqa: PLC0415
         from goalflight_acp_client import ACP_SDK_REEXEC  # noqa: PLC0415
-    except BaseException:
+    except ImportError:
+        # The SDK genuinely is not importable here. Proceeding silently is
+        # correct and deliberate: main() still handles submit, the test ACP
+        # seam, and permanent os-sandbox refusal, and a real ACP session imports
+        # goalflight_acp_run again at _run_acp_shape WITHOUT this guard, so a
+        # broken SDK still fails there rather than being papered over.
+        return
+    except Exception as exc:
+        # Anything that is NOT an ImportError means the probe could not find
+        # out -- an OSError, a TypeError from a half-initialised module. That is
+        # UNKNOWN, and silently returning renders it as "no re-exec needed",
+        # which is the error-swallowing-lookup shape this codebase keeps
+        # shipping. Proceed (fail-open is right on this path, per above) but say
+        # so, so the operator is not left to infer it from behaviour.
+        #
+        # BaseException is deliberately NOT caught: KeyboardInterrupt and
+        # SystemExit are the operator stopping us, and swallowing them here made
+        # the launch path un-interruptible during startup.
+        print(
+            "goalflight_dispatch: WARN: ACP SDK re-exec probe could not complete "
+            f"({type(exc).__name__}: {exc}); continuing without re-exec, so an ACP "
+            "session may resolve a different interpreter than expected.",
+            file=sys.stderr,
+        )
         return
     # Re-exec here so a later SDK import sees the venv. Do not fail-close on
     # UNAVAILABLE: main() still has submit, the test ACP seam, and permanent
