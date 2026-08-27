@@ -13,12 +13,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Isolate every machine-global writable default. A test that omits an explicit
-# messages_dir/fleet_dir must never migrate or append to the operator's live
-# ~/.goal-flight state merely because the production helper supplies defaults.
+# messages_dir/journal_dir/fleet_dir must never migrate or append to the
+# operator's live ~/.goal-flight or ~/.local/state/goal-flight merely because
+# the production helper supplies defaults. Journal isolation is its own knob
+# (GOALFLIGHT_JOURNAL_DIR); TASK_STORE_DIR only isolates journals incidentally
+# and a test that pops the store override would otherwise write the live XDG
+# journals index.
 _GF_TEST_ENV_BASE="$(mktemp -d "${TMPDIR:-/tmp}/gf-test-env-XXXXXX")"
 trap 'rm -rf "$_GF_TEST_ENV_BASE" 2>/dev/null || true' EXIT
 _GF_TASK_STORE_BASE="${GOALFLIGHT_TASK_STORE_DIR:-$_GF_TEST_ENV_BASE/task-store}"
 _GF_MESSAGES_BASE="${GOALFLIGHT_MESSAGES_DIR:-$_GF_TEST_ENV_BASE/messages}"
+_GF_JOURNAL_BASE="${GOALFLIGHT_JOURNAL_DIR:-$_GF_TEST_ENV_BASE/journal}"
 
 pass=0
 fail=0
@@ -40,6 +45,7 @@ run_isolated_test_env() {
     -u GOALFLIGHT_ISOLATED_TEST_FILE \
     GOALFLIGHT_CAPACITY_CONF="${GOALFLIGHT_CAPACITY_CONF:-/dev/null}" \
     GOALFLIGHT_MESSAGES_DIR="$_GF_MESSAGES_BASE" \
+    GOALFLIGHT_JOURNAL_DIR="$_GF_JOURNAL_BASE" \
     GOALFLIGHT_TASK_STORE_DIR="${GOALFLIGHT_TASK_STORE_DIR:-$_GF_TASK_STORE_BASE}" "$@"
 }
 
