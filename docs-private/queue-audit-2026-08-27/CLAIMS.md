@@ -15,7 +15,7 @@ auditable rather than a bulk delete.
 | battery-tool-v2 | battery-main | — | | awaiting |
 | battery-tool-v2 | battery-engine | — | | awaiting (notified late, see correction) |
 | battery-tool-v2 | battery-webui | — | | awaiting (notified late) |
-| pm2 | pm2-engine | — | | awaiting (notified late) |
+| pm2 | pm2-engine | **KEEP 1 · ABANDON 2** | 2026-08-27 | ★ KEEP = `t801-fix1` — LIVE AND RUNNING at reply time (do not drain; it is mid-fix-round on commit b1b0a9c). ABANDON `t800-pulse` (superseded id; the work ran as `t800-pulse2`, converged through a 3-round review arc, and MERGED to main at afdd67d — nothing lost) and `t702-rev-seam` (t-702 shipped in the engine-lane merge f2aa933 with its review set converged; the missing prompt file confirms it predates the current arc; re-derive from the store if ever wanted, never re-fire). |
 | pm2 | pm2-reports | — | | awaiting (notified late) |
 | regolith | regolith-engine | — | | awaiting (notified late) |
 | regolith | regolith-main | — | | awaiting |
@@ -66,3 +66,22 @@ reads `queued`/`pid=None` for a worker's ENTIRE run, and the only reliable check
 they have found is walking `ps` for the codex/grok `--cwd` argument and counting
 distinct PGIDs. (That status-file unreliability is another instance of the
 duplicated-authority class, t-373.)
+
+
+## ★★ SECOND NEAR MISS — the consent correction was not theoretical
+
+pm2-bugs answered **ALL ABANDON** for pm2. Under my ORIGINAL project-level rule
+that reply, plus pm2-main's silence, could have expired every pm2 row — and
+pm2-engine has since claimed `t801-fix1` as **LIVE work running right now**.
+So the project-as-unit-of-consent rule would have destroyed a live dispatch on
+the say-so of a controller who did not own it and could not see it.
+
+pm2-engine was only asked because battery-bugs pointed out the flaw. Two
+independent near misses in one hour, both in the same direction: **a
+sibling's answer is not consent for your rows.** The amended rule (consent is
+the owning controller label) is load-bearing, not bookkeeping.
+
+Corollary worth keeping: the two ALL-ABANDON replies received so far are
+honest for their OWN labels and must NOT be read as project-wide verdicts,
+however they are phrased. When recording a reply, record WHICH LABEL it speaks
+for, not which project it came from.
