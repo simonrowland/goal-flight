@@ -5100,74 +5100,165 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                    tail: Path, lease_id: str | None, worker_pid: int | None, state: str,
                    effective_account: str | None = None,
                    codex_home: str | None = None,
-                   request_envelope: dict | None = None) -> None:
+                   request_envelope: dict | None = None) -> dict | None:
+    """Record one lifecycle transition; never fail a spawned worker's launch.
+
+    Returns None when the record committed. When the journal refuses the
+    transition but a worker process was spawned, the refusal is a bookkeeping
+    problem, not evidence about the worker: the status file is still written
+    and the refusal is surfaced LOUDLY (stderr + the status file), and the
+    unrecovered refusal payload is returned so launch-site callers can fold
+    it into their own warnings. Only when no worker was spawned does a
+    refusal raise, unchanged.
+    """
     if state == "waiting_capacity":
         # Re-check the fused snapshot from stamp/prepare. Do not take a second
         # registry read: a later contended open is what turned an already
         # identified owner into "did not identify it" / unknown.
         _prepare_attempt_controller_registration(args, project_root)
-    with contextlib.redirect_stdout(io.StringIO()):
-        record_code = goalflight_ledger.cmd_record(
-            argparse.Namespace(
-                dispatch_id=args.dispatch_id,
-                prompt_id=None,
-                prompt_path=prompt_path,
-                task_ids=getattr(args, "task_ids", []),
-                agent=args.agent,
-                engine=_account_engine(args.agent) or args.agent,
-                shape=args.shape,
-                account=args.account or "default",
-                effective_account=effective_account,
-                request_envelope_json=(
-                    json.dumps(request_envelope, sort_keys=True)
-                    if request_envelope is not None
-                    else None
-                ),
-                transport="dispatch",
-                project_root=str(project_root),
-                controller_pid=_controller_pid(args),
-                controller_session_id=_controller_session_id(args),
-                controller_label=_controller_label(args),
-                claimant_pid=os.getpid() if state == "waiting_capacity" else None,
-                worker_pid=worker_pid,
-                acp_session_id=None,
-                logical_session_id=args.dispatch_id,
-                engine_session_id=_resolved_engine_session_id(args),
-                codex_session_id=getattr(args, "codex_session_id", None),
-                codex_home=codex_home or getattr(args, "codex_resume_home", None),
-                codex_home_owner_dispatch_id=_codex_home_owner_dispatch_id(args),
-                parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
-                worker_cwd=str(_worker_cwd(args)),
-                dispatch_argv=_canonical_replay_argv(
-                    args,
-                    _raw_worker_args(args)
-                    if getattr(args, "worker", None) is not None
-                    else [],
-                    tail=tail,
-                    status_json=status_json,
-                ),
-                lease_id=lease_id,
-                stdout_path=str(tail),
-                stderr_path=None,
-                status_path=str(status_json),
-                os_sandbox_json=json.dumps(
-                    _os_sandbox_posture(args, worker_pid=worker_pid),
-                    sort_keys=True,
-                ),
-                queue_launch_token=getattr(args, "queue_launch_token", None),
-                detached=bool(getattr(args, "launch_detached", False)),
-                state=state,
-                json=True,
+
+    spawn_state = goalflight_ledger.worker_spawn_state(worker_pid)
+
+    def _record_once() -> tuple[int, dict | None]:
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            code = goalflight_ledger.cmd_record(
+                argparse.Namespace(
+                    dispatch_id=args.dispatch_id,
+                    prompt_id=None,
+                    prompt_path=prompt_path,
+                    task_ids=getattr(args, "task_ids", []),
+                    agent=args.agent,
+                    engine=_account_engine(args.agent) or args.agent,
+                    shape=args.shape,
+                    account=args.account or "default",
+                    effective_account=effective_account,
+                    request_envelope_json=(
+                        json.dumps(request_envelope, sort_keys=True)
+                        if request_envelope is not None
+                        else None
+                    ),
+                    transport="dispatch",
+                    project_root=str(project_root),
+                    controller_pid=_controller_pid(args),
+                    controller_session_id=_controller_session_id(args),
+                    controller_label=_controller_label(args),
+                    claimant_pid=os.getpid() if state == "waiting_capacity" else None,
+                    worker_pid=worker_pid if spawn_state == "spawned" else None,
+                    acp_session_id=None,
+                    logical_session_id=args.dispatch_id,
+                    engine_session_id=_resolved_engine_session_id(args),
+                    codex_session_id=getattr(args, "codex_session_id", None),
+                    codex_home=codex_home or getattr(args, "codex_resume_home", None),
+                    codex_home_owner_dispatch_id=_codex_home_owner_dispatch_id(args),
+                    parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
+                    worker_cwd=str(_worker_cwd(args)),
+                    dispatch_argv=_canonical_replay_argv(
+                        args,
+                        _raw_worker_args(args)
+                        if getattr(args, "worker", None) is not None
+                        else [],
+                        tail=tail,
+                        status_json=status_json,
+                    ),
+                    lease_id=lease_id,
+                    stdout_path=str(tail),
+                    stderr_path=None,
+                    status_path=str(status_json),
+                    os_sandbox_json=json.dumps(
+                        _os_sandbox_posture(args, worker_pid=worker_pid),
+                        sort_keys=True,
+                    ),
+                    queue_launch_token=getattr(args, "queue_launch_token", None),
+                    detached=bool(getattr(args, "launch_detached", False)),
+                    state=state,
+                    json=True,
+                )
             )
+        return code, goalflight_ledger.parse_record_refusal(capture.getvalue())
+
+    record_code, refusal = _record_once()
+    if (
+        record_code != 0
+        and spawn_state != "none"
+        and goalflight_ledger.is_retryable_startup_race(refusal)
+    ):
+        # The worker claims RUNNING asynchronously after spawn, so "not yet"
+        # becomes "yes" on its own within the worker's startup. Re-record
+        # against a bounded deadline BEFORE deciding anything else. Budget
+        # derivation: goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S.
+        record_code, refusal = goalflight_ledger.retry_record_after_startup_race(
+            _record_once,
+            record_code,
+            refusal,
+            project_root=project_root,
+            dispatch_id=str(args.dispatch_id),
+            timeout_s=goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S,
         )
+    warning = None
     if record_code != 0:
-        raise RuntimeError(
-            f"journal attempt transition refused for {args.dispatch_id}: exit {record_code}"
+        if spawn_state == "none":
+            # No worker process exists, so a refused transition is a genuine
+            # launch failure. Unchanged behaviour.
+            raise RuntimeError(
+                f"journal attempt transition refused for {args.dispatch_id}: exit {record_code}"
+            )
+        # A worker was spawned (or spawn state is indeterminate, which takes
+        # the same safe branch). Keep the liveness authority written and the
+        # refusal visible; losing the warning is as bad as losing the status
+        # file, so the refusal goes to BOTH stderr and the status payload.
+        warning = {
+            "kind": "journal_attempt_transition_refused",
+            "exit_code": record_code,
+            "disposition": (refusal or {}).get("disposition"),
+            "retryable": (refusal or {}).get("retryable"),
+            "error": (refusal or {}).get("error"),
+            "state": state,
+            "detail": (
+                "worker process was spawned but the journal transition was "
+                "refused; bookkeeping is incomplete, the worker may be alive "
+                "— do not blind-retry this dispatch"
+            ),
+        }
+        worker_alive = None
+        if spawn_state == "spawned":
+            with contextlib.suppress(Exception):
+                worker_alive = goalflight_compat.pid_alive(worker_pid)
+        print(
+            "DISPATCH-LEDGER-WARN "
+            + json.dumps(
+                {
+                    "dispatch_id": args.dispatch_id,
+                    "worker_pid": worker_pid,
+                    "worker_alive": worker_alive,
+                    "tail": str(tail),
+                    "status_json": str(status_json),
+                    "warning": warning,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
         )
+        with contextlib.suppress(Exception):
+            write_status(
+                status_json,
+                {
+                    **_prelaunch_status_metadata(args),
+                    "worker_pid": worker_pid,
+                    "worker_alive": worker_alive,
+                    "tail_path": str(tail),
+                    "state": state,
+                    "reason": "ledger_transition_refused",
+                    "ledger_record_warning": warning,
+                    "updated_at": int(time.time()),
+                },
+            )
     _export_dashboard_status_for_project(project_root)
     _upsert_project_registry_for_dispatch(project_root)
     if state in {"waiting_capacity", "starting", "running"}:
         _start_dashboard_refresh_for_project(project_root)
+    return warning
 
 
 _NATIVE_RECORD_LEDGER = _record_ledger
@@ -14345,6 +14436,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:
             registration_errors.append(_registration_error("write_pidfile", e))
             pidfile = None
+        ledger_running_warning = None
         try:
             if wait_for_worker_claim:
                 goalflight_ledger.claim_attempt_running(
@@ -14352,7 +14444,7 @@ def main(argv: list[str] | None = None) -> int:
                     str(args.dispatch_id),
                     worker_pid,
                 )
-            _record_ledger(
+            ledger_running_warning = _record_ledger(
                 args,
                 project_root=project_root,
                 prompt_path=prompt_path,
@@ -14372,6 +14464,20 @@ def main(argv: list[str] | None = None) -> int:
                 )
         except Exception as e:
             registration_errors.append(_registration_error("record_ledger_running", e))
+        if ledger_running_warning:
+            # _record_ledger already warned loudly and wrote the status file;
+            # fold the refusal into the launch registration warnings too so
+            # every operator surface carries it.
+            registration_errors.append(
+                {
+                    "step": "record_ledger_running",
+                    "reason": (
+                        "journal attempt transition refused: "
+                        f"{ledger_running_warning.get('disposition') or 'unknown'} "
+                        f"({ledger_running_warning.get('error') or 'no detail'})"
+                    ),
+                }
+            )
 
         summary_head.update({"worker_pid": worker_pid, "worker_identity": worker_identity_token})
         if effective_account:
@@ -14449,6 +14555,11 @@ def main(argv: list[str] | None = None) -> int:
                 "state": "starting",
                 "reason": "watcher_launching",
                 "updated_at": int(time.time()),
+                **(
+                    {"ledger_record_warning": ledger_running_warning}
+                    if ledger_running_warning
+                    else {}
+                ),
             })
         _export_dashboard_status_for_project(project_root)
         _start_dashboard_refresh_for_project(project_root)
