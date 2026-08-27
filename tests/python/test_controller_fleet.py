@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Fleet-wide controller diagnostic: connected / idle / stale / disconnected."""
+"""Fleet-wide controller diagnostic: connected / idle / stale / unknown."""
 
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 import io
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -52,6 +54,60 @@ def _project(tmp_path: Path, name: str) -> Path:
     root = tmp_path / name
     root.mkdir()
     return root
+
+
+def _git_project(tmp_path: Path, name: str) -> Path:
+    root = _project(tmp_path, name)
+    subprocess.run(
+        ["git", "init", "--quiet"],
+        cwd=root,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return root
+
+
+def _insert_ended_generation(
+    root: Path,
+    label: str,
+    *,
+    generation: int,
+    state: str,
+    nonce: str,
+    reason: str,
+) -> None:
+    authority = journal.open_or_create_journal(root)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    written = authority.write(
+        journal.RowOperation.insert(
+            "controller_leases",
+            {
+                "project_root": str(authority.project_root),
+                "label": label,
+                "generation": generation,
+                "nonce": nonce,
+                "principal_json": "{}",
+                "state": state,
+                "claimed_at": now,
+                "renewed_at": now,
+                "renew_deadline_at": now,
+                "ended_at": now,
+                "ended_reason": reason,
+            },
+        )
+    )
+    assert written.committed
+
+
+def _assert_no_live_row_carries_retire(payload: dict) -> None:
+    for row in payload["controllers"]:
+        assert controllers.live_row_may_not_retire(row)
+        assert controllers.retire_command_is_canonical(row)
+        if row.get("state") == "live":
+            assert row.get("retire_command") is None
+        if row.get("bucket") == "unknown":
+            assert row.get("retire_command") is None
 
 
 def _run(argv: list[str] | None = None) -> tuple[int, str]:
@@ -220,6 +276,17 @@ def test_holder_state_never_collapses_unknown_into_dead() -> None:
     assert controllers.holder_state(None) == "unknown"
 
 
+def test_classify_bucket_splits_unknown_from_stale() -> None:
+    live = {"incarnation_state": "live-lock", "retired": False, "wake_armed": True, "idle_seconds": 10}
+    dead = {"incarnation_state": "dead-lock", "retired": False, "wake_armed": False, "idle_seconds": 10}
+    unknown = {"incarnation_state": "unknown-lock", "retired": False, "wake_armed": None, "idle_seconds": None}
+    ended = {"incarnation_state": "ended", "retired": True, "wake_armed": False, "idle_seconds": 10}
+    assert controllers.classify_bucket(live, idle_hours=4) == "connected"
+    assert controllers.classify_bucket(dead, idle_hours=4) == "stale"
+    assert controllers.classify_bucket(unknown, idle_hours=4) == "unknown"
+    assert controllers.classify_bucket(ended, idle_hours=4) is None
+
+
 def test_live_armed_renders_connected_with_raw_idle_age(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -291,7 +358,7 @@ def test_dead_holder_occupying_lease_renders_stale_with_retire_command(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _isolate(monkeypatch, tmp_path)
-    root = _project(tmp_path, "poisoned")
+    root = _git_project(tmp_path, "poisoned")
     lease = _claim_lease(root, "pm2", _reaped_principal(), "pm2-nonce")
     holder = wake.register_lease_holder(
         root,
@@ -315,7 +382,14 @@ def test_dead_holder_occupying_lease_renders_stale_with_retire_command(
     assert row["retire_command"] is not None
     assert "--retire" in row["retire_command"]
     assert "--acknowledge-retirement" in row["retire_command"]
-    assert str(task.resolve_project_root(str(root))) in row["retire_command"]
+    parsed = controllers.retire_command_project_root(row["retire_command"])
+    assert parsed is not None
+    canonical = task.resolve_project_root(parsed)
+    assert canonical == task.resolve_project_root(str(root))
+    assert canonical == controllers.canonical_project_root(root)
+    assert row["project"] == "poisoned"
+    assert row["project_root"] == str(canonical)
+    assert controllers.retire_command_is_canonical(row)
     assert "stale" in text.lower()
     assert "retire (proof of death):" in text
     assert row["retire_command"] in text
@@ -340,12 +414,14 @@ def test_unreadable_lease_renders_unknown_without_retire_command(
         payload = json.loads(json_text)
         row = _row_for(payload, "alice")
         assert row["state"] == "unknown"
+        assert row["bucket"] == "unknown"
         assert row["retire_command"] is None
         assert row["unknown_reason"]
         assert "retirement refused" in row["unknown_reason"]
         assert "unknown" in text
         assert "retire (proof of death):" not in text
         assert "--retire" not in text
+        _assert_no_live_row_carries_retire(payload)
     finally:
         if lock_path is not None:
             lock_path.chmod(0o600)
@@ -391,7 +467,7 @@ def test_unreadable_project_does_not_drop_other_projects(
     del registered
 
 
-def test_disconnected_retired_row_holds_nothing(
+def test_retired_label_is_not_a_fleet_member(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _isolate(monkeypatch, tmp_path)
@@ -406,13 +482,15 @@ def test_disconnected_retired_row_holds_nothing(
         ledger_records=[],
     )
     assert retired["retired"] is True
+    ended = journal.Journal.open_reader(root).lease_records(include_ended=True)
+    assert any(row["state"] == "RETIRED" and row["label"] == "old" for row in ended)
+    assert journal.Journal.open_reader(root).active_lease("old") is None
     code, text = _run(["--json"])
     assert code == 0
-    row = _row_for(json.loads(text), "old")
-    assert row["bucket"] == "disconnected"
-    assert row["occupies"] is False
-    assert row["retire_command"] is None
-    assert row["idle"] == "—"
+    payload = json.loads(text)
+    labels = {row.get("label") for row in payload["controllers"]}
+    assert "old" not in labels
+    assert all(row.get("bucket") != "disconnected" for row in payload["controllers"])
 
 
 def test_owned_unmeasured_renders_unknown_never_zero(
@@ -544,3 +622,207 @@ def test_last_drain_comes_from_journal_cursor(
         holder.close()
     del registered
     del nonce
+
+
+def test_historical_generations_yield_one_active_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate(monkeypatch, tmp_path)
+    root = _git_project(tmp_path, "alpha")
+    _insert_ended_generation(
+        root,
+        "alice",
+        generation=1,
+        state=journal.LEASE_EXPIRED,
+        nonce="expired-nonce",
+        reason="holder-dead",
+    )
+    _insert_ended_generation(
+        root,
+        "alice",
+        generation=2,
+        state=journal.LEASE_SUPERSEDED,
+        nonce="superseded-nonce",
+        reason="explicit-takeover",
+    )
+    registered, holder, nonce = _hold_registered_lease(root, "alice", "live-nonce")
+    waiter = _arm_listener(root, "alice", nonce)
+    try:
+        ended = journal.Journal.open_reader(root).lease_records(include_ended=True)
+        states = Counter(
+            str(row["state"]) for row in ended if row["label"] == "alice"
+        )
+        assert states[journal.LEASE_EXPIRED] == 1
+        assert states[journal.LEASE_SUPERSEDED] == 1
+        assert states[journal.LEASE_ACTIVE] == 1
+        code, text = _run(["--json"])
+    finally:
+        waiter.close()
+        holder.close()
+    assert code == 0
+    payload = json.loads(text)
+    matches = [row for row in payload["controllers"] if row.get("label") == "alice"]
+    assert len(matches) == 1
+    row = matches[0]
+    assert row["state"] == "live"
+    assert row["bucket"] in {"connected", "idle"}
+    assert row["retire_command"] is None
+    _assert_no_live_row_carries_retire(payload)
+    del registered
+
+
+def test_live_current_generation_never_gets_retire_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate(monkeypatch, tmp_path)
+    root = _git_project(tmp_path, "alpha")
+    _insert_ended_generation(
+        root,
+        "alice",
+        generation=1,
+        state=journal.LEASE_EXPIRED,
+        nonce="dead-history",
+        reason="holder-dead",
+    )
+    _insert_ended_generation(
+        root,
+        "alice",
+        generation=2,
+        state=journal.LEASE_SUPERSEDED,
+        nonce="superseded-history",
+        reason="explicit-takeover",
+    )
+    registered, holder, nonce = _hold_registered_lease(root, "alice", "live-nonce")
+    waiter = _arm_listener(root, "alice", nonce)
+    try:
+        probe_state, _session = sessions.probe_live_session(root, label="alice")
+        assert probe_state == "live"
+        payload = json.loads(_run(["--json"])[1])
+    finally:
+        waiter.close()
+        holder.close()
+    row = _row_for(payload, "alice")
+    assert row["state"] == "live"
+    assert row["retire_command"] is None
+    assert "--retire" not in json.dumps(payload)
+    _assert_no_live_row_carries_retire(payload)
+    del registered
+
+
+def test_retire_command_project_root_round_trips(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate(monkeypatch, tmp_path)
+    root = _git_project(tmp_path, "poisoned")
+    lease = _claim_lease(root, "pm2", _reaped_principal(), "pm2-nonce")
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="pm2",
+        lease_nonce=lease.nonce,
+    )
+    holder.close()
+    _expire_past_dead_holder_margin(root, "pm2")
+    payload = json.loads(_run(["--json"])[1])
+    row = _row_for(payload, "pm2")
+    assert row["bucket"] == "stale"
+    command = row["retire_command"]
+    assert command
+    parsed = controllers.retire_command_project_root(command)
+    assert parsed is not None
+    tokens = shlex.split(command)
+    assert tokens[tokens.index("--project-root") + 1] == parsed
+    resolved = task.resolve_project_root(parsed)
+    named = controllers.canonical_project_root(root)
+    assert named is not None
+    assert resolved == named
+    assert row["project_root"] == str(named)
+    assert row["project"] == named.name
+    assert controllers.retire_command_is_canonical(row)
+    del lease
+
+
+def test_unresolvable_root_renders_unknown_not_path_segment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate(monkeypatch, tmp_path)
+    root = _project(tmp_path, "simonrowland")
+    registered, holder, nonce = _hold_registered_lease(root, "alice", "alice-nonce")
+    waiter = _arm_listener(root, "alice", nonce)
+    try:
+        payload = json.loads(_run(["--json"])[1])
+        table = _run([])[1]
+    finally:
+        waiter.close()
+        holder.close()
+    row = _row_for(payload, "alice")
+    assert row["project"] == "unknown"
+    assert row["project_root"] is None
+    assert row["project"] != "simonrowland"
+    assert "simonrowland" not in (row["project"] or "")
+    assert row["retire_command"] is None
+    alice_lines = [line for line in table.splitlines() if "alice" in line]
+    assert alice_lines
+    assert "simonrowland" not in alice_lines[0].split()[2]
+    _assert_no_live_row_carries_retire(payload)
+    del registered
+
+
+def test_one_row_per_project_label_when_journals_disagree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate(monkeypatch, tmp_path)
+    live_root = _project(tmp_path, "one")
+    dead_root = _project(tmp_path, "two")
+    registered, holder, nonce = _hold_registered_lease(
+        live_root, "alice", "live-nonce"
+    )
+    waiter = _arm_listener(live_root, "alice", nonce)
+    lease = _claim_lease(dead_root, "alice", _reaped_principal(), "dead-nonce")
+    dead_holder = wake.register_lease_holder(
+        dead_root,
+        controller_label="alice",
+        lease_nonce=lease.nonce,
+    )
+    dead_holder.close()
+    _expire_past_dead_holder_margin(dead_root, "alice")
+    try:
+        payload = json.loads(_run(["--json"])[1])
+    finally:
+        waiter.close()
+        holder.close()
+    matches = [row for row in payload["controllers"] if row.get("label") == "alice"]
+    assert len(matches) == 1
+    row = matches[0]
+    assert row["bucket"] == "unknown"
+    assert row["state"] == "unknown"
+    assert row["project"] == "unknown"
+    assert row["retire_command"] is None
+    assert "disagree" in (row["unknown_reason"] or "")
+    _assert_no_live_row_carries_retire(payload)
+    del registered
+    del lease
+
+
+def test_same_label_in_two_real_projects_stays_two_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate(monkeypatch, tmp_path)
+    alpha = _git_project(tmp_path, "alpha")
+    beta = _git_project(tmp_path, "beta")
+    a_reg, a_holder, a_nonce = _hold_registered_lease(alpha, "alice", "a-nonce")
+    b_reg, b_holder, b_nonce = _hold_registered_lease(beta, "alice", "b-nonce")
+    a_wait = _arm_listener(alpha, "alice", a_nonce)
+    b_wait = _arm_listener(beta, "alice", b_nonce)
+    try:
+        payload = json.loads(_run(["--json"])[1])
+    finally:
+        a_wait.close()
+        b_wait.close()
+        a_holder.close()
+        b_holder.close()
+    matches = [row for row in payload["controllers"] if row.get("label") == "alice"]
+    assert len(matches) == 2
+    projects = {row["project"] for row in matches}
+    assert projects == {"alpha", "beta"}
+    _assert_no_live_row_carries_retire(payload)
+    del a_reg, b_reg

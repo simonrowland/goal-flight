@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Fleet-wide controller diagnostic: connected / idle / stale / disconnected.
+"""Fleet-wide controller diagnostic: connected / idle / stale / unknown.
 
-One read-only command over every journal under the state-dir journals index.
-Consumes ``controller_roster`` (tri-state holder facts, unread, owned, idle
-age, last-drain, wake/supervisor, t-338 retirement proof). Does not probe
-around the roster, take journal write locks, or run retire.
+Current fleet state is the ACTIVE generation per (project, label). Ended
+lease rows (EXPIRED / SUPERSEDED / RETIRED) are history, not members.
+``disconnected`` is empty by construction: a cleanly released label has no
+row, and an ACTIVE-but-holder-dead generation is ``stale``.
+
+``unknown`` is the could-not-tell bucket (unreadable probes, unresolvable
+roots, or two journals naming the same member differently). It never
+carries a retire command. ``stale`` is the action-bearing alarm.
 
     python3 scripts/goalflight_controllers.py
     python3 scripts/goalflight_controllers.py --json
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -66,13 +71,14 @@ JSON_ROW_KEYS = (
 )
 BUCKET_ORDER = {
     "stale": 0,
-    "connected": 1,
-    "idle": 2,
-    "disconnected": 3,
+    "unknown": 1,
+    "connected": 2,
+    "idle": 3,
     None: 4,
 }
 HOLDER_LIVE = frozenset({"live-lock", "live-overdue"})
 HOLDER_DEAD = frozenset({"dead-lock", "ended"})
+UNKNOWN_PROJECT = "unknown"
 
 
 def _utc_now() -> datetime:
@@ -80,22 +86,47 @@ def _utc_now() -> datetime:
 
 
 def peek_journal_project_roots(path: Path) -> tuple[list[str] | None, str | None]:
-    """Read-only sqlite peek. ``(None, error)`` when the file cannot be told."""
+    """Read-only peek of ACTIVE project_root values. ``(None, error)`` on fail."""
+    pairs, error = peek_active_lease_identities(path)
+    if pairs is None:
+        return None, error
+    roots: list[str] = []
+    seen: set[str] = set()
+    for root, _label in pairs:
+        if root not in seen:
+            seen.add(root)
+            roots.append(root)
+    return roots, None
+
+
+def peek_active_lease_identities(
+    path: Path,
+) -> tuple[list[tuple[str, str]] | None, str | None]:
+    """Read-only sqlite peek of current-generation (project_root, label) pairs."""
     connection: sqlite3.Connection | None = None
     try:
-        connection = sqlite3.connect(
-            path.as_uri() + "?mode=ro",
-            uri=True,
+        connection = goalflight_journal._open_readonly_connection(
+            path,
             timeout=0,
             isolation_level=None,
         )
         connection.execute("PRAGMA query_only = ON")
         connection.execute("PRAGMA busy_timeout = 0")
         rows = connection.execute(
-            "SELECT DISTINCT project_root FROM controller_leases"
+            "SELECT DISTINCT project_root, label FROM controller_leases "
+            "WHERE state = 'ACTIVE'"
         ).fetchall()
-        roots = [str(row[0]) for row in rows if isinstance(row[0], str) and row[0]]
-        return roots, None
+        pairs: list[tuple[str, str]] = []
+        for row in rows:
+            root = row[0]
+            label = row[1]
+            if isinstance(root, str) and root and isinstance(label, str) and label:
+                pairs.append((root, label))
+        return pairs, None
+    except goalflight_journal.JournalBusy:
+        return None, "JournalBusy"
+    except goalflight_journal.JournalError as exc:
+        return None, type(exc).__name__
     except sqlite3.OperationalError as exc:
         message = str(exc).lower()
         if any(marker in message for marker in ("locked", "busy")):
@@ -108,6 +139,33 @@ def peek_journal_project_roots(path: Path) -> tuple[list[str] | None, str | None
     finally:
         if connection is not None:
             connection.close()
+
+
+def canonical_project_root(raw: Path | str | None) -> Path | None:
+    """Git-canonical project root, or None when the path is not a project."""
+    if raw is None:
+        return None
+    start = Path(str(raw)).expanduser()
+    if not start.is_dir():
+        return None
+    git_root = goalflight_task._git_canonical_root(start)
+    if git_root is None:
+        return None
+    return goalflight_task._strip_managed_worktree(git_root)
+
+
+def project_identity(raw: Path | str | None) -> tuple[str, Path | None, str]:
+    """Return ``(group_key, canonical_root, display_name)``.
+
+    Display is the canonical checkout's name. An unresolvable root is
+    ``unknown``, never a path segment of the recorded value.
+    """
+    canonical = canonical_project_root(raw)
+    if canonical is None:
+        return UNKNOWN_PROJECT, None, UNKNOWN_PROJECT
+    resolved = canonical.resolve(strict=False)
+    name = resolved.name.strip() or UNKNOWN_PROJECT
+    return f"project:{resolved}", resolved, name
 
 
 def holder_state(incarnation_state: object) -> str:
@@ -135,15 +193,20 @@ def classify_bucket(
     *,
     idle_hours: float,
 ) -> str | None:
-    """Four healthy/fault buckets. None when the classifier cannot tell."""
+    """Current-generation buckets. Ended leases are not fleet members.
+
+    ``stale`` is provably-dead-and-occupying (the action-bearing alarm).
+    Holder-unknown occupying rows go to ``unknown``, not ``stale``, so a
+    could-not-tell probe cannot inflate the alarm bucket or carry retire.
+    """
     state = holder_state(record.get("incarnation_state"))
     retired = bool(record.get("retired"))
     occupies = not retired
     armed = record.get("wake_armed")
     idle_s = record.get("idle_seconds")
     threshold_s = idle_hours * 3600.0
-    if retired and not occupies:
-        return "disconnected"
+    if retired or not occupies:
+        return None
     if state == "live" and armed is True:
         if idle_s is None:
             # Live and armed, but the idle classifier cannot run. Connected
@@ -155,11 +218,11 @@ def classify_bucket(
     if state == "live":
         # Holder is live; supervisor may be absent or unknown. Not stale.
         return "connected"
-    if occupies:
+    if state == "unknown":
+        return "unknown"
+    if state == "dead":
         return "stale"
-    if retired:
-        return "disconnected"
-    return None
+    return "unknown"
 
 
 def retire_command(project_root: Path | str, label: str) -> str:
@@ -171,16 +234,26 @@ def retire_command(project_root: Path | str, label: str) -> str:
 
 
 def _shell_token(value: object) -> str:
-    import shlex
-
     return shlex.quote(str(value))
 
 
-def _project_name(project_root: Path | str | None, *, fallback: str) -> str:
-    if project_root is None:
-        return fallback
-    name = Path(str(project_root)).name.strip()
-    return name or fallback
+def retire_command_project_root(command: str) -> str | None:
+    """Extract ``--project-root`` from an emitted retire command."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    for index, token in enumerate(tokens):
+        if token == "--project-root" and index + 1 < len(tokens):
+            return tokens[index + 1]
+    return None
+
+
+def _project_display_name(canonical: Path | None) -> str:
+    if canonical is None:
+        return UNKNOWN_PROJECT
+    name = canonical.name.strip()
+    return name or UNKNOWN_PROJECT
 
 
 def _unknown_reason(record: dict[str, Any], *, state: str, bucket: str | None) -> str | None:
@@ -196,7 +269,12 @@ def _unknown_reason(record: dict[str, Any], *, state: str, bucket: str | None) -
         parts.append("unread unmeasured")
     if record.get("nonterminal_owned_dispatches") is None:
         parts.append("owned unmeasured")
-    if record.get("idle_seconds") is None and bucket in {"connected", "idle", "stale"}:
+    if record.get("idle_seconds") is None and bucket in {
+        "connected",
+        "idle",
+        "stale",
+        "unknown",
+    }:
         parts.append("idle age unmeasured")
     if not parts:
         return None
@@ -204,42 +282,105 @@ def _unknown_reason(record: dict[str, Any], *, state: str, bucket: str | None) -
 
 
 def _idle_cell(record: dict[str, Any], *, bucket: str | None) -> str:
+    del bucket
     compact = record.get("idle_compact") or sessions._format_idle_compact(
         record.get("idle_seconds")
     )
-    if bucket == "disconnected":
-        return "—"
     return f"idle {compact}"
+
+
+def live_row_may_not_retire(row: dict[str, Any]) -> bool:
+    """Hard invariant: a live current generation never carries retire."""
+    return not (row.get("state") == "live" and row.get("retire_command"))
+
+
+def retire_command_is_canonical(row: dict[str, Any]) -> bool:
+    """Emitted ``--project-root`` must round-trip through the project resolver."""
+    command = row.get("retire_command")
+    if not command:
+        return True
+    parsed = retire_command_project_root(str(command))
+    if not parsed:
+        return False
+    canonical = canonical_project_root(parsed)
+    if canonical is None:
+        return False
+    reported = row.get("project_root")
+    if not reported:
+        return False
+    reported_canonical = canonical_project_root(str(reported))
+    if reported_canonical is None:
+        return False
+    resolved = goalflight_task.resolve_project_root(parsed)
+    return (
+        resolved.resolve(strict=False) == canonical.resolve(strict=False)
+        and reported_canonical.resolve(strict=False) == canonical.resolve(strict=False)
+    )
+
+
+def _may_emit_retire(
+    *,
+    bucket: str | None,
+    state: str,
+    occupies: bool,
+    eligible: bool,
+    canonical: Path | None,
+) -> bool:
+    if canonical is None:
+        return False
+    if state == "live":
+        return False
+    if bucket != "stale" or state != "dead" or not occupies:
+        return False
+    return eligible is True
 
 
 def fleet_row(
     record: dict[str, Any],
     *,
-    project_root: Path,
+    canonical: Path | None,
     idle_hours: float,
     journal_name: str | None = None,
+    recorded_root: Path | str | None = None,
 ) -> dict[str, Any]:
     state = holder_state(record.get("incarnation_state"))
     bucket = classify_bucket(record, idle_hours=idle_hours)
     occupies = not bool(record.get("retired"))
     eligible = record.get("retirement_eligible") is True
-    # Unknown never qualifies, even if t-338's PID-backed gate would pass.
-    show_retire = bucket == "stale" and state == "dead" and eligible and occupies
+    show_retire = _may_emit_retire(
+        bucket=bucket,
+        state=state,
+        occupies=occupies,
+        eligible=eligible,
+        canonical=canonical,
+    )
     label = str(record.get("label") or "") or None
     unknown_reason = None
-    if state == "unknown" or bucket is None:
+    if state == "unknown" or bucket in {None, "unknown"}:
         unknown_reason = _unknown_reason(record, state=state, bucket=bucket)
-        if show_retire:
-            show_retire = False
+        show_retire = False
         if unknown_reason is None:
             unknown_reason = (
                 "state unknown; retirement refused until it resolves"
             )
+    if canonical is None:
+        recorded = str(recorded_root) if recorded_root is not None else None
+        if recorded:
+            extra = f"unresolvable root {recorded}"
+            base = (unknown_reason or "").removesuffix(
+                "; retirement refused until it resolves"
+            )
+            unknown_reason = (
+                f"{base}; {extra}; retirement refused until it resolves"
+                if base
+                else f"{extra}; retirement refused until it resolves"
+            )
+    display = _project_display_name(canonical)
     return {
-        "bucket": bucket,
+        "bucket": bucket if bucket is not None else "unknown",
         "label": label,
-        "project": _project_name(project_root, fallback=journal_name or "unknown"),
-        "project_root": str(project_root),
+        "project": display,
+        "project_root": str(canonical) if canonical is not None else None,
         "state": state,
         "idle_seconds": record.get("idle_seconds"),
         "idle": _idle_cell(record, bucket=bucket),
@@ -254,11 +395,14 @@ def fleet_row(
         "wake_armed": record.get("wake_armed"),
         "occupies": occupies,
         "retire_command": (
-            retire_command(project_root, label) if show_retire and label else None
+            retire_command(canonical, label)
+            if show_retire and label and canonical is not None
+            else None
         ),
         "unknown_reason": unknown_reason,
         "retirement_eligible": record.get("retirement_eligible"),
         "retirement_reason": record.get("retirement_reason"),
+        "_source": journal_name,
     }
 
 
@@ -268,14 +412,18 @@ def unknown_project_row(
     journal_path: Path | None,
     error: str,
 ) -> dict[str, Any]:
-    fallback = journal_path.parent.name if journal_path is not None else "unknown"
-    root_text = str(project_root) if project_root is not None else None
-    reason = f"journal unreadable ({error}); retirement refused until it resolves"
+    canonical = canonical_project_root(project_root)
+    display = _project_display_name(canonical)
+    source = journal_path.parent.name if journal_path is not None else None
+    where = f" at {journal_path}" if journal_path is not None else ""
+    reason = (
+        f"journal unreadable ({error}){where}; retirement refused until it resolves"
+    )
     return {
-        "bucket": None,
+        "bucket": "unknown",
         "label": None,
-        "project": _project_name(project_root, fallback=fallback),
-        "project_root": root_text,
+        "project": display,
+        "project_root": str(canonical) if canonical is not None else None,
         "state": "unknown",
         "idle_seconds": None,
         "idle": "idle unknown",
@@ -290,84 +438,95 @@ def unknown_project_row(
         "unknown_reason": reason,
         "retirement_eligible": None,
         "retirement_reason": error,
+        "_source": source,
     }
 
 
-def collect_controller_rows(
-    *,
-    idle_hours: float,
-    ledger_records: list[dict] | None = None,
-) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    seen_roots: set[str] = set()
-    files = goalflight_journal.iter_journal_files()
-    for path in files:
-        roots, peek_error = peek_journal_project_roots(path)
-        if roots is None:
-            rows.append(
-                unknown_project_row(
-                    project_root=None,
-                    journal_path=path,
-                    error=peek_error or "unreadable",
-                )
-            )
+def _row_group_key(row: dict[str, Any]) -> tuple[str, str] | None:
+    label = row.get("label")
+    if not label:
+        return None
+    root = row.get("project_root")
+    identity = str(root) if root else UNKNOWN_PROJECT
+    return identity, str(label)
+
+
+def _row_facts(row: dict[str, Any]) -> tuple[object, object, object, object]:
+    return (
+        row.get("bucket"),
+        row.get("state"),
+        row.get("occupies"),
+        row.get("supervisor"),
+    )
+
+
+def _disagreement_row(items: list[dict[str, Any]]) -> dict[str, Any]:
+    sources = sorted(
+        {
+            str(item.get("_source") or item.get("project") or "journal")
+            for item in items
+        }
+    )
+    named = ", ".join(sources)
+    first = items[0]
+    project_roots = {item.get("project_root") for item in items}
+    shared_root = project_roots.pop() if len(project_roots) == 1 else None
+    canonical = canonical_project_root(shared_root) if shared_root else None
+    return {
+        "bucket": "unknown",
+        "label": first.get("label"),
+        "project": _project_display_name(canonical) if canonical is not None else UNKNOWN_PROJECT,
+        "project_root": str(canonical) if canonical is not None else None,
+        "state": "unknown",
+        "idle_seconds": None,
+        "idle": "idle unknown",
+        "unread": None,
+        "last_drain_at": None,
+        "last_drain_seconds": None,
+        "owned": None,
+        "supervisor": "unknown",
+        "wake_armed": None,
+        "occupies": None,
+        "retire_command": None,
+        "unknown_reason": (
+            f"journals disagree ({named}); retirement refused until it resolves"
+        ),
+        "retirement_eligible": None,
+        "retirement_reason": "journals_disagree",
+        "_source": named,
+    }
+
+
+def merge_controller_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One (project, label) yields exactly one row."""
+    unlabeled: list[dict[str, Any]] = []
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = _row_group_key(row)
+        if key is None:
+            unlabeled.append(row)
             continue
-        if not roots:
-            # Journal exists but has no lease rows — nothing to report.
+        grouped.setdefault(key, []).append(row)
+    merged = list(unlabeled)
+    for items in grouped.values():
+        if len(items) == 1:
+            merged.append(items[0])
             continue
-        for raw_root in roots:
-            if raw_root in seen_roots:
-                continue
-            seen_roots.add(raw_root)
-            project_root = Path(raw_root)
-            try:
-                resolved = goalflight_task.resolve_project_root(str(project_root))
-            except (OSError, RuntimeError, ValueError):
-                resolved = project_root
-            try:
-                roster = sessions.controller_roster(
-                    resolved,
-                    include_retired=True,
-                    ledger_records=ledger_records,
-                )
-            except (
-                goalflight_journal.JournalBusy,
-                goalflight_journal.JournalDisappeared,
-                goalflight_journal.JournalIOError,
-                OSError,
-                RuntimeError,
-                ValueError,
-            ) as exc:
-                rows.append(
-                    unknown_project_row(
-                        project_root=resolved,
-                        journal_path=path,
-                        error=type(exc).__name__,
-                    )
-                )
-                continue
-            measurements = roster.get("measurements") or {}
-            registry = measurements.get("controller_registry") or {}
-            if registry.get("measured") is False:
-                rows.append(
-                    unknown_project_row(
-                        project_root=resolved,
-                        journal_path=path,
-                        error=str(registry.get("error") or "unreadable"),
-                    )
-                )
-                continue
-            for record in roster.get("controllers") or []:
-                if not isinstance(record, dict):
-                    continue
-                rows.append(
-                    fleet_row(
-                        record,
-                        project_root=resolved,
-                        idle_hours=idle_hours,
-                        journal_name=path.parent.name,
-                    )
-                )
+        fact_set = {_row_facts(item) for item in items}
+        if len(fact_set) == 1:
+            merged.append(items[0])
+            continue
+        merged.append(_disagreement_row(items))
+    return merged
+
+
+def _sanitize_retire_commands(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        if not live_row_may_not_retire(row) or not retire_command_is_canonical(row):
+            row["retire_command"] = None
+
+
+def _sort_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows.sort(
         key=lambda row: (
             BUCKET_ORDER.get(row.get("bucket"), 4),
@@ -379,6 +538,94 @@ def collect_controller_rows(
     return rows
 
 
+def collect_controller_rows(
+    *,
+    idle_hours: float,
+    ledger_records: list[dict] | None = None,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    roster_cache: dict[str, dict[str, Any] | BaseException] = {}
+    files = goalflight_journal.iter_journal_files()
+    for path in files:
+        pairs, peek_error = peek_active_lease_identities(path)
+        if pairs is None:
+            rows.append(
+                unknown_project_row(
+                    project_root=None,
+                    journal_path=path,
+                    error=peek_error or "unreadable",
+                )
+            )
+            continue
+        if not pairs:
+            # No ACTIVE generation — not a fleet member, not disconnected.
+            continue
+        seen_probe: set[str] = set()
+        for raw_root, _label in pairs:
+            _key, canonical, _display = project_identity(raw_root)
+            probe_root = canonical if canonical is not None else Path(raw_root)
+            probe_token = str(probe_root)
+            if probe_token in seen_probe:
+                continue
+            seen_probe.add(probe_token)
+            cached = roster_cache.get(probe_token)
+            if cached is None:
+                try:
+                    cached = sessions.controller_roster(
+                        probe_root,
+                        include_retired=False,
+                        ledger_records=ledger_records,
+                    )
+                except (
+                    goalflight_journal.JournalBusy,
+                    goalflight_journal.JournalDisappeared,
+                    goalflight_journal.JournalIOError,
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                ) as exc:
+                    cached = exc
+                roster_cache[probe_token] = cached
+            if isinstance(cached, BaseException):
+                rows.append(
+                    unknown_project_row(
+                        project_root=canonical,
+                        journal_path=path,
+                        error=type(cached).__name__,
+                    )
+                )
+                continue
+            roster = cached
+            measurements = roster.get("measurements") or {}
+            registry = measurements.get("controller_registry") or {}
+            if registry.get("measured") is False:
+                rows.append(
+                    unknown_project_row(
+                        project_root=canonical,
+                        journal_path=path,
+                        error=str(registry.get("error") or "unreadable"),
+                    )
+                )
+                continue
+            for record in roster.get("controllers") or []:
+                if not isinstance(record, dict):
+                    continue
+                if record.get("retired"):
+                    continue
+                rows.append(
+                    fleet_row(
+                        record,
+                        canonical=canonical,
+                        idle_hours=idle_hours,
+                        journal_name=path.parent.name,
+                        recorded_root=raw_root,
+                    )
+                )
+    rows = merge_controller_rows(rows)
+    _sanitize_retire_commands(rows)
+    return _sort_rows(rows)
+
+
 def render_table(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return "no known controllers"
@@ -386,7 +633,6 @@ def render_table(rows: list[dict[str, Any]]) -> str:
         "connected": 0,
         "idle": 0,
         "stale": 0,
-        "disconnected": 0,
         "unknown": 0,
     }
     display_rows: list[tuple[str, ...]] = []
@@ -426,9 +672,8 @@ def render_table(rows: list[dict[str, Any]]) -> str:
     lines.append("---")
     lines.append(
         "controllers: "
-        f"{len(rows)}  connected {counts['connected']} · idle {counts['idle']} · "
-        f"stale {counts['stale']} · disconnected {counts['disconnected']} · "
-        f"unknown {counts['unknown']}"
+        f"{len(rows)}  stale {counts['stale']} · unknown {counts['unknown']} · "
+        f"connected {counts['connected']} · idle {counts['idle']}"
     )
     retire_lines = [
         str(row["retire_command"])
@@ -481,8 +726,8 @@ def build_payload(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "List controllers across every project journal: connected, idle, "
-            "stale, or disconnected."
+            "List current-generation controllers across every project journal: "
+            "connected, idle, stale, or unknown."
         )
     )
     parser.add_argument(
