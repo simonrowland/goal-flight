@@ -477,6 +477,32 @@ def test_malformed_matching_lease_is_ambiguous(tmp_path: Path) -> None:
     assert result["kept_reasons"] == {"lease_live_or_indeterminate": 1}
 
 
+def _stub_controller_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    state: str,
+    session: dict | None = None,
+    expected_label: str | None | object = ...,
+) -> None:
+    def probe(
+        _project: Path,
+        *,
+        label: str | None = None,
+        pid: int | None = None,
+    ) -> tuple[str, dict | None]:
+        del pid
+        if expected_label is not ... and label != expected_label:
+            pytest.fail(f"unexpected label: {label}")
+        return state, session
+
+    monkeypatch.setattr(D.goalflight_session_status, "probe_live_session", probe)
+    monkeypatch.setattr(
+        D.goalflight_session_status,
+        "live_session",
+        lambda *_args, **_kwargs: pytest.fail("legacy collapsing wrapper was used"),
+    )
+
+
 def test_live_controller_beacon_vetoes_reconciliation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -489,14 +515,11 @@ def test_live_controller_beacon_vetoes_reconciliation(
         controller_pid=controller_pid,
         controller_session_id="controller-session",
     )
-    monkeypatch.setattr(
-        D.goalflight_session_status,
-        "live_session",
-        lambda _project, *, label=None: (
-            {"id": "controller-session", "pid": controller_pid}
-            if label is None
-            else pytest.fail(f"unexpected label: {label}")
-        ),
+    _stub_controller_probe(
+        monkeypatch,
+        state="live",
+        session={"id": "controller-session", "pid": controller_pid},
+        expected_label=None,
     )
 
     result = _run(tmp_path)
@@ -518,22 +541,135 @@ def test_live_stable_controller_label_vetoes_after_session_rollover(
         controller_session_id="old-controller-session",
         controller_label="controller-a",
     )
-
-    def live_session(_project: Path, *, label: str | None = None) -> dict:
-        assert label == "controller-a"
-        return {
+    _stub_controller_probe(
+        monkeypatch,
+        state="live",
+        session={
             "id": "new-controller-session",
             "pid": os.getpid(),
             "label": "controller-a",
-        }
-
-    monkeypatch.setattr(D.goalflight_session_status, "live_session", live_session)
+        },
+        expected_label="controller-a",
+    )
 
     result = _run(tmp_path)
 
     assert result["closed"] == 0
     assert _read(dispatch_id)["state"] == "running"
     assert result["kept_reasons"] == {"controller_live_or_indeterminate": 1}
+
+
+def test_unreadable_controller_probe_does_not_reclaim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "controller-unreadable"
+    _record(
+        tmp_path,
+        dispatch_id,
+        controller_pid=os.getpid(),
+        controller_session_id="controller-session",
+    )
+    _stub_controller_probe(monkeypatch, state="unreadable", session=None)
+
+    result = _run(tmp_path)
+    entry = result["entries"][0]
+
+    assert result["closed"] == 0
+    assert _read(dispatch_id)["state"] == "running"
+    assert entry["eligible"] is False
+    assert entry["reason"] == "controller_indeterminate"
+    assert entry["controller_evidence"] == "controller_indeterminate"
+    assert result["kept_reasons"] == {"controller_indeterminate": 1}
+    detail = entry["detail"]
+    assert "--retire" in detail
+    assert "--acknowledge-retirement" in detail
+    assert "t-238" in detail
+
+
+def test_unexpected_controller_probe_state_does_not_reclaim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "controller-busy"
+    _record(
+        tmp_path,
+        dispatch_id,
+        controller_pid=os.getpid(),
+        controller_session_id="controller-session",
+    )
+    _stub_controller_probe(monkeypatch, state="busy", session=None)
+
+    result = _run(tmp_path)
+    entry = result["entries"][0]
+
+    assert result["closed"] == 0
+    assert _read(dispatch_id)["state"] == "running"
+    assert entry["eligible"] is False
+    assert entry["reason"] == "controller_live_or_indeterminate"
+    assert entry["controller_evidence"] == "controller_beacon_error:unexpected_probe_state:busy"
+    assert result["kept_reasons"] == {"controller_live_or_indeterminate": 1}
+
+
+def test_reconcile_abandoned_text_print_includes_kept_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dispatch_id = "controller-unreadable-print"
+    _record(
+        tmp_path,
+        dispatch_id,
+        controller_pid=os.getpid(),
+        controller_session_id="controller-session",
+        controller_label="engine",
+    )
+    _stub_controller_probe(
+        monkeypatch,
+        state="unreadable",
+        session=None,
+        expected_label="engine",
+    )
+    queue_dir = tmp_path / "state" / "dispatch-queue"
+    queue_dir.mkdir(parents=True, exist_ok=True)
+
+    rc = D._cmd_reconcile_abandoned(
+        ["--queue-dir", str(queue_dir), "--stale-s", "0"]
+    )
+    captured = capsys.readouterr().out.strip()
+
+    assert rc == 0
+    assert captured.startswith("RECONCILE-ABANDONED ")
+    payload = json.loads(captured.split(" ", 1)[1])
+    assert payload["kept_reasons"] == {"controller_indeterminate": 1}
+    assert payload["would_close"] == 0
+    assert payload["kept"] == 1
+    assert "controller_indeterminate" in captured
+    assert _read(dispatch_id)["state"] == "running"
+
+
+def test_dead_controller_probe_still_reclaims(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "controller-dead"
+    _record(
+        tmp_path,
+        dispatch_id,
+        controller_pid=99999,
+        controller_session_id="controller-session",
+    )
+    _stub_controller_probe(monkeypatch, state="dead", session=None)
+
+    result = _run(tmp_path)
+    closed = _read(dispatch_id)
+
+    assert result["closed"] == 1
+    assert closed["state"] == "inconclusive_no_final"
+    assert closed["reason"] == "abandoned_without_verdict"
+    assert closed["outcome"]["reconciliation"]["controller_evidence"] == (
+        "controller_beacon_absent"
+    )
 
 
 def test_reconciliation_is_idempotent(tmp_path: Path) -> None:

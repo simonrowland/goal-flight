@@ -7239,6 +7239,21 @@ def _abandoned_lease_evidence(record: dict, capacity_state: dict) -> tuple[bool,
     return False, "lease_nonterminal:" + ",".join(sorted(states))
 
 
+def _abandoned_controller_indeterminate_unlock(record: dict) -> str:
+    raw_label = record.get("controller_label")
+    label = str(raw_label).strip() if isinstance(raw_label, str) else ""
+    retire = (
+        "python3 scripts/goalflight_session_status.py --retire "
+        + (shlex.quote(label) if label else "<label>")
+        + " --acknowledge-retirement"
+    )
+    return (
+        "controller registry unreadable; reclaim stays held. "
+        f"If the holder is dead, nonce-less {retire}; "
+        "if the journal is unreadable, repair it (t-238)."
+    )
+
+
 def _abandoned_controller_evidence(record: dict) -> tuple[bool, str]:
     session_id = record.get("controller_session_id")
     controller_pid = record.get("controller_pid")
@@ -7249,14 +7264,24 @@ def _abandoned_controller_evidence(record: dict) -> tuple[bool, str]:
     if not isinstance(project_root, str) or not project_root:
         return False, "controller_owner_project_indeterminate"
     try:
-        live = goalflight_session_status.live_session(
+        state, live = goalflight_session_status.probe_live_session(
             Path(project_root).expanduser(),
             label=str(controller_label) if controller_label else None,
         )
     except Exception as exc:
         return False, f"controller_beacon_error:{type(exc).__name__}"
-    if not isinstance(live, dict):
+    if state == "unreadable":
+        # A busy or lock-indeterminate registry is not "controller gone".
+        return False, "controller_indeterminate"
+    if state == "dead":
         return True, "controller_beacon_absent"
+    if state != "live":
+        # probe_live_session documents live|dead|unreadable only. Refuse to
+        # treat an unexpected state as proven absence (sibling kernel lookup
+        # raises; here the fail-closed arm is controller_beacon_error:).
+        return False, f"controller_beacon_error:unexpected_probe_state:{state}"
+    if not isinstance(live, dict):
+        return False, "controller_beacon_error:live_session_missing"
     if live.get("conflicting_beacons"):
         return False, "controller_beacon_conflict"
     if controller_label:
@@ -7331,12 +7356,19 @@ def _evaluate_abandoned_dispatch(
         }
     controller_inactive, controller_evidence = _abandoned_controller_evidence(record)
     if not controller_inactive:
-        return {
+        held = {
             **result,
             "eligible": False,
-            "reason": "controller_live_or_indeterminate",
+            "reason": (
+                "controller_indeterminate"
+                if controller_evidence == "controller_indeterminate"
+                else "controller_live_or_indeterminate"
+            ),
             "controller_evidence": controller_evidence,
         }
+        if controller_evidence == "controller_indeterminate":
+            held["detail"] = _abandoned_controller_indeterminate_unlock(record)
+        return held
     latest_progress_s, progress_fingerprint = _abandoned_progress_snapshot(record, status)
     if latest_progress_s is None:
         return {**result, "eligible": False, "reason": "progress_time_indeterminate"}
@@ -7676,6 +7708,7 @@ def _cmd_reconcile_abandoned(argv: list[str]) -> int:
                     "would_close": payload["would_close"],
                     "kept": payload["kept"],
                     "scanned": payload["scanned"],
+                    "kept_reasons": payload["kept_reasons"],
                 },
                 sort_keys=True,
             )
