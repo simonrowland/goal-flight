@@ -7,6 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
@@ -391,7 +393,20 @@ def test_recorded_terminal_success_marker() -> None:
     )
 
 
-def test_terminal_marker_dispatch_identity_poison_pairs() -> None:
+def test_terminal_marker_dispatch_identity_poison_pairs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The foreign-id rule is a ledger lookup (t-367): isolate the run ledger
+    # and record the genuinely-foreign dispatch FOR REAL so ``other-live-id``
+    # names a known foreign dispatch and its attention marker must not bind.
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "other-live-id",
+            "state": "running",
+        }
+    )
     expected = "wake-fold"
     assert_true(
         "exact dispatch marker is bound",
@@ -545,6 +560,88 @@ def test_terminal_marker_dispatch_identity_poison_pairs() -> None:
                 foreign, expected_dispatch_id=expected
             )
             is None,
+        )
+
+
+def test_attention_hyphenated_term_before_dash_binds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """t-367: a hyphenated technical term abutting the dash is prose, and the
+    escalation must BIND — only a ledger-known dispatch id is foreign.
+
+    The shape-only rule (hyphenated token + identity dash) DROPPED each of
+    the measured shapes below because a one-word hyphenated term is
+    indistinguishable from a foreign dispatch id without a lookup. The fix
+    treats a token as foreign only when a run-ledger record exists for it;
+    anything else — including an id-shaped token the ledger does not know,
+    and any ledger read failure — fails toward binding.
+    """
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    expected = "wake-fold"
+    measured_drop_shapes = (
+        "utf-8 — output is not decodable",
+        "read-only — cannot write sandbox path",
+        "pre-commit — hook refuses the chunk",
+        "file-not-found — input fixture missing",
+        "end-to-end — smoke run aborted",
+    )
+    for kind in goalflight_terminal.ATTENTION_MARKERS:
+        for text in measured_drop_shapes:
+            assert_true(
+                f"{kind} payload {text.split(' — ')[0]!r} is prose and binds",
+                goalflight_watch._terminal_marker_matches_dispatch(
+                    {"kind": kind, "text": text}, expected
+                ),
+            )
+        # Id-shaped but unknown to the ledger: the lookup cannot confirm a
+        # foreign dispatch, so the marker binds (fail toward binding).
+        assert_true(
+            f"ledger-unknown id-shaped {kind} still binds",
+            goalflight_watch._terminal_marker_matches_dispatch(
+                {"kind": kind, "text": "t999-never-dispatched — needs controller"},
+                expected,
+            ),
+        )
+        # Two-word hyphenated openings bound under the shape rule too;
+        # keep them green.
+        for text in (
+            "read-only sandbox — cannot write",
+            "pre-commit review — still running",
+        ):
+            assert_true(
+                f"{kind} payload {text.split(' — ')[0]!r} still binds",
+                goalflight_watch._terminal_marker_matches_dispatch(
+                    {"kind": kind, "text": text}, expected
+                ),
+            )
+
+    # A token WITH a real ledger record names a foreign dispatch: no bind.
+    goalflight_ledger.write_record(
+        {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "t998-sibling-worker",
+            "state": "running",
+        }
+    )
+    for kind in goalflight_terminal.ATTENTION_MARKERS:
+        assert_true(
+            f"ledger-known foreign {kind} does not bind",
+            not goalflight_watch._terminal_marker_matches_dispatch(
+                {"kind": kind, "text": "t998-sibling-worker — needs controller"},
+                expected,
+            ),
+        )
+
+    # Ledger unreachable (state dir does not exist): the failed lookup must
+    # bind, not silently classify every hyphenated token as foreign.
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "missing-state"))
+    for kind in goalflight_terminal.ATTENTION_MARKERS:
+        assert_true(
+            f"unreachable ledger still binds {kind}",
+            goalflight_watch._terminal_marker_matches_dispatch(
+                {"kind": kind, "text": "t998-sibling-worker — needs controller"},
+                expected,
+            ),
         )
 
 

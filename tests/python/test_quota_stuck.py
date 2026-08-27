@@ -908,6 +908,66 @@ def test_tail_quota_signature_preserves_float_mtime() -> None:
         assert_true("mtime keeps subsecond precision", abs(float(info["tail_mtime"]) - ts) < 0.01)
 
 
+def test_advisory_names_the_reset_horizon_or_says_it_is_unknown() -> None:
+    """An exhausted-quota advisory must not read as a cancelled account.
+
+    Controllers act on this text. Without a horizon they read "quota exhausted"
+    as terminal and route work off the provider permanently, when the usual
+    cause is a short rolling window on a live seat.
+    """
+    exhausted = quota.goalflight_dispatch_states.LIMIT_KIND_EXHAUSTED
+
+    # Horizon unknown: no worker reported a reset time.
+    unknown = quota.advisory_payload(
+        {
+            "provider": "kimi",
+            "scope": "account",
+            "stuck_worker_count": 2,
+            "stuck_workers": [
+                {"dispatch_id": "d1", "limit_kind": exhausted},
+                {"dispatch_id": "d2", "limit_kind": exhausted},
+            ],
+        }
+    )
+    text = unknown["text"]
+    assert_true("unknown horizon is stated as unknown", "UNKNOWN" in text)
+    assert_true("unknown horizon denies the account reading", "NOT the account" in text)
+    assert_true("unknown horizon names the short window", "hours" in text)
+    assert_true("unknown horizon names the longer cap", "days" in text)
+    assert_true("unknown horizon warns before rerouting", "Re-probe" in text)
+    assert_eq("reset_horizon is exposed structurally", unknown["reset_horizon"], text.split("; ", 1)[1].split(" - ", 1)[0])
+
+    # Horizon known: a single reported reset time is stated verbatim.
+    known = quota.advisory_payload(
+        {
+            "provider": "kimi",
+            "scope": "agent",
+            "stuck_worker_count": 1,
+            "stuck_workers": [
+                {"dispatch_id": "d1", "limit_kind": exhausted, "reset_at": "2026-08-27T23:00:00Z"},
+            ],
+        }
+    )
+    assert_true("known horizon names the reopen time", "window reopens 2026-08-27T23:00:00Z" in known["text"])
+    assert_true("known horizon does not claim unknown", "UNKNOWN" not in known["text"])
+
+    # Disagreeing horizons: report the earliest AND disclose the disagreement,
+    # rather than silently picking one.
+    split = quota.advisory_payload(
+        {
+            "provider": "kimi",
+            "scope": "agent",
+            "stuck_worker_count": 2,
+            "stuck_workers": [
+                {"dispatch_id": "d1", "limit_kind": exhausted, "reset_at": "2026-08-27T23:00:00Z"},
+                {"dispatch_id": "d2", "limit_kind": exhausted, "reset_at": "2026-08-28T06:00:00Z"},
+            ],
+        }
+    )
+    assert_true("split horizon reports the earliest", "2026-08-27T23:00:00Z" in split["text"])
+    assert_true("split horizon discloses disagreement", "2 distinct reset times" in split["text"])
+
+
 def main() -> None:
     tests = [
         test_tail_signature_classifies_exhausted_provider,
@@ -929,6 +989,7 @@ def main() -> None:
         test_draft_artifact_reconcile_requires_finality_before_complete,
         test_draft_artifact_rejects_paths_outside_project_root,
         test_tail_quota_signature_preserves_float_mtime,
+        test_advisory_names_the_reset_horizon_or_says_it_is_unknown,
     ]
     for test in tests:
         test()

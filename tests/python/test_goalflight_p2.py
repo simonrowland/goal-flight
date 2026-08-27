@@ -333,6 +333,61 @@ def _ledger_record(
     return json.loads(completed.stdout)
 
 
+def test_running_before_worker_claims_is_not_reported_as_a_lost_cas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that has not claimed RUNNING *yet* is a race, not a lost CAS.
+
+    Receipt (kiln, 2026-08-27): this branch reported the fabricated disposition
+    "cas_lost", which is the same code (exit 3) the genuine concurrent-writer
+    losses return. The caller could not tell "not yet" (retryable against the
+    worker's own startup) from "lost" (not retryable), treated it as fatal, and
+    reported a live worker as a failed launch. The worker went on to finish the
+    job five minutes later, unobserved.
+
+    The precondition here is real, not stubbed: a fresh dispatch is asked to
+    record `running` before anything has claimed RUNNING, which is exactly the
+    startup ordering that produced the receipt.
+    """
+    env = _set_state_env(monkeypatch, tmp_path)
+    project = tmp_path / "project"
+    project.mkdir(parents=True, exist_ok=True)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "goalflight_ledger.py"),
+            "record",
+            "--dispatch-id",
+            "not-yet-running",
+            "--agent",
+            "codex",
+            "--project-root",
+            str(project),
+            "--state",
+            "running",
+            "--json",
+        ],
+        cwd=project,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 3, completed.stdout or completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["ok"] is False
+    # The whole point: this must be distinguishable from a genuine CAS loss.
+    assert payload["disposition"] == "attempt_not_yet_running"
+    assert payload["disposition"] != "cas_lost"
+    assert payload["retryable"] is True
+    # And the error must tell a reader the worker may be alive, because the
+    # damage in the receipt was concluding the opposite.
+    assert "startup race" in payload["error"]
+    assert "may already be alive" in payload["error"]
+
+
 def test_terminal_state_and_outbox_rollback_together_on_sigkill(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
