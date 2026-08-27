@@ -53,7 +53,7 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -77,6 +77,15 @@ NON_CONTROLLER_ROLES = frozenset({"listener", "drainer", "mirror", "dashboard"})
 CONTROLLER_LOCK_READY_TIMEOUT_S = 3.0
 CONTROLLER_LOCK_STARTUP_GRACE_S = 5.0
 CONTROLLER_LOCK_POLL_S = 0.5
+# Nonce-less retirement requires renew_deadline_at to lag now by at least one
+# full journal lease horizon. DEFAULT_LEASE_HORIZON_S is the longest interval a
+# live holder is expected to go without renewing; requiring an extra full
+# horizon after that stored deadline is the margin that keeps a merely-overdue
+# live holder — or a clock skewed by up to one horizon — from qualifying as
+# proven-dead. A holder that is alive and renewing would have moved the
+# deadline forward well before this elapsed.
+DEAD_HOLDER_RETIRE_MARGIN_S = goalflight_journal.DEFAULT_LEASE_HORIZON_S
+DEAD_HOLDER_RELEASE_REASON = "retired-dead-holder"
 
 _EXPECTED_OPTIONAL_ERRORS = (
     ImportError,
@@ -1575,6 +1584,148 @@ def controller_roster_lines(roster: dict) -> list[str]:
     return lines
 
 
+def _stored_pid_principal(
+    lease: goalflight_journal.LeaseIdentity,
+) -> tuple[int, str] | None:
+    """Return the stored PID-backed principal, or None if the lease has none."""
+    principal = lease.principal if isinstance(lease.principal, dict) else {}
+    pid = principal.get("pid")
+    start_token = principal.get("start_token")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    token = str(start_token or "").strip()
+    if not token:
+        return None
+    return pid, token
+
+
+def _incumbent_nonce_refusal() -> dict:
+    return {
+        "retired": False,
+        "reason": "retirer_not_incumbent",
+        "message": "retirement requires the active lease nonce",
+    }
+
+
+def _renew_deadline_expired_for_dead_holder(
+    lease: goalflight_journal.LeaseIdentity,
+    *,
+    now: datetime | None = None,
+) -> tuple[bool, datetime | None]:
+    deadline = _parse_utc(lease.renew_deadline_at)
+    if deadline is None:
+        return False, None
+    measured_now = now or datetime.now(timezone.utc)
+    if measured_now.tzinfo is None:
+        measured_now = measured_now.replace(tzinfo=timezone.utc)
+    expired = measured_now.astimezone(timezone.utc) >= (
+        deadline + timedelta(seconds=DEAD_HOLDER_RETIRE_MARGIN_S)
+    )
+    return expired, deadline
+
+
+def _dead_holder_retirement_gate(
+    lease: goalflight_journal.LeaseIdentity,
+    project_root: Path,
+    *,
+    label: str,
+    ledger_records: list[dict] | None,
+) -> dict | None:
+    """Return a refusal, or None when nonce-less retirement is proven.
+
+    Generation-lock state may be unknown or unreadable; that is the case this
+    path exists for. Death is proven from the stored PID-backed principal, the
+    renew deadline, and a measured-zero owned-dispatch count — never from an
+    indeterminate probe.
+    """
+    stored = _stored_pid_principal(lease)
+    if stored is None:
+        return {
+            "retired": False,
+            "reason": "missing_stored_principal",
+            "message": (
+                "nonce-less retirement requires a stored PID-backed principal "
+                "(pid + start_token); this lease has none. Repair the journal "
+                "manually (t-238) or retire with the active lease nonce."
+            ),
+        }
+    pid, _start_token = stored
+    liveness = goalflight_compat.pid_liveness(pid)
+    if liveness is None:
+        return {
+            "retired": False,
+            "reason": "holder_liveness_indeterminate",
+            "message": (
+                f"stored principal pid {pid} liveness is indeterminate; "
+                "the probe could not find out whether the holder is dead. "
+                "Confirmed death is pid_liveness(...) is False; an "
+                "EPERM/unavailable probe is not death."
+            ),
+            "controller_pid": pid,
+        }
+    if liveness is True:
+        return _incumbent_nonce_refusal()
+    live_state, _session = probe_live_session(project_root, label=label)
+    if live_state == "live":
+        return _incumbent_nonce_refusal()
+    expired, deadline = _renew_deadline_expired_for_dead_holder(lease)
+    if deadline is None:
+        return {
+            "retired": False,
+            "reason": "renew_deadline_unreadable",
+            "message": (
+                "stored renew_deadline_at is missing or unparseable; "
+                "nonce-less retirement cannot prove the deadline is past "
+                f"one full lease horizon ({int(DEAD_HOLDER_RETIRE_MARGIN_S)}s). "
+                "Repair the journal manually (t-238) or retire with the "
+                "active lease nonce."
+            ),
+            "renew_deadline_at": lease.renew_deadline_at,
+            "required_margin_s": DEAD_HOLDER_RETIRE_MARGIN_S,
+        }
+    if not expired:
+        return {
+            "retired": False,
+            "reason": "renew_deadline_not_past_horizon",
+            "message": (
+                f"stored renew_deadline_at {deadline.isoformat()} is not past "
+                f"by one full lease horizon ({int(DEAD_HOLDER_RETIRE_MARGIN_S)}s). "
+                "Nonce-less retirement needs that margin so a merely-overdue "
+                "or clock-skewed live holder cannot qualify."
+            ),
+            "renew_deadline_at": lease.renew_deadline_at,
+            "required_margin_s": DEAD_HOLDER_RETIRE_MARGIN_S,
+        }
+    owned, owned_error = _nonterminal_owned_dispatches(
+        goalflight_task.resolve_project_root(str(project_root)),
+        records=ledger_records,
+    )
+    if owned is None:
+        return {
+            "retired": False,
+            "reason": "owned_dispatches_unmeasured",
+            "message": (
+                "nonterminal owned dispatches could not be measured "
+                f"({owned_error}); unknown is not zero. Fix the ledger read "
+                "and retry, or retire with the active lease nonce."
+            ),
+            "owned_dispatch_measurement_error": owned_error,
+        }
+    owned_dispatches = owned.get(label, [])
+    if owned_dispatches:
+        return {
+            "retired": False,
+            "reason": "dead_holder_owns_nonterminal_dispatches",
+            "message": (
+                f"the lease still owns {len(owned_dispatches)} nonterminal "
+                "dispatch(es); nonce-less retirement requires zero. Reap or "
+                "rehome those dispatches, then retry."
+            ),
+            "nonterminal_owned_dispatches": owned_dispatches,
+        }
+    return None
+
+
 def retire_controller(
     project_root: Path,
     name: str,
@@ -1595,44 +1746,75 @@ def retire_controller(
         authority = goalflight_journal.Journal(project_root)
     except (
         goalflight_journal.JournalBusy,
-        goalflight_journal.JournalDisappeared,
         goalflight_journal.JournalIOError,
-    ):
+    ) as exc:
+        return {
+            "retired": False,
+            "reason": "registry_unreadable",
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
+    except goalflight_journal.JournalDisappeared:
         return {"retired": False, "reason": "controller_not_registered"}
     lease = authority.active_lease(label)
     if lease is None:
         return {"retired": False, "reason": "controller_not_registered"}
     resolved_nonce = str(session_id or "")
-    if not resolved_nonce or resolved_nonce != lease.nonce:
+    nonce_matches = bool(resolved_nonce) and resolved_nonce == lease.nonce
+    if nonce_matches:
+        if pid is not None:
+            measured = _controller_process_identity(pid)
+            expected = lease.principal
+            if (
+                measured is None
+                or expected.get("pid") != pid
+                or expected.get("start_token") != measured.get("start_token")
+                or (process_identity is not None and process_identity != measured)
+            ):
+                return {"retired": False, "reason": "retirer_not_incumbent"}
+        owned, owned_error = _nonterminal_owned_dispatches(
+            goalflight_task.resolve_project_root(str(project_root)),
+            records=ledger_records,
+        )
+        owned_dispatches = owned.get(label, []) if owned is not None else []
+        if (owned_dispatches or owned_error) and not acknowledge:
+            return {
+                "retired": False,
+                "reason": "retirement_requires_acknowledgement",
+                "acknowledgement_flag": "--acknowledge-retirement",
+                "nonterminal_owned_dispatches": owned_dispatches,
+                "owned_dispatch_measurement_error": owned_error,
+            }
+        result = authority.release_lease(label, nonce=lease.nonce, reason="retired")
+        if not result.committed or result.value is None:
+            return {
+                "retired": False,
+                "reason": "retirement_cas_lost",
+                "message": result.reason,
+            }
+        ended = result.value
+        _publish_lease_generation_event(project_root, ended, only_if_present=True)
         return {
-            "retired": False,
-            "reason": "retirer_not_incumbent",
-            "message": "retirement requires the active lease nonce",
+            "retired": True,
+            "label": label,
+            "generation": ended.generation,
+            "retired_at": _now_iso(),
+            "acknowledged": bool(owned_dispatches or owned_error),
         }
-    if pid is not None:
-        measured = _controller_process_identity(pid)
-        expected = lease.principal
-        if (
-            measured is None
-            or expected.get("pid") != pid
-            or expected.get("start_token") != measured.get("start_token")
-            or (process_identity is not None and process_identity != measured)
-        ):
-            return {"retired": False, "reason": "retirer_not_incumbent"}
-    owned, owned_error = _nonterminal_owned_dispatches(
-        goalflight_task.resolve_project_root(str(project_root)),
-        records=ledger_records,
+
+    refusal = _dead_holder_retirement_gate(
+        lease,
+        project_root,
+        label=label,
+        ledger_records=ledger_records,
     )
-    owned_dispatches = owned.get(label, []) if owned is not None else []
-    if (owned_dispatches or owned_error) and not acknowledge:
-        return {
-            "retired": False,
-            "reason": "retirement_requires_acknowledgement",
-            "acknowledgement_flag": "--acknowledge-retirement",
-            "nonterminal_owned_dispatches": owned_dispatches,
-            "owned_dispatch_measurement_error": owned_error,
-        }
-    result = authority.release_lease(label, nonce=lease.nonce, reason="retired")
+    if refusal is not None:
+        return refusal
+    result = authority.release_lease(
+        label,
+        nonce=lease.nonce,
+        reason=DEAD_HOLDER_RELEASE_REASON,
+    )
     if not result.committed or result.value is None:
         return {
             "retired": False,
@@ -1646,23 +1828,30 @@ def retire_controller(
         "label": label,
         "generation": ended.generation,
         "retired_at": _now_iso(),
-        "acknowledged": bool(owned_dispatches or owned_error),
+        "acknowledged": False,
+        "release_reason": DEAD_HOLDER_RELEASE_REASON,
     }
 
 
-def release_session(project_root: Path, *, pid: int) -> bool:
+def release_session(project_root: Path, *, pid: int) -> dict:
     """Release the active lease owned by this exact process generation."""
     try:
         authority = goalflight_journal.Journal(project_root)
     except (
         goalflight_journal.JournalBusy,
-        goalflight_journal.JournalDisappeared,
         goalflight_journal.JournalIOError,
-    ):
-        return False
+    ) as exc:
+        return {
+            "released": False,
+            "reason": "registry_unreadable",
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
+    except goalflight_journal.JournalDisappeared:
+        return {"released": False, "reason": "controller_not_registered"}
     measured = _controller_process_identity(pid)
     if measured is None:
-        return False
+        return {"released": False}
     for row in authority.lease_records():
         principal = json.loads(str(row.get("principal_json") or "{}"))
         if principal.get("pid") != pid or principal.get("start_token") != measured.get("start_token"):
@@ -1678,8 +1867,8 @@ def release_session(project_root: Path, *, pid: int) -> bool:
                 released.value,
                 only_if_present=True,
             )
-        return released.committed
-    return False
+        return {"released": bool(released.committed)}
+    return {"released": False}
 
 
 def ensure_session(project_root: Path, *, pid: int | None = None) -> dict:
@@ -2725,9 +2914,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.release_session:
-        removed = release_session(project_root, pid=args.session_pid or os.getpid())
-        print(json.dumps({"released": removed}))
-        return 0 if removed else 1
+        result = release_session(project_root, pid=args.session_pid or os.getpid())
+        print(json.dumps(result))
+        return 0 if result.get("released") else 1
 
     if args.claim:
         if not args.queue:

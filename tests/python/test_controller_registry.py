@@ -5,10 +5,12 @@ from __future__ import annotations
 
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+import errno
 import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -31,6 +33,7 @@ def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
         "GOALFLIGHT_MESSAGES_DIR": tmp_path / "messages",
         "GOALFLIGHT_STATE_DIR": tmp_path / "state",
         "GOALFLIGHT_WAKE_LEDGER_DIR": tmp_path / "wake-ledger",
+        "GOALFLIGHT_PIDFILE_DIR": tmp_path / "pidfiles",
         "GOAL_FLIGHT_PIDFILE_DIR": tmp_path / "pidfiles",
     }.items():
         monkeypatch.setenv(key, str(value))
@@ -132,7 +135,10 @@ def test_retirement_releases_lease_without_legacy_mail_cursor_artifacts(
         ledger_records=[],
     )
     assert result["retired"] is True
+    assert "release_reason" not in result
     assert journal.Journal(root).active_lease("engine") is None
+    ended = journal.Journal(root).lease_records(include_ended=True)
+    assert ended[0]["ended_reason"] == "retired"
     messages_dir = Path(os.environ["GOALFLIGHT_MESSAGES_DIR"] )
     assert not (messages_dir / ".read-cursor.json").exists()
     assert not (messages_dir / ".ack-cursor.json").exists()
@@ -279,3 +285,345 @@ def test_list_controllers_dead_lock_stays_dead_when_deadline_elapsed(
     assert "dead-lock" in text
     assert "live-overdue" not in text
     assert "renew" not in text
+
+
+def _reaped_principal() -> dict:
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    identity = sessions.goalflight_compat.process_start_identity(proc.pid)
+    assert identity is not None
+    proc.kill()
+    proc.wait(timeout=5)
+    assert sessions.goalflight_compat.pid_liveness(proc.pid) is False
+    return {"pid": int(identity["pid"]), "start_token": str(identity["start_token"])}
+
+
+def _live_principal() -> dict:
+    pid = os.getpid()
+    identity = sessions.goalflight_compat.process_start_identity(pid)
+    assert identity is not None
+    assert sessions.goalflight_compat.pid_liveness(pid) is True
+    return {"pid": pid, "start_token": str(identity["start_token"])}
+
+
+def _claim_lease(root: Path, label: str, principal: dict, nonce: str):
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        label,
+        principal=principal,
+        nonce=nonce,
+    )
+    assert claimed.committed and claimed.value is not None
+    return claimed.value
+
+
+def _expire_past_dead_holder_margin(root: Path, label: str) -> str:
+    past = datetime.now(timezone.utc) - timedelta(
+        seconds=journal.DEFAULT_LEASE_HORIZON_S + 60
+    )
+    return _set_renew_deadline(root, label, past)
+
+
+def _make_generation_lock_unreadable(root: Path, label: str, nonce: str) -> Path:
+    path = wake._generation_lock_path(
+        root,
+        kind=wake.LEASE_KIND,
+        label=wake._lease_lock_identity(label, nonce),
+        generation_key=nonce,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+    path.chmod(0o000)
+    assert (
+        wake.lease_holder_alive(root, controller_label=label, lease_nonce=nonce)
+        is None
+    )
+    return path
+
+
+def _owned_running_record(root: Path, label: str, dispatch_id: str) -> dict:
+    resolved = sessions.goalflight_task.resolve_project_root(str(root))
+    return {
+        "controller_label": label,
+        "project_root": str(resolved.resolve()),
+        "dispatch_id": dispatch_id,
+        "state": "running",
+    }
+
+
+def test_dead_holder_unreadable_lock_retires_without_nonce(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _isolate(monkeypatch, tmp_path)
+    lease = _claim_lease(root, "engine", _reaped_principal(), "engine-nonce")
+    _expire_past_dead_holder_margin(root, "engine")
+    lock_path = _make_generation_lock_unreadable(root, "engine", lease.nonce)
+    try:
+        result = sessions.retire_controller(
+            root,
+            "engine",
+            acknowledge=True,
+            ledger_records=[],
+        )
+        assert result["retired"] is True
+        from goalflight_dispatch import _kernel_live_controller_sessions
+
+        # RETIRED rows must drop out of the ACTIVE scan so this still-unreadable
+        # lock cannot poison kernel lookup. include_ended would fail this pin.
+        lookup = _kernel_live_controller_sessions(root)
+        assert lookup.sessions is not None
+        assert isinstance(lookup.sessions, list)
+        assert lookup.unreadable_reason is None
+    finally:
+        lock_path.chmod(0o600)
+    assert result["release_reason"] == "retired-dead-holder"
+    ended = journal.Journal(root).lease_records(include_ended=True)
+    assert len(ended) == 1
+    assert ended[0]["state"] == "RETIRED"
+    assert ended[0]["ended_reason"] == "retired-dead-holder"
+    assert journal.Journal(root).active_lease("engine") is None
+
+
+def test_dead_holder_inside_horizon_refuses_nonce_less_retirement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _isolate(monkeypatch, tmp_path)
+    lease = _claim_lease(root, "engine", _reaped_principal(), "engine-nonce")
+    lock_path = _make_generation_lock_unreadable(root, "engine", lease.nonce)
+    try:
+        result = sessions.retire_controller(
+            root,
+            "engine",
+            acknowledge=True,
+            ledger_records=[],
+        )
+    finally:
+        lock_path.chmod(0o600)
+    assert result["retired"] is False
+    assert result["reason"] == "renew_deadline_not_past_horizon"
+    assert journal.Journal(root).active_lease("engine") is not None
+
+
+def test_indeterminate_principal_refuses_nonce_less_retirement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _isolate(monkeypatch, tmp_path)
+    principal = _live_principal()
+    lease = _claim_lease(root, "engine", principal, "engine-nonce")
+    _expire_past_dead_holder_margin(root, "engine")
+    stored_pid = int(principal["pid"])
+    original_kill = sessions.goalflight_compat.os.kill
+
+    def eperm_kill(pid, sig):
+        if pid == stored_pid:
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+        return original_kill(pid, sig)
+
+    monkeypatch.setattr(sessions.goalflight_compat.os, "kill", eperm_kill)
+    assert sessions.goalflight_compat.pid_liveness(stored_pid) is None
+    result = sessions.retire_controller(
+        root,
+        "engine",
+        acknowledge=True,
+        ledger_records=[],
+    )
+    assert result["retired"] is False
+    assert result["reason"] == "holder_liveness_indeterminate"
+    message = str(result["message"])
+    assert "indeterminate" in message
+    assert "could not find out" in message
+    assert journal.Journal(root).active_lease("engine") is not None
+    assert journal.Journal(root).active_lease("engine").nonce == lease.nonce
+
+
+def test_dead_holder_with_owned_dispatch_refuses_nonce_less_retirement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _isolate(monkeypatch, tmp_path)
+    lease = _claim_lease(root, "engine", _reaped_principal(), "engine-nonce")
+    _expire_past_dead_holder_margin(root, "engine")
+    lock_path = _make_generation_lock_unreadable(root, "engine", lease.nonce)
+    try:
+        result = sessions.retire_controller(
+            root,
+            "engine",
+            acknowledge=True,
+            ledger_records=[_owned_running_record(root, "engine", "still-running")],
+        )
+    finally:
+        lock_path.chmod(0o600)
+    assert result["retired"] is False
+    assert result["reason"] == "dead_holder_owns_nonterminal_dispatches"
+    assert result["nonterminal_owned_dispatches"][0]["dispatch_id"] == "still-running"
+    assert journal.Journal(root).active_lease("engine") is not None
+
+
+def test_live_principal_without_nonce_refuses_exactly_as_today(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _isolate(monkeypatch, tmp_path)
+    lease = _claim_lease(root, "engine", _live_principal(), "engine-nonce")
+    result = sessions.retire_controller(
+        root,
+        "engine",
+        acknowledge=True,
+        ledger_records=[],
+    )
+    assert result == {
+        "retired": False,
+        "reason": "retirer_not_incumbent",
+        "message": "retirement requires the active lease nonce",
+    }
+    assert journal.Journal(root).active_lease("engine").nonce == lease.nonce
+
+
+def test_missing_stored_principal_refuses_toward_manual_repair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _isolate(monkeypatch, tmp_path)
+    lease = _claim_lease(
+        root,
+        "engine",
+        {"principal_id": "no-pid-principal"},
+        "engine-nonce",
+    )
+    _expire_past_dead_holder_margin(root, "engine")
+    result = sessions.retire_controller(
+        root,
+        "engine",
+        acknowledge=True,
+        ledger_records=[],
+    )
+    assert result["retired"] is False
+    assert result["reason"] == "missing_stored_principal"
+    message = str(result["message"]).lower()
+    assert "manual" in message
+    assert "t-238" in message
+    assert journal.Journal(root).active_lease("engine").nonce == lease.nonce
+
+
+def _raise_journal_init(error: Exception):
+    def _init(self, *args, **kwargs):
+        raise error
+
+    return _init
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        journal.JournalBusy("journal busy"),
+        journal.JournalIOError("journal io"),
+    ),
+)
+def test_retire_and_release_busy_or_io_is_unreadable_not_unregistered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
+) -> None:
+    root = _isolate(monkeypatch, tmp_path)
+    _claim_lease(root, "engine", _reaped_principal(), "engine-nonce")
+    monkeypatch.setattr(
+        sessions.goalflight_journal.Journal, "__init__", _raise_journal_init(error)
+    )
+    retired = sessions.retire_controller(
+        root,
+        "engine",
+        acknowledge=True,
+        ledger_records=[],
+    )
+    assert retired["retired"] is False
+    assert retired["reason"] == "registry_unreadable"
+    assert retired["error_type"] == type(error).__name__
+    assert retired["message"]
+    released = sessions.release_session(root, pid=os.getpid())
+    assert released["released"] is False
+    assert released["reason"] == "registry_unreadable"
+    assert released["error_type"] == type(error).__name__
+    assert released["message"]
+
+
+def test_retire_and_release_disappeared_journal_is_not_registered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _isolate(monkeypatch, tmp_path)
+    _claim_lease(root, "engine", _reaped_principal(), "engine-nonce")
+    monkeypatch.setattr(
+        sessions.goalflight_journal.Journal,
+        "__init__",
+        _raise_journal_init(journal.JournalDisappeared("journal disappeared")),
+    )
+    retired = sessions.retire_controller(
+        root,
+        "engine",
+        acknowledge=True,
+        ledger_records=[],
+    )
+    assert retired == {"retired": False, "reason": "controller_not_registered"}
+    released = sessions.release_session(root, pid=os.getpid())
+    assert released == {"released": False, "reason": "controller_not_registered"}
+
+
+def test_unmeasured_owned_dispatches_refuse_nonce_less_retirement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _isolate(monkeypatch, tmp_path)
+    lease = _claim_lease(root, "engine", _reaped_principal(), "engine-nonce")
+    _expire_past_dead_holder_margin(root, "engine")
+    lock_path = _make_generation_lock_unreadable(root, "engine", lease.nonce)
+    monkeypatch.setattr(
+        sessions,
+        "_nonterminal_owned_dispatches",
+        lambda *args, **kwargs: (None, "OSError"),
+    )
+    try:
+        result = sessions.retire_controller(
+            root,
+            "engine",
+            acknowledge=True,
+            ledger_records=[],
+        )
+    finally:
+        lock_path.chmod(0o600)
+    assert result["retired"] is False
+    assert result["reason"] == "owned_dispatches_unmeasured"
+    assert result["owned_dispatch_measurement_error"] == "OSError"
+    message = str(result["message"]).lower()
+    assert "unknown is not zero" in message
+    assert journal.Journal(root).active_lease("engine") is not None
+
+
+def test_missing_renew_deadline_refuses_toward_manual_repair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _isolate(monkeypatch, tmp_path)
+    lease = _claim_lease(root, "engine", _reaped_principal(), "engine-nonce")
+    authority = journal.Journal(root)
+    updated = authority.write(
+        journal.RowOperation.update(
+            "controller_leases",
+            {"renew_deadline_at": ""},
+            where={
+                "project_root": str(authority.project_root),
+                "label": "engine",
+                "generation": lease.generation,
+            },
+            row_cap=1,
+            expected_rows=1,
+        )
+    )
+    assert updated.committed
+    result = sessions.retire_controller(
+        root,
+        "engine",
+        acknowledge=True,
+        ledger_records=[],
+    )
+    assert result["retired"] is False
+    assert result["reason"] == "renew_deadline_unreadable"
+    message = str(result["message"]).lower()
+    assert "t-238" in message
+    assert "manual" in message
+    assert "wait" not in message
+    assert journal.Journal(root).active_lease("engine").nonce == lease.nonce
