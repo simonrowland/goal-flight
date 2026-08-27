@@ -619,6 +619,46 @@ def advisory_key(entry: dict) -> str:
     return f"{entry.get('budget_key') or entry.get('provider')}:{entry.get('stuck_worker_count', 0)}:{ids}"
 
 
+def reset_horizon_clause(entry: dict) -> str:
+    """Name WHICH metering window closed, or say plainly that we cannot tell.
+
+    A bare "quota exhausted" is read by controllers as a dead or cancelled
+    account, and they stop routing work to the provider entirely. The
+    underlying fact is much weaker: one metering window closed. Providers here
+    meter on at least two horizons at once -- a short rolling window measured in
+    hours, and a longer token cap measured in days -- so a seat that reports
+    "exhausted" is routinely a live subscription whose short window will reopen
+    shortly. The tail we classify from usually names neither horizon.
+
+    Reporting the horizon as UNKNOWN, and naming both possibilities, is the
+    difference between a controller waiting out a window and a controller
+    writing off a vendor whose seat is still valid. Same three-state rule the
+    rest of this codebase follows: "I could not determine the horizon" must not
+    render as a determination.
+    """
+    resets = sorted(
+        {
+            str(item.get("reset_at")).strip()
+            for item in entry.get("stuck_workers") or []
+            if str(item.get("reset_at") or "").strip()
+        }
+    )
+    if not resets and str(entry.get("reset_at") or "").strip():
+        resets = [str(entry["reset_at"]).strip()]
+    if len(resets) == 1:
+        return f"window reopens {resets[0]}"
+    if resets:
+        return (
+            f"earliest window reopens {resets[0]} "
+            f"({len(resets)} distinct reset times across the stuck workers)"
+        )
+    return (
+        "reset time UNKNOWN -- a metering window closed, NOT the account: this "
+        "may be the short rolling window (hours) or the longer token cap (days). "
+        "Re-probe before routing work off this provider"
+    )
+
+
 def advisory_payload(entry: dict) -> dict[str, Any]:
     provider = entry.get("provider") or entry.get("budget_key") or "unknown"
     count = int(entry.get("stuck_worker_count") or 0)
@@ -632,16 +672,17 @@ def advisory_payload(entry: dict) -> dict[str, Any]:
         if kinds == {goalflight_dispatch_states.LIMIT_KIND_EXHAUSTED}
         else "provider limit unresolved"
     )
+    horizon = reset_horizon_clause(entry)
     # Account scope is never held by capacity; do not claim a hold there.
     if entry.get("scope") == "account":
         text = (
-            f"{provider} {condition}: {count} agent(s) stuck "
+            f"{provider} {condition}: {count} agent(s) stuck; {horizon} "
             "- re-dispatch their tasks; advisory only, no automated consumer "
             "(capacity does not hold this lane)"
         )
     else:
         text = (
-            f"{provider} {condition}: {count} agent(s) stuck "
+            f"{provider} {condition}: {count} agent(s) stuck; {horizon} "
             "- re-dispatch their tasks; holding new provider dispatch"
         )
     return {
@@ -652,6 +693,7 @@ def advisory_payload(entry: dict) -> dict[str, Any]:
         "stuck_worker_count": count,
         "stuck_workers": entry.get("stuck_workers") or [],
         "labels": entry.get("labels") or [],
+        "reset_horizon": horizon,
         "advisory_key": advisory_key(entry),
     }
 
