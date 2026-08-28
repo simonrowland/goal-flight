@@ -2723,6 +2723,13 @@ def test_reconcile_projects_wake_before_slow_failing_history_mutation_pair(
         ),
         encoding="utf-8",
     )
+    # The sidecar-terminal gate holds a first terminal write unless the
+    # recorded worker identity is provably dead, so this ordering scenario
+    # carries a dead pid: process_identity(1_000_000_001) must be absent.
+    dead_pid = 1_000_000_001
+    assert ledger.process_identity(dead_pid) is None, (
+        "precondition failed: dead-pid constant unexpectedly has a live process"
+    )
     ledger.write_record(
         {
             "schema": ledger.SCHEMA,
@@ -2730,6 +2737,7 @@ def test_reconcile_projects_wake_before_slow_failing_history_mutation_pair(
             "project_root": str(project),
             "state": "running",
             "status_path": str(status_path),
+            "worker_pid": dead_pid,
         }
     )
 

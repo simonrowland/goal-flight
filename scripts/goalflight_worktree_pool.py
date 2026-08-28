@@ -8,27 +8,33 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 from typing import TextIO
 
 
 WORKTREE_SEATS_ENV = "GOALFLIGHT_WORKTREE_SEATS"
 WORKTREE_LOCK_FD_ENV = "GOALFLIGHT_WORKTREE_LOCK_FD"
-# Seats bound how many worktrees EXIST, not how much work may run: seats are
-# reused, so N seats sustains N CONCURRENT workers per project indefinitely
-# rather than N total dispatches. 4 was therefore acting as a de-facto
-# per-controller worker cap, which was never intended -- several controllers
-# share one project root (battery-tool-v2 currently has five), so four seats
-# starved the whole project between them.
+# Per-repository checkout ceiling, NOT a per-controller worker cap. There is no
+# such cap in this codebase and none is wanted. The old default of 4 became a
+# de-facto fan-out limit and pushed every extra dispatch onto ad-hoc
+# `git worktree add`, which is how the bypass (SC-06) became the main road:
+# 358 worktrees fleet-wide, 210 of one repo's 211 ad-hoc, 202GB, and a machine
+# at 100% disk. Seats are REUSED, so N seats sustains N CONCURRENT workers per
+# project indefinitely rather than N total dispatches. Several controllers
+# share one project root, so four seats starved the whole project between them.
 #
 # Derivation. The binding constraints are RAM and the machine concurrency cap,
-# not disk: a seat is one git worktree, and the checkout is ~40MB here, so 24
-# seats is under 1GB per project. The machine cap is 120 concurrent workers
-# across ~5 active projects, i.e. ~24 per project if every project ran flat out
-# simultaneously -- which is the number that stops seats from binding before
-# the real capacity gate does. Sanity check: today's busiest project ran ~12
-# concurrent workers, so 24 leaves 2x headroom and still cannot, by itself,
-# reach the 120 machine cap.
+# not disk: a seat is one git worktree, ~40MB of checkout here, so 24 seats is
+# under 1GB per project. The machine cap is 120 concurrent workers across ~5
+# active projects, i.e. ~24 per project if every project ran flat out at once --
+# the point where seats stop binding before the real capacity gate does. Sanity
+# check: the busiest project observed ~12 concurrent workers, so 24 leaves 2x
+# headroom and still cannot, alone, reach the 120 machine cap.
+#
+# Raise via GOALFLIGHT_WORKTREE_SEATS when one repo needs more concurrent seats.
+# NEVER lower this default to "shape" concurrency -- that is what made 4 behave
+# as a worker cap.
 DEFAULT_WORKTREE_SEATS = 24
 WORKTREE_SEAT_PREFIX = "wt-"
 QUARANTINE_REF_PREFIX = "goalflight/quarantine"
@@ -112,6 +118,133 @@ def inherited_worktree_lock_fds() -> tuple[int, ...]:
             f"{WORKTREE_LOCK_FD_ENV} does not name an open descriptor: {raw!r}"
         ) from exc
     return (fd,)
+
+
+def pass_worktree_lock_fds(env: dict[str, str] | None = None) -> tuple[int, ...]:
+    """Descriptors a child must inherit to keep holding this process's seat.
+
+    ``inherited_worktree_lock_fds`` reads this process's ``os.environ``. A
+    parent that acquired a *new* seat puts the fd in the child env dict
+    without exporting it on itself; that fd still has to be in ``pass_fds``
+    or the helper exec closes it and the seat frees while the worker runs.
+    """
+    fds: list[int] = []
+    seen: set[int] = set()
+    for fd in inherited_worktree_lock_fds():
+        if fd not in seen:
+            fds.append(fd)
+            seen.add(fd)
+    raw = ""
+    if env is not None:
+        raw = str(env.get(WORKTREE_LOCK_FD_ENV) or "").strip()
+    if not raw:
+        return tuple(fds)
+    try:
+        fd = int(raw)
+        os.fstat(fd)
+    except (ValueError, OSError):
+        return tuple(fds)
+    if fd not in seen:
+        fds.append(fd)
+    return tuple(fds)
+
+
+def pool_seat_name(path: str | Path) -> str | None:
+    """Return ``wt-N`` when the basename matches the seat naming pattern.
+
+    A matching name is necessary but not sufficient for a maintained seat.
+    Ad-hoc worktrees can be named ``wt-5``; ask ``registered_pool_seat_verdict``.
+    """
+    name = Path(path).name
+    if not name.startswith(WORKTREE_SEAT_PREFIX):
+        return None
+    rest = name[len(WORKTREE_SEAT_PREFIX) :]
+    if rest.isdigit() and int(rest) >= 1:
+        return name
+    return None
+
+
+def is_pool_seat_path(path: str | Path) -> bool:
+    """True when the basename looks like ``wt-N``. Not a registration check."""
+    return pool_seat_name(path) is not None
+
+
+def registered_pool_seat_verdict(
+    path: str | Path,
+    *,
+    project_root: Path,
+) -> tuple[str, str]:
+    """Ask the pool whether ``path`` is a registered seat.
+
+    Returns ``("yes"|"no"|"unknown", reason)``. Name is irrelevant unless the
+    path is the managed seat path ``<project>/worktrees/wt-N`` for a configured
+    slot *and* the matching lock file exists. A missing lock is "not
+    registered" (de-registered and ad-hoc trees are litter). If registration
+    cannot be determined, the verdict is unknown so a deleter retains.
+    """
+    try:
+        root = project_root.resolve()
+    except OSError as exc:
+        return "unknown", f"project root unresolvable ({exc})"
+    try:
+        resolved = Path(path).resolve()
+    except OSError as exc:
+        return "unknown", f"worktree path unresolvable ({exc})"
+
+    managed_root = root / "worktrees"
+    try:
+        managed_root = managed_root.resolve()
+    except OSError as exc:
+        return "unknown", f"managed worktree root unresolvable ({exc})"
+
+    try:
+        if resolved.parent != managed_root:
+            return (
+                "no",
+                f"{resolved} is not under the managed seat root {managed_root}",
+            )
+    except OSError as exc:
+        return "unknown", f"managed seat path could not be compared ({exc})"
+
+    seat_name = pool_seat_name(resolved)
+    if seat_name is None:
+        return "no", f"{resolved.name} is not a pool seat name"
+
+    try:
+        seat_limit = configured_worktree_seats()
+    except WorktreeSeatError as exc:
+        return "unknown", f"seat configuration unreadable ({exc})"
+
+    slot = int(seat_name[len(WORKTREE_SEAT_PREFIX) :])
+    if slot > seat_limit:
+        return (
+            "no",
+            f"{seat_name} is outside the configured seat range 1..{seat_limit}",
+        )
+
+    try:
+        lock_root = _git_common_dir(root) / "goalflight-worktree-seat-locks"
+    except WorktreeSeatError as exc:
+        return "unknown", f"seat lock directory unreadable ({exc})"
+
+    lock_path = lock_root / f"{seat_name}.lock"
+    try:
+        if lock_root.is_symlink():
+            return "unknown", f"seat lock root is a symlink ({lock_root})"
+        st = os.lstat(lock_path)
+    except FileNotFoundError:
+        return (
+            "no",
+            f"no seat lock for {seat_name}; path is not a registered pool seat",
+        )
+    except OSError as exc:
+        return "unknown", f"seat lock unreadable for {seat_name} ({exc})"
+
+    if stat.S_ISLNK(st.st_mode):
+        return "unknown", f"seat lock is a symlink ({lock_path})"
+    if not stat.S_ISREG(st.st_mode):
+        return "unknown", f"seat lock is not a regular file ({lock_path})"
+    return "yes", f"registered pool seat {seat_name}"
 
 
 def _git(

@@ -322,6 +322,73 @@ def test_parent_release_keeps_inherited_worker_lease_until_worker_dies() -> None
                 proc.wait(timeout=10)
 
 
+def test_default_seat_count_is_not_a_per_controller_cap() -> None:
+    assert_true(
+        "default is the documented checkout ceiling",
+        goalflight_worktree_pool.DEFAULT_WORKTREE_SEATS == 24,
+    )
+    assert_true(
+        "wt-1 basename matches the seat name pattern",
+        goalflight_worktree_pool.is_pool_seat_path("/repo/worktrees/wt-1"),
+    )
+    assert_true(
+        "ad-hoc task tree is not a pool seat name",
+        not goalflight_worktree_pool.is_pool_seat_path("/repo/worktrees/t-353-live"),
+    )
+
+
+def test_registration_ignores_basename_without_a_lock() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        repo = make_repo(root)
+        adhoc = root / "wt-9"
+        git(repo, "worktree", "add", "-q", "-b", "adhoc-wt9", str(adhoc))
+        with seat_limit(2):
+            verdict, reason = goalflight_worktree_pool.registered_pool_seat_verdict(
+                adhoc, project_root=repo
+            )
+            assert_true(
+                "ad-hoc wt-9 is not registered",
+                verdict == "no",
+            )
+            assert_true(
+                "reason names the managed root, not the basename",
+                "managed seat root" in reason,
+            )
+            lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "real-seat")
+            try:
+                yes, yes_reason = goalflight_worktree_pool.registered_pool_seat_verdict(
+                    lease.path, project_root=repo
+                )
+                assert_true("acquired seat is registered", yes == "yes")
+                assert_true("reason names the seat", "wt-1" in yes_reason)
+            finally:
+                lease.release()
+            still_yes, _ = goalflight_worktree_pool.registered_pool_seat_verdict(
+                repo / "worktrees" / "wt-1", project_root=repo
+            )
+            assert_true("released seat stays registered", still_yes == "yes")
+
+            prior = os.environ.get(goalflight_worktree_pool.WORKTREE_SEATS_ENV)
+            os.environ[goalflight_worktree_pool.WORKTREE_SEATS_ENV] = "bogus"
+            try:
+                unknown, unknown_reason = (
+                    goalflight_worktree_pool.registered_pool_seat_verdict(
+                        repo / "worktrees" / "wt-1", project_root=repo
+                    )
+                )
+            finally:
+                if prior is None:
+                    os.environ.pop(goalflight_worktree_pool.WORKTREE_SEATS_ENV, None)
+                else:
+                    os.environ[goalflight_worktree_pool.WORKTREE_SEATS_ENV] = prior
+            assert_true("unreadable seat config is unknown", unknown == "unknown")
+            assert_true(
+                "unknown reason names configuration",
+                "configuration unreadable" in unknown_reason,
+            )
+
+
 def main() -> None:
     tests = [
         test_hard_ceiling_is_lazy_and_reuses_seats,
@@ -329,6 +396,8 @@ def main() -> None:
         test_dirty_seat_is_quarantined_then_reset_on_acquire,
         test_sigkill_releases_kernel_lease_without_cleanup,
         test_parent_release_keeps_inherited_worker_lease_until_worker_dies,
+        test_default_seat_count_is_not_a_per_controller_cap,
+        test_registration_ignores_basename_without_a_lock,
     ]
     for test in tests:
         test()

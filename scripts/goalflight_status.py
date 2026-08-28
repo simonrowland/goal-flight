@@ -812,6 +812,21 @@ def reconcile_fast_plane_record(
         else staged
     )
     reconciled = _decorate_trace_status(candidate)
+    sidecar_for_hold = (
+        reconciled.get("_wait_status_snapshot")
+        if isinstance(reconciled.get("_wait_status_snapshot"), dict)
+        else None
+    )
+    hold = goalflight_ledger.sidecar_terminal_hold(
+        reconciled,
+        sidecar=sidecar_for_hold,
+    )
+    if hold is not None:
+        reconciled["sidecar_hold"] = hold["liveness"]
+        reconciled["sidecar_hold_reason"] = hold["reason"]
+    else:
+        reconciled.pop("sidecar_hold", None)
+        reconciled.pop("sidecar_hold_reason", None)
     if not retain_status_snapshot:
         reconciled.pop("_wait_status_snapshot", None)
     return reconciled
@@ -1647,6 +1662,13 @@ def _dispatch_cells(record: dict) -> str:
             f" sandbox requested={requested} supported={supported} "
             f"enforced={enforced}"
         )
+    hold = record.get("sidecar_hold")
+    if hold in {"live", "unknown"}:
+        hold_reason = record.get("sidecar_hold_reason")
+        hold_text = f"held: {hold}"
+        if hold_reason:
+            hold_text += f" ({hold_reason})"
+        cells += f" {hold_text}"
     resume = _resume_hint(record)
     if resume:
         cells += f" | {resume}"

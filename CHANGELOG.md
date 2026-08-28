@@ -6,7 +6,76 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Added
+
+- `goalflight_dispatch.py --worktree <base>` acquires a pooled `wt-N` seat
+  prepared at git ref `<base>` and runs the worker there. The seat lock fd is
+  inherited by the worker (same contract as `acp_run`). Exhaustion refuses
+  with every held seat named and never falls back to `git worktree add`.
+  Existing `--cwd` is unchanged when the flag is omitted.
+- `goalflight_worktree_gc.py` now exempts maintained `wt-N` pool seats from
+  reclamation and treats an identity-live worker (pid + start_token) as still
+  owning its tree even when the ledger row carries a liveness verdict such as
+  `idle_timeout`. After merging a worker branch, run
+  `python3 scripts/goalflight_worktree_gc.py --into main` (report) or
+  `--apply`. Exemption is by seat registration (managed path + lock file),
+  not basename: an ad-hoc tree named `wt-N` is litter. Unknown registration
+  retains. A retain reason for an identity-live terminal row says
+  identity-live, not "non-terminal".
+- `goalflight_trace_archive.py` copies selected finished-dispatch tails from
+  volatile `/tmp` dispatch state into gitignored
+  `docs-private/traces/<YYYY-MM-DD>/<dispatch-id>/`. Policy keeps runs that
+  emitted a worker marker or named a findings path, caps oversized tails
+  (head+tail, dropped middle recorded), and drops steer mailboxes, watcher
+  logs, empty/capacity-blocked noise, and the unattended 7.1 GB `/tmp`
+  backlog. Tails are untrusted; this tool never `git add`s. Going-forward
+  hook is `goalflight_ledger.cmd_finish`. Sweep a backlog with
+  `--source-dir --apply`. Archived tails are unreviewed worker output.
+  Credential-shaped material is redacted at copy time with a named marker
+  and a per-tail count; this tool refuses to `git add`. The drop list
+  (unmarked/capacity, steer, watcher, caffeinate, pidfile, prompt,
+  tail-middle, historical `/tmp` backlog) is in the module docstring and
+  CLI help.
+
 ### Changed
+
+- `goalflight_ledger.cmd_finish` archives going-forward dispatch tails
+  (pinned: deleting the hook turns `test_cmd_finish_archives_going_forward_tails`
+  red).
+- `--worktree` no longer passes a closed seat-lock fd into the post-spawn
+  caffeinate helper. Sidecars get an env without `GOALFLIGHT_WORKTREE_LOCK_FD`
+  so Darwin `caffeinate -w` starts after the launcher releases its copy.
+- The worker daemon helper now starts the child with Popen cwd set to the
+  leased seat (or `--cwd`). Claude `-p` has no `--cwd` flag and raw `--`
+  has none either; both inherit the seat as process cwd.
+- Default worktree seat count is 24 (was 4). This is a per-repository
+  checkout ceiling, not a per-controller worker cap; there is none.
+- `goalflight_ledger.py reconcile-outbox` no longer promotes a sidecar's
+  terminal verdict (`failed` / `idle_timeout` / `complete`) into journal and
+  ledger terminal authority while the recorded worker identity (pid + start
+  token, never pid alone) still matches a live process. A terminal sidecar is
+  a statement about the dispatch channel, not the worker; terminalizing a live
+  worker frees its capacity lease and makes its worktree look unowned to GC.
+  When liveness cannot be determined (no recorded identity fields, unreadable
+  process table) the verdict is UNKNOWN and also holds — terminalizing is the
+  destructive direction, so doubt resolves against the write (deliberately the
+  opposite default from admission control). Unknown is not a permanent leak:
+  each reconcile re-probes identity (a RUNNING journal instance is copied onto
+  the record so it gains a pid, or the process table becomes readable) and
+  then live keeps holding while dead terminalizes. Age is never the resolver.
+  Still-unknown stays held until that re-probe succeeds or a human /
+  higher-authority pass acts, stamped on the ledger and named `held: unknown`
+  (vs `held: live`) on status and fleet output with the reason. A held verdict
+  is never silent: reconcile records a durable `sidecar_terminal_overruled`
+  journal attention item (reason `worker_identity_live` /
+  `worker_identity_unknown`) and lists it in the result JSON's `overruled`
+  field; once the hold converges the OPEN item is resolved. A genuinely dead
+  worker — identity gone, or the pid now belongs to a different process —
+  terminalizes exactly as before, and records or journal attempts that are
+  already terminal still re-commit idempotently so the repair path is not
+  stranded.
+- Default worktree seat count is 24 (was 4). This is a per-repository
+  checkout ceiling, not a per-controller worker cap; there is none.
 
 - `goalflight_journal_gc.py` no longer retains a proven-root-gone journal
   forever just because it holds non-terminal dispatch records that can never
@@ -62,6 +131,21 @@ incremented when meaningful skill behaviour changes.
 
 ### Fixed
 
+- Controller mail is now attributed end to end. `post_message` (the shared
+  admit path), CLI `post`, the MCP `goalflight_post_message` tool, fleet
+  steering, and quota advisories stamp `source.controller_label` for
+  controller-transport mail. The declared source is
+  `GOALFLIGHT_CONTROLLER_LABEL` or a caller-supplied field — never a pid
+  and never the git directory name. A leftover `GOALFLIGHT_DISPATCH_ID`
+  stamps `UNKNOWN` rather than omitting the field. When no label can be
+  established the record carries the explicit `UNKNOWN` sentinel, and
+  relay renders a real label as `from` ahead of a shared adapter name
+  (`codex`, `fleet`, `goalflight_status`). Unattributed controller mail
+  says `from UNKNOWN` rather than guessing from the node (`from local`)
+  or inbox id. Pre-existing journal records without the field still read
+  and render `UNKNOWN`. The field is additive, trusted addressing
+  metadata, and never proves authorship — the capability-derived author
+  digest remains the only self-authorship proof.
 - Persistent shortfall hints no longer tell operators to arm `follow` /
   `listen` / `--watch-follow` beside a live `supervise`. Status, next,
   relay, reminder, tool-entry, and doctor reuse one three-state detector

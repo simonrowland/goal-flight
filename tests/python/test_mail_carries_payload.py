@@ -632,7 +632,7 @@ def test_drain_leads_with_signal_and_keeps_chatter_visible(
     assert set(kinds[:2]) == {"[merge-request]", "[user_need]"}
     assert kinds[2] == "[result]"
     patch_line = next(line for line in lines if line.startswith("[merge-request]"))
-    assert "wire resume engines from grok" in patch_line
+    assert f"wire resume engines from {label}" in patch_line
     assert "next: git am" in patch_line
     assert "dispatch terminal: complete" in lines[2]
     assert lines[3].startswith("drained 3 · cursor ")
@@ -723,7 +723,7 @@ def test_merge_request_can_address_a_controller(
         assert messages.main(["relay", "--drain"]) == 0
     line = stdout.getvalue().splitlines()[0]
     assert line.startswith("[merge-request] side-branch seq=1 — ")
-    assert "land the idle harvest from grok" in line
+    assert f"land the idle harvest from {label}" in line
     assert "next: git apply" in line
 
 
