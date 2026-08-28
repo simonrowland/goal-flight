@@ -641,7 +641,14 @@ def read_records() -> list[dict]:
     path = runs_dir(create=False)
     if not path.exists():
         return records
-    for p in sorted(path.glob("*.json")):
+    # pathlib.Path.glob on an unreadable directory returns [] without raising
+    # (observed). os.listdir raises OSError, which callers that distinguish
+    # UNKNOWN from empty must see -- an unlistable ledger is not "no records".
+    names = os.listdir(path)
+    for name in sorted(names):
+        if not name.endswith(".json"):
+            continue
+        p = path / name
         try:
             records.append(json.loads(p.read_text()))
         except (OSError, json.JSONDecodeError):

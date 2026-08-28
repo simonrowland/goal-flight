@@ -500,7 +500,26 @@ def resolve_project_root(value: str | None = None) -> Path:
     start = Path(explicit) if explicit else Path.cwd()
     # A path that is not a directory (or not a checkout) cannot be interrogated;
     # fall back to the previous behaviour rather than failing the caller.
-    canonical = _git_canonical_root(start) if start.is_dir() else None
+    # The fallback is named out loud (t-349): silently rendering "could not
+    # canonicalize" as "definitely this root" reads as a guard and is not one --
+    # a mistyped path used to surface only as a misleading
+    # "controller is not registered" refusal downstream.
+    if not start.is_dir():
+        print(
+            f"goalflight_task: WARN: resolve_project_root: {start} is not a "
+            "directory; cannot canonicalize via git -- treating the path itself "
+            "as the project root",
+            file=sys.stderr,
+        )
+        return _strip_managed_worktree(start)
+    canonical = _git_canonical_root(start)
+    if canonical is None:
+        print(
+            f"goalflight_task: WARN: resolve_project_root: {start} is not inside "
+            "a git checkout; cannot canonicalize via git -- treating the path "
+            "itself as the project root",
+            file=sys.stderr,
+        )
     return _strip_managed_worktree(canonical or start)
 
 

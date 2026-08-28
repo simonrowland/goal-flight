@@ -762,7 +762,35 @@ ACCOUNT_ENGINE_BY_AGENT = {
 RETIRED_AGENT_LABELS = {
     "grok": "use --agent grok-code (coding) or --agent grok-research (web search)",
 }
-GIT_BASE_PIN_RE = re.compile(r"(?<![A-Za-z0-9_./:-])([0-9A-Fa-f]{7,40})(?![A-Za-z0-9_./:-])")
+# t-356: a git base pin is an EXPLICIT marker, never a bare hex token. Briefs
+# legitimately cite evidence commits as prose (measurement tables, receipts);
+# scanning for bare hex read one of those citations as the intended base and
+# warned GIT BASE PIN MISMATCH against a correct cwd HEAD -- pure noise that
+# trained controllers to reach for --ignore-git-warn. The recognized markers,
+# observed in real briefs:
+#   - a frontmatter-style `base: <sha>` line (quoted YAML, `Base SHA:`,
+#     markdown `**base:**`, bullets, and backticks around the sha are tolerated)
+#   - the `branch <name> @ <sha>` header convention, and a line-level
+#     `<name> @ <sha>` pin without the word `branch`
+# Every other hex-shaped token in the text is prose.
+GIT_BASE_PIN_BASE_LINE_RE = re.compile(
+    r"^[ \t]*(?:[-#>*]+[ \t]*)*(?:\*\*)?base(?:\s+sha)?\s*:\s*(?:\*\*)?\s*"
+    r"[`'\"]?([0-9A-Fa-f]{7,40})[`'\"]?(?![0-9A-Za-z])",
+    re.IGNORECASE | re.MULTILINE,
+)
+GIT_BASE_PIN_BRANCH_AT_RE = re.compile(
+    r"\bbranch\s+\S+?\s+@\s+`?([0-9A-Fa-f]{7,40})`?(?![0-9A-Za-z])",
+    re.IGNORECASE,
+)
+GIT_BASE_PIN_NAME_AT_RE = re.compile(
+    r"^[ \t]*(?:[-#>*]+[ \t]*)*\S+\s+@\s+`?([0-9A-Fa-f]{7,40})`?(?![0-9A-Za-z])",
+    re.IGNORECASE | re.MULTILINE,
+)
+GIT_BASE_PIN_MARKER_RES = (
+    GIT_BASE_PIN_BASE_LINE_RE,
+    GIT_BASE_PIN_BRANCH_AT_RE,
+    GIT_BASE_PIN_NAME_AT_RE,
+)
 TASK_ID_RE = re.compile(r"^[tb]-\d+$")
 LOWER_BASE_SHA_RE = re.compile(r"[0-9a-f]{40}")
 READ_ONLY_INLINE_RETURN_PROMPT_PATTERNS = (
@@ -1007,6 +1035,8 @@ def _cmd_spawn_daemon() -> int:
                 filter_argv.append(str(stdout_file))
                 ready_r, ready_w = os.pipe()
                 filter_env = os.environ.copy()
+                filter_env.pop(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, None)
+                filter_env.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
                 filter_env[goalflight_output_redact.READY_FD_ENV] = str(ready_w)
                 filter_proc = subprocess.Popen(
                     filter_argv,
@@ -1075,6 +1105,7 @@ def _spawn_daemonized_process(
     serialize_stdout: bool = False,
     label: str,
     cwd: str | None = None,
+    inherit_occupancy_lock: bool = False,
 ) -> int:
     """Spawn a child through the private daemon helper and return the child's pid."""
     spec = {
@@ -1086,7 +1117,35 @@ def _spawn_daemonized_process(
         "serialize_stdout": bool(stdout_path and serialize_stdout),
         "cwd": cwd,
     }
+    child_env = dict(env)
     inherited_lock_fds = goalflight_worktree_pool.pass_worktree_lock_fds(env)
+    occupancy_fds: set[int] = set()
+    for source in (os.environ, env):
+        occupancy_raw = str(
+            source.get(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV) or ""
+        ).strip()
+        if occupancy_raw:
+            with contextlib.suppress(ValueError):
+                occupancy_fds.add(int(occupancy_raw))
+    if inherit_occupancy_lock:
+        seen = set(inherited_lock_fds)
+        extra: list[int] = []
+        for fd in occupancy_fds:
+            if fd in seen:
+                continue
+            try:
+                os.fstat(fd)
+            except OSError:
+                continue
+            extra.append(fd)
+            seen.add(fd)
+        if extra:
+            inherited_lock_fds = tuple(inherited_lock_fds) + tuple(extra)
+    else:
+        inherited_lock_fds = tuple(
+            fd for fd in inherited_lock_fds if fd not in occupancy_fds
+        )
+        child_env.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
     helper = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), DAEMON_SPAWN_ARG],
         input=json.dumps(spec, sort_keys=True),
@@ -1094,7 +1153,7 @@ def _spawn_daemonized_process(
         text=True,
         encoding="utf-8",
         errors="replace",
-        env=env,
+        env=child_env,
         timeout=30,
         pass_fds=inherited_lock_fds,
         **_detached_popen_kwargs(),
@@ -1401,15 +1460,18 @@ def _wait_for_detached_watcher(
 
 
 def _sidecar_env(env: dict[str, str]) -> dict[str, str]:
-    """Env for helpers that must not inherit the worker's seat lock fd.
+    """Env for helpers that must not inherit the worker's lock fds.
 
     After the launcher releases its copy, ``GOALFLIGHT_WORKTREE_LOCK_FD`` in
     the worker env names a closed descriptor. Passing that dict to caffeinate
     (or any other sidecar) makes the daemon helper raise WorktreeSeatError
-    instead of starting.
+    instead of starting. Occupancy is the same class of leak: a sidecar that
+    keeps ``GOALFLIGHT_OCCUPANCY_LOCK_FD`` open holds the tree after the
+    worker dies.
     """
     out = dict(env)
     out.pop(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, None)
+    out.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
     return out
 
 
@@ -1521,6 +1583,27 @@ def _requested_worktree_base(args) -> str | None:
     return text or None
 
 
+def _inherited_seat_lock_present() -> bool:
+    """True when this process already holds a pooled-seat lock fd.
+
+    Occupancy uses a different fd in the same inherited-fd helper. Treating
+    occupancy as "seat already leased" would skip ``--worktree`` acquire after
+    the occupancy bind, or skip it in a child that only inherited occupancy.
+    """
+    raw = os.environ.get(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, "").strip()
+    if not raw:
+        return False
+    try:
+        fd = int(raw)
+        os.fstat(fd)
+    except (ValueError, OSError) as exc:
+        raise goalflight_worktree_pool.WorktreeSeatError(
+            f"{goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV} does not name an "
+            f"open descriptor: {raw!r}"
+        ) from exc
+    return True
+
+
 def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease | None:
     """Acquire a pooled seat when ``--worktree`` is set. Never falls back to add.
 
@@ -1528,11 +1611,18 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     ``GOALFLIGHT_WORKTREE_LOCK_FD`` in the worker env and pass that fd through
     spawn, then ``release()`` this process's copy so the worker's lifetime is
     the lease lifetime.
+
+    Occupancy must bind AFTER this so the kernel lock is on the seat path,
+    not the project ``--cwd``. Caching the lease lets the launch path call
+    this once before occupancy and again when wiring env/summary.
     """
+    existing = getattr(args, "_worktree_seat", None)
+    if existing is not None:
+        return existing
     base = _requested_worktree_base(args)
     if base is None:
         return None
-    if goalflight_worktree_pool.inherited_worktree_lock_fds():
+    if _inherited_seat_lock_present():
         # Fleet / parent already leased a seat and passed the fd. Re-acquire
         # would LOCK_EX-succeed in this process (flock is per-process) and
         # reset a tree the worker is already in.
@@ -1543,6 +1633,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
         base=base,
     )
     args.cwd = str(lease.path)
+    args._worktree_seat = lease
     return lease
 
 
@@ -2400,7 +2491,15 @@ def _read_prompt_for_guard(args) -> str:
 
 
 def _extract_git_base_pins(text: str) -> list[str]:
-    return [m.group(1).lower() for m in GIT_BASE_PIN_RE.finditer(text or "")]
+    """Explicitly-marked git base pins, in document order. Bare SHAs are prose."""
+    text = text or ""
+    marked = [
+        (match.start(), match.group(1).lower())
+        for pattern in GIT_BASE_PIN_MARKER_RES
+        for match in pattern.finditer(text)
+    ]
+    marked.sort()
+    return [sha for _pos, sha in marked]
 
 
 def _git_head_for_cwd(cwd: Path) -> str | None:
@@ -2428,6 +2527,16 @@ def _valid_lower_base_sha(value: object) -> str | None:
 
 
 def _git_pin_warning(args) -> str | None:
+    """Advisory git-base-pin check. A genuine mismatch WARNS and still launches.
+
+    Refusing would be the stricter reading of the 2026-08-27 sweep (warn then
+    start). Keep it advisory: a stale worktree base is sometimes intentional
+    (reproduce a bug; finish a chunk started on an older merge), and
+    --ignore-git-warn already exists as the silence hatch. Two writers in one
+    tree (t-375) corrupt the filesystem; a mismatched pin does not. After
+    t-356 this warning only fires on explicit markers, so it can be trusted
+    instead of trained-ignored.
+    """
     if getattr(args, "ignore_git_warn", False) or not _prompt_requested(args):
         return None
     # b-052: measure the tree the worker will actually run in (--cwd), not the
@@ -2446,7 +2555,8 @@ def _git_pin_warning(args) -> str | None:
         return (
             "WARN: prompt carries no git base pin; "
             f"HEAD is {short_head} - workers on stale clones will build on the wrong base; "
-            f"add 'verify HEAD is {short_head}' or pass --ignore-git-warn"
+            f"mark the base explicitly with a 'base: {short_head}' line or a "
+            f"'branch <name> @ {short_head}' header, or pass --ignore-git-warn"
         )
     mismatched_pins = [pin for pin in pins if not head.startswith(pin)]
     if not mismatched_pins:
@@ -2455,6 +2565,7 @@ def _git_pin_warning(args) -> str | None:
         "WARN: GIT BASE PIN MISMATCH: "
         f"prompt pin {mismatched_pins[0]} does not match cwd HEAD {short_head}; "
         "stale brief or wrong repo state - workers on stale clones will build on the wrong base; "
+        "advisory only, launch continues (a stale base is sometimes intentional); "
         "update the pin or pass --ignore-git-warn"
     )
 
@@ -2649,6 +2760,309 @@ def _refuse_reused_dispatch_id_for_launch(dispatch_id: str, *, allow_queued: boo
         _refuse_reused_nonterminal_dispatch_id(dispatch_id)
 
 
+def _record_declared_read_only(record: dict) -> bool:
+    """True when the incumbent's own recorded launch posture cannot write.
+
+    Write-capability is the dispatch's enforced sandbox, not a process scan
+    and not a bare --read-only declaration. A ``--`` worker that was asked
+    to be read-only can still write; treating it as a reviewer would let a
+    second writer in. Do not consult supported_profile: that field names
+    what the launch path knows how to support, and can say read-only even
+    for a writer. A top-level read_only flag with requested_profile
+    workspace-write is a writer.
+    """
+    posture = record.get("os_sandbox")
+    requested = None
+    enforced = None
+    if isinstance(posture, dict):
+        requested = posture.get("requested_profile")
+        enforced = posture.get("enforced_profile")
+        if requested == "workspace-write":
+            return False
+        if enforced == "read-only":
+            return True
+    if requested != "read-only":
+        return False
+    agent = str(record.get("agent") or "")
+    shape = str(record.get("shape") or "bash")
+    if shape == "acp":
+        return False
+    return agent in {"grok-code", "grok-research", "codex"}
+
+
+def _occupancy_exempt_read_only(args) -> bool:
+    """True when this launch cannot write the tree, so occupancy does not apply.
+
+    --read-only on a ``-- <cmd>`` worker is a declaration only: the command
+    can still write. Occupancy skips only launch paths that actually enforce
+    the posture (bash-shape grok deny-rules, bash-shape codex --sandbox).
+    """
+    if not _effective_read_only(args):
+        return False
+    if _raw_worker_args(args):
+        return False
+    agent = str(getattr(args, "agent", "") or "")
+    shape = getattr(args, "shape", "bash")
+    if shape == "acp":
+        return False
+    return agent in {"grok-code", "grok-research", "codex"}
+
+
+def _same_worker_tree(record_cwd: object, target: Path) -> bool:
+    try:
+        candidate = os.path.realpath(str(record_cwd).strip())
+    except (OSError, ValueError):
+        return False
+    return bool(candidate) and candidate == os.path.realpath(str(target))
+
+
+def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None]:
+    """(occupied_reason, unknown_reason, occupied_state) for this write tree.
+
+    Occupancy is judged from the ledger's non-terminal set -- the lifecycle
+    authority -- never from a process scan: a queued/starting dispatch owns its
+    tree before any worker process exists for pgrep to see, and pid liveness
+    cannot tell a searcher from a worker. ``occupied_state`` is the ledger
+    state of a named occupant so a freshly acquired kernel lock can tell a
+    queued owner (ledger-only claim) from a stale running row after SIGKILL.
+    """
+    target = _worker_cwd(args)
+    try:
+        records = goalflight_ledger.read_records()
+    except OSError as exc:
+        return None, f"dispatch ledger could not be read ({type(exc).__name__}: {exc})", None
+    own_id = getattr(args, "dispatch_id", None)
+    host = socket.gethostname()
+    unknown: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        record_id = record.get("dispatch_id")
+        if own_id and record_id == own_id:
+            continue  # the drained/resumed launch re-enters with its own queued record
+        if goalflight_ledger.record_is_unreadable(record):
+            unknown.append(f"ledger record {record.get('path') or record_id} is unreadable")
+            continue
+        state = record.get("state")
+        terminal = goalflight_ledger.terminal_state_for(
+            state, record.get("reason") or record.get("error")
+        )
+        if terminal != "unknown":
+            # Settled vocabulary (complete/failed/blocked/...) vacates the tree.
+            # watcher_stopped is terminal in the ledger vocabulary, but a live
+            # worker under that label is still writing -- reuse the resume
+            # liveness reading instead of treating the tree as free.
+            if not _is_live_watcher_stopped(state, record.get("worker_alive")):
+                continue
+        if record.get("transport") == "fleet-ssh":
+            continue  # remote worker: its cwd is a path on another node's disk
+        record_host = record.get("hostname")
+        if isinstance(record_host, str) and record_host and record_host != host:
+            continue  # recorded by a dispatch launched on another machine
+        record_cwd = _resume_cwd_from_record(record)
+        if record_cwd is None:
+            unknown.append(
+                f"non-terminal dispatch {record_id} (state={state or 'running'}) "
+                "has no worker cwd evidence"
+            )
+            continue
+        if not _same_worker_tree(record_cwd, target):
+            continue
+        if _record_declared_read_only(record):
+            continue  # a reviewer shares the tree legitimately; it is not a writer
+        return (
+            f"worktree {target} is already owned by non-terminal dispatch "
+            f"{record_id} (state={state or 'running'}); a second writer would "
+            "share one filesystem tree with no merge discipline",
+            None,
+            str(state or "running"),
+        )
+    if unknown:
+        detail = "; ".join(unknown[:3])
+        if len(unknown) > 3:
+            detail += f"; and {len(unknown) - 3} more"
+        return None, detail, None
+    return None, None, None
+
+
+class _InheritedOccupancyLock:
+    """A lock fd inherited from the parent launcher; this process must not close it."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def release(self) -> None:
+        return None
+
+
+def _bind_worktree_occupancy_lock(args, lock) -> None:
+    """Keep the lock alive in this process and publish the fd for worker inherit."""
+    args._worktree_occupancy_lock = lock
+    fd = lock.fileno()
+    os.set_inheritable(fd, True)
+    os.environ[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] = str(fd)
+
+
+def _inherited_occupancy_lock():
+    raw = os.environ.get(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, "").strip()
+    if not raw:
+        return None, None
+    try:
+        fd = int(raw)
+        os.fstat(fd)
+    except (ValueError, OSError) as exc:
+        return None, (
+            f"{goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV} does not name an "
+            f"open descriptor: {raw!r} ({type(exc).__name__}: {exc})"
+        )
+    return _InheritedOccupancyLock(fd), None
+
+
+def _occupancy_occupied_messages(reason: str) -> tuple[str, str]:
+    refusal = "\n".join(
+        [
+            reason.rstrip(".") + ".",
+            "Use --occupied-worktree-forced to override and launch a "
+            "concurrent writer.",
+        ]
+    )
+    forced_warning = (
+        f"--occupied-worktree-forced accepted: {reason.rstrip('.')}; the two "
+        "writers now share one filesystem tree with no merge discipline."
+    )
+    return refusal, forced_warning
+
+
+def _occupancy_unknown_messages(args, detail: str) -> tuple[str, str]:
+    target = _worker_cwd(args)
+    refusal = "\n".join(
+        [
+            f"worktree occupancy of {target} is unknown ({detail}).",
+            "Retry the dispatch; refusing before record or launch.",
+            "Use --occupied-worktree-forced to override and launch without "
+            "occupancy evidence.",
+        ]
+    )
+    forced_warning = (
+        f"--occupied-worktree-forced accepted: worktree occupancy of "
+        f"{target} is unknown ({detail}); launching without occupancy evidence."
+    )
+    return refusal, forced_warning
+
+
+def _finish_worktree_occupancy(args, *, refusal: str, forced_warning: str) -> str | None:
+    if getattr(args, "occupied_worktree_forced", False):
+        return forced_warning
+    raise DispatchUsageError(refusal)
+
+
+def _prepare_attempt_worktree_occupancy(args) -> str | None:
+    """Refuse a second writer into an occupied worktree, or return the forced-path warning.
+
+    Enforcement is an exclusive non-blocking kernel lock on the target
+    worktree, inherited by the worker so the claim outlives this dispatcher
+    and is released by the kernel on crash. The ledger is diagnostic: it
+    names the incumbent and fail-closes on unlistable/unreadable records.
+    A launch that actually cannot write (enforced read-only) is never
+    refused here. --read-only on a write-capable ``--`` worker is not
+    enough. --occupied-worktree-forced converts either refusal into a
+    visible warning, matching the --unregistered-forced hatch.
+    """
+    if _occupancy_exempt_read_only(args):
+        return None
+    if getattr(args, "submit", False) and _requested_worktree_base(args):
+        # A queued --worktree job does not have a seat yet. Occupying --cwd
+        # (the project root) would serialize every pooled submit onto one
+        # tree; drain binds the seat and then occupies that path.
+        return None
+
+    occupied, unknown, occupied_state = _worktree_incumbent_reason(args)
+    lock = None
+    lock_busy = None
+    lock_unknown = None
+    inherited, inherited_unknown = _inherited_occupancy_lock()
+    if inherited_unknown:
+        lock_unknown = inherited_unknown
+    elif inherited is not None:
+        lock = inherited
+    else:
+        target = _worker_cwd(args)
+        dispatch_id = str(getattr(args, "dispatch_id", None) or "unknown-dispatch")
+        try:
+            lock = goalflight_worktree_pool.try_acquire_worktree_path_lock(
+                target, dispatch_id
+            )
+        except goalflight_worktree_pool.WorktreePathLockBusy as exc:
+            lock_busy = str(exc)
+        except goalflight_worktree_pool.WorktreePathLockUnknown as exc:
+            lock_unknown = str(exc)
+        except OSError as exc:
+            lock_unknown = f"{type(exc).__name__}: {exc}"
+
+    forced = bool(getattr(args, "occupied_worktree_forced", False))
+
+    if lock is None:
+        if lock_unknown is not None:
+            detail = unknown or lock_unknown
+            refusal, forced_warning = _occupancy_unknown_messages(args, detail)
+            return _finish_worktree_occupancy(
+                args, refusal=refusal, forced_warning=forced_warning
+            )
+        reason = occupied or lock_busy
+        if reason is None:
+            reason = (
+                f"worktree {_worker_cwd(args)} is already owned by a live "
+                "dispatch holding the worktree lock; a second writer would "
+                "share one filesystem tree with no merge discipline"
+            )
+        refusal, forced_warning = _occupancy_occupied_messages(reason)
+        return _finish_worktree_occupancy(
+            args, refusal=refusal, forced_warning=forced_warning
+        )
+
+    # Kernel lock is held. Ledger unknown still fail-closes: an unlistable
+    # ledger must not become a green light. A recorded occupant other than
+    # this drain/resume id is the queued-owner case (no process holds a
+    # lock). Drain of our own queued row skips own_id; a leftover sibling
+    # queued row must not deadlock the holder of the live lock.
+    if unknown is not None and occupied is None:
+        if not forced:
+            lock.release()
+        refusal, forced_warning = _occupancy_unknown_messages(args, unknown)
+        if forced:
+            _bind_worktree_occupancy_lock(args, lock)
+            return forced_warning
+        return _finish_worktree_occupancy(
+            args, refusal=refusal, forced_warning=forced_warning
+        )
+    if occupied is not None and not getattr(args, "from_queue", False):
+        # A queued row occupies with no process. A running/starting row whose
+        # worker already died (SIGKILL) leaves the kernel lock free; dropping
+        # the lock we just won would recreate the dual-launch TOCTOU until
+        # the watcher rewrites the ledger.
+        if inherited is None and occupied_state in {"running", "starting"}:
+            _bind_worktree_occupancy_lock(args, lock)
+            return None
+        if not forced:
+            lock.release()
+        refusal, forced_warning = _occupancy_occupied_messages(occupied)
+        if forced:
+            _bind_worktree_occupancy_lock(args, lock)
+            return forced_warning
+        return _finish_worktree_occupancy(
+            args, refusal=refusal, forced_warning=forced_warning
+        )
+
+    _bind_worktree_occupancy_lock(args, lock)
+    if occupied is not None and forced:
+        refusal, forced_warning = _occupancy_occupied_messages(occupied)
+        return forced_warning
+    return None
+
+
 def _write_windows_dispatch_refusal(args) -> tuple[dict, Path]:
     dispatch_id = args.dispatch_id or _default_dispatch_id(args.agent)
     args.dispatch_id = dispatch_id
@@ -2697,7 +3111,14 @@ def _refuse_windows_dispatch(args) -> int:
 
 
 def _find_dispatch_record(dispatch_id: str) -> dict | None:
-    for record in goalflight_ledger.read_records():
+    try:
+        records = goalflight_ledger.read_records()
+    except OSError:
+        # Unlistable ledger is occupancy UNKNOWN, not "this id is free". The
+        # occupancy gate refuses (or the --occupied-worktree-forced hatch
+        # consents). Do not crash the reused-id lookup with a traceback.
+        return None
+    for record in records:
         if record.get("dispatch_id") == dispatch_id:
             return record
     return None
@@ -3694,7 +4115,7 @@ def _resume_launch_argv(
         base,
         replace=replace,
         inject=inject,
-        strip_flags=_replay_strip_flags() + ("--unregistered-forced",),
+        strip_flags=_replay_strip_flags() + ("--unregistered-forced", "--occupied-worktree-forced"),
         strip_options=("--tail", "--status-json", "--prompt"),
     )
     if source["engine"] == "codex":
@@ -5570,6 +5991,7 @@ LAUNCH_ARGV_CLASS: dict[str, str] = {
     "--controller-label": "preserve",
     "--session-label": "preserve",
     "--unregistered-forced": "preserve",
+    "--occupied-worktree-forced": "preserve",
     "--controller-beacon-pid": "preserve",
     "--controller-session-id": "preserve",
     "--parent-dispatch-id": "preserve",
@@ -5724,6 +6146,9 @@ def _canonical_replay_argv_from_original(
     if getattr(args, "unregistered_forced", False):
         if "--unregistered-forced" not in argv:
             argv = _insert_before_worker_remainder(argv, ["--unregistered-forced"])
+    if getattr(args, "occupied_worktree_forced", False):
+        if "--occupied-worktree-forced" not in argv:
+            argv = _insert_before_worker_remainder(argv, ["--occupied-worktree-forced"])
     if raw_argv and "--" not in argv:
         argv += ["--", *raw_argv]
     return argv
@@ -5800,6 +6225,8 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv += ["--controller-session-id", controller_session_id]
     if getattr(args, "unregistered_forced", False):
         argv.append("--unregistered-forced")
+    if getattr(args, "occupied_worktree_forced", False):
+        argv.append("--occupied-worktree-forced")
     engine_session_id = _resolved_engine_session_id(args)
     if engine_session_id is not None:
         argv += ["--engine-session-id", engine_session_id]
@@ -13039,6 +13466,11 @@ def _acp_detached_child_argv(args) -> list[str]:
         and "--unregistered-forced" not in argv
     ):
         argv = _insert_before_worker_remainder(argv, ["--unregistered-forced"])
+    if (
+        getattr(args, "occupied_worktree_forced", False)
+        and "--occupied-worktree-forced" not in argv
+    ):
+        argv = _insert_before_worker_remainder(argv, ["--occupied-worktree-forced"])
     if "--acp-detached-child" not in argv:
         argv = _insert_before_worker_remainder(argv, ["--acp-detached-child"])
     return argv
@@ -13095,6 +13527,7 @@ def _run_acp_detached_launcher(
         stderr="stdout",
         serialize_stdout=True,
         label="acp",
+        inherit_occupancy_lock=True,
     )
     _mark_queue_claim_worker_spawned(args, child_pid)
 
@@ -13681,6 +14114,25 @@ _SUBCOMMAND_HELP: tuple[tuple[str, str], ...] = (
 )
 
 
+def _existing_cwd_arg(value: str) -> str:
+    """--cwd must name a real directory at argument-parse time (t-349).
+
+    A nonexistent --cwd used to flow into resolve_project_root, whose
+    not-a-checkout fallback renders the path as its own project root. The
+    dispatch then landed on an empty controller registry and refused with
+    "controller is not registered", recommending --unregistered-forced -- an
+    operator following that advice launched an unowned dispatch into a phantom
+    project root for what was actually a path typo (t337-w3/w4/w5). Refusing
+    here fires before any registry lookup, so that advice is never reached.
+    """
+    expanded = Path(str(value)).expanduser()
+    if not expanded.exists():
+        raise argparse.ArgumentTypeError(f"cwd does not exist: {value}")
+    if not expanded.is_dir():
+        raise argparse.ArgumentTypeError(f"cwd is not a directory: {value}")
+    return value
+
+
 def _build_launch_parser() -> argparse.ArgumentParser:
     parser = _TerseArgumentParser(
         description=(
@@ -13709,7 +14161,7 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         default=[],
         help="Comma-separated linked task/bug ids (t-/b-). May be repeated.",
     )
-    parser.add_argument("--cwd", help="Worker working directory")
+    parser.add_argument("--cwd", type=_existing_cwd_arg, help="Worker working directory")
     parser.add_argument(
         "--worktree",
         metavar="BASE",
@@ -13871,6 +14323,16 @@ def _build_launch_parser() -> argparse.ArgumentParser:
             "Override the registered-controller launch refusal. The dispatch is "
             "recorded with no owner, so its terminal event wakes every controller "
             "in the project."
+        ),
+    )
+    parser.add_argument(
+        "--occupied-worktree-forced",
+        action="store_true",
+        help=(
+            "Override the occupied-worktree launch refusal: launch even though a "
+            "kernel lock or a non-terminal dispatch already owns --cwd (the two "
+            "writers then share one filesystem tree with no merge discipline), "
+            "or when occupancy cannot be evaluated."
         ),
     )
     parser.add_argument(
@@ -14039,6 +14501,29 @@ def main(argv: list[str] | None = None) -> int:
                 args.dispatch_id,
                 allow_queued=args.from_queue or args.submit,
             )
+            if not getattr(args, "submit", False):
+                try:
+                    _bind_dispatch_worktree(args)
+                except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
+                    print(f"goalflight_dispatch: {e}", file=sys.stderr)
+                    print(
+                        "goalflight_dispatch: refusing to git worktree add; "
+                        "wait for a seat or raise GOALFLIGHT_WORKTREE_SEATS",
+                        file=sys.stderr,
+                    )
+                    return 2
+                except goalflight_worktree_pool.WorktreeSeatError as e:
+                    print(
+                        f"goalflight_dispatch: worktree seat error: {e}",
+                        file=sys.stderr,
+                    )
+                    return 1
+            occupancy_warning = _prepare_attempt_worktree_occupancy(args)
+            if occupancy_warning is not None:
+                args.dispatch_warnings = [
+                    *getattr(args, "dispatch_warnings", []),
+                    occupancy_warning,
+                ]
             account_env = (
                 {} if goalflight_compat.is_windows() else _resolve_launch_account_env(args)
             )
@@ -14084,8 +14569,6 @@ def main(argv: list[str] | None = None) -> int:
         _apply_max_idle_default(args)
         _validate_before_side_effects(args, raw)
         dispatch_warnings = _dispatch_warnings(args, raw)
-        account_env = _resolve_launch_account_env(args)
-        _validate_claude_auth_before_attempt(args, account_env)
     except UnsupportedAgentSandboxRequest as e:
         try:
             return _record_unsupported_sandbox_rejection(args, e)
@@ -14109,6 +14592,37 @@ def main(argv: list[str] | None = None) -> int:
             args.dispatch_id,
             allow_queued=args.from_queue or args.submit,
         )
+        if not getattr(args, "submit", False):
+            _bind_dispatch_worktree(args)
+        occupancy_warning = _prepare_attempt_worktree_occupancy(args)
+        if occupancy_warning is not None:
+            dispatch_warnings = [*dispatch_warnings, occupancy_warning]
+    except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        print(
+            "goalflight_dispatch: refusing to git worktree add; "
+            "wait for a seat or raise GOALFLIGHT_WORKTREE_SEATS",
+            file=sys.stderr,
+        )
+        return 2
+    except goalflight_worktree_pool.WorktreeSeatError as e:
+        print(f"goalflight_dispatch: worktree seat error: {e}", file=sys.stderr)
+        return 1
+    except DispatchUsageError as e:
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        return 64
+    # Occupancy is the filesystem-corruption gate; it must refuse a second
+    # writer before account/auth work that could spawn or misdirect the
+    # operator. Same order as the ACP branch.
+    try:
+        account_env = _resolve_launch_account_env(args)
+        _validate_claude_auth_before_attempt(args, account_env)
+    except UnsupportedAgentSandboxRequest as e:
+        try:
+            return _record_unsupported_sandbox_rejection(args, e)
+        except DispatchUsageError as record_error:
+            print(f"goalflight_dispatch: {record_error}", file=sys.stderr)
+            return 64
     except DispatchUsageError as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64
@@ -14517,6 +15031,7 @@ def main(argv: list[str] | None = None) -> int:
             serialize_stdout=True,
             label="worker",
             cwd=str(_worker_cwd(args)),
+            inherit_occupancy_lock=True,
         )
         if worktree_seat is not None:
             # Worker inherited the fd. Drop this process's copy so the seat
@@ -14688,7 +15203,7 @@ def main(argv: list[str] | None = None) -> int:
         _start_dashboard_refresh_for_project(project_root)
         watcher_pid = _spawn_daemonized_process(
             watch_cmd,
-            env=os.environ.copy(),
+            env=_sidecar_env(os.environ.copy()),
             stdout_path=watch_log,
             stdout_mode="wb",
             stderr="stdout",
