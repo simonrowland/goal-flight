@@ -11386,6 +11386,8 @@ def _terminal_ledger_requeue_pending(
     if _requeue_failure_kind(record, tail) not in {"auth", "quota"}:
         return False
     intent = record.get("requeue")
+    if _requeue_disposition_is_terminal(intent):
+        return False
     child_id = intent.get("child_id") if isinstance(intent, dict) else None
     return not (
         isinstance(child_id, str)
@@ -12875,6 +12877,200 @@ def _effective_account_cooldown(effective_account: str) -> str | None:
     return cooldown if isinstance(cooldown, str) and cooldown else None
 
 
+REQUEUE_TERMINAL_DISPOSITIONS = frozenset({"satisfied", "abandoned", "expired"})
+REQUEUE_MAX_ATTEMPTS = 3
+REQUEUE_MAX_AGE_S = 24 * 60 * 60
+
+
+def _requeue_disposition_is_terminal(intent: object) -> bool:
+    return (
+        isinstance(intent, dict)
+        and intent.get("disposition") in REQUEUE_TERMINAL_DISPOSITIONS
+    )
+
+
+def _requeue_record_event_ts(record: dict) -> float | None:
+    for key in ("ended_at", "started_at", "updated_at"):
+        ts = _parse_timestamp_s(record.get(key))
+        if ts is not None:
+            return ts
+    intent = record.get("requeue")
+    if isinstance(intent, dict):
+        ts = _parse_timestamp_s(intent.get("requeued_at"))
+        if ts is not None:
+            return ts
+    return None
+
+
+def _requeue_intent_age_s(intent: dict, *, now_s: float | None = None) -> float | None:
+    ts = _parse_timestamp_s(intent.get("requeued_at"))
+    if ts is None:
+        return None
+    now = time.time() if now_s is None else float(now_s)
+    return max(0.0, now - ts)
+
+
+def _requeue_attempt_count(intent: dict) -> int | None:
+    raw = intent.get("attempt_count")
+    if raw is None:
+        return None
+    try:
+        count = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if count < 0:
+        return None
+    return count
+
+
+def _later_complete_successor_id(record: dict, entry: dict) -> str | None:
+    """A later success-terminal dispatch for the same task_ids, if proven.
+
+    Unlinked work, unlistable/unreadable ledger rows, and candidates whose
+    timestamps cannot be ordered are not a determination of "no successor".
+    They simply fail to prove one. Callers must retain the intent in those
+    cases rather than treating absence of a return value as expiry.
+    """
+    task_ids = set(_entry_task_ids(entry, record))
+    if not task_ids:
+        return None
+    self_id = str(record.get("dispatch_id") or entry.get("dispatch_id") or "")
+    self_ts = _requeue_record_event_ts(record)
+    if self_ts is None:
+        return None
+    try:
+        records = goalflight_ledger.read_records()
+    except OSError:
+        return None
+    for other in records:
+        if not isinstance(other, dict) or goalflight_ledger.record_is_unreadable(other):
+            continue
+        other_id = str(other.get("dispatch_id") or "")
+        if not other_id or other_id == self_id:
+            continue
+        if not (task_ids & set(_entry_task_ids(None, other))):
+            continue
+        state = str(other.get("state") or "")
+        terminal = str(other.get("terminal_state") or "")
+        if (
+            state not in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
+            and terminal not in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
+        ):
+            continue
+        other_ts = _requeue_record_event_ts(other)
+        if other_ts is None or other_ts < self_ts:
+            continue
+        return other_id
+    return None
+
+
+def _requeue_child_success_id(intent: dict) -> str | None:
+    child_id = intent.get("child_id")
+    if not isinstance(child_id, str) or not child_id:
+        return None
+    path = goalflight_ledger.record_path(child_id, create=False)
+    try:
+        if not path.exists():
+            return None
+        child = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(child, dict) or goalflight_ledger.record_is_unreadable(child):
+        return None
+    state = str(child.get("state") or "")
+    terminal = str(child.get("terminal_state") or "")
+    if (
+        state in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
+        or terminal in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
+    ):
+        return child_id
+    return None
+
+
+def _requeue_stop_decision(
+    record: dict,
+    entry: dict,
+    *,
+    regenerating: bool = False,
+    now_s: float | None = None,
+) -> dict | None:
+    """Return a terminal disposition when the retry is proven obsolete.
+
+    Missing timestamps or attempt counts are UNKNOWN and must retain.
+    """
+    successor = _later_complete_successor_id(record, entry)
+    if successor:
+        return {
+            "disposition": "satisfied",
+            "reason": "successor_complete",
+            "satisfied_by": successor,
+        }
+    intent = record.get("requeue")
+    if isinstance(intent, dict):
+        child_done = _requeue_child_success_id(intent)
+        if child_done:
+            return {
+                "disposition": "satisfied",
+                "reason": "retry_complete",
+                "satisfied_by": child_done,
+            }
+        age_s = _requeue_intent_age_s(intent, now_s=now_s)
+        if age_s is not None and age_s >= REQUEUE_MAX_AGE_S:
+            return {"disposition": "expired", "reason": "max_age"}
+        if regenerating:
+            attempts = _requeue_attempt_count(intent)
+            if attempts is not None and attempts >= REQUEUE_MAX_ATTEMPTS:
+                return {"disposition": "expired", "reason": "max_attempts"}
+    return None
+
+
+def _requeue_child_created_at(intent: dict) -> str:
+    """Oldest known child created_at. Never invent a younger stamp on regen."""
+    for key in ("child_created_at", "requeued_at"):
+        value = intent.get(key)
+        if isinstance(value, str) and value.strip() and _parse_timestamp_s(value) is not None:
+            return value
+    return goalflight_ledger.utc_now()
+
+
+def _unlink_requeue_child_files(queue_dir: Path, child_id: str) -> None:
+    # Only the queued envelope. A .claimed-* carrier may be a live launch;
+    # unlinking it would discard work we have not proven is idle.
+    queue_path = _queue_entry_path(child_id, queue_dir=queue_dir)
+    with contextlib.suppress(OSError):
+        queue_path.unlink()
+
+
+def _commit_requeue_disposition(
+    record: dict,
+    intent: dict,
+    decision: dict,
+    *,
+    queue_dir: Path,
+) -> bool:
+    now = goalflight_ledger.utc_now()
+    updated = dict(intent)
+    updated["disposition"] = decision["disposition"]
+    updated["disposition_at"] = now
+    updated["disposition_reason"] = decision.get("reason")
+    if decision.get("satisfied_by"):
+        updated["satisfied_by"] = decision["satisfied_by"]
+    record["requeue"] = updated
+    try:
+        goalflight_ledger.write_record(record)
+    except OSError as exc:
+        print(
+            "goalflight_dispatch: requeue disposition warning: "
+            f"{type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return False
+    child_id = updated.get("child_id")
+    if isinstance(child_id, str) and child_id:
+        _unlink_requeue_child_files(queue_dir, child_id)
+    return True
+
+
 def _write_json_exclusive(path: Path, payload: dict) -> bool:
     """Durably create one queue entry without ever replacing an existing path."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -12912,6 +13108,8 @@ def _requeue_child_entry(
     requeued_from: str,
     queue_dir: Path,
     not_before: str | None,
+    created_at: str | None = None,
+    requeue_attempt: int | None = None,
 ) -> dict | None:
     dispatch_argv = list(entry.get("dispatch_argv") or [])
     if not dispatch_argv:
@@ -12929,6 +13127,7 @@ def _requeue_child_entry(
         dispatch_argv, "--status-json", str(status_json)
     )
     now = goalflight_ledger.utc_now()
+    child_created_at = created_at if isinstance(created_at, str) and created_at.strip() else now
     queue_path = _queue_entry_path(child_id, queue_dir=queue_dir)
     child = _sanitize_restore_envelope(entry, increment_recovery_count=False)
     request = (
@@ -12949,7 +13148,7 @@ def _requeue_child_entry(
             "schema": DISPATCH_QUEUE_SCHEMA,
             "state": "queued",
             "dispatch_id": child_id,
-            "created_at": now,
+            "created_at": child_created_at,
             "updated_at": now,
             "queue_path": str(queue_path),
             "dispatch_argv": dispatch_argv,
@@ -12957,6 +13156,9 @@ def _requeue_child_entry(
             "requeued_from": requeued_from,
         }
     )
+    if requeue_attempt is not None:
+        child["requeue_attempt"] = requeue_attempt
+        request["requeue_attempt"] = requeue_attempt
     for key in (
         "requeue",
         "restore_txn_id",
@@ -13002,6 +13204,16 @@ def _maybe_requeue_terminal_claim(
         return True
 
     intent = record.get("requeue")
+    if _requeue_disposition_is_terminal(intent):
+        return True
+    would_requeue = _requeue_failure_kind(record, tail) in {"auth", "quota"}
+    if isinstance(intent, dict) or would_requeue:
+        decision = _requeue_stop_decision(record, entry, regenerating=False)
+        if decision is not None:
+            seed = intent if isinstance(intent, dict) else {}
+            return _commit_requeue_disposition(
+                record, seed, decision, queue_dir=queue_dir
+            )
     if intent is None:
         effective_account = record.get("effective_account")
         if not isinstance(effective_account, str) or not effective_account:
@@ -13030,6 +13242,11 @@ def _maybe_requeue_terminal_claim(
         return False
     if _requeue_child_exists(queue_dir, child_id):
         return True
+    decision = _requeue_stop_decision(record, entry, regenerating=True)
+    if decision is not None:
+        return _commit_requeue_disposition(
+            record, intent, decision, queue_dir=queue_dir
+        )
 
     failure_kind = _requeue_failure_kind(record, tail)
     effective_account = record.get("effective_account")
@@ -13049,12 +13266,17 @@ def _maybe_requeue_terminal_claim(
             not_before = policy.get("not_before") or None
         elif isinstance(effective_account, str):
             not_before = _effective_account_cooldown(effective_account)
+    created_at = _requeue_child_created_at(intent)
+    prior_attempts = _requeue_attempt_count(intent)
+    next_attempt = (prior_attempts or 0) + 1
     child = _requeue_child_entry(
         entry,
         child_id=child_id,
         requeued_from=dispatch_id,
         queue_dir=queue_dir,
         not_before=not_before,
+        created_at=created_at,
+        requeue_attempt=next_attempt,
     )
     if child is None:
         return False
@@ -13068,6 +13290,20 @@ def _maybe_requeue_terminal_claim(
             file=sys.stderr,
         )
         return False
+    if created:
+        intent["attempt_count"] = next_attempt
+        intent["child_created_at"] = created_at
+        intent["last_lodged_at"] = goalflight_ledger.utc_now()
+        record["requeue"] = intent
+        try:
+            goalflight_ledger.write_record(record)
+        except OSError as exc:
+            print(
+                "goalflight_dispatch: requeue attempt warning: "
+                f"{type(exc).__name__}",
+                file=sys.stderr,
+            )
+            # Child is already durable; keep the claim unlinked.
     return created or _requeue_child_exists(queue_dir, child_id)
 
 

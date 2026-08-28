@@ -48,6 +48,12 @@ incremented when meaningful skill behaviour changes.
   (unmarked/capacity, steer, watcher, caffeinate, pidfile, prompt,
   tail-middle, historical `/tmp` backlog) is in the module docstring and
   CLI help.
+- Requeue intent lifecycle: a retry now carries a terminal disposition
+  (`satisfied` / `abandoned` / `expired`). Regeneration stops when a later
+  dispatch for the same task_ids is complete, when the intent is older
+  than 24h, or after 3 lodges. The queue entry keeps the original
+  `created_at` and surfaces `requeue_attempt`. UNKNOWN timestamps,
+  unlistable ledgers, and unlinked work retain the intent.
 
 ### Changed
 
