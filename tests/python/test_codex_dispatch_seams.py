@@ -1351,6 +1351,10 @@ def test_future_requeue_not_before_is_left_queued(tmp_path: Path) -> None:
     assert "unknown time" in str(row.get("winner_age") or "")
     assert "age " not in str(row.get("winner_age") or "")
     assert "age 0m" not in str(row.get("headroom") or "")
+    holds_nb = (payload.get("holds") or {}).get("not_before") or {}
+    assert holds_nb.get("count") == 1
+    assert holds_nb.get("winner") == row["winner"]
+    assert holds_nb.get("winner_age") == row["winner_age"]
 
 
 def test_not_before_contradicted_by_newer_healthy_probe_no_longer_gates(
@@ -1444,7 +1448,7 @@ def _drain_held_not_before(
     dispatch_id: str,
     probe_row: dict,
     ledger_record: dict | None,
-) -> dict:
+) -> tuple[dict, dict]:
     queue_dir = tmp_path / "queue"
     queue_dir.mkdir()
     queue_path = queue_dir / f"{dispatch_id}.json"
@@ -1486,7 +1490,7 @@ def _drain_held_not_before(
         if row.get("reason") == "not_before"
     ]
     assert len(holds) == 1, payload
-    return holds[0]
+    return holds[0], payload
 
 
 def test_not_before_hold_detail_names_winning_probe_and_age(
@@ -1499,7 +1503,7 @@ def test_not_before_hold_detail_names_winning_probe_and_age(
     as the usage table. Queue bytes are not rewritten.
     """
     probe_at = time.time() - 5 * 86400
-    row = _drain_held_not_before(
+    row, payload = _drain_held_not_before(
         tmp_path,
         monkeypatch,
         dispatch_id="held-probe-win",
@@ -1533,6 +1537,10 @@ def test_not_before_hold_detail_names_winning_probe_and_age(
     assert "winner: probe → exhausted" in row["headroom"], row
     assert "age " in row["winner_age"], row
     assert "age " in row["headroom"], row
+    holds_nb = (payload.get("holds") or {}).get("not_before") or {}
+    assert holds_nb.get("count") == 1, holds_nb
+    assert holds_nb.get("winner") == "probe", holds_nb
+    assert holds_nb.get("winner_age") == row["winner_age"], holds_nb
 
 
 def test_not_before_hold_detail_names_winning_dispatch_and_age(
@@ -1540,7 +1548,7 @@ def test_not_before_hold_detail_names_winning_dispatch_and_age(
 ) -> None:
     """Reverse: a newer dispatch wall beating a stale healthy probe is named."""
     now = time.time()
-    row = _drain_held_not_before(
+    row, payload = _drain_held_not_before(
         tmp_path,
         monkeypatch,
         dispatch_id="held-dispatch-win",
@@ -1577,6 +1585,10 @@ def test_not_before_hold_detail_names_winning_dispatch_and_age(
     assert row["verdict"] == "exhausted", row
     assert "winner: dispatch → exhausted" in row["headroom"], row
     assert "age " in row["winner_age"], row
+    holds_nb = (payload.get("holds") or {}).get("not_before") or {}
+    assert holds_nb.get("count") == 1, holds_nb
+    assert holds_nb.get("winner") == "dispatch", holds_nb
+    assert holds_nb.get("winner_age") == row["winner_age"], holds_nb
 
 
 def test_requeue_child_ledger_evidence_prevents_duplicate(

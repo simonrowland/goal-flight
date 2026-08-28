@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+import time
 import types
 
 import pytest
@@ -286,19 +287,38 @@ def test_not_before_is_surfaced_as_detail(capsys) -> None:
 
 
 def test_not_before_detail_prints_winning_source_and_age(capsys) -> None:
-    """Same winner vocabulary as usage: probe vs recorded exhaustion, plus age."""
+    """Same winner vocabulary as usage: probe vs recorded exhaustion, plus age.
+
+    Fields come from `_not_before_headroom_fields`, not a constructed string.
+    """
+    now = time.time()
+    probe_at = now - 5 * 86400
+    import goalflight_usage as usage
+
+    fields = gd._not_before_headroom_fields(
+        {
+            "winner": usage.SOURCE_PROBE,
+            "verdict": "exhausted",
+            "probe": {
+                "source": usage.SOURCE_PROBE,
+                "state": "walled",
+                "observed_at": probe_at,
+            },
+            "dispatch": None,
+        },
+        now=now,
+    )
     gd._report_why_this_entry_did_not_launch(_args("mine"), {"details": [
         {
             "dispatch_id": "mine",
             "reason": "not_before",
             "not_before": "2026-09-01T11:44:00Z",
-            "winner": "probe",
-            "verdict": "exhausted",
-            "winner_age": "Aug 27 14:00, age 5.0d",
-            "headroom": "winner: probe → exhausted (as of Aug 27 14:00, age 5.0d)",
+            **fields,
         },
     ]})
     err = capsys.readouterr().err
+    assert fields["winner"] == "probe"
+    assert "age " in str(fields.get("winner_age") or "")
     assert "not_before" in err
     assert "winner: probe → exhausted" in err
-    assert "age 5.0d" in err
+    assert str(fields["winner_age"]) in err

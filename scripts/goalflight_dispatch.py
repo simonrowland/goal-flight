@@ -12005,6 +12005,8 @@ def _headroom_for_queue_entry(
             row = dict(candidate)
             break
     if row is None:
+        # A probe that was never taken has no observed_at. Stamping `now`
+        # here used to print "age 0m" for a measurement that did not happen.
         row = usage._row(
             provider,
             account=account,
@@ -13611,17 +13613,10 @@ def _drain_queue_once(args) -> dict:
     left_queued += len(deferred_entries)
     not_before_until: str | None = None
     not_before_until_ts: float | None = None
+    not_before_winner: object = None
+    not_before_winner_age: object = None
     for _sort_key, path, entry, _read_error in deferred_entries:
         not_before_ts = _queue_entry_not_before_ts(entry)
-        if (
-            isinstance(entry, dict)
-            and not_before_ts is not None
-            and (not_before_until_ts is None or not_before_ts < not_before_until_ts)
-        ):
-            not_before_until_ts = not_before_ts
-            not_before_until = entry.get("not_before") or (
-                entry.get("request") if isinstance(entry.get("request"), dict) else {}
-            ).get("not_before")
         row = {
             "dispatch_id": (
                 str(entry.get("dispatch_id"))
@@ -13644,11 +13639,29 @@ def _drain_queue_once(args) -> dict:
                 )
             )
         details.append(row)
+        if (
+            isinstance(entry, dict)
+            and not_before_ts is not None
+            and (not_before_until_ts is None or not_before_ts < not_before_until_ts)
+        ):
+            not_before_until_ts = not_before_ts
+            not_before_until = entry.get("not_before") or (
+                entry.get("request") if isinstance(entry.get("request"), dict) else {}
+            ).get("not_before")
+            not_before_winner = row.get("winner")
+            not_before_winner_age = row.get("winner_age")
     # Hold-reason aggregation (t-345): the summary must say WHY entries are
     # held, not only THAT launched:0. `until` is the EARLIEST pending
     # not_before — when this queue next becomes eligible to make progress.
+    # Winner+age of that earliest row is the operator surface for launched:0
+    # drains that only read the hold summary / compact DRAIN line.
     holds: dict = {
-        "not_before": {"count": len(deferred_entries), "until": not_before_until},
+        "not_before": {
+            "count": len(deferred_entries),
+            "until": not_before_until,
+            "winner": not_before_winner,
+            "winner_age": not_before_winner_age,
+        },
         "restore_prepared": {
             "count": len(restore_prepared_candidates),
             "owner_live": 0,
@@ -14134,6 +14147,8 @@ def _cmd_drain(argv: list[str]) -> int:
                     "live_claimer": payload.get("live_claimer", 0),
                     "waiting_not_before": not_before_hold.get("count", 0),
                     "waiting_not_before_until": not_before_hold.get("until"),
+                    "waiting_not_before_winner": not_before_hold.get("winner"),
+                    "waiting_not_before_age": not_before_hold.get("winner_age"),
                     "awaiting_owner_reconcile": restore_hold.get("count", 0),
                     "owner_generation_dead": restore_hold.get("owner_dead", 0),
                     "quarantined": holds.get("quarantined", 0),

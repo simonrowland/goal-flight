@@ -208,6 +208,8 @@ def test_holds_report_quota_waits_and_restore_prepared_by_owner_state(
         holds = payload["holds"]
         assert holds["not_before"]["count"] == 1, holds
         assert holds["not_before"]["until"] == future, holds
+        assert holds["not_before"]["winner"] in {"probe", "dispatch", "none"}, holds
+        assert holds["not_before"]["winner_age"], holds
         rp = holds["restore_prepared"]
         assert rp["count"] == 4, rp
         assert rp["owner_live"] == 1, rp
@@ -314,7 +316,12 @@ def test_empty_queue_reports_zero_holds(
     queue = _queue_dir(tmp_path)
     payload = _drain_json(queue, capsys)
     assert payload["holds"] == {
-        "not_before": {"count": 0, "until": None},
+        "not_before": {
+            "count": 0,
+            "until": None,
+            "winner": None,
+            "winner_age": None,
+        },
         "restore_prepared": {"count": 0, "owner_live": 0, "owner_dead": 0, "owner_unknown": 0},
         "reconcile_pending": {},
         "quarantined": 0,
@@ -349,6 +356,8 @@ def test_text_line_carries_hold_summary(tmp_path: Path, capsys: pytest.CaptureFi
     assert summary["launched"] == 0
     assert summary["waiting_not_before"] == 1
     assert summary["waiting_not_before_until"] == future
+    assert summary["waiting_not_before_winner"] in {"probe", "dispatch", "none"}
+    assert summary["waiting_not_before_age"]
     assert summary["awaiting_owner_reconcile"] == 1
     assert summary["owner_generation_dead"] == 0
     assert summary["attention"] == 0
