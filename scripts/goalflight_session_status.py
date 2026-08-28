@@ -73,6 +73,10 @@ CONTROLLER_PID_ENV = "GOALFLIGHT_CONTROLLER_PID"
 CONTROLLER_SESSION_ID_ENV = "GOALFLIGHT_CONTROLLER_SESSION_ID"
 CONTROLLER_HEARTBEAT_RECENCY_S = 15 * 60
 CONTROLLER_HEARTBEAT_MAX_FUTURE_S = 60
+# Surface the renewal cliff before the deadline, not only after it. 30 minutes
+# is inside one heartbeat-recency window of a 2-hour lease horizon so an
+# idle-looking controller still sees the quarantine stake in time to --join.
+RENEW_WARN_WITHIN_S = 30 * 60
 NON_CONTROLLER_ROLES = frozenset({"listener", "drainer", "mirror", "dashboard"})
 CONTROLLER_LOCK_READY_TIMEOUT_S = 3.0
 CONTROLLER_LOCK_STARTUP_GRACE_S = 5.0
@@ -1522,13 +1526,20 @@ def _wake_supervisor_fields(
     *,
     label: str,
     lease_nonce: str | None,
+    now_epoch: float | None = None,
 ) -> dict:
-    """Coverage + supervisor generation, without collapsing unknown to absent."""
+    """Coverage + supervisor generation, without collapsing unknown to absent.
+
+    ``wake_armed`` is generation presence (a supervise argv or live coverage).
+    ``wake_alive`` is observed recency of the stream monitor: a process listing
+    or leftover lock can stay armed after the feed has gone silent.
+    """
     if not lease_nonce:
         return {
             "supervisor": goalflight_wake.SUPERVISOR_UNKNOWN,
             "wake_covered": None,
             "wake_armed": None,
+            "wake_alive": None,
         }
     try:
         supervisor = goalflight_wake.supervisor_generation_state(
@@ -1566,10 +1577,32 @@ def _wake_supervisor_fields(
         armed = False
     else:
         armed = None
+    alive: bool | None = None
+    try:
+        monitor = goalflight_wake.monitor_status(
+            project_root,
+            controller_label=label,
+            lease_nonce=lease_nonce,
+            now_epoch=now_epoch,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        monitor = None
+    if isinstance(monitor, dict):
+        state = str(monitor.get("state") or "")
+        if state == "recent":
+            alive = True
+        elif state in {"stale", "fault"}:
+            alive = False
+        # awaiting-first-record is armed-not-yet-observed, not proven dead.
+        # Treating it as False would alarm "wake DEAD" for the first follow
+        # heartbeat interval after a healthy supervisor spawn.
+    if alive is None and supervisor == goalflight_wake.SUPERVISOR_ABSENT:
+        alive = False
     return {
         "supervisor": supervisor,
         "wake_covered": covered,
         "wake_armed": armed,
+        "wake_alive": alive,
     }
 
 
@@ -1736,6 +1769,7 @@ def controller_roster(
             project_root,
             label=label,
             lease_nonce=nonce,
+            now_epoch=measured_now.timestamp(),
         )
         retired = bool(record.get("retired_at"))
         retirement = _retirement_fields(
@@ -1769,6 +1803,7 @@ def controller_roster(
                 "supervisor": wake["supervisor"],
                 "wake_covered": wake["wake_covered"],
                 "wake_armed": wake["wake_armed"],
+                "wake_alive": wake["wake_alive"],
                 "renew_deadline_at": record.get("renew_deadline_at"),
                 "retired": retired,
                 "retired_at": record.get("retired_at"),
@@ -1796,6 +1831,65 @@ def controller_roster(
     }
 
 
+def _owned_dispatch_count(record: dict) -> int | None:
+    owned = record.get("nonterminal_owned_dispatches")
+    if isinstance(owned, bool) or not isinstance(owned, int) or owned < 0:
+        return None
+    return owned
+
+
+def controller_alert_lines(
+    record: dict,
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    """Actionable warnings for the controller that owns this roster row.
+
+    Roster fields already compute incarnation, wake, and owned-dispatch
+    counts. Nothing was putting those in front of the owner. These lines
+    name the stake: a roll quarantines N dispatches; an unarmed or
+    armed-but-dead supervisor is deafness, not a data point.
+    """
+    alerts: list[str] = []
+    label = "".join(
+        char if char.isprintable() and char not in "\r\n" else "?"
+        for char in str(record.get("label") or "controller")
+    ) or "controller"
+    owned = _owned_dispatch_count(record)
+    measured_now = now or datetime.now(timezone.utc)
+    if measured_now.tzinfo is None:
+        measured_now = measured_now.replace(tzinfo=timezone.utc)
+    measured_now = measured_now.astimezone(timezone.utc)
+    deadline = _parse_utc(record.get("renew_deadline_at"))
+    if owned and owned > 0 and deadline is not None:
+        remaining = (deadline - measured_now).total_seconds()
+        if remaining <= 0:
+            alerts.append(
+                f"{label}: lease overdue — {owned} dispatches would be "
+                "quarantined by a roll; renew (--join)"
+            )
+        elif remaining <= RENEW_WARN_WITHIN_S:
+            minutes = max(1, int(remaining // 60))
+            alerts.append(
+                f"{label}: lease renews in {minutes}m — {owned} dispatches "
+                "would be quarantined by a roll; renew (--join)"
+            )
+    if owned and owned > 0:
+        armed = record.get("wake_armed")
+        alive = record.get("wake_alive")
+        if armed is False:
+            alerts.append(
+                f"{label}: wake unarmed with {owned} non-terminal dispatches "
+                "— controller is deaf"
+            )
+        elif armed is True and alive is False:
+            alerts.append(
+                f"{label}: wake armed but DEAD (not observed alive) with "
+                f"{owned} non-terminal dispatches — controller is deaf"
+            )
+    return alerts
+
+
 def controller_roster_lines(roster: dict) -> list[str]:
     measurements = roster.get("measurements")
     registry = (
@@ -1818,17 +1912,28 @@ def controller_roster_lines(roster: dict) -> list[str]:
         state = str(record.get("incarnation_state") or "unknown")
         if conflict > 1:
             state = f"{state}, conflict {conflict}"
-        renew_note = (
-            " | lease overdue — renew (--join)"
-            if record.get("incarnation_state") == "live-overdue"
-            else ""
-        )
+        notes: list[str] = []
+        owned_count = _owned_dispatch_count(record)
+        if record.get("incarnation_state") == "live-overdue":
+            if owned_count:
+                notes.append(
+                    f"lease overdue — {owned_count} dispatches would be "
+                    "quarantined by a roll; renew (--join)"
+                )
+            else:
+                notes.append("lease overdue — renew (--join)")
+        if owned_count:
+            if record.get("wake_armed") is True and record.get("wake_alive") is False:
+                notes.append("wake DEAD")
+            elif record.get("wake_armed") is False:
+                notes.append("wake unarmed")
+        suffix = "".join(f" | {note}" for note in notes)
         lines.append(
             f"{label} | {record.get('idle')} | "
             f"{state} | "
             f"unread {unread if unread is not None else 'unknown'} | "
             f"owned {owned if owned is not None else 'unknown'}"
-            f"{renew_note}"
+            f"{suffix}"
         )
     return lines
 
@@ -2422,6 +2527,19 @@ def aggregate_status(project_root: Path, *, ttl_days: int = 7) -> dict:
     )
     backlog_counts, backlog_error = _task_backlog_counts(project_root)
     ready_frontier, ready_frontier_error = _ready_frontier(project_root)
+    owner_alerts: list[str] = []
+    try:
+        roster = controller_roster(project_root)
+        measured_now = datetime.now(timezone.utc)
+        for record in roster.get("controllers") or []:
+            if not isinstance(record, dict):
+                continue
+            owner_alerts.extend(controller_alert_lines(record, now=measured_now))
+    except Exception:
+        # Alerts are additive. A busy journal or wake-ledger probe must not
+        # turn `session_status --text` into a crash; the queue/lease verdict
+        # remains the activation answer.
+        owner_alerts = []
     return {
         "active": active,
         "queue_file": str(newest_queue.relative_to(project_root)) if newest_queue else None,
@@ -2446,6 +2564,7 @@ def aggregate_status(project_root: Path, *, ttl_days: int = 7) -> dict:
         "ready_frontier": ready_frontier,
         "ready_frontier_error": ready_frontier_error,
         "ttl_days": ttl_days,
+        "owner_alerts": owner_alerts,
     }
 
 
@@ -2649,6 +2768,10 @@ def to_text(status: dict) -> str:
             pieces.append(counts_text)
         if resume_text:
             pieces.append(resume_text)
+        for alert in status.get("owner_alerts") or []:
+            text_alert = str(alert).strip()
+            if text_alert:
+                pieces.append(text_alert)
         return "; ".join(pieces)
     leases_count = status["active_capacity_leases_in_project"]
     pieces = [
@@ -2662,6 +2785,10 @@ def to_text(status: dict) -> str:
         pieces.append(counts_text)
     if resume_text:
         pieces.append(resume_text)
+    for alert in status.get("owner_alerts") or []:
+        text_alert = str(alert).strip()
+        if text_alert:
+            pieces.append(text_alert)
     return "; ".join(pieces)
 
 
