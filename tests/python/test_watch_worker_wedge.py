@@ -88,8 +88,8 @@ def test_true_positive_all_three_legs_is_stall_candidate() -> None:
 
 
 def test_default_sustain_is_fifteen_minutes_not_five() -> None:
-    """5 minutes sits inside grok burst-gap range; 15 minutes is the default."""
-    assert watch.DEFAULT_WEDGE_IDLE_SECS == 900.0
+    """5 minutes sits inside grok burst-gap range; default is grok p99+ margin."""
+    assert watch.DEFAULT_WEDGE_IDLE_SECS == 1080.0
     # Injected 5-minute window still classifies when tests ask for it.
     assert _wedge(threshold_s=300.0) is not None
     # Default window: 400s of silence is not enough.
@@ -328,6 +328,11 @@ def _run_wedge_watcher(
         except StopIteration:
             return dict(last_cpu)
 
+    def guarded_kill(pid, sig=0):
+        if sig == 0:
+            raise ProcessLookupError(pid)
+        raise AssertionError("watcher must not kill a wedged worker")
+
     stdout = io.StringIO()
     with patch.dict(os.environ, env, clear=False), patch.object(
         sys, "argv", monkeypatch_argv
@@ -346,6 +351,10 @@ def _run_wedge_watcher(
     ), patch.object(
         watch, "pgroup_cputime_snapshot", next_cpu
     ), patch.object(
+        watch.wedge_watch,
+        "provider_socket_state",
+        lambda *_args, **_kwargs: watch.wedge_watch.SOCKET_NONE,
+    ), patch.object(
         watch, "system_starved", lambda: False
     ), patch.object(
         watch.TraceLiveness, "sample", lambda self, **_kwargs: {}
@@ -354,7 +363,7 @@ def _run_wedge_watcher(
     ), patch.object(
         sys, "stdout", stdout
     ), patch(
-        "os.kill", side_effect=AssertionError("watcher must not kill a wedged worker")
+        "os.kill", side_effect=guarded_kill
     ):
         rc = watch.main()
     return rc, payloads, stdout.getvalue()
@@ -423,7 +432,7 @@ def test_watcher_loop_true_positive_emits_once_and_stays_alive() -> None:
         wedged = [p for p in payloads if p.get("state") == "worker_stalled_candidate"]
         assert wedged, [p.get("state") for p in payloads]
         evidence = wedged[0].get("wedge_evidence") or {}
-        for key in ("tail_age_s", "tree_age_s", "cpu_delta_s", "sample_interval_s", "tail_bytes_grown"):
+        for key in ("tail_age_s", "tree_writes", "cpu_delta_s", "tail_bytes_grown"):
             assert key in evidence, evidence
         assert evidence["cpu_delta_s"] == 0.0
         assert evidence["authoritative"] is False
