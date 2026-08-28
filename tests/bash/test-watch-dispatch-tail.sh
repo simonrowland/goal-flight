@@ -59,7 +59,7 @@ cleanup_pidfile() {
   rm -f "$PIDFILE_DIR/$stem"
 }
 wait_for_file() {
-  local path="$1" attempts="${2:-50}" i
+  local path="$1" attempts="${2:-150}" i
   i=0
   while [ "$i" -lt "$attempts" ]; do
     [ -f "$path" ] && return 0
@@ -67,6 +67,24 @@ wait_for_file() {
     i=$((i + 1))
   done
   [ -f "$path" ]
+}
+wait_for_needle() {
+  local path="$1" needle="$2" attempts="${3:-200}" i
+  i=0
+  while [ "$i" -lt "$attempts" ]; do
+    if [ -f "$path" ] && grep -q "$needle" "$path" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -f "$path" ] && grep -q "$needle" "$path" 2>/dev/null
+}
+stop_pid() {
+  local pid="$1"
+  [ -n "$pid" ] || return 0
+  kill "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
 }
 start_isolated_sleep() {
   local duration="$1"
@@ -92,13 +110,11 @@ run_dead_tail_case() {
   local out="$4"
   local expected="$5"
   local dispatch_id="${6:-$label}"
-  local worker_sleep="5"
 
-  # Negative dead-tail cases need enough startup margin for the watcher to
-  # register the worker before it exits; otherwise they fail before emitting the
-  # WATCHER-EXIT summary the case is checking.
-  [ "$expected" = "1" ] && worker_sleep="2.5"
-  sleep "$worker_sleep" & WORKER_PID=$!
+  # The watcher exits 1 at startup if the worker PID is already gone
+  # (python3 import under load can outlast a short `sleep N`). Hold the
+  # worker until the pidfile proves registration, then inject death.
+  sleep 3600 & WORKER_PID=$!
   PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
   bash "$WATCHER" \
     --pid "$WORKER_PID" --tail "$tail" \
@@ -106,10 +122,18 @@ run_dead_tail_case() {
     --session-id "$dispatch_id" \
     --ignore-prompt-file "$prompt" \
     --poll-secs 1 --max-idle-secs 30 \
-    > "$out" 2>&1
+    > "$out" 2>&1 &
+  WATCHER_PID=$!
+  if ! wait_for_file "$PIDFILE_DIR/$PIDFILE_STEM"; then
+    expect_eq "$label watcher registered live worker" "yes" "no"
+    stop_pid "$WATCHER_PID"
+    stop_pid "$WORKER_PID"
+    cleanup_pidfile "$PIDFILE_STEM"
+    return
+  fi
+  stop_pid "$WORKER_PID"
+  wait "$WATCHER_PID"
   watcher_exit=$?
-  kill "$WORKER_PID" 2>/dev/null
-  wait "$WORKER_PID" 2>/dev/null
   expect_eq "$label exit code" "$expected" "$watcher_exit"
   cleanup_pidfile "$PIDFILE_STEM"
 }
@@ -124,13 +148,7 @@ run_pid_dead_grace_marker_case() {
   local dispatch_id="${7:-$label}"
 
   : > "$tail"
-  (
-    sleep 2.5
-    {
-      echo "grok worker completed review"
-      echo "$marker"
-    } >> "$tail"
-  ) & WORKER_PID=$!
+  sleep 3600 & WORKER_PID=$!
   PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
   bash "$WATCHER" \
     --pid "$WORKER_PID" --tail "$tail" \
@@ -138,9 +156,22 @@ run_pid_dead_grace_marker_case() {
     --session-id "$dispatch_id" \
     --ignore-prompt-file "$prompt" \
     --poll-secs 1 --max-idle-secs 30 \
-    > "$out" 2>&1
+    > "$out" 2>&1 &
+  WATCHER_PID=$!
+  if ! wait_for_file "$PIDFILE_DIR/$PIDFILE_STEM"; then
+    expect_eq "$label watcher registered live worker" "yes" "no"
+    stop_pid "$WATCHER_PID"
+    stop_pid "$WORKER_PID"
+    cleanup_pidfile "$PIDFILE_STEM"
+    return
+  fi
+  {
+    echo "grok worker completed review"
+    echo "$marker"
+  } >> "$tail"
+  stop_pid "$WORKER_PID"
+  wait "$WATCHER_PID"
   watcher_exit=$?
-  wait "$WORKER_PID" 2>/dev/null
   expect_eq "$label exit code" "$expected" "$watcher_exit"
   cleanup_pidfile "$PIDFILE_STEM"
 }
@@ -175,7 +206,7 @@ bash "$WATCHER" \
 WATCHER_PID=$!
 
 # Verify pidfile exists
-if wait_for_file "$PIDFILE_DIR/$PIDFILE_STEM" 50; then
+if wait_for_file "$PIDFILE_DIR/$PIDFILE_STEM"; then
   expect_eq "case-1 pidfile written at startup" "yes" "yes"
 else
   expect_eq "case-1 pidfile written at startup" "yes" "no"
@@ -184,7 +215,11 @@ fi
 # Let the worker expose a marker as its last line, then grow the tail while it
 # remains alive. The watcher must discard that candidate instead of exiting 0.
 : > "$TRIGGER"
-sleep 2.3
+if wait_for_needle /tmp/watcher-out-marker-$$.txt "terminal candidate disproved by live tail growth"; then
+  expect_eq "case-1 growth veto recorded" "yes" "yes"
+else
+  expect_eq "case-1 growth veto recorded" "yes" "no"
+fi
 watcher_finished_early=0
 watcher_exit=0
 if kill -0 "$WATCHER_PID" 2>/dev/null; then
@@ -209,11 +244,6 @@ if [ -f "$PIDFILE_DIR/$PIDFILE_STEM" ]; then
 else
   expect_eq "case-1 pidfile removed after worker exit" "removed" "removed"
 fi
-if grep -q "WATCHER-DISCARD: terminal candidate disproved by live tail growth" /tmp/watcher-out-marker-$$.txt; then
-  expect_eq "case-1 growth veto recorded" "yes" "yes"
-else
-  expect_eq "case-1 growth veto recorded" "yes" "no"
-fi
 if grep -q "WATCHER-EXIT: marker exit_code=0" /tmp/watcher-out-marker-$$.txt; then
   expect_eq "case-1 WATCHER-EXIT summary line emitted" "yes" "yes"
 else
@@ -230,12 +260,16 @@ fi
 # The six-second candidate grace is only a growth-veto window. A live worker
 # that remains quiet past it is still live evidence, so the watcher must keep
 # watching until worker exit (or the ordinary max-idle classifier).
+# Hold the worker until the watcher itself records the pending state; a
+# wall-clock sleep 7 vs worker sleep 8 races load and misses the log line.
 TAIL=/tmp/test-watch-quiet-live-marker-$$.txt
 OUT=/tmp/watcher-out-quiet-live-marker-$$.txt
+HOLD=/tmp/test-watch-quiet-live-hold-$$
+rm -f "$HOLD"
 : > "$TAIL"
 (
   echo "**COMPLETE:** quiet-live-marker — bounded work complete"
-  sleep 8
+  while [ ! -f "$HOLD" ]; do sleep 0.05; done
 ) >> "$TAIL" & WORKER_PID=$!
 PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
 bash "$WATCHER" \
@@ -246,8 +280,11 @@ bash "$WATCHER" \
   > "$OUT" 2>&1 &
 WATCHER_PID=$!
 
-# Wait past POST_TERMINAL_EXIT_GRACE_SECS (6s) while the worker remains alive.
-sleep 7
+if wait_for_needle "$OUT" "terminal candidate still pending while worker is alive"; then
+  expect_eq "case-1q pending state recorded" "yes" "yes"
+else
+  expect_eq "case-1q pending state recorded" "yes" "no"
+fi
 quiet_watcher_finished_early=0
 watcher_exit=0
 if kill -0 "$WATCHER_PID" 2>/dev/null; then
@@ -258,18 +295,14 @@ else
   quiet_watcher_finished_early=1
   expect_eq "case-1q quiet live marker stays pending through grace" "running" "exited-$watcher_exit"
 fi
+: > "$HOLD"
 wait "$WORKER_PID" 2>/dev/null
 if [ "$quiet_watcher_finished_early" -eq 0 ]; then
   wait "$WATCHER_PID"
   watcher_exit=$?
 fi
 expect_eq "case-1q worker exit reconciles quiet marker" "0" "$watcher_exit"
-if grep -q "terminal candidate still pending while worker is alive" "$OUT"; then
-  expect_eq "case-1q pending state recorded" "yes" "yes"
-else
-  expect_eq "case-1q pending state recorded" "yes" "no"
-fi
-rm -f "$TAIL" "$OUT"
+rm -f "$TAIL" "$OUT" "$HOLD"
 cleanup_pidfile "$PIDFILE_STEM"
 
 # ---- Case 1r: tail growth resets the outer event-silence clock ----
@@ -312,8 +345,10 @@ if grep -q "WATCHER-EXIT: liveness_indeterminate exit_code=2" "$OUT"; then
 else
   expect_eq "case-1r event-silence summary" "yes" "no"
 fi
-kill "$WORKER_PID" 2>/dev/null
-wait "$WORKER_PID" 2>/dev/null
+if [ -s "$CHILD_PID_FILE" ]; then
+  stop_pid "$(cat "$CHILD_PID_FILE")"
+fi
+stop_pid "$WORKER_PID"
 rm -f "$TAIL" "$OUT" "$CHILD_PID_FILE"
 cleanup_pidfile "$PIDFILE_STEM"
 
@@ -466,7 +501,7 @@ cleanup_pidfile "$PIDFILE_STEM"
 # removes the pidfile.
 TAIL=/tmp/test-watch-marker-dead-$$.txt
 : > "$TAIL"
-sleep 2 & WORKER_PID=$!
+sleep 3600 & WORKER_PID=$!
 PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
 
 bash "$WATCHER" \
@@ -476,13 +511,17 @@ bash "$WATCHER" \
   --poll-secs 1 --max-idle-secs 30 \
   > /tmp/watcher-out-marker-dead-$$.txt 2>&1 &
 WATCHER_PID=$!
-wait "$WORKER_PID" 2>/dev/null
-sleep 0.1
-echo "**COMPLETE:** test-marker-dead — done" >> "$TAIL"
-sleep 0.5  # let watcher observe marker after worker exit
-wait "$WATCHER_PID"
-watcher_exit=$?
-expect_eq "case-1b exit code (marker + worker dead)" "0" "$watcher_exit"
+if ! wait_for_file "$PIDFILE_DIR/$PIDFILE_STEM"; then
+  expect_eq "case-1b watcher registered live worker" "yes" "no"
+  stop_pid "$WATCHER_PID"
+  stop_pid "$WORKER_PID"
+else
+  echo "**COMPLETE:** test-marker-dead — done" >> "$TAIL"
+  stop_pid "$WORKER_PID"
+  wait "$WATCHER_PID"
+  watcher_exit=$?
+  expect_eq "case-1b exit code (marker + worker dead)" "0" "$watcher_exit"
+fi
 if [ -f "$PIDFILE_DIR/$PIDFILE_STEM" ]; then
   expect_eq "case-1b pidfile removed (worker dead on exit)" "removed" "still-present"
 else
@@ -851,14 +890,14 @@ fi
 rm -f "$TAIL" "$PROMPT" "$OUT"
 
 # ---- Case 1j: worker-dead final reconciliation maps BLOCKED to blocked exit ----
+# Attention kinds terminalize only as the last own line. Trailing prose is the
+# COMPLETE dead-path shape and must not be copied onto BLOCKED/FAILED (python
+# lock-in: test_dead_path_attention_only_own_final_unquoted_line).
 TAIL=/tmp/test-watch-dead-reconcile-blocked-$$.txt
 PROMPT=/tmp/test-watch-dead-reconcile-blocked-$$.prompt
 OUT=/tmp/watcher-out-dead-reconcile-blocked-$$.txt
 : > "$PROMPT"
-cat > "$TAIL" <<'EOF'
-BLOCKED: x
-post-marker summary
-EOF
+printf '%s\n' "BLOCKED: x" > "$TAIL"
 run_dead_tail_case "case-1j dead reconcile BLOCKED blocks" "$TAIL" "$PROMPT" "$OUT" "4" "x"
 if grep -q "WATCHER-EXIT: marker exit_code=4" "$OUT"; then
   expect_eq "case-1j reconciled BLOCKED exit summary" "yes" "yes"
@@ -870,7 +909,7 @@ rm -f "$TAIL" "$PROMPT" "$OUT"
 # ---- Case 2: worker PID dies without marker → exit 1 ----
 TAIL=/tmp/test-watch-piddead-$$.txt
 : > "$TAIL"
-sleep 2 & WORKER_PID=$!
+sleep 3600 & WORKER_PID=$!
 PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
 
 bash "$WATCHER" \
@@ -880,10 +919,16 @@ bash "$WATCHER" \
   --poll-secs 1 --max-idle-secs 30 \
   > /tmp/watcher-out-piddead-$$.txt 2>&1 &
 WATCHER_PID=$!
-# Worker exits naturally after 2s; watcher should detect and exit 1.
-wait "$WATCHER_PID"
-watcher_exit=$?
-expect_eq "case-2 exit code on pid-dead-no-marker" "1" "$watcher_exit"
+if ! wait_for_file "$PIDFILE_DIR/$PIDFILE_STEM"; then
+  expect_eq "case-2 watcher registered live worker" "yes" "no"
+  stop_pid "$WATCHER_PID"
+  stop_pid "$WORKER_PID"
+else
+  stop_pid "$WORKER_PID"
+  wait "$WATCHER_PID"
+  watcher_exit=$?
+  expect_eq "case-2 exit code on pid-dead-no-marker" "1" "$watcher_exit"
+fi
 if grep -q "WATCHER-EXIT: pid-dead exit_code=1" /tmp/watcher-out-piddead-$$.txt; then
   expect_eq "case-2 WATCHER-EXIT summary line emitted" "yes" "yes"
 else
@@ -964,21 +1009,20 @@ bash "$WATCHER" \
   --poll-secs 1 --max-idle-secs 2 \
   > /tmp/watcher-out-idle-child-$$.txt 2>&1 &
 WATCHER_PID=$!
-sleep 6
+if wait_for_needle /tmp/watcher-out-idle-child-$$.txt "live child; tail-quiet is not idle"; then
+  expect_eq "case-3c live_descendants logged" "yes" "yes"
+else
+  expect_eq "case-3c live_descendants logged" "yes" "no"
+fi
 if kill -0 "$WATCHER_PID" 2>/dev/null; then
   expect_eq "case-3c watcher still running with live child" "alive" "alive"
-  if grep -q "live_descendants=" /tmp/watcher-out-idle-child-$$.txt; then
-    expect_eq "case-3c live_descendants logged" "yes" "yes"
-  else
-    expect_eq "case-3c live_descendants logged" "yes" "no"
-  fi
   kill "$WATCHER_PID" 2>/dev/null
   wait "$WATCHER_PID" 2>/dev/null
 else
   wait "$WATCHER_PID"
   expect_eq "case-3c watcher still running with live child" "alive" "exited:$?"
 fi
-kill "$WORKER_PID" 2>/dev/null
+kill -TERM -"$WORKER_PID" 2>/dev/null || kill "$WORKER_PID" 2>/dev/null
 wait "$WORKER_PID" 2>/dev/null
 rm -f "$TAIL" /tmp/watcher-out-idle-child-$$.txt
 cleanup_pidfile "$PIDFILE_STEM"
@@ -1078,11 +1122,13 @@ cleanup_pidfile "$PIDFILE_STEM"
 
 # ---- Case 3b: CPU-busy silence → running_quiet, not exit 2 ----
 TAIL=/tmp/test-watch-running-quiet-$$.txt
+HOLD=/tmp/test-watch-running-quiet-hold-$$
+rm -f "$HOLD"
 : > "$TAIL"
-python3 -c 'import time
-end = time.time() + 8
+HOLD="$HOLD" python3 -c 'import os, pathlib, time
+flag = pathlib.Path(os.environ["HOLD"])
 x = 0
-while time.time() < end:
+while not flag.exists():
     x += 1
 ' & WORKER_PID=$!
 PIDFILE_STEM="$$.bashtail.${WORKER_PID}.jsonl"
@@ -1094,7 +1140,11 @@ bash "$WATCHER" \
   --poll-secs 1 --max-idle-secs 1 \
   > /tmp/watcher-out-running-quiet-$$.txt 2>&1 &
 WATCHER_PID=$!
-sleep 5
+if wait_for_needle /tmp/watcher-out-running-quiet-$$.txt "WATCHER-STATE: running_quiet"; then
+  expect_eq "case-3b running_quiet state logged" "yes" "yes"
+else
+  expect_eq "case-3b running_quiet state logged" "yes" "no"
+fi
 running_quiet_watcher_alive=no
 if kill -0 "$WATCHER_PID" 2>/dev/null; then
   running_quiet_watcher_alive=yes
@@ -1103,20 +1153,16 @@ else
   wait "$WATCHER_PID"
   expect_eq "case-3b watcher still running during CPU-busy silence" "running" "exited-$?"
 fi
-if grep -q "WATCHER-STATE: running_quiet" /tmp/watcher-out-running-quiet-$$.txt; then
-  expect_eq "case-3b running_quiet state logged" "yes" "yes"
-else
-  expect_eq "case-3b running_quiet state logged" "yes" "no"
-fi
 if [ "$running_quiet_watcher_alive" = "yes" ]; then
   echo "**COMPLETE:** test-running-quiet — busy worker done" >> "$TAIL"
+  : > "$HOLD"
   wait "$WATCHER_PID"
   watcher_exit=$?
   expect_eq "case-3b exit code after terminal marker" "0" "$watcher_exit"
 fi
-kill "$WORKER_PID" 2>/dev/null
-wait "$WORKER_PID" 2>/dev/null
-rm -f "$TAIL" /tmp/watcher-out-running-quiet-$$.txt
+: > "$HOLD"
+stop_pid "$WORKER_PID"
+rm -f "$TAIL" "$HOLD" /tmp/watcher-out-running-quiet-$$.txt
 cleanup_pidfile "$PIDFILE_STEM"
 
 # ---- Case 4: orchestrator PID dies → exit 3 ----
@@ -1282,12 +1328,23 @@ if [ "$spin_ps_rc" -ne 0 ]; then
 elif [ -z "$SPIN_PGID" ]; then
   expect_eq "case-6 live spinner started" "yes" "no"
 else
-  busy=$(pgroup_cpu_pct "$SPIN_PGID")
-  # Flat-out spinner on one core must read clearly busy (same floor as python twin).
-  if awk -v b="$busy" 'BEGIN { exit !(b + 0 > 25.0) }'; then
+  # Scale-free on purpose (python twin: test_pgroup_cpu_pct_measures_now...).
+  # An absolute 25% floor measures whether the spinner won a core, not whether
+  # the sampler uses cputime delta. Under suite load the spinner may get a
+  # fraction; the load-independent signal is busy-then-idle order.
+  busy="unknown"
+  for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    busy=$(pgroup_cpu_pct "$SPIN_PGID")
+    if awk -v b="$busy" 'BEGIN { exit !(b + 0 > 0.0) }'; then
+      break
+    fi
+    [ -f "$SPIN_FLAG" ] && break
+    sleep 0.1
+  done
+  if awk -v b="$busy" 'BEGIN { exit !(b + 0 > 0.0) }'; then
     expect_eq "case-6 live spinner reads busy (not decaying-average blind)" "busy" "busy"
   else
-    expect_eq "case-6 live spinner reads busy (not decaying-average blind)" "busy>25" "got-$busy"
+    expect_eq "case-6 live spinner reads busy (not decaying-average blind)" "busy>0" "got-$busy"
   fi
   # Wait for the spin→sleep transition the child signals.
   for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
@@ -1304,6 +1361,11 @@ else
       expect_eq "case-6 stopped spinner reads idle (cputime delta, not decay)" "idle" "idle"
     else
       expect_eq "case-6 stopped spinner reads idle (cputime delta, not decay)" "idle<2" "got-$settled"
+    fi
+    if awk -v b="$busy" -v s="$settled" 'BEGIN { exit !(b + 0 > s + 0) }'; then
+      expect_eq "case-6 busy exceeds settled (delta, not inverted %cpu)" "yes" "yes"
+    else
+      expect_eq "case-6 busy exceeds settled (delta, not inverted %cpu)" "busy>settled" "busy=$busy settled=$settled"
     fi
   else
     expect_eq "case-6 spinner signalled finished" "yes" "no"
