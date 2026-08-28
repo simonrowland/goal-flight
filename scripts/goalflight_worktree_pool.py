@@ -8,27 +8,35 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 from typing import TextIO
 
 
 WORKTREE_SEATS_ENV = "GOALFLIGHT_WORKTREE_SEATS"
 WORKTREE_LOCK_FD_ENV = "GOALFLIGHT_WORKTREE_LOCK_FD"
-# Seats bound how many worktrees EXIST, not how much work may run: seats are
-# reused, so N seats sustains N CONCURRENT workers per project indefinitely
-# rather than N total dispatches. 4 was therefore acting as a de-facto
-# per-controller worker cap, which was never intended -- several controllers
-# share one project root (battery-tool-v2 currently has five), so four seats
-# starved the whole project between them.
+OCCUPANCY_LOCK_FD_ENV = "GOALFLIGHT_OCCUPANCY_LOCK_FD"
+OCCUPANCY_LOCK_NAME = "goalflight-worktree.lock"
+# Per-repository checkout ceiling, NOT a per-controller worker cap. There is no
+# such cap in this codebase and none is wanted. The old default of 4 became a
+# de-facto fan-out limit and pushed every extra dispatch onto ad-hoc
+# `git worktree add`, which is how the bypass (SC-06) became the main road:
+# 358 worktrees fleet-wide, 210 of one repo's 211 ad-hoc, 202GB, and a machine
+# at 100% disk. Seats are REUSED, so N seats sustains N CONCURRENT workers per
+# project indefinitely rather than N total dispatches. Several controllers
+# share one project root, so four seats starved the whole project between them.
 #
 # Derivation. The binding constraints are RAM and the machine concurrency cap,
-# not disk: a seat is one git worktree, and the checkout is ~40MB here, so 24
-# seats is under 1GB per project. The machine cap is 120 concurrent workers
-# across ~5 active projects, i.e. ~24 per project if every project ran flat out
-# simultaneously -- which is the number that stops seats from binding before
-# the real capacity gate does. Sanity check: today's busiest project ran ~12
-# concurrent workers, so 24 leaves 2x headroom and still cannot, by itself,
-# reach the 120 machine cap.
+# not disk: a seat is one git worktree, ~40MB of checkout here, so 24 seats is
+# under 1GB per project. The machine cap is 120 concurrent workers across ~5
+# active projects, i.e. ~24 per project if every project ran flat out at once --
+# the point where seats stop binding before the real capacity gate does. Sanity
+# check: the busiest project observed ~12 concurrent workers, so 24 leaves 2x
+# headroom and still cannot, alone, reach the 120 machine cap.
+#
+# Raise via GOALFLIGHT_WORKTREE_SEATS when one repo needs more concurrent seats.
+# NEVER lower this default to "shape" concurrency -- that is what made 4 behave
+# as a worker cap.
 DEFAULT_WORKTREE_SEATS = 24
 WORKTREE_SEAT_PREFIX = "wt-"
 QUARANTINE_REF_PREFIX = "goalflight/quarantine"
@@ -40,6 +48,52 @@ class WorktreeSeatError(RuntimeError):
 
 class WorktreeSeatUnavailable(WorktreeSeatError):
     """Raised when every configured seat is held."""
+
+
+class WorktreePathLockBusy(WorktreeSeatError):
+    """Raised when the exclusive worktree-path lock is already held."""
+
+    def __init__(self, message: str, *, occupant_id: str | None = None) -> None:
+        super().__init__(message)
+        self.occupant_id = occupant_id
+
+
+class WorktreePathLockUnknown(WorktreeSeatError):
+    """Raised when the worktree-path lock cannot be evaluated."""
+
+
+class WorktreePathLock:
+    """Exclusive kernel lock on an arbitrary worktree path.
+
+    Ownership is the open file description: close the descriptor (or die) and
+    the kernel releases the claim. Do not LOCK_UN while a worker may still
+    hold an inherited descriptor for the same description.
+    """
+
+    def __init__(self, *, path: Path, lock_file: TextIO, dispatch_id: str) -> None:
+        self.path = path
+        self.dispatch_id = dispatch_id
+        self._lock_file: TextIO | None = lock_file
+
+    def fileno(self) -> int:
+        if self._lock_file is None:
+            raise WorktreeSeatError(
+                f"worktree path lock already released: {self.path}"
+            )
+        return self._lock_file.fileno()
+
+    def release(self) -> None:
+        lock_file = self._lock_file
+        if lock_file is None:
+            return
+        self._lock_file = None
+        lock_file.close()
+
+    def __enter__(self) -> "WorktreePathLock":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self.release()
 
 
 class WorktreeSeatLease:
@@ -100,18 +154,161 @@ def configured_worktree_seats() -> int:
 
 
 def inherited_worktree_lock_fds() -> tuple[int, ...]:
-    """Return validated inherited seat-lock descriptors, if this is a child."""
-    raw = os.environ.get(WORKTREE_LOCK_FD_ENV, "").strip()
-    if not raw:
-        return ()
+    """Return validated inherited seat-lock and occupancy-lock descriptors."""
+    fds: list[int] = []
+    errors: list[str] = []
+    for env_name in (WORKTREE_LOCK_FD_ENV, OCCUPANCY_LOCK_FD_ENV):
+        raw = os.environ.get(env_name, "").strip()
+        if not raw:
+            continue
+        try:
+            fd = int(raw)
+            os.fstat(fd)
+        except (ValueError, OSError):
+            errors.append(f"{env_name} does not name an open descriptor: {raw!r}")
+            continue
+        if fd not in fds:
+            fds.append(fd)
+    if errors:
+        raise WorktreeSeatError("; ".join(errors))
+    return tuple(fds)
+
+
+def pass_worktree_lock_fds(env: dict[str, str] | None = None) -> tuple[int, ...]:
+    """Descriptors a child must inherit to keep holding this process's locks.
+
+    ``inherited_worktree_lock_fds`` reads this process's ``os.environ`` for
+    both the pooled-seat fd and the occupancy fd. A parent that acquired a
+    *new* seat puts the fd in the child env dict without exporting it on
+    itself; that fd still has to be in ``pass_fds`` or the helper exec closes
+    it and the seat frees while the worker runs. Occupancy is usually
+    exported on the parent; the env-dict lookup still covers a child env
+    that names an occupancy fd the parent has not exported.
+
+    Callers that must not hold occupancy (watcher, caffeinate, redact
+    sidecars) strip that fd after this returns; passing the combined set
+    unchanged to those processes would keep the tree occupied after the
+    worker dies.
+    """
+    fds: list[int] = []
+    seen: set[int] = set()
+    for fd in inherited_worktree_lock_fds():
+        if fd not in seen:
+            fds.append(fd)
+            seen.add(fd)
+    if env is None:
+        return tuple(fds)
+    for env_name in (WORKTREE_LOCK_FD_ENV, OCCUPANCY_LOCK_FD_ENV):
+        raw = str(env.get(env_name) or "").strip()
+        if not raw:
+            continue
+        try:
+            fd = int(raw)
+            os.fstat(fd)
+        except (ValueError, OSError):
+            continue
+        if fd not in seen:
+            fds.append(fd)
+            seen.add(fd)
+    return tuple(fds)
+
+
+def pool_seat_name(path: str | Path) -> str | None:
+    """Return ``wt-N`` when the basename matches the seat naming pattern.
+
+    A matching name is necessary but not sufficient for a maintained seat.
+    Ad-hoc worktrees can be named ``wt-5``; ask ``registered_pool_seat_verdict``.
+    """
+    name = Path(path).name
+    if not name.startswith(WORKTREE_SEAT_PREFIX):
+        return None
+    rest = name[len(WORKTREE_SEAT_PREFIX) :]
+    if rest.isdigit() and int(rest) >= 1:
+        return name
+    return None
+
+
+def is_pool_seat_path(path: str | Path) -> bool:
+    """True when the basename looks like ``wt-N``. Not a registration check."""
+    return pool_seat_name(path) is not None
+
+
+def registered_pool_seat_verdict(
+    path: str | Path,
+    *,
+    project_root: Path,
+) -> tuple[str, str]:
+    """Ask the pool whether ``path`` is a registered seat.
+
+    Returns ``("yes"|"no"|"unknown", reason)``. Name is irrelevant unless the
+    path is the managed seat path ``<project>/worktrees/wt-N`` for a configured
+    slot *and* the matching lock file exists. A missing lock is "not
+    registered" (de-registered and ad-hoc trees are litter). If registration
+    cannot be determined, the verdict is unknown so a deleter retains.
+    """
     try:
-        fd = int(raw)
-        os.fstat(fd)
-    except (ValueError, OSError) as exc:
-        raise WorktreeSeatError(
-            f"{WORKTREE_LOCK_FD_ENV} does not name an open descriptor: {raw!r}"
-        ) from exc
-    return (fd,)
+        root = project_root.resolve()
+    except OSError as exc:
+        return "unknown", f"project root unresolvable ({exc})"
+    try:
+        resolved = Path(path).resolve()
+    except OSError as exc:
+        return "unknown", f"worktree path unresolvable ({exc})"
+
+    managed_root = root / "worktrees"
+    try:
+        managed_root = managed_root.resolve()
+    except OSError as exc:
+        return "unknown", f"managed worktree root unresolvable ({exc})"
+
+    try:
+        if resolved.parent != managed_root:
+            return (
+                "no",
+                f"{resolved} is not under the managed seat root {managed_root}",
+            )
+    except OSError as exc:
+        return "unknown", f"managed seat path could not be compared ({exc})"
+
+    seat_name = pool_seat_name(resolved)
+    if seat_name is None:
+        return "no", f"{resolved.name} is not a pool seat name"
+
+    try:
+        seat_limit = configured_worktree_seats()
+    except WorktreeSeatError as exc:
+        return "unknown", f"seat configuration unreadable ({exc})"
+
+    slot = int(seat_name[len(WORKTREE_SEAT_PREFIX) :])
+    if slot > seat_limit:
+        return (
+            "no",
+            f"{seat_name} is outside the configured seat range 1..{seat_limit}",
+        )
+
+    try:
+        lock_root = _git_common_dir(root) / "goalflight-worktree-seat-locks"
+    except WorktreeSeatError as exc:
+        return "unknown", f"seat lock directory unreadable ({exc})"
+
+    lock_path = lock_root / f"{seat_name}.lock"
+    try:
+        if lock_root.is_symlink():
+            return "unknown", f"seat lock root is a symlink ({lock_root})"
+        st = os.lstat(lock_path)
+    except FileNotFoundError:
+        return (
+            "no",
+            f"no seat lock for {seat_name}; path is not a registered pool seat",
+        )
+    except OSError as exc:
+        return "unknown", f"seat lock unreadable for {seat_name} ({exc})"
+
+    if stat.S_ISLNK(st.st_mode):
+        return "unknown", f"seat lock is a symlink ({lock_path})"
+    if not stat.S_ISREG(st.st_mode):
+        return "unknown", f"seat lock is not a regular file ({lock_path})"
+    return "yes", f"registered pool seat {seat_name}"
 
 
 def _git(
@@ -389,3 +586,113 @@ def acquire_worktree_seat(
         )
     finally:
         allocation_file.close()
+
+
+def _lock_open_flags() -> int:
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def worktree_path_lock_path(target: Path) -> Path:
+    """Return the per-worktree occupancy lock path.
+
+    Git checkouts keep the lock inside the worktree's git dir so it is unique
+    per tree and not an untracked file in the project. Non-git directories
+    (test trees) fall back to a hidden file in the tree itself.
+    """
+    try:
+        target = Path(os.path.realpath(str(target)))
+    except OSError as exc:
+        raise WorktreePathLockUnknown(
+            f"worktree path {target} could not be resolved ({type(exc).__name__}: {exc})"
+        ) from exc
+    git_meta = target / ".git"
+    try:
+        if git_meta.is_file():
+            text = git_meta.read_text(encoding="utf-8")
+            for line in text.splitlines():
+                if line.lower().startswith("gitdir:"):
+                    git_dir = Path(line.split(":", 1)[1].strip())
+                    if not git_dir.is_absolute():
+                        git_dir = target / git_dir
+                    return git_dir.resolve(strict=False) / OCCUPANCY_LOCK_NAME
+        if git_meta.is_dir():
+            return git_meta / OCCUPANCY_LOCK_NAME
+    except OSError as exc:
+        raise WorktreePathLockUnknown(
+            f"worktree occupancy lock path for {target} could not be evaluated "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
+    return target / f".{OCCUPANCY_LOCK_NAME}"
+
+
+def try_acquire_worktree_path_lock(target: Path, dispatch_id: str) -> WorktreePathLock:
+    """Acquire an exclusive, non-blocking kernel lock on ``target``.
+
+    Failure to acquire is occupancy: ``WorktreePathLockBusy``. Failure to
+    evaluate the lock at all (unreadable path, fd exhaustion) is
+    ``WorktreePathLockUnknown``. The returned lock must be inherited by the
+    worker; closing it in the launcher without passing the fd vacates the tree
+    while the worker still writes.
+    """
+    try:
+        resolved = Path(os.path.realpath(str(target)))
+    except OSError as exc:
+        raise WorktreePathLockUnknown(
+            f"worktree path {target} could not be resolved ({type(exc).__name__}: {exc})"
+        ) from exc
+    if not resolved.is_dir():
+        raise WorktreePathLockUnknown(
+            f"worktree path {resolved} is not a readable directory"
+        )
+    lock_path = worktree_path_lock_path(resolved)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise WorktreePathLockUnknown(
+            f"cannot create occupancy lock directory {lock_path.parent} ({exc})"
+        ) from exc
+    try:
+        lock_fd = os.open(str(lock_path), _lock_open_flags(), 0o600)
+    except OSError as exc:
+        raise WorktreePathLockUnknown(
+            f"cannot open worktree occupancy lock {lock_path}: {exc}"
+        ) from exc
+    lock_file = os.fdopen(lock_fd, "r+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        payload = _lock_metadata(lock_file)
+        occupant_id = str(payload.get("dispatch_id") or "unknown-dispatch")
+        pid = payload.get("pid")
+        lock_file.close()
+        held = f" (kernel lock held pid={pid})" if isinstance(pid, int) else " (kernel lock held)"
+        raise WorktreePathLockBusy(
+            f"worktree {resolved} is already owned by non-terminal dispatch "
+            f"{occupant_id}{held}; a second writer would share one filesystem "
+            "tree with no merge discipline",
+            occupant_id=occupant_id,
+        ) from exc
+    except OSError as exc:
+        lock_file.close()
+        raise WorktreePathLockUnknown(
+            f"worktree occupancy lock of {resolved} could not be evaluated "
+            f"({type(exc).__name__}: {exc})"
+        ) from exc
+    try:
+        os.set_inheritable(lock_file.fileno(), True)
+        _write_occupant(
+            lock_file, seat_name=resolved.name, dispatch_id=dispatch_id
+        )
+        return WorktreePathLock(
+            path=resolved,
+            lock_file=lock_file,
+            dispatch_id=dispatch_id,
+        )
+    except BaseException:
+        lock_file.close()
+        raise

@@ -6,8 +6,71 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Added
+
+- `goalflight_dispatch.py --worktree <base>` acquires a pooled `wt-N` seat
+  prepared at git ref `<base>` and runs the worker there. The seat lock fd is
+  inherited by the worker (same contract as `acp_run`). Exhaustion refuses
+  with every held seat named and never falls back to `git worktree add`.
+  Existing `--cwd` is unchanged when the flag is omitted.
+- `goalflight_worktree_gc.py` now exempts maintained `wt-N` pool seats from
+  reclamation and treats an identity-live worker (pid + start_token) as still
+  owning its tree even when the ledger row carries a liveness verdict such as
+  `idle_timeout`. After merging a worker branch, run
+  `python3 scripts/goalflight_worktree_gc.py --into main` (report) or
+  `--apply`. Exemption is by seat registration (managed path + lock file),
+  not basename: an ad-hoc tree named `wt-N` is litter. Unknown registration
+  retains. A retain reason for an identity-live terminal row says
+  identity-live, not "non-terminal".
+- `goalflight_trace_archive.py` copies selected finished-dispatch tails from
+  volatile `/tmp` dispatch state into gitignored
+  `docs-private/traces/<YYYY-MM-DD>/<dispatch-id>/`. Policy keeps runs that
+  emitted a worker marker or named a findings path, caps oversized tails
+  (head+tail, dropped middle recorded), and drops steer mailboxes, watcher
+  logs, empty/capacity-blocked noise, and the unattended 7.1 GB `/tmp`
+  backlog. Tails are untrusted; this tool never `git add`s. Going-forward
+  hook is `goalflight_ledger.cmd_finish`. Sweep a backlog with
+  `--source-dir --apply`. Archived tails are unreviewed worker output.
+  Credential-shaped material is redacted at copy time with a named marker
+  and a per-tail count; this tool refuses to `git add`. The drop list
+  (unmarked/capacity, steer, watcher, caffeinate, pidfile, prompt,
+  tail-middle, historical `/tmp` backlog) is in the module docstring and
+  CLI help.
+
 ### Changed
 
+- Drain no longer mints unadoptable `restore_prepared` queue envelopes when
+  releasing a pre-worker claim whose ledger is already `queued`. The second
+  DrainClaimGuard restore used to write a new `restore_prepared` txn, abort
+  because the ledger still named the previous txn, and leave a file drain
+  will never launch (`awaiting_owner_reconcile` + `unlinked_quarantine_deferred`).
+  A queued ledger row now republishes as `queued`; an existing `restore_prepared`
+  envelope is finished by the same restore transaction (or dropped if the
+  ledger is already terminal); new ledger rows copy `controller_label` /
+  `controller_pid` from the envelope so the entry is attributable.
+
+- `goalflight_messages.py post --to-controller` no longer reports success when
+  the send reached nobody. The CLI exits non-zero and
+  `controller_delivery.status` names the miss. When the label is missing from
+  the current project's registry but registered in another, the error names
+  `--controller-project-root` with that path. An unreadable or unresolvable
+  registry is UNKNOWN (exit 2, `controller_registry_unknown`) and does not
+  record a reached-nobody delivery. Every non-zero `--to-controller` exit
+  emits that `controller_delivery` object on stdout; a usage refusal is
+  `controller_post_usage` (exit 2) and is not collapsed into a miss. Same-project
+  posts are unchanged.
+
+- `goalflight_ledger.cmd_finish` archives going-forward dispatch tails
+  (pinned: deleting the hook turns `test_cmd_finish_archives_going_forward_tails`
+  red).
+- `--worktree` no longer passes a closed seat-lock fd into the post-spawn
+  caffeinate helper. Sidecars get an env without `GOALFLIGHT_WORKTREE_LOCK_FD`
+  so Darwin `caffeinate -w` starts after the launcher releases its copy.
+- The worker daemon helper now starts the child with Popen cwd set to the
+  leased seat (or `--cwd`). Claude `-p` has no `--cwd` flag and raw `--`
+  has none either; both inherit the seat as process cwd.
+- Default worktree seat count is 24 (was 4). This is a per-repository
+  checkout ceiling, not a per-controller worker cap; there is none.
 - `goalflight_ledger.py reconcile-outbox` no longer promotes a sidecar's
   terminal verdict (`failed` / `idle_timeout` / `complete`) into journal and
   ledger terminal authority while the recorded worker identity (pid + start
@@ -32,6 +95,9 @@ incremented when meaningful skill behaviour changes.
   terminalizes exactly as before, and records or journal attempts that are
   already terminal still re-commit idempotently so the repair path is not
   stranded.
+- Default worktree seat count is 24 (was 4). This is a per-repository
+  checkout ceiling, not a per-controller worker cap; there is none.
+
 - `goalflight_journal_gc.py` no longer retains a proven-root-gone journal
   forever just because it holds non-terminal dispatch records that can never
   reconcile (reconciliation runs from the project root). Such journals are now

@@ -762,16 +762,38 @@ def journals_index_dir() -> Path:
 def iter_journal_files() -> list[Path]:
     """Return every journal sqlite path under the journals index.
 
-    A listing failure is an empty list, not a crash. Callers must treat an
-    unreadable *file* as its own unknown row rather than skipping the index.
+    Raises ``JournalIOError`` when the index exists but cannot be listed:
+    an unreadable index is UNKNOWN, not an empty fleet. A genuinely absent
+    index is an empty list. Callers must treat an unreadable *file* as its
+    own unknown row rather than skipping the index.
     """
     base = journals_index_dir()
+    # pathlib glob swallows PermissionError and yields nothing; iterdir
+    # raises, keeping unreadable distinct from absent.
     try:
-        # Do not filter with is_file(): a permission error would silently drop
-        # an unreadable journal. Peek it and let the caller emit unknown.
-        return sorted(base.glob(f"*/{JOURNAL_FILE_NAME}"))
-    except OSError:
+        children = list(base.iterdir())
+    except FileNotFoundError:
         return []
+    except OSError as exc:
+        raise JournalIOError(
+            f"journals index is unreadable, so the fleet roster is unknown: "
+            f"{base}: {exc}"
+        ) from exc
+    files: list[Path] = []
+    for child in children:
+        if not child.is_dir():
+            continue
+        candidate = child / JOURNAL_FILE_NAME
+        try:
+            names = {entry.name for entry in child.iterdir()}
+        except OSError:
+            # Unreadable per-project dir: the journal path is conventional,
+            # so include it and let the caller's peek emit an unknown row.
+            files.append(candidate)
+            continue
+        if JOURNAL_FILE_NAME in names:
+            files.append(candidate)
+    return sorted(files)
 
 
 def resolve_journal_path(project_root: Path | str) -> Path:
@@ -787,6 +809,24 @@ def resolve_journal_path(project_root: Path | str) -> Path:
 
 def journal_write_lock_path(journal_path: Path) -> Path:
     return journal_path.with_name(f".{journal_path.name}.write.lock")
+
+
+def _lstat_presence(path: Path) -> str:
+    """Return ``present`` / ``absent`` / ``unknown``. Never ``lexists`` here.
+
+    ``os.path.lexists`` is ``lstat`` wrapped in ``except (OSError, ValueError):
+    return False``, so it answers False for both "not there" and "I could not
+    look". Only FileNotFoundError is evidence of absence; any other OSError
+    means presence could not be verified. Same contract as journal_gc's
+    ``_presence``.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unknown"
+    return "present"
 
 
 def _is_busy(exc: BaseException) -> bool:
@@ -990,13 +1030,25 @@ class Journal:
             jitter_min_s=jitter_min_s,
             jitter_max_s=jitter_max_s,
         )
+        presence = _lstat_presence(self.path)
+        if presence == "unknown":
+            raise JournalIOError(
+                f"journal init refused because path presence is unreadable, so "
+                f"absence is unverified: {self.path}"
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         write_lock, deadline = self._acquire_construction_lock()
         try:
-            if os.path.lexists(self.path):
+            presence = _lstat_presence(self.path)
+            if presence == "present":
                 raise JournalError(
                     f"journal init refused because the database already exists: {self.path}; "
                     "open it with Journal(...) instead"
+                )
+            if presence == "unknown":
+                raise JournalIOError(
+                    f"journal init refused because path presence is unreadable, so "
+                    f"absence is unverified: {self.path}"
                 )
             self._claim_fresh_database_path()
             try:
@@ -1106,11 +1158,20 @@ class Journal:
         return write_lock, deadline
 
     def _require_existing_database(self) -> None:
-        if not os.path.lexists(self.path):
+        presence = _lstat_presence(self.path)
+        if presence == "absent":
             raise JournalDisappeared(
                 f"journal database is absent: {self.path}. Failing closed because streams "
                 "cannot rebuild journal authority. Restore a validated WAL-safe backup; "
                 "use the init verb only for an intentional first bootstrap."
+            )
+        if presence == "unknown":
+            # Unreadable is not absent: disappearance is unverified, and the
+            # callers' unknown handling (probe "unreadable", roster error,
+            # controller_indeterminate) keeps every gate shut.
+            raise JournalIOError(
+                f"journal path presence is unreadable, so disappearance is unverified: "
+                f"{self.path}"
             )
         if self.path.is_symlink():
             raise JournalIntegrityError(
@@ -1191,7 +1252,7 @@ class Journal:
                     )
             except (JournalDisappeared, JournalIOError) as exc:
                 open_failures += 1
-                self._raise_disappeared_if_absent(exc)
+                self._raise_disappeared_or_unverified(exc)
                 if self._open_retry_delay(open_started, open_failures):
                     continue
                 raise self._open_io_failure(open_started, open_failures, exc) from exc
@@ -1212,7 +1273,7 @@ class Journal:
                     self._raise_integrity_failure(f"journal reader parse failed: {exc}")
                 if _is_cantopen(exc):
                     open_failures += 1
-                    self._raise_disappeared_if_absent(exc)
+                    self._raise_disappeared_or_unverified(exc)
                     if self._open_retry_delay(open_started, open_failures):
                         continue
                     raise self._open_io_failure(open_started, open_failures, exc) from exc
@@ -1236,13 +1297,13 @@ class Journal:
                 if not _is_busy(exc):
                     if _is_cantopen(exc):
                         open_failures += 1
-                        self._raise_disappeared_if_absent(exc)
+                        self._raise_disappeared_or_unverified(exc)
                         if self._open_retry_delay(open_started, open_failures):
                             continue
                         raise self._open_io_failure(
                             open_started, open_failures, exc
                         ) from exc
-                    self._raise_disappeared_if_absent(exc)
+                    self._raise_disappeared_or_unverified(exc)
                     if self._read_only_client:
                         raise JournalIOError(
                             f"journal readonly probe unavailable/unreadable for {self.path}: "
@@ -1961,10 +2022,23 @@ class Journal:
             time.sleep(delay)
         return time.monotonic() < deadline
 
-    def _raise_disappeared_if_absent(self, cause: BaseException) -> None:
-        if not os.path.lexists(self.path):
+    def _raise_disappeared_or_unverified(self, cause: BaseException) -> None:
+        """Reclassify a low-level open/read failure by path presence.
+
+        Present: return, so the caller keeps its own retry/IO-failure path.
+        Genuinely absent: JournalDisappeared. Unverifiable (unreadable):
+        JournalIOError — an unreadable path is not absence, and the IO
+        verdict is what the caller's budget-exhausted path would raise anyway.
+        """
+        presence = _lstat_presence(self.path)
+        if presence == "absent":
             raise JournalDisappeared(
                 f"journal database vanished without creating a replacement: {self.path}"
+            ) from cause
+        if presence == "unknown":
+            raise JournalIOError(
+                f"journal path is unreadable after a failure, so disappearance is "
+                f"unverified: {self.path}"
             ) from cause
 
     def _open_retry_delay(self, started: float, failures: int) -> bool:
@@ -2109,7 +2183,7 @@ class Journal:
                 raise
             except sqlite3.OperationalError as exc:
                 if not _is_busy(exc):
-                    self._raise_disappeared_if_absent(exc)
+                    self._raise_disappeared_or_unverified(exc)
                     raise
                 if self._retry_delay(started, deadline_s=deadline):
                     continue
@@ -5309,7 +5383,15 @@ def open_or_create_journal(
 ) -> Journal:
     """Open authority, explicitly bootstrapping only a truly absent path."""
     path = resolve_journal_path(project_root)
-    if os.path.lexists(path):
+    presence = _lstat_presence(path)
+    if presence == "unknown":
+        # An unreadable present path must not fall through to create: the
+        # bootstrap attempt would fail (or worse, partially claim) against a
+        # database that may be live.
+        raise JournalIOError(
+            f"journal path presence is unreadable, so absence is unverified: {path}"
+        )
+    if presence == "present":
         return Journal(project_root, allow_migration=allow_migration)
     try:
         return Journal.create(project_root)
@@ -5317,9 +5399,15 @@ def open_or_create_journal(
         # Availability failures are not a create race. Preserve their concrete
         # operator verdict instead of retrying them merely because a path exists.
         raise
-    except JournalError:
-        if not os.path.lexists(path):
+    except JournalError as exc:
+        presence = _lstat_presence(path)
+        if presence == "absent":
             raise
+        if presence == "unknown":
+            raise JournalIOError(
+                f"journal create failed and the path is unreadable, so absence is "
+                f"unverified: {path}"
+            ) from exc
         return Journal(project_root, allow_migration=allow_migration)
 
 
@@ -5396,10 +5484,16 @@ def restore_snapshot(
 ) -> Path:
     source = Path(os.path.abspath(os.fspath(Path(snapshot).expanduser())))
     destination = resolve_journal_path(project_root)
-    if not os.path.lexists(destination):
+    presence = _lstat_presence(destination)
+    if presence == "absent":
         raise JournalDisappeared(
             f"restore target journal is absent: {destination}. Failing closed; use init only "
             "for an intentional bootstrap, then retry restore from the validated snapshot."
+        )
+    if presence == "unknown":
+        raise JournalIOError(
+            f"restore target journal is unreadable, so absence is unverified: "
+            f"{destination}. Do not init over an unreadable live journal."
         )
     if not i_understand:
         raise JournalError(
@@ -5411,9 +5505,14 @@ def restore_snapshot(
         raise JournalError("restore snapshot must differ from the live journal")
 
     with goalflight_task.FileLock(journal_write_lock_path(destination)):
-        if not os.path.lexists(destination):
+        locked_presence = _lstat_presence(destination)
+        if locked_presence == "absent":
             raise JournalDisappeared(
                 f"restore target journal disappeared before exclusion was acquired: {destination}"
+            )
+        if locked_presence == "unknown":
+            raise JournalIOError(
+                f"restore target journal is unreadable after exclusion: {destination}"
             )
         if destination.is_symlink() or not destination.is_file():
             raise JournalIntegrityError(f"restore target is not a regular non-symlink file: {destination}")

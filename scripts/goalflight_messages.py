@@ -748,6 +748,165 @@ def controller_addressee_project_root(envelope: dict) -> str | None:
     return str(root).strip() if isinstance(root, str) and str(root).strip() else None
 
 
+def lookup_to_controller_label(
+    label: str,
+    *,
+    project_root: Path | str,
+    search_other_projects: bool = True,
+) -> dict[str, object]:
+    """Registry lookup for ``post --to-controller``.
+
+    ``found``, ``missing``, ``elsewhere``, or ``unknown``. Unknown means the
+    addressed project's registry could not be read, or the root could not be
+    resolved — never "label not found".
+    """
+    resolved = str(label or "").strip()
+    try:
+        root_text = controller_address_project_root(project_root)
+    except (OSError, MessageError) as exc:
+        return {
+            "state": "unknown",
+            "error": type(exc).__name__,
+            "project_root": str(project_root),
+            "label": resolved,
+        }
+    if not Path(root_text).is_dir():
+        # Not a checkout we can interrogate: UNKNOWN, never "no such label".
+        return {
+            "state": "unknown",
+            "error": "project_root_unresolvable",
+            "project_root": root_text,
+            "label": resolved,
+        }
+    try:
+        import goalflight_journal  # type: ignore
+        import goalflight_session_status as sessions  # type: ignore
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
+        return {
+            "state": "unknown",
+            "error": type(exc).__name__,
+            "project_root": root_text,
+            "label": resolved,
+        }
+    try:
+        records, error = sessions._probe_registered_controller_records(Path(root_text))
+    except (goalflight_journal.JournalError, OSError) as exc:
+        records, error = None, type(exc).__name__
+    if records is None:
+        return {
+            "state": "unknown",
+            "error": str(error or "unreadable"),
+            "project_root": root_text,
+            "label": resolved,
+        }
+    registered = {
+        str(record["label"])
+        for record in records
+        if record.get("label") and not record.get("retired_at")
+    }
+    if resolved in registered:
+        return {"state": "found", "project_root": root_text, "label": resolved}
+    if not search_other_projects:
+        return {"state": "missing", "project_root": root_text, "label": resolved}
+    others = _other_project_roots_for_controller_label(
+        resolved, current_root=root_text
+    )
+    if others:
+        return {
+            "state": "elsewhere",
+            "project_root": root_text,
+            "label": resolved,
+            "project_roots": others,
+        }
+    return {"state": "missing", "project_root": root_text, "label": resolved}
+
+
+def _other_project_roots_for_controller_label(
+    label: str, *, current_root: str
+) -> list[str]:
+    """Return other project roots that currently register ``label``.
+
+    Unreadable extra journals are skipped: a miss in the current project is
+    already known, and a readable hit is enough to name the flag. An
+    unreadable *current* registry is handled by ``lookup_to_controller_label``.
+    """
+    try:
+        import goalflight_controllers  # type: ignore
+        import goalflight_journal  # type: ignore
+    except _EXPECTED_OPTIONAL_ERRORS:
+        return []
+    try:
+        files = goalflight_journal.iter_journal_files()
+    except goalflight_journal.JournalIOError:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for path in files:
+        pairs, _peek_error = goalflight_controllers.peek_active_lease_identities(path)
+        if not pairs:
+            continue
+        for root, lease_label in pairs:
+            if lease_label != label or root == current_root or root in seen:
+                continue
+            seen.add(root)
+            found.append(root)
+    return found
+
+
+def _controller_registry_unknown_detail(addressing: Mapping[str, object]) -> str:
+    error = str(addressing.get("error") or "unreadable").strip() or "unreadable"
+    root = addressing.get("project_root")
+    return (
+        f"controller registry for {root} is unreadable ({error}); "
+        "addressing is UNKNOWN"
+    )
+
+
+def _print_post_result(result: Mapping[str, object], args: argparse.Namespace) -> None:
+    print(json.dumps(result, indent=2 if getattr(args, "json", False) else None))
+
+
+def _to_controller_refusal_result(
+    *,
+    label: str,
+    status: str,
+    detail: str,
+    project_root: object | None = None,
+) -> dict[str, object]:
+    delivery: dict[str, object] = {
+        "requested": True,
+        "delivered": False,
+        "status": status,
+        "recipient_label": label,
+        "detail": detail,
+    }
+    if project_root is not None:
+        delivery["project_root"] = str(project_root)
+    return {"recorded": False, "controller_delivery": delivery}
+
+
+def _apply_other_project_controller_delivery(
+    report: dict[str, object], addressing: Mapping[str, object]
+) -> None:
+    roots = [str(root) for root in (addressing.get("project_roots") or ()) if str(root)]
+    if not roots:
+        return
+    suggested = roots[0]
+    label = str(addressing.get("label") or "")
+    current = str(addressing.get("project_root") or "")
+    named = suggested if len(roots) == 1 else ", ".join(roots)
+    report["requested"] = True
+    report["delivered"] = False
+    report["status"] = "controller_addressee_other_project"
+    report["suggested_controller_project_root"] = suggested
+    if len(roots) > 1:
+        report["suggested_controller_project_roots"] = roots
+    report["detail"] = (
+        f"label '{label}' is not registered in {current}; it is registered in "
+        f"{named} — pass --controller-project-root {suggested}"
+    )
+
+
 def controller_cursor_key(
     label: str,
     dispatch_id: str,
@@ -2504,10 +2663,26 @@ def cmd_from_text(args: argparse.Namespace) -> int:
 
 
 def cmd_post(args: argparse.Namespace) -> int:
+    to_controller = getattr(args, "to_controller", None)
     try:
         payload = json.loads(args.payload) if args.payload else {"text": args.text or ""}
     except (ValueError, RecursionError) as exc:
-        raise MessageError(f"payload is invalid JSON: {exc}") from exc
+        detail = f"payload is invalid JSON: {exc}"
+        if not to_controller:
+            raise MessageError(detail) from exc
+        # Usage error, not an addressing outcome. Exit 2 is the CLI refusal
+        # code used for MessageError elsewhere. Still emit controller_delivery
+        # so a --json consumer is not left with an empty stdout. Distinct from
+        # controller_addressee_unresolved (exit 1, a real miss) and
+        # controller_registry_unknown (exit 2, could not determine).
+        result = _to_controller_refusal_result(
+            label=str(to_controller),
+            status="controller_post_usage",
+            detail=detail,
+        )
+        _print_post_result(result, args)
+        print(detail, file=sys.stderr)
+        return 2
     if getattr(args, "subject", None) and isinstance(payload, dict):
         payload.setdefault("subject", args.subject)
     source = {
@@ -2523,38 +2698,113 @@ def cmd_post(args: argparse.Namespace) -> int:
     # incident shape, and skipping the stamp omitted the field. A worker id
     # cannot establish a controller name, so the stamp writes UNKNOWN.
     # post_message stamps again (idempotent) for library callers.
-    _stamp_controller_source_label(source)
-    author_capability = None
-    if not os.environ.get("GOALFLIGHT_DISPATCH_ID"):
-        author_capability = _presented_ambient_controller_capability()
-    addressee = None
-    if getattr(args, "to_controller", None):
-        addressed_root = getattr(args, "controller_project_root", None) or _current_project_root()
-        if addressed_root is None:
-            print(
-                "post: --to-controller requires --controller-project-root outside a git project",
-                file=sys.stderr,
+    addressing: dict[str, object] | None = None
+    addressed_root: Path | str | None = None
+    try:
+        _stamp_controller_source_label(source)
+        author_capability = None
+        if not os.environ.get("GOALFLIGHT_DISPATCH_ID"):
+            author_capability = _presented_ambient_controller_capability()
+        addressee = None
+        if to_controller:
+            explicit_root = getattr(args, "controller_project_root", None)
+            addressed_root = explicit_root or _current_project_root()
+            if addressed_root is None:
+                # Unresolvable root: UNKNOWN (exit 2), not a miss. Argument-
+                # shaped, but the outcome is "could not determine".
+                detail = (
+                    "post: --to-controller requires --controller-project-root "
+                    "outside a git project; addressing is UNKNOWN"
+                )
+                result = _to_controller_refusal_result(
+                    label=str(to_controller),
+                    status="controller_registry_unknown",
+                    detail=detail,
+                )
+                _print_post_result(result, args)
+                print(detail, file=sys.stderr)
+                return 2
+            # Exit 1 (plus controller_delivery.status) is the scripted signal
+            # that a --to-controller send reached nobody. A JSON note on exit 0
+            # is what failed: callers treated the record as a successful
+            # delivery. Keep the carrier record; do not take the reached-nobody
+            # path when the registry itself cannot be read (UNKNOWN, exit 2).
+            addressing = lookup_to_controller_label(
+                args.to_controller,
+                project_root=Path(addressed_root),
+                search_other_projects=explicit_root is None,
             )
-            return 2
-        addressee = controller_addressee(
-            args.to_controller,
-            project_root=Path(addressed_root),
+            if addressing["state"] == "unknown":
+                detail = _controller_registry_unknown_detail(addressing)
+                result = _to_controller_refusal_result(
+                    label=str(to_controller),
+                    status="controller_registry_unknown",
+                    detail=detail,
+                    project_root=addressing.get("project_root"),
+                )
+                _print_post_result(result, args)
+                print(detail, file=sys.stderr)
+                return 2
+            addressee = controller_addressee(
+                args.to_controller,
+                project_root=Path(addressed_root),
+            )
+        result = post_message(
+            dispatch_id=args.dispatch_id,
+            msg_type=args.type,
+            payload=payload,
+            messages_dir=args.messages_dir,
+            source=source,
+            author_capability=author_capability,
+            addressee=addressee,
+            fleet_dir=args.fleet_dir,
+            update_aggregate=args.refresh_aggregate,
+            deliver_to_worker=(
+                addressee is None and _controller_delivery_requested(args.dispatch_id, args.type)
+            ),
         )
-    result = post_message(
-        dispatch_id=args.dispatch_id,
-        msg_type=args.type,
-        payload=payload,
-        messages_dir=args.messages_dir,
-        source=source,
-        author_capability=author_capability,
-        addressee=addressee,
-        fleet_dir=args.fleet_dir,
-        update_aggregate=args.refresh_aggregate,
-        deliver_to_worker=(
-            addressee is None and _controller_delivery_requested(args.dispatch_id, args.type)
-        ),
-    )
-    print(json.dumps(result, indent=2 if args.json else None))
+    except MessageError as exc:
+        if not to_controller:
+            raise
+        # A determinate lookup (found/missing/elsewhere) already answered the
+        # addressing question; a later refusal is usage, not a miss. Exit 2 is
+        # still the CLI refusal code. If lookup never completed, this is
+        # UNKNOWN — do not collapse it into controller_addressee_unresolved.
+        determinate = addressing is not None and addressing.get("state") in {
+            "found",
+            "missing",
+            "elsewhere",
+        }
+        if determinate:
+            detail = f"post refused: {exc}"
+            status = "controller_post_usage"
+        else:
+            detail = (
+                f"controller addressing failed ({type(exc).__name__}: {exc}); "
+                "addressing is UNKNOWN"
+            )
+            status = "controller_registry_unknown"
+        project_root = None
+        if addressing and addressing.get("project_root"):
+            project_root = addressing.get("project_root")
+        elif addressed_root is not None:
+            project_root = addressed_root
+        result = _to_controller_refusal_result(
+            label=str(to_controller),
+            status=status,
+            detail=detail,
+            project_root=project_root,
+        )
+        _print_post_result(result, args)
+        print(detail, file=sys.stderr)
+        return 2
+    if (
+        addressing is not None
+        and addressing.get("state") == "elsewhere"
+        and isinstance(result.get("controller_delivery"), dict)
+    ):
+        _apply_other_project_controller_delivery(result["controller_delivery"], addressing)
+    _print_post_result(result, args)
     delivery = result["delivery"]
     if post_result_is_error(result):
         controller_delivery = result.get("controller_delivery")
@@ -7904,7 +8154,8 @@ def _run_cli(argv: list[str] | None = None) -> int:
         type=Path,
         help=(
             "project root that scopes --to-controller; defaults to the current git "
-            "project, and is required for explicit cross-project addressing"
+            "project. Omit for same-project mail; pass it when the label is "
+            "registered in another project's registry"
         ),
     )
     post.add_argument("--node", default="local")
