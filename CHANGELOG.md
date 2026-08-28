@@ -39,6 +39,14 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- `goalflight_messages.py post --to-controller` no longer reports success when
+  the send reached nobody. The CLI exits non-zero and
+  `controller_delivery.status` names the miss. When the label is missing from
+  the current project's registry but registered in another, the error names
+  `--controller-project-root` with that path. An unreadable registry is
+  UNKNOWN (exit 2, `controller_registry_unknown`) and does not record a
+  reached-nobody delivery. Same-project posts are unchanged.
+
 - `goalflight_ledger.cmd_finish` archives going-forward dispatch tails
   (pinned: deleting the hook turns `test_cmd_finish_archives_going_forward_tails`
   red).
