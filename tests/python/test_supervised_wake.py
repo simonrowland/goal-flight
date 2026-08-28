@@ -1606,6 +1606,40 @@ def test_n_identical_failures_produce_one_restart_with_count() -> None:
     assert all(int(record.get("count") or 0) >= 1 for record in restarts)
 
 
+def test_unique_slot_labels_suffix_only_repeated_kinds() -> None:
+    assert supervise._unique_slot_labels(["stream", "backup", "watchdog"]) == [
+        "stream",
+        "backup",
+        "watchdog",
+    ]
+    assert supervise._unique_slot_labels(["backup", "backup"]) == [
+        "backup-1",
+        "backup-2",
+    ]
+    assert supervise._unique_slot_labels(
+        ["stream", "backup", "backup", "watchdog"]
+    ) == ["stream", "backup-1", "backup-2", "watchdog"]
+
+
+def test_two_backup_slots_emit_distinguishable_restart_records() -> None:
+    """Two backup doorbells must not share a collapse gate."""
+    crash = _python_child("raise SystemExit(1)")
+    host = RealCrashHost(stop_after_spawns=4)
+    _run(
+        host,
+        [("backup", crash), ("backup", crash)],
+        heartbeat_s=10_000.0,
+        coverage_s=10_000.0,
+        next_repeat_floor_s=10_000.0,
+    )
+    restarts = [record for record in _records(host) if record.get("type") == "restart"]
+    children = sorted(str(record.get("child")) for record in restarts)
+    assert children == ["backup-1", "backup-2"]
+    assert len(restarts) == 2
+    assert all(record.get("reason") == "exit-1" for record in restarts)
+    assert all(int(record["count"]) >= 1 for record in restarts)
+
+
 def test_changed_failure_reason_surfaces_instead_of_collapsing() -> None:
     host = FakeHost(
         scripts={

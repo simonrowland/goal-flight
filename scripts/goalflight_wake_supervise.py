@@ -314,11 +314,34 @@ class WaitResult:
 class _Slot:
     kind: str
     command: str
+    label: str
     child: Any = None
     backoff_s: float = 0.0
     next_start: float = 0.0
     stopped_reason: str | None = None
     unarmed_faults: int = 0
+
+
+def _unique_slot_labels(kinds: list[str]) -> list[str]:
+    """Name each slot uniquely. Unique kinds keep the kind; pools get kind-N.
+
+    Persistent coverage repeats the ``backup`` kind once per missing doorbell
+    (default two). Stream and watchdog appear once. Without a per-slot label
+    those backups share a collapse gate and one child's failures suppress
+    the other's record.
+    """
+    totals: dict[str, int] = {}
+    for kind in kinds:
+        totals[kind] = totals.get(kind, 0) + 1
+    seen: dict[str, int] = {}
+    labels: list[str] = []
+    for kind in kinds:
+        if totals[kind] == 1:
+            labels.append(kind)
+            continue
+        seen[kind] = seen.get(kind, 0) + 1
+        labels.append(f"{kind}-{seen[kind]}")
+    return labels
 
 
 def classify_child_exit(
@@ -828,7 +851,8 @@ class _RestartGate:
     copy (tests and --chatty-adjacent zero-floor). The pending group also
     flushes at supervisor exit and when the floor deadline wakes the loop,
     so a collapse is never a contentless "this happened, some number of
-    times." One instance per child identity.
+    times." One instance per slot label (unique kinds keep the kind name;
+    a backup pool is backup-1, backup-2, …).
     """
 
     pending: _RestartGroup | None = None
@@ -1048,8 +1072,12 @@ def run_supervisor(
             return SUPERVISE_START_EXIT
         return SUPERVISE_START_EXIT
     slots = [
-        _Slot(kind=kind, command=command, next_start=host.now)
-        for kind, command in items
+        _Slot(kind=kind, command=command, label=label, next_start=host.now)
+        for (kind, command), label in zip(
+            items,
+            _unique_slot_labels([kind for kind, _command in items]),
+            strict=True,
+        )
     ]
 
     def stop_for_stdout_detector() -> int | None:
@@ -1458,7 +1486,7 @@ def run_supervisor(
                 emitted = emit_stop(
                     reason=reason,
                     scope=scope,
-                    child=slot.kind,
+                    child=slot.label,
                     exit=event.returncode,
                     live=live,
                     target=target,
@@ -1480,7 +1508,7 @@ def run_supervisor(
             record: dict[str, object] = {
                 "kind": "supervise",
                 "type": "restart",
-                "child": slot.kind,
+                "child": slot.label,
                 "exit": event.returncode,
                 "reason": reason,
                 "backoff_s": delay,
