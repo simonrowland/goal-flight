@@ -272,6 +272,11 @@ RFC3339_RE = re.compile(
 )
 MESSAGE_PRIORITIES = frozenset({"normal", "urgent"})
 MAX_SOURCE_VALUE_LENGTH = 128
+# Stamped as source.controller_label when controller-transport mail is posted
+# by a process whose controller identity genuinely cannot be established. An
+# absent field invites the reader to guess a sender; the explicit sentinel
+# states that attribution is unknown. Never a fallback label.
+UNKNOWN_CONTROLLER_LABEL = "UNKNOWN"
 MAX_PROJECT_ROOT_LENGTH = 4096
 QUARANTINE_BYTES_LIMIT = 256
 MAX_JSON_DEPTH = 32
@@ -652,6 +657,15 @@ def validate_envelope(
         _bounded_nonblank_string(
             source.get(key), path=f"{path}.source.{key}", limit=MAX_SOURCE_VALUE_LENGTH
         )
+    # Optional attribution. Additive: records predating the field simply omit
+    # it; when present it must be a real bounded value (or the explicit
+    # UNKNOWN sentinel), never a blank placeholder.
+    if "controller_label" in source:
+        _bounded_nonblank_string(
+            source.get("controller_label"),
+            path=f"{path}.source.controller_label",
+            limit=MAX_SOURCE_VALUE_LENGTH,
+        )
     author_digest = envelope.get("author_digest")
     if author_digest is not None and (
         not isinstance(author_digest, str)
@@ -732,6 +746,125 @@ def controller_addressee_project_root(envelope: dict) -> str | None:
         return None
     root = addressee.get("project_root")
     return str(root).strip() if isinstance(root, str) and str(root).strip() else None
+
+
+def lookup_to_controller_label(
+    label: str,
+    *,
+    project_root: Path | str,
+    search_other_projects: bool = True,
+) -> dict[str, object]:
+    """Three-state registry lookup for ``post --to-controller``.
+
+    ``found``, ``missing``, ``elsewhere``, or ``unknown``. Unknown means the
+    addressed project's registry could not be read — never "label not found".
+    """
+    resolved = str(label or "").strip()
+    root_text = controller_address_project_root(project_root)
+    try:
+        import goalflight_journal  # type: ignore
+        import goalflight_session_status as sessions  # type: ignore
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
+        return {
+            "state": "unknown",
+            "error": type(exc).__name__,
+            "project_root": root_text,
+            "label": resolved,
+        }
+    try:
+        records, error = sessions._probe_registered_controller_records(Path(root_text))
+    except (goalflight_journal.JournalError, OSError) as exc:
+        records, error = None, type(exc).__name__
+    if records is None:
+        return {
+            "state": "unknown",
+            "error": str(error or "unreadable"),
+            "project_root": root_text,
+            "label": resolved,
+        }
+    registered = {
+        str(record["label"])
+        for record in records
+        if record.get("label") and not record.get("retired_at")
+    }
+    if resolved in registered:
+        return {"state": "found", "project_root": root_text, "label": resolved}
+    if not search_other_projects:
+        return {"state": "missing", "project_root": root_text, "label": resolved}
+    others = _other_project_roots_for_controller_label(
+        resolved, current_root=root_text
+    )
+    if others:
+        return {
+            "state": "elsewhere",
+            "project_root": root_text,
+            "label": resolved,
+            "project_roots": others,
+        }
+    return {"state": "missing", "project_root": root_text, "label": resolved}
+
+
+def _other_project_roots_for_controller_label(
+    label: str, *, current_root: str
+) -> list[str]:
+    """Return other project roots that currently register ``label``.
+
+    Unreadable extra journals are skipped: a miss in the current project is
+    already known, and a readable hit is enough to name the flag. An
+    unreadable *current* registry is handled by ``lookup_to_controller_label``.
+    """
+    try:
+        import goalflight_controllers  # type: ignore
+        import goalflight_journal  # type: ignore
+    except _EXPECTED_OPTIONAL_ERRORS:
+        return []
+    try:
+        files = goalflight_journal.iter_journal_files()
+    except goalflight_journal.JournalIOError:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for path in files:
+        pairs, _peek_error = goalflight_controllers.peek_active_lease_identities(path)
+        if not pairs:
+            continue
+        for root, lease_label in pairs:
+            if lease_label != label or root == current_root or root in seen:
+                continue
+            seen.add(root)
+            found.append(root)
+    return found
+
+
+def _controller_registry_unknown_detail(addressing: Mapping[str, object]) -> str:
+    error = str(addressing.get("error") or "unreadable").strip() or "unreadable"
+    root = addressing.get("project_root")
+    return (
+        f"controller registry for {root} is unreadable ({error}); "
+        "addressing is UNKNOWN"
+    )
+
+
+def _apply_other_project_controller_delivery(
+    report: dict[str, object], addressing: Mapping[str, object]
+) -> None:
+    roots = [str(root) for root in (addressing.get("project_roots") or ()) if str(root)]
+    if not roots:
+        return
+    suggested = roots[0]
+    label = str(addressing.get("label") or "")
+    current = str(addressing.get("project_root") or "")
+    named = suggested if len(roots) == 1 else ", ".join(roots)
+    report["requested"] = True
+    report["delivered"] = False
+    report["status"] = "controller_addressee_other_project"
+    report["suggested_controller_project_root"] = suggested
+    if len(roots) > 1:
+        report["suggested_controller_project_roots"] = roots
+    report["detail"] = (
+        f"label '{label}' is not registered in {current}; it is registered in "
+        f"{named} — pass --controller-project-root {suggested}"
+    )
 
 
 def controller_cursor_key(
@@ -1310,6 +1443,11 @@ def post_message(
         raise MessageError("source must be an object")
     if source:
         base_source.update(source)
+    # Controller-transport mail is attributed here, at the shared admit path,
+    # so CLI leftover-dispatch-id, library callers, and quota advisories cannot
+    # omit the field. Producers that bypass post_message (write_steering_envelope)
+    # stamp the same way. Non-controller transports are unchanged.
+    _stamp_controller_source_label(base_source)
     envelope = {
         "schema": "goalflight.message.v1",
         "schema_version": 1,
@@ -1921,6 +2059,50 @@ def _presented_ambient_controller_capability() -> str | None:
     return next(iter(capabilities)) if len(capabilities) == 1 else None
 
 
+def _controller_post_source_label() -> str | None:
+    """Return the declared outbound controller label, or None.
+
+    Worker shells (``GOALFLIGHT_DISPATCH_ID``) never inherit a controller
+    name. The only real source is the operator-declared
+    ``GOALFLIGHT_CONTROLLER_LABEL``. ``resolve_controller_label``'s PID /
+    repo-name fallback is a worktree-invariant *session* identity — not a
+    sender. Using it here would stamp a from-line the poster did not declare
+    (a pid or a directory name), which is the original incident with the
+    tool's authority behind the guess. Unestablishable stays ``None``; the
+    caller stamps the explicit ``UNKNOWN`` sentinel.
+    """
+    if str(os.environ.get("GOALFLIGHT_DISPATCH_ID") or "").strip():
+        return None
+    raw = str(os.environ.get("GOALFLIGHT_CONTROLLER_LABEL") or "").strip()
+    return raw[:64] or None
+
+
+def _stamp_controller_source_label(source: dict) -> None:
+    """Attribute controller-transport mail in place: label, else UNKNOWN.
+
+    Trusted, not lease-validated. Labels are addressing metadata. A poster
+    already had to hold a lease to admit controller mail, but several
+    controllers can hold leases on one journal at once, and MCP / status /
+    fleet posters may not carry a unique lease nonce in-process. Checking the
+    declared name against "the" held lease is therefore ambiguous, and
+    treating an unvalidatable name as UNKNOWN would blank those producers
+    while still not proving authorship. Proof remains ``author_digest`` from
+    a presented capability (see ``envelope_authored_by_controller``).
+
+    Consequence: ``from`` on relay is a self-asserted name. A process that
+    sets ``GOALFLIGHT_CONTROLLER_LABEL`` or passes ``source.controller_label``
+    is believed. Readers must not treat the field as authenticated identity.
+    An unestablishable name is the explicit sentinel UNKNOWN — never omitted,
+    never a pid, never a repo or directory name.
+    """
+    if str(source.get("transport") or "") != "controller":
+        return
+    if str(source.get("controller_label") or "").strip():
+        return
+    label = _controller_post_source_label()
+    source["controller_label"] = label if label else UNKNOWN_CONTROLLER_LABEL
+
+
 def _controller_sender_session_id(dispatch_id: str) -> str | None:
     """Return the declared live controller that authored an outbound steer.
 
@@ -2019,12 +2201,21 @@ def goalflight_post_message_tool(
     source = arguments.get("source")
     if source is not None and not isinstance(source, dict):
         raise MessageError("source must be an object when provided")
+    # The MCP server posts on the controller's behalf; attribute controller-
+    # transport mail the same way the CLI does, so the bytes match a file
+    # append from an identically-identified shell. post_message's base source
+    # defaults the transport to "controller", so an unspecified transport is
+    # controller mail too.
+    stamped_source = dict(source) if source else {}
+    if "transport" not in stamped_source:
+        stamped_source["transport"] = "controller"
+    _stamp_controller_source_label(stamped_source)
     return post_message(
         dispatch_id=str(dispatch_id),
         msg_type=str(msg_type),
         payload=payload,
         messages_dir=messages_dir,
-        source=source,
+        source=stamped_source,
         seq=arguments.get("seq"),
         priority=arguments.get("priority"),
         addressee=arguments.get("addressee"),
@@ -2447,20 +2638,50 @@ def cmd_post(args: argparse.Namespace) -> int:
     # must not pay for a doorbell wake. The descriptive label remains source
     # metadata; proof is stamped separately from the capability this process
     # actually carried. Workers cannot inherit authorship from a leftover label.
+    # Stamp even when GOALFLIGHT_DISPATCH_ID is set: that leftover is the
+    # incident shape, and skipping the stamp omitted the field. A worker id
+    # cannot establish a controller name, so the stamp writes UNKNOWN.
+    # post_message stamps again (idempotent) for library callers.
+    _stamp_controller_source_label(source)
     author_capability = None
     if not os.environ.get("GOALFLIGHT_DISPATCH_ID"):
-        source_label = os.environ.get("GOALFLIGHT_CONTROLLER_LABEL", "").strip()
-        if source_label:
-            source["controller_label"] = source_label
         author_capability = _presented_ambient_controller_capability()
     addressee = None
+    addressing: dict[str, object] | None = None
     if getattr(args, "to_controller", None):
-        addressed_root = getattr(args, "controller_project_root", None) or _current_project_root()
+        explicit_root = getattr(args, "controller_project_root", None)
+        addressed_root = explicit_root or _current_project_root()
         if addressed_root is None:
             print(
                 "post: --to-controller requires --controller-project-root outside a git project",
                 file=sys.stderr,
             )
+            return 2
+        # Exit 1 (plus controller_delivery.status) is the scripted signal that
+        # a --to-controller send reached nobody. A JSON note on exit 0 is what
+        # failed: callers treated the record as a successful delivery. Keep the
+        # carrier record; do not take the reached-nobody path when the
+        # registry itself cannot be read (UNKNOWN, exit 2).
+        addressing = lookup_to_controller_label(
+            args.to_controller,
+            project_root=Path(addressed_root),
+            search_other_projects=explicit_root is None,
+        )
+        if addressing["state"] == "unknown":
+            detail = _controller_registry_unknown_detail(addressing)
+            result = {
+                "recorded": False,
+                "controller_delivery": {
+                    "requested": True,
+                    "delivered": False,
+                    "status": "controller_registry_unknown",
+                    "project_root": addressing["project_root"],
+                    "recipient_label": args.to_controller,
+                    "detail": detail,
+                },
+            }
+            print(json.dumps(result, indent=2 if args.json else None))
+            print(detail, file=sys.stderr)
             return 2
         addressee = controller_addressee(
             args.to_controller,
@@ -2480,6 +2701,12 @@ def cmd_post(args: argparse.Namespace) -> int:
             addressee is None and _controller_delivery_requested(args.dispatch_id, args.type)
         ),
     )
+    if (
+        addressing is not None
+        and addressing.get("state") == "elsewhere"
+        and isinstance(result.get("controller_delivery"), dict)
+    ):
+        _apply_other_project_controller_delivery(result["controller_delivery"], addressing)
     print(json.dumps(result, indent=2 if args.json else None))
     delivery = result["delivery"]
     if post_result_is_error(result):
@@ -4054,13 +4281,37 @@ def envelope_headline(envelope: dict) -> str:
 
 
 def envelope_from(envelope: dict) -> str:
-    """Who sent it: the source node/adapter when recorded, else the inbox id."""
+    """Who sent it, rendered so an unknown sender reads as unknown.
+
+    For controller-transport mail a real (non-UNKNOWN) ``controller_label``
+    outranks adapter: adapter is a host/tool name (``codex``, ``fleet``,
+    ``goalflight_status``) shared by many controllers, not which controller
+    posted. UNKNOWN is not a real identity, so an informative adapter still
+    wins over the sentinel — quota/fleet posts that could not establish a
+    controller keep naming their producer. Adapter ``unknown`` is
+    uninformative and never wins. Non-controller mail keeps the historical
+    adapter/node/inbox fallback. Falling through to the node ("local") on
+    controller mail reads as a determination and has already invited one
+    wrong guess in production.
+    """
     source = envelope.get("source")
     source = source if isinstance(source, dict) else {}
-    for key in ("adapter", "node"):
-        value = source.get(key)
-        if isinstance(value, str) and value.strip() and value.strip() != "unknown":
-            return sanitize_display(value)
+    label = source.get("controller_label")
+    real_label = (
+        isinstance(label, str)
+        and label.strip()
+        and label.strip() != UNKNOWN_CONTROLLER_LABEL
+    )
+    if real_label:
+        return sanitize_display(label)
+    adapter = source.get("adapter")
+    if isinstance(adapter, str) and adapter.strip() and adapter.strip() != "unknown":
+        return sanitize_display(adapter)
+    if str(source.get("transport") or "") == "controller":
+        return UNKNOWN_CONTROLLER_LABEL
+    node = source.get("node")
+    if isinstance(node, str) and node.strip() and node.strip() != "unknown":
+        return sanitize_display(node)
     return sanitize_display(envelope.get("dispatch_id") or "?")
 
 
@@ -4840,6 +5091,8 @@ def write_steering_envelope(
     resolved_messages_dir = messages_dir or default_messages_dir()
 
     def update(existing: list[dict]) -> tuple[list[dict], dict]:
+        source = {"node": "local", "adapter": "fleet", "transport": "controller"}
+        _stamp_controller_source_label(source)
         envelope = {
             "schema": "goalflight.message.v1",
             "schema_version": 1,
@@ -4847,7 +5100,7 @@ def write_steering_envelope(
             "dispatch_id": STEERING_DISPATCH_ID,
             "seq": max((int(item.get("seq", 0)) for item in existing), default=0) + 1,
             "ts": utc_now(),
-            "source": {"node": "local", "adapter": "fleet", "transport": "controller"},
+            "source": source,
             "type": "steering",
             "priority": "normal",
             "payload": {
@@ -7804,7 +8057,8 @@ def _run_cli(argv: list[str] | None = None) -> int:
         type=Path,
         help=(
             "project root that scopes --to-controller; defaults to the current git "
-            "project, and is required for explicit cross-project addressing"
+            "project. Omit for same-project mail; pass it when the label is "
+            "registered in another project's registry"
         ),
     )
     post.add_argument("--node", default="local")

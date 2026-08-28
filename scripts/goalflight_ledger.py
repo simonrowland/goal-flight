@@ -9,6 +9,7 @@ raw logs into the model context.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import errno
 import hashlib
@@ -388,6 +389,96 @@ def identity_matches(record: dict) -> tuple[bool, str]:
     return False, reason
 
 
+def worker_identity_liveness(record: dict) -> tuple[str, str]:
+    """Three-state worker liveness: ``live`` / ``dead`` / ``unknown``, plus reason.
+
+    ``identity_matches`` already collapses every maybe-live reading (coarse
+    identity, a missing lstart side) to ``live``. What remains genuinely
+    indeterminate is an absent recorded identity (``no_pid``) or a failed
+    process-table probe (``identity_indeterminate``); those map to ``unknown``,
+    never to ``dead`` -- "could not find out" is not non-existence. A pid that
+    now belongs to a different process (``pid_reused_*``) is ``dead``: the
+    recorded worker is gone even though the pid number survives.
+    """
+    matched, reason = identity_matches(record)
+    if reason in {"no_pid", "identity_indeterminate"}:
+        return "unknown", reason
+    if matched:
+        return "live", reason
+    return "dead", reason
+
+
+def _terminal_sidecar_observation(
+    record: dict,
+    sidecar: dict | None = None,
+) -> dict | None:
+    """Return the matching sidecar when it carries a terminal verdict."""
+    candidate = sidecar
+    if not (
+        isinstance(candidate, dict)
+        and candidate.get("dispatch_id") == record.get("dispatch_id")
+    ):
+        status_path_value = record.get("status_path")
+        if not (isinstance(status_path_value, str) and status_path_value):
+            return None
+        try:
+            loaded = json.loads(Path(status_path_value).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not (
+            isinstance(loaded, dict)
+            and loaded.get("dispatch_id") == record.get("dispatch_id")
+        ):
+            return None
+        candidate = loaded
+    state = candidate.get("terminal_pending_state") or candidate.get("state")
+    terminal = terminal_state_for(
+        state, candidate.get("reason") or candidate.get("error")
+    )
+    if terminal in {"", "unknown", "watcher_stopped"}:
+        return None
+    return candidate
+
+
+def sidecar_terminal_hold(
+    record: dict,
+    *,
+    sidecar: dict | None = None,
+) -> dict[str, str] | None:
+    """Describe a held terminal sidecar, or None when there is no hold.
+
+    A hold exists when the ledger row is not already structurally terminal, a
+    matching sidecar carries a terminal verdict, and worker identity is not
+    dead (``live`` or ``unknown``). Identity is re-probed on every call.
+    Age is never consulted: a timer that terminalizes an indeterminate
+    record is the blind sweeper this reconciler forbids.
+
+    Unknown stays a hold until a later probe can determine identity (the
+    record gains a pid, a RUNNING journal instance is copied onto it, or
+    the process table becomes readable) or a human / higher-authority pass
+    acts. Dead identity is not a hold -- the sidecar may be committed.
+    """
+    if _terminal_key(record) not in {"", "unknown", "watcher_stopped"}:
+        return None
+    observation = _terminal_sidecar_observation(record, sidecar)
+    if observation is None:
+        return None
+    liveness, reason = worker_identity_liveness(record)
+    if liveness == "dead":
+        return None
+    state = str(
+        observation.get("terminal_pending_state") or observation.get("state") or ""
+    )
+    return {
+        "liveness": liveness,
+        "reason": reason,
+        "sidecar_state": state,
+        "terminal_state": terminal_state_for(
+            state, observation.get("reason") or observation.get("error")
+        ),
+    }
+
+
 def _is_detached_controller_dead_record(record: dict) -> bool:
     if not record.get("detached"):
         return False
@@ -491,6 +582,37 @@ def write_record(record: dict) -> Path:
     return path
 
 
+def _stamp_nonterminal_fields(record: dict, fields: dict) -> None:
+    """Persist derived fields onto a still-non-terminal ledger row.
+
+    Used to durably copy a RUNNING journal identity onto the record (the
+    unknown-hold resolution path: the record gains a pid) and to stamp a
+    sidecar hold so operator surfaces can name ``held: live`` vs
+    ``held: unknown``. Never writes over an already-terminal row.
+    """
+    dispatch_id = str(record.get("dispatch_id") or "")
+    if not dispatch_id or not fields:
+        return
+    with StateLock():
+        current_path = record_path(dispatch_id)
+        if current_path.exists():
+            try:
+                current = json.loads(current_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                current = dict(record)
+        else:
+            current = dict(record)
+        if not isinstance(current, dict):
+            current = dict(record)
+        if _terminal_key(current) not in {"", "unknown", "watcher_stopped"}:
+            return
+        current.update(fields)
+        write_record(current)
+        record.update(fields)
+        if current.get("updated_at"):
+            record["updated_at"] = current["updated_at"]
+
+
 def record_engine_session_id(dispatch_id: str, session_id: str) -> Path:
     """Attach a harvested engine session handle without replacing launch metadata."""
     with StateLock():
@@ -520,7 +642,14 @@ def read_records() -> list[dict]:
     path = runs_dir(create=False)
     if not path.exists():
         return records
-    for p in sorted(path.glob("*.json")):
+    # pathlib.Path.glob on an unreadable directory returns [] without raising
+    # (observed). os.listdir raises OSError, which callers that distinguish
+    # UNKNOWN from empty must see -- an unlistable ledger is not "no records".
+    names = os.listdir(path)
+    for name in sorted(names):
+        if not name.endswith(".json"):
+            continue
+        p = path / name
         try:
             records.append(json.loads(p.read_text()))
         except (OSError, json.JSONDecodeError):
@@ -752,6 +881,131 @@ def wait_attempt_running(
                 f"worker did not claim attempt {attempt.attempt_id} RUNNING within {timeout_s:.1f}s"
             )
         time.sleep(0.01)
+
+
+#: Disposition reported when a state="running" record arrives before the
+#: worker's asynchronous RUNNING claim has landed in the journal. This is a
+#: startup race, not a lost compare-and-swap: the claim is still in flight,
+#: so the refusal is retryable by waiting. Callers must key on this
+#: structured field, never on the human-readable error text. The string must
+#: match cmd_record's state="running" not-yet-RUNNING payload (committed
+#: behaviour; do not re-fabricate "cas_lost").
+RECORD_DISPOSITION_ATTEMPT_NOT_YET_RUNNING = "attempt_not_yet_running"
+
+#: Bounded deadline for re-recording a state="running" transition refused
+#: with RECORD_DISPOSITION_ATTEMPT_NOT_YET_RUNNING.
+#:
+#: Derivation:
+#:   premise — the missing event is the worker's RUNNING claim, exactly one
+#:     journal write: claim_attempt_running is open + read + one bounded CAS
+#:     transaction (mark_attempt_running).
+#:   cost — the journal bounds a single write transaction at
+#:     transaction_budget_s = 1.0s (goalflight_journal); the observed
+#:     uncontended cost of the claim itself is milliseconds.
+#:   contention — roughly nine controllers share this box, and a project
+#:     journal's writers (controller, watchers, fleet sweep) serialize on the
+#:     writer lock. A pathological queue of ~10 writers each burning their
+#:     entire 1s budget clears in ~10s; the realistic contended wait for one
+#:     claim is far under a second.
+#:   anchor — wait_attempt_running above already defaults to timeout_s=10.0
+#:     for this exact wait (worker claims RUNNING); 10s is the codebase's
+#:     sanctioned bound for the claim to land.
+#:   sanity — 10s is 10x the journal's own worst-case single-write budget and
+#:     matches the pathological ~10-writer contention estimate, and the poll
+#:     below uses a read-only peek (Journal.open_reader takes no writer lock),
+#:     so the retry loop itself adds no write contention.
+RECORD_STARTUP_RACE_RETRY_BUDGET_S = 10.0
+
+
+def parse_record_refusal(captured_stdout: str) -> dict | None:
+    """Return the structured refusal payload cmd_record printed, if any.
+
+    cmd_record emits one JSON object per refused transition
+    ({"ok": False, "disposition": ..., "retryable": ..., "error": ...}).
+    Parse that payload — never pattern-match the human error text — so
+    callers key on ``disposition``/``retryable``.
+    """
+    refusal = None
+    for line in captured_stdout.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("ok") is False:
+            refusal = payload
+    return refusal
+
+
+def is_retryable_startup_race(refusal: dict | None) -> bool:
+    """True when the refusal is the startup race, i.e. retryable by waiting."""
+    return (
+        isinstance(refusal, dict)
+        and refusal.get("disposition") == RECORD_DISPOSITION_ATTEMPT_NOT_YET_RUNNING
+        and refusal.get("retryable") is True
+    )
+
+
+def worker_spawn_state(worker_pid: int | None) -> str:
+    """Three-state answer to "was a worker process spawned on this path?"
+
+    The spawn helpers either return the child's positive pid or raise, so
+    None is definitive: no spawn happened here. A positive int names the
+    spawned process. Anything else is indeterminate — and indeterminate is
+    NOT "no worker": callers must take the safe branch (write the status file
+    and warn), because a spurious status file costs an operator one warning
+    read, while a missing one costs duplicated work and a two-writer tree
+    collision.
+    """
+    if worker_pid is None:
+        return "none"
+    if isinstance(worker_pid, bool) or not isinstance(worker_pid, int):
+        return "unknown"
+    return "spawned" if worker_pid > 0 else "unknown"
+
+
+def retry_record_after_startup_race(
+    record_once,
+    initial_code: int,
+    initial_refusal: dict | None,
+    *,
+    project_root: Path | str,
+    dispatch_id: str,
+    timeout_s: float = RECORD_STARTUP_RACE_RETRY_BUDGET_S,
+    poll_s: float = 0.05,
+) -> tuple[int, dict | None]:
+    """Re-record a startup-race-refused transition once the attempt is RUNNING.
+
+    ``record_once`` performs one record attempt and returns
+    ``(exit_code, refusal_payload_or_None)``; the initial attempt's result is
+    passed in so the original refusal survives a deadline that expires before
+    the attempt ever reaches RUNNING. An attempt that reaches a final state
+    can never be claimed, so the wait ends early instead of burning the whole
+    budget. Returns the last ``(exit_code, refusal)``; ``(0, None)`` means
+    the re-record committed. The peek is read-only (open_reader takes no
+    writer lock), so polling does not contend with the in-flight claim.
+    """
+    deadline = time.monotonic() + timeout_s
+    code, refusal = initial_code, initial_refusal
+    while time.monotonic() < deadline:
+        attempt = None
+        with contextlib.suppress(Exception):
+            attempt = goalflight_journal.Journal.open_reader(
+                project_root
+            ).attempt_for_dispatch(dispatch_id)
+        if attempt is None:
+            time.sleep(poll_s)
+            continue
+        if attempt.lifecycle_state in goalflight_journal.ATTEMPT_FINAL_STATES:
+            break
+        if attempt.lifecycle_state == goalflight_journal.ATTEMPT_RUNNING:
+            code, refusal = record_once()
+            if code == 0 or not is_retryable_startup_race(refusal):
+                break
+        time.sleep(poll_s)
+    return code, refusal
 
 
 def scan_surplus(records: list[dict], limit: int = 20) -> list[dict]:
@@ -1138,6 +1392,13 @@ def cmd_finish(args: argparse.Namespace) -> int:
         # Like the terminal outbox projection, history is derived and repaired
         # by the producer's slow catch-up sweep.
         pass
+    try:
+        import goalflight_trace_archive
+
+        goalflight_trace_archive.archive_finished_dispatch(record, apply=True)
+    except Exception:
+        # Archive is best-effort. A full disk must not fail a terminal commit.
+        pass
     print(json.dumps({
         "ok": True,
         "dispatch_id": args.dispatch_id,
@@ -1148,6 +1409,71 @@ def cmd_finish(args: argparse.Namespace) -> int:
         "idempotent": winner.idempotent,
     }, sort_keys=True))
     return 0
+
+
+def _record_sidecar_overrule(
+    authority: goalflight_journal.Journal,
+    record: dict,
+    *,
+    state: str,
+    reason: object,
+    terminal_state: str,
+    liveness: str,
+    liveness_reason: str,
+    observed_at: str,
+) -> dict[str, object]:
+    """Surface a held sidecar verdict as a durable journal attention item.
+
+    The sidecar said terminal and the recorded worker identity disagreed (or
+    could not be read). The reconciler holds journal/ledger non-terminal; this
+    is the visible half of that decision, so a sidecar verdict is never
+    silently dropped. One OPEN item per (dispatch, sidecar state, liveness)
+    via the deterministic item id; repeat reconciles do not pile up rows.
+    """
+    dispatch_id = str(record.get("dispatch_id") or "")
+    payload = goalflight_output_redact.redact_data(
+        {
+            "dispatch_id": dispatch_id,
+            "sidecar_state": state,
+            "terminal_state": terminal_state,
+            "sidecar_reason": reason,
+            "liveness": liveness,
+            "liveness_reason": liveness_reason,
+            "worker_pid": record.get("worker_pid"),
+            "observed_at": observed_at,
+            "text": (
+                f"sidecar verdict '{terminal_state}' for {dispatch_id} not "
+                f"promoted: worker identity is {liveness} ({liveness_reason}); "
+                "journal and ledger left non-terminal"
+                + (
+                    ". Held until a later reconcile can determine identity "
+                    "(the record gains a pid, a RUNNING journal instance is "
+                    "copied onto it, or the process table becomes readable) "
+                    "or a human/higher-authority pass acts; not resolved by age"
+                    if liveness == "unknown"
+                    else ""
+                )
+            ),
+        }
+    )
+    write = authority.record_system_attention(
+        item_type="sidecar_terminal_overruled",
+        reason=f"worker_identity_{liveness}",
+        dedupe_namespace="sidecar-terminal-overruled",
+        dedupe_key=f"{dispatch_id}:{state}:{liveness}",
+        payload=payload,
+    )
+    return {
+        "dispatch_id": dispatch_id,
+        "sidecar_state": state,
+        "terminal_state": terminal_state,
+        "liveness": liveness,
+        "liveness_reason": liveness_reason,
+        "worker_pid": record.get("worker_pid"),
+        "attention_item_id": (
+            str(write.value["item_id"]) if write.committed and write.value else None
+        ),
+    }
 
 
 def reconcile_terminal_outbox(
@@ -1185,6 +1511,7 @@ def reconcile_terminal_outbox(
     already_terminal = 0
     retryable = 0
     cas_lost = 0
+    overruled: list[dict[str, object]] = []
     history_records: list[dict] = []
     records = read_records()
     known_dispatch_ids = {
@@ -1236,14 +1563,24 @@ def reconcile_terminal_outbox(
             }
             records.append(record)
         if not record.get("worker_pid"):
-            record["worker_pid"] = worker_instance["pid"]
-            record["worker_identity"] = worker_instance
-            record["worker_pgid"] = worker_instance.get("pgid")
-            record["attempt_id"] = str(row["attempt_id"])
-            record["launch_token"] = str(row["launch_token"])
-            record["launch_epoch"] = int(row["launch_epoch"])
+            # Re-probe path for an unknown hold: a RUNNING journal instance
+            # is trusted identity (the worker claimed itself). Copy it onto
+            # the in-memory record AND the durable ledger row so the record
+            # actually gains a pid. The next identity check in this pass
+            # (and later reconciles / operator surfaces) can then resolve
+            # live vs dead. Age is not consulted.
+            hydrated = {
+                "worker_pid": worker_instance["pid"],
+                "worker_identity": worker_instance,
+                "worker_pgid": worker_instance.get("pgid"),
+                "attempt_id": str(row["attempt_id"]),
+                "launch_token": str(row["launch_token"]),
+                "launch_epoch": int(row["launch_epoch"]),
+            }
             if _terminal_key(record) in {"", "unknown", "watcher_stopped"}:
-                record["state"] = "running"
+                hydrated["state"] = "running"
+            record.update(hydrated)
+            _stamp_nonterminal_fields(record, hydrated)
     for record in records:
         if not isinstance(record, dict) or not record.get("dispatch_id"):
             continue
@@ -1260,21 +1597,7 @@ def reconcile_terminal_outbox(
         terminal_state = _terminal_key(record)
         state = str(record.get("state") or "")
         reason: object = record.get("reason") or record.get("error")
-        status_observation: dict | None = None
-        status_path_value = record.get("status_path")
-        if isinstance(status_path_value, str) and status_path_value:
-            try:
-                candidate = json.loads(Path(status_path_value).read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                candidate = None
-            if (
-                isinstance(candidate, dict)
-                and candidate.get("dispatch_id") == record.get("dispatch_id")
-            ):
-                candidate_state = candidate.get("terminal_pending_state") or candidate.get("state")
-                candidate_terminal = terminal_state_for(candidate_state, candidate.get("reason") or candidate.get("error"))
-                if candidate_terminal not in {"", "unknown", "watcher_stopped"}:
-                    status_observation = candidate
+        status_observation = _terminal_sidecar_observation(record)
         expired_launch = str(record["dispatch_id"]) in expired_launches
         needs_ledger_projection = status_observation is not None or expired_launch or terminal_state in {
             "",
@@ -1287,7 +1610,88 @@ def reconcile_terminal_outbox(
                 or status_observation.get("state")
             )
             reason = status_observation.get("reason") or status_observation.get("error")
+            record_terminal_key = terminal_state
             terminal_state = terminal_state_for(state, reason)
+            # Process identity outranks a sidecar verdict. A terminal sidecar
+            # (failed / idle_timeout / complete) is a statement about the
+            # dispatch channel, not about the worker: watchers write
+            # idle_timeout after the worker already did its work, and a
+            # status-write-error mirror says failed while the worker runs on.
+            # While the recorded identity (pid AND start token, never pid
+            # alone) still matches a live process, promoting the sidecar would
+            # terminalize a running worker -- first-terminal-wins poisons the
+            # journal, frees the capacity lease, and the worktree-GC ownership
+            # predicate (keyed on non-terminal ledger state) would read the
+            # tree as unowned. Hold instead, and surface the disagreement as
+            # an attention item: a silently ignored sidecar is its own defect.
+            #
+            # Three-state: when liveness cannot be determined (no recorded
+            # identity fields, unreadable process table) the verdict is
+            # UNKNOWN and UNKNOWN holds. Terminalizing is the destructive
+            # direction, so doubt resolves against the write. This is
+            # deliberately the opposite default from admission control, which
+            # treats an unproven worker as not reusable: there the cheap error
+            # is a blocked reuse, here the expensive error is a terminal write
+            # over live work. A genuinely dead worker -- identity gone, or the
+            # pid now belongs to a different process -- still terminalizes
+            # below, exactly as before.
+            #
+            # Unknown is a hold, not a swallow, and it is not age-based. Each
+            # reconcile re-probes identity. The resolution path is: a RUNNING
+            # journal instance copied onto the record (the record gains a
+            # pid), or the process table becoming readable again. Either makes
+            # liveness determinable -- live keeps holding, dead terminalizes.
+            # A timer that terminalizes an indeterminate record would
+            # terminalize live workers whose identity was merely unreadable
+            # at one moment. Still-unknown stays held until that re-probe
+            # succeeds or a human / higher-authority pass acts, and the hold
+            # is stamped on the ledger so operator surfaces can name it.
+            #
+            # The gate applies only to the FIRST terminal write. When the
+            # record or the journal attempt is already terminal, the terminal
+            # authority has already fired: the re-commit below is idempotent
+            # and first-terminal-wins keeps the original verdict, so a
+            # disagreeing sidecar cannot overwrite it. Gating that path would
+            # strand the ledger/journal repair this reconciler exists to do.
+            if record_terminal_key in {"", "unknown", "watcher_stopped"}:
+                attempt = authority.attempt_for_dispatch(str(record["dispatch_id"]))
+                attempt_final = (
+                    attempt is not None
+                    and attempt.lifecycle_state
+                    in goalflight_journal.ATTEMPT_FINAL_STATES
+                )
+                if not attempt_final:
+                    liveness, liveness_reason = worker_identity_liveness(record)
+                    if liveness != "dead":
+                        authority.resolve_system_attention(
+                            item_type="sidecar_terminal_overruled",
+                            dispatch_id=str(record["dispatch_id"]),
+                            keep_reason=f"worker_identity_{liveness}",
+                        )
+                        overruled.append(
+                            _record_sidecar_overrule(
+                                authority,
+                                record,
+                                state=state,
+                                reason=reason,
+                                terminal_state=terminal_state,
+                                liveness=liveness,
+                                liveness_reason=liveness_reason,
+                                observed_at=reconcile_at,
+                            )
+                        )
+                        _stamp_nonterminal_fields(
+                            record,
+                            {
+                                "sidecar_hold": liveness,
+                                "sidecar_hold_reason": liveness_reason,
+                            },
+                        )
+                        continue
+                authority.resolve_system_attention(
+                    item_type="sidecar_terminal_overruled",
+                    dispatch_id=str(record["dispatch_id"]),
+                )
         elif expired_launch:
             state = "abandoned"
             terminal_state = "abandoned"
@@ -1338,6 +1742,8 @@ def reconcile_terminal_outbox(
                         if current_path.exists()
                         else dict(record)
                     )
+                    current.pop("sidecar_hold", None)
+                    current.pop("sidecar_hold_reason", None)
                     current.update(
                         {
                             "state": str(
@@ -1385,6 +1791,7 @@ def reconcile_terminal_outbox(
         "already_terminal": already_terminal,
         "cas_lost": cas_lost,
         "retryable": retryable,
+        "overruled": overruled,
         "projected": len(projected),
     }
 
@@ -1460,6 +1867,10 @@ def status_payload() -> dict:
             "result_path": r.get("result_path"),
             "result_paths": r.get("result_paths"),
         }
+        hold = sidecar_terminal_hold(r)
+        if hold is not None:
+            row["sidecar_hold"] = hold["liveness"]
+            row["sidecar_hold_reason"] = hold["reason"]
         rows.append(row)
     return {
         "schema": SCHEMA,

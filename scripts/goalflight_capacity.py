@@ -86,6 +86,16 @@ INDETERMINATE_LIVE_RETENTION_S = 7200
 INDETERMINATE_LIVE_REASON = "liveness_indeterminate_worker_live"
 
 
+CAPACITY_STATE_UNREADABLE = "capacity_state_unreadable"
+
+
+class CapacityStateUnreadable(Exception):
+    """Raised when capacity.json cannot be read or parsed.
+
+    This is UNKNOWN, never a measured empty lease set. Admission must refuse.
+    """
+
+
 class CapacityWaitInterrupted(Exception):
     """Raised when SIGTERM/SIGINT interrupts acquire_with_wait."""
 
@@ -351,19 +361,73 @@ class StateLock:
         self._fh.close()
 
 
+def _empty_state() -> dict:
+    return {"schema": SCHEMA, "machine_id": machine_id(), "leases": {}, "cooldowns": {}}
+
+
 def load_state() -> dict:
+    """Load capacity.json.
+
+    A missing file is a measured empty (first use). An unreadable or corrupt
+    file is UNKNOWN: raise ``CapacityStateUnreadable`` instead of returning
+    zero leases.
+
+    This is the OPPOSITE of the queue/journal keep-direction, and the
+    contrast is deliberate. For deletion/terminalization, unknown must keep
+    the work — treating unreadability as absence destroys live envelopes and
+    journals. For admission, unknown must refuse — treating unreadability as
+    zero leases over-commits the machine at exactly the moment it is
+    unhealthy.
+
+    Retry/backoff is not widened here. ``acquire_with_wait`` already polls
+    ``decision=wait`` at ``CAPACITY_WAIT_POLL_S`` plus jitter until the lane
+    wait budget expires (defaults in ``CAPACITY_WAIT_DEFAULTS_S``). A flaky
+    read therefore retries on the existing budget; a persistent unreadable
+    file then surfaces as ``reason=capacity_state_unreadable``, distinct from
+    ``machine_worker_cap`` / ``agent_worker_cap``, so it cannot be mistaken
+    for a genuine cap-reached hold (t-068).
+    """
     path = state_path()
-    if not path.exists():
-        return {"schema": SCHEMA, "machine_id": machine_id(), "leases": {}, "cooldowns": {}}
+    # ``Path.exists()`` returns False on OSError, collapsing parent-unreadable
+    # into absent. Only FileNotFoundError is evidence the file is gone.
     try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        data = {"schema": SCHEMA, "machine_id": machine_id(), "leases": {}, "cooldowns": {}}
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _empty_state()
+    except OSError as exc:
+        raise CapacityStateUnreadable(
+            f"capacity state unreadable: {type(exc).__name__}: {path}"
+        ) from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CapacityStateUnreadable(
+            f"capacity state corrupt: JSONDecodeError: {path}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise CapacityStateUnreadable(f"capacity state is not an object: {path}")
     data.setdefault("schema", SCHEMA)
     data.setdefault("machine_id", machine_id())
     data.setdefault("leases", {})
     data.setdefault("cooldowns", {})
+    if not isinstance(data.get("leases"), dict) or not isinstance(
+        data.get("cooldowns"), dict
+    ):
+        raise CapacityStateUnreadable(
+            f"capacity state has no readable lease map: {path}"
+        )
     return data
+
+
+def unreadable_admission_payload(exc: CapacityStateUnreadable) -> dict:
+    """Wait payload for an unreadable capacity read. Not cap-reached."""
+    return {
+        "decision": "wait",
+        "reason": CAPACITY_STATE_UNREADABLE,
+        "error": str(exc),
+        "measured": False,
+        "retry_after_s": int(CAPACITY_WAIT_POLL_S),
+    }
 
 
 def save_state(data: dict) -> None:
@@ -1029,7 +1093,13 @@ def cmd_acquire(args: argparse.Namespace) -> int:
     prof = profile(args)
     rss_mb = args.mem_mb or AGENT_RSS_MB.get(agent, DEFAULT_WORST_WORKER_MB)
     with StateLock():
-        data = load_state()
+        try:
+            data = load_state()
+        except CapacityStateUnreadable as exc:
+            # Refuse admission. Do not persist: a save here would clobber the
+            # unreadable file with a false empty lease map plus the new grant.
+            print(json.dumps(unreadable_admission_payload(exc), sort_keys=True))
+            return 2
         prune_state(data)
         cooldown = cooldown_for(data, agent)
         if cooldown:
@@ -1245,7 +1315,19 @@ def cmd_status(args: argparse.Namespace) -> int:
     # poller race-flip another project's lease). Active-lease reclaim is the
     # job of `release-stale`, which is liveness-gated by design.
     with StateLock():
-        data = load_state()
+        try:
+            data = load_state()
+        except CapacityStateUnreadable as exc:
+            payload = {
+                "error": str(exc),
+                "reason": CAPACITY_STATE_UNREADABLE,
+                "measured": False,
+            }
+            if args.json:
+                print(json.dumps(payload, sort_keys=True))
+            else:
+                print(f"capacity: unreadable: {exc}", file=sys.stderr)
+            return 1
     prune_state(data)
     pressure = current_rate_pressure(args)
     payload = {
@@ -1342,7 +1424,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except CapacityStateUnreadable as exc:
+        print(json.dumps(unreadable_admission_payload(exc), sort_keys=True))
+        return 2
 
 
 if __name__ == "__main__":

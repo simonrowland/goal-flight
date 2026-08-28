@@ -933,7 +933,38 @@ def _authority_snapshot(
             }
         if detail:
             detail += "; reconciled by journal authority"
+        hold = record.get("sidecar_hold")
+        if (
+            hold in {"live", "unknown"}
+            and not goalflight_dispatch_states.is_terminal_state(journal_value)
+        ):
+            hold_label = f"held: {hold}"
+            hold_reason = record.get("sidecar_hold_reason")
+            hold_text = (
+                f"{hold_label} ({hold_reason})" if hold_reason else hold_label
+            )
+            resolution = hold_label
+            detail = f"{detail}; {hold_text}" if detail else hold_text
         return verdict, detail, resolution
+
+    hold = record.get("sidecar_hold")
+    if hold in {"live", "unknown"}:
+        hold_label = f"held: {hold}"
+        hold_reason = record.get("sidecar_hold_reason")
+        hold_text = f"{hold_label} ({hold_reason})" if hold_reason else hold_label
+        if detail:
+            detail += f"; {hold_text}"
+        else:
+            detail = hold_text
+        return (
+            {
+                "display_state": "running",
+                "is_terminal": False,
+                "classification_conflict": False,
+            },
+            detail,
+            hold_label,
+        )
 
     # A status sidecar is structurally newer only when both sources carry an
     # observation time and the sidecar's is later. Otherwise disagreement is
@@ -1328,9 +1359,15 @@ def _active_controller_roots_from_journals() -> set[str]:
     if base is None:
         return roots
     try:
-        paths = list(base.glob(f"*/{goalflight_journal.JOURNAL_FILE_NAME}"))
-    except OSError:
-        return roots
+        # glob swallows PermissionError and yields nothing — the empty-fleet
+        # rendering 8df3081 closed on iter_journal_files. Use that primitive.
+        paths = goalflight_journal.iter_journal_files()
+    except goalflight_journal.JournalIOError:
+        raise
+    except OSError as exc:
+        raise OSError(
+            f"journals index unreadable, controller roots unknown: {base}: {exc}"
+        ) from exc
     for path in paths:
         try:
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)

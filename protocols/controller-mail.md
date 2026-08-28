@@ -67,8 +67,27 @@ python3 <skill-root>/scripts/goalflight_messages.py post \
 
 `--to-controller` uses a durable label. `--controller-project-root` defaults to the
 current canonical git project and is needed only for explicit cross-project mail.
+A send that reaches nobody is not success: the CLI exits non-zero and
+`controller_delivery.status` is the machine-readable miss (`controller_addressee_unresolved`,
+`controller_addressee_other_project`, or `controller_registry_unknown`). When the
+label is registered in another project, that error names `--controller-project-root`
+with that path. An unreadable registry is UNKNOWN and does not record a
+reached-nobody delivery.
 Producers record the journal assignment before projecting the JSONL carrier; retry
 heals an unprojected assignment rather than creating a second store.
+
+Every controller-transport post is attributed: the sender's declared controller
+label is stamped into `source.controller_label` at the shared admit path
+(`post_message`) and at producers that bypass it, or the explicit sentinel
+`UNKNOWN` when no identity can be established — including a leftover
+`GOALFLIGHT_DISPATCH_ID`, a bash-tool shell that dropped the session
+variables, or a PID-only environment. A pid or git directory name is never
+a sender. Relay renders a real label as the `from` party even when an
+informative adapter is also present (adapter is a host/tool name shared by
+many controllers). Unattributed controller mail says `from UNKNOWN` — read
+it as "sender not establishable", never as a license to infer one. The label
+is trusted descriptive metadata, not lease-validated; authorship proof
+remains the capability-derived author digest.
 
 ## Patch flow — mail is how work leaves a controller
 

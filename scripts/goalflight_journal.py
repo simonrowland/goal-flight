@@ -762,16 +762,38 @@ def journals_index_dir() -> Path:
 def iter_journal_files() -> list[Path]:
     """Return every journal sqlite path under the journals index.
 
-    A listing failure is an empty list, not a crash. Callers must treat an
-    unreadable *file* as its own unknown row rather than skipping the index.
+    Raises ``JournalIOError`` when the index exists but cannot be listed:
+    an unreadable index is UNKNOWN, not an empty fleet. A genuinely absent
+    index is an empty list. Callers must treat an unreadable *file* as its
+    own unknown row rather than skipping the index.
     """
     base = journals_index_dir()
+    # pathlib glob swallows PermissionError and yields nothing; iterdir
+    # raises, keeping unreadable distinct from absent.
     try:
-        # Do not filter with is_file(): a permission error would silently drop
-        # an unreadable journal. Peek it and let the caller emit unknown.
-        return sorted(base.glob(f"*/{JOURNAL_FILE_NAME}"))
-    except OSError:
+        children = list(base.iterdir())
+    except FileNotFoundError:
         return []
+    except OSError as exc:
+        raise JournalIOError(
+            f"journals index is unreadable, so the fleet roster is unknown: "
+            f"{base}: {exc}"
+        ) from exc
+    files: list[Path] = []
+    for child in children:
+        if not child.is_dir():
+            continue
+        candidate = child / JOURNAL_FILE_NAME
+        try:
+            names = {entry.name for entry in child.iterdir()}
+        except OSError:
+            # Unreadable per-project dir: the journal path is conventional,
+            # so include it and let the caller's peek emit an unknown row.
+            files.append(candidate)
+            continue
+        if JOURNAL_FILE_NAME in names:
+            files.append(candidate)
+    return sorted(files)
 
 
 def resolve_journal_path(project_root: Path | str) -> Path:
@@ -787,6 +809,24 @@ def resolve_journal_path(project_root: Path | str) -> Path:
 
 def journal_write_lock_path(journal_path: Path) -> Path:
     return journal_path.with_name(f".{journal_path.name}.write.lock")
+
+
+def _lstat_presence(path: Path) -> str:
+    """Return ``present`` / ``absent`` / ``unknown``. Never ``lexists`` here.
+
+    ``os.path.lexists`` is ``lstat`` wrapped in ``except (OSError, ValueError):
+    return False``, so it answers False for both "not there" and "I could not
+    look". Only FileNotFoundError is evidence of absence; any other OSError
+    means presence could not be verified. Same contract as journal_gc's
+    ``_presence``.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unknown"
+    return "present"
 
 
 def _is_busy(exc: BaseException) -> bool:
@@ -990,13 +1030,25 @@ class Journal:
             jitter_min_s=jitter_min_s,
             jitter_max_s=jitter_max_s,
         )
+        presence = _lstat_presence(self.path)
+        if presence == "unknown":
+            raise JournalIOError(
+                f"journal init refused because path presence is unreadable, so "
+                f"absence is unverified: {self.path}"
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         write_lock, deadline = self._acquire_construction_lock()
         try:
-            if os.path.lexists(self.path):
+            presence = _lstat_presence(self.path)
+            if presence == "present":
                 raise JournalError(
                     f"journal init refused because the database already exists: {self.path}; "
                     "open it with Journal(...) instead"
+                )
+            if presence == "unknown":
+                raise JournalIOError(
+                    f"journal init refused because path presence is unreadable, so "
+                    f"absence is unverified: {self.path}"
                 )
             self._claim_fresh_database_path()
             try:
@@ -1106,11 +1158,20 @@ class Journal:
         return write_lock, deadline
 
     def _require_existing_database(self) -> None:
-        if not os.path.lexists(self.path):
+        presence = _lstat_presence(self.path)
+        if presence == "absent":
             raise JournalDisappeared(
                 f"journal database is absent: {self.path}. Failing closed because streams "
                 "cannot rebuild journal authority. Restore a validated WAL-safe backup; "
                 "use the init verb only for an intentional first bootstrap."
+            )
+        if presence == "unknown":
+            # Unreadable is not absent: disappearance is unverified, and the
+            # callers' unknown handling (probe "unreadable", roster error,
+            # controller_indeterminate) keeps every gate shut.
+            raise JournalIOError(
+                f"journal path presence is unreadable, so disappearance is unverified: "
+                f"{self.path}"
             )
         if self.path.is_symlink():
             raise JournalIntegrityError(
@@ -1191,7 +1252,7 @@ class Journal:
                     )
             except (JournalDisappeared, JournalIOError) as exc:
                 open_failures += 1
-                self._raise_disappeared_if_absent(exc)
+                self._raise_disappeared_or_unverified(exc)
                 if self._open_retry_delay(open_started, open_failures):
                     continue
                 raise self._open_io_failure(open_started, open_failures, exc) from exc
@@ -1212,7 +1273,7 @@ class Journal:
                     self._raise_integrity_failure(f"journal reader parse failed: {exc}")
                 if _is_cantopen(exc):
                     open_failures += 1
-                    self._raise_disappeared_if_absent(exc)
+                    self._raise_disappeared_or_unverified(exc)
                     if self._open_retry_delay(open_started, open_failures):
                         continue
                     raise self._open_io_failure(open_started, open_failures, exc) from exc
@@ -1236,13 +1297,13 @@ class Journal:
                 if not _is_busy(exc):
                     if _is_cantopen(exc):
                         open_failures += 1
-                        self._raise_disappeared_if_absent(exc)
+                        self._raise_disappeared_or_unverified(exc)
                         if self._open_retry_delay(open_started, open_failures):
                             continue
                         raise self._open_io_failure(
                             open_started, open_failures, exc
                         ) from exc
-                    self._raise_disappeared_if_absent(exc)
+                    self._raise_disappeared_or_unverified(exc)
                     if self._read_only_client:
                         raise JournalIOError(
                             f"journal readonly probe unavailable/unreadable for {self.path}: "
@@ -1961,10 +2022,23 @@ class Journal:
             time.sleep(delay)
         return time.monotonic() < deadline
 
-    def _raise_disappeared_if_absent(self, cause: BaseException) -> None:
-        if not os.path.lexists(self.path):
+    def _raise_disappeared_or_unverified(self, cause: BaseException) -> None:
+        """Reclassify a low-level open/read failure by path presence.
+
+        Present: return, so the caller keeps its own retry/IO-failure path.
+        Genuinely absent: JournalDisappeared. Unverifiable (unreadable):
+        JournalIOError — an unreadable path is not absence, and the IO
+        verdict is what the caller's budget-exhausted path would raise anyway.
+        """
+        presence = _lstat_presence(self.path)
+        if presence == "absent":
             raise JournalDisappeared(
                 f"journal database vanished without creating a replacement: {self.path}"
+            ) from cause
+        if presence == "unknown":
+            raise JournalIOError(
+                f"journal path is unreadable after a failure, so disappearance is "
+                f"unverified: {self.path}"
             ) from cause
 
     def _open_retry_delay(self, started: float, failures: int) -> bool:
@@ -2109,7 +2183,7 @@ class Journal:
                 raise
             except sqlite3.OperationalError as exc:
                 if not _is_busy(exc):
-                    self._raise_disappeared_if_absent(exc)
+                    self._raise_disappeared_or_unverified(exc)
                     raise
                 if self._retry_delay(started, deadline_s=deadline):
                     continue
@@ -4186,6 +4260,172 @@ class Journal:
         )
         return [dict(row) for row in rows]
 
+    def record_system_attention(
+        self,
+        *,
+        item_type: str,
+        reason: str,
+        dedupe_namespace: str,
+        dedupe_key: str,
+        payload: Mapping[str, object],
+    ) -> WriteResult[dict[str, object]]:
+        """Record one operator-visible system anomaly, idempotently.
+
+        The durable surface for journal-observed faults that are not tied to a
+        controller lease; the outbox projector's ``terminal_outbox_quarantined``
+        item is the in-module precedent. ``dedupe_namespace``/``dedupe_key``
+        pin the item id, so a repeated observation lands exactly one OPEN row
+        plus one quiet attention-stream delivery event. The delivery stays
+        quiet on purpose: a waking ``*`` broadcast would pop a sibling's live
+        slot, and operator surfaces read ``attention_items()`` rather than the
+        wake class.
+        """
+        item_type = self._state_token(item_type, label="attention item_type")
+        reason = self._identity_token(reason, label="attention reason")
+        namespace = self._identity_token(dedupe_namespace, label="dedupe_namespace")
+        key = str(dedupe_key or "")
+        if not key or len(key) > 512:
+            raise ValueError("dedupe_key must be non-empty and bounded")
+        item_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"goalflight:{namespace}:{key}"))
+        payload_json = self._json_object(
+            {**dict(payload), "item_id": item_id, "type": item_type},
+            label="system_attention_payload",
+        )
+        now = utc_now()
+
+        def action(connection: sqlite3.Connection) -> dict[str, object]:
+            inserted = connection.execute(
+                """
+                INSERT OR IGNORE INTO system_attention_items (
+                    item_id, project_root, item_type, state, reason,
+                    payload_json, wake_class, created_at
+                ) VALUES (?, ?, ?, 'OPEN', ?, ?, 'waking', ?)
+                """,
+                (
+                    item_id,
+                    str(self.project_root),
+                    item_type,
+                    reason,
+                    payload_json,
+                    now,
+                ),
+            )
+            next_seq = int(
+                connection.execute(
+                    """
+                    SELECT COALESCE(MAX(stream_seq), 0) + 1
+                    FROM delivery_events
+                    WHERE project_root = ? AND recipient_label = '*'
+                      AND stream_id = 'attention'
+                    """,
+                    (str(self.project_root),),
+                ).fetchone()[0]
+            )
+            delivered = connection.execute(
+                """
+                INSERT OR IGNORE INTO delivery_events (
+                    project_root, recipient_label, origin_node, event_uuid,
+                    stream_id, stream_seq, carrier_path, event_type,
+                    wake_class, created_at, projected_at
+                ) VALUES (?, '*', 'journal', ?, 'attention', ?, ?,
+                          'controller_attention', 'quiet', ?, ?)
+                """,
+                (
+                    str(self.project_root),
+                    item_id,
+                    next_seq,
+                    f"journal:{namespace}:{item_id}",
+                    now,
+                    now,
+                ),
+            )
+            if delivered.rowcount == 1:
+                self._invalidate_delivery_cursor_snapshots(
+                    connection,
+                    project_root=str(self.project_root),
+                    recipient_label="*",
+                    updated_at=now,
+                )
+            return {"item_id": item_id, "created": bool(inserted.rowcount == 1)}
+
+        return self._domain_write(action)
+
+    def resolve_system_attention(
+        self,
+        *,
+        item_type: str,
+        dispatch_id: str,
+        keep_reason: str | None = None,
+    ) -> WriteResult[dict[str, object]]:
+        """Resolve OPEN system attention items for one dispatch.
+
+        Matches ``payload_json.dispatch_id``. When ``keep_reason`` is set,
+        OPEN items whose reason still matches stay OPEN so a live hold is
+        not collapsed while an earlier unknown hold for the same dispatch
+        is retired. Withdraws the quiet attention-stream delivery event
+        so a resolved item does not keep paging.
+        """
+        item_type = self._state_token(item_type, label="attention item_type")
+        dispatch = str(dispatch_id or "")
+        if not dispatch or len(dispatch) > 512:
+            raise ValueError("dispatch_id must be non-empty and bounded")
+        keep_reason_token = (
+            self._identity_token(keep_reason, label="attention reason")
+            if keep_reason is not None
+            else None
+        )
+        now = utc_now()
+
+        def action(connection: sqlite3.Connection) -> dict[str, object]:
+            rows = connection.execute(
+                """
+                SELECT item_id, reason, payload_json
+                FROM system_attention_items
+                WHERE project_root = ? AND item_type = ? AND state = 'OPEN'
+                """,
+                (str(self.project_root), item_type),
+            ).fetchall()
+            resolved: list[str] = []
+            for row in rows:
+                if (
+                    keep_reason_token is not None
+                    and str(row["reason"]) == keep_reason_token
+                ):
+                    continue
+                try:
+                    payload = json.loads(str(row["payload_json"]))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                if str(payload.get("dispatch_id") or "") != dispatch:
+                    continue
+                item_id = str(row["item_id"])
+                updated = connection.execute(
+                    """
+                    UPDATE system_attention_items
+                    SET state = 'RESOLVED', resolved_at = ?
+                    WHERE item_id = ? AND state = 'OPEN'
+                    """,
+                    (now, item_id),
+                )
+                if updated.rowcount != 1:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE delivery_events
+                    SET withdrawn_at = ?
+                    WHERE project_root = ? AND origin_node = 'journal'
+                      AND event_uuid = ? AND event_type = 'controller_attention'
+                      AND withdrawn_at IS NULL
+                    """,
+                    (now, str(self.project_root), item_id),
+                )
+                resolved.append(item_id)
+            return {"resolved_item_ids": resolved, "resolved_at": now}
+
+        return self._domain_write(action)
+
     def attempt_for_dispatch(self, dispatch_id: str) -> AttemptIdentity | None:
         dispatch = self._identity_token(dispatch_id, label="dispatch_id")
         rows = self.read_all(
@@ -5143,7 +5383,15 @@ def open_or_create_journal(
 ) -> Journal:
     """Open authority, explicitly bootstrapping only a truly absent path."""
     path = resolve_journal_path(project_root)
-    if os.path.lexists(path):
+    presence = _lstat_presence(path)
+    if presence == "unknown":
+        # An unreadable present path must not fall through to create: the
+        # bootstrap attempt would fail (or worse, partially claim) against a
+        # database that may be live.
+        raise JournalIOError(
+            f"journal path presence is unreadable, so absence is unverified: {path}"
+        )
+    if presence == "present":
         return Journal(project_root, allow_migration=allow_migration)
     try:
         return Journal.create(project_root)
@@ -5151,9 +5399,15 @@ def open_or_create_journal(
         # Availability failures are not a create race. Preserve their concrete
         # operator verdict instead of retrying them merely because a path exists.
         raise
-    except JournalError:
-        if not os.path.lexists(path):
+    except JournalError as exc:
+        presence = _lstat_presence(path)
+        if presence == "absent":
             raise
+        if presence == "unknown":
+            raise JournalIOError(
+                f"journal create failed and the path is unreadable, so absence is "
+                f"unverified: {path}"
+            ) from exc
         return Journal(project_root, allow_migration=allow_migration)
 
 
@@ -5230,10 +5484,16 @@ def restore_snapshot(
 ) -> Path:
     source = Path(os.path.abspath(os.fspath(Path(snapshot).expanduser())))
     destination = resolve_journal_path(project_root)
-    if not os.path.lexists(destination):
+    presence = _lstat_presence(destination)
+    if presence == "absent":
         raise JournalDisappeared(
             f"restore target journal is absent: {destination}. Failing closed; use init only "
             "for an intentional bootstrap, then retry restore from the validated snapshot."
+        )
+    if presence == "unknown":
+        raise JournalIOError(
+            f"restore target journal is unreadable, so absence is unverified: "
+            f"{destination}. Do not init over an unreadable live journal."
         )
     if not i_understand:
         raise JournalError(
@@ -5245,9 +5505,14 @@ def restore_snapshot(
         raise JournalError("restore snapshot must differ from the live journal")
 
     with goalflight_task.FileLock(journal_write_lock_path(destination)):
-        if not os.path.lexists(destination):
+        locked_presence = _lstat_presence(destination)
+        if locked_presence == "absent":
             raise JournalDisappeared(
                 f"restore target journal disappeared before exclusion was acquired: {destination}"
+            )
+        if locked_presence == "unknown":
+            raise JournalIOError(
+                f"restore target journal is unreadable after exclusion: {destination}"
             )
         if destination.is_symlink() or not destination.is_file():
             raise JournalIntegrityError(f"restore target is not a regular non-symlink file: {destination}")

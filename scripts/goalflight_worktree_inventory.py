@@ -31,13 +31,12 @@ from pathlib import Path
 import subprocess
 import sys
 
-# Why 32: the bounded pool in goalflight_worktree_pool.py defaults to
-# DEFAULT_WORKTREE_SEATS = 4, and a repo running several controllers with a
-# handful of long-lived side worktrees each lands in the low tens. 32 is ~8x the
-# single-pool default, so a repo honouring the pool discipline cannot trip it,
-# while genuine unbounded growth (the observed case was 456, 14x this threshold)
-# trips it immediately. It is a reporting threshold only — nothing is deleted.
-DEFAULT_BUSY_THRESHOLD = 32
+# Why 8x the pool default: a repo honouring the pool plus a handful of
+# long-lived side worktrees still lands well below that multiple, while genuine
+# unbounded growth (observed 456) trips immediately. Reporting threshold only.
+from goalflight_worktree_pool import DEFAULT_WORKTREE_SEATS  # noqa: E402
+
+DEFAULT_BUSY_THRESHOLD = DEFAULT_WORKTREE_SEATS * 8
 
 # Why 50%: ENFILE is raised against the whole-system table, so the useful alarm is
 # a fraction of kern.maxfiles rather than an absolute count. The observed failure

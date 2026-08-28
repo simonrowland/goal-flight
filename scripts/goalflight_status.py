@@ -671,11 +671,18 @@ def _dispatch_queue_dir() -> Path:
     return goalflight_ledger.state_dir() / "dispatch-queue"
 
 
-def _dispatch_queue_depth() -> int:
+def _dispatch_queue_depth() -> int | None:
+    """Queued ``*.json`` count. None is UNKNOWN, not a measured zero."""
     try:
-        return len(list(_dispatch_queue_dir().glob("*.json")))
-    except OSError:
+        return sum(
+            1
+            for path in _dispatch_queue_dir().iterdir()
+            if path.name.endswith(".json")
+        )
+    except FileNotFoundError:
         return 0
+    except OSError:
+        return None
 
 
 def _launchd_drainer_loaded() -> bool:
@@ -725,6 +732,16 @@ def _drainer_live() -> bool:
 
 def _queue_drainer_warnings() -> list[dict]:
     queue_depth = _dispatch_queue_depth()
+    if queue_depth is None:
+        return [
+            {
+                "code": "queue_unreadable",
+                "severity": "WARN",
+                "queue_depth": None,
+                "message": "dispatch queue listing failed; depth unknown (not empty)",
+                "remedy": "check permissions on the dispatch-queue directory",
+            }
+        ]
     if queue_depth <= 0 or _drainer_live():
         return []
     return [
@@ -795,6 +812,21 @@ def reconcile_fast_plane_record(
         else staged
     )
     reconciled = _decorate_trace_status(candidate)
+    sidecar_for_hold = (
+        reconciled.get("_wait_status_snapshot")
+        if isinstance(reconciled.get("_wait_status_snapshot"), dict)
+        else None
+    )
+    hold = goalflight_ledger.sidecar_terminal_hold(
+        reconciled,
+        sidecar=sidecar_for_hold,
+    )
+    if hold is not None:
+        reconciled["sidecar_hold"] = hold["liveness"]
+        reconciled["sidecar_hold_reason"] = hold["reason"]
+    else:
+        reconciled.pop("sidecar_hold", None)
+        reconciled.pop("sidecar_hold_reason", None)
     if not retain_status_snapshot:
         reconciled.pop("_wait_status_snapshot", None)
     return reconciled
@@ -1630,6 +1662,13 @@ def _dispatch_cells(record: dict) -> str:
             f" sandbox requested={requested} supported={supported} "
             f"enforced={enforced}"
         )
+    hold = record.get("sidecar_hold")
+    if hold in {"live", "unknown"}:
+        hold_reason = record.get("sidecar_hold_reason")
+        hold_text = f"held: {hold}"
+        if hold_reason:
+            hold_text += f" ({hold_reason})"
+        cells += f" {hold_text}"
     resume = _resume_hint(record)
     if resume:
         cells += f" | {resume}"
