@@ -1509,7 +1509,12 @@ def _unlink_queue_entry(dispatch_id: str) -> None:
 
 
 def cmd_cancel_requeue(args: argparse.Namespace) -> int:
-    """Mark a persisted requeue intent abandoned so it cannot regenerate."""
+    """Mark a persisted requeue intent abandoned so it cannot regenerate.
+
+    A ``-retry-<hex>`` id is a hint, not proof. Unlistable ledgers and
+    retry ids that are not the intent's ``child_id`` refuse rather than
+    abandoning a different live retry.
+    """
     requested_id = str(args.dispatch_id or "")
     path = record_path(requested_id, create=False)
     acted_id = requested_id
@@ -1519,6 +1524,16 @@ def cmd_cancel_requeue(args: argparse.Namespace) -> int:
         base_id = lookup.get("base_dispatch_id")
         if not base_id:
             print(json.dumps(_missing_dispatch_payload(requested_id), sort_keys=True))
+            return 1
+        if lookup.get("base_source") == "id_pattern" and lookup.get("listing") != "ok":
+            print(json.dumps({
+                "ok": False,
+                "error": "requeue_base_unproven",
+                "dispatch_id": requested_id,
+                "base_dispatch_id": base_id,
+                "base_source": lookup.get("base_source"),
+                "ledger_listing": lookup.get("listing"),
+            }, sort_keys=True))
             return 1
         path = record_path(base_id, create=False)
         if not path.exists():
@@ -1536,6 +1551,15 @@ def cmd_cancel_requeue(args: argparse.Namespace) -> int:
                 "ok": False,
                 "error": "no_requeue_intent",
                 "dispatch_id": acted_id,
+            }, sort_keys=True))
+            return 1
+        if via_retry_id and intent.get("child_id") != requested_id:
+            print(json.dumps({
+                "ok": False,
+                "error": "requeue_child_mismatch",
+                "dispatch_id": acted_id,
+                "requested_dispatch_id": requested_id,
+                "child_id": intent.get("child_id"),
             }, sort_keys=True))
             return 1
         existing = intent.get("disposition")

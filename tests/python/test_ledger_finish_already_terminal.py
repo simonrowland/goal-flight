@@ -38,6 +38,17 @@ def _write_running(dispatch_id: str, project: Path) -> None:
     )
 
 
+def _cancel(dispatch_id: str) -> tuple[int, dict]:
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+        code = ledger.cmd_cancel_requeue(
+            argparse.Namespace(dispatch_id=dispatch_id)
+        )
+    raw = buf.getvalue()
+    payload = json.loads(raw) if raw.strip() else {}
+    return code, payload
+
+
 def _finish(
     dispatch_id: str,
     *,
@@ -225,11 +236,8 @@ def test_cancel_requeue_abandons_intent_and_unlinks_child(tmp_path: Path) -> Non
     child_path = dispatch._queue_entry_path(child_id, queue_dir=queue_dir)
     assert child_path.exists()
 
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        rc = ledger.cmd_cancel_requeue(argparse.Namespace(dispatch_id=parent_id))
-    assert rc == 0, buf.getvalue()
-    payload = json.loads(buf.getvalue())
+    rc, payload = _cancel(parent_id)
+    assert rc == 0, payload
     assert payload["ok"] is True
     assert payload["disposition"] == "abandoned"
     assert payload["idempotent"] is False
@@ -237,14 +245,98 @@ def test_cancel_requeue_abandons_intent_and_unlinks_child(tmp_path: Path) -> Non
     assert intent["disposition"] == "abandoned"
     assert not child_path.exists()
 
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        rc = ledger.cmd_cancel_requeue(argparse.Namespace(dispatch_id=child_id))
-    assert rc == 0, buf.getvalue()
-    again = json.loads(buf.getvalue())
+    rc, again = _cancel(child_id)
+    assert rc == 0, again
     assert again["ok"] is True
     assert again["idempotent"] is True
     assert again["dispatch_id"] == parent_id
+
+
+def test_cancel_requeue_refuses_retry_id_that_is_not_the_child(
+    tmp_path: Path,
+) -> None:
+    """id_pattern is a hint. A mismatched retry id must not abandon the live child."""
+    import goalflight_dispatch as dispatch
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    parent_id = "cancel-mismatch-base"
+    live_child = "cancel-mismatch-base-retry-bbbbbbbb"
+    wrong_child = "cancel-mismatch-base-retry-deadbeef"
+    queue_dir = dispatch._dispatch_queue_dir()
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    now = ledger.utc_now()
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": parent_id,
+            "agent": "codex",
+            "engine": "codex",
+            "shape": "bash",
+            "account": "default",
+            "transport": "dispatch",
+            "project_root": str(project),
+            "state": "quota_exhausted",
+            "terminal_state": "quota_exhausted",
+            "started_at": now,
+            "ended_at": now,
+            "requeue": {"child_id": live_child, "requeued_at": now},
+        }
+    )
+    child_path = dispatch._queue_entry_path(live_child, queue_dir=queue_dir)
+    child_path.write_text("{}", encoding="utf-8")
+
+    rc, payload = _cancel(wrong_child)
+    assert rc != 0, payload
+    assert payload["ok"] is False
+    assert payload["error"] == "requeue_child_mismatch"
+    assert payload["dispatch_id"] == parent_id
+    assert payload["requested_dispatch_id"] == wrong_child
+    assert payload["child_id"] == live_child
+    intent = json.loads(ledger.record_path(parent_id).read_text(encoding="utf-8"))["requeue"]
+    assert intent.get("disposition") not in {"abandoned", "satisfied", "expired"}
+    assert child_path.exists()
+
+
+def test_cancel_requeue_refuses_id_pattern_when_ledger_listing_is_unknown(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Unlistable ledger + retry-shaped id is UNKNOWN, not a parent to abandon."""
+    parent_id = "cancel-unknown-base"
+    guess = f"{parent_id}-retry-deadbeef"
+    project = tmp_path / "repo"
+    project.mkdir()
+    now = ledger.utc_now()
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": parent_id,
+            "agent": "codex",
+            "engine": "codex",
+            "shape": "bash",
+            "account": "default",
+            "transport": "dispatch",
+            "project_root": str(project),
+            "state": "quota_exhausted",
+            "terminal_state": "quota_exhausted",
+            "started_at": now,
+            "ended_at": now,
+            "requeue": {"child_id": f"{parent_id}-retry-aaaaaaaa", "requeued_at": now},
+        }
+    )
+
+    def _boom() -> list:
+        raise OSError("ledger listing blocked")
+
+    monkeypatch.setattr(ledger, "read_records", _boom)
+    rc, payload = _cancel(guess)
+    assert rc != 0, payload
+    assert payload["ok"] is False
+    assert payload["error"] == "requeue_base_unproven"
+    assert payload["base_source"] == "id_pattern"
+    assert payload["ledger_listing"] == "unknown"
+    intent = json.loads(ledger.record_path(parent_id).read_text(encoding="utf-8"))["requeue"]
+    assert intent.get("disposition") not in {"abandoned", "satisfied", "expired"}
 
 
 def test_finish_cli_refuses_conflicting_terminal_state(tmp_path: Path) -> None:

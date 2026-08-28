@@ -96,7 +96,11 @@ incremented when meaningful skill behaviour changes.
   refuses with a non-zero exit and names the current state when the
   requested state differs. Same-state retries stay quiet (`idempotent:
   true`). A retry id with no ledger row now names the base dispatch to
-  act on instead of a bare `missing_dispatch`.
+  act on instead of a bare `missing_dispatch`. `cancel-requeue` of a
+  retry id refuses when the ledger listing is UNKNOWN and the only base
+  is the id-shape hint, and when the parent's `child_id` is not the
+  requested id. Guessing a parent from `-retry-<hex>` is not permission
+  to abandon a live retry.
 
 - Drain `not_before` hold details now name the winning headroom source
   (probe vs recorded exhaustion) and its age, matching the usage EVIDENCE
