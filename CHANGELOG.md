@@ -8,6 +8,18 @@ incremented when meaningful skill behaviour changes.
 
 ### Added
 
+- **Watchlist two-tier wedge detector (`goalflight_wedge_watch.py`).** Cheap
+  path is one `stat` of the tail (mtime + size). After the tail has been
+  idle longer than a data-derived probation (1080s, above p99=965.7s of
+  max tail-idle on 719 successful grok dispatches; Codex n=770 never
+  reached 900s; moonshot/cursor too thin for a split) the worker joins a
+  watchlist and only then pays for worktree-write counts, CPU-seconds
+  delta (not `%cpu`), and an ESTABLISHED-socket look. Verdicts are
+  `live` / `wedged` / `UNKNOWN`. The canonical UNKNOWN is idle tail + 0
+  CPU-seconds + 0 tree writes + a provider socket (waiting); a failed
+  socket look is also UNKNOWN, never a silent default to wedged.
+  `wedged` is an attention flag — it does not kill or terminalize.
+  Status line names the numbers and, for UNKNOWN, the reason.
 - `goalflight_dispatch.py --worktree <base>` acquires a pooled `wt-N` seat
   prepared at git ref `<base>` and runs the worker there. The seat lock fd is
   inherited by the worker (same contract as `acp_run`). Exhaustion refuses
@@ -56,6 +68,10 @@ incremented when meaningful skill behaviour changes.
   UNKNOWN of every path. That row names no tree, so it cannot gate an
   unrelated worktree. Unreadable or unlistable records still refuse.
   A matching `worker_cwd` still occupies even when `project_root` differs.
+
+- Watch-layer stall probation default is 1080s (was 900s), above p99 of
+  successful grok max tail-idle. The cheap path no longer CPU-samples for
+  wedge detection until a worker is watchlisted.
 
 - Drain no longer mints unadoptable `restore_prepared` queue envelopes when
   releasing a pre-worker claim whose ledger is already `queued`. The second

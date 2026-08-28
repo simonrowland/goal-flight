@@ -51,6 +51,7 @@ from goalflight_liveness import (
     system_starved,
     write_status,
 )
+import goalflight_wedge_watch as wedge_watch
 
 # `\**` tolerance: grok (and other markdown-emitting workers) write **COMPLETE:**
 # etc.; without it the bold marker is never matched and the worker idle-times-out
@@ -158,17 +159,17 @@ WEDGE_CONFIRM_SAMPLES = 2
 REPLY_WAIT_MARKER_KINDS = frozenset({"USER-NEED", "USER-CONFIRM"})
 WORKER_WAIT_ARM_GRACE_SECS = 1.0
 # Live salvage CANDIDATE: tail stale + tree quiet + cumulative CPU flat.
-# Detection only; the watcher never kills. 5 minutes was rejected: healthy
-# grok tails grow in bursts (521→841→985→1130 bytes) with multi-minute
-# silences and CPU 0 between bursts; a 5-minute window sat inside that
-# burst-gap range, and one healthy worker was quiet 27 minutes. Default
-# 15 minutes. Even then this is not a verdict — a worker waiting on a
-# remote/studio job matches all three legs while healthy. A clean
-# separation in a small same-source sample is not a property of the world.
+# Detection only; the watcher never kills. Probation is
+# goalflight_wedge_watch.DEFAULT_PROBATION_S (1080s), derived from 719
+# successful grok dispatches (p99 max-idle 965.7s). 5 minutes sat inside
+# grok burst-gap range; the previous 900s default was itself below that
+# p99 (19 complete grok workers recovered after 900–2398s of tail idle).
+# Three-state verdicts live/wedged/UNKNOWN live in wedge_watch; this
+# overlay stays non-terminal so a wedged flag cannot kill.
 WORKER_STALLED_CANDIDATE_STATE = "worker_stalled_candidate"
 WORKER_WEDGED_STATE = WORKER_STALLED_CANDIDATE_STATE  # alias; not an authoritative verdict
-DEFAULT_WEDGE_IDLE_SECS = 900.0
-WEDGE_CPU_DELTA_EPSILON_S = 0.05
+DEFAULT_WEDGE_IDLE_SECS = wedge_watch.DEFAULT_PROBATION_S
+WEDGE_CPU_DELTA_EPSILON_S = wedge_watch.CPU_EPSILON_S
 WEDGE_CAVEAT = (
     "remote-wait and burst-gap workers match this signature while healthy; "
     "controller judgment required"
@@ -316,6 +317,52 @@ def apply_worker_wedge(
             evidence if evidence is not None else payload.get("wedge_evidence"),
         )
     return {"event": event, "wedged": is_wedged}
+
+
+def apply_wedge_watch_observation(
+    payload: dict,
+    *,
+    observation: wedge_watch.WedgeObservation,
+    previously_wedged: bool,
+    previous_verdict: str | None,
+    dispatch_id: str,
+) -> dict:
+    """Surface a three-state watchlist verdict. Never kills, never terminalizes."""
+    payload["wedge_verdict"] = observation.verdict
+    payload["wedge_status_line"] = wedge_watch.format_status_line(observation)
+    if observation.reason:
+        payload["wedge_unknown_reason"] = observation.reason
+    if observation.socket_state:
+        payload["wedge_socket_state"] = observation.socket_state
+    is_wedged = observation.verdict == wedge_watch.VERDICT_WEDGED
+    event = wedge_transition(was_wedged=previously_wedged, is_wedged=is_wedged)
+    if is_wedged:
+        payload["state"] = WORKER_STALLED_CANDIDATE_STATE
+        payload["liveness_state"] = WORKER_STALLED_CANDIDATE_STATE
+        payload["reason"] = "worker_stalled_candidate"
+        payload["wedge_evidence"] = {
+            "verdict": observation.verdict,
+            "tail_age_s": observation.quiet_s,
+            "cpu_delta_s": observation.cpu_s,
+            "tree_writes": observation.tree_writes,
+            "tail_bytes_grown": observation.tail_delta_bytes,
+            "watchlisted_s": observation.watchlisted_s,
+            "socket_state": observation.socket_state,
+            "authoritative": False,
+            "caveat": WEDGE_CAVEAT,
+        }
+    if event is not None:
+        emit_wedge_event(
+            event,
+            dispatch_id,
+            payload.get("wedge_evidence") if is_wedged else None,
+        )
+    if (
+        observation.verdict != wedge_watch.VERDICT_LIVE
+        and previous_verdict != observation.verdict
+    ):
+        print(payload["wedge_status_line"], flush=True)
+    return {"event": event, "wedged": is_wedged, "verdict": observation.verdict}
 
 
 class TreeMtimeSample:
@@ -556,6 +603,9 @@ def load_wedge_watch_state(payload: dict | None) -> dict:
         "cputime_sample": None,
         "cputime_sampled_at": None,
         "candidate_announced_at": None,
+        "watchlisted_at": None,
+        "last_observe_epoch": None,
+        "last_verdict": None,
     }
     if not isinstance(payload, dict):
         return dict(empty)
@@ -581,10 +631,26 @@ def load_wedge_watch_state(payload: dict | None) -> dict:
             announced_f = float(updated) if updated is not None else 0.0
         except (TypeError, ValueError):
             announced_f = 0.0
+    def _opt_float(value: object) -> float | None:
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    last_verdict = blob.get("last_verdict")
+    if last_verdict not in {
+        wedge_watch.VERDICT_LIVE,
+        wedge_watch.VERDICT_WEDGED,
+        wedge_watch.VERDICT_UNKNOWN,
+    }:
+        last_verdict = None
     return {
         "cputime_sample": deserialize_cputime_sample(blob.get("cputime_sample")),
         "cputime_sampled_at": sampled_at_f,
         "candidate_announced_at": announced_f,
+        "watchlisted_at": _opt_float(blob.get("watchlisted_at")),
+        "last_observe_epoch": _opt_float(blob.get("last_observe_epoch")),
+        "last_verdict": last_verdict,
     }
 
 
@@ -593,11 +659,17 @@ def dump_wedge_watch_state(
     cputime_sample: dict[int, float] | None,
     cputime_sampled_at: float | None,
     candidate_announced_at: float | None,
+    watchlisted_at: float | None = None,
+    last_observe_epoch: float | None = None,
+    last_verdict: str | None = None,
 ) -> dict:
     return {
         "cputime_sample": serialize_cputime_sample(cputime_sample),
         "cputime_sampled_at": cputime_sampled_at,
         "candidate_announced_at": candidate_announced_at,
+        "watchlisted_at": watchlisted_at,
+        "last_observe_epoch": last_observe_epoch,
+        "last_verdict": last_verdict,
     }
 
 
@@ -3430,11 +3502,10 @@ def main() -> int:
         type=float,
         default=DEFAULT_WEDGE_IDLE_SECS,
         help=(
-            "Sustained tail mtime + worker-tree silence + flat cumulative CPU "
-            "before flagging worker_stalled_candidate. Detection only: never "
-            "kills the worker and is not a verdict (remote-wait workers match "
-            "this signature while healthy). 5 minutes was inside grok burst-gap "
-            "range; default is 900s. 0 disables."
+            "Tail-idle probation before a worker joins the expensive watchlist "
+            "(tree-write count, CPU-seconds delta, provider socket). Default "
+            f"is {int(DEFAULT_WEDGE_IDLE_SECS)}s, above p99 of successful grok "
+            "max-idle. Detection only: never kills. 0 disables."
         ),
     )
     parser.add_argument(
@@ -3642,6 +3713,9 @@ def main() -> int:
     prev_cputime_at_epoch: float | None = restored_watch["cputime_sampled_at"]
     prev_cputime_at_mono: float | None = None
     candidate_announced_at: float | None = restored_watch["candidate_announced_at"]
+    watchlisted_at_epoch: float | None = restored_watch.get("watchlisted_at")
+    last_observe_epoch: float | None = restored_watch.get("last_observe_epoch")
+    last_wedge_verdict: str | None = restored_watch.get("last_verdict")
     previously_wedged = candidate_announced_at is not None or (
         isinstance(prior_status, dict)
         and prior_status.get("state") in {WORKER_STALLED_CANDIDATE_STATE, "worker_wedged"}
@@ -4200,21 +4274,9 @@ def main() -> int:
         if worker_is_alive:
             tracked_worker_pgid = args.pgid or process_group_id(args.pid)
             pgid = tracked_worker_pgid or pgid
+            # Idle-timeout still needs a rate. Watchlist CPU-seconds are
+            # sampled later, and only for workers past probation.
             cpu_pct = pgroup_cpu_pct(pgid)
-            cpu_sample = pgroup_cputime_snapshot(pgid)
-            if cpu_sample is not None and prev_cputime_sample is not None:
-                if prev_cputime_at_mono is not None:
-                    sample_interval_s = now_mono - prev_cputime_at_mono
-                elif prev_cputime_at_epoch is not None:
-                    sample_interval_s = max(0.0, now - prev_cputime_at_epoch)
-                if sample_interval_s is not None and sample_interval_s > 0:
-                    cpu_delta_s = cputime_delta_seconds(prev_cputime_sample, cpu_sample)
-                else:
-                    sample_interval_s = None
-            if cpu_sample is not None:
-                prev_cputime_sample = cpu_sample
-                prev_cputime_at_mono = now_mono
-                prev_cputime_at_epoch = now
         else:
             cpu_pct = 0.0
             prev_cputime_sample = None
@@ -4370,7 +4432,17 @@ def main() -> int:
             )
         trace_active = bool(trace_sample.get("trace_active"))
         tail_age_s = _tail_mtime_age_s(tail, now=now)
-        tree_age_s: float | None = None
+        tree_writes: int | None = None
+        tree_available = False
+        socket_state = wedge_watch.SOCKET_UNKNOWN
+        watchlisted = (
+            wedge_idle_s > 0
+            and worker_is_alive
+            and not trace_active
+            and not trace_attention
+            and not terminal
+            and wedge_watch.cheap_watchlist_join(tail_age_s, probation_s=wedge_idle_s)
+        )
         if wedge_idle_s > 0:
             payload["wedge_tree_leg"] = {
                 "kind": tree_leg.get("kind"),
@@ -4381,59 +4453,91 @@ def main() -> int:
                 "worker_cwd": tree_leg.get("worker_cwd"),
                 "canonical_root": tree_leg.get("canonical_root"),
             }
-        if (
-            wedge_idle_s > 0
-            and tree_leg.get("kind") == WEDGE_TREE_LEG_WORKER_CWD
-            and worker_is_alive
-            and not trace_active
-            and not trace_attention
-            and tail_age_s is not None
-            and tail_age_s >= wedge_idle_s
-            and cpu_delta_s is not None
-            and sample_interval_s is not None
-            and sample_interval_s > 0
-            and cpu_delta_s <= WEDGE_CPU_DELTA_EPSILON_S
-            and isinstance(tree_root, Path)
-        ):
-            newest_tree_sample = sample_newest_mtime_under(
-                tree_root,
-                stop_if_newer_than=now - wedge_idle_s,
-            )
-            if newest_tree_sample.available and newest_tree_sample.newest is not None:
-                tree_age_s = max(0.0, now - newest_tree_sample.newest)
+        if watchlisted:
+            if watchlisted_at_epoch is None:
+                watchlisted_at_epoch = now
+            tracked_worker_pgid = args.pgid or process_group_id(args.pid)
+            pgid = tracked_worker_pgid or pgid
+            cpu_sample = pgroup_cputime_snapshot(pgid)
+            if cpu_sample is not None and prev_cputime_sample is not None:
+                if prev_cputime_at_mono is not None:
+                    sample_interval_s = now_mono - prev_cputime_at_mono
+                elif prev_cputime_at_epoch is not None:
+                    sample_interval_s = max(0.0, now - prev_cputime_at_epoch)
+                if sample_interval_s is not None and sample_interval_s > 0:
+                    cpu_delta_s = cputime_delta_seconds(prev_cputime_sample, cpu_sample)
+                else:
+                    sample_interval_s = None
+            if cpu_sample is not None:
+                prev_cputime_sample = cpu_sample
+                prev_cputime_at_mono = now_mono
+                prev_cputime_at_epoch = now
+            if (
+                tree_leg.get("kind") == WEDGE_TREE_LEG_WORKER_CWD
+                and isinstance(tree_root, Path)
+                and tail_age_s is not None
+            ):
+                # Count writes since the tail went idle, not only since the
+                # last 2s poll: a tree write 90s ago must still veto (the
+                # tail lags while a worker edits).
+                tree_sample = wedge_watch.count_tree_writes_since(
+                    tree_root,
+                    since_mtime=now - tail_age_s,
+                )
+                tree_available = tree_sample.available
+                tree_writes = tree_sample.count
+            socket_pids = _worker_process_tree(args.pid)
+            socket_state = wedge_watch.provider_socket_state(socket_pids)
+        else:
+            watchlisted_at_epoch = None
+            prev_cputime_sample = None
+            prev_cputime_at_mono = None
+            prev_cputime_at_epoch = None
+        watchlisted_s = (
+            max(0.0, now - watchlisted_at_epoch)
+            if watchlisted and watchlisted_at_epoch is not None
+            else None
+        )
         if terminal:
             # A sign-off is not a recover event. Leave wedge classification
             # off this payload so the marker path can terminalize cleanly.
             previously_wedged = False
+            last_wedge_verdict = None
         else:
-            wedge_evidence = classify_worker_wedge(
+            observation = wedge_watch.observe_wedge(
+                dispatch_id=args.dispatch_id,
                 worker_alive=worker_is_alive and not trace_active and not trace_attention,
-                tail_age_s=tail_age_s,
-                tree_age_s=tree_age_s,
-                cpu_delta_s=cpu_delta_s,
+                quiet_s=tail_age_s,
+                tail_delta_bytes=tail_bytes_grown,
+                probation_s=wedge_idle_s,
+                tree_writes=tree_writes,
+                tree_available=tree_available,
+                cpu_s=cpu_delta_s,
                 sample_interval_s=sample_interval_s,
-                threshold_s=wedge_idle_s,
-                tail_bytes_grown=tail_bytes_grown,
+                socket_state=socket_state,
+                watchlisted_s=watchlisted_s,
             )
-            if wedge_evidence is not None:
-                wedge_evidence["tree_scan_kind"] = tree_leg.get("kind")
-                if tree_leg.get("scan_root") is not None:
-                    wedge_evidence["tree_scan_root"] = str(tree_leg["scan_root"])
-            wedge_applied = apply_worker_wedge(
+            wedge_applied = apply_wedge_watch_observation(
                 payload,
-                evidence=wedge_evidence,
+                observation=observation,
                 previously_wedged=previously_wedged,
+                previous_verdict=last_wedge_verdict,
                 dispatch_id=args.dispatch_id,
             )
             previously_wedged = bool(wedge_applied["wedged"])
+            last_wedge_verdict = observation.verdict
             if wedge_applied["event"] == "enter":
                 candidate_announced_at = now
             elif wedge_applied["event"] == "recover":
                 candidate_announced_at = None
+        last_observe_epoch = now
         payload["wedge_watch"] = dump_wedge_watch_state(
             cputime_sample=prev_cputime_sample,
             cputime_sampled_at=prev_cputime_at_epoch,
             candidate_announced_at=candidate_announced_at,
+            watchlisted_at=watchlisted_at_epoch,
+            last_observe_epoch=last_observe_epoch,
+            last_verdict=last_wedge_verdict,
         )
         if low_power_relax:
             payload["low_power_relax"] = True
