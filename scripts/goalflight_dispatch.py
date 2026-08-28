@@ -6624,14 +6624,21 @@ def _report_why_this_entry_did_not_launch(args, payload: dict) -> None:
             # unspecified" and was running as pid 83652 at the time.
             return
         reason = str(entry.get("reason") or "unspecified")
-        detail = (
-            entry.get("process_evidence")
-            or entry.get("not_before")
-            or entry.get("detail")
-            or entry.get("unpark_event")
-            or entry.get("park_exit_state")
-            or ""
-        )
+        if reason == "not_before":
+            detail = "; ".join(
+                str(part)
+                for part in (entry.get("not_before"), entry.get("headroom"))
+                if part
+            )
+        else:
+            detail = (
+                entry.get("process_evidence")
+                or entry.get("not_before")
+                or entry.get("detail")
+                or entry.get("unpark_event")
+                or entry.get("park_exit_state")
+                or ""
+            )
         suffix = f" [{detail}]" if detail else ""
         print(
             f"goalflight_dispatch: {dispatch_id} not launched: {reason}{suffix}",
@@ -11787,6 +11794,44 @@ def _headroom_for_queue_entry(
     }
 
 
+def _not_before_headroom_fields(
+    headroom: dict | None, *, now: float
+) -> dict[str, object]:
+    """Name the winning source and its age, matching the usage EVIDENCE column.
+
+    Usage prints ``winner: probe → healthy`` plus ``as of <local>, age <delta>``.
+    Drain hold details used to carry only the stored timestamp, so an operator
+    staring at a gated queue entry could not tell a live probe from a stale
+    record. Same fact, same vocabulary; the queue file is not rewritten.
+    """
+    import goalflight_usage as usage
+
+    evidence = headroom if isinstance(headroom, dict) else {}
+    winner = evidence.get("winner")
+    if winner == usage.SOURCE_PROBE:
+        source = "probe"
+        observed_blob = evidence.get("probe")
+    elif winner == usage.SOURCE_DISPATCH:
+        source = "dispatch"
+        observed_blob = evidence.get("dispatch")
+    else:
+        source = "none"
+        observed_blob = evidence.get("probe")
+    observed_at = (
+        observed_blob.get("observed_at")
+        if isinstance(observed_blob, dict)
+        else None
+    )
+    as_of = usage._observed_text(observed_at, now=now)
+    winner_text = usage._winner_text(evidence)
+    return {
+        "winner": source,
+        "verdict": evidence.get("verdict") or usage.HEADROOM_UNKNOWN,
+        "winner_age": as_of,
+        "headroom": f"{winner_text} (as of {as_of})",
+    }
+
+
 def _queue_entry_drain_candidate(path: Path) -> tuple[tuple[int, float, str], Path, dict | None, str | None]:
     entry: dict | None = None
     read_error: str | None = None
@@ -13276,6 +13321,7 @@ def _drain_queue_once(args) -> dict:
         )
     ]
     deferred_entries: list = []
+    entry_headroom = None
     if stored_gated:
         import goalflight_usage as usage
 
@@ -13315,6 +13361,7 @@ def _drain_queue_once(args) -> dict:
             headroom_cache[key] = verdict
             return verdict
 
+        entry_headroom = _entry_headroom
         deferred_entries = [
             candidate
             for candidate in stored_gated
@@ -13339,22 +13386,28 @@ def _drain_queue_once(args) -> dict:
             not_before_until = entry.get("not_before") or (
                 entry.get("request") if isinstance(entry.get("request"), dict) else {}
             ).get("not_before")
-        details.append(
-            {
-                "dispatch_id": (
-                    str(entry.get("dispatch_id"))
-                    if isinstance(entry, dict) and entry.get("dispatch_id")
-                    else path.stem
-                ),
-                "state": "queued",
-                "reason": "not_before",
-                "not_before": (
-                    entry.get("not_before")
-                    if isinstance(entry, dict)
-                    else None
-                ),
-            }
-        )
+        row = {
+            "dispatch_id": (
+                str(entry.get("dispatch_id"))
+                if isinstance(entry, dict) and entry.get("dispatch_id")
+                else path.stem
+            ),
+            "state": "queued",
+            "reason": "not_before",
+            "not_before": (
+                entry.get("not_before")
+                if isinstance(entry, dict)
+                else None
+            ),
+        }
+        if entry_headroom is not None:
+            row.update(
+                _not_before_headroom_fields(
+                    entry_headroom(entry if isinstance(entry, dict) else None),
+                    now=now_s,
+                )
+            )
+        details.append(row)
     # Hold-reason aggregation (t-345): the summary must say WHY entries are
     # held, not only THAT launched:0. `until` is the EARLIEST pending
     # not_before — when this queue next becomes eligible to make progress.

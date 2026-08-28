@@ -39,6 +39,11 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- Drain `not_before` hold details now name the winning headroom source
+  (probe vs recorded exhaustion) and its age, matching the usage EVIDENCE
+  column (`winner: probe → exhausted (as of …, age …)`). The queue file is
+  not rewritten.
+
 - Worktree occupancy no longer treats a readable non-terminal ledger row
   with no `worker_cwd` (and no `--cwd` in `dispatch_argv`) as occupancy
   UNKNOWN of every path. That row names no tree, so it cannot gate an

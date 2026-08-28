@@ -1340,14 +1340,15 @@ def test_future_requeue_not_before_is_left_queued(tmp_path: Path) -> None:
     assert payload["launched"] == 0
     assert payload["left_queued"] == 1
     assert payload["remaining"] == 1
-    assert payload["details"] == [
-        {
-            "dispatch_id": "future-requeue",
-            "state": "queued",
-            "reason": "not_before",
-            "not_before": "2999-01-02T03:04:05Z",
-        }
-    ]
+    assert len(payload["details"]) == 1
+    row = payload["details"][0]
+    assert row["dispatch_id"] == "future-requeue"
+    assert row["state"] == "queued"
+    assert row["reason"] == "not_before"
+    assert row["not_before"] == "2999-01-02T03:04:05Z"
+    assert row["winner"] in {"probe", "dispatch", "none"}
+    assert "winner:" in str(row.get("headroom") or "")
+    assert "age " in str(row.get("winner_age") or "")
 
 
 def test_not_before_contradicted_by_newer_healthy_probe_no_longer_gates(
@@ -1432,6 +1433,148 @@ def test_not_before_contradicted_by_newer_healthy_probe_no_longer_gates(
     assert not_before_holds == [], payload
     leftover = json.loads(queue_path.read_text(encoding="utf-8"))
     assert leftover["not_before"] == "2026-09-01T11:44:00Z"
+
+
+def _drain_held_not_before(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    dispatch_id: str,
+    probe_row: dict,
+    ledger_record: dict | None,
+) -> dict:
+    queue_dir = tmp_path / "queue"
+    queue_dir.mkdir()
+    queue_path = queue_dir / f"{dispatch_id}.json"
+    D._write_json_atomic(
+        queue_path,
+        {
+            "schema": D.DISPATCH_QUEUE_SCHEMA,
+            "state": "queued",
+            "dispatch_id": dispatch_id,
+            "agent": "codex",
+            "created_at": L.utc_now(),
+            "not_before": "2026-09-01T11:44:00Z",
+            "request": {
+                "not_before": "2026-09-01T11:44:00Z",
+                "account": "25ca6b",
+                "agent": "codex",
+            },
+            "dispatch_argv": ["--agent", "codex", "--account", "25ca6b"],
+        },
+    )
+    monkeypatch.setattr(D, "_NOT_BEFORE_PROBE_ROWS", [probe_row])
+    if ledger_record is not None:
+        L.write_record(ledger_record)
+    monkeypatch.setattr(D, "_claim_queue_entry", lambda path: None)
+    payload = D._drain_queue_once(
+        argparse.Namespace(
+            queue_dir=str(queue_dir),
+            remote_node=None,
+            capacity_wait_s=0.0,
+            claim_stale_s=D.QUEUE_CLAIM_STALE_S,
+            limit=0,
+        )
+    )
+    leftover = json.loads(queue_path.read_text(encoding="utf-8"))
+    assert leftover["not_before"] == "2026-09-01T11:44:00Z"
+    holds = [
+        row
+        for row in payload.get("details") or []
+        if row.get("reason") == "not_before"
+    ]
+    assert len(holds) == 1, payload
+    return holds[0]
+
+
+def test_not_before_hold_detail_names_winning_probe_and_age(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held not_before row must name the live probe, not only the timestamp.
+
+    Fresh exhaustion probe vs stale healthy dispatch: the entry stays gated
+    (verdict is not healthy) and the detail uses the same winner vocabulary
+    as the usage table. Queue bytes are not rewritten.
+    """
+    probe_at = time.time() - 5 * 86400
+    row = _drain_held_not_before(
+        tmp_path,
+        monkeypatch,
+        dispatch_id="held-probe-win",
+        probe_row={
+            "provider": "codex",
+            "account": "25ca6b",
+            "remaining": "0%",
+            "reset_at": None,
+            "flags": ["walled"],
+            "evidence": {
+                "probe": {
+                    "source": "quota_probe",
+                    "state": "walled",
+                    "observed_at": probe_at,
+                },
+                "dispatch": None,
+                "conflict": False,
+            },
+        },
+        ledger_record={
+            "schema": L.SCHEMA,
+            "dispatch_id": "stale-ok",
+            "agent": "codex",
+            "effective_account": "25ca6b",
+            "state": "complete",
+            "ended_at": "2026-08-20T00:48:00+00:00",
+        },
+    )
+    assert row["winner"] == "probe", row
+    assert row["verdict"] == "exhausted", row
+    assert "winner: probe → exhausted" in row["headroom"], row
+    assert "age " in row["winner_age"], row
+    assert "age " in row["headroom"], row
+
+
+def test_not_before_hold_detail_names_winning_dispatch_and_age(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reverse: a newer dispatch wall beating a stale healthy probe is named."""
+    now = time.time()
+    row = _drain_held_not_before(
+        tmp_path,
+        monkeypatch,
+        dispatch_id="held-dispatch-win",
+        probe_row={
+            "provider": "codex",
+            "account": "25ca6b",
+            "remaining": "92%",
+            "reset_at": None,
+            "flags": [],
+            "evidence": {
+                "probe": {
+                    "source": "quota_probe",
+                    "state": "reported",
+                    "observed_at": now - 5 * 86400,
+                },
+                "dispatch": None,
+                "conflict": False,
+            },
+        },
+        ledger_record={
+            "schema": L.SCHEMA,
+            "dispatch_id": "fresh-wall",
+            "agent": "codex",
+            "effective_account": "25ca6b",
+            "state": "quota_exhausted",
+            "limit_kind": "exhausted",
+            "reset_at": "2026-09-01T11:44:00Z",
+            "ended_at": datetime.fromtimestamp(
+                now - 60, tz=datetime.now().astimezone().tzinfo
+            ).isoformat(),
+        },
+    )
+    assert row["winner"] == "dispatch", row
+    assert row["verdict"] == "exhausted", row
+    assert "winner: dispatch → exhausted" in row["headroom"], row
+    assert "age " in row["winner_age"], row
 
 
 def test_requeue_child_ledger_evidence_prevents_duplicate(

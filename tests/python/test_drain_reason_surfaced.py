@@ -283,3 +283,22 @@ def test_not_before_is_surfaced_as_detail(capsys) -> None:
     ]})
     err = capsys.readouterr().err
     assert "not_before" in err and "2026-08-29" in err
+
+
+def test_not_before_detail_prints_winning_source_and_age(capsys) -> None:
+    """Same winner vocabulary as usage: probe vs recorded exhaustion, plus age."""
+    gd._report_why_this_entry_did_not_launch(_args("mine"), {"details": [
+        {
+            "dispatch_id": "mine",
+            "reason": "not_before",
+            "not_before": "2026-09-01T11:44:00Z",
+            "winner": "probe",
+            "verdict": "exhausted",
+            "winner_age": "Aug 27 14:00, age 5.0d",
+            "headroom": "winner: probe → exhausted (as of Aug 27 14:00, age 5.0d)",
+        },
+    ]})
+    err = capsys.readouterr().err
+    assert "not_before" in err
+    assert "winner: probe → exhausted" in err
+    assert "age 5.0d" in err
