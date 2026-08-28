@@ -49,6 +49,90 @@ _SECRET_PREFIX_MAX = 4 + 19  # "xai-" plus one short of the entropy bound
 _SECRET_PREFIX_RE = re.compile(br"(?i)(?:x|xa|xai|xai-[a-z0-9]{0,19})\Z")
 READY_FD_ENV = "GOALFLIGHT_REDACT_READY_FD"
 
+# Archive-time redaction is deliberately aggressive. A false positive in an
+# archived transcript costs nothing; a leaked token costs a lot. Named markers
+# tell a reader what class of material was removed and that the file is not
+# verbatim. Live capture (`redact_text`) stays on the vendor key shape so a
+# worker tail is not painted over with archive markers.
+_ARCHIVE_REDACT_WHY = (
+    "credential-shaped material; archived tails are unreviewed worker output"
+)
+
+
+def archive_redaction_marker(kind: str) -> str:
+    return f"[redacted {kind}: {_ARCHIVE_REDACT_WHY}]"
+
+
+_ARCHIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("bearer token", re.compile(r"(?i)(?:authorization:\s*)?bearer\s+\S+")),
+    ("authorization header", re.compile(r"(?i)authorization:\s*\S+")),
+    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
+    ("xai api key", re.compile(r"(?i)xai-[a-z0-9]{20,}")),
+    ("openai-style key", re.compile(r"(?i)sk-[a-z0-9_-]{20,}")),
+    (
+        "github token",
+        re.compile(r"(?i)(?:ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)[a-z0-9_]{20,}"),
+    ),
+    (
+        "auth.json field",
+        re.compile(
+            r'(?i)("(?:api[_-]?key|access_token|refresh_token|client_secret|'
+            r'password|secret|token)"\s*:\s*")([^"]+)(")'
+        ),
+    ),
+    (
+        "private key block",
+        re.compile(
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+            re.DOTALL,
+        ),
+    ),
+    (
+        "long base64",
+        re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{80,}={0,2}(?![A-Za-z0-9+/=])"),
+    ),
+)
+
+
+def redact_archive_text(text: str) -> tuple[str, int, list[str]]:
+    """Replace credential-shaped archive text with named markers.
+
+    Returns ``(redacted_text, substitution_count, kinds_applied)``. Never
+    raises. Does not try to be clever: short labels such as ``xai-0`` are
+    left alone because they miss the entropy bound; git SHAs and ordinary
+    prose are not matched.
+    """
+    try:
+        count = 0
+        kinds: list[str] = []
+        for kind, pattern in _ARCHIVE_PATTERNS:
+            marker = archive_redaction_marker(kind)
+            if kind == "auth.json field":
+
+                def _keep_key(match: re.Match[str], *, _marker: str = marker) -> str:
+                    return match.group(1) + _marker + match.group(3)
+
+                text, n = pattern.subn(_keep_key, text)
+            else:
+                text, n = pattern.subn(marker, text)
+            if n:
+                count += n
+                kinds.append(kind)
+        return text, count, kinds
+    except Exception:
+        return archive_redaction_marker("unclassified"), 1, ["unclassified"]
+
+
+def redact_archive_bytes(data: bytes) -> tuple[bytes, int, list[str]]:
+    """Byte wrapper around ``redact_archive_text``. Never raises."""
+    try:
+        text = data.decode("utf-8", errors="replace")
+        redacted, count, kinds = redact_archive_text(text)
+        return redacted.encode("utf-8"), count, kinds
+    except Exception:
+        marker = archive_redaction_marker("unclassified").encode("ascii")
+        return marker, 1, ["unclassified"]
+
 
 def redact_text(text: str) -> str:
     """Replace credential-shaped substrings. Never raises."""

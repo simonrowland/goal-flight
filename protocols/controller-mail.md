@@ -67,6 +67,12 @@ python3 <skill-root>/scripts/goalflight_messages.py post \
 
 `--to-controller` uses a durable label. `--controller-project-root` defaults to the
 current canonical git project and is needed only for explicit cross-project mail.
+A send that reaches nobody is not success: the CLI exits non-zero and
+`controller_delivery.status` is the machine-readable miss (`controller_addressee_unresolved`,
+`controller_addressee_other_project`, or `controller_registry_unknown`). When the
+label is registered in another project, that error names `--controller-project-root`
+with that path. An unreadable registry is UNKNOWN and does not record a
+reached-nobody delivery.
 Producers record the journal assignment before projecting the JSONL carrier; retry
 heals an unprojected assignment rather than creating a second store.
 
