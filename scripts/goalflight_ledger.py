@@ -9,6 +9,7 @@ raw logs into the model context.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import errno
 import hashlib
@@ -641,7 +642,14 @@ def read_records() -> list[dict]:
     path = runs_dir(create=False)
     if not path.exists():
         return records
-    for p in sorted(path.glob("*.json")):
+    # pathlib.Path.glob on an unreadable directory returns [] without raising
+    # (observed). os.listdir raises OSError, which callers that distinguish
+    # UNKNOWN from empty must see -- an unlistable ledger is not "no records".
+    names = os.listdir(path)
+    for name in sorted(names):
+        if not name.endswith(".json"):
+            continue
+        p = path / name
         try:
             records.append(json.loads(p.read_text()))
         except (OSError, json.JSONDecodeError):
@@ -873,6 +881,131 @@ def wait_attempt_running(
                 f"worker did not claim attempt {attempt.attempt_id} RUNNING within {timeout_s:.1f}s"
             )
         time.sleep(0.01)
+
+
+#: Disposition reported when a state="running" record arrives before the
+#: worker's asynchronous RUNNING claim has landed in the journal. This is a
+#: startup race, not a lost compare-and-swap: the claim is still in flight,
+#: so the refusal is retryable by waiting. Callers must key on this
+#: structured field, never on the human-readable error text. The string must
+#: match cmd_record's state="running" not-yet-RUNNING payload (committed
+#: behaviour; do not re-fabricate "cas_lost").
+RECORD_DISPOSITION_ATTEMPT_NOT_YET_RUNNING = "attempt_not_yet_running"
+
+#: Bounded deadline for re-recording a state="running" transition refused
+#: with RECORD_DISPOSITION_ATTEMPT_NOT_YET_RUNNING.
+#:
+#: Derivation:
+#:   premise — the missing event is the worker's RUNNING claim, exactly one
+#:     journal write: claim_attempt_running is open + read + one bounded CAS
+#:     transaction (mark_attempt_running).
+#:   cost — the journal bounds a single write transaction at
+#:     transaction_budget_s = 1.0s (goalflight_journal); the observed
+#:     uncontended cost of the claim itself is milliseconds.
+#:   contention — roughly nine controllers share this box, and a project
+#:     journal's writers (controller, watchers, fleet sweep) serialize on the
+#:     writer lock. A pathological queue of ~10 writers each burning their
+#:     entire 1s budget clears in ~10s; the realistic contended wait for one
+#:     claim is far under a second.
+#:   anchor — wait_attempt_running above already defaults to timeout_s=10.0
+#:     for this exact wait (worker claims RUNNING); 10s is the codebase's
+#:     sanctioned bound for the claim to land.
+#:   sanity — 10s is 10x the journal's own worst-case single-write budget and
+#:     matches the pathological ~10-writer contention estimate, and the poll
+#:     below uses a read-only peek (Journal.open_reader takes no writer lock),
+#:     so the retry loop itself adds no write contention.
+RECORD_STARTUP_RACE_RETRY_BUDGET_S = 10.0
+
+
+def parse_record_refusal(captured_stdout: str) -> dict | None:
+    """Return the structured refusal payload cmd_record printed, if any.
+
+    cmd_record emits one JSON object per refused transition
+    ({"ok": False, "disposition": ..., "retryable": ..., "error": ...}).
+    Parse that payload — never pattern-match the human error text — so
+    callers key on ``disposition``/``retryable``.
+    """
+    refusal = None
+    for line in captured_stdout.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            payload = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("ok") is False:
+            refusal = payload
+    return refusal
+
+
+def is_retryable_startup_race(refusal: dict | None) -> bool:
+    """True when the refusal is the startup race, i.e. retryable by waiting."""
+    return (
+        isinstance(refusal, dict)
+        and refusal.get("disposition") == RECORD_DISPOSITION_ATTEMPT_NOT_YET_RUNNING
+        and refusal.get("retryable") is True
+    )
+
+
+def worker_spawn_state(worker_pid: int | None) -> str:
+    """Three-state answer to "was a worker process spawned on this path?"
+
+    The spawn helpers either return the child's positive pid or raise, so
+    None is definitive: no spawn happened here. A positive int names the
+    spawned process. Anything else is indeterminate — and indeterminate is
+    NOT "no worker": callers must take the safe branch (write the status file
+    and warn), because a spurious status file costs an operator one warning
+    read, while a missing one costs duplicated work and a two-writer tree
+    collision.
+    """
+    if worker_pid is None:
+        return "none"
+    if isinstance(worker_pid, bool) or not isinstance(worker_pid, int):
+        return "unknown"
+    return "spawned" if worker_pid > 0 else "unknown"
+
+
+def retry_record_after_startup_race(
+    record_once,
+    initial_code: int,
+    initial_refusal: dict | None,
+    *,
+    project_root: Path | str,
+    dispatch_id: str,
+    timeout_s: float = RECORD_STARTUP_RACE_RETRY_BUDGET_S,
+    poll_s: float = 0.05,
+) -> tuple[int, dict | None]:
+    """Re-record a startup-race-refused transition once the attempt is RUNNING.
+
+    ``record_once`` performs one record attempt and returns
+    ``(exit_code, refusal_payload_or_None)``; the initial attempt's result is
+    passed in so the original refusal survives a deadline that expires before
+    the attempt ever reaches RUNNING. An attempt that reaches a final state
+    can never be claimed, so the wait ends early instead of burning the whole
+    budget. Returns the last ``(exit_code, refusal)``; ``(0, None)`` means
+    the re-record committed. The peek is read-only (open_reader takes no
+    writer lock), so polling does not contend with the in-flight claim.
+    """
+    deadline = time.monotonic() + timeout_s
+    code, refusal = initial_code, initial_refusal
+    while time.monotonic() < deadline:
+        attempt = None
+        with contextlib.suppress(Exception):
+            attempt = goalflight_journal.Journal.open_reader(
+                project_root
+            ).attempt_for_dispatch(dispatch_id)
+        if attempt is None:
+            time.sleep(poll_s)
+            continue
+        if attempt.lifecycle_state in goalflight_journal.ATTEMPT_FINAL_STATES:
+            break
+        if attempt.lifecycle_state == goalflight_journal.ATTEMPT_RUNNING:
+            code, refusal = record_once()
+            if code == 0 or not is_retryable_startup_race(refusal):
+                break
+        time.sleep(poll_s)
+    return code, refusal
 
 
 def scan_surplus(records: list[dict], limit: int = 20) -> list[dict]:

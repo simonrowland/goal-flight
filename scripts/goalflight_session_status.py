@@ -2405,11 +2405,21 @@ def aggregate_status(project_root: Path, *, ttl_days: int = 7) -> dict:
     if newest_queue is not None:
         queue_front = read_queue_state(newest_queue)
         queue_active, queue_reason = queue_active_now(queue_front, ttl_days=ttl_days)
-    leases_for_project = _active_leases_for(project_root)
+    leases_for_project, leases_probe_error = _active_leases_for(project_root)
     notes = find_resume_notes(project_root)
     newest_notes = newest(notes)
     notes_active, notes_reason = _resume_notes_active(newest_notes, ttl_days=ttl_days)
-    active = queue_active or bool(leases_for_project) or notes_active
+    # Resource admission: a failed capacity probe is UNKNOWN, not zero active
+    # leases. Rendering unknown as zero would certify the project free for new
+    # work at exactly the moment the capacity view is unhealthy, so an
+    # unmeasured capacity axis refuses to certify the session as inactive.
+    capacity_measured = leases_for_project is not None
+    active = (
+        queue_active
+        or notes_active
+        or not capacity_measured
+        or bool(leases_for_project)
+    )
     backlog_counts, backlog_error = _task_backlog_counts(project_root)
     ready_frontier, ready_frontier_error = _ready_frontier(project_root)
     return {
@@ -2420,10 +2430,14 @@ def aggregate_status(project_root: Path, *, ttl_days: int = 7) -> dict:
         "queue_slug": queue_front.get("slug"),
         "queue_last_touched": queue_front.get("last-touched") or queue_front.get("last_touched"),
         "queue_current_session": queue_front.get("current_session"),
-        "active_capacity_leases_in_project": len(leases_for_project),
+        "active_capacity_leases_in_project": (
+            len(leases_for_project) if capacity_measured else None
+        ),
         "active_capacity_lease_dispatch_ids": [
-            lease.get("dispatch_id") for lease in leases_for_project
+            lease.get("dispatch_id") for lease in (leases_for_project or [])
         ],
+        "capacity_probe_measured": capacity_measured,
+        "capacity_probe_error": leases_probe_error,
         "newest_resume_notes": str(newest_notes.relative_to(project_root)) if newest_notes else None,
         "resume_notes_active": notes_active,
         "resume_notes_reason": notes_reason,
@@ -2579,9 +2593,14 @@ def _resume_notes_active(notes_path: Path | None, *, ttl_days: int = 7) -> tuple
     return False, "no signal"
 
 
-def _active_leases_for(project_root: Path) -> list[dict]:
+def _active_leases_for(project_root: Path) -> tuple[list[dict] | None, str | None]:
     """Call goalflight_capacity.py status --json, return active leases
-    whose project_root matches ours. Best-effort: empty list on any failure.
+    whose project_root matches ours.
+
+    ``(leases, None)`` is a measured read — possibly a measured zero.
+    ``(None, error)`` is a failed read: UNKNOWN, never zero. Zero is an
+    answer that licenses new admissions against a false floor, so a failed
+    probe must stay distinguishable from a measured empty.
     """
     try:
         import subprocess
@@ -2596,10 +2615,10 @@ def _active_leases_for(project_root: Path) -> list[dict]:
             timeout=10,
         )
         if out.returncode != 0:
-            return []
+            return None, f"capacity status exited {out.returncode}"
         data = json.loads(out.stdout or "{}")
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError):
-        return []
+    except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as exc:
+        return None, f"capacity status unreadable: {type(exc).__name__}"
     # capacity status JSON: `{"active": [<lease>, ...]}` already filtered.
     active = data.get("active") or []
     target = str(project_root.resolve())
@@ -2610,7 +2629,7 @@ def _active_leases_for(project_root: Path) -> list[dict]:
         lp = lease.get("project_root")
         if lp and str(Path(lp).resolve()) == target:
             matched.append(lease)
-    return matched
+    return matched, None
 
 
 def to_text(status: dict) -> str:
@@ -2631,10 +2650,11 @@ def to_text(status: dict) -> str:
         if resume_text:
             pieces.append(resume_text)
         return "; ".join(pieces)
+    leases_count = status["active_capacity_leases_in_project"]
     pieces = [
         f"active goal-flight session ({status['queue_slug'] or 'unnamed'})",
         f"queue={status['queue_file']}",
-        f"capacity_leases={status['active_capacity_leases_in_project']}",
+        f"capacity_leases={leases_count if leases_count is not None else 'unknown'}",
     ]
     if status["queue_last_touched"]:
         pieces.append(f"last-touched={status['queue_last_touched']}")

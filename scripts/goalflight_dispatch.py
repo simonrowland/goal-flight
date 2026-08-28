@@ -762,7 +762,35 @@ ACCOUNT_ENGINE_BY_AGENT = {
 RETIRED_AGENT_LABELS = {
     "grok": "use --agent grok-code (coding) or --agent grok-research (web search)",
 }
-GIT_BASE_PIN_RE = re.compile(r"(?<![A-Za-z0-9_./:-])([0-9A-Fa-f]{7,40})(?![A-Za-z0-9_./:-])")
+# t-356: a git base pin is an EXPLICIT marker, never a bare hex token. Briefs
+# legitimately cite evidence commits as prose (measurement tables, receipts);
+# scanning for bare hex read one of those citations as the intended base and
+# warned GIT BASE PIN MISMATCH against a correct cwd HEAD -- pure noise that
+# trained controllers to reach for --ignore-git-warn. The recognized markers,
+# observed in real briefs:
+#   - a frontmatter-style `base: <sha>` line (quoted YAML, `Base SHA:`,
+#     markdown `**base:**`, bullets, and backticks around the sha are tolerated)
+#   - the `branch <name> @ <sha>` header convention, and a line-level
+#     `<name> @ <sha>` pin without the word `branch`
+# Every other hex-shaped token in the text is prose.
+GIT_BASE_PIN_BASE_LINE_RE = re.compile(
+    r"^[ \t]*(?:[-#>*]+[ \t]*)*(?:\*\*)?base(?:\s+sha)?\s*:\s*(?:\*\*)?\s*"
+    r"[`'\"]?([0-9A-Fa-f]{7,40})[`'\"]?(?![0-9A-Za-z])",
+    re.IGNORECASE | re.MULTILINE,
+)
+GIT_BASE_PIN_BRANCH_AT_RE = re.compile(
+    r"\bbranch\s+\S+?\s+@\s+`?([0-9A-Fa-f]{7,40})`?(?![0-9A-Za-z])",
+    re.IGNORECASE,
+)
+GIT_BASE_PIN_NAME_AT_RE = re.compile(
+    r"^[ \t]*(?:[-#>*]+[ \t]*)*\S+\s+@\s+`?([0-9A-Fa-f]{7,40})`?(?![0-9A-Za-z])",
+    re.IGNORECASE | re.MULTILINE,
+)
+GIT_BASE_PIN_MARKER_RES = (
+    GIT_BASE_PIN_BASE_LINE_RE,
+    GIT_BASE_PIN_BRANCH_AT_RE,
+    GIT_BASE_PIN_NAME_AT_RE,
+)
 TASK_ID_RE = re.compile(r"^[tb]-\d+$")
 LOWER_BASE_SHA_RE = re.compile(r"[0-9a-f]{40}")
 READ_ONLY_INLINE_RETURN_PROMPT_PATTERNS = (
@@ -1007,6 +1035,8 @@ def _cmd_spawn_daemon() -> int:
                 filter_argv.append(str(stdout_file))
                 ready_r, ready_w = os.pipe()
                 filter_env = os.environ.copy()
+                filter_env.pop(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, None)
+                filter_env.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
                 filter_env[goalflight_output_redact.READY_FD_ENV] = str(ready_w)
                 filter_proc = subprocess.Popen(
                     filter_argv,
@@ -1075,6 +1105,7 @@ def _spawn_daemonized_process(
     serialize_stdout: bool = False,
     label: str,
     cwd: str | None = None,
+    inherit_occupancy_lock: bool = False,
 ) -> int:
     """Spawn a child through the private daemon helper and return the child's pid."""
     spec = {
@@ -1086,7 +1117,35 @@ def _spawn_daemonized_process(
         "serialize_stdout": bool(stdout_path and serialize_stdout),
         "cwd": cwd,
     }
+    child_env = dict(env)
     inherited_lock_fds = goalflight_worktree_pool.pass_worktree_lock_fds(env)
+    occupancy_fds: set[int] = set()
+    for source in (os.environ, env):
+        occupancy_raw = str(
+            source.get(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV) or ""
+        ).strip()
+        if occupancy_raw:
+            with contextlib.suppress(ValueError):
+                occupancy_fds.add(int(occupancy_raw))
+    if inherit_occupancy_lock:
+        seen = set(inherited_lock_fds)
+        extra: list[int] = []
+        for fd in occupancy_fds:
+            if fd in seen:
+                continue
+            try:
+                os.fstat(fd)
+            except OSError:
+                continue
+            extra.append(fd)
+            seen.add(fd)
+        if extra:
+            inherited_lock_fds = tuple(inherited_lock_fds) + tuple(extra)
+    else:
+        inherited_lock_fds = tuple(
+            fd for fd in inherited_lock_fds if fd not in occupancy_fds
+        )
+        child_env.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
     helper = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), DAEMON_SPAWN_ARG],
         input=json.dumps(spec, sort_keys=True),
@@ -1094,7 +1153,7 @@ def _spawn_daemonized_process(
         text=True,
         encoding="utf-8",
         errors="replace",
-        env=env,
+        env=child_env,
         timeout=30,
         pass_fds=inherited_lock_fds,
         **_detached_popen_kwargs(),
@@ -1401,15 +1460,18 @@ def _wait_for_detached_watcher(
 
 
 def _sidecar_env(env: dict[str, str]) -> dict[str, str]:
-    """Env for helpers that must not inherit the worker's seat lock fd.
+    """Env for helpers that must not inherit the worker's lock fds.
 
     After the launcher releases its copy, ``GOALFLIGHT_WORKTREE_LOCK_FD`` in
     the worker env names a closed descriptor. Passing that dict to caffeinate
     (or any other sidecar) makes the daemon helper raise WorktreeSeatError
-    instead of starting.
+    instead of starting. Occupancy is the same class of leak: a sidecar that
+    keeps ``GOALFLIGHT_OCCUPANCY_LOCK_FD`` open holds the tree after the
+    worker dies.
     """
     out = dict(env)
     out.pop(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, None)
+    out.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
     return out
 
 
@@ -1521,6 +1583,27 @@ def _requested_worktree_base(args) -> str | None:
     return text or None
 
 
+def _inherited_seat_lock_present() -> bool:
+    """True when this process already holds a pooled-seat lock fd.
+
+    Occupancy uses a different fd in the same inherited-fd helper. Treating
+    occupancy as "seat already leased" would skip ``--worktree`` acquire after
+    the occupancy bind, or skip it in a child that only inherited occupancy.
+    """
+    raw = os.environ.get(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, "").strip()
+    if not raw:
+        return False
+    try:
+        fd = int(raw)
+        os.fstat(fd)
+    except (ValueError, OSError) as exc:
+        raise goalflight_worktree_pool.WorktreeSeatError(
+            f"{goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV} does not name an "
+            f"open descriptor: {raw!r}"
+        ) from exc
+    return True
+
+
 def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease | None:
     """Acquire a pooled seat when ``--worktree`` is set. Never falls back to add.
 
@@ -1528,11 +1611,18 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     ``GOALFLIGHT_WORKTREE_LOCK_FD`` in the worker env and pass that fd through
     spawn, then ``release()`` this process's copy so the worker's lifetime is
     the lease lifetime.
+
+    Occupancy must bind AFTER this so the kernel lock is on the seat path,
+    not the project ``--cwd``. Caching the lease lets the launch path call
+    this once before occupancy and again when wiring env/summary.
     """
+    existing = getattr(args, "_worktree_seat", None)
+    if existing is not None:
+        return existing
     base = _requested_worktree_base(args)
     if base is None:
         return None
-    if goalflight_worktree_pool.inherited_worktree_lock_fds():
+    if _inherited_seat_lock_present():
         # Fleet / parent already leased a seat and passed the fd. Re-acquire
         # would LOCK_EX-succeed in this process (flock is per-process) and
         # reset a tree the worker is already in.
@@ -1543,6 +1633,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
         base=base,
     )
     args.cwd = str(lease.path)
+    args._worktree_seat = lease
     return lease
 
 
@@ -2400,7 +2491,15 @@ def _read_prompt_for_guard(args) -> str:
 
 
 def _extract_git_base_pins(text: str) -> list[str]:
-    return [m.group(1).lower() for m in GIT_BASE_PIN_RE.finditer(text or "")]
+    """Explicitly-marked git base pins, in document order. Bare SHAs are prose."""
+    text = text or ""
+    marked = [
+        (match.start(), match.group(1).lower())
+        for pattern in GIT_BASE_PIN_MARKER_RES
+        for match in pattern.finditer(text)
+    ]
+    marked.sort()
+    return [sha for _pos, sha in marked]
 
 
 def _git_head_for_cwd(cwd: Path) -> str | None:
@@ -2428,6 +2527,16 @@ def _valid_lower_base_sha(value: object) -> str | None:
 
 
 def _git_pin_warning(args) -> str | None:
+    """Advisory git-base-pin check. A genuine mismatch WARNS and still launches.
+
+    Refusing would be the stricter reading of the 2026-08-27 sweep (warn then
+    start). Keep it advisory: a stale worktree base is sometimes intentional
+    (reproduce a bug; finish a chunk started on an older merge), and
+    --ignore-git-warn already exists as the silence hatch. Two writers in one
+    tree (t-375) corrupt the filesystem; a mismatched pin does not. After
+    t-356 this warning only fires on explicit markers, so it can be trusted
+    instead of trained-ignored.
+    """
     if getattr(args, "ignore_git_warn", False) or not _prompt_requested(args):
         return None
     # b-052: measure the tree the worker will actually run in (--cwd), not the
@@ -2446,7 +2555,8 @@ def _git_pin_warning(args) -> str | None:
         return (
             "WARN: prompt carries no git base pin; "
             f"HEAD is {short_head} - workers on stale clones will build on the wrong base; "
-            f"add 'verify HEAD is {short_head}' or pass --ignore-git-warn"
+            f"mark the base explicitly with a 'base: {short_head}' line or a "
+            f"'branch <name> @ {short_head}' header, or pass --ignore-git-warn"
         )
     mismatched_pins = [pin for pin in pins if not head.startswith(pin)]
     if not mismatched_pins:
@@ -2455,6 +2565,7 @@ def _git_pin_warning(args) -> str | None:
         "WARN: GIT BASE PIN MISMATCH: "
         f"prompt pin {mismatched_pins[0]} does not match cwd HEAD {short_head}; "
         "stale brief or wrong repo state - workers on stale clones will build on the wrong base; "
+        "advisory only, launch continues (a stale base is sometimes intentional); "
         "update the pin or pass --ignore-git-warn"
     )
 
@@ -2649,6 +2760,334 @@ def _refuse_reused_dispatch_id_for_launch(dispatch_id: str, *, allow_queued: boo
         _refuse_reused_nonterminal_dispatch_id(dispatch_id)
 
 
+def _record_declared_read_only(record: dict) -> bool:
+    """True when the incumbent's own recorded launch posture cannot write.
+
+    Write-capability is the dispatch's enforced sandbox, not a process scan
+    and not a bare --read-only declaration. A ``--`` worker that was asked
+    to be read-only can still write; treating it as a reviewer would let a
+    second writer in. Do not consult supported_profile: that field names
+    what the launch path knows how to support, and can say read-only even
+    for a writer. A top-level read_only flag with requested_profile
+    workspace-write is a writer.
+    """
+    posture = record.get("os_sandbox")
+    requested = None
+    enforced = None
+    if isinstance(posture, dict):
+        requested = posture.get("requested_profile")
+        enforced = posture.get("enforced_profile")
+        if requested == "workspace-write":
+            return False
+        if enforced == "read-only":
+            return True
+    if requested != "read-only":
+        return False
+    agent = str(record.get("agent") or "")
+    shape = str(record.get("shape") or "bash")
+    if shape == "acp":
+        return False
+    return agent in {"grok-code", "grok-research", "codex"}
+
+
+def _occupancy_exempt_read_only(args) -> bool:
+    """True when this launch cannot write the tree, so occupancy does not apply.
+
+    --read-only on a ``-- <cmd>`` worker is a declaration only: the command
+    can still write. Occupancy skips only launch paths that actually enforce
+    the posture (bash-shape grok deny-rules, bash-shape codex --sandbox).
+    """
+    if not _effective_read_only(args):
+        return False
+    if _raw_worker_args(args):
+        return False
+    agent = str(getattr(args, "agent", "") or "")
+    shape = getattr(args, "shape", "bash")
+    if shape == "acp":
+        return False
+    return agent in {"grok-code", "grok-research", "codex"}
+
+
+def _same_worker_tree(record_cwd: object, target: Path) -> bool:
+    try:
+        candidate = os.path.realpath(str(record_cwd).strip())
+    except (OSError, ValueError):
+        return False
+    return bool(candidate) and candidate == os.path.realpath(str(target))
+
+
+def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None]:
+    """(occupied_reason, unknown_reason, occupied_state) for this write tree.
+
+    Occupancy is judged from the ledger's non-terminal set -- the lifecycle
+    authority -- never from a process scan: a queued/starting dispatch owns its
+    tree before any worker process exists for pgrep to see, and pid liveness
+    cannot tell a searcher from a worker. ``occupied_state`` is the ledger
+    state of a named occupant so a freshly acquired kernel lock can tell a
+    queued owner (ledger-only claim) from a stale running row after SIGKILL.
+    """
+    target = _worker_cwd(args)
+    try:
+        records = goalflight_ledger.read_records()
+    except OSError as exc:
+        return None, f"dispatch ledger could not be read ({type(exc).__name__}: {exc})", None
+    own_id = getattr(args, "dispatch_id", None)
+    host = socket.gethostname()
+    unknown: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        record_id = record.get("dispatch_id")
+        if own_id and record_id == own_id:
+            continue  # the drained/resumed launch re-enters with its own queued record
+        if goalflight_ledger.record_is_unreadable(record):
+            unknown.append(f"ledger record {record.get('path') or record_id} is unreadable")
+            continue
+        state = record.get("state")
+        terminal = goalflight_ledger.terminal_state_for(
+            state, record.get("reason") or record.get("error")
+        )
+        if terminal != "unknown":
+            # Settled vocabulary (complete/failed/blocked/...) vacates the tree.
+            # watcher_stopped is terminal in the ledger vocabulary, but a live
+            # worker under that label is still writing -- reuse the resume
+            # liveness reading instead of treating the tree as free.
+            if not _is_live_watcher_stopped(state, record.get("worker_alive")):
+                continue
+        if record.get("transport") == "fleet-ssh":
+            continue  # remote worker: its cwd is a path on another node's disk
+        record_host = record.get("hostname")
+        if isinstance(record_host, str) and record_host and record_host != host:
+            continue  # recorded by a dispatch launched on another machine
+        record_cwd = _resume_cwd_from_record(record)
+        if record_cwd is None:
+            unknown.append(
+                f"non-terminal dispatch {record_id} (state={state or 'running'}) "
+                "has no worker cwd evidence"
+            )
+            continue
+        if not _same_worker_tree(record_cwd, target):
+            continue
+        if _record_declared_read_only(record):
+            continue  # a reviewer shares the tree legitimately; it is not a writer
+        return (
+            f"worktree {target} is already owned by non-terminal dispatch "
+            f"{record_id} (state={state or 'running'}); a second writer would "
+            "share one filesystem tree with no merge discipline",
+            None,
+            str(state or "running"),
+        )
+    if unknown:
+        detail = "; ".join(unknown[:3])
+        if len(unknown) > 3:
+            detail += f"; and {len(unknown) - 3} more"
+        return None, detail, None
+    return None, None, None
+
+
+class _InheritedOccupancyLock:
+    """A lock fd inherited from the parent launcher; this process must not close it."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def release(self) -> None:
+        return None
+
+
+def _bind_worktree_occupancy_lock(args, lock) -> None:
+    """Keep the lock alive in this process and publish the fd for worker inherit."""
+    args._worktree_occupancy_lock = lock
+    fd = lock.fileno()
+    os.set_inheritable(fd, True)
+    os.environ[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] = str(fd)
+
+
+def _release_worktree_occupancy_lock(args) -> None:
+    """Drop this process's occupancy fd and the env name that pointed at it.
+
+    Submit holds the kernel lock only while the submit process is writing the
+    queue row. Leaving ``GOALFLIGHT_OCCUPANCY_LOCK_FD`` set after that fd is
+    closed makes the next in-process launch treat occupancy as unknown.
+    """
+    lock = getattr(args, "_worktree_occupancy_lock", None)
+    fd: int | None = None
+    if lock is not None:
+        with contextlib.suppress(Exception):
+            fd = lock.fileno()
+        with contextlib.suppress(Exception):
+            lock.release()
+        args._worktree_occupancy_lock = None
+    raw = os.environ.get(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, "").strip()
+    if raw and (fd is None or raw == str(fd)):
+        os.environ.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
+
+
+def _inherited_occupancy_lock():
+    raw = os.environ.get(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, "").strip()
+    if not raw:
+        return None, None
+    try:
+        fd = int(raw)
+        os.fstat(fd)
+    except (ValueError, OSError) as exc:
+        return None, (
+            f"{goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV} does not name an "
+            f"open descriptor: {raw!r} ({type(exc).__name__}: {exc})"
+        )
+    return _InheritedOccupancyLock(fd), None
+
+
+def _occupancy_occupied_messages(reason: str) -> tuple[str, str]:
+    refusal = "\n".join(
+        [
+            reason.rstrip(".") + ".",
+            "Use --occupied-worktree-forced to override and launch a "
+            "concurrent writer.",
+        ]
+    )
+    forced_warning = (
+        f"--occupied-worktree-forced accepted: {reason.rstrip('.')}; the two "
+        "writers now share one filesystem tree with no merge discipline."
+    )
+    return refusal, forced_warning
+
+
+def _occupancy_unknown_messages(args, detail: str) -> tuple[str, str]:
+    target = _worker_cwd(args)
+    refusal = "\n".join(
+        [
+            f"worktree occupancy of {target} is unknown ({detail}).",
+            "Retry the dispatch; refusing before record or launch.",
+            "Use --occupied-worktree-forced to override and launch without "
+            "occupancy evidence.",
+        ]
+    )
+    forced_warning = (
+        f"--occupied-worktree-forced accepted: worktree occupancy of "
+        f"{target} is unknown ({detail}); launching without occupancy evidence."
+    )
+    return refusal, forced_warning
+
+
+def _finish_worktree_occupancy(args, *, refusal: str, forced_warning: str) -> str | None:
+    if getattr(args, "occupied_worktree_forced", False):
+        return forced_warning
+    raise DispatchUsageError(refusal)
+
+
+def _prepare_attempt_worktree_occupancy(args) -> str | None:
+    """Refuse a second writer into an occupied worktree, or return the forced-path warning.
+
+    Enforcement is an exclusive non-blocking kernel lock on the target
+    worktree, inherited by the worker so the claim outlives this dispatcher
+    and is released by the kernel on crash. The ledger is diagnostic: it
+    names the incumbent and fail-closes on unlistable/unreadable records.
+    A launch that actually cannot write (enforced read-only) is never
+    refused here. --read-only on a write-capable ``--`` worker is not
+    enough. --occupied-worktree-forced converts either refusal into a
+    visible warning, matching the --unregistered-forced hatch.
+    """
+    if _occupancy_exempt_read_only(args):
+        return None
+    if getattr(args, "submit", False) and _requested_worktree_base(args):
+        # A queued --worktree job does not have a seat yet. Occupying --cwd
+        # (the project root) would serialize every pooled submit onto one
+        # tree; drain binds the seat and then occupies that path.
+        return None
+
+    occupied, unknown, occupied_state = _worktree_incumbent_reason(args)
+    lock = None
+    lock_busy = None
+    lock_unknown = None
+    inherited, inherited_unknown = _inherited_occupancy_lock()
+    if inherited_unknown:
+        lock_unknown = inherited_unknown
+    elif inherited is not None:
+        lock = inherited
+    else:
+        target = _worker_cwd(args)
+        dispatch_id = str(getattr(args, "dispatch_id", None) or "unknown-dispatch")
+        try:
+            lock = goalflight_worktree_pool.try_acquire_worktree_path_lock(
+                target, dispatch_id
+            )
+        except goalflight_worktree_pool.WorktreePathLockBusy as exc:
+            own = str(getattr(args, "dispatch_id", None) or "")
+            if own and getattr(exc, "occupant_id", None) == own:
+                # Same dispatch already occupies the tree (duplicate submit,
+                # opportunistic drain). Not a second writer.
+                return None
+            lock_busy = str(exc)
+        except goalflight_worktree_pool.WorktreePathLockUnknown as exc:
+            lock_unknown = str(exc)
+        except OSError as exc:
+            lock_unknown = f"{type(exc).__name__}: {exc}"
+
+    forced = bool(getattr(args, "occupied_worktree_forced", False))
+
+    if lock is None:
+        if lock_unknown is not None:
+            detail = unknown or lock_unknown
+            refusal, forced_warning = _occupancy_unknown_messages(args, detail)
+            return _finish_worktree_occupancy(
+                args, refusal=refusal, forced_warning=forced_warning
+            )
+        reason = occupied or lock_busy
+        if reason is None:
+            reason = (
+                f"worktree {_worker_cwd(args)} is already owned by a live "
+                "dispatch holding the worktree lock; a second writer would "
+                "share one filesystem tree with no merge discipline"
+            )
+        refusal, forced_warning = _occupancy_occupied_messages(reason)
+        return _finish_worktree_occupancy(
+            args, refusal=refusal, forced_warning=forced_warning
+        )
+
+    # Kernel lock is held. Ledger unknown still fail-closes: an unlistable
+    # ledger must not become a green light. A recorded occupant other than
+    # this drain/resume id is the queued-owner case (no process holds a
+    # lock). Drain of our own queued row skips own_id; a leftover sibling
+    # queued row must not deadlock the holder of the live lock.
+    if unknown is not None and occupied is None:
+        if not forced:
+            lock.release()
+        refusal, forced_warning = _occupancy_unknown_messages(args, unknown)
+        if forced:
+            _bind_worktree_occupancy_lock(args, lock)
+            return forced_warning
+        return _finish_worktree_occupancy(
+            args, refusal=refusal, forced_warning=forced_warning
+        )
+    if occupied is not None and not getattr(args, "from_queue", False):
+        # A queued row occupies with no process. A running/starting row whose
+        # worker already died (SIGKILL) leaves the kernel lock free; dropping
+        # the lock we just won would recreate the dual-launch TOCTOU until
+        # the watcher rewrites the ledger.
+        if inherited is None and occupied_state in {"running", "starting"}:
+            _bind_worktree_occupancy_lock(args, lock)
+            return None
+        if not forced:
+            lock.release()
+        refusal, forced_warning = _occupancy_occupied_messages(occupied)
+        if forced:
+            _bind_worktree_occupancy_lock(args, lock)
+            return forced_warning
+        return _finish_worktree_occupancy(
+            args, refusal=refusal, forced_warning=forced_warning
+        )
+
+    _bind_worktree_occupancy_lock(args, lock)
+    if occupied is not None and forced:
+        refusal, forced_warning = _occupancy_occupied_messages(occupied)
+        return forced_warning
+    return None
+
+
 def _write_windows_dispatch_refusal(args) -> tuple[dict, Path]:
     dispatch_id = args.dispatch_id or _default_dispatch_id(args.agent)
     args.dispatch_id = dispatch_id
@@ -2697,7 +3136,14 @@ def _refuse_windows_dispatch(args) -> int:
 
 
 def _find_dispatch_record(dispatch_id: str) -> dict | None:
-    for record in goalflight_ledger.read_records():
+    try:
+        records = goalflight_ledger.read_records()
+    except OSError:
+        # Unlistable ledger is occupancy UNKNOWN, not "this id is free". The
+        # occupancy gate refuses (or the --occupied-worktree-forced hatch
+        # consents). Do not crash the reused-id lookup with a traceback.
+        return None
+    for record in records:
         if record.get("dispatch_id") == dispatch_id:
             return record
     return None
@@ -3694,7 +4140,7 @@ def _resume_launch_argv(
         base,
         replace=replace,
         inject=inject,
-        strip_flags=_replay_strip_flags() + ("--unregistered-forced",),
+        strip_flags=_replay_strip_flags() + ("--unregistered-forced", "--occupied-worktree-forced"),
         strip_options=("--tail", "--status-json", "--prompt"),
     )
     if source["engine"] == "codex":
@@ -5153,74 +5599,168 @@ def _record_ledger(args, *, project_root: Path, prompt_path: str | None, status_
                    tail: Path, lease_id: str | None, worker_pid: int | None, state: str,
                    effective_account: str | None = None,
                    codex_home: str | None = None,
-                   request_envelope: dict | None = None) -> None:
+                   request_envelope: dict | None = None) -> dict | None:
+    """Record one lifecycle transition; never fail a spawned worker's launch.
+
+    Returns None when the record committed. When the journal refuses the
+    transition but a worker process was spawned, the refusal is a bookkeeping
+    problem, not evidence about the worker: the status file is still written
+    and the refusal is surfaced LOUDLY (stderr + the status file), and the
+    unrecovered refusal payload is returned so launch-site callers can fold
+    it into their own warnings. Only when no worker was spawned does a
+    refusal raise, unchanged.
+    """
     if state == "waiting_capacity":
         # Re-check the fused snapshot from stamp/prepare. Do not take a second
         # registry read: a later contended open is what turned an already
         # identified owner into "did not identify it" / unknown.
         _prepare_attempt_controller_registration(args, project_root)
-    with contextlib.redirect_stdout(io.StringIO()):
-        record_code = goalflight_ledger.cmd_record(
-            argparse.Namespace(
-                dispatch_id=args.dispatch_id,
-                prompt_id=None,
-                prompt_path=prompt_path,
-                task_ids=getattr(args, "task_ids", []),
-                agent=args.agent,
-                engine=_account_engine(args.agent) or args.agent,
-                shape=args.shape,
-                account=args.account or "default",
-                effective_account=effective_account,
-                request_envelope_json=(
-                    json.dumps(request_envelope, sort_keys=True)
-                    if request_envelope is not None
-                    else None
-                ),
-                transport="dispatch",
-                project_root=str(project_root),
-                controller_pid=_controller_pid(args),
-                controller_session_id=_controller_session_id(args),
-                controller_label=_controller_label(args),
-                claimant_pid=os.getpid() if state == "waiting_capacity" else None,
-                worker_pid=worker_pid,
-                acp_session_id=None,
-                logical_session_id=args.dispatch_id,
-                engine_session_id=_resolved_engine_session_id(args),
-                codex_session_id=getattr(args, "codex_session_id", None),
-                codex_home=codex_home or getattr(args, "codex_resume_home", None),
-                codex_home_owner_dispatch_id=_codex_home_owner_dispatch_id(args),
-                parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
-                worker_cwd=str(_worker_cwd(args)),
-                dispatch_argv=_canonical_replay_argv(
-                    args,
-                    _raw_worker_args(args)
-                    if getattr(args, "worker", None) is not None
-                    else [],
-                    tail=tail,
-                    status_json=status_json,
-                ),
-                lease_id=lease_id,
-                stdout_path=str(tail),
-                stderr_path=None,
-                status_path=str(status_json),
-                os_sandbox_json=json.dumps(
-                    _os_sandbox_posture(args, worker_pid=worker_pid),
-                    sort_keys=True,
-                ),
-                queue_launch_token=getattr(args, "queue_launch_token", None),
-                detached=bool(getattr(args, "launch_detached", False)),
-                state=state,
-                json=True,
+
+    spawn_state = goalflight_ledger.worker_spawn_state(worker_pid)
+
+    def _record_once() -> tuple[int, dict | None]:
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            code = goalflight_ledger.cmd_record(
+                argparse.Namespace(
+                    dispatch_id=args.dispatch_id,
+                    prompt_id=None,
+                    prompt_path=prompt_path,
+                    task_ids=getattr(args, "task_ids", []),
+                    agent=args.agent,
+                    engine=_account_engine(args.agent) or args.agent,
+                    shape=args.shape,
+                    account=args.account or "default",
+                    effective_account=effective_account,
+                    request_envelope_json=(
+                        json.dumps(request_envelope, sort_keys=True)
+                        if request_envelope is not None
+                        else None
+                    ),
+                    transport="dispatch",
+                    project_root=str(project_root),
+                    controller_pid=_controller_pid(args),
+                    controller_session_id=_controller_session_id(args),
+                    controller_label=_controller_label(args),
+                    claimant_pid=os.getpid() if state == "waiting_capacity" else None,
+                    worker_pid=worker_pid if spawn_state == "spawned" else None,
+                    acp_session_id=None,
+                    logical_session_id=args.dispatch_id,
+                    engine_session_id=_resolved_engine_session_id(args),
+                    codex_session_id=getattr(args, "codex_session_id", None),
+                    codex_home=codex_home or getattr(args, "codex_resume_home", None),
+                    codex_home_owner_dispatch_id=_codex_home_owner_dispatch_id(args),
+                    parent_dispatch_id=getattr(args, "parent_dispatch_id", None),
+                    worker_cwd=str(_worker_cwd(args)),
+                    dispatch_argv=_canonical_replay_argv(
+                        args,
+                        _raw_worker_args(args)
+                        if getattr(args, "worker", None) is not None
+                        else [],
+                        tail=tail,
+                        status_json=status_json,
+                    ),
+                    lease_id=lease_id,
+                    stdout_path=str(tail),
+                    stderr_path=None,
+                    status_path=str(status_json),
+                    os_sandbox_json=json.dumps(
+                        _os_sandbox_posture(args, worker_pid=worker_pid),
+                        sort_keys=True,
+                    ),
+                    queue_launch_token=getattr(args, "queue_launch_token", None),
+                    detached=bool(getattr(args, "launch_detached", False)),
+                    state=state,
+                    json=True,
+                )
             )
+        return code, goalflight_ledger.parse_record_refusal(capture.getvalue())
+
+    record_code, refusal = _record_once()
+    if (
+        record_code != 0
+        and spawn_state != "none"
+        and goalflight_ledger.is_retryable_startup_race(refusal)
+    ):
+        # The worker claims RUNNING asynchronously after spawn, so "not yet"
+        # becomes "yes" on its own within the worker's startup. Re-record
+        # against a bounded deadline BEFORE deciding anything else. Budget
+        # derivation: goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S.
+        record_code, refusal = goalflight_ledger.retry_record_after_startup_race(
+            _record_once,
+            record_code,
+            refusal,
+            project_root=project_root,
+            dispatch_id=str(args.dispatch_id),
+            timeout_s=goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S,
         )
+    warning = None
     if record_code != 0:
-        raise RuntimeError(
-            f"journal attempt transition refused for {args.dispatch_id}: exit {record_code}"
+        if spawn_state == "none":
+            # No worker process exists, so a refused transition is a genuine
+            # launch failure. Unchanged behaviour.
+            raise RuntimeError(
+                f"journal attempt transition refused for {args.dispatch_id}: exit {record_code}"
+            )
+        # A worker was spawned (or spawn state is indeterminate, which takes
+        # the same safe branch). Keep the liveness authority written and the
+        # refusal visible; losing the warning is as bad as losing the status
+        # file, so the refusal goes to BOTH stderr and the status payload.
+        warning = {
+            "kind": "journal_attempt_transition_refused",
+            "exit_code": record_code,
+            "disposition": (refusal or {}).get("disposition"),
+            "retryable": (refusal or {}).get("retryable"),
+            "error": (refusal or {}).get("error"),
+            "state": state,
+            "spawn_state": spawn_state,
+            "detail": (
+                "worker process was spawned but the journal transition was "
+                "refused; bookkeeping is incomplete, the worker may be alive "
+                "— do not blind-retry this dispatch"
+            ),
+        }
+        worker_alive = None
+        if spawn_state == "spawned":
+            with contextlib.suppress(Exception):
+                worker_alive = goalflight_compat.pid_alive(worker_pid)
+        print(
+            "DISPATCH-LEDGER-WARN "
+            + json.dumps(
+                {
+                    "dispatch_id": args.dispatch_id,
+                    "worker_pid": worker_pid,
+                    "worker_alive": worker_alive,
+                    "spawn_state": spawn_state,
+                    "tail": str(tail),
+                    "status_json": str(status_json),
+                    "warning": warning,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
         )
+        with contextlib.suppress(Exception):
+            write_status(
+                status_json,
+                {
+                    **_prelaunch_status_metadata(args),
+                    "worker_pid": worker_pid,
+                    "worker_alive": worker_alive,
+                    "spawn_state": spawn_state,
+                    "tail_path": str(tail),
+                    "state": state,
+                    "reason": "ledger_transition_refused",
+                    "ledger_record_warning": warning,
+                    "updated_at": int(time.time()),
+                },
+            )
     _export_dashboard_status_for_project(project_root)
     _upsert_project_registry_for_dispatch(project_root)
     if state in {"waiting_capacity", "starting", "running"}:
         _start_dashboard_refresh_for_project(project_root)
+    return warning
 
 
 _NATIVE_RECORD_LEDGER = _record_ledger
@@ -5231,16 +5771,20 @@ def _attempt_claiming_worker_argv(
     dispatch_id: str,
     worker_argv: list[str],
 ) -> tuple[list[str], bool]:
-    if not os.path.lexists(goalflight_journal.resolve_journal_path(project_root)):
+    try:
+        # Peek-only: the RUNNING CAS lives in the unsandboxed watcher. A writer
+        # Journal() would take the construction write lock on the launch path.
+        # Only a genuine FileNotFoundError (JournalDisappeared) is "no journal".
+        # An unreadable present journal raises JournalIOError and must not skip
+        # attempt fencing.
+        attempt = goalflight_journal.Journal.open_reader(
+            project_root
+        ).attempt_for_dispatch(dispatch_id)
+    except goalflight_journal.JournalDisappeared:
         # Embedders can replace the ledger-recording seam when they own launch
         # tracking. Preserve that pre-P2 seam without bootstrapping authority
         # behind the embedding's back.
         return worker_argv, False
-    # Peek-only: the RUNNING CAS lives in the unsandboxed watcher. A writer
-    # Journal() would take the construction write lock on the launch path.
-    attempt = goalflight_journal.Journal.open_reader(project_root).attempt_for_dispatch(
-        dispatch_id
-    )
     if attempt is None:
         if _record_ledger is not _NATIVE_RECORD_LEDGER:
             # Controller registration can create the journal independently of
@@ -5570,6 +6114,7 @@ LAUNCH_ARGV_CLASS: dict[str, str] = {
     "--controller-label": "preserve",
     "--session-label": "preserve",
     "--unregistered-forced": "preserve",
+    "--occupied-worktree-forced": "preserve",
     "--controller-beacon-pid": "preserve",
     "--controller-session-id": "preserve",
     "--parent-dispatch-id": "preserve",
@@ -5724,6 +6269,9 @@ def _canonical_replay_argv_from_original(
     if getattr(args, "unregistered_forced", False):
         if "--unregistered-forced" not in argv:
             argv = _insert_before_worker_remainder(argv, ["--unregistered-forced"])
+    if getattr(args, "occupied_worktree_forced", False):
+        if "--occupied-worktree-forced" not in argv:
+            argv = _insert_before_worker_remainder(argv, ["--occupied-worktree-forced"])
     if raw_argv and "--" not in argv:
         argv += ["--", *raw_argv]
     return argv
@@ -5800,6 +6348,8 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
         argv += ["--controller-session-id", controller_session_id]
     if getattr(args, "unregistered_forced", False):
         argv.append("--unregistered-forced")
+    if getattr(args, "occupied_worktree_forced", False):
+        argv.append("--occupied-worktree-forced")
     engine_session_id = _resolved_engine_session_id(args)
     if engine_session_id is not None:
         argv += ["--engine-session-id", engine_session_id]
@@ -5811,12 +6361,26 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
 
 
 def _existing_queue_entry_paths(queue_path: Path) -> list[Path]:
-    paths = [queue_path] if queue_path.exists() else []
-    paths.extend(
-        path
-        for path in sorted(queue_path.parent.glob(f"{queue_path.name}.claimed-*"))
-        if not path.name.endswith(".failed")
-    )
+    """Live envelope and claim paths. Unreadable parent is not empty."""
+    parent = queue_path.parent
+    try:
+        entries = list(parent.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise OSError(
+            f"queue dir unreadable while looking for {queue_path.name}: "
+            f"{type(exc).__name__}"
+        ) from exc
+    name = queue_path.name
+    paths: list[Path] = []
+    for path in sorted(entries):
+        if path.name == name:
+            paths.append(path)
+        elif path.name.startswith(f"{name}.claimed-") and not path.name.endswith(
+            ".failed"
+        ):
+            paths.append(path)
     return paths
 
 
@@ -5843,6 +6407,8 @@ def _cleanup_partial_submit(queue_path: Path, status_json: Path) -> None:
             prompt_sidecar.unlink()
     with contextlib.suppress(OSError):
         status_json.with_suffix(status_json.suffix + ".tmp").unlink()
+    # glob-empty here only skips leftover ``*.tmp.*`` cleanup; it does not
+    # delete live envelopes. Unreadable parent leaves tmps in place.
     for tmp in queue_path.parent.glob(f"{queue_path.name}.tmp.*"):
         with contextlib.suppress(OSError):
             tmp.unlink()
@@ -6109,22 +6675,25 @@ def _queue_launch_token(entry: dict | None = None) -> str:
         project_root = entry.get("project_root") or request.get("cwd")
         if dispatch_id and project_root:
             resolved_root = goalflight_task.resolve_project_root(str(project_root))
-            if os.path.lexists(goalflight_journal.resolve_journal_path(resolved_root)):
+            try:
                 # Peek-only reuse of a still-PREPARED attempt. Read errors must
                 # still escape before the carrier is claimed; open_reader does.
+                # Only JournalDisappeared is absent; unreadable is JournalIOError.
                 attempt = goalflight_journal.Journal.open_reader(
                     resolved_root
                 ).attempt_for_dispatch(dispatch_id)
-                if (
-                    attempt is not None
-                    and attempt.lifecycle_state == goalflight_journal.ATTEMPT_PREPARED
-                ):
-                    # A queue child refused before spawn. The durable claim
-                    # was restored, but its journal preparation is still the
-                    # same attempt. Reuse that fencing token so the next
-                    # drain can continue PREPARED -> STARTING. A journal read
-                    # error must escape before the carrier is claimed.
-                    return attempt.launch_token
+            except goalflight_journal.JournalDisappeared:
+                attempt = None
+            if (
+                attempt is not None
+                and attempt.lifecycle_state == goalflight_journal.ATTEMPT_PREPARED
+            ):
+                # A queue child refused before spawn. The durable claim
+                # was restored, but its journal preparation is still the
+                # same attempt. Reuse that fencing token so the next
+                # drain can continue PREPARED -> STARTING. A journal read
+                # error must escape before the carrier is claimed.
+                return attempt.launch_token
     return uuid.uuid4().hex
 
 
@@ -6981,6 +7550,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
         return 1
     if duplicate_active:
         print(f"STATUS: queued already {args.dispatch_id}")
+        _release_worktree_occupancy_lock(args)
         _drain_on_submit(args, queue_path)
         return 0
     print(
@@ -6997,6 +7567,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
         ),
         flush=True,
     )
+    _release_worktree_occupancy_lock(args)
     _drain_on_submit(args, queue_path)
     return 0
 
@@ -7310,10 +7881,10 @@ def _release_stale_capacity_for_drain() -> None:
 def _read_capacity_state_for_reconciliation() -> dict:
     """Read capacity state without converting corruption into an empty lease set."""
 
-    path = goalflight_capacity.state_path()
-    if not path.exists():
-        return {"schema": goalflight_capacity.SCHEMA, "leases": {}}
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = goalflight_capacity.load_state()
+    except goalflight_capacity.CapacityStateUnreadable as exc:
+        raise ValueError(str(exc)) from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("leases"), dict):
         raise ValueError("capacity state has no readable lease map")
     return payload
@@ -8005,7 +8576,7 @@ def reconcile_abandoned_dispatches(
         key = str(entry.get("reason") or "unknown")
         kept_reasons[key] = kept_reasons.get(key, 0) + 1
     claimer_counts = _claimer_report_fields(resolved_queue_dir)
-    return {
+    report = {
         "schema": ABANDONED_RECONCILIATION_SCHEMA,
         "mode": "dry-run" if dry_run else "automatic",
         "stale_seconds": stale_s,
@@ -8019,6 +8590,9 @@ def reconcile_abandoned_dispatches(
         "live_claimer": claimer_counts["live_claimer"],
         "entries": entries,
     }
+    if claimer_counts.get("queue_listing_error"):
+        report["queue_listing_error"] = str(claimer_counts["queue_listing_error"])
+    return report
 
 
 def _reconcile_abandoned_for_drain(queue_dir: Path) -> dict:
@@ -8254,12 +8828,38 @@ def _prefer_claim_carrier(statuses: list[ClaimCarrierStatus]) -> ClaimCarrierSta
     return statuses[0]
 
 
-def _summarize_claim_markers(queue_dir: Path) -> dict[str, int]:
-    """Count leftover claim markers by claimer adjudication. Read-only."""
-    summary = {"dead": 0, "unknown": 0, "live": 0}
-    if not queue_dir.is_dir():
+def _queue_dir_listing(queue_dir: Path) -> list[Path]:
+    """List queue-dir entries, raising on a failed listing.
+
+    ``Path.glob`` swallows ``PermissionError`` and yields nothing, which
+    renders an unreadable queue as an empty one — the collapse that licensed
+    ``worker_provably_gone`` for an envelope still on disk. ``iterdir``
+    raises. A directory that vanished between the ``is_dir`` probe and the
+    listing is genuinely absent: no entries.
+    """
+    try:
+        return list(queue_dir.iterdir())
+    except FileNotFoundError:
+        return []
+
+
+def _summarize_claim_markers(queue_dir: Path) -> dict[str, int | str]:
+    """Count leftover claim markers by claimer adjudication. Read-only.
+
+    An unreadable queue dir is UNKNOWN, not all-zero counts: the report
+    carries ``listing_error`` instead of pretending no markers exist.
+    """
+    summary: dict[str, int | str] = {"dead": 0, "unknown": 0, "live": 0}
+    # Do not probe with ``is_dir()``: Path.is_dir returns False on OSError, so a
+    # parent-unreadable queue would look absent (all-zero, no listing_error).
+    try:
+        entries = _queue_dir_listing(queue_dir)
+    except OSError as exc:
+        summary["listing_error"] = f"queue_dir_unreadable:{type(exc).__name__}"
         return summary
-    for claim in queue_dir.glob("*.json.claimed-*"):
+    for claim in entries:
+        if ".json.claimed-" not in claim.name:
+            continue
         if claim.name.endswith(".failed"):
             continue
         kind = _adjudicate_claim_marker(claim).kind
@@ -8272,13 +8872,17 @@ def _summarize_claim_markers(queue_dir: Path) -> dict[str, int]:
     return summary
 
 
-def _claimer_report_fields(queue_dir: Path) -> dict[str, int]:
+def _claimer_report_fields(queue_dir: Path) -> dict[str, int | str]:
     summary = _summarize_claim_markers(queue_dir)
-    return {
+    fields: dict[str, int | str] = {
         "dead_claimer": summary["dead"],
         "unknown_claimer": summary["unknown"],
         "live_claimer": summary["live"],
     }
+    listing_error = summary.get("listing_error")
+    if listing_error:
+        fields["queue_listing_error"] = str(listing_error)
+    return fields
 
 
 def _abandoned_carrier_keep_reason(carrier: ClaimCarrierStatus) -> str | None:
@@ -8297,16 +8901,29 @@ def _claim_has_active_carrier(queue_dir: Path, dispatch_id: str) -> ClaimCarrier
     A bare ``.json`` is a queued envelope (healthy carrier). A ``.claimed-*``
     marker is a claimer: LIVE, DEAD, or UNKNOWN via pid+start-token identity.
     The result is truthy whenever any matching file exists, so restore/close
-    paths that used this as a presence gate still refuse to mutate.
+    paths that used this as a presence gate still refuse to mutate. A queue
+    dir that cannot be listed is UNKNOWN, never NONE: unreadable is not
+    absent, and the abandoned gate must keep what it cannot verify.
     """
     if not dispatch_id:
         return ClaimCarrierStatus()
-    if not queue_dir.is_dir():
-        return ClaimCarrierStatus()
+    # Do not probe with ``is_dir()``: Path.is_dir returns False on OSError, so a
+    # parent-unreadable queue would look NONE while the envelope is still on
+    # disk. Listing raises; FileNotFoundError is the absent/NONE path.
     safe = goalflight_compat.safe_dispatch_filename(dispatch_id)
     statuses: list[ClaimCarrierStatus] = []
+    try:
+        entries = _queue_dir_listing(queue_dir)
+    except OSError as exc:
+        return ClaimCarrierStatus(
+            ClaimCarrierKind.UNKNOWN,
+            f"queue_dir_unreadable:{type(exc).__name__}",
+            str(queue_dir),
+        )
     # Canonical name is usually "<dispatch_id>.json" but may be priority-prefixed.
-    for path in queue_dir.glob("*.json"):
+    for path in entries:
+        if not path.name.endswith(".json"):
+            continue
         if path.name.endswith(".failed"):
             continue
         try:
@@ -8325,7 +8942,9 @@ def _claim_has_active_carrier(queue_dir: Path, dispatch_id: str) -> ClaimCarrier
             statuses.append(
                 ClaimCarrierStatus(ClaimCarrierKind.QUEUED, "queued_envelope", str(path))
             )
-    for claim in queue_dir.glob("*.json.claimed-*"):
+    for claim in entries:
+        if ".json.claimed-" not in claim.name:
+            continue
         if claim.name.endswith(".failed"):
             continue
         try:
@@ -10080,7 +10699,23 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
     pending_launch = 0
     quarantined = 0
     pending_reasons: list[dict] = []
-    for claim in sorted(queue_dir.glob("*.json.claimed-*")):
+    try:
+        entries = _queue_dir_listing(queue_dir)
+    except OSError as exc:
+        # An unreadable queue is not an empty queue. Republish/terminalize
+        # decisions need the carrier listing, so refuse the whole pass and
+        # surface the failure instead of reconciling blind.
+        listing_error = f"queue_dir_unreadable:{type(exc).__name__}"
+        return {
+            "restored": 0,
+            "cleared": 0,
+            "pending_launch": 0,
+            "quarantined": 0,
+            "ledger_terminalized": 0,
+            "pending_reasons": [{"dispatch_id": "", "reason": listing_error}],
+            "listing_error": listing_error,
+        }
+    for claim in sorted(path for path in entries if ".json.claimed-" in path.name):
         if claim.name.endswith(".failed"):
             continue
         try:
@@ -11475,9 +12110,11 @@ def _write_json_exclusive(path: Path, payload: dict) -> bool:
 
 def _requeue_child_exists(queue_dir: Path, child_id: str) -> bool:
     queue_path = _queue_entry_path(child_id, queue_dir=queue_dir)
-    if queue_path.exists() or any(
-        queue_path.parent.glob(f"{queue_path.name}.claimed-*")
-    ):
+    try:
+        if _existing_queue_entry_paths(queue_path):
+            return True
+    except OSError:
+        # Unreadable queue is not "child gone". Keep: refuse to mint a duplicate.
         return True
     return goalflight_ledger.record_path(child_id, create=False).exists()
 
@@ -12051,6 +12688,26 @@ def _note_drain_journal_skip(
     acc["details"].append(detail)
 
 
+def _drain_launch_capacity_reason(
+    returncode: int, stdout: str, stderr: str
+) -> str | None:
+    """Classify a drain-launch capacity refusal.
+
+    Unreadable capacity state and genuine cap-reached both exit 2, and the
+    launch stdout can carry ``blocked_capacity`` for both. Prefer
+    ``capacity_state_unreadable`` so this cannot surface as
+    ``capacity_unavailable`` (t-068).
+    """
+    if returncode != 2:
+        return None
+    launch_output = f"{stdout}{stderr}"
+    if "capacity_state_unreadable" in launch_output:
+        return "capacity_state_unreadable"
+    if "blocked_capacity" in launch_output:
+        return "capacity_unavailable"
+    return None
+
+
 def _drain_queue_once(args) -> dict:
     queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else _dispatch_queue_dir()
     queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -12074,6 +12731,13 @@ def _drain_queue_once(args) -> dict:
         _release_stale_capacity_for_drain()
         abandoned_reconciliation = _reconcile_abandoned_for_drain(queue_dir)
     recovery = _recover_claimed_queue_entries(queue_dir, stale_s=args.claim_stale_s)
+    if recovery.get("listing_error"):
+        # The queue could not be listed: every candidate is invisible, so a
+        # "0 launched, 0 remaining" pass would be a false green. Fail the
+        # drain with the listing error instead of reporting an empty queue.
+        raise OSError(
+            f"dispatch queue listing failed for {queue_dir}: {recovery['listing_error']}"
+        )
     launched = 0
     left_queued = 0
     failed = 0
@@ -12094,7 +12758,9 @@ def _drain_queue_once(args) -> dict:
     # out and report each one with its owner-generation adjudication below.
     restore_prepared_candidates: list[tuple] = []
     launch_candidates: list[tuple] = []
-    for path in queue_dir.glob("*.json"):
+    for path in _queue_dir_listing(queue_dir):
+        if not path.name.endswith(".json"):
+            continue
         candidate = _queue_entry_drain_candidate(path)
         if (
             isinstance(candidate[2], dict)
@@ -12267,7 +12933,14 @@ def _drain_queue_once(args) -> dict:
                 exc=exc,
             )
             continue
-        except goalflight_journal.JournalError as exc:
+        except (
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+            goalflight_journal.JournalError,
+        ) as exc:
+            # Name the availability subtypes: a bare JournalError catch flattens
+            # unreadable vs disappeared. Unreadable still fails closed here
+            # (do not launch); the reason string keeps the concrete class.
             _note_drain_journal_skip(
                 drain_acc,
                 dispatch_id=dispatch_id,
@@ -12341,7 +13014,11 @@ def _drain_queue_once(args) -> dict:
                 lease.release_reason = "journal_busy"
                 _remember_drain_journal_skip(drain_acc, project_key, "busy")
                 continue
-            except goalflight_journal.JournalError as exc:
+            except (
+                goalflight_journal.JournalDisappeared,
+                goalflight_journal.JournalIOError,
+                goalflight_journal.JournalError,
+            ) as exc:
                 lease.release_reason = f"journal_error:{type(exc).__name__}"
                 _remember_drain_journal_skip(drain_acc, project_key, "error")
                 continue
@@ -12372,10 +13049,11 @@ def _drain_queue_once(args) -> dict:
                         claim=claim,
                     )
                 else:
+                    drain_env = _sidecar_env(os.environ.copy())
                     proc = subprocess.run(
                         [sys.executable, str(Path(__file__).resolve()), *launch_argv],
                         cwd=str(Path(entry.get("process_cwd") or entry.get("project_root") or Path.cwd()).resolve()),
-                        env=os.environ.copy(),
+                        env=drain_env,
                         text=True,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
@@ -12398,7 +13076,9 @@ def _drain_queue_once(args) -> dict:
                 dispatch_id,
                 queue_launch_token=launch_token,
             )
-            no_capacity = proc.returncode == 2 and "blocked_capacity" in (proc.stdout + proc.stderr)
+            capacity_reason = _drain_launch_capacity_reason(
+                proc.returncode, proc.stdout, proc.stderr
+            )
             if stdout_launched and ledger_confirmed:
                 carrier_cleanup = _positive_live_carrier_cleanup(
                     claim,
@@ -12425,8 +13105,8 @@ def _drain_queue_once(args) -> dict:
                 else:
                     lease.consume(state="launched", launched=True)
                 continue
-            if no_capacity:
-                lease.release_reason = "capacity_unavailable"
+            if capacity_reason:
+                lease.release_reason = capacity_reason
                 continue
             if stdout_launched and not ledger_confirmed:
                 # Stdout is not launch proof. Keep the carrier pending until a
@@ -12488,9 +13168,20 @@ def _drain_queue_once(args) -> dict:
                 lease.release_reason = f"launch_refused_pre_spawn:{proc.returncode}"
                 continue
             lease.release_reason = f"launch_failed_pending_ledger:{proc.returncode}"
-    remaining = len(list(queue_dir.glob("*.json")))
+    # Launches already happened, so a listing failure here must not become the
+    # error payload (which reports launched=0): report the count as unknown.
+    queue_listing_error: str | None = None
+    try:
+        remaining: int | None = sum(
+            1 for path in _queue_dir_listing(queue_dir) if path.name.endswith(".json")
+        )
+    except OSError as exc:
+        remaining = None
+        queue_listing_error = f"queue_dir_unreadable:{type(exc).__name__}"
     claimer_counts = _claimer_report_fields(queue_dir)
-    return {
+    if queue_listing_error is None and claimer_counts.get("queue_listing_error"):
+        queue_listing_error = str(claimer_counts["queue_listing_error"])
+    payload = {
         "schema": f"{DISPATCH_QUEUE_SCHEMA}.drain.v1",
         "queue_dir": str(queue_dir),
         "launched": drain_acc["launched"],
@@ -12509,6 +13200,9 @@ def _drain_queue_once(args) -> dict:
         "abandoned_reconciliation": abandoned_reconciliation,
         "details": details,
     }
+    if queue_listing_error is not None:
+        payload["queue_listing_error"] = queue_listing_error
+    return payload
 
 
 def _drain_error_payload(args, exc: BaseException) -> dict:
@@ -13039,6 +13733,11 @@ def _acp_detached_child_argv(args) -> list[str]:
         and "--unregistered-forced" not in argv
     ):
         argv = _insert_before_worker_remainder(argv, ["--unregistered-forced"])
+    if (
+        getattr(args, "occupied_worktree_forced", False)
+        and "--occupied-worktree-forced" not in argv
+    ):
+        argv = _insert_before_worker_remainder(argv, ["--occupied-worktree-forced"])
     if "--acp-detached-child" not in argv:
         argv = _insert_before_worker_remainder(argv, ["--acp-detached-child"])
     return argv
@@ -13095,6 +13794,7 @@ def _run_acp_detached_launcher(
         stderr="stdout",
         serialize_stdout=True,
         label="acp",
+        inherit_occupancy_lock=True,
     )
     _mark_queue_claim_worker_spawned(args, child_pid)
 
@@ -13681,6 +14381,25 @@ _SUBCOMMAND_HELP: tuple[tuple[str, str], ...] = (
 )
 
 
+def _existing_cwd_arg(value: str) -> str:
+    """--cwd must name a real directory at argument-parse time (t-349).
+
+    A nonexistent --cwd used to flow into resolve_project_root, whose
+    not-a-checkout fallback renders the path as its own project root. The
+    dispatch then landed on an empty controller registry and refused with
+    "controller is not registered", recommending --unregistered-forced -- an
+    operator following that advice launched an unowned dispatch into a phantom
+    project root for what was actually a path typo (t337-w3/w4/w5). Refusing
+    here fires before any registry lookup, so that advice is never reached.
+    """
+    expanded = Path(str(value)).expanduser()
+    if not expanded.exists():
+        raise argparse.ArgumentTypeError(f"cwd does not exist: {value}")
+    if not expanded.is_dir():
+        raise argparse.ArgumentTypeError(f"cwd is not a directory: {value}")
+    return value
+
+
 def _build_launch_parser() -> argparse.ArgumentParser:
     parser = _TerseArgumentParser(
         description=(
@@ -13709,7 +14428,7 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         default=[],
         help="Comma-separated linked task/bug ids (t-/b-). May be repeated.",
     )
-    parser.add_argument("--cwd", help="Worker working directory")
+    parser.add_argument("--cwd", type=_existing_cwd_arg, help="Worker working directory")
     parser.add_argument(
         "--worktree",
         metavar="BASE",
@@ -13871,6 +14590,16 @@ def _build_launch_parser() -> argparse.ArgumentParser:
             "Override the registered-controller launch refusal. The dispatch is "
             "recorded with no owner, so its terminal event wakes every controller "
             "in the project."
+        ),
+    )
+    parser.add_argument(
+        "--occupied-worktree-forced",
+        action="store_true",
+        help=(
+            "Override the occupied-worktree launch refusal: launch even though a "
+            "kernel lock or a non-terminal dispatch already owns --cwd (the two "
+            "writers then share one filesystem tree with no merge discipline), "
+            "or when occupancy cannot be evaluated."
         ),
     )
     parser.add_argument(
@@ -14039,13 +14768,39 @@ def main(argv: list[str] | None = None) -> int:
                 args.dispatch_id,
                 allow_queued=args.from_queue or args.submit,
             )
+            if not getattr(args, "submit", False):
+                try:
+                    _bind_dispatch_worktree(args)
+                except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
+                    print(f"goalflight_dispatch: {e}", file=sys.stderr)
+                    print(
+                        "goalflight_dispatch: refusing to git worktree add; "
+                        "wait for a seat or raise GOALFLIGHT_WORKTREE_SEATS",
+                        file=sys.stderr,
+                    )
+                    return 2
+                except goalflight_worktree_pool.WorktreeSeatError as e:
+                    print(
+                        f"goalflight_dispatch: worktree seat error: {e}",
+                        file=sys.stderr,
+                    )
+                    return 1
+            occupancy_warning = _prepare_attempt_worktree_occupancy(args)
+            if occupancy_warning is not None:
+                args.dispatch_warnings = [
+                    *getattr(args, "dispatch_warnings", []),
+                    occupancy_warning,
+                ]
             account_env = (
                 {} if goalflight_compat.is_windows() else _resolve_launch_account_env(args)
             )
             if not goalflight_compat.is_windows():
                 _validate_claude_auth_before_attempt(args, account_env)
             if args.submit:
-                return _submit_dispatch(args, raw, base=base)
+                try:
+                    return _submit_dispatch(args, raw, base=base)
+                finally:
+                    _release_worktree_occupancy_lock(args)
             if (
                 not args.foreground
                 and not getattr(args, "launch_detached", False)
@@ -14084,8 +14839,6 @@ def main(argv: list[str] | None = None) -> int:
         _apply_max_idle_default(args)
         _validate_before_side_effects(args, raw)
         dispatch_warnings = _dispatch_warnings(args, raw)
-        account_env = _resolve_launch_account_env(args)
-        _validate_claude_auth_before_attempt(args, account_env)
     except UnsupportedAgentSandboxRequest as e:
         try:
             return _record_unsupported_sandbox_rejection(args, e)
@@ -14109,11 +14862,45 @@ def main(argv: list[str] | None = None) -> int:
             args.dispatch_id,
             allow_queued=args.from_queue or args.submit,
         )
+        if not getattr(args, "submit", False):
+            _bind_dispatch_worktree(args)
+        occupancy_warning = _prepare_attempt_worktree_occupancy(args)
+        if occupancy_warning is not None:
+            dispatch_warnings = [*dispatch_warnings, occupancy_warning]
+    except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        print(
+            "goalflight_dispatch: refusing to git worktree add; "
+            "wait for a seat or raise GOALFLIGHT_WORKTREE_SEATS",
+            file=sys.stderr,
+        )
+        return 2
+    except goalflight_worktree_pool.WorktreeSeatError as e:
+        print(f"goalflight_dispatch: worktree seat error: {e}", file=sys.stderr)
+        return 1
+    except DispatchUsageError as e:
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        return 64
+    # Occupancy is the filesystem-corruption gate; it must refuse a second
+    # writer before account/auth work that could spawn or misdirect the
+    # operator. Same order as the ACP branch.
+    try:
+        account_env = _resolve_launch_account_env(args)
+        _validate_claude_auth_before_attempt(args, account_env)
+    except UnsupportedAgentSandboxRequest as e:
+        try:
+            return _record_unsupported_sandbox_rejection(args, e)
+        except DispatchUsageError as record_error:
+            print(f"goalflight_dispatch: {record_error}", file=sys.stderr)
+            return 64
     except DispatchUsageError as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64
     if args.submit:
-        return _submit_dispatch(args, raw, base=base)
+        try:
+            return _submit_dispatch(args, raw, base=base)
+        finally:
+            _release_worktree_occupancy_lock(args)
     tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
 
@@ -14517,6 +15304,7 @@ def main(argv: list[str] | None = None) -> int:
             serialize_stdout=True,
             label="worker",
             cwd=str(_worker_cwd(args)),
+            inherit_occupancy_lock=True,
         )
         if worktree_seat is not None:
             # Worker inherited the fd. Drop this process's copy so the seat
@@ -14579,6 +15367,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:
             registration_errors.append(_registration_error("write_pidfile", e))
             pidfile = None
+        ledger_running_warning = None
         try:
             if wait_for_worker_claim:
                 goalflight_ledger.claim_attempt_running(
@@ -14586,7 +15375,7 @@ def main(argv: list[str] | None = None) -> int:
                     str(args.dispatch_id),
                     worker_pid,
                 )
-            _record_ledger(
+            ledger_running_warning = _record_ledger(
                 args,
                 project_root=project_root,
                 prompt_path=prompt_path,
@@ -14606,6 +15395,20 @@ def main(argv: list[str] | None = None) -> int:
                 )
         except Exception as e:
             registration_errors.append(_registration_error("record_ledger_running", e))
+        if ledger_running_warning:
+            # _record_ledger already warned loudly and wrote the status file;
+            # fold the refusal into the launch registration warnings too so
+            # every operator surface carries it.
+            registration_errors.append(
+                {
+                    "step": "record_ledger_running",
+                    "reason": (
+                        "journal attempt transition refused: "
+                        f"{ledger_running_warning.get('disposition') or 'unknown'} "
+                        f"({ledger_running_warning.get('error') or 'no detail'})"
+                    ),
+                }
+            )
 
         summary_head.update({"worker_pid": worker_pid, "worker_identity": worker_identity_token})
         if effective_account:
@@ -14683,12 +15486,17 @@ def main(argv: list[str] | None = None) -> int:
                 "state": "starting",
                 "reason": "watcher_launching",
                 "updated_at": int(time.time()),
+                **(
+                    {"ledger_record_warning": ledger_running_warning}
+                    if ledger_running_warning
+                    else {}
+                ),
             })
         _export_dashboard_status_for_project(project_root)
         _start_dashboard_refresh_for_project(project_root)
         watcher_pid = _spawn_daemonized_process(
             watch_cmd,
-            env=os.environ.copy(),
+            env=_sidecar_env(os.environ.copy()),
             stdout_path=watch_log,
             stdout_mode="wb",
             stderr="stdout",

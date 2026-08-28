@@ -278,6 +278,70 @@ def test_sigkill_releases_kernel_lease_without_cleanup() -> None:
                 proc.wait(timeout=10)
 
 
+def test_path_lock_sigkill_releases_without_cleanup() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tree = Path(td) / "tree"
+        tree.mkdir()
+        child_code = "\n".join(
+            [
+                "import os, signal, sys",
+                f"sys.path.insert(0, {str(ROOT / 'scripts')!r})",
+                "from pathlib import Path",
+                "import goalflight_worktree_pool as pool",
+                "lock = pool.try_acquire_worktree_path_lock(Path(sys.argv[1]), 'killed-path')",
+                "print(lock.fileno(), flush=True)",
+                "signal.pause()",
+            ]
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child_code, str(tree)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=os.environ.copy(),
+        )
+        try:
+            assert proc.stdout is not None
+            held_fd = proc.stdout.readline().strip()
+            assert_true("child acquired path lock", held_fd.isdigit())
+            try:
+                goalflight_worktree_pool.try_acquire_worktree_path_lock(
+                    tree, "blocked-path"
+                )
+            except goalflight_worktree_pool.WorktreePathLockBusy as exc:
+                assert_true("live occupant diagnosed", "killed-path" in str(exc))
+            else:
+                raise AssertionError("live child did not hold the path lock")
+
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
+            replacement = goalflight_worktree_pool.try_acquire_worktree_path_lock(
+                tree, "replacement-path"
+            )
+            replacement.release()
+        finally:
+            if proc.poll() is None:
+                os.kill(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=10)
+
+
+def test_path_locks_on_different_trees_do_not_serialize() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tree_a = Path(td) / "a"
+        tree_b = Path(td) / "b"
+        tree_a.mkdir()
+        tree_b.mkdir()
+        lock_a = goalflight_worktree_pool.try_acquire_worktree_path_lock(tree_a, "a")
+        try:
+            lock_b = goalflight_worktree_pool.try_acquire_worktree_path_lock(tree_b, "b")
+            try:
+                assert_true("distinct lock files", lock_a.path != lock_b.path)
+            finally:
+                lock_b.release()
+        finally:
+            lock_a.release()
+
+
 def test_parent_release_keeps_inherited_worker_lease_until_worker_dies() -> None:
     with tempfile.TemporaryDirectory() as td, seat_limit(1):
         repo = make_repo(Path(td))
@@ -395,6 +459,8 @@ def main() -> None:
         test_process_concurrency_gets_distinct_seats_and_names_all_occupants,
         test_dirty_seat_is_quarantined_then_reset_on_acquire,
         test_sigkill_releases_kernel_lease_without_cleanup,
+        test_path_lock_sigkill_releases_without_cleanup,
+        test_path_locks_on_different_trees_do_not_serialize,
         test_parent_release_keeps_inherited_worker_lease_until_worker_dies,
         test_default_seat_count_is_not_a_per_controller_cap,
         test_registration_ignores_basename_without_a_lock,

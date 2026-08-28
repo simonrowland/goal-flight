@@ -570,15 +570,31 @@ def check_controller_lease_liveness(project_root: Path) -> dict:
     """Report ACTIVE journal leases against their sole kernel liveness witness."""
     resolved_root = project_root.resolve()
     journal_path = goalflight_journal.resolve_journal_path(resolved_root)
-    if not os.path.lexists(journal_path):
+    presence = goalflight_journal._lstat_presence(journal_path)
+    if presence == "absent":
         # No journal file: there is no lease surface. That is a real, healthy
-        # doctor state. JournalBusy and the fatal subclasses
-        # (JournalDisappeared after the path was present, JournalIOError)
-        # are unread authority, not absence — they must not report green.
+        # doctor state. Only FileNotFoundError is absence; unreadable is not.
+        # JournalBusy and the fatal subclasses (JournalDisappeared after the
+        # path was present, JournalIOError) are unread authority, not
+        # absence — they must not report green.
         return {
             "ok": True,
             "present": False,
             "project_root": str(resolved_root),
+            "active_controller_leases_in_project": 0,
+            "active_but_dead_controller_leases_in_project": 0,
+            "unknown_controller_lease_holders_in_project": 0,
+            "leases": [],
+        }
+    if presence == "unknown":
+        return {
+            "ok": False,
+            "present": True,
+            "project_root": str(resolved_root),
+            "error": (
+                "journal path presence is unreadable, so absence is unverified: "
+                f"{journal_path}"
+            ),
             "active_controller_leases_in_project": 0,
             "active_but_dead_controller_leases_in_project": 0,
             "unknown_controller_lease_holders_in_project": 0,
@@ -659,11 +675,23 @@ def check_wake_coverage(project_root: Path) -> dict:
     """Report wake-pool coverage and the generation-safe re-arm hint."""
     resolved_root = project_root.resolve()
     journal_path = goalflight_journal.resolve_journal_path(resolved_root)
-    if not os.path.lexists(journal_path):
+    presence = goalflight_journal._lstat_presence(journal_path)
+    if presence == "absent":
         return {
             "ok": True,
             "present": False,
             "project_root": str(resolved_root),
+            "pools": [],
+        }
+    if presence == "unknown":
+        return {
+            "ok": False,
+            "present": True,
+            "project_root": str(resolved_root),
+            "error": (
+                "journal path presence is unreadable, so absence is unverified: "
+                f"{journal_path}"
+            ),
             "pools": [],
         }
     try:

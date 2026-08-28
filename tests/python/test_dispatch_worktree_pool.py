@@ -71,6 +71,8 @@ def _env(tmp: Path, *, seats: int) -> dict[str, str]:
     env["GOALFLIGHT_WORKTREE_SEATS"] = str(seats)
     env["GOALFLIGHT_DISABLE_NUDGES"] = "1"
     env.pop("GOALFLIGHT_STEER_FILE", None)
+    env.pop("GOALFLIGHT_WORKTREE_LOCK_FD", None)
+    env.pop("GOALFLIGHT_OCCUPANCY_LOCK_FD", None)
     return env
 
 
@@ -150,6 +152,8 @@ def test_seat_survives_for_worker_lifetime_then_frees_on_death(
             "from pathlib import Path",
             "fd = int(os.environ['GOALFLIGHT_WORKTREE_LOCK_FD'])",
             "os.fstat(fd)",
+            "occ = int(os.environ['GOALFLIGHT_OCCUPANCY_LOCK_FD'])",
+            "os.fstat(occ)",
             "Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8')",
             "signal.pause()",
         ]
@@ -308,10 +312,16 @@ def test_cwd_without_worktree_does_not_acquire_a_seat(
 def test_sidecar_env_drops_closed_worktree_lock_fd() -> None:
     import goalflight_dispatch as D
 
-    env = {"PATH": "/usr/bin", goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV: "5"}
+    env = {
+        "PATH": "/usr/bin",
+        goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV: "5",
+        goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV: "7",
+    }
     sidecar = D._sidecar_env(env)
     assert goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV not in sidecar
+    assert goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV not in sidecar
     assert env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] == "5"
+    assert env[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] == "7"
     assert sidecar["PATH"] == "/usr/bin"
 
 
@@ -355,6 +365,78 @@ def test_worktree_launch_does_not_fail_caffeinate_on_stale_lock_fd(
     launched = _launched_payload(proc.stdout)
     if sys.platform == "darwin" and shutil.which("caffeinate"):
         assert launched.get("caffeinate_pid"), combined
+
+
+def test_two_worktree_launches_do_not_serialize_on_occupancy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pooled seats are distinct trees; occupancy must not lock the project root."""
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, seats=2)
+    release = tmp_path / "release-both"
+    marker_a = tmp_path / "ready-a"
+    marker_b = tmp_path / "ready-b"
+
+    def worker(marker: Path) -> str:
+        return (
+            "import os, time\n"
+            "from pathlib import Path\n"
+            "os.fstat(int(os.environ['GOALFLIGHT_WORKTREE_LOCK_FD']))\n"
+            "os.fstat(int(os.environ['GOALFLIGHT_OCCUPANCY_LOCK_FD']))\n"
+            f"Path({str(marker)!r}).write_text(os.getcwd(), encoding='utf-8')\n"
+            f"release = Path({str(release)!r})\n"
+            "deadline = time.monotonic() + 20\n"
+            "while not release.exists():\n"
+            "    if time.monotonic() >= deadline:\n"
+            "        raise TimeoutError('release')\n"
+            "    time.sleep(0.05)\n"
+            "print('COMPLETE: wt-conc — ok', flush=True)\n"
+        )
+
+    pa = subprocess.Popen(
+        _dispatch_cmd(tmp_path, repo, "wt-conc-a", sys.executable, "-c", worker(marker_a)),
+        cwd=str(ROOT),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    pb = subprocess.Popen(
+        _dispatch_cmd(tmp_path, repo, "wt-conc-b", sys.executable, "-c", worker(marker_b)),
+        cwd=str(ROOT),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.time() + 20
+        while time.time() < deadline and not (marker_a.exists() and marker_b.exists()):
+            time.sleep(0.05)
+        assert marker_a.exists() and marker_b.exists(), (
+            "pooled launches did not overlap",
+            pa.poll(),
+            pb.poll(),
+        )
+        cwd_a = marker_a.read_text(encoding="utf-8").strip()
+        cwd_b = marker_b.read_text(encoding="utf-8").strip()
+        assert cwd_a != cwd_b, (cwd_a, cwd_b)
+        assert Path(cwd_a).name.startswith("wt-")
+        assert Path(cwd_b).name.startswith("wt-")
+        release.write_text("go", encoding="utf-8")
+        out_a, err_a = pa.communicate(timeout=30)
+        out_b, err_b = pb.communicate(timeout=30)
+    finally:
+        if pa.poll() is None:
+            pa.kill()
+            pa.wait(timeout=5)
+        if pb.poll() is None:
+            pb.kill()
+            pb.wait(timeout=5)
+    assert pa.returncode == 0, out_a + err_a
+    assert pb.returncode == 0, out_b + err_b
+    assert 64 not in {pa.returncode, pb.returncode}
 
 
 def test_raw_worker_process_cwd_is_the_leased_seat(
