@@ -29,9 +29,16 @@ Rules:
   death releases the seat without a registry, timeout, or reaper
 - the dispatch id written inside the lock file is diagnostic only; availability
   is decided exclusively by the live kernel lock, never by recorded metadata
+- acquire prepares each seat on a named branch `seat/<dispatch-id>` (never a
+  detached HEAD). Worker commits are therefore reachable after seat reuse.
+  `DISPATCH-START` / `DISPATCH-LAUNCHED` report `worktree_branch`.
 - acquire quarantines abandoned dirty work to
-  `goalflight/quarantine/wt-<N>-<UTC-time>`, then runs
-  `git checkout -f <base>` and `git clean -fd`; release only closes the lease
+  `goalflight/quarantine/wt-<N>-<UTC-time>`, then checks out
+  `seat/<dispatch-id>` at `<base>` and `git clean -fd`. It refuses to reset a
+  seat when HEAD is detached-and-ahead of other refs, when the branch it would
+  force-move uniquely holds commits, or when cleanliness cannot be determined;
+  the reason names exactly what would be lost. UNKNOWN retains. Release only
+  closes the lease
 - the pool is intentionally persistent; completed/failed seats are reused,
   not removed
 - disjoint write ownership in the prompt

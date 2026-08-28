@@ -51,6 +51,16 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- Pooled worktree seats check out `seat/<dispatch-id>` rather than a detached
+  HEAD, so worker commits stay reachable when the seat is reused.
+  `DISPATCH-START` / `DISPATCH-LAUNCHED` report `worktree_branch`. Acquire
+  refuses to reset a seat whose detached HEAD (or a branch it would
+  force-move) uniquely holds commits, or whose cleanliness cannot be
+  determined, and names what would be lost. UNKNOWN retains. Dirty
+  uncommitted files are still quarantined onto `goalflight/quarantine/...`.
+  The named seat branch is the save at terminal completion; no extra ref is
+  minted.
+
 - Drain `not_before` hold details now name the winning headroom source
   (probe vs recorded exhaustion) and its age, matching the usage EVIDENCE
   column (`winner: probe → exhausted (as of …, age …)`). The queue file is

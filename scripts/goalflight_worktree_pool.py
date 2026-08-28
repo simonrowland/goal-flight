@@ -39,7 +39,14 @@ OCCUPANCY_LOCK_NAME = "goalflight-worktree.lock"
 # as a worker cap.
 DEFAULT_WORKTREE_SEATS = 24
 WORKTREE_SEAT_PREFIX = "wt-"
+SEAT_BRANCH_PREFIX = "seat"
 QUARANTINE_REF_PREFIX = "goalflight/quarantine"
+
+# Three-state verdicts, same shape as goalflight_worktree_gc.py. UNKNOWN always
+# retains (refuses reset). Do not collapse "could not tell" into a green light.
+YES = "yes"
+NO = "no"
+UNKNOWN = "unknown"
 
 
 class WorktreeSeatError(RuntimeError):
@@ -48,6 +55,10 @@ class WorktreeSeatError(RuntimeError):
 
 class WorktreeSeatUnavailable(WorktreeSeatError):
     """Raised when every configured seat is held."""
+
+
+class WorktreeSeatResetRefused(WorktreeSeatError):
+    """Raised when resetting a free seat would lose unique or undetermined work."""
 
 
 class WorktreePathLockBusy(WorktreeSeatError):
@@ -107,11 +118,13 @@ class WorktreeSeatLease:
         dispatch_id: str,
         lock_file: TextIO,
         quarantine_branch: str | None,
+        branch: str,
     ) -> None:
         self.path = path
         self.seat_name = seat_name
         self.dispatch_id = dispatch_id
         self.quarantine_branch = quarantine_branch
+        self.branch = branch
         self._lock_file: TextIO | None = lock_file
 
     def fileno(self) -> int:
@@ -317,22 +330,48 @@ def _git(
     input_text: str | None = None,
     env: dict[str, str] | None = None,
 ) -> str:
-    result = subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        input=input_text,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        check=False,
-    )
+    result = _git_proc(cwd, *args, input_text=input_text, env=env)
+    if result is None:
+        raise WorktreeSeatError(f"git {' '.join(args)} could not run in {cwd}")
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise WorktreeSeatError(f"git {' '.join(args)} failed in {cwd}: {detail}")
     return result.stdout.strip()
+
+
+def _git_proc(
+    cwd: Path,
+    *args: str,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            input=input_text,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _condition(verdict: str, reason: str) -> dict[str, str]:
+    return {"verdict": verdict, "reason": reason}
+
+
+def seat_branch_name(dispatch_id: str) -> str:
+    """Return the named branch a seat for ``dispatch_id`` must be checked out on."""
+    raw = str(dispatch_id).strip()
+    if not raw:
+        raise WorktreeSeatError("dispatch id is empty; cannot name a seat branch")
+    return f"{SEAT_BRANCH_PREFIX}/{raw}"
 
 
 def _git_common_dir(cwd: Path) -> Path:
@@ -400,6 +439,238 @@ def _occupant_description(lock_file: TextIO, seat_name: str) -> str:
     pid = payload.get("pid")
     suffix = f" pid={pid}" if isinstance(pid, int) else ""
     return f"{seat_name}={dispatch_id}{suffix}"
+
+
+def _refnames(cwd: Path) -> tuple[list[str] | None, str]:
+    proc = _git_proc(cwd, "for-each-ref", "--format=%(refname)")
+    if proc is None:
+        return None, "git for-each-ref could not run"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+        return None, detail
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()], ""
+
+
+def check_reset_preserves_commits(
+    cwd: Path,
+    *,
+    start: str,
+    base_commit: str,
+    moving_ref: str | None,
+) -> dict[str, str]:
+    """YES if moving ``start`` to ``base_commit`` would not lose unique commits.
+
+    ``moving_ref`` is the full refname that ``checkout -B`` / ``worktree add -B``
+    will force-move. That ref is excluded from the keep-set. Detached HEAD
+    passes ``moving_ref=None``: nothing currently names those commits.
+    UNKNOWN retains — losing a commit is irreversible.
+    """
+    refs, err = _refnames(cwd)
+    if refs is None:
+        return _condition(
+            UNKNOWN,
+            f"cannot list refs ({err}); unique commits are unknown",
+        )
+    exclude = [base_commit]
+    for ref in refs:
+        if moving_ref and ref == moving_ref:
+            continue
+        exclude.append(ref)
+    proc = _git_proc(cwd, "rev-list", "--oneline", start, "--not", *exclude)
+    if proc is None:
+        return _condition(
+            UNKNOWN, "git rev-list could not run; unique commits are unknown"
+        )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+        return _condition(UNKNOWN, f"cannot enumerate unique commits ({detail})")
+    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        return _condition(YES, "no unique commits would become unreachable")
+    shown = ", ".join(lines[:8])
+    extra = f" (+{len(lines) - 8} more)" if len(lines) > 8 else ""
+    target = moving_ref or "detached HEAD"
+    return _condition(
+        NO,
+        f"{target} has commits not reachable from the new base or any other ref; "
+        f"reset would lose: {shown}{extra}",
+    )
+
+
+def check_seat_cleanliness(worktree_path: Path) -> dict[str, str]:
+    """YES clean / NO dirty / UNKNOWN. Same three-state as worktree GC check_clean."""
+    proc = _git_proc(
+        worktree_path, "status", "--porcelain=v1", "--untracked-files=all"
+    )
+    if proc is None:
+        return _condition(
+            UNKNOWN, "git status could not run, so cleanliness is unknown"
+        )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+        return _condition(
+            UNKNOWN, f"git status failed ({detail}), so cleanliness is unknown"
+        )
+    dirty = [line for line in proc.stdout.splitlines() if line.strip()]
+    if dirty:
+        return _condition(
+            NO,
+            f"worktree has uncommitted or untracked files ({len(dirty)} entries)",
+        )
+    return _condition(YES, "worktree is clean")
+
+
+def evaluate_seat_reset_safety(
+    worktree_path: Path,
+    *,
+    base_commit: str,
+    new_branch: str,
+) -> dict:
+    """Decide whether an existing seat may be reset onto ``new_branch`` at base.
+
+    Conjunction, same shape as ``goalflight_worktree_gc.classify``: every
+    conjunct that we cannot prove must retain. Unique commits (detached and
+    ahead, or a branch we would force-move) are a hard retain. Cleanliness
+    UNKNOWN is a hard retain. Dirty (NO) is not: acquire still quarantines
+    uncommitted files onto ``goalflight/quarantine/...`` before checkout, which
+    is the pool guarantee this helper must not replace.
+
+    Could share ``check_clean`` with GC: GC already imports this module, so
+    extracting cleanliness into a third module would be the cycle-free share.
+    Unique-commits-vs-other-refs is a different question than GC's
+    merged-into-integration, so that conjunct stays here.
+    """
+    abbrev_proc = _git_proc(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
+    if abbrev_proc is None or abbrev_proc.returncode != 0:
+        detail = "git rev-parse --abbrev-ref HEAD could not run"
+        if abbrev_proc is not None:
+            detail = (abbrev_proc.stderr or abbrev_proc.stdout or "").strip() or detail
+        return {
+            "decision": "retain",
+            "reason": f"current branch unknown ({detail}); refusing reset",
+            "conditions": {},
+        }
+    abbrev = abbrev_proc.stdout.strip() or "HEAD"
+    detached = abbrev == "HEAD"
+
+    head_proc = _git_proc(worktree_path, "rev-parse", "HEAD")
+    if head_proc is None or head_proc.returncode != 0:
+        detail = "cannot resolve HEAD"
+        if head_proc is not None:
+            detail = (head_proc.stderr or head_proc.stdout or "").strip() or detail
+        return {
+            "decision": "retain",
+            "reason": f"{detail}; refusing reset",
+            "conditions": {},
+        }
+    head = head_proc.stdout.strip()
+
+    if detached:
+        commits = check_reset_preserves_commits(
+            worktree_path, start=head, base_commit=base_commit, moving_ref=None
+        )
+    elif abbrev == new_branch:
+        commits = check_reset_preserves_commits(
+            worktree_path,
+            start=head,
+            base_commit=base_commit,
+            moving_ref=f"refs/heads/{new_branch}",
+        )
+    else:
+        commits = _condition(
+            YES,
+            f"branch {abbrev!r} remains after checkout of {new_branch!r}",
+        )
+
+    clean = check_seat_cleanliness(worktree_path)
+    conditions = {"commits_preserved": commits, "cleanliness": clean}
+    blockers: list[str] = []
+    if commits["verdict"] != YES:
+        blockers.append(commits["reason"])
+    if clean["verdict"] == UNKNOWN:
+        blockers.append(clean["reason"])
+    if blockers:
+        return {
+            "decision": "retain",
+            "reason": "; ".join(blockers),
+            "conditions": conditions,
+        }
+    return {
+        "decision": "reset",
+        "reason": "unique commits stay reachable; cleanliness is known",
+        "conditions": conditions,
+    }
+
+
+def _create_seat_worktree(
+    project_root: Path,
+    worktree_path: Path,
+    *,
+    branch: str,
+    base_commit: str,
+) -> None:
+    ref = f"refs/heads/{branch}"
+    exists = _git_proc(project_root, "show-ref", "--verify", "--quiet", ref)
+    if exists is None:
+        raise WorktreeSeatError(
+            f"cannot determine whether seat branch {branch} already exists; refusing add"
+        )
+    if exists.returncode not in (0, 1):
+        detail = (exists.stderr or exists.stdout or "").strip() or f"exit {exists.returncode}"
+        raise WorktreeSeatError(
+            f"cannot determine whether seat branch {branch} exists ({detail})"
+        )
+    if exists.returncode == 0:
+        commits = check_reset_preserves_commits(
+            project_root,
+            start=ref,
+            base_commit=base_commit,
+            moving_ref=ref,
+        )
+        if commits["verdict"] != YES:
+            raise WorktreeSeatResetRefused(
+                f"refusing to reset {branch}: {commits['reason']}"
+            )
+        _git(
+            project_root,
+            "worktree",
+            "add",
+            "-B",
+            branch,
+            str(worktree_path),
+            base_commit,
+        )
+        return
+    _git(
+        project_root,
+        "worktree",
+        "add",
+        "-b",
+        branch,
+        str(worktree_path),
+        base_commit,
+    )
+
+
+def _prepare_seat_checkout(
+    worktree_path: Path, *, branch: str, base_commit: str
+) -> None:
+    _git(worktree_path, "checkout", "-f", "-B", branch, base_commit)
+    _git(worktree_path, "clean", "-fd")
+
+
+def _assert_seat_on_named_branch(worktree_path: Path, *, seat_name: str, branch: str) -> str:
+    actual = _git(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
+    if actual == "HEAD":
+        raise WorktreeSeatError(
+            f"worktree seat {seat_name} is detached after prepare; "
+            "refusing to hand a detached HEAD to a worker"
+        )
+    if actual != branch:
+        raise WorktreeSeatError(
+            f"worktree seat {seat_name} checked out {actual!r}, expected {branch!r}"
+        )
+    return actual
 
 
 def _quarantine_dirty_worktree(
@@ -474,6 +745,7 @@ def acquire_worktree_seat(
     _verify_project_root(project_root)
     seat_limit = configured_worktree_seats()
     base_commit = _git(project_root, "rev-parse", "--verify", f"{base}^{{commit}}")
+    branch = seat_branch_name(dispatch_id)
 
     if managed_root is not None:
         managed_root = managed_root.expanduser()
@@ -516,6 +788,7 @@ def acquire_worktree_seat(
         # diagnostic metadata between that occupant's flock and metadata write.
         fcntl.flock(allocation_file.fileno(), fcntl.LOCK_EX)
         occupants: list[str] = []
+        refused: list[str] = []
         for slot in range(1, seat_limit + 1):
             seat_name = f"{WORKTREE_SEAT_PREFIX}{slot}"
             worktree_path = managed_root / seat_name
@@ -538,17 +811,25 @@ def acquire_worktree_seat(
                 prior_dispatch_id = str(
                     _lock_metadata(lock_file).get("dispatch_id") or "unknown-dispatch"
                 )
-                _write_occupant(lock_file, seat_name=seat_name, dispatch_id=dispatch_id)
-                if worktree_path.exists() or worktree_path.is_symlink():
+                existing = worktree_path.exists() or worktree_path.is_symlink()
+                if existing:
                     _verify_existing_seat(project_root, worktree_path)
-                else:
-                    _git(
+                    safety = evaluate_seat_reset_safety(
+                        worktree_path,
+                        base_commit=base_commit,
+                        new_branch=branch,
+                    )
+                    if safety["decision"] != "reset":
+                        refused.append(f"{seat_name}: {safety['reason']}")
+                        lock_file.close()
+                        continue
+                _write_occupant(lock_file, seat_name=seat_name, dispatch_id=dispatch_id)
+                if not existing:
+                    _create_seat_worktree(
                         project_root,
-                        "worktree",
-                        "add",
-                        "--detach",
-                        str(worktree_path),
-                        base_commit,
+                        worktree_path,
+                        branch=branch,
+                        base_commit=base_commit,
                     )
                     _verify_existing_seat(project_root, worktree_path)
 
@@ -557,8 +838,9 @@ def acquire_worktree_seat(
                     seat_name=seat_name,
                     abandoned_dispatch_id=prior_dispatch_id,
                 )
-                _git(worktree_path, "checkout", "-f", base_commit)
-                _git(worktree_path, "clean", "-fd")
+                _prepare_seat_checkout(
+                    worktree_path, branch=branch, base_commit=base_commit
+                )
                 remaining = _git(
                     worktree_path,
                     "status",
@@ -569,20 +851,38 @@ def acquire_worktree_seat(
                     raise WorktreeSeatError(
                         f"worktree seat {seat_name} is not clean after acquire-time reset"
                     )
+                actual_branch = _assert_seat_on_named_branch(
+                    worktree_path, seat_name=seat_name, branch=branch
+                )
                 return WorktreeSeatLease(
                     path=worktree_path,
                     seat_name=seat_name,
                     dispatch_id=dispatch_id,
                     lock_file=lock_file,
                     quarantine_branch=quarantine_branch,
+                    branch=actual_branch,
                 )
+            except WorktreeSeatResetRefused as exc:
+                refused.append(f"{seat_name}: {exc}")
+                lock_file.close()
+                continue
             except BaseException:
                 lock_file.close()
                 raise
 
-        detail = ", ".join(occupants)
+        held = ", ".join(occupants)
+        lost = "; ".join(refused)
+        if refused and not occupants:
+            raise WorktreeSeatResetRefused(
+                f"all {seat_limit} worktree seats would lose work on reset: {lost}"
+            )
+        if refused:
+            raise WorktreeSeatResetRefused(
+                f"all {seat_limit} worktree seats are unavailable: "
+                f"held: {held or 'none'}; refusing reset: {lost}"
+            )
         raise WorktreeSeatUnavailable(
-            f"all {seat_limit} worktree seats are held: {detail}"
+            f"all {seat_limit} worktree seats are held: {held}"
         )
     finally:
         allocation_file.close()
