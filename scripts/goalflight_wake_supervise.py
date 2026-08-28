@@ -805,9 +805,10 @@ class _RepeatGate:
 
     kind=next uses this so an unchanged idle frontier does not wake the
     controller every keepalive. Restart records use ``_RestartGate`` so a
-    crash loop at a fixed backoff does not flood the same channel and the
-    emitted copy still carries occurrence count. One instance per stream
-    (next); a changed key emits immediately.
+    crash loop at a fixed backoff does not flood the same channel: the
+    first copy still emits immediately and later copies collapse with an
+    occurrence count. One instance per stream (next); a changed key
+    emits immediately.
     """
 
     last_key: str | None = None
@@ -835,7 +836,15 @@ class _RestartGroup:
 
 
 def _restart_group_record(group: _RestartGroup) -> dict[str, object]:
-    """Stamp scale onto a collapsed restart without mutating the gate key."""
+    """Stamp scale onto a restart batch without mutating the gate key.
+
+    ``count`` is the number of child restarts this record represents.
+    Records do not overlap: the first copy of a key is one record with
+    ``count=1``, and a later collapse record counts only the copies held
+    after that first. Summing ``count`` across ``type=restart`` records
+    recovers the true restart total. ``window_s`` is the span of the
+    copies in this record (0 for a single immediate first copy).
+    """
     record = dict(group.record)
     record["count"] = group.count
     record["window_s"] = max(0.0, float(group.last_at) - float(group.first_at))
@@ -844,17 +853,20 @@ def _restart_group_record(group: _RestartGroup) -> dict[str, object]:
 
 @dataclass
 class _RestartGate:
-    """Hold identical restarts until the group closes; emit with count.
+    """Emit the first restart of a key immediately; collapse later copies.
 
-    Same key inside floor_s accumulates. A changed key flushes the previous
-    group so a new failure reason is not swallowed. floor_s <= 0 emits every
-    copy (tests and --chatty-adjacent zero-floor). The pending group also
-    flushes at supervisor exit and when the floor deadline wakes the loop,
-    so a collapse is never a contentless "this happened, some number of
-    times." One instance per slot label (unique kinds keep the kind name;
-    a backup pool is backup-1, backup-2, …).
+    The first note of a key is written at once (count=1, window_s=0).
+    Later identical keys inside floor_s accumulate as a pending group.
+    When the group closes (key change, floor, or supervisor exit), the
+    held copies emit as one record whose count is the number of
+    suppressed restarts — not including the already-emitted first.
+    Summing count across records recovers the true restart total.
+    floor_s <= 0 emits every copy. One instance per slot label (unique
+    kinds keep the kind name; a backup pool is backup-1, backup-2, …).
     """
 
+    last_key: str | None = None
+    window_start: float = field(default=-math.inf)
     pending: _RestartGroup | None = None
 
     def flush_at(self, floor_s: float) -> float | None:
@@ -862,7 +874,7 @@ class _RestartGate:
             return None
         if floor_s <= 0:
             return self.pending.first_at
-        return self.pending.first_at + floor_s
+        return self.window_start + floor_s
 
     def note(
         self,
@@ -873,35 +885,64 @@ class _RestartGate:
         floor_s: float,
     ) -> list[dict[str, object]]:
         emits: list[dict[str, object]] = []
-        pending = self.pending
-        if pending is not None and pending.key == key and floor_s > 0:
+        if (
+            floor_s > 0
+            and self.last_key == key
+            and now - self.window_start < floor_s
+        ):
+            pending = self.pending
+            if pending is None:
+                self.pending = _RestartGroup(
+                    key=key,
+                    record=record,
+                    count=1,
+                    first_at=now,
+                    last_at=now,
+                )
+            else:
+                pending.count += 1
+                pending.last_at = now
+                pending.record = record
+            return []
+        if floor_s > 0 and self.last_key == key and self.pending is not None:
+            # Same key at or past the floor: include this copy in the
+            # closing group so a straddle retry is counted once.
+            pending = self.pending
             pending.count += 1
             pending.last_at = now
             pending.record = record
-            if now - pending.first_at < floor_s:
-                return []
             emits.append(_restart_group_record(pending))
             self.pending = None
+            self.last_key = None
+            self.window_start = -math.inf
             return emits
-        if pending is not None:
-            emits.append(_restart_group_record(pending))
+        if self.pending is not None:
+            emits.append(_restart_group_record(self.pending))
             self.pending = None
-        group = _RestartGroup(
-            key=key,
-            record=record,
-            count=1,
-            first_at=now,
-            last_at=now,
+        emits.append(
+            _restart_group_record(
+                _RestartGroup(
+                    key=key,
+                    record=record,
+                    count=1,
+                    first_at=now,
+                    last_at=now,
+                )
+            )
         )
         if floor_s <= 0:
-            emits.append(_restart_group_record(group))
+            self.last_key = None
+            self.window_start = -math.inf
             return emits
-        self.pending = group
+        self.last_key = key
+        self.window_start = now
         return emits
 
     def flush(self) -> list[dict[str, object]]:
         pending = self.pending
         self.pending = None
+        self.last_key = None
+        self.window_start = -math.inf
         if pending is None:
             return []
         return [_restart_group_record(pending)]
