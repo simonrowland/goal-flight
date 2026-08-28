@@ -53,6 +53,10 @@ class WorktreeSeatUnavailable(WorktreeSeatError):
 class WorktreePathLockBusy(WorktreeSeatError):
     """Raised when the exclusive worktree-path lock is already held."""
 
+    def __init__(self, message: str, *, occupant_id: str | None = None) -> None:
+        super().__init__(message)
+        self.occupant_id = occupant_id
+
 
 class WorktreePathLockUnknown(WorktreeSeatError):
     """Raised when the worktree-path lock cannot be evaluated."""
@@ -670,7 +674,8 @@ def try_acquire_worktree_path_lock(target: Path, dispatch_id: str) -> WorktreePa
         raise WorktreePathLockBusy(
             f"worktree {resolved} is already owned by non-terminal dispatch "
             f"{occupant_id}{held}; a second writer would share one filesystem "
-            "tree with no merge discipline"
+            "tree with no merge discipline",
+            occupant_id=occupant_id,
         ) from exc
     except OSError as exc:
         lock_file.close()

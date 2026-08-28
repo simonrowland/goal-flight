@@ -2906,6 +2906,26 @@ def _bind_worktree_occupancy_lock(args, lock) -> None:
     os.environ[goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV] = str(fd)
 
 
+def _release_worktree_occupancy_lock(args) -> None:
+    """Drop this process's occupancy fd and the env name that pointed at it.
+
+    Submit holds the kernel lock only while the submit process is writing the
+    queue row. Leaving ``GOALFLIGHT_OCCUPANCY_LOCK_FD`` set after that fd is
+    closed makes the next in-process launch treat occupancy as unknown.
+    """
+    lock = getattr(args, "_worktree_occupancy_lock", None)
+    fd: int | None = None
+    if lock is not None:
+        with contextlib.suppress(Exception):
+            fd = lock.fileno()
+        with contextlib.suppress(Exception):
+            lock.release()
+        args._worktree_occupancy_lock = None
+    raw = os.environ.get(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, "").strip()
+    if raw and (fd is None or raw == str(fd)):
+        os.environ.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
+
+
 def _inherited_occupancy_lock():
     raw = os.environ.get(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, "").strip()
     if not raw:
@@ -2996,6 +3016,11 @@ def _prepare_attempt_worktree_occupancy(args) -> str | None:
                 target, dispatch_id
             )
         except goalflight_worktree_pool.WorktreePathLockBusy as exc:
+            own = str(getattr(args, "dispatch_id", None) or "")
+            if own and getattr(exc, "occupant_id", None) == own:
+                # Same dispatch already occupies the tree (duplicate submit,
+                # opportunistic drain). Not a second writer.
+                return None
             lock_busy = str(exc)
         except goalflight_worktree_pool.WorktreePathLockUnknown as exc:
             lock_unknown = str(exc)
@@ -7525,6 +7550,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
         return 1
     if duplicate_active:
         print(f"STATUS: queued already {args.dispatch_id}")
+        _release_worktree_occupancy_lock(args)
         _drain_on_submit(args, queue_path)
         return 0
     print(
@@ -7541,6 +7567,7 @@ def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
         ),
         flush=True,
     )
+    _release_worktree_occupancy_lock(args)
     _drain_on_submit(args, queue_path)
     return 0
 
@@ -13022,10 +13049,11 @@ def _drain_queue_once(args) -> dict:
                         claim=claim,
                     )
                 else:
+                    drain_env = _sidecar_env(os.environ.copy())
                     proc = subprocess.run(
                         [sys.executable, str(Path(__file__).resolve()), *launch_argv],
                         cwd=str(Path(entry.get("process_cwd") or entry.get("project_root") or Path.cwd()).resolve()),
-                        env=os.environ.copy(),
+                        env=drain_env,
                         text=True,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
@@ -14769,7 +14797,10 @@ def main(argv: list[str] | None = None) -> int:
             if not goalflight_compat.is_windows():
                 _validate_claude_auth_before_attempt(args, account_env)
             if args.submit:
-                return _submit_dispatch(args, raw, base=base)
+                try:
+                    return _submit_dispatch(args, raw, base=base)
+                finally:
+                    _release_worktree_occupancy_lock(args)
             if (
                 not args.foreground
                 and not getattr(args, "launch_detached", False)
@@ -14866,7 +14897,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64
     if args.submit:
-        return _submit_dispatch(args, raw, base=base)
+        try:
+            return _submit_dispatch(args, raw, base=base)
+        finally:
+            _release_worktree_occupancy_lock(args)
     tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
 
