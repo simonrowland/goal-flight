@@ -719,7 +719,63 @@ def test_cwdless_dead_identity_does_not_block() -> None:
 
 
 def test_matching_project_root_without_cwd_does_not_occupy() -> None:
-    """project_root is not a path claim; it does not substitute for worker_cwd."""
+    """Live identity + matching project_root + no cwd is occupancy UNKNOWN.
+
+    project_root is not a path claim, but this is write-capable admission:
+    a live nameless row in this repo must not be rendered as "does not
+    occupy this path". --occupied-worktree-forced remains the hatch.
+    """
+    with _temp_dir() as td:
+        tmp = Path(td)
+        tree = tmp / "tree"
+        tree.mkdir()
+        env = _env(tmp)
+        identity = ledger.process_identity(os.getpid())
+        assert identity is not None, os.getpid()
+        _write_runs_record(
+            tmp,
+            "root-only",
+            worker_cwd=None,
+            worker_pid=os.getpid(),
+            worker_identity=identity,
+            project_root=str(tree.resolve()),
+        )
+        refused = _run(
+            _dispatch_cmd(
+                tmp, tree, "root-only-writer", _quick_writer("root-only-writer")
+            ),
+            env,
+        )
+        assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
+        assert "occupancy" in refused.stderr and "unknown" in refused.stderr, refused.stderr
+        assert "root-only" in refused.stderr, refused.stderr
+        assert "names no worker cwd" in refused.stderr, refused.stderr
+        assert "project_root" in refused.stderr, refused.stderr
+        assert "--occupied-worktree-forced" in refused.stderr, refused.stderr
+        assert not _ledger_record(tmp, "root-only-writer"), refused.stderr
+
+        forced = _run(
+            _dispatch_cmd(
+                tmp,
+                tree,
+                "root-only-writer",
+                _quick_writer("root-only-writer"),
+                extra=["--occupied-worktree-forced"],
+                foreground=True,
+            ),
+            env,
+        )
+        assert forced.returncode == 0, (forced.stdout, forced.stderr)
+        assert "DISPATCH-END" in forced.stdout, forced.stdout
+        assert "occupied-worktree-forced accepted" in forced.stderr, forced.stderr
+
+
+def test_matching_project_root_without_cwd_skips_when_identity_not_live() -> None:
+    """No live identity + matching project_root is still a skip, not a refuse.
+
+    Proven-dead / missing identity is the fleet-outage class: reconcile
+    closes those. project_root alone is not a path claim.
+    """
     with _temp_dir() as td:
         tmp = Path(td)
         tree = tmp / "tree"
@@ -727,21 +783,26 @@ def test_matching_project_root_without_cwd_does_not_occupy() -> None:
         env = _env(tmp)
         _write_runs_record(
             tmp,
-            "root-only",
+            "root-only-nopid",
             worker_cwd=None,
             project_root=str(tree.resolve()),
         )
         launched = _run(
             _dispatch_cmd(
-                tmp, tree, "root-only-writer", _quick_writer("root-only-writer"), foreground=True
+                tmp,
+                tree,
+                "root-only-nopid-writer",
+                _quick_writer("root-only-nopid-writer"),
+                foreground=True,
             ),
             env,
         )
         assert launched.returncode == 0, (launched.stdout, launched.stderr)
         assert "DISPATCH-END" in launched.stdout, launched.stdout
         assert "occupancy" not in launched.stderr or "unknown" not in launched.stderr, launched.stderr
-        assert "root-only" in launched.stderr, launched.stderr
+        assert "root-only-nopid" in launched.stderr, launched.stderr
         assert "names no worker cwd" in launched.stderr, launched.stderr
+        assert "occupancy skip" in launched.stderr, launched.stderr
 
 
 def test_different_project_root_with_matching_cwd_still_occupies() -> None:
@@ -787,6 +848,129 @@ def test_cwdless_field_with_argv_cwd_matching_target_still_blocks() -> None:
         assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
         assert "argv-cwd" in refused.stderr, refused.stderr
         assert not _ledger_record(tmp, "argv-second"), refused.stderr
+        assert "occupancy skip" not in refused.stderr, refused.stderr
+
+
+def test_argv_cwd_and_request_cwd_disagree_occupy_both_trees() -> None:
+    """No top-level worker_cwd, but argv --cwd and request.cwd both exist.
+
+    Live measured shape: missing worker_cwd is not nameless when argv or
+    request still names a path. Disagreeing sources that both exist occupy
+    every named tree (refuse on a superset).
+    """
+    with _temp_dir() as td:
+        tmp = Path(td)
+        tree_a = tmp / "tree-a"
+        tree_b = tmp / "tree-b"
+        tree_a.mkdir()
+        tree_b.mkdir()
+        env = _env(tmp)
+        _write_runs_record(
+            tmp,
+            "split-cwd",
+            state="queued",
+            worker_cwd=None,
+            dispatch_argv=["--cwd", str(tree_a.resolve()), "--agent", "test"],
+            request={"cwd": str(tree_b.resolve())},
+            project_root=str(tree_b.resolve()),
+        )
+        refused_a = _run(
+            _dispatch_cmd(tmp, tree_a, "split-a", _quick_writer("split-a")), env
+        )
+        assert refused_a.returncode == 64, (
+            refused_a.returncode, refused_a.stdout, refused_a.stderr
+        )
+        assert "split-cwd" in refused_a.stderr, refused_a.stderr
+        assert not _ledger_record(tmp, "split-a"), refused_a.stderr
+
+        refused_b = _run(
+            _dispatch_cmd(tmp, tree_b, "split-b", _quick_writer("split-b")), env
+        )
+        assert refused_b.returncode == 64, (
+            refused_b.returncode, refused_b.stdout, refused_b.stderr
+        )
+        assert "split-cwd" in refused_b.stderr, refused_b.stderr
+        assert not _ledger_record(tmp, "split-b"), refused_b.stderr
+
+
+def test_relative_worker_cwd_resolved_against_project_root_occupies() -> None:
+    """Relative worker_cwd is not nameless when project_root can place it."""
+    with _temp_dir() as td:
+        tmp = Path(td)
+        parent = tmp / "repo"
+        tree = parent / "tree"
+        parent.mkdir()
+        tree.mkdir()
+        env = _env(tmp)
+        _write_runs_record(
+            tmp,
+            "rel-cwd",
+            state="queued",
+            worker_cwd="tree",
+            project_root=str(parent.resolve()),
+        )
+        refused = _run(
+            _dispatch_cmd(tmp, tree, "rel-second", _quick_writer("rel-second")), env
+        )
+        assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
+        assert "rel-cwd" in refused.stderr, refused.stderr
+        assert not _ledger_record(tmp, "rel-second"), refused.stderr
+
+
+def test_cwd_after_double_dash_in_argv_is_path_evidence() -> None:
+    """--cwd recorded after -- still names the tree; the row is not nameless."""
+    with _temp_dir() as td:
+        tmp = Path(td)
+        tree = tmp / "tree"
+        tree.mkdir()
+        env = _env(tmp)
+        _write_runs_record(
+            tmp,
+            "argv-after",
+            state="queued",
+            worker_cwd=None,
+            dispatch_argv=["--agent", "test", "--", "--cwd", str(tree.resolve())],
+        )
+        refused = _run(
+            _dispatch_cmd(tmp, tree, "argv-after-second", _quick_writer("argv-after-second")),
+            env,
+        )
+        assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
+        assert "argv-after" in refused.stderr, refused.stderr
+        assert not _ledger_record(tmp, "argv-after-second"), refused.stderr
+
+
+def test_live_cwdless_matching_project_root_second_writer_is_refused() -> None:
+    """Item-4 hole: planted live nameless matching-root row refuses a writer.
+
+    Concurrent empty-ledger dual-launch (0 extra writes) does not cover a
+    pre-existing cwd-less live identity in this project.
+    """
+    with _temp_dir() as td:
+        tmp = Path(td)
+        tree = tmp / "tree"
+        tree.mkdir()
+        env = _env(tmp)
+        identity = ledger.process_identity(os.getpid())
+        assert identity is not None, os.getpid()
+        _write_runs_record(
+            tmp,
+            "live-cwdless",
+            worker_cwd=None,
+            worker_pid=os.getpid(),
+            worker_identity=identity,
+            project_root=str(tree.resolve()),
+        )
+        refused = _run(
+            _dispatch_cmd(
+                tmp, tree, "after-live-cwdless", _quick_writer("after-live-cwdless")
+            ),
+            env,
+        )
+        assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
+        assert "live-cwdless" in refused.stderr, refused.stderr
+        assert "occupancy" in refused.stderr and "unknown" in refused.stderr, refused.stderr
+        assert not _ledger_record(tmp, "after-live-cwdless"), refused.stderr
 
 
 def test_synthetic_queued_record_with_target_cwd_still_blocks() -> None:
@@ -1393,8 +1577,13 @@ if __name__ == "__main__":
     test_cwdless_nonterminal_record_does_not_block_unrelated_worktree()
     test_cwdless_dead_identity_does_not_block()
     test_matching_project_root_without_cwd_does_not_occupy()
+    test_matching_project_root_without_cwd_skips_when_identity_not_live()
     test_different_project_root_with_matching_cwd_still_occupies()
     test_cwdless_field_with_argv_cwd_matching_target_still_blocks()
+    test_argv_cwd_and_request_cwd_disagree_occupy_both_trees()
+    test_relative_worker_cwd_resolved_against_project_root_occupies()
+    test_cwd_after_double_dash_in_argv_is_path_evidence()
+    test_live_cwdless_matching_project_root_second_writer_is_refused()
     test_synthetic_queued_record_with_target_cwd_still_blocks()
     test_submit_into_occupied_tree_is_refused()
     test_preset_bash_writer_refused_into_occupied_worktree()

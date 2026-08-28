@@ -2816,14 +2816,177 @@ def _same_worker_tree(record_cwd: object, target: Path) -> bool:
     return bool(candidate) and candidate == os.path.realpath(str(target))
 
 
+def _occupancy_option_values(argv: list[str], flag: str) -> list[str]:
+    """Every ``--flag`` / ``--flag=`` value in argv, including after ``--``.
+
+    Occupancy has to see the path the worker received even when ``--cwd`` was
+    recorded after the remainder split. Admission refuses a superset; missing
+    a value is the bug.
+    """
+    prefix = flag + "="
+    values: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == flag:
+            if index + 1 < len(argv):
+                nxt = argv[index + 1]
+                if nxt and not nxt.startswith("-"):
+                    values.append(nxt)
+                    index += 2
+                    continue
+            index += 1
+            continue
+        if token.startswith(prefix):
+            values.append(token[len(prefix) :])
+        index += 1
+    return values
+
+
+def _occupancy_argv_from_record(record: dict) -> list[str]:
+    """dispatch_argv from any of the shapes a queue/ledger row actually stores."""
+    envelope = (
+        record.get("request_envelope")
+        if isinstance(record.get("request_envelope"), dict)
+        else {}
+    )
+    request = record.get("request") if isinstance(record.get("request"), dict) else {}
+    env_request = (
+        envelope.get("request") if isinstance(envelope.get("request"), dict) else {}
+    )
+    for blob in (
+        record.get("dispatch_argv"),
+        envelope.get("dispatch_argv"),
+        request.get("dispatch_argv"),
+        env_request.get("dispatch_argv"),
+    ):
+        if isinstance(blob, list) and blob:
+            return [str(part) for part in blob]
+        if isinstance(blob, str) and blob.strip():
+            try:
+                return shlex.split(blob)
+            except ValueError:
+                return blob.split()
+    return []
+
+
+def _occupancy_cwd_raw_values(record: dict) -> list[str]:
+    """Raw cwd strings from worker_cwd, dispatch_argv --cwd, and request.cwd.
+
+    A row is nameless only when every source is absent or unusable. The three
+    can disagree; occupancy occupies every path they resolve to.
+    """
+    values: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: object) -> None:
+        if raw is None:
+            return
+        text = str(raw).strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        values.append(text)
+
+    add(record.get("worker_cwd"))
+    for token in _occupancy_option_values(
+        _occupancy_argv_from_record(record), "--cwd"
+    ):
+        add(token)
+    envelope = (
+        record.get("request_envelope")
+        if isinstance(record.get("request_envelope"), dict)
+        else {}
+    )
+    env_request = (
+        envelope.get("request") if isinstance(envelope.get("request"), dict) else {}
+    )
+    request = record.get("request") if isinstance(record.get("request"), dict) else {}
+    add(env_request.get("cwd"))
+    add(request.get("cwd"))
+    return values
+
+
+def _resolve_occupancy_cwd(raw: str, project_root: object) -> Path | None:
+    """Resolve a recorded cwd; relative strings join ``project_root`` first."""
+    text = str(raw).strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        root = (
+            str(project_root).strip()
+            if isinstance(project_root, str)
+            else ""
+        )
+        if not root:
+            return None
+        path = Path(root).expanduser() / path
+    try:
+        return path.resolve(strict=False)
+    except (OSError, ValueError):
+        return None
+
+
+def _occupancy_paths_from_record(record: dict) -> list[Path]:
+    """Every cwd the record can name, for admission.
+
+    Relative results are resolved against ``project_root``. Duplicate realpaths
+    collapse. An empty list means the row is nameless.
+    """
+    root = record.get("project_root")
+    found: list[Path] = []
+    seen: set[str] = set()
+    for raw in _occupancy_cwd_raw_values(record):
+        resolved = _resolve_occupancy_cwd(raw, root)
+        if resolved is None:
+            continue
+        try:
+            key = os.path.realpath(str(resolved))
+        except (OSError, ValueError):
+            continue
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        found.append(resolved)
+    return found
+
+
+def _record_project_root_matches_target(record: dict, target: Path) -> bool:
+    """True when the record's project_root is this tree's repo (not host-wide)."""
+    raw = record.get("project_root")
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    try:
+        recorded = os.path.realpath(str(Path(raw.strip()).expanduser()))
+        target_real = os.path.realpath(str(target))
+    except (OSError, ValueError):
+        return False
+    if not recorded or not target_real:
+        return False
+    if recorded == target_real:
+        return True
+    try:
+        rec_root = os.path.realpath(
+            str(goalflight_task.resolve_project_root(raw))
+        )
+        tgt_root = os.path.realpath(
+            str(goalflight_task.resolve_project_root(str(target)))
+        )
+    except (OSError, ValueError):
+        return False
+    return bool(rec_root) and rec_root == tgt_root
+
+
 def _cwdless_nonterminal_warning(record: dict) -> str:
     """Operator-facing line for a readable non-terminal row that names no path.
 
     Surfaces on stderr of ``goalflight_dispatch`` (the launch operator, and
     drain which runs even when launched:0). Drain JSON ``attention`` carries
     the same dispatch id under ``cwdless_nonterminal`` for the controller
-    reading the DRAIN line. Skipping is still correct; the warning must not
-    become occupancy UNKNOWN.
+    reading the DRAIN line. Used on the skip path (dead / other-project
+    nameless rows). A live nameless row that shares this project_root is
+    occupancy UNKNOWN of the target, not a skip.
     """
     dispatch_id = str(record.get("dispatch_id") or record.get("path") or "unknown")
     state = str(record.get("state") or "running")
@@ -2858,7 +3021,7 @@ def _iter_cwdless_nonterminal_records(records, *, host: str | None = None):
         record_host = record.get("hostname")
         if isinstance(record_host, str) and record_host and record_host != host:
             continue
-        if _resume_cwd_from_record(record) is not None:
+        if _occupancy_paths_from_record(record):
             continue
         yield record
 
@@ -2873,19 +3036,25 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
     state of a named occupant so a freshly acquired kernel lock can tell a
     queued owner (ledger-only claim) from a stale running row after SIGKILL.
 
-    The predicate selects records that can be tied to THIS path. A readable
-    record with no ``worker_cwd`` and no ``--cwd`` in ``dispatch_argv`` names
-    no tree: it is a bookkeeping defect, not occupancy of the target, whether
-    the recorded pid is live, missing, or gone (pid + start_token; never
-    pgrep). The skip does not gate, but it is not silent: stderr WARNING
-    names the dispatch id and state (launch operator / drain sees it), and
-    drain JSON ``attention`` lists ``cwdless_nonterminal`` so a periodic
-    drain with launched:0 still surfaces the ghost. ``project_root`` is
-    never a path claim -- linked/shared worktrees and mis-recorded roots
-    mean a matching ``worker_cwd`` still occupies when the root differs,
-    and a matching root without a cwd still names no tree. Unreadable or
-    unlistable records remain occupancy UNKNOWN: they might name this path,
-    so the gate still refuses rather than reading as free.
+    The predicate selects records that can be tied to THIS path. Cwd is
+    taken from ``worker_cwd``, ``dispatch_argv --cwd`` (including after
+    ``--``), and ``request.cwd``; a relative result is resolved against
+    ``project_root``. A row is nameless only when all three are absent or
+    unusable. Disagreeing sources that both resolve occupy every named
+    path (refuse on a superset).
+
+    A nameless non-terminal row is not occupancy of a specific tree, but
+    this is a write-capable admission site: unknown must not be rendered
+    as "does not occupy this path". Split on identity liveness (pid +
+    start_token; never pgrep): proven-dead / no live identity skip+warn
+    (reconcile already closes those); live identity on this host whose
+    ``project_root`` matches the target tree's repo is occupancy UNKNOWN
+    of this project (refuse; ``--occupied-worktree-forced`` is the hatch);
+    missing or other ``project_root`` skip+warn (cannot be this repo).
+    ``project_root`` is never itself a path claim -- a matching
+    ``worker_cwd`` still occupies when the root differs. Unreadable or
+    unlistable records remain occupancy UNKNOWN: they might name this
+    path, so the gate still refuses rather than reading as free.
     """
     target = _worker_cwd(args)
     try:
@@ -2920,14 +3089,28 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
         record_host = record.get("hostname")
         if isinstance(record_host, str) and record_host and record_host != host:
             continue  # recorded by a dispatch launched on another machine
-        record_cwd = _resume_cwd_from_record(record)
-        if record_cwd is None:
-            # Readable, but tied to no path. Do not treat "owns an unknown
-            # path" as "might own this path". Skipping is correct; silence
-            # is not — this is how a dead cwd-less row sat for days.
-            _warn_cwdless_nonterminal(record)
+        occupancy_paths = _occupancy_paths_from_record(record)
+        if not occupancy_paths:
+            # Nameless after every cwd source. Write admission must not
+            # treat "cannot name the path" as "does not occupy this path".
+            liveness, _liveness_reason = goalflight_ledger.worker_identity_liveness(
+                record
+            )
+            if liveness != "live":
+                _warn_cwdless_nonterminal(record)
+                continue
+            if _record_declared_read_only(record):
+                _warn_cwdless_nonterminal(record)
+                continue
+            if not _record_project_root_matches_target(record, target):
+                _warn_cwdless_nonterminal(record)
+                continue
+            unknown.append(
+                f"live dispatch {record_id} (state={state or 'running'}) "
+                "names no worker cwd and shares this project_root"
+            )
             continue
-        if not _same_worker_tree(record_cwd, target):
+        if not any(_same_worker_tree(path, target) for path in occupancy_paths):
             continue
         if _record_declared_read_only(record):
             continue  # a reviewer shares the tree legitimately; it is not a writer
