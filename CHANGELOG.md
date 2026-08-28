@@ -72,6 +72,21 @@ incremented when meaningful skill behaviour changes.
   and JSON payload report `created` / `relocated` / `retained` with
   `retained_by_controller` counts so a stable file total cannot hide a
   composition change.
+- Requeue intent lifecycle: a retry now carries a terminal disposition
+  (`satisfied` / `abandoned` / `expired`). Regeneration stops when a later
+  dispatch for the same task_ids is complete, when the intent is older
+  than 24h, or after 3 lodges. The queue entry keeps the original
+  `created_at` and surfaces `requeue_attempt`. UNKNOWN timestamps,
+  unlistable ledgers, and unlinked work retain the intent.
+  `ledger cancel-requeue` is the sanctioned abandon path.
+
+### Changed
+
+- `goalflight_ledger.py finish --terminal-state` on an already-terminal row
+  refuses with a non-zero exit and names the current state when the
+  requested state differs. Same-state retries stay quiet (`idempotent:
+  true`). A retry id with no ledger row now names the base dispatch to
+  act on instead of a bare `missing_dispatch`.
 
 - Drain `not_before` hold details now name the winning headroom source
   (probe vs recorded exhaustion) and its age, matching the usage EVIDENCE
