@@ -880,11 +880,14 @@ def _decorate_trace_status(record: dict) -> dict:
         out["liveness_state"] = "running_via_trace"
     if sidecar.get("state") in {"long_running", "long_running_review"}:
         out["trace_attention_state"] = sidecar["state"]
+    for key in ("wedge_verdict", "wedge_status_line", "wedge_unknown_reason", "wedge_socket_state"):
+        if key in sidecar:
+            out[key] = sidecar[key]
     if sidecar.get("state") in {"worker_stalled_candidate", "worker_wedged"}:
         # Live salvage CANDIDATE: process still exists. Overlay so a
         # controller can distinguish "maybe stuck, tree may hold finished
         # work" from worker_dead without terminalizing the ledger row.
-        # Not a verdict: remote-wait workers match this signature while healthy.
+        # wedge_verdict is the three-state word; this state stays non-terminal.
         out["state"] = "worker_stalled_candidate"
         out["liveness_state"] = "worker_stalled_candidate"
         evidence = sidecar.get("wedge_evidence")
@@ -1672,6 +1675,12 @@ def _dispatch_cells(record: dict) -> str:
     resume = _resume_hint(record)
     if resume:
         cells += f" | {resume}"
+    verdict = record.get("wedge_verdict")
+    if verdict in {"wedged", "UNKNOWN"}:
+        cells += f" | {verdict}"
+        reason = record.get("wedge_unknown_reason")
+        if isinstance(reason, str) and reason:
+            cells += f" ({reason})"
     return cells
 
 
@@ -2954,7 +2963,11 @@ def main(argv: list[str] | None = None) -> int:
         if record is None:
             print(f"{args.dispatch}  unknown (no record for this scope; try --all-projects)")
             return 2
-        print(f"{args.dispatch}  {_dispatch_cells(record)}  {record.get('status_path') or '-'}")
+        wedge_line = record.get("wedge_status_line")
+        if isinstance(wedge_line, str) and wedge_line.strip():
+            print(wedge_line)
+        else:
+            print(f"{args.dispatch}  {_dispatch_cells(record)}  {record.get('status_path') or '-'}")
         return 0
 
     payload["milestone"] = _milestone_payload(project_root)
