@@ -252,6 +252,19 @@ def load_states(path: Path = STATE_PATH) -> dict | None:
     return document
 
 
+def _entry_is_auth_failure(entry: object) -> bool:
+    """True when a cached probe recorded an auth failure, not headroom.
+
+    A 401 is not a dead credential (see module docstring). Serving that
+    cached verdict for the rest of the TTL is how a re-authenticated host
+    kept rendering as needs-login while a live probe succeeded immediately.
+    """
+    if not isinstance(entry, dict) or entry.get("ok"):
+        return False
+    error = str(entry.get("error") or "").lower()
+    return "401" in error or "auth" in error
+
+
 def states_are_fresh(document: dict | None, *, now: float | None = None) -> bool:
     if not document:
         return False
@@ -261,7 +274,14 @@ def states_are_fresh(document: dict | None, *, now: float | None = None) -> bool
     age = (_now() if now is None else now) - float(updated_at)
     # A timestamp from the future means a clock moved; treat it as stale rather
     # than trusting it forever.
-    return 0 <= age <= STATE_TTL_S
+    if not (0 <= age <= STATE_TTL_S):
+        return False
+    seats = document.get("seats")
+    if isinstance(seats, dict) and any(
+        _entry_is_auth_failure(entry) for entry in seats.values()
+    ):
+        return False
+    return True
 
 
 def refresh_states(
@@ -397,8 +417,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
-    document = refresh_states() if args.refresh else (load_states() or {})
-    if not document:
+    document = load_states() or {}
+    if args.refresh or not states_are_fresh(document):
         document = refresh_states()
     selected = select_seat(allow_refresh=False)
 

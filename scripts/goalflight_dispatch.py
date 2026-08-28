@@ -2816,6 +2816,216 @@ def _same_worker_tree(record_cwd: object, target: Path) -> bool:
     return bool(candidate) and candidate == os.path.realpath(str(target))
 
 
+def _occupancy_option_values(argv: list[str], flag: str) -> list[str]:
+    """Every ``--flag`` / ``--flag=`` value in argv, including after ``--``.
+
+    Occupancy has to see the path the worker received even when ``--cwd`` was
+    recorded after the remainder split. Admission refuses a superset; missing
+    a value is the bug.
+    """
+    prefix = flag + "="
+    values: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == flag:
+            if index + 1 < len(argv):
+                nxt = argv[index + 1]
+                if nxt and not nxt.startswith("-"):
+                    values.append(nxt)
+                    index += 2
+                    continue
+            index += 1
+            continue
+        if token.startswith(prefix):
+            values.append(token[len(prefix) :])
+        index += 1
+    return values
+
+
+def _occupancy_argv_from_record(record: dict) -> list[str]:
+    """dispatch_argv from any of the shapes a queue/ledger row actually stores."""
+    envelope = (
+        record.get("request_envelope")
+        if isinstance(record.get("request_envelope"), dict)
+        else {}
+    )
+    request = record.get("request") if isinstance(record.get("request"), dict) else {}
+    env_request = (
+        envelope.get("request") if isinstance(envelope.get("request"), dict) else {}
+    )
+    for blob in (
+        record.get("dispatch_argv"),
+        envelope.get("dispatch_argv"),
+        request.get("dispatch_argv"),
+        env_request.get("dispatch_argv"),
+    ):
+        if isinstance(blob, list) and blob:
+            return [str(part) for part in blob]
+        if isinstance(blob, str) and blob.strip():
+            try:
+                return shlex.split(blob)
+            except ValueError:
+                return blob.split()
+    return []
+
+
+def _occupancy_cwd_raw_values(record: dict) -> list[str]:
+    """Raw cwd strings from worker_cwd, dispatch_argv --cwd, and request.cwd.
+
+    A row is nameless only when every source is absent or unusable. The three
+    can disagree; occupancy occupies every path they resolve to.
+    """
+    values: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: object) -> None:
+        if raw is None:
+            return
+        text = str(raw).strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        values.append(text)
+
+    add(record.get("worker_cwd"))
+    for token in _occupancy_option_values(
+        _occupancy_argv_from_record(record), "--cwd"
+    ):
+        add(token)
+    envelope = (
+        record.get("request_envelope")
+        if isinstance(record.get("request_envelope"), dict)
+        else {}
+    )
+    env_request = (
+        envelope.get("request") if isinstance(envelope.get("request"), dict) else {}
+    )
+    request = record.get("request") if isinstance(record.get("request"), dict) else {}
+    add(env_request.get("cwd"))
+    add(request.get("cwd"))
+    return values
+
+
+def _resolve_occupancy_cwd(raw: str, project_root: object) -> Path | None:
+    """Resolve a recorded cwd; relative strings join ``project_root`` first."""
+    text = str(raw).strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        root = (
+            str(project_root).strip()
+            if isinstance(project_root, str)
+            else ""
+        )
+        if not root:
+            return None
+        path = Path(root).expanduser() / path
+    try:
+        return path.resolve(strict=False)
+    except (OSError, ValueError):
+        return None
+
+
+def _occupancy_paths_from_record(record: dict) -> list[Path]:
+    """Every cwd the record can name, for admission.
+
+    Relative results are resolved against ``project_root``. Duplicate realpaths
+    collapse. An empty list means the row is nameless.
+    """
+    root = record.get("project_root")
+    found: list[Path] = []
+    seen: set[str] = set()
+    for raw in _occupancy_cwd_raw_values(record):
+        resolved = _resolve_occupancy_cwd(raw, root)
+        if resolved is None:
+            continue
+        try:
+            key = os.path.realpath(str(resolved))
+        except (OSError, ValueError):
+            continue
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        found.append(resolved)
+    return found
+
+
+def _record_project_root_matches_target(record: dict, target: Path) -> bool:
+    """True when the record's project_root is this tree's repo (not host-wide)."""
+    raw = record.get("project_root")
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    try:
+        recorded = os.path.realpath(str(Path(raw.strip()).expanduser()))
+        target_real = os.path.realpath(str(target))
+    except (OSError, ValueError):
+        return False
+    if not recorded or not target_real:
+        return False
+    if recorded == target_real:
+        return True
+    try:
+        rec_root = os.path.realpath(
+            str(goalflight_task.resolve_project_root(raw))
+        )
+        tgt_root = os.path.realpath(
+            str(goalflight_task.resolve_project_root(str(target)))
+        )
+    except (OSError, ValueError):
+        return False
+    return bool(rec_root) and rec_root == tgt_root
+
+
+def _cwdless_nonterminal_warning(record: dict) -> str:
+    """Operator-facing line for a readable non-terminal row that names no path.
+
+    Surfaces on stderr of ``goalflight_dispatch`` (the launch operator, and
+    drain which runs even when launched:0). Drain JSON ``attention`` carries
+    the same dispatch id under ``cwdless_nonterminal`` for the controller
+    reading the DRAIN line. Used on the skip path (dead / other-project
+    nameless rows). A live nameless row that shares this project_root is
+    occupancy UNKNOWN of the target, not a skip.
+    """
+    dispatch_id = str(record.get("dispatch_id") or record.get("path") or "unknown")
+    state = str(record.get("state") or "running")
+    return (
+        f"goalflight_dispatch: WARNING — ledger dispatch {dispatch_id} "
+        f"(state={state}) names no worker cwd; occupancy skip "
+        f"(does not gate any worktree)"
+    )
+
+
+def _warn_cwdless_nonterminal(record: dict) -> None:
+    print(_cwdless_nonterminal_warning(record), file=sys.stderr)
+
+
+def _iter_cwdless_nonterminal_records(records, *, host: str | None = None):
+    """Yield readable non-terminal rows occupancy would skip as nameless."""
+    host = socket.gethostname() if host is None else host
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if goalflight_ledger.record_is_unreadable(record):
+            continue
+        state = record.get("state")
+        terminal = goalflight_ledger.terminal_state_for(
+            state, record.get("reason") or record.get("error")
+        )
+        if terminal != "unknown":
+            if not _is_live_watcher_stopped(state, record.get("worker_alive")):
+                continue
+        if record.get("transport") == "fleet-ssh":
+            continue
+        record_host = record.get("hostname")
+        if isinstance(record_host, str) and record_host and record_host != host:
+            continue
+        if _occupancy_paths_from_record(record):
+            continue
+        yield record
+
+
 def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None]:
     """(occupied_reason, unknown_reason, occupied_state) for this write tree.
 
@@ -2825,6 +3035,26 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
     cannot tell a searcher from a worker. ``occupied_state`` is the ledger
     state of a named occupant so a freshly acquired kernel lock can tell a
     queued owner (ledger-only claim) from a stale running row after SIGKILL.
+
+    The predicate selects records that can be tied to THIS path. Cwd is
+    taken from ``worker_cwd``, ``dispatch_argv --cwd`` (including after
+    ``--``), and ``request.cwd``; a relative result is resolved against
+    ``project_root``. A row is nameless only when all three are absent or
+    unusable. Disagreeing sources that both resolve occupy every named
+    path (refuse on a superset).
+
+    A nameless non-terminal row is not occupancy of a specific tree, but
+    this is a write-capable admission site: unknown must not be rendered
+    as "does not occupy this path". Split on identity liveness (pid +
+    start_token; never pgrep): proven-dead / no live identity skip+warn
+    (reconcile already closes those); live identity on this host whose
+    ``project_root`` matches the target tree's repo is occupancy UNKNOWN
+    of this project (refuse; ``--occupied-worktree-forced`` is the hatch);
+    missing or other ``project_root`` skip+warn (cannot be this repo).
+    ``project_root`` is never itself a path claim -- a matching
+    ``worker_cwd`` still occupies when the root differs. Unreadable or
+    unlistable records remain occupancy UNKNOWN: they might name this
+    path, so the gate still refuses rather than reading as free.
     """
     target = _worker_cwd(args)
     try:
@@ -2859,14 +3089,28 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
         record_host = record.get("hostname")
         if isinstance(record_host, str) and record_host and record_host != host:
             continue  # recorded by a dispatch launched on another machine
-        record_cwd = _resume_cwd_from_record(record)
-        if record_cwd is None:
+        occupancy_paths = _occupancy_paths_from_record(record)
+        if not occupancy_paths:
+            # Nameless after every cwd source. Write admission must not
+            # treat "cannot name the path" as "does not occupy this path".
+            liveness, _liveness_reason = goalflight_ledger.worker_identity_liveness(
+                record
+            )
+            if liveness != "live":
+                _warn_cwdless_nonterminal(record)
+                continue
+            if _record_declared_read_only(record):
+                _warn_cwdless_nonterminal(record)
+                continue
+            if not _record_project_root_matches_target(record, target):
+                _warn_cwdless_nonterminal(record)
+                continue
             unknown.append(
-                f"non-terminal dispatch {record_id} (state={state or 'running'}) "
-                "has no worker cwd evidence"
+                f"live dispatch {record_id} (state={state or 'running'}) "
+                "names no worker cwd and shares this project_root"
             )
             continue
-        if not _same_worker_tree(record_cwd, target):
+        if not any(_same_worker_tree(path, target) for path in occupancy_paths):
             continue
         if _record_declared_read_only(record):
             continue  # a reviewer shares the tree legitimately; it is not a writer
@@ -6616,14 +6860,21 @@ def _report_why_this_entry_did_not_launch(args, payload: dict) -> None:
             # unspecified" and was running as pid 83652 at the time.
             return
         reason = str(entry.get("reason") or "unspecified")
-        detail = (
-            entry.get("process_evidence")
-            or entry.get("not_before")
-            or entry.get("detail")
-            or entry.get("unpark_event")
-            or entry.get("park_exit_state")
-            or ""
-        )
+        if reason == "not_before":
+            detail = "; ".join(
+                str(part)
+                for part in (entry.get("not_before"), entry.get("headroom"))
+                if part
+            )
+        else:
+            detail = (
+                entry.get("process_evidence")
+                or entry.get("not_before")
+                or entry.get("detail")
+                or entry.get("unpark_event")
+                or entry.get("park_exit_state")
+                or ""
+            )
         suffix = f" [{detail}]" if detail else ""
         print(
             f"goalflight_dispatch: {dispatch_id} not launched: {reason}{suffix}",
@@ -11527,6 +11778,298 @@ def _queue_entry_not_before_ts(entry: dict | None) -> float | None:
     return parsed.timestamp() if parsed is not None else None
 
 
+# Tests inject usage-shaped probe rows so drain re-derives not_before without
+# touching a billing endpoint. None means "load seat-state / live usage".
+_NOT_BEFORE_PROBE_ROWS: list | None = None
+
+
+def _queue_entry_provider_account(
+    entry: dict | None,
+) -> tuple[str | None, str | None]:
+    """Billing identity for a queued entry, used to re-derive not_before."""
+    if not isinstance(entry, dict):
+        return None, None
+    request = entry.get("request") if isinstance(entry.get("request"), dict) else {}
+    argv = list(entry.get("dispatch_argv") or [])
+    agent = None
+    for raw in (
+        entry.get("agent"),
+        request.get("agent"),
+        _option_value_before_worker_remainder(argv, "--agent"),
+    ):
+        if isinstance(raw, str) and raw.strip():
+            agent = raw.strip()
+            break
+    account = None
+    for raw in (
+        entry.get("effective_account"),
+        request.get("effective_account"),
+        entry.get("account"),
+        request.get("account"),
+        _option_value_before_worker_remainder(argv, "--account"),
+    ):
+        if isinstance(raw, str) and raw.strip() and raw.strip() != "default":
+            account = raw.strip()
+            break
+    if account is None:
+        requeued_from = entry.get("requeued_from") or request.get("requeued_from")
+        if isinstance(requeued_from, str) and requeued_from:
+            try:
+                payload = json.loads(
+                    goalflight_ledger.record_path(
+                        requeued_from, create=False
+                    ).read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict):
+                for key in ("effective_account", "account"):
+                    raw = payload.get(key)
+                    if isinstance(raw, str) and raw.strip() and raw.strip() != "default":
+                        account = raw.strip()
+                        break
+                if agent is None:
+                    raw = payload.get("agent")
+                    if isinstance(raw, str) and raw.strip():
+                        agent = raw.strip()
+    if not agent:
+        return None, account
+    import goalflight_usage as usage
+
+    provider = usage._record_provider({"agent": agent})
+    return (str(provider) if provider else None), account
+
+
+def _seat_entry_probe_row(
+    provider: str,
+    account: str | None,
+    entry: dict,
+    observed_at: float | None,
+):
+    """Turn one seat-state record into a usage row. Cooldown-only is not a probe."""
+    import goalflight_usage as usage
+
+    used = entry.get("used_percent")
+    remaining_percent = entry.get("remaining_percent")
+    flags: tuple[str, ...] = ()
+    probe_state = None
+    remaining_text = "unknown"
+    if isinstance(used, (int, float)) and not isinstance(used, bool):
+        remaining_value = max(0.0, 100.0 - float(used))
+        remaining_text = f"{usage._format_number(remaining_value)}%"
+        if float(used) >= 100 or remaining_value <= 0:
+            flags = ("walled",)
+            probe_state = "walled"
+        else:
+            probe_state = "reported"
+    elif isinstance(remaining_percent, (int, float)) and not isinstance(
+        remaining_percent, bool
+    ):
+        remaining_text = f"{usage._format_number(float(remaining_percent))}%"
+        if float(remaining_percent) <= 0:
+            flags = ("walled",)
+            probe_state = "walled"
+        else:
+            probe_state = "reported"
+    elif entry.get("ok") is False:
+        remaining_text = "unavailable"
+        flags = ("unavailable",)
+        probe_state = "unavailable"
+    else:
+        return None
+    row = usage._row(
+        provider,
+        account=account,
+        remaining=remaining_text,
+        reset_at=usage.parse_reset(entry.get("reset_at")),
+        flags=flags,
+    )
+    row["evidence"] = {
+        "probe": {
+            "source": usage.SOURCE_PROBE,
+            "state": probe_state,
+            "observed_at": observed_at,
+        },
+        "dispatch": None,
+        "conflict": False,
+        "verdict": usage.HEADROOM_UNKNOWN,
+        "winner": None,
+    }
+    return row
+
+
+def _quota_state_roots() -> list[Path]:
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for raw in (
+        os.environ.get("GOALFLIGHT_CODEX_STATE_DIR"),
+        os.environ.get("GOALFLIGHT_STATE_DIR"),
+    ):
+        if raw:
+            path = Path(raw).expanduser()
+            key = str(path)
+            if key not in seen:
+                seen.add(key)
+                roots.append(path)
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return roots
+    home_state = Path.home() / ".goal-flight"
+    key = str(home_state)
+    if key not in seen:
+        roots.append(home_state)
+    return roots
+
+
+def _seat_state_as_usage_rows() -> list[dict]:
+    rows: list[dict] = []
+    for root in _quota_state_roots():
+        for filename, provider in (
+            ("grok-seat-states.json", "grok"),
+            ("codex-seat-states.json", "codex"),
+        ):
+            path = root / filename
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(document, dict) or not isinstance(
+                document.get("seats"), dict
+            ):
+                continue
+            observed_at = document.get("updated_at")
+            if not isinstance(observed_at, (int, float)):
+                observed_at = None
+            for key, entry in document["seats"].items():
+                if not isinstance(entry, dict):
+                    continue
+                seat_observed = entry.get("probed_at") or entry.get("updated_at")
+                if isinstance(seat_observed, (int, float)):
+                    observed = float(seat_observed)
+                else:
+                    observed = float(observed_at) if observed_at is not None else None
+                account = None if key in ("", None) else str(key)
+                row = _seat_entry_probe_row(provider, account, entry, observed)
+                if row is not None:
+                    rows.append(row)
+    return rows
+
+
+def _probe_rows_for_not_before(*, providers: set[str] | None = None) -> list[dict]:
+    if _NOT_BEFORE_PROBE_ROWS is not None:
+        return list(_NOT_BEFORE_PROBE_ROWS)
+    rows = _seat_state_as_usage_rows()
+    # Tests inject rows or seat-state files. Never hit a billing endpoint
+    # from drain under pytest — the autouse fixture does not isolate HOME,
+    # so a live reader would use the operator login.
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return rows
+    try:
+        import goalflight_usage as usage
+
+        specs = tuple(
+            spec
+            for spec in usage.READERS
+            if providers is None or spec.provider in providers
+        )
+        live = usage.collect_usage(
+            timeout_s=min(usage.DEFAULT_TIMEOUT_S, 8.0),
+            reader_specs=specs or usage.READERS,
+            ledger_records=[],
+        )
+        if live:
+            return list(live)
+    except Exception:
+        pass
+    return rows
+
+
+def _headroom_for_queue_entry(
+    entry: dict | None,
+    *,
+    now: float,
+    probe_rows: list[dict],
+    ledger_records: list,
+) -> dict:
+    import goalflight_usage as usage
+
+    _ = now  # age is derived at the hold-summary call site, not minted here
+    provider, account = _queue_entry_provider_account(entry)
+    if not provider:
+        return {"verdict": usage.HEADROOM_UNKNOWN, "winner": None}
+    account_key = usage._label(account) or ""
+    row = None
+    for candidate in probe_rows:
+        if str(candidate.get("provider") or "") != provider:
+            continue
+        if (usage._label(candidate.get("account")) or "") == account_key:
+            row = dict(candidate)
+            break
+    if row is None:
+        # A probe that was never taken has no observed_at. Stamping `now`
+        # here used to print "age 0m" for a measurement that did not happen.
+        row = usage._row(
+            provider,
+            account=account,
+            remaining="unavailable",
+            reset_at=None,
+            flags=("unavailable",),
+        )
+        row["evidence"] = {
+            "probe": {
+                "source": usage.SOURCE_PROBE,
+                "state": "unavailable",
+            },
+            "dispatch": None,
+            "conflict": False,
+            "verdict": usage.HEADROOM_UNKNOWN,
+            "winner": None,
+        }
+    overlaid = usage.overlay_dispatch_evidence([row], ledger_records)
+    evidence = overlaid[0].get("evidence") if overlaid else None
+    return evidence if isinstance(evidence, dict) else {
+        "verdict": usage.HEADROOM_UNKNOWN,
+        "winner": None,
+    }
+
+
+def _not_before_headroom_fields(
+    headroom: dict | None, *, now: float
+) -> dict[str, object]:
+    """Name the winning source and its age, matching the usage EVIDENCE column.
+
+    Usage prints ``winner: probe → healthy`` plus ``as of <local>, age <delta>``.
+    Drain hold details used to carry only the stored timestamp, so an operator
+    staring at a gated queue entry could not tell a live probe from a stale
+    record. Same fact, same vocabulary; the queue file is not rewritten.
+    """
+    import goalflight_usage as usage
+
+    evidence = headroom if isinstance(headroom, dict) else {}
+    winner = evidence.get("winner")
+    if winner == usage.SOURCE_PROBE:
+        source = "probe"
+        observed_blob = evidence.get("probe")
+    elif winner == usage.SOURCE_DISPATCH:
+        source = "dispatch"
+        observed_blob = evidence.get("dispatch")
+    else:
+        source = "none"
+        observed_blob = evidence.get("probe")
+    observed_at = (
+        observed_blob.get("observed_at")
+        if isinstance(observed_blob, dict)
+        else None
+    )
+    as_of = usage._observed_text(observed_at, now=now)
+    winner_text = usage._winner_text(evidence)
+    return {
+        "winner": source,
+        "verdict": evidence.get("verdict") or usage.HEADROOM_UNKNOWN,
+        "winner_age": as_of,
+        "headroom": f"{winner_text} (as of {as_of})",
+    }
+
+
 def _queue_entry_drain_candidate(path: Path) -> tuple[tuple[int, float, str], Path, dict | None, str | None]:
     entry: dict | None = None
     read_error: str | None = None
@@ -13003,20 +13546,99 @@ def _drain_queue_once(args) -> dict:
             launch_candidates.append(candidate)
     entries = sorted(launch_candidates)
     now_s = time.time()
-    deferred_entries = [
+    # Re-derive not_before against current probe vs dispatch evidence rather
+    # than freezing the reset predicted at requeue. A seat that now probes
+    # healthy (and that probe is newer than the exhaustion record) is
+    # eligible this pass; the queue file is not mutated.
+    stored_gated = [
         candidate
         for candidate in entries
         if (
             _queue_entry_not_before_ts(candidate[2]) is not None
-            and _queue_entry_not_before_ts(candidate[2]) > now_s
+            and (_queue_entry_not_before_ts(candidate[2]) or 0) > now_s
         )
     ]
+    deferred_entries: list = []
+    entry_headroom = None
+    if stored_gated:
+        import goalflight_usage as usage
+
+        probe_rows: list | None = None
+        ledger_records: list | None = None
+        headroom_cache: dict[tuple[str | None, str | None], dict] = {}
+
+        def _entry_headroom(entry: dict | None) -> dict:
+            nonlocal probe_rows, ledger_records
+            key = _queue_entry_provider_account(entry)
+            cached = headroom_cache.get(key)
+            if cached is not None:
+                return cached
+            if probe_rows is None:
+                providers = {
+                    provider
+                    for provider, _account in (
+                        _queue_entry_provider_account(item[2])
+                        for item in stored_gated
+                    )
+                    if provider
+                }
+                probe_rows = _probe_rows_for_not_before(
+                    providers=providers or None
+                )
+            if ledger_records is None:
+                try:
+                    ledger_records = goalflight_ledger.read_records()
+                except (OSError, ValueError):
+                    ledger_records = []
+            verdict = _headroom_for_queue_entry(
+                entry,
+                now=now_s,
+                probe_rows=probe_rows,
+                ledger_records=ledger_records,
+            )
+            headroom_cache[key] = verdict
+            return verdict
+
+        entry_headroom = _entry_headroom
+        deferred_entries = [
+            candidate
+            for candidate in stored_gated
+            if usage.not_before_still_gates(
+                _queue_entry_not_before_ts(candidate[2]),
+                now=now_s,
+                headroom=_entry_headroom(candidate[2]),
+            )
+        ]
     entries = [candidate for candidate in entries if candidate not in deferred_entries]
     left_queued += len(deferred_entries)
     not_before_until: str | None = None
     not_before_until_ts: float | None = None
+    not_before_winner: object = None
+    not_before_winner_age: object = None
     for _sort_key, path, entry, _read_error in deferred_entries:
         not_before_ts = _queue_entry_not_before_ts(entry)
+        row = {
+            "dispatch_id": (
+                str(entry.get("dispatch_id"))
+                if isinstance(entry, dict) and entry.get("dispatch_id")
+                else path.stem
+            ),
+            "state": "queued",
+            "reason": "not_before",
+            "not_before": (
+                entry.get("not_before")
+                if isinstance(entry, dict)
+                else None
+            ),
+        }
+        if entry_headroom is not None:
+            row.update(
+                _not_before_headroom_fields(
+                    entry_headroom(entry if isinstance(entry, dict) else None),
+                    now=now_s,
+                )
+            )
+        details.append(row)
         if (
             isinstance(entry, dict)
             and not_before_ts is not None
@@ -13026,27 +13648,20 @@ def _drain_queue_once(args) -> dict:
             not_before_until = entry.get("not_before") or (
                 entry.get("request") if isinstance(entry.get("request"), dict) else {}
             ).get("not_before")
-        details.append(
-            {
-                "dispatch_id": (
-                    str(entry.get("dispatch_id"))
-                    if isinstance(entry, dict) and entry.get("dispatch_id")
-                    else path.stem
-                ),
-                "state": "queued",
-                "reason": "not_before",
-                "not_before": (
-                    entry.get("not_before")
-                    if isinstance(entry, dict)
-                    else None
-                ),
-            }
-        )
+            not_before_winner = row.get("winner")
+            not_before_winner_age = row.get("winner_age")
     # Hold-reason aggregation (t-345): the summary must say WHY entries are
     # held, not only THAT launched:0. `until` is the EARLIEST pending
     # not_before — when this queue next becomes eligible to make progress.
+    # Winner+age of that earliest row is the operator surface for launched:0
+    # drains that only read the hold summary / compact DRAIN line.
     holds: dict = {
-        "not_before": {"count": len(deferred_entries), "until": not_before_until},
+        "not_before": {
+            "count": len(deferred_entries),
+            "until": not_before_until,
+            "winner": not_before_winner,
+            "winner_age": not_before_winner_age,
+        },
         "restore_prepared": {
             "count": len(restore_prepared_candidates),
             "owner_live": 0,
@@ -13111,6 +13726,22 @@ def _drain_queue_once(args) -> dict:
                     if entry.get("updated_at"):
                         item["updated_at"] = str(entry.get("updated_at"))
                 attention.append(item)
+    try:
+        occupancy_records = list(goalflight_ledger.read_records())
+    except OSError:
+        occupancy_records = []
+    for record in _iter_cwdless_nonterminal_records(occupancy_records):
+        # Bookkeeping defect, not a hold: skip is correct, silence is not.
+        # Compact DRAIN `cwdless_nonterminal` + stderr WARN are the surfaces
+        # the launch operator and the periodic drainer already read.
+        attention.append(
+            {
+                "dispatch_id": str(record.get("dispatch_id") or ""),
+                "state": str(record.get("state") or "running"),
+                "attention": "cwdless_nonterminal",
+            }
+        )
+        _warn_cwdless_nonterminal(record)
     if args.limit and args.limit > 0:
         entries = entries[: args.limit]
     if not remote_node and entries:
@@ -13516,10 +14147,18 @@ def _cmd_drain(argv: list[str]) -> int:
                     "live_claimer": payload.get("live_claimer", 0),
                     "waiting_not_before": not_before_hold.get("count", 0),
                     "waiting_not_before_until": not_before_hold.get("until"),
+                    "waiting_not_before_winner": not_before_hold.get("winner"),
+                    "waiting_not_before_age": not_before_hold.get("winner_age"),
                     "awaiting_owner_reconcile": restore_hold.get("count", 0),
                     "owner_generation_dead": restore_hold.get("owner_dead", 0),
                     "quarantined": holds.get("quarantined", 0),
                     "attention": len(payload.get("attention") or []),
+                    "cwdless_nonterminal": sum(
+                        1
+                        for item in (payload.get("attention") or [])
+                        if isinstance(item, dict)
+                        and item.get("attention") == "cwdless_nonterminal"
+                    ),
                     "queue_dir": payload["queue_dir"],
                 },
                 sort_keys=True,

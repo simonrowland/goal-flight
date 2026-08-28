@@ -141,6 +141,41 @@ def test_future_timestamp_is_treated_as_stale(tmp_path: Path) -> None:
     assert seats.states_are_fresh(doc, now=NOW) is False
 
 
+def test_cached_auth_failure_is_not_fresh_and_select_reprobes(tmp_path: Path) -> None:
+    """A cached HTTP 401 is not a stable measurement.
+
+    Serving it for the rest of the TTL is how a re-authenticated host kept
+    rendering as needs-login while a live probe succeeded immediately.
+    """
+    path = _states(
+        tmp_path / "s.json",
+        {
+            "": {
+                "ok": False,
+                "used_percent": None,
+                "error": "billing endpoint returned HTTP 401",
+            }
+        },
+        updated_at=NOW,
+    )
+    document = seats.load_states(path)
+    assert seats.states_are_fresh(document, now=NOW) is False
+
+    calls: list[str] = []
+
+    def refresher(*, path, now):
+        del path
+        calls.append("refreshed")
+        return {
+            "version": 1,
+            "updated_at": now,
+            "seats": {"": _entry(12.0)},
+        }
+
+    assert seats.select_seat(path=path, now=NOW, refresher=refresher) is None
+    assert calls == ["refreshed"]
+
+
 def test_refresh_records_every_account_including_unreachable_ones(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -39,6 +39,24 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- Drain `not_before` hold details now name the winning headroom source
+  (probe vs recorded exhaustion) and its age, matching the usage EVIDENCE
+  column (`winner: probe → exhausted (as of …, age …)`). The queue file is
+  not rewritten.
+
+- Occupancy skip of a readable non-terminal ledger row with no worker cwd
+  now warns on stderr naming the dispatch id and state (the launch
+  operator and drain already read that stream). Drain JSON `attention`
+  lists `cwdless_nonterminal` and the compact DRAIN line carries the
+  count, so a launched:0 pass still surfaces the ghost. The skip still
+  does not gate any worktree.
+
+- Worktree occupancy no longer treats a readable non-terminal ledger row
+  with no `worker_cwd` (and no `--cwd` in `dispatch_argv`) as occupancy
+  UNKNOWN of every path. That row names no tree, so it cannot gate an
+  unrelated worktree. Unreadable or unlistable records still refuse.
+  A matching `worker_cwd` still occupies even when `project_root` differs.
+
 - Drain no longer mints unadoptable `restore_prepared` queue envelopes when
   releasing a pre-worker claim whose ledger is already `queued`. The second
   DrainClaimGuard restore used to write a new `restore_prepared` txn, abort

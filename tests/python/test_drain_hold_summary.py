@@ -208,6 +208,8 @@ def test_holds_report_quota_waits_and_restore_prepared_by_owner_state(
         holds = payload["holds"]
         assert holds["not_before"]["count"] == 1, holds
         assert holds["not_before"]["until"] == future, holds
+        assert holds["not_before"]["winner"] in {"probe", "dispatch", "none"}, holds
+        assert holds["not_before"]["winner_age"], holds
         rp = holds["restore_prepared"]
         assert rp["count"] == 4, rp
         assert rp["owner_live"] == 1, rp
@@ -270,13 +272,56 @@ def test_reconcile_pending_reasons_are_aggregated(
     assert pending.get("unlinked_quarantine_deferred") == 2, pending
 
 
+def test_cwdless_nonterminal_is_drain_attention_not_a_hold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A readable running row with no cwd is a bookkeeping defect, not a gate.
+
+    Drain still launches nothing from an empty queue, but attention names the
+    dispatch id so a launched:0 pass is not silent. Occupancy skip does not
+    become UNKNOWN of every tree.
+    """
+    queue = _queue_dir(tmp_path)
+    _record(tmp_path, "cwdless-ghost", worker_cwd=None, state="running")
+    rc = D._cmd_drain(["--queue-dir", str(queue), "--claim-stale-s", "9999", "--json"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    items = [
+        row
+        for row in payload.get("attention") or []
+        if row.get("attention") == "cwdless_nonterminal"
+    ]
+    assert len(items) == 1, payload.get("attention")
+    assert items[0]["dispatch_id"] == "cwdless-ghost"
+    assert items[0]["state"] == "running"
+    assert "cwdless-ghost" in captured.err
+    assert "names no worker cwd" in captured.err
+    assert "occupancy skip" in captured.err
+    assert payload["holds"]["not_before"]["count"] == 0
+    assert payload["launched"] == 0
+
+    rc = D._cmd_drain(["--queue-dir", str(queue), "--claim-stale-s", "9999"])
+    assert rc == 0
+    line = capsys.readouterr().out
+    text = line[line.index("{") :]
+    summary = json.loads(text)
+    assert summary["cwdless_nonterminal"] == 1
+    assert summary["attention"] == 1
+
+
 def test_empty_queue_reports_zero_holds(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     queue = _queue_dir(tmp_path)
     payload = _drain_json(queue, capsys)
     assert payload["holds"] == {
-        "not_before": {"count": 0, "until": None},
+        "not_before": {
+            "count": 0,
+            "until": None,
+            "winner": None,
+            "winner_age": None,
+        },
         "restore_prepared": {"count": 0, "owner_live": 0, "owner_dead": 0, "owner_unknown": 0},
         "reconcile_pending": {},
         "quarantined": 0,
@@ -311,6 +356,8 @@ def test_text_line_carries_hold_summary(tmp_path: Path, capsys: pytest.CaptureFi
     assert summary["launched"] == 0
     assert summary["waiting_not_before"] == 1
     assert summary["waiting_not_before_until"] == future
+    assert summary["waiting_not_before_winner"] in {"probe", "dispatch", "none"}
+    assert summary["waiting_not_before_age"]
     assert summary["awaiting_owner_reconcile"] == 1
     assert summary["owner_generation_dead"] == 0
     assert summary["attention"] == 0
