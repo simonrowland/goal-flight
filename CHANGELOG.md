@@ -39,6 +39,11 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- Worktree occupancy no longer treats a readable non-terminal ledger row
+  with no `worker_cwd` (and no `--cwd` in `dispatch_argv`) as occupancy
+  UNKNOWN of every path. That row names no tree, so it cannot gate an
+  unrelated worktree. Unreadable or unlistable records still refuse.
+  A matching `worker_cwd` still occupies even when `project_root` differs.
 - `goalflight_messages.py post --to-controller` no longer reports success when
   the send reached nobody. The CLI exits non-zero and
   `controller_delivery.status` names the miss. When the label is missing from

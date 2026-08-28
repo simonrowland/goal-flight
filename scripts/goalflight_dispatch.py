@@ -2825,6 +2825,16 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
     cannot tell a searcher from a worker. ``occupied_state`` is the ledger
     state of a named occupant so a freshly acquired kernel lock can tell a
     queued owner (ledger-only claim) from a stale running row after SIGKILL.
+
+    The predicate selects records that can be tied to THIS path. A readable
+    record with no ``worker_cwd`` and no ``--cwd`` in ``dispatch_argv`` names
+    no tree: it is a bookkeeping defect, not occupancy of the target, whether
+    the recorded pid is live, missing, or gone (pid + start_token; never
+    pgrep). ``project_root`` is never a path claim -- linked/shared worktrees
+    and mis-recorded roots mean a matching ``worker_cwd`` still occupies when
+    the root differs, and a matching root without a cwd still names no tree.
+    Unreadable or unlistable records remain occupancy UNKNOWN: they might
+    name this path, so the gate still refuses rather than reading as free.
     """
     target = _worker_cwd(args)
     try:
@@ -2861,10 +2871,8 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
             continue  # recorded by a dispatch launched on another machine
         record_cwd = _resume_cwd_from_record(record)
         if record_cwd is None:
-            unknown.append(
-                f"non-terminal dispatch {record_id} (state={state or 'running'}) "
-                "has no worker cwd evidence"
-            )
+            # Readable, but tied to no path. Do not treat "owns an unknown
+            # path" as "might own this path".
             continue
         if not _same_worker_tree(record_cwd, target):
             continue
