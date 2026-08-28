@@ -5571,7 +5571,12 @@ def _follow_heartbeat_record(seq: int, interval_s: float) -> dict[str, object]:
     }
 
 
-def _follow_event_record(row: dict[str, object], envelope: dict) -> dict[str, object]:
+def _follow_event_record(
+    row: dict[str, object],
+    envelope: dict,
+    *,
+    cursor_version: int | None = None,
+) -> dict[str, object]:
     raw_payload = envelope.get("payload")
     payload_data = raw_payload if isinstance(raw_payload, dict) else {}
     record: dict[str, object] = {
@@ -5584,6 +5589,12 @@ def _follow_event_record(row: dict[str, object], envelope: dict) -> dict[str, ob
             "data": payload_data,
         },
     }
+    if (
+        isinstance(cursor_version, int)
+        and not isinstance(cursor_version, bool)
+        and cursor_version >= 0
+    ):
+        record["cursor_version"] = cursor_version
     try:
         _follow_line_bytes(record)
         return record
@@ -6187,7 +6198,11 @@ def _emit_claimed_follow_events(
         return True, False
     try:
         for row, envelope in visible:
-            if not emit(_follow_event_record(row, envelope)):
+            if not emit(
+                _follow_event_record(
+                    row, envelope, cursor_version=cursor_version
+                )
+            ):
                 released = goalflight_wake.release_ring_claim(
                     project_root,
                     controller_label=controller_label,
@@ -6515,6 +6530,12 @@ def cmd_follow(args) -> int:
                         }
                     )
                     return 3
+                # Follow peeks the live cursor every poll. Backup doorbells
+                # snapshot cursor_version at arm. Those two clocks can
+                # diverge inside one supervisor; a stuck peek then re-emits
+                # the unread set every successful ring claim. The supervisor
+                # mux caps that flood; this peek must still carry
+                # cursor_version on each event so lag is observable.
                 snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
                 candidate_rows = [
                     item

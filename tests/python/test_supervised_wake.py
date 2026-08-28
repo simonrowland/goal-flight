@@ -4343,3 +4343,197 @@ def test_unreadable_startup_with_explicit_nonce_starts(
     assert missing_err is not None and "journal unreadable" in missing_err
     assert missing_code == supervise.SUPERVISE_START_EXIT
     assert "did-not-arm" not in str(missing_err)
+
+
+def _cursor_event_line(version: int, seq: int, *, event_type: str = "controller-notice") -> str:
+    return json.dumps(
+        {
+            "kind": "event",
+            "cursor_version": version,
+            "payload": {
+                "type": event_type,
+                "stream_seq": seq,
+                "dispatch_id": f"mail-{seq}",
+            },
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def test_divergent_cursor_children_emit_bounded_output() -> None:
+    """A stuck child at 5220 vs a sibling at 5550 must not flood stdout.
+
+    Regression for the battery-webui volume kill: one child re-emitted ~330
+    envelopes per cycle while a sibling had already moved 330 versions ahead.
+    First copies still emit; the remainder collapses into one named record.
+    """
+    stuck_version = 5220
+    live_version = 5550
+    n_stuck = 330
+    n_live = 3
+    # Live sibling first so the tracker has 5550 before the stuck burst hits
+    # the cap. FakeHost emits one timestamp per wait, so later offsets are
+    # later loop iterations, not one batched flood.
+    live_lines = [
+        (index * 0.001, _cursor_event_line(live_version, 10_000 + index))
+        for index in range(n_live)
+    ]
+    stuck_lines = [
+        (1.0 + index * 0.001, _cursor_event_line(stuck_version, index))
+        for index in range(n_stuck)
+    ]
+    host = FakeHost(
+        scripts={
+            "backup": [
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=stuck_lines,
+                ),
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=live_lines,
+                ),
+            ],
+            "watchdog": [
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (
+                            0.5,
+                            '{"kind":"event","payload":{"type":"listener-dead"}}',
+                        ),
+                    ],
+                )
+            ],
+        },
+        stop_after_waits=500,
+    )
+    _run(
+        host,
+        _items("backup", "backup", "watchdog"),
+        heartbeat_s=50.0,
+        coverage_s=50.0,
+    )
+    records = _records(host)
+    stuck_events = [
+        record
+        for record in records
+        if record.get("kind") == "event"
+        and record.get("cursor_version") == stuck_version
+    ]
+    live_events = [
+        record
+        for record in records
+        if record.get("kind") == "event"
+        and record.get("cursor_version") == live_version
+    ]
+    named = [
+        record
+        for record in records
+        if record.get("kind") == "supervise"
+        and record.get("type") in {"cursor-lag", "child-backlog"}
+    ]
+    # Hard bound well under the 330-envelope flood. Revert against 2fa63c4
+    # fails here because the mux forwards every child line.
+    assert len(stuck_events) <= 16
+    assert len(stuck_events) >= 1
+    assert len(live_events) == n_live
+    assert len(named) == 1
+    lag = named[0]
+    assert lag["type"] == "cursor-lag"
+    assert lag["child"] == "backup-1"
+    assert lag["behind"] == stuck_version
+    assert lag["ahead"] == live_version
+    assert int(lag["count"]) == n_stuck - len(stuck_events)
+    assert int(lag["count"]) + len(stuck_events) == n_stuck
+    joined = "".join(host.lines)
+    assert '"type":"listener-dead"' in joined
+    assert joined.count(_cursor_event_line(stuck_version, 0)) == 1
+
+
+def test_same_cursor_burst_collapses_as_named_backlog_not_lag() -> None:
+    """Volume without sibling divergence is still bounded, under a different name."""
+    n = 40
+    version = 100
+    host = FakeHost(
+        scripts={
+            "backup": [
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (index * 0.001, _cursor_event_line(version, index))
+                        for index in range(n)
+                    ],
+                )
+            ]
+        },
+        stop_after_waits=80,
+    )
+    _run(host, _items("backup"), heartbeat_s=50.0, coverage_s=50.0)
+    records = _records(host)
+    events = [
+        record
+        for record in records
+        if record.get("kind") == "event" and record.get("cursor_version") == version
+    ]
+    named = [
+        record
+        for record in records
+        if record.get("kind") == "supervise"
+        and record.get("type") in {"cursor-lag", "child-backlog"}
+    ]
+    assert len(events) <= 16
+    assert len(named) == 1
+    assert named[0]["type"] == "child-backlog"
+    assert named[0]["child"] == "backup"
+    assert int(named[0]["count"]) + len(events) == n
+    assert "cursor-lag" not in {record.get("type") for record in named}
+
+
+def test_small_divergent_burst_is_not_named_or_collapsed() -> None:
+    """Healthy jitter of a few envelopes at different versions must stay quiet."""
+    host = FakeHost(
+        scripts={
+            "backup": [
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (0.0, _cursor_event_line(10, 1)),
+                        (0.001, _cursor_event_line(10, 2)),
+                    ],
+                ),
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (0.002, _cursor_event_line(40, 3)),
+                        (0.003, _cursor_event_line(40, 4)),
+                    ],
+                ),
+            ]
+        },
+        stop_after_waits=20,
+    )
+    _run(host, _items("backup", "backup"), heartbeat_s=50.0, coverage_s=50.0)
+    records = _records(host)
+    events = [record for record in records if record.get("kind") == "event"]
+    named = [
+        record
+        for record in records
+        if record.get("kind") == "supervise"
+        and record.get("type") in {"cursor-lag", "child-backlog"}
+    ]
+    assert len(events) == 4
+    assert named == []
