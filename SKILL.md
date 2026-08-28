@@ -196,6 +196,9 @@ the shared project root with the raw prompt (no mandate). `/goal-flight execute`
 **Always-on drainer:** the `com.goalflight.drain` launchd daemon runs `goalflight_dispatch.py
 drain --json` every ~60s and LAUNCHES anything queued — queuing is not free, and the
 ledger/queue are shared across projects (identify origin by `project_root`).
+`drain --queue-dir <path>` scopes to envelopes already in that directory (it does
+not restore ledger orphans into a private dir). Launch one id with
+`drain --dispatch-id <id>`.
 
 ## Review layers
 
