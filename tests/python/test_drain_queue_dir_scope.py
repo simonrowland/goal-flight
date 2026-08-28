@@ -65,18 +65,17 @@ def _write_queue_entry(
     dispatch_id: str,
     *,
     controller_label: str | None,
-    project_root: Path,
+    project_root: Path | None,
     extra: dict | None = None,
 ) -> Path:
     path = queue / f"{dispatch_id}.json"
+    root_text = str(project_root) if project_root is not None else ""
     body = {
         "schema": D.DISPATCH_QUEUE_SCHEMA,
         "state": "queued",
         "dispatch_id": dispatch_id,
         "agent": "test-dispatch",
         "shape": "bash",
-        "project_root": str(project_root),
-        "process_cwd": str(project_root),
         "created_at": "2026-08-28T00:00:00+00:00",
         "updated_at": "2026-08-28T00:00:00+00:00",
         "queue_path": str(path),
@@ -85,17 +84,19 @@ def _write_queue_entry(
             "test-dispatch",
             "--dispatch-id",
             dispatch_id,
-            "--cwd",
-            str(project_root),
         ],
         "request": {
             "agent": "test-dispatch",
-            "cwd": str(project_root),
-            "tail": str(project_root / f"{dispatch_id}.tail"),
-            "status_json": str(project_root / f"{dispatch_id}.status.json"),
+            "tail": str((project_root or queue) / f"{dispatch_id}.tail"),
+            "status_json": str((project_root or queue) / f"{dispatch_id}.status.json"),
             "controller_label": controller_label,
         },
     }
+    if root_text:
+        body["project_root"] = root_text
+        body["process_cwd"] = root_text
+        body["dispatch_argv"].extend(["--cwd", root_text])
+        body["request"]["cwd"] = root_text
     if controller_label:
         body["controller_label"] = controller_label
     if extra:
@@ -409,3 +410,152 @@ def test_text_drain_line_names_retained_and_owners(
     assert summary["relocated"] == 0
     assert summary["retained"] >= 1
     assert summary["retained_by_controller"].get("pm2-reports", 0) >= 1
+
+
+def _capture_claims(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    claimed: list[Path] = []
+
+    def _capture(path: Path) -> Path | None:
+        claimed.append(path)
+        return None
+
+    monkeypatch.setattr(D, "_claim_queue_entry", _capture)
+    return claimed
+
+
+def test_unlabelled_scoped_drain_retains_already_present_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1-2: empty invoker label is not --cross-project for a scoped dir."""
+    _canonical_queue(tmp_path)
+    private = tmp_path / "private-queue"
+    private.mkdir()
+    other_root = tmp_path / "pm2"
+    other_root.mkdir()
+    path = _write_queue_entry(
+        private,
+        "pm2-leftover",
+        controller_label="pm2-engine",
+        project_root=other_root,
+    )
+    original = path.read_bytes()
+    claimed = _capture_claims(monkeypatch)
+
+    payload = _drain_json(["--queue-dir", str(private), "--json"], capsys)
+    assert claimed == [], payload
+    assert path.exists()
+    assert path.read_bytes() == original
+    assert payload["launched"] == 0, payload
+    assert payload["retained"] >= 1, payload
+    assert any(
+        item.get("dispatch_id") == "pm2-leftover"
+        and item.get("reason") == "unknown_invoker_label"
+        for item in payload.get("details") or []
+    ), payload["details"]
+
+
+def test_nameless_owner_in_scoped_dir_is_retained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1-3: missing owner label is not permission to launch."""
+    _canonical_queue(tmp_path)
+    private = tmp_path / "private-queue"
+    private.mkdir()
+    other_root = tmp_path / "mystery"
+    other_root.mkdir()
+    path = _write_queue_entry(
+        private,
+        "nameless",
+        controller_label=None,
+        project_root=other_root,
+    )
+    claimed = _capture_claims(monkeypatch)
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", "gf-ctrl")
+
+    payload = _drain_json(["--queue-dir", str(private), "--json"], capsys)
+    assert claimed == [], payload
+    assert path.exists()
+    assert any(
+        item.get("dispatch_id") == "nameless"
+        and item.get("reason") == "unknown_owner"
+        for item in payload.get("details") or []
+    ), payload["details"]
+
+
+def test_matching_label_missing_project_root_is_retained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1-3: matching label without a project_root skips the ownership conjunct."""
+    _canonical_queue(tmp_path)
+    private = tmp_path / "private-queue"
+    private.mkdir()
+    path = _write_queue_entry(
+        private,
+        "blank-root",
+        controller_label="shared-ctrl",
+        project_root=None,
+    )
+    claimed = _capture_claims(monkeypatch)
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", "shared-ctrl")
+
+    payload = _drain_json(["--queue-dir", str(private), "--json"], capsys)
+    assert claimed == [], payload
+    assert path.exists()
+    assert any(
+        item.get("dispatch_id") == "blank-root"
+        and item.get("reason") == "unknown_project_root"
+        for item in payload.get("details") or []
+    ), payload["details"]
+
+
+def test_same_label_foreign_project_root_is_retained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Same controller id, different repo: the advertised --cross-project case."""
+    _canonical_queue(tmp_path)
+    private = tmp_path / "private-queue"
+    private.mkdir()
+    other_root = tmp_path / "other-repo"
+    other_root.mkdir()
+    path = _write_queue_entry(
+        private,
+        "other-repo-job",
+        controller_label="shared-ctrl",
+        project_root=other_root,
+    )
+    claimed = _capture_claims(monkeypatch)
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", "shared-ctrl")
+
+    payload = _drain_json(["--queue-dir", str(private), "--json"], capsys)
+    assert claimed == [], payload
+    assert path.exists()
+    assert any(
+        item.get("dispatch_id") == "other-repo-job"
+        and item.get("reason") == "foreign_project_root"
+        for item in payload.get("details") or []
+    ), payload["details"]
+
+
+def test_unreadable_scoped_queue_json_is_retained_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1-4: truncated JSON is unreadable, not a nameless launch candidate."""
+    _canonical_queue(tmp_path)
+    private = tmp_path / "private-queue"
+    private.mkdir()
+    broken = private / "battery.json"
+    broken.write_text("{truncated", encoding="utf-8")
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", "gf-ctrl")
+
+    payload = _drain_json(["--queue-dir", str(private), "--json"], capsys)
+    assert broken.exists(), list(private.iterdir())
+    assert broken.read_text(encoding="utf-8") == "{truncated"
+    assert not list(private.glob("*.claimed-*")), list(private.iterdir())
+    assert not list(private.glob("*.failed")), list(private.iterdir())
+    assert payload["launched"] == 0, payload
+    assert payload["failed"] == 0, payload
+    assert any(
+        item.get("dispatch_id") == "battery"
+        and item.get("reason") == "unreadable_queue_entry"
+        for item in payload.get("details") or []
+    ), payload["details"]

@@ -67,11 +67,13 @@ incremented when meaningful skill behaviour changes.
   foreign or empty directory it drains envelopes already there and does **not**
   run ledger-wide orphan republish into that directory (b-276). Cross-project
   claim/launch of a known-foreign `controller_label` / `project_root` in a
-  scoped directory is retained unless `--cross-project`. UNKNOWN owners are
-  not materialized from the ledger into a scoped dir. The compact DRAIN line
-  and JSON payload report `created` / `relocated` / `retained` with
-  `retained_by_controller` counts so a stable file total cannot hide a
-  composition change.
+  scoped directory is retained unless `--cross-project`. An unlabelled
+  invoker, a nameless or unreadable envelope, or a matching label with no
+  `project_root` is also retained: missing evidence is not permission to
+  launch. UNKNOWN owners are not materialized from the ledger into a scoped
+  dir. The compact DRAIN line and JSON payload report `created` /
+  `relocated` / `retained` with `retained_by_controller` counts so a stable
+  file total cannot hide a composition change.
 - Requeue intent lifecycle: a retry now carries a terminal disposition
   (`satisfied` / `abandoned` / `expired`). Regeneration stops when a later
   dispatch for the same task_ids **in the same project** is complete, when

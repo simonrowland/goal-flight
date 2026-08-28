@@ -11386,25 +11386,30 @@ def _scoped_launch_retain_reason(
     invoker_label: str | None,
     invoker_project: Path | None,
     allow_cross: bool,
+    read_error: str | None = None,
 ) -> str | None:
-    """Retain already-present envelopes owned by a different known controller.
+    """Retain unless this invoker is proven to own the already-present envelope.
 
-    UNKNOWN owners already in this directory are launchable: the caller placed
-    the file here. Write/move of UNKNOWN owners is a different path (retain).
-    Unlabelled invokers (daemon / tests) do not apply this filter.
+    ``None`` means launch or reconcile. A string is the retain reason.
+    ``allow_cross`` is the explicit override. Missing, empty, or unreadable
+    owner evidence is not permission to act.
     """
-    if allow_cross or not invoker_label:
+    if allow_cross:
         return None
+    if read_error:
+        return "unreadable_queue_entry"
+    if not invoker_label:
+        return "unknown_invoker_label"
+    if entry is None:
+        return "unknown_owner"
     owner_label, owner_project = _entry_owner_fields(entry)
-    if owner_label and owner_label != invoker_label:
+    if not owner_label:
+        return "unknown_owner"
+    if owner_label != invoker_label:
         return "foreign_controller_label"
-    if (
-        owner_label
-        and owner_label == invoker_label
-        and owner_project
-        and invoker_project
-        and not _project_roots_match(owner_project, invoker_project)
-    ):
+    if not owner_project or not invoker_project:
+        return "unknown_project_root"
+    if not _project_roots_match(owner_project, invoker_project):
         return "foreign_project_root"
     return None
 
@@ -14167,12 +14172,13 @@ def _drain_queue_once(args) -> dict:
     if scoped_queue:
         kept_entries = []
         for candidate in entries:
-            _sort_key, path, entry, _read_error = candidate
+            _sort_key, path, entry, read_error = candidate
             retain_reason = _scoped_launch_retain_reason(
                 entry if isinstance(entry, dict) else None,
                 invoker_label=invoker_label,
                 invoker_project=invoker_project,
                 allow_cross=allow_cross,
+                read_error=read_error,
             )
             if retain_reason is None:
                 kept_entries.append(candidate)
