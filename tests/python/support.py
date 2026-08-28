@@ -45,6 +45,7 @@ MACHINE_PATH_ENV = (
     "GOAL_FLIGHT_PIDFILE_DIR",
     "GOALFLIGHT_PIDFILE_DIR",
     "GOALFLIGHT_FLEET_DIR",
+    "XDG_STATE_HOME",
 )
 
 
@@ -62,6 +63,10 @@ def isolated_machine_env(root: Path) -> dict[str, str]:
         "GOALFLIGHT_WAKE_LEDGER_DIR": str(root / "wake-ledger"),
         "GOAL_FLIGHT_PIDFILE_DIR": str(pids),
         "GOALFLIGHT_PIDFILE_DIR": str(pids),
+        # JOURNAL_DIR does not cover the XDG fallback. A test that pops
+        # JOURNAL_DIR (and TASK_STORE_DIR) writes ~/.local/state/goal-flight
+        # unless XDG_STATE_HOME is redirected too.
+        "XDG_STATE_HOME": str(root / "xdg"),
         "GOALFLIGHT_CAPACITY_CONF": os.devnull,
         "PYTHONUNBUFFERED": "1",
     }

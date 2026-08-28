@@ -31,6 +31,9 @@ required_fragments = (
     "-u GOALFLIGHT_ISOLATED_TEST_FILE",
     'GOALFLIGHT_MESSAGES_DIR="$_GF_MESSAGES_BASE"',
     'GOALFLIGHT_JOURNAL_DIR="$_GF_JOURNAL_BASE"',
+    'GOAL_FLIGHT_PIDFILE_DIR="$_GF_PIDFILE_BASE"',
+    'GOALFLIGHT_PIDFILE_DIR="$_GF_PIDFILE_BASE"',
+    'XDG_STATE_HOME="$_GF_XDG_BASE"',
     "project-<10-hex>",
 )
 for fragment in required_fragments:

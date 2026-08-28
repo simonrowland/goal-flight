@@ -131,6 +131,28 @@ def test_journal_dir_loss_is_isolated_only_incidentally_by_task_store(
     assert not live_slug.exists(), f"leaked live journal dir: {live_slug}"
 
 
+def test_create_after_losing_overrides_does_not_mint_operator_xdg(
+    tmp_path: Path,
+) -> None:
+    """Popping JOURNAL_DIR and TASK_STORE_DIR must not mint ~/.local/state.
+
+    The production fallback is XDG_STATE_HOME (else ~/.local/state). Suite
+    isolation has to redirect that too; JOURNAL_DIR alone is not the index.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    operator_index = Path.home() / ".local" / "state" / "goal-flight" / "journals"
+    with env_cleared("GOALFLIGHT_JOURNAL_DIR", "GOALFLIGHT_TASK_STORE_DIR"):
+        slug = task.resolve_task_store_dir(project).name
+        created = journal.Journal.create(project).path.resolve()
+    live_slug = operator_index / slug
+    xdg = Path(os.environ["XDG_STATE_HOME"])
+    assert created.is_file()
+    assert created.is_relative_to(xdg.resolve()), created
+    assert not created.is_relative_to(operator_index.resolve()), created
+    assert not live_slug.exists(), f"leaked operator journal dir: {live_slug}"
+
+
 def test_subprocess_create_inherits_gate_journal_dir(tmp_path: Path) -> None:
     """A child that only gets the gate-style env must still miss the live store.
 

@@ -13,17 +13,25 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Isolate every machine-global writable default. A test that omits an explicit
-# messages_dir/journal_dir/fleet_dir must never migrate or append to the
-# operator's live ~/.goal-flight or ~/.local/state/goal-flight merely because
-# the production helper supplies defaults. Journal isolation is its own knob
-# (GOALFLIGHT_JOURNAL_DIR); TASK_STORE_DIR only isolates journals incidentally
-# and a test that pops the store override would otherwise write the live XDG
-# journals index.
+# messages_dir/journal_dir/fleet_dir/pidfile_dir must never migrate or append to
+# the operator's live ~/.goal-flight, ~/.local/state/goal-flight, or
+# /tmp/goal-flight-acp-pids.d merely because the production helper supplies
+# defaults. Journal isolation is its own knob (GOALFLIGHT_JOURNAL_DIR);
+# TASK_STORE_DIR only isolates journals incidentally and a test that pops the
+# store override would otherwise write the live XDG journals index. Pidfile
+# isolation is GOAL_FLIGHT_PIDFILE_DIR (production name) with the
+# GOALFLIGHT_PIDFILE_DIR alias kept in lockstep.
 _GF_TEST_ENV_BASE="$(mktemp -d "${TMPDIR:-/tmp}/gf-test-env-XXXXXX")"
 trap 'rm -rf "$_GF_TEST_ENV_BASE" 2>/dev/null || true' EXIT
 _GF_TASK_STORE_BASE="${GOALFLIGHT_TASK_STORE_DIR:-$_GF_TEST_ENV_BASE/task-store}"
 _GF_MESSAGES_BASE="${GOALFLIGHT_MESSAGES_DIR:-$_GF_TEST_ENV_BASE/messages}"
 _GF_JOURNAL_BASE="${GOALFLIGHT_JOURNAL_DIR:-$_GF_TEST_ENV_BASE/journal}"
+_GF_PIDFILE_BASE="${GOAL_FLIGHT_PIDFILE_DIR:-${GOALFLIGHT_PIDFILE_DIR:-$_GF_TEST_ENV_BASE/pids}}"
+# Do not pass the operator's XDG_STATE_HOME through: that is the journals-index
+# fallback when JOURNAL_DIR / TASK_STORE_DIR are unset. Preserve it only so the
+# live-index snapshot still watches the operator's directory, not the isolate.
+_GF_OPERATOR_XDG_STATE_HOME="${XDG_STATE_HOME-}"
+_GF_XDG_BASE="$_GF_TEST_ENV_BASE/xdg"
 
 pass=0
 fail=0
@@ -46,7 +54,10 @@ run_isolated_test_env() {
     GOALFLIGHT_CAPACITY_CONF="${GOALFLIGHT_CAPACITY_CONF:-/dev/null}" \
     GOALFLIGHT_MESSAGES_DIR="$_GF_MESSAGES_BASE" \
     GOALFLIGHT_JOURNAL_DIR="$_GF_JOURNAL_BASE" \
-    GOALFLIGHT_TASK_STORE_DIR="${GOALFLIGHT_TASK_STORE_DIR:-$_GF_TASK_STORE_BASE}" "$@"
+    GOALFLIGHT_TASK_STORE_DIR="${GOALFLIGHT_TASK_STORE_DIR:-$_GF_TASK_STORE_BASE}" \
+    GOAL_FLIGHT_PIDFILE_DIR="$_GF_PIDFILE_BASE" \
+    GOALFLIGHT_PIDFILE_DIR="$_GF_PIDFILE_BASE" \
+    XDG_STATE_HOME="$_GF_XDG_BASE" "$@"
 }
 
 # Bash tests (tests/bash/test-*.sh)
@@ -115,11 +126,12 @@ if command -v python3 >/dev/null 2>&1 && [ -d "$REPO_ROOT/tests/python" ]; then
     # Snapshot live XDG project-<10-hex> journal slugs so a suite leak cannot
     # hide behind incidental TASK_STORE_DIR isolation of the test's own slug.
     _GF_LIVE_SLUG_SNAP="$(mktemp "${TMPDIR:-/tmp}/gf-live-journal-slugs-XXXXXX")"
-    env -u GOALFLIGHT_JOURNAL_DIR -u GOALFLIGHT_TASK_STORE_DIR python3 - "$_GF_LIVE_SLUG_SNAP" <<'PY'
+    env -u GOALFLIGHT_JOURNAL_DIR -u GOALFLIGHT_TASK_STORE_DIR -u XDG_STATE_HOME \
+      python3 - "$_GF_LIVE_SLUG_SNAP" "$_GF_OPERATOR_XDG_STATE_HOME" <<'PY'
 import os, re, sys
 from pathlib import Path
-xdg = os.environ.get("XDG_STATE_HOME", "").strip()
-base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+op = sys.argv[2].strip()
+base = Path(op).expanduser() if op else Path.home() / ".local" / "state"
 index = base / "goal-flight" / "journals"
 pat = re.compile(r"^project-[0-9a-f]{10}$")
 names = []
@@ -144,7 +156,8 @@ PY
       failed_tests+=("tests/python")
     fi
     rm -f /tmp/goal-flight-test-$$.out
-    if ! env -u GOALFLIGHT_JOURNAL_DIR -u GOALFLIGHT_TASK_STORE_DIR python3 - "$_GF_LIVE_SLUG_SNAP" <<'PY'
+    if ! env -u GOALFLIGHT_JOURNAL_DIR -u GOALFLIGHT_TASK_STORE_DIR -u XDG_STATE_HOME \
+      python3 - "$_GF_LIVE_SLUG_SNAP" "$_GF_OPERATOR_XDG_STATE_HOME" <<'PY'
 import os, re, sys
 from pathlib import Path
 before = {
@@ -152,8 +165,8 @@ before = {
     for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
     if line.strip()
 }
-xdg = os.environ.get("XDG_STATE_HOME", "").strip()
-base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+op = sys.argv[2].strip()
+base = Path(op).expanduser() if op else Path.home() / ".local" / "state"
 index = base / "goal-flight" / "journals"
 pat = re.compile(r"^project-[0-9a-f]{10}$")
 after = set()

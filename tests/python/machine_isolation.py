@@ -26,6 +26,7 @@ messages dir              ``GOALFLIGHT_MESSAGES_DIR``                           
 task store                ``GOALFLIGHT_TASK_STORE_DIR``                         yes
 fleet dir                 ``GOALFLIGHT_FLEET_DIR``                              yes
 capacity conf             live ``~/.goal-flight/capacity.local.json``           ``/dev/null``
+XDG state home            ``XDG_STATE_HOME`` else ``~/.local/state``            yes
 ambient identity          ``GOALFLIGHT_DISPATCH_ID`` / prompt / steer / lease   scrubbed
 
 Pre-fix fixture completeness in the six-file selection (function-scoped
@@ -113,5 +114,8 @@ def isolate_goalflight_machine_state_impl(
     request: pytest.FixtureRequest,
 ) -> dict[str, str] | None:
     if request.node.get_closest_marker("live_machine_state") is not None:
+        # The driver injects XDG_STATE_HOME into every child. Drop it so
+        # tests of the production default still see the operator's XDG.
+        monkeypatch.delenv("XDG_STATE_HOME", raising=False)
         return None
     return apply_isolated_machine_env(tmp_path, monkeypatch)

@@ -297,6 +297,7 @@ def test_isolated_env_scrubs_ambient_runtime_identity(
     assert env["GOAL_FLIGHT_PIDFILE_DIR"] == env["GOALFLIGHT_PIDFILE_DIR"] == str(
         tmp_path / "pids"
     )
+    assert env["XDG_STATE_HOME"] == str(tmp_path / "xdg")
 
 
 def test_flake_report_is_visible_without_becoming_a_failure() -> None:
