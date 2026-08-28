@@ -720,6 +720,7 @@ def _launch(args: argparse.Namespace) -> int:
         {
             "worktree_path": str(worktree_seat.path),
             "worktree_seat": worktree_seat.seat_name,
+            "worktree_branch": worktree_seat.branch,
             "quarantine_branch": worktree_seat.quarantine_branch,
         },
     )
@@ -850,6 +851,7 @@ def _launch(args: argparse.Namespace) -> int:
         "worktree_base_sha": getattr(args, "base_sha", ""),
         "worktree_path": str(worktree_seat.path),
         "worktree_seat": worktree_seat.seat_name,
+        "worktree_branch": worktree_seat.branch,
         "quarantine_branch": worktree_seat.quarantine_branch,
     }
     receipt_file = _receipt_path(state_dir, args.dispatch_id)

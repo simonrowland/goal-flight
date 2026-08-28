@@ -4038,6 +4038,7 @@ async def _run_acp_dispatch_impl(
                 worker_cwd=worker_cwd,
                 worktree_path=str(worktree_seat.path),
                 worktree_seat=worktree_seat.seat_name,
+                worktree_branch=worktree_seat.branch,
                 quarantine_branch=worktree_seat.quarantine_branch,
             )
         try:

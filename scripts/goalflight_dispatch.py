@@ -16079,6 +16079,7 @@ def main(argv: list[str] | None = None) -> int:
             worker_argv, stdin_path = build_worker(args, prompt_path, raw)
             summary_head["worktree_seat"] = worktree_seat.seat_name
             summary_head["worktree_path"] = str(worktree_seat.path)
+            summary_head["worktree_branch"] = worktree_seat.branch
             summary_head["worktree_base"] = _requested_worktree_base(args)
         _record_ledger(
             args,

@@ -41,6 +41,7 @@ class FakeProc:
 class FakeSeatLease:
     path = ROOT
     seat_name = "wt-1"
+    branch = "seat/fake"
     quarantine_branch = None
 
     def __init__(self) -> None:
