@@ -87,6 +87,11 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- The CI honesty script always runs from `tests/run.sh`. Absence of the
+  gitignored `tests/python/ext` zone is N/A inside that script (tracked
+  `--list` paths and runner fragments still asserted). The outer skip that
+  swallowed the whole honesty check on worktrees and clean clones is gone.
+
 - `goalflight_ledger.py finish --terminal-state` on an already-terminal row
   refuses with a non-zero exit and names the current state when the
   requested state differs. Same-state retries stay quiet (`idempotent:

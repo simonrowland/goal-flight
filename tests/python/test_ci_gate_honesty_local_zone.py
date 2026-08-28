@@ -180,32 +180,27 @@ def test_honesty_still_passes_when_zone_present_and_listed(tmp_path: Path) -> No
     assert SKIP_REASON_NEEDLE not in result.stdout
 
 
-def test_run_sh_skips_honesty_when_local_only_zone_is_absent(tmp_path: Path) -> None:
+def test_run_sh_still_runs_honesty_when_local_only_zone_is_absent(
+    tmp_path: Path,
+) -> None:
+    """Absence of tests/python/ext is N/A inside honesty, not a gate skip.
+
+    Replaces test_run_sh_skips_honesty_when_local_only_zone_is_absent, which
+    pinned the over-broad run.sh continue that swallowed tracked-path checks.
+    """
     root = tmp_path / "gate-absent"
     bash_dir = root / "tests" / "bash"
     bash_dir.mkdir(parents=True)
     (bash_dir / "test-ci-gate-honesty.sh").write_text(
-        "#!/usr/bin/env bash\necho SHOULD-NOT-RUN\nexit 1\n",
+        "#!/usr/bin/env bash\necho HONESTY-RAN\nexit 1\n",
         encoding="utf-8",
     )
     result = _run_copied_gate(root, tmp_path)
     combined = result.stdout + result.stderr
-    assert "SHOULD-NOT-RUN" not in combined
-    assert "FAIL  tests/bash/test-ci-gate-honesty.sh" not in combined
-    assert (
-        "SKIP  tests/bash/test-ci-gate-honesty.sh "
-        "(tests/python/ext is a gitignored local-only zone, absent from worktrees by construction)"
-    ) in result.stdout
-    skip_lines = [
-        line for line in result.stdout.splitlines() if line.startswith("SKIP  ")
-    ]
-    summary = [line for line in result.stdout.splitlines() if line.startswith("=====")]
-    assert summary, combined
-    # Summary is "N passed, M skipped, K failed". The skip count must match
-    # the SKIP lines this run actually emitted. Other fixture failures (no
-    # python suite) must not desynchronise that count.
-    skipped = int(summary[-1].split(",")[1].strip().split()[0])
-    assert skipped == len(skip_lines), combined
+    assert result.returncode != 0, combined
+    assert "HONESTY-RAN" in combined
+    assert "FAIL  tests/bash/test-ci-gate-honesty.sh" in combined
+    assert "SKIP  tests/bash/test-ci-gate-honesty.sh" not in combined
 
 
 def test_run_sh_still_runs_honesty_when_local_only_zone_is_present(
