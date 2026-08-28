@@ -52,7 +52,6 @@ if listed.returncode != 0:
     raise SystemExit(f"tests/run.sh --list failed: {listed.stdout}\n{listed.stderr}")
 paths = set(listed.stdout.splitlines())
 for required in (
-    "tests/python/ext/test_claude_usage.py",
     "tests/python/test_ci_mutation_guards.py",
     "tests/python/test_goalflight_gate.py",
     "tests/python/test_script_style_modules.py",
@@ -60,6 +59,19 @@ for required in (
 ):
     if required not in paths:
         raise SystemExit(f"tests/run.sh --list omitted {required}")
+
+# tests/python/ext is gitignored and is not materialised in worktrees.
+# Absence is not-applicable, not a failed collection. When the zone exists,
+# nested discovery must still list the local-only module or the gate is lying.
+local_only_zone = root / "tests" / "python" / "ext"
+local_only_required = "tests/python/ext/test_claude_usage.py"
+if not local_only_zone.exists():
+    print(
+        "SKIP  tests/python/ext "
+        "(gitignored local-only zone, absent from worktrees by construction)"
+    )
+elif local_only_required not in paths:
+    raise SystemExit(f"tests/run.sh --list omitted {local_only_required}")
 
 print("CI gate honesty tests passed")
 PY

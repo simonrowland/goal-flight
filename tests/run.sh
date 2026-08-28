@@ -73,6 +73,17 @@ for test in test-*.sh; do
     test-grok-*.sh)
       if [ "${GOALFLIGHT_LIVE_GROK:-0}" != "1" ]; then
         echo "SKIP  tests/bash/$test (live grok probe; set GOALFLIGHT_LIVE_GROK=1 to run)"
+        skip=$((skip + 1))
+        continue
+      fi
+      ;;
+    test-ci-gate-honesty.sh)
+      # tests/python/ext is gitignored and is not materialised in worktrees.
+      # Absence is not-applicable, not a failed honesty check. Listing above
+      # still names this file so --list collection stays stable.
+      if [ ! -e "$REPO_ROOT/tests/python/ext" ]; then
+        echo "SKIP  tests/bash/$test (tests/python/ext is a gitignored local-only zone, absent from worktrees by construction)"
+        skip=$((skip + 1))
         continue
       fi
       ;;
