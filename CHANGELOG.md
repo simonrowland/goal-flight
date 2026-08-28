@@ -132,14 +132,17 @@ incremented when meaningful skill behaviour changes.
   immediately. `--chatty` restores the raw keepalive and frontier feed.
   Supervisor `type=restart` records reuse that same floor: consecutive
   fast failures escalate 1s → 2 → 4 … to a 120s cap (reset after a
-  successful or long-lived run; exit 0 stays at zero delay), and a
-  verbatim-identical restart line is collapsed until the floor rather
-  than emitted on every retry. The collapsed copy carries `count` and
-  `window_s` so suppressing repetition does not hide scale. Restart
-  collapse is keyed per slot identity (`backup-1` / `backup-2` when the
-  doorbell pool repeats the `backup` kind) so one child's failures
-  cannot suppress another's record. Generic failures keep restarting
-  — a silent give-up would deafen the wake channel.
+  successful or long-lived run; exit 0 stays at zero delay). The first
+  copy of a restart key emits immediately; later identical copies
+  collapse until the floor, a key change, or supervisor exit. Each
+  record's `count` is the number of restarts that record represents
+  (the immediate first has `count=1`; a collapse record counts only the
+  held copies). Summing `count` across `type=restart` records recovers
+  the true restart total. `window_s` is the span of the copies in that
+  record. Restart collapse is keyed per slot identity (`backup-1` /
+  `backup-2` when the doorbell pool repeats the `backup` kind) so one
+  child's failures cannot suppress another's record. Generic failures
+  keep restarting — a silent give-up would deafen the wake channel.
 - Listener and persistent-backup slot counts have no upper bound.
   `MAX_LISTENER_SLOTS` and `ListenerSlotsFull` are gone. Arming past the
   configured target takes the next free slot; `--listener-slots` /

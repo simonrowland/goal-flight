@@ -433,8 +433,14 @@ idle beat. Terse `supervise` then suppresses a verbatim-identical `kind=next`
 payload until that same floor; a content change still wakes immediately, and
 `--chatty` restores the raw keepalive and frontier feed. Failure restarts
 escalate 1s → 2 → 4 … to 120s (reset on a successful or long-lived run; exit 0
-stays at zero delay) and reuse that floor so a crash loop does not emit the
-same `type=restart` line on every retry. The host may batch
+stays at zero delay). The first `type=restart` of a key emits immediately;
+verbatim-identical copies then reuse that floor so a crash loop does not emit
+the same line on every retry. Each restart record's `count` is the number of
+child restarts that record represents: the immediate first has `count=1`, and a
+later collapse record counts only the copies held after that first. Summing
+`count` across `type=restart` records recovers the true restart total.
+`window_s` is the span of the copies in that record (0 for a single immediate
+first copy). The host may batch
 lines produced within 200 ms, so every line is an independently parseable JSON
 object and consumers enumerate all records in a batch.
 An event defers the next idle heartbeat, avoiding a contradictory event plus
