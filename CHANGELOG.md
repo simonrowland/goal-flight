@@ -74,10 +74,12 @@ incremented when meaningful skill behaviour changes.
   composition change.
 - Requeue intent lifecycle: a retry now carries a terminal disposition
   (`satisfied` / `abandoned` / `expired`). Regeneration stops when a later
-  dispatch for the same task_ids is complete, when the intent is older
-  than 24h, or after 3 lodges. The queue entry keeps the original
-  `created_at` and surfaces `requeue_attempt`. UNKNOWN timestamps,
-  unlistable ledgers, and unlinked work retain the intent.
+  dispatch for the same task_ids **in the same project** is complete, when
+  the intent is older than 24h, or after 3 lodges. The queue entry keeps
+  the original `created_at` and surfaces `requeue_attempt`. UNKNOWN
+  timestamps, unlistable ledgers, unlinked work, and a missing or
+  foreign `project_root` retain the intent (task ids collide across
+  repos; they are not a host-wide successor).
   `ledger cancel-requeue` is the sanctioned abandon path.
 
 ### Changed

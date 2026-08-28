@@ -9376,8 +9376,13 @@ def _ledger_task_ids_advanced(
     *,
     self_dispatch_id: str,
     entry_created_timestamp_s: float | None = None,
+    self_project_root: object | None = None,
 ) -> tuple[int, int, str]:
-    """Return counts plus the typed reason ledger authority is inconclusive."""
+    """Return counts plus the typed reason ledger authority is inconclusive.
+
+    Same-task completions in another project's ledger row are not this
+    envelope's successor. Missing project_root on either side is not a match.
+    """
     if not task_ids:
         return 0, 0, "conclusive"
     wanted = set(task_ids)
@@ -9401,6 +9406,9 @@ def _ledger_task_ids_advanced(
         rec_ids = set(_entry_task_ids(None, record))
         overlap = wanted & rec_ids
         if not overlap:
+            continue
+        other_root = _entry_owner_fields(None, record)[1]
+        if not _project_roots_match(self_project_root, other_root):
             continue
         state = str(record.get("state") or "")
         terminal = str(
@@ -9501,10 +9509,12 @@ def _linked_task_truth_detail(
         store_issue = "task_store_unavailable"
 
     self_id = str(entry.get("dispatch_id") or (record or {}).get("dispatch_id") or "")
+    self_root = _entry_owner_fields(entry, record)[1]
     ledger_complete, ledger_advanced, ledger_issue = _ledger_task_ids_advanced(
         task_ids,
         self_dispatch_id=self_id,
         entry_created_timestamp_s=entry_created_timestamp_s,
+        self_project_root=self_root,
     )
 
     # Prefer explicit store truth when every linked id is present and complete.
@@ -13227,9 +13237,16 @@ def _later_complete_successor_id(record: dict, entry: dict) -> str | None:
     timestamps cannot be ordered are not a determination of "no successor".
     They simply fail to prove one. Callers must retain the intent in those
     cases rather than treating absence of a return value as expiry.
+
+    Task ids collide across projects on this box by design. A successor is
+    only proven when both rows name a project_root and those roots match.
+    Missing or empty project_root is UNKNOWN, not a host-wide match.
     """
     task_ids = set(_entry_task_ids(entry, record))
     if not task_ids:
+        return None
+    self_root = _entry_owner_fields(entry, record)[1]
+    if not self_root:
         return None
     self_id = str(record.get("dispatch_id") or entry.get("dispatch_id") or "")
     self_ts = _requeue_record_event_ts(record)
@@ -13246,6 +13263,9 @@ def _later_complete_successor_id(record: dict, entry: dict) -> str | None:
         if not other_id or other_id == self_id:
             continue
         if not (task_ids & set(_entry_task_ids(None, other))):
+            continue
+        other_root = _entry_owner_fields(None, other)[1]
+        if not _project_roots_match(self_root, other_root):
             continue
         state = str(other.get("state") or "")
         terminal = str(other.get("terminal_state") or "")

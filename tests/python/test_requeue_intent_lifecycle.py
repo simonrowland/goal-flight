@@ -86,6 +86,7 @@ def _write_quota_record(
     ended_at: str,
     requeue: dict | None = None,
     state: str = "quota_exhausted",
+    project_root: Path | str | None = "",
 ) -> dict:
     record = {
         "schema": L.SCHEMA,
@@ -96,17 +97,30 @@ def _write_quota_record(
         "account": "default",
         "effective_account": "seat-r",
         "transport": "dispatch",
-        "project_root": str(tmp_path),
         "state": state,
         "terminal_state": state,
         "started_at": ended_at,
         "ended_at": ended_at,
         "task_ids": list(task_ids or []),
     }
+    if project_root == "":
+        record["project_root"] = str(tmp_path)
+    elif project_root is not None:
+        record["project_root"] = str(project_root)
     if requeue is not None:
         record["requeue"] = requeue
     L.write_record(record)
     return json.loads(L.record_path(dispatch_id).read_text(encoding="utf-8"))
+
+
+def _plant_child_envelope(queue_dir: Path, child_id: str) -> Path:
+    """A real retry file so successor unlink is observed, not vacuous."""
+    child_path = D._queue_entry_path(child_id, queue_dir=queue_dir)
+    child_path.write_text(
+        json.dumps({"schema": D.DISPATCH_QUEUE_SCHEMA, "dispatch_id": child_id}),
+        encoding="utf-8",
+    )
+    return child_path
 
 
 def _read_record(dispatch_id: str) -> dict:
@@ -115,6 +129,11 @@ def _read_record(dispatch_id: str) -> dict:
 
 def _iso_days_ago(days: int) -> str:
     stamp = datetime.now(timezone.utc) - timedelta(days=days)
+    return stamp.isoformat(timespec="seconds")
+
+
+def _iso_hours_ago(hours: int) -> str:
+    stamp = datetime.now(timezone.utc) - timedelta(hours=hours)
     return stamp.isoformat(timespec="seconds")
 
 
@@ -127,6 +146,7 @@ def test_completed_successor_satisfies_intent_and_does_not_relodge(
     task_ids = ["t-successor"]
     parent_ended = _iso_days_ago(3)
     entry, queue_dir, tail = _claimed_entry(tmp_path, parent_id, task_ids=task_ids)
+    child_path = _plant_child_envelope(queue_dir, child_id)
     _write_quota_record(
         parent_id,
         tmp_path=tmp_path,
@@ -150,9 +170,113 @@ def test_completed_successor_satisfies_intent_and_does_not_relodge(
     assert intent["disposition"] == "satisfied"
     assert intent["satisfied_by"] == successor_id
     assert intent["disposition_reason"] == "successor_complete"
-    child_path = D._queue_entry_path(child_id, queue_dir=queue_dir)
     assert not child_path.exists()
     assert D._terminal_ledger_requeue_pending(parent, entry, queue_dir=queue_dir) is False
+
+
+def test_foreign_project_successor_does_not_satisfy_or_unlink(tmp_path: Path) -> None:
+    """Same task id in another repo is not a successor (host-wide ledger).
+
+    Task ids collide across projects by design. Matching on task_ids alone
+    would unlink this project's retry when a different repo completes the
+    same chunk id.
+    """
+    kiln_root = tmp_path / "kiln"
+    papers_root = tmp_path / "papers-propulsion"
+    kiln_root.mkdir()
+    papers_root.mkdir()
+    parent_id = "kiln-t022-quota"
+    successor_id = "papers-t022-done"
+    child_id = "kiln-t022-quota-retry-cafecafe"
+    task_ids = ["t-022"]
+    parent_ended = _iso_hours_ago(1)
+    entry, queue_dir, tail = _claimed_entry(kiln_root, parent_id, task_ids=task_ids)
+    child_path = _plant_child_envelope(queue_dir, child_id)
+    _write_quota_record(
+        parent_id,
+        tmp_path=kiln_root,
+        task_ids=task_ids,
+        ended_at=parent_ended,
+        requeue={"child_id": child_id, "requeued_at": parent_ended},
+        project_root=kiln_root,
+    )
+    _write_quota_record(
+        successor_id,
+        tmp_path=papers_root,
+        task_ids=task_ids,
+        ended_at=_iso_days_ago(0),
+        state="complete",
+        project_root=papers_root,
+    )
+
+    assert D._maybe_requeue_terminal_claim(
+        _txn(), entry, queue_dir=queue_dir, tail=tail
+    )
+    parent = _read_record(parent_id)
+    intent = parent["requeue"]
+    assert intent.get("disposition") not in {"satisfied", "abandoned", "expired"}
+    assert intent.get("satisfied_by") != successor_id
+    assert child_path.exists(), "foreign complete must not unlink this project's retry"
+
+
+def test_empty_project_root_successor_is_not_proof(tmp_path: Path) -> None:
+    """Missing project_root is UNKNOWN, not a same-project successor."""
+    parent_id = "empty-root-parent"
+    successor_id = "empty-root-other"
+    child_id = "empty-root-parent-retry-deadbeef"
+    task_ids = ["t-022"]
+    parent_ended = _iso_hours_ago(1)
+    entry, queue_dir, tail = _claimed_entry(tmp_path, parent_id, task_ids=task_ids)
+    child_path = _plant_child_envelope(queue_dir, child_id)
+    _write_quota_record(
+        parent_id,
+        tmp_path=tmp_path,
+        task_ids=task_ids,
+        ended_at=parent_ended,
+        requeue={"child_id": child_id, "requeued_at": parent_ended},
+        project_root=tmp_path,
+    )
+    _write_quota_record(
+        successor_id,
+        tmp_path=tmp_path,
+        task_ids=task_ids,
+        ended_at=_iso_days_ago(0),
+        state="complete",
+        project_root=None,
+    )
+
+    assert D._maybe_requeue_terminal_claim(
+        _txn(), entry, queue_dir=queue_dir, tail=tail
+    )
+    parent = _read_record(parent_id)
+    intent = parent["requeue"]
+    assert intent.get("disposition") not in {"satisfied", "abandoned", "expired"}
+    assert child_path.exists()
+
+
+def test_ledger_task_ids_advanced_ignores_foreign_project(tmp_path: Path) -> None:
+    """Same-class: drain completion authority must not count another repo's t-022."""
+    kiln_root = tmp_path / "kiln"
+    papers_root = tmp_path / "papers-propulsion"
+    kiln_root.mkdir()
+    papers_root.mkdir()
+    _write_quota_record(
+        "papers-t022-done",
+        tmp_path=papers_root,
+        task_ids=["t-022"],
+        ended_at=_iso_days_ago(0),
+        state="complete",
+        project_root=papers_root,
+    )
+    complete, advanced, issue = D._ledger_task_ids_advanced(
+        ["t-022"],
+        self_dispatch_id="kiln-t022-quota",
+        entry_created_timestamp_s=1.0,
+        self_project_root=str(kiln_root),
+    )
+    assert complete == 0
+    assert advanced == 0
+    assert issue == "conclusive"
 
 
 def test_stale_intent_expires_by_age_and_does_not_relodge(tmp_path: Path) -> None:
