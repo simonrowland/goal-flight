@@ -5746,16 +5746,20 @@ def _attempt_claiming_worker_argv(
     dispatch_id: str,
     worker_argv: list[str],
 ) -> tuple[list[str], bool]:
-    if not os.path.lexists(goalflight_journal.resolve_journal_path(project_root)):
+    try:
+        # Peek-only: the RUNNING CAS lives in the unsandboxed watcher. A writer
+        # Journal() would take the construction write lock on the launch path.
+        # Only a genuine FileNotFoundError (JournalDisappeared) is "no journal".
+        # An unreadable present journal raises JournalIOError and must not skip
+        # attempt fencing.
+        attempt = goalflight_journal.Journal.open_reader(
+            project_root
+        ).attempt_for_dispatch(dispatch_id)
+    except goalflight_journal.JournalDisappeared:
         # Embedders can replace the ledger-recording seam when they own launch
         # tracking. Preserve that pre-P2 seam without bootstrapping authority
         # behind the embedding's back.
         return worker_argv, False
-    # Peek-only: the RUNNING CAS lives in the unsandboxed watcher. A writer
-    # Journal() would take the construction write lock on the launch path.
-    attempt = goalflight_journal.Journal.open_reader(project_root).attempt_for_dispatch(
-        dispatch_id
-    )
     if attempt is None:
         if _record_ledger is not _NATIVE_RECORD_LEDGER:
             # Controller registration can create the journal independently of
@@ -6332,12 +6336,26 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
 
 
 def _existing_queue_entry_paths(queue_path: Path) -> list[Path]:
-    paths = [queue_path] if queue_path.exists() else []
-    paths.extend(
-        path
-        for path in sorted(queue_path.parent.glob(f"{queue_path.name}.claimed-*"))
-        if not path.name.endswith(".failed")
-    )
+    """Live envelope and claim paths. Unreadable parent is not empty."""
+    parent = queue_path.parent
+    try:
+        entries = list(parent.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise OSError(
+            f"queue dir unreadable while looking for {queue_path.name}: "
+            f"{type(exc).__name__}"
+        ) from exc
+    name = queue_path.name
+    paths: list[Path] = []
+    for path in sorted(entries):
+        if path.name == name:
+            paths.append(path)
+        elif path.name.startswith(f"{name}.claimed-") and not path.name.endswith(
+            ".failed"
+        ):
+            paths.append(path)
     return paths
 
 
@@ -6364,6 +6382,8 @@ def _cleanup_partial_submit(queue_path: Path, status_json: Path) -> None:
             prompt_sidecar.unlink()
     with contextlib.suppress(OSError):
         status_json.with_suffix(status_json.suffix + ".tmp").unlink()
+    # glob-empty here only skips leftover ``*.tmp.*`` cleanup; it does not
+    # delete live envelopes. Unreadable parent leaves tmps in place.
     for tmp in queue_path.parent.glob(f"{queue_path.name}.tmp.*"):
         with contextlib.suppress(OSError):
             tmp.unlink()
@@ -6630,22 +6650,25 @@ def _queue_launch_token(entry: dict | None = None) -> str:
         project_root = entry.get("project_root") or request.get("cwd")
         if dispatch_id and project_root:
             resolved_root = goalflight_task.resolve_project_root(str(project_root))
-            if os.path.lexists(goalflight_journal.resolve_journal_path(resolved_root)):
+            try:
                 # Peek-only reuse of a still-PREPARED attempt. Read errors must
                 # still escape before the carrier is claimed; open_reader does.
+                # Only JournalDisappeared is absent; unreadable is JournalIOError.
                 attempt = goalflight_journal.Journal.open_reader(
                     resolved_root
                 ).attempt_for_dispatch(dispatch_id)
-                if (
-                    attempt is not None
-                    and attempt.lifecycle_state == goalflight_journal.ATTEMPT_PREPARED
-                ):
-                    # A queue child refused before spawn. The durable claim
-                    # was restored, but its journal preparation is still the
-                    # same attempt. Reuse that fencing token so the next
-                    # drain can continue PREPARED -> STARTING. A journal read
-                    # error must escape before the carrier is claimed.
-                    return attempt.launch_token
+            except goalflight_journal.JournalDisappeared:
+                attempt = None
+            if (
+                attempt is not None
+                and attempt.lifecycle_state == goalflight_journal.ATTEMPT_PREPARED
+            ):
+                # A queue child refused before spawn. The durable claim
+                # was restored, but its journal preparation is still the
+                # same attempt. Reuse that fencing token so the next
+                # drain can continue PREPARED -> STARTING. A journal read
+                # error must escape before the carrier is claimed.
+                return attempt.launch_token
     return uuid.uuid4().hex
 
 
@@ -7831,10 +7854,10 @@ def _release_stale_capacity_for_drain() -> None:
 def _read_capacity_state_for_reconciliation() -> dict:
     """Read capacity state without converting corruption into an empty lease set."""
 
-    path = goalflight_capacity.state_path()
-    if not path.exists():
-        return {"schema": goalflight_capacity.SCHEMA, "leases": {}}
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = goalflight_capacity.load_state()
+    except goalflight_capacity.CapacityStateUnreadable as exc:
+        raise ValueError(str(exc)) from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("leases"), dict):
         raise ValueError("capacity state has no readable lease map")
     return payload
@@ -8526,7 +8549,7 @@ def reconcile_abandoned_dispatches(
         key = str(entry.get("reason") or "unknown")
         kept_reasons[key] = kept_reasons.get(key, 0) + 1
     claimer_counts = _claimer_report_fields(resolved_queue_dir)
-    return {
+    report = {
         "schema": ABANDONED_RECONCILIATION_SCHEMA,
         "mode": "dry-run" if dry_run else "automatic",
         "stale_seconds": stale_s,
@@ -8540,6 +8563,9 @@ def reconcile_abandoned_dispatches(
         "live_claimer": claimer_counts["live_claimer"],
         "entries": entries,
     }
+    if claimer_counts.get("queue_listing_error"):
+        report["queue_listing_error"] = str(claimer_counts["queue_listing_error"])
+    return report
 
 
 def _reconcile_abandoned_for_drain(queue_dir: Path) -> dict:
@@ -8775,12 +8801,38 @@ def _prefer_claim_carrier(statuses: list[ClaimCarrierStatus]) -> ClaimCarrierSta
     return statuses[0]
 
 
-def _summarize_claim_markers(queue_dir: Path) -> dict[str, int]:
-    """Count leftover claim markers by claimer adjudication. Read-only."""
-    summary = {"dead": 0, "unknown": 0, "live": 0}
-    if not queue_dir.is_dir():
+def _queue_dir_listing(queue_dir: Path) -> list[Path]:
+    """List queue-dir entries, raising on a failed listing.
+
+    ``Path.glob`` swallows ``PermissionError`` and yields nothing, which
+    renders an unreadable queue as an empty one — the collapse that licensed
+    ``worker_provably_gone`` for an envelope still on disk. ``iterdir``
+    raises. A directory that vanished between the ``is_dir`` probe and the
+    listing is genuinely absent: no entries.
+    """
+    try:
+        return list(queue_dir.iterdir())
+    except FileNotFoundError:
+        return []
+
+
+def _summarize_claim_markers(queue_dir: Path) -> dict[str, int | str]:
+    """Count leftover claim markers by claimer adjudication. Read-only.
+
+    An unreadable queue dir is UNKNOWN, not all-zero counts: the report
+    carries ``listing_error`` instead of pretending no markers exist.
+    """
+    summary: dict[str, int | str] = {"dead": 0, "unknown": 0, "live": 0}
+    # Do not probe with ``is_dir()``: Path.is_dir returns False on OSError, so a
+    # parent-unreadable queue would look absent (all-zero, no listing_error).
+    try:
+        entries = _queue_dir_listing(queue_dir)
+    except OSError as exc:
+        summary["listing_error"] = f"queue_dir_unreadable:{type(exc).__name__}"
         return summary
-    for claim in queue_dir.glob("*.json.claimed-*"):
+    for claim in entries:
+        if ".json.claimed-" not in claim.name:
+            continue
         if claim.name.endswith(".failed"):
             continue
         kind = _adjudicate_claim_marker(claim).kind
@@ -8793,13 +8845,17 @@ def _summarize_claim_markers(queue_dir: Path) -> dict[str, int]:
     return summary
 
 
-def _claimer_report_fields(queue_dir: Path) -> dict[str, int]:
+def _claimer_report_fields(queue_dir: Path) -> dict[str, int | str]:
     summary = _summarize_claim_markers(queue_dir)
-    return {
+    fields: dict[str, int | str] = {
         "dead_claimer": summary["dead"],
         "unknown_claimer": summary["unknown"],
         "live_claimer": summary["live"],
     }
+    listing_error = summary.get("listing_error")
+    if listing_error:
+        fields["queue_listing_error"] = str(listing_error)
+    return fields
 
 
 def _abandoned_carrier_keep_reason(carrier: ClaimCarrierStatus) -> str | None:
@@ -8818,16 +8874,29 @@ def _claim_has_active_carrier(queue_dir: Path, dispatch_id: str) -> ClaimCarrier
     A bare ``.json`` is a queued envelope (healthy carrier). A ``.claimed-*``
     marker is a claimer: LIVE, DEAD, or UNKNOWN via pid+start-token identity.
     The result is truthy whenever any matching file exists, so restore/close
-    paths that used this as a presence gate still refuse to mutate.
+    paths that used this as a presence gate still refuse to mutate. A queue
+    dir that cannot be listed is UNKNOWN, never NONE: unreadable is not
+    absent, and the abandoned gate must keep what it cannot verify.
     """
     if not dispatch_id:
         return ClaimCarrierStatus()
-    if not queue_dir.is_dir():
-        return ClaimCarrierStatus()
+    # Do not probe with ``is_dir()``: Path.is_dir returns False on OSError, so a
+    # parent-unreadable queue would look NONE while the envelope is still on
+    # disk. Listing raises; FileNotFoundError is the absent/NONE path.
     safe = goalflight_compat.safe_dispatch_filename(dispatch_id)
     statuses: list[ClaimCarrierStatus] = []
+    try:
+        entries = _queue_dir_listing(queue_dir)
+    except OSError as exc:
+        return ClaimCarrierStatus(
+            ClaimCarrierKind.UNKNOWN,
+            f"queue_dir_unreadable:{type(exc).__name__}",
+            str(queue_dir),
+        )
     # Canonical name is usually "<dispatch_id>.json" but may be priority-prefixed.
-    for path in queue_dir.glob("*.json"):
+    for path in entries:
+        if not path.name.endswith(".json"):
+            continue
         if path.name.endswith(".failed"):
             continue
         try:
@@ -8846,7 +8915,9 @@ def _claim_has_active_carrier(queue_dir: Path, dispatch_id: str) -> ClaimCarrier
             statuses.append(
                 ClaimCarrierStatus(ClaimCarrierKind.QUEUED, "queued_envelope", str(path))
             )
-    for claim in queue_dir.glob("*.json.claimed-*"):
+    for claim in entries:
+        if ".json.claimed-" not in claim.name:
+            continue
         if claim.name.endswith(".failed"):
             continue
         try:
@@ -10601,7 +10672,23 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
     pending_launch = 0
     quarantined = 0
     pending_reasons: list[dict] = []
-    for claim in sorted(queue_dir.glob("*.json.claimed-*")):
+    try:
+        entries = _queue_dir_listing(queue_dir)
+    except OSError as exc:
+        # An unreadable queue is not an empty queue. Republish/terminalize
+        # decisions need the carrier listing, so refuse the whole pass and
+        # surface the failure instead of reconciling blind.
+        listing_error = f"queue_dir_unreadable:{type(exc).__name__}"
+        return {
+            "restored": 0,
+            "cleared": 0,
+            "pending_launch": 0,
+            "quarantined": 0,
+            "ledger_terminalized": 0,
+            "pending_reasons": [{"dispatch_id": "", "reason": listing_error}],
+            "listing_error": listing_error,
+        }
+    for claim in sorted(path for path in entries if ".json.claimed-" in path.name):
         if claim.name.endswith(".failed"):
             continue
         try:
@@ -11996,9 +12083,11 @@ def _write_json_exclusive(path: Path, payload: dict) -> bool:
 
 def _requeue_child_exists(queue_dir: Path, child_id: str) -> bool:
     queue_path = _queue_entry_path(child_id, queue_dir=queue_dir)
-    if queue_path.exists() or any(
-        queue_path.parent.glob(f"{queue_path.name}.claimed-*")
-    ):
+    try:
+        if _existing_queue_entry_paths(queue_path):
+            return True
+    except OSError:
+        # Unreadable queue is not "child gone". Keep: refuse to mint a duplicate.
         return True
     return goalflight_ledger.record_path(child_id, create=False).exists()
 
@@ -12572,6 +12661,26 @@ def _note_drain_journal_skip(
     acc["details"].append(detail)
 
 
+def _drain_launch_capacity_reason(
+    returncode: int, stdout: str, stderr: str
+) -> str | None:
+    """Classify a drain-launch capacity refusal.
+
+    Unreadable capacity state and genuine cap-reached both exit 2, and the
+    launch stdout can carry ``blocked_capacity`` for both. Prefer
+    ``capacity_state_unreadable`` so this cannot surface as
+    ``capacity_unavailable`` (t-068).
+    """
+    if returncode != 2:
+        return None
+    launch_output = f"{stdout}{stderr}"
+    if "capacity_state_unreadable" in launch_output:
+        return "capacity_state_unreadable"
+    if "blocked_capacity" in launch_output:
+        return "capacity_unavailable"
+    return None
+
+
 def _drain_queue_once(args) -> dict:
     queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else _dispatch_queue_dir()
     queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -12595,6 +12704,13 @@ def _drain_queue_once(args) -> dict:
         _release_stale_capacity_for_drain()
         abandoned_reconciliation = _reconcile_abandoned_for_drain(queue_dir)
     recovery = _recover_claimed_queue_entries(queue_dir, stale_s=args.claim_stale_s)
+    if recovery.get("listing_error"):
+        # The queue could not be listed: every candidate is invisible, so a
+        # "0 launched, 0 remaining" pass would be a false green. Fail the
+        # drain with the listing error instead of reporting an empty queue.
+        raise OSError(
+            f"dispatch queue listing failed for {queue_dir}: {recovery['listing_error']}"
+        )
     launched = 0
     left_queued = 0
     failed = 0
@@ -12615,7 +12731,9 @@ def _drain_queue_once(args) -> dict:
     # out and report each one with its owner-generation adjudication below.
     restore_prepared_candidates: list[tuple] = []
     launch_candidates: list[tuple] = []
-    for path in queue_dir.glob("*.json"):
+    for path in _queue_dir_listing(queue_dir):
+        if not path.name.endswith(".json"):
+            continue
         candidate = _queue_entry_drain_candidate(path)
         if (
             isinstance(candidate[2], dict)
@@ -12788,7 +12906,14 @@ def _drain_queue_once(args) -> dict:
                 exc=exc,
             )
             continue
-        except goalflight_journal.JournalError as exc:
+        except (
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+            goalflight_journal.JournalError,
+        ) as exc:
+            # Name the availability subtypes: a bare JournalError catch flattens
+            # unreadable vs disappeared. Unreadable still fails closed here
+            # (do not launch); the reason string keeps the concrete class.
             _note_drain_journal_skip(
                 drain_acc,
                 dispatch_id=dispatch_id,
@@ -12862,7 +12987,11 @@ def _drain_queue_once(args) -> dict:
                 lease.release_reason = "journal_busy"
                 _remember_drain_journal_skip(drain_acc, project_key, "busy")
                 continue
-            except goalflight_journal.JournalError as exc:
+            except (
+                goalflight_journal.JournalDisappeared,
+                goalflight_journal.JournalIOError,
+                goalflight_journal.JournalError,
+            ) as exc:
                 lease.release_reason = f"journal_error:{type(exc).__name__}"
                 _remember_drain_journal_skip(drain_acc, project_key, "error")
                 continue
@@ -12919,7 +13048,9 @@ def _drain_queue_once(args) -> dict:
                 dispatch_id,
                 queue_launch_token=launch_token,
             )
-            no_capacity = proc.returncode == 2 and "blocked_capacity" in (proc.stdout + proc.stderr)
+            capacity_reason = _drain_launch_capacity_reason(
+                proc.returncode, proc.stdout, proc.stderr
+            )
             if stdout_launched and ledger_confirmed:
                 carrier_cleanup = _positive_live_carrier_cleanup(
                     claim,
@@ -12946,8 +13077,8 @@ def _drain_queue_once(args) -> dict:
                 else:
                     lease.consume(state="launched", launched=True)
                 continue
-            if no_capacity:
-                lease.release_reason = "capacity_unavailable"
+            if capacity_reason:
+                lease.release_reason = capacity_reason
                 continue
             if stdout_launched and not ledger_confirmed:
                 # Stdout is not launch proof. Keep the carrier pending until a
@@ -13009,9 +13140,20 @@ def _drain_queue_once(args) -> dict:
                 lease.release_reason = f"launch_refused_pre_spawn:{proc.returncode}"
                 continue
             lease.release_reason = f"launch_failed_pending_ledger:{proc.returncode}"
-    remaining = len(list(queue_dir.glob("*.json")))
+    # Launches already happened, so a listing failure here must not become the
+    # error payload (which reports launched=0): report the count as unknown.
+    queue_listing_error: str | None = None
+    try:
+        remaining: int | None = sum(
+            1 for path in _queue_dir_listing(queue_dir) if path.name.endswith(".json")
+        )
+    except OSError as exc:
+        remaining = None
+        queue_listing_error = f"queue_dir_unreadable:{type(exc).__name__}"
     claimer_counts = _claimer_report_fields(queue_dir)
-    return {
+    if queue_listing_error is None and claimer_counts.get("queue_listing_error"):
+        queue_listing_error = str(claimer_counts["queue_listing_error"])
+    payload = {
         "schema": f"{DISPATCH_QUEUE_SCHEMA}.drain.v1",
         "queue_dir": str(queue_dir),
         "launched": drain_acc["launched"],
@@ -13030,6 +13172,9 @@ def _drain_queue_once(args) -> dict:
         "abandoned_reconciliation": abandoned_reconciliation,
         "details": details,
     }
+    if queue_listing_error is not None:
+        payload["queue_listing_error"] = queue_listing_error
+    return payload
 
 
 def _drain_error_payload(args, exc: BaseException) -> dict:

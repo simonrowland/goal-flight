@@ -671,11 +671,18 @@ def _dispatch_queue_dir() -> Path:
     return goalflight_ledger.state_dir() / "dispatch-queue"
 
 
-def _dispatch_queue_depth() -> int:
+def _dispatch_queue_depth() -> int | None:
+    """Queued ``*.json`` count. None is UNKNOWN, not a measured zero."""
     try:
-        return len(list(_dispatch_queue_dir().glob("*.json")))
-    except OSError:
+        return sum(
+            1
+            for path in _dispatch_queue_dir().iterdir()
+            if path.name.endswith(".json")
+        )
+    except FileNotFoundError:
         return 0
+    except OSError:
+        return None
 
 
 def _launchd_drainer_loaded() -> bool:
@@ -725,6 +732,16 @@ def _drainer_live() -> bool:
 
 def _queue_drainer_warnings() -> list[dict]:
     queue_depth = _dispatch_queue_depth()
+    if queue_depth is None:
+        return [
+            {
+                "code": "queue_unreadable",
+                "severity": "WARN",
+                "queue_depth": None,
+                "message": "dispatch queue listing failed; depth unknown (not empty)",
+                "remedy": "check permissions on the dispatch-queue directory",
+            }
+        ]
     if queue_depth <= 0 or _drainer_live():
         return []
     return [
