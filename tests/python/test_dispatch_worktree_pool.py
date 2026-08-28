@@ -477,6 +477,205 @@ def test_raw_worker_process_cwd_is_the_leased_seat(
     assert Path(marker.read_text(encoding="utf-8")).resolve() == seat
 
 
+def _commit_in(worktree: Path, message: str, text: str = "unique work\n") -> str:
+    (worktree / "tracked.txt").write_text(text, encoding="utf-8")
+    _git(worktree, "add", "tracked.txt")
+    _git(worktree, "commit", "-m", message)
+    return _git(worktree, "rev-parse", "HEAD")
+
+
+def _payloads(stdout: str) -> tuple[dict, dict]:
+    started: dict = {}
+    launched: dict = {}
+    for line in stdout.splitlines():
+        if line.startswith("DISPATCH-START "):
+            started = json.loads(line[len("DISPATCH-START ") :])
+        elif line.startswith("DISPATCH-LAUNCHED "):
+            launched = json.loads(line[len("DISPATCH-LAUNCHED ") :])
+    return started, launched
+
+
+def test_acquire_checks_out_named_seat_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "named-one")
+    try:
+        abbrev = _git(lease.path, "rev-parse", "--abbrev-ref", "HEAD")
+        assert abbrev == "seat/named-one", abbrev
+        status = _git(lease.path, "status", "--branch", "--porcelain=v1")
+        assert "HEAD (no branch)" not in status, status
+        assert status.splitlines()[0].startswith("## seat/named-one"), status
+        assert lease.branch == "seat/named-one"
+    finally:
+        lease.release()
+
+
+def test_dispatch_payload_includes_worktree_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, seats=1)
+    marker = tmp_path / "branch-ready"
+    worker = (
+        "from pathlib import Path; import os; "
+        "os.fstat(int(os.environ['GOALFLIGHT_WORKTREE_LOCK_FD'])); "
+        f"Path({str(marker)!r}).write_text('ok'); "
+        "print('COMPLETE: seat-branch — ok', flush=True)"
+    )
+    proc = subprocess.run(
+        _dispatch_cmd(
+            tmp_path,
+            repo,
+            "report-branch",
+            sys.executable,
+            "-c",
+            worker,
+        ),
+        cwd=str(ROOT),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, combined
+    started, launched = _payloads(proc.stdout)
+    assert started.get("worktree_branch") == "seat/report-branch", started
+    assert launched.get("worktree_branch") == "seat/report-branch", launched
+    assert launched.get("worktree_seat") == "wt-1", launched
+    deadline = time.time() + 10
+    while time.time() < deadline and not marker.exists():
+        time.sleep(0.05)
+    assert marker.exists(), combined
+
+
+def test_refuse_reset_when_detached_ahead_of_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real commit on a real detached seat must block acquire-time reset."""
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "detached-ahead")
+    _git(lease.path, "checkout", "--detach")
+    sha = _commit_in(lease.path, "unique detached commit")
+    short = _git(lease.path, "rev-parse", "--short", "HEAD")
+    lease.release()
+
+    nxt = None
+    try:
+        nxt = goalflight_worktree_pool.acquire_worktree_seat(repo, "next-occupant")
+    except Exception as exc:
+        text = str(exc)
+        assert "would lose" in text, text
+        assert short in text or sha[:7] in text, text
+        assert "detached HEAD" in text, text
+        assert isinstance(exc, goalflight_worktree_pool.WorktreeSeatResetRefused)
+    else:
+        raise AssertionError(
+            f"acquire reset a detached-ahead seat; unique commit {sha} "
+            f"HEAD is now {_git(lease.path, 'rev-parse', 'HEAD')}"
+        )
+    finally:
+        if nxt is not None:
+            nxt.release()
+    assert _git(lease.path, "rev-parse", "HEAD") == sha
+    assert _git(lease.path, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+    assert (lease.path / "tracked.txt").read_text(encoding="utf-8") == "unique work\n"
+
+
+def test_detached_ahead_seat_is_skipped_for_a_free_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    repo = _make_repo(tmp_path)
+    first = goalflight_worktree_pool.acquire_worktree_seat(repo, "keep-me")
+    _git(first.path, "checkout", "--detach")
+    sha = _commit_in(first.path, "do not clobber")
+    first.release()
+
+    second = goalflight_worktree_pool.acquire_worktree_seat(repo, "use-wt-2")
+    try:
+        assert second.path.name == "wt-2"
+        assert second.branch == "seat/use-wt-2"
+        assert _git(first.path, "rev-parse", "HEAD") == sha
+        assert _git(first.path, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+    finally:
+        second.release()
+
+
+def test_reuse_keeps_prior_named_branch_reachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    first = goalflight_worktree_pool.acquire_worktree_seat(repo, "worker-a")
+    sha = _commit_in(first.path, "worker a finished")
+    assert _git(first.path, "rev-parse", "--abbrev-ref", "HEAD") == "seat/worker-a"
+    first.release()
+
+    second = goalflight_worktree_pool.acquire_worktree_seat(repo, "worker-b")
+    try:
+        assert second.branch == "seat/worker-b"
+        assert _git(second.path, "rev-parse", "--abbrev-ref", "HEAD") == "seat/worker-b"
+        assert _git(repo, "rev-parse", "refs/heads/seat/worker-a") == sha
+        assert _git(repo, "show", "seat/worker-a:tracked.txt") == "unique work"
+    finally:
+        second.release()
+
+
+def test_refuse_reset_when_same_branch_uniquely_holds_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "same-id")
+    sha = _commit_in(lease.path, "retry must not rewind this branch")
+    short = _git(lease.path, "rev-parse", "--short", "HEAD")
+    lease.release()
+
+    nxt = None
+    try:
+        nxt = goalflight_worktree_pool.acquire_worktree_seat(repo, "same-id")
+    except Exception as exc:
+        text = str(exc)
+        assert "would lose" in text, text
+        assert short in text or sha[:7] in text, text
+        assert isinstance(exc, goalflight_worktree_pool.WorktreeSeatResetRefused)
+    else:
+        raise AssertionError(
+            f"acquire rewound unique branch seat/same-id; unique commit {sha} "
+            f"HEAD is now {_git(lease.path, 'rev-parse', 'HEAD')}"
+        )
+    finally:
+        if nxt is not None:
+            nxt.release()
+    assert _git(lease.path, "rev-parse", "HEAD") == sha
+    assert _git(lease.path, "rev-parse", "--abbrev-ref", "HEAD") == "seat/same-id"
+
+
+def test_saved_detached_commit_does_not_block_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "already-saved")
+    _git(lease.path, "checkout", "--detach")
+    sha = _commit_in(lease.path, "saved elsewhere")
+    _git(lease.path, "branch", "rescue/already-saved")
+    lease.release()
+
+    reused = goalflight_worktree_pool.acquire_worktree_seat(repo, "after-rescue")
+    try:
+        assert _git(reused.path, "rev-parse", "--abbrev-ref", "HEAD") == "seat/after-rescue"
+        assert _git(repo, "rev-parse", "refs/heads/rescue/already-saved") == sha
+    finally:
+        reused.release()
+
+
 def test_claude_preset_has_no_cwd_flag_seat_is_process_cwd() -> None:
     import argparse
     import goalflight_dispatch as D
