@@ -6,6 +6,15 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- `supervise` backlog cap keys on envelope identity, not raw line count.
+  Duplicate copies of one cursor snapshot still collapse as `cursor-lag` /
+  `child-backlog`. Distinct envelopes (new cursor versions, unique headlines,
+  a later `kind=ring`) still forward past eight copies. Distinct volume itself
+  is bounded as `distinct-withheld`, which names how many new envelopes were
+  held and that `relay --drain` retrieves them.
+
 ### Added
 
 - **Watchlist two-tier wedge detector (`goalflight_wedge_watch.py`).** Cheap
