@@ -139,14 +139,22 @@ def _carrier_alerts_and_their_appends(module):
         if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
             return None
         call = stmt.value
-        if not (isinstance(call.func, ast.Attribute) and call.func.attr == "append"
+        if (isinstance(call.func, ast.Attribute) and call.func.attr == "append"
                 and isinstance(call.func.value, ast.Name)
                 and call.func.value.id == "details"
                 and call.args and isinstance(call.args[0], ast.Dict)):
-            return None
-        return {k.value: v.value
-                for k, v in zip(call.args[0].keys, call.args[0].values)
-                if isinstance(k, ast.Constant) and isinstance(v, ast.Constant)}
+            return {k.value: v.value
+                    for k, v in zip(call.args[0].keys, call.args[0].values)
+                    if isinstance(k, ast.Constant) and isinstance(v, ast.Constant)}
+        # Drain records confirmed-launch details through DrainClaimGuard.consume
+        # rather than a literal details.append.
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "consume":
+            out = {}
+            for kw in call.keywords:
+                if kw.arg and isinstance(kw.value, ast.Constant):
+                    out[kw.arg] = kw.value.value
+            return out or None
+        return None
 
     claimed: set[int] = set()
     for node in ast.walk(tree):

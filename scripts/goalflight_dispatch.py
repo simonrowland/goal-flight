@@ -119,6 +119,13 @@ DAEMON_SPAWN_ARG = "__goalflight_spawn_daemon"
 DISPATCH_QUEUE_SCHEMA = "goalflight.dispatch-queue.v1"
 QUEUE_CLAIM_STALE_S = 300.0
 LAUNCH_TIMEOUT_S = QUEUE_CLAIM_STALE_S
+# Drain launch-confirmation wait. Per-entry subprocess.run used to use this
+# as a serial timeout, so N hung entries took ~N*45s per pass. The pass
+# budget is one confirmation window; leftover entries stay queued.
+DRAIN_LAUNCH_CONFIRM_S = 45.0
+DRAIN_LAUNCH_TIMEOUT_FLOOR_S = 20.0
+LAUNCH_BACKOFF_INITIAL_S = 60.0
+LAUNCH_BACKOFF_CAP_S = 900.0
 ABANDONED_RECONCILE_STALE_S = QUEUE_CLAIM_STALE_S
 ABANDONED_RECONCILIATION_SCHEMA = "goalflight.abandoned-reconciliation.v1"
 MAX_CLAIM_RECOVERY_REQUEUES = 1
@@ -2738,6 +2745,51 @@ def _nonterminal_dispatch_reuse_reason(
         f"classification={classification} state={record.get('state') or 'running'} "
         f"status={record.get('status_path') or '-'}"
     )
+
+
+def _launch_authority_entry(args) -> dict:
+    return {
+        "dispatch_id": str(getattr(args, "dispatch_id", "") or ""),
+        "task_ids": list(getattr(args, "task_ids", []) or []),
+        "project_root": str(_project_root(args)),
+        "created_at": goalflight_ledger.utc_now(),
+        "dispatch_argv": list(getattr(args, "_original_argv", None) or []),
+    }
+
+
+def _refuse_launch_blocked_by_completion_authority(args) -> None:
+    """Launch-path sibling/completion gate. Occupancy-forced does not bypass this.
+
+    Occupancy is a worktree lock. Two workers on one task is a different hole:
+    drain used to spawn without asking ``_entry_completion_authority``, whose
+    production callers were restore / reconcile / terminal-commit only.
+
+    ``--submit`` is not a spawn: occupancy-forced may still queue into an
+    occupied tree. Drain consults this gate before the child runs.
+    """
+    if getattr(args, "submit", False):
+        return
+    if not getattr(args, "task_ids", None):
+        return
+    decision = _entry_completion_authority(_launch_authority_entry(args))
+    if not _completion_decision_blocks_restore(decision):
+        return
+    assert isinstance(decision, dict)
+    message = str(decision.get("reason") or "partial_task_supersession")
+    print(
+        DISPATCH_REFUSED_PREFIX
+        + json.dumps(
+            {
+                "dispatch_id": getattr(args, "dispatch_id", None),
+                "permanent": True,
+                "reason": message,
+                "state": str(decision.get("state") or "worker_dead"),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    raise DispatchUsageError(message)
 
 
 def _refuse_reused_nonterminal_dispatch_id(
@@ -13956,6 +14008,13 @@ class _DrainClaimGuard:
         self.consumed = True
         if launched:
             self.acc["launched"] += 1
+            self.acc.setdefault("launched_task_ids", set()).update(
+                _entry_task_ids(self.entry)
+            )
+        if pending and reason in _DRAIN_CONFIRMED_LAUNCH_REASONS:
+            self.acc.setdefault("launched_task_ids", set()).update(
+                _entry_task_ids(self.entry)
+            )
         if left_queued:
             self.acc["left_queued"] += 1
         if failed:
@@ -14036,6 +14095,8 @@ class _DrainClaimGuard:
                 self.acc["pending_claims"] += 1
             return False
         if restored is None:
+            if self.release_reason == "launch_timeout_pending_ledger":
+                _stamp_launch_backoff(self.claim, self.entry)
             uncommitted = (
                 "capacity_restore_uncommitted"
                 if self.release_reason == "capacity_unavailable"
@@ -14053,15 +14114,18 @@ class _DrainClaimGuard:
                 }
             )
             return False
+        if self.release_reason == "launch_timeout_pending_ledger":
+            _stamp_launch_backoff(restored, self.entry)
         _restore_queued_record_from_entry(self.entry, restored)
+        detail = {
+            "dispatch_id": self.dispatch_id,
+            "state": "queued",
+            "reason": self.release_reason,
+        }
+        if self.entry.get("launch_backoff_until"):
+            detail["launch_backoff_until"] = self.entry.get("launch_backoff_until")
         self.acc["left_queued"] += 1
-        self.acc["details"].append(
-            {
-                "dispatch_id": self.dispatch_id,
-                "state": "queued",
-                "reason": self.release_reason,
-            }
-        )
+        self.acc["details"].append(detail)
         return False
 
 
@@ -14121,6 +14185,76 @@ def _note_drain_journal_skip(
     acc["details"].append(detail)
 
 
+def _drain_launch_timeout_s(args) -> float:
+    return max(
+        DRAIN_LAUNCH_TIMEOUT_FLOOR_S,
+        float(getattr(args, "capacity_wait_s", 0.0) or 0.0) + DRAIN_LAUNCH_CONFIRM_S,
+    )
+
+
+def _drain_launch_pass_budget_s(args) -> float:
+    """Wall budget for launch-confirmation waits in one drain pass.
+
+    Defaults to one confirmation timeout so N hung entries cannot take N
+    timeouts. Tests inject ``args.launch_budget_s``.
+    """
+    override = getattr(args, "launch_budget_s", None)
+    if override is not None:
+        return max(0.05, float(override))
+    return _drain_launch_timeout_s(args)
+
+
+def _queue_entry_launch_backoff_ts(entry: dict | None) -> float | None:
+    if not isinstance(entry, dict):
+        return None
+    parsed = goalflight_ledger.parse_utc(entry.get("launch_backoff_until"))
+    return parsed.timestamp() if parsed is not None else None
+
+
+def _launch_backoff_delay_s(timeout_count: int) -> float:
+    exponent = max(0, int(timeout_count) - 1)
+    return min(LAUNCH_BACKOFF_CAP_S, LAUNCH_BACKOFF_INITIAL_S * (2 ** exponent))
+
+
+def _stamp_launch_backoff(claim: Path, entry: dict) -> None:
+    """Persist launch-timeout backoff onto the claim so restore keeps it.
+
+    Distinct from not_before: usage-probe re-derivation must not clear this.
+    """
+    try:
+        observed = json.loads(claim.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        observed = dict(entry)
+    if not isinstance(observed, dict):
+        observed = dict(entry)
+    count = int(observed.get("launch_timeout_count") or entry.get("launch_timeout_count") or 0) + 1
+    delay_s = _launch_backoff_delay_s(count)
+    until = (
+        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delay_s)
+    ).isoformat(timespec="seconds")
+    observed["launch_timeout_count"] = count
+    observed["launch_backoff_until"] = until
+    observed["launch_fail_reason"] = "launch_timeout"
+    entry["launch_timeout_count"] = count
+    entry["launch_backoff_until"] = until
+    entry["launch_fail_reason"] = "launch_timeout"
+    with contextlib.suppress(OSError):
+        _write_json_atomic(claim, observed)
+
+
+def _drain_capacity_slots() -> dict:
+    try:
+        return goalflight_capacity.launch_slot_budget()
+    except Exception:
+        return {
+            "unreadable": True,
+            "operating_cap": 0,
+            "active": 0,
+            "global_remaining": 0,
+            "by_pool": {},
+        }
+
+
 def _drain_launch_capacity_reason(
     returncode: int, stdout: str, stderr: str
 ) -> str | None:
@@ -14142,6 +14276,17 @@ def _drain_launch_capacity_reason(
 
 
 def _drain_queue_once(args) -> dict:
+    pass_started = time.monotonic()
+    timing = {
+        "pass_s": 0.0,
+        "reconcile_s": 0.0,
+        "recovery_s": 0.0,
+        "launch_s": 0.0,
+        "journal_s": 0.0,
+        "launch_timeouts": 0,
+        "launch_concurrency": 1,
+        "capacity_slots": 0,
+    }
     canonical_queue = _dispatch_queue_dir()
     queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else canonical_queue
     queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -14152,6 +14297,7 @@ def _drain_queue_once(args) -> dict:
     allow_cross = bool(getattr(args, "cross_project", False))
     invoker_label, invoker_project = _drain_invoker_identity(args)
     remote_node = _remote_drain_node(args)
+    t_reconcile = time.monotonic()
     abandoned_reconciliation = {
         "schema": ABANDONED_RECONCILIATION_SCHEMA,
         "mode": "skipped",
@@ -14180,6 +14326,8 @@ def _drain_queue_once(args) -> dict:
     else:
         _release_stale_capacity_for_drain()
         abandoned_reconciliation = _reconcile_abandoned_for_drain(queue_dir)
+    timing["reconcile_s"] = round(time.monotonic() - t_reconcile, 3)
+    t_recovery = time.monotonic()
     recovery = _recover_claimed_queue_entries(
         queue_dir,
         stale_s=args.claim_stale_s,
@@ -14197,6 +14345,7 @@ def _drain_queue_once(args) -> dict:
         raise OSError(
             f"dispatch queue listing failed for {queue_dir}: {recovery['listing_error']}"
         )
+    timing["recovery_s"] = round(time.monotonic() - t_recovery, 3)
     launched = 0
     left_queued = 0
     failed = 0
@@ -14428,6 +14577,8 @@ def _drain_queue_once(args) -> dict:
         },
         "reconcile_pending": {},
         "quarantined": int(recovery.get("quarantined") or 0),
+        "launch_backoff": {"count": 0, "until": None},
+        "pass_launch_budget": {"count": 0},
     }
     for pending in recovery.get("pending_reasons") or []:
         if isinstance(pending, dict):
@@ -14514,7 +14665,15 @@ def _drain_queue_once(args) -> dict:
         "skipped_projects_busy": set(),
         "skipped_projects_error": set(),
         "details": details,
+        "launched_task_ids": set(),
     }
+    timeout_s = _drain_launch_timeout_s(args)
+    pass_budget_s = _drain_launch_pass_budget_s(args)
+    slots = _drain_capacity_slots()
+    timing["capacity_slots"] = int(slots.get("global_remaining") or 0)
+    timing["capacity_unreadable"] = bool(slots.get("unreadable"))
+    t_launch = time.monotonic()
+    launch_deadline = t_launch + pass_budget_s
     for _sort_key, path, _scan_entry, _scan_read_error in entries:
         claim_error: Exception | None = None
         entry: dict | None = None
@@ -14553,12 +14712,53 @@ def _drain_queue_once(args) -> dict:
                 kind="error",
             )
             continue
+        backoff_ts = _queue_entry_launch_backoff_ts(
+            _scan_entry if isinstance(_scan_entry, dict) else None
+        )
+        if backoff_ts is not None and backoff_ts > time.time():
+            drain_acc["left_queued"] += 1
+            until = (
+                _scan_entry.get("launch_backoff_until")
+                if isinstance(_scan_entry, dict)
+                else None
+            )
+            details.append(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "queued",
+                    "reason": "launch_backoff",
+                    "launch_backoff_until": until,
+                }
+            )
+            holds["launch_backoff"]["count"] = int(holds["launch_backoff"]["count"]) + 1
+            if until and (
+                holds["launch_backoff"].get("until") is None
+                or str(until) < str(holds["launch_backoff"]["until"])
+            ):
+                holds["launch_backoff"]["until"] = until
+            continue
+        remaining_s = launch_deadline - time.monotonic()
+        if remaining_s <= 0:
+            drain_acc["left_queued"] += 1
+            details.append(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "queued",
+                    "reason": "pass_launch_budget",
+                }
+            )
+            holds["pass_launch_budget"]["count"] = int(
+                holds["pass_launch_budget"]["count"]
+            ) + 1
+            continue
+        t_journal = time.monotonic()
         try:
             launch_token = _queue_launch_token(_scan_entry)
         except goalflight_journal.JournalBusy as exc:
             # Busy is retryable and per-project. Skipping this project for the
             # rest of the pass keeps one contended journal from denying every
             # other project's queued work.
+            timing["journal_s"] += time.monotonic() - t_journal
             _note_drain_journal_skip(
                 drain_acc,
                 dispatch_id=dispatch_id,
@@ -14575,6 +14775,7 @@ def _drain_queue_once(args) -> dict:
             # Name the availability subtypes: a bare JournalError catch flattens
             # unreadable vs disappeared. Unreadable still fails closed here
             # (do not launch); the reason string keeps the concrete class.
+            timing["journal_s"] += time.monotonic() - t_journal
             _note_drain_journal_skip(
                 drain_acc,
                 dispatch_id=dispatch_id,
@@ -14583,6 +14784,7 @@ def _drain_queue_once(args) -> dict:
                 exc=exc,
             )
             continue
+        timing["journal_s"] += time.monotonic() - t_journal
         _test_signal_file(
             "GOALFLIGHT_TEST_DRAIN_BEFORE_CLAIM_FILE",
             str(path),
@@ -14637,6 +14839,24 @@ def _drain_queue_once(args) -> dict:
             dispatch_id=dispatch_id,
             acc=drain_acc,
         ) as lease:
+            launch_task_ids = set(_entry_task_ids(entry))
+            decision = _entry_completion_authority(entry)
+            same_task_already_spawned = bool(
+                launch_task_ids
+                and launch_task_ids & drain_acc["launched_task_ids"]
+            )
+            if same_task_already_spawned or _completion_decision_blocks_restore(
+                decision
+            ):
+                # Do not spawn. Leave the claim unconsumed so __exit__ restore
+                # terminalizes or parks through the same authority path
+                # reconcile already uses. Occupancy-forced does not bypass
+                # this: it waives the worktree lock, not a second worker.
+                # launched_task_ids covers the same-pass queued pair whose
+                # sibling is still listed as queued until the child records
+                # starting — counting queued in _ledger_task_ids_advanced
+                # would deadlock restore of two parked envelopes.
+                continue
             try:
                 launch_argv = _drain_launch_argv(
                     list(entry.get("dispatch_argv") or []),
@@ -14671,7 +14891,10 @@ def _drain_queue_once(args) -> dict:
                     pending=not committed,
                 )
                 continue
-            timeout_s = max(20.0, float(args.capacity_wait_s or 0.0) + 45.0)
+            entry_timeout_s = min(
+                timeout_s,
+                max(0.05, launch_deadline - time.monotonic()),
+            )
             try:
                 lease.launch_attempted = True
                 if remote_node:
@@ -14691,12 +14914,13 @@ def _drain_queue_once(args) -> dict:
                         text=True,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
-                        timeout=timeout_s,
+                        timeout=entry_timeout_s,
                     )
             except _RemoteDrainBlocked as exc:
                 lease.release_reason = f"remote_blocked:{exc.code}:{exc}"
                 continue
             except subprocess.TimeoutExpired:
+                timing["launch_timeouts"] += 1
                 lease.release_reason = "launch_timeout_pending_ledger"
                 continue
             stdout_launched = proc.returncode == 0 and "DISPATCH-LAUNCHED " in proc.stdout
@@ -14816,6 +15040,13 @@ def _drain_queue_once(args) -> dict:
     if queue_listing_error is None and claimer_counts.get("queue_listing_error"):
         queue_listing_error = str(claimer_counts["queue_listing_error"])
     _warn_drain_queue_mutations(queue_mutations)
+    if not int((holds.get("launch_backoff") or {}).get("count") or 0):
+        holds.pop("launch_backoff", None)
+    if not int((holds.get("pass_launch_budget") or {}).get("count") or 0):
+        holds.pop("pass_launch_budget", None)
+    timing["launch_s"] = round(time.monotonic() - t_launch, 3)
+    timing["journal_s"] = round(float(timing["journal_s"]), 3)
+    timing["pass_s"] = round(time.monotonic() - pass_started, 3)
     payload = {
         "schema": f"{DISPATCH_QUEUE_SCHEMA}.drain.v1",
         "queue_dir": str(queue_dir),
@@ -14839,6 +15070,7 @@ def _drain_queue_once(args) -> dict:
         "retained": int(queue_mutations.get("retained") or 0),
         "queue_mutations": queue_mutations,
         "queue_dir_scope": scoped_queue,
+        "timing": timing,
     }
     if dispatch_ids is not None:
         payload["dispatch_ids"] = sorted(dispatch_ids)
@@ -14973,6 +15205,22 @@ def _cmd_drain(argv: list[str]) -> int:
                     "created": payload.get("created", 0),
                     "relocated": payload.get("relocated", 0),
                     "retained": payload.get("retained", 0),
+                    "pass_s": (payload.get("timing") or {}).get("pass_s"),
+                    "launch_s": (payload.get("timing") or {}).get("launch_s"),
+                    "reconcile_s": (payload.get("timing") or {}).get("reconcile_s"),
+                    "journal_s": (payload.get("timing") or {}).get("journal_s"),
+                    "launch_timeouts": (payload.get("timing") or {}).get("launch_timeouts"),
+                    "capacity_slots": (payload.get("timing") or {}).get("capacity_slots"),
+                    "waiting_launch_backoff": (
+                        holds.get("launch_backoff") or {}
+                    ).get("count", 0)
+                    if isinstance(holds.get("launch_backoff"), dict)
+                    else 0,
+                    "pass_launch_budget": (
+                        holds.get("pass_launch_budget") or {}
+                    ).get("count", 0)
+                    if isinstance(holds.get("pass_launch_budget"), dict)
+                    else 0,
                     "retained_by_controller": {
                         str(label): int((counts or {}).get("retained") or 0)
                         for label, counts in (
@@ -16482,6 +16730,7 @@ def main(argv: list[str] | None = None) -> int:
                     *getattr(args, "dispatch_warnings", []),
                     occupancy_warning,
                 ]
+            _refuse_launch_blocked_by_completion_authority(args)
             account_env = (
                 {} if goalflight_compat.is_windows() else _resolve_launch_account_env(args)
             )
@@ -16558,6 +16807,10 @@ def main(argv: list[str] | None = None) -> int:
         occupancy_warning = _prepare_attempt_worktree_occupancy(args)
         if occupancy_warning is not None:
             dispatch_warnings = [*dispatch_warnings, occupancy_warning]
+        # Occupancy-forced is a worktree hatch. Same-task live siblings still
+        # refuse here so a second direct launch cannot spawn just because the
+        # tree lock was waived. --submit is excluded: queuing is not a spawn.
+        _refuse_launch_blocked_by_completion_authority(args)
     except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         print(

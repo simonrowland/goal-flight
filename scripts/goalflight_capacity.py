@@ -852,6 +852,69 @@ def active_leases(data: dict) -> list[dict]:
     return [lease for lease in data.get("leases", {}).values() if lease.get("state") == "active"]
 
 
+def launch_slot_budget(
+    agent: str | None = None,
+    priority: str = "normal",
+    args: argparse.Namespace | None = None,
+) -> dict:
+    """Read-only remaining worker slots. Never persists.
+
+    Fail-closed: unreadable capacity state yields remaining=0 and
+    ``unreadable=True``. Lane math matches acquire so drain can ask instead
+    of throttling by being slow. Drain itself stays serial (same-task spawn
+    is a TOCTOU on the ledger-read completion gate); this budget is the
+    operator/report surface and the cap on "should we even try".
+    """
+    del priority  # acquire-time lane ceilings stay on the child acquire path
+    prof = profile(args)
+    operating_cap = int(prof["operating_cap"])
+    try:
+        with StateLock():
+            data = load_state()
+    except CapacityStateUnreadable as exc:
+        return {
+            "unreadable": True,
+            "reason": str(exc),
+            "operating_cap": operating_cap,
+            "active": 0,
+            "global_remaining": 0,
+            "by_pool": {},
+            "agent": agent,
+            "agent_remaining": 0,
+        }
+    prune_state(data)
+    leases = active_leases(data)
+    active = len(leases)
+    global_remaining = max(0, operating_cap - active)
+    pressure = current_rate_pressure(args)
+    pool_active: dict[str, int] = {}
+    for lease in leases:
+        pool = cap_pool(normalize_agent(str(lease.get("agent") or "")))
+        if not pool:
+            continue
+        pool_active[pool] = pool_active.get(pool, 0) + 1
+    by_pool: dict[str, int] = {}
+    for pool in set(DEFAULT_AGENT_CAPS) | set(pool_active):
+        if not pool:
+            continue
+        base = DEFAULT_AGENT_CAPS.get(pool, 2)
+        effective, _detail = adaptive_agent_cap(pool, base, pressure)
+        by_pool[pool] = max(0, int(effective) - int(pool_active.get(pool, 0)))
+    agent_remaining = None
+    if agent:
+        pool = cap_pool(normalize_agent(agent))
+        agent_remaining = min(global_remaining, by_pool.get(pool, global_remaining))
+    return {
+        "unreadable": False,
+        "operating_cap": operating_cap,
+        "active": active,
+        "global_remaining": global_remaining,
+        "by_pool": by_pool,
+        "agent": agent,
+        "agent_remaining": agent_remaining,
+    }
+
+
 def cooldown_for(data: dict, agent: str) -> dict | None:
     cooldowns = data.get("cooldowns", {})
     return cooldowns.get(agent) or cooldowns.get(agent.split("-")[0])
