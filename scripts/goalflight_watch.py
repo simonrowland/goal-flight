@@ -28,6 +28,7 @@ import goalflight_codex_sessions
 import goalflight_capacity
 import goalflight_dispatch_states
 import goalflight_engine_sessions
+import goalflight_fs
 import goalflight_ledger
 import goalflight_quota_stuck
 import goalflight_steer_mailbox
@@ -3447,12 +3448,29 @@ def _discarded_terminal_candidate_matches(
     return evidence.get("marker") == marker and vetoed_offset == observed_offset
 
 
-def _dispatch_record_is_nonterminal(dispatch_id: str) -> bool:
+def _dispatch_record_is_nonterminal(dispatch_id: str) -> bool | None:
+    """True = live nonterminal, False = terminal or absent, None = could not tell.
+
+    Unreadable ledger is not "retired". ``except OSError: return False`` licensed
+    the watcher to exit while a running row sat behind a chmod-000 parent.
+    """
     try:
         path = goalflight_ledger.record_path(dispatch_id, create=False)
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+    except OSError:
+        return None
+    presence = goalflight_fs.path_presence(path)
+    if presence == "absent":
         return False
+    if presence == "unknown":
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
     state = record.get("state")
     terminal = record.get("terminal_state") or goalflight_ledger.terminal_state_for(
         state,
@@ -3561,7 +3579,8 @@ def main() -> int:
 
     tail = Path(args.tail)
     status_path = Path(args.status_json)
-    status_existed_at_startup = status_path.exists()
+    status_presence = goalflight_fs.path_presence(status_path)
+    status_existed_at_startup = status_presence == "present"
 
     controller_session_id = args.controller_session_id
     controller_pid = args.controller_pid
@@ -3589,20 +3608,28 @@ def main() -> int:
             prompt_provenance_available = prompt_snapshot_available
         else:
             prompt_snapshot_needs_retry = True
-        if not ignore_prompt_path.exists() and not status_existed_at_startup:
+        dispatch_record_nonterminal_at_startup = _dispatch_record_is_nonterminal(
+            args.dispatch_id
+        )
+        prompt_presence = goalflight_fs.path_presence(ignore_prompt_path)
+        sidecar_indeterminate = (
+            prompt_presence == "unknown"
+            or status_presence == "unknown"
+            or dispatch_record_nonterminal_at_startup is None
+        )
+        if sidecar_indeterminate or dispatch_record_nonterminal_at_startup is True:
+            # Live or unreadable ledger: absent-looking sidecars are not
+            # permission to retire. exists() is False for a child of an
+            # unsearchable parent; consult presence + ledger first.
+            pass
+        elif prompt_presence == "absent" and not status_existed_at_startup:
             print(
                 "goalflight_watch: dispatch retired; prompt sidecar and status "
                 f"are absent for {args.dispatch_id}",
                 flush=True,
             )
             return 0
-        dispatch_record_nonterminal_at_startup = _dispatch_record_is_nonterminal(
-            args.dispatch_id
-        )
-        if (
-            not status_existed_at_startup
-            and not dispatch_record_nonterminal_at_startup
-        ):
+        elif not status_existed_at_startup:
             print(
                 "goalflight_watch: dispatch retired; status is absent without "
                 f"a non-terminal record for {args.dispatch_id}",

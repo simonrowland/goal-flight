@@ -29,6 +29,7 @@ import goalflight_compat as fcntl
 import goalflight_dispatch_paths
 import goalflight_dispatch_states
 import goalflight_fleet_console_history
+import goalflight_fs
 import goalflight_journal
 import goalflight_output_redact
 import goalflight_task
@@ -557,10 +558,19 @@ def write_record(record: dict) -> Path:
             record["project_root"]
         )
     path = record_path(record["dispatch_id"])
-    if path.exists():
+    presence = goalflight_fs.path_presence(path)
+    if presence == "unknown":
+        raise OSError(
+            f"ledger record unreadable; refusing to overwrite {path}"
+        )
+    if presence == "present":
         try:
             current = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except OSError as exc:
+            raise OSError(
+                f"ledger record unreadable; refusing to overwrite {path}"
+            ) from exc
+        except json.JSONDecodeError:
             current = None
         if isinstance(current, dict):
             current_ended_at = current.get("ended_at")
