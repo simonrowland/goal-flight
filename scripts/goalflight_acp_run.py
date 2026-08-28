@@ -614,49 +614,118 @@ def _record_acp_ledger_state(
     lease_id: str | None,
     worker_pid: int | None,
     state: str,
-) -> None:
-    """Record one ACP lifecycle state through the shared journal authority."""
-    with contextlib.redirect_stdout(io.StringIO()):
-        record_code = goalflight_ledger.cmd_record(
-            argparse.Namespace(
-                dispatch_id=dispatch_id,
-                prompt_id=cfg.prompt_id,
-                prompt_path=cfg.prompt,
-                task_ids=getattr(cfg, "task_ids", []),
-                agent=cfg.agent,
-                engine=goalflight_ledger.infer_engine(cfg.agent),
-                shape="acp",
-                account=getattr(cfg, "account", None) or "default",
-                effective_account=effective_account,
-                request_envelope_json=(
-                    json.dumps(cfg.request_envelope, sort_keys=True)
-                    if isinstance(getattr(cfg, "request_envelope", None), dict)
-                    else None
-                ),
-                transport="acp",
-                project_root=str(project_root),
-                controller_pid=controller_pid,
-                controller_session_id=controller_session_id,
-                controller_label=controller_label,
-                worker_pid=worker_pid,
-                acp_session_id=cfg.session_id,
-                logical_session_id=cfg.session_id,
-                engine_session_id=getattr(cfg, "engine_session_id", None)
-                or cfg.session_id,
-                lease_id=lease_id,
-                stdout_path=None,
-                stderr_path=None,
-                status_path=str(status_path),
-                os_sandbox_json=json.dumps(payload.get("os_sandbox") or {}, sort_keys=True),
-                queue_launch_token=getattr(cfg, "queue_launch_token", None),
-                state=state,
-                json=True,
+) -> dict | None:
+    """Record one ACP lifecycle state through the shared journal authority.
+
+    Returns None when the record committed. When the journal refuses the
+    transition but a worker process was spawned, the refusal is a bookkeeping
+    problem, not evidence about the worker: the status file is still written
+    and the refusal is surfaced LOUDLY (stderr + the status payload), and the
+    unrecovered refusal payload is returned. Only when no worker was spawned
+    does a refusal raise, unchanged.
+    """
+
+    spawn_state = goalflight_ledger.worker_spawn_state(worker_pid)
+
+    def _record_once() -> tuple[int, dict | None]:
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            code = goalflight_ledger.cmd_record(
+                argparse.Namespace(
+                    dispatch_id=dispatch_id,
+                    prompt_id=cfg.prompt_id,
+                    prompt_path=cfg.prompt,
+                    task_ids=getattr(cfg, "task_ids", []),
+                    agent=cfg.agent,
+                    engine=goalflight_ledger.infer_engine(cfg.agent),
+                    shape="acp",
+                    account=getattr(cfg, "account", None) or "default",
+                    effective_account=effective_account,
+                    request_envelope_json=(
+                        json.dumps(cfg.request_envelope, sort_keys=True)
+                        if isinstance(getattr(cfg, "request_envelope", None), dict)
+                        else None
+                    ),
+                    transport="acp",
+                    project_root=str(project_root),
+                    controller_pid=controller_pid,
+                    controller_session_id=controller_session_id,
+                    controller_label=controller_label,
+                    worker_pid=worker_pid if spawn_state == "spawned" else None,
+                    acp_session_id=cfg.session_id,
+                    logical_session_id=cfg.session_id,
+                    engine_session_id=getattr(cfg, "engine_session_id", None)
+                    or cfg.session_id,
+                    lease_id=lease_id,
+                    stdout_path=None,
+                    stderr_path=None,
+                    status_path=str(status_path),
+                    os_sandbox_json=json.dumps(payload.get("os_sandbox") or {}, sort_keys=True),
+                    queue_launch_token=getattr(cfg, "queue_launch_token", None),
+                    state=state,
+                    json=True,
+                )
             )
+        return code, goalflight_ledger.parse_record_refusal(capture.getvalue())
+
+    record_code, refusal = _record_once()
+    if (
+        record_code != 0
+        and spawn_state != "none"
+        and goalflight_ledger.is_retryable_startup_race(refusal)
+    ):
+        # The worker claims RUNNING asynchronously after spawn, so "not yet"
+        # becomes "yes" on its own within the worker's startup. Re-record
+        # against a bounded deadline BEFORE deciding anything else. Budget
+        # derivation: goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S.
+        record_code, refusal = goalflight_ledger.retry_record_after_startup_race(
+            _record_once,
+            record_code,
+            refusal,
+            project_root=project_root,
+            dispatch_id=dispatch_id,
+            timeout_s=goalflight_ledger.RECORD_STARTUP_RACE_RETRY_BUDGET_S,
         )
     if record_code != 0:
-        raise RuntimeError(
-            f"journal attempt transition refused for {dispatch_id}: exit {record_code}"
+        if spawn_state == "none":
+            # No worker process exists, so a refused transition is a genuine
+            # launch failure. Unchanged behaviour.
+            raise RuntimeError(
+                f"journal attempt transition refused for {dispatch_id}: exit {record_code}"
+            )
+        # A worker was spawned (or spawn state is indeterminate, which takes
+        # the same safe branch). Keep the liveness authority written and the
+        # refusal visible: stderr AND the status payload, so the next
+        # update_status write carries it too.
+        warning = {
+            "kind": "journal_attempt_transition_refused",
+            "exit_code": record_code,
+            "disposition": (refusal or {}).get("disposition"),
+            "retryable": (refusal or {}).get("retryable"),
+            "error": (refusal or {}).get("error"),
+            "state": state,
+            "spawn_state": spawn_state,
+            "detail": (
+                "worker process was spawned but the journal transition was "
+                "refused; bookkeeping is incomplete, the worker may be alive "
+                "— do not blind-retry this dispatch"
+            ),
+        }
+        payload["ledger_record_warning"] = warning
+        payload["spawn_state"] = spawn_state
+        print(
+            "goalflight_acp_run: WARN: journal attempt transition refused for "
+            f"{dispatch_id} after worker spawn (pid {worker_pid}, "
+            f"status {status_path}): "
+            f"disposition={warning['disposition']} error={warning['error']}; "
+            "worker may be alive; bookkeeping incomplete",
+            file=sys.stderr,
+            flush=True,
         )
+        with contextlib.suppress(Exception):
+            write_status(status_path, payload)
+        return warning
+    return None
 
 
 class _SigtermCancelBridge:
