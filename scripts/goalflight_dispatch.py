@@ -7484,10 +7484,13 @@ def _quarantine_unlinked_claim_if_observed_orphan(
     defers. The only eligible cases are a token-matched terminal record whose
     worker identity is not live/indeterminate, or an unrecorded pre-spawn claim.
     Both must survive a first-observed orphan interval before quarantine.
-    """
-    if _is_task_linked(entry, record):
-        return None
 
+    A ledger row that does not name this claim's launch token is not this
+    claim's record. Restore sanitizes ``queue_launch_token`` off the queued
+    row, so a later abandoned claim would otherwise bind to a different
+    attempt and defer forever. No claim token while a row exists cannot
+    bind either: that stays UNKNOWN and is retained.
+    """
     now_s = time.time()
     claim_token = _queue_launch_token_from_entry(entry)
     record_token = (
@@ -7495,11 +7498,17 @@ def _quarantine_unlinked_claim_if_observed_orphan(
         if isinstance(record, dict)
         else None
     )
+    record_for_this_claim = (
+        isinstance(record, dict)
+        and bool(claim_token)
+        and record_token == claim_token
+    )
+    if _is_task_linked(entry, record if record_for_this_claim else None):
+        return None
+
     worker_status = "no_record"
     worker_reason = "no_record"
-    if isinstance(record, dict):
-        if not claim_token or record_token != claim_token:
-            return None
+    if record_for_this_claim:
         if not _dispatch_record_is_terminal(record):
             return None
         worker_status, worker_reason = _queue_claim_identity_status(
@@ -7510,6 +7519,8 @@ def _quarantine_unlinked_claim_if_observed_orphan(
             return None
         basis = "observed_unlinked_terminal_record"
     else:
+        if isinstance(record, dict) and not claim_token:
+            return None
         if not _entry_pre_spawn(entry):
             return None
         if (

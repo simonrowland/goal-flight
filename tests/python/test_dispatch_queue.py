@@ -2712,6 +2712,111 @@ def test_launch_started_queued_ledger_is_not_restored() -> None:
         assert not (queue / f"{dispatch_id}.json").exists()
 
 
+def test_tokenless_queued_ledger_does_not_bind_a_later_abandoned_claim() -> None:
+    """Live b-208 shape: queued ledger stripped of the launch token.
+
+    Restore writes ``queue_launch_token: None`` onto the ledger row. A later
+    drain claims again, then the claimant dies. The leftover carrier has a
+    new token; the row does not. That row is a different attempt, not
+    non-terminal evidence about this claim. First recover stamps the orphan
+    clock; the next recover with a closed stale window parks the carrier and
+    republishes the queued envelope from the ledger.
+
+    Staleness and death are not stubbed: created_at is 400s in the past, and
+    the filename pid is probed with ``os.kill(pid, 0)`` and must be gone.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _b065_env(tmp)
+        old_env = os.environ.copy()
+        dispatch_id = "b208-tokenless-queued"
+        dead_pid = 99_999_991
+        try:
+            os.kill(dead_pid, 0)
+        except ProcessLookupError:
+            pass
+        except PermissionError as exc:
+            raise AssertionError(
+                f"precondition: pid {dead_pid} must be absent, not live-other-user"
+            ) from exc
+        else:
+            raise AssertionError(f"precondition: pid {dead_pid} is live")
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            queue = tmp / "state" / "dispatch-queue"
+            queue.mkdir(parents=True)
+            created = (
+                dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=400)
+            ).isoformat()
+            claim = queue / f"{dispatch_id}.json.claimed-{dead_pid}-1000"
+            argv = ["--agent", "test-dispatch", "--dispatch-id", dispatch_id]
+            entry = {
+                "schema": D.DISPATCH_QUEUE_SCHEMA,
+                "state": "claimed",
+                "dispatch_id": dispatch_id,
+                "agent": "test-dispatch",
+                "shape": "bash",
+                "project_root": str(tmp),
+                "created_at": created,
+                "dispatch_argv": argv,
+                "claim_recovery_count": 1,
+                "queue_launch_token": "later-abandoned-token",
+                "request": {
+                    "cwd": str(tmp),
+                    "tail": str(tmp / f"{dispatch_id}.tail"),
+                    "status_json": str(tmp / f"{dispatch_id}.status.json"),
+                    "agent": "test-dispatch",
+                },
+            }
+            claim.write_text(json.dumps(entry), encoding="utf-8")
+            D.goalflight_ledger.write_record(
+                {
+                    "schema": D.goalflight_ledger.SCHEMA,
+                    "dispatch_id": dispatch_id,
+                    "state": "queued",
+                    "terminal_state": "unknown",
+                    "agent": "test-dispatch",
+                    "project_root": str(tmp),
+                    "dispatch_argv": argv,
+                    "started_at": created,
+                    "claim_recovery_count": 1,
+                    "status_path": str(tmp / f"{dispatch_id}.status.json"),
+                    "stdout_path": str(tmp / f"{dispatch_id}.tail"),
+                }
+            )
+            first = D._recover_claimed_queue_entries(queue, stale_s=0)
+            first_claim_present = claim.exists()
+            stamped = json.loads(claim.read_text(encoding="utf-8")) if first_claim_present else {}
+            second = D._recover_claimed_queue_entries(queue, stale_s=0)
+            queued_path = queue / f"{dispatch_id}.json"
+            qfiles = list((queue / "quarantine").glob("*.quarantined*"))
+            record = json.loads(
+                (tmp / "state" / "runs.d" / f"{dispatch_id}.json").read_text(encoding="utf-8")
+            )
+            second_claim_present = claim.exists()
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert first["restored"] == 0, first
+        assert first["pending_launch"] >= 1, first
+        assert any(
+            row.get("reason") == "unlinked_quarantine_deferred"
+            for row in first.get("pending_reasons") or []
+        ), first
+        assert first_claim_present, first
+        assert stamped.get("orphan_first_seen_at"), stamped
+        assert not second_claim_present, second
+        assert qfiles, second
+        assert second.get("quarantined", 0) == 1, second
+        assert second.get("restored", 0) == 1, second
+        assert queued_path.exists(), second
+        queued = json.loads(queued_path.read_text(encoding="utf-8"))
+        assert queued.get("state") == "queued", queued
+        assert list(queued.get("dispatch_argv") or []) == argv
+        assert record.get("state") == "queued", record
+
+
 def test_blocked_capacity_missing_carrier_republishes_or_surfaces() -> None:
     """Carrier-less blocked_capacity must not vanish from pending_reasons."""
     with tempfile.TemporaryDirectory() as td:
