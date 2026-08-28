@@ -2816,6 +2816,53 @@ def _same_worker_tree(record_cwd: object, target: Path) -> bool:
     return bool(candidate) and candidate == os.path.realpath(str(target))
 
 
+def _cwdless_nonterminal_warning(record: dict) -> str:
+    """Operator-facing line for a readable non-terminal row that names no path.
+
+    Surfaces on stderr of ``goalflight_dispatch`` (the launch operator, and
+    drain which runs even when launched:0). Drain JSON ``attention`` carries
+    the same dispatch id under ``cwdless_nonterminal`` for the controller
+    reading the DRAIN line. Skipping is still correct; the warning must not
+    become occupancy UNKNOWN.
+    """
+    dispatch_id = str(record.get("dispatch_id") or record.get("path") or "unknown")
+    state = str(record.get("state") or "running")
+    return (
+        f"goalflight_dispatch: WARNING — ledger dispatch {dispatch_id} "
+        f"(state={state}) names no worker cwd; occupancy skip "
+        f"(does not gate any worktree)"
+    )
+
+
+def _warn_cwdless_nonterminal(record: dict) -> None:
+    print(_cwdless_nonterminal_warning(record), file=sys.stderr)
+
+
+def _iter_cwdless_nonterminal_records(records, *, host: str | None = None):
+    """Yield readable non-terminal rows occupancy would skip as nameless."""
+    host = socket.gethostname() if host is None else host
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if goalflight_ledger.record_is_unreadable(record):
+            continue
+        state = record.get("state")
+        terminal = goalflight_ledger.terminal_state_for(
+            state, record.get("reason") or record.get("error")
+        )
+        if terminal != "unknown":
+            if not _is_live_watcher_stopped(state, record.get("worker_alive")):
+                continue
+        if record.get("transport") == "fleet-ssh":
+            continue
+        record_host = record.get("hostname")
+        if isinstance(record_host, str) and record_host and record_host != host:
+            continue
+        if _resume_cwd_from_record(record) is not None:
+            continue
+        yield record
+
+
 def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None]:
     """(occupied_reason, unknown_reason, occupied_state) for this write tree.
 
@@ -2830,11 +2877,15 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
     record with no ``worker_cwd`` and no ``--cwd`` in ``dispatch_argv`` names
     no tree: it is a bookkeeping defect, not occupancy of the target, whether
     the recorded pid is live, missing, or gone (pid + start_token; never
-    pgrep). ``project_root`` is never a path claim -- linked/shared worktrees
-    and mis-recorded roots mean a matching ``worker_cwd`` still occupies when
-    the root differs, and a matching root without a cwd still names no tree.
-    Unreadable or unlistable records remain occupancy UNKNOWN: they might
-    name this path, so the gate still refuses rather than reading as free.
+    pgrep). The skip does not gate, but it is not silent: stderr WARNING
+    names the dispatch id and state (launch operator / drain sees it), and
+    drain JSON ``attention`` lists ``cwdless_nonterminal`` so a periodic
+    drain with launched:0 still surfaces the ghost. ``project_root`` is
+    never a path claim -- linked/shared worktrees and mis-recorded roots
+    mean a matching ``worker_cwd`` still occupies when the root differs,
+    and a matching root without a cwd still names no tree. Unreadable or
+    unlistable records remain occupancy UNKNOWN: they might name this path,
+    so the gate still refuses rather than reading as free.
     """
     target = _worker_cwd(args)
     try:
@@ -2872,7 +2923,9 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
         record_cwd = _resume_cwd_from_record(record)
         if record_cwd is None:
             # Readable, but tied to no path. Do not treat "owns an unknown
-            # path" as "might own this path".
+            # path" as "might own this path". Skipping is correct; silence
+            # is not — this is how a dead cwd-less row sat for days.
+            _warn_cwdless_nonterminal(record)
             continue
         if not _same_worker_tree(record_cwd, target):
             continue
@@ -13477,6 +13530,22 @@ def _drain_queue_once(args) -> dict:
                     if entry.get("updated_at"):
                         item["updated_at"] = str(entry.get("updated_at"))
                 attention.append(item)
+    try:
+        occupancy_records = list(goalflight_ledger.read_records())
+    except OSError:
+        occupancy_records = []
+    for record in _iter_cwdless_nonterminal_records(occupancy_records):
+        # Bookkeeping defect, not a hold: skip is correct, silence is not.
+        # Compact DRAIN `cwdless_nonterminal` + stderr WARN are the surfaces
+        # the launch operator and the periodic drainer already read.
+        attention.append(
+            {
+                "dispatch_id": str(record.get("dispatch_id") or ""),
+                "state": str(record.get("state") or "running"),
+                "attention": "cwdless_nonterminal",
+            }
+        )
+        _warn_cwdless_nonterminal(record)
     if args.limit and args.limit > 0:
         entries = entries[: args.limit]
     if not remote_node and entries:
@@ -13886,6 +13955,12 @@ def _cmd_drain(argv: list[str]) -> int:
                     "owner_generation_dead": restore_hold.get("owner_dead", 0),
                     "quarantined": holds.get("quarantined", 0),
                     "attention": len(payload.get("attention") or []),
+                    "cwdless_nonterminal": sum(
+                        1
+                        for item in (payload.get("attention") or [])
+                        if isinstance(item, dict)
+                        and item.get("attention") == "cwdless_nonterminal"
+                    ),
                     "queue_dir": payload["queue_dir"],
                 },
                 sort_keys=True,

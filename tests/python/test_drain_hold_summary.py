@@ -270,6 +270,44 @@ def test_reconcile_pending_reasons_are_aggregated(
     assert pending.get("unlinked_quarantine_deferred") == 2, pending
 
 
+def test_cwdless_nonterminal_is_drain_attention_not_a_hold(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A readable running row with no cwd is a bookkeeping defect, not a gate.
+
+    Drain still launches nothing from an empty queue, but attention names the
+    dispatch id so a launched:0 pass is not silent. Occupancy skip does not
+    become UNKNOWN of every tree.
+    """
+    queue = _queue_dir(tmp_path)
+    _record(tmp_path, "cwdless-ghost", worker_cwd=None, state="running")
+    rc = D._cmd_drain(["--queue-dir", str(queue), "--claim-stale-s", "9999", "--json"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    items = [
+        row
+        for row in payload.get("attention") or []
+        if row.get("attention") == "cwdless_nonterminal"
+    ]
+    assert len(items) == 1, payload.get("attention")
+    assert items[0]["dispatch_id"] == "cwdless-ghost"
+    assert items[0]["state"] == "running"
+    assert "cwdless-ghost" in captured.err
+    assert "names no worker cwd" in captured.err
+    assert "occupancy skip" in captured.err
+    assert payload["holds"]["not_before"]["count"] == 0
+    assert payload["launched"] == 0
+
+    rc = D._cmd_drain(["--queue-dir", str(queue), "--claim-stale-s", "9999"])
+    assert rc == 0
+    line = capsys.readouterr().out
+    text = line[line.index("{") :]
+    summary = json.loads(text)
+    assert summary["cwdless_nonterminal"] == 1
+    assert summary["attention"] == 1
+
+
 def test_empty_queue_reports_zero_holds(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

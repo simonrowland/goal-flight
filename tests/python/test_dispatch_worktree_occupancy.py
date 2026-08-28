@@ -668,6 +668,10 @@ def test_cwdless_nonterminal_record_does_not_block_unrelated_worktree() -> None:
         assert launched.returncode == 0, (launched.stdout, launched.stderr)
         assert "DISPATCH-END" in launched.stdout, launched.stdout
         assert "occupancy" not in launched.stderr or "unknown" not in launched.stderr, launched.stderr
+        assert "cwdless-live" in launched.stderr, launched.stderr
+        assert "names no worker cwd" in launched.stderr, launched.stderr
+        assert "occupancy skip" in launched.stderr, launched.stderr
+        assert "(state=running)" in launched.stderr, launched.stderr
 
 
 def test_cwdless_dead_identity_does_not_block() -> None:
@@ -710,6 +714,8 @@ def test_cwdless_dead_identity_does_not_block() -> None:
         assert launched.returncode == 0, (launched.stdout, launched.stderr)
         assert "DISPATCH-END" in launched.stdout, launched.stdout
         assert "occupancy" not in launched.stderr or "unknown" not in launched.stderr, launched.stderr
+        assert "cwdless-dead" in launched.stderr, launched.stderr
+        assert "names no worker cwd" in launched.stderr, launched.stderr
 
 
 def test_matching_project_root_without_cwd_does_not_occupy() -> None:
@@ -734,6 +740,8 @@ def test_matching_project_root_without_cwd_does_not_occupy() -> None:
         assert launched.returncode == 0, (launched.stdout, launched.stderr)
         assert "DISPATCH-END" in launched.stdout, launched.stdout
         assert "occupancy" not in launched.stderr or "unknown" not in launched.stderr, launched.stderr
+        assert "root-only" in launched.stderr, launched.stderr
+        assert "names no worker cwd" in launched.stderr, launched.stderr
 
 
 def test_different_project_root_with_matching_cwd_still_occupies() -> None:

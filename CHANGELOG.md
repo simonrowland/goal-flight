@@ -44,6 +44,13 @@ incremented when meaningful skill behaviour changes.
   column (`winner: probe → exhausted (as of …, age …)`). The queue file is
   not rewritten.
 
+- Occupancy skip of a readable non-terminal ledger row with no worker cwd
+  now warns on stderr naming the dispatch id and state (the launch
+  operator and drain already read that stream). Drain JSON `attention`
+  lists `cwdless_nonterminal` and the compact DRAIN line carries the
+  count, so a launched:0 pass still surfaces the ghost. The skip still
+  does not gate any worktree.
+
 - Worktree occupancy no longer treats a readable non-terminal ledger row
   with no `worker_cwd` (and no `--cwd` in `dispatch_argv`) as occupancy
   UNKNOWN of every path. That row names no tree, so it cannot gate an
