@@ -11179,13 +11179,270 @@ def _resume_restore_prepared_envelopes(queue_dir: Path) -> dict:
     }
 
 
-def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
+def _same_queue_dir(left: Path, right: Path) -> bool:
+    """True when two queue directories name the same location after resolve."""
+    try:
+        return left.expanduser().resolve() == right.expanduser().resolve()
+    except OSError:
+        return os.path.normpath(str(left.expanduser())) == os.path.normpath(
+            str(right.expanduser())
+        )
+
+
+def _empty_queue_mutations() -> dict:
+    return {
+        "created": 0,
+        "relocated": 0,
+        "retained": 0,
+        "by_controller": {},
+        "details": [],
+    }
+
+
+def _merge_queue_mutations(dest: dict, src: dict | None) -> dict:
+    if not isinstance(src, dict):
+        return dest
+    for key in ("created", "relocated", "retained"):
+        dest[key] = int(dest.get(key) or 0) + int(src.get(key) or 0)
+    by_controller = dest.setdefault("by_controller", {})
+    incoming = src.get("by_controller") if isinstance(src.get("by_controller"), dict) else {}
+    for label, counts in incoming.items():
+        if not isinstance(counts, dict):
+            continue
+        slot = by_controller.setdefault(
+            str(label), {"created": 0, "relocated": 0, "retained": 0}
+        )
+        for key in ("created", "relocated", "retained"):
+            slot[key] = int(slot.get(key) or 0) + int(counts.get(key) or 0)
+    dest.setdefault("details", []).extend(
+        item for item in (src.get("details") or []) if isinstance(item, dict)
+    )
+    return dest
+
+
+def _record_queue_mutation(
+    mutations: dict,
+    *,
+    action: str,
+    dispatch_id: str,
+    reason: str,
+    controller_label: str | None = None,
+    project_root: str | None = None,
+) -> None:
+    if action not in {"created", "relocated", "retained"}:
+        raise ValueError(f"unknown queue mutation action: {action}")
+    mutations[action] = int(mutations.get(action) or 0) + 1
+    label = str(controller_label or "").strip() or "unknown"
+    slot = mutations.setdefault("by_controller", {}).setdefault(
+        label, {"created": 0, "relocated": 0, "retained": 0}
+    )
+    slot[action] = int(slot.get(action) or 0) + 1
+    detail = {
+        "dispatch_id": dispatch_id,
+        "action": action,
+        "reason": reason,
+        "controller_label": None if label == "unknown" else label,
+    }
+    if project_root:
+        detail["project_root"] = str(project_root)
+    mutations.setdefault("details", []).append(detail)
+
+
+def _drain_dispatch_id_filter(args) -> set[str] | None:
+    raw = getattr(args, "dispatch_ids", None)
+    if not raw:
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    ids = {str(item).strip() for item in raw if str(item).strip()}
+    return ids or None
+
+
+def _drain_invoker_identity(args) -> tuple[str | None, Path | None]:
+    label = getattr(args, "controller_label", None)
+    if not str(label or "").strip():
+        label = os.environ.get("GOALFLIGHT_CONTROLLER_LABEL")
+    label_text = str(label).strip() if label else ""
+    try:
+        project = goalflight_task.resolve_project_root(str(Path.cwd()))
+    except Exception:
+        project = Path.cwd()
+    return (label_text or None), project
+
+
+def _entry_owner_fields(
+    entry: dict | None, record: dict | None = None
+) -> tuple[str | None, str | None]:
+    payload = entry if isinstance(entry, dict) else {}
+    attribution = _controller_attribution_from_entry(payload, record)
+    raw_label = attribution.get("controller_label")
+    label = str(raw_label).strip() if raw_label else ""
+    request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+    project = (
+        payload.get("project_root")
+        or (record.get("project_root") if isinstance(record, dict) else None)
+        or request.get("cwd")
+    )
+    project_text = str(project).strip() if project else ""
+    return (label or None), (project_text or None)
+
+
+def _normalized_project_root(value: object) -> str | None:
+    if not value:
+        return None
+    try:
+        return str(Path(str(value)).expanduser().resolve())
+    except OSError:
+        return os.path.normpath(str(Path(str(value)).expanduser()))
+
+
+def _project_roots_match(left: object, right: object) -> bool:
+    a = _normalized_project_root(left)
+    b = _normalized_project_root(right)
+    return bool(a and b and a == b)
+
+
+def _queue_path_is_elsewhere(queue_path: object, queue_dir: Path) -> bool:
+    if not queue_path:
+        return False
+    try:
+        parent = Path(str(queue_path)).expanduser().resolve().parent
+    except OSError:
+        return True
+    return not _same_queue_dir(parent, queue_dir)
+
+
+def _ledger_row_would_republish_into(
+    record: dict,
+    queue_dir: Path,
+    *,
+    stale_s: float,
+    now_s: float,
+) -> bool:
+    """Read-only: the ledger restore path would write this row into queue_dir."""
+    if not isinstance(record, dict):
+        return False
+    dispatch_id = str(record.get("dispatch_id") or "")
+    if not dispatch_id:
+        return False
+    if record.get("transport") == "fleet-ssh":
+        return False
+    if _claim_has_active_carrier(queue_dir, dispatch_id):
+        return False
+    entry = _ledger_request_entry(record)
+    if not (_ledger_is_restorable_prelaunch(record) and _entry_pre_worker(entry)):
+        return False
+    admission = classify_reconciliation_admission(entry, now_s, stale_s=stale_s)
+    return ADMISSION_DECISION[admission] is AdmissionAction.ADMIT_TO_GATE
+
+
+def _preview_scoped_ledger_retains(
+    queue_dir: Path,
+    *,
+    stale_s: float,
+    dispatch_ids: set[str] | None = None,
+) -> dict:
+    """Name ledger orphans a scoped drain refuses to materialize into queue_dir."""
+    mutations = _empty_queue_mutations()
+    now_s = time.time()
+    try:
+        records = goalflight_ledger.read_records()
+    except Exception:
+        return mutations
+    for record in records:
+        if not _ledger_row_would_republish_into(
+            record, queue_dir, stale_s=stale_s, now_s=now_s
+        ):
+            continue
+        dispatch_id = str(record.get("dispatch_id") or "")
+        if dispatch_ids is not None and dispatch_id not in dispatch_ids:
+            continue
+        label, project = _entry_owner_fields(_ledger_request_entry(record), record)
+        reason = "unknown_owner" if not label else "queue_dir_scope"
+        _record_queue_mutation(
+            mutations,
+            action="retained",
+            dispatch_id=dispatch_id,
+            reason=reason,
+            controller_label=label,
+            project_root=project,
+        )
+    return mutations
+
+
+def _scoped_launch_retain_reason(
+    entry: dict | None,
+    *,
+    invoker_label: str | None,
+    invoker_project: Path | None,
+    allow_cross: bool,
+) -> str | None:
+    """Retain already-present envelopes owned by a different known controller.
+
+    UNKNOWN owners already in this directory are launchable: the caller placed
+    the file here. Write/move of UNKNOWN owners is a different path (retain).
+    Unlabelled invokers (daemon / tests) do not apply this filter.
+    """
+    if allow_cross or not invoker_label:
+        return None
+    owner_label, owner_project = _entry_owner_fields(entry)
+    if owner_label and owner_label != invoker_label:
+        return "foreign_controller_label"
+    if (
+        owner_label
+        and owner_label == invoker_label
+        and owner_project
+        and invoker_project
+        and not _project_roots_match(owner_project, invoker_project)
+    ):
+        return "foreign_project_root"
+    return None
+
+
+def _warn_drain_queue_mutations(mutations: dict) -> None:
+    created = int(mutations.get("created") or 0)
+    relocated = int(mutations.get("relocated") or 0)
+    retained = int(mutations.get("retained") or 0)
+    if created == 0 and relocated == 0 and retained == 0:
+        return
+    by_controller = mutations.get("by_controller") if isinstance(mutations.get("by_controller"), dict) else {}
+    owners = {
+        str(label): {
+            key: int(counts.get(key) or 0)
+            for key in ("created", "relocated", "retained")
+        }
+        for label, counts in by_controller.items()
+        if isinstance(counts, dict)
+    }
+    print(
+        "goalflight_dispatch: drain queue mutations "
+        + json.dumps(
+            {
+                "created": created,
+                "relocated": relocated,
+                "retained": retained,
+                "by_controller": owners,
+            },
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+    )
+
+
+def _recover_claimed_queue_entries(
+    queue_dir: Path,
+    *,
+    stale_s: float,
+    restore_ledger_orphans: bool = True,
+    dispatch_ids: set[str] | None = None,
+) -> dict:
     """Run each carrier through the single PRE-ADMIT→T→Q→S→L owner."""
     restored = 0
     cleared = 0
     pending_launch = 0
     quarantined = 0
     pending_reasons: list[dict] = []
+    queue_mutations = _empty_queue_mutations()
     try:
         entries = _queue_dir_listing(queue_dir)
     except OSError as exc:
@@ -11201,6 +11458,7 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
             "ledger_terminalized": 0,
             "pending_reasons": [{"dispatch_id": "", "reason": listing_error}],
             "listing_error": listing_error,
+            "queue_mutations": queue_mutations,
         }
     for claim in sorted(path for path in entries if ".json.claimed-" in path.name):
         if claim.name.endswith(".failed"):
@@ -11210,6 +11468,9 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
         except (OSError, json.JSONDecodeError):
             continue
         if not isinstance(entry, dict):
+            continue
+        claim_dispatch_id = str(entry.get("dispatch_id") or "")
+        if dispatch_ids is not None and claim_dispatch_id not in dispatch_ids:
             continue
         try:
             outcome = _reconcile_claim_transaction(
@@ -11252,12 +11513,28 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
                         detail["status_write_failed"] = True
                 pending_reasons.append(detail)
 
-    ledger_stats = _reconcile_ledger_prelaunch_orphans(queue_dir, stale_s=stale_s, now=time.time())
+    ledger_stats: dict = {
+        "terminalized": 0,
+        "pending": 0,
+        "quarantined": 0,
+        "preserved": 0,
+        "restored": 0,
+        "pending_reasons": [],
+        "queue_mutations": _empty_queue_mutations(),
+    }
+    if restore_ledger_orphans:
+        ledger_stats = _reconcile_ledger_prelaunch_orphans(
+            queue_dir,
+            stale_s=stale_s,
+            now=time.time(),
+            dispatch_ids=dispatch_ids,
+        )
     ledger_terminalized = int(ledger_stats.get("terminalized") or 0)
     restored += int(ledger_stats.get("restored") or 0)
     pending_launch += int(ledger_stats.get("pending") or 0)
     quarantined += int(ledger_stats.get("quarantined") or 0)
     pending_reasons.extend(ledger_stats.get("pending_reasons") or [])
+    _merge_queue_mutations(queue_mutations, ledger_stats.get("queue_mutations"))
     resume_stats = _resume_restore_prepared_envelopes(queue_dir)
     restored += int(resume_stats.get("restored") or 0)
     cleared += int(resume_stats.get("cleared") or 0)
@@ -11273,6 +11550,7 @@ def _recover_claimed_queue_entries(queue_dir: Path, *, stale_s: float) -> dict:
         "quarantined": quarantined,
         "ledger_terminalized": ledger_terminalized,
         "pending_reasons": pending_reasons,
+        "queue_mutations": queue_mutations,
     }
 
 
@@ -11487,6 +11765,7 @@ def _reconcile_ledger_prelaunch_orphans(
     *,
     stale_s: float,
     now: float | None = None,
+    dispatch_ids: set[str] | None = None,
 ) -> dict:
     """Reconcile carrier-less rows with the same typed admission and held gate."""
     now_s = time.time() if now is None else float(now)
@@ -11496,6 +11775,7 @@ def _reconcile_ledger_prelaunch_orphans(
     preserved = 0
     restored = 0
     pending_reasons: list[dict] = []
+    queue_mutations = _empty_queue_mutations()
     try:
         records = goalflight_ledger.read_records()
     except Exception:
@@ -11506,6 +11786,7 @@ def _reconcile_ledger_prelaunch_orphans(
             "preserved": 0,
             "restored": 0,
             "pending_reasons": [],
+            "queue_mutations": queue_mutations,
         }
 
     for record in records:
@@ -11514,6 +11795,33 @@ def _reconcile_ledger_prelaunch_orphans(
         dispatch_id = str(record.get("dispatch_id") or "")
         if not dispatch_id:
             continue
+        if dispatch_ids is not None and dispatch_id not in dispatch_ids:
+            continue
+
+        def _note_republish(outcome: _ClaimReconcileResult, source: dict, rebuilt: dict) -> None:
+            nonlocal restored, pending
+            if outcome.action != "restored":
+                pending += 1
+                detail = outcome.pending_detail(dispatch_id)
+                if detail is not None:
+                    pending_reasons.append(detail)
+                return
+            restored += 1
+            action = (
+                "relocated"
+                if _queue_path_is_elsewhere(source.get("queue_path"), queue_dir)
+                else "created"
+            )
+            label, project = _entry_owner_fields(rebuilt, source)
+            _record_queue_mutation(
+                queue_mutations,
+                action=action,
+                dispatch_id=dispatch_id,
+                reason="ledger_prelaunch_carrier_missing",
+                controller_label=label,
+                project_root=project,
+            )
+
         entry = _ledger_request_entry(record)
         if (
             record.get("transport") != "fleet-ssh"
@@ -11529,13 +11837,7 @@ def _reconcile_ledger_prelaunch_orphans(
                     queue_dir=queue_dir,
                     reason="ledger_prelaunch_carrier_missing",
                 )
-                if outcome.action == "restored":
-                    restored += 1
-                else:
-                    pending += 1
-                    detail = outcome.pending_detail(dispatch_id)
-                    if detail is not None:
-                        pending_reasons.append(detail)
+                _note_republish(outcome, record, entry)
                 continue
             # Do not fall through to the terminal continue: blocked_capacity
             # is restorable but still terminal-labeled, and a silent skip
@@ -11653,13 +11955,7 @@ def _reconcile_ledger_prelaunch_orphans(
                 queue_dir=queue_dir,
                 reason="ledger_prelaunch_carrier_missing",
             )
-            if outcome.action == "restored":
-                restored += 1
-            else:
-                pending += 1
-                detail = outcome.pending_detail(dispatch_id)
-                if detail is not None:
-                    pending_reasons.append(detail)
+            _note_republish(outcome, record, entry)
             continue
         if linked:
             mark_refusals = []
@@ -11700,6 +11996,7 @@ def _reconcile_ledger_prelaunch_orphans(
         "preserved": preserved,
         "restored": restored,
         "pending_reasons": pending_reasons,
+        "queue_mutations": queue_mutations,
     }
 
 
@@ -13495,8 +13792,15 @@ def _drain_launch_capacity_reason(
 
 
 def _drain_queue_once(args) -> dict:
-    queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else _dispatch_queue_dir()
+    canonical_queue = _dispatch_queue_dir()
+    queue_dir = Path(args.queue_dir).expanduser() if args.queue_dir else canonical_queue
     queue_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # --queue-dir is a SCOPE: drain envelopes already in that directory.
+    # Ledger-wide restore into a foreign/empty directory is the b-276 trap.
+    scoped_queue = not _same_queue_dir(queue_dir, canonical_queue)
+    dispatch_ids = _drain_dispatch_id_filter(args)
+    allow_cross = bool(getattr(args, "cross_project", False))
+    invoker_label, invoker_project = _drain_invoker_identity(args)
     remote_node = _remote_drain_node(args)
     abandoned_reconciliation = {
         "schema": ABANDONED_RECONCILIATION_SCHEMA,
@@ -13513,10 +13817,25 @@ def _drain_queue_once(args) -> dict:
                 fleet_dispatch.assert_live_ssh_opt_in()
             except Exception as exc:
                 raise _RemoteDrainBlocked(str(exc), code="live_ssh_required") from exc
+    elif scoped_queue:
+        # Abandoned recon consults queue_dir for carriers. A private/empty
+        # directory would look carrier-less and could close live work.
+        abandoned_reconciliation = {
+            "schema": ABANDONED_RECONCILIATION_SCHEMA,
+            "mode": "skipped",
+            "closed": 0,
+            "reason": "queue_dir_scope",
+        }
+        _release_stale_capacity_for_drain()
     else:
         _release_stale_capacity_for_drain()
         abandoned_reconciliation = _reconcile_abandoned_for_drain(queue_dir)
-    recovery = _recover_claimed_queue_entries(queue_dir, stale_s=args.claim_stale_s)
+    recovery = _recover_claimed_queue_entries(
+        queue_dir,
+        stale_s=args.claim_stale_s,
+        restore_ledger_orphans=not scoped_queue,
+        dispatch_ids=dispatch_ids,
+    )
     if recovery.get("listing_error"):
         # The queue could not be listed: every candidate is invisible, so a
         # "0 launched, 0 remaining" pass would be a false green. Fail the
@@ -13556,6 +13875,79 @@ def _drain_queue_once(args) -> dict:
         else:
             launch_candidates.append(candidate)
     entries = sorted(launch_candidates)
+    queue_mutations = _empty_queue_mutations()
+    _merge_queue_mutations(queue_mutations, recovery.get("queue_mutations"))
+    if scoped_queue:
+        _merge_queue_mutations(
+            queue_mutations,
+            _preview_scoped_ledger_retains(
+                queue_dir,
+                stale_s=args.claim_stale_s,
+                dispatch_ids=dispatch_ids,
+            ),
+        )
+    if dispatch_ids is not None:
+        matched_ids: set[str] = set()
+        filtered_entries = []
+        for candidate in entries:
+            _sort_key, path, entry, _read_error = candidate
+            dispatch_id = (
+                str(entry.get("dispatch_id") or path.stem)
+                if isinstance(entry, dict)
+                else path.stem
+            )
+            if dispatch_id in dispatch_ids:
+                matched_ids.add(dispatch_id)
+                filtered_entries.append(candidate)
+        for missing_id in sorted(dispatch_ids - matched_ids):
+            details.append(
+                {
+                    "dispatch_id": missing_id,
+                    "state": "queued",
+                    "reason": "not_in_queue",
+                }
+            )
+        entries = filtered_entries
+    if scoped_queue:
+        kept_entries = []
+        for candidate in entries:
+            _sort_key, path, entry, _read_error = candidate
+            retain_reason = _scoped_launch_retain_reason(
+                entry if isinstance(entry, dict) else None,
+                invoker_label=invoker_label,
+                invoker_project=invoker_project,
+                allow_cross=allow_cross,
+            )
+            if retain_reason is None:
+                kept_entries.append(candidate)
+                continue
+            dispatch_id = (
+                str(entry.get("dispatch_id") or path.stem)
+                if isinstance(entry, dict)
+                else path.stem
+            )
+            label, project = _entry_owner_fields(
+                entry if isinstance(entry, dict) else None
+            )
+            _record_queue_mutation(
+                queue_mutations,
+                action="retained",
+                dispatch_id=dispatch_id,
+                reason=retain_reason,
+                controller_label=label,
+                project_root=project,
+            )
+            left_queued += 1
+            details.append(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "queued",
+                    "reason": retain_reason,
+                    "controller_label": label,
+                    "project_root": project,
+                }
+            )
+        entries = kept_entries
     now_s = time.time()
     # Re-derive not_before against current probe vs dispatch evidence rather
     # than freezing the reset predicted at requeue. A seat that now probes
@@ -14055,6 +14447,7 @@ def _drain_queue_once(args) -> dict:
     claimer_counts = _claimer_report_fields(queue_dir)
     if queue_listing_error is None and claimer_counts.get("queue_listing_error"):
         queue_listing_error = str(claimer_counts["queue_listing_error"])
+    _warn_drain_queue_mutations(queue_mutations)
     payload = {
         "schema": f"{DISPATCH_QUEUE_SCHEMA}.drain.v1",
         "queue_dir": str(queue_dir),
@@ -14073,7 +14466,14 @@ def _drain_queue_once(args) -> dict:
         "recovered_claims": recovery,
         "abandoned_reconciliation": abandoned_reconciliation,
         "details": details,
+        "created": int(queue_mutations.get("created") or 0),
+        "relocated": int(queue_mutations.get("relocated") or 0),
+        "retained": int(queue_mutations.get("retained") or 0),
+        "queue_mutations": queue_mutations,
+        "queue_dir_scope": scoped_queue,
     }
+    if dispatch_ids is not None:
+        payload["dispatch_ids"] = sorted(dispatch_ids)
     if queue_listing_error is not None:
         payload["queue_listing_error"] = queue_listing_error
     return payload
@@ -14098,6 +14498,10 @@ def _drain_error_payload(args, exc: BaseException) -> dict:
         "attention": [],
         "recovered_claims": {"restored": 0, "failed": 0},
         "details": [],
+        "created": 0,
+        "relocated": 0,
+        "retained": 0,
+        "queue_mutations": _empty_queue_mutations(),
         "error": f"{type(exc).__name__}: {exc}",
     }
     if isinstance(exc, _RemoteDrainBlocked):
@@ -14112,7 +14516,34 @@ def _cmd_drain(argv: list[str]) -> int:
         description="Drain queued goal-flight dispatch requests.",
         usage_hint="try drain [--json] [--limit N] (or --help)",
     )
-    parser.add_argument("--queue-dir")
+    parser.add_argument(
+        "--queue-dir",
+        help=(
+            "Drain only envelopes already in this directory. Does not restore "
+            "ledger orphans into it (that was a destination trap). Default: "
+            "the canonical shared dispatch-queue."
+        ),
+    )
+    parser.add_argument(
+        "--dispatch-id",
+        action="append",
+        dest="dispatch_ids",
+        metavar="ID",
+        help="Launch only this queued dispatch id (repeatable). Other entries are left untouched.",
+    )
+    parser.add_argument(
+        "--cross-project",
+        action="store_true",
+        help=(
+            "Allow claiming/launching envelopes in --queue-dir whose "
+            "controller_label or project_root differs from this controller. "
+            "Default: retain foreign-owned files already in a scoped directory."
+        ),
+    )
+    parser.add_argument(
+        "--controller-label",
+        help="Invoking controller label (default: $GOALFLIGHT_CONTROLLER_LABEL).",
+    )
     parser.add_argument("--capacity-wait-s", type=float, default=0.0)
     parser.add_argument("--claim-stale-s", type=float, default=QUEUE_CLAIM_STALE_S)
     parser.add_argument("--limit", type=int, default=0, help="maximum queue entries to inspect; 0 = all")
@@ -14171,6 +14602,16 @@ def _cmd_drain(argv: list[str]) -> int:
                         and item.get("attention") == "cwdless_nonterminal"
                     ),
                     "queue_dir": payload["queue_dir"],
+                    "created": payload.get("created", 0),
+                    "relocated": payload.get("relocated", 0),
+                    "retained": payload.get("retained", 0),
+                    "retained_by_controller": {
+                        str(label): int((counts or {}).get("retained") or 0)
+                        for label, counts in (
+                            (payload.get("queue_mutations") or {}).get("by_controller") or {}
+                        ).items()
+                        if int((counts or {}).get("retained") or 0)
+                    },
                 },
                 sort_keys=True,
             )

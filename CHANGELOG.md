@@ -48,6 +48,9 @@ incremented when meaningful skill behaviour changes.
   (unmarked/capacity, steer, watcher, caffeinate, pidfile, prompt,
   tail-middle, historical `/tmp` backlog) is in the module docstring and
   CLI help.
+- `goalflight_dispatch.py drain --dispatch-id <id>` (repeatable) launches only
+  the named queued envelope(s). A controller can drain its own work without
+  walking the shared cross-project queue.
 
 ### Changed
 
@@ -60,6 +63,15 @@ incremented when meaningful skill behaviour changes.
   uncommitted files are still quarantined onto `goalflight/quarantine/...`.
   The named seat branch is the save at terminal completion; no extra ref is
   minted.
+- `drain --queue-dir` is a **scope**, not a restore destination. Pointed at a
+  foreign or empty directory it drains envelopes already there and does **not**
+  run ledger-wide orphan republish into that directory (b-276). Cross-project
+  claim/launch of a known-foreign `controller_label` / `project_root` in a
+  scoped directory is retained unless `--cross-project`. UNKNOWN owners are
+  not materialized from the ledger into a scoped dir. The compact DRAIN line
+  and JSON payload report `created` / `relocated` / `retained` with
+  `retained_by_controller` counts so a stable file total cannot hide a
+  composition change.
 
 - Drain `not_before` hold details now name the winning headroom source
   (probe vs recorded exhaustion) and its age, matching the usage EVIDENCE

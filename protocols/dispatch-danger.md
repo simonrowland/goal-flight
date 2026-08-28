@@ -67,7 +67,10 @@ Consequences:
 - **The ledger/queue are shared across projects.** Workers from different repos interleave
   in one `$GOALFLIGHT_STATE_DIR/runs.d/` (ledger) and `dispatch-queue/` (queue). Identify a
   worker's origin project by its record's `project_root`. The same task id can appear in
-  two projects at once.
+  two projects at once. `drain --queue-dir <path>` scopes the pass to envelopes
+  **already in that directory**; it does not restore ledger orphans into a private
+  dir (that was a destination trap). To launch one queued id without touching
+  others: `drain --dispatch-id <id>`.
 - To pause the daemon: `launchctl unload ~/Library/LaunchAgents/com.goalflight.drain.plist`
   (reload with `launchctl load …`).
 
