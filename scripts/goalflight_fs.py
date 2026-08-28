@@ -48,7 +48,12 @@ def list_dir(path: Path | str) -> tuple[ListingState, list[Path]]:
     directory reads as empty and licenses "not there" actions. ``iterdir``
     raises; this helper turns that into ``unreadable`` instead of ``[]``.
 
-    A directory that vanishes between the lstat and the listing is ``absent``.
+    ``lstat`` does not follow symlinks; ``iterdir`` does. A present
+    dangling symlink (or an unmounted target) therefore raises
+    ``FileNotFoundError`` from the listing even though the directory
+    entry still exists. Re-lstat on that exception splits the TOCTOU
+    race (entry gone → ``absent``) from present-but-unreachable
+    (``unreadable``). Only a vanished inode is ``absent``.
     """
     directory = Path(path)
     try:
@@ -60,7 +65,11 @@ def list_dir(path: Path | str) -> tuple[ListingState, list[Path]]:
     try:
         return "ok", list(directory.iterdir())
     except FileNotFoundError:
-        return "absent", []
+        # iterdir follows; the first lstat did not. Decide from the
+        # inode that is there now, not from whichever call raised.
+        if path_presence(directory) == "absent":
+            return "absent", []
+        return "unreadable", []
     except OSError:
         return "unreadable", []
 

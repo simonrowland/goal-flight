@@ -84,6 +84,123 @@ def test_primitive_missing_dir_is_absent_not_unreadable(tmp_path: Path) -> None:
     assert entries == []
 
 
+def test_dangling_symlink_runs_d_is_unreadable_not_unowned(tmp_path: Path) -> None:
+    """P1: present dangling symlink is unreadable, not absent.
+
+    lstat of the symlink inode succeeds; iterdir follows and raises
+    FileNotFoundError. Mapping that to absent licenses check_unowned yes
+    and would delete the live worker's tree.
+    """
+    target = tmp_path / "real-ledger"
+    target.mkdir()
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (target / "live.json").write_text(
+        json.dumps(
+            {
+                "dispatch_id": "live-owner",
+                "state": "running",
+                "worker_cwd": str(wt),
+            }
+        ),
+        encoding="utf-8",
+    )
+    runs = tmp_path / "runs.d"
+    runs.symlink_to(target)
+    assert fs.path_presence(runs) == "present"
+    live_state, live_entries = fs.list_dir(runs)
+    assert live_state == "ok"
+    assert any(entry.name == "live.json" for entry in live_entries)
+    assert gc.check_unowned(str(wt), runs)["verdict"] == "no"
+    target.rename(tmp_path / "real-ledger-gone")
+    revert_failure = ""
+    try:
+        assert fs.path_presence(runs) == "present"
+        state, entries = fs.list_dir(runs)
+        assert state == "unreadable"
+        assert entries == []
+        suffix_state, suffix_entries = fs.list_dir_suffix(runs, ".json")
+        assert suffix_state == "unreadable"
+        assert suffix_entries == []
+        records, unreadable = gc.read_ledger_records(runs)
+        assert records == []
+        assert unreadable == [str(runs)]
+        verdict = gc.check_unowned(str(wt), runs)
+        assert verdict["verdict"] != "yes"
+        assert verdict["verdict"] == "unknown"
+        assert "unreadable" in verdict["reason"]
+        missing = tmp_path / "no-such-runs.d"
+        assert fs.list_dir(missing)[0] == "absent"
+    finally:
+        try:
+            runs.unlink()
+        except OSError as exc:
+            revert_failure = f"unlink {runs}: {exc}"
+    assert revert_failure == "", revert_failure
+
+
+def test_primitive_symlink_loop_is_unreadable(tmp_path: Path) -> None:
+    loop = tmp_path / "runs.d"
+    revert_failure = ""
+    try:
+        loop.symlink_to(loop)
+        assert fs.path_presence(loop) == "present"
+        state, entries = fs.list_dir(loop)
+        assert state == "unreadable"
+        assert entries == []
+    finally:
+        try:
+            loop.unlink()
+        except OSError as exc:
+            revert_failure = f"unlink {loop}: {exc}"
+    assert revert_failure == "", revert_failure
+
+
+def test_primitive_file_where_dir_expected_is_unreadable(tmp_path: Path) -> None:
+    path = tmp_path / "runs.d"
+    path.write_text("not a directory\n", encoding="utf-8")
+    assert fs.path_presence(path) == "present"
+    state, entries = fs.list_dir(path)
+    assert state == "unreadable"
+    assert entries == []
+
+
+def test_primitive_removed_between_lstat_and_iterdir_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TOCTOU: the directory inode itself vanished after a successful lstat."""
+    directory = tmp_path / "runs.d"
+    directory.mkdir()
+    original_lstat = os.lstat
+    first = {"pending": True}
+
+    def lstat_then_remove(path: object, *args: object, **kwargs: object):
+        result = original_lstat(path, *args, **kwargs)
+        if first["pending"] and os.fspath(path) == os.fspath(directory):
+            first["pending"] = False
+            directory.rmdir()
+        return result
+
+    monkeypatch.setattr(os, "lstat", lstat_then_remove)
+    state, entries = fs.list_dir(directory)
+    assert state == "absent"
+    assert entries == []
+    assert fs.path_presence(directory) == "absent"
+
+
+def test_primitive_empty_readable_dir_still_unowned(tmp_path: Path) -> None:
+    directory = tmp_path / "runs.d"
+    directory.mkdir()
+    state, entries = fs.list_dir(directory)
+    assert state == "ok"
+    assert entries == []
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    verdict = gc.check_unowned(str(wt), directory)
+    assert verdict["verdict"] == "yes"
+    assert "no non-terminal dispatch records this path" in verdict["reason"]
+
+
 def test_c1_unlistable_ledger_dir_is_not_unowned(tmp_path: Path) -> None:
     ledger_dir = tmp_path / "runs.d"
     ledger_dir.mkdir()
