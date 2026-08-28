@@ -82,6 +82,7 @@ import goalflight_dispatch_paths
 import goalflight_dispatch_states
 import goalflight_engine_sessions
 import goalflight_fleet_billing
+import goalflight_fs
 import goalflight_steer_mailbox
 import goalflight_ledger
 import goalflight_journal
@@ -134,6 +135,7 @@ BLOCKED_COMPLETION_AUTHORITY_STATE = "blocked_completion_authority"
 COMPLETION_AUTHORITY_PARK_REASONS = frozenset(
     {
         "completion_authority_unavailable",
+        "completion_authority_token_indeterminate",
         COMPLETION_AUTHORITY_TIMESTAMP_UNREADABLE,
     }
 )
@@ -3050,7 +3052,9 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
     (reconcile already closes those); live identity on this host whose
     ``project_root`` matches the target tree's repo is occupancy UNKNOWN
     of this project (refuse; ``--occupied-worktree-forced`` is the hatch);
-    missing or other ``project_root`` skip+warn (cannot be this repo).
+    missing ``project_root`` on a live nameless row is also UNKNOWN (cannot
+    tell "other repo" from "this repo, unlabeled"); a *different* readable
+    ``project_root`` skip+warn (cannot be this repo).
     ``project_root`` is never itself a path claim -- a matching
     ``worker_cwd`` still occupies when the root differs. Unreadable or
     unlistable records remain occupancy UNKNOWN: they might name this
@@ -3103,6 +3107,13 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
                 _warn_cwdless_nonterminal(record)
                 continue
             if not _record_project_root_matches_target(record, target):
+                raw_root = record.get("project_root")
+                if not isinstance(raw_root, str) or not raw_root.strip():
+                    unknown.append(
+                        f"live dispatch {record_id} (state={state or 'running'}) "
+                        "names no worker cwd and no project_root"
+                    )
+                    continue
                 _warn_cwdless_nonterminal(record)
                 continue
             unknown.append(
@@ -8155,9 +8166,11 @@ def _read_capacity_state_for_reconciliation() -> dict:
 def _abandoned_status_payload(record: dict) -> tuple[dict | None, str]:
     """Read status evidence without confusing absence with corruption.
 
-    A status file that was never created is absent evidence.  A file that
-    exists but cannot be read, parsed, or tied to this dispatch is ambiguous
-    evidence and must veto reconciliation.
+    A recorded ``status_path`` whose file is missing is indeterminate, not
+    empty evidence: ``{}`` is not a veto and licenses ``no_recorded_pid``
+    close. A file that cannot be read, parsed, or tied to this dispatch
+    is also ambiguous and must veto reconciliation. Pointer-absent remains
+    ``status_path_absent``.
     """
 
     status_path = record.get("status_path")
@@ -8168,7 +8181,9 @@ def _abandoned_status_payload(record: dict) -> tuple[dict | None, str]:
     try:
         payload = json.loads(Path(status_path).expanduser().read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {}, "status_file_absent"
+        # Recorded path, missing file: never-created vs write-failed vs
+        # unlinked. Empty {} is not a veto and licenses no_recorded_pid close.
+        return None, "status_file_absent"
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return None, f"status_unreadable:{type(exc).__name__}"
     if not isinstance(payload, dict):
@@ -8211,9 +8226,13 @@ def _abandoned_output_evidence(record: dict) -> tuple[bool, str]:
     if not isinstance(raw, str):
         return False, "output_path_invalid"
     path = Path(raw).expanduser()
+    presence = goalflight_fs.path_presence(path)
+    if presence == "absent":
+        return True, "output_file_absent"
+    if presence == "unknown":
+        # exists() is False for a child of an unsearchable parent.
+        return False, "output_unreadable:unsearchable"
     try:
-        if not path.exists():
-            return True, "output_file_absent"
         if not path.is_file():
             return False, "output_not_regular_file"
         with path.open("rb") as stream:
@@ -8424,7 +8443,8 @@ def _abandoned_controller_evidence(record: dict) -> tuple[bool, str]:
     controller_pid = record.get("controller_pid")
     controller_label = record.get("controller_label")
     if not controller_label and (not session_id or controller_pid is None):
-        return True, "controller_unowned"
+        # Empty/missing controller identity is not "nobody to protect".
+        return False, "controller_identity_absent"
     project_root = record.get("project_root")
     if not isinstance(project_root, str) or not project_root:
         return False, "controller_owner_project_indeterminate"
@@ -8534,7 +8554,8 @@ def _evaluate_abandoned_dispatch(
             "eligible": False,
             "reason": (
                 "controller_indeterminate"
-                if controller_evidence == "controller_indeterminate"
+                if controller_evidence
+                in {"controller_indeterminate", "controller_identity_absent"}
                 else "controller_live_or_indeterminate"
             ),
             "controller_evidence": controller_evidence,
@@ -9569,6 +9590,23 @@ def _linked_task_truth(
     return truth
 
 
+def _completion_authority_token_bind(entry: dict | None, record: dict | None) -> str:
+    """Bind a terminal ledger row to this carrier: match, mismatch, or unknown.
+
+    Dispatch ids are reusable once terminal. A new carrier with a new
+    ``queue_launch_token`` must not inherit the previous attempt's complete
+    row. Missing tokens cannot prove the bind, so the caller must not unlink.
+    """
+    entry_token = _queue_launch_token_from_entry(entry) if isinstance(entry, dict) else None
+    raw = record.get("queue_launch_token") if isinstance(record, dict) else None
+    record_token = str(raw) if raw not in (None, "") else None
+    if not entry_token or not record_token:
+        return "unknown"
+    if entry_token == record_token:
+        return "match"
+    return "mismatch"
+
+
 def _entry_completion_authority(
     entry: dict,
     record: dict | None = None,
@@ -9598,6 +9636,8 @@ def _entry_completion_authority(
             }
 
     # Leg 0: already-terminal ledger for this dispatch (first-terminal-wins).
+    # Bind to queue_launch_token so a reused dispatch id cannot unlink the
+    # current carrier on the strength of an earlier attempt's complete row.
     has_terminal_record = bool(dispatch_id and _dispatch_record_is_terminal(record))
     if has_terminal_record:
         existing = record or _find_dispatch_record(dispatch_id) or {}
@@ -9607,12 +9647,24 @@ def _entry_completion_authority(
             "superseded",
             "worker_dead",
         } | set(goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES):
-            return {
-                "state": existing_state,
-                "reason": "existing_terminal_record",
-                "marker": None,
-                "source": "ledger",
-            }
+            bind = _completion_authority_token_bind(entry, existing)
+            if bind == "unknown":
+                return {
+                    "state": "deferred",
+                    "reason": "completion_authority_token_indeterminate",
+                    "marker": None,
+                    "source": "ledger",
+                    "indeterminate_cause": "queue_launch_token_unbound",
+                    "indeterminate_sources": ["queue_launch_token"],
+                    "bounded_deferral": False,
+                }
+            if bind == "match":
+                return {
+                    "state": existing_state,
+                    "reason": "existing_terminal_record",
+                    "marker": None,
+                    "source": "ledger",
+                }
 
     project_root = _project_root_for_entry(entry, record)
     marker = _scan_entry_completion_marker(entry)
@@ -10287,6 +10339,7 @@ def _commit_restore_transaction(
         record is not None
         and _dispatch_record_is_terminal(record)
         and str(record.get("state") or "") not in {"blocked_capacity"}
+        and _completion_authority_token_bind(fresh, record) == "match"
     ):
         if not _unlink_matching_restore_target(target, fresh):
             return None, None
@@ -10394,6 +10447,7 @@ def _commit_restore_transaction(
         if (
             _dispatch_record_is_terminal(ledger_record)
             and str(ledger_record.get("state") or "") not in {"blocked_capacity"}
+            and _completion_authority_token_bind(fresh, ledger_record) == "match"
         ):
             with contextlib.suppress(OSError):
                 target.unlink()
@@ -10904,6 +10958,7 @@ def _reconcile_claim_transaction(
             record is not None
             and _dispatch_record_is_terminal(record)
             and not _ledger_is_restorable_prelaunch(record)
+            and _completion_authority_token_bind(fresh, record) == "match"
         ):
             if not linked:
                 quarantined_path = _quarantine_unlinked_claim_if_observed_orphan(
@@ -13545,12 +13600,19 @@ def _maybe_requeue_terminal_claim(
     if not dispatch_id:
         return True
     record_path = goalflight_ledger.record_path(dispatch_id, create=False)
+    presence = goalflight_fs.path_presence(record_path)
+    if presence == "unknown":
+        return False
+    if presence == "absent":
+        return True
     try:
         record = json.loads(record_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return True
+    except OSError:
+        return False
+    except (ValueError, json.JSONDecodeError):
+        return False
     if not isinstance(record, dict):
-        return True
+        return False
 
     intent = record.get("requeue")
     if _requeue_disposition_is_terminal(intent):
@@ -14462,6 +14524,19 @@ def _drain_queue_once(args) -> dict:
             if isinstance(_scan_entry, dict)
             else path.stem
         )
+        if _scan_read_error:
+            # Unscoped drain used to claim then mutate unreadable JSON to
+            # .failed. Scoped drain already retains; the canonical queue
+            # must too.
+            drain_acc["left_queued"] += 1
+            details.append(
+                {
+                    "dispatch_id": dispatch_id,
+                    "state": "queued",
+                    "reason": "unreadable_queue_entry",
+                }
+            )
+            continue
         if project_key and project_key in drain_acc["skipped_projects_busy"]:
             _note_drain_journal_skip(
                 drain_acc,

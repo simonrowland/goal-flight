@@ -28,6 +28,20 @@ import goalflight_ledger as L  # noqa: E402
 SESSION_ID = "12345678-1234-4abc-8def-1234567890ab"
 
 
+def _gone_controller() -> dict:
+    """Proven-dead controller fields so abandonment can still close.
+
+    Empty label is no longer permission to close (SC-153 C5). Close tests
+    must name a controller that ``probe_live_session`` will report dead
+    against an isolated journal-less project root.
+    """
+    return {
+        "controller_pid": 99999,
+        "controller_session_id": "dead-controller-session",
+        "controller_label": "dead-controller",
+    }
+
+
 @pytest.fixture(autouse=True)
 def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     state = tmp_path / "state"
@@ -121,6 +135,9 @@ def _record(
             extra = {**extra, "worker_pgid": pgid}
     payload.update(extra)
     L.write_record(payload)
+    status_file = Path(str(payload.get("status_path") or status))
+    if not status_file.exists():
+        _write_status(tmp_path, dispatch_id)
     return payload
 
 
@@ -224,7 +241,7 @@ def _write_rollout(home: Path) -> None:
 
 def test_no_pid_no_lease_no_marker_closes_without_asserting_outcome(tmp_path: Path) -> None:
     dispatch_id = "abandoned-no-verdict"
-    _record(tmp_path, dispatch_id)
+    _record(tmp_path, dispatch_id, **_gone_controller())
 
     result = _run(tmp_path)
     closed = _read(dispatch_id)
@@ -293,7 +310,13 @@ def test_stale_worker_alive_true_with_dead_pid_is_eligible(tmp_path: Path) -> No
     )
 
     dispatch_id = "stale-alive-dead-pid"
-    _record(tmp_path, dispatch_id, worker_pid=pid, worker_identity=identity)
+    _record(
+        tmp_path,
+        dispatch_id,
+        worker_pid=pid,
+        worker_identity=identity,
+        **_gone_controller(),
+    )
     _write_status(
         tmp_path,
         dispatch_id,
@@ -444,6 +467,7 @@ def test_dead_pids_without_group_contract_are_eligible(tmp_path: Path) -> None:
         worker_identity=identity,
         worker_pgid=pid,
         queue_launch_token="launch-token-absent-contract",
+        **_gone_controller(),
     )
     _write_status(
         tmp_path,
@@ -652,6 +676,7 @@ def test_terminal_marker_reconciles_observed_real_outcome(tmp_path: Path) -> Non
         tmp_path,
         dispatch_id,
         tail_text=f"work log\nCOMPLETE: {dispatch_id} — verified result\n",
+        **_gone_controller(),
     )
 
     result = _run(tmp_path)
@@ -672,7 +697,7 @@ def test_terminal_marker_arriving_after_final_evaluation_wins(
     tmp_path: Path,
 ) -> None:
     dispatch_id = "marker-during-close"
-    record = _record(tmp_path, dispatch_id)
+    record = _record(tmp_path, dispatch_id, **_gone_controller())
     tail = Path(record["stdout_path"])
     original = D._abandoned_terminal_outcome
     injected = False
@@ -698,7 +723,7 @@ def test_terminal_marker_arriving_after_final_evaluation_wins(
 
 def test_recent_progress_is_ambiguous_and_left_open(tmp_path: Path) -> None:
     dispatch_id = "recent-progress"
-    _record(tmp_path, dispatch_id)
+    _record(tmp_path, dispatch_id, **_gone_controller())
 
     result = _run(tmp_path, now=dt.datetime.now(dt.timezone.utc))
 
@@ -709,7 +734,7 @@ def test_recent_progress_is_ambiguous_and_left_open(tmp_path: Path) -> None:
 
 def test_young_partially_written_record_is_left_open(tmp_path: Path) -> None:
     dispatch_id = "young-partial-record"
-    record = _record(tmp_path, dispatch_id)
+    record = _record(tmp_path, dispatch_id, **_gone_controller())
     Path(record["stdout_path"]).unlink()
 
     result = _run(tmp_path, now=dt.datetime.now(dt.timezone.utc))
@@ -754,6 +779,64 @@ def test_missing_status_pointer_is_ambiguous_and_left_open(tmp_path: Path) -> No
     assert result["closed"] == 0
     assert _read(dispatch_id)["state"] == "running"
     assert result["kept_reasons"] == {"status_indeterminate": 1}
+
+
+def test_recorded_status_path_file_absent_is_ambiguous_and_left_open(
+    tmp_path: Path,
+) -> None:
+    """C3: a recorded status_path whose file is missing is not empty evidence."""
+    dispatch_id = "missing-status-file"
+    record = _record(tmp_path, dispatch_id, **_gone_controller())
+    Path(str(record["status_path"])).unlink()
+
+    result = _run(tmp_path)
+    entry = result["entries"][0]
+
+    assert result["closed"] == 0
+    assert _read(dispatch_id)["state"] == "running"
+    assert result["kept_reasons"] == {"status_indeterminate": 1}
+    assert entry["status_evidence"] == "status_file_absent"
+
+
+def test_empty_controller_label_is_not_permission_to_close(tmp_path: Path) -> None:
+    """C5: missing controller identity retains, it does not read as unowned."""
+    dispatch_id = "empty-controller-label"
+    _record(tmp_path, dispatch_id)
+
+    result = _run(tmp_path)
+    entry = result["entries"][0]
+
+    assert result["closed"] == 0
+    assert _read(dispatch_id)["state"] == "running"
+    assert result["kept_reasons"] == {"controller_indeterminate": 1}
+    assert entry["controller_evidence"] == "controller_identity_absent"
+
+
+def test_output_child_of_unsearchable_parent_is_not_gone(tmp_path: Path) -> None:
+    """C4: Path.exists() False on an unsearchable parent is not output_file_absent."""
+    dispatch_id = "output-unsearchable-parent"
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    tail = hidden / f"{dispatch_id}.tail"
+    tail.write_text("worker output stopped without a verdict\n", encoding="utf-8")
+    _record(
+        tmp_path,
+        dispatch_id,
+        **_gone_controller(),
+        stdout_path=str(tail),
+    )
+
+    os.chmod(hidden, 0o000)
+    try:
+        result = _run(tmp_path)
+    finally:
+        os.chmod(hidden, 0o700)
+
+    entry = result["entries"][0]
+    assert result["closed"] == 0
+    assert _read(dispatch_id)["state"] == "running"
+    assert result["kept_reasons"] == {"output_indeterminate": 1}
+    assert "unsearchable" in str(entry.get("output_evidence") or "")
 
 
 def test_missing_output_pointer_is_ambiguous_and_left_open(tmp_path: Path) -> None:
@@ -980,7 +1063,7 @@ def test_reconcile_abandoned_dry_run_text_states_no_record_changed(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     dispatch_id = "dry-run-would-close"
-    _record(tmp_path, dispatch_id)
+    _record(tmp_path, dispatch_id, **_gone_controller())
     queue_dir = tmp_path / "state" / "dispatch-queue"
     queue_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1027,7 +1110,7 @@ def test_dead_controller_probe_still_reclaims(
 
 def test_reconciliation_is_idempotent(tmp_path: Path) -> None:
     dispatch_id = "idempotent-close"
-    _record(tmp_path, dispatch_id)
+    _record(tmp_path, dispatch_id, **_gone_controller())
 
     first = _run(tmp_path)
     record_path = L.record_path(dispatch_id)
@@ -1043,8 +1126,8 @@ def test_local_drain_tick_runs_reconciliation_automatically(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    queue_dir = tmp_path / "queue"
-    queue_dir.mkdir()
+    queue_dir = Path(os.environ["GOALFLIGHT_STATE_DIR"]) / "dispatch-queue"
+    queue_dir.mkdir(parents=True, exist_ok=True)
     calls: list[Path] = []
     expected = {
         "schema": D.ABANDONED_RECONCILIATION_SCHEMA,
@@ -1084,13 +1167,14 @@ def test_inferred_abandonment_is_resumable_and_fresh_child_stays_live(
     fresh_child_id = "resume-child-fresh"
     home = tmp_path / "state" / "dispatch-homes" / parent_id
     _write_rollout(home)
-    parent = _record(tmp_path, parent_id, codex_home=home)
+    parent = _record(tmp_path, parent_id, codex_home=home, **_gone_controller())
     stale_child = _record(
         tmp_path,
         stale_child_id,
         parent_dispatch_id=parent_id,
         codex_home=home,
         state="waiting_capacity",
+        **_gone_controller(),
     )
     stale_child["codex_home_owner_dispatch_id"] = parent_id
     L.write_record(stale_child)

@@ -217,6 +217,32 @@ def test_drop_current_condition_would_delete_the_checkout(tmp_path: Path, repo: 
 # Three-state discipline.
 
 
+def test_unlistable_ledger_dir_retains_as_unknown_not_as_unowned(
+    tmp_path: Path, repo: Path
+) -> None:
+    """C1: glob-swallowed PermissionError on the ledger dir is UNKNOWN, not unowned.
+
+    Corrupt-but-listable JSON (the sibling test) cannot catch this: glob
+    yields [] without raising, so unreadable stays empty and check_unowned
+    used to return yes.
+    """
+    wt = _add_worktree(repo, tmp_path, "unlistable-ledger")
+    _commit_in(wt)
+    _merge_into_main(repo, "unlistable-ledger")
+    _write_ledger("live-owner", "running", wt)
+    runs = goalflight_ledger.runs_dir(create=False)
+    os.chmod(runs, 0o000)
+    try:
+        _done, report = _run(repo)
+    finally:
+        os.chmod(runs, 0o700)
+    entry = _entry(report, wt)
+    assert entry["decision"] == "retain", entry
+    unowned = entry["conditions"]["unowned"]
+    assert unowned["verdict"] == "unknown", entry
+    assert "unreadable" in unowned["reason"]
+
+
 def test_unreadable_ledger_retains_as_unknown_not_as_unowned(
     tmp_path: Path, repo: Path
 ) -> None:

@@ -11,6 +11,7 @@ import subprocess
 from typing import Any
 
 import goalflight_compat
+import goalflight_fs
 from goalflight_adapter_gate import validate_adapter_gate
 from goalflight_os_sandbox import (
     OS_SANDBOX_OFF,
@@ -57,9 +58,14 @@ RETRYABLE_MANIFEST_REASONS = frozenset(
 
 def load_manifest_with_reason(agent: str) -> tuple[dict[str, Any] | None, str | None]:
     for path in manifest_candidates(agent):
+        presence = goalflight_fs.path_presence(path)
+        if presence == "absent":
+            continue
+        if presence == "unknown":
+            # exists() is False for a child of an unsearchable adapters dir
+            # and would collapse into adapter_manifest_missing (not retryable).
+            return None, "adapter_manifest_unreadable"
         try:
-            if not path.exists():
-                continue
             data = json.loads(path.read_text())
         except OSError:
             return None, "adapter_manifest_unreadable"
@@ -144,9 +150,11 @@ def _command_available(argv: list[str]) -> bool:
 def validate_acp_dispatch_readiness(agent: str, argv: list[str]) -> dict[str, Any] | None:
     manifest, manifest_error = load_manifest_with_reason(agent)
     if manifest is None:
+        reason = manifest_error or "adapter_manifest_missing"
         return {
             "allowed": False,
-            "reason": manifest_error or "adapter_manifest_missing",
+            "reason": reason,
+            "retryable": reason in RETRYABLE_MANIFEST_REASONS,
             "required_probe_ids": [],
             "blocked_fields": ["adapter"],
             "safe_next_action": "fix_adapter_manifest_or_select_known_adapter",

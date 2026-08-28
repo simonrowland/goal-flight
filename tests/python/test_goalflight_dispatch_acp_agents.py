@@ -488,11 +488,6 @@ def test_watcher_both_absent_returns_before_scanner_initialization() -> None:
                     "IncrementalTailScanner",
                     side_effect=AssertionError("retired watcher initialized scanner"),
                 ), \
-                patch.object(
-                    goalflight_watch,
-                    "_dispatch_record_is_nonterminal",
-                    return_value=True,
-                ), \
                 contextlib.redirect_stdout(output):
             rc = goalflight_watch.main()
 

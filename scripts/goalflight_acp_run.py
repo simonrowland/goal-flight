@@ -2563,7 +2563,8 @@ async def _run_acp_dispatch_impl(
     gate = validate_acp_dispatch_readiness(cfg.agent, [command, *acp_args])
     if gate is not None:
         payload.update({"state": "blocked_adapter_gate", "error": gate})
-        _commit_prelaunch_terminal(payload, project_root=project_root)
+        if not os_sandbox_refusal_is_retryable(gate):
+            _commit_prelaunch_terminal(payload, project_root=project_root)
         write_status(status_path, payload)
         return payload
     if os_sandbox_error is not None:

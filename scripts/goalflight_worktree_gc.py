@@ -75,6 +75,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import goalflight_compat  # noqa: E402
 import goalflight_dispatch_states  # noqa: E402
+import goalflight_fs  # noqa: E402
 import goalflight_ledger  # noqa: E402
 import goalflight_worktree_pool  # noqa: E402
 
@@ -120,13 +121,7 @@ def _presence(path: Path) -> str:
     ``exists()`` answers False for both "not there" and "I could not look".
     Only FileNotFoundError is evidence of absence.
     """
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return "absent"
-    except OSError:
-        return "unknown"
-    return "present"
+    return goalflight_fs.path_presence(path)
 
 
 def _resolve(path: str) -> str:
@@ -297,13 +292,16 @@ def read_ledger_records(ledger_dir: Path) -> tuple[list[dict[str, Any]], list[st
         return [], []
     if state == "unknown":
         return [], [str(ledger_dir)]
+    listing, children = goalflight_fs.list_dir_suffix(ledger_dir, ".json")
+    if listing == "absent":
+        return [], []
+    if listing == "unreadable":
+        # glob swallows PermissionError and yields []; iterdir raises.
+        # An unlistable runs dir is not "no owner".
+        return [], [str(ledger_dir)]
     records: list[dict[str, Any]] = []
     unreadable: list[str] = []
-    try:
-        children = sorted(ledger_dir.glob("*.json"))
-    except OSError:
-        return [], [str(ledger_dir)]
-    for child in children:
+    for child in sorted(children):
         try:
             payload = json.loads(child.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
