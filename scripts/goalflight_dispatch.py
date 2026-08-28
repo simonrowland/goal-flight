@@ -12228,6 +12228,20 @@ def _queue_entry_created_ts(entry: dict | None, path: Path) -> float:
         return float("inf")
 
 
+def _queue_entry_last_attempted_ts(entry: dict | None) -> float:
+    """Attempt-cursor sort key. Never-attempted entries are 0.0 (first).
+
+    Chosen over mutating created_at: original FIFO identity stays, and
+    never-attempted work of the same priority always precedes a dead letter
+    whose backoff has expired. Bound: every same-priority queued id gets a
+    turn within N passes.
+    """
+    if not isinstance(entry, dict):
+        return 0.0
+    parsed = goalflight_ledger.parse_utc(entry.get("launch_last_attempted_at"))
+    return parsed.timestamp() if parsed is not None else 0.0
+
+
 def _queue_entry_not_before_ts(entry: dict | None) -> float | None:
     if not isinstance(entry, dict):
         return None
@@ -12529,7 +12543,7 @@ def _not_before_headroom_fields(
     }
 
 
-def _queue_entry_drain_candidate(path: Path) -> tuple[tuple[int, float, str], Path, dict | None, str | None]:
+def _queue_entry_drain_candidate(path: Path) -> tuple[tuple[int, float, float, str], Path, dict | None, str | None]:
     entry: dict | None = None
     read_error: str | None = None
     try:
@@ -12544,6 +12558,7 @@ def _queue_entry_drain_candidate(path: Path) -> tuple[tuple[int, float, str], Pa
     return (
         (
             QUEUE_PRIORITY_RANK.get(priority, QUEUE_PRIORITY_RANK[QUEUE_DEFAULT_PRIORITY]),
+            _queue_entry_last_attempted_ts(entry),
             _queue_entry_created_ts(entry, path),
             path.name,
         ),
@@ -13993,6 +14008,8 @@ class _DrainClaimGuard:
         self.allow_restore = True
         self.launch_attempted = False
         self.release_reason = "claim_released_pre_worker"
+        self.stamp_backoff = False
+        self.fail_reason = "launch_budget_burn"
 
     def consume(
         self,
@@ -14095,8 +14112,13 @@ class _DrainClaimGuard:
                 self.acc["pending_claims"] += 1
             return False
         if restored is None:
-            if self.release_reason == "launch_timeout_pending_ledger":
-                _stamp_launch_backoff(self.claim, self.entry)
+            if self.launch_attempted:
+                _stamp_launch_attempt(
+                    self.claim,
+                    self.entry,
+                    backoff=self.stamp_backoff,
+                    fail_reason=self.fail_reason,
+                )
             uncommitted = (
                 "capacity_restore_uncommitted"
                 if self.release_reason == "capacity_unavailable"
@@ -14114,8 +14136,13 @@ class _DrainClaimGuard:
                 }
             )
             return False
-        if self.release_reason == "launch_timeout_pending_ledger":
-            _stamp_launch_backoff(restored, self.entry)
+        if self.launch_attempted:
+            _stamp_launch_attempt(
+                restored,
+                self.entry,
+                backoff=self.stamp_backoff,
+                fail_reason=self.fail_reason,
+            )
         _restore_queued_record_from_entry(self.entry, restored)
         detail = {
             "dispatch_id": self.dispatch_id,
@@ -14216,10 +14243,59 @@ def _launch_backoff_delay_s(timeout_count: int) -> float:
     return min(LAUNCH_BACKOFF_CAP_S, LAUNCH_BACKOFF_INITIAL_S * (2 ** exponent))
 
 
-def _stamp_launch_backoff(claim: Path, entry: dict) -> None:
-    """Persist launch-timeout backoff onto the claim so restore keeps it.
+def _launch_attempt_consumed_budget(
+    elapsed_s: float, pass_budget_s: float, remaining_after_s: float
+) -> bool:
+    """True when this attempt used a material slice of the pass launch budget.
 
-    Distinct from not_before: usage-probe re-derivation must not clear this.
+    Discriminator is budget burn, not exception type. Fast refusals (missing
+    argv, instant rc=2) leave leftover budget for the next entry this pass
+    and must not stamp a 60s backoff — that would park capacity-waiting work.
+
+    Derivation of material_s:
+      production pass_budget ≈ DRAIN_LAUNCH_CONFIRM_S (45s)
+        0.25 * 45 = 11.25; min(1.0, max(0.05, 11.25)) = 1.0s
+      test pass_budget 0.40s
+        0.25 * 0.40 = 0.10; min(1.0, max(0.05, 0.10)) = 0.10s
+    A handshake that fails after ≥1s in production (or ≥0.10s in the probe-D
+    budget) is a burn; a 20ms argv error is not. remaining_after_s <= 0 is
+    always a burn: nothing else fits this pass.
+    """
+    if remaining_after_s <= 0:
+        return True
+    material_s = min(1.0, max(0.05, 0.25 * float(pass_budget_s)))
+    return float(elapsed_s) >= material_s
+
+
+def _mark_launch_budget_burn_if_material(
+    lease: "_DrainClaimGuard",
+    timing: dict,
+    *,
+    attempt_started: float,
+    pass_budget_s: float,
+    launch_deadline: float,
+) -> None:
+    elapsed_s = time.monotonic() - attempt_started
+    remaining_after_s = launch_deadline - time.monotonic()
+    if not _launch_attempt_consumed_budget(elapsed_s, pass_budget_s, remaining_after_s):
+        return
+    lease.stamp_backoff = True
+    lease.fail_reason = "launch_budget_burn"
+    timing["launch_budget_burns"] = int(timing.get("launch_budget_burns") or 0) + 1
+
+
+def _stamp_launch_attempt(
+    claim: Path,
+    entry: dict,
+    *,
+    backoff: bool = False,
+    fail_reason: str | None = None,
+) -> None:
+    """Persist the attempt cursor, and optional backoff, onto the envelope.
+
+    Distinct from not_before: usage-probe re-derivation must not clear these.
+    last_attempted_at is the forward-progress cursor (never-attempted first).
+    Backoff is the next-pass skip for a material budget burn.
     """
     try:
         observed = json.loads(claim.read_text(encoding="utf-8"))
@@ -14227,17 +14303,24 @@ def _stamp_launch_backoff(claim: Path, entry: dict) -> None:
         observed = dict(entry)
     if not isinstance(observed, dict):
         observed = dict(entry)
-    count = int(observed.get("launch_timeout_count") or entry.get("launch_timeout_count") or 0) + 1
-    delay_s = _launch_backoff_delay_s(count)
-    until = (
-        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delay_s)
-    ).isoformat(timespec="seconds")
-    observed["launch_timeout_count"] = count
-    observed["launch_backoff_until"] = until
-    observed["launch_fail_reason"] = "launch_timeout"
-    entry["launch_timeout_count"] = count
-    entry["launch_backoff_until"] = until
-    entry["launch_fail_reason"] = "launch_timeout"
+    attempted_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds")
+    observed["launch_last_attempted_at"] = attempted_at
+    entry["launch_last_attempted_at"] = attempted_at
+    if backoff:
+        count = int(
+            observed.get("launch_timeout_count") or entry.get("launch_timeout_count") or 0
+        ) + 1
+        delay_s = _launch_backoff_delay_s(count)
+        until = (
+            dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delay_s)
+        ).isoformat(timespec="seconds")
+        reason = fail_reason or "launch_budget_burn"
+        observed["launch_timeout_count"] = count
+        observed["launch_backoff_until"] = until
+        observed["launch_fail_reason"] = reason
+        entry["launch_timeout_count"] = count
+        entry["launch_backoff_until"] = until
+        entry["launch_fail_reason"] = reason
     with contextlib.suppress(OSError):
         _write_json_atomic(claim, observed)
 
@@ -14284,6 +14367,7 @@ def _drain_queue_once(args) -> dict:
         "launch_s": 0.0,
         "journal_s": 0.0,
         "launch_timeouts": 0,
+        "launch_budget_burns": 0,
         "launch_concurrency": 1,
         "capacity_slots": 0,
     }
@@ -14895,6 +14979,7 @@ def _drain_queue_once(args) -> dict:
                 timeout_s,
                 max(0.05, launch_deadline - time.monotonic()),
             )
+            attempt_started = time.monotonic()
             try:
                 lease.launch_attempted = True
                 if remote_node:
@@ -14918,10 +15003,19 @@ def _drain_queue_once(args) -> dict:
                     )
             except _RemoteDrainBlocked as exc:
                 lease.release_reason = f"remote_blocked:{exc.code}:{exc}"
+                _mark_launch_budget_burn_if_material(
+                    lease,
+                    timing,
+                    attempt_started=attempt_started,
+                    pass_budget_s=pass_budget_s,
+                    launch_deadline=launch_deadline,
+                )
                 continue
             except subprocess.TimeoutExpired:
                 timing["launch_timeouts"] += 1
                 lease.release_reason = "launch_timeout_pending_ledger"
+                lease.stamp_backoff = True
+                lease.fail_reason = "launch_timeout"
                 continue
             stdout_launched = proc.returncode == 0 and "DISPATCH-LAUNCHED " in proc.stdout
             # Drain launch accounting: a token-matched worker_pid means launch occurred
@@ -14965,6 +15059,13 @@ def _drain_queue_once(args) -> dict:
                 continue
             if capacity_reason:
                 lease.release_reason = capacity_reason
+                _mark_launch_budget_burn_if_material(
+                    lease,
+                    timing,
+                    attempt_started=attempt_started,
+                    pass_budget_s=pass_budget_s,
+                    launch_deadline=launch_deadline,
+                )
                 continue
             if stdout_launched and not ledger_confirmed:
                 # Stdout is not launch proof. Keep the carrier pending until a
@@ -15024,6 +15125,13 @@ def _drain_queue_once(args) -> dict:
                     )
                     continue
                 lease.release_reason = f"launch_refused_pre_spawn:{proc.returncode}"
+                _mark_launch_budget_burn_if_material(
+                    lease,
+                    timing,
+                    attempt_started=attempt_started,
+                    pass_budget_s=pass_budget_s,
+                    launch_deadline=launch_deadline,
+                )
                 continue
             lease.release_reason = f"launch_failed_pending_ledger:{proc.returncode}"
     # Launches already happened, so a listing failure here must not become the
@@ -15210,6 +15318,7 @@ def _cmd_drain(argv: list[str]) -> int:
                     "reconcile_s": (payload.get("timing") or {}).get("reconcile_s"),
                     "journal_s": (payload.get("timing") or {}).get("journal_s"),
                     "launch_timeouts": (payload.get("timing") or {}).get("launch_timeouts"),
+                    "launch_budget_burns": (payload.get("timing") or {}).get("launch_budget_burns"),
                     "capacity_slots": (payload.get("timing") or {}).get("capacity_slots"),
                     "waiting_launch_backoff": (
                         holds.get("launch_backoff") or {}

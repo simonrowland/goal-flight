@@ -11,6 +11,10 @@ read, not a lock, and same-task double-spawn is a confirmed TOCTOU if two
 children are in flight before either records running. The pass instead bounds
 total launch wait and backs off entries that just timed out.
 
+A slow non-timeout failure at a stable FIFO head used to burn the pass
+budget without a backoff stamp, so the same dead letter was retried every
+pass and the healthy tail never started. Tests below lock that hole.
+
 Tests isolate state under pytest's tmp_path. They never touch the live shared
 queue at /tmp/goal-flight-501/dispatch-queue.
 """
@@ -50,6 +54,13 @@ N_HUNG = 4
 # One confirmation wait plus restore, not N waits. Restore of a timed-out
 # claim is ~1s; N serial hangs on 2d88c4f measured 3.49s.
 SERIAL_CEILING_S = HANG_S * N_HUNG + 0.8
+# Probe D: front sleeps past the pass budget then returns rc=2. Sleep must
+# meet or exceed the budget so leftover remaining_s cannot start the tail
+# even if restore is cheap. Revert-failure on 2c160d8: healthy is attempted
+# on neither pass.
+SLOW_FAIL_S = 0.50
+STARVE_BUDGET_S = 0.40
+BOUNDED_PASSES = 3
 
 
 @pytest.fixture(autouse=True)
@@ -198,6 +209,72 @@ def _launched_run_factory(tmp_path: Path):
     return fake_run
 
 
+def _reason_for(payload: dict, dispatch_id: str) -> str:
+    for row in payload.get("details") or []:
+        if row.get("dispatch_id") == dispatch_id:
+            return str(row.get("reason") or "")
+    return ""
+
+
+def _launched_ids(payload: dict) -> list[str]:
+    return [
+        str(row.get("dispatch_id") or "")
+        for row in payload.get("details") or []
+        if row.get("state") == "launched"
+    ]
+
+
+def _selective_child_run(
+    tmp_path: Path,
+    *,
+    slow_fail_ids: frozenset[str] = frozenset(),
+    hang_ids: frozenset[str] = frozenset(),
+    attempts: list[str] | None = None,
+):
+    """Drain-child mock: hang, slow rc=2, or ledger-confirmed launch by id."""
+    launch = _launched_run_factory(tmp_path)
+
+    def fake_run(argv, *args, **kwargs):
+        argv_list = list(argv)
+        if not _is_drain_child(argv_list):
+            return _REAL_SUBPROCESS_RUN(argv, *args, **kwargs)
+        try:
+            dispatch_id = argv_list[argv_list.index("--dispatch-id") + 1]
+        except (ValueError, IndexError):
+            dispatch_id = ""
+        if attempts is not None:
+            attempts.append(dispatch_id)
+        if dispatch_id in hang_ids:
+            time.sleep(HANG_S)
+            raise subprocess.TimeoutExpired(
+                argv_list, kwargs.get("timeout") or HANG_S
+            )
+        if dispatch_id in slow_fail_ids:
+            time.sleep(SLOW_FAIL_S)
+            return subprocess.CompletedProcess(
+                argv_list, 2, stdout="", stderr="slow-fail"
+            )
+        return launch(argv, *args, **kwargs)
+
+    return fake_run
+
+
+def _write_front_and_healthy(queue: Path, project: Path) -> tuple[Path, Path]:
+    front = _write_entry(
+        queue,
+        "slow-fail",
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    back = _write_entry(
+        queue,
+        "healthy-back",
+        project_root=project,
+        created_at="2026-01-01T00:00:01+00:00",
+    )
+    return front, back
+
+
 def test_unlaunchable_entries_do_not_multiply_pass_wall_time(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -310,7 +387,14 @@ def test_pass_reports_launch_and_reconcile_timing(
     payload = D._drain_queue_once(_drain_args(queue))
     timing = payload.get("timing")
     assert isinstance(timing, dict), payload
-    for key in ("pass_s", "launch_s", "reconcile_s", "capacity_slots"):
+    for key in (
+        "pass_s",
+        "launch_s",
+        "reconcile_s",
+        "capacity_slots",
+        "launch_timeouts",
+        "launch_budget_burns",
+    ):
         assert key in timing, timing
         assert isinstance(timing[key], (int, float)), timing
 
@@ -482,3 +566,211 @@ def test_two_drain_threads_on_one_dispatch_id_yield_one_launch(
         assert not thread.is_alive()
     assert launches == ["solo-id"], launches
     assert sum(row.get("launched") or 0 for row in results) == 1, results
+
+
+def test_slow_non_timeout_failure_at_head_does_not_starve_healthy_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Probe D: front returns rc=2 after most of the budget; tail must launch.
+
+    Revert-failure on 2c160d8: both passes attempt only slow-fail
+    (launch_refused_pre_spawn:2 + pass_launch_budget). Healthy-back is
+    never subprocess-attempted because the restored head keeps the same
+    FIFO position and is immediately eligible next pass.
+    """
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    _write_front_and_healthy(queue, project)
+    attempts: list[str] = []
+    monkeypatch.setattr(
+        D.subprocess,
+        "run",
+        _selective_child_run(
+            tmp_path,
+            slow_fail_ids=frozenset({"slow-fail"}),
+            attempts=attempts,
+        ),
+    )
+    args = _drain_args(queue, launch_budget_s=STARVE_BUDGET_S)
+    payloads: list[dict] = []
+    for _ in range(BOUNDED_PASSES):
+        payloads.append(D._drain_queue_once(args))
+        if "healthy-back" in _launched_ids(payloads[-1]):
+            break
+    launched_across = [did for payload in payloads for did in _launched_ids(payload)]
+    assert "healthy-back" in launched_across, (
+        f"healthy-back never launched within {BOUNDED_PASSES} passes; "
+        f"attempts={attempts} payloads={payloads}"
+    )
+    assert attempts.count("healthy-back") >= 1, attempts
+    assert len(payloads) <= BOUNDED_PASSES, payloads
+
+
+def test_launch_refused_pre_spawn_at_head_stamps_backoff_and_unblocks_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refused-pre-spawn restore path must stamp backoff, not just TimeoutExpired.
+
+    Revert-failure on 2c160d8: pass 1 reason is launch_refused_pre_spawn:2,
+    the queued envelope has no launch_backoff_until, timing.launch_timeouts
+    is 0, and there is no non-timeout burn field. Pass 2 retries the same
+    head.
+    """
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    front, _back = _write_front_and_healthy(queue, project)
+    attempts: list[str] = []
+    monkeypatch.setattr(
+        D.subprocess,
+        "run",
+        _selective_child_run(
+            tmp_path,
+            slow_fail_ids=frozenset({"slow-fail"}),
+            attempts=attempts,
+        ),
+    )
+    args = _drain_args(queue, launch_budget_s=STARVE_BUDGET_S)
+    first = D._drain_queue_once(args)
+    assert first["launched"] == 0, first
+    assert _reason_for(first, "slow-fail").startswith("launch_refused_pre_spawn"), first
+    assert _reason_for(first, "healthy-back") == "pass_launch_budget", first
+    timing = first.get("timing") or {}
+    assert int(timing.get("launch_timeouts") or 0) == 0, first
+    burns = int(timing.get("launch_budget_burns") or 0)
+    assert burns >= 1, first
+    queued = json.loads(front.read_text(encoding="utf-8"))
+    assert queued.get("state") == "queued", queued
+    assert queued.get("launch_backoff_until"), queued
+    assert queued.get("launch_last_attempted_at"), queued
+    assert queued.get("launch_fail_reason") == "launch_budget_burn", queued
+
+    second = D._drain_queue_once(args)
+    assert "healthy-back" in _launched_ids(second), (attempts, second)
+    assert "slow-fail" not in attempts[1:], attempts
+
+
+def test_timeout_at_head_still_launches_healthy_on_next_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Probe B: TimeoutExpired at the front still unblocks the tail on pass 2.
+
+    Revert-failure: hung-front retried immediately, healthy never launched,
+    or launch_budget_burns is charged for a timeout (it must stay a timeout).
+    """
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    _write_entry(
+        queue,
+        "hung-front",
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    _write_entry(
+        queue,
+        "healthy-back",
+        project_root=project,
+        created_at="2026-01-01T00:00:01+00:00",
+    )
+    attempts: list[str] = []
+    monkeypatch.setattr(
+        D.subprocess,
+        "run",
+        _selective_child_run(
+            tmp_path,
+            hang_ids=frozenset({"hung-front"}),
+            attempts=attempts,
+        ),
+    )
+    args = _drain_args(queue, launch_budget_s=STARVE_BUDGET_S)
+    first = D._drain_queue_once(args)
+    assert first["launched"] == 0, first
+    assert int((first.get("timing") or {}).get("launch_timeouts") or 0) == 1, first
+    assert int((first.get("timing") or {}).get("launch_budget_burns") or 0) == 0, first
+    assert attempts == ["hung-front"], attempts
+
+    second = D._drain_queue_once(args)
+    assert "healthy-back" in _launched_ids(second), (attempts, second)
+    assert "hung-front" not in attempts[1:], attempts
+
+
+def test_attempt_cursor_unblocks_tail_after_backoff_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FIFO head must not shadow the tail once backoff has expired.
+
+    Backoff skip is enough for the next daemon tick, but a stable
+    (priority, created_at, name) order would retry the dead letter the
+    moment launch_backoff_until lapses. The attempt cursor must put
+    never-attempted work first. Revert-failure on 2c160d8: after clearing
+    backoff, pass 2 attempts only slow-fail again.
+    """
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    front, _back = _write_front_and_healthy(queue, project)
+    attempts: list[str] = []
+    monkeypatch.setattr(
+        D.subprocess,
+        "run",
+        _selective_child_run(
+            tmp_path,
+            slow_fail_ids=frozenset({"slow-fail"}),
+            attempts=attempts,
+        ),
+    )
+    args = _drain_args(queue, launch_budget_s=STARVE_BUDGET_S)
+    first = D._drain_queue_once(args)
+    assert first["launched"] == 0, first
+    queued = json.loads(front.read_text(encoding="utf-8"))
+    queued.pop("launch_backoff_until", None)
+    D._write_json_atomic(front, queued)
+
+    second = D._drain_queue_once(args)
+    assert "healthy-back" in _launched_ids(second), (attempts, second)
+    assert attempts[-1] == "healthy-back" or "healthy-back" in attempts[1:], attempts
+
+
+def test_pass_wall_time_still_does_not_scale_with_n_unlaunchable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N slow rc=2 entries must not take ~N times one confirmation wait.
+
+    Same N-independence claim as the TimeoutExpired case, for the
+    non-timeout restore path. Revert-failure: elapsed scales with N.
+    """
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    n = N_HUNG
+    fail_ids = frozenset(f"slow-{index}" for index in range(n))
+    for index in range(n):
+        _write_entry(
+            queue,
+            f"slow-{index}",
+            project_root=project,
+            created_at=f"2026-01-01T00:00:0{index}+00:00",
+        )
+    monkeypatch.setattr(
+        D.subprocess,
+        "run",
+        _selective_child_run(tmp_path, slow_fail_ids=fail_ids),
+    )
+    args = _drain_args(queue, launch_budget_s=STARVE_BUDGET_S)
+    started = time.monotonic()
+    payload = D._drain_queue_once(args)
+    elapsed = time.monotonic() - started
+    # One slow wait plus restore, not N waits. N*SLOW_FAIL_S is 2.0s for
+    # n=4, which sits inside a linear ceiling; the ratchet is one burn.
+    ceiling = SLOW_FAIL_S + 1.2
+    assert elapsed < ceiling, (
+        f"pass wall {elapsed:.3f}s scaled with {n} slow-fail entries "
+        f"(ceiling {ceiling:.3f}s); payload={payload}"
+    )
+    assert payload["launched"] == 0, payload
+    burns = int((payload.get("timing") or {}).get("launch_budget_burns") or 0)
+    assert burns == 1, payload
+    reasons = [str(row.get("reason") or "") for row in payload.get("details") or []]
+    assert reasons.count("pass_launch_budget") == n - 1, payload
