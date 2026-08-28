@@ -44,13 +44,27 @@ incremented when meaningful skill behaviour changes.
   UNKNOWN of every path. That row names no tree, so it cannot gate an
   unrelated worktree. Unreadable or unlistable records still refuse.
   A matching `worker_cwd` still occupies even when `project_root` differs.
+
+- Drain no longer mints unadoptable `restore_prepared` queue envelopes when
+  releasing a pre-worker claim whose ledger is already `queued`. The second
+  DrainClaimGuard restore used to write a new `restore_prepared` txn, abort
+  because the ledger still named the previous txn, and leave a file drain
+  will never launch (`awaiting_owner_reconcile` + `unlinked_quarantine_deferred`).
+  A queued ledger row now republishes as `queued`; an existing `restore_prepared`
+  envelope is finished by the same restore transaction (or dropped if the
+  ledger is already terminal); new ledger rows copy `controller_label` /
+  `controller_pid` from the envelope so the entry is attributable.
+
 - `goalflight_messages.py post --to-controller` no longer reports success when
   the send reached nobody. The CLI exits non-zero and
   `controller_delivery.status` names the miss. When the label is missing from
   the current project's registry but registered in another, the error names
-  `--controller-project-root` with that path. An unreadable registry is
-  UNKNOWN (exit 2, `controller_registry_unknown`) and does not record a
-  reached-nobody delivery. Same-project posts are unchanged.
+  `--controller-project-root` with that path. An unreadable or unresolvable
+  registry is UNKNOWN (exit 2, `controller_registry_unknown`) and does not
+  record a reached-nobody delivery. Every non-zero `--to-controller` exit
+  emits that `controller_delivery` object on stdout; a usage refusal is
+  `controller_post_usage` (exit 2) and is not collapsed into a miss. Same-project
+  posts are unchanged.
 
 - `goalflight_ledger.cmd_finish` archives going-forward dispatch tails
   (pinned: deleting the hook turns `test_cmd_finish_archives_going_forward_tails`

@@ -7,6 +7,7 @@ to a live controller. Callers detect a miss by exit code and structured
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -22,6 +23,7 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(ROOT / "tests" / "python"))
 
 import goalflight_journal as journal  # noqa: E402
+import goalflight_messages as messages  # noqa: E402
 import goalflight_task as task  # noqa: E402
 from support import isolated_machine_env  # noqa: E402
 
@@ -73,6 +75,7 @@ def _post(
     dispatch_id: str,
     text: str = "addressing probe",
     controller_project_root: Path | None = None,
+    extra_args: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     argv = [
         sys.executable,
@@ -90,9 +93,12 @@ def _post(
         text,
         "--to-controller",
         label,
+        "--json",
     ]
     if controller_project_root is not None:
         argv.extend(["--controller-project-root", str(controller_project_root)])
+    if extra_args:
+        argv.extend(extra_args)
     return subprocess.run(
         argv,
         cwd=str(cwd),
@@ -210,3 +216,172 @@ def test_unreadable_registry_is_unknown_not_label_not_found(
     assert "UNKNOWN" in unknown_delivery["detail"]
     inbox = Path(env["GOALFLIGHT_MESSAGES_DIR"]) / "unreadable-registry.jsonl"
     assert not inbox.exists()
+
+
+def test_lookup_unreadable_registry_returns_unknown_not_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The chmod-000 path must be UNKNOWN at lookup, before post_message."""
+    _isolate(monkeypatch, tmp_path)
+    project = _git_project(tmp_path / "project")
+    _claim(project, "local-controller")
+    journal_dir = journal.resolve_journal_path(project).parent
+    os.chmod(journal_dir, 0o000)
+    try:
+        addressing = messages.lookup_to_controller_label(
+            "missing-controller",
+            project_root=project,
+            search_other_projects=False,
+        )
+    finally:
+        os.chmod(journal_dir, 0o700)
+    assert addressing["state"] == "unknown"
+    assert addressing["state"] != "missing"
+
+
+def test_unresolvable_controller_project_root_emits_unknown_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _isolate(monkeypatch, tmp_path)
+    sender = _git_project(tmp_path / "sender")
+    missing_root = tmp_path / "no-such-project"
+    posted = _post(
+        env,
+        cwd=sender,
+        label="somebody",
+        dispatch_id="unresolvable-root",
+        controller_project_root=missing_root,
+    )
+    result = _payload(posted)
+    delivery = result["controller_delivery"]
+    assert posted.returncode == 2, posted.stderr
+    assert delivery["status"] == "controller_registry_unknown"
+    assert delivery["delivered"] is False
+    assert result["recorded"] is False
+    assert "UNKNOWN" in delivery["detail"]
+    assert "not registered" not in delivery["detail"]
+    inbox = Path(env["GOALFLIGHT_MESSAGES_DIR"]) / "unresolvable-root.jsonl"
+    assert not inbox.exists()
+
+
+def test_to_controller_usage_error_still_emits_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _isolate(monkeypatch, tmp_path)
+    project = _git_project(tmp_path / "project")
+    _claim(project, "local-controller")
+    posted = _post(
+        env,
+        cwd=project,
+        label="local-controller",
+        dispatch_id="usage-json",
+        extra_args=["--payload", "{"],
+    )
+    result = _payload(posted)
+    delivery = result["controller_delivery"]
+    assert posted.returncode == 2, posted.stderr
+    assert delivery["status"] == "controller_post_usage"
+    assert delivery["delivered"] is False
+    assert result["recorded"] is False
+    assert delivery["status"] != "controller_addressee_unresolved"
+    assert delivery["status"] != "controller_registry_unknown"
+
+
+def test_to_controller_missing_project_root_outside_git_emits_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = _isolate(monkeypatch, tmp_path)
+    monkeypatch.setattr(messages, "_current_project_root", lambda: None)
+    args = argparse.Namespace(
+        payload=None,
+        text="x",
+        subject=None,
+        node="local",
+        adapter="unknown",
+        transport="controller",
+        to_controller="somebody",
+        controller_project_root=None,
+        dispatch_id="no-root",
+        type="controller-notice",
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        fleet_dir=Path(env["GOALFLIGHT_FLEET_DIR"]),
+        refresh_aggregate=False,
+        json=True,
+    )
+    code = messages.cmd_post(args)
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    delivery = result["controller_delivery"]
+    assert code == 2
+    assert delivery["status"] == "controller_registry_unknown"
+    assert delivery["delivered"] is False
+    assert result["recorded"] is False
+    assert "UNKNOWN" in delivery["detail"]
+
+
+def test_nonzero_to_controller_json_statuses_are_distinct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _isolate(monkeypatch, tmp_path)
+    project = _git_project(tmp_path / "project")
+    other = _git_project(tmp_path / "other")
+    _claim(project, "same-project-controller")
+    _claim(other, "elsewhere-controller")
+
+    delivered = _post(
+        env,
+        cwd=project,
+        label="same-project-controller",
+        dispatch_id="status-delivered",
+    )
+    miss = _post(
+        env,
+        cwd=project,
+        label="no-such-label",
+        dispatch_id="status-miss",
+    )
+    elsewhere = _post(
+        env,
+        cwd=project,
+        label="elsewhere-controller",
+        dispatch_id="status-elsewhere",
+    )
+    journal_dir = journal.resolve_journal_path(project).parent
+    os.chmod(journal_dir, 0o000)
+    try:
+        unknown = _post(
+            env,
+            cwd=project,
+            label="no-such-label",
+            dispatch_id="status-unknown",
+        )
+    finally:
+        os.chmod(journal_dir, 0o700)
+    usage = _post(
+        env,
+        cwd=project,
+        label="same-project-controller",
+        dispatch_id="status-usage",
+        extra_args=["--payload", "{"],
+    )
+
+    rows = []
+    for posted in (delivered, miss, elsewhere, unknown, usage):
+        payload = _payload(posted)
+        rows.append(
+            (
+                posted.returncode,
+                payload["controller_delivery"]["status"],
+                payload["controller_delivery"]["delivered"],
+            )
+        )
+    assert rows[0] == (0, "delivered_to_controller", True)
+    assert rows[1][0] == 1
+    assert rows[1][1] == "controller_addressee_unresolved"
+    assert rows[1][2] is False
+    assert rows[2][0] != 0
+    assert rows[2][1] == "controller_addressee_other_project"
+    assert rows[3] == (2, "controller_registry_unknown", False)
+    assert rows[4] == (2, "controller_post_usage", False)
+    statuses = [row[1] for row in rows]
+    assert len(set(statuses)) == len(statuses)
