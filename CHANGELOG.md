@@ -53,9 +53,12 @@ incremented when meaningful skill behaviour changes.
   the send reached nobody. The CLI exits non-zero and
   `controller_delivery.status` names the miss. When the label is missing from
   the current project's registry but registered in another, the error names
-  `--controller-project-root` with that path. An unreadable registry is
-  UNKNOWN (exit 2, `controller_registry_unknown`) and does not record a
-  reached-nobody delivery. Same-project posts are unchanged.
+  `--controller-project-root` with that path. An unreadable or unresolvable
+  registry is UNKNOWN (exit 2, `controller_registry_unknown`) and does not
+  record a reached-nobody delivery. Every non-zero `--to-controller` exit
+  emits that `controller_delivery` object on stdout; a usage refusal is
+  `controller_post_usage` (exit 2) and is not collapsed into a miss. Same-project
+  posts are unchanged.
 
 - `goalflight_ledger.cmd_finish` archives going-forward dispatch tails
   (pinned: deleting the hook turns `test_cmd_finish_archives_going_forward_tails`

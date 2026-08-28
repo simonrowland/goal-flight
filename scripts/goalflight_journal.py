@@ -785,6 +785,25 @@ def resolve_journal_path(project_root: Path | str) -> Path:
     )
 
 
+def _journal_path_is_present(path: Path) -> bool:
+    """Return whether ``path`` exists.
+
+    ``os.path.lexists`` swallows ``EACCES`` as absent, which would collapse an
+    unreadable parent into ``JournalDisappeared``. Disappearance must be
+    verified; an unreadable identity is ``JournalIOError``.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise JournalIOError(
+            f"journal path identity is unreadable, so disappearance is unverified: "
+            f"{path}: {exc}"
+        ) from exc
+    return True
+
+
 def journal_write_lock_path(journal_path: Path) -> Path:
     return journal_path.with_name(f".{journal_path.name}.write.lock")
 
@@ -1106,7 +1125,7 @@ class Journal:
         return write_lock, deadline
 
     def _require_existing_database(self) -> None:
-        if not os.path.lexists(self.path):
+        if not _journal_path_is_present(self.path):
             raise JournalDisappeared(
                 f"journal database is absent: {self.path}. Failing closed because streams "
                 "cannot rebuild journal authority. Restore a validated WAL-safe backup; "
@@ -1962,7 +1981,7 @@ class Journal:
         return time.monotonic() < deadline
 
     def _raise_disappeared_if_absent(self, cause: BaseException) -> None:
-        if not os.path.lexists(self.path):
+        if not _journal_path_is_present(self.path):
             raise JournalDisappeared(
                 f"journal database vanished without creating a replacement: {self.path}"
             ) from cause

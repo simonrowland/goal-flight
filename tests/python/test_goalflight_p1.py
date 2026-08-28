@@ -449,6 +449,24 @@ def test_genuinely_absent_journal_keeps_disappearance_verdict(
         journal.Journal(project, open_retry_budget_s=0.02)
 
 
+def test_unreadable_journal_parent_is_io_not_disappearance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = tmp_path / "unreadable-parent"
+    project.mkdir()
+    authority = journal.Journal.create(project)
+    journal_dir = authority.path.parent
+    os.chmod(journal_dir, 0o000)
+    try:
+        with pytest.raises(journal.JournalIOError, match="disappearance is unverified"):
+            journal.Journal.open_reader(project)
+        with pytest.raises(journal.JournalIOError):
+            journal.Journal(project, open_retry_budget_s=0.02)
+    finally:
+        os.chmod(journal_dir, 0o700)
+
+
 def test_open_retry_still_detects_replacement_database(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
