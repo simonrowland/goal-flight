@@ -1402,6 +1402,49 @@ def test_repeat_gate_collapses_identical_keys_inside_the_floor() -> None:
     assert gate.should_emit("other", now=10.1, floor_s=10.0) is True
 
 
+def test_restart_gate_holds_identical_keys_and_emits_count_on_flush() -> None:
+    """N identical restarts become one record whose count is N, not a void."""
+    gate = supervise._RestartGate()
+    record = {
+        "kind": "supervise",
+        "type": "restart",
+        "child": "backup",
+        "exit": 1,
+        "reason": "exit-1",
+        "backoff_s": 120.0,
+    }
+    n = 7
+    for index in range(n):
+        emitted = gate.note(
+            "k",
+            record,
+            now=float(index),
+            floor_s=1000.0,
+        )
+        assert emitted == []
+    flushed = gate.flush()
+    assert len(flushed) == 1
+    assert flushed[0]["count"] == n
+    assert flushed[0]["window_s"] == float(n - 1)
+    assert flushed[0]["reason"] == "exit-1"
+    changed = gate.note(
+        "k2",
+        {**record, "reason": "exit-7", "exit": 7},
+        now=float(n),
+        floor_s=1000.0,
+    )
+    assert changed == []
+    second = gate.note(
+        "k3",
+        {**record, "reason": "exit-1", "exit": 1},
+        now=float(n + 1),
+        floor_s=1000.0,
+    )
+    assert len(second) == 1
+    assert second[0]["reason"] == "exit-7"
+    assert second[0]["count"] == 1
+
+
 def test_real_fast_crash_escalates_backoff_and_caps(
     tmp_path: Path,
 ) -> None:
@@ -1424,6 +1467,7 @@ def test_real_fast_crash_escalates_backoff_and_caps(
     assert delays[-1] == supervise.BACKOFF_CAP_S
     assert all(record.get("reason") == "exit-1" for record in restarts)
     assert all(record.get("exit") == 1 for record in restarts)
+    assert all(int(record["count"]) == 1 for record in restarts)
     assert [kind for kind, _command in host.spawns] == ["backup"] * (failures + 1)
 
 
@@ -1494,6 +1538,7 @@ def test_exit_0_rearms_at_zero_backoff() -> None:
     assert all(record.get("reason") == "rang" for record in restarts)
     assert all(record.get("exit") == 0 for record in restarts)
     assert all(float(record["backoff_s"]) == 0.0 for record in restarts)
+    assert all(int(record["count"]) == 1 for record in restarts)
 
 
 def test_identical_restart_records_are_collapsed_until_the_next_floor() -> None:
@@ -1530,6 +1575,60 @@ def test_identical_restart_records_are_collapsed_until_the_next_floor() -> None:
     ]
     assert len(cap_records) == 2
     assert extra_at_cap + 1 > len(cap_records)
+    assert all(int(record["count"]) >= 1 for record in cap_records)
+    assert sum(int(record["count"]) for record in cap_records) == extra_at_cap + 1
+
+
+def test_n_identical_failures_produce_one_restart_with_count() -> None:
+    """N identical cap-level failures inside the floor: one record, count=N."""
+    crash = _python_child("raise SystemExit(1)")
+    failures_to_cap = 8
+    n_at_cap = 5
+    failures = failures_to_cap + n_at_cap - 1
+    host = RealCrashHost(stop_after_spawns=failures + 1)
+    _run(
+        host,
+        [("backup", crash)],
+        heartbeat_s=10_000.0,
+        coverage_s=10_000.0,
+        next_repeat_floor_s=10_000.0,
+    )
+    restarts = [record for record in _records(host) if record.get("type") == "restart"]
+    delays = [float(record["backoff_s"]) for record in restarts]
+    assert delays == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 120.0]
+    cap_records = [
+        record for record in restarts if float(record["backoff_s"]) == 120.0
+    ]
+    assert len(cap_records) == 1
+    assert int(cap_records[0]["count"]) == n_at_cap
+    assert float(cap_records[0]["window_s"]) >= 4 * supervise.BACKOFF_CAP_S
+    assert cap_records[0]["reason"] == "exit-1"
+    assert all(int(record.get("count") or 0) >= 1 for record in restarts)
+
+
+def test_changed_failure_reason_surfaces_instead_of_collapsing() -> None:
+    host = FakeHost(
+        scripts={
+            "backup": [
+                PlannedExit(lifetime_s=0.05, returncode=1, output="fault", armed=True),
+                PlannedExit(lifetime_s=0.05, returncode=1, output="fault", armed=True),
+                PlannedExit(lifetime_s=0.05, returncode=7, output="other", armed=True),
+            ]
+        },
+        stop_after_spawns=4,
+    )
+    _run(
+        host,
+        _items("backup"),
+        heartbeat_s=10_000.0,
+        coverage_s=10_000.0,
+        next_repeat_floor_s=10_000.0,
+    )
+    restarts = [record for record in _records(host) if record.get("type") == "restart"]
+    reasons = [record.get("reason") for record in restarts]
+    assert "exit-1" in reasons
+    assert "exit-7" in reasons
+    assert reasons.index("exit-1") < reasons.index("exit-7")
 
 
 def test_dead_nonce_from_session_status_stops_before_respawn() -> None:
@@ -2112,11 +2211,23 @@ def test_coverage_status_keeps_t322_sizing_after_supervise(
 
 
 class _RecordingHost(supervise.RealHost):
-    """RealHost that captures multiplexed stdout and stops on restart/stop."""
+    """RealHost that captures multiplexed stdout and stops on restart/stop.
+
+    A child exit also stops the loop so a deferred collapsed restart can
+    flush at supervisor exit instead of waiting for the 15-minute floor.
+    """
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
         self.lines: list[str] = []
+
+    def wait(
+        self, children: list[object], timeout_s: float
+    ) -> supervise.WaitResult:
+        result = super().wait(children, timeout_s)
+        if result.exits:
+            self._stop = True
+        return result
 
     def write_stdout(self, line: str) -> bool:
         text = line if line.endswith("\n") else line + "\n"

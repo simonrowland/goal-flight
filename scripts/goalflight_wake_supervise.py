@@ -60,7 +60,12 @@ SUPERVISE_START_EXIT = 2
 #
 # Fast vs long-run: ran_s < LONG_LIVED_S (30s) escalates; a child that
 # already ran 30s+ did useful work, so a later non-zero exit is one
-# incident, not a crash loop — reset to INITIAL. 30s is far above
+# incident, not a crash loop — reset to INITIAL (1s), not zero. Zero
+# delay is reserved for ACTION_REARM (exit 0 / rang). A long-lived
+# non-zero exit still failed; putting it on the success path would
+# make backoff_s=0 mean two things and would re-arm a slowly-dying
+# child as fast as a doorbell ring. The extra 1s after a 30s+ run is
+# not a tax on the wake path — rings already use 0. 30s is far above
 # spawn-and-die (tens of ms) and far below a healthy doorbell wait.
 # ACTION_REARM (including exit 0 / rang) resets to 0 so a recovered
 # child is immediately responsive and one transient failure does not
@@ -756,7 +761,7 @@ def _next_payload_key(record: dict[str, object]) -> str:
 
 
 def _restart_record_key(record: dict[str, object]) -> str:
-    """Stable identity of a restart record, ignoring live/target churn."""
+    """Stable identity of a restart record, ignoring live/target/count churn."""
     return json.dumps(
         {
             "backoff_s": record.get("backoff_s"),
@@ -776,9 +781,10 @@ class _RepeatGate:
     """Emit the first copy of a key; suppress identical copies until floor_s.
 
     kind=next uses this so an unchanged idle frontier does not wake the
-    controller every keepalive. Restart records reuse it so a crash loop
-    at a fixed backoff does not flood the same channel. One instance per
-    stream (next) or per child (restart); a changed key emits immediately.
+    controller every keepalive. Restart records use ``_RestartGate`` so a
+    crash loop at a fixed backoff does not flood the same channel and the
+    emitted copy still carries occurrence count. One instance per stream
+    (next); a changed key emits immediately.
     """
 
     last_key: str | None = None
@@ -794,6 +800,87 @@ class _RepeatGate:
         self.last_key = key
         self.last_at = now
         return True
+
+
+@dataclass
+class _RestartGroup:
+    key: str
+    record: dict[str, object]
+    count: int
+    first_at: float
+    last_at: float
+
+
+def _restart_group_record(group: _RestartGroup) -> dict[str, object]:
+    """Stamp scale onto a collapsed restart without mutating the gate key."""
+    record = dict(group.record)
+    record["count"] = group.count
+    record["window_s"] = max(0.0, float(group.last_at) - float(group.first_at))
+    return record
+
+
+@dataclass
+class _RestartGate:
+    """Hold identical restarts until the group closes; emit with count.
+
+    Same key inside floor_s accumulates. A changed key flushes the previous
+    group so a new failure reason is not swallowed. floor_s <= 0 emits every
+    copy (tests and --chatty-adjacent zero-floor). The pending group also
+    flushes at supervisor exit and when the floor deadline wakes the loop,
+    so a collapse is never a contentless "this happened, some number of
+    times." One instance per child identity.
+    """
+
+    pending: _RestartGroup | None = None
+
+    def flush_at(self, floor_s: float) -> float | None:
+        if self.pending is None:
+            return None
+        if floor_s <= 0:
+            return self.pending.first_at
+        return self.pending.first_at + floor_s
+
+    def note(
+        self,
+        key: str,
+        record: dict[str, object],
+        *,
+        now: float,
+        floor_s: float,
+    ) -> list[dict[str, object]]:
+        emits: list[dict[str, object]] = []
+        pending = self.pending
+        if pending is not None and pending.key == key and floor_s > 0:
+            pending.count += 1
+            pending.last_at = now
+            pending.record = record
+            if now - pending.first_at < floor_s:
+                return []
+            emits.append(_restart_group_record(pending))
+            self.pending = None
+            return emits
+        if pending is not None:
+            emits.append(_restart_group_record(pending))
+            self.pending = None
+        group = _RestartGroup(
+            key=key,
+            record=record,
+            count=1,
+            first_at=now,
+            last_at=now,
+        )
+        if floor_s <= 0:
+            emits.append(_restart_group_record(group))
+            return emits
+        self.pending = group
+        return emits
+
+    def flush(self) -> list[dict[str, object]]:
+        pending = self.pending
+        self.pending = None
+        if pending is None:
+            return []
+        return [_restart_group_record(pending)]
 
 
 @dataclass
@@ -1126,7 +1213,7 @@ def run_supervisor(
     active_forwarding_read: _ForwardingFrontierRead | None = None
     pending_forwarding_read: _ForwardingFrontierRead | None = None
     next_gate = _RepeatGate()
-    restart_gates: dict[str, _RepeatGate] = {}
+    restart_gates: dict[str, _RestartGate] = {}
     repeat_floor_s = max(0.0, float(next_repeat_floor_s))
 
     def emit_pending_stream_wake(*, paired_frontier: bool = False) -> bool:
@@ -1190,13 +1277,25 @@ def run_supervisor(
             return True
         return _emit(host, record)
 
+    def emit_restart_records(records: list[dict[str, object]]) -> bool:
+        for outgoing in records:
+            if not _emit(host, outgoing):
+                return False
+        return True
+
     def emit_restart(record: dict[str, object]) -> bool:
         child = str(record.get("child") or "")
-        gate = restart_gates.setdefault(child, _RepeatGate())
+        gate = restart_gates.setdefault(child, _RestartGate())
         key = _restart_record_key(record)
-        if not gate.should_emit(key, now=host.now, floor_s=repeat_floor_s):
-            return True
-        return _emit(host, record)
+        return emit_restart_records(
+            gate.note(key, record, now=host.now, floor_s=repeat_floor_s)
+        )
+
+    def emit_pending_restarts() -> bool:
+        outgoing: list[dict[str, object]] = []
+        for gate in restart_gates.values():
+            outgoing.extend(gate.flush())
+        return emit_restart_records(outgoing)
 
     while host.running():
         # Every detector reports to _PeerLossDetector; stop_for_stdout_detector
@@ -1232,6 +1331,10 @@ def run_supervisor(
         for slot in slots:
             if slot.child is None and slot.stopped_reason is None:
                 wake_at = min(wake_at, slot.next_start)
+        for gate in restart_gates.values():
+            flush_at = gate.flush_at(repeat_floor_s)
+            if flush_at is not None:
+                wake_at = min(wake_at, flush_at)
         timeout_s = max(0.0, wake_at - now)
         live_children = [
             slot.child
@@ -1386,6 +1489,12 @@ def run_supervisor(
                 record.update(live=live, target=target)
             if not emit_restart(record):
                 return stop_after_failed_write()
+        for gate in list(restart_gates.values()):
+            flush_at = gate.flush_at(repeat_floor_s)
+            if flush_at is None or host.now < flush_at:
+                continue
+            if not emit_restart_records(gate.flush()):
+                return stop_after_failed_write()
         coverage_ok, coverage_emitted = emit_coverage()
         if not coverage_ok:
             return stop_after_failed_write()
@@ -1402,9 +1511,13 @@ def run_supervisor(
             next_coverage = host.now + max(0.01, float(coverage_s))
         stopped = spawn_due()
         if stopped is not None:
+            if not emit_pending_restarts():
+                return stop_after_failed_write()
             host.kill_all()
             return stopped
 
+    if not emit_pending_restarts():
+        return stop_after_failed_write()
     signum = getattr(host, "stop_signum", None)
     if isinstance(signum, int) and signum > 0:
         live, target = _live_target(slots)

@@ -134,8 +134,10 @@ incremented when meaningful skill behaviour changes.
   fast failures escalate 1s → 2 → 4 … to a 120s cap (reset after a
   successful or long-lived run; exit 0 stays at zero delay), and a
   verbatim-identical restart line is collapsed until the floor rather
-  than emitted on every retry. Generic failures keep restarting — a
-  silent give-up would deafen the wake channel.
+  than emitted on every retry. The collapsed copy carries `count` and
+  `window_s` so suppressing repetition does not hide scale. Generic
+  failures keep restarting — a silent give-up would deafen the wake
+  channel.
 - Listener and persistent-backup slot counts have no upper bound.
   `MAX_LISTENER_SLOTS` and `ListenerSlotsFull` are gone. Arming past the
   configured target takes the next free slot; `--listener-slots` /
