@@ -121,6 +121,26 @@ STREAM_FRONTIER_GRACE_S = 1.0
 # until this floor so the anti-stall beat still exists. --chatty
 # restores the raw heartbeat/frontier feed and therefore the raw cadence.
 DEFAULT_NEXT_REPEAT_FLOOR_S = 15.0 * 60.0
+# A stuck child can re-emit an unread backlog every cycle (incident: 330
+# envelopes from cursor 5220 while a sibling had reached 5550). Cap the
+# forwarded copies so volume cannot kill the host monitor; collapse the
+# rest into one named record. 8 is above a legitimate doorbell burst and
+# far below a host volume limit. Flush the named record after 1s so a
+# live supervisor reports the stuck child without waiting for the 15-minute
+# next-payload floor.
+CHILD_BACKLOG_CAP = 8
+CURSOR_LAG_THRESHOLD = 16
+CHILD_BACKLOG_FLUSH_S = 1.0
+_PASSTHROUGH_EVENT_TYPES = frozenset(
+    {
+        "listener-dead",
+        "listener-fault",
+        "listener-exit",
+        "watchdog-dead",
+        "listener-degraded",
+        "listener-recovered",
+    }
+)
 _DEAD_NONCE_MARKERS = (
     "controller-capability-mismatch",
     "lease-nonce-not-live",
@@ -948,6 +968,195 @@ class _RestartGate:
         return [_restart_group_record(pending)]
 
 
+def _parse_child_record(line: str) -> dict[str, object] | None:
+    text = str(line or "").strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        record = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _line_cursor_version(line: str) -> int | None:
+    record = _parse_child_record(line)
+    if record is None:
+        return None
+    version = record.get("cursor_version")
+    if version is None:
+        payload = record.get("payload")
+        if isinstance(payload, dict):
+            version = payload.get("cursor_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+        return None
+    return version
+
+
+def _is_backlog_capable_line(line: str) -> bool:
+    """Mail-like lines a stuck cursor can replay. Diagnostics always pass."""
+    text = str(line or "").strip()
+    if not text:
+        return False
+    if text.startswith("advance:"):
+        return True
+    record = _parse_child_record(text)
+    if record is None:
+        return True
+    kind = str(record.get("kind") or "")
+    if kind in {"pending-at-arm", "ring"}:
+        return True
+    if kind != "event":
+        return False
+    payload = record.get("payload")
+    event_type = (
+        str(payload.get("type") or "") if isinstance(payload, dict) else ""
+    )
+    return event_type not in _PASSTHROUGH_EVENT_TYPES
+
+
+@dataclass
+class _CursorLedger:
+    """Per-child cursor versions observed on this supervisor's stdout.
+
+    Stream peeks live each poll; backup ``--report-pending`` snapshots at
+    arm; the watchdog has no cursor. Those clocks can diverge. A lag is
+    reportable only when it also produces a backlog burst — naming a
+    1-version peek jitter would make the feed noisier, which is the
+    failure being repaired.
+    """
+
+    versions: dict[str, int] = field(default_factory=dict)
+
+    def note(self, child: str, version: int | None) -> None:
+        if version is None:
+            return
+        self.versions[child] = version
+
+    def lag_for(self, child: str) -> tuple[int, int] | None:
+        mine = self.versions.get(child)
+        if mine is None or len(self.versions) < 2:
+            return None
+        ahead = max(self.versions.values())
+        if ahead - mine >= CURSOR_LAG_THRESHOLD:
+            return mine, ahead
+        return None
+
+
+@dataclass
+class _ChildBacklogPending:
+    child: str
+    count: int
+    first_at: float
+    last_at: float
+    cursor_version: int | None
+    behind: int | None
+    ahead: int | None
+
+
+def _child_backlog_record(pending: _ChildBacklogPending) -> dict[str, object]:
+    """Stamp a collapsed burst. count is disjoint from already-forwarded copies."""
+    lagged = (
+        pending.behind is not None
+        and pending.ahead is not None
+        and pending.ahead - pending.behind >= CURSOR_LAG_THRESHOLD
+    )
+    record: dict[str, object] = {
+        "kind": "supervise",
+        "type": "cursor-lag" if lagged else "child-backlog",
+        "child": pending.child,
+        "count": pending.count,
+        "window_s": max(0.0, float(pending.last_at) - float(pending.first_at)),
+    }
+    if pending.cursor_version is not None:
+        record["cursor_version"] = pending.cursor_version
+    if lagged:
+        record["behind"] = pending.behind
+        record["ahead"] = pending.ahead
+        record["lag"] = pending.ahead - pending.behind
+    return record
+
+
+@dataclass
+class _ChildBacklogGate:
+    """Forward the first copies of a child's backlog; collapse the rest.
+
+    First CHILD_BACKLOG_CAP mail-like lines emit immediately. Later copies
+    in the window accumulate as one pending named record. Summing the
+    forwarded copies plus that record's count recovers the true burst
+    size. Floor expiry starts a new cap window so genuine later news is
+    not held forever.
+    """
+
+    child: str
+    forwarded: int = 0
+    window_start: float = field(default=-math.inf)
+    pending: _ChildBacklogPending | None = None
+
+    def flush_at(self, floor_s: float) -> float | None:
+        del floor_s
+        if self.pending is None:
+            return None
+        return self.pending.first_at + CHILD_BACKLOG_FLUSH_S
+
+    def note(
+        self,
+        *,
+        now: float,
+        floor_s: float,
+        cursor_version: int | None,
+        lag: tuple[int, int] | None,
+    ) -> tuple[bool, list[dict[str, object]]]:
+        emits: list[dict[str, object]] = []
+        if (
+            self.forwarded > 0
+            and floor_s > 0
+            and now - self.window_start >= floor_s
+        ):
+            if self.pending is not None:
+                emits.append(_child_backlog_record(self.pending))
+                self.pending = None
+            self.forwarded = 0
+            self.window_start = now
+        if self.forwarded == 0:
+            self.window_start = now
+        if self.forwarded < CHILD_BACKLOG_CAP:
+            self.forwarded += 1
+            return True, emits
+        behind, ahead = lag if lag is not None else (None, None)
+        if self.pending is None:
+            self.pending = _ChildBacklogPending(
+                child=self.child,
+                count=1,
+                first_at=now,
+                last_at=now,
+                cursor_version=cursor_version,
+                behind=behind,
+                ahead=ahead,
+            )
+        else:
+            self.pending.count += 1
+            self.pending.last_at = now
+            if cursor_version is not None:
+                self.pending.cursor_version = cursor_version
+            if lag is not None:
+                self.pending.behind, self.pending.ahead = lag
+        return False, emits
+
+    def flush(
+        self, ledger: _CursorLedger | None = None
+    ) -> list[dict[str, object]]:
+        if self.pending is None:
+            return []
+        if ledger is not None:
+            lag = ledger.lag_for(self.child)
+            if lag is not None:
+                self.pending.behind, self.pending.ahead = lag
+        record = _child_backlog_record(self.pending)
+        self.pending = None
+        return [record]
+
+
 @dataclass
 class _ForwardingFrontierRead:
     done: threading.Event
@@ -1283,6 +1492,8 @@ def run_supervisor(
     pending_forwarding_read: _ForwardingFrontierRead | None = None
     next_gate = _RepeatGate()
     restart_gates: dict[str, _RestartGate] = {}
+    cursor_ledger = _CursorLedger()
+    backlog_gates: dict[str, _ChildBacklogGate] = {}
     repeat_floor_s = max(0.0, float(next_repeat_floor_s))
 
     def emit_pending_stream_wake(*, paired_frontier: bool = False) -> bool:
@@ -1364,7 +1575,36 @@ def run_supervisor(
         outgoing: list[dict[str, object]] = []
         for gate in restart_gates.values():
             outgoing.extend(gate.flush())
+        for gate in backlog_gates.values():
+            outgoing.extend(gate.flush(cursor_ledger))
         return emit_restart_records(outgoing)
+
+    def _slot_label_for(child: Any) -> str:
+        slot = next((row for row in slots if row.child is child), None)
+        if slot is not None:
+            return slot.label
+        return str(getattr(child, "kind", "") or "child")
+
+    def forward_child_line(child: Any, line: str) -> bool:
+        label = _slot_label_for(child)
+        version = _line_cursor_version(line)
+        cursor_ledger.note(label, version)
+        if not _is_backlog_capable_line(line):
+            text = line if line.endswith("\n") else line + "\n"
+            return _write_stdout(host, text, source="write-child-output")
+        gate = backlog_gates.setdefault(label, _ChildBacklogGate(child=label))
+        forward, named = gate.note(
+            now=host.now,
+            floor_s=repeat_floor_s,
+            cursor_version=version,
+            lag=cursor_ledger.lag_for(label),
+        )
+        if not emit_restart_records(named):
+            return False
+        if not forward:
+            return True
+        text = line if line.endswith("\n") else line + "\n"
+        return _write_stdout(host, text, source="write-child-output")
 
     while host.running():
         # Every detector reports to _PeerLossDetector; stop_for_stdout_detector
@@ -1401,6 +1641,10 @@ def run_supervisor(
             if slot.child is None and slot.stopped_reason is None:
                 wake_at = min(wake_at, slot.next_start)
         for gate in restart_gates.values():
+            flush_at = gate.flush_at(repeat_floor_s)
+            if flush_at is not None:
+                wake_at = min(wake_at, flush_at)
+        for gate in backlog_gates.values():
             flush_at = gate.flush_at(repeat_floor_s)
             if flush_at is not None:
                 wake_at = min(wake_at, flush_at)
@@ -1468,8 +1712,7 @@ def run_supervisor(
                         if not emit_pending_stream_wake(paired_frontier=True):
                             return stop_after_failed_write()
                     continue
-            text = line if line.endswith("\n") else line + "\n"
-            if not _write_stdout(host, text, source="write-child-output"):
+            if not forward_child_line(child, line):
                 return stop_after_failed_write()
         stream_exited = any(
             str(getattr(event.child, "kind", "") or "") == "stream"
@@ -1567,6 +1810,11 @@ def run_supervisor(
         coverage_ok, coverage_emitted = emit_coverage()
         if not coverage_ok:
             return stop_after_failed_write()
+        for gate in list(backlog_gates.values()):
+            flush_at = gate.flush_at(repeat_floor_s)
+            if flush_at is not None and host.now >= flush_at:
+                if not emit_restart_records(gate.flush(cursor_ledger)):
+                    return stop_after_failed_write()
         if host.now >= next_heartbeat:
             if not emit_heartbeat():
                 return stop_after_failed_write()

@@ -127,7 +127,12 @@ python3 <skill-root>/scripts/goalflight_messages.py supervise \
 Arm the supervisor with **no timeout**. It must run for the life of the session.
 Do not set, tune, or reason about a timeout value: a bounded monitor is killed
 from outside, so the supervisor never writes a `type=stop` record and the
-controller goes deaf with no diagnostic at all. On Claude Code, set
+controller goes deaf with no diagnostic at all. A persistent (unbounded)
+monitor can also be killed for output volume: a child that falls behind its
+siblings re-emits the unread backlog every cycle, the host kills the monitor,
+no `type=stop` is written, and the controller goes deaf the same way.
+`supervise` caps that re-emission and names the stuck child (`cursor-lag` /
+`child-backlog`) instead of forwarding N duplicate envelopes. On Claude Code, set
 `persistent: true`; that makes `timeout_ms` inert, and where the host requires
 the field to be present it is a placeholder, never a knob.
 

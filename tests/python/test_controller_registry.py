@@ -752,3 +752,154 @@ def test_missing_renew_deadline_refuses_toward_manual_repair(
     assert "manual" in message
     assert "wait" not in message
     assert journal.Journal(root).active_lease("engine").nonce == lease.nonce
+
+
+def _owned_records(root: Path, label: str, count: int) -> list[dict]:
+    return [
+        _owned_running_record(root, label, f"owned-{index}")
+        for index in range(count)
+    ]
+
+
+def test_overdue_lease_with_owned_dispatches_names_quarantine_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A lapsed renew deadline holding work must name how many a roll would quarantine."""
+    root = _isolate(monkeypatch, tmp_path)
+    _registered, holder = _hold_registered_lease(root, "engine", "engine-nonce")
+    try:
+        past = datetime.now(timezone.utc) - timedelta(hours=12, minutes=30)
+        _set_renew_deadline(root, "engine", past)
+        roster = sessions.controller_roster(
+            root, ledger_records=_owned_records(root, "engine", 10)
+        )
+        record = roster["controllers"][0]
+        assert record["incarnation_state"] == "live-overdue"
+        assert record["nonterminal_owned_dispatches"] == 10
+        line = sessions.controller_roster_lines(roster)[0]
+        assert "10" in line
+        assert "quarantine" in line.lower()
+        alerts = sessions.controller_alert_lines(record)
+        joined = " ".join(alerts)
+        assert "10" in joined
+        assert "quarantine" in joined.lower()
+        text = sessions.to_text(
+            {
+                "active": True,
+                "queue_file": "docs-private/goal-queue-demo.md",
+                "queue_slug": "demo",
+                "queue_last_touched": None,
+                "active_capacity_leases_in_project": 0,
+                "backlog_counts": {},
+                "ready_frontier": {"count": 0},
+                "owner_alerts": alerts,
+            }
+        )
+        assert "10" in text
+        assert "quarantine" in text.lower()
+    finally:
+        holder.close()
+
+
+def test_armed_but_dead_supervisor_is_distinct_from_armed_and_live(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """wake_armed is generation presence; wake_alive is observed recency."""
+    root = _isolate(monkeypatch, tmp_path)
+    registered, holder = _hold_registered_lease(root, "engine", "engine-nonce")
+    nonce = registered["session"]["lease_nonce"]
+    now_epoch = 1_800_000_000.0
+    heartbeat_s = 120.0
+    dead_after_s = 360.0
+    try:
+        monkeypatch.setattr(
+            wake,
+            "supervisor_generation_state",
+            lambda *args, **kwargs: wake.SUPERVISOR_RUNNING,
+        )
+        wake.activate_monitor_state(
+            root,
+            controller_label="engine",
+            lease_nonce=nonce,
+            heartbeat_s=heartbeat_s,
+            dead_after_s=dead_after_s,
+            now_epoch=now_epoch,
+        )
+        wake.record_monitor_emit(
+            root,
+            controller_label="engine",
+            lease_nonce=nonce,
+            record_kind="heartbeat",
+            now_epoch=now_epoch,
+        )
+        live_roster = sessions.controller_roster(
+            root,
+            ledger_records=_owned_records(root, "engine", 10),
+            now=datetime.fromtimestamp(now_epoch, tz=timezone.utc),
+        )
+        live = live_roster["controllers"][0]
+        assert live["wake_armed"] is True
+        assert live["wake_alive"] is True
+        live_line = sessions.controller_roster_lines(live_roster)[0]
+        assert "wake DEAD" not in live_line
+        assert "deaf" not in live_line.lower()
+
+        wake.record_monitor_emit(
+            root,
+            controller_label="engine",
+            lease_nonce=nonce,
+            record_kind="heartbeat",
+            now_epoch=now_epoch - dead_after_s - 1,
+        )
+        dead_roster = sessions.controller_roster(
+            root,
+            ledger_records=_owned_records(root, "engine", 10),
+            now=datetime.fromtimestamp(now_epoch, tz=timezone.utc),
+        )
+        dead = dead_roster["controllers"][0]
+        assert dead["wake_armed"] is True
+        assert dead["wake_alive"] is False
+        dead_line = sessions.controller_roster_lines(dead_roster)[0]
+        assert "wake DEAD" in dead_line or "deaf" in dead_line.lower()
+        alerts = sessions.controller_alert_lines(dead)
+        joined = " ".join(alerts).lower()
+        assert "armed" in joined
+        assert "10" in joined
+        assert live["wake_alive"] is not dead["wake_alive"]
+        assert "wake DEAD" not in live_line
+    finally:
+        holder.close()
+
+
+def test_unarmed_supervisor_with_owned_dispatches_is_an_alarm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _isolate(monkeypatch, tmp_path)
+    _registered, holder = _hold_registered_lease(root, "engine", "engine-nonce")
+    try:
+        monkeypatch.setattr(
+            wake,
+            "supervisor_generation_state",
+            lambda *args, **kwargs: wake.SUPERVISOR_ABSENT,
+        )
+        monkeypatch.setattr(
+            wake,
+            "coverage_status",
+            lambda *args, **kwargs: {
+                "covered": False,
+                "live_waiters": 0,
+                "target_waiters": 4,
+            },
+        )
+        roster = sessions.controller_roster(
+            root, ledger_records=_owned_records(root, "engine", 10)
+        )
+        record = roster["controllers"][0]
+        assert record["wake_armed"] is False
+        line = sessions.controller_roster_lines(roster)[0]
+        alerts = sessions.controller_alert_lines(record)
+        blob = f"{line}\n" + "\n".join(alerts)
+        assert "10" in blob
+        assert "wake" in blob.lower()
+    finally:
+        holder.close()
