@@ -26,6 +26,7 @@ import uuid
 
 import goalflight_compat
 import goalflight_compat as fcntl
+import goalflight_dispatch_paths
 import goalflight_dispatch_states
 import goalflight_fleet_console_history
 import goalflight_journal
@@ -1291,13 +1292,83 @@ def cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+_RETRY_DISPATCH_ID_RE = re.compile(r"^(?P<base>.+)-retry-[0-9a-f]{8}$")
+
+
+def retry_base_dispatch_id(dispatch_id: str) -> str | None:
+    match = _RETRY_DISPATCH_ID_RE.fullmatch(str(dispatch_id or ""))
+    return match.group("base") if match else None
+
+
+def lookup_requeue_base(dispatch_id: str) -> dict[str, str | None]:
+    """Name the base ledger row a retry id belongs to, when that can be proven.
+
+    Intent match on a readable parent is a determination. The `-retry-<hex>`
+    parse is a hint from the id shape, not proof the base row exists. An
+    unlistable or unreadable ledger is UNKNOWN and is reported as such.
+    """
+    parsed = retry_base_dispatch_id(dispatch_id)
+    found_id: str | None = None
+    listing = "ok"
+    try:
+        records = read_records()
+    except OSError:
+        listing = "unknown"
+        records = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if record_is_unreadable(record):
+            listing = "unknown"
+            continue
+        intent = record.get("requeue")
+        if isinstance(intent, dict) and intent.get("child_id") == dispatch_id:
+            parent = str(record.get("dispatch_id") or "")
+            if parent:
+                found_id = parent
+                break
+    if found_id:
+        source = "ledger_intent"
+        base_id = found_id
+    elif parsed:
+        source = "id_pattern"
+        base_id = parsed
+    else:
+        source = None
+        base_id = None
+    return {
+        "base_dispatch_id": base_id,
+        "base_source": source,
+        "listing": listing,
+    }
+
+
+def _missing_dispatch_payload(dispatch_id: str) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "ok": False,
+        "error": "missing_dispatch",
+        "dispatch_id": dispatch_id,
+    }
+    lookup = lookup_requeue_base(dispatch_id)
+    if lookup.get("base_dispatch_id"):
+        payload["base_dispatch_id"] = lookup["base_dispatch_id"]
+        payload["base_source"] = lookup["base_source"]
+        payload["hint"] = (
+            "retry ids have no ledger row; act on the base dispatch_id"
+        )
+    if lookup.get("listing") == "unknown":
+        payload["ledger_listing"] = "unknown"
+    return payload
+
+
 def cmd_finish(args: argparse.Namespace) -> int:
-    path = record_path(args.dispatch_id)
+    path = record_path(args.dispatch_id, create=False)
     if not path.exists():
-        print(json.dumps({"ok": False, "error": "missing_dispatch", "dispatch_id": args.dispatch_id}))
+        print(json.dumps(_missing_dispatch_payload(args.dispatch_id), sort_keys=True))
         return 1
     record = json.loads(path.read_text())
-    terminal_state = getattr(args, "terminal_state", None) or terminal_state_for(args.state, args.reason)
+    requested_terminal = getattr(args, "terminal_state", None)
+    terminal_state = requested_terminal or terminal_state_for(args.state, args.reason)
     committed = commit_terminal_authority(
         record,
         state=args.state,
@@ -1315,6 +1386,26 @@ def cmd_finish(args: argparse.Namespace) -> int:
         }, sort_keys=True))
         return 3 if committed.cas_lost else 2
     winner = committed.value
+    if (
+        winner.idempotent
+        and requested_terminal
+        and requested_terminal != winner.terminal_state
+    ):
+        # Journal already has a terminal winner. Applying a *different*
+        # explicit --terminal-state would be a silent no-op: ok:true with
+        # the original state. Same-state retries stay quiet so crash-retry
+        # callers keep working. Refuse, do not ACT — journal first-writer
+        # wins, and the requeue intent (not finish) is the lever for quota
+        # retry hygiene.
+        print(json.dumps({
+            "ok": False,
+            "error": "already_terminal",
+            "dispatch_id": args.dispatch_id,
+            "current_state": record.get("state"),
+            "current_terminal_state": winner.terminal_state,
+            "requested_terminal_state": requested_terminal,
+        }, sort_keys=True))
+        return 2
     with StateLock():
         record = json.loads(path.read_text())
         terminal_state = winner.terminal_state
@@ -1408,6 +1499,77 @@ def cmd_finish(args: argparse.Namespace) -> int:
         "event_uuid": winner.event_uuid,
         "idempotent": winner.idempotent,
     }, sort_keys=True))
+    return 0
+
+
+def _unlink_queue_entry(dispatch_id: str) -> None:
+    path = goalflight_dispatch_paths.queue_entry_path(dispatch_id)
+    with contextlib.suppress(OSError):
+        path.unlink()
+
+
+def cmd_cancel_requeue(args: argparse.Namespace) -> int:
+    """Mark a persisted requeue intent abandoned so it cannot regenerate."""
+    requested_id = str(args.dispatch_id or "")
+    path = record_path(requested_id, create=False)
+    acted_id = requested_id
+    via_retry_id = False
+    if not path.exists():
+        lookup = lookup_requeue_base(requested_id)
+        base_id = lookup.get("base_dispatch_id")
+        if not base_id:
+            print(json.dumps(_missing_dispatch_payload(requested_id), sort_keys=True))
+            return 1
+        path = record_path(base_id, create=False)
+        if not path.exists():
+            payload = _missing_dispatch_payload(requested_id)
+            payload["error"] = "missing_base_dispatch"
+            print(json.dumps(payload, sort_keys=True))
+            return 1
+        acted_id = base_id
+        via_retry_id = True
+    with StateLock():
+        record = json.loads(path.read_text(encoding="utf-8"))
+        intent = record.get("requeue")
+        if not isinstance(intent, dict):
+            print(json.dumps({
+                "ok": False,
+                "error": "no_requeue_intent",
+                "dispatch_id": acted_id,
+            }, sort_keys=True))
+            return 1
+        existing = intent.get("disposition")
+        if existing in {"satisfied", "abandoned", "expired"}:
+            payload = {
+                "ok": True,
+                "dispatch_id": acted_id,
+                "disposition": existing,
+                "idempotent": True,
+            }
+            if via_retry_id:
+                payload["requested_dispatch_id"] = requested_id
+            print(json.dumps(payload, sort_keys=True))
+            return 0
+        now = utc_now()
+        updated = dict(intent)
+        updated["disposition"] = "abandoned"
+        updated["disposition_at"] = now
+        updated["disposition_reason"] = "operator_cancel"
+        record["requeue"] = updated
+        write_record(record)
+    child_id = updated.get("child_id")
+    if isinstance(child_id, str) and child_id:
+        _unlink_queue_entry(child_id)
+    payload = {
+        "ok": True,
+        "dispatch_id": acted_id,
+        "disposition": "abandoned",
+        "idempotent": False,
+        "child_id": child_id,
+    }
+    if via_retry_id:
+        payload["requested_dispatch_id"] = requested_id
+    print(json.dumps(payload, sort_keys=True))
     return 0
 
 
@@ -2194,6 +2356,13 @@ def build_parser() -> argparse.ArgumentParser:
     ))
     fin.add_argument("--elapsed-s", type=float)
     fin.set_defaults(func=cmd_finish)
+
+    cancel_requeue = sub.add_parser(
+        "cancel-requeue",
+        help="abandon a persisted quota/auth requeue intent so it cannot regenerate",
+    )
+    cancel_requeue.add_argument("--dispatch-id", required=True)
+    cancel_requeue.set_defaults(func=cmd_cancel_requeue)
 
     reconcile = sub.add_parser(
         "reconcile-outbox",
