@@ -559,3 +559,40 @@ def test_unreadable_scoped_queue_json_is_retained_not_failed(
         and item.get("reason") == "unreadable_queue_entry"
         for item in payload.get("details") or []
     ), payload["details"]
+
+
+def test_scoped_drain_does_not_reconcile_foreign_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P1-5: --cross-project does not currently gate claim-reconcile; it must."""
+    _canonical_queue(tmp_path)
+    private = tmp_path / "private-queue"
+    private.mkdir()
+    other_root = tmp_path / "pm2"
+    other_root.mkdir()
+    queued = _write_queue_entry(
+        private,
+        "pm2-stale-claim",
+        controller_label="pm2-engine",
+        project_root=other_root,
+    )
+    claim = queued.with_name(f"{queued.name}.claimed-99-1")
+    queued.rename(claim)
+    reconciled: list[Path] = []
+    real_reconcile = D._reconcile_claim_transaction
+
+    def _track(claim_path, entry, **kwargs):
+        reconciled.append(claim_path)
+        return real_reconcile(claim_path, entry, **kwargs)
+
+    monkeypatch.setattr(D, "_reconcile_claim_transaction", _track)
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", "gf-ctrl")
+
+    payload = _drain_json(
+        ["--queue-dir", str(private), "--claim-stale-s", "0", "--json"],
+        capsys,
+    )
+    assert reconciled == [], payload
+    assert claim.exists(), list(private.iterdir())
+    assert not list(private.glob("pm2-stale-claim.json")), list(private.iterdir())
+    assert payload["created"] == 0, payload

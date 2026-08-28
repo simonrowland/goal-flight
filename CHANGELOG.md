@@ -70,8 +70,9 @@ incremented when meaningful skill behaviour changes.
   scoped directory is retained unless `--cross-project`. An unlabelled
   invoker, a nameless or unreadable envelope, or a matching label with no
   `project_root` is also retained: missing evidence is not permission to
-  launch. UNKNOWN owners are not materialized from the ledger into a scoped
-  dir. The compact DRAIN line and JSON payload report `created` /
+  launch. Scoped claim-reconcile and requeue writes use the same owner
+  proof; `--cross-project` is the override. UNKNOWN owners are not
+  materialized from the ledger into a scoped dir. The compact DRAIN line and JSON payload report `created` /
   `relocated` / `retained` with `retained_by_controller` counts so a stable
   file total cannot hide a composition change.
 - Requeue intent lifecycle: a retry now carries a terminal disposition

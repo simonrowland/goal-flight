@@ -11450,8 +11450,17 @@ def _recover_claimed_queue_entries(
     stale_s: float,
     restore_ledger_orphans: bool = True,
     dispatch_ids: set[str] | None = None,
+    invoker_label: str | None = None,
+    invoker_project: Path | None = None,
+    allow_cross: bool = False,
+    scoped_queue: bool = False,
 ) -> dict:
-    """Run each carrier through the single PRE-ADMIT→T→Q→S→L owner."""
+    """Run each carrier through the single PRE-ADMIT→T→Q→S→L owner.
+
+    Scoped drain without ``--cross-project`` does not reconcile a claim
+    whose owner cannot be proven. Requeue writes into ``queue_dir`` and
+    unlinking the claim both require that proof.
+    """
     restored = 0
     cleared = 0
     pending_launch = 0
@@ -11487,6 +11496,24 @@ def _recover_claimed_queue_entries(
         claim_dispatch_id = str(entry.get("dispatch_id") or "")
         if dispatch_ids is not None and claim_dispatch_id not in dispatch_ids:
             continue
+        if scoped_queue:
+            retain_reason = _scoped_launch_retain_reason(
+                entry,
+                invoker_label=invoker_label,
+                invoker_project=invoker_project,
+                allow_cross=allow_cross,
+            )
+            if retain_reason is not None:
+                label, project = _entry_owner_fields(entry)
+                _record_queue_mutation(
+                    queue_mutations,
+                    action="retained",
+                    dispatch_id=claim_dispatch_id or claim.name,
+                    reason=retain_reason,
+                    controller_label=label,
+                    project_root=project,
+                )
+                continue
         try:
             outcome = _reconcile_claim_transaction(
                 claim,
@@ -14096,6 +14123,10 @@ def _drain_queue_once(args) -> dict:
         stale_s=args.claim_stale_s,
         restore_ledger_orphans=not scoped_queue,
         dispatch_ids=dispatch_ids,
+        invoker_label=invoker_label,
+        invoker_project=invoker_project,
+        allow_cross=allow_cross,
+        scoped_queue=scoped_queue,
     )
     if recovery.get("listing_error"):
         # The queue could not be listed: every candidate is invisible, so a
