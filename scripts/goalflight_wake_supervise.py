@@ -123,14 +123,19 @@ STREAM_FRONTIER_GRACE_S = 1.0
 DEFAULT_NEXT_REPEAT_FLOOR_S = 15.0 * 60.0
 # A stuck child can re-emit an unread backlog every cycle (incident: 330
 # envelopes from cursor 5220 while a sibling had reached 5550). Cap the
-# forwarded copies so volume cannot kill the host monitor; collapse the
-# rest into one named record. 8 is above a legitimate doorbell burst and
-# far below a host volume limit. Flush the named record after 1s so a
-# live supervisor reports the stuck child without waiting for the 15-minute
-# next-payload floor.
+# forwarded *copies of one identity* so volume cannot kill the host
+# monitor; collapse further copies into one named record. 8 is above a
+# legitimate doorbell burst and far below a host volume limit. Distinct
+# envelopes (new cursor versions, unique headlines) still forward past
+# that copy cap. Distinct *volume* is a different risk: bound first-copies
+# at CHILD_DISTINCT_CAP and name the withhold instead of folding it into
+# a dedup record. Flush named records after 1s so a live supervisor
+# reports without waiting for the 15-minute next-payload floor.
 CHILD_BACKLOG_CAP = 8
+CHILD_DISTINCT_CAP = 32
 CURSOR_LAG_THRESHOLD = 16
 CHILD_BACKLOG_FLUSH_S = 1.0
+DISTINCT_WITHHELD_RETRIEVE = "relay --drain"
 _PASSTHROUGH_EVENT_TYPES = frozenset(
     {
         "listener-dead",
@@ -1015,6 +1020,43 @@ def _is_backlog_capable_line(line: str) -> bool:
     return event_type not in _PASSTHROUGH_EVENT_TYPES
 
 
+def _backlog_line_identity(line: str) -> str:
+    """Stable key for one envelope. Same key = a copy, not new mail.
+
+    JSON carrying ``cursor_version`` groups as one unread-snapshot identity
+    so a stuck child re-emitting 330 items from cursor 5220 still collapses.
+    Kind is part of that key: ``kind=ring`` at the same cursor is a
+    different envelope from the snapshot's events. Headlines and
+    ``advance:`` commands key on the line itself.
+    """
+    text = str(line or "").strip()
+    if text.startswith("advance:"):
+        return f"advance:{text[len('advance:'):].strip()}"
+    record = _parse_child_record(text)
+    if record is None:
+        return f"line:{text}"
+    kind = str(record.get("kind") or "") or "record"
+    version = _line_cursor_version(text)
+    if version is not None:
+        return f"snapshot:{kind}:{version}"
+    payload = record.get("payload")
+    payload_d = payload if isinstance(payload, dict) else {}
+    dispatch_id = payload_d.get("dispatch_id") or record.get("dispatch_id") or ""
+    stream_seq = payload_d.get("stream_seq")
+    if stream_seq is None:
+        stream_seq = record.get("stream_seq")
+    if dispatch_id or stream_seq is not None:
+        return f"{kind}:{dispatch_id}:{stream_seq}"
+    return f"{kind}:{text}"
+
+
+def _identity_copy_cap(identity: str) -> int:
+    """Cursor snapshots may show a burst of copies; a headline is itself."""
+    if identity.startswith("snapshot:"):
+        return CHILD_BACKLOG_CAP
+    return 1
+
+
 @dataclass
 class _CursorLedger:
     """Per-child cursor versions observed on this supervisor's stdout.
@@ -1054,6 +1096,15 @@ class _ChildBacklogPending:
     ahead: int | None
 
 
+@dataclass
+class _DistinctWithheldPending:
+    child: str
+    count: int
+    first_at: float
+    last_at: float
+    forwarded: int
+
+
 def _child_backlog_record(pending: _ChildBacklogPending) -> dict[str, object]:
     """Stamp a collapsed burst. count is disjoint from already-forwarded copies."""
     lagged = (
@@ -1077,52 +1128,66 @@ def _child_backlog_record(pending: _ChildBacklogPending) -> dict[str, object]:
     return record
 
 
+def _distinct_withheld_record(
+    pending: _DistinctWithheldPending,
+) -> dict[str, object]:
+    """Stamp withheld *new* envelopes. This is not a duplicate collapse."""
+    return {
+        "kind": "supervise",
+        "type": "distinct-withheld",
+        "child": pending.child,
+        "count": pending.count,
+        "forwarded": pending.forwarded,
+        "retrieve": DISTINCT_WITHHELD_RETRIEVE,
+        "window_s": max(0.0, float(pending.last_at) - float(pending.first_at)),
+    }
+
+
 @dataclass
 class _ChildBacklogGate:
-    """Forward the first copies of a child's backlog; collapse the rest.
+    """Forward new envelopes; collapse duplicate copies of one identity.
 
-    First CHILD_BACKLOG_CAP mail-like lines emit immediately. Later copies
-    in the window accumulate as one pending named record. Summing the
-    forwarded copies plus that record's count recovers the true burst
-    size. Floor expiry starts a new cap window so genuine later news is
-    not held forever.
+    First CHILD_BACKLOG_CAP copies of a cursor-snapshot identity emit.
+    Later copies in the window accumulate as child-backlog / cursor-lag.
+    A new identity still emits even after that copy cap, up to
+    CHILD_DISTINCT_CAP first-copies; further distinct identities flush as
+    distinct-withheld (count is how many new envelopes were held; retrieve
+    names relay --drain). Floor expiry starts a new window so genuine
+    later news is not held forever.
     """
 
     child: str
     forwarded: int = 0
     window_start: float = field(default=-math.inf)
     pending: _ChildBacklogPending | None = None
+    distinct_pending: _DistinctWithheldPending | None = None
+    copies_by_identity: dict[str, int] = field(default_factory=dict)
+    distinct_forwarded: int = 0
+
+    def _reset_window(self, now: float) -> None:
+        self.forwarded = 0
+        self.window_start = now
+        self.copies_by_identity.clear()
+        self.distinct_forwarded = 0
 
     def flush_at(self, floor_s: float) -> float | None:
         del floor_s
-        if self.pending is None:
+        due: list[float] = []
+        if self.pending is not None:
+            due.append(self.pending.first_at + CHILD_BACKLOG_FLUSH_S)
+        if self.distinct_pending is not None:
+            due.append(self.distinct_pending.first_at + CHILD_BACKLOG_FLUSH_S)
+        if not due:
             return None
-        return self.pending.first_at + CHILD_BACKLOG_FLUSH_S
+        return min(due)
 
-    def note(
+    def _note_duplicate_copy(
         self,
         *,
         now: float,
-        floor_s: float,
         cursor_version: int | None,
         lag: tuple[int, int] | None,
-    ) -> tuple[bool, list[dict[str, object]]]:
-        emits: list[dict[str, object]] = []
-        if (
-            self.forwarded > 0
-            and floor_s > 0
-            and now - self.window_start >= floor_s
-        ):
-            if self.pending is not None:
-                emits.append(_child_backlog_record(self.pending))
-                self.pending = None
-            self.forwarded = 0
-            self.window_start = now
-        if self.forwarded == 0:
-            self.window_start = now
-        if self.forwarded < CHILD_BACKLOG_CAP:
-            self.forwarded += 1
-            return True, emits
+    ) -> None:
         behind, ahead = lag if lag is not None else (None, None)
         if self.pending is None:
             self.pending = _ChildBacklogPending(
@@ -1134,27 +1199,80 @@ class _ChildBacklogGate:
                 behind=behind,
                 ahead=ahead,
             )
-        else:
-            self.pending.count += 1
-            self.pending.last_at = now
-            if cursor_version is not None:
-                self.pending.cursor_version = cursor_version
-            if lag is not None:
-                self.pending.behind, self.pending.ahead = lag
+            return
+        self.pending.count += 1
+        self.pending.last_at = now
+        if cursor_version is not None:
+            self.pending.cursor_version = cursor_version
+        if lag is not None:
+            self.pending.behind, self.pending.ahead = lag
+
+    def _note_distinct_withheld(self, now: float) -> None:
+        if self.distinct_pending is None:
+            self.distinct_pending = _DistinctWithheldPending(
+                child=self.child,
+                count=1,
+                first_at=now,
+                last_at=now,
+                forwarded=self.distinct_forwarded,
+            )
+            return
+        self.distinct_pending.count += 1
+        self.distinct_pending.last_at = now
+        self.distinct_pending.forwarded = self.distinct_forwarded
+
+    def note(
+        self,
+        *,
+        now: float,
+        floor_s: float,
+        cursor_version: int | None,
+        lag: tuple[int, int] | None,
+        identity: str,
+    ) -> tuple[bool, list[dict[str, object]]]:
+        emits: list[dict[str, object]] = []
+        if (
+            (self.forwarded > 0 or self.distinct_forwarded > 0)
+            and floor_s > 0
+            and now - self.window_start >= floor_s
+        ):
+            emits.extend(self.flush())
+            self._reset_window(now)
+        if self.forwarded == 0 and self.distinct_forwarded == 0:
+            self.window_start = now
+        copies = self.copies_by_identity.get(identity, 0)
+        if copies == 0:
+            if self.distinct_forwarded >= CHILD_DISTINCT_CAP:
+                self._note_distinct_withheld(now)
+                return False, emits
+            self.copies_by_identity[identity] = 1
+            self.distinct_forwarded += 1
+            self.forwarded += 1
+            return True, emits
+        if copies < _identity_copy_cap(identity):
+            self.copies_by_identity[identity] = copies + 1
+            self.forwarded += 1
+            return True, emits
+        self._note_duplicate_copy(
+            now=now, cursor_version=cursor_version, lag=lag
+        )
         return False, emits
 
     def flush(
         self, ledger: _CursorLedger | None = None
     ) -> list[dict[str, object]]:
-        if self.pending is None:
-            return []
-        if ledger is not None:
-            lag = ledger.lag_for(self.child)
-            if lag is not None:
-                self.pending.behind, self.pending.ahead = lag
-        record = _child_backlog_record(self.pending)
-        self.pending = None
-        return [record]
+        records: list[dict[str, object]] = []
+        if self.pending is not None:
+            if ledger is not None:
+                lag = ledger.lag_for(self.child)
+                if lag is not None:
+                    self.pending.behind, self.pending.ahead = lag
+            records.append(_child_backlog_record(self.pending))
+            self.pending = None
+        if self.distinct_pending is not None:
+            records.append(_distinct_withheld_record(self.distinct_pending))
+            self.distinct_pending = None
+        return records
 
 
 @dataclass
@@ -1598,6 +1716,7 @@ def run_supervisor(
             floor_s=repeat_floor_s,
             cursor_version=version,
             lag=cursor_ledger.lag_for(label),
+            identity=_backlog_line_identity(line),
         )
         if not emit_restart_records(named):
             return False

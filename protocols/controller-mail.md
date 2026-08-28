@@ -132,7 +132,12 @@ monitor can also be killed for output volume: a child that falls behind its
 siblings re-emits the unread backlog every cycle, the host kills the monitor,
 no `type=stop` is written, and the controller goes deaf the same way.
 `supervise` caps that re-emission and names the stuck child (`cursor-lag` /
-`child-backlog`) instead of forwarding N duplicate envelopes. On Claude Code, set
+`child-backlog`) instead of forwarding N duplicate envelopes. The cap keys on
+envelope identity (cursor-snapshot for JSON with `cursor_version`; the line
+itself for headlines and `advance:`), not raw line count: a new envelope still
+forwards after eight copies of a *different* identity. Distinct volume is a
+separate bound (`distinct-withheld`): it names how many new envelopes were
+held and that `relay --drain` retrieves them. On Claude Code, set
 `persistent: true`; that makes `timeout_ms` inert, and where the host requires
 the field to be present it is a placeholder, never a knob.
 
@@ -177,8 +182,9 @@ follows:
   not elapsed
 - backup: pending headlines plus one `advance: <command>` line, or a ring
 - watchdog: JSON `{"kind":"event",...}` with `listener-dead` / related payload
-- supervise: `{"kind":"supervise","type":"heartbeat"|"coverage"|"probe"|"restart"|"stop"|"exit",...}`;
-  default output keeps actionable `restart` records with their reason and
+- supervise: `{"kind":"supervise","type":"heartbeat"|"coverage"|"probe"|"restart"|"stop"|"exit"|"cursor-lag"|"child-backlog"|"distinct-withheld",...}`;
+  default output keeps actionable `restart` records with their reason,
+  `cursor-lag` / `child-backlog` / `distinct-withheld` backlog records, and
   `stop` / signal-driven `exit` records with the exact supervisor `rearm`
   command while suppressing `live` / `target`. `--debug` independently restores
   per-tick `heartbeat` emission, and chatty output restores `live` / `target`

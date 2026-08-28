@@ -4537,3 +4537,214 @@ def test_small_divergent_burst_is_not_named_or_collapsed() -> None:
     ]
     assert len(events) == 4
     assert named == []
+
+
+def _ring_line(version: int, *, coverage_id: str = "cov-1") -> str:
+    return json.dumps(
+        {
+            "kind": "ring",
+            "reason": "event",
+            "coverage_id": coverage_id,
+            "cursor_version": version,
+            "advance_command": (
+                "python3 scripts/goalflight_messages.py listen --advance"
+            ),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _named_backlog_records(records: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        record
+        for record in records
+        if record.get("kind") == "supervise"
+        and record.get("type")
+        in {"cursor-lag", "child-backlog", "distinct-withheld"}
+    ]
+
+
+def test_distinct_envelopes_past_cap_are_forwarded() -> None:
+    """N distinct live envelopes must all reach stdout, even past CHILD_BACKLOG_CAP.
+
+    Regression for wake-deafness P1: the mux counted mail-like lines per child
+    per 15-minute window and never compared envelope identity. Twelve distinct
+    cursor versions therefore forwarded only eight and folded the rest into a
+    child-backlog count. Genuine new mail must not share that collapse.
+    """
+    n = 12
+    assert n > supervise.CHILD_BACKLOG_CAP
+    host = FakeHost(
+        scripts={
+            "backup": [
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (index * 0.001, _cursor_event_line(200 + index, index))
+                        for index in range(n)
+                    ],
+                )
+            ]
+        },
+        stop_after_waits=80,
+    )
+    _run(host, _items("backup"), heartbeat_s=50.0, coverage_s=50.0)
+    records = _records(host)
+    events = [
+        record
+        for record in records
+        if record.get("kind") == "event"
+    ]
+    versions = {record.get("cursor_version") for record in events}
+    named = _named_backlog_records(records)
+    collapse = [
+        record
+        for record in named
+        if record.get("type") in {"cursor-lag", "child-backlog"}
+    ]
+    assert len(events) == n
+    assert versions == set(range(200, 200 + n))
+    assert collapse == []
+
+
+def test_distinct_headlines_past_cap_are_forwarded() -> None:
+    """Backup pending headlines are distinct envelopes, not duplicate copies."""
+    n = 12
+    assert n > supervise.CHILD_BACKLOG_CAP
+    headlines = [
+        f"[notice] mail-{index} seq={index} — headline {index}"
+        for index in range(n)
+    ]
+    host = FakeHost(
+        scripts={
+            "backup": [
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (index * 0.001, headlines[index]) for index in range(n)
+                    ],
+                )
+            ]
+        },
+        stop_after_waits=80,
+    )
+    _run(host, _items("backup"), heartbeat_s=50.0, coverage_s=50.0)
+    joined = "".join(host.lines)
+    for headline in headlines:
+        assert headline in joined
+    collapse = [
+        record
+        for record in _named_backlog_records(_records(host))
+        if record.get("type") in {"cursor-lag", "child-backlog"}
+    ]
+    assert collapse == []
+
+
+def test_genuine_ring_after_backlog_cap_reaches_controller() -> None:
+    """A kind=ring inside the 15-minute window after the cap fired must forward.
+
+    Same-cursor events fill the duplicate cap; a later doorbell from that slot
+    is a different envelope and must not become pending.count.
+    """
+    cap = supervise.CHILD_BACKLOG_CAP
+    stuck_version = 50
+    stdout_lines = [
+        (index * 0.001, _cursor_event_line(stuck_version, index))
+        for index in range(cap)
+    ]
+    ring_at = 60.0
+    assert ring_at < supervise.DEFAULT_NEXT_REPEAT_FLOOR_S
+    stdout_lines.append((ring_at, _ring_line(stuck_version)))
+    host = FakeHost(
+        scripts={
+            "backup": [
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=stdout_lines,
+                )
+            ]
+        },
+        stop_after_waits=80,
+    )
+    _run(host, _items("backup"), heartbeat_s=50.0, coverage_s=50.0)
+    records = _records(host)
+    rings = [record for record in records if record.get("kind") == "ring"]
+    assert len(rings) == 1
+    assert rings[0]["cursor_version"] == stuck_version
+    assert rings[0]["coverage_id"] == "cov-1"
+
+
+def test_distinct_volume_names_withheld_mail_and_how_to_retrieve_it() -> None:
+    """A flood of distinct headlines must not reopen the unbounded-output path.
+
+    The duplicate collapse record (child-backlog) is the wrong name for
+    withheld *new* envelopes. The loud record counts distinct items and
+    points at relay --drain.
+    """
+    cap = supervise.CHILD_DISTINCT_CAP
+    n = cap + 8
+    headlines = [
+        f"[notice] flood-{index} seq={index} — distinct body {index}"
+        for index in range(n)
+    ]
+    host = FakeHost(
+        scripts={
+            "backup": [
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (index * 0.001, headlines[index]) for index in range(n)
+                    ],
+                )
+            ]
+        },
+        stop_after_waits=80,
+    )
+    _run(host, _items("backup"), heartbeat_s=50.0, coverage_s=50.0)
+    joined = "".join(host.lines)
+    forwarded = [headline for headline in headlines if headline in joined]
+    withheld = [headline for headline in headlines if headline not in joined]
+    records = _records(host)
+    loud = [
+        record
+        for record in records
+        if record.get("kind") == "supervise"
+        and record.get("type") == "distinct-withheld"
+    ]
+    collapse = [
+        record
+        for record in records
+        if record.get("kind") == "supervise"
+        and record.get("type") in {"cursor-lag", "child-backlog"}
+    ]
+    assert len(forwarded) == cap
+    assert len(withheld) == n - cap
+    assert collapse == []
+    assert len(loud) == 1
+    assert loud[0]["child"] == "backup"
+    assert int(loud[0]["count"]) == n - cap
+    assert "relay --drain" in str(loud[0].get("retrieve") or "")
+
+
+def test_backlog_identity_groups_cursor_snapshot_not_ring() -> None:
+    """Same cursor_version events share an identity; a ring at that cursor does not."""
+    event_a = _cursor_event_line(5220, 0)
+    event_b = _cursor_event_line(5220, 1)
+    event_new = _cursor_event_line(5221, 2)
+    ring = _ring_line(5220)
+    headline = "[notice] mail-1 seq=1 — body"
+    ident = supervise._backlog_line_identity
+    assert ident(event_a) == ident(event_b)
+    assert ident(event_a) != ident(event_new)
+    assert ident(event_a) != ident(ring)
+    assert ident(headline) == ident(headline)
+    assert ident(headline) != ident("[notice] mail-2 seq=2 — other")

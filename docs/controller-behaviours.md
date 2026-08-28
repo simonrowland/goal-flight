@@ -177,7 +177,9 @@ goes deaf without a diagnostic. A persistent (unbounded) monitor can also be
 killed for output volume: a child that falls behind its siblings re-emits the
 unread backlog every cycle, the host kills the monitor, no `type=stop` is
 written, and the controller goes deaf the same way. `supervise` caps that
-re-emission and names the stuck child. On Claude Code use `persistent: true`; that
+re-emission by envelope identity and names the stuck child (`cursor-lag` /
+`child-backlog`); distinct envelopes still forward, and `distinct-withheld`
+points at `relay --drain` when distinct volume itself is the risk. On Claude Code use `persistent: true`; that
 makes `timeout_ms` inert, and a host-required value is only a placeholder,
 never a knob. In the decomposed fallback, only after supervisor absence is
 proven, arm one generation-bound
