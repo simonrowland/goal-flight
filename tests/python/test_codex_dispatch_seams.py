@@ -1348,7 +1348,9 @@ def test_future_requeue_not_before_is_left_queued(tmp_path: Path) -> None:
     assert row["not_before"] == "2999-01-02T03:04:05Z"
     assert row["winner"] in {"probe", "dispatch", "none"}
     assert "winner:" in str(row.get("headroom") or "")
-    assert "age " in str(row.get("winner_age") or "")
+    assert "unknown time" in str(row.get("winner_age") or "")
+    assert "age " not in str(row.get("winner_age") or "")
+    assert "age 0m" not in str(row.get("headroom") or "")
 
 
 def test_not_before_contradicted_by_newer_healthy_probe_no_longer_gates(

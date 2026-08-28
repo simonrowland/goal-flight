@@ -596,10 +596,20 @@ def test_every_report_row_carries_probe_source_and_observation_time(
         (91 * 60, "1.5h"),
         (47 * 60 * 60, "47.0h"),
         (49 * 60 * 60, "2.0d"),
+        (-1.0, "not ordered"),
+        (-90 * 60, "not ordered"),
     ],
 )
 def test_humanized_delta_boundaries(seconds: float, expected: str):
     assert usage.humanize_delta(seconds) == expected
+
+
+def test_observed_text_future_timestamp_is_implausible_not_age_zero():
+    now = 2_000_000_000.0
+    assert usage._observed_text(now + 3600, now=now) == "implausible time"
+    assert usage._observed_text(None, now=now) == "unknown time"
+    assert "age " in usage._observed_text(now - 60, now=now)
+    assert "age 0m" not in usage._observed_text(now + 5, now=now)
 
 
 def test_soonest_reset_selects_across_epoch_and_iso_sources():

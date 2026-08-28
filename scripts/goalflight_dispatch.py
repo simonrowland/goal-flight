@@ -11992,6 +11992,7 @@ def _headroom_for_queue_entry(
 ) -> dict:
     import goalflight_usage as usage
 
+    _ = now  # age is derived at the hold-summary call site, not minted here
     provider, account = _queue_entry_provider_account(entry)
     if not provider:
         return {"verdict": usage.HEADROOM_UNKNOWN, "winner": None}
@@ -12015,7 +12016,6 @@ def _headroom_for_queue_entry(
             "probe": {
                 "source": usage.SOURCE_PROBE,
                 "state": "unavailable",
-                "observed_at": now,
             },
             "dispatch": None,
             "conflict": False,

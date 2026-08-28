@@ -1158,7 +1158,8 @@ def overlay_dispatch_evidence(
 
 
 def humanize_delta(seconds: float) -> str:
-    seconds = max(0.0, seconds)
+    if seconds < 0:
+        return "not ordered"
     minutes = seconds / 60
     if minutes < 90:
         return f"{int(minutes)}m"
@@ -1185,6 +1186,8 @@ def _observed_text(value: object, *, now: float) -> str:
     observed_at = parse_reset(value)
     if observed_at is None:
         return "unknown time"
+    if observed_at > now:
+        return "implausible time"
     local = datetime.fromtimestamp(observed_at).astimezone().strftime("%b %d %H:%M")
     return f"{local}, age {humanize_delta(now - observed_at)}"
 
