@@ -143,7 +143,7 @@ if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
       exit 1
     fi
     # Test 9: monitor sees FORK-COMPLETE and exits 0.
-    timeout 30 "$SCRIPT" monitor "$FAKE_JSONL" --poll 1 --idle-stop 5 > /tmp/monitor-test-out.txt 2>&1 &
+    timeout 30 "$SCRIPT" monitor "$FAKE_JSONL" --poll 1 --idle-stop 5 > "$TMPROOT"/monitor-test-out.txt 2>&1 &
     MONITOR_PID=$!
     sleep 2
     # Append a fork-complete event (already in initial line, but make sure monitor reads it)
@@ -152,15 +152,15 @@ if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
     wait "$MONITOR_PID" 2>/dev/null
     rc=$?
     set -e
-    if [ "$rc" = "0" ] && grep -q "FORK-COMPLETE" /tmp/monitor-test-out.txt; then
+    if [ "$rc" = "0" ] && grep -q "FORK-COMPLETE" "$TMPROOT"/monitor-test-out.txt; then
       echo "test9 pass: monitor exits 0 on FORK-COMPLETE marker"
     else
       echo "test9 FAIL: monitor rc=$rc; output below:"
-      cat /tmp/monitor-test-out.txt
-      rm -f "$FAKE_JSONL" /tmp/monitor-test-out.txt
+      cat "$TMPROOT"/monitor-test-out.txt
+      rm -f "$FAKE_JSONL" "$TMPROOT"/monitor-test-out.txt
       exit 1
     fi
-    rm -f "$FAKE_JSONL" /tmp/monitor-test-out.txt
+    rm -f "$FAKE_JSONL" "$TMPROOT"/monitor-test-out.txt
   fi
 fi
 
@@ -186,7 +186,7 @@ if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
     FAKE_BLOCKED_SID="bbbb1111-test-test-test-${RANDOM}cccc"
     FAKE_BLOCKED_JSONL="$SUBDIR/${FAKE_BLOCKED_SID}.jsonl"
     echo '{"type":"prompt","message":{"role":"user","content":[{"type":"text","text":"start"}]}}' > "$FAKE_BLOCKED_JSONL"
-    timeout 30 "$SCRIPT" monitor "$FAKE_BLOCKED_JSONL" --poll 1 --idle-stop 5 > /tmp/monitor-blocked-out.txt 2>&1 &
+    timeout 30 "$SCRIPT" monitor "$FAKE_BLOCKED_JSONL" --poll 1 --idle-stop 5 > "$TMPROOT"/monitor-blocked-out.txt 2>&1 &
     MPID=$!
     sleep 2
     echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"FORK-BLOCKED: synthetic missing-dep test"}]}}' >> "$FAKE_BLOCKED_JSONL"
@@ -194,15 +194,15 @@ if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
     wait "$MPID" 2>/dev/null
     rc=$?
     set -e
-    if [ "$rc" = "1" ] && grep -q "FORK-BLOCKED" /tmp/monitor-blocked-out.txt; then
+    if [ "$rc" = "1" ] && grep -q "FORK-BLOCKED" "$TMPROOT"/monitor-blocked-out.txt; then
       echo "test11 pass: monitor exits 1 on FORK-BLOCKED"
     else
       echo "test11 FAIL: expected rc=1; got rc=$rc"
-      cat /tmp/monitor-blocked-out.txt
-      rm -f "$FAKE_BLOCKED_JSONL" /tmp/monitor-blocked-out.txt
+      cat "$TMPROOT"/monitor-blocked-out.txt
+      rm -f "$FAKE_BLOCKED_JSONL" "$TMPROOT"/monitor-blocked-out.txt
       exit 1
     fi
-    rm -f "$FAKE_BLOCKED_JSONL" /tmp/monitor-blocked-out.txt
+    rm -f "$FAKE_BLOCKED_JSONL" "$TMPROOT"/monitor-blocked-out.txt
   fi
 fi
 
@@ -216,7 +216,7 @@ if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
     FAKE_NEED_SID="cccc1111-test-test-test-${RANDOM}dddd"
     FAKE_NEED_JSONL="$SUBDIR/${FAKE_NEED_SID}.jsonl"
     echo '{"type":"prompt","message":{"role":"user","content":[{"type":"text","text":"start"}]}}' > "$FAKE_NEED_JSONL"
-    timeout 30 "$SCRIPT" monitor "$FAKE_NEED_JSONL" --poll 1 --idle-stop 5 > /tmp/monitor-need-out.txt 2>&1 &
+    timeout 30 "$SCRIPT" monitor "$FAKE_NEED_JSONL" --poll 1 --idle-stop 5 > "$TMPROOT"/monitor-need-out.txt 2>&1 &
     MPID=$!
     sleep 2
     echo '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"FORK-NEED: confirm if X is in-scope"}]}}' >> "$FAKE_NEED_JSONL"
@@ -224,15 +224,15 @@ if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
     wait "$MPID" 2>/dev/null
     rc=$?
     set -e
-    if [ "$rc" = "2" ] && grep -q "FORK-NEED" /tmp/monitor-need-out.txt; then
+    if [ "$rc" = "2" ] && grep -q "FORK-NEED" "$TMPROOT"/monitor-need-out.txt; then
       echo "test12 pass: monitor exits 2 on FORK-NEED"
     else
       echo "test12 FAIL: expected rc=2; got rc=$rc"
-      cat /tmp/monitor-need-out.txt
-      rm -f "$FAKE_NEED_JSONL" /tmp/monitor-need-out.txt
+      cat "$TMPROOT"/monitor-need-out.txt
+      rm -f "$FAKE_NEED_JSONL" "$TMPROOT"/monitor-need-out.txt
       exit 1
     fi
-    rm -f "$FAKE_NEED_JSONL" /tmp/monitor-need-out.txt
+    rm -f "$FAKE_NEED_JSONL" "$TMPROOT"/monitor-need-out.txt
   fi
 fi
 
