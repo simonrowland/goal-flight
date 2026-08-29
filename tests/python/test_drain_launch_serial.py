@@ -306,10 +306,13 @@ def test_unlaunchable_entries_do_not_multiply_pass_wall_time(
     leftover = payload["left_queued"] + payload.get("pending_claims", 0)
     assert leftover >= N_HUNG, payload
     timeouts = int((payload.get("timing") or {}).get("launch_timeouts") or 0)
-    assert timeouts == 1, payload
+    # Slack after the first hang used to be eaten by ~1s claim restore (full
+    # ledger scan). Direct record lookup made restore cheap, so leftover
+    # budget may start one more short hang. N hangs still cannot run.
+    assert 1 <= timeouts < N_HUNG, payload
     reasons = [str(row.get("reason") or "") for row in payload.get("details") or []]
-    assert reasons.count("launch_timeout_pending_ledger") == 1, payload
-    assert reasons.count("pass_launch_budget") == N_HUNG - 1, payload
+    assert reasons.count("launch_timeout_pending_ledger") == timeouts, payload
+    assert reasons.count("pass_launch_budget") == N_HUNG - timeouts, payload
 
 
 def test_healthy_entry_launches_promptly_when_capacity_available(
@@ -391,12 +394,25 @@ def test_pass_reports_launch_and_reconcile_timing(
         "pass_s",
         "launch_s",
         "reconcile_s",
+        "recovery_s",
         "capacity_slots",
         "launch_timeouts",
         "launch_budget_burns",
     ):
         assert key in timing, timing
         assert isinstance(timing[key], (int, float)), timing
+    recovery = timing.get("recovery")
+    assert isinstance(recovery, dict), timing
+    for key in (
+        "listing_s",
+        "claim_loop_s",
+        "ledger_lookup_s",
+        "fs_identity_s",
+        "flock_probe_s",
+        "skip_n",
+        "claimed_carriers",
+    ):
+        assert key in recovery, recovery
 
 
 def test_launch_slot_budget_is_read_only_remaining_slots(

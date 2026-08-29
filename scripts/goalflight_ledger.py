@@ -648,6 +648,42 @@ def record_codex_session_id(dispatch_id: str, session_id: str) -> Path:
     return record_engine_session_id(dispatch_id, session_id)
 
 
+def _unreadable_record(path: Path, dispatch_id: str | None = None) -> dict:
+    """Placeholder for a present-but-unreadable ledger file. Not absence."""
+    return {
+        "schema": SCHEMA,
+        "dispatch_id": dispatch_id or path.stem,
+        "state": "unreadable",
+        "path": str(path),
+    }
+
+
+def read_record(dispatch_id: str) -> dict | None:
+    """Read one ledger row by dispatch_id. Unreadable is not absent.
+
+    ``read_records`` scans the whole runs dir. Recovery used to call that on
+    every per-carrier lookup, so a 2500-row ledger cost seconds per claim.
+    The on-disk name is ``safe_dispatch_filename(id).json``; look that up.
+    """
+    if not isinstance(dispatch_id, str) or not dispatch_id:
+        return None
+    path = record_path(dispatch_id, create=False)
+    presence = goalflight_fs.path_presence(path)
+    if presence == "absent":
+        return None
+    if presence == "unknown":
+        return _unreadable_record(
+            path, goalflight_compat.safe_dispatch_filename(dispatch_id)
+        )
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _unreadable_record(path)
+    if not isinstance(record, dict):
+        return _unreadable_record(path)
+    return record
+
+
 def read_records() -> list[dict]:
     records: list[dict] = []
     path = runs_dir(create=False)
@@ -664,7 +700,7 @@ def read_records() -> list[dict]:
         try:
             records.append(json.loads(p.read_text()))
         except (OSError, json.JSONDecodeError):
-            records.append({"schema": SCHEMA, "dispatch_id": p.stem, "state": "unreadable", "path": str(p)})
+            records.append(_unreadable_record(p))
     return records
 
 
