@@ -47,7 +47,7 @@ import grok_usage  # noqa: E402
 # flips away from it. Below 100 on purpose: a seat that is exactly empty has
 # already begun failing dispatches, so the flip has to happen while there is
 # still usable headroom left to flip with.
-EXHAUSTED_AT_PERCENT = 95.0
+EXHAUSTED_AT_PERCENT = 98.0
 
 STATE_PATH = Path.home() / ".goal-flight" / "grok-seat-states.json"
 STATE_TTL_S = 600.0

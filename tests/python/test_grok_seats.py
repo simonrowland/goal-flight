@@ -37,13 +37,26 @@ def _entry(used, ok=True):
 
 @pytest.mark.parametrize(
     ("used", "eligible"),
-    [(0.0, True), (50.0, True), (94.9, True), (95.0, False), (99.0, False), (100.0, False)],
+    [
+        (0.0, True),
+        (50.0, True),
+        (seats.EXHAUSTED_AT_PERCENT - 0.1, True),
+        (seats.EXHAUSTED_AT_PERCENT, False),
+        (99.9, False),
+        (100.0, False),
+    ],
 )
-def test_flip_threshold_is_95_percent_used(tmp_path: Path, used, eligible) -> None:
-    """A seat is starved at 95% spent, not at 100%.
+def test_flip_threshold_starves_at_the_configured_percent(
+    tmp_path: Path, used, eligible
+) -> None:
+    """A seat is starved at EXHAUSTED_AT_PERCENT spent, not at 100.
 
     Waiting for 100 means flipping only after dispatches have already started
     failing; the flip has to happen while there is still headroom to flip with.
+    The cases are expressed relative to the constant rather than pinned to a
+    literal, so tuning the reserve moves the boundary and does not require
+    editing the assertion -- an assertion edited to match a changed value is how
+    a real regression gets normalised.
     """
     path = _states(tmp_path / "s.json", {"": _entry(100.0), "seat": _entry(used)})
     selected = seats.select_seat(path=path, now=NOW, allow_refresh=False)
