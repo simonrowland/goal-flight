@@ -11,6 +11,7 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -1122,6 +1123,113 @@ def test_reconciliation_is_idempotent(tmp_path: Path) -> None:
     assert record_path.read_bytes() == after_first
 
 
+def test_reconcile_parses_far_fewer_rows_than_terminal_history(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A pass over mostly-terminal history must not json.loads every row.
+
+    Work unit is parse/evaluate count, not wall time. Age is not a skip
+    predicate: the live rows below are still all evaluated.
+    """
+    terminal_n = 40
+    live_ids = ("live-a", "live-b", "live-c")
+    for i in range(terminal_n):
+        _record(tmp_path, f"done-{i:02d}", state="complete")
+    for dispatch_id in live_ids:
+        _record(tmp_path, dispatch_id, **_gone_controller())
+
+    evaluated: list[str] = []
+    real = D._evaluate_abandoned_dispatch
+
+    def wrapped(record: dict, **kwargs: object) -> dict:
+        evaluated.append(str(record.get("dispatch_id") or ""))
+        return real(record, **kwargs)
+
+    monkeypatch.setattr(D, "_evaluate_abandoned_dispatch", wrapped)
+    result = _run(tmp_path)
+    work = L.last_read_work()
+
+    assert work["listed"] == terminal_n + len(live_ids)
+    assert work["parsed"] == len(live_ids)
+    assert work["skipped_terminal"] == terminal_n
+    assert result["parsed"] == len(live_ids)
+    assert result["skipped_terminal"] == terminal_n
+    assert result["listed"] == work["listed"]
+    assert set(evaluated) == set(live_ids)
+    assert work["parsed"] < work["listed"] / 4
+
+
+def test_skipped_terminal_row_reenters_when_rewritten_nonterminal(
+    tmp_path: Path,
+) -> None:
+    _record(tmp_path, "flip", state="complete")
+    first = L.read_records(skip_terminal=True)
+    assert [row.get("dispatch_id") for row in first] == []
+    assert L.last_read_work()["skipped_terminal"] == 1
+    assert L.last_read_work()["parsed"] == 0
+
+    current = _read("flip")
+    current["state"] = "running"
+    current["terminal_state"] = "unknown"
+    L.write_record(current)
+    second = L.read_records(skip_terminal=True)
+    assert [row.get("dispatch_id") for row in second] == ["flip"]
+    assert L.last_read_work()["parsed"] == 1
+    assert L.last_read_work()["skipped_terminal"] == 0
+
+
+def test_old_nonterminal_row_is_not_skipped_by_age(tmp_path: Path) -> None:
+    _record(tmp_path, "old-queued", state="queued")
+    path = L.record_path("old-queued")
+    os.utime(path, (0, 0))
+    rows = L.read_records(skip_terminal=True)
+    assert [row.get("dispatch_id") for row in rows] == ["old-queued"]
+    assert L.last_read_work()["parsed"] == 1
+    assert L.last_read_work()["skipped_terminal"] == 0
+
+
+def test_read_records_default_still_returns_terminal_history(tmp_path: Path) -> None:
+    _record(tmp_path, "done", state="complete")
+    _record(tmp_path, "live", state="running")
+    rows = L.read_records()
+    assert {row.get("dispatch_id") for row in rows} == {"done", "live"}
+    assert L.last_read_work()["parsed"] == 2
+    assert L.last_read_work()["skipped_terminal"] == 0
+
+
+def test_compact_terminal_json_is_parsed_not_silently_skipped(tmp_path: Path) -> None:
+    """Peek only matches pretty-printed top-level state. Compact JSON fail-opens."""
+    path = L.record_path("compact-done")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"dispatch_id": "compact-done", "state": "complete"}),
+        encoding="utf-8",
+    )
+    rows = L.read_records(skip_terminal=True)
+    assert [row.get("dispatch_id") for row in rows] == ["compact-done"]
+    assert L.last_read_work()["parsed"] == 1
+    assert L.last_read_work()["skipped_terminal"] == 0
+
+
+def test_overlapping_skip_reads_both_see_live_rows(tmp_path: Path) -> None:
+    for i in range(20):
+        _record(tmp_path, f"done-{i:02d}", state="complete")
+    _record(tmp_path, "live", state="running")
+    seen: list[list[object]] = []
+
+    def worker() -> None:
+        rows = L.read_records(skip_terminal=True)
+        seen.append([row.get("dispatch_id") for row in rows])
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert seen == [["live"], ["live"]]
+
+
 def test_local_drain_tick_runs_reconciliation_automatically(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1224,3 +1332,20 @@ def test_inferred_abandonment_is_resumable_and_fresh_child_stays_live(
     second = _run(tmp_path, now=_future_now(1800.0))
     assert second["closed"] == 0
     assert _read(fresh_child_id)["state"] == "running"
+
+
+def test_peek_refuses_truncated_document_and_parses_it_instead() -> None:
+    """A truncated prefix must never be skipped as terminal.
+
+    The top-level state line can appear in an incomplete document. Skipping
+    on that strands the row forever: the same prefix peeks the same terminal
+    state on every later pass, so it is never parsed. Fail toward parsing.
+    """
+    import goalflight_ledger as ledger
+
+    truncated = '{\n  "dispatch_id": "x",\n  "state": "complete",\n  "tail":'
+    complete = '{\n  "dispatch_id": "x",\n  "state": "complete"\n}\n'
+
+    assert ledger._peek_top_level_state(truncated) is None
+    assert ledger._peek_top_level_state(complete) == "complete"
+    assert ledger._peek_top_level_state(complete + "\n\n") == "complete"
