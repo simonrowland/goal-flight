@@ -239,6 +239,31 @@ def test_lookup_unreadable_registry_returns_unknown_not_missing(
     assert addressing["state"] != "missing"
 
 
+def test_lookup_unresolvable_project_root_returns_unknown_not_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lookup is a question. A missing checkout is UNKNOWN, not TaskError.
+
+    Reverting ``lookup_to_controller_label`` to ``resolve_project_root``
+    (via ``controller_address_project_root``) raises TaskError here, so the
+    CLI never emits the structured unknown JSON.
+    """
+    _isolate(monkeypatch, tmp_path)
+    missing = tmp_path / "no-such-project"
+    assert not missing.exists()
+    addressing = messages.lookup_to_controller_label(
+        "somebody",
+        project_root=missing,
+        search_other_projects=False,
+    )
+    assert addressing["state"] == "unknown"
+    assert addressing["state"] != "missing"
+    assert addressing["error"] == "project_root_unresolvable"
+    assert addressing["label"] == "somebody"
+    with pytest.raises(task.TaskError, match="Refusing to write to another store"):
+        task.resolve_project_root(str(missing))
+
+
 def test_unresolvable_controller_project_root_emits_unknown_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
