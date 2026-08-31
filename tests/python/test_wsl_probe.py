@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import subprocess
 import sys
 import tempfile
@@ -165,6 +166,58 @@ def case_wsl_decline_stamp_suppresses_prompt_signal() -> None:
     assert payload["decline_stamp"].endswith("docs-private/windows-wsl-install-declined.json")
 
 
+def case_wsl_decline_stamp_probe_preserves_unknown() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td)
+        stamp = goalflight_compat.wsl_decline_stamp_path(project)
+        original_stat = Path.stat
+
+        def fail_stamp_stat(self: Path, *args, **kwargs):
+            if self == stamp:
+                raise OSError(errno.ESTALE, "stale decline stamp")
+            return original_stat(self, *args, **kwargs)
+
+        with patch.object(Path, "stat", fail_stamp_stat):
+            assert goalflight_compat.wsl_install_declined(project) is None
+        assert goalflight_compat.wsl_install_declined(project) is False
+
+
+def case_wsl_marker_probe_preserves_unknown_and_negative() -> None:
+    with patch("goalflight_compat.is_windows", return_value=False), \
+        patch("goalflight_compat.sys.platform", "linux"), \
+        patch.object(
+            Path, "read_text", side_effect=OSError(errno.ESTALE, "stale proc")
+        ):
+        assert goalflight_compat.is_wsl() is None
+
+    with patch("goalflight_compat.is_windows", return_value=False), \
+        patch("goalflight_compat.sys.platform", "linux"), \
+        patch.object(Path, "read_text", side_effect=("6.1.0-linux", "Linux version 6.1")):
+        assert goalflight_compat.is_wsl() is False
+
+    with patch("goalflight_compat.is_windows", return_value=False), \
+        patch("goalflight_compat.sys.platform", "linux"), \
+        patch.object(
+            Path,
+            "read_text",
+            side_effect=(
+                "microsoft-standard-WSL2",
+                OSError(errno.ESTALE, "stale proc"),
+            ),
+        ):
+        assert goalflight_compat.is_wsl() is True
+
+
+def case_probe_wsl_preserves_platform_unknown() -> None:
+    with patch("goalflight_compat.is_windows", return_value=False), \
+        patch("goalflight_compat.is_wsl", return_value=None):
+        payload = goalflight_compat.probe_wsl(ROOT)
+    assert payload["state"] == "platform_probe_unknown"
+    assert payload["is_wsl"] is None
+    assert payload["usable"] is False
+    assert payload["present"] is False
+
+
 def case_wsl_drvfs_mountinfo_parser() -> None:
     lines = [
         "36 25 0:32 / / rw,relatime - ext4 /dev/sdb rw",
@@ -190,7 +243,7 @@ def case_wsl_drvfs_detection_uses_mount_fstype_before_syntax() -> None:
     with patch("goalflight_compat._mount_fstype_for_path", return_value="drvfs"):
         assert goalflight_compat.is_wsl_drvfs_path("/custom/project")
     with patch("goalflight_compat._mount_fstype_for_path", return_value=None):
-        assert goalflight_compat.is_wsl_drvfs_path("/mnt/d/project")
+        assert goalflight_compat.is_wsl_drvfs_path("/mnt/d/project") is None
 
 
 def main() -> None:
@@ -201,6 +254,9 @@ def main() -> None:
     case_wsl_launch_no_distro_clears_fake_distro_lines()
     case_wsl_utf16_distro_output_is_ready()
     case_wsl_decline_stamp_suppresses_prompt_signal()
+    case_wsl_decline_stamp_probe_preserves_unknown()
+    case_wsl_marker_probe_preserves_unknown_and_negative()
+    case_probe_wsl_preserves_platform_unknown()
     case_wsl_drvfs_mountinfo_parser()
     case_wsl_drvfs_detection_uses_mount_fstype_before_syntax()
     print("OK: WSL probe tests pass")

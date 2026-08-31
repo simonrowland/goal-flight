@@ -101,27 +101,6 @@ def case_doctor_linux_desktop_probe_is_unknown_not_missing() -> None:
         assert goalflight_doctor.app_exists("DefinitelyMissingGoalFlightApp") is None
 
 
-def case_doctor_reports_wsl_drvfs_warnings() -> None:
-    old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
-    os.environ["GOALFLIGHT_STATE_DIR"] = "/mnt/d/goal-flight-state"
-    try:
-        with patch("goalflight_compat.is_wsl", return_value=True):
-            payload = goalflight_doctor.check_wsl_filesystems(
-                Path("/mnt/c/project"),
-                fleet_dir=Path("/mnt/e/fleet"),
-            )
-    finally:
-        if old_state_dir is None:
-            os.environ.pop("GOALFLIGHT_STATE_DIR", None)
-        else:
-            os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
-    assert payload["ok"] is False
-    assert any("project_root" in item for item in payload["warnings"])
-    assert any("state_dir" in item for item in payload["warnings"])
-    assert any("fleet_lock_dir" in item for item in payload["warnings"])
-    assert any("worktree_root" in item for item in payload["warnings"])
-
-
 def case_doctor_skips_non_drvfs_mnt_mount_warning() -> None:
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
     os.environ["GOALFLIGHT_STATE_DIR"] = "/mnt/d/goal-flight-state"
@@ -769,7 +748,6 @@ def main() -> None:
     case_doctor_reports_platform_fields_for_windows()
     case_doctor_reports_platform_fields_for_linux()
     case_doctor_linux_desktop_probe_is_unknown_not_missing()
-    case_doctor_reports_wsl_drvfs_warnings()
     case_doctor_skips_non_drvfs_mnt_mount_warning()
     case_doctor_reports_drvfs_mount_warning_from_fstype()
     case_filesystem_type_branches_stat_for_platforms()

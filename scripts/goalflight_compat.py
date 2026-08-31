@@ -34,6 +34,7 @@ import os
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -121,35 +122,26 @@ def is_linux() -> bool:
     return sys.platform.startswith("linux")
 
 
-def is_wsl() -> bool:
-    """True when Python is already running inside WSL, not native Windows.
+def is_wsl() -> bool | None:
+    """Report whether Python is running inside WSL, preserving uncertainty.
 
     WSL reports as Linux/POSIX to Python, so ``is_windows()`` must stay false
-    there. If this misdetects on a real WSL box, check
-    ``/proc/sys/kernel/osrelease`` and ``/proc/version`` first; WSL1/WSL2 both
-    include a Microsoft/WSL marker in one of those files.
+    there. ``False`` means the platform is definitely not Linux/WSL or both
+    Linux markers were readable and negative. ``None`` means at least one
+    marker could not be read, so a WSL marker may have been hidden.
     """
     if is_windows() or sys.platform != "linux":
         return False
+    probe_failed = False
     for marker_path in (Path("/proc/sys/kernel/osrelease"), Path("/proc/version")):
         try:
             text = marker_path.read_text(encoding="utf-8", errors="ignore").lower()
         except OSError:
+            probe_failed = True
             continue
         if "microsoft" in text or "wsl" in text:
             return True
-    return False
-
-
-def _syntactic_wsl_drive_path(path: Path) -> bool:
-    parts = path.parts
-    return (
-        len(parts) >= 3
-        and parts[0] == "/"
-        and parts[1] == "mnt"
-        and len(parts[2]) == 1
-        and parts[2].isalpha()
-    )
+    return None if probe_failed else False
 
 
 def nearest_existing_path(path: Path) -> Path | None:
@@ -240,13 +232,12 @@ def _mount_fstype_for_path(path: Path) -> str | None:
     return _mountinfo_fstype_for_path(path) or _findmnt_fstype_for_path(path)
 
 
-def is_wsl_drvfs_path(path: str | os.PathLike[str] | None) -> bool:
-    """True when a WSL path is backed by a Windows filesystem mount.
+def is_wsl_drvfs_path(path: str | os.PathLike[str] | None) -> bool | None:
+    """Report whether a WSL path is backed by a Windows filesystem mount.
 
-    Prefer mount fstype evidence (``drvfs`` / ``9p`` / ``v9fs``) so custom
-    automounts and symlinked roots are detected without false-warning on a real
-    Linux filesystem mounted under ``/mnt/<letter>``. If mount metadata is not
-    available, retain the legacy syntactic ``/mnt/<drive>`` fallback.
+    ``True`` and ``False`` require mount-fstype evidence. ``None`` means the
+    metadata probes could not decide; path syntax alone cannot distinguish a
+    DrvFs mount from a real Linux filesystem mounted under ``/mnt/<letter>``.
     """
     if path is None:
         return False
@@ -258,15 +249,9 @@ def is_wsl_drvfs_path(path: str | os.PathLike[str] | None) -> bool:
     except OSError:
         resolved = target
     fstype = _mount_fstype_for_path(resolved)
-    original_syntactic = _syntactic_wsl_drive_path(original)
-    target_syntactic = _syntactic_wsl_drive_path(target)
-    resolved_syntactic = _syntactic_wsl_drive_path(resolved)
-    if fstype:
-        if fstype.lower() in _WSL_WINDOWS_FS_TYPES:
-            return True
-        if target_syntactic or resolved_syntactic or not original_syntactic:
-            return False
-    return original_syntactic or target_syntactic or resolved_syntactic
+    if fstype is None:
+        return None
+    return fstype.lower() in _WSL_WINDOWS_FS_TYPES
 
 
 def python_executable() -> str:
@@ -352,18 +337,23 @@ def allowed_env_override(
 
 
 def path_is_under(path: str | os.PathLike[str], roots: list[str | os.PathLike[str]]) -> bool:
-    """True when path resolves under one of roots; missing paths are OK."""
+    """True when path resolves under one of roots; deny resolution failures.
+
+    Missing paths remain eligible because ``strict=False`` resolves their
+    existing prefix. An unavailable resolution is not replaced by a lexical
+    comparison: callers use this result as an authorization boundary.
+    """
     candidate = Path(path).expanduser()
     try:
         candidate_resolved = candidate.resolve(strict=False)
     except OSError:
-        candidate_resolved = candidate.absolute()
+        return False
     for root in roots:
         root_path = Path(root).expanduser()
         try:
             root_resolved = root_path.resolve(strict=False)
         except OSError:
-            root_resolved = root_path.absolute()
+            continue
         try:
             candidate_resolved.relative_to(root_resolved)
             return True
@@ -405,6 +395,17 @@ def windows_watcher_skip() -> str:
     )
 
 
+def _regular_file_status(path: Path) -> bool | None:
+    """Return regular-file status without turning stat failure into absence."""
+    try:
+        mode = path.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return None
+    return stat.S_ISREG(mode)
+
+
 def wsl_decline_stamp_path(project_root: str | os.PathLike[str]) -> Path:
     """Per-project stamp recording that the operator declined WSL install.
 
@@ -416,13 +417,11 @@ def wsl_decline_stamp_path(project_root: str | os.PathLike[str]) -> Path:
     return Path(project_root) / "docs-private" / "windows-wsl-install-declined.json"
 
 
-def wsl_install_declined(project_root: str | os.PathLike[str] | None) -> bool:
+def wsl_install_declined(project_root: str | os.PathLike[str] | None) -> bool | None:
+    """Return decline-stamp state, or ``None`` when stat cannot decide."""
     if project_root is None:
         return False
-    try:
-        return wsl_decline_stamp_path(project_root).is_file()
-    except OSError:
-        return False
+    return _regular_file_status(wsl_decline_stamp_path(project_root))
 
 
 def record_wsl_install_declined(
@@ -577,10 +576,12 @@ def probe_wsl(
     fields in doctor JSON for encoding or enterprise-policy output.
     """
     declined = wsl_install_declined(project_root)
+    windows = is_windows()
+    wsl_state = is_wsl()
     base = {
         "schema": "goalflight.wsl_probe.v1",
-        "is_windows": is_windows(),
-        "is_wsl": is_wsl(),
+        "is_windows": windows,
+        "is_wsl": wsl_state,
         "usable": False,
         "present": False,
         "wsl_exe_present": False,
@@ -592,13 +593,21 @@ def probe_wsl(
         "requires_admin": True,
         "requires_reboot": True,
     }
-    if not is_windows():
+    if not windows:
+        if wsl_state is None:
+            base.update(
+                {
+                    "state": "platform_probe_unknown",
+                    "reason": "WSL marker files could not be read",
+                }
+            )
+            return base
         base.update(
             {
-                "state": "running_under_wsl" if is_wsl() else "not_native_windows",
-                "usable": is_wsl(),
-                "present": is_wsl(),
-                "reason": "already inside WSL" if is_wsl() else "not native Windows",
+                "state": "running_under_wsl" if wsl_state else "not_native_windows",
+                "usable": wsl_state,
+                "present": wsl_state,
+                "reason": "already inside WSL" if wsl_state else "not native Windows",
             }
         )
         return base
@@ -832,8 +841,9 @@ def _absolute_unfollowed(value: Path | str) -> Path:
     return Path(os.path.abspath(os.path.expanduser(str(value))))
 
 
-def _looks_like_skill_root(root: Path) -> bool:
-    return (root / "scripts" / "goalflight_messages.py").is_file()
+def _looks_like_skill_root(root: Path) -> bool | None:
+    """Return marker state, preserving an indeterminate stat as ``None``."""
+    return _regular_file_status(root / "scripts" / "goalflight_messages.py")
 
 
 def _candidate_skill_root(value: Path | str) -> Path | None:
@@ -841,7 +851,8 @@ def _candidate_skill_root(value: Path | str) -> Path | None:
     if not expanded.is_absolute():
         return None
     root = _absolute_unfollowed(expanded)
-    if not _looks_like_skill_root(root):
+    marker_status = _looks_like_skill_root(root)
+    if marker_status is False:
         return None
     return root
 
@@ -868,7 +879,9 @@ def installed_skill_root() -> Path | None:
     about usability: a relative path's meaning depends on the reader's cwd, and
     resolving it against the *emitter's* cwd is exactly how six live listeners
     ended up running ``scripts/...``. Falling back to the pin yields a path that
-    means the same thing in every shell. Returns None when the pin is absent too.
+    means the same thing in every shell. A failed marker stat retains that pin
+    so a transient filesystem error cannot seed the running checkout into rearm
+    commands. Returns None only when the pin is definitely absent or not a file.
     """
     raw = os.environ.get("GOALFLIGHT_ROOT", "").strip()
     if raw:
@@ -932,14 +945,27 @@ def gstack_browse_bin_candidates() -> list[Path]:
 
 
 def resolve_gstack_browse_bin() -> Path | None:
-    """First executable gstack browse binary among known install locations."""
+    """First executable gstack browser, retaining an uncertain candidate.
+
+    ``None`` is reserved for candidates proven absent, non-files, or
+    non-executable. If stat/access raises, return the first uncertain path after
+    checking later candidates for a confirmed executable; path-returning
+    callers then preserve the capability instead of silently disabling it.
+    """
+    uncertain: Path | None = None
     for candidate in gstack_browse_bin_candidates():
+        file_status = _regular_file_status(candidate)
+        if file_status is None:
+            uncertain = uncertain or candidate
+            continue
+        if file_status is False:
+            continue
         try:
-            if candidate.is_file() and os.access(candidate, os.X_OK):
+            if os.access(candidate, os.X_OK):
                 return candidate
         except OSError:
-            continue
-    return None
+            uncertain = uncertain or candidate
+    return uncertain
 
 
 # --------------------------------------------------------------------------- #
@@ -947,17 +973,21 @@ def resolve_gstack_browse_bin() -> Path | None:
 # POSIX: os.kill(pid, 0) (unchanged). Windows: OpenProcess +                  #
 # GetExitCodeProcess -- NEVER os.kill(pid, 0). ctypes, zero wheels.          #
 # --------------------------------------------------------------------------- #
+def _positive_pid(value) -> int | None:
+    """Return an exact positive integer PID; reject coercible lookalikes."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def pid_liveness(pid) -> bool | None:
     """Probe ``pid`` without collapsing an unavailable probe into death.
 
     ``True`` means the process is live, ``False`` means it is known not to
     exist, and ``None`` means the platform probe could not decide.
     """
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return False
-    if pid <= 0:
+    pid = _positive_pid(pid)
+    if pid is None:
         return False
 
     if not is_windows():
@@ -999,7 +1029,8 @@ def pid_liveness(pid) -> bool | None:
         PROCESS_QUERY_LIMITED_INFORMATION, False, pid
     )
     if not handle:  # pragma: no cover
-        return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        error = ctypes.get_last_error()
+        return True if error == ERROR_ACCESS_DENIED else None
     try:  # pragma: no cover
         # Declare signatures so 64-bit HANDLE/exit-code marshal correctly (ctypes
         # defaults to int=32-bit, which truncates handles on 64-bit Windows).
@@ -1010,7 +1041,7 @@ def pid_liveness(pid) -> bool | None:
         code = wintypes.DWORD()
         ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
         if not ok:
-            return True  # could not query exit code; assume alive (conservative)
+            return None
         return code.value == STILL_ACTIVE
     finally:  # pragma: no cover
         kernel32.CloseHandle(handle)
@@ -1092,14 +1123,12 @@ def pid_is_zombie(pid: int) -> bool | None:
     coverage needs the stricter distinction because a forked child can retain
     an inherited lock after the recorded owner exits.
     """
-    try:
-        pid_int = int(pid)
-    except (TypeError, ValueError):
-        return None
-    if pid_int <= 0:
+    pid_int = _positive_pid(pid)
+    if pid_int is None:
         return None
     if is_windows():  # Windows liveness already checks STILL_ACTIVE.
-        return False if pid_alive(pid_int) else True
+        liveness = pid_liveness(pid_int)
+        return None if liveness is None else not liveness
     if sys.platform == "darwin":
         info = _darwin_process_bsd_info(pid_int)
         if info is not None:
@@ -1134,11 +1163,8 @@ def windows_process_identity(pid) -> dict | None:
     time from GetProcessTimes is the minimum identity token we require before
     terminating a stale pidfile entry.
     """
-    try:
-        pid_int = int(pid)
-    except (TypeError, ValueError):
-        return None
-    if pid_int <= 0 or not is_windows():
+    pid_int = _positive_pid(pid)
+    if pid_int is None or not is_windows():
         return None
 
     import ctypes  # pragma: no cover
@@ -1192,7 +1218,7 @@ def windows_process_identity(pid) -> dict | None:
 
 def process_start_identity(pid: int, *, include_ancestry: bool = False) -> dict | None:
     """Return a PID-reuse-safe, fine-grained process start identity when available."""
-    if not isinstance(pid, int) or pid <= 0 or not pid_alive(pid):
+    if _positive_pid(pid) is None or not pid_alive(pid):
         return None
 
     if is_windows():
@@ -1346,11 +1372,8 @@ def kill_pid(
     because pid reuse can target an unrelated process, so Windows kills require
     a recorded creation-time identity that still matches the live pid.
     """
-    try:
-        pid_int = int(pid)
-    except (TypeError, ValueError):
-        return False
-    if pid_int <= 0:
+    pid_int = _positive_pid(pid)
+    if pid_int is None or pid_int == 1:
         return False
     kill_signal = sig if sig is not None else getattr(signal, "SIGTERM", 15)
 
@@ -1380,10 +1403,9 @@ def kill_pid(
             return False
 
     if process_group:
-        try:
-            target = int(pgid) if pgid is not None else pid_int
-        except (TypeError, ValueError):
-            target = pid_int
+        target = pid_int if pgid is None else _positive_pid(pgid)
+        if target is None or target == 1:
+            return False
         try:
             os.killpg(target, kill_signal)
             return True

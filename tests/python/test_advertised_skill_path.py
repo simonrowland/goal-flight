@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -96,6 +98,32 @@ def test_missing_install_falls_back_to_running_copy(
     )
     assert script == (checkout / "scripts" / "goalflight_messages.py").resolve()
     _assert_copyable(str(script))
+
+
+def test_failed_pin_marker_probe_keeps_the_pinned_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    install = _plant_skill(home / ".goal-flight" / "skill")
+    checkout = _plant_skill(tmp_path / "checkout")
+    marker = install / "scripts" / "goalflight_messages.py"
+    original_stat = os.stat
+
+    def fail_marker_stat(path, *args, **kwargs):
+        if isinstance(path, (str, os.PathLike)) and Path(path) == marker:
+            raise OSError(errno.ESTALE, "stale install marker")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls, _home=home: _home))
+    monkeypatch.delenv("GOALFLIGHT_ROOT", raising=False)
+    monkeypatch.setattr(os, "stat", fail_marker_stat)
+
+    assert compat._looks_like_skill_root(install) is None  # noqa: SLF001
+    assert compat.installed_skill_root() == install
+    assert compat.advertised_skill_root(
+        running_file=checkout / "scripts" / "goalflight_wake.py"
+    ) == install
 
 
 def test_mutation_lookup_fail_still_emits_absolute_running_copy(
