@@ -637,7 +637,35 @@ def test_unreadable_ledger_dir_is_unknown_not_unoccupied() -> None:
         assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
         assert "occupancy" in refused.stderr and "unknown" in refused.stderr, refused.stderr
         assert "Retry the dispatch" in refused.stderr, refused.stderr
+        assert "already has a non-terminal ledger record" not in refused.stderr, refused.stderr
+        assert "unique --dispatch-id" not in refused.stderr, refused.stderr
+        assert "runs.d" in refused.stderr, refused.stderr
         assert not _ledger_record(tmp, "unk-dir-writer"), refused.stderr
+
+
+def test_genuine_duplicate_dispatch_id_is_still_refused() -> None:
+    """A readable non-terminal row for this id is still a duplicate, not occupancy."""
+    with _temp_dir() as td:
+        tmp = Path(td)
+        tree = tmp / "tree"
+        other = tmp / "other-tree"
+        tree.mkdir()
+        other.mkdir()
+        env = _env(tmp)
+        _write_runs_record(
+            tmp,
+            "dup-id",
+            state="running",
+            worker_cwd=str(other.resolve()),
+            project_root=str(other.resolve()),
+        )
+        refused = _run(_dispatch_cmd(tmp, tree, "dup-id", _quick_writer("dup-id")), env)
+        assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
+        assert "already has a non-terminal ledger record" in refused.stderr, refused.stderr
+        assert "dup-id" in refused.stderr, refused.stderr
+        assert "DISPATCH-LAUNCHED" not in refused.stdout, refused.stdout
+        planted = _ledger_record(tmp, "dup-id")
+        assert planted.get("state") == "running", planted
 
 
 def test_cwdless_nonterminal_record_does_not_block_unrelated_worktree() -> None:
@@ -1574,6 +1602,7 @@ if __name__ == "__main__":
     test_queued_incumbent_owns_tree_before_any_worker_spawns()
     test_unreadable_ledger_record_is_unknown_not_unoccupied()
     test_unreadable_ledger_dir_is_unknown_not_unoccupied()
+    test_genuine_duplicate_dispatch_id_is_still_refused()
     test_cwdless_nonterminal_record_does_not_block_unrelated_worktree()
     test_cwdless_dead_identity_does_not_block()
     test_matching_project_root_without_cwd_does_not_occupy()
