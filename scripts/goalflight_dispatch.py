@@ -126,6 +126,38 @@ DRAIN_LAUNCH_CONFIRM_S = 45.0
 DRAIN_LAUNCH_TIMEOUT_FLOOR_S = 20.0
 LAUNCH_BACKOFF_INITIAL_S = 60.0
 LAUNCH_BACKOFF_CAP_S = 900.0
+# Saturate the durable retry cursor once it reaches the capped delay. Capacity
+# and other transient gates may remain blocked indefinitely, but their JSON
+# counter must not grow without bound while the effective policy stays 15m.
+MAX_LAUNCH_BACKOFF_COUNT = 5
+# Three independent, provably pre-worker failures are enough to distinguish a
+# dead carrier from a one-pass transient while keeping the retry window bounded.
+# Capacity refusals are deferrals, not failed launch attempts, and do not spend
+# this budget.
+MAX_DRAIN_PRE_WORKER_FAILURES = 3
+# Drain launch-attempt classification is three states, not a flipped boolean.
+# Round 1 counted every pre-worker nonzero as a strike. Round 2 counted only
+# the authenticated prefix, and never counted _RemoteDrainBlocked. Both left
+# an unproved remainder that retried every pass with no cursor.
+LAUNCH_ATTEMPT_CLASS_PROVEN_FAILURE = "proven-failure"
+LAUNCH_ATTEMPT_CLASS_PROVEN_TRANSIENT = "proven-transient"
+LAUNCH_ATTEMPT_CLASS_UNDETERMINED = "undetermined"
+REMOTE_TRANSIENT_DRAIN_CODES = frozenset(
+    {
+        "fleet_unavailable",
+        "fleet_unreadable",
+        "fleet_missing",
+    }
+)
+LAUNCH_ATTEMPT_CURSOR_KEYS = (
+    "launch_pre_worker_failure_count",
+    "launch_backoff_count",
+    "launch_backoff_until",
+    "launch_last_attempted_at",
+    "launch_fail_reason",
+    "launch_attempt_class",
+    "launch_undetermined_count",
+)
 ABANDONED_RECONCILE_STALE_S = QUEUE_CLAIM_STALE_S
 ABANDONED_RECONCILIATION_SCHEMA = "goalflight.abandoned-reconciliation.v1"
 MAX_CLAIM_RECOVERY_REQUEUES = 1
@@ -1012,6 +1044,10 @@ STEER_ACK_RE = goalflight_terminal.STEER_ACK_RE
 
 class DispatchUsageError(Exception):
     pass
+
+
+class ProvenPreWorkerRefusal(DispatchUsageError):
+    """Queued request data is insufficient for this child to spawn a worker."""
 
 
 class _TerseArgumentParser(argparse.ArgumentParser):
@@ -2836,21 +2872,21 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     if not raw_argv:
         retired = RETIRED_AGENT_LABELS.get(args.agent)
         if retired:
-            raise DispatchUsageError(
+            raise ProvenPreWorkerRefusal(
                 f"--agent {args.agent!r} is retired — {retired}"
             )
         if args.agent not in PRESET_AGENTS:
-            raise DispatchUsageError(
+            raise ProvenPreWorkerRefusal(
                 "no worker preset for --agent "
                 f"{args.agent!r} — use --agent codex|grok-code|grok-research|moonshot|cursor|claude with "
                 "--prompt/--prompt-file, or pass a raw worker after `-- <cmd...>`"
             )
         if args.agent in STDIN_PROMPT_AGENTS and not _prompt_requested(args):
-            raise DispatchUsageError(
+            raise ProvenPreWorkerRefusal(
                 f"--agent {args.agent} requires --prompt or --prompt-file; refusing to feed empty stdin"
             )
         if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
-            raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
+            raise ProvenPreWorkerRefusal(f"prompt file not found: {args.prompt_file}")
         _guard_read_only_write_prompt(args)
         _guard_grok_code_research_prompt(args)
     # `--os-sandbox` is a dispatch-level safety claim even when `-- <cmd>`
@@ -6299,6 +6335,16 @@ def _record_queued_status(args, *, project_root: Path, status_json: Path, tail: 
 
 
 DISPATCH_REFUSED_PREFIX = "DISPATCH-REFUSED "
+PROVEN_PRE_WORKER_REFUSAL_PREFIX = "DISPATCH-PRE-WORKER-REFUSED "
+
+
+def _emit_proven_pre_worker_refusal(error: ProvenPreWorkerRefusal) -> None:
+    """Give the parent drain positive proof that carrier input blocked spawn."""
+    print(
+        PROVEN_PRE_WORKER_REFUSAL_PREFIX
+        + json.dumps({"reason": str(error)}, sort_keys=True),
+        flush=True,
+    )
 
 
 def _permanent_sandbox_refusal_payload(
@@ -6347,6 +6393,128 @@ def _permanent_pre_spawn_refusal_reason(
         if reason:
             return reason
     return None
+
+
+def _pre_spawn_launch_failure_reason(proc: subprocess.CompletedProcess) -> str:
+    """Specific, bounded child diagnostic for a retryable pre-spawn failure."""
+    blob = goalflight_output_redact.redact_text(
+        f"{proc.stderr or ''}\n{proc.stdout or ''}"
+    )
+    diagnostic = ""
+    for line in reversed(blob.splitlines()):
+        candidate = line.strip()
+        if not candidate:
+            continue
+        if candidate.startswith("goalflight_dispatch:"):
+            candidate = candidate.split(":", 1)[1].strip()
+        diagnostic = " ".join(candidate.split())[:300]
+        if diagnostic:
+            break
+    if not diagnostic:
+        diagnostic = "no_child_diagnostic"
+    return f"launch_refused_pre_spawn:{proc.returncode}:{diagnostic}"
+
+
+def _proven_pre_worker_refusal_reason(
+    proc: subprocess.CompletedProcess,
+) -> str | None:
+    """Return a child-authenticated carrier defect, never an ambient gate."""
+    blob = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    for line in blob.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(PROVEN_PRE_WORKER_REFUSAL_PREFIX):
+            continue
+        try:
+            payload = json.loads(
+                stripped[len(PROVEN_PRE_WORKER_REFUSAL_PREFIX) :]
+            )
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        reason = str(payload.get("reason") or "").strip()
+        if reason:
+            return f"launch_refused_pre_spawn:{proc.returncode}:{reason[:300]}"
+    return None
+
+
+def _proven_transient_local_pre_spawn(proc: subprocess.CompletedProcess) -> bool:
+    """True only for named ambient gates whose diagnostic we can match positively.
+
+    Absence of DISPATCH-PRE-WORKER-REFUSED is not proof of transience.
+    """
+    blob = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
+    if "wait for a seat" in blob:
+        return True
+    if "label in use" in blob:
+        return True
+    if "queue claim launch marker failed:" in blob:
+        return True
+    return False
+
+
+def _classify_local_pre_spawn_attempt(
+    proc: subprocess.CompletedProcess,
+) -> str:
+    """Classify a local pre-worker child exit into one of the three states.
+
+    A refusal with no recognised prefix resolves to undetermined: it is not
+    the authenticated carrier-defect prefix, and it is not a named ambient
+    gate. Do not spend the strike budget. Do always back off and persist
+    launch_attempt_class so the envelope cannot churn every pass invisibly.
+    """
+    if _proven_pre_worker_refusal_reason(proc):
+        return LAUNCH_ATTEMPT_CLASS_PROVEN_FAILURE
+    if _proven_transient_local_pre_spawn(proc):
+        return LAUNCH_ATTEMPT_CLASS_PROVEN_TRANSIENT
+    return LAUNCH_ATTEMPT_CLASS_UNDETERMINED
+
+
+def _classify_remote_drain_blocked(exc: "_RemoteDrainBlocked") -> str:
+    """Classify a parent-side remote drain block.
+
+    fleet_unavailable / fleet_unreadable / fleet_missing are proven-transient:
+    ambient fleet infrastructure, waiting or repairing the node can make the
+    same envelope launchable.
+
+    Every other _RemoteDrainBlocked — including missing_prompt,
+    unsupported_agent, invalid_base_sha, and generic dispatch_error —
+    resolves to undetermined. The parent exception is not the authenticated
+    child prefix, so it must not spend the strike budget, but it must always
+    back off and persist the class. Treating all remote blocks as "not a
+    failure" was the round-2 inversion of treating all of them as failures.
+    """
+    if getattr(exc, "code", "") in REMOTE_TRANSIENT_DRAIN_CODES:
+        return LAUNCH_ATTEMPT_CLASS_PROVEN_TRANSIENT
+    return LAUNCH_ATTEMPT_CLASS_UNDETERMINED
+
+
+def _apply_launch_attempt_class(
+    lease: "_DrainClaimGuard",
+    attempt_class: str,
+    *,
+    mark_material_burn,
+) -> None:
+    """Bind strike/backoff policy for one classified attempt onto the lease."""
+    lease.attempt_class = attempt_class
+    if attempt_class == LAUNCH_ATTEMPT_CLASS_PROVEN_FAILURE:
+        # Authenticated defect or incomplete pre-worker confirmation.
+        # Always back off: a millisecond refusal still consumed a pass.
+        # Material-burn is telemetry (timing.launch_budget_burns), not the
+        # backoff gate — stamp_backoff is already True.
+        lease.count_launch_failure = True
+        lease.stamp_backoff = True
+        mark_material_burn()
+        return
+    if attempt_class == LAUNCH_ATTEMPT_CLASS_UNDETERMINED:
+        # Could not prove failure or transience. Do not spend strikes on
+        # an unproved failure; do not retry every pass with no cursor.
+        lease.count_launch_failure = False
+        lease.stamp_backoff = True
+        mark_material_burn()
+        return
+    lease.count_launch_failure = False
+    mark_material_burn()
 
 
 def _record_unsupported_sandbox_rejection(
@@ -6933,6 +7101,7 @@ def _drain_on_submit(args, queue_path: Path) -> None:
 _DRAIN_CONFIRMED_LAUNCH_REASONS = frozenset({
     "launched_carrier_cleanup_pending",
     "worker_record_present_carrier_cleanup_pending",
+    "worker_record_present_after_launch_timeout_carrier_cleanup_pending",
 })
 
 
@@ -10812,6 +10981,12 @@ def _restore_claim_if_incomplete(
             return None, None
         if classify_reconciliation_admission(fresh, time.time(), stale_s=0.0) is not txn.admission:
             return None, None
+        # Copy in-memory attempt cursor onto the claim snapshot restore will
+        # publish. Stamp's ledger+carrier writes are a second durable copy;
+        # this is the copy that survives when both of those throw.
+        for key in LAUNCH_ATTEMPT_CURSOR_KEYS:
+            if key in entry:
+                fresh[key] = entry[key]
         restored, decision = _commit_restore_transaction(
             txn,
             claim,
@@ -12152,6 +12327,11 @@ def _ledger_request_entry(record: dict) -> dict:
             "started_at": record.get("started_at"),
         }
     )
+    # Launch-attempt state is ledger-durable so carrier-loss repair cannot
+    # silently reset either the terminal budget or its scheduling backoff.
+    for key in LAUNCH_ATTEMPT_CURSOR_KEYS:
+        if key in record:
+            entry[key] = record[key]
     return entry
 
 
@@ -14381,7 +14561,9 @@ class _DrainClaimGuard:
         self.launch_attempted = False
         self.release_reason = "claim_released_pre_worker"
         self.stamp_backoff = False
-        self.fail_reason = "launch_budget_burn"
+        self.count_launch_failure = False
+        self.attempt_class: str | None = None
+        self.fail_reason = "launch_attempt_failed_unclassified"
 
     def consume(
         self,
@@ -14472,6 +14654,57 @@ class _DrainClaimGuard:
                 }
             )
             return False
+        if self.launch_attempted and self.count_launch_failure:
+            failure_count = _next_launch_failure_count(
+                observed,
+                self.entry,
+                _find_dispatch_record(self.dispatch_id) or {},
+            )
+            if failure_count >= MAX_DRAIN_PRE_WORKER_FAILURES:
+                terminal_reason = (
+                    f"launch_attempt_limit_exceeded:{self.fail_reason}"
+                )
+                committed, terminal_detail = _terminalize_pre_worker_launch_failure(
+                    self.claim,
+                    observed,
+                    reason=terminal_reason,
+                    failure_count=failure_count,
+                )
+                if committed:
+                    self.acc["failed"] += 1
+                    self.acc["details"].append(
+                        {
+                            "dispatch_id": self.dispatch_id,
+                            "state": "failed",
+                            "reason": terminal_reason,
+                            "launch_pre_worker_failure_count": failure_count,
+                        }
+                    )
+                else:
+                    self.acc["pending_claims"] += 1
+                    self.acc["failed"] += 1
+                    self.acc["details"].append(
+                        {
+                            "dispatch_id": self.dispatch_id,
+                            "state": "claimed",
+                            "reason": terminal_detail,
+                            "launch_pre_worker_failure_count": failure_count,
+                        }
+                    )
+                return False
+        # Apply the attempt cursor onto in-memory entry before restore so the
+        # restore write carries it. Stamp's later ledger+carrier writes can
+        # both throw; without this, the increment never lands on disk.
+        stamp_fields = None
+        if self.launch_attempted:
+            stamp_fields = _apply_launch_attempt_cursor(
+                self.claim,
+                self.entry,
+                backoff=self.stamp_backoff,
+                failed=self.count_launch_failure,
+                fail_reason=self.fail_reason,
+                attempt_class=self.attempt_class,
+            )
         restored, decision = _restore_claim_if_incomplete(
             self.claim,
             self.entry,
@@ -14484,12 +14717,12 @@ class _DrainClaimGuard:
                 self.acc["pending_claims"] += 1
             return False
         if restored is None:
-            if self.launch_attempted:
-                _stamp_launch_attempt(
+            stamp_error = None
+            if stamp_fields is not None:
+                stamp_error = _persist_launch_attempt_cursor(
                     self.claim,
                     self.entry,
-                    backoff=self.stamp_backoff,
-                    fail_reason=self.fail_reason,
+                    stamp_fields,
                 )
             uncommitted = (
                 "capacity_restore_uncommitted"
@@ -14500,20 +14733,23 @@ class _DrainClaimGuard:
             )
             self.acc["pending_claims"] += 1
             self.acc["failed"] += 1
-            self.acc["details"].append(
-                {
-                    "dispatch_id": self.dispatch_id,
-                    "state": "claimed",
-                    "reason": uncommitted,
-                }
-            )
+            detail = {
+                "dispatch_id": self.dispatch_id,
+                "state": "claimed",
+                "reason": uncommitted,
+            }
+            if stamp_error:
+                detail["launch_attempt_stamp_error"] = stamp_error
+            if self.attempt_class:
+                detail["launch_attempt_class"] = self.attempt_class
+            self.acc["details"].append(detail)
             return False
-        if self.launch_attempted:
-            _stamp_launch_attempt(
+        stamp_error = None
+        if stamp_fields is not None:
+            stamp_error = _persist_launch_attempt_cursor(
                 restored,
                 self.entry,
-                backoff=self.stamp_backoff,
-                fail_reason=self.fail_reason,
+                stamp_fields,
             )
         _restore_queued_record_from_entry(self.entry, restored)
         detail = {
@@ -14523,6 +14759,11 @@ class _DrainClaimGuard:
         }
         if self.entry.get("launch_backoff_until"):
             detail["launch_backoff_until"] = self.entry.get("launch_backoff_until")
+        if self.attempt_class:
+            detail["launch_attempt_class"] = self.attempt_class
+        if stamp_error:
+            detail["launch_attempt_stamp_error"] = stamp_error
+            self.acc["failed"] += 1
         self.acc["left_queued"] += 1
         self.acc["details"].append(detail)
         return False
@@ -14618,9 +14859,12 @@ def _launch_attempt_consumed_budget(
 ) -> bool:
     """True when this attempt used a material slice of the pass launch budget.
 
-    Discriminator is budget burn, not exception type. Fast refusals (missing
-    argv, instant rc=2) leave leftover budget for the next entry this pass
-    and must not stamp a 60s backoff — that would park capacity-waiting work.
+    Used only for proven-transient gates (seat, controller, claim-marker
+    OSError, fleet infrastructure, capacity). Fast transients must not stamp
+    a 60s backoff — that would park work a free seat could launch in seconds.
+
+    Proven-failure and undetermined attempts always back off even when this
+    returns False: a millisecond refusal still consumed a drain pass.
 
     Derivation of material_s:
       production pass_budget ≈ DRAIN_LAUNCH_CONFIRM_S (45s)
@@ -14628,7 +14872,7 @@ def _launch_attempt_consumed_budget(
       test pass_budget 0.40s
         0.25 * 0.40 = 0.10; min(1.0, max(0.05, 0.10)) = 0.10s
     A handshake that fails after ≥1s in production (or ≥0.10s in the probe-D
-    budget) is a burn; a 20ms argv error is not. remaining_after_s <= 0 is
+    budget) is a burn; a 20ms seat wait is not. remaining_after_s <= 0 is
     always a burn: nothing else fits this pass.
     """
     if remaining_after_s <= 0:
@@ -14650,23 +14894,30 @@ def _mark_launch_budget_burn_if_material(
     if not _launch_attempt_consumed_budget(elapsed_s, pass_budget_s, remaining_after_s):
         return
     lease.stamp_backoff = True
-    lease.fail_reason = "launch_budget_burn"
     timing["launch_budget_burns"] = int(timing.get("launch_budget_burns") or 0) + 1
 
 
-def _stamp_launch_attempt(
+def _next_launch_failure_count(*entries: dict) -> int:
+    return max(
+        (
+            int(entry.get("launch_pre_worker_failure_count") or 0)
+            for entry in entries
+            if isinstance(entry, dict)
+        ),
+        default=0,
+    ) + 1
+
+
+def _apply_launch_attempt_cursor(
     claim: Path,
     entry: dict,
     *,
     backoff: bool = False,
+    failed: bool = False,
     fail_reason: str | None = None,
-) -> None:
-    """Persist the attempt cursor, and optional backoff, onto the envelope.
-
-    Distinct from not_before: usage-probe re-derivation must not clear these.
-    last_attempted_at is the forward-progress cursor (never-attempted first).
-    Backoff is the next-pass skip for a material budget burn.
-    """
+    attempt_class: str | None = None,
+) -> dict:
+    """Mutate entry with this attempt's cursor. Returns fields to persist. No I/O."""
     try:
         observed = json.loads(claim.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError):
@@ -14676,23 +14927,184 @@ def _stamp_launch_attempt(
     attempted_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds")
     observed["launch_last_attempted_at"] = attempted_at
     entry["launch_last_attempted_at"] = attempted_at
+    dispatch_id = str(observed.get("dispatch_id") or entry.get("dispatch_id") or "")
+    record = _find_dispatch_record(dispatch_id) if dispatch_id else None
+    count = max(
+        int(observed.get("launch_pre_worker_failure_count") or 0),
+        int(entry.get("launch_pre_worker_failure_count") or 0),
+        int((record or {}).get("launch_pre_worker_failure_count") or 0),
+    )
+    if fail_reason:
+        observed["launch_fail_reason"] = fail_reason
+        entry["launch_fail_reason"] = fail_reason
+    if failed:
+        count += 1
+        reason = fail_reason or "launch_attempt_failed_unclassified"
+        observed["launch_pre_worker_failure_count"] = count
+        observed["launch_fail_reason"] = reason
+        entry["launch_pre_worker_failure_count"] = count
+        entry["launch_fail_reason"] = reason
     if backoff:
-        count = int(
-            observed.get("launch_timeout_count") or entry.get("launch_timeout_count") or 0
-        ) + 1
-        delay_s = _launch_backoff_delay_s(count)
+        backoff_count = min(
+            MAX_LAUNCH_BACKOFF_COUNT,
+            max(
+                int(observed.get("launch_backoff_count") or 0),
+                int(entry.get("launch_backoff_count") or 0),
+                int((record or {}).get("launch_backoff_count") or 0),
+            )
+            + 1,
+        )
+        delay_s = _launch_backoff_delay_s(backoff_count)
         until = (
             dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delay_s)
         ).isoformat(timespec="seconds")
-        reason = fail_reason or "launch_budget_burn"
-        observed["launch_timeout_count"] = count
+        reason = fail_reason or "launch_backoff_unclassified"
+        observed["launch_backoff_count"] = backoff_count
         observed["launch_backoff_until"] = until
         observed["launch_fail_reason"] = reason
-        entry["launch_timeout_count"] = count
+        entry["launch_backoff_count"] = backoff_count
         entry["launch_backoff_until"] = until
         entry["launch_fail_reason"] = reason
-    with contextlib.suppress(OSError):
-        _write_json_atomic(claim, observed)
+    if attempt_class:
+        observed["launch_attempt_class"] = attempt_class
+        entry["launch_attempt_class"] = attempt_class
+        if attempt_class == LAUNCH_ATTEMPT_CLASS_UNDETERMINED:
+            undetermined = min(
+                MAX_LAUNCH_BACKOFF_COUNT,
+                max(
+                    int(observed.get("launch_undetermined_count") or 0),
+                    int(entry.get("launch_undetermined_count") or 0),
+                    int((record or {}).get("launch_undetermined_count") or 0),
+                )
+                + 1,
+            )
+            observed["launch_undetermined_count"] = undetermined
+            entry["launch_undetermined_count"] = undetermined
+    return {
+        key: observed[key]
+        for key in LAUNCH_ATTEMPT_CURSOR_KEYS
+        if key in observed
+    }
+
+
+def _persist_launch_attempt_cursor(
+    claim: Path,
+    entry: dict,
+    stamp_fields: dict,
+) -> str | None:
+    """Write already-applied cursor fields to ledger and carrier."""
+    dispatch_id = str(entry.get("dispatch_id") or "")
+    errors: list[str] = []
+    try:
+        with goalflight_ledger.StateLock():
+            durable_record = _find_dispatch_record(dispatch_id)
+            if durable_record is None:
+                errors.append("ledger_missing")
+            else:
+                durable_record.update(stamp_fields)
+                goalflight_ledger.write_record(durable_record)
+    except OSError as exc:
+        errors.append(f"ledger:{type(exc).__name__}")
+    try:
+        with _queue_mutation_lock(claim.parent):
+            current = json.loads(claim.read_text(encoding="utf-8"))
+            if not isinstance(current, dict):
+                raise ValueError("carrier payload is not an object")
+            if str(current.get("dispatch_id") or "") != dispatch_id:
+                raise ValueError("carrier dispatch changed")
+            current_token = current.get("queue_launch_token")
+            expected_token = entry.get("queue_launch_token")
+            if current_token and expected_token and current_token != expected_token:
+                raise ValueError("carrier launch token changed")
+            current.update(stamp_fields)
+            _write_json_atomic(claim, current)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        errors.append(f"carrier:{type(exc).__name__}")
+    if errors:
+        return "launch_attempt_stamp_failed:" + ",".join(errors)
+    return None
+
+
+def _stamp_launch_attempt(
+    claim: Path,
+    entry: dict,
+    *,
+    backoff: bool = False,
+    failed: bool = False,
+    fail_reason: str | None = None,
+    attempt_class: str | None = None,
+) -> str | None:
+    """Persist the attempt cursor, failure count, and optional backoff.
+
+    Distinct from not_before: usage-probe re-derivation must not clear these.
+    last_attempted_at is the forward-progress cursor (never-attempted first).
+    Backoff is the next-pass skip. Proven-failure and undetermined attempts
+    always back off, even when fast; proven-transient / capacity deferrals
+    back off only on a material budget burn so a free seat is not parked.
+    """
+    stamp_fields = _apply_launch_attempt_cursor(
+        claim,
+        entry,
+        backoff=backoff,
+        failed=failed,
+        fail_reason=fail_reason,
+        attempt_class=attempt_class,
+    )
+    return _persist_launch_attempt_cursor(claim, entry, stamp_fields)
+
+
+def _terminalize_pre_worker_launch_failure(
+    claim: Path,
+    entry: dict,
+    *,
+    reason: str,
+    failure_count: int,
+) -> tuple[bool, str]:
+    """Commit a proven pre-worker launch failure to ledger, status, and carrier.
+
+    A missing ledger row must not leave the carrier queued: that retries a
+    proven refusal forever. Fail the envelope from the claim alone, then
+    report the ledger gap on the detail.
+    """
+    dispatch_id = str(entry.get("dispatch_id") or claim.stem)
+    ledger_error: str | None = None
+    try:
+        with goalflight_ledger.StateLock():
+            durable_record = _find_dispatch_record(dispatch_id)
+            if durable_record is None:
+                ledger_error = "ledger_missing"
+            else:
+                durable_record["launch_pre_worker_failure_count"] = int(failure_count)
+                durable_record["launch_fail_reason"] = reason
+                goalflight_ledger.write_record(durable_record)
+        if ledger_error is None:
+            _finish_ledger(
+                dispatch_id,
+                "failed",
+                reason,
+                worker_still_alive=False,
+            )
+    except (OSError, RuntimeError, ValueError) as exc:
+        ledger_error = type(exc).__name__
+
+    with _queue_mutation_lock(claim.parent):
+        try:
+            fresh = json.loads(claim.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            fresh = dict(entry)
+        if fresh.get("queue_launch_token") != entry.get("queue_launch_token"):
+            return False, "launch_failure_terminal_claim_changed"
+        fresh["launch_pre_worker_failure_count"] = int(failure_count)
+        fresh["launch_fail_reason"] = reason
+        committed = _mark_claim_failed_locked(claim, fresh, reason=reason)
+    if committed:
+        _write_reconciled_terminal_status(fresh, None)
+        if ledger_error:
+            return True, f"{reason}:terminal_ledger_{ledger_error}"
+        return True, reason
+    if ledger_error:
+        return False, f"launch_failure_terminal_commit_failed:{ledger_error}"
+    return False, "launch_failure_terminal_carrier_cleanup_pending"
 
 
 def _drain_capacity_slots() -> dict:
@@ -15179,14 +15591,15 @@ def _drain_queue_once(args) -> dict:
                 if isinstance(_scan_entry, dict)
                 else None
             )
-            details.append(
-                {
-                    "dispatch_id": dispatch_id,
-                    "state": "queued",
-                    "reason": "launch_backoff",
-                    "launch_backoff_until": until,
-                }
-            )
+            detail = {
+                "dispatch_id": dispatch_id,
+                "state": "queued",
+                "reason": "launch_backoff",
+                "launch_backoff_until": until,
+            }
+            if isinstance(_scan_entry, dict) and _scan_entry.get("launch_attempt_class"):
+                detail["launch_attempt_class"] = _scan_entry.get("launch_attempt_class")
+            details.append(detail)
             holds["launch_backoff"]["count"] = int(holds["launch_backoff"]["count"]) + 1
             if until and (
                 holds["launch_backoff"].get("until") is None
@@ -15376,19 +15789,59 @@ def _drain_queue_once(args) -> dict:
                     )
             except _RemoteDrainBlocked as exc:
                 lease.release_reason = f"remote_blocked:{exc.code}:{exc}"
-                _mark_launch_budget_burn_if_material(
+                lease.fail_reason = lease.release_reason
+                _apply_launch_attempt_class(
                     lease,
-                    timing,
-                    attempt_started=attempt_started,
-                    pass_budget_s=pass_budget_s,
-                    launch_deadline=launch_deadline,
+                    _classify_remote_drain_blocked(exc),
+                    mark_material_burn=lambda: _mark_launch_budget_burn_if_material(
+                        lease,
+                        timing,
+                        attempt_started=attempt_started,
+                        pass_budget_s=pass_budget_s,
+                        launch_deadline=launch_deadline,
+                    ),
                 )
                 continue
             except subprocess.TimeoutExpired:
                 timing["launch_timeouts"] += 1
+                ledger_confirmed = _dispatch_has_worker_record(
+                    dispatch_id,
+                    queue_launch_token=launch_token,
+                )
+                if ledger_confirmed:
+                    carrier_cleanup = _positive_live_carrier_cleanup(
+                        claim,
+                        entry,
+                        queue_dir,
+                        worker_record_sufficient=True,
+                        stale_s=args.claim_stale_s,
+                    )
+                    if carrier_cleanup == "pending":
+                        _alert_launched_carrier_pending(dispatch_id, where="drain")
+                        lease.consume(
+                            state="claimed",
+                            reason="worker_record_present_after_launch_timeout_carrier_cleanup_pending",
+                            pending=True,
+                        )
+                    else:
+                        lease.consume(
+                            state="launched",
+                            reason="worker_record_present_after_launch_timeout",
+                            launched=True,
+                        )
+                    continue
                 lease.release_reason = "launch_timeout_pending_ledger"
-                lease.stamp_backoff = True
-                lease.fail_reason = "launch_timeout"
+                # TimeoutExpired kills the launcher. With no token-matched
+                # worker record, __exit__ will spend this budget only if the
+                # launch-owned claim also remains provably pre-worker.
+                lease.fail_reason = (
+                    "launch_confirmation_timeout:no_token_matched_worker_record"
+                )
+                _apply_launch_attempt_class(
+                    lease,
+                    LAUNCH_ATTEMPT_CLASS_PROVEN_FAILURE,
+                    mark_material_burn=lambda: None,
+                )
                 continue
             stdout_launched = proc.returncode == 0 and "DISPATCH-LAUNCHED " in proc.stdout
             # Drain launch accounting: a token-matched worker_pid means launch occurred
@@ -15432,12 +15885,17 @@ def _drain_queue_once(args) -> dict:
                 continue
             if capacity_reason:
                 lease.release_reason = capacity_reason
-                _mark_launch_budget_burn_if_material(
+                lease.fail_reason = capacity_reason
+                _apply_launch_attempt_class(
                     lease,
-                    timing,
-                    attempt_started=attempt_started,
-                    pass_budget_s=pass_budget_s,
-                    launch_deadline=launch_deadline,
+                    LAUNCH_ATTEMPT_CLASS_PROVEN_TRANSIENT,
+                    mark_material_burn=lambda: _mark_launch_budget_burn_if_material(
+                        lease,
+                        timing,
+                        attempt_started=attempt_started,
+                        pass_budget_s=pass_budget_s,
+                        launch_deadline=launch_deadline,
+                    ),
                 )
                 continue
             if stdout_launched and not ledger_confirmed:
@@ -15478,32 +15936,47 @@ def _drain_queue_once(args) -> dict:
             except (OSError, json.JSONDecodeError):
                 observed_claim = None
             if (
-                proc.returncode != 0
-                and isinstance(observed_claim, dict)
+                isinstance(observed_claim, dict)
                 and observed_claim.get("queue_launch_token") == launch_token
                 and _entry_pre_worker(observed_claim)
             ):
-                permanent_reason = _permanent_pre_spawn_refusal_reason(proc)
-                if permanent_reason:
-                    # Inert flag combo / unsupported sandbox: waiting cannot
-                    # make it valid. Restore-to-queued is the silent stick.
-                    committed = _mark_claim_failed(
-                        claim, entry, reason=permanent_reason
+                if proc.returncode != 0:
+                    permanent_reason = _permanent_pre_spawn_refusal_reason(proc)
+                    if permanent_reason:
+                        # Inert flag combo / unsupported sandbox: waiting cannot
+                        # make it valid. Restore-to-queued is the silent stick.
+                        committed = _mark_claim_failed(
+                            claim, entry, reason=permanent_reason
+                        )
+                        lease.consume(
+                            state="failed" if committed else "claimed",
+                            reason=permanent_reason,
+                            failed=True,
+                            pending=not committed,
+                        )
+                        continue
+                    diagnostic = _pre_spawn_launch_failure_reason(proc)
+                    lease.fail_reason = diagnostic
+                    lease.release_reason = (
+                        f"launch_refused_pre_spawn:{proc.returncode}"
                     )
-                    lease.consume(
-                        state="failed" if committed else "claimed",
-                        reason=permanent_reason,
-                        failed=True,
-                        pending=not committed,
+                    attempt_class = _classify_local_pre_spawn_attempt(proc)
+                else:
+                    lease.fail_reason = (
+                        "launch_confirmation_missing:exit_0_no_worker_record"
                     )
-                    continue
-                lease.release_reason = f"launch_refused_pre_spawn:{proc.returncode}"
-                _mark_launch_budget_burn_if_material(
+                    lease.release_reason = lease.fail_reason
+                    attempt_class = LAUNCH_ATTEMPT_CLASS_PROVEN_FAILURE
+                _apply_launch_attempt_class(
                     lease,
-                    timing,
-                    attempt_started=attempt_started,
-                    pass_budget_s=pass_budget_s,
-                    launch_deadline=launch_deadline,
+                    attempt_class,
+                    mark_material_burn=lambda: _mark_launch_budget_burn_if_material(
+                        lease,
+                        timing,
+                        attempt_started=attempt_started,
+                        pass_budget_s=pass_budget_s,
+                        launch_deadline=launch_deadline,
+                    ),
                 )
                 continue
             lease.release_reason = f"launch_failed_pending_ledger:{proc.returncode}"
@@ -15752,7 +16225,7 @@ def _normalize_acp_agent(args) -> None:
     }
     args.agent = aliases.get(agent, agent)
     if args.agent not in {"codex-acp", "grok-acp", "cursor", "claude"}:
-        raise DispatchUsageError(
+        raise ProvenPreWorkerRefusal(
             "--shape acp v1 supports --agent codex-acp, grok-acp, cursor, or "
             f"claude-acp; got {agent!r}"
         )
@@ -17170,9 +17643,9 @@ def main(argv: list[str] | None = None) -> int:
             _normalize_acp_agent(args)
             _apply_max_idle_default(args)
             if not _prompt_requested(args):
-                raise DispatchUsageError("--shape acp requires --prompt or --prompt-file")
+                raise ProvenPreWorkerRefusal("--shape acp requires --prompt or --prompt-file")
             if args.prompt_file and not Path(args.prompt_file).expanduser().exists():
-                raise DispatchUsageError(f"prompt file not found: {args.prompt_file}")
+                raise ProvenPreWorkerRefusal(f"prompt file not found: {args.prompt_file}")
             _validate_os_sandbox_conflict(args)
             _validate_agent_os_sandbox(args)
             _validate_os_sandbox_boundary(args)
@@ -17251,6 +17724,10 @@ def main(argv: list[str] | None = None) -> int:
             except DispatchUsageError as record_error:
                 print(f"goalflight_dispatch: {record_error}", file=sys.stderr)
                 return 64
+        except ProvenPreWorkerRefusal as e:
+            _emit_proven_pre_worker_refusal(e)
+            print(f"goalflight_dispatch: {e}", file=sys.stderr)
+            return 64
         except DispatchUsageError as e:
             print(f"goalflight_dispatch: {e}", file=sys.stderr)
             return 64
@@ -17268,6 +17745,10 @@ def main(argv: list[str] | None = None) -> int:
         except DispatchUsageError as record_error:
             print(f"goalflight_dispatch: {record_error}", file=sys.stderr)
             return 64
+    except ProvenPreWorkerRefusal as e:
+        _emit_proven_pre_worker_refusal(e)
+        print(f"goalflight_dispatch: {e}", file=sys.stderr)
+        return 64
     except DispatchUsageError as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64
