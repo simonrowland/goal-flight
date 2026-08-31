@@ -142,6 +142,82 @@ def test_cmd_listen_rings_when_watchdog_claim_creation_is_unknown(
     assert dead["payload"]["claim_state"] == "unknown"
 
 
+def test_cmd_listen_rings_when_waiter_probe_is_unavailable_and_watchdog_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An indeterminate sibling must not silence a missing watchdog lock."""
+    for key, value in isolated_machine_env(tmp_path).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("GOALFLIGHT_TEST_MODE", "1")
+    monkeypatch.setenv("GOALFLIGHT_WAKE_ENTRY_POLL_S", "0")
+    monkeypatch.setenv("GOALFLIGHT_TEST_LISTENER_START_TOKEN", "test-listener-token")
+    monkeypatch.setattr(wake, "_process_listing", lambda **_kwargs: [])
+    project = tmp_path / "project"
+    project.mkdir()
+    authority = journal.open_or_create_journal(project)
+    claimed = authority.claim_or_renew_lease(
+        "ctl", principal={"principal_id": "unavailable-waiters-missing-watchdog"}
+    )
+    assert claimed.committed and claimed.value is not None
+    lease = claimed.value
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=120,
+        dead_after_s=360,
+    )
+    monkeypatch.setattr(
+        messages,
+        "_wake_recovery_action",
+        lambda *_args, **_kwargs: {"kind": "arm-component"},
+    )
+    monkeypatch.setattr(
+        wake,
+        "coverage_status",
+        lambda *_args, **_kwargs: {
+            "wake_mode": "persistent",
+            "reason": "waiter-probe-unavailable",
+            "watchdog": {"required": True, "state": "missing", "observed": 0},
+            "live_waiters": None,
+            "target_waiters": 4,
+            "missing_components": ["watchdog"],
+        },
+    )
+    args = SimpleNamespace(
+        project_root=str(project),
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        poll_secs=0.01,
+        listener_slots=1,
+        timeout_s=1,
+        json=True,
+        report_pending=False,
+        watch_follow=False,
+    )
+    with wake.register_lease_holder(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    ):
+        code = messages.cmd_listen(args)
+
+    records = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("{")
+    ]
+    dead = next(
+        record
+        for record in records
+        if record.get("payload", {}).get("type") == "watchdog-dead"
+    )
+    assert code == 0
+    assert dead["payload"]["type"] == "watchdog-dead"
+
+
 @pytest.mark.parametrize(
     "label,nonce",
     [("", "n"), ("ctl", ""), ("   ", "n"), ("ctl", "   ")],

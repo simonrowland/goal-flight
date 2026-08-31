@@ -2386,6 +2386,34 @@ def live_waiters(
         os.close(directory_fd)
 
 
+def _watchdog_lock_state(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str | None,
+) -> str:
+    """Return live, missing, or unknown for this generation's watchdog lock.
+
+    The aggregate waiter probe may be UNKNOWN because a sibling listener
+    identity is unreadable. The watchdog lock is a separate path: probe it
+    alone rather than omitting the watchdog key or copying the aggregate
+    unknown onto a definite missing/live claim.
+    """
+    nonce = str(lease_nonce or "").strip()
+    label = str(controller_label or "").strip()
+    if not nonce or not label:
+        return "unknown"
+    observed = live_waiters(
+        project_root,
+        controller_label=label,
+        generation_key=nonce,
+        kinds={WATCHDOG_KIND},
+    )
+    if observed is None:
+        return "unknown"
+    return "live" if observed else "missing"
+
+
 def lease_holder_alive(
     project_root: Path | str,
     *,
@@ -2473,7 +2501,7 @@ def coverage_status(
         target_waiters = (
             persistent_wake_target() if persistent else listener_slot_count()
         )
-        return {
+        payload: dict[str, object] = {
             "covered": False,
             "reason": "waiter-probe-unavailable",
             "live_waiters": None,
@@ -2489,8 +2517,26 @@ def coverage_status(
                     else "not-applicable"
                 ),
             },
-            **({"wake_mode": "persistent"} if persistent else {}),
         }
+        if persistent:
+            payload["wake_mode"] = "persistent"
+            watchdog_state = _watchdog_lock_state(
+                project_root,
+                controller_label=str(controller_label),
+                lease_nonce=lease_nonce,
+            )
+            payload["watchdog"] = {
+                "required": True,
+                "state": watchdog_state,
+                "observed": (
+                    None
+                    if watchdog_state == "unknown"
+                    else int(watchdog_state == "live")
+                ),
+            }
+            if watchdog_state == "missing":
+                payload["missing_components"] = ["watchdog"]
+        return payload
     monitor_waiters = [row for row in waiters if row.kind == MONITOR_KIND]
     portable_waiters = [row for row in waiters if row.kind == "listener"]
     watchdog_waiters = [row for row in waiters if row.kind == WATCHDOG_KIND]
@@ -2777,9 +2823,12 @@ def coverage_rearm_commands(
 ) -> list[str]:
     """Return exact tracked-task commands for the missing wake components."""
     live = status.get("live_waiters")
-    target = int(status.get("target_waiters") or listener_slot_count())
-    missing = max(0, target - (live if isinstance(live, int) else 0))
     if status.get("wake_mode") != "persistent":
+        if not isinstance(live, int):
+            # UNKNOWN depth is not a zero-live shortfall.
+            return []
+        target = int(status.get("target_waiters") or listener_slot_count())
+        missing = max(0, target - live)
         command = listener_start_command(
             project_root,
             controller_label=controller_label,

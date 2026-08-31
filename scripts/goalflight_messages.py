@@ -7917,6 +7917,14 @@ def cmd_listen(args) -> int:
                 if isinstance(watchdog_status, dict)
                 else ""
             )
+            if (
+                witness_status.get("wake_mode") == "persistent"
+                and watchdog_state not in {"live", "missing", "unknown"}
+            ):
+                # Absent or unrecognised key is UNKNOWN, not "not missing".
+                # coverage_status publishes missing when the watchdog lock
+                # itself is absent even if sibling waiters are indeterminate.
+                watchdog_state = "unknown"
             if watchdog_state == "live":
                 watchdog_observed_live = True
             elif (

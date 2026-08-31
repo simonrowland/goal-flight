@@ -2170,6 +2170,11 @@ class RealHost:
             )
         except (OSError, RuntimeError, ValueError, TypeError):
             return
+        if waiters is None:
+            # UNKNOWN is not "no live waiters": do not mark children armed
+            # without a determinate pid match, and do not treat the set as
+            # empty.
+            return
         if not waiters:
             return
         pids = {int(row.pid) for row in waiters}
@@ -2446,11 +2451,10 @@ class RealHost:
         if fdmap and self.stdout_detector_status().failure is None:
             while True:
                 try:
-                    events_ready = poller.poll(
-                        math.ceil(
-                            max(0.0, deadline - time.monotonic()) * 1000.0
-                        )
+                    poll_timeout_ms = math.ceil(
+                        max(0.0, deadline - time.monotonic()) * 1000.0
                     )
+                    events_ready = poller.poll(poll_timeout_ms)
                 except (OSError, ValueError) as exc:
                     policy, error_name = _detector_error_policy(exc)
                     if policy == "retry":
@@ -2530,10 +2534,26 @@ class RealHost:
                         error_name,
                     )
                     break
-                # Returning from poll is the only evidence that the readiness
-                # service recovered; clear the consecutive-failure window now.
-                self._stdout_poll_transient_started = None
-                self.report_stdout_detector("poll", "available")
+                # Reset policy: only a blocking poll (timeout > 0) that
+                # returns without EAGAIN may clear the consecutive-failure
+                # window. This poller is multiplexed across stdout, children,
+                # and the signal pipe, so a poll(0) that returns events is
+                # still only instantaneous readiness — often of a different
+                # fd — not proof the blocking poll recovered. poll(0) must
+                # not reset a budget opened by positive-timeout EAGAIN and
+                # must not be published as definite available. Events from
+                # poll(0) are still processed below.
+                poll_clears_budget = poll_timeout_ms > 0
+                if poll_clears_budget:
+                    self._stdout_poll_transient_started = None
+                    self.report_stdout_detector("poll", "available")
+                else:
+                    self.report_stdout_detector(
+                        "poll",
+                        "unknown",
+                        "zero-timeout poll is not evidence the blocking "
+                        "readiness service recovered",
+                    )
                 ready = [
                     fd
                     for fd, events in events_ready
