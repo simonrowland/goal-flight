@@ -2064,6 +2064,10 @@ class RealHost:
         self._children: list[RealChild] = []
         self._stop = False
         self._stdout_detector = _PeerLossDetector()
+        # Consecutive poll EAGAIN is one host-level outage, even when shorter
+        # semantic waits return to the supervisor loop. Only a successful
+        # poll clears this timestamp; loop turnover is not detector recovery.
+        self._stdout_poll_transient_started: float | None = None
         self._stdout_pending: tuple[object, str, bytes, int, int] | None = None
         self._stdout_needs_delimiter = False
         self._stdout_recovery_completion = b""
@@ -2440,8 +2444,6 @@ class RealHost:
             remaining = 0.0
         ready: list[int] = []
         if fdmap and self.stdout_detector_status().failure is None:
-            transient_started: float | None = None
-            transient_deadline: float | None = None
             while True:
                 try:
                     events_ready = poller.poll(
@@ -2471,15 +2473,33 @@ class RealHost:
                                 "controlling stdout peer-gone probe confirmed closure",
                             )
                             break
-                        if transient_started is None:
-                            transient_started = now
-                            transient_deadline = (
-                                now + TRANSIENT_DETECTOR_RETRY_BUDGET_S
+                        if self._stdout_poll_transient_started is None:
+                            self._stdout_poll_transient_started = now
+                        transient_started = self._stdout_poll_transient_started
+                        transient_deadline = (
+                            transient_started
+                            + TRANSIENT_DETECTOR_RETRY_BUDGET_S
+                        )
+                        # The host-level failure window outranks this call's
+                        # semantic deadline. Thus continuous EAGAIN becomes
+                        # terminal after the budget plus retry/scheduler delay,
+                        # however often coverage wakes turn the loop over.
+                        if now >= transient_deadline:
+                            elapsed = now - transient_started
+                            self.report_stdout_detector(
+                                "poll",
+                                "unavailable",
+                                "stdout poll failed persistently for "
+                                f"{elapsed:.3f}s under consecutive {error_name} "
+                                f"with no peer-gone evidence: {exc}",
+                                error_name,
                             )
+                            break
                         # The semantic wait itself is complete. Preserve the
                         # inconclusive detector observation and retry it on the
-                        # next supervisor iteration; an expired zero-time wait
-                        # is not evidence that the detector is unavailable.
+                        # next supervisor iteration without resetting the
+                        # host-level window; an expired zero-time wait is not
+                        # evidence that the detector recovered.
                         if now >= deadline:
                             self.report_stdout_detector(
                                 "poll",
@@ -2487,34 +2507,22 @@ class RealHost:
                                 "stdout poll temporarily unavailable at wait deadline",
                             )
                             break
-                        assert transient_deadline is not None
-                        if now < transient_deadline:
-                            elapsed = now - transient_started
-                            self.report_stdout_detector(
-                                "poll",
-                                "unknown",
-                                "stdout poll temporarily unavailable; retrying "
-                                f"({elapsed:.3f}s/"
-                                f"{TRANSIENT_DETECTOR_RETRY_BUDGET_S:.3f}s)",
-                            )
-                            time.sleep(
-                                min(
-                                    TRANSIENT_DETECTOR_RETRY_S,
-                                    max(0.0, transient_deadline - now),
-                                    max(0.0, deadline - now),
-                                )
-                            )
-                            continue
                         elapsed = now - transient_started
                         self.report_stdout_detector(
                             "poll",
-                            "unavailable",
-                            "stdout poll failed persistently for "
-                            f"{elapsed:.3f}s under consecutive {error_name} "
-                            f"with no peer-gone evidence: {exc}",
-                            error_name,
+                            "unknown",
+                            "stdout poll temporarily unavailable; retrying "
+                            f"({elapsed:.3f}s/"
+                            f"{TRANSIENT_DETECTOR_RETRY_BUDGET_S:.3f}s)",
                         )
-                        break
+                        time.sleep(
+                            min(
+                                TRANSIENT_DETECTOR_RETRY_S,
+                                max(0.0, transient_deadline - now),
+                                max(0.0, deadline - now),
+                            )
+                        )
+                        continue
                     self.report_stdout_detector(
                         "poll",
                         "unavailable",
@@ -2522,6 +2530,9 @@ class RealHost:
                         error_name,
                     )
                     break
+                # Returning from poll is the only evidence that the readiness
+                # service recovered; clear the consecutive-failure window now.
+                self._stdout_poll_transient_started = None
                 self.report_stdout_detector("poll", "available")
                 ready = [
                     fd

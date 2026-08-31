@@ -3237,34 +3237,42 @@ def test_real_host_retries_transient_poll_eagain_until_success(
 ) -> None:
     real_poll = supervise.select.poll
     supervisor_calls: list[int | None] = []
+    successful_polls = 0
 
     class EagainThreePoll:
         def __init__(self) -> None:
             self.inner = real_poll()
+            self.is_supervisor_detector = False
 
         def register(self, fd: int, eventmask: int) -> None:
             self.inner.register(fd, eventmask)
+            self.is_supervisor_detector |= bool(eventmask & select.POLLIN)
 
         def poll(self, timeout: int | None = None) -> list[tuple[int, int]]:
-            if timeout and timeout > 0:
+            nonlocal successful_polls
+            if self.is_supervisor_detector:
                 supervisor_calls.append(timeout)
                 if len(supervisor_calls) <= 3:
                     raise OSError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+                successful_polls += 1
             return self.inner.poll(timeout)
 
     class StopAfterSuccessfulPollHost(supervise.RealHost):
         children_alive_after_poll = False
+        wait_calls = 0
 
         def wait(
             self,
             children: list[object],
             timeout_s: float,
         ) -> supervise.WaitResult:
+            self.wait_calls += 1
             result = super().wait(children, timeout_s)
-            self.children_alive_after_poll = bool(children) and all(
-                getattr(child, "alive", False) for child in children
-            )
-            self._stop = True
+            if successful_polls:
+                self.children_alive_after_poll = bool(children) and all(
+                    getattr(child, "alive", False) for child in children
+                )
+                self._stop = True
             return result
 
     monkeypatch.setattr(supervise.select, "poll", EagainThreePoll)
@@ -3286,7 +3294,7 @@ def test_real_host_retries_transient_poll_eagain_until_success(
             lease_nonce="nonce-1",
             host=host,
             heartbeat_s=0.1,
-            coverage_s=0.1,
+            coverage_s=0.01,
             items=[
                 (
                     "backup",
@@ -3307,6 +3315,8 @@ def test_real_host_retries_transient_poll_eagain_until_success(
 
     assert code == 0
     assert len(supervisor_calls) == 4
+    assert successful_polls == 1
+    assert host.wait_calls >= 2
     assert host.children_alive_after_poll
     records = [json.loads(line) for line in wire.decode("utf-8").splitlines()]
     assert all(record.get("type") != "stop" for record in records)
@@ -3314,6 +3324,7 @@ def test_real_host_retries_transient_poll_eagain_until_success(
     assert status.availability == "available"
     assert status.failure is None
     assert not status.peer_gone
+    assert host._stdout_poll_transient_started is None
 
 
 def test_real_host_poll_eagain_prefers_real_peer_gone_signal(
@@ -3391,20 +3402,38 @@ def test_real_host_persistent_poll_eagain_stops_after_elapsed_budget(
     real_poll = supervise.select.poll
     supervisor_calls = 0
     retry_budget_s = 0.05
+    semantic_wait_s = retry_budget_s / 5
+    test_timeout_s = retry_budget_s * 5
 
     class PersistentlyEagainPoll:
         def __init__(self) -> None:
             self.inner = real_poll()
+            self.is_supervisor_detector = False
 
         def register(self, fd: int, eventmask: int) -> None:
             self.inner.register(fd, eventmask)
+            self.is_supervisor_detector |= bool(eventmask & select.POLLIN)
 
         def poll(self, timeout: int | None = None) -> list[tuple[int, int]]:
             nonlocal supervisor_calls
-            if timeout and timeout > 0:
+            if self.is_supervisor_detector:
                 supervisor_calls += 1
                 raise OSError(errno.EAGAIN, os.strerror(errno.EAGAIN))
             return self.inner.poll(timeout)
+
+    class StopIfDetectorFailureIsNeverDeclared(_RecordingHost):
+        wait_calls = 0
+
+        def wait(
+            self,
+            children: list[object],
+            timeout_s: float,
+        ) -> supervise.WaitResult:
+            self.wait_calls += 1
+            result = super().wait(children, timeout_s)
+            if time.monotonic() - started >= test_timeout_s:
+                self._stop = True
+            return result
 
     monkeypatch.setattr(supervise.select, "poll", PersistentlyEagainPoll)
     monkeypatch.setattr(
@@ -3416,7 +3445,7 @@ def test_real_host_persistent_poll_eagain_stops_after_elapsed_budget(
     peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
     original_stdout = sys.stdout
     monkeypatch.setattr(sys, "stdout", peer_stdout)
-    host = _RecordingHost(
+    host = StopIfDetectorFailureIsNeverDeclared(
         project_root=tmp_path,
         controller_label="bugs",
         lease_nonce="nonce-1",
@@ -3430,7 +3459,7 @@ def test_real_host_persistent_poll_eagain_stops_after_elapsed_budget(
             lease_nonce="nonce-1",
             host=host,
             heartbeat_s=10.0,
-            coverage_s=10.0,
+            coverage_s=semantic_wait_s,
             items=[
                 (
                     "backup",
@@ -3446,8 +3475,9 @@ def test_real_host_persistent_poll_eagain_stops_after_elapsed_budget(
         host.kill_all()
 
     assert code == supervise.SUPERVISE_STOP_EXIT
-    assert retry_budget_s <= elapsed < 0.5
+    assert retry_budget_s <= elapsed < test_timeout_s
     assert supervisor_calls >= 3
+    assert host.wait_calls >= 3
     status = host.stdout_detector_status()
     assert status.failure is not None
     assert status.failure.source == "poll"

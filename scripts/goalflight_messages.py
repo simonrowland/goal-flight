@@ -7933,6 +7933,11 @@ def cmd_listen(args) -> int:
                 # on arrival and the pool churns without ever carrying mail.
                 # A failed claim is UNKNOWN, though, not proof that another arm
                 # already announced it. Surface that state on this doorbell.
+                # UNKNOWN announcements are intentionally bounded by the 15s
+                # startup grace and pool depth, not by a terminal retry count:
+                # suppressing them after N failures would turn claim-storage
+                # loss into a permanently silent watchdog death. Claim-storage
+                # recovery or a supervisor restart restores definite state.
                 claim_state = _watchdog_death_claim_state(
                     project_root,
                     controller_label=label,

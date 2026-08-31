@@ -2372,7 +2372,10 @@ def live_waiters(
                 # A held lock with an unavailable process/identity probe may
                 # still belong to the recorded live waiter. Preserve its path
                 # and report UNKNOWN for the aggregate instead of converting
-                # missing evidence into cleanup authority.
+                # missing evidence into cleanup authority. This intentionally
+                # has no TTL: the path does not count as live, while deleting
+                # it by age could erase the only witness for a live waiter.
+                # Any later determinate lock/identity probe performs cleanup.
                 indeterminate = True
         if indeterminate:
             return None
