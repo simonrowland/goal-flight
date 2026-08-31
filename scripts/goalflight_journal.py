@@ -2976,6 +2976,14 @@ class Journal:
                     ).fetchone()
                     assert renewed is not None
                     return self._lease_identity(renewed)
+                # Call-site resolution of UNKNOWN: expire only on alive is False.
+                # alive=None is an indeterminate probe, not proof of death, so it
+                # must not authorize replacing a live generation. Same-principal
+                # renewal already returned above and never consults this bit.
+                # A different principal with UNKNOWN therefore falls through to
+                # label-in-use unless takeover is set; reconnect is authorized
+                # by other evidence (dead PID, unheld lock, same principal, or
+                # an ancestry-matched return that renews as that principal).
                 incumbent_proven_dead = bool(
                     incumbent_liveness is not None
                     and incumbent_liveness.alive is False

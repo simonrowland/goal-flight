@@ -239,7 +239,14 @@ def test_beacon_claim_distinguishes_contract_from_transient(
 
 @pytest.mark.parametrize(
     "error",
-    (ValueError("bad startup claim"), OSError("temporary startup I/O")),
+    (
+        ValueError("bad startup claim"),
+        OSError("temporary startup I/O"),
+        sqlite3.OperationalError("database or disk is full"),
+        json.JSONDecodeError("Expecting value", "{", 0),
+        journal.JournalIntegrityError("journal failed integrity check"),
+        journal.JournalUpgradeRequired("journal requires upgrade"),
+    ),
 )
 def test_startup_claim_faults_are_structured_at_process_boundary(
     isolated: Path,

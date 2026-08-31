@@ -486,37 +486,53 @@ def _lease_holder_liveness(
     )
 
 
+def _combine_liveness_probes(*probes: bool | None) -> bool | None:
+    """Three-valued AND: False (dead) dominates; True only if every probe is True.
+
+    UNKNOWN (None) is not coerced to life or death. A dead PID behind an
+    UNKNOWN lock is still dead; a live PID behind an UNKNOWN lock stays
+    UNKNOWN.
+    """
+    if any(probe is False for probe in probes):
+        return False
+    if any(probe is None for probe in probes):
+        return None
+    return True
+
+
 def _incumbent_liveness_state(
     lease: goalflight_journal.LeaseIdentity,
 ) -> bool | None:
-    """Return positive life/death evidence, preserving UNKNOWN at every probe.
+    """Return True/False/None from lock, PID, and identity without collapsing.
 
-    A stranger may replace an incumbent only when one of the existing probes
-    positively proves that generation dead. Failure to prove life is not proof
-    of death. Returning sessions are recognized separately by ancestry, so
-    UNKNOWN does not need to be widened here to make reconnect work.
+    A stranger may replace an incumbent only when a probe positively proves
+    that generation dead. Failure to prove life is not proof of death: None
+    stays None. Returning sessions are recognized separately by same-principal
+    renewal or ancestry, so UNKNOWN here must not become True (that stalls
+    reconnect as ``label_in_use``) and must not become False (that expires a
+    live generation whose probe was merely unavailable).
     """
     lock_alive = goalflight_wake.lease_holder_alive(
         lease.project_root,
         controller_label=lease.label,
         lease_nonce=lease.nonce,
     )
-    if lock_alive is not True:
-        return lock_alive
     pid = lease.principal.get("pid")
     start_token = lease.principal.get("start_token")
     if pid is None:
         # principal_id leases have no process to re-measure; the lock is the
-        # only witness.
-        return True
+        # only witness. True/False/None pass through unchanged.
+        return lock_alive
     if not isinstance(pid, int) or pid <= 0:
-        return None
+        return _combine_liveness_probes(lock_alive, None)
     pid_alive = goalflight_compat.pid_liveness(pid)
-    if pid_alive is not True:
-        return pid_alive
     if not isinstance(start_token, str) or not start_token:
-        return None
-    return goalflight_compat.process_identity_matches(pid, start_token)
+        return _combine_liveness_probes(lock_alive, pid_alive, None)
+    return _combine_liveness_probes(
+        lock_alive,
+        pid_alive,
+        goalflight_compat.process_identity_matches(pid, start_token),
+    )
 
 
 def _incumbent_principal_is_in_claimant_ancestry(
@@ -551,9 +567,11 @@ def _claim_incumbent_liveness(
 ) -> goalflight_journal.LeaseLivenessEvidence | None:
     """Measure the incumbent without converting UNKNOWN into death.
 
-    ``alive=False`` is reserved for a positive death probe. Same-principal
-    renewals, ancestry-proven returns, and explicit takeovers do not depend on
-    this evidence, so they keep the direct lock measurement.
+    ``alive=False`` is reserved for a positive death probe. ``alive=None`` is
+    the third state and is passed through for the caller to resolve. Same-
+    principal renewals, ancestry-proven returns, and explicit takeovers do
+    not depend on this three-probe evidence, so they keep the direct lock
+    measurement (UNKNOWN lock does not invent death or life there either).
     """
     measured = _lease_holder_liveness(lease)
     if lease is None or measured is None:
@@ -922,10 +940,13 @@ def claim_session(
         and not same_principal
         and _incumbent_principal_is_in_claimant_ancestry(incumbent, principal)
     )
-    # UNKNOWN must neither authorize a stranger to take this label nor block a
-    # claimant returning through the recorded holder's own ancestry. The former
-    # needs positive death evidence; the latter renews the already-owned lease
-    # under its recorded principal and never enters the takeover gate.
+    # Call-site resolution of UNKNOWN (alive=None from _claim_incumbent_liveness):
+    # a stranger needs a positive death probe before this label can move, so
+    # UNKNOWN does not authorize expiry. A claimant in the recorded holder's
+    # ancestry is other evidence of the same session: renew under the recorded
+    # principal and never enter the takeover gate. UNKNOWN must not be widened
+    # to alive=True here; that would refuse ordinary return-after-restart once
+    # a later probe (dead PID, released lock) proves the generation gone.
     claim_principal = (
         dict(incumbent.principal)
         if returning_self and incumbent is not None and not takeover
@@ -3433,15 +3454,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.controller_startup:
-        result = claim_controller_startup(
-            project_root,
-            pid=args.session_pid,
-            label=args.session_label,
-            pid_from_ancestry=args.controller_pid_from_ancestry,
-            session_id=args.controller_session_id,
-            takeover=args.takeover,
-            hold_lock=True,
-        )
+        # Outer process boundary: claim_controller_startup already structures
+        # unexpected faults, but this CLI arm must still never print a
+        # traceback. A controller that cannot parse startup output does not start.
+        try:
+            result = claim_controller_startup(
+                project_root,
+                pid=args.session_pid,
+                label=args.session_label,
+                pid_from_ancestry=args.controller_pid_from_ancestry,
+                session_id=args.controller_session_id,
+                takeover=args.takeover,
+                hold_lock=True,
+            )
+        except Exception as exc:
+            result = {
+                "claimed": False,
+                "reason": "claim_failed",
+                "error_type": type(exc).__name__,
+            }
         if result.get("claimed"):
             _index_controller_project(project_root)
         adopted_label = result.get("adopted_label")

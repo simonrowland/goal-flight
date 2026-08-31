@@ -16,11 +16,10 @@ worktree share one lease. Set `GOALFLIGHT_CONTROLLER_LABEL` only when multiple
 controllers share a project. Carry the returned `session.pid`, label, and
 `session.lease_nonce` on later controller/listener operations.
 
-A repeated claim from the same measured PID/start-token generation renews the lease
-horizon only when it carries the returned nonce (via
-`GOALFLIGHT_CONTROLLER_SESSION_ID` or `--controller-session-id`). An ancestry match
-without that capability returns visible `label in use`, as does a live different
-generation; neither is stolen. Use `--join <name> --acknowledge-controller-conflict`
+A repeated claim from the same measured PID/start-token generation renews the
+lease. A child of that recorded holder reconnects the same generation even when
+a liveness probe is UNKNOWN. A proven-live different generation returns visible
+`label in use`; it is not stolen. Use `--join <name> --acknowledge-controller-conflict`
 only for an explicit cooperative succession. Listener, drainer, mirror, and dashboard
 roles never claim or renew; a nonce-carrying verified watchdog tick may renew the
 controller lease.

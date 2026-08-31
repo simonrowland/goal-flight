@@ -421,6 +421,16 @@ def test_same_measured_process_generation_renews_idempotently(
     assert second["session"]["generation"] == first["session"]["generation"]
 
 
+def test_liveness_probes_keep_unknown_and_let_death_dominate() -> None:
+    """UNKNOWN stays UNKNOWN; only a positive False probe proves death."""
+    assert sessions._combine_liveness_probes(None, False) is False
+    assert sessions._combine_liveness_probes(None, True) is None
+    assert sessions._combine_liveness_probes(True, True, True) is True
+    assert sessions._combine_liveness_probes(True, None, True) is None
+    assert sessions._combine_liveness_probes(True, True, False) is False
+    assert sessions._combine_liveness_probes(False, None, True) is False
+
+
 def test_lease_liveness_uses_only_lock_when_process_identity_is_unavailable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -451,51 +461,69 @@ def test_lease_liveness_uses_only_lock_when_process_identity_is_unavailable(
 def test_reused_pid_cannot_replace_active_claim_with_missing_lock_witness(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The original missing-lock guard remains fail-closed."""
+    """A missing generation-lock is UNKNOWN, not proof the incumbent is dead."""
     root = _root(monkeypatch, tmp_path)
-    tokens = {71001: "first-generation"}
-    monkeypatch.setattr(
-        sessions,
-        "_controller_process_identity",
-        lambda pid: {"pid": pid, "start_token": tokens[pid]},
-    )
-    first = sessions.claim_session(root, pid=71001, label="controller")
-    assert wake.lease_holder_alive(
-        root,
-        controller_label="controller",
-        lease_nonce=first["lease_nonce"],
-    ) is None
-    tokens[71001] = "reused-generation"
-    result = sessions.claim_controller_startup(
-        root,
-        pid=71001,
-        label="controller",
-        role="controller",
-        session_id=first["id"],
-    )
-    assert result["claimed"] is False
-    assert result["reason"] == "label_in_use"
-    active = journal.Journal(root).active_lease("controller")
-    assert active is not None and active.generation == first["generation"]
+    host = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        live_identity = compat.process_start_identity(host.pid)
+        assert live_identity is not None
+        monkeypatch.setattr(
+            sessions,
+            "_controller_process_identity",
+            lambda pid: (
+                live_identity
+                if pid == host.pid
+                else {"pid": pid, "start_token": "reused-generation"}
+            ),
+        )
+        first = sessions.claim_session(root, pid=host.pid, label="controller")
+        assert wake.lease_holder_alive(
+            root,
+            controller_label="controller",
+            lease_nonce=first["lease_nonce"],
+        ) is None
+        pid_calls: list[int] = []
+        original_pid_liveness = compat.pid_liveness
 
-    takeover = sessions.claim_controller_startup(
-        root,
-        pid=71001,
-        label="controller",
-        role="controller",
-        session_id=first["id"],
-        takeover=True,
-    )
-    assert takeover["claimed"] is True
-    assert takeover["session"]["generation"] == first["generation"] + 1
-    assert takeover["session"]["id"] != first["id"]
-    ended = next(
-        row
-        for row in journal.Journal(root).lease_records(include_ended=True)
-        if row["generation"] == first["generation"]
-    )
-    assert ended["state"] == "SUPERSEDED"
-    assert ended["ended_reason"] == "explicit-takeover"
+        def pid_tripwire(pid: int) -> bool | None:
+            pid_calls.append(pid)
+            return original_pid_liveness(pid)
+
+        monkeypatch.setattr(compat, "pid_liveness", pid_tripwire)
+        result = sessions.claim_controller_startup(
+            root,
+            pid=71001,
+            label="controller",
+            role="controller",
+            session_id=first["id"],
+        )
+        assert host.pid in pid_calls
+        assert result["claimed"] is False
+        assert result["reason"] == "label_in_use"
+        active = journal.Journal(root).active_lease("controller")
+        assert active is not None and active.generation == first["generation"]
+
+        takeover = sessions.claim_controller_startup(
+            root,
+            pid=71001,
+            label="controller",
+            role="controller",
+            session_id=first["id"],
+            takeover=True,
+        )
+        assert takeover["claimed"] is True
+        assert takeover["session"]["generation"] == first["generation"] + 1
+        assert takeover["session"]["id"] != first["id"]
+        ended = next(
+            row
+            for row in journal.Journal(root).lease_records(include_ended=True)
+            if row["generation"] == first["generation"]
+        )
+        assert ended["state"] == "SUPERSEDED"
+        assert ended["ended_reason"] == "explicit-takeover"
+    finally:
+        host.kill()
+        host.wait(timeout=3)
 
 
 def test_reused_pid_reconnects_without_takeover_when_identity_no_longer_matches(
@@ -803,14 +831,70 @@ def test_controller_startup_reconnects_dead_pid_lease_without_takeover(
         controller_label="alpha",
         lease_nonce=first["session"]["lease_nonce"],
     )
+    pid_calls: list[int] = []
+    original_pid_liveness = compat.pid_liveness
+
+    def pid_tripwire(pid: int) -> bool | None:
+        pid_calls.append(pid)
+        return original_pid_liveness(pid)
+
+    monkeypatch.setattr(compat, "pid_liveness", pid_tripwire)
     try:
         second = sessions.claim_controller_startup(
             root, pid=71902, label="alpha", role="controller"
         )
     finally:
         holder.close()
+    if dead_holder.pid not in pid_calls:
+        raise AssertionError("pid_liveness was not consulted before reconnect")
     assert second["claimed"] is True
     assert second["session"]["label"] == "alpha"
+    assert second["session"]["generation"] == first["session"]["generation"] + 1
+    assert "takeover" not in str(second)
+    ended = next(
+        row
+        for row in journal.Journal(root).lease_records(include_ended=True)
+        if row["generation"] == first["session"]["generation"]
+    )
+    assert ended["state"] == "EXPIRED"
+    assert ended["ended_reason"] == "holder-dead"
+
+
+def test_controller_startup_reconnects_dead_pid_with_missing_lock_without_takeover(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """UNKNOWN lock must not hide a proven-dead PID or stall name-slug reconnect."""
+    root = _root(monkeypatch, tmp_path)
+    dead_holder = subprocess.Popen([sys.executable, "-c", ""])
+    dead_holder.wait(timeout=3)
+    assert compat.pid_liveness(dead_holder.pid) is False
+    identities = {
+        dead_holder.pid: {"pid": dead_holder.pid, "start_token": "dead-no-lock"},
+        71904: {"pid": 71904, "start_token": "returning-no-lock"},
+    }
+    monkeypatch.setattr(sessions, "_controller_process_identity", identities.get)
+    first = sessions.claim_controller_startup(
+        root, pid=dead_holder.pid, label="alpha", role="controller"
+    )
+    assert first["claimed"] is True
+    assert wake.lease_holder_alive(
+        root,
+        controller_label="alpha",
+        lease_nonce=first["session"]["lease_nonce"],
+    ) is None
+    pid_calls: list[int] = []
+    original_pid_liveness = compat.pid_liveness
+
+    def pid_tripwire(pid: int) -> bool | None:
+        pid_calls.append(pid)
+        return original_pid_liveness(pid)
+
+    monkeypatch.setattr(compat, "pid_liveness", pid_tripwire)
+    second = sessions.claim_controller_startup(
+        root, pid=71904, label="alpha", role="controller"
+    )
+    assert dead_holder.pid in pid_calls
+    assert second["claimed"] is True
     assert second["session"]["generation"] == first["session"]["generation"] + 1
     assert "takeover" not in str(second)
     ended = next(
