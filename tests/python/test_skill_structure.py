@@ -787,13 +787,20 @@ def test_skill_md_structural_invariants() -> None:
     # authoring, it just taxes the next edit. 600 leaves ~10% room at the current
     # 545 lines.
     #
+    # Raised 600 -> 670 on 2026-08-31 on owner instruction, the file having
+    # reached 606. Kept the 2026-08-10 discipline rather than re-pinning to the
+    # current size: ~10% headroom (606 -> 670), and the byte cap moved with it
+    # so neither goes vestigial. Measured ratio has drifted 61 -> 67 bytes/line,
+    # so 670 lines is ~44.9KB against the 45,000B cap and the two still bind at
+    # about the same point.
+    #
     # This is still a REAL cap, not a formality. SKILL.md loads into every
     # controller's context, so its size is a per-session token cost on every run.
     # The cap exists to push detail into protocols/, which stay off the budget
-    # and load only when referenced. Reaching 600 means moving a section out, not
-    # raising it again -- and any future raise should keep visible headroom
-    # rather than re-pinning the ceiling to whatever the file happens to weigh.
-    assert_true(f"SKILL.md wc -l <= 600 (got {wc_line_count})", wc_line_count <= 600)
+    # and load only when referenced. Reaching 670 should mean moving a section
+    # out; any future raise should again keep visible headroom rather than
+    # re-pinning the ceiling to whatever the file happens to weigh.
+    assert_true(f"SKILL.md wc -l <= 670 (got {wc_line_count})", wc_line_count <= 670)
 
     frontmatter_markers = [idx for idx, line in enumerate(skill_lines) if line.strip() == "---"]
     assert_true("SKILL.md has YAML frontmatter close", len(frontmatter_markers) >= 2)

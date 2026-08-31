@@ -720,8 +720,13 @@ def test_instruction_split_contract() -> None:
         # only one leaves the other vestigial -- on 2026-08-10 a single change
         # tripped both within 24 bytes and 0 lines of their limits, which is what
         # happens when each raise re-pins the ceiling to the current size.
-        f"SKILL under 37KB (got {len(skill.encode())}B)",
-        len(skill.encode()) <= 37_000,
+        # Raised 37KB -> 45KB on 2026-08-31 on owner instruction, paired with the
+        # line budget (600 -> 670) which stays primary. Measured ratio is now
+        # ~67 bytes/line (was ~61), so 670 lines is ~44.9KB: the two caps still
+        # bind at about the same point, which is the whole reason they are
+        # raised together. Setting only one leaves the other vestigial.
+        f"SKILL under 45KB (got {len(skill.encode())}B)",
+        len(skill.encode()) <= 45_000,
     )
     for protocol in [
         "session-preflight.md",
