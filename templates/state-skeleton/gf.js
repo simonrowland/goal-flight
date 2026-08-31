@@ -78,6 +78,7 @@
     { key: "pending", label: "To do", cls: "sec-pending" },
     { key: "working", label: "In progress", cls: "sec-working" },
     { key: "awaiting-review", label: "Awaiting review", cls: "sec-review" },
+    { key: "worker-inconclusive", label: "Inconclusive / look again", cls: "sec-inconclusive" },
     { key: "worker-failed", label: "Failed / needs attention", cls: "sec-failed" },
     { key: "waiting", label: "Waiting", cls: "sec-waiting" },
     { key: "backlog", label: "Backlog", cls: "sec-backlog" },
@@ -89,6 +90,7 @@
     pending: "to do",
     working: "in progress",
     "awaiting-review": "awaiting review",
+    "worker-inconclusive": "inconclusive",
     "worker-failed": "worker failed",
     waiting: "waiting",
     backlog: "backlog",
@@ -107,7 +109,8 @@
     if (s === "outstanding") return "pending";
     if (s === "delegated") return "working";
     if (s === "decision" || s === "pending" || s === "working" ||
-      s === "awaiting-review" || s === "worker-failed" || s === "waiting" ||
+      s === "awaiting-review" || s === "worker-inconclusive" ||
+      s === "worker-failed" || s === "waiting" ||
       s === "done-reviewed") return s;
     return null;
   }
@@ -178,7 +181,7 @@
     var s = it.status;
     if (it.kind === "decision") return "decision";
     if (it.worker_done || s === "worker-finished" || s === "awaiting-review") return "awaiting-review";
-    if (s === "working" || s === "worker-failed") return s;
+    if (s === "working" || s === "worker-failed" || s === "worker-inconclusive") return s;
     if (unresolvedBlockerIds(it, byId).length) return "waiting";
     if (s === "waiting") return "waiting";
     if (s === "done" || s === "done-reviewed") return "done-reviewed";

@@ -57,7 +57,12 @@ PROJECT_REGISTRY_THROTTLE_S = 3600
 # VALID_FAMILIES keeps q for legacy rows that already used that prefix.
 FAMILY_PREFIX_BY_KIND = {"task": "t", "bug": "b", "decision": "d"}
 VALID_FAMILIES = {"t", "b", "d", "q", "ADR"}
-TASK_DISPATCH_STATES = {"working", "worker-finished", "worker-failed"}
+TASK_DISPATCH_STATES = {
+    "working",
+    "worker-finished",
+    "worker-failed",
+    "worker-inconclusive",
+}
 ITEM_ID_RE = re.compile(r"\b((?:ADR|bp|[tbqd])-\d+)\b", re.IGNORECASE)
 RESUME_NOTES_RE = re.compile(r"^RESUME-NOTES-(\d{4}-\d{2}-\d{2})(?:-rev(\d+))?\.md$", re.IGNORECASE)
 REVIEW_SEVERITY = {"P0": "critical", "P1": "high", "P2": "medium", "P3": "low"}
@@ -157,6 +162,7 @@ MARKDOWN_SECTIONS = (
     ("pending", "To do"),
     ("working", "In progress"),
     ("awaiting-review", "Awaiting review"),
+    ("worker-inconclusive", "Inconclusive / look again"),
     ("worker-failed", "Failed / needs attention"),
     ("waiting", "Waiting"),
 )
@@ -167,6 +173,7 @@ STATUS_LABELS = {
     "decision": "decision",
     "waiting": "waiting",
     "done-reviewed": "done reviewed",
+    "worker-inconclusive": "inconclusive",
     "worker-failed": "worker failed",
 }
 

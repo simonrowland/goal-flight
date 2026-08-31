@@ -455,6 +455,33 @@ assert("derived_status item is not pending", !derivedMount.innerHTML.includes("T
 GF.index([
   {
     schema_version: 1,
+    id: "t-inconclusive",
+    kind: "task",
+    title: "Hung after COMPLETE",
+    blocked_by: [],
+    links: [],
+    done: false,
+    derived_status: "worker-inconclusive"
+  },
+  {
+    schema_version: 1,
+    id: "t-failed",
+    kind: "task",
+    title: "Worker died",
+    blocked_by: [],
+    links: [],
+    done: false,
+    derived_status: "worker-failed"
+  }
+]);
+assert("inconclusive derived_status is its own section", GF.store.byId["t-inconclusive"]._section === "worker-inconclusive");
+assert("failed derived_status stays failed", GF.store.byId["t-failed"]._section === "worker-failed");
+assert("inconclusive is not pending", GF.canonicalSection("worker-inconclusive") === "worker-inconclusive");
+assert("inconclusive is not worker-failed", GF.canonicalSection("worker-inconclusive") !== "worker-failed");
+
+GF.index([
+  {
+    schema_version: 1,
     id: "t-deferred",
     kind: "task",
     title: "Deferred task",

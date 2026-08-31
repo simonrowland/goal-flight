@@ -1319,8 +1319,25 @@ def _split_task_ids(value: str | None) -> list[str]:
     return out
 
 
+# Dispatch terminals that mean "look again", not success and not failure.
+# Mapped into the task-store breadcrumb so a controller does not re-dispatch
+# completed work from a flattened worker-failed status.
+_INCONCLUSIVE_TASK_TERMINALS = frozenset(
+    {
+        "inconclusive_timeout",
+        "inconclusive_no_final",
+        "liveness_indeterminate",
+        "idle_timeout",
+    }
+)
+
+
 def _task_state_for_terminal(dispatch_state: object) -> str:
-    return "worker-finished" if dispatch_state == "complete" else "worker-failed"
+    if dispatch_state == "complete":
+        return "worker-finished"
+    if dispatch_state in _INCONCLUSIVE_TASK_TERMINALS:
+        return "worker-inconclusive"
+    return "worker-failed"
 
 
 def _cleanup_codex_dispatch_home(

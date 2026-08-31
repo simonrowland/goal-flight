@@ -59,13 +59,121 @@ def case_windows_cleanup_skips_bare_pidfile_pid() -> None:
         with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), \
             patch("goalflight_acp_client._ps_meta", return_value=None), \
             patch("goalflight_compat.is_windows", return_value=True), \
+            patch("goalflight_compat.pid_liveness", side_effect=lambda pid: pid == 12345), \
             patch("goalflight_compat.pid_alive", side_effect=fake_pid_alive), \
             patch("goalflight_compat.kill_pid", side_effect=AssertionError("bare reused pid killed")), \
             patch("goalflight_acp_client.log.warning") as warn:
             killed = goalflight_acp_client.cleanup_ghosts()
+            missing_identity_unlinked = not stale.exists()
+            warned = warn.called
     assert killed == 0
-    assert not stale.exists()
-    assert warn.called
+    assert missing_identity_unlinked
+    assert warned
+
+
+def case_windows_cleanup_does_not_kill_indeterminate_pid() -> None:
+    """pid_liveness None must not reach kill_pid, even with creation identity.
+
+    pid_alive collapses None to True; the Windows ghost path used that boolean
+    as a kill gate. Reverting the liveness check to pid_alive fails this case.
+    """
+    import goalflight_compat
+
+    assert goalflight_compat.pid_alive(os.getpid()) is True
+    assert goalflight_compat.pid_alive(999999) is False
+    with tempfile.TemporaryDirectory() as td:
+        pid_dir = Path(td)
+        tracked = pid_dir / "999999.jsonl"
+        tracked.write_text(
+            json.dumps(
+                {
+                    "pid": 12345,
+                    "agent": "codex-acp",
+                    "creation_time": "same",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        kills: list[int] = []
+
+        def fake_kill(pid, *args, **kwargs):
+            kills.append(int(pid))
+            raise AssertionError("indeterminate windows pid killed")
+
+        with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), \
+            patch("goalflight_acp_client._ps_meta", return_value=None), \
+            patch("goalflight_compat.is_windows", return_value=True), \
+            patch("goalflight_compat.pid_liveness", return_value=None), \
+            patch("goalflight_compat.pid_alive", side_effect=lambda pid: pid == 12345), \
+            patch("goalflight_compat.kill_pid", side_effect=fake_kill):
+            killed = goalflight_acp_client.cleanup_ghosts()
+            preserved = tracked.exists()
+    assert killed == 0
+    assert kills == []
+    assert preserved
+
+
+def case_windows_cleanup_kills_confirmed_live_identity() -> None:
+    """A confirmed-live Windows pid with matching identity still reaps."""
+    with tempfile.TemporaryDirectory() as td:
+        pid_dir = Path(td)
+        tracked = pid_dir / "999999.jsonl"
+        tracked.write_text(
+            json.dumps(
+                {
+                    "pid": 12345,
+                    "agent": "codex-acp",
+                    "creation_time": "same",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), \
+            patch("goalflight_acp_client._ps_meta", return_value=None), \
+            patch("goalflight_compat.is_windows", return_value=True), \
+            patch("goalflight_compat.pid_liveness", side_effect=lambda pid: True if pid == 12345 else False), \
+            patch("goalflight_compat.pid_alive", side_effect=lambda pid: pid == 12345), \
+            patch("goalflight_compat.kill_pid", return_value=True) as kill:
+            killed = goalflight_acp_client.cleanup_ghosts()
+            unlinked = not tracked.exists()
+    assert killed == 1
+    assert kill.called
+    assert unlinked
+
+
+def case_windows_cleanup_unlinks_confirmed_dead_pid() -> None:
+    """A confirmed-dead Windows pid still skips kill and drops the pidfile."""
+    with tempfile.TemporaryDirectory() as td:
+        pid_dir = Path(td)
+        tracked = pid_dir / "999999.jsonl"
+        tracked.write_text(
+            json.dumps(
+                {
+                    "pid": 12345,
+                    "agent": "codex-acp",
+                    "creation_time": "same",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), \
+            patch("goalflight_acp_client._ps_meta", return_value=None), \
+            patch("goalflight_compat.is_windows", return_value=True), \
+            patch("goalflight_compat.pid_liveness", return_value=False), \
+            patch("goalflight_compat.pid_alive", return_value=False), \
+            patch(
+                "goalflight_compat.kill_pid",
+                side_effect=AssertionError("dead windows pid killed"),
+            ):
+            killed = goalflight_acp_client.cleanup_ghosts()
+            unlinked = not tracked.exists()
+    assert killed == 0
+    assert unlinked
 
 
 def case_posix_cleanup_preserves_live_legacy_pidfile() -> None:
@@ -1100,6 +1208,9 @@ def main() -> None:
     case_pid_reuse_lstart_change_is_different()
     case_unavailable_meta_preserves_kill_fallthrough()
     case_windows_cleanup_skips_bare_pidfile_pid()
+    case_windows_cleanup_does_not_kill_indeterminate_pid()
+    case_windows_cleanup_kills_confirmed_live_identity()
+    case_windows_cleanup_unlinks_confirmed_dead_pid()
     case_posix_cleanup_preserves_live_legacy_pidfile()
     case_indeterminate_connection_kill_retains_tracking()
     case_connection_fallback_refuses_reused_pid()
@@ -1115,7 +1226,7 @@ def main() -> None:
     case_initial_lease_attach_failure_cleans_before_running()
     case_group_kill_can_disable_unchecked_pid_fallback()
     case_atexit_pool_kill_requires_fine_identity()
-    print("OK: 19 ACP kill identity tests pass")
+    print("OK: 22 ACP kill identity tests pass")
 
 
 if __name__ == "__main__":

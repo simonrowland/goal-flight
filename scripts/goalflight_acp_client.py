@@ -594,7 +594,14 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                     continue
                 continue
             if goalflight_compat.is_windows():
-                if not goalflight_compat.pid_alive(pid):
+                liveness = goalflight_compat.pid_liveness(pid)
+                if liveness is False:
+                    continue
+                if liveness is None:
+                    # Boolean pid_alive would treat this as live and fall through
+                    # to kill. Unknown is not a kill warrant; keep the pidfile.
+                    skipped_stale += 1
+                    preserve_pidfile = True
                     continue
                 if not entry.get("creation_time"):
                     skipped_stale += 1
