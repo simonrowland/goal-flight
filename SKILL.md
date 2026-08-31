@@ -294,6 +294,7 @@ Evidence: `docs-private/research/goal-flight-gotchas-audit/addendum.md`.
 - **Command-form drift.** Adapter `forbidden_args` + the current invocation override old docs.
 - **Worker bypass.** On sandbox/permission/write/commit block, return `BLOCKED:`; alternate delivery is orchestrator-only.
 - **False worker death.** Reconcile pid+start-time, status, ledger, tail marker, output mtime, and dirty tree before discarding work.
+- **Throttled/quota-killed is not failed — RESUME it.** `transient_throttle`, `quota_exhausted` and sandbox `BLOCKED:` say nothing about the work's quality, and the worktree usually holds finished or nearly-finished uncommitted edits. Run `git -C <worktree> status --short`, then `goalflight_dispatch.py resume <id> --prompt-file <brief> --cwd <worktree>`. Redispatching instead silently discards that work. (Controllers keep re-learning this one; it is an affordance gap, not a knowledge gap.)
 - **Quiet is not dead.** Network waits and child tests may show no output/CPU; confirm terminal markers, process tree, and idle.
 - **Terminal marker not final until reconciled.** COMPLETE/RESULT/READY still needs idle/controller-dead logic.
 - **Rollover loses notifications, not state.** Status JSON, ledgers, resume/reconcile are authoritative.
@@ -361,7 +362,32 @@ Two orthogonal axes:
 - Goal-loop returns converged result, never draft: plan/act/test/self-review until green.
 - Comms shape: `controller-direct`, `acp`, or `bash-tail`.
 Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background exec.
-A dead worker is not automatically a lost worker: resume when its accumulated context outvalues a clean read (quota death mid-task, partial edits only its author understands), redispatch when the premise moved (fix rounds, steers, reviews — a reviewer must never resume the implementer). See `protocols/dispatch-resume.md`.
+### ★ A dead worker is usually a RESUMABLE worker — check before redispatching
+
+```bash
+python3 <skill-root>/scripts/goalflight_dispatch.py resume <dispatch_id> --prompt-file <brief> --cwd <worktree>
+```
+
+**Reach for this FIRST whenever a dispatch dies for a reason that is not about
+its work** — `transient_throttle`, `quota_exhausted`, a killed process, a
+sandbox `BLOCKED:` after the work was done. Resume continues the worker's
+recorded session, so its accumulated context survives; a fresh dispatch throws
+that away and re-reads everything.
+
+**Before deciding, look at the worktree** — `git -C <worktree> status --short`.
+A throttled worker very often left uncommitted work that is complete or nearly
+so. Discarding it is the expensive mistake, and a clean-looking worktree is NOT
+proof the worker did nothing: it may simply not have reached its first commit.
+
+- **Resume** when accumulated context outvalues a clean read: quota/throttle
+  death mid-task, partial edits only its author understands, a long
+  investigation whose findings are not yet written down.
+- **Redispatch** when the premise moved: fix rounds, steers, reviews — and **a
+  reviewer must never resume the implementer.**
+- **Never do both.** Two workers in one worktree is a known incident shape. If a
+  replacement is already queued for that worktree, do not also resume.
+
+See `protocols/dispatch-resume.md`.
 Dispatch defaults detached; `--foreground` only for sync scripts/tests. Queue: `--submit --drain-on-submit`.
 Do not hand-iterate (>~3 edit/test cycles) what a goal-loop should converge.
 
