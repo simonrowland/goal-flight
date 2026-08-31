@@ -242,8 +242,18 @@ def case_wsl_drvfs_detection_uses_mount_fstype_before_syntax() -> None:
         assert not goalflight_compat.is_wsl_drvfs_path("/mnt/d/project")
     with patch("goalflight_compat._mount_fstype_for_path", return_value="drvfs"):
         assert goalflight_compat.is_wsl_drvfs_path("/custom/project")
-    with patch("goalflight_compat._mount_fstype_for_path", return_value=None):
+    with patch("goalflight_compat.is_linux", return_value=True), \
+        patch("goalflight_compat._mount_fstype_for_path", return_value=None):
         assert goalflight_compat.is_wsl_drvfs_path("/mnt/d/project") is None
+
+
+def case_drvfs_probe_is_definite_off_linux_without_fstype() -> None:
+    with patch("goalflight_compat.is_linux", return_value=False), \
+        patch("goalflight_compat._mount_fstype_for_path", return_value=None):
+        assert goalflight_compat.is_wsl_drvfs_path("/tmp") is False
+        assert goalflight_compat.is_wsl_drvfs_path("/mnt/c/x") is False
+    if not goalflight_compat.is_linux():
+        assert goalflight_compat.is_wsl_drvfs_path("/tmp") is False
 
 
 def main() -> None:
@@ -259,6 +269,7 @@ def main() -> None:
     case_probe_wsl_preserves_platform_unknown()
     case_wsl_drvfs_mountinfo_parser()
     case_wsl_drvfs_detection_uses_mount_fstype_before_syntax()
+    case_drvfs_probe_is_definite_off_linux_without_fstype()
     print("OK: WSL probe tests pass")
 
 

@@ -235,9 +235,11 @@ def _mount_fstype_for_path(path: Path) -> str | None:
 def is_wsl_drvfs_path(path: str | os.PathLike[str] | None) -> bool | None:
     """Report whether a WSL path is backed by a Windows filesystem mount.
 
-    ``True`` and ``False`` require mount-fstype evidence. ``None`` means the
-    metadata probes could not decide; path syntax alone cannot distinguish a
-    DrvFs mount from a real Linux filesystem mounted under ``/mnt/<letter>``.
+    ``True`` and ``False`` require mount-fstype evidence on Linux. Off Linux,
+    DrvFs cannot exist, so the probe returns ``False`` without mountinfo.
+    ``None`` means a Linux host whose mount metadata probes could not decide;
+    path syntax alone cannot distinguish a DrvFs mount from a real Linux
+    filesystem mounted under ``/mnt/<letter>``.
     """
     if path is None:
         return False
@@ -249,9 +251,15 @@ def is_wsl_drvfs_path(path: str | os.PathLike[str] | None) -> bool | None:
     except OSError:
         resolved = target
     fstype = _mount_fstype_for_path(resolved)
-    if fstype is None:
-        return None
-    return fstype.lower() in _WSL_WINDOWS_FS_TYPES
+    if fstype is not None:
+        return fstype.lower() in _WSL_WINDOWS_FS_TYPES
+    # DrvFs/9p/v9fs Windows-interop mounts exist only on Linux (WSL). Off
+    # Linux this probe is answerable without mountinfo/findmnt: the path is
+    # not DrvFs. Returning None here made every Darwin path permanently
+    # unknown. Linux without fstype evidence stays None.
+    if not is_linux():
+        return False
+    return None
 
 
 def python_executable() -> str:
@@ -1011,6 +1019,8 @@ def pid_liveness(pid) -> bool | None:
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000  # pragma: no cover
     STILL_ACTIVE = 259  # pragma: no cover
     ERROR_ACCESS_DENIED = 5  # pragma: no cover
+    ERROR_NOT_ENOUGH_MEMORY = 8  # pragma: no cover
+    ERROR_INVALID_PARAMETER = 87  # pragma: no cover
 
     # ctypes.WinDLL exists only on Windows. Missing it means this host is not a
     # Windows ctypes (lied/simulated platform) — UNKNOWN, not a crash. A later
@@ -1030,7 +1040,18 @@ def pid_liveness(pid) -> bool | None:
     )
     if not handle:  # pragma: no cover
         error = ctypes.get_last_error()
-        return True if error == ERROR_ACCESS_DENIED else None
+        if error == ERROR_ACCESS_DENIED:
+            # Process exists; QUERY_LIMITED_INFORMATION was denied.
+            return True
+        if error == ERROR_INVALID_PARAMETER:
+            # Documented no-such-process for a positive PID. Idle/PID 0 is
+            # already rejected by _positive_pid (MSDN also uses 87 for Idle).
+            return False
+        if error == ERROR_NOT_ENOUGH_MEMORY:
+            # Probe failed under memory pressure; not a liveness fact.
+            return None
+        # Unclassified last-error is not proof the PID is live or dead.
+        return None
     try:  # pragma: no cover
         # Declare signatures so 64-bit HANDLE/exit-code marshal correctly (ctypes
         # defaults to int=32-bit, which truncates handles on 64-bit Windows).

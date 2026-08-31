@@ -111,6 +111,15 @@ def case_windows_probe_failures_are_indeterminate() -> None:
         assert goalflight_compat.pid_alive(4242) is True
 
 
+def case_windows_openprocess_invalid_parameter_is_dead() -> None:
+    kernel32 = _Kernel32(handle=0, exit_code=0)
+    with patch("goalflight_compat.is_windows", return_value=True), \
+        patch("ctypes.WinDLL", return_value=kernel32, create=True), \
+        patch("ctypes.get_last_error", return_value=87, create=True):
+        assert goalflight_compat.pid_liveness(4242) is False
+        assert goalflight_compat.pid_alive(4242) is False
+
+
 def case_windows_zombie_probe_preserves_unknown() -> None:
     with patch("goalflight_compat.is_windows", return_value=True), \
         patch("goalflight_compat.pid_liveness", return_value=None):
@@ -268,6 +277,7 @@ def main() -> None:
     case_windows_pid_liveness_without_windll_is_unknown()
     case_windows_pid_liveness_kernel32_load_failure_is_visible()
     case_windows_probe_failures_are_indeterminate()
+    case_windows_openprocess_invalid_parameter_is_dead()
     case_windows_zombie_probe_preserves_unknown()
     case_pid_parameters_require_positive_integers()
     case_kill_pid_refuses_init_targets()
