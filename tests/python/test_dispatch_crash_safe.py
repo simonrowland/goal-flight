@@ -244,6 +244,20 @@ def _run(
         end = {}
         if lines and lines[-1].startswith("DISPATCH-END "):
             end = json.loads(lines[-1].split(" ", 1)[1])
+        # Inconclusive post-terminal idle leaves the worker alive in tmp.
+        # Reap it before TemporaryDirectory teardown; the captured payload
+        # already recorded worker_still_alive.
+        leftover = end.get("worker_pid")
+        if leftover and end.get("worker_still_alive"):
+            pid = int(leftover)
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(pid, signal.SIGTERM)
+            deadline = time.time() + 2.0
+            while time.time() < deadline and _process_exists(pid):
+                time.sleep(0.05)
+            if _process_exists(pid):
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    os.killpg(pid, signal.SIGKILL)
         return proc.returncode, elapsed, end
 
 
@@ -1010,6 +1024,134 @@ def case_post_terminal_delayed_worker_exit_is_observed() -> None:
                 _observe_process_exit(worker)
 
 
+def case_post_terminal_idle_action_pins_hang_versus_exit() -> None:
+    """Helper contract: live+idle terminalizes (inconclusive), death terminalizes (complete)."""
+    assert goalflight_watch._post_terminal_candidate_action(
+        worker_alive=True,
+        tail_grew=False,
+        grace_expired=True,
+        idle_confirmed=True,
+    ) == "terminalize"
+    assert goalflight_watch._post_terminal_candidate_action(
+        worker_alive=True,
+        tail_grew=False,
+        grace_expired=True,
+        idle_confirmed=False,
+    ) == "pending"
+    assert goalflight_watch._post_terminal_candidate_action(
+        worker_alive=True,
+        tail_grew=False,
+        grace_expired=False,
+        idle_confirmed=True,
+    ) == "pending"
+    assert goalflight_watch._post_terminal_candidate_action(
+        worker_alive=False,
+        tail_grew=False,
+        grace_expired=False,
+        idle_confirmed=False,
+    ) == "terminalize"
+
+
+def case_shared_cwd_complete_then_hang_is_inconclusive() -> None:
+    """COMPLETE then hang is inconclusive even when cwd is the canonical root.
+
+    Dispatch launches with --cwd as both project_root and worker_cwd, so the
+    tree probe is skipped and classify_liveness never wedges. Post-terminal
+    idle must not wait on that wedge.
+    """
+    survivor = {
+        "line": 1,
+        "kind": "COMPLETE",
+        "text": "shared-cwd-hang — signed off",
+    }
+
+    def scan_result(marker: dict, size: int) -> goalflight_watch.TailScanResult:
+        return goalflight_watch.TailScanResult(
+            markers=[marker],
+            mail_markers=[],
+            terminal=marker,
+            size=size,
+            content_bytes=0,
+            validation_bytes=0,
+            lines_materialized=0,
+            resynced=False,
+            resync_reason=None,
+            fence_unbalanced=False,
+        )
+
+    class FakeScanner:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def scan(self, **_kwargs):
+            return scan_result(dict(survivor), 100)
+
+    class FakeTraceLiveness:
+        def __init__(self, **_kwargs):
+            pass
+
+        def sample(self, **_kwargs):
+            return {"trace_active": False}
+
+    clock = [0.0]
+    calls = [0]
+
+    def fake_active_monotonic() -> float:
+        calls[0] += 1
+        if calls[0] > 200:
+            raise AssertionError(
+                "watcher did not settle post-terminal idle with shared cwd "
+                f"after {calls[0]} clock samples"
+            )
+        clock[0] += 2.0
+        return clock[0]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        tail = tmp_path / "tail.txt"
+        status = tmp_path / "status.json"
+        shared = tmp_path / "repo"
+        shared.mkdir()
+        tail.write_text("synthetic tail\n", encoding="utf-8")
+        env = os.environ.copy()
+        _isolate_state_env(env, tmp_path)
+        argv = [
+            str(WATCH),
+            "--pid", "4242",
+            "--pgid", "4242",
+            "--tail", str(tail),
+            "--status-json", str(status),
+            "--dispatch-id", "shared-cwd-hang",
+            "--project-root", str(shared),
+            "--worker-cwd", str(shared),
+            "--poll-secs", "0.1",
+            "--max-idle-secs", "0.1",
+            "--stay-after-terminal",
+        ]
+        output = io.StringIO()
+        with patch.dict(os.environ, env, clear=False), \
+                patch.object(sys, "argv", argv), \
+                patch.object(goalflight_watch, "IncrementalTailScanner", FakeScanner), \
+                patch.object(goalflight_watch, "TraceLiveness", FakeTraceLiveness), \
+                patch.object(goalflight_watch, "worker_alive", return_value=(True, "match", {"pid": 4242})), \
+                patch.object(goalflight_watch, "pgroup_cpu_pct", return_value=0.0), \
+                patch.object(goalflight_watch, "live_descendant_count", return_value=None), \
+                patch.object(goalflight_watch, "system_starved", return_value=False), \
+                patch.object(goalflight_watch, "active_monotonic", side_effect=fake_active_monotonic), \
+                patch.object(goalflight_watch.time, "sleep", return_value=None), \
+                patch.object(goalflight_watch.signal, "signal", return_value=None), \
+                patch.object(goalflight_watch.atexit, "register", return_value=None), \
+                contextlib.redirect_stdout(output):
+            rc = goalflight_watch.main()
+
+        payload = json.loads(status.read_text(encoding="utf-8"))
+        assert rc == 1, (rc, output.getvalue(), payload)
+        assert payload.get("state") == "inconclusive_timeout", payload
+        assert payload.get("reason") == "marker:COMPLETE:post_terminal_idle_timeout", payload
+        assert payload.get("worker_alive") is True, payload
+        assert payload.get("terminal_pending_state") == "complete", payload
+
+
 def case_dispatch_post_terminal_idle_returns_inconclusive() -> None:
     rc, elapsed, end = _run(
         [
@@ -1382,6 +1524,8 @@ def main() -> None:
     case_stability_recheck_detects_growth_after_surviving_candidate()
     case_post_terminal_busy_worker_stays_armed_after_grace()
     case_post_terminal_delayed_worker_exit_is_observed()
+    case_post_terminal_idle_action_pins_hang_versus_exit()
+    case_shared_cwd_complete_then_hang_is_inconclusive()
     case_dispatch_post_terminal_idle_returns_inconclusive()
     case_worker_and_watcher_survive_launcher_pgroup_sigterm()
     case_foreground_keyboard_interrupt_leaves_worker_and_watcher_running()
