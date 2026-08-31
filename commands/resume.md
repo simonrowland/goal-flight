@@ -45,9 +45,59 @@ baseline, handoff prose, status, `next`, then continue the top task without
 waiting for a re-prompt when no real blocker exists.
 
 The resume entry auto-claims/renews only the controller role's journal lease. Carry
-its label and `lease_nonce`; if it reports `label in use`, surface the incumbent and
-do not steal it. Listener, drainer, mirror, and dashboard children never claim during
+its label. Listener, drainer, mirror, and dashboard children never claim during
 resume; a verified watchdog tick may renew the controller lease.
+
+### `label in use` — adopt by default; defer only on PROVEN live competition
+
+A returning session normally finds its own label held by its own dead
+predecessor. That is the common case, not a conflict. **Do not stall the resume
+on it.** Take over unless you can prove, at this instant, that the holder is
+both alive AND a different session:
+
+1. `kill -0 <holder_pid>` — if the pid is gone, **take over immediately**.
+2. If it is alive, read its elapsed time and ancestry with
+   `ps -o pid=,ppid=,etime=,args= -p <holder_pid>`. **`etime` is
+   `[[dd-]hh:]mm:ss` — `01:39` is one minute thirty-nine seconds, not an hour
+   and a half.** Misreading it has caused a controller to defer to a process
+   that had just started.
+3. Walk both ancestries. A holder that shares your host-app ancestor is a
+   sibling of your own launch, not a competing operator. **Take over.**
+4. Only when the holder is alive, and rooted in a genuinely different session,
+   surface it to the owner and ask before `--takeover`.
+
+The cost is asymmetric and that is why the default is adopt: taking over a dead
+or sibling holder costs one generation, while deferring wrongly leaves the
+project with no controller at all and the owner waiting.
+
+## STEP 1.5 — ARM THE WAKE BEFORE YOU REBUILD ANYTHING
+
+**Do this immediately after the lease claim, before status, before reading
+notes, before any measurement.** A controller without a wake is deaf: worker
+results land in the journal and nothing tells it. Every minute spent
+"orienting" first is a minute of missed events.
+
+Arm ONE `supervise` process through the host's persistent monitor — never a
+bounded monitor, never a shell `&`, never per-component listeners when a
+supervisor is available:
+
+```bash
+python3 <skill-root>/scripts/goalflight_messages.py supervise \
+  --project-root "$PWD" --controller-label <label> --lease-nonce <token>
+```
+
+On Claude Code that is the Monitor tool with `persistent: true` and **no
+timeout you reason about** — a bounded monitor is killed outside the
+supervisor, so no `type=stop` record appears and the controller goes deaf with
+no diagnostic.
+
+Confirm it is actually armed before moving on: the supervisor's first write is
+a `{"kind":"supervise","type":"probe","reason":"stdout-peer-liveness"}` record.
+If `--list-controllers` still reports `supervisor: absent` after arming, treat
+that as a blocker and resolve it — do not proceed to STEP 2 deaf.
+
+Stop any pre-existing direct listeners first; a supervisor plus loose listeners
+double-deliver.
 
 ## STEP 2 — Rebuild status
 
