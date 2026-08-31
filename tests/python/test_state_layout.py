@@ -971,6 +971,14 @@ def main() -> None:
         test_scaffold_project_state_rejects_symlinked_state_dir,
         test_scaffold_project_state_migrates_pre_v11_dashboard_index_to_root_dashboard,
         test_scaffold_project_state_refreshes_known_legacy_hash_with_backup,
+        test_scaffold_project_state_writes_managed_view_manifest,
+        test_refresh_views_updates_managed_stale_manifest_install_with_backup,
+        test_refresh_views_skips_operator_customization_with_manifest,
+        test_refresh_views_dry_run_mutates_nothing,
+        test_project_registry_upserted_from_scaffold_and_task_store_save,
+        test_refresh_views_all_reports_missing_registry_project_without_deleting,
+        test_refresh_views_all_contains_hostile_registry_entries_per_entry,
+        test_refresh_views_all_table_escapes_control_characters,
         test_scaffold_project_state_preserves_customized_current_managed_view,
         test_scaffold_project_state_preserves_foreign_managed_path_file,
         test_scaffold_project_state_respects_gitignore_branches,
@@ -990,14 +998,13 @@ def main() -> None:
         test_project_readiness_requires_session_status_under_skill_root,
         test_project_readiness_treats_initialized_state_layout_absence_as_warning,
         test_state_protocols_are_discoverable_from_index_and_commands,
+        test_every_worktree_of_a_repo_resolves_to_one_task_store,
+        test_subdirectory_of_a_git_repo_shares_the_store,
+        test_a_path_outside_any_checkout_is_returned_unchanged,
     ]
     for test in tests:
         test()
         print(f"PASS {test.__name__}")
-
-
-if __name__ == "__main__":
-    main()
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -1058,6 +1065,38 @@ def test_every_worktree_of_a_repo_resolves_to_one_task_store() -> None:
         assert_true("one store for every entry point", len(stores) == 1)
 
 
+def test_subdirectory_of_a_git_repo_shares_the_store() -> None:
+    """Relative --git-common-dir is vs the git cwd, not toplevel.
+
+    From repo/src git prints ``../.git``. Joining that to toplevel hashed the
+    parent of the repo; a reader at the repo root looked at a different slug.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td).resolve()
+        repo = base / "proj"
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        repo.joinpath("f.txt").write_text("x")
+        _git(repo, "add", "f.txt")
+        _git(repo, "commit", "-qm", "init")
+        src = repo / "src"
+        src.mkdir()
+        nested = src / "nested"
+        nested.mkdir()
+
+        from_root = goalflight_task.resolve_project_root(str(repo))
+        from_src = goalflight_task.resolve_project_root(str(src))
+        from_nested = goalflight_task.resolve_project_root(str(nested))
+        assert_true("root is the repo", from_root == repo)
+        assert_true("src collapses to repo", from_src == repo)
+        assert_true("nested collapses to repo", from_nested == repo)
+        stores = {
+            goalflight_task.resolve_task_store_dir(root)
+            for root in (from_root, from_src, from_nested)
+        }
+        assert_true("one store from root and subdirs", len(stores) == 1)
+
+
 def test_a_path_outside_any_checkout_is_returned_unchanged() -> None:
     """An existing non-repo directory is itself; a missing path must refuse.
 
@@ -1078,3 +1117,7 @@ def test_a_path_outside_any_checkout_is_returned_unchanged() -> None:
         assert_true("missing path refuses retarget", "Refusing to write to another store" in message)
     else:
         raise AssertionError("missing project root must refuse, not return itself")
+
+
+if __name__ == "__main__":
+    main()

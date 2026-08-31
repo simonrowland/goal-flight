@@ -136,18 +136,197 @@ def test_snapshot_scan_error_is_not_an_empty_store(
     loaded = store.load_items()
     assert [row["id"] for row in loaded] == ["t-500"]
 
-    real_glob = Path.glob
+    real_listdir = os.listdir
+    log_resolved = log.resolve()
 
-    def boom(self: Path, pattern: str):  # noqa: ANN202
-        if pattern == "tasks-*.jsonl":
-            raise OSError(errno.EACCES, "permission denied")
-        return real_glob(self, pattern)
+    def boom(path: str | os.PathLike[str]) -> list[str]:
+        if Path(path).resolve() == log_resolved:
+            raise OSError(errno.EACCES, "permission denied", str(path))
+        return real_listdir(path)
 
-    monkeypatch.setattr(Path, "glob", boom)
+    monkeypatch.setattr(os, "listdir", boom)
     with pytest.raises(task.TaskError, match="snapshot scan failed"):
         store.load_items()
     with pytest.raises(task.TaskError, match="empty store"):
         store.load_items()
+
+
+_SKIP_CHMOD000 = pytest.mark.skipif(
+    sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="chmod 000 does not bite on Windows or as root",
+)
+
+
+@_SKIP_CHMOD000
+def test_unlistable_snapshot_dir_is_unknown_not_empty(tmp_path: Path) -> None:
+    """Path.glob on chmod 000 returns [] without raising; the reader must not."""
+    project = tmp_path / "legacy-project"
+    log = project / "docs-private" / "log"
+    log.mkdir(parents=True)
+    surviving = _item("t-500", "surviving requirement")
+    (log / "tasks-20260101.jsonl").write_text(
+        json.dumps(surviving, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    store = task.TaskStore(project)
+    assert [row["id"] for row in store.load_items()] == ["t-500"]
+
+    os.chmod(log, 0o000)
+    try:
+        with pytest.raises(task.TaskError, match="snapshot scan failed"):
+            store.load_items()
+        listed = _run(project, "list", "--json")
+        assert listed.returncode != 0, listed.stdout
+        assert "snapshot scan failed" in listed.stderr
+        assert listed.stdout.strip() != "[]"
+        captured = _run(project, "capture", "new while snapshots unreadable")
+        assert captured.returncode != 0, captured.stdout
+        assert "snapshot scan failed" in captured.stderr
+    finally:
+        os.chmod(log, 0o700)
+
+    restored = task.TaskStore(project).load_items()
+    assert [row["id"] for row in restored] == ["t-500"]
+    assert all(row["title"] != "new while snapshots unreadable" for row in restored)
+
+
+def _init_git_repo(path: Path) -> None:
+    subprocess.run(
+        ["git", "init", "-q"],
+        cwd=str(path),
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    (path / "f.txt").write_text("x", encoding="utf-8")
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        }
+    )
+    subprocess.run(
+        ["git", "add", "f.txt"],
+        cwd=str(path),
+        check=True,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    subprocess.run(
+        ["git", "commit", "-qm", "init"],
+        cwd=str(path),
+        check=True,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+
+def test_subdirectory_capture_is_visible_from_repo_root(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    src = repo / "src"
+    src.mkdir()
+    _init_git_repo(repo)
+
+    captured = _run(src, "capture", "from-subdir-healthy")
+    assert captured.returncode == 0, captured.stderr
+    item_id = captured.stdout.strip()
+    assert item_id.startswith("t-")
+
+    shown_src = _run(src, "show", item_id, "--json")
+    shown_root = _run(repo, "show", item_id, "--json")
+    listed_root = _run(repo, "list", "--json")
+    listed_src = _run(src, "list", "--json")
+    assert shown_src.returncode == 0, shown_src.stderr
+    assert shown_root.returncode == 0, shown_root.stderr
+    assert listed_root.returncode == 0, listed_root.stderr
+    assert listed_src.returncode == 0, listed_src.stderr
+    assert json.loads(shown_src.stdout)["title"] == "from-subdir-healthy"
+    assert json.loads(shown_root.stdout)["title"] == "from-subdir-healthy"
+    root_ids = [row["id"] for row in json.loads(listed_root.stdout)]
+    src_ids = [row["id"] for row in json.loads(listed_src.stdout)]
+    assert item_id in root_ids
+    assert src_ids == root_ids
+
+    root_store = task.resolve_task_store_dir(task.resolve_project_root(str(repo)))
+    src_store = task.resolve_task_store_dir(task.resolve_project_root(str(src)))
+    assert root_store == src_store
+
+
+def test_empty_git_dir_from_subdirectory_refuses(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    src = repo / "src"
+    src.mkdir()
+    _init_git_repo(repo)
+
+    store_root = Path(os.environ["GOALFLIGHT_TASK_STORE_DIR"])
+    before = {p for p in store_root.rglob("*") if p.is_file()} if store_root.exists() else set()
+    proc = _run(src, "capture", "from-subdir-broken-gitdir", env={"GIT_DIR": ""})
+    assert proc.returncode != 0, proc.stdout
+    assert "unresolvable project root" in proc.stderr
+    assert "Refusing to write to another store" in proc.stderr
+    after = {p for p in store_root.rglob("*") if p.is_file()} if store_root.exists() else set()
+    assert not any(path.name == "tasks.jsonl" for path in after - before)
+
+    listed = _run(repo, "list", "--json")
+    assert listed.returncode == 0, listed.stderr
+    assert json.loads(listed.stdout) == []
+
+
+@_SKIP_CHMOD000
+def test_unreadable_dot_git_from_subdirectory_refuses(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    src = repo / "src"
+    src.mkdir()
+    _init_git_repo(repo)
+    git_dir = repo / ".git"
+
+    store_root = Path(os.environ["GOALFLIGHT_TASK_STORE_DIR"])
+    before = {p for p in store_root.rglob("*") if p.is_file()} if store_root.exists() else set()
+    os.chmod(git_dir, 0o000)
+    try:
+        proc = _run(src, "capture", "captured-while-git-unreadable")
+        assert proc.returncode != 0, proc.stdout
+        assert "unresolvable project root" in proc.stderr
+        assert "Refusing to write to another store" in proc.stderr
+    finally:
+        os.chmod(git_dir, 0o700)
+    after = {p for p in store_root.rglob("*") if p.is_file()} if store_root.exists() else set()
+    assert not any(path.name == "tasks.jsonl" for path in after - before)
+
+
+def test_empty_git_dir_in_non_git_directory_still_captures(tmp_path: Path) -> None:
+    project = tmp_path / "plain"
+    project.mkdir()
+    (project / "docs-private").mkdir()
+    proc = _run(project, "capture", "plain-with-empty-git-dir", env={"GIT_DIR": ""})
+    assert proc.returncode == 0, proc.stderr
+    item_id = proc.stdout.strip()
+    shown = _run(project, "show", item_id, "--json")
+    assert shown.returncode == 0, shown.stderr
+    assert json.loads(shown.stdout)["title"] == "plain-with-empty-git-dir"
+
+
+def test_git_repo_root_capture_show_list_round_trip(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "docs-private").mkdir()
+    _init_git_repo(repo)
+    captured = _run(repo, "capture", "from-repo-root")
+    assert captured.returncode == 0, captured.stderr
+    item_id = captured.stdout.strip()
+    shown = _run(repo, "show", item_id, "--json")
+    listed = _run(repo, "list", "--json")
+    assert shown.returncode == 0, shown.stderr
+    assert listed.returncode == 0, listed.stderr
+    assert json.loads(shown.stdout)["title"] == "from-repo-root"
+    assert item_id in [row["id"] for row in json.loads(listed.stdout)]
 
 
 def test_genuine_empty_store_still_reads_empty(tmp_path: Path) -> None:

@@ -388,6 +388,31 @@ def _strip_managed_worktree(path: Path) -> Path:
     return resolved
 
 
+def _git_checkout_marker_present(start: Path) -> bool:
+    """True when ``start`` or an ancestor has a ``.git`` file or directory.
+
+    Used only after git itself could not name the checkout. A present marker
+    means this is not a known non-git identity: an unreadable ``.git`` or an
+    empty ``GIT_DIR`` still looks like "not a git repository" on stderr, and
+    treating that as "the start path is the project" writes a second store.
+    An OSError statting the marker is also unknown, not "absent".
+    """
+    current = _resolve_loose(start)
+    while True:
+        marker = current / ".git"
+        try:
+            os.lstat(marker)
+            return True
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
 def _git_canonical_root(start: Path, *, refuse_unknown: bool = False) -> Path | None:
     """Repo root as seen from ``start``, with worktrees collapsed to the main
     checkout.
@@ -395,13 +420,16 @@ def _git_canonical_root(start: Path, *, refuse_unknown: bool = False) -> Path | 
     Return values, and which way indeterminate falls:
     - ``Path``: git ran and named a checkout; worktrees collapse to the main
       root so every worktree of one project shares one task store.
-    - ``None``: git ran and said ``start`` is not inside a repository. The
-      caller may treat ``start`` itself as the identity (tests, non-git dirs).
+    - ``None``: git ran and said ``start`` is not inside a repository, and no
+      ``.git`` marker is present on ``start`` or its ancestors. The caller may
+      treat ``start`` itself as the identity (tests, non-git dirs).
     - raises ``TaskError`` when ``refuse_unknown=True``: git could not be asked,
-      or failed for a reason other than "not a repository". A store must not
-      guess a root: writing into a different store looks like a successful
-      capture of a requirement that later "vanished". Losing a requirement is
-      worse than rejecting the write.
+      failed for a reason other than "not a repository", or said "not a
+      repository" from a path that still has a ``.git`` marker (unreadable
+      gitdir, empty ``GIT_DIR``, and similar). A store must not guess a root:
+      writing into a different store looks like a successful capture of a
+      requirement that later "vanished". Losing a requirement is worse than
+      rejecting the write.
     - ``None`` when ``refuse_unknown=False`` (legacy callers such as the
       controller registry): the same git failure is still unknown, but those
       callers already map unknown to "not a project" rather than opening a
@@ -410,7 +438,9 @@ def _git_canonical_root(start: Path, *, refuse_unknown: bool = False) -> Path | 
     ``--git-common-dir`` is the worktree-invariant part: every worktree of one
     repo reports the SAME common dir, while ``--show-toplevel`` differs per
     worktree. Collapsing on the common dir is what makes all worktrees of a
-    project share one task store.
+    project share one task store. Git emits a relative common dir against the
+    command cwd (``start``), not against toplevel; joining to toplevel from a
+    subdirectory walked out of the repo.
     """
     try:
         top = Path(
@@ -437,6 +467,12 @@ def _git_canonical_root(start: Path, *, refuse_unknown: bool = False) -> Path | 
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or "").strip()
         if "not a git repository" in stderr.lower():
+            if refuse_unknown and _git_checkout_marker_present(start):
+                detail = stderr or f"git exited {exc.returncode}"
+                raise TaskError(
+                    f"unresolvable project root {start}: git rev-parse failed "
+                    f"({detail}). Refusing to write to another store"
+                ) from exc
             return None
         if refuse_unknown:
             detail = stderr or f"git exited {exc.returncode}"
@@ -448,7 +484,13 @@ def _git_canonical_root(start: Path, *, refuse_unknown: bool = False) -> Path | 
 
     common = Path(common_raw)
     if not common.is_absolute():
-        common = top / common
+        # Relative --git-common-dir is vs the git cwd (start), not toplevel.
+        # start=repo/src + "../.git" joined to toplevel is parent-of-repo.
+        common = start / common
+    try:
+        common = common.resolve(strict=False)
+    except OSError:
+        pass
     return common.parent if common.name == ".git" else top
 
 
@@ -2380,19 +2422,27 @@ class TaskStore:
     def _legacy_snapshot_paths(self) -> list[Path]:
         """Surviving ``docs-private/log/tasks-*.jsonl`` snapshots, newest first.
 
-        An empty glob is a genuine empty: there are no snapshots. An OSError
-        while globbing or statting is a failed scan, not emptiness — converting
+        An empty listing is a genuine empty: there are no snapshots. An OSError
+        while listing or statting is a failed scan, not emptiness — converting
         it to ``[]`` made surviving requirements render as an empty store.
         Losing a requirement is worse than rejecting the read.
+
+        ``Path.glob`` cannot carry this distinction: on an unreadable directory
+        it returns ``[]`` without raising (same pathlib behaviour
+        ``goalflight_ledger.py`` already documents). ``os.listdir`` raises.
         """
+        log_dir = self.export_docs_dir / "log"
         try:
-            return sorted(
-                (self.export_docs_dir / "log").glob("tasks-*.jsonl"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
+            if not log_dir.is_dir():
+                return []
+            names = os.listdir(log_dir)
+            paths = [
+                log_dir / name
+                for name in names
+                if name.startswith("tasks-") and name.endswith(".jsonl")
+            ]
+            return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
         except OSError as exc:
-            log_dir = self.export_docs_dir / "log"
             raise TaskError(
                 f"legacy snapshot scan failed under {log_dir}: {exc}. "
                 "Refusing to treat an unreadable scan as an empty store"
