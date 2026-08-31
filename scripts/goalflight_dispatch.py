@@ -979,7 +979,8 @@ WORKER_EXECUTION_PREAMBLE = (
 # has to be explicit, and it has to name the escalation path, because an
 # unattended worker has no operator to ask and will otherwise just expand.
 SCOPE_GUARD_PREAMBLE = (
-    "Scope contract -- complete the task with the minimum sufficient change:\n"
+    "Scope contract -- where this task changes code, make the minimum "
+    "sufficient change:\n"
     "- Reuse existing code, helpers, patterns, and test setup before adding "
     "anything new. Search for what already does this before writing a second one.\n"
     "- Fix the root cause. Do not stack patches around a premise you have not "
@@ -4661,7 +4662,6 @@ def _worker_prompt_preamble(
     agent: str | None,
     *,
     orientation_path: Path | None = None,
-    scope_guard: bool = True,
 ) -> str:
     is_cursor = agent in CURSOR_AGENTS
     preambles = [
@@ -4678,11 +4678,7 @@ def _worker_prompt_preamble(
     # test_dispatch_steer.case_preamble_routing_matrix, which pins that split.
     if agent in {"grok-code", "grok-research", "moonshot"}:
         preambles.append(WORKER_EXECUTION_PREAMBLE)
-    # Reviewers are excluded: "minimum sufficient change" reads as "report the
-    # minimum sufficient finding", and review thoroughness is the gate that has
-    # actually been catching defects. Read-only is the signal for that.
-    if scope_guard:
-        preambles.append(SCOPE_GUARD_PREAMBLE)
+    preambles.append(SCOPE_GUARD_PREAMBLE)
     return "\n\n".join(preambles)
 
 
@@ -4693,15 +4689,12 @@ def _materialize_steer_prompt(
     *,
     agent: str | None = None,
     orientation_path: Path | None = None,
-    scope_guard: bool = True,
 ) -> str | None:
     if not prompt_path:
         return None
     body_path = Path(prompt_path)
     body = body_path.read_text(encoding="utf-8", errors="replace")
-    preamble = _worker_prompt_preamble(
-        agent, orientation_path=orientation_path, scope_guard=scope_guard
-    )
+    preamble = _worker_prompt_preamble(agent, orientation_path=orientation_path)
     if agent not in {*CURSOR_AGENTS, "codex-acp", "claude-acp"}:
         preamble += (
             "\n\nTerminal evidence identity contract:\n"
@@ -17425,7 +17418,6 @@ def main(argv: list[str] | None = None) -> int:
             args.dispatch_id,
             agent=args.agent,
             orientation_path=orientation_path,
-            scope_guard=not _effective_read_only(args),
         )
     try:
         worker_argv, stdin_path = build_worker(args, prompt_path, raw)

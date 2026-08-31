@@ -901,17 +901,16 @@ def case_preamble_routing_matrix() -> None:
         preamble = goalflight_dispatch._worker_prompt_preamble(agent)
         assert goalflight_dispatch.STEER_PROMPT_PREAMBLE in preamble, agent
         assert goalflight_dispatch.PROMPT_FILE_PREAMBLE in preamble, agent
-    # The scope guard goes to every implementer regardless of agent, and is
-    # withheld from read-only dispatches: telling a reviewer to make "the
-    # minimum sufficient change" reads as "report the minimum sufficient
-    # finding", and review thoroughness is the gate that catches defects.
+    # The scope guard goes to every dispatch regardless of agent. It binds
+    # code CHANGES, not the task in general, so it is inert for a reviewer
+    # whose deliverable is findings rather than a diff -- which is why there
+    # is no opt-out flag. (--read-only cannot serve as one: it refuses any
+    # prompt that writes a review artifact, so no review dispatch sets it.)
     scope_marker = goalflight_dispatch.SCOPE_GUARD_PREAMBLE
     for agent in ("grok-code", "grok-research", "moonshot", "codex", "cursor",
                   "claude-acp", "codex-acp", "opencode", None):
         assert scope_marker in goalflight_dispatch._worker_prompt_preamble(agent), agent
-        assert scope_marker not in goalflight_dispatch._worker_prompt_preamble(
-            agent, scope_guard=False
-        ), agent
+    assert "where this task changes code" in scope_marker
     # Escalation must be named, or an unattended worker expands scope silently.
     assert "reason `scope`" in scope_marker
     # ...but never as a literal marker token: this text lands in every prompt,
