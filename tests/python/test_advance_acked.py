@@ -138,7 +138,13 @@ def _set_state_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str,
         monkeypatch.setenv(key, value)
         if value != "/dev/null":
             Path(value).mkdir(parents=True, exist_ok=True)
-    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
+    for key in (
+        "GOALFLIGHT_DISPATCH_ID",
+        "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+        "GOALFLIGHT_CONTROLLER_SESSION_ID",
+        "GOALFLIGHT_CONTROLLER_LABEL",
+    ):
+        monkeypatch.delenv(key, raising=False)
     env = os.environ.copy()
     env.update(values)
     return env
@@ -191,23 +197,31 @@ def _pending(authority: journal.Journal, label: str) -> list[tuple[str, int]]:
     ]
 
 
-def _advance_acked(project: Path, label: str, nonce: str) -> int:
+def _advance(
+    project: Path,
+    label: str,
+    *args: str,
+    nonce: str | None = None,
+) -> tuple[int, str, str]:
+    argv = [
+        "advance",
+        "--controller-label",
+        label,
+        "--project-root",
+        str(project),
+        *args,
+    ]
+    if nonce is not None:
+        argv[1:1] = ["--lease-nonce", nonce]
     stdout, stderr = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        rc = gm.main(
-            [
-                "advance",
-                "--acked",
-                "--controller-label",
-                label,
-                "--lease-nonce",
-                nonce,
-                "--json",
-                "--project-root",
-                str(project),
-            ]
-        )
-    assert rc == 0, stderr.getvalue() or stdout.getvalue()
+        rc = gm.main(argv)
+    return rc, stdout.getvalue(), stderr.getvalue()
+
+
+def _advance_acked(project: Path, label: str, nonce: str) -> int:
+    rc, stdout, stderr = _advance(project, label, "--acked", "--json", nonce=nonce)
+    assert rc == 0, stderr or stdout
     return rc
 
 
@@ -394,3 +408,142 @@ def test_same_addressed_payload_requires_matching_label_and_body() -> None:
     different_text = addressed("battery-webui")
     different_text["payload"] = {"text": "other"}
     assert not gm._same_addressed_payload(different_text, incoming)
+
+
+def test_acked_advances_with_label_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A controller that knows its slug does not need to carry a nonce."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    _claim(authority, "battery-webui")
+    messages_dir = Path(os.environ["GOALFLIGHT_MESSAGES_DIR"])
+    _post(project, messages_dir, "battery-webui", "label-only mail")
+    assert os.environ.get("GOALFLIGHT_CONTROLLER_LEASE_NONCE") in (None, "")
+    rc, stdout, stderr = _advance(
+        project, "battery-webui", "--acked", "--json"
+    )
+    assert rc == 0, stderr or stdout
+    assert "--lease-nonce" not in (stderr + stdout)
+    assert _pending(authority, "battery-webui") == []
+    cursor = authority.cursor_status("battery-webui")
+    assert cursor is not None
+    assert cursor["positions"] == {STREAM: 1}
+
+
+def test_explicit_nonce_still_pins_the_live_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Passing --lease-nonce still binds the write to that generation."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    lease = _claim(authority, "battery-webui")
+    messages_dir = Path(os.environ["GOALFLIGHT_MESSAGES_DIR"])
+    _post(project, messages_dir, "battery-webui", "pinned generation")
+    rc_wrong, _, err_wrong = _advance(
+        project,
+        "battery-webui",
+        "--acked",
+        "--json",
+        nonce="not-the-active-nonce",
+    )
+    assert rc_wrong != 0
+    assert "no longer active" in err_wrong or "lease generation changed" in err_wrong
+    assert _pending(authority, "battery-webui") == [(STREAM, 1)]
+    rc, stdout, stderr = _advance(
+        project, "battery-webui", "--acked", "--json", nonce=lease.nonce
+    )
+    assert rc == 0, stderr or stdout
+    assert _pending(authority, "battery-webui") == []
+
+
+def test_stale_generation_nonce_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An older generation cannot fall back to the label's current nonce."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    first = _claim(authority, "battery-webui")
+    messages_dir = Path(os.environ["GOALFLIGHT_MESSAGES_DIR"])
+    _post(project, messages_dir, "battery-webui", "survives stale child")
+    successor = authority.claim_or_renew_lease(
+        "battery-webui",
+        principal={"principal_id": "battery-webui-successor"},
+        takeover=True,
+    )
+    assert successor.committed and successor.value is not None
+    assert successor.value.generation == first.generation + 1
+    assert successor.value.nonce != first.nonce
+    rc_acked, _, err_acked = _advance(
+        project, "battery-webui", "--acked", "--json", nonce=first.nonce
+    )
+    assert rc_acked != 0
+    assert "no longer active" in err_acked or "lease generation changed" in err_acked
+    peek = authority.cursor_peek("battery-webui", nonce=successor.value.nonce)
+    assert peek.items
+    stream = str(peek.items[0]["stream_id"])
+    seq = int(peek.items[0]["stream_seq"])
+    token = peek.stream_snapshots[stream]
+    rc_write, _, err_write = _advance(
+        project,
+        "battery-webui",
+        "--cursor-version",
+        str(peek.cursor_version),
+        "--stream-snapshot",
+        f"{stream}={token}",
+        "--position",
+        f"{stream}={seq}",
+        nonce=first.nonce,
+    )
+    assert rc_write != 0
+    assert "lease generation changed" in err_write
+    assert _pending(authority, "battery-webui") == [(STREAM, 1)]
+    rc_live, stdout_live, err_live = _advance(
+        project, "battery-webui", "--acked", "--json"
+    )
+    assert rc_live == 0, err_live or stdout_live
+    assert _pending(authority, "battery-webui") == []
+
+
+def test_no_active_lease_reconnects_by_slug(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    journal.open_or_create_journal(project)
+    rc, _, stderr = _advance(project, "ghost-controller", "--acked")
+    assert rc != 0
+    assert "no active lease for ghost-controller" in stderr
+    assert "reconnect as:" in stderr
+    assert "--session-label" in stderr
+    assert "ghost-controller" in stderr
+    assert "lease nonce are required" not in stderr
+    assert "--lease-nonce" not in stderr
+    assert "--takeover" not in stderr
+
+
+def test_one_label_cannot_advance_anothers_cursor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Resolving nonce from a label must not drain a different label."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    alice = _claim(authority, "alice")
+    _claim(authority, "bob")
+    messages_dir = Path(os.environ["GOALFLIGHT_MESSAGES_DIR"])
+    _post(project, messages_dir, "alice", "alice mail", dispatch_id="alice-stream")
+    _post(project, messages_dir, "bob", "bob mail", dispatch_id="bob-stream")
+    rc, stdout, stderr = _advance(project, "alice", "--acked", "--json")
+    assert rc == 0, stderr or stdout
+    assert _pending(authority, "alice") == []
+    assert _pending(authority, "bob") == [("bob-stream", 1)]
+    rc_cross, _, err_cross = _advance(
+        project, "bob", "--acked", "--json", nonce=alice.nonce
+    )
+    assert rc_cross != 0
+    assert "no longer active" in err_cross or "lease generation changed" in err_cross
+    assert _pending(authority, "bob") == [("bob-stream", 1)]

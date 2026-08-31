@@ -83,7 +83,7 @@ supervisor is available:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py supervise \
-  --project-root "$PWD" --controller-label <label> --lease-nonce <token>
+  --project-root "$PWD" --controller-label <label>
 ```
 
 On Claude Code that is the Monitor tool with `persistent: true` and **no

@@ -5238,6 +5238,21 @@ def _parse_cursor_stream_snapshots(
     return snapshots
 
 
+def _no_active_lease_reconnect(label: str) -> str:
+    """One actionable reconnect line naming the slug, not a nonce hunt."""
+    command = shlex.join(
+        [
+            "python3",
+            str(goalflight_compat.advertised_script("goalflight_session_status.py")),
+            "--controller-startup",
+            "--controller-pid-from-ancestry",
+            "--session-label",
+            label,
+        ]
+    )
+    return f"no active lease for {label}; reconnect as: {command}"
+
+
 def cmd_advance_cursor(args: argparse.Namespace) -> int:
     """Advance the server cursor by CAS to validated journal positions."""
     import goalflight_journal  # type: ignore
@@ -5257,10 +5272,17 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
         or os.environ.get("GOALFLIGHT_CONTROLLER_LEASE_NONCE")
         or os.environ.get("GOALFLIGHT_CONTROLLER_SESSION_ID")
         or ""
-    ).strip()
+    ).strip() or None
     try:
-        if not label or not nonce:
-            raise ValueError("active controller label and lease nonce are required")
+        if not label:
+            raise ValueError("active controller label is required")
+        if nonce is None:
+            lease = goalflight_journal.Journal.open_reader(project_root).active_lease(
+                label
+            )
+            if lease is None:
+                raise ValueError(_no_active_lease_reconnect(label))
+            nonce = lease.nonce
         if getattr(args, "acked", False):
             if args.position or args.stream_snapshot or args.cursor_version is not None:
                 raise ValueError(
@@ -8458,7 +8480,14 @@ def _run_cli(argv: list[str] | None = None) -> int:
     )
     advance.add_argument("--project-root", default=None)
     advance.add_argument("--controller-label", default=None)
-    advance.add_argument("--lease-nonce", default=None)
+    advance.add_argument(
+        "--lease-nonce",
+        default=None,
+        help=(
+            "pin a specific lease generation; without this, advance "
+            "resolves the journal ACTIVE lease for (project, label)"
+        ),
+    )
     advance.add_argument("--cursor-version", type=int, default=None)
     advance.add_argument(
         "--acked",
