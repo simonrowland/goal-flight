@@ -55,6 +55,14 @@ def test_dispatch_state_aliases_and_lifecycle() -> None:
     assert states.terminal_state_for("wedged") == "error"
     assert states.is_terminal_state("worker_dead") is True
     assert states.terminal_state_for("worker_dead") == "worker_dead"
+    assert states.is_terminal_state("killed") is True
+    assert states.is_running_state("killed") is False
+    assert "killed" in states.TERMINAL_STATES
+    assert states.terminal_state_for("killed") == "killed"
+    assert states.is_terminal_state("blocked_task_breadcrumb") is True
+    assert states.is_running_state("blocked_task_breadcrumb") is False
+    assert "blocked_task_breadcrumb" in states.TERMINAL_STATES
+    assert states.terminal_state_for("blocked_task_breadcrumb") == "blocked"
 
 
 def test_limit_retry_policy_holds_exhausted_and_retries_transient() -> None:
@@ -152,12 +160,68 @@ def test_dispatch_reuse_guard_blocks_live_watcher_stopped() -> None:
         ledger.identity_matches = orig_identity_matches
 
 
+def _defined_dispatch_states() -> set[str]:
+    """Every state spelling the module itself declares.
+
+    Derived from ``*_STATES`` frozensets, ``*_STATE`` string constants, and
+    alias maps — not a hand-written literal, so adding a constant without
+    classifying it fails ``test_defined_states_are_partitioned``.
+    """
+    found: set[str] = set()
+    for name, value in vars(states).items():
+        if name.startswith("_"):
+            continue
+        if name.endswith("_STATES") and isinstance(value, (frozenset, set)):
+            found.update(item for item in value if isinstance(item, str))
+        elif name.endswith("_STATE") and isinstance(value, str) and value:
+            found.add(value)
+    for src, dst in states.DISPATCH_STATE_ALIASES.items():
+        if isinstance(src, str):
+            found.add(src)
+        if isinstance(dst, str):
+            found.add(dst)
+    return found
+
+
+def test_defined_states_are_partitioned() -> None:
+    """A state in neither terminal nor running silently accumulates records.
+
+    Removing a spelling from both sets must fail CI. Attention and the live
+    salvage candidate are named exceptions: they are classified by their own
+    module constants and must not be stuffed into TERMINAL_STATES (leases)
+    or RUNNING_STATES (drain would treat a parked human-wait as abandonable).
+    """
+    overlap = states.TERMINAL_STATES & states.RUNNING_STATES
+    assert overlap == frozenset(), overlap
+
+    exempt = set(states.ATTENTION_STATES) | {states.WORKER_STALLED_CANDIDATE_STATE}
+    orphans: list[str] = []
+    both: list[str] = []
+    for state in sorted(_defined_dispatch_states()):
+        terminal = states.is_terminal_state(state)
+        running = states.is_running_state(state)
+        if terminal and running:
+            both.append(state)
+            continue
+        if terminal or running:
+            continue
+        if state not in exempt:
+            orphans.append(state)
+    assert both == [], both
+    assert orphans == [], orphans
+    assert "killed" in states.TERMINAL_STATES
+    assert "blocked_task_breadcrumb" in states.TERMINAL_STATES
+    assert "killed" not in states.RUNNING_STATES
+    assert "blocked_task_breadcrumb" not in states.RUNNING_STATES
+
+
 def main() -> None:
     test_dispatch_state_aliases_and_lifecycle()
     test_limit_retry_policy_holds_exhausted_and_retries_transient()
     test_ledger_uses_shared_terminal_vocabulary()
     test_dispatch_controller_uses_shared_terminal_vocabulary()
     test_dispatch_reuse_guard_blocks_live_watcher_stopped()
+    test_defined_states_are_partitioned()
     print("OK: dispatch state tests pass")
 
 

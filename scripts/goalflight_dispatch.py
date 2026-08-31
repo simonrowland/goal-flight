@@ -8868,7 +8868,10 @@ def reconcile_abandoned_dispatches(
     if current.tzinfo is None:
         current = current.replace(tzinfo=dt.timezone.utc)
     now_s = current.timestamp()
-    initial_records = goalflight_ledger.read_records()
+    # Per-pass cost must track live work, not dispatch history. Terminal
+    # rows are skipped before json.loads; see read_records(skip_terminal=True).
+    initial_records = goalflight_ledger.read_records(skip_terminal=True)
+    read_work = goalflight_ledger.last_read_work()
     with goalflight_capacity.StateLock():
         initial_capacity = _read_capacity_state_for_reconciliation()
 
@@ -9026,7 +9029,10 @@ def reconcile_abandoned_dispatches(
         "schema": ABANDONED_RECONCILIATION_SCHEMA,
         "mode": "dry-run" if dry_run else "automatic",
         "stale_seconds": stale_s,
-        "scanned": len(initial_records),
+        "listed": read_work["listed"],
+        "parsed": read_work["parsed"],
+        "skipped_terminal": read_work["skipped_terminal"],
+        "scanned": read_work["parsed"],
         "closed": len(closed),
         "would_close": len(would_close),
         "kept": len(entries) - len(closed) - len(would_close),

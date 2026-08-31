@@ -684,10 +684,58 @@ def read_record(dispatch_id: str) -> dict | None:
     return record
 
 
-def read_records() -> list[dict]:
+# Pretty-printed ledger rows from write_record (indent=2, sort_keys=True)
+# put the top-level "state" on its own two-space line. Nested keys indent
+# further, so this is not a cache and does not need invalidation: every
+# pass lists the directory and peeks current bytes. A row whose skip was
+# wrong re-enters as soon as the top-level state is no longer terminal, or
+# if the peek fails (compact/malformed JSON) — then we parse. Age is not
+# a predicate; an old queued/running row is still parsed.
+_TOP_LEVEL_STATE_RE = re.compile(r'^  "state": "([^"]*)"', re.MULTILINE)
+
+# Work units of the last read_records() call. Tests assert parse/evaluate
+# count, not wall time. Not a skip cache.
+_LAST_READ_WORK = {
+    "listed": 0,
+    "parsed": 0,
+    "skipped_terminal": 0,
+}
+
+
+def last_read_work() -> dict[str, int]:
+    """Return a copy of the work counters from the last ``read_records`` call."""
+    return dict(_LAST_READ_WORK)
+
+
+def _peek_top_level_state(raw: str) -> str | None:
+    match = _TOP_LEVEL_STATE_RE.search(raw)
+    return match.group(1) if match else None
+
+
+def read_records(*, skip_terminal: bool = False) -> list[dict]:
+    """Load ledger rows.
+
+    Drain used to ``json.loads`` every historical row every pass, so cost
+    grew with dispatch history forever (measured: scanned 2318, ~3.5 min
+    against a 60s interval). Reconcile only needs non-terminal rows.
+
+    ``skip_terminal=True`` peeks the pretty-printed top-level state and
+    skips ``json.loads`` for rows that are already terminal. This is the
+    cheapest correct filter: no mtime high-water and no index to
+    invalidate. Two overlapping drain passes both list independently; a
+    row closed by the other pass either still peeks as running (existing
+    lock/progress checks apply) or peeks as terminal (correctly skipped).
+
+    Default ``skip_terminal=False`` keeps occupancy/status callers on the
+    full history.
+    """
     records: list[dict] = []
+    listed = 0
+    parsed = 0
+    skipped_terminal = 0
     path = runs_dir(create=False)
     if not path.exists():
+        _LAST_READ_WORK.update(listed=0, parsed=0, skipped_terminal=0)
         return records
     # pathlib.Path.glob on an unreadable directory returns [] without raising
     # (observed). os.listdir raises OSError, which callers that distinguish
@@ -696,11 +744,27 @@ def read_records() -> list[dict]:
     for name in sorted(names):
         if not name.endswith(".json"):
             continue
+        listed += 1
         p = path / name
         try:
-            records.append(json.loads(p.read_text()))
-        except (OSError, json.JSONDecodeError):
+            raw = p.read_text()
+        except OSError:
+            parsed += 1
             records.append(_unreadable_record(p))
+            continue
+        if skip_terminal:
+            peeked = _peek_top_level_state(raw)
+            if peeked is not None and goalflight_dispatch_states.is_terminal_state(peeked):
+                skipped_terminal += 1
+                continue
+        try:
+            records.append(json.loads(raw))
+        except json.JSONDecodeError:
+            records.append(_unreadable_record(p))
+        parsed += 1
+    _LAST_READ_WORK.update(
+        listed=listed, parsed=parsed, skipped_terminal=skipped_terminal
+    )
     return records
 
 

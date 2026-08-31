@@ -44,10 +44,12 @@ FAILURE_TERMINAL_RECORD_STATES = frozenset(
         "blocked_completion_authority",
         "blocked_os_sandbox",
         "blocked_session_limit",
+        "blocked_task_breadcrumb",
         "blocked_windows_dispatch",
         "inconclusive_timeout",
         "inconclusive_no_final",
         "worker_dead",
+        "killed",
         "tool_timeout",
         "stalled",
         "remote_turn_silence",
@@ -69,11 +71,24 @@ WEDGED_TERMINAL_RECORD_STATES = frozenset(
 WORKER_STALLED_CANDIDATE_STATE = "worker_stalled_candidate"
 WORKER_WEDGED_STATE = WORKER_STALLED_CANDIDATE_STATE
 
-TERMINAL_SUCCESS_STATES = SUCCESS_TERMINAL_RECORD_STATES
+# killed: an operator/supervisor stopped the worker. Nothing will advance
+# the row; it belongs with the other failure terminals. Observed on disk
+# without a current producer in this tree — live status records still carry
+# the string, so membership here is what closes the drain/wait gap.
+#
+# blocked_task_breadcrumb: produced by goalflight_watch when a *terminal*
+# task-store breadcrumb cannot be written because the store itself is
+# corrupt or unwritable (missing task ids do not take this path). The
+# worker has already finished; the run stops for a human. Prefix-normalize
+# already maps blocked* → blocked, but the raw spelling must sit in the
+# terminal set or a coverage walk of the constants treats it as an orphan.
 
 TERMINAL_FAILURE_STATES = FAILURE_TERMINAL_RECORD_STATES | WEDGED_TERMINAL_RECORD_STATES
 
-TERMINAL_STATES = TERMINAL_SUCCESS_STATES | TERMINAL_FAILURE_STATES
+# TERMINAL_SUCCESS_STATES was a literal alias of SUCCESS_TERMINAL_RECORD_STATES
+# (only assigned here, then unioned into TERMINAL_STATES). Folded; callers
+# already import SUCCESS_TERMINAL_RECORD_STATES.
+TERMINAL_STATES = SUCCESS_TERMINAL_RECORD_STATES | TERMINAL_FAILURE_STATES
 
 SALVAGE_NEEDED_STATES = frozenset(
     {
