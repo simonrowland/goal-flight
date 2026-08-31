@@ -97,17 +97,17 @@ def attach_worker_to_capacity_lease(
     worker_pid: int,
     worker_pgid: int | None = None,
 ) -> None:
-    """Persist worker identity before RUNNING so stale reclaim sees its group."""
-    if not lease_id:
-        return
-    with goalflight_capacity.StateLock():
-        data = goalflight_capacity.load_state()
-        lease = data.get("leases", {}).get(lease_id)
-        if lease:
-            lease["worker_pid"] = worker_pid
-            if worker_pgid and worker_pgid > 1:
-                lease["worker_pgid"] = worker_pgid
-            goalflight_capacity.save_state(data)
+    """Persist worker pid/pgid and start token before RUNNING.
+
+    Reclaim uses the start token to tell this worker from a recycled PID. If
+    capture fails, identity is left unset rather than invented: a confirmed-live
+    PID/group then holds until death, and a confirmed-dead PID/group is
+    reclaimable. Expiring because the token is missing would reclaim a live
+    worker; holding a live group without a token cannot distinguish reuse.
+    """
+    goalflight_capacity.attach_worker_to_capacity_lease(
+        lease_id, worker_pid, worker_pgid
+    )
 
 
 def _attach_worker_state_before_running(

@@ -15,7 +15,9 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 import socket
+import subprocess
 import sys
+import time
 
 import pytest
 
@@ -247,7 +249,16 @@ def test_c1_healthy_readable_ledger_still_reports_owner(tmp_path: Path) -> None:
     assert verdict["verdict"] == "no"
 
 
-def test_c2_c7_unreadable_ledger_is_not_retired() -> None:
+def test_c2_c7_unreadable_ledger_is_not_retired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(tmp_path / "dispatch"))
+    monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal"))
+    monkeypatch.setenv("GOALFLIGHT_MESSAGES_DIR", str(tmp_path / "messages"))
+    monkeypatch.setenv("GOALFLIGHT_TASK_STORE", str(tmp_path / "task-store.sqlite"))
     dispatch_id = "c7-unreadable"
     path = L.record_path(dispatch_id, create=True)
     path.write_text(
@@ -255,8 +266,70 @@ def test_c2_c7_unreadable_ledger_is_not_retired() -> None:
         encoding="utf-8",
     )
     runs = path.parent
-    with _mode(runs, 0o000):
-        assert W._dispatch_record_is_nonterminal(dispatch_id) is None
+    prompt = tmp_path / "worker.prompt.md"
+    prompt.write_text("do the work\n", encoding="utf-8")
+    tail = tmp_path / "worker.tail"
+    tail.write_text("worker started\n", encoding="utf-8")
+    status = tmp_path / "worker.status.json"
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    watcher = None
+    try:
+        with _mode(runs, 0o000):
+            # Real unsearchable parent: the ledger read itself fails.
+            assert W._dispatch_record_is_nonterminal(dispatch_id) is None
+            watcher = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "goalflight_watch.py"),
+                    "--pid",
+                    str(worker.pid),
+                    "--tail",
+                    str(tail),
+                    "--status-json",
+                    str(status),
+                    "--dispatch-id",
+                    dispatch_id,
+                    "--ignore-prompt-file",
+                    str(prompt),
+                    "--poll-secs",
+                    "0.05",
+                    "--max-idle-secs",
+                    "60",
+                    "--detached",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=os.environ.copy(),
+            )
+            deadline = time.monotonic() + 5.0
+            while (
+                time.monotonic() < deadline
+                and not status.exists()
+                and watcher.poll() is None
+            ):
+                time.sleep(0.05)
+            assert status.is_file(), (
+                watcher.returncode,
+                watcher.stdout.read() if watcher.poll() is not None and watcher.stdout else "",
+                watcher.stderr.read() if watcher.poll() is not None and watcher.stderr else "",
+            )
+            assert watcher.poll() is None, "unreadable ledger retired the live watcher"
+    finally:
+        if watcher is not None and watcher.poll() is None:
+            watcher.terminate()
+            try:
+                watcher.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                watcher.kill()
+                watcher.communicate(timeout=5)
+        worker.kill()
+        worker.wait(timeout=5)
 
 
 def test_c2_c7_absent_record_is_not_nonterminal() -> None:

@@ -148,6 +148,31 @@ def test_corrupt_capacity_json_refuses_admission(tmp_path: Path) -> None:
     assert "from-corrupt" not in raw
 
 
+def test_capacity_object_missing_leases_refuses_admission(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    state_file = cap.state_path()
+    incomplete = {
+        "schema": cap.SCHEMA,
+        "machine_id": cap.machine_id(),
+        "cooldowns": {},
+    }
+    state_file.write_text(json.dumps(incomplete), encoding="utf-8")
+    before = state_file.read_text(encoding="utf-8")
+
+    rc, payload = _acquire(
+        "--lease-id",
+        "from-missing-leases",
+        "--project-root",
+        str(project),
+    )
+    assert rc == 2, payload
+    assert payload["reason"] == "capacity_state_unreadable", payload
+    assert payload.get("measured") is False, payload
+    assert state_file.read_text(encoding="utf-8") == before
+    with pytest.raises(cap.CapacityStateUnreadable):
+        cap.load_state()
+
+
 def test_absent_capacity_state_still_admits(tmp_path: Path) -> None:
     project = _project(tmp_path)
     state_file = cap.state_path()

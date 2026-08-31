@@ -33,12 +33,24 @@ import goalflight_capacity  # noqa: E402
 import goalflight_acp_run  # noqa: E402
 import goalflight_ledger  # noqa: E402
 import goalflight_watch  # noqa: E402
+from goalflight_liveness import (  # noqa: E402
+    LivenessThresholds,
+    TREE_PROBE_SKIPPED,
+    classify_liveness,
+)
 
 
 def _watcher_env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_TEST_MODE"] = "1"
     env.pop("GOALFLIGHT_TEST_PGROUP_CPU_PCT", None)
+    for key in (
+        "GOALFLIGHT_DISPATCH_ID",
+        "GOALFLIGHT_STEER_FILE",
+        "GOALFLIGHT_DISPATCH_SCRIPT",
+        "GOALFLIGHT_PROMPT_FILE",
+    ):
+        env.pop(key, None)
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
     env["GOALFLIGHT_DISPATCH_DIR"] = str(tmp / "dispatch")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
@@ -463,6 +475,7 @@ def test_quiet_worker_with_sleeping_child_is_not_idle_killed(tmp_path: Path) -> 
                 status=status,
                 worker_pid=worker.pid,
                 dispatch_id="quiet-child",
+                liveness_indeterminate_secs="1.2",
             ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -561,6 +574,7 @@ def test_quiet_worker_writing_worktree_is_not_idle_killed(tmp_path: Path) -> Non
                 dispatch_id="quiet-tree",
                 project_root=project_root,
                 worker_cwd=worker_cwd,
+                liveness_indeterminate_secs="1.2",
             ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -797,6 +811,15 @@ def test_indeterminate_cleanup_retains_unverified_group_after_leader_exit(
         attached = goalflight_capacity.load_state()["leases"][lease_id]
         assert attached["worker_pid"] == worker.pid, attached
         assert attached["worker_pgid"] == worker.pid, attached
+        attached_identity = attached.get("worker_identity")
+        assert isinstance(attached_identity, dict), attached
+        assert attached_identity.get("start_token") == identity.get("start_token"), (
+            attached_identity,
+            identity,
+        )
+        assert attached.get("process_identity_schema") == (
+            goalflight_capacity.PROCESS_IDENTITY_SCHEMA
+        )
 
         release.write_text("go", encoding="utf-8")
         deadline = time.monotonic() + 5.0
@@ -1275,7 +1298,7 @@ def test_canonical_root_writer_reaches_indeterminate_not_idle_timeout(
         worker.wait(timeout=5)
 
 
-def test_live_descendant_reaches_universal_outer_bound(tmp_path: Path) -> None:
+def test_live_descendant_survives_indeterminate_outer_bound(tmp_path: Path) -> None:
     project_root = tmp_path / "repo"
     worker_cwd = tmp_path / "worktree"
     project_root.mkdir()
@@ -1296,7 +1319,8 @@ def test_live_descendant_reaches_universal_outer_bound(tmp_path: Path) -> None:
             "    'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'\n"
             "])\n"
             f"Path({str(child_pid_file)!r}).write_text(str(child.pid))\n"
-            f"Path({str(process_table_file)!r}).write_text(f'{{os.getpid()}} 1\\n{{child.pid}} {{os.getpid()}}\\n')\n"
+            f"Path({str(process_table_file)!r}).write_text("
+            f"f'{{os.getpid()}} 1 S\\n{{child.pid}} {{os.getpid()}} S\\n')\n"
             "try:\n"
             "    time.sleep(60)\n"
             "finally:\n"
@@ -1308,6 +1332,7 @@ def test_live_descendant_reaches_universal_outer_bound(tmp_path: Path) -> None:
         stderr=subprocess.DEVNULL,
     )
     _auto_reap_worker(worker)
+    watcher = None
     try:
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline and not child_pid_file.exists():
@@ -1316,7 +1341,7 @@ def test_live_descendant_reaches_universal_outer_bound(tmp_path: Path) -> None:
         child_pid = int(child_pid_file.read_text(encoding="utf-8"))
         assert goalflight_compat.pid_alive(child_pid), child_pid
         process_rows = process_table_file.read_text(encoding="utf-8").splitlines()
-        assert f"{child_pid} {worker.pid}" in process_rows, process_rows
+        assert f"{child_pid} {worker.pid} S" in process_rows, process_rows
         bindir = _descendant_ps_table_bindir(tmp_path, process_table_file)
         env = _watcher_env(tmp_path)
         env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
@@ -1325,8 +1350,23 @@ def test_live_descendant_reaches_universal_outer_bound(tmp_path: Path) -> None:
             ps_runner=lambda *a, **k: subprocess.run(*a, **k, env=env),
         )
         assert count is not None and count >= 1, count
+        # Unit pin: if classify_liveness again treats positive descendants as
+        # an unresolved probe at the outer bound, this assertion goes red
+        # without waiting on watcher startup.
+        assert (
+            classify_liveness(
+                True,
+                0.0,
+                2.0,
+                LivenessThresholds(idle_timeout_s=0.4, cpu_epsilon_pct=0.1),
+                live_descendants=count,
+                tree_probe=TREE_PROBE_SKIPPED,
+                indeterminate_timeout_s=1.2,
+            )
+            == "running_quiet"
+        ), count
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
-        proc = subprocess.run(
+        watcher = subprocess.Popen(
             _watcher_cmd(
                 tail=tail,
                 status=status,
@@ -1338,32 +1378,58 @@ def test_live_descendant_reaches_universal_outer_bound(tmp_path: Path) -> None:
                 max_idle_secs="0.4",
                 liveness_indeterminate_secs="1.2",
             ),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=15,
             env=env,
         )
-        payload = _read_status(status)
-        assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr, payload)
-        assert payload.get("state") == "liveness_indeterminate", payload
-        assert int(payload.get("live_descendants") or 0) >= 1, payload
-        assert "descendants" not in (payload.get("liveness_unknown_probes") or []), payload
-        assert payload.get("worker_disposition") == "terminated_on_liveness_indeterminate", payload
-        assert payload.get("worker_termination_signals") == ["SIGTERM", "SIGKILL"], payload
-        assert worker.poll() is not None, payload
-        deadline = time.monotonic() + 2.0
-        while (
-            time.monotonic() < deadline
-            and goalflight_compat.pid_alive(child_pid)
-            and goalflight_compat.pid_is_zombie(child_pid) is not True
-        ):
+        # Wait until the watcher itself has passed the outer bound with a
+        # positive descendant count. A 2s wall-clock sleep could end before
+        # seconds_since_event reached 1.2s, so reverting the classifier hunk
+        # used to leave this test green.
+        deadline = time.monotonic() + 8.0
+        payload = {}
+        while time.monotonic() < deadline:
+            payload = _read_status(status)
+            sse = payload.get("seconds_since_event")
+            if watcher.poll() is not None:
+                break
+            if (
+                payload.get("liveness_state") == "running_quiet"
+                and int(payload.get("live_descendants") or 0) >= 1
+                and sse is not None
+                and float(sse) >= 1.2
+            ):
+                break
             time.sleep(0.05)
-        assert (
-            not goalflight_compat.pid_alive(child_pid)
-            or goalflight_compat.pid_is_zombie(child_pid) is True
-        ), child_pid
+        assert watcher.poll() is None, (
+            watcher.returncode,
+            watcher.stdout.read() if watcher.stdout else "",
+            watcher.stderr.read() if watcher.stderr else "",
+            payload,
+        )
+        assert payload.get("liveness_state") == "running_quiet", payload
+        assert payload.get("state") not in {
+            "idle_timeout",
+            "wedged",
+            "liveness_indeterminate",
+        }, payload
+        assert int(payload.get("live_descendants") or 0) >= 1, payload
+        assert float(payload.get("seconds_since_event") or 0) >= 1.2, payload
+        assert worker.poll() is None, payload
+        assert goalflight_compat.pid_alive(child_pid), child_pid
     finally:
-        worker.kill()
+        if watcher is not None and watcher.poll() is None:
+            watcher.terminate()
+            try:
+                watcher.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                watcher.kill()
+                watcher.communicate(timeout=5)
+        try:
+            os.killpg(worker.pid, signal.SIGKILL)
+        except OSError:
+            pass
         worker.wait(timeout=5)
 
 
