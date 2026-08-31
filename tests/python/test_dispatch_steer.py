@@ -749,6 +749,8 @@ def case_prompt_preamble_is_materialized() -> None:
             goalflight_dispatch.STEER_PROMPT_PREAMBLE
             + "\n\n"
             + goalflight_dispatch.PROMPT_FILE_PREAMBLE
+            + "\n\n"
+            + goalflight_dispatch.SCOPE_GUARD_PREAMBLE
             + "\n\nTerminal evidence identity contract:\n"
             + "- Every terminal marker payload starts with the exact dispatch id `prompt-case`.\n"
             + "- Successful final shape: `!COMPLETE: prompt-case — <summary>`.\n"
@@ -899,6 +901,25 @@ def case_preamble_routing_matrix() -> None:
         preamble = goalflight_dispatch._worker_prompt_preamble(agent)
         assert goalflight_dispatch.STEER_PROMPT_PREAMBLE in preamble, agent
         assert goalflight_dispatch.PROMPT_FILE_PREAMBLE in preamble, agent
+    # The scope guard goes to every implementer regardless of agent, and is
+    # withheld from read-only dispatches: telling a reviewer to make "the
+    # minimum sufficient change" reads as "report the minimum sufficient
+    # finding", and review thoroughness is the gate that catches defects.
+    scope_marker = goalflight_dispatch.SCOPE_GUARD_PREAMBLE
+    for agent in ("grok-code", "grok-research", "moonshot", "codex", "cursor",
+                  "claude-acp", "codex-acp", "opencode", None):
+        assert scope_marker in goalflight_dispatch._worker_prompt_preamble(agent), agent
+        assert scope_marker not in goalflight_dispatch._worker_prompt_preamble(
+            agent, scope_guard=False
+        ), agent
+    # Escalation must be named, or an unattended worker expands scope silently.
+    assert "reason `scope`" in scope_marker
+    # ...but never as a literal marker token: this text lands in every prompt,
+    # and worker tails echo the prompt, so a bare "BLOCKED:" here would be
+    # scraped back as a real escalation from every dispatch (b-109).
+    assert "BLOCKED:" not in scope_marker
+    # Scope limits must not read as permission to skip the brief's verification.
+    assert "not on VERIFICATION" in scope_marker
 
 
 def main() -> None:

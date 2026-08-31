@@ -970,6 +970,42 @@ WORKER_EXECUTION_PREAMBLE = (
     "Do not print anything after it.\n"
     "- Legacy unprefixed marker lines remain accepted; new emissions use the `!` prefix."
 )
+
+
+# Workers routinely deliver a correct fix wrapped in scaffolding nobody asked
+# for: a config knob with one caller, a compatibility shim for a case that
+# cannot occur, a parallel implementation left beside the one it replaces.
+# The failure is not laziness, it is the opposite -- so the counter-pressure
+# has to be explicit, and it has to name the escalation path, because an
+# unattended worker has no operator to ask and will otherwise just expand.
+SCOPE_GUARD_PREAMBLE = (
+    "Scope contract -- complete the task with the minimum sufficient change:\n"
+    "- Reuse existing code, helpers, patterns, and test setup before adding "
+    "anything new. Search for what already does this before writing a second one.\n"
+    "- Fix the root cause. Do not stack patches around a premise you have not "
+    "verified.\n"
+    "- Add an abstraction, adapter, config knob, or compatibility layer ONLY for "
+    "a second real caller in this task, or because the brief requires it. If you "
+    "cannot name the failure a mechanism prevents, it is a liability, not rigor.\n"
+    "- Preserve behaviour outside the requested change, and delete the code you "
+    "replace. Do not leave two implementations of one behaviour alive.\n"
+    "- Do not design for rare or future cases nobody asked about.\n"
+    "- Every touched file must be necessary. No debug code, backup copies, dead "
+    "paths, or scratch files in the final diff.\n"
+    "- The brief's stated scope is also a floor: do not quietly narrow it. If you "
+    "cannot finish part of it, finish the rest and say plainly what you left.\n"
+    "- These are limits on SCOPE, not on VERIFICATION. Where the brief asks for "
+    "self-review, regression tests, or a revert-check, do all of it -- that is "
+    "the acceptance criteria, not scope creep.\n"
+    "- If the work starts growing future-use layers, workaround stacks, unrelated "
+    "cleanup, or tests for unstated behaviour: stop and escalate instead of "
+    "expanding it yourself -- emit a blocked marker in the dispatch-id shape "
+    "given below, with reason `scope`, naming what you would have to expand "
+    "and why. There is no interactive operator to approve an "
+    "expansion mid-run; the orchestrator decides. Escalate the same way before "
+    "adding a dependency or changing a public API, schema, or wire format.\n"
+    "- Read-only discovery is always allowed and never needs escalation."
+)
 STEER_ACK_RE = goalflight_terminal.STEER_ACK_RE
 
 
@@ -4621,7 +4657,12 @@ def _mark_reconciled_parent_resumed(
 CURSOR_AGENTS = {"cursor", "cursor-agent"}
 
 
-def _worker_prompt_preamble(agent: str | None, *, orientation_path: Path | None = None) -> str:
+def _worker_prompt_preamble(
+    agent: str | None,
+    *,
+    orientation_path: Path | None = None,
+    scope_guard: bool = True,
+) -> str:
     is_cursor = agent in CURSOR_AGENTS
     preambles = [
         STEER_PROMPT_PREAMBLE,
@@ -4637,6 +4678,11 @@ def _worker_prompt_preamble(agent: str | None, *, orientation_path: Path | None 
     # test_dispatch_steer.case_preamble_routing_matrix, which pins that split.
     if agent in {"grok-code", "grok-research", "moonshot"}:
         preambles.append(WORKER_EXECUTION_PREAMBLE)
+    # Reviewers are excluded: "minimum sufficient change" reads as "report the
+    # minimum sufficient finding", and review thoroughness is the gate that has
+    # actually been catching defects. Read-only is the signal for that.
+    if scope_guard:
+        preambles.append(SCOPE_GUARD_PREAMBLE)
     return "\n\n".join(preambles)
 
 
@@ -4647,12 +4693,15 @@ def _materialize_steer_prompt(
     *,
     agent: str | None = None,
     orientation_path: Path | None = None,
+    scope_guard: bool = True,
 ) -> str | None:
     if not prompt_path:
         return None
     body_path = Path(prompt_path)
     body = body_path.read_text(encoding="utf-8", errors="replace")
-    preamble = _worker_prompt_preamble(agent, orientation_path=orientation_path)
+    preamble = _worker_prompt_preamble(
+        agent, orientation_path=orientation_path, scope_guard=scope_guard
+    )
     if agent not in {*CURSOR_AGENTS, "codex-acp", "claude-acp"}:
         preamble += (
             "\n\nTerminal evidence identity contract:\n"
@@ -17376,6 +17425,7 @@ def main(argv: list[str] | None = None) -> int:
             args.dispatch_id,
             agent=args.agent,
             orientation_path=orientation_path,
+            scope_guard=not _effective_read_only(args),
         )
     try:
         worker_argv, stdin_path = build_worker(args, prompt_path, raw)
