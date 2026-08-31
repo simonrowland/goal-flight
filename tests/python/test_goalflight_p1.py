@@ -994,6 +994,97 @@ def test_envelope_validation_serializes_total_bounded_canonical_json(tmp_path: P
         messages.validate_envelope(invalid_root)
 
 
+def test_validate_envelope_unresolvable_addressee_root_is_message_error_not_task_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Validating stored mail whose addressee checkout vanished is a MessageError.
+
+    Reverting the conversion leaves ``validate_envelope`` raising TaskError,
+    which ``_read_envelope_records`` does not catch, so one stale addressee
+    poisons the carrier. Capture of the same path must still refuse.
+    """
+    _set_state_env(monkeypatch, tmp_path)
+    first = messages.post_message(
+        dispatch_id="vanished-addressee",
+        msg_type="status",
+        payload={"text": "before"},
+        messages_dir=tmp_path / "messages",
+        project_journal_delivery=False,
+    )
+    missing = tmp_path / "deleted-checkout"
+    assert not missing.exists()
+    stored = {
+        **first["envelope"],
+        "type": "controller-notice",
+        "addressee": {
+            "kind": "controller",
+            "label": "main",
+            "project_root": str(missing),
+        },
+    }
+    with pytest.raises(messages.MessageError, match="unresolvable project root") as caught:
+        messages.validate_envelope(stored)
+    assert not isinstance(caught.value, task.TaskError)
+    assert "Refusing to write to another store" not in str(caught.value)
+    with pytest.raises(task.TaskError, match="Refusing to write to another store"):
+        task.resolve_project_root(str(missing))
+
+    path = Path(first["path"])
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(stored) + "\n")
+    errors: list[dict[str, object]] = []
+    loaded = messages.read_envelopes_tolerant(path, carrier_errors=errors)
+    assert [item["payload"]["text"] for item in loaded] == ["before"]
+    assert errors
+    assert any("unresolvable project root" in str(error.get("error", "")) for error in errors)
+
+
+def test_validate_envelope_resolvable_noncanonical_addressee_root_is_still_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two spellings of a live root must still fail validation.
+
+    A linked worktree collapses to the main checkout. Storing the worktree
+    path would hash a slug no reader watches. Reverting the unresolvable
+    conversion must not be the only way this stays rejected: a live
+    non-canonical spelling is MessageError, not a pass.
+    """
+    _set_state_env(monkeypatch, tmp_path)
+    main = tmp_path / "project-main"
+    main.mkdir()
+    _git(main, "init", "-q")
+    (main / "tracked.txt").write_text("one\n", encoding="utf-8")
+    _git(main, "add", "tracked.txt")
+    _git(main, "commit", "-qm", "initial")
+    linked = tmp_path / "project-linked"
+    _git(main, "worktree", "add", "-q", "-b", "linked-test", str(linked))
+    canonical = str(task.resolve_project_root(str(linked)))
+    assert canonical == str(task.resolve_project_root(str(main)))
+    assert str(linked) != canonical
+
+    posted = messages.post_message(
+        dispatch_id="noncanonical-addressee",
+        msg_type="status",
+        payload={"text": "valid"},
+        messages_dir=tmp_path / "messages",
+        project_journal_delivery=False,
+    )
+    stored = {
+        **posted["envelope"],
+        "type": "controller-notice",
+        "addressee": {
+            "kind": "controller",
+            "label": "main",
+            "project_root": str(linked),
+        },
+    }
+    with pytest.raises(messages.MessageError, match="expected canonical root") as caught:
+        messages.validate_envelope(stored)
+    assert canonical in str(caught.value)
+    assert "unresolvable project root" not in str(caught.value)
+    assert not isinstance(caught.value, task.TaskError)
+
+
 def test_record_local_value_and_recursion_failures_quarantine_and_writers_continue(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
