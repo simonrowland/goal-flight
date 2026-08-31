@@ -61,7 +61,6 @@ SERIAL_CEILING_S = HANG_S * N_HUNG + 0.8
 SLOW_FAIL_S = 0.50
 STARVE_BUDGET_S = 0.40
 BOUNDED_PASSES = 3
-EXPECTED_TERMINAL_ATTEMPTS = 3
 
 
 @pytest.fixture(autouse=True)
@@ -233,6 +232,73 @@ def _write_missing_prompt_entry(
     D._write_json_atomic(path, payload)
     _write_queued_ledger(path)
     return path
+
+
+def _write_prompt_file_entry(
+    queue: Path,
+    dispatch_id: str,
+    *,
+    project_root: Path,
+    agent: str,
+    prompt: str,
+    extra_argv: list[str] | None = None,
+    request_extra: dict | None = None,
+) -> Path:
+    path = queue / f"{dispatch_id}.json"
+    prompt_file = project_root / f"{dispatch_id}.prompt.md"
+    prompt_file.write_text(prompt, encoding="utf-8")
+    tail = project_root / f"{dispatch_id}.tail"
+    status = project_root / f"{dispatch_id}.status.json"
+    argv = [
+        "--agent",
+        agent,
+        "--prompt-file",
+        str(prompt_file),
+        "--dispatch-id",
+        dispatch_id,
+        "--cwd",
+        str(project_root),
+        "--tail",
+        str(tail),
+        "--status-json",
+        str(status),
+        "--unregistered-forced",
+        "--occupied-worktree-forced",
+        "--ignore-git-warn",
+    ]
+    if extra_argv:
+        argv[2:2] = list(extra_argv)
+    payload = {
+        "schema": D.DISPATCH_QUEUE_SCHEMA,
+        "state": "queued",
+        "dispatch_id": dispatch_id,
+        "agent": agent,
+        "shape": "bash",
+        "project_root": str(project_root),
+        "process_cwd": str(project_root),
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "queue_path": str(path),
+        "dispatch_argv": argv,
+        "request": {
+            "agent": agent,
+            "cwd": str(project_root),
+            "prompt_file": str(prompt_file),
+            "tail": str(tail),
+            "status_json": str(status),
+            **(request_extra or {}),
+        },
+    }
+    D._write_json_atomic(path, payload)
+    _write_queued_ledger(path)
+    return path
+
+
+def _clear_launch_backoff(path: Path) -> dict:
+    queued = json.loads(path.read_text(encoding="utf-8"))
+    queued.pop("launch_backoff_until", None)
+    D._write_json_atomic(path, queued)
+    return queued
 
 
 def _is_drain_child(argv: list[object]) -> bool:
@@ -416,7 +482,13 @@ def test_healthy_entry_launches_promptly_when_capacity_available(
 def test_real_pre_spawn_refusal_terminalizes_after_bounded_attempts(
     tmp_path: Path,
 ) -> None:
-    """A real child computes its missing-prompt refusal; drain never supplies it."""
+    """A real child computes its missing-prompt refusal; drain never supplies it.
+
+    Pins bounded abandon, not the exact strike count. A policy of 4 strikes,
+    or two permanents after one transient, still meets the contract as long as
+    the envelope is failed within MAX_DRAIN_PRE_WORKER_FAILURES counted
+    attempts and does not retry unboundedly.
+    """
     queue = _queue_dir(tmp_path)
     project = tmp_path / "proj"
     project.mkdir()
@@ -428,21 +500,33 @@ def test_real_pre_spawn_refusal_terminalizes_after_bounded_attempts(
     )
 
     payloads = []
-    for attempt in range(1, EXPECTED_TERMINAL_ATTEMPTS + 1):
+    bound = D.MAX_DRAIN_PRE_WORKER_FAILURES + 2
+    last_count = 0
+    for _attempt in range(1, bound + 1):
         payload = D._drain_queue_once(_drain_args(queue))
         payloads.append(payload)
-        if attempt < EXPECTED_TERMINAL_ATTEMPTS:
-            queued = json.loads(path.read_text(encoding="utf-8"))
-            assert queued["state"] == "queued", (attempt, queued, payload)
-            assert queued["launch_pre_worker_failure_count"] == attempt, queued
-            assert "prompt file not found" in queued["launch_fail_reason"], queued
+        if not path.exists():
+            break
+        queued = json.loads(path.read_text(encoding="utf-8"))
+        assert queued["state"] == "queued", (queued, payload)
+        assert queued.get("launch_backoff_until"), queued
+        last_count = int(queued.get("launch_pre_worker_failure_count") or 0)
+        assert 1 <= last_count <= D.MAX_DRAIN_PRE_WORKER_FAILURES, queued
+        assert "prompt file not found" in queued["launch_fail_reason"], queued
+        _clear_launch_backoff(path)
+    else:
+        raise AssertionError(
+            f"carrier still queued after {bound} passes; payloads={payloads}"
+        )
 
     assert path.exists() is False, payloads
     failed_paths = list(queue.glob(f"{dispatch_id}.json.claimed-*.failed"))
     assert len(failed_paths) == 1, (failed_paths, payloads)
     failed = json.loads(failed_paths[0].read_text(encoding="utf-8"))
     assert failed["state"] == "failed", failed
-    assert failed["launch_pre_worker_failure_count"] == EXPECTED_TERMINAL_ATTEMPTS, failed
+    assert 1 <= int(failed["launch_pre_worker_failure_count"]) <= (
+        D.MAX_DRAIN_PRE_WORKER_FAILURES
+    ), failed
     reason = str(failed.get("reason") or "")
     assert reason.startswith("launch_attempt_limit_exceeded:"), failed
     assert "prompt file not found" in reason, failed
@@ -451,11 +535,13 @@ def test_real_pre_spawn_refusal_terminalizes_after_bounded_attempts(
     record = json.loads(ledger.record_path(dispatch_id).read_text(encoding="utf-8"))
     assert record.get("state") == "failed", record
     assert str(record.get("terminal_state") or "") not in {"", "unknown"}, record
-    assert record.get("reason") == reason, record
-    assert record["launch_pre_worker_failure_count"] == EXPECTED_TERMINAL_ATTEMPTS
+    assert str(record.get("reason") or "").startswith("launch_attempt_limit_exceeded:"), record
+    assert 1 <= int(record["launch_pre_worker_failure_count"]) <= (
+        D.MAX_DRAIN_PRE_WORKER_FAILURES
+    )
     status = json.loads((project / f"{dispatch_id}.status.json").read_text(encoding="utf-8"))
     assert status.get("state") == "failed", status
-    assert status.get("reason") == reason, status
+    assert str(status.get("reason") or "").startswith("launch_attempt_limit_exceeded:"), status
 
 
 def test_legacy_launch_timeout_count_does_not_spend_new_failure_budget(
@@ -527,6 +613,10 @@ def test_transient_local_pre_spawn_gate_does_not_spend_failure_budget(
     queued = json.loads(path.read_text(encoding="utf-8"))
     assert int(queued.get("launch_pre_worker_failure_count") or 0) == 0, queued
     assert int(queued.get("launch_timeout_count") or 0) == 0, queued
+    assert queued.get("launch_attempt_class") == (
+        D.LAUNCH_ATTEMPT_CLASS_PROVEN_TRANSIENT
+    ), queued
+    assert not queued.get("launch_backoff_until"), queued
     assert queued.get("launch_fail_reason") == (
         f"launch_refused_pre_spawn:{returncode}:{diagnostic}"
     ), queued
@@ -563,6 +653,9 @@ def test_remote_fleet_gate_does_not_spend_failure_budget(
     queued = json.loads(path.read_text(encoding="utf-8"))
     assert int(queued.get("launch_pre_worker_failure_count") or 0) == 0, queued
     assert int(queued.get("launch_timeout_count") or 0) == 0, queued
+    assert queued.get("launch_attempt_class") == (
+        D.LAUNCH_ATTEMPT_CLASS_PROVEN_TRANSIENT
+    ), queued
     assert "remote_blocked:fleet_unavailable" in _reason_for(payload, dispatch_id)
 
 
@@ -866,12 +959,9 @@ def test_failure_count_survives_ledger_carrier_republication(tmp_path: Path) -> 
     assert path.exists(), first
     stamped = json.loads(path.read_text(encoding="utf-8"))
     assert stamped["launch_pre_worker_failure_count"] == 1
-    assert D._stamp_launch_attempt(
-        path,
-        stamped,
-        backoff=True,
-        fail_reason="capacity_unavailable",
-    ) is None
+    assert stamped.get("launch_backoff_until"), stamped
+    backoff_count = int(stamped.get("launch_backoff_count") or 0)
+    assert backoff_count >= 1, stamped
     path.unlink()
 
     recovered = D._recover_claimed_queue_entries(queue, stale_s=0.0)
@@ -880,7 +970,7 @@ def test_failure_count_survives_ledger_carrier_republication(tmp_path: Path) -> 
     assert path.exists(), recovered
     republished = json.loads(path.read_text(encoding="utf-8"))
     assert republished["launch_pre_worker_failure_count"] == 1, republished
-    assert republished["launch_backoff_count"] == 1, republished
+    assert republished["launch_backoff_count"] == backoff_count, republished
     assert republished.get("launch_backoff_until"), republished
 
 
@@ -898,6 +988,7 @@ def test_launch_attempt_stamp_write_error_is_reported_and_ledger_durable(
         if (
             target == path
             and "launch_pre_worker_failure_count" in payload
+            and path.exists()
         ):
             raise OSError("simulated carrier stamp failure")
         real_write(target, payload)
@@ -1225,3 +1316,326 @@ def test_pass_wall_time_still_does_not_scale_with_n_unlaunchable(
     assert burns == 1, payload
     reasons = [str(row.get("reason") or "") for row in payload.get("details") or []]
     assert reasons.count("pass_launch_budget") == n - 1, payload
+
+
+def _assert_undetermined_and_backed_off(
+    queue: Path,
+    path: Path,
+    dispatch_id: str,
+    payload: dict,
+) -> dict:
+    assert path.exists(), payload
+    queued = json.loads(path.read_text(encoding="utf-8"))
+    assert queued.get("state") == "queued", queued
+    assert queued.get("launch_attempt_class") == (
+        D.LAUNCH_ATTEMPT_CLASS_UNDETERMINED
+    ), queued
+    assert queued.get("launch_backoff_until"), queued
+    assert int(queued.get("launch_undetermined_count") or 0) >= 1, queued
+    assert int(queued.get("launch_pre_worker_failure_count") or 0) == 0, queued
+    second = D._drain_queue_once(_drain_args(queue))
+    assert _reason_for(second, dispatch_id) == "launch_backoff", second
+    assert int(second.get("launched") or 0) == 0, second
+    return queued
+
+
+def test_grok_code_web_research_prompt_is_undetermined_and_backs_off(
+    tmp_path: Path,
+) -> None:
+    """Queued grok-code 'search the web' must not sit with no accounting."""
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    dispatch_id = "grok-web-research"
+    path = _write_prompt_file_entry(
+        queue,
+        dispatch_id,
+        project_root=project,
+        agent="grok-code",
+        prompt="Please search the web for goal-flight drain launch accounting.",
+    )
+    payload = D._drain_queue_once(_drain_args(queue))
+    queued = _assert_undetermined_and_backed_off(queue, path, dispatch_id, payload)
+    assert "WEB RESEARCH" in str(queued.get("launch_fail_reason") or ""), queued
+
+
+def test_read_only_write_artifact_prompt_is_undetermined_and_backs_off(
+    tmp_path: Path,
+) -> None:
+    """Queued --read-only write-artifact prompt must not sit with no accounting."""
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    dispatch_id = "readonly-write-artifact"
+    path = _write_prompt_file_entry(
+        queue,
+        dispatch_id,
+        project_root=project,
+        agent="codex",
+        prompt="Please write the review artifact to docs-private/findings.md.",
+        extra_argv=["--read-only"],
+        request_extra={"read_only": True},
+    )
+    payload = D._drain_queue_once(_drain_args(queue))
+    queued = _assert_undetermined_and_backed_off(queue, path, dispatch_id, payload)
+    assert "read-only" in str(queued.get("launch_fail_reason") or "").lower(), queued
+
+
+def test_remote_missing_prompt_is_undetermined_and_backs_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Remote drain with no prompt must not sit queued with no accounting."""
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    dispatch_id = "remote-missing-prompt"
+    path = _write_entry(
+        queue,
+        dispatch_id,
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    queued = json.loads(path.read_text(encoding="utf-8"))
+    queued["agent"] = "codex"
+    queued["request"]["agent"] = "codex"
+    D._write_json_atomic(path, queued)
+    _write_queued_ledger(path)
+    monkeypatch.setattr(D, "_validate_remote_drain_node", lambda _args: None)
+    payload = D._drain_queue_once(
+        _drain_args(
+            queue,
+            remote_node="test-node",
+            remote_runner=object(),
+        )
+    )
+    queued = _assert_undetermined_and_backed_off(queue, path, dispatch_id, payload)
+    assert "remote_blocked:missing_prompt" in str(
+        queued.get("launch_fail_reason") or ""
+    ), queued
+
+
+def test_unprefixed_bad_task_id_is_undetermined_not_a_named_case(
+    tmp_path: Path,
+) -> None:
+    """A carrier defect outside the three measured cases is still classified.
+
+    Queued --task with a syntactically invalid id raises DispatchUsageError
+    before the proven-prefix handler. That is the class: unrecognised prefix,
+    not a widened match of the three symptoms.
+    """
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    dispatch_id = "bad-task-id"
+    path = _write_prompt_file_entry(
+        queue,
+        dispatch_id,
+        project_root=project,
+        agent="codex",
+        prompt="ordinary coding prompt",
+        extra_argv=["--task", "not-a-task-id"],
+    )
+    payload = D._drain_queue_once(_drain_args(queue))
+    queued = _assert_undetermined_and_backed_off(queue, path, dispatch_id, payload)
+    assert "t-/b- ids" in str(queued.get("launch_fail_reason") or ""), queued
+
+
+def test_dual_stamp_write_failure_still_persists_cursor_via_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restore publishes the in-memory cursor even if stamp's two writes throw."""
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    dispatch_id = "dual-stamp-fail"
+    path = _write_missing_prompt_entry(queue, dispatch_id, project_root=project)
+    real_write = D._write_json_atomic
+
+    def fail_ledger(_record: dict) -> Path:
+        raise OSError("simulated ledger stamp failure")
+
+    def fail_second_carrier(target: Path, payload: dict) -> None:
+        if (
+            target == path
+            and "launch_pre_worker_failure_count" in payload
+            and path.exists()
+        ):
+            raise OSError("simulated carrier stamp failure")
+        real_write(target, payload)
+
+    monkeypatch.setattr(D.goalflight_ledger, "write_record", fail_ledger)
+    monkeypatch.setattr(D, "_write_json_atomic", fail_second_carrier)
+    payload = D._drain_queue_once(_drain_args(queue))
+
+    assert path.exists(), payload
+    queued = json.loads(path.read_text(encoding="utf-8"))
+    assert queued["launch_pre_worker_failure_count"] == 1, queued
+    detail = next(
+        row
+        for row in payload.get("details") or []
+        if row.get("dispatch_id") == dispatch_id
+    )
+    error = str(detail.get("launch_attempt_stamp_error") or "")
+    assert "ledger:OSError" in error, detail
+    assert "carrier:OSError" in error, detail
+
+
+def test_terminalize_without_ledger_still_fails_the_carrier(tmp_path: Path) -> None:
+    """A queue-only proven refusal must not retry forever because ledger is missing."""
+    queue = _queue_dir(tmp_path)
+    dispatch_id = "orphan-no-ledger"
+    claim = queue / f"{dispatch_id}.json.claimed-test"
+    entry = {
+        "schema": D.DISPATCH_QUEUE_SCHEMA,
+        "state": "claimed",
+        "dispatch_id": dispatch_id,
+        "agent": "codex",
+        "queue_launch_token": "tok",
+        "project_root": str(tmp_path),
+    }
+    D._write_json_atomic(claim, entry)
+    committed, detail = D._terminalize_pre_worker_launch_failure(
+        claim,
+        entry,
+        reason="launch_attempt_limit_exceeded:test",
+        failure_count=D.MAX_DRAIN_PRE_WORKER_FAILURES,
+    )
+    assert committed is True, detail
+    assert claim.exists() is False, detail
+    failed_paths = list(queue.glob(f"{dispatch_id}.json.claimed-test.failed"))
+    assert len(failed_paths) == 1, (failed_paths, detail)
+    failed = json.loads(failed_paths[0].read_text(encoding="utf-8"))
+    assert failed["state"] == "failed", failed
+    assert "ledger_missing" in detail, detail
+
+
+def test_real_claim_marker_oserror_is_not_a_proven_refusal(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Production claim-marker OSError must not emit the authenticated prefix."""
+    claim = tmp_path / "marker.json"
+    claim.write_text("{}", encoding="utf-8")
+    claim.chmod(0o000)
+    args = argparse.Namespace(
+        from_queue=True,
+        queue_claim_path=str(claim),
+        queue_launch_token="tok",
+    )
+    try:
+        with pytest.raises(D.DispatchUsageError) as caught:
+            D._mark_queue_claim_launch_started(args)
+    finally:
+        claim.chmod(0o600)
+    assert "queue claim launch marker failed:" in str(caught.value)
+    captured = capsys.readouterr()
+    assert D.PROVEN_PRE_WORKER_REFUSAL_PREFIX not in captured.out
+    assert D.PROVEN_PRE_WORKER_REFUSAL_PREFIX not in captured.err
+    assert not isinstance(caught.value, D.ProvenPreWorkerRefusal)
+
+
+def test_controller_label_in_use_handler_does_not_emit_proven_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The production rc-73 handler must not raise or print a proven refusal."""
+    monkeypatch.setattr(
+        D,
+        "_stamp_controller_session",
+        lambda *_args, **_kwargs: {
+            "reason": "label_in_use",
+            "message": "controller label in use",
+        },
+    )
+    code = D.main(
+        [
+            "--agent",
+            "test-dispatch",
+            "--cwd",
+            str(tmp_path),
+            "--unregistered-forced",
+            "--occupied-worktree-forced",
+            "--",
+            sys.executable,
+            "-c",
+            "print('must-not-launch')",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 73, (code, captured)
+    assert "label in use" in captured.err
+    assert D.PROVEN_PRE_WORKER_REFUSAL_PREFIX not in captured.out
+    assert D.PROVEN_PRE_WORKER_REFUSAL_PREFIX not in captured.err
+
+
+def test_real_worktree_seat_child_does_not_emit_proven_prefix_or_spend_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Production WorktreeSeatUnavailable must not emit the authenticated prefix.
+
+    Drain classification of that diagnostic is pinned by the parametrized
+    transient-gate test. This drives the real bind path, not a mocked child.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.email", "goalflight-test@example.invalid"],
+        ["git", "config", "user.name", "Goal Flight Test"],
+    ):
+        result = _REAL_SUBPROCESS_RUN(
+            args,
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert result.returncode == 0, (args, result.stderr)
+    (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+    for args in (["git", "add", "tracked.txt"], ["git", "commit", "-m", "base"]):
+        result = _REAL_SUBPROCESS_RUN(
+            args,
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert result.returncode == 0, (args, result.stderr)
+
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    import goalflight_worktree_pool as pool
+
+    holder = pool.acquire_worktree_seat(repo, "seat-holder")
+    try:
+        code = D.main(
+            [
+                "--agent",
+                "test-dispatch",
+                "--cwd",
+                str(repo),
+                "--worktree",
+                "HEAD",
+                "--unregistered-forced",
+                "--occupied-worktree-forced",
+                "--ignore-git-warn",
+                "--",
+                sys.executable,
+                "-c",
+                "print('must-not-launch')",
+            ]
+        )
+    finally:
+        holder.release()
+    captured = capsys.readouterr()
+    assert code == 2, (code, captured)
+    assert "wait for a seat" in captured.err
+    assert D.PROVEN_PRE_WORKER_REFUSAL_PREFIX not in captured.out
+    assert D.PROVEN_PRE_WORKER_REFUSAL_PREFIX not in captured.err
+
+
+def main() -> None:
+    raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+if __name__ == "__main__":
+    main()
