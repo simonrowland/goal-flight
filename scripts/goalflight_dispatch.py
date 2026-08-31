@@ -17959,6 +17959,7 @@ def main(argv: list[str] | None = None) -> int:
                     expected_home=resume_home,
                     expected_session_id=args.codex_session_id,
                     expected_home_owner_dispatch_id=codex_home_owner_dispatch_id,
+                    exclude_dispatch_id=args.dispatch_id,
                 )
                 if _CODEX_RESUME_CLAIM_VALIDATED_HOOK is not None:
                     _CODEX_RESUME_CLAIM_VALIDATED_HOOK(
@@ -17988,6 +17989,7 @@ def main(argv: list[str] | None = None) -> int:
                     parent_dispatch_id=args.parent_dispatch_id,
                     expected_engine=resume_engine,
                     expected_session_id=engine_session_id,
+                    exclude_dispatch_id=args.dispatch_id,
                 )
                 _record_ledger(
                     args,
