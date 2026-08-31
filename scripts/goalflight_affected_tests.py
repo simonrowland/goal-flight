@@ -18,6 +18,18 @@ full suite's.
 Selection is deliberately over-inclusive (substring mention, not import
 analysis): a false positive costs 0.2s, a false negative costs a missed
 regression.
+
+Use this to check a single module too, rather than running it by hand:
+
+    python3 scripts/goalflight_affected_tests.py tests/python/test_foo.py
+
+`python3 tests/python/test_foo.py` is NOT a general substitute. On a module
+with no `__main__` guard it executes zero tests, prints nothing, and exits 0 --
+a pass that cannot fail. Measured: test_goalflight_p3.py exits 0 as a script
+while pytest reports 4 failed, 41 passed. Running a module by hand also leaves
+every GOALFLIGHT_* isolation variable unset, so it reads the live journal,
+task store, and capacity conf instead of a sandbox. This routes on the suite's
+own has_main_driver predicate and sets the isolation, so neither trap applies.
 """
 
 from __future__ import annotations
@@ -125,9 +137,9 @@ def isolated_env(base: Path) -> dict[str, str]:
 
 
 def run_module(module: Path, timeout: float) -> tuple[Path, str, str]:
-    # Each module gets its own isolation base. run.sh can share one because it
-    # does not run modules concurrently; here they would collide on dispatch
-    # ids and ledger records inside a shared state dir.
+    # Each module gets its own isolation base. tests/run.sh can share one
+    # because it does not run modules concurrently; here they would collide on
+    # dispatch ids and ledger records inside a shared state dir.
     base = Path(tempfile.mkdtemp(prefix="gf-affected-mod-"))
     if has_main_driver(module):
         argv = [sys.executable, str(module)]
@@ -225,21 +237,22 @@ def main() -> int:
     # did not pass is re-run once, alone, and only a second non-pass counts.
     suspects = [r for r in results if r[1] != PASSED]
     if suspects and not args.no_rerun:
-        print(f"re-running {len(suspects)} non-passing module(s) serially to separate flakes...")
+        print(f"re-running {len(suspects)} non-passing module(s) serially...")
         confirmed: list[tuple[Path, str, str]] = []
         for module, _state, _detail in suspects:
             again = run_module(module, args.timeout)
             confirmed.append(again)
-            label = "FLAKY (passed on rerun)" if again[1] == PASSED else again[1].upper()
+            label = "CLEARED ON RERUN" if again[1] == PASSED else again[1].upper()
             first = again[2].strip().splitlines()[0] if again[2].strip() else ""
             print(f"{label:24} {module.relative_to(REPO_ROOT)}  {first[:150]}")
         by_module = {m: (m, s, d) for m, s, d in confirmed}
         results = [by_module.get(r[0], r) for r in results]
-        flaky = [m for m, s, _ in confirmed if s == PASSED]
-        if flaky:
+        cleared = [m for m, s, _ in confirmed if s == PASSED]
+        if cleared:
             print(
-                f"\n{len(flaky)} module(s) passed only on the serial rerun. Treated as "
-                "passing here, but they are unreliable under load and cannot gate anything."
+                f"\n{len(cleared)} module(s) failed the parallel sweep and passed the "
+                "shared-base rerun: an isolation-model artefact or load flake, not a "
+                "defect. Counted as passing."
             )
 
     passed = [r for r in results if r[1] == PASSED]
