@@ -20,6 +20,10 @@ import goalflight_doctor  # noqa: E402
 def case_doctor_reports_platform_fields_for_windows() -> None:
     patches = [
         patch("goalflight_compat.is_windows", return_value=True),
+        # Simulated Windows must not reach native pid syscalls (ctypes.WinDLL
+        # is absent on POSIX). This case's subject is doctor's platform fields.
+        patch("goalflight_compat.pid_liveness", return_value=False),
+        patch("goalflight_compat.process_start_identity", return_value=None),
         patch("goalflight_compat.python_executable", return_value=r"C:\Python311\python.exe"),
         patch("goalflight_compat.probe_wsl", return_value={
             "state": "ready",
