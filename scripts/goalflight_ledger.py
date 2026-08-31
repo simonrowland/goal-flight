@@ -79,8 +79,19 @@ def canonicalize_project_root_on_store(project_root: object) -> str:
     Delivery targeting deliberately trusts stored roots and must not spawn git
     while reading a record.  Every ledger persistence therefore crosses this
     write-side boundary; repeating it for updates is intentionally idempotent.
+
+    The field is a label on a record in the ledger's own store (keyed by
+    dispatch_id), not a task-store destination.  Collapse when the root can
+    be resolved; otherwise keep the raw identity so a vanished checkout can
+    still reach a terminal ledger state.  The raw value is not a collapsed
+    identity.  Paths that select a task-store destination still call
+    ``resolve_project_root`` and still refuse.
     """
-    return str(goalflight_task.resolve_project_root(str(project_root)))
+    raw = str(project_root)
+    resolved = goalflight_task.resolve_project_root_for_read(raw)
+    if resolved is not None:
+        return str(resolved)
+    return raw
 
 
 def runs_dir(*, create: bool = True) -> Path:
