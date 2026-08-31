@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import select
 import shlex
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ HOOKS_MANIFEST = ROOT / "hooks" / "hooks.json"
 sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_doctor as doctor  # noqa: E402
+import goalflight_fleet_console as fleet  # noqa: E402
 import goalflight_journal as journal  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
 import goalflight_session_status as sessions  # noqa: E402
@@ -156,6 +158,67 @@ def _run_supervised_child(
     assert child_exit is not None, f"supervised {kind} child did not exit"
     records = [json.loads(line) for line in lines if line.startswith("{")]
     return records, child_exit
+
+
+def _wait_for_supervisor_stop(
+    process: subprocess.Popen[str],
+    *,
+    reason: str,
+    timeout_s: float = 8.0,
+) -> dict[str, object]:
+    """Read the real supervisor stream until one child enters stopped_reason."""
+    assert process.stdout is not None
+    deadline = time.monotonic() + timeout_s
+    observed: list[dict[str, object]] = []
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            diagnostic = process.stderr.read() if process.stderr is not None else ""
+            raise AssertionError(
+                f"supervisor exited {process.returncode}: {diagnostic}"
+            )
+        readable, _writable, _errored = select.select(
+            [process.stdout],
+            [],
+            [],
+            max(0.0, min(0.1, deadline - time.monotonic())),
+        )
+        if not readable:
+            continue
+        line = process.stdout.readline()
+        if not line.startswith("{"):
+            continue
+        record = json.loads(line)
+        if not isinstance(record, dict):
+            continue
+        observed.append(record)
+        if record.get("type") == "stop" and record.get("reason") == reason:
+            return record
+    raise AssertionError(f"supervisor did not stop a slot: {observed}")
+
+
+def _start_in_flight_attempt(
+    project: Path,
+    lease: journal.LeaseIdentity,
+    dispatch_id: str,
+) -> None:
+    authority = journal.open_or_create_journal(project)
+    prepared = authority.prepare_attempt(
+        dispatch_id,
+        owner_controller_label=lease.label,
+        owner_session_nonce=lease.nonce,
+    )
+    assert prepared.committed and prepared.value is not None
+    attempt = prepared.value
+    starting = authority.start_attempt(attempt.attempt_id, attempt.launch_token)
+    assert starting.committed and starting.value is not None
+    started = starting.value
+    running = authority.mark_attempt_running(
+        started.attempt_id,
+        started.launch_token,
+        launch_epoch=started.launch_epoch,
+        worker_instance={"pid": os.getpid(), "source": "stopped-slot-test"},
+    )
+    assert running.committed
 
 
 def _minimal_doctor_payload(wake_coverage: dict[str, object]) -> dict[str, object]:
@@ -1573,42 +1636,124 @@ def test_doctor_wake_coverage_reports_supervisor_state(
         controller_label=lease.label,
         lease_nonce=lease.nonce,
     )
-    _persistent_shortfall_plan(
-        project, lease, monkeypatch, [(4242, supervise_cmd)]
+    parts = shlex.split(supervise_cmd)
+    parts[0] = sys.executable
+    supervise_env = dict(os.environ)
+    supervise_env.pop("GOALFLIGHT_DISPATCH_ID", None)
+    held_watchdog = wake.register_watchdog_waiter(
+        project,
+        controller_label=lease.label,
+        generation_key=lease.nonce,
     )
-    result = doctor.check_wake_coverage(project)
-    assert result["present"] is True
-    assert result["pools"]
-    pool = result["pools"][0]
-    assert pool["label"] == lease.label
-    assert pool["supervisor"] == wake.SUPERVISOR_RUNNING
-    assert pool["ok"] is False
-    assert result["ok"] is False
-    assert isinstance(pool["live_waiters"], int)
-    assert isinstance(pool["target_waiters"], int)
-    assert int(pool["live_waiters"]) < int(pool["target_waiters"])
-    assert pool["missing_components"]
-    assert pool["reason"]
-    hint = str(pool["hint"])
-    assert "Restart the supervisor" in hint
-    assert supervise_cmd in hint
-    encoded = json.dumps(pool)
-    for component_command in _component_commands(project, lease):
-        assert component_command not in encoded
-        assert component_command not in hint
-    lines = doctor.collect_human_lines(
-        _minimal_doctor_payload(result)  # type: ignore[arg-type]
+    supervisor = subprocess.Popen(
+        parts,
+        cwd=project,
+        env=supervise_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
-    line = next(line for line in lines if "wake coverage hint-ctl" in line)
-    assert "wake coverage hint-ctl" in line
-    assert "supervisor=running" in line
-    assert "Restart the supervisor" in line
-    assert supervise_cmd in line
-    parsed = doctor.parse_status_line(line)
-    assert parsed["level"] == "warn"
-    assert "Restart the supervisor" in parsed["detail"]
-    for component_command in _component_commands(project, lease):
-        assert component_command not in line
+    try:
+        stop = _wait_for_supervisor_stop(supervisor, reason="did-not-arm")
+        assert stop["scope"] == "slot"
+        assert stop["child"] == "watchdog"
+        assert supervisor.poll() is None
+
+        # The competing watchdog is gone, but spawn_due retains the real
+        # slot's stopped_reason.  The remaining three children stay armed.
+        held_watchdog.close()
+        held_watchdog = None
+        deadline = time.monotonic() + 5.0
+        while True:
+            status = wake.coverage_status(
+                project,
+                controller_label=lease.label,
+                lease_nonce=lease.nonce,
+            )
+            live = status.get("live_waiters")
+            target = status.get("target_waiters")
+            if (
+                isinstance(live, int)
+                and isinstance(target, int)
+                and live == target - 1
+                and "watchdog" in (status.get("missing_components") or [])
+            ):
+                break
+            assert time.monotonic() < deadline, status
+            time.sleep(0.05)
+        assert supervisor.poll() is None
+        time.sleep(0.2)
+        settled = wake.coverage_status(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        )
+        assert settled["live_waiters"] == live
+        assert settled["target_waiters"] == target
+        assert settled["missing_components"] == ["watchdog"]
+
+        # Process discovery remains a separate concern; supply only the real
+        # live process identity.  Coverage and stopped_reason came from the
+        # production supervisor and wake ledger above.
+        monkeypatch.setattr(
+            wake,
+            "_process_listing",
+            lambda *args, **kwargs: [(supervisor.pid, supervise_cmd)],
+        )
+        result = doctor.check_wake_coverage(project)
+        assert result["present"] is True
+        assert result["pools"]
+        pool = result["pools"][0]
+        assert pool["label"] == lease.label
+        assert pool["supervisor"] == wake.SUPERVISOR_RUNNING
+        assert pool["ok"] is False
+        assert result["ok"] is False
+        assert pool["live_waiters"] == live
+        assert pool["target_waiters"] == target
+        assert pool["missing_components"] == ["watchdog"]
+        assert pool["reason"]
+        hint = str(pool["hint"])
+        assert "Restart the supervisor" in hint
+        assert supervise_cmd in hint
+        encoded = json.dumps(pool)
+        for component_command in _component_commands(project, lease):
+            assert component_command not in encoded
+            assert component_command not in hint
+        lines = doctor.collect_human_lines(
+            _minimal_doctor_payload(result)  # type: ignore[arg-type]
+        )
+        line = next(line for line in lines if "wake coverage hint-ctl" in line)
+        assert "supervisor=running" in line
+        assert "Restart the supervisor" in line
+        assert supervise_cmd in line
+        parsed = doctor.parse_status_line(line)
+        assert parsed["level"] == "warn"
+
+        _start_in_flight_attempt(project, lease, "stopped-slot-attention")
+        attention = fleet._controller_attention_rows(
+            [project],
+            {"capacity_state": {"leases": {}}, "dispatch": {"records": []}},
+        )
+        rows = [row for row in attention if row["kind"] == "controller_hung"]
+        assert len(rows) == 1
+        assert rows[0]["action"] == supervise_cmd
+        assert "wake coverage incomplete" in str(rows[0]["headline"])
+        assert f"{live}/{target}" in str(rows[0]["headline"])
+        assert "missing=watchdog" in str(rows[0]["headline"])
+    finally:
+        if held_watchdog is not None:
+            held_watchdog.close()
+        if supervisor.poll() is None:
+            supervisor.terminate()
+            try:
+                supervisor.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                supervisor.kill()
+                supervisor.wait(timeout=5)
+        if supervisor.stdout is not None:
+            supervisor.stdout.close()
+        if supervisor.stderr is not None:
+            supervisor.stderr.close()
 
 
 def test_stopped_slot_is_not_healthy(
@@ -1652,7 +1797,11 @@ def test_doctor_supervised_full_pool_stays_green(
         controller_label=lease.label,
         lease_nonce=lease.nonce,
     )
-    monkeypatch.setattr(wake, "_process_listing", lambda: [(4242, supervise_cmd)])
+    monkeypatch.setattr(
+        wake,
+        "_process_listing",
+        lambda *args, **kwargs: [(4242, supervise_cmd)],
+    )
     wake.activate_monitor_state(
         project,
         controller_label=lease.label,
@@ -1709,6 +1858,14 @@ def test_doctor_supervised_full_pool_stays_green(
         parsed = doctor.parse_status_line(line)
         assert parsed["detail"] == "supervisor=running"
         assert parsed["level"] == "ok"
+        _start_in_flight_attempt(project, lease, "healthy-pool-attention")
+        attention = fleet._controller_attention_rows(
+            [project],
+            {"capacity_state": {"leases": {}}, "dispatch": {"records": []}},
+        )
+        assert not [
+            row for row in attention if row["kind"] == "controller_hung"
+        ]
 
 
 def test_doctor_unknown_machine_payload_is_numberless(
