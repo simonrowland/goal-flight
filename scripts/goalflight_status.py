@@ -817,10 +817,12 @@ def _queue_drainer_warnings() -> list[dict]:
 def this_project_root() -> str | None:
     """Worktree-collapsed canonical project root, or None outside a project."""
     try:
-        return str(goalflight_task.resolve_project_root(str(Path.cwd())))
+        cwd = str(Path.cwd())
     except _EXPECTED_OPTIONAL_ERRORS:
-        pass
-    return None
+        return None
+    # None: not a project. Do not pretend we are in some other store.
+    root = goalflight_task.resolve_project_root_for_read(cwd)
+    return str(root) if root is not None else None
 
 
 def _record_is_structurally_terminal(record: object) -> bool:
@@ -1158,11 +1160,13 @@ def _dashboard_count_bucket(record: dict) -> str:
 
 
 def dashboard_status_payload(project_root: str | Path | None) -> dict:
-    root = (
-        str(goalflight_task.resolve_project_root(str(project_root)))
-        if project_root is not None
-        else None
-    )
+    if project_root is None:
+        root = None
+    else:
+        resolved = goalflight_task.resolve_project_root_for_read(str(project_root))
+        # Unresolved: keep the given string as a filter key. Passing None
+        # would mean all-projects and invent a machine-wide count.
+        root = str(resolved) if resolved is not None else str(project_root)
     generated_at = _utc_now()
     now = dt.datetime.now(dt.timezone.utc)
     records = _dashboard_status_records(root)
@@ -1449,10 +1453,14 @@ def _wait_authority_rows(
     for dispatch_id in wait_ids:
         raw = raw_records.get(dispatch_id) or {}
         root_value = raw.get("project_root") or project_root or str(Path.cwd())
-        try:
-            root_key = str(goalflight_task.resolve_project_root(str(root_value)))
-        except (OSError, RuntimeError, ValueError):
-            root_key = str(Path(str(root_value)).resolve(strict=False))
+        resolved = goalflight_task.resolve_project_root_for_read(str(root_value))
+        # Unresolved: group by the stored string. That is a dict key, not a
+        # store write, and not a claim that we canonicalized the checkout.
+        root_key = (
+            str(resolved)
+            if resolved is not None
+            else str(Path(str(root_value)).resolve(strict=False))
+        )
         grouped.setdefault(root_key, []).append(dispatch_id)
 
     authority: dict[str, dict] = {}
@@ -1775,12 +1783,24 @@ def _milestone_payload(project_root: str | None) -> dict:
 
 def milestone_status_payload(project_root: str | Path | None) -> dict:
     """Public, fail-closed milestone projection for peer status consumers."""
-    root = (
-        str(goalflight_task.resolve_project_root(str(project_root)))
-        if project_root is not None
-        else None
-    )
-    return _milestone_payload(root)
+    if project_root is None:
+        return _milestone_payload(None)
+    resolved = goalflight_task.resolve_project_root_for_read(str(project_root))
+    if resolved is None:
+        # Do not reuse the "no active cadence" payload: that is a measured
+        # negative, not "could not resolve".
+        return {
+            "schema": goalflight_milestone.SCHEMA,
+            "active_cadence": None,
+            "commits_since": None,
+            "K": None,
+            "last_marker": None,
+            "due": None,
+            "reason": "project root unresolvable",
+            "warnings": [],
+            "error": "unresolvable-project-root",
+        }
+    return _milestone_payload(str(resolved))
 
 
 def _milestone_nudge_line(status: dict) -> str | None:
@@ -2356,7 +2376,20 @@ def wait_for_dispatches(
     heartbeat_s: float | None = None,
     json_output: bool = False,
 ) -> int:
-    root = goalflight_task.resolve_project_root(project_root or str(Path.cwd()))
+    requested = project_root or str(Path.cwd())
+    root = goalflight_task.resolve_project_root_for_read(requested)
+    if root is None:
+        # Skip waiter registration (a write) and mail counts. Still wait
+        # against the requested string so data-sourced roots join ledger
+        # rows. Do not return 0 as if every id were terminal.
+        return _wait_for_dispatches_registered(
+            wait_ids,
+            project_root=requested,
+            timeout_s=timeout_s,
+            poll_s=poll_s,
+            heartbeat_s=heartbeat_s,
+            json_output=json_output,
+        )
     label = goalflight_session_status.resolve_controller_label(project_root=root)
     if not label:
         label = root.name
@@ -2609,17 +2642,25 @@ def _mail_watermark(project_root: str | None, wait_ids: list[str]) -> set[tuple[
     """
     identities: set[tuple[str, object]] = set()
     observed = False
-    try:
-        root = goalflight_task.resolve_project_root(project_root or str(Path.cwd()))
-        events = _open_wait_journal_reader(str(root)).delivery_event_watermark(
-            stream_ids=wait_ids,
-            waking_only=True,
-        )
-    except _EXPECTED_OPTIONAL_ERRORS:
-        pass
-    else:
-        observed = True
-        identities.update(("event", f"{origin}:{event_uuid}") for _, origin, event_uuid in events)
+    root = goalflight_task.resolve_project_root_for_read(
+        project_root or str(Path.cwd())
+    )
+    # None: journal was not read. Leave observed False so the watermark
+    # is None (unreadable), not an empty set (no mail).
+    if root is not None:
+        try:
+            events = _open_wait_journal_reader(str(root)).delivery_event_watermark(
+                stream_ids=wait_ids,
+                waking_only=True,
+            )
+        except _EXPECTED_OPTIONAL_ERRORS:
+            pass
+        else:
+            observed = True
+            identities.update(
+                ("event", f"{origin}:{event_uuid}")
+                for _, origin, event_uuid in events
+            )
 
     try:
         import goalflight_messages as _gm
@@ -2992,7 +3033,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.all_projects:
         project_root = None
     elif args.project:
-        project_root = str(goalflight_task.resolve_project_root(args.project))
+        resolved = goalflight_task.resolve_project_root_for_read(args.project)
+        # Unresolved --project is a scope key, not a store write, and not
+        # all-projects (None).
+        project_root = str(resolved) if resolved is not None else args.project
     else:
         project_root = this_project_root()
 

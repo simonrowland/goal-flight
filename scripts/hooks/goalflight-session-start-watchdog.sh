@@ -360,7 +360,10 @@ def journal_activity(repo_root: str, cwd: str) -> bool:
         import goalflight_journal
         import goalflight_task
 
-        root = goalflight_task.resolve_project_root(cwd)
+        root = goalflight_task.resolve_project_root_for_read(cwd)
+        if root is None:
+            # Unresolved cwd is not evidence of journal activity.
+            return False
         # Peek-only: must not take the write lock or inherit the 5s writer
         # budget. Open retries default to JOURNAL_OPEN_RETRY_BUDGET_S (75s);
         # cap them to the same 3s SessionStart wall as the subprocess calls.

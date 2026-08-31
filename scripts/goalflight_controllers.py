@@ -607,7 +607,9 @@ def retire_command_is_canonical(row: dict[str, Any]) -> bool:
     reported_canonical = canonical_project_root(str(reported))
     if reported_canonical is None:
         return False
-    resolved = goalflight_task.resolve_project_root(parsed)
+    resolved = goalflight_task.resolve_project_root_for_read(parsed)
+    if resolved is None:
+        return False
     return (
         resolved.resolve(strict=False) == canonical.resolve(strict=False)
         and reported_canonical.resolve(strict=False) == canonical.resolve(strict=False)

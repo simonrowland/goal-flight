@@ -1001,6 +1001,7 @@ def main() -> None:
         test_every_worktree_of_a_repo_resolves_to_one_task_store,
         test_subdirectory_of_a_git_repo_shares_the_store,
         test_a_path_outside_any_checkout_is_returned_unchanged,
+        test_read_of_missing_root_returns_none_and_write_still_refuses,
     ]
     for test in tests:
         test()
@@ -1117,6 +1118,35 @@ def test_a_path_outside_any_checkout_is_returned_unchanged() -> None:
         assert_true("missing path refuses retarget", "Refusing to write to another store" in message)
     else:
         raise AssertionError("missing project root must refuse, not return itself")
+
+
+def test_read_of_missing_root_returns_none_and_write_still_refuses() -> None:
+    """Read of a missing checkout is None; write of the same path still refuses.
+
+    Returning the missing path itself used to accept a capture into a different
+    store. The read path must not do that either: None is "could not resolve",
+    not an identity. An existing non-git directory remains a known identity.
+    """
+    missing = Path("/no/such/project/root-for-read")
+    assert_true(
+        "read of missing is None",
+        goalflight_task.resolve_project_root_for_read(str(missing)) is None,
+    )
+    try:
+        goalflight_task.resolve_project_root(str(missing))
+    except goalflight_task.TaskError as exc:
+        message = str(exc)
+        assert_true("write still names the root", str(missing) in message)
+        assert_true("write still says unresolvable", "unresolvable project root" in message)
+        assert_true("write still refuses retarget", "Refusing to write to another store" in message)
+    else:
+        raise AssertionError("write of missing project root must still refuse")
+    with tempfile.TemporaryDirectory() as td:
+        plain = Path(td).resolve()
+        assert_true(
+            "read of existing non-git is the path",
+            goalflight_task.resolve_project_root_for_read(str(plain)) == plain,
+        )
 
 
 if __name__ == "__main__":

@@ -111,10 +111,11 @@ def _session_file(project_root: Path) -> Path:
 
 def _git_project_root() -> Path | None:
     try:
-        return goalflight_task.resolve_project_root(str(Path.cwd()))
+        cwd = str(Path.cwd())
     except _EXPECTED_OPTIONAL_ERRORS:
-        # Project discovery is best-effort identity evidence, never a launch gate.
         return None
+    # None: not a project. Discovery must not invent another store.
+    return goalflight_task.resolve_project_root_for_read(cwd)
 
 
 def _normalize_controller_label(value: object) -> str | None:
@@ -139,10 +140,9 @@ def resolve_controller_label(
         root = _git_project_root()
     if root is None:
         return None
-    try:
-        return goalflight_task.resolve_project_root(str(root)).name[:64] or None
-    except (OSError, RuntimeError):
-        return None
+    resolved = goalflight_task.resolve_project_root_for_read(str(root))
+    # None: label cannot be derived from a checkout that is not there.
+    return (resolved.name[:64] or None) if resolved is not None else None
 
 
 def resolve_controller_pid(
@@ -212,7 +212,10 @@ def _probe_registered_controller_records(
     registered.
     """
     try:
-        root = goalflight_task.resolve_project_root(str(project_root))
+        root = goalflight_task.resolve_project_root_for_read(str(project_root))
+        if root is None:
+            # Unreadable, not an empty roster.
+            return None, "unresolvable-project-root"
         authority = goalflight_journal.Journal.open_reader(root)
         records = []
         for row in authority.lease_records(include_ended=include_retired):
@@ -1087,7 +1090,10 @@ def probe_live_session(
     "there is no live session". Unreadable means the caller could not tell
     and must retry; only a readable absent or changed lease is dead.
     """
-    root = goalflight_task.resolve_project_root(str(project_root))
+    root = goalflight_task.resolve_project_root_for_read(str(project_root))
+    if root is None:
+        # Could not open the journal. Unknown is not dead.
+        return "unreadable", None
     if label is None and pid is None:
         declared_pid = resolve_controller_pid()
         label_was_declared = bool(str(os.environ.get(CONTROLLER_LABEL_ENV) or "").strip())
@@ -2214,8 +2220,20 @@ def _dead_holder_retirement_gate(
             "renew_deadline_at": lease.renew_deadline_at,
             "required_margin_s": DEAD_HOLDER_RETIRE_MARGIN_S,
         }
+    owned_root = goalflight_task.resolve_project_root_for_read(str(project_root))
+    if owned_root is None:
+        return {
+            "retired": False,
+            "reason": "owned_dispatches_unmeasured",
+            "message": (
+                "nonterminal owned dispatches could not be measured "
+                "(unresolvable-project-root); unknown is not zero. Fix the "
+                "project root and retry, or retire with the active lease nonce."
+            ),
+            "owned_dispatch_measurement_error": "unresolvable-project-root",
+        }
     owned, owned_error = _nonterminal_owned_dispatches(
-        goalflight_task.resolve_project_root(str(project_root)),
+        owned_root,
         records=ledger_records,
     )
     if owned is None:
@@ -2290,10 +2308,14 @@ def retire_controller(
                 or (process_identity is not None and process_identity != measured)
             ):
                 return {"retired": False, "reason": "retirer_not_incumbent"}
-        owned, owned_error = _nonterminal_owned_dispatches(
-            goalflight_task.resolve_project_root(str(project_root)),
-            records=ledger_records,
-        )
+        owned_root = goalflight_task.resolve_project_root_for_read(str(project_root))
+        if owned_root is None:
+            owned, owned_error = None, "unresolvable-project-root"
+        else:
+            owned, owned_error = _nonterminal_owned_dispatches(
+                owned_root,
+                records=ledger_records,
+            )
         owned_dispatches = owned.get(label, []) if owned is not None else []
         if (owned_dispatches or owned_error) and not acknowledge:
             return {

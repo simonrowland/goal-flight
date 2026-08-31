@@ -92,6 +92,32 @@ def test_unresolvable_root_capture_refuses_and_writes_nowhere(tmp_path: Path) ->
     assert not any(path.name == "tasks.jsonl" for path in new_files), new_files
 
 
+def test_read_of_unresolvable_root_is_none_not_an_identity(tmp_path: Path) -> None:
+    missing = tmp_path / "no-such-checkout"
+    assert not missing.exists()
+    assert task.resolve_project_root_for_read(str(missing)) is None
+    with pytest.raises(task.TaskError, match="Refusing to write to another store"):
+        task.resolve_project_root(str(missing))
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert task.resolve_project_root_for_read(str(plain)) == plain
+
+
+def test_read_of_git_oserror_is_none_not_the_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "maybe-git"
+    project.mkdir()
+
+    def boom(*_args: object, **_kwargs: object) -> str:
+        raise OSError(errno.ENOENT, "No such file or directory", "git")
+
+    monkeypatch.setattr(task.subprocess, "check_output", boom)
+    assert task.resolve_project_root_for_read(str(project)) is None
+    with pytest.raises(task.TaskError, match="Refusing to write to another store"):
+        task.resolve_project_root(str(project))
+
+
 def test_existing_non_git_directory_still_captures(tmp_path: Path) -> None:
     project = tmp_path / "plain"
     project.mkdir()

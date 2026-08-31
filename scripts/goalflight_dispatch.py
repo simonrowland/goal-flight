@@ -3163,13 +3163,14 @@ def _record_project_root_matches_target(record: dict, target: Path) -> bool:
         return False
     if recorded == target_real:
         return True
+    rec = goalflight_task.resolve_project_root_for_read(raw)
+    tgt = goalflight_task.resolve_project_root_for_read(str(target))
+    if rec is None or tgt is None:
+        # Cannot prove a match. Not a claim that the record is other-project.
+        return False
     try:
-        rec_root = os.path.realpath(
-            str(goalflight_task.resolve_project_root(raw))
-        )
-        tgt_root = os.path.realpath(
-            str(goalflight_task.resolve_project_root(str(target)))
-        )
+        rec_root = os.path.realpath(str(rec))
+        tgt_root = os.path.realpath(str(tgt))
     except (OSError, ValueError):
         return False
     return bool(rec_root) and rec_root == tgt_root
@@ -7084,7 +7085,16 @@ def _queue_launch_token(entry: dict | None = None) -> str:
         dispatch_id = str(entry.get("dispatch_id") or "")
         project_root = entry.get("project_root") or request.get("cwd")
         if dispatch_id and project_root:
-            resolved_root = goalflight_task.resolve_project_root(str(project_root))
+            resolved_root = goalflight_task.resolve_project_root_for_read(
+                str(project_root)
+            )
+            if resolved_root is None:
+                # Drain already fails closed on JournalIOError (do not launch
+                # into another store). None is not a new token.
+                raise goalflight_journal.JournalIOError(
+                    f"unresolvable project root {project_root}: "
+                    "cannot peek launch token"
+                )
             try:
                 # Peek-only reuse of a still-PREPARED attempt. Read errors must
                 # still escape before the carrier is claimed; open_reader does.
@@ -14530,10 +14540,8 @@ def _drain_project_key(entry: dict | None) -> str:
     raw = entry.get("project_root") or request.get("cwd")
     if not isinstance(raw, str) or not raw.strip():
         return ""
-    try:
-        return str(goalflight_task.resolve_project_root(raw))
-    except Exception:
-        return raw
+    resolved = goalflight_task.resolve_project_root_for_read(raw)
+    return str(resolved) if resolved is not None else raw
 
 
 def _remember_drain_journal_skip(acc: dict, project_key: str, kind: str) -> None:
