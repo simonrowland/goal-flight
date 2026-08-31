@@ -126,6 +126,11 @@ DRAIN_LAUNCH_CONFIRM_S = 45.0
 DRAIN_LAUNCH_TIMEOUT_FLOOR_S = 20.0
 LAUNCH_BACKOFF_INITIAL_S = 60.0
 LAUNCH_BACKOFF_CAP_S = 900.0
+# Three independent, provably pre-worker failures are enough to distinguish a
+# dead carrier from a one-pass transient while keeping the retry window bounded.
+# Capacity refusals are deferrals, not failed launch attempts, and do not spend
+# this budget.
+MAX_DRAIN_PRE_WORKER_FAILURES = 3
 ABANDONED_RECONCILE_STALE_S = QUEUE_CLAIM_STALE_S
 ABANDONED_RECONCILIATION_SCHEMA = "goalflight.abandoned-reconciliation.v1"
 MAX_CLAIM_RECOVERY_REQUEUES = 1
@@ -6361,6 +6366,26 @@ def _permanent_pre_spawn_refusal_reason(
         if reason:
             return reason
     return None
+
+
+def _pre_spawn_launch_failure_reason(proc: subprocess.CompletedProcess) -> str:
+    """Specific, bounded child diagnostic for a retryable pre-spawn failure."""
+    blob = goalflight_output_redact.redact_text(
+        f"{proc.stderr or ''}\n{proc.stdout or ''}"
+    )
+    diagnostic = ""
+    for line in reversed(blob.splitlines()):
+        candidate = line.strip()
+        if not candidate:
+            continue
+        if candidate.startswith("goalflight_dispatch:"):
+            candidate = candidate.split(":", 1)[1].strip()
+        diagnostic = " ".join(candidate.split())[:300]
+        if diagnostic:
+            break
+    if not diagnostic:
+        diagnostic = "no_child_diagnostic"
+    return f"launch_refused_pre_spawn:{proc.returncode}:{diagnostic}"
 
 
 def _record_unsupported_sandbox_rejection(
@@ -14386,7 +14411,8 @@ class _DrainClaimGuard:
         self.launch_attempted = False
         self.release_reason = "claim_released_pre_worker"
         self.stamp_backoff = False
-        self.fail_reason = "launch_budget_burn"
+        self.count_launch_failure = False
+        self.fail_reason = "launch_attempt_failed_unclassified"
 
     def consume(
         self,
@@ -14477,6 +14503,40 @@ class _DrainClaimGuard:
                 }
             )
             return False
+        if self.launch_attempted and self.count_launch_failure:
+            failure_count = _next_launch_failure_count(observed, self.entry)
+            if failure_count >= MAX_DRAIN_PRE_WORKER_FAILURES:
+                terminal_reason = (
+                    f"launch_attempt_limit_exceeded:{self.fail_reason}"
+                )
+                committed, terminal_detail = _terminalize_pre_worker_launch_failure(
+                    self.claim,
+                    observed,
+                    reason=terminal_reason,
+                    failure_count=failure_count,
+                )
+                if committed:
+                    self.acc["failed"] += 1
+                    self.acc["details"].append(
+                        {
+                            "dispatch_id": self.dispatch_id,
+                            "state": "failed",
+                            "reason": terminal_reason,
+                            "launch_timeout_count": failure_count,
+                        }
+                    )
+                else:
+                    self.acc["pending_claims"] += 1
+                    self.acc["failed"] += 1
+                    self.acc["details"].append(
+                        {
+                            "dispatch_id": self.dispatch_id,
+                            "state": "claimed",
+                            "reason": terminal_detail,
+                            "launch_timeout_count": failure_count,
+                        }
+                    )
+                return False
         restored, decision = _restore_claim_if_incomplete(
             self.claim,
             self.entry,
@@ -14494,6 +14554,7 @@ class _DrainClaimGuard:
                     self.claim,
                     self.entry,
                     backoff=self.stamp_backoff,
+                    failed=self.count_launch_failure,
                     fail_reason=self.fail_reason,
                 )
             uncommitted = (
@@ -14518,6 +14579,7 @@ class _DrainClaimGuard:
                 restored,
                 self.entry,
                 backoff=self.stamp_backoff,
+                failed=self.count_launch_failure,
                 fail_reason=self.fail_reason,
             )
         _restore_queued_record_from_entry(self.entry, restored)
@@ -14657,8 +14719,18 @@ def _mark_launch_budget_burn_if_material(
     if not _launch_attempt_consumed_budget(elapsed_s, pass_budget_s, remaining_after_s):
         return
     lease.stamp_backoff = True
-    lease.fail_reason = "launch_budget_burn"
     timing["launch_budget_burns"] = int(timing.get("launch_budget_burns") or 0) + 1
+
+
+def _next_launch_failure_count(*entries: dict) -> int:
+    return max(
+        (
+            int(entry.get("launch_timeout_count") or 0)
+            for entry in entries
+            if isinstance(entry, dict)
+        ),
+        default=0,
+    ) + 1
 
 
 def _stamp_launch_attempt(
@@ -14666,13 +14738,17 @@ def _stamp_launch_attempt(
     entry: dict,
     *,
     backoff: bool = False,
+    failed: bool = False,
     fail_reason: str | None = None,
 ) -> None:
-    """Persist the attempt cursor, and optional backoff, onto the envelope.
+    """Persist the attempt cursor, failure count, and optional backoff.
 
     Distinct from not_before: usage-probe re-derivation must not clear these.
     last_attempted_at is the forward-progress cursor (never-attempted first).
-    Backoff is the next-pass skip for a material budget burn.
+    Backoff is the next-pass skip for a material budget burn. A fast failed
+    launch still increments the failure count without parking the rest of the
+    queue; capacity-only deferrals may back off without spending the terminal
+    failure budget.
     """
     try:
         observed = json.loads(claim.read_text(encoding="utf-8"))
@@ -14683,23 +14759,70 @@ def _stamp_launch_attempt(
     attempted_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds")
     observed["launch_last_attempted_at"] = attempted_at
     entry["launch_last_attempted_at"] = attempted_at
+    count = int(
+        observed.get("launch_timeout_count") or entry.get("launch_timeout_count") or 0
+    )
+    if failed:
+        count += 1
+        reason = fail_reason or "launch_attempt_failed_unclassified"
+        observed["launch_timeout_count"] = count
+        observed["launch_fail_reason"] = reason
+        entry["launch_timeout_count"] = count
+        entry["launch_fail_reason"] = reason
     if backoff:
-        count = int(
-            observed.get("launch_timeout_count") or entry.get("launch_timeout_count") or 0
+        backoff_count = int(
+            observed.get("launch_backoff_count")
+            or entry.get("launch_backoff_count")
+            or 0
         ) + 1
-        delay_s = _launch_backoff_delay_s(count)
+        delay_s = _launch_backoff_delay_s(backoff_count)
         until = (
             dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delay_s)
         ).isoformat(timespec="seconds")
-        reason = fail_reason or "launch_budget_burn"
-        observed["launch_timeout_count"] = count
+        reason = fail_reason or "launch_backoff_unclassified"
+        observed["launch_backoff_count"] = backoff_count
         observed["launch_backoff_until"] = until
         observed["launch_fail_reason"] = reason
-        entry["launch_timeout_count"] = count
+        entry["launch_backoff_count"] = backoff_count
         entry["launch_backoff_until"] = until
         entry["launch_fail_reason"] = reason
     with contextlib.suppress(OSError):
         _write_json_atomic(claim, observed)
+
+
+def _terminalize_pre_worker_launch_failure(
+    claim: Path,
+    entry: dict,
+    *,
+    reason: str,
+    failure_count: int,
+) -> tuple[bool, str]:
+    """Commit a proven pre-worker launch failure to ledger, status, and carrier."""
+    dispatch_id = str(entry.get("dispatch_id") or claim.stem)
+    try:
+        _finish_ledger(
+            dispatch_id,
+            "failed",
+            reason,
+            worker_still_alive=False,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return False, f"launch_failure_terminal_commit_failed:{type(exc).__name__}"
+
+    with _queue_mutation_lock(claim.parent):
+        try:
+            fresh = json.loads(claim.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            fresh = dict(entry)
+        if fresh.get("queue_launch_token") != entry.get("queue_launch_token"):
+            return False, "launch_failure_terminal_claim_changed"
+        fresh["launch_timeout_count"] = int(failure_count)
+        fresh["launch_fail_reason"] = reason
+        committed = _mark_claim_failed_locked(claim, fresh, reason=reason)
+    if committed:
+        _write_reconciled_terminal_status(fresh, None)
+        return True, reason
+    return False, "launch_failure_terminal_carrier_cleanup_pending"
 
 
 def _drain_capacity_slots() -> dict:
@@ -15383,6 +15506,8 @@ def _drain_queue_once(args) -> dict:
                     )
             except _RemoteDrainBlocked as exc:
                 lease.release_reason = f"remote_blocked:{exc.code}:{exc}"
+                lease.count_launch_failure = True
+                lease.fail_reason = lease.release_reason
                 _mark_launch_budget_burn_if_material(
                     lease,
                     timing,
@@ -15393,9 +15518,38 @@ def _drain_queue_once(args) -> dict:
                 continue
             except subprocess.TimeoutExpired:
                 timing["launch_timeouts"] += 1
+                ledger_confirmed = _dispatch_has_worker_record(
+                    dispatch_id,
+                    queue_launch_token=launch_token,
+                )
+                if ledger_confirmed:
+                    carrier_cleanup = _positive_live_carrier_cleanup(
+                        claim,
+                        entry,
+                        queue_dir,
+                        worker_record_sufficient=True,
+                        stale_s=args.claim_stale_s,
+                    )
+                    if carrier_cleanup == "pending":
+                        _alert_launched_carrier_pending(dispatch_id, where="drain")
+                        lease.consume(
+                            state="claimed",
+                            reason="worker_record_present_after_launch_timeout_carrier_cleanup_pending",
+                            pending=True,
+                        )
+                    else:
+                        lease.consume(
+                            state="launched",
+                            reason="worker_record_present_after_launch_timeout",
+                            launched=True,
+                        )
+                    continue
                 lease.release_reason = "launch_timeout_pending_ledger"
                 lease.stamp_backoff = True
-                lease.fail_reason = "launch_timeout"
+                lease.count_launch_failure = True
+                lease.fail_reason = (
+                    "launch_confirmation_timeout:no_token_matched_worker_record"
+                )
                 continue
             stdout_launched = proc.returncode == 0 and "DISPATCH-LAUNCHED " in proc.stdout
             # Drain launch accounting: a token-matched worker_pid means launch occurred
@@ -15439,6 +15593,7 @@ def _drain_queue_once(args) -> dict:
                 continue
             if capacity_reason:
                 lease.release_reason = capacity_reason
+                lease.fail_reason = capacity_reason
                 _mark_launch_budget_burn_if_material(
                     lease,
                     timing,
@@ -15485,26 +15640,35 @@ def _drain_queue_once(args) -> dict:
             except (OSError, json.JSONDecodeError):
                 observed_claim = None
             if (
-                proc.returncode != 0
-                and isinstance(observed_claim, dict)
+                isinstance(observed_claim, dict)
                 and observed_claim.get("queue_launch_token") == launch_token
                 and _entry_pre_worker(observed_claim)
             ):
-                permanent_reason = _permanent_pre_spawn_refusal_reason(proc)
-                if permanent_reason:
-                    # Inert flag combo / unsupported sandbox: waiting cannot
-                    # make it valid. Restore-to-queued is the silent stick.
-                    committed = _mark_claim_failed(
-                        claim, entry, reason=permanent_reason
+                if proc.returncode != 0:
+                    permanent_reason = _permanent_pre_spawn_refusal_reason(proc)
+                    if permanent_reason:
+                        # Inert flag combo / unsupported sandbox: waiting cannot
+                        # make it valid. Restore-to-queued is the silent stick.
+                        committed = _mark_claim_failed(
+                            claim, entry, reason=permanent_reason
+                        )
+                        lease.consume(
+                            state="failed" if committed else "claimed",
+                            reason=permanent_reason,
+                            failed=True,
+                            pending=not committed,
+                        )
+                        continue
+                    lease.fail_reason = _pre_spawn_launch_failure_reason(proc)
+                    lease.release_reason = (
+                        f"launch_refused_pre_spawn:{proc.returncode}"
                     )
-                    lease.consume(
-                        state="failed" if committed else "claimed",
-                        reason=permanent_reason,
-                        failed=True,
-                        pending=not committed,
+                else:
+                    lease.fail_reason = (
+                        "launch_confirmation_missing:exit_0_no_worker_record"
                     )
-                    continue
-                lease.release_reason = f"launch_refused_pre_spawn:{proc.returncode}"
+                    lease.release_reason = lease.fail_reason
+                lease.count_launch_failure = True
                 _mark_launch_budget_burn_if_material(
                     lease,
                     timing,

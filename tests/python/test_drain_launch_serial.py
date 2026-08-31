@@ -61,6 +61,7 @@ SERIAL_CEILING_S = HANG_S * N_HUNG + 0.8
 SLOW_FAIL_S = 0.50
 STARVE_BUDGET_S = 0.40
 BOUNDED_PASSES = 3
+EXPECTED_TERMINAL_ATTEMPTS = 3
 
 
 @pytest.fixture(autouse=True)
@@ -154,6 +155,83 @@ def _write_entry(
         payload["task_ids"] = list(task_ids)
         payload["request"]["task_ids"] = list(task_ids)
     D._write_json_atomic(path, payload)
+    return path
+
+
+def _write_queued_ledger(path: Path) -> dict:
+    entry = json.loads(path.read_text(encoding="utf-8"))
+    request = entry["request"]
+    agent = str(entry["agent"])
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": entry["dispatch_id"],
+            "agent": agent,
+            "engine": agent,
+            "shape": entry["shape"],
+            "transport": "dispatch",
+            "project_root": entry["project_root"],
+            "worker_pid": None,
+            "stdout_path": request["tail"],
+            "status_path": request["status_json"],
+            "state": "queued",
+            "terminal_state": "unknown",
+            "dispatch_argv": entry["dispatch_argv"],
+            "started_at": ledger.utc_now(),
+        }
+    )
+    return entry
+
+
+def _write_missing_prompt_entry(
+    queue: Path,
+    dispatch_id: str,
+    *,
+    project_root: Path,
+) -> Path:
+    path = queue / f"{dispatch_id}.json"
+    missing_prompt = project_root / "deleted-before-drain.md"
+    tail = project_root / f"{dispatch_id}.tail"
+    status = project_root / f"{dispatch_id}.status.json"
+    argv = [
+        "--agent",
+        "codex",
+        "--prompt-file",
+        str(missing_prompt),
+        "--dispatch-id",
+        dispatch_id,
+        "--cwd",
+        str(project_root),
+        "--tail",
+        str(tail),
+        "--status-json",
+        str(status),
+        "--unregistered-forced",
+        "--occupied-worktree-forced",
+        "--ignore-git-warn",
+    ]
+    payload = {
+        "schema": D.DISPATCH_QUEUE_SCHEMA,
+        "state": "queued",
+        "dispatch_id": dispatch_id,
+        "agent": "codex",
+        "shape": "bash",
+        "project_root": str(project_root),
+        "process_cwd": str(project_root),
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "queue_path": str(path),
+        "dispatch_argv": argv,
+        "request": {
+            "agent": "codex",
+            "cwd": str(project_root),
+            "prompt_file": str(missing_prompt),
+            "tail": str(tail),
+            "status_json": str(status),
+        },
+    }
+    D._write_json_atomic(path, payload)
+    _write_queued_ledger(path)
     return path
 
 
@@ -333,6 +411,110 @@ def test_healthy_entry_launches_promptly_when_capacity_available(
     elapsed = time.monotonic() - started
     assert payload["launched"] == 1, payload
     assert elapsed < 2.0, elapsed
+
+
+def test_real_pre_spawn_refusal_terminalizes_after_bounded_attempts(
+    tmp_path: Path,
+) -> None:
+    """A real child computes its missing-prompt refusal; drain never supplies it."""
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    dispatch_id = "missing-prompt-bounded"
+    path = _write_missing_prompt_entry(
+        queue,
+        dispatch_id,
+        project_root=project,
+    )
+
+    payloads = []
+    for attempt in range(1, EXPECTED_TERMINAL_ATTEMPTS + 1):
+        payload = D._drain_queue_once(_drain_args(queue))
+        payloads.append(payload)
+        if attempt < EXPECTED_TERMINAL_ATTEMPTS:
+            queued = json.loads(path.read_text(encoding="utf-8"))
+            assert queued["state"] == "queued", (attempt, queued, payload)
+            assert queued["launch_timeout_count"] == attempt, queued
+            assert "prompt file not found" in queued["launch_fail_reason"], queued
+
+    assert path.exists() is False, payloads
+    failed_paths = list(queue.glob(f"{dispatch_id}.json.claimed-*.failed"))
+    assert len(failed_paths) == 1, (failed_paths, payloads)
+    failed = json.loads(failed_paths[0].read_text(encoding="utf-8"))
+    assert failed["state"] == "failed", failed
+    assert failed["launch_timeout_count"] == EXPECTED_TERMINAL_ATTEMPTS, failed
+    reason = str(failed.get("reason") or "")
+    assert reason.startswith("launch_attempt_limit_exceeded:"), failed
+    assert "prompt file not found" in reason, failed
+    assert "launch_budget_burn" not in reason, failed
+
+    record = json.loads(ledger.record_path(dispatch_id).read_text(encoding="utf-8"))
+    assert record.get("state") == "failed", record
+    assert str(record.get("terminal_state") or "") not in {"", "unknown"}, record
+    assert record.get("reason") == reason, record
+    status = json.loads((project / f"{dispatch_id}.status.json").read_text(encoding="utf-8"))
+    assert status.get("state") == "failed", status
+    assert status.get("reason") == reason, status
+
+
+def test_real_confirmed_launch_does_not_spend_failure_budget(tmp_path: Path) -> None:
+    """The production child must launch and ledger-confirm without a supplied proof."""
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    dispatch_id = "real-confirmed-launch"
+    path = _write_entry(
+        queue,
+        dispatch_id,
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    _write_queued_ledger(path)
+
+    payload = D._drain_queue_once(_drain_args(queue))
+    assert payload["launched"] == 1, payload
+    assert path.exists() is False, payload
+    assert not list(queue.glob(f"{dispatch_id}*.failed")), payload
+    assert int((payload.get("timing") or {}).get("launch_timeouts") or 0) == 0, payload
+
+
+def test_real_ledger_confirmation_survives_lost_launcher_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lose the real child's response after it launches; ledger proof must win."""
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    dispatch_id = "real-launch-response-lost"
+    path = _write_entry(
+        queue,
+        dispatch_id,
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    _write_queued_ledger(path)
+
+    def lose_response_after_real_launch(argv, *args, **kwargs):
+        proc = _REAL_SUBPROCESS_RUN(argv, *args, **kwargs)
+        if not _is_drain_child(list(argv)):
+            return proc
+        assert "DISPATCH-LAUNCHED " in proc.stdout, proc
+        raise subprocess.TimeoutExpired(
+            list(argv),
+            kwargs.get("timeout") or 1.0,
+            output=proc.stdout,
+            stderr=proc.stderr,
+        )
+
+    monkeypatch.setattr(D.subprocess, "run", lose_response_after_real_launch)
+    payload = D._drain_queue_once(_drain_args(queue))
+    assert payload["launched"] == 1, payload
+    assert int((payload.get("timing") or {}).get("launch_timeouts") or 0) == 1, payload
+    assert _reason_for(payload, dispatch_id) == (
+        "worker_record_present_after_launch_timeout"
+    ), payload
+    assert path.exists() is False, payload
+    assert not list(queue.glob(f"{dispatch_id}*.failed")), payload
 
 
 def test_launch_timeout_backs_off_next_pass(
@@ -660,7 +842,9 @@ def test_launch_refused_pre_spawn_at_head_stamps_backoff_and_unblocks_tail(
     assert queued.get("state") == "queued", queued
     assert queued.get("launch_backoff_until"), queued
     assert queued.get("launch_last_attempted_at"), queued
-    assert queued.get("launch_fail_reason") == "launch_budget_burn", queued
+    assert queued.get("launch_fail_reason") == (
+        "launch_refused_pre_spawn:2:slow-fail"
+    ), queued
 
     second = D._drain_queue_once(args)
     assert "healthy-back" in _launched_ids(second), (attempts, second)
