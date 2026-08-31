@@ -23,6 +23,7 @@ import goalflight_journal as J  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
 import goalflight_wake as wake  # noqa: E402
 import goalflight_watch as W  # noqa: E402
+import goalflight_worktree_pool as WP  # noqa: E402
 
 
 SESSION_ID = "12345678-1234-4abc-8def-1234567890ab"
@@ -57,6 +58,8 @@ def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "GOALFLIGHT_CONTROLLER_PID",
         "GOALFLIGHT_CONTROLLER_SESSION_ID",
         "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+        "GOALFLIGHT_WORKTREE_LOCK_FD",
+        "GOALFLIGHT_OCCUPANCY_LOCK_FD",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -794,6 +797,65 @@ def test_dead_preclaim_is_reconciled_before_retry(
         L.record_path(f"resume-child-{os.getpid()}").read_text(encoding="utf-8")
     )
     assert retry["state"] == "running"
+
+
+def test_closed_occupancy_fd_does_not_block_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A leftover closed occupancy fd is ended state, not occupancy unknown."""
+    parent_id = "closed-fd-parent"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Retry after a closed occupancy fd.", encoding="utf-8")
+    _stub_detached_runtime(monkeypatch)
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda _agent, _base: "closed-fd-child",
+    )
+    # A closed descriptor number, not a live flock holder.
+    monkeypatch.setenv(WP.OCCUPANCY_LOCK_FD_ENV, "999999")
+
+    assert D._cmd_resume(
+        [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+    ) == 0
+    retry = json.loads(L.record_path("closed-fd-child").read_text(encoding="utf-8"))
+    assert retry["state"] == "running"
+
+
+def test_live_occupancy_holder_still_blocks_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A genuinely live occupancy lock still refuses a second writer."""
+    parent_id = "live-occ-parent"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Do not share this tree.", encoding="utf-8")
+    _stub_detached_runtime(monkeypatch)
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda _agent, _base: "live-occ-child",
+    )
+    lock = WP.try_acquire_worktree_path_lock(tmp_path, "live-holder")
+    try:
+        rc = D._cmd_resume(
+            [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+        )
+    finally:
+        lock.release()
+
+    assert rc == 64
+    err = capsys.readouterr().err
+    assert "already owned" in err
+    assert not L.record_path("live-occ-child").exists()
 
 
 def test_parent_child_grandchild_resume_preserves_original_home_owner(

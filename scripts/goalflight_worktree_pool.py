@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import fcntl
 import json
 import os
@@ -177,7 +178,16 @@ def inherited_worktree_lock_fds() -> tuple[int, ...]:
         try:
             fd = int(raw)
             os.fstat(fd)
-        except (ValueError, OSError):
+        except (ValueError, OSError) as exc:
+            # A closed occupancy fd is leftover ended state, not a missing
+            # seat. The occupancy prepare path treats EBADF the same way.
+            if (
+                env_name == OCCUPANCY_LOCK_FD_ENV
+                and isinstance(exc, OSError)
+                and exc.errno == errno.EBADF
+            ):
+                os.environ.pop(OCCUPANCY_LOCK_FD_ENV, None)
+                continue
             errors.append(f"{env_name} does not name an open descriptor: {raw!r}")
             continue
         if fd not in fds:
