@@ -156,6 +156,8 @@ PY
       failed_tests+=("tests/python")
     fi
     rm -f /tmp/goal-flight-test-$$.out
+    # python exits 1 when the operator index gained project-<10-hex> children.
+    # `if !` puts that leak on this then-branch; do not move FAIL to else.
     if ! env -u GOALFLIGHT_JOURNAL_DIR -u GOALFLIGHT_TASK_STORE_DIR -u XDG_STATE_HOME \
       python3 - "$_GF_LIVE_SLUG_SNAP" "$_GF_OPERATOR_XDG_STATE_HOME" <<'PY'
 import os, re, sys
@@ -183,8 +185,6 @@ if leaked:
     raise SystemExit(1)
 PY
     then
-      :
-    else
       echo "FAIL  live journals index gained project-<10-hex> children during python suite"
       fail=$((fail + 1))
       failed_tests+=("live-journal-isolation")
