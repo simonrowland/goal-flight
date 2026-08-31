@@ -708,6 +708,17 @@ def last_read_work() -> dict[str, int]:
 
 
 def _peek_top_level_state(raw: str) -> str | None:
+    """Peek the top-level state, but only from a document that looks complete.
+
+    The state line can appear in a truncated prefix, and skipping on that
+    would strand the row: the same prefix peeks the same terminal state on
+    every later pass, so it would never be parsed. write_record publishes via
+    tmp + fsync + replace, so no current writer can leave such a file — this
+    guards a future writer that does not, and it fails toward parsing, which
+    is the safe direction.
+    """
+    if not raw.rstrip().endswith("}"):
+        return None
     match = _TOP_LEVEL_STATE_RE.search(raw)
     return match.group(1) if match else None
 

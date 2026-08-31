@@ -1332,3 +1332,20 @@ def test_inferred_abandonment_is_resumable_and_fresh_child_stays_live(
     second = _run(tmp_path, now=_future_now(1800.0))
     assert second["closed"] == 0
     assert _read(fresh_child_id)["state"] == "running"
+
+
+def test_peek_refuses_truncated_document_and_parses_it_instead() -> None:
+    """A truncated prefix must never be skipped as terminal.
+
+    The top-level state line can appear in an incomplete document. Skipping
+    on that strands the row forever: the same prefix peeks the same terminal
+    state on every later pass, so it is never parsed. Fail toward parsing.
+    """
+    import goalflight_ledger as ledger
+
+    truncated = '{\n  "dispatch_id": "x",\n  "state": "complete",\n  "tail":'
+    complete = '{\n  "dispatch_id": "x",\n  "state": "complete"\n}\n'
+
+    assert ledger._peek_top_level_state(truncated) is None
+    assert ledger._peek_top_level_state(complete) == "complete"
+    assert ledger._peek_top_level_state(complete + "\n\n") == "complete"
