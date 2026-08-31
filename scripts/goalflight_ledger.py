@@ -1886,11 +1886,10 @@ def reconcile_terminal_outbox(
                 or not candidate.get("project_root")
             ):
                 continue
-            try:
-                candidate_root = goalflight_task.resolve_project_root(
-                    str(candidate["project_root"])
-                )
-            except Exception:
+            candidate_root = goalflight_task.resolve_project_root_for_read(
+                str(candidate["project_root"])
+            )
+            if candidate_root is None:
                 continue
             if candidate_root == canonical_root:
                 record = candidate
@@ -1926,11 +1925,10 @@ def reconcile_terminal_outbox(
             continue
         if not record.get("project_root"):
             continue
-        try:
-            record_root = goalflight_task.resolve_project_root(
-                str(record["project_root"])
-            )
-        except Exception:
+        record_root = goalflight_task.resolve_project_root_for_read(
+            str(record["project_root"])
+        )
+        if record_root is None:
             continue
         if record_root != canonical_root:
             continue

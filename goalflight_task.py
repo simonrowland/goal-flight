@@ -580,22 +580,59 @@ def resolve_project_root(value: str | None = None) -> Path:
 
     A genuine existing directory that is not a git checkout still resolves to
     itself (tests, non-git trees). That is a known identity, not a fallback.
+
+    This is the write path: it always refuses rather than guess. Read and
+    advisory callers must use ``resolve_project_root_for_read``.
     """
+    root = _resolve_project_root(value, for_write=True)
+    if root is None:
+        raise TaskError(
+            "unresolvable project root: write path returned no identity. "
+            "Refusing to write to another store"
+        )
+    return root
+
+
+def resolve_project_root_for_read(value: str | None = None) -> Path | None:
+    """Canonical project root for a read or advisory caller, or None.
+
+    Same identity as ``resolve_project_root`` when the path is a directory.
+    Returns None when the root cannot be resolved, instead of refusing as a
+    write would. Callers must not treat None as an empty measurement.
+    """
+    return _resolve_project_root(value, for_write=False)
+
+
+def _resolve_project_root(value: str | None = None, *, for_write: bool) -> Path | None:
+    """Shared identity for write (refuse) and read (None) project-root resolution."""
     explicit = value or os.environ.get("GOALFLIGHT_PROJECT_ROOT")
     start = Path(explicit) if explicit else Path.cwd()
     try:
         is_dir = start.is_dir()
     except OSError as exc:
+        if not for_write:
+            return None
         raise TaskError(
             f"unresolvable project root {start}: cannot stat ({exc}). "
             "Refusing to write to another store"
         ) from exc
     if not is_dir:
+        if not for_write:
+            return None
         raise TaskError(
             f"unresolvable project root {start}: not a directory. "
             "Refusing to write to another store"
         )
-    canonical = _git_canonical_root(start, refuse_unknown=True)
+    try:
+        # refuse_unknown=True on both paths so a git probe failure is not
+        # collapsed into "this directory is the project". Write raises;
+        # read returns None. None from _git_canonical_root still means a
+        # genuine existing non-git directory, which is a known identity.
+        canonical = _git_canonical_root(start, refuse_unknown=True)
+    except TaskError:
+        if for_write:
+            raise
+        return None
     if canonical is None:
         # Existing non-git directory: the path itself is the identity (tests,
         # non-git trees). This is not a fallback from a failed probe.

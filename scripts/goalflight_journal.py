@@ -1089,9 +1089,16 @@ class Journal:
         a mode=rw handle immediately hardened with query_only, then checks the
         live epoch fence in ``read_all``.
         """
+        root = goalflight_task.resolve_project_root_for_read(str(project_root))
+        if root is None:
+            # Unresolvable is unreadable, not an empty journal and not a
+            # write-path TaskError that kills the caller.
+            raise JournalIOError(
+                f"unresolvable project root {project_root}: journal cannot be read"
+            )
         self = cls.__new__(cls)
         self._configure(
-            project_root,
+            root,
             client_epochs=client_epochs,
             allow_migration=False,
             retry_budget_s=retry_budget_s,

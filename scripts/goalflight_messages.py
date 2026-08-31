@@ -3100,10 +3100,11 @@ def _current_project_root() -> Path | None:
     try:
         import goalflight_task  # type: ignore
 
-        return goalflight_task.resolve_project_root(str(Path.cwd()))
+        cwd = str(Path.cwd())
     except _EXPECTED_OPTIONAL_ERRORS:
-        pass
-    return None
+        return None
+    # None: cwd is not a project. Do not substitute another store.
+    return goalflight_task.resolve_project_root_for_read(cwd)
 
 
 def _project_ledger_records(project_root: Path) -> list[dict]:
@@ -3622,7 +3623,11 @@ def controller_mail_summary(
         import goalflight_session_status as sessions  # type: ignore
         import goalflight_task  # type: ignore
 
-        root = goalflight_task.resolve_project_root(str(task_store_project_root))
+        # None: did not open a journal. Return without a count so this is
+        # not reported as 0 mail.
+        root = goalflight_task.resolve_project_root_for_read(str(task_store_project_root))
+        if root is None:
+            return {"reason": "unresolvable-project-root"}
         authority = goalflight_journal.Journal.open_reader(root)
         label = sessions.resolve_controller_label(
             controller_label,
@@ -3689,7 +3694,10 @@ def listener_coverage_status(
     """Return live wake coverage from the kernel-held waiter ledger."""
     import goalflight_task  # type: ignore
 
-    root = goalflight_task.resolve_project_root(str(project_root))
+    # None: coverage was not measured. Omit live_waiters so 0 is not a count.
+    root = goalflight_task.resolve_project_root_for_read(str(project_root))
+    if root is None:
+        return {"reason": "unresolvable-project-root"}
     label = str(controller_label or "").strip()
     del identity_probe  # compatibility-only; lock state replaces process probing.
     nonce = str(lease_nonce or "").strip() or None
@@ -4084,7 +4092,10 @@ def emit_wake_entry_notice(
     """Bounded no-listener mail poll for one ambient claimed controller."""
     import goalflight_task  # type: ignore
 
-    root = goalflight_task.resolve_project_root(str(project_root))
+    # None: skip the poll. Do not report covered/uncovered or 0 mail.
+    root = goalflight_task.resolve_project_root_for_read(str(project_root))
+    if root is None:
+        return {"reason": "unresolvable-project-root"}
     ambient = _ambient_claimed_controller(
         root,
         controller_label=controller_label,
@@ -4149,7 +4160,12 @@ def emit_listener_reminder(
     try:
         if project_root is None or exposure < 1:
             return None
-        root = _canonical_project_root(Path(project_root))
+        import goalflight_task  # type: ignore
+
+        # None: render nothing. An unresolvable root is not "no listener".
+        root = goalflight_task.resolve_project_root_for_read(str(project_root))
+        if root is None:
+            return None
         label = str(controller_label or "").strip()
         if not label:
             register_cmd = shlex.join(
@@ -4213,17 +4229,25 @@ def emit_controller_mail_notice(
     try:
         resolved_owned_dispatch_ids = owned_dispatch_ids
         if resolved_owned_dispatch_ids is None:
-            resolved_owned_dispatch_ids = (
-                _project_dispatch_ids(_canonical_project_root(project_root))
-                if project_root is not None
-                else set()
-            )
+            if project_root is None:
+                resolved_owned_dispatch_ids = set()
+            else:
+                import goalflight_task  # type: ignore
+
+                # None: did not enumerate this project's dispatches.
+                root = goalflight_task.resolve_project_root_for_read(str(project_root))
+                if root is None:
+                    return None
+                resolved_owned_dispatch_ids = _project_dispatch_ids(root)
         summary = controller_mail_summary(
             owned_dispatch_ids=resolved_owned_dispatch_ids,
             task_store_project_root=project_root,
             messages_dir=messages_dir,
             fleet_dir=fleet_dir,
         )
+        if "count" not in summary:
+            # Unresolved or unread journal: not a measured 0.
+            return None
         for error in summary.get("carrier_errors") or []:
             _emit_carrier_error(error, stream=stream)
         count = int(summary.get("count") or 0)
@@ -4262,7 +4286,10 @@ def emit_listener_activity_signal(
         import goalflight_session_status as sessions  # type: ignore
         import goalflight_task  # type: ignore
 
-        root = goalflight_task.resolve_project_root(str(project_root))
+        # None: render nothing. Coverage was not measured.
+        root = goalflight_task.resolve_project_root_for_read(str(project_root))
+        if root is None:
+            return ""
         label = str(controller_label or "").strip()
         if not label:
             label = str(sessions.resolve_controller_label(project_root=root) or "").strip()

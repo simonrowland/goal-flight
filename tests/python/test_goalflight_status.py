@@ -1307,6 +1307,79 @@ def test_wait_dead_drain_status_identity_does_not_cast_second_verdict() -> None:
             S.goalflight_compat.pid_alive = orig_pid_alive
 
 
+def test_unresolvable_fixture_root_does_not_crash_or_fabricate() -> None:
+    """``/repo/A`` is a fixture label, not a checkout to write into.
+
+    The write resolver must still refuse that path. Advisory surfaces that
+    inherited it used to raise; they must return a non-count instead of 0 mail
+    or covered=True.
+    """
+    import goalflight_messages as gm
+    import goalflight_task as task
+
+    missing = "/repo/A"
+    try:
+        task.resolve_project_root(missing)
+    except task.TaskError as exc:
+        check("write of fixture root still refuses", "Refusing to write to another store" in str(exc))
+    else:
+        check("write of fixture root still refuses", False)
+
+    stream = io.StringIO()
+    notice = gm.emit_wake_entry_notice(project_root=missing, stream=stream)
+    check("wake notice reason is unresolvable", notice.get("reason") == "unresolvable-project-root")
+    check("wake notice has no mail count", "count" not in notice)
+    check("wake notice does not claim coverage", notice.get("covered") is not True)
+    check("wake notice printed nothing", stream.getvalue() == "")
+
+    summary = gm.controller_mail_summary(task_store_project_root=Path(missing))
+    check("mail summary reason is unresolvable", summary.get("reason") == "unresolvable-project-root")
+    check("mail summary has no count", "count" not in summary)
+    check("mail summary has no needs list", "needs" not in summary)
+
+    signal = gm.emit_listener_activity_signal(project_root=missing, stream=io.StringIO())
+    check("activity signal renders nothing", signal == "")
+
+    milestone = S.milestone_status_payload(missing)
+    check("milestone due is not a measured False", milestone.get("due") is None)
+    check("milestone cadence is not a measured False", milestone.get("active_cadence") is None)
+
+
+def test_wait_unresolvable_root_is_not_all_terminal() -> None:
+    """A wait whose project root will not resolve must not exit 0 as 'all terminal'."""
+    orig_cycle, orig_root = S._wait_cycle_payload, S.this_project_root
+    payload = {
+        "schema": "goalflight.status.aggregate.v1",
+        "capacity": {"operating_cap": 16},
+        "capacity_state": {"leases": {}, "cooldowns": {}},
+        "dispatch": {
+            "records": [
+                {
+                    "dispatch_id": "still-live",
+                    "project_root": "/no/such/project/root",
+                    "classification": "expected_live",
+                    "agent": "codex",
+                    "worker_pid": 111,
+                    "worker_still_alive": True,
+                    "status_path": "/tmp/still-live.json",
+                    "_wait_snapshot_complete": True,
+                }
+            ],
+            "surplus_processes": [],
+        },
+    }
+    S._wait_cycle_payload = lambda *args, **kwargs: payload
+    S.this_project_root = lambda: "/no/such/project/root"
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = S.main(["--wait", "still-live", "--wait-timeout", "0.05", "--poll-s", "0.01"])
+        check("wait unresolvable root is not all-terminal", rc != 0)
+        check("wait unresolvable root is timeout not success", rc == 1)
+    finally:
+        S._wait_cycle_payload, S.this_project_root = orig_cycle, orig_root
+
+
 def main() -> int:
     test_scope()
     test_worktree_scope()
@@ -1333,6 +1406,8 @@ def main() -> int:
     test_wait_snapshot_uses_single_liveness_result()
     test_wait_explicit_id_uses_drain_status_identity_across_scope()
     test_wait_dead_drain_status_identity_does_not_cast_second_verdict()
+    test_unresolvable_fixture_root_does_not_crash_or_fabricate()
+    test_wait_unresolvable_root_is_not_all_terminal()
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILED: {_FAILS}")
         return 1
