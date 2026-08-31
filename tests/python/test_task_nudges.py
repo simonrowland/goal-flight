@@ -370,6 +370,7 @@ def test_done_suggest_same_tasks_new_dispatch_is_one_event() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         project = tmp / "project"
+        project.mkdir()
         env = _env(tmp)
         with _applied_env(env):
             T.post_done_suggest_nudge(["t-257"], project, "dispatch-a")
@@ -384,10 +385,49 @@ def test_done_suggest_same_tasks_new_dispatch_is_one_event() -> None:
         assert_true("done-suggest has no interrogative", "?" not in text)
 
 
+def test_resolve_journal_path_unresolvable_is_unreadable_not_a_write_refuse() -> None:
+    """Naming a journal is a read. A missing checkout must not raise TaskError.
+
+    Reverting ``resolve_journal_path`` to ``resolve_project_root`` raises
+    TaskError here and kills a caller that was only asking where the journal
+    is. Capture of the same path must still refuse.
+    """
+    import goalflight_journal as J
+
+    with tempfile.TemporaryDirectory() as td:
+        missing = Path(td) / "no-such-project"
+        assert_true("fixture root does not exist", not missing.exists())
+        try:
+            J.resolve_journal_path(missing)
+        except J.JournalIOError as exc:
+            text = str(exc)
+            assert_true("read names the unresolvable root", "unresolvable project root" in text)
+            assert_true(
+                "read does not refuse as a write",
+                "Refusing to write to another store" not in text,
+            )
+        except T.TaskError as exc:
+            raise AssertionError(
+                f"resolve_journal_path used the write-refuse helper: {exc}"
+            ) from exc
+        else:
+            raise AssertionError("expected JournalIOError for an unresolvable root")
+        try:
+            T.resolve_project_root(str(missing))
+        except T.TaskError as exc:
+            assert_true(
+                "write of the same path still refuses",
+                "Refusing to write to another store" in str(exc),
+            )
+        else:
+            raise AssertionError("write path must still refuse an unresolvable root")
+
+
 def test_done_suggest_new_task_still_posts() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         project = tmp / "project"
+        project.mkdir()
         env = _env(tmp)
         with _applied_env(env):
             T.post_done_suggest_nudge(["t-257"], project, "dispatch-a")
@@ -411,6 +451,7 @@ def main() -> None:
     test_watcher_prompt_echo_does_not_post_done_suggest()
     test_done_suggest_same_tasks_new_dispatch_is_one_event()
     test_done_suggest_new_task_still_posts()
+    test_resolve_journal_path_unresolvable_is_unreadable_not_a_write_refuse()
     print("OK: task nudge tests pass")
 
 

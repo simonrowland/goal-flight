@@ -801,8 +801,17 @@ def iter_journal_files() -> list[Path]:
 
 
 def resolve_journal_path(project_root: Path | str) -> Path:
-    """Resolve the journal with the task store's exact canonical project key."""
-    root = goalflight_task.resolve_project_root(str(project_root))
+    """Resolve the journal with the task store's exact canonical project key.
+
+    Naming the path is a read: unresolvable is unreadable (JournalIOError),
+    not a write-path TaskError and not a guessed store. Callers that then
+    create or restore still refuse through Journal construction.
+    """
+    root = goalflight_task.resolve_project_root_for_read(str(project_root))
+    if root is None:
+        raise JournalIOError(
+            f"unresolvable project root {project_root}: journal path cannot be resolved"
+        )
     task_store = goalflight_task.resolve_task_store_dir(root)
     override = os.environ.get("GOALFLIGHT_JOURNAL_DIR", "").strip()
     state_base = Path(override).expanduser() if override else task_store.parents[1]

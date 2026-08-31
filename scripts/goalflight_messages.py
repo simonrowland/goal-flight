@@ -779,14 +779,25 @@ def lookup_to_controller_label(
     """
     resolved = str(label or "").strip()
     try:
-        root_text = controller_address_project_root(project_root)
-    except (OSError, MessageError) as exc:
+        import goalflight_task  # type: ignore
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
         return {
             "state": "unknown",
             "error": type(exc).__name__,
             "project_root": str(project_root),
             "label": resolved,
         }
+    # Lookup is a question about a registry, not a store destination.
+    # Unresolvable is UNKNOWN, never a write-path TaskError and never "missing".
+    root = goalflight_task.resolve_project_root_for_read(str(project_root))
+    if root is None:
+        return {
+            "state": "unknown",
+            "error": "project_root_unresolvable",
+            "project_root": str(project_root),
+            "label": resolved,
+        }
+    root_text = str(root)
     if not Path(root_text).is_dir():
         # Not a checkout we can interrogate: UNKNOWN, never "no such label".
         return {
