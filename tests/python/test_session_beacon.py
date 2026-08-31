@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -447,6 +448,56 @@ def test_lease_liveness_uses_only_lock_when_process_identity_is_unavailable(
     assert dead is not None and dead.alive is False
 
 
+def test_reused_pid_cannot_replace_active_claim_with_missing_lock_witness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The original missing-lock guard remains fail-closed."""
+    root = _root(monkeypatch, tmp_path)
+    tokens = {71001: "first-generation"}
+    monkeypatch.setattr(
+        sessions,
+        "_controller_process_identity",
+        lambda pid: {"pid": pid, "start_token": tokens[pid]},
+    )
+    first = sessions.claim_session(root, pid=71001, label="controller")
+    assert wake.lease_holder_alive(
+        root,
+        controller_label="controller",
+        lease_nonce=first["lease_nonce"],
+    ) is None
+    tokens[71001] = "reused-generation"
+    result = sessions.claim_controller_startup(
+        root,
+        pid=71001,
+        label="controller",
+        role="controller",
+        session_id=first["id"],
+    )
+    assert result["claimed"] is False
+    assert result["reason"] == "label_in_use"
+    active = journal.Journal(root).active_lease("controller")
+    assert active is not None and active.generation == first["generation"]
+
+    takeover = sessions.claim_controller_startup(
+        root,
+        pid=71001,
+        label="controller",
+        role="controller",
+        session_id=first["id"],
+        takeover=True,
+    )
+    assert takeover["claimed"] is True
+    assert takeover["session"]["generation"] == first["generation"] + 1
+    assert takeover["session"]["id"] != first["id"]
+    ended = next(
+        row
+        for row in journal.Journal(root).lease_records(include_ended=True)
+        if row["generation"] == first["generation"]
+    )
+    assert ended["state"] == "SUPERSEDED"
+    assert ended["ended_reason"] == "explicit-takeover"
+
+
 def test_reused_pid_reconnects_without_takeover_when_identity_no_longer_matches(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -495,6 +546,190 @@ def test_reused_pid_reconnects_without_takeover_when_identity_no_longer_matches(
     assert ended["ended_reason"] == "holder-dead"
 
 
+def test_stranger_cannot_take_label_when_pid_liveness_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    host = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    original_kill = compat.os.kill
+    holder = None
+    try:
+        identity = compat.process_start_identity(host.pid)
+        assert identity is not None
+        authority = journal.open_or_create_journal(root)
+        claimed = authority.claim_or_renew_lease("alpha", principal=identity)
+        assert claimed.committed and claimed.value is not None
+        holder = wake.register_lease_holder(
+            root,
+            controller_label="alpha",
+            lease_nonce=claimed.value.nonce,
+        )
+
+        def deny_pid_probe(pid: int, signal: int) -> None:
+            if pid == host.pid:
+                raise PermissionError(errno.EPERM, "Operation not permitted")
+            original_kill(pid, signal)
+
+        monkeypatch.setattr(compat.os, "kill", deny_pid_probe)
+        assert compat.pid_liveness(host.pid) is None
+        monkeypatch.setattr(
+            sessions,
+            "_controller_process_identity",
+            lambda pid: {"pid": pid, "start_token": "stranger"},
+        )
+        refused = sessions.claim_controller_startup(
+            root, pid=71931, label="alpha", role="controller"
+        )
+        assert refused["claimed"] is False
+        assert refused["reason"] == "label_in_use"
+        active = journal.Journal(root).active_lease("alpha")
+        assert active is not None and active.generation == claimed.value.generation
+    finally:
+        monkeypatch.setattr(compat.os, "kill", original_kill)
+        if holder is not None:
+            holder.close()
+        host.kill()
+        host.wait(timeout=3)
+
+
+def test_stranger_cannot_take_label_when_process_identity_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    host = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    holder = None
+    try:
+        identity = compat.process_start_identity(host.pid)
+        assert identity is not None
+        authority = journal.open_or_create_journal(root)
+        claimed = authority.claim_or_renew_lease("alpha", principal=identity)
+        assert claimed.committed and claimed.value is not None
+        holder = wake.register_lease_holder(
+            root,
+            controller_label="alpha",
+            lease_nonce=claimed.value.nonce,
+        )
+        original_start_identity = compat.process_start_identity
+
+        def unavailable_identity(pid: int, *, include_ancestry: bool = False):
+            if pid == host.pid:
+                return None
+            return original_start_identity(pid, include_ancestry=include_ancestry)
+
+        monkeypatch.setattr(compat, "process_start_identity", unavailable_identity)
+        assert compat.pid_liveness(host.pid) is True
+        assert (
+            compat.process_identity_matches(host.pid, str(identity["start_token"]))
+            is None
+        )
+        monkeypatch.setattr(
+            sessions,
+            "_controller_process_identity",
+            lambda pid: {"pid": pid, "start_token": "stranger"},
+        )
+        refused = sessions.claim_controller_startup(
+            root, pid=71932, label="alpha", role="controller"
+        )
+        assert refused["claimed"] is False
+        assert refused["reason"] == "label_in_use"
+        active = journal.Journal(root).active_lease("alpha")
+        assert active is not None and active.generation == claimed.value.generation
+    finally:
+        if holder is not None:
+            holder.close()
+        host.kill()
+        host.wait(timeout=3)
+
+
+@pytest.mark.parametrize("unknown_probe", ("lock", "pid", "identity"))
+def test_ancestry_matched_return_reconnects_when_probe_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    unknown_probe: str,
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    holder_pid = os.getpid()
+    holder_identity = compat.process_start_identity(holder_pid)
+    assert holder_identity is not None
+    identity = {
+        "pid": holder_pid,
+        "start_token": str(holder_identity["start_token"]),
+    }
+    returning = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    assert any(
+        process.get("pid") == holder_pid
+        and process.get("start_token") == identity["start_token"]
+        for process in sessions._controller_process_ancestry(returning.pid)
+    )
+    original_kill = compat.os.kill
+    holder = None
+    try:
+        authority = journal.open_or_create_journal(root)
+        claimed = authority.claim_or_renew_lease("alpha", principal=identity)
+        assert claimed.committed and claimed.value is not None
+        if unknown_probe != "lock":
+            holder = wake.register_lease_holder(
+                root,
+                controller_label="alpha",
+                lease_nonce=claimed.value.nonce,
+            )
+        if unknown_probe == "pid":
+
+            def deny_pid_probe(pid: int, signal: int) -> None:
+                if pid == holder_pid:
+                    raise PermissionError(errno.EPERM, "Operation not permitted")
+                original_kill(pid, signal)
+
+            monkeypatch.setattr(compat.os, "kill", deny_pid_probe)
+        elif unknown_probe == "identity":
+            original_start_identity = compat.process_start_identity
+
+            def unavailable_identity(pid: int, *, include_ancestry: bool = False):
+                if pid == holder_pid and not include_ancestry:
+                    return None
+                return original_start_identity(pid, include_ancestry=include_ancestry)
+
+            monkeypatch.setattr(compat, "process_start_identity", unavailable_identity)
+
+        assert sessions._incumbent_liveness_state(claimed.value) is None
+        returned = sessions.claim_controller_startup(
+            root,
+            pid=returning.pid,
+            label="alpha",
+            role="controller",
+            hold_lock=True,
+        )
+        assert returned["claimed"] is True
+        assert returned["session"]["generation"] == claimed.value.generation
+        assert returned["session"]["pid"] == holder_pid
+        assert returned["session"]["kernel_lock_held"] is True
+        if unknown_probe == "lock":
+            released = sessions.release_session(root, pid=holder_pid)
+            assert released["released"] is True
+            deadline = time.monotonic() + 7
+            while (
+                wake.lease_holder_alive(
+                    root,
+                    controller_label="alpha",
+                    lease_nonce=claimed.value.nonce,
+                )
+                is True
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.05)
+            assert wake.lease_holder_alive(
+                root,
+                controller_label="alpha",
+                lease_nonce=claimed.value.nonce,
+            ) is not True
+    finally:
+        monkeypatch.setattr(compat.os, "kill", original_kill)
+        if holder is not None:
+            holder.close()
+        returning.kill()
+        returning.wait(timeout=3)
+
+
 def test_name_only_reconnect_discards_historical_ambient_nonce(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -508,10 +743,23 @@ def test_name_only_reconnect_discards_historical_ambient_nonce(
     first = sessions.claim_controller_startup(
         root, pid=71001, label="alpha", role="controller", environ={}
     )
+    assert first["claimed"] is True
+    first_holder = wake.register_lease_holder(
+        root,
+        controller_label="alpha",
+        lease_nonce=first["session"]["lease_nonce"],
+    )
+    first_holder.close()
     second = sessions.claim_controller_startup(
         root, pid=71002, label="alpha", role="controller", environ={}
     )
-    assert first["claimed"] is True and second["claimed"] is True
+    assert second["claimed"] is True
+    second_holder = wake.register_lease_holder(
+        root,
+        controller_label="alpha",
+        lease_nonce=second["session"]["lease_nonce"],
+    )
+    second_holder.close()
 
     result = sessions.claim_controller_startup(
         root,
@@ -535,26 +783,32 @@ def test_name_only_reconnect_discards_historical_ambient_nonce(
 def test_controller_startup_reconnects_dead_pid_lease_without_takeover(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Returning under a dead holder's label claims automatically.
-
-    This is the test that must fail with the reconnect change reverted:
-    a lease whose recorded pid is dead, no --takeover, claimed: true.
-    """
+    """A held lock reaches the real dead-PID probe before reconnecting."""
     root = _root(monkeypatch, tmp_path)
+    dead_holder = subprocess.Popen([sys.executable, "-c", ""])
+    dead_holder.wait(timeout=3)
+    assert compat.pid_liveness(dead_holder.pid) is False
     identities = {
-        71901: {"pid": 71901, "start_token": "dead-holder"},
+        dead_holder.pid: {"pid": dead_holder.pid, "start_token": "dead-holder"},
         71902: {"pid": 71902, "start_token": "returning"},
     }
     monkeypatch.setattr(sessions, "_controller_process_identity", identities.get)
     first = sessions.claim_controller_startup(
-        root, pid=71901, label="alpha", role="controller"
+        root, pid=dead_holder.pid, label="alpha", role="controller"
     )
     assert first["claimed"] is True
     assert first["session"]["label"] == "alpha"
-
-    second = sessions.claim_controller_startup(
-        root, pid=71902, label="alpha", role="controller"
+    holder = wake.register_lease_holder(
+        root,
+        controller_label="alpha",
+        lease_nonce=first["session"]["lease_nonce"],
     )
+    try:
+        second = sessions.claim_controller_startup(
+            root, pid=71902, label="alpha", role="controller"
+        )
+    finally:
+        holder.close()
     assert second["claimed"] is True
     assert second["session"]["label"] == "alpha"
     assert second["session"]["generation"] == first["session"]["generation"] + 1

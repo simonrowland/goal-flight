@@ -34,6 +34,14 @@ Dispatch replay children verify the incumbent lease and stamp ownership only on 
 exact match. A mismatch is visible and leaves the dispatch unowned; it never silently
 clears ownership and proceeds as though the claim succeeded.
 
+`--controller-startup` result semantics are fail-closed. `claim_conflict` provides
+no usable ownership capability, so a controller or dispatcher must treat itself as
+unregistered even when a late fault leaves the journal's committed state uncertain.
+Re-read the controller roster, then retry the whole startup claim once with the same
+label: a settled competing claim becomes `label_in_use`, while a repeated
+`claim_conflict` is a journal/storage fault that requires operator attention.
+`--takeover` is not a retry for `claim_conflict`.
+
 1. Run procedural status:
 
 ```bash
