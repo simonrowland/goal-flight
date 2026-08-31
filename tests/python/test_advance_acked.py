@@ -305,9 +305,19 @@ def test_acked_fanout_with_duplicate_addressee_drains_every_controller(
         assert STREAM in cursor["positions"]
 
 
-def test_identical_addressee_payload_retry_is_not_recorded(
+def test_identical_addressee_payload_is_still_delivered(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """Identical content is not proof of a duplicate; deliver it.
+
+    This inverts an earlier assertion. A producer-side dedupe keyed on
+    (label, type, payload) across the carrier's whole lifetime was withdrawn
+    because it silently dropped legitimate mail: the same advisory sent an
+    hour later, and the same notice sent to one label in two different
+    project roots. Identical text can be a genuinely new event, and losing
+    real mail is worse than the duplicate the filter prevented. Duplicates
+    are handled on the consumer side by --acked completion instead.
+    """
     _set_state_env(monkeypatch, tmp_path)
     project = _git_project(tmp_path)
     authority = journal.open_or_create_journal(project)
@@ -316,8 +326,8 @@ def test_identical_addressee_payload_retry_is_not_recorded(
     first = _post(project, messages_dir, "battery-webui", "one message")
     second = _post(project, messages_dir, "battery-webui", "one message")
     assert first["recorded"] is True
-    assert second["recorded"] is False
-    assert second["envelope"]["seq"] == first["envelope"]["seq"]
+    assert second["recorded"] is True, "a legitimate repeat must not be suppressed"
+    assert second["envelope"]["seq"] != first["envelope"]["seq"]
 
 
 def test_relay_summary_only_since_is_headline_and_count_without_bodies(

@@ -1527,10 +1527,15 @@ def post_message(
         if not isinstance(addressee, dict):
             raise MessageError("addressee must be an object")
         envelope["addressee"] = dict(addressee)
-        if skip_if is None:
-            skip_if = lambda item, _incoming=envelope: _same_addressed_payload(
-                item, _incoming
-            )
+        # Producer-side dedupe is DISABLED. It was added to stop an 18s retry
+        # double-writing one envelope, but the predicate compared only label,
+        # type and payload across the carrier's whole lifetime -- no window and
+        # no project_root. That silently dropped a legitimate repeat (the same
+        # advisory an hour later) and the same notice sent to one label in two
+        # different projects. Suppressing real mail is worse than the duplicate
+        # it prevented, and the consumer-side fix below already drains
+        # duplicates. Re-enable only with a bounded window and a complete
+        # addressee identity; callers may still pass an explicit skip_if.
     # Boundary validation, including canonical serialization, happens before any
     # carrier/ingestion state is touched. The final seq-bearing form is validated
     # and serialized again under the transaction lock.
