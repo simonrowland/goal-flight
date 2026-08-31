@@ -8327,13 +8327,16 @@ def _read_capacity_state_for_reconciliation() -> dict:
 
 
 def _abandoned_status_payload(record: dict) -> tuple[dict | None, str]:
-    """Read status evidence without confusing absence with corruption.
+    """Read status evidence, treating every unreadable case as indeterminate.
 
-    A recorded ``status_path`` whose file is missing is indeterminate, not
-    empty evidence: ``{}`` is not a veto and licenses ``no_recorded_pid``
-    close. A file that cannot be read, parsed, or tied to this dispatch
-    is also ambiguous and must veto reconciliation. Pointer-absent remains
-    ``status_path_absent``.
+    Returns ``(payload, evidence)``. **Every failure returns ``None``, and
+    ``None`` vetoes reconciliation** at the caller (``status_indeterminate``).
+    That includes a recorded ``status_path`` whose file is missing:
+    never-created, write-failed and unlinked are indistinguishable from here,
+    so absence is "could not tell", never proof the dispatch is closable.
+
+    Only a payload that reads, parses, and names this same ``dispatch_id`` is
+    returned as evidence.
     """
 
     status_path = record.get("status_path")
@@ -8345,7 +8348,10 @@ def _abandoned_status_payload(record: dict) -> tuple[dict | None, str]:
         payload = json.loads(Path(status_path).expanduser().read_text(encoding="utf-8"))
     except FileNotFoundError:
         # Recorded path, missing file: never-created vs write-failed vs
-        # unlinked. Empty {} is not a veto and licenses no_recorded_pid close.
+        # unlinked are indistinguishable here, so this vetoes rather than
+        # licensing a close. A row whose status file was removed therefore
+        # stays ineligible for reconciliation for good — acceptable only
+        # because the ledger, not this file, is the authority on terminality.
         return None, "status_file_absent"
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return None, f"status_unreadable:{type(exc).__name__}"
