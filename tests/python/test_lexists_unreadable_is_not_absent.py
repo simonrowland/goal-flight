@@ -49,7 +49,10 @@ def test_doctor_unreadable_journal_is_not_healthy_absent(tmp_path: Path) -> None
         assert leases["ok"] is False, leases
         assert leases["present"] is True, leases
         assert "error" in leases
-        assert leases["active_controller_leases_in_project"] == 0
+        assert leases["leases"] is None
+        assert leases["active_controller_leases_in_project"] is None
+        assert leases["active_but_dead_controller_leases_in_project"] is None
+        assert leases["unknown_controller_lease_holders_in_project"] is None
 
         coverage = doctor.check_wake_coverage(root)
         assert coverage["ok"] is False, coverage

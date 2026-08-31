@@ -132,8 +132,10 @@ def test_doctor_unreadable_journal_is_not_false_green(
     assert result["ok"] is False
     assert result["present"] is True
     assert type(error).__name__ in str(result.get("error") or "")
-    assert result["leases"] == []
-    assert result["active_controller_leases_in_project"] == 0
+    assert result["leases"] is None
+    assert result["active_controller_leases_in_project"] is None
+    assert result["active_but_dead_controller_leases_in_project"] is None
+    assert result["unknown_controller_lease_holders_in_project"] is None
     line = doctor.status_line(
         result["ok"],
         "controller lease holder liveness",
