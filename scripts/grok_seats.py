@@ -24,11 +24,11 @@ Three rules carry the design:
   be genuinely unmeasurable. Such a seat stays ELIGIBLE (there is no evidence it
   is starved) but ranks behind any seat measured to have headroom, because a
   measured number is better evidence than an absence.
-* **A 401 is not a dead credential.** An optional local rotator (loaded from
-  ``ext`` if present, otherwise a no-op) may recover a failed probe before this
-  module records the seat dead, and may mark a seat exhausted the moment a
-  dispatch proves it. Most installs have no rotator; a missing one must never
-  change or fail a dispatch.
+* **A 401 may be recoverable.** An optional local rotator (loaded from ``ext``
+  if present, otherwise a no-op) may recover a failed probe before this module
+  records the seat unusable, and may mark a seat exhausted the moment a dispatch
+  proves it. Most installs have no rotator; a missing one must never change or
+  fail a dispatch.
 """
 
 from __future__ import annotations
@@ -255,14 +255,16 @@ def load_states(path: Path = STATE_PATH) -> dict | None:
 def _entry_is_auth_failure(entry: object) -> bool:
     """True when a cached probe recorded an auth failure, not headroom.
 
-    A 401 is not a dead credential (see module docstring). Serving that
-    cached verdict for the rest of the TTL is how a re-authenticated host
-    kept rendering as needs-login while a live probe succeeded immediately.
+    Auth failures are not selectable, but their cached verdict is kept stale so
+    a re-authenticated host is observed by the next live probe.
     """
     if not isinstance(entry, dict) or entry.get("ok"):
         return False
     error = str(entry.get("error") or "").lower()
-    return "401" in error or "auth" in error
+    return any(
+        signal in error
+        for signal in ("401", "403", "auth", "no grok login", "session token")
+    )
 
 
 def states_are_fresh(document: dict | None, *, now: float | None = None) -> bool:
@@ -278,8 +280,12 @@ def states_are_fresh(document: dict | None, *, now: float | None = None) -> bool
         return False
     seats = document.get("seats")
     if isinstance(seats, dict) and any(
-        _entry_is_auth_failure(entry) for entry in seats.values()
+        isinstance(entry, dict) and entry.get("ok") is False
+        for entry in seats.values()
     ):
+        # Older caches used ok=False for every probe failure. Refresh once so a
+        # transient monitoring failure is rewritten as usable/unknown instead
+        # of remaining benched for the old cache's TTL.
         return False
     return True
 
@@ -335,7 +341,10 @@ def refresh_states(
             except BaseException:
                 pass
         seats[label or HOST_KEY] = {
-            "ok": bool(record.get("ok")),
+            # Cached `ok` describes whether the seat is usable, not whether the
+            # separate usage probe succeeded. The retained error and absent
+            # percentage distinguish usable/unknown from usable/measured.
+            "ok": bool(record.get("ok")) or not _entry_is_auth_failure(record),
             "used_percent": record.get("used_percent"),
             "error": record.get("error"),
         }
@@ -362,9 +371,6 @@ def _rank(entry: object) -> tuple[int, float] | None:
         return None
     used = entry.get("used_percent")
     if isinstance(used, bool) or not isinstance(used, (int, float)):
-        # Unknown usage. Not evidence of exhaustion, so still eligible -- but a
-        # reader that outright FAILED is not eligible, because we do not even
-        # know the login works.
         return (1, 0.0) if entry.get("ok") else None
     if float(used) >= EXHAUSTED_AT_PERCENT:
         return None
@@ -432,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
         used = entry.get("used_percent")
         shown = "unknown" if used is None else f"{float(used):.0f}%"
         eligible = "eligible" if _rank(entry) is not None else "STARVED"
-        note = "" if entry.get("ok") else f"  [{entry.get('error')}]"
+        note = f"  [{entry.get('error')}]" if entry.get("error") else ""
         print(f"  {name:18s} used={shown:8s} {eligible}{note}")
     print(f"selected: {selected or '(host ~/.grok)'}")
     return 0

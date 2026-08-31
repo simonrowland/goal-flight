@@ -102,11 +102,19 @@ def test_unknown_usage_is_eligible_but_ranks_behind_a_measured_seat(
     assert seats.select_seat(path=only_unknown, now=NOW, allow_refresh=False) == "unknown"
 
 
-def test_a_failed_probe_is_not_eligible(tmp_path: Path) -> None:
-    """Unknown-but-reporting differs from could-not-reach-it: a login we cannot
-    even confirm works must not be selected."""
+@pytest.mark.parametrize("status", [401, 403])
+def test_an_auth_failure_is_not_eligible(tmp_path: Path, status: int) -> None:
+    """An auth rejection establishes that the saved login cannot serve work."""
     path = _states(
-        tmp_path / "s.json", {"": _entry(100.0), "broken": _entry(None, ok=False)}
+        tmp_path / "s.json",
+        {
+            "": _entry(100.0),
+            "broken": {
+                "ok": False,
+                "used_percent": None,
+                "error": f"billing endpoint returned HTTP {status}",
+            },
+        },
     )
     assert seats.select_seat(path=path, now=NOW, allow_refresh=False) is None
 
@@ -189,6 +197,35 @@ def test_cached_auth_failure_is_not_fresh_and_select_reprobes(tmp_path: Path) ->
     assert calls == ["refreshed"]
 
 
+def test_cached_transient_failure_is_reprobed_into_selectable_unknown(
+    tmp_path: Path,
+) -> None:
+    """A pre-fix cache must not keep a transient failure benched for its TTL."""
+    path = _states(
+        tmp_path / "s.json",
+        {
+            "seat": {
+                "ok": False,
+                "used_percent": None,
+                "error": "billing endpoint returned HTTP 503",
+            }
+        },
+        updated_at=NOW,
+    )
+    calls: list[str] = []
+
+    def refresher(*, path, now):
+        calls.append("refreshed")
+        return {
+            "version": 1,
+            "updated_at": now,
+            "seats": {"seat": _entry(None)},
+        }
+
+    assert seats.select_seat(path=path, now=NOW, refresher=refresher) == "seat"
+    assert calls == ["refreshed"]
+
+
 def test_refresh_records_every_account_including_unreachable_ones(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -207,9 +244,10 @@ def test_refresh_records_every_account_including_unreachable_ones(
     path = tmp_path / "s.json"
     document = seats.refresh_states(path=path, now=NOW, reader=reader)
     assert document["seats"][""]["used_percent"] == 12.0
-    # a reader that raised must be recorded as unusable, not dropped silently
-    assert document["seats"]["seat"]["ok"] is False
-    assert json.loads(path.read_text())["seats"]["seat"]["ok"] is False
+    # A reader failure says headroom is unknown, not that the saved login died.
+    assert document["seats"]["seat"]["ok"] is True
+    assert document["seats"]["seat"]["used_percent"] is None
+    assert json.loads(path.read_text())["seats"]["seat"]["ok"] is True
 
 
 def test_refresh_default_path_loads_the_optional_recover_hook(
@@ -292,10 +330,18 @@ def test_refresh_recovers_a_401_via_optional_hook_before_recording_dead(
     assert persisted["seats"]["seat"]["ok"] is True
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "billing endpoint returned HTTP 503",
+        TimeoutError("billing endpoint timed out"),
+        ConnectionResetError("billing connection reset"),
+    ],
+)
 def test_refresh_does_not_offer_a_non_401_failure_to_the_rotator(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, failure
 ) -> None:
-    """Only a 401 is recoverable. A 503 must be recorded dead without a nudge."""
+    """A transient probe failure leaves unknown headroom selectable."""
     monkeypatch.setattr(
         seats.grok_usage,
         "accounts",
@@ -304,19 +350,25 @@ def test_refresh_does_not_offer_a_non_401_failure_to_the_rotator(
     recover_calls: list[dict] = []
 
     def reader(*, auth_path, timeout_s, account):
-        return {"ok": False, "error": "billing endpoint returned HTTP 503"}
+        if isinstance(failure, BaseException):
+            raise failure
+        return {"ok": False, "error": failure}
 
     def recover(**kwargs):
         recover_calls.append(kwargs)
         return {"ok": True, "used_percent": 1.0}
 
+    def unexpected_refresh(**kwargs):
+        pytest.fail(f"transient cache was treated as stale: {kwargs}")
+
     path = tmp_path / "s.json"
     document = seats.refresh_states(
         path=path, now=NOW, reader=reader, recover=recover
     )
-    assert recover_calls == [], "a 503 must not be offered to the recover hook"
-    assert document["seats"]["seat"]["ok"] is False, document
-    assert seats._rank(document["seats"]["seat"]) is None
+    assert recover_calls == [], "a transient failure must not reach the recover hook"
+    assert document["seats"]["seat"]["ok"] is True, document
+    assert document["seats"]["seat"]["error"]
+    assert seats.select_seat(path=path, now=NOW, refresher=unexpected_refresh) == "seat"
 
 
 def test_refresh_records_dead_when_401_survives_recovery(
@@ -342,10 +394,11 @@ def test_refresh_records_dead_when_401_survives_recovery(
     assert seats._rank(document["seats"]["seat"]) is None
 
 
-def test_refresh_without_recover_hook_records_401_as_dead(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize("status", [401, 403])
+def test_refresh_without_recover_hook_records_auth_failure_as_dead(
+    tmp_path: Path, monkeypatch, status: int
 ) -> None:
-    """Most installs have no rotator; a 401 then stays a failed probe."""
+    """Without successful recovery, an auth rejection stays unusable."""
     monkeypatch.setattr(
         seats.grok_usage,
         "accounts",
@@ -353,7 +406,7 @@ def test_refresh_without_recover_hook_records_401_as_dead(
     )
 
     def reader(*, auth_path, timeout_s, account):
-        return {"ok": False, "error": "billing endpoint returned HTTP 401"}
+        return {"ok": False, "error": f"billing endpoint returned HTTP {status}"}
 
     path = tmp_path / "s.json"
     document = seats.refresh_states(
