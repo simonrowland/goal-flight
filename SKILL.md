@@ -362,6 +362,38 @@ Two orthogonal axes:
 - Goal-loop returns converged result, never draft: plan/act/test/self-review until green.
 - Comms shape: `controller-direct`, `acp`, or `bash-tail`.
 Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background exec.
+### ★ Worker worktrees: use the POOL, never `git worktree add`
+
+```bash
+python3 <skill-root>/scripts/goalflight_dispatch.py --worktree main   ... # NOT git worktree add
+```
+
+`--worktree <ref>` acquires a **pooled seat** prepared at that ref. Seats are
+**REUSED**, so the pool sustains that many *concurrent* workers indefinitely —
+it is not a budget of total dispatches. Exhaustion refuses and names every held
+seat; it never silently falls back to `git worktree add`.
+
+**★ THE SEAT COUNT IS NOT A PARALLELISM CAP. Do not treat it as one.**
+Wide fan-out is wanted — parallelism is how this tool earns its keep. What is
+being prevented is **worktree sprawl**: disk exhaustion and codedb
+over-indexing, both of which scale with the number of checkout ROOTS, not with
+how many workers you run. Twenty workers through eight reused seats is healthy;
+twenty ad-hoc trees is the problem.
+
+**The failure mode is well documented and recurs:** a controller reads the seat
+count as a worker cap, decides it needs more concurrency than that, and
+hand-rolls `git worktree add` for the excess. That bypass is how one repo
+reached **210 ad-hoc worktrees of 211, 202GB, and a machine at 100% disk**. If
+you genuinely need more concurrent seats, raise `GOALFLIGHT_WORKTREE_SEATS` —
+**never** work around the pool, and never lower the seat count to "shape"
+fan-out.
+
+Reclaim with `scripts/goalflight_worktree_gc.py` (report by default, `--apply`
+to remove). Its predicate is deliberately four-part — **merged, clean, unowned
+by a live dispatch, not checked out** — so do not hand-roll a cheaper one: a
+worker that has not yet reached its first commit looks exactly like an
+abandoned tree, and "clean and merged" alone will delete live work.
+
 ### ★ A dead worker is usually a RESUMABLE worker — check before redispatching
 
 ```bash
