@@ -698,7 +698,19 @@ def validate_envelope(
         )
         if not Path(project_root).is_absolute():
             raise MessageError(f"{path}.addressee.project_root: expected an absolute path")
-        canonical_root = _canonical_project_root_text(project_root)
+        # Stored-envelope well-formedness is a read. An addressee root that
+        # no longer resolves cannot be canonicalized; report that as
+        # MessageError so callers stay on the documented path. A resolvable
+        # non-canonical spelling still refuses: that check exists so mail is
+        # not routed to a slug no reader hashes.
+        import goalflight_task  # type: ignore
+
+        try:
+            canonical_root = _canonical_project_root_text(project_root)
+        except goalflight_task.TaskError as exc:
+            raise MessageError(
+                f"{path}.addressee.project_root: unresolvable project root {project_root!r}"
+            ) from exc
         if project_root != canonical_root:
             raise MessageError(
                 f"{path}.addressee.project_root: expected canonical root {canonical_root!r}"
