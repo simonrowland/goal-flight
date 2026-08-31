@@ -3652,6 +3652,13 @@ def _find_dispatch_record(dispatch_id: str) -> dict | None:
 
     Recovery used to call ``read_records()`` here. A 2500-row ledger times
     ~16 lookups per carrier was the 10s/carrier drain cost.
+
+    ``None`` means a successful observation of absence. An unlistable ledger
+    is not that: ``read_record`` already returns the unreadable placeholder
+    when presence is unknown, and this wrapper must not map a raised
+    ``OSError`` onto ``None`` either — callers that treat ``None`` as "id is
+    free" would then act on a fabricated vacancy. The placeholder is
+    distinguishable via ``record_is_unreadable``.
     """
     t0 = time.monotonic()
     try:
@@ -3660,8 +3667,11 @@ def _find_dispatch_record(dispatch_id: str) -> dict | None:
         try:
             return goalflight_ledger.read_record(dispatch_id)
         except OSError:
-            # Unlistable ledger is occupancy UNKNOWN, not "this id is free".
-            return None
+            path = goalflight_ledger.record_path(dispatch_id, create=False)
+            return goalflight_ledger._unreadable_record(
+                path,
+                goalflight_compat.safe_dispatch_filename(dispatch_id),
+            )
     finally:
         _pass_time("ledger_lookup_s", time.monotonic() - t0, count_key="ledger_lookup_n")
 

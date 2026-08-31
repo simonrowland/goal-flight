@@ -244,3 +244,64 @@ def test_f9_successful_process_scan_still_reports_real_surplus_match(
         {"pid": 424242, "comm": "codex", "args": "codex exec worker"}
     ]
     assert ledger.scan_surplus([{"worker_pid": 424242}]) == []
+
+
+def test_find_dispatch_record_oserror_is_unreadable_not_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reverting the OSError arm to ``return None`` fabricates "id is free"."""
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(tmp_path / "state"))
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": "real-row",
+            "state": "running",
+            "started_at": ledger.utc_now(),
+        }
+    )
+    found = dispatch._find_dispatch_record("real-row")
+    assert found is not None and found.get("dispatch_id") == "real-row"
+    assert found.get("state") == "running"
+    assert dispatch._find_dispatch_record("no-such-id") is None
+
+    def boom(_dispatch_id: str):
+        raise OSError("injected unlistable ledger")
+
+    monkeypatch.setattr(dispatch.goalflight_ledger, "read_record", boom)
+    record = dispatch._find_dispatch_record("maybe-there")
+    assert record is not None, "OSError must not read as a free id"
+    assert ledger.record_is_unreadable(record), record
+
+
+@REQUIRES_UNSEARCHABLE_ANCESTOR
+def test_unlistable_runs_dir_lookup_is_not_a_free_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unlistable parent cannot make either lookup invent absence."""
+    hidden = tmp_path / "hidden"
+    monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(hidden / "state"))
+    ledger.write_record(
+        {
+            "schema": ledger.SCHEMA,
+            "dispatch_id": "existing-lookup",
+            "state": "running",
+            "started_at": ledger.utc_now(),
+        }
+    )
+
+    with _mode(hidden, 0o000):
+        via_read = ledger.read_record("existing-lookup")
+        via_find = dispatch._find_dispatch_record("existing-lookup")
+        via_read_missing = ledger.read_record("never-created")
+        via_find_missing = dispatch._find_dispatch_record("never-created")
+
+    assert ledger.record_is_unreadable(via_read), via_read
+    assert ledger.record_is_unreadable(via_find), via_find
+    assert ledger.record_is_unreadable(via_read_missing), via_read_missing
+    assert ledger.record_is_unreadable(via_find_missing), via_find_missing
+    assert via_read.get("state") != "running"
+    assert via_find.get("state") != "running"
+
+    restored = ledger.read_record("existing-lookup")
+    assert restored is not None and restored.get("state") == "running"
+    assert dispatch._find_dispatch_record("never-created") is None
