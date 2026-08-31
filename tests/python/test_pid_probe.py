@@ -60,6 +60,40 @@ def case_windows_access_denied_means_alive() -> None:
         assert goalflight_compat.pid_alive(4242) is True
 
 
+def case_windows_pid_liveness_without_windll_is_unknown() -> None:
+    import ctypes
+
+    prior = getattr(ctypes, "WinDLL", None)
+    had = hasattr(ctypes, "WinDLL")
+    try:
+        if had:
+            del ctypes.WinDLL
+        with patch("goalflight_compat.is_windows", return_value=True), \
+            patch("goalflight_compat.os.kill", side_effect=AssertionError("os.kill must not run")):
+            assert not hasattr(ctypes, "WinDLL")
+            assert goalflight_compat.pid_liveness(4242) is None
+            assert goalflight_compat.pid_alive(4242) is True
+    finally:
+        if had:
+            ctypes.WinDLL = prior
+
+
+def case_windows_pid_liveness_kernel32_load_failure_is_visible() -> None:
+    with patch("goalflight_compat.is_windows", return_value=True), \
+        patch(
+            "ctypes.WinDLL",
+            side_effect=OSError(2, "The specified module could not be found"),
+            create=True,
+        ), \
+        patch("goalflight_compat.os.kill", side_effect=AssertionError("os.kill must not run")):
+        try:
+            goalflight_compat.pid_liveness(4242)
+        except OSError as exc:
+            assert exc.errno == 2
+        else:
+            raise AssertionError("kernel32 load failure must not become unknown")
+
+
 def case_posix_pid_probe_error_is_indeterminate() -> None:
     with patch("goalflight_compat.is_windows", return_value=False), \
         patch(
@@ -167,6 +201,8 @@ def case_ledger_windows_identity_indeterminate_not_expected_live() -> None:
 def main() -> None:
     case_windows_pid_alive_does_not_call_os_kill()
     case_windows_access_denied_means_alive()
+    case_windows_pid_liveness_without_windll_is_unknown()
+    case_windows_pid_liveness_kernel32_load_failure_is_visible()
     case_posix_pid_probe_error_is_indeterminate()
     case_live_pid_probe_error_classifies_indeterminate()
     case_live_ps_probe_error_classifies_indeterminate()

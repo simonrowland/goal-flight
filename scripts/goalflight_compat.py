@@ -982,7 +982,13 @@ def pid_liveness(pid) -> bool | None:
     STILL_ACTIVE = 259  # pragma: no cover
     ERROR_ACCESS_DENIED = 5  # pragma: no cover
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # pragma: no cover
+    # ctypes.WinDLL exists only on Windows. Missing it means this host is not a
+    # Windows ctypes (lied/simulated platform) — UNKNOWN, not a crash. A later
+    # kernel32 load OSError is a real API failure and is left uncaught.
+    windll = getattr(ctypes, "WinDLL", None)  # pragma: no cover
+    if windll is None:  # pragma: no cover
+        return None
+    kernel32 = windll("kernel32", use_last_error=True)  # pragma: no cover
     kernel32.OpenProcess.restype = wintypes.HANDLE  # pragma: no cover
     kernel32.OpenProcess.argtypes = (  # pragma: no cover
         wintypes.DWORD,
