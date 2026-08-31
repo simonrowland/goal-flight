@@ -227,9 +227,43 @@ def check_merged(repo: Path, branch: str | None, detached: bool, into: str) -> d
     if proc.returncode == 0:
         return _condition(YES, f"branch {branch!r} is merged into {into!r}")
     if proc.returncode == 1:
+        # Ancestry answers "is this branch an ancestor of main?", but the
+        # question is "is this branch's work in main?". Every branch whose
+        # commits landed by rebase, squash, or cherry-pick fails the ancestry
+        # test forever, so its worktree can never be reclaimed -- which is how
+        # a checkout accumulates dozens of immortal trees holding work that is
+        # already shipped.
+        #
+        # git cherry compares by patch-id: "+ <sha>" is a commit with no
+        # equivalent upstream, "- <sha>" is one already applied. No "+" lines
+        # means nothing unique is left to protect.
+        try:
+            cherry = _git(repo, "cherry", into, branch)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return _condition(
+                UNKNOWN,
+                f"branch {branch!r} is not an ancestor of {into!r} and patch "
+                f"equivalence could not be evaluated ({exc.__class__.__name__})",
+            )
+        if cherry.returncode != 0:
+            detail = (cherry.stderr or cherry.stdout).strip() or f"exit {cherry.returncode}"
+            return _condition(
+                UNKNOWN,
+                f"branch {branch!r} is not an ancestor of {into!r} and patch "
+                f"equivalence could not be evaluated ({detail})",
+            )
+        unique = [
+            line for line in cherry.stdout.splitlines() if line.startswith("+")
+        ]
+        if not unique:
+            return _condition(
+                YES,
+                f"every commit on branch {branch!r} is already applied in "
+                f"{into!r} (patch-id equivalent, not an ancestor)",
+            )
         return _condition(
             NO,
-            f"branch {branch!r} has commits not in {into!r}",
+            f"branch {branch!r} has {len(unique)} commit(s) not in {into!r}",
         )
     detail = (proc.stderr or proc.stdout).strip() or f"exit {proc.returncode}"
     return _condition(

@@ -161,6 +161,62 @@ def test_drop_merged_condition_would_delete_unmerged_work(tmp_path: Path, repo: 
     assert entry["conditions"]["not_current"]["verdict"] == "yes"
 
 
+def test_cherry_picked_branch_counts_as_merged(tmp_path: Path, repo: Path) -> None:
+    """Work already in main by patch-id frees its tree, even without ancestry.
+
+    Ancestry answers "is this branch an ancestor of main?" but the question is
+    "is this branch's work in main?". Every branch that lands by rebase,
+    squash, or cherry-pick fails ancestry forever, so before this its worktree
+    could never be reclaimed -- the mechanism behind dozens of immortal trees
+    holding already-shipped work.
+    """
+    wt = _add_worktree(repo, tmp_path, "picked")
+    _commit_in(wt)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=wt, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    # Advance main first. Without this the cherry-pick reproduces an identical
+    # sha (same tree, parent, message, and same-second timestamps), which would
+    # make the branch a genuine ancestor and prove nothing.
+    _commit_in(repo, "on-main.txt")
+    # Cherry-pick, deliberately NOT merge: main gains the patch, not the commit.
+    _git(repo, "cherry-pick", sha)
+
+    ancestry = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", "picked", "main"],
+        cwd=repo, capture_output=True, text=True, check=False,
+    )
+    assert ancestry.returncode == 1, "fixture must not be an ancestor, or it proves nothing"
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["conditions"]["merged"]["verdict"] == "yes", entry
+    assert "patch-id equivalent" in entry["conditions"]["merged"]["reason"], entry
+    assert entry["decision"] == "remove", entry
+
+
+def test_unmerged_branch_with_one_unique_commit_is_still_retained(
+    tmp_path: Path, repo: Path
+) -> None:
+    """The patch-id path must not become a blanket yes.
+
+    A branch whose work is only partly upstream still holds unique commits and
+    must stay protected; otherwise the equivalence check would delete real work.
+    """
+    wt = _add_worktree(repo, tmp_path, "partly")
+    _commit_in(wt, "shared.txt")
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=wt, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    _git(repo, "cherry-pick", sha)
+    _commit_in(wt, "unique.txt")  # this one never reaches main
+
+    _done, report = _run(repo)
+    entry = _entry(report, wt)
+    assert entry["conditions"]["merged"]["verdict"] == "no", entry
+    assert entry["decision"] == "retain", entry
+
+
 def test_drop_clean_condition_would_delete_dirty_worktree(tmp_path: Path, repo: Path) -> None:
     """Condition (2) alone protects this tree: merged, unowned, not current."""
     wt = _add_worktree(repo, tmp_path, "dirty")
@@ -340,7 +396,7 @@ def test_report_only_is_default_and_prints_retention_reasons(
     assert done.returncode == 0, done.stderr
     assert "would_remove" in done.stdout
     assert "why=" in done.stdout
-    assert "has commits not in" in done.stdout
+    assert "commit(s) not in" in done.stdout
     assert "report only" in done.stdout
     assert removable.is_dir() and kept.is_dir()
 
