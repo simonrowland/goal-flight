@@ -25,6 +25,8 @@ if str(ROOT) not in sys.path:
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import goalflight_dispatch_states as states  # noqa: E402
+import goalflight_ledger as ledger  # noqa: E402
 import goalflight_task as task  # noqa: E402
 
 
@@ -90,6 +92,74 @@ def test_unresolvable_root_capture_refuses_and_writes_nowhere(tmp_path: Path) ->
     after = {p for p in store_root.rglob("*") if p.is_file()} if store_root.exists() else set()
     new_files = after - before
     assert not any(path.name == "tasks.jsonl" for path in new_files), new_files
+
+
+def test_ledger_terminal_record_writable_when_project_root_is_gone(
+    tmp_path: Path,
+) -> None:
+    """A vanished checkout is a ledger label, not a store destination.
+
+    Reverting ``canonicalize_project_root_on_store`` to ``resolve_project_root``
+    (the write-refuse helper) raises TaskError here and strands the dispatch:
+    the terminal ledger row cannot be written, so reconciliation cannot observe
+    it. Capture of the same path must still refuse.
+    """
+    vanished = tmp_path / "deleted-worktree"
+    assert not vanished.exists()
+
+    store_root = Path(os.environ["GOALFLIGHT_TASK_STORE_DIR"])
+    before = {p for p in store_root.rglob("*") if p.is_file()} if store_root.exists() else set()
+
+    dispatch_id = "vanished-root-terminal"
+    path = ledger.write_record(
+        {
+            "dispatch_id": dispatch_id,
+            "state": "complete",
+            "terminal_state": "complete",
+            "project_root": str(vanished),
+        }
+    )
+    assert path.is_file()
+    stored = ledger.read_record(dispatch_id)
+    assert stored is not None
+    assert stored["dispatch_id"] == dispatch_id
+    assert stored["state"] == "complete"
+    assert states.is_terminal_state(stored["state"])
+    assert stored["project_root"] == str(vanished)
+    assert path == ledger.record_path(dispatch_id)
+    assert task.resolve_project_root_for_read(stored["project_root"]) is None
+
+    proc = _run(vanished, "capture", "must not land in another store")
+    assert proc.returncode != 0, proc.stderr
+    assert "unresolvable project root" in proc.stderr
+    assert "Refusing to write to another store" in proc.stderr
+    with pytest.raises(task.TaskError, match="Refusing to write to another store"):
+        task.resolve_project_root(str(vanished))
+
+    after = {p for p in store_root.rglob("*") if p.is_file()} if store_root.exists() else set()
+    assert not any(path.name == "tasks.jsonl" for path in after - before), after - before
+
+
+def test_canonicalize_on_store_collapses_live_root_and_keeps_missing_raw(
+    tmp_path: Path,
+) -> None:
+    """Live roots still collapse; a missing root keeps the raw label.
+
+    The stored missing value is the unresolved identity, not a collapsed one.
+    A reader hashing that identity for a task-store key is not addressing the
+    ledger record; ledger lookup is by dispatch_id.
+    """
+    live = tmp_path / "plain"
+    live.mkdir()
+    collapsed = task.resolve_project_root(str(live))
+    assert ledger.canonicalize_project_root_on_store(str(live)) == str(collapsed)
+
+    missing = tmp_path / "gone-checkout"
+    assert not missing.exists()
+    assert ledger.canonicalize_project_root_on_store(str(missing)) == str(missing)
+    live_store = task.resolve_task_store_dir(collapsed)
+    raw_store = task.resolve_task_store_dir(missing)
+    assert raw_store != live_store
 
 
 def test_read_of_unresolvable_root_is_none_not_an_identity(tmp_path: Path) -> None:
