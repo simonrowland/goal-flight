@@ -246,3 +246,51 @@ def test_completed_work_does_not_leave_restore_prepared(
     assert not marker.exists(), "completed work was relaunched"
     rp = (payload.get("holds") or {}).get("restore_prepared") or {}
     assert int(rp.get("count") or 0) == 0, payload
+
+
+def test_indeterminate_restore_prepared_is_not_dropped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A complete row that cannot be bound to this envelope must stay visible.
+
+    Restore sanitizes queue_launch_token. Without a matching restore_txn_id
+    there is no proof this envelope is the completed attempt, so drain must
+    not unlink it.
+    """
+    queue = _queue_dir(tmp_path)
+    dispatch_id = "indeterminate-restore-prepared"
+    marker = tmp_path / "indeterminate-should-not-launch.txt"
+    entry = _claim_entry(tmp_path, dispatch_id, token="tok-indet", marker=marker)
+    prepared = D._sanitize_restore_envelope(entry, increment_recovery_count=False)
+    prepared.update(
+        {
+            "state": "restore_prepared",
+            "restore_txn_id": "txn-envelope-only",
+            "restore_reason": "normal_drain_restore",
+        }
+    )
+    target = queue / f"{dispatch_id}.json"
+    D._write_json_atomic(target, prepared)
+    record = D._new_reconciliation_record(entry)
+    record.update(
+        {
+            "state": "complete",
+            "terminal_state": "complete",
+            "queue_path": str(target),
+        }
+    )
+    record.pop("queue_launch_token", None)
+    record.pop("restore_txn_id", None)
+    L.write_record(record)
+
+    rc = D._cmd_drain(["--queue-dir", str(queue), "--capacity-wait-s", "0", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0, payload
+    assert payload["launched"] == 0, payload
+    assert target.exists(), "unclassifiable envelope was dropped"
+    leftover = json.loads(target.read_text(encoding="utf-8"))
+    assert leftover.get("state") == "restore_prepared", leftover
+    assert leftover.get("dispatch_id") == dispatch_id, leftover
+    assert not marker.exists(), "unclassifiable envelope was relaunched"
+    rp = (payload.get("holds") or {}).get("restore_prepared") or {}
+    assert int(rp.get("count") or 0) >= 1, payload

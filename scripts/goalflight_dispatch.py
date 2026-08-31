@@ -2905,6 +2905,11 @@ def _nonterminal_dispatch_reuse_reason(
     record = _find_dispatch_record(dispatch_id)
     if record is None:
         return None
+    if goalflight_ledger.record_is_unreadable(record):
+        # Unlistable runs.d makes every id look present-but-unreadable.
+        # That is not proof the id is taken; occupancy fail-closes on the
+        # directory itself. Inventing a duplicate here stalls every launch.
+        return None
     if (
         allow_queued
         and record.get("state") == "queued"
@@ -9993,15 +9998,27 @@ def _completion_authority_token_bind(entry: dict | None, record: dict | None) ->
     Dispatch ids are reusable once terminal. A new carrier with a new
     ``queue_launch_token`` must not inherit the previous attempt's complete
     row. Missing tokens cannot prove the bind, so the caller must not unlink.
+
+    Restore envelopes strip ``queue_launch_token`` (a new claim will mint
+    one). Bind those to a terminal row through matching ``restore_txn_id``;
+    missing txn ids stay unknown so an unclassifiable envelope is not dropped.
     """
     entry_token = _queue_launch_token_from_entry(entry) if isinstance(entry, dict) else None
     raw = record.get("queue_launch_token") if isinstance(record, dict) else None
     record_token = str(raw) if raw not in (None, "") else None
-    if not entry_token or not record_token:
-        return "unknown"
-    if entry_token == record_token:
-        return "match"
-    return "mismatch"
+    if entry_token and record_token:
+        return "match" if entry_token == record_token else "mismatch"
+    entry_txn = None
+    record_txn = None
+    if isinstance(entry, dict):
+        raw_txn = entry.get("restore_txn_id")
+        entry_txn = str(raw_txn) if raw_txn not in (None, "") else None
+    if isinstance(record, dict):
+        raw_txn = record.get("restore_txn_id")
+        record_txn = str(raw_txn) if raw_txn not in (None, "") else None
+    if entry_txn and record_txn:
+        return "match" if entry_txn == record_txn else "mismatch"
+    return "unknown"
 
 
 def _entry_completion_authority(
