@@ -3336,7 +3336,7 @@ async def _run_acp_dispatch_impl(
         cpu: float | None,
         quiet_for_s: float,
         source: str,
-    ) -> tuple[str, float | None, int | None]:
+    ) -> tuple[str | None, float | None, int | None]:
         """Publish one evidence-based outer-wall verdict across ACP paths."""
         async with liveness_outer_lock:
             if heartbeat_outcome is not None:
@@ -3351,10 +3351,31 @@ async def _run_acp_dispatch_impl(
                 else await asyncio.to_thread(pgroup_cpu_pct, pgid)
             )
             descendants = await asyncio.to_thread(live_descendant_count, proc.pid)
+            activity_snapshot = activity.snapshot(active_monotonic())
+            if float(activity_snapshot["quiet_for_s"]) < cfg.max_quiet_s:
+                return None, measured_cpu, descendants
             known_idle = (
                 cpu_confirmed_idle(measured_cpu, cfg.cpu_epsilon)
                 and descendants == 0
             )
+            observed_state = (
+                "confirmed_idle"
+                if known_idle
+                else "positive_cpu_without_observable_progress"
+                if measured_cpu is not None and measured_cpu > cfg.cpu_epsilon
+                else "liveness_unobservable"
+            )
+            observation = {
+                "observed_state": observed_state,
+                "recent_forward_progress_observed": False,
+                "events_seen": int(activity_snapshot["raw_events_seen"]),
+                "wedge_progress_seen": int(
+                    activity_snapshot["wedge_progress_seen"]
+                ),
+                "outstanding_tool_calls": int(
+                    activity_snapshot["outstanding_count"]
+                ),
+            }
             outer_state = "wedged" if known_idle else LIVENESS_INDETERMINATE_STATE
             outer_error = (
                 {
@@ -3363,6 +3384,7 @@ async def _run_acp_dispatch_impl(
                     "reason": "confirmed_idle",
                     "quiet_for_s": round(quiet_for_s, 3),
                     "hard_wall_s": cfg.max_quiet_s,
+                    **observation,
                 }
                 if known_idle
                 else {
@@ -3371,6 +3393,7 @@ async def _run_acp_dispatch_impl(
                     "reason": "event_silence_outer_bound",
                     "quiet_for_s": round(quiet_for_s, 3),
                     "hard_wall_s": cfg.max_quiet_s,
+                    **observation,
                 }
             )
             await mark_heartbeat_terminal(outer_state, outer_error)
@@ -3393,6 +3416,8 @@ async def _run_acp_dispatch_impl(
                 liveness_outer_bound_classification=(
                     "confirmed_idle" if known_idle else "indeterminate"
                 ),
+                liveness_outer_bound_observation=observed_state,
+                liveness_outer_bound_recent_forward_progress_observed=False,
                 liveness_outer_bound_source=source,
                 quiet_for_s=round(quiet_for_s, 3),
             )
@@ -3755,12 +3780,15 @@ async def _run_acp_dispatch_impl(
                 # unfalsifiable. Conversely this is not a death verdict: the
                 # typed state records indeterminate liveness, and finalization
                 # retains capacity unless later cleanup proves group death.
-                await mark_liveness_outer_terminal(
+                outer_outcome, _, _ = await mark_liveness_outer_terminal(
                     pgid=pgid,
                     cpu=cpu_pct,
                     quiet_for_s=quiet_for_s,
                     source="heartbeat",
                 )
+                if outer_outcome is None:
+                    await asyncio.sleep(cfg.heartbeat_interval)
+                    continue
                 await conn.kill()
                 return
             decision = heartbeat_wedge_decision(
@@ -3909,12 +3937,14 @@ async def _run_acp_dispatch_impl(
             lambda: asyncio.to_thread(pgroup_cpu_pct, pgid)
         )
         if idle_gate.hard_wall_expired:
-            await mark_liveness_outer_terminal(
+            outer_outcome, _, _ = await mark_liveness_outer_terminal(
                 pgid=pgid,
                 cpu=cpu,
                 quiet_for_s=cfg.max_quiet_s,
                 source="idle_callback",
             )
+            if outer_outcome is None:
+                return True
             return False
         descendants = None
         descendant_veto = False

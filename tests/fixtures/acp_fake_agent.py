@@ -894,15 +894,18 @@ def handle_prompt(req_id: int, params: dict) -> None:
         # is the only thing that can reap it. Stays low-CPU so the CPU-aware idle
         # gate classifies it wedged rather than running_quiet.
         child = None
+        process_table_file = os.environ.get(
+            "GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE"
+        )
+        if process_table_file and SCENARIO != "idle_silent_with_child":
+            with open(process_table_file, "w", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()} 1\n")
         if SCENARIO == "idle_silent_with_child":
             child = subprocess.Popen(["sleep", "60"])
             child_pid_file = os.environ.get("GOALFLIGHT_FAKE_ACP_CHILD_PID_FILE")
             if child_pid_file:
                 with open(child_pid_file, "w", encoding="utf-8") as handle:
                     handle.write(str(child.pid))
-            process_table_file = os.environ.get(
-                "GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE"
-            )
             if process_table_file:
                 with open(process_table_file, "w", encoding="utf-8") as handle:
                     handle.write(f"{os.getpid()} 1\n{child.pid} {os.getpid()}\n")
