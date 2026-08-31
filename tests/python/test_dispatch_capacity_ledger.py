@@ -31,6 +31,12 @@ import goalflight_watch  # noqa: E402
 
 def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
+    for key in (
+        "GOALFLIGHT_DISPATCH_ID",
+        "GOALFLIGHT_WORKTREE_LOCK_FD",
+        "GOALFLIGHT_OCCUPANCY_LOCK_FD",
+    ):
+        env.pop(key, None)
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
     env["GOALFLIGHT_JOURNAL_DIR"] = str(tmp / "journal")
@@ -1066,7 +1072,18 @@ def case_account_guard_before_prompt_materialization() -> None:
         )
         assert proc.returncode == 64, f"expected usage rc=64; stdout={proc.stdout} stderr={proc.stderr}"
         assert "Refusing to bill the wrong account" in proc.stderr, proc.stderr
-        assert not (tmp / "state").exists(), "prompt/id/lease side effects happened before account guard"
+        state = tmp / "state"
+        assert not state.exists(), "prompt/id/lease side effects happened before account guard"
+        assert not (state / "dispatch" / ".dispatch-ids").exists(), (
+            "dispatch-id reservation happened before account guard"
+        )
+        prompt_files = list(state.rglob("*.prompt")) if state.exists() else []
+        assert prompt_files == [], (
+            f"prompt materialization happened before account guard: {prompt_files}"
+        )
+        assert not (state / "capacity.json").exists(), (
+            "capacity lease happened before account guard"
+        )
 
 
 def case_codex_routed_subscription_strips_openai_api_key() -> None:
@@ -1201,7 +1218,15 @@ def case_dispatch_id_collision_suffix() -> None:
         env["GOALFLIGHT_DISPATCH_ID_SEED"] = "collision-id"
         env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "2"
 
+        trees = [tmp / "tree-a", tmp / "tree-b"]
+        for tree in trees:
+            tree.mkdir()
+        started = 0
+
         def start_once() -> subprocess.Popen[str]:
+            nonlocal started
+            worker_cwd = trees[started]
+            started += 1
             return subprocess.Popen(
                 [
                     sys.executable,
@@ -1214,7 +1239,7 @@ def case_dispatch_id_collision_suffix() -> None:
                     "--max-idle-secs",
                     "5",
                     "--cwd",
-                    str(tmp),
+                    str(worker_cwd),
                     "--foreground",
                     "--",
                     sys.executable,

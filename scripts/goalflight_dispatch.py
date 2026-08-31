@@ -54,6 +54,7 @@ import contextlib
 import datetime as dt
 from dataclasses import dataclass, field
 from enum import Enum
+import errno
 import hashlib
 try:
     import fcntl
@@ -2895,6 +2896,9 @@ def _validate_before_side_effects(args, raw_argv: list[str]) -> None:
     _validate_os_sandbox_conflict(args)
     _validate_agent_os_sandbox(args)
     _validate_os_sandbox_boundary(args)
+    # Billing refusal is a pre-write guard. Id reservation, prompt
+    # materialization, occupancy bind, and capacity leases must not land first.
+    _resolve_account_env(args)
 
 
 def _nonterminal_dispatch_reuse_reason(
@@ -3425,7 +3429,17 @@ def _inherited_occupancy_lock():
     try:
         fd = int(raw)
         os.fstat(fd)
-    except (ValueError, OSError) as exc:
+    except ValueError as exc:
+        return None, (
+            f"{goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV} does not name an "
+            f"open descriptor: {raw!r} ({type(exc).__name__}: {exc})"
+        )
+    except OSError as exc:
+        # A closed fd is leftover from a previous in-process launch whose
+        # occupancy descriptor ended. It is not occupancy evidence.
+        if exc.errno == errno.EBADF:
+            os.environ.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
+            return None, None
         return None, (
             f"{goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV} does not name an "
             f"open descriptor: {raw!r} ({type(exc).__name__}: {exc})"
@@ -3556,11 +3570,17 @@ def _prepare_attempt_worktree_occupancy(args) -> str | None:
             args, refusal=refusal, forced_warning=forced_warning
         )
     if occupied is not None and not getattr(args, "from_queue", False):
-        # A queued row occupies with no process. A running/starting row whose
-        # worker already died (SIGKILL) leaves the kernel lock free; dropping
-        # the lock we just won would recreate the dual-launch TOCTOU until
-        # the watcher rewrites the ledger.
-        if inherited is None and occupied_state in {"running", "starting"}:
+        # A queued row occupies with no process. A running/starting/
+        # waiting_capacity row whose holder already died (SIGKILL) leaves
+        # the kernel lock free; dropping the lock we just won would recreate
+        # the dual-launch TOCTOU until the watcher rewrites the ledger.
+        # waiting_capacity is a live dispatcher holding occupancy through
+        # the capacity wait; a killed preclaim is not a holder.
+        if inherited is None and occupied_state in {
+            "running",
+            "starting",
+            "waiting_capacity",
+        }:
             _bind_worktree_occupancy_lock(args, lock)
             return None
         if not forced:
@@ -4496,7 +4516,9 @@ def _cmd_resume(argv: list[str]) -> int:
         )
         return 64
     try:
-        source = _validate_resume_source(args.dispatch_id)
+        source = _validate_resume_source(
+            args.dispatch_id, reconcile_dead_preclaim=True
+        )
         _resume_worker_cwd(
             source["record"], override=getattr(args, "cwd", None)
         )
@@ -16707,6 +16729,9 @@ def _run_acp_detached_launcher(
         label="acp",
         inherit_occupancy_lock=True,
     )
+    # Worker inherited the occupancy fd. Drop this process's copy so a later
+    # in-process launch does not see a closed descriptor as occupancy unknown.
+    _release_worktree_occupancy_lock(args)
     _mark_queue_claim_worker_spawned(args, child_pid)
 
     def report_queued() -> None:
@@ -17667,6 +17692,7 @@ def main(argv: list[str] | None = None) -> int:
             _validate_agent_os_sandbox(args)
             _validate_os_sandbox_boundary(args)
             _guard_read_only_write_prompt(args)
+            _resolve_account_env(args)
             dispatch_warnings = _dispatch_warnings(args, raw)
             args.dispatch_warnings = dispatch_warnings
             base = _dispatch_base_dir()
@@ -18234,6 +18260,11 @@ def main(argv: list[str] | None = None) -> int:
             cwd=str(_worker_cwd(args)),
             inherit_occupancy_lock=True,
         )
+        # Worker inherited the occupancy fd. Drop this process's copy so a
+        # later in-process launch does not see a closed descriptor as
+        # occupancy unknown. Sidecars must not keep the now-closed number.
+        _release_worktree_occupancy_lock(args)
+        env.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
         if worktree_seat is not None:
             # Worker inherited the fd. Drop this process's copy so the seat
             # lifetime is the worker's, not the launcher's. Sidecars must not
