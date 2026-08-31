@@ -166,6 +166,7 @@ def _dispatch_command(
     launch_detached: bool = False,
     foreground: bool = True,
     isolate_project: bool = True,
+    cwd: Path | None = None,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -189,7 +190,7 @@ def _dispatch_command(
         # leases are keyed by (label, project_root), so using the repository
         # root would inherit a live controller's lease and make the result
         # depend on ambient host state.
-        cmd += ["--cwd", str(tmp)]
+        cmd += ["--cwd", str(cwd if cwd is not None else tmp)]
     if controller_pid is not None:
         cmd += ["--controller-pid", str(controller_pid)]
     if from_queue:
@@ -217,6 +218,7 @@ def _run_dispatch(
     launch_detached: bool = False,
     foreground: bool = True,
     isolate_project: bool = True,
+    cwd: Path | None = None,
     timeout_s: float = 90.0,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -233,6 +235,7 @@ def _run_dispatch(
             launch_detached=launch_detached,
             foreground=foreground,
             isolate_project=isolate_project,
+            cwd=cwd,
         ),
         cwd=ROOT,
         env=env,
@@ -1301,6 +1304,19 @@ def case_idle_timeout_state_releases_and_classifies_terminal() -> None:
         env["GOALFLIGHT_TEST_MODE"] = "1"
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
         dispatch_id = "dispatch-idle-timeout"
+        # A cwd equal to the sandbox project root makes the tree probe
+        # skip (cwd_is_canonical_root) and classify_liveness never wedges.
+        # Init a git root so --cwd under it collapses to tmp as project_root
+        # while remaining a distinct worker cwd the probe can scan.
+        worker_cwd = tmp / "worker-cwd"
+        worker_cwd.mkdir()
+        subprocess.run(
+            ["git", "init", "-q"],
+            cwd=tmp,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
         worker_pid = None
         try:
             proc = _run_dispatch(
@@ -1310,11 +1326,14 @@ def case_idle_timeout_state_releases_and_classifies_terminal() -> None:
                 "import time; time.sleep(60)",
                 poll_secs="0.1",
                 max_idle_secs="0.2",
+                cwd=worker_cwd,
                 timeout_s=90,
             )
             worker_pid = _worker_pid_from_stdout(proc.stdout)
             assert proc.returncode == 2, f"dispatch rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
-            assert json.loads((tmp / f"{dispatch_id}.status.json").read_text())["state"] == "idle_timeout"
+            status = json.loads((tmp / f"{dispatch_id}.status.json").read_text())
+            assert status["state"] == "idle_timeout", status
+            assert status.get("tree_probe") == "measured", status
             _assert_terminal_record_and_lease(env, dispatch_id, "idle_timeout")
         finally:
             _kill_if_alive(worker_pid)
