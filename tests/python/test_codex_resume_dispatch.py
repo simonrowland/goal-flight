@@ -1009,6 +1009,178 @@ def test_resume_refuses_existing_nonterminal_child_for_same_session(
     )
 
 
+def _from_queue_resume_argv(
+    *,
+    child_id: str,
+    parent_id: str,
+    prompt: Path,
+    cwd: Path,
+    home: Path,
+    tail: Path,
+    status_path: Path,
+) -> list[str]:
+    """Drain relaunch of an already-queued resume envelope."""
+    return [
+        "--agent",
+        "codex",
+        "--unregistered-forced",
+        "--shape",
+        "bash",
+        "--dispatch-id",
+        child_id,
+        "--cwd",
+        str(cwd),
+        "--prompt-file",
+        str(prompt),
+        "--tail",
+        str(tail),
+        "--status-json",
+        str(status_path),
+        "--parent-dispatch-id",
+        parent_id,
+        "--codex-session-id",
+        SESSION_ID,
+        "--codex-resume-home",
+        str(home),
+        "--codex-home-owner-dispatch-id",
+        parent_id,
+        "--from-queue",
+        "--launch-detached",
+    ]
+
+
+def _write_resume_child_record(
+    tmp_path: Path,
+    *,
+    dispatch_id: str,
+    parent_id: str,
+    home: Path,
+    state: str,
+    worker_cwd: Path | None = None,
+    worker_pid: int | None = None,
+) -> dict:
+    record = _write_parent_record(
+        tmp_path,
+        dispatch_id=dispatch_id,
+        home=home,
+    )
+    record.update(
+        {
+            "state": state,
+            "terminal_state": "unknown",
+            "parent_dispatch_id": parent_id,
+            "codex_home_owner_dispatch_id": parent_id,
+            "worker_pid": worker_pid,
+        }
+    )
+    if worker_cwd is not None:
+        record["worker_cwd"] = str(worker_cwd)
+    L.write_record(record)
+    return record
+
+
+def test_queued_resume_envelope_launches_when_only_nonterminal_child_is_itself(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Drain relaunch must not treat the envelope being launched as a duplicate."""
+    parent_id = "selfblock-parent"
+    child_id = "selfblock-queued"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    _write_resume_child_record(
+        tmp_path,
+        dispatch_id=child_id,
+        parent_id=parent_id,
+        home=home,
+        state="queued",
+    )
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Continue the queued resume.", encoding="utf-8")
+    tail = tmp_path / "queued.tail"
+    status_path = tmp_path / "queued.status.json"
+    spawn_calls, leases = _stub_detached_runtime(monkeypatch)
+
+    rc = D.main(
+        _from_queue_resume_argv(
+            child_id=child_id,
+            parent_id=parent_id,
+            prompt=prompt,
+            cwd=tmp_path,
+            home=home,
+            tail=tail,
+            status_path=status_path,
+        )
+    )
+
+    assert rc == 0
+    assert leases == ["lease-resume"]
+    assert any(call["label"] == "worker" for call in spawn_calls)
+    ledger = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
+    assert ledger["state"] == "running"
+    assert ledger["parent_dispatch_id"] == parent_id
+    assert ledger["codex_session_id"] == SESSION_ID
+
+
+def test_queued_resume_envelope_refuses_different_live_resume_child(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Excluding the mid-launch envelope must not admit a second live resume."""
+    parent_id = "selfblock-parent"
+    child_id = "selfblock-queued"
+    other_id = "selfblock-zzz-live"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    _write_resume_child_record(
+        tmp_path,
+        dispatch_id=child_id,
+        parent_id=parent_id,
+        home=home,
+        state="queued",
+    )
+    other_cwd = tmp_path / "other-tree"
+    other_cwd.mkdir()
+    _write_resume_child_record(
+        tmp_path,
+        dispatch_id=other_id,
+        parent_id=parent_id,
+        home=home,
+        state="running",
+        worker_cwd=other_cwd,
+        worker_pid=43211,
+    )
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Do not share this session.", encoding="utf-8")
+    tail = tmp_path / "queued.tail"
+    status_path = tmp_path / "queued.status.json"
+    spawn_calls, _leases = _stub_detached_runtime(monkeypatch)
+
+    rc = D.main(
+        _from_queue_resume_argv(
+            child_id=child_id,
+            parent_id=parent_id,
+            prompt=prompt,
+            cwd=tmp_path,
+            home=home,
+            tail=tail,
+            status_path=status_path,
+        )
+    )
+
+    assert rc == 64
+    assert spawn_calls == []
+    err = capsys.readouterr().err
+    assert (
+        "goalflight_dispatch: dispatch selfblock-parent already has non-terminal "
+        f"resume child {other_id} for session {SESSION_ID}"
+    ) in err
+    assert f"resume child {child_id} " not in err
+
+
 def test_main_reports_resume_build_usage_error_without_traceback(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
