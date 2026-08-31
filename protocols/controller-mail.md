@@ -120,8 +120,7 @@ that monitor operation itself, with the repository as its working directory:
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py supervise \
   --project-root "$PWD" \
-  --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
-  --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE"
+  --controller-label "$GOALFLIGHT_CONTROLLER_LABEL"
 ```
 
 Arm the supervisor with **no timeout**. It must run for the life of the session.
@@ -256,8 +255,7 @@ and this exact command:
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py follow \
   --project-root "$PWD" \
-  --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
-  --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE"
+  --controller-label "$GOALFLIGHT_CONTROLLER_LABEL"
 ```
 
 Do **not** run this with shell `&`, `nohup`, a detached dispatcher, or an ordinary
@@ -313,7 +311,6 @@ supervisor instead. In the decomposed unsupervised path, arm the backup pool wit
 python3 <skill-root>/scripts/goalflight_messages.py listen \
   --project-root "$PWD" \
   --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
-  --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE" \
   --listener-slots 2 \
   --report-pending
 ```
@@ -325,7 +322,6 @@ claims a doorbell slot or reads the mail cursor:
 python3 <skill-root>/scripts/goalflight_messages.py listen \
   --project-root "$PWD" \
   --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
-  --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE" \
   --watch-follow
 ```
 
@@ -397,7 +393,6 @@ surface:
 python3 <skill-root>/scripts/goalflight_messages.py listen \
   --project-root "$PWD" \
   --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
-  --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE" \
   --report-pending
 ```
 
@@ -437,7 +432,6 @@ requested position does not invalidate a safe command:
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py advance \
   --project-root "$PWD" --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
-  --lease-nonce "$GOALFLIGHT_CONTROLLER_LEASE_NONCE" \
   --cursor-version <version> --stream-snapshot '<stream>=<token>' \
   --position '<stream>=<seq>'
 ```

@@ -2224,7 +2224,7 @@ def test_supervise_items_are_the_configured_persistent_pool(
 def test_controller_mail_documents_supervise_front_door() -> None:
     doctrine = (ROOT / "protocols" / "controller-mail.md").read_text(encoding="utf-8")
     assert "goalflight_messages.py supervise" in doctrine
-    assert "--lease-nonce" in doctrine
+    assert "--controller-label" in doctrine
     assert "live/" in doctrine
     assert "no timeout" in doctrine.lower()
     assert "`persistent: true`" in doctrine

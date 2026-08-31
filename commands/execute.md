@@ -67,7 +67,7 @@ duration; wait separately on anything you need back early.
 
 **Arm the wait; let it wake you.** A controller entry auto-claims its canonical
 project lease. Prefer one generation-bound `goalflight_messages.py supervise
---project-root "$PWD" --controller-label <label> --lease-nonce <nonce>` through
+--project-root "$PWD" --controller-label <label>` through
 the host persistent monitor; it owns the stream, backup doorbell pool, and
 watchdog as one feed and re-arms children itself. Arm it with **no timeout** so
 it runs for the life of the session. Never set, tune, or reason about a timeout
@@ -77,7 +77,7 @@ Code use `persistent: true`; that makes `timeout_ms` inert, and a host-required
 value is only a placeholder, never a knob. In the decomposed fallback, only
 after supervisor absence is proven, arm one generation-bound
 `goalflight_messages.py follow --project-root
-"$PWD" --controller-label <label> --lease-nonce <nonce>` through that monitor —
+"$PWD" --controller-label <label>` through that monitor —
 never through ordinary shell backgrounding — and keep two tracked `listen
 --listener-slots 2 --report-pending` backup doorbells plus one separately tracked
 `listen --watch-follow` watchdog. The watchdog holds its own generation lock and
@@ -254,7 +254,7 @@ body-free doorbell:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py listen \
-  --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>
+  --project-root "$PWD" --controller-label <label>
 ```
 
 On exit 0, peek with `relay --new --json`, process the items, advance their
