@@ -3123,61 +3123,68 @@ def test_auto_claim_is_controller_only_and_never_steals_live_label(
 ) -> None:
     _set_state_env(monkeypatch, tmp_path)
     project = _project(tmp_path)
-    identities = {
-        44001: {"pid": 44001, "start_token": "controller-entry"},
-        44002: {"pid": 44002, "start_token": "different-controller"},
-    }
-    monkeypatch.setattr(sessions, "_controller_process_identity", identities.get)
+    host = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        live_identity = sessions._controller_process_identity(host.pid)
+        assert live_identity is not None
+        identities = {
+            host.pid: live_identity,
+            44002: {"pid": 44002, "start_token": "different-controller"},
+        }
+        monkeypatch.setattr(sessions, "_controller_process_identity", identities.get)
 
-    claimed = sessions.claim_controller_startup(
-        project,
-        pid=44001,
-        label="entry",
-        role="controller",
-    )
-    assert claimed["claimed"] is True
-    authority = journal.Journal(project)
-    incumbent = authority.active_lease("entry")
-    assert incumbent is not None
-    holder = wake.register_lease_holder(
-        project,
-        controller_label="entry",
-        lease_nonce=incumbent.nonce,
-    )
-    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_SESSION_ID", incumbent.nonce)
+        claimed = sessions.claim_controller_startup(
+            project,
+            pid=host.pid,
+            label="entry",
+            role="controller",
+        )
+        assert claimed["claimed"] is True
+        authority = journal.Journal(project)
+        incumbent = authority.active_lease("entry")
+        assert incumbent is not None
+        holder = wake.register_lease_holder(
+            project,
+            controller_label="entry",
+            lease_nonce=incumbent.nonce,
+        )
+        monkeypatch.setenv("GOALFLIGHT_CONTROLLER_SESSION_ID", incumbent.nonce)
 
-    watchdog = sessions.claim_controller_startup(
-        project,
-        pid=44001,
-        label="entry",
-        role="watchdog",
-    )
-    assert watchdog["claimed"] is True
-    assert watchdog["session"]["generation"] == incumbent.generation
+        watchdog = sessions.claim_controller_startup(
+            project,
+            pid=host.pid,
+            label="entry",
+            role="watchdog",
+        )
+        assert watchdog["claimed"] is True
+        assert watchdog["session"]["generation"] == incumbent.generation
 
-    for role in ("listener", "drainer", "mirror", "dashboard"):
-        skipped = sessions.claim_controller_startup(
+        for role in ("listener", "drainer", "mirror", "dashboard"):
+            skipped = sessions.claim_controller_startup(
+                project,
+                pid=44002,
+                label=f"{role}-must-not-exist",
+                role=role,
+            )
+            assert skipped == {"claimed": False, "reason": "role_does_not_claim", "role": role}
+            assert authority.active_lease(f"{role}-must-not-exist") is None
+
+        refused = sessions.claim_controller_startup(
             project,
             pid=44002,
-            label=f"{role}-must-not-exist",
-            role=role,
+            label="entry",
+            role="controller",
         )
-        assert skipped == {"claimed": False, "reason": "role_does_not_claim", "role": role}
-        assert authority.active_lease(f"{role}-must-not-exist") is None
-
-    refused = sessions.claim_controller_startup(
-        project,
-        pid=44002,
-        label="entry",
-        role="controller",
-    )
-    assert refused["reason"] == "label_in_use"
-    after_refusal = authority.active_lease("entry")
-    assert after_refusal is not None
-    assert after_refusal.generation == incumbent.generation
-    assert after_refusal.nonce == incumbent.nonce
-    assert after_refusal.principal == incumbent.principal
-    holder.close()
+        assert refused["reason"] == "label_in_use"
+        after_refusal = authority.active_lease("entry")
+        assert after_refusal is not None
+        assert after_refusal.generation == incumbent.generation
+        assert after_refusal.nonce == incumbent.nonce
+        assert after_refusal.principal == incumbent.principal
+        holder.close()
+    finally:
+        host.kill()
+        host.wait(timeout=3)
 
 
 def test_hidden_consumers_use_journal_and_relay_is_peek_only(

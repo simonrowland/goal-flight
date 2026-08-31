@@ -486,6 +486,66 @@ def _lease_holder_liveness(
     )
 
 
+def _incumbent_is_proven_live_different_session(
+    lease: goalflight_journal.LeaseIdentity,
+) -> bool:
+    """True only when every available probe proves a live holder.
+
+    Reconnect by label unless the incumbent is a proven live different
+    session. An indeterminate pid, identity, or lock probe is not proof of
+    life: treating UNKNOWN as live is how a returning controller is told
+    ``label in use`` and stops. Prefer the existing liveness primitives
+    (kernel lock, ``pid_liveness``, ``process_identity_matches``) rather
+    than a new probe.
+    """
+    lock_alive = goalflight_wake.lease_holder_alive(
+        lease.project_root,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    if lock_alive is not True:
+        return False
+    pid = lease.principal.get("pid")
+    start_token = lease.principal.get("start_token")
+    if pid is None:
+        # principal_id leases have no process to re-measure; the lock is the
+        # only witness.
+        return True
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if goalflight_compat.pid_liveness(pid) is not True:
+        return False
+    if not isinstance(start_token, str) or not start_token:
+        return False
+    return goalflight_compat.process_identity_matches(pid, start_token) is True
+
+
+def _claim_incumbent_liveness(
+    lease: goalflight_journal.LeaseIdentity | None,
+    principal: dict[str, object],
+    *,
+    takeover: bool = False,
+) -> goalflight_journal.LeaseLivenessEvidence | None:
+    """Lock liveness, synthesized dead when a returning claim may reconnect.
+
+    ``alive=False`` is the claim-or-renew signal to expire the incumbent and
+    allocate the next generation. Same-principal renewals and explicit
+    takeovers keep the measured lock bit so they do not invent a death.
+    """
+    measured = _lease_holder_liveness(lease)
+    if lease is None or measured is None:
+        return measured
+    if takeover or _same_lease_principal(lease, principal):
+        return measured
+    if _incumbent_is_proven_live_different_session(lease):
+        return measured
+    return goalflight_journal.LeaseLivenessEvidence(
+        generation=lease.generation,
+        nonce=lease.nonce,
+        alive=False,
+    )
+
+
 def _auto_claim_refusal_reason(
     *,
     role: str,
@@ -835,8 +895,12 @@ def claim_session(
         "hostname": socket.gethostname(),
     }
     incumbent = authority.active_lease(resolved_label)
-    incumbent_liveness = _lease_holder_liveness(incumbent)
     same_principal = _same_lease_principal(incumbent, principal)
+    incumbent_liveness = _claim_incumbent_liveness(
+        incumbent,
+        principal,
+        takeover=takeover,
+    )
     if same_principal and incumbent is not None:
         candidate_nonce = incumbent.nonce
     elif session_id and (incumbent is None or session_id != incumbent.nonce):

@@ -280,6 +280,31 @@ def _unowned_registration_args(*, forced: bool = False) -> argparse.Namespace:
     )
 
 
+def _assert_reconnect_bounce(message: str, *, slug: str, advertised: Path | None = None) -> None:
+    assert "controller not connected; reconnect as:" in message
+    assert "--session-label" in message
+    assert slug in message
+    assert "--takeover" not in message
+    assert "--unregistered-forced" not in message
+    assert "--lease-nonce" not in message
+    assert "controller is not registered" not in message
+    command = next(
+        line
+        for line in message.splitlines()
+        if "controller not connected; reconnect as:" in line
+    )
+    argv = shlex.split(command.split("reconnect as:", 1)[1])
+    assert argv[0] == "python3"
+    assert argv[2:] == [
+        "--controller-startup",
+        "--controller-pid-from-ancestry",
+        "--session-label",
+        slug,
+    ]
+    if advertised is not None:
+        assert argv[1] == str(advertised / "scripts" / "goalflight_session_status.py")
+
+
 def test_controller_registry_lookup_does_not_take_journal_write_lock(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -535,7 +560,7 @@ def test_absent_controller_registry_remains_definitely_unregistered(
         project,
         lookup=lookup,
     )
-    assert "controller is not registered" in warning
+    _assert_reconnect_bounce(warning, slug="project")
     assert "controller registry could not be read" not in warning
 
     with pytest.raises(dispatch.DispatchUsageError) as error:
@@ -543,7 +568,7 @@ def test_absent_controller_registry_remains_definitely_unregistered(
             _unowned_registration_args(),
             project,
         )
-    assert "controller is not registered" in str(error.value)
+    _assert_reconnect_bounce(str(error.value), slug="project")
     assert "could not be read" not in str(error.value)
 
     forced = dispatch._prepare_attempt_controller_registration(
@@ -551,7 +576,7 @@ def test_absent_controller_registry_remains_definitely_unregistered(
         project,
     )
     assert forced is not None
-    assert "controller is not registered" in forced
+    _assert_reconnect_bounce(forced, slug="project")
     assert "ownership could not be determined" not in forced
 
 
@@ -747,8 +772,7 @@ def test_unique_live_controller_outside_ancestry_is_not_adopted(
     assert completed.returncode != 0
     assert not sentinel.exists()
     assert _capacity_leases(dispatch_id) == []
-    assert "sibling-controller is kernel-live under pid" in completed.stderr
-    assert "not in this invocation's process ancestry" in completed.stderr
+    _assert_reconnect_bounce(completed.stderr, slug="sibling-controller")
     assert "--controller-session-id" not in completed.stderr
 
 
@@ -850,19 +874,11 @@ def test_live_controller_with_wrong_nonce_refuses_with_exact_owned_command(
 
     assert completed.returncode != 0
     assert not sentinel.exists()
-    assert "kernel-live controller exists" in completed.stderr
-    lines = completed.stderr.splitlines()
-    command_line = next(line for line in lines if "goalflight_dispatch.py" in line)
-    command = shlex.split(command_line)
-    assert command[:2] == [
-        "python3",
-        str(advertised / "scripts" / "goalflight_dispatch.py"),
-    ]
-    assert command[command.index("--controller-label") + 1] == "registered-test"
-    assert command[command.index("--controller-pid") + 1] == str(os.getpid())
-    assert command[command.index("--controller-session-id") + 1] == nonce
-    assert "wrong-nonce" not in command
-    assert str(ROOT) not in command_line
+    _assert_reconnect_bounce(
+        completed.stderr, slug="registered-test", advertised=advertised
+    )
+    assert "wrong-nonce" not in completed.stderr
+    assert str(ROOT) not in completed.stderr
 
 
 def test_live_controller_under_different_pid_is_not_adopted(
@@ -891,9 +907,7 @@ def test_live_controller_under_different_pid_is_not_adopted(
 
     assert completed.returncode != 0
     assert not sentinel.exists()
-    assert "registered-test is kernel-live under pid" in completed.stderr
-    assert f"not requested pid {os.getpid() + 1}" in completed.stderr
-    assert "refusing to adopt or displace" in completed.stderr
+    _assert_reconnect_bounce(completed.stderr, slug="registered-test")
 
 
 def test_correct_nonce_does_not_override_wrong_explicit_pid(
@@ -925,9 +939,7 @@ def test_correct_nonce_does_not_override_wrong_explicit_pid(
     assert completed.returncode != 0
     assert not sentinel.exists()
     assert _capacity_leases(dispatch_id) == []
-    assert "registered-test is kernel-live under pid" in completed.stderr
-    assert f"not requested pid {requested_pid}" in completed.stderr
-    assert "refusing to adopt or displace" in completed.stderr
+    _assert_reconnect_bounce(completed.stderr, slug="registered-test")
 
 
 def test_multiple_kernel_live_controllers_refuse_without_guessing(
@@ -962,10 +974,7 @@ def test_multiple_kernel_live_controllers_refuse_without_guessing(
         "SELECT dispatch_id FROM dispatch_attempts WHERE dispatch_id = ?",
         (dispatch_id,),
     ) == []
-    assert "controller identity is ambiguous" in completed.stderr
-    assert "controller-a (pid" in completed.stderr
-    assert "controller-b (pid" in completed.stderr
-    assert "Refusing to guess an owner" in completed.stderr
+    _assert_reconnect_bounce(completed.stderr, slug="project")
 
 
 def test_unregistered_controller_refuses_before_worker_or_capacity(
@@ -985,23 +994,17 @@ def test_unregistered_controller_refuses_before_worker_or_capacity(
     pidfiles = tmp_path / "pidfiles"
     assert not pidfiles.exists() or list(pidfiles.iterdir()) == []
 
-    lines = completed.stderr.splitlines()
-    warning_index = next(
-        index for index, line in enumerate(lines) if "controller is not registered" in line
+    _assert_reconnect_bounce(
+        completed.stderr, slug="project", advertised=advertised
     )
-    command = shlex.join(
-        [
-            "python3",
-            str(advertised / "scripts" / "goalflight_session_status.py"),
-            "--controller-startup",
-            "--controller-pid-from-ancestry",
-        ]
+    bounce = next(
+        line
+        for line in completed.stderr.splitlines()
+        if "controller not connected; reconnect as:" in line
     )
-    assert lines[warning_index + 1] == command
-    assert "--unregistered-forced" in lines[warning_index + 2]
-    command_path = Path(shlex.split(lines[warning_index + 1])[1])
+    command_path = Path(shlex.split(bounce.split("reconnect as:", 1)[1])[1])
     assert command_path.is_absolute()
-    assert "~" not in lines[warning_index + 1]
+    assert "~" not in bounce
     assert str(ROOT) not in completed.stderr
 
 
@@ -1034,7 +1037,9 @@ def test_direct_acp_unregistered_refuses_before_capacity_or_spawn(
     assert payload["worker_pid"] is None
     assert capacity_calls == []
     assert spawn_calls == []
-    assert "controller is not registered" in str(payload["error"])
+    _assert_reconnect_bounce(
+        str(payload["error"]), slug="project", advertised=advertised
+    )
     assert str(advertised / "scripts" / "goalflight_session_status.py") in str(
         payload["error"]
     )
@@ -1096,11 +1101,9 @@ def test_unregistered_forced_launches_with_null_owner_and_warns(
 
     assert completed.returncode == 0, (completed.stdout, completed.stderr)
     assert sentinel.is_file()
-    assert "controller is not registered" in completed.stderr
-    assert "--unregistered-forced" in completed.stderr
+    _assert_reconnect_bounce(completed.stderr, slug="project")
     tail = (tmp_path / f"{dispatch_id}.tail").read_text(encoding="utf-8")
-    assert "controller is not registered" in tail
-    assert "--unregistered-forced" in tail
+    _assert_reconnect_bounce(tail, slug="project")
     record = json.loads(ledger.record_path(dispatch_id, create=False).read_text())
     assert record["controller_session_id"] is None
     assert record["controller_pid"] is None
@@ -1408,7 +1411,7 @@ def test_matching_capability_stays_unknown_not_mismatch_when_registry_unreadable
     assert stamped_unknown["reason"] != stamped_mismatch["reason"]
     assert "controller registry could not be read" not in mismatch_message
     assert "Retry the dispatch" not in mismatch_message
-    assert "kernel-live controller exists" in mismatch_message
+    _assert_reconnect_bounce(mismatch_message, slug="registered-test")
 
 
 def test_fused_unknown_forced_still_launches_unowned(
@@ -1447,7 +1450,7 @@ def test_fused_absent_controller_still_refuses_unforced(
     dispatch._stamp_controller_session(args, project)
     with pytest.raises(dispatch.DispatchUsageError) as error:
         dispatch._prepare_attempt_controller_registration(args, project)
-    assert "controller is not registered" in str(error.value)
+    _assert_reconnect_bounce(str(error.value), slug="project")
     assert "could not be read" not in str(error.value)
     assert len(calls) == 1
 

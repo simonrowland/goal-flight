@@ -735,10 +735,14 @@ def listener_exit_reason(
         return "orphaned"
     if lease.get("state") != LEASE_ACTIVE:
         return "superseded"
-    if (
-        lease.get("generation") != coverage.get("lease_generation")
-        or lease.get("nonce") != coverage.get("lease_nonce")
-    ):
+    # Label is identity. Generation is the fence for stale children: it is
+    # already monotonic and already stored on coverage. The nonce column is
+    # kept as a per-generation record so live --lease-nonce callers still
+    # resolve, but it is not a second capability. Observed 1:1 nonce-per-
+    # generation mapping means the nonce clause could never fire unless
+    # generation already differed. A stale child from a previous incarnation
+    # is distinguishable only by generation, not by an unguessable secret.
+    if lease.get("generation") != coverage.get("lease_generation"):
         return "superseded"
     del now  # Kept for call compatibility; deadlines no longer decide liveness.
     return None
@@ -2938,10 +2942,11 @@ class Journal:
             if active is not None:
                 same_principal = self._principal_matches(active, principal)
                 # Process identity (pid + start token), or the stable principal_id
-                # fallback, identifies the incumbent.  The nonce is a lease
-                # capability returned to that principal, not a second identity
-                # requirement: claim-or-renew must also work when a fresh helper
-                # can re-measure its controller but cannot carry the nonce.
+                # fallback, identifies the incumbent. The nonce column is a
+                # per-generation record, not a fence: callers reconnect by
+                # label, and stale children are fenced by generation. Claim-or-
+                # renew must still work when a fresh helper can re-measure its
+                # controller but cannot carry the nonce.
                 if same_principal:
                     renewed_at = _next_lease_renewed_at(active["renewed_at"])
                     connection.execute(

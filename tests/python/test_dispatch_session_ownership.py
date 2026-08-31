@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 import datetime as dt
+import os
 import sys
 
 import pytest
@@ -386,12 +387,19 @@ def test_dispatch_auto_claim_conflict_is_visible_and_never_steals(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root, authority = _state(monkeypatch, tmp_path)
+    live_pid = os.getpid()
+    live_identity = sessions._controller_process_identity(live_pid)
+    assert live_identity is not None
     incumbent = authority.claim_or_renew_lease(
-        "owner", principal={"pid": 62001, "start_token": "incumbent"}
+        "owner",
+        principal={
+            "pid": live_pid,
+            "start_token": live_identity["start_token"],
+        },
     )
     assert incumbent.committed and incumbent.value is not None
     identities = {
-        62001: {"pid": 62001, "start_token": "incumbent"},
+        live_pid: live_identity,
         62002: {"pid": 62002, "start_token": "different"},
     }
     monkeypatch.setattr(sessions, "_controller_process_identity", identities.get)
@@ -454,11 +462,18 @@ def test_dispatch_main_returns_visible_label_in_use_before_launch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root, authority = _state(monkeypatch, tmp_path)
+    live_pid = os.getpid()
+    live_identity = sessions._controller_process_identity(live_pid)
+    assert live_identity is not None
     assert authority.claim_or_renew_lease(
-        "owner", principal={"pid": 62001, "start_token": "incumbent"}
+        "owner",
+        principal={
+            "pid": live_pid,
+            "start_token": live_identity["start_token"],
+        },
     ).committed
     identities = {
-        62001: {"pid": 62001, "start_token": "incumbent"},
+        live_pid: live_identity,
         62002: {"pid": 62002, "start_token": "different"},
     }
     monkeypatch.setattr(sessions, "_controller_process_identity", identities.get)
