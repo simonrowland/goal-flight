@@ -7,7 +7,11 @@ root; the dispatch then refused with "controller is not registered" and
 recommended --unregistered-forced -- advice that would launch an unowned
 dispatch into a phantom project root for what was a path typo. The refusal
 must fire at parse time, before any registry lookup, so that advice is never
-reached; and the resolver's fallback must say out loud which root it chose.
+reached.
+
+A genuine existing directory that is not a git checkout still resolves to
+itself. A missing path is unresolvable: the resolver refuses rather than
+treating the typo as a new store.
 """
 
 from __future__ import annotations
@@ -124,30 +128,33 @@ def case_file_cwd_refused_at_parse_time() -> None:
         assert f"cwd is not a directory: {not_a_dir}" in proc.stderr, proc.stderr
 
 
-def case_resolver_fallback_warns_and_names_the_fallback() -> None:
+def case_existing_non_git_dir_is_itself_and_missing_path_refuses() -> None:
     with tempfile.TemporaryDirectory() as td:
         plain = Path(td).resolve() / "plain"
         plain.mkdir()
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             resolved = goalflight_task.resolve_project_root(str(plain))
-        assert resolved == plain, resolved  # return value unchanged
-        warning = err.getvalue()
-        assert "WARN" in warning, warning
-        assert str(plain) in warning, warning
-        assert "treating the path itself as the project root" in warning, warning
+        assert resolved == plain, resolved  # existing non-git dir is itself
+        # Not a fallback: a real directory that is not a checkout is a known
+        # identity. Do not warn on every CLI invocation (json stdout/stderr
+        # contracts depend on a quiet success path).
+        assert "unresolvable project root" not in err.getvalue(), err.getvalue()
 
     missing = Path(tempfile.gettempdir()) / "gf-t349-no-such-dir"
     assert not missing.exists()
-    expected = missing.resolve()  # the fallback keeps _strip_managed_worktree's loose resolution
-    err = io.StringIO()
-    with contextlib.redirect_stderr(err):
-        resolved = goalflight_task.resolve_project_root(str(missing))
-    assert resolved == expected, (resolved, expected)  # return value unchanged
-    warning = err.getvalue()
-    assert "WARN" in warning, warning
-    assert str(missing) in warning, warning
-    assert "treating the path itself as the project root" in warning, warning
+    # A missing path used to warn and return itself, which accepted a typo
+    # capture into a different store. Unresolvable roots must refuse.
+    try:
+        goalflight_task.resolve_project_root(str(missing))
+    except goalflight_task.TaskError as exc:
+        message = str(exc)
+        assert "unresolvable project root" in message, message
+        assert str(missing) in message, message
+        assert "not a directory" in message, message
+        assert "Refusing to write to another store" in message, message
+    else:
+        raise AssertionError("missing project root must refuse, not retarget")
 
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
@@ -159,5 +166,5 @@ def case_resolver_fallback_warns_and_names_the_fallback() -> None:
 if __name__ == "__main__":
     case_nonexistent_cwd_refused_at_parse_time()
     case_file_cwd_refused_at_parse_time()
-    case_resolver_fallback_warns_and_names_the_fallback()
+    case_existing_non_git_dir_is_itself_and_missing_path_refuses()
     print("PASS: test_dispatch_cwd_guard")

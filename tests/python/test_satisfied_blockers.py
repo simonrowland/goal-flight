@@ -71,6 +71,9 @@ def _run_task(project: Path, env: dict[str, str], *args: str) -> subprocess.Comp
 
 
 def _new(project: Path, env: dict[str, str], title: str, *args: str) -> str:
+    # A missing path is unresolvable (not a silent new store). Tests that
+    # exercise blocker/done behaviour still need a real project directory.
+    project.mkdir(parents=True, exist_ok=True)
     proc = _run_task(project, env, "new", title, *args)
     assert_true(f"new {title!r} exits 0: {proc.stderr}", proc.returncode == 0)
     item_id = proc.stdout.strip()

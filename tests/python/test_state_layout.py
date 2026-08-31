@@ -1059,9 +1059,22 @@ def test_every_worktree_of_a_repo_resolves_to_one_task_store() -> None:
 
 
 def test_a_path_outside_any_checkout_is_returned_unchanged() -> None:
-    """Resolution must not require git: a non-repo path stays itself."""
+    """An existing non-repo directory is itself; a missing path must refuse.
+
+    Resolution must not require git for a real directory: tests and non-git
+    trees use that identity. A missing path used to return itself and accept
+    a capture into a different store. Unresolvable is not a root.
+    """
     with tempfile.TemporaryDirectory() as td:
         plain = Path(td).resolve()
         assert_true("non-git path unchanged", goalflight_task.resolve_project_root(str(plain)) == plain)
     missing = Path("/no/such/project/root")
-    assert_true("missing path unchanged", goalflight_task.resolve_project_root(str(missing)) == missing)
+    try:
+        goalflight_task.resolve_project_root(str(missing))
+    except goalflight_task.TaskError as exc:
+        message = str(exc)
+        assert_true("missing path names the root", str(missing) in message)
+        assert_true("missing path says unresolvable", "unresolvable project root" in message)
+        assert_true("missing path refuses retarget", "Refusing to write to another store" in message)
+    else:
+        raise AssertionError("missing project root must refuse, not return itself")
