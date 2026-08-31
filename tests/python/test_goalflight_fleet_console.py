@@ -758,6 +758,10 @@ def test_fast_plane_project_classes_are_live_only_mutation_pair() -> None:
         and payload["registry_unsampled"] == 1,
     )
     assert_true(
+        "unsampled registry roots make fleet coverage incomplete",
+        payload["incomplete"] is True,
+    )
+    assert_true(
         "truncated sample names the unsampled live-capable-excluded root",
         [item["name"] for item in payload["registry_unsampled_projects"]]
         == ["old-worktree"],

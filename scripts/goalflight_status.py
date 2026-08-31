@@ -302,7 +302,13 @@ def _output_tail_reconcile_gate(record: dict, *, tail_mtime: float | None) -> tu
     return False, f"worker_alive_tail_recent:{int(max(0.0, idle_s))}s"
 
 
-def _ignore_prefix_lines(prompt_path: object) -> list[str]:
+def _ignore_prefix_lines(prompt_path: object) -> list[str] | None:
+    """Prompt lines to suppress, or ``None`` when the prompt is unreadable.
+
+    An absent prompt path genuinely means there is no prompt echo to suppress.
+    A configured path that cannot be read is different: tail markers cannot be
+    authenticated against prompt echoes until that read succeeds.
+    """
     if not prompt_path:
         return []
     try:
@@ -314,7 +320,7 @@ def _ignore_prefix_lines(prompt_path: object) -> list[str]:
             ).splitlines()
         ]
     except OSError:
-        return []
+        return None
 
 
 def _tail_path_from_record(record: dict) -> Path | None:
@@ -569,10 +575,22 @@ def _reconcile_output_tail_record(record: dict) -> dict:
     # (D022). _final_terminal_marker is the watcher's own reconciliation-grade scan
     # (skips fences/diff-hunks/prompt-echoes, takes the last valid marker).
     expected_dispatch_id = str(record.get("dispatch_id") or "").strip()
+    ignore_prefix_lines = _ignore_prefix_lines(record.get("prompt_path"))
+    if ignore_prefix_lines is None:
+        out = dict(record)
+        out["tail_path"] = str(tail)
+        out["tail_mtime"] = mtime
+        out["output_tail_reconciliation"] = {
+            "candidate": True,
+            "promoted": False,
+            "reason": "prompt_unreadable",
+            "idle_threshold_s": _OUTPUT_TAIL_IDLE_RECONCILE_S,
+        }
+        return out
     marker = (
         _final_terminal_marker(
             tail,
-            ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")),
+            ignore_prefix_lines=ignore_prefix_lines,
             kimi_output=moonshot_family(record.get("agent")),
             expected_dispatch_id=expected_dispatch_id,
         )
@@ -685,7 +703,7 @@ def _dispatch_queue_depth() -> int | None:
         return None
 
 
-def _launchd_drainer_loaded() -> bool:
+def _launchd_drainer_loaded() -> bool | None:
     try:
         proc = subprocess.run(
             ["launchctl", "list", _DRAIN_LAUNCHD_LABEL],
@@ -694,11 +712,11 @@ def _launchd_drainer_loaded() -> bool:
             timeout=2,
         )
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-        return False
+        return None
     return proc.returncode == 0
 
 
-def _drain_process_running() -> bool:
+def _drain_process_running() -> bool | None:
     try:
         proc = subprocess.run(
             ["ps", "-axo", "command="],
@@ -707,9 +725,9 @@ def _drain_process_running() -> bool:
             timeout=2,
         )
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-        return False
+        return None
     if proc.returncode != 0:
-        return False
+        return None
     for command in proc.stdout.splitlines():
         try:
             tokens = shlex.split(command)
@@ -726,8 +744,24 @@ def _drain_process_running() -> bool:
     return False
 
 
+def _drainer_state() -> bool | None:
+    launchd = _launchd_drainer_loaded()
+    process = _drain_process_running()
+    if launchd is True or process is True:
+        return True
+    if launchd is False and process is False:
+        return False
+    return None
+
+
 def _drainer_live() -> bool:
-    return _launchd_drainer_loaded() or _drain_process_running()
+    """Compatibility predicate: UNKNOWN fails safe as potentially live.
+
+    Dispatch callers use this boolean to decide whether starting or prescribing
+    another drainer is safe. Only a definite double-negative permits that.
+    Status uses ``_drainer_state`` directly so it can report UNKNOWN.
+    """
+    return _drainer_state() is not False
 
 
 def _queue_drainer_warnings() -> list[dict]:
@@ -742,8 +776,26 @@ def _queue_drainer_warnings() -> list[dict]:
                 "remedy": "check permissions on the dispatch-queue directory",
             }
         ]
-    if queue_depth <= 0 or _drainer_live():
+    if queue_depth <= 0:
         return []
+    drainer_live = _drainer_state()
+    if drainer_live is True:
+        return []
+    if drainer_live is None:
+        # Starting another drain pass is unsafe while both process probes are
+        # unavailable; report UNKNOWN without prescribing duplicate launch.
+        return [
+            {
+                "code": "queue_drainer_unknown",
+                "severity": "WARN",
+                "queue_depth": queue_depth,
+                "message": (
+                    f"{queue_depth} queued dispatch request(s); "
+                    "drain worker liveness could not be measured"
+                ),
+                "remedy": "restore launchctl/ps visibility, then recheck drainer liveness",
+            }
+        ]
     return [
         {
             "code": _QUEUE_PENDING_NO_DRAINER,
@@ -1706,11 +1758,11 @@ def _milestone_payload(project_root: str | None) -> dict:
         detail = " ".join(f"{exc.__class__.__name__}: {exc}".split())
         return {
             "schema": goalflight_milestone.SCHEMA,
-            "active_cadence": False,
+            "active_cadence": True,
             "commits_since": None,
             "K": None,
             "last_marker": None,
-            "due": False,
+            "due": None,
             "reason": "milestone unavailable",
             "warnings": [],
             "error": detail,
@@ -2471,9 +2523,13 @@ def _wait_for_dispatches_registered(
             # human or a peer controller decided this controller needed, which
             # outranks saving one re-arm -- and the re-arm is printed below,
             # pre-filled, so it costs a single call.
-            if mail_baseline is not None:
-                current = _mail_watermark(project_root, wait_ids)
-                fresh = (current - mail_baseline) if current is not None else set()
+            current = _mail_watermark(project_root, wait_ids)
+            if current is not None:
+                # If the baseline probe failed, every visible waking identity
+                # may have arrived during the observation gap. Wake safely
+                # instead of re-baselining over a worker's blocking question.
+                fresh = current if mail_baseline is None else current - mail_baseline
+                mail_baseline = current
                 if fresh:
                     pending = [r["dispatch_id"] for r in rows if not r["terminal"]]
                     if json_output:
@@ -2707,19 +2763,16 @@ def _verify_record(dispatch_id: str, project_root: str | None) -> dict | None:
     no reconcile pass) — the run-ledger lookup is by id, and artifact verification then
     opens declared paths directly, so nothing here enumerates the worker's output dir."""
     match = None
-    try:
-        for record in goalflight_ledger.read_records():
-            if record.get("dispatch_id") != dispatch_id:
-                continue
-            if project_root and record.get("project_root") not in (None, project_root):
-                continue
-            match = record  # latest matching record wins
-    except _EXPECTED_OPTIONAL_ERRORS:
-        return None
+    for record in goalflight_ledger.read_records():
+        if record.get("dispatch_id") != dispatch_id:
+            continue
+        if project_root and record.get("project_root") not in (None, project_root):
+            continue
+        match = record  # latest matching record wins
     return match
 
 
-def _direct_open_exists(path: Path) -> tuple[bool, int]:
+def _direct_open_exists(path: Path) -> tuple[bool | None, int]:
     """Confirm a path by DIRECT OPEN (a fresh FS fetch), NEVER directory enumeration.
     On local APFS a separate process's listdir/glob/find view of a just-created file can
     be stale for MINUTES, while opening a known path by name is fresh (2026-06-23 APFS
@@ -2732,7 +2785,7 @@ def _direct_open_exists(path: Path) -> tuple[bool, int]:
     except FileNotFoundError:
         return False, 0
     except OSError:
-        return False, 0
+        return None, 0
 
 
 def verify_artifacts(dispatch_id: str, *, project_root: str | None) -> dict:
@@ -2741,20 +2794,39 @@ def verify_artifacts(dispatch_id: str, *, project_root: str | None) -> dict:
     by enumerating a directory. This is the trustworthy "did the worker actually write
     its outputs?" check: a controller must never conclude an artifact is missing (and
     re-author it) from ls/find/git-status/grep, which share a stale enumeration view."""
-    record = _verify_record(dispatch_id, project_root)
+    try:
+        record = _verify_record(dispatch_id, project_root)
+    except _EXPECTED_OPTIONAL_ERRORS as exc:
+        detail = " ".join(f"{type(exc).__name__}: {exc}".split())
+        return {
+            "dispatch_id": dispatch_id,
+            "found": None,
+            "reason": f"ledger unreadable; record presence unknown ({detail})",
+        }
     if record is None:
         return {"dispatch_id": dispatch_id, "found": False,
                 "reason": "no ledger record for this id/scope (try --all-projects)"}
+    if record.get("state") == "unreadable":
+        return {
+            "dispatch_id": dispatch_id,
+            "found": None,
+            "reason": "ledger record exists but is unreadable",
+        }
     base = Path(record.get("project_root") or record.get("process_cwd") or Path.cwd()).expanduser()
     tail = _tail_path_from_record(record)
     marker = None
+    verification_error = None
     if tail is not None:
-        marker = _final_terminal_marker(
-            tail,
-            ignore_prefix_lines=_ignore_prefix_lines(record.get("prompt_path")),
-            kimi_output=moonshot_family(record.get("agent")),
-            expected_dispatch_id=dispatch_id,
-        )
+        ignore_prefix_lines = _ignore_prefix_lines(record.get("prompt_path"))
+        if ignore_prefix_lines is None:
+            verification_error = "prompt unreadable; terminal marker unknown"
+        else:
+            marker = _final_terminal_marker(
+                tail,
+                ignore_prefix_lines=ignore_prefix_lines,
+                kimi_output=moonshot_family(record.get("agent")),
+                expected_dispatch_id=dispatch_id,
+            )
     # Only a SUCCESS marker (READY/COMPLETE/RESULT) declares deliverables — a FAILED:/
     # BLOCKED: marker that happens to name a path must NOT report it as a present artifact.
     declared: list[str] = []
@@ -2776,6 +2848,7 @@ def verify_artifacts(dispatch_id: str, *, project_root: str | None) -> dict:
         "declared_artifacts": declared,
         "results": results,
         "all_present": all_present,
+        "verification_error": verification_error,
     }
 
 
@@ -2940,7 +3013,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{args.verify_artifacts}  {result.get('reason')}")
         else:
             for r in result["results"]:
-                mark = "OK" if (r["present"] and r["bytes"] > 0) else "MISSING"
+                if r["present"] is None:
+                    mark = "UNKNOWN"
+                else:
+                    mark = "OK" if (r["present"] and r["bytes"] > 0) else "MISSING"
                 print(f"  [{mark}] {r['path']} ({r['bytes']}B)")
             if not result["declared_artifacts"]:
                 print("  (no artifact path declared in the terminal marker)")

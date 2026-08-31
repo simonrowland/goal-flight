@@ -2640,6 +2640,80 @@ def test_unclaimed_wait_wakes_on_mail_to_waited_dispatch_with_exit_three(
     assert live_attempt.lifecycle_state == journal.ATTEMPT_RUNNING
 
 
+def test_wait_retries_unreadable_mail_baseline_and_wakes_after_recovery(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _env = isolated
+    dispatch_id = "mail-baseline-recovers"
+    carrier = messages.inbox_path(messages.default_messages_dir(), dispatch_id)
+    carrier.parent.mkdir(parents=True, exist_ok=True)
+    # A directory at the exact carrier path makes the real no-follow read fail;
+    # the absent journal makes the other real source fail too.
+    carrier.mkdir()
+    baseline_unknown = threading.Event()
+    real_watermark = status._mail_watermark
+
+    def observed_watermark(*args, **kwargs):
+        value = real_watermark(*args, **kwargs)
+        if value is None:
+            baseline_unknown.set()
+        return value
+
+    monkeypatch.setattr(status, "_mail_watermark", observed_watermark)
+    monkeypatch.setattr(
+        status,
+        "_wait_cycle_payload",
+        lambda *_args, **_kwargs: {
+            "schema": "goalflight.status.wait.v1",
+            "dispatch": {
+                "records": [
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": "running",
+                        "classification": "running",
+                        "worker_pid": os.getpid(),
+                        "worker_still_alive": True,
+                    }
+                ]
+            },
+        },
+    )
+    result: list[int] = []
+    waiter = threading.Thread(
+        target=lambda: result.append(
+            status._wait_for_dispatches_registered(
+                [dispatch_id],
+                project_root=str(root),
+                timeout_s=3,
+                poll_s=0.02,
+                heartbeat_s=10,
+            )
+        )
+    )
+    try:
+        waiter.start()
+        assert baseline_unknown.wait(timeout=2)
+        journal.open_or_create_journal(root)
+        carrier.rmdir()
+        carrier.write_text("", encoding="utf-8")
+        posted = messages.post_message(
+            dispatch_id=dispatch_id,
+            msg_type="controller-notice",
+            payload={"text": "arrived while baseline visibility recovered"},
+            messages_dir=messages.default_messages_dir(),
+            source={"node": "test", "adapter": "pytest", "transport": "controller"},
+            deliver_to_worker=True,
+        )
+        assert posted["recorded"] is True
+        waiter.join(timeout=4)
+    finally:
+        if carrier.is_dir():
+            carrier.rmdir()
+    assert not waiter.is_alive()
+    assert result == [3]
+
+
 def test_deleted_cursor_token_cli_surface_does_not_displace_healthy_listener(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:

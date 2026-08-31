@@ -1348,7 +1348,9 @@ def _journals_dir() -> Path | None:
     return goalflight_task.resolve_state_base_dir() / "journals"
 
 
-def _active_controller_roots_from_journals() -> set[str]:
+def _active_controller_roots_from_journals(
+    errors: list[str] | None = None,
+) -> set[str]:
     """Project roots that still have an ACTIVE lease row.
 
     One directory listing plus a DISTINCT on the lease table — not a
@@ -1371,7 +1373,9 @@ def _active_controller_roots_from_journals() -> set[str]:
     for path in paths:
         try:
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            if errors is not None:
+                errors.append(_safe_error("controller_journal", exc))
             continue
         try:
             rows = conn.execute(
@@ -1381,7 +1385,9 @@ def _active_controller_roots_from_journals() -> set[str]:
                 supplied = row[0] if row else None
                 if isinstance(supplied, str) and supplied:
                     roots.add(supplied)
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            if errors is not None:
+                errors.append(_safe_error("controller_journal", exc))
             continue
         finally:
             conn.close()
@@ -2351,7 +2357,10 @@ def _without_terminal_history(machine_status: object) -> dict[str, Any]:
     return payload
 
 
-def _queue_summary(machine_status: object) -> tuple[dict[str, dict[str, Any]], int]:
+def _queue_summary(
+    machine_status: object,
+    errors: list[str] | None = None,
+) -> tuple[dict[str, dict[str, Any]], int | None]:
     """Per-project queue depth from the dispatch queue, plus a machine total.
 
     Queued work is INVISIBLE in dispatch records -- an entry becomes a record
@@ -2374,19 +2383,33 @@ def _queue_summary(machine_status: object) -> tuple[dict[str, dict[str, Any]], i
     total = 0
     try:
         entries = sorted(queue_dir.iterdir())
-    except OSError:
+    except FileNotFoundError:
         return {}, 0
+    except OSError as exc:
+        if errors is not None:
+            errors.append(_safe_error("dispatch_queue", exc))
+        return {}, None
+    unreadable = False
     for entry in entries:
-        if not entry.is_file():
-            continue
         try:
+            if not entry.is_file():
+                continue
             row = json.loads(entry.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            unreadable = True
+            if errors is not None:
+                errors.append(_safe_error("dispatch_queue_entry", exc))
             continue
         if not isinstance(row, dict):
+            unreadable = True
+            if errors is not None:
+                errors.append("dispatch_queue_entry:invalid_record")
             continue
         root = _canonical_root(row.get("project_root"))
         if root is None:
+            unreadable = True
+            if errors is not None:
+                errors.append("dispatch_queue_entry:missing_project_root")
             continue
         total += 1
         bucket = by_root.setdefault(root, {"depth": 0, "lanes": {}, "oldest_created_at": None})
@@ -2401,16 +2424,18 @@ def _queue_summary(machine_status: object) -> tuple[dict[str, dict[str, Any]], i
             {"agent": agent, "count": count}
             for agent, count in sorted(bucket["lanes"].items(), key=lambda kv: (-kv[1], kv[0]))
         ]
-    return by_root, total
+    return by_root, None if unreadable else total
 
 
-def _empty_queue_row() -> dict[str, Any]:
-    return {"depth": 0, "lanes": [], "oldest_created_at": None}
+def _empty_queue_row(*, known: bool = True) -> dict[str, Any]:
+    return {"depth": 0 if known else None, "lanes": [], "oldest_created_at": None}
 
 
 def _attach_queue_rows(
     projects: list[dict[str, Any]],
     queue_by_root: dict[str, dict[str, Any]],
+    *,
+    queue_known: bool = True,
 ) -> None:
     """Merge queue depth onto project rows, keyed by the SAME id the rows use.
 
@@ -2422,7 +2447,9 @@ def _attach_queue_rows(
     by_id = {_project_id(root): row for root, row in queue_by_root.items()}
     for project in projects:
         found = by_id.get(project.get("project_id"))
-        project["queue"] = dict(found) if found else _empty_queue_row()
+        project["queue"] = (
+            dict(found) if found and queue_known else _empty_queue_row(known=queue_known)
+        )
 
 
 def _record_is_terminal(record: object) -> bool:
@@ -2818,7 +2845,7 @@ def build_fleet_plane(
     usage_rows = source_values["usage"]
     registered = source_values["projects"]
 
-    queue_by_root, queue_total = _queue_summary(machine_status)
+    queue_by_root, queue_total = _queue_summary(machine_status, errors)
     fast_roots = _fast_project_roots(
         machine_status,
         queue_by_root=queue_by_root,
@@ -2838,7 +2865,7 @@ def build_fleet_plane(
         visible_roots=fast_roots,
     )
     seen_roots = set(fast_roots)
-    for supplied in _active_controller_roots_from_journals():
+    for supplied in _active_controller_roots_from_journals(errors):
         root = _canonical_root(supplied)
         if root is None or root in seen_roots:
             continue
@@ -2868,7 +2895,11 @@ def build_fleet_plane(
     # Attach queue depth by the project's own root. Every row gets the key --
     # the allowlist requires it, and an absent queue must read as depth 0, not
     # as a missing field a renderer has to guess about.
-    _attach_queue_rows(projects, queue_by_root)
+    _attach_queue_rows(
+        projects,
+        queue_by_root,
+        queue_known=queue_total is not None,
+    )
     # Only project history has a disclosure/fetch path in the renderer. Remote
     # and unassigned retention remains bounded, but its omitted rows must not
     # inflate the global '+N in history' claim into unreachable inventory.
@@ -2911,6 +2942,10 @@ def build_fleet_plane(
         "controllers": controllers,
         "unassigned_workers": unassigned,
     }
+    if registry_omitted:
+        # Deep sampling is useful, but it is not proof about unsampled roots.
+        # Keep the successful rows and make partial coverage explicit.
+        payload["incomplete"] = True
     validate_projection(payload, "fleet")
     return payload
 
@@ -3411,10 +3446,11 @@ def sample_exit_code(payload: dict[str, Any], plane: str) -> int:
     """Report and return the shared healthy/degraded producer exit contract."""
     # A retained last-good sample keeps last_success_at so the renderer can
     # age the data. That stamp is no longer "this tick succeeded": last_error
-    # or incomplete means the tick failed even when older rows remain.
+    # identifies that failure even when older rows remain. ``incomplete`` can
+    # also mean a successful fleet tick intentionally deep-sampled only part
+    # of the registry; that is honest coverage metadata, not a producer crash.
     if (
         payload.get("last_error")
-        or payload.get("incomplete")
         or payload.get("last_success_at") is None
     ):
         print(

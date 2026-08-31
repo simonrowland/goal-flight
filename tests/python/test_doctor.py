@@ -299,6 +299,14 @@ def _minimal_human_payload(**overrides: object) -> dict:
         "gstack_browser": {"present": True, "detail": "ok"},
         "agent_traits": {"ok": True, "detail": "ok"},
         "autoreview": {"present": True, "version": "1.0"},
+        # Session status is a canonical doctor probe. The fixture used to omit
+        # it, allowing a missing/failed probe to retain a green verdict.
+        "session_status": {
+            "ok": True,
+            "present": True,
+            "active": False,
+            "queue_state": None,
+        },
         "cursor": {
             "desktop_present": True,
             "agent": {"present": True, "version": "1.0"},
@@ -347,7 +355,11 @@ def _minimal_human_payload(**overrides: object) -> dict:
         },
         "router": {"ok": True, "recommended_entrypoint": "status"},
         "worker_currency": {},
-        "rate_pressure": {"providers_under_pressure": [], "records_examined": 64},
+        "rate_pressure": {
+            "available": True,
+            "providers_under_pressure": [],
+            "records_examined": 64,
+        },
     }
     payload.update(overrides)
     return payload
@@ -402,6 +414,85 @@ def case_doctor_json_verdict_ok_when_text_has_no_warns() -> None:
     assert _text_entries(payload, "warn") == []
     assert summary["warnings"] == []
     assert summary["verdict"] == "ok"
+
+
+def case_doctor_failed_session_status_makes_verdict_warn() -> None:
+    payload = _minimal_human_payload(
+        session_status={
+            "ok": False,
+            "present": True,
+            "error": "journal unreadable",
+            "install_hint": "run session status directly",
+        }
+    )
+    summary = goalflight_doctor.verdict_summary(payload)
+    assert summary["verdict"] == "warn"
+    assert any(
+        row["probe"] == "session status" and "journal unreadable" in row["detail"]
+        for row in summary["warnings"]
+    )
+
+
+def case_doctor_failed_rate_pressure_probe_is_not_ok() -> None:
+    with patch.object(
+        goalflight_doctor.goalflight_rate_pressure,
+        "collect_records",
+        side_effect=OSError("pressure ledger unreadable"),
+    ):
+        unavailable = goalflight_doctor._rate_pressure_summary()
+    payload = _minimal_human_payload(rate_pressure=unavailable)
+    summary = goalflight_doctor.verdict_summary(payload)
+    assert summary["verdict"] == "warn"
+    assert any(
+        row["probe"] == "rate-pressure unavailable"
+        and "pressure ledger unreadable" in row["detail"]
+        for row in summary["warnings"]
+    )
+    assert not any(
+        line.startswith("[OK] rate-pressure")
+        for line in goalflight_doctor.collect_human_lines(payload)
+    )
+
+
+def case_doctor_line_cap_cannot_hide_late_warning() -> None:
+    payload = _minimal_human_payload(
+        host_goalflight_install={
+            f"healthy-host-{index}": {"ok": True, "detail": "ok"}
+            for index in range(goalflight_doctor._HUMAN_LINE_CAP + 5)
+        },
+        rate_pressure={
+            "available": True,
+            "providers_under_pressure": [
+                {
+                    "provider": "late-provider",
+                    "count": 3,
+                    "fallback_providers": [],
+                    "recommended_caps": {"codex": 1},
+                }
+            ],
+            "records_examined": 3,
+        },
+    )
+    lines = goalflight_doctor.collect_human_lines(payload)
+    assert len(lines) > goalflight_doctor._HUMAN_LINE_CAP
+    summary = goalflight_doctor.verdict_summary(payload)
+    assert summary["verdict"] == "warn"
+    assert any(row["probe"] == "rate-pressure late-provider" for row in summary["warnings"])
+    shown = goalflight_doctor.display_human_lines(lines, verbose=True)
+    assert len(shown) == goalflight_doctor._HUMAN_LINE_CAP
+    assert any(line.startswith("[WARN] rate-pressure late-provider") for line in shown)
+
+
+def test_doctor_failed_session_status_makes_verdict_warn() -> None:
+    case_doctor_failed_session_status_makes_verdict_warn()
+
+
+def test_doctor_failed_rate_pressure_probe_is_not_ok() -> None:
+    case_doctor_failed_rate_pressure_probe_is_not_ok()
+
+
+def test_doctor_line_cap_cannot_hide_late_warning() -> None:
+    case_doctor_line_cap_cannot_hide_late_warning()
 
 
 def case_doctor_human_omits_ok_keeps_warn_and_info() -> None:
@@ -584,6 +675,9 @@ def main() -> None:
     case_claude_acp_reports_pinned_build_when_orig_differs()
     case_doctor_json_verdict_matches_text_warnings_and_info()
     case_doctor_json_verdict_ok_when_text_has_no_warns()
+    case_doctor_failed_session_status_makes_verdict_warn()
+    case_doctor_failed_rate_pressure_probe_is_not_ok()
+    case_doctor_line_cap_cannot_hide_late_warning()
     case_doctor_json_cli_attaches_verdict_alongside_probes()
     case_doctor_human_omits_ok_keeps_warn_and_info()
     case_doctor_verbose_recovers_ok_lines_verbatim()

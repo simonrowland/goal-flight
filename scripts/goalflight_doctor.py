@@ -3324,6 +3324,7 @@ def _rate_pressure_summary() -> dict:
         pressure = goalflight_rate_pressure.pressure_per_provider(records, pool_map=pool_map)
         current_caps = dict(goalflight_capacity.DEFAULT_AGENT_CAPS) if goalflight_capacity else {}
         rec = goalflight_rate_pressure.recommend(pressure, current_caps, pool_map=pool_map)
+        rec["available"] = True
         rec["records_examined"] = len(records)
         rec["state_dir"] = str(state_dir)
         return rec
@@ -3445,9 +3446,26 @@ def verdict_summary(payload: dict) -> dict:
 
 def display_human_lines(lines: list[str], *, verbose: bool = False) -> list[str]:
     """Human text: silence [OK] unless --verbose. WARN/INFO stay."""
+    visible = list(lines) if verbose else [line for line in lines if not line.startswith("[OK]")]
+    if len(visible) <= _HUMAN_LINE_CAP:
+        return visible
     if verbose:
-        return list(lines)
-    return [line for line in lines if not line.startswith("[OK]")]
+        # A cap must never let an earlier chorus of healthy probes hide the
+        # only warning. Preserve source order when untruncated; otherwise put
+        # actionable/unknown rows ahead of optional healthy detail.
+        visible = [line for line in visible if not line.startswith("[OK]")] + [
+            line for line in visible if line.startswith("[OK]")
+        ]
+    shown = visible[: _HUMAN_LINE_CAP - 1]
+    omitted = visible[_HUMAN_LINE_CAP - 1 :]
+    shown.append(
+        status_line(
+            False if any(line.startswith("[WARN]") for line in omitted) else None,
+            "doctor output truncated",
+            f"{len(omitted)} additional probe row(s); use --json for the complete verdict",
+        )
+    )
+    return shown
 
 
 def print_human(payload: dict, *, verbose: bool = False) -> None:
@@ -3458,7 +3476,18 @@ def print_human(payload: dict, *, verbose: bool = False) -> None:
 def collect_human_lines(payload: dict) -> list[str]:
     plugin = payload["plugin"]
     controller_leases = payload.get("controller_lease_liveness") or {}
+    session_status = payload.get("session_status")
+    session_status = session_status if isinstance(session_status, dict) else {}
+    session_ok = session_status.get("ok") if "ok" in session_status else False
+    session_detail = (
+        f"active={session_status.get('active')} queue={session_status.get('queue_state')}"
+        if session_ok
+        else session_status.get("error")
+        or session_status.get("install_hint")
+        or "canonical session-status probe missing"
+    )
     lines = [
+        status_line(session_ok, "session status", session_detail),
         status_line(
             None if plugin.get("skipped") else plugin.get("manifest_exists"),
             "package plugin manifest",
@@ -3849,7 +3878,15 @@ def collect_human_lines(payload: dict) -> list[str]:
     # not overheat services in a way that crashes the live session.
     rp = payload.get("rate_pressure") or {}
     pressured = rp.get("providers_under_pressure") or []
-    if pressured:
+    if rp.get("available") is False:
+        lines.append(
+            status_line(
+                False,
+                "rate-pressure unavailable",
+                rp.get("reason") or "provider pressure could not be measured",
+            )
+        )
+    elif pressured:
         for entry in pressured:
             provider = entry.get("provider")
             count = entry.get("count")
@@ -3864,7 +3901,7 @@ def collect_human_lines(payload: dict) -> list[str]:
         records = rp.get("records_examined", 0)
         lines.append(status_line(True, "rate-pressure", f"no provider under pressure ({records} records examined)"))
 
-    return lines[:_HUMAN_LINE_CAP]
+    return lines
 
 
 def main(argv: list[str] | None = None) -> int:

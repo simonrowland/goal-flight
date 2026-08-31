@@ -66,7 +66,9 @@ def _retainable_fleet_payload(generation_id: str, *, observed_at: str) -> dict:
     payload["sample_started_at"] = observed_at
     payload["sample_finished_at"] = observed_at
     payload["last_error"] = None
-    payload["incomplete"] = False
+    # A successful deep sample is still partial coverage when registry roots
+    # remain unsampled. The old fixture pinned the false-complete projection.
+    payload["incomplete"] = True
     payload["registry_total"] = 77
     payload["registry_deep_sampled"] = 3
     payload["registry_unsampled"] = 74

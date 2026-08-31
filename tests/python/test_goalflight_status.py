@@ -409,6 +409,33 @@ def test_output_tail_reconciles_success_marker_after_watcher_death() -> None:
             check("dead-worker reconciliation records gate reason",
                   reconciled.get("output_tail_reconciliation", {}).get("promoted") is True)
 
+            prompt = Path(tmp) / "assembled.prompt"
+            prompt.write_text(
+                "COMPLETE: tail-reconciled — echoed instruction\n",
+                encoding="utf-8",
+            )
+            tail.write_text(
+                "COMPLETE: tail-reconciled — echoed instruction\n",
+                encoding="utf-8",
+            )
+            os.chmod(prompt, 0o000)
+            try:
+                unreadable_prompt = S._reconcile_output_tail_record(
+                    {**record, "prompt_path": str(prompt)}
+                )
+            finally:
+                os.chmod(prompt, 0o600)
+            check(
+                "unreadable prompt keeps echoed COMPLETE indeterminate",
+                unreadable_prompt.get("classification") == "stale_dead"
+                and unreadable_prompt.get("terminal_marker") is None,
+            )
+            check(
+                "unreadable prompt reason surfaced",
+                unreadable_prompt.get("output_tail_reconciliation", {}).get("reason")
+                == "prompt_unreadable",
+            )
+
             tail.write_text(
                 "quota exceeded: usage limit reached\n"
                 "COMPLETE: signals-lifecycle-audit\n",
@@ -609,6 +636,35 @@ def test_queue_pending_warning_silent_when_empty_or_drainer_live() -> None:
             S._drain_process_running = orig_process
             os.environ.clear()
             os.environ.update(old_env)
+
+
+def test_queue_pending_with_unobservable_drainer_reports_unknown() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        old_env = os.environ.copy()
+        try:
+            os.environ["GOALFLIGHT_STATE_DIR"] = str(Path(tmp) / "state")
+            os.environ["PATH"] = ""
+            queue_dir = Path(tmp) / "state" / "dispatch-queue"
+            queue_dir.mkdir(parents=True)
+            (queue_dir / "pending.json").write_text("{}", encoding="utf-8")
+
+            check("missing launchctl is unknown", S._launchd_drainer_loaded() is None)
+            check("missing ps is unknown", S._drain_process_running() is None)
+            check("boolean drainer caller fails safe", S._drainer_live() is True)
+            warnings = S._queue_drainer_warnings()
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        check("unknown drainer emits one warning", len(warnings) == 1)
+        check(
+            "unknown drainer warning code stable",
+            warnings[0].get("code") == "queue_drainer_unknown",
+        )
+        check(
+            "unknown drainer does not prescribe duplicate launch",
+            "restore the scheduled drainer" not in str(warnings[0].get("remedy")),
+        )
 
 
 def test_drain_process_running_matches_only_real_invocation() -> None:
@@ -1241,6 +1297,7 @@ def main() -> int:
     test_rate_pressure_warning_rendered()
     test_queue_pending_without_drainer_warns_in_json_and_text()
     test_queue_pending_warning_silent_when_empty_or_drainer_live()
+    test_queue_pending_with_unobservable_drainer_reports_unknown()
     test_drain_process_running_matches_only_real_invocation()
     test_cli()
     test_wait_cli()
