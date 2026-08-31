@@ -2377,7 +2377,7 @@ def _queue_summary(
     dispatch = status.get("dispatch")
     state_dir = (dispatch or {}).get("state_dir") if isinstance(dispatch, dict) else None
     if not isinstance(state_dir, str) or not state_dir:
-        return {}, 0
+        return {}, None
     queue_dir = Path(state_dir) / "dispatch-queue"
     by_root: dict[str, dict[str, Any]] = {}
     total = 0
@@ -2795,7 +2795,12 @@ def build_fleet_plane(
             "capacity": {},
             "capacity_state": {"leases": {}},
             "rate_pressure": {},
-            "dispatch": {"records": []},
+            "dispatch": {
+                "records": [],
+                # Status may fail after the state directory is already known.
+                # Keep that directory so queue depth can still be measured.
+                "state_dir": str(goalflight_compat.resolve_state_dir()),
+            },
             "warnings": [],
         }
     resolved_fleet_dir = fleet_dir or goalflight_messages.default_fleet_dir()

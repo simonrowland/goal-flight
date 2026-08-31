@@ -114,6 +114,19 @@ def _retainable_fleet_payload(generation_id: str, *, observed_at: str) -> dict:
     return payload
 
 
+def test_current_partial_registry_sample_is_incomplete_without_timeout() -> None:
+    """Pin partial-coverage incomplete without the timeout overlay that also sets it."""
+    payload = _retainable_fleet_payload(
+        "current-partial",
+        observed_at="2026-08-02T10:00:00+00:00",
+    )
+    assert payload["last_error"] is None
+    assert payload["incomplete"] is True
+    assert payload["registry_total"] == 77
+    assert payload["registry_deep_sampled"] == 3
+    assert payload["registry_unsampled"] == 74
+
+
 def test_default_budgets_follow_live_measurement_and_leave_reserve() -> None:
     assert producer.DEFAULT_BUDGET_S == {"attention": 3.0, "fleet": 4.0}
     assert console.PLANE_CADENCE_SECONDS == {"attention": 20, "fleet": 60}

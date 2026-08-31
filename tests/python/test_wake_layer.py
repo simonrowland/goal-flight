@@ -2714,6 +2714,52 @@ def test_wait_retries_unreadable_mail_baseline_and_wakes_after_recovery(
     assert result == [3]
 
 
+def test_wait_stops_when_mail_watermark_stays_unreadable(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root, _env = isolated
+    dispatch_id = "mail-watermark-unavailable"
+    monkeypatch.setattr(status, "_WAIT_MAIL_UNREADABLE_GRACE_S", 0.0)
+    monkeypatch.setattr(status, "_mail_watermark", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        status,
+        "_wait_cycle_payload",
+        lambda *_args, **_kwargs: {
+            "schema": "goalflight.status.wait.v1",
+            "dispatch": {
+                "records": [
+                    {
+                        "dispatch_id": dispatch_id,
+                        "state": "running",
+                        "classification": "running",
+                        "worker_pid": os.getpid(),
+                        "worker_still_alive": True,
+                    }
+                ]
+            },
+        },
+    )
+
+    code = status._wait_for_dispatches_registered(
+        [dispatch_id],
+        project_root=str(root),
+        timeout_s=3,
+        poll_s=0.02,
+        heartbeat_s=10,
+        json_output=True,
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert code == status._WAIT_EXIT_MAIL_UNAVAILABLE
+    assert payload["woken_by"] == "mail_unavailable"
+    assert payload["mail_watermark_available"] is False
+    assert payload["pending"] == [dispatch_id]
+    assert "blocking mail may be pending" in captured.err
+
+
 def test_deleted_cursor_token_cli_surface_does_not_displace_healthy_listener(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:

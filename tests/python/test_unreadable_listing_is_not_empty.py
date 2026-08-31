@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from unittest import mock
 
 import pytest
 
@@ -134,7 +135,62 @@ def test_fleet_console_unreadable_index_is_not_empty_roots(tmp_path: Path) -> No
         os.chmod(index, 0o700)
 
 
+def test_fleet_plane_local_status_failure_still_measures_queue(tmp_path: Path) -> None:
+    state_dir = Path(os.environ["GOALFLIGHT_STATE_DIR"])
+    queue = state_dir / "dispatch-queue"
+    queue.mkdir(parents=True, exist_ok=True)
+    (queue / "pending.json").write_text(
+        json.dumps(
+            {
+                "dispatch_id": "queued-1",
+                "project_root": str(tmp_path / "proj"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    with (
+        mock.patch.object(
+            fleet.goalflight_status,
+            "status_payload",
+            side_effect=RuntimeError("local status unreadable"),
+        ),
+        mock.patch.object(
+            fleet.goalflight_fleet_status_cli,
+            "build_fleet_status",
+            return_value={},
+        ),
+        mock.patch.object(fleet.goalflight_usage, "collect_usage", return_value=[]),
+        mock.patch.object(fleet.goalflight_task, "read_project_registry", return_value=[]),
+        mock.patch.object(fleet, "_active_controller_roots_from_journals", return_value=[]),
+    ):
+        payload = fleet.build_fleet_plane(generation_id="local-status-failure")
+    assert payload["machine"]["queue_depth"] == 1
+    assert payload["incomplete"] is True
+    assert payload["last_error"]
+    assert "local_status" in str(payload["last_error"])
+
+
 def test_fleet_console_queue_unreadable_or_malformed_is_unknown(tmp_path: Path) -> None:
+    upstream_errors: list[str] = []
+    by_root, depth = fleet._queue_summary(
+        {"dispatch": {"records": []}},
+        upstream_errors,
+    )
+    assert by_root == {}
+    assert depth is None
+    assert upstream_errors == []
+
+    measured_empty = tmp_path / "measured-empty"
+    measured_empty.mkdir()
+    empty_errors: list[str] = []
+    by_root, depth = fleet._queue_summary(
+        {"dispatch": {"state_dir": str(measured_empty)}},
+        empty_errors,
+    )
+    assert by_root == {}
+    assert depth == 0
+    assert empty_errors == []
+
     state_dir = tmp_path / "state"
     queue = state_dir / "dispatch-queue"
     queue.mkdir(parents=True)

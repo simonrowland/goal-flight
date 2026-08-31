@@ -703,9 +703,10 @@ def test_status_surfaces_milestone_probe_failure_as_unavailable() -> None:
             rc = S.main(["--json"])
         data = json.loads(buf.getvalue())
         assert rc == 0
-        # Probe failure cannot prove cadence inactive or not due. This test
-        # previously pinned those false definite answers.
-        assert data["milestone"]["active_cadence"] is True
+        # Probe failure cannot prove cadence active, inactive, due, or not due.
+        # All unmeasured fields stay unknown instead of swapping one guess for
+        # its opposite.
+        assert data["milestone"]["active_cadence"] is None
         assert data["milestone"]["due"] is None
         assert data["milestone"]["reason"] == "milestone unavailable"
         assert data["milestone"]["error"] == "RuntimeError: boom second line"

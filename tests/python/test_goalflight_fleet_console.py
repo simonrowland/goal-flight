@@ -691,6 +691,7 @@ def test_fast_plane_project_classes_are_live_only_mutation_pair() -> None:
             "rate_pressure": {},
             "warnings": [],
             "dispatch": {
+                "state_dir": str(temp_root / "state"),
                 "records": [
                     {
                         "dispatch_id": "live-worker",

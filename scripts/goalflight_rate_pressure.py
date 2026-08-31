@@ -63,6 +63,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import stat
 import sys
 import time
 from datetime import datetime
@@ -74,6 +75,10 @@ import goalflight_dispatch_states
 from goalflight_agent_limits import DEFAULT_AGENT_CAPS
 
 SCHEMA = "goalflight.rate-pressure.v1"
+
+
+class RatePressureInputError(RuntimeError):
+    """A ledger scan could not prove what records it examined."""
 
 # Agent label → provider key. New workers extend this map; the walkback
 # auto-handles them as long as the provider classification is correct.
@@ -556,11 +561,15 @@ def _default_state_dir() -> Path:
     return goalflight_compat.resolve_state_dir()
 
 
-def _read_record(path: Path) -> dict | None:
+def _read_record(path: Path) -> dict:
     try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        detail = " ".join(f"{type(exc).__name__}: {exc}".split())
+        raise RatePressureInputError(f"{path}: {detail}") from exc
+    if not isinstance(payload, dict):
+        raise RatePressureInputError(f"{path}: expected JSON object")
+    return payload
 
 
 def _read_status(record: dict) -> dict | None:
@@ -810,15 +819,25 @@ def recommend(
 
 
 def collect_records(state_dir: Path) -> list[dict]:
-    """Read all dispatch records under <state_dir>/runs.d/."""
+    """Read every dispatch record, or fail if the scan is not authoritative."""
     runs = state_dir / "runs.d"
-    if not runs.is_dir():
+    try:
+        mode = runs.stat().st_mode
+    except FileNotFoundError:
         return []
+    except OSError as exc:
+        detail = " ".join(f"{type(exc).__name__}: {exc}".split())
+        raise RatePressureInputError(f"{runs}: {detail}") from exc
+    if not stat.S_ISDIR(mode):
+        raise RatePressureInputError(f"{runs}: expected directory")
+    try:
+        paths = sorted(path for path in runs.iterdir() if path.suffix == ".json")
+    except OSError as exc:
+        detail = " ".join(f"{type(exc).__name__}: {exc}".split())
+        raise RatePressureInputError(f"{runs}: {detail}") from exc
     out = []
-    for path in sorted(runs.glob("*.json")):
-        rec = _read_record(path)
-        if rec is not None:
-            out.append(rec)
+    for path in paths:
+        out.append(_read_record(path))
     return out
 
 
@@ -847,7 +866,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     state_dir = Path(args.state_dir)
-    records = collect_records(state_dir)
+    try:
+        records = collect_records(state_dir)
+    except RatePressureInputError as exc:
+        print(json.dumps({
+            "schema": SCHEMA,
+            "available": False,
+            "state_dir": str(state_dir),
+            "records_examined": None,
+            "error": str(exc),
+        }, sort_keys=True))
+        return 2
     billing = load_billing_accounts()
     pool_map = agent_limit_pool_map(billing)
 

@@ -487,8 +487,111 @@ def test_doctor_failed_session_status_makes_verdict_warn() -> None:
     case_doctor_failed_session_status_makes_verdict_warn()
 
 
+def case_doctor_rejects_structurally_empty_session_status() -> None:
+    with patch.object(
+        goalflight_doctor,
+        "run",
+        return_value={"returncode": 0, "stdout": "{}", "stderr": ""},
+    ):
+        result = goalflight_doctor.check_session_status(ROOT, ROOT)
+    assert result["ok"] is False
+    assert "invalid session status payload" in result["error"]
+    assert "missing fields" in result["error"]
+    payload = _minimal_human_payload(session_status=result)
+    lines = goalflight_doctor.collect_human_lines(payload)
+    assert any(line.startswith("[WARN] session status") for line in lines)
+    assert not any(line.startswith("[OK] session status") for line in lines)
+    assert "active=False" not in "\n".join(lines)
+
+
+def test_doctor_rejects_structurally_empty_session_status() -> None:
+    case_doctor_rejects_structurally_empty_session_status()
+
+
+def case_doctor_accepts_canonical_inactive_session_status() -> None:
+    canonical = {
+        "active": False,
+        "queue_file": None,
+        "queue_state": None,
+        "queue_reason": "no queue files",
+        "active_capacity_leases_in_project": 0,
+        "newest_resume_notes": None,
+        "resume_notes_active": False,
+    }
+    with patch.object(
+        goalflight_doctor,
+        "run",
+        return_value={
+            "returncode": 0,
+            "stdout": json.dumps(canonical),
+            "stderr": "",
+        },
+    ):
+        result = goalflight_doctor.check_session_status(ROOT, ROOT)
+    assert result["ok"] is True
+    assert result["active"] is False
+    assert result["active_capacity_leases_in_project"] == 0
+    payload = _minimal_human_payload(session_status=result)
+    lines = goalflight_doctor.collect_human_lines(payload)
+    assert any(
+        line.startswith("[OK] session status") and "active=False" in line
+        for line in lines
+    )
+
+
+def test_doctor_accepts_canonical_inactive_session_status() -> None:
+    case_doctor_accepts_canonical_inactive_session_status()
+
+
 def test_doctor_failed_rate_pressure_probe_is_not_ok() -> None:
     case_doctor_failed_rate_pressure_probe_is_not_ok()
+
+
+def case_doctor_malformed_rate_pressure_record_is_unavailable() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        runs = state_dir / "runs.d"
+        runs.mkdir(parents=True)
+        (runs / "broken.json").write_text("{", encoding="utf-8")
+        with patch.object(
+            goalflight_doctor.goalflight_compat,
+            "resolve_state_dir",
+            return_value=state_dir,
+        ):
+            unavailable = goalflight_doctor._rate_pressure_summary()
+    payload = _minimal_human_payload(rate_pressure=unavailable)
+    lines = goalflight_doctor.collect_human_lines(payload)
+    assert unavailable["available"] is False
+    assert "RatePressureInputError" in unavailable["reason"]
+    assert any(line.startswith("[WARN] rate-pressure unavailable") for line in lines)
+    assert not any(line.startswith("[OK] rate-pressure") for line in lines)
+
+
+def test_doctor_malformed_rate_pressure_record_is_unavailable() -> None:
+    case_doctor_malformed_rate_pressure_record_is_unavailable()
+
+
+def case_doctor_empty_rate_pressure_directory_is_measured_zero() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td) / "state"
+        (state_dir / "runs.d").mkdir(parents=True)
+        with patch.object(
+            goalflight_doctor.goalflight_compat,
+            "resolve_state_dir",
+            return_value=state_dir,
+        ):
+            available = goalflight_doctor._rate_pressure_summary()
+    payload = _minimal_human_payload(rate_pressure=available)
+    assert available["available"] is True
+    assert available["records_examined"] == 0
+    assert any(
+        line.startswith("[OK] rate-pressure") and "0 records examined" in line
+        for line in goalflight_doctor.collect_human_lines(payload)
+    )
+
+
+def test_doctor_empty_rate_pressure_directory_is_measured_zero() -> None:
+    case_doctor_empty_rate_pressure_directory_is_measured_zero()
 
 
 def test_doctor_line_cap_cannot_hide_late_warning() -> None:
@@ -676,7 +779,11 @@ def main() -> None:
     case_doctor_json_verdict_matches_text_warnings_and_info()
     case_doctor_json_verdict_ok_when_text_has_no_warns()
     case_doctor_failed_session_status_makes_verdict_warn()
+    case_doctor_rejects_structurally_empty_session_status()
+    case_doctor_accepts_canonical_inactive_session_status()
     case_doctor_failed_rate_pressure_probe_is_not_ok()
+    case_doctor_malformed_rate_pressure_record_is_unavailable()
+    case_doctor_empty_rate_pressure_directory_is_measured_zero()
     case_doctor_line_cap_cannot_hide_late_warning()
     case_doctor_json_cli_attaches_verdict_alongside_probes()
     case_doctor_human_omits_ok_keeps_warn_and_info()

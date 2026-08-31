@@ -79,6 +79,10 @@ _QUEUE_PENDING_NO_DRAINER = "queue_pending_no_drainer"
 # confirmed-dead worker before --wait resolves it to a terminal worker_dead
 # verdict (instead of polling to the wait-timeout). >= 2 default poll intervals.
 _WAIT_HEARTBEAT_S = 1200.0
+# A fixed-set join cannot safely remain asleep when both mail authorities stay
+# unreadable: blocking mail may already exist.  Allow brief recovery, then
+# return a distinct infrastructure wake instead of silently waiting forever.
+_WAIT_MAIL_UNREADABLE_GRACE_S = 10.0
 # --wait missing-id grace: a wait may be armed in the same breath as the
 # dispatch, so an unknown id is not refused. After this many seconds with
 # still no ledger/journal record, name it once (typo signal) and keep waiting.
@@ -1758,7 +1762,7 @@ def _milestone_payload(project_root: str | None) -> dict:
         detail = " ".join(f"{exc.__class__.__name__}: {exc}".split())
         return {
             "schema": goalflight_milestone.SCHEMA,
-            "active_cadence": True,
+            "active_cadence": None,
             "commits_since": None,
             "K": None,
             "last_marker": None,
@@ -2442,6 +2446,7 @@ def _wait_for_dispatches_registered(
     mail_baseline = _mail_watermark(project_root, wait_ids)
 
     start = time.monotonic()
+    mail_unreadable_since = start if mail_baseline is None else None
     poll_s = max(0.05, poll_s)
     if timeout_s in (None, 0, 0.0):
         timeout_s = None
@@ -2525,6 +2530,7 @@ def _wait_for_dispatches_registered(
             # pre-filled, so it costs a single call.
             current = _mail_watermark(project_root, wait_ids)
             if current is not None:
+                mail_unreadable_since = None
                 # If the baseline probe failed, every visible waking identity
                 # may have arrived during the observation gap. Wake safely
                 # instead of re-baselining over a worker's blocking question.
@@ -2551,6 +2557,33 @@ def _wait_for_dispatches_registered(
                         file=sys.stderr,
                     )
                     return _WAIT_EXIT_MAIL
+            else:
+                if mail_unreadable_since is None:
+                    mail_unreadable_since = now
+                if now - mail_unreadable_since >= _WAIT_MAIL_UNREADABLE_GRACE_S:
+                    pending = [r["dispatch_id"] for r in rows if not r["terminal"]]
+                    if json_output:
+                        print(json.dumps(
+                            {
+                                "ok": False,
+                                "woken_by": "mail_unavailable",
+                                "mail_watermark_available": False,
+                                "pending": pending,
+                                "dispatches": rows,
+                            },
+                            sort_keys=True,
+                        ))
+                    else:
+                        print(
+                            "wait stopped: mail watermark unavailable; "
+                            f"{sum(1 for r in rows if r['terminal'])}/{len(rows)} terminal"
+                        )
+                    print(
+                        "wait mail health: journal and dispatch-mail watermark "
+                        "remain unreadable; blocking mail may be pending",
+                        file=sys.stderr,
+                    )
+                    return _WAIT_EXIT_MAIL_UNAVAILABLE
 
             time.sleep(poll_s)
     except KeyboardInterrupt:
@@ -2559,10 +2592,11 @@ def _wait_for_dispatches_registered(
 
 
 # --wait exit codes: 0 all terminal, 1 timeout, 2 usage, 3 woken by new mail,
-# 130 interrupt. A mail wake MUST NOT reuse 0 -- callers key off the code, and
+# 4 mail authority unavailable, 130 interrupt. A wake MUST NOT reuse 0 -- callers key off the code, and
 # reporting "all terminal" for a wait that ended with workers still running is
 # the same false-verdict class this module keeps having to fix.
 _WAIT_EXIT_MAIL = 3
+_WAIT_EXIT_MAIL_UNAVAILABLE = 4
 
 
 def _mail_watermark(project_root: str | None, wait_ids: list[str]) -> set[tuple[str, object]] | None:
@@ -2839,7 +2873,20 @@ def verify_artifacts(dispatch_id: str, *, project_root: str | None) -> dict:
             p = base / rel
         present, nbytes = _direct_open_exists(p)
         results.append({"path": str(p), "present": present, "bytes": nbytes})
-    all_present = bool(results) and all(r["present"] and r["bytes"] > 0 for r in results)
+    if verification_error is not None:
+        all_present = None
+    elif not results:
+        all_present = False
+    elif any(
+        r["present"] is False
+        or (r["present"] is True and r["bytes"] <= 0)
+        for r in results
+    ):
+        all_present = False
+    elif any(r["present"] is None for r in results):
+        all_present = None
+    else:
+        all_present = True
     return {
         "dispatch_id": dispatch_id,
         "found": True,
@@ -2882,7 +2929,8 @@ def main(argv: list[str] | None = None) -> int:
             "unclaimed fixed-set join (does not claim/renew): block until all "
             "ids are terminal. Accepts space-separated (`--wait a b`), "
             "comma-separated (`--wait a,b`), or repeated (`--wait a --wait b`); "
-            "new waking mail on any waited ID exits 3. After 30s, ids with no "
+            "new waking mail on any waited ID exits 3; a persistent unreadable "
+            "mail watermark exits 4. After 30s, ids with no "
             "dispatch record at all are named once; the wait continues. For "
             "claimed controllers use the messages listen -> relay -> advance "
             "doorbell loop"
@@ -2922,7 +2970,8 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "verify a dispatch's DECLARED artifacts (named in its terminal marker) exist "
             "by DIRECT OPEN of each path — never directory enumeration, which can read "
-            "stale for minutes on local APFS. exit 0 = all present+nonempty, 1 = not"
+            "stale for minutes on local APFS. exit 0 = all present+nonempty, "
+            "1 = definitely not all present, 2 = unknown"
         ),
     )
     parser.add_argument(
@@ -3009,8 +3058,10 @@ def main(argv: list[str] | None = None) -> int:
         result = verify_artifacts(args.verify_artifacts, project_root=project_root)
         if args.json:
             print(json.dumps(result, sort_keys=True))
-        elif not result.get("found"):
-            print(f"{args.verify_artifacts}  {result.get('reason')}")
+        elif result.get("found") is None:
+            print(f"{args.verify_artifacts}  UNKNOWN: {result.get('reason')}")
+        elif result.get("found") is False:
+            print(f"{args.verify_artifacts}  NOT FOUND: {result.get('reason')}")
         else:
             for r in result["results"]:
                 if r["present"] is None:
@@ -3018,15 +3069,23 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     mark = "OK" if (r["present"] and r["bytes"] > 0) else "MISSING"
                 print(f"  [{mark}] {r['path']} ({r['bytes']}B)")
-            if not result["declared_artifacts"]:
+            if result.get("verification_error"):
+                print(f"  [UNKNOWN] {result['verification_error']}")
+            elif not result["declared_artifacts"]:
                 print("  (no artifact path declared in the terminal marker)")
+            aggregate = (
+                "unknown" if result["all_present"] is None
+                else str(result["all_present"]).lower()
+            )
             print(
-                f"{args.verify_artifacts}  all_present={result['all_present']} "
+                f"{args.verify_artifacts}  all_present={aggregate} "
                 f"marker={result.get('terminal_marker')} classif={result.get('classification')}"
             )
-        if not result.get("found"):
+        if result.get("found") is not True:
             return 2
-        return 0 if result.get("all_present") else 1
+        if result.get("all_present") is None:
+            return 2
+        return 0 if result.get("all_present") is True else 1
 
     payload = scope_payload(status_payload(), project_root)
 

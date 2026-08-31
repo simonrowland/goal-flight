@@ -21,8 +21,12 @@ from support import skip_posix_on_native_windows
 skip_posix_on_native_windows("rate-pressure fixtures assert POSIX /tmp state paths")
 
 import json
+import os
 import sys
+import tempfile
 import time
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1105,6 +1109,55 @@ def test_collect_records_reads_files():
             p.unlink()
         runs.rmdir()
         state_dir.rmdir()
+
+
+def test_collect_records_rejects_malformed_record() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td)
+        runs = state_dir / "runs.d"
+        runs.mkdir()
+        (runs / "broken.json").write_text("{", encoding="utf-8")
+        try:
+            rp.collect_records(state_dir)
+        except rp.RatePressureInputError as exc:
+            assert_true("malformed record named", "broken.json" in str(exc))
+        else:
+            raise AssertionError("malformed pressure record was silently skipped")
+
+
+def test_collect_records_rejects_unreadable_record() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td)
+        runs = state_dir / "runs.d"
+        runs.mkdir()
+        record = runs / "private.json"
+        record.write_text(json.dumps({"dispatch_id": "limited"}), encoding="utf-8")
+        os.chmod(record, 0o000)
+        try:
+            try:
+                rp.collect_records(state_dir)
+            except rp.RatePressureInputError as exc:
+                assert_true("unreadable record named", "private.json" in str(exc))
+            else:
+                raise AssertionError("unreadable pressure record was silently skipped")
+        finally:
+            os.chmod(record, 0o600)
+
+
+def test_cli_malformed_record_is_unavailable_not_zero() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        state_dir = Path(td)
+        runs = state_dir / "runs.d"
+        runs.mkdir()
+        (runs / "broken.json").write_text("{", encoding="utf-8")
+        buf = StringIO()
+        with redirect_stdout(buf):
+            code = rp.main(["--state-dir", str(state_dir), "--json"])
+        payload = json.loads(buf.getvalue())
+        assert_eq("malformed CLI exit", code, 2)
+        assert_eq("malformed CLI available", payload["available"], False)
+        assert_eq("malformed CLI count unknown", payload["records_examined"], None)
+        assert_true("malformed CLI error named", "broken.json" in payload["error"])
 
 
 # ----- runner -----

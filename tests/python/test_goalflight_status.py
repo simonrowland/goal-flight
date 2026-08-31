@@ -924,6 +924,7 @@ def test_wait_help_distinguishes_unclaimed_join_from_claimed_doorbell() -> None:
     help_text = " ".join(buf.getvalue().split())
     check("--wait help says it does not claim", "does not claim/renew" in help_text)
     check("--wait help names exit 3 mail wake", "mail on any waited ID exits 3" in help_text)
+    check("--wait help names exit 4 unreadable watermark", "unreadable mail watermark exits 4" in help_text)
     check("--wait help directs claimed controllers to doorbell", "claimed controllers" in help_text)
 
 

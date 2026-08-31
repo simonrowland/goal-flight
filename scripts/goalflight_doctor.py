@@ -551,15 +551,58 @@ def check_session_status(skill_root: Path, project_root: Path) -> dict:
                 f"`{sys.executable} {helper} --project-root {project_root} --json`."
             ),
         }
+    required = {
+        "active",
+        "queue_file",
+        "queue_state",
+        "queue_reason",
+        "active_capacity_leases_in_project",
+        "newest_resume_notes",
+        "resume_notes_active",
+    }
+    invalid_reason = None
+    if not isinstance(payload, dict):
+        invalid_reason = "expected JSON object"
+    else:
+        missing = sorted(required - payload.keys())
+        leases = payload.get("active_capacity_leases_in_project")
+        if missing:
+            invalid_reason = f"missing fields: {', '.join(missing)}"
+        elif not isinstance(payload.get("active"), bool):
+            invalid_reason = "active must be boolean"
+        elif (
+            leases is not None
+            and (isinstance(leases, bool) or not isinstance(leases, int) or leases < 0)
+        ):
+            invalid_reason = "active_capacity_leases_in_project must be non-negative integer or null"
+        elif not isinstance(payload.get("resume_notes_active"), bool):
+            invalid_reason = "resume_notes_active must be boolean"
+        elif not isinstance(payload.get("queue_reason"), str):
+            invalid_reason = "queue_reason must be string"
+        elif any(
+            payload.get(key) is not None and not isinstance(payload.get(key), str)
+            for key in ("queue_file", "queue_state", "newest_resume_notes")
+        ):
+            invalid_reason = "queue and resume-note paths/state must be strings or null"
+    if invalid_reason is not None:
+        return {
+            "ok": False,
+            "present": True,
+            "error": f"invalid session status payload: {invalid_reason}",
+            "install_hint": (
+                "session_status returned an incompatible payload; run the helper "
+                "directly and reinstall goal-flight if its schema is stale."
+            ),
+        }
     return {
         "ok": True,
         "present": True,
-        "active": payload.get("active", False),
+        "active": payload["active"],
         "queue_file": payload.get("queue_file"),
         "queue_state": payload.get("queue_state"),
         "queue_reason": payload.get("queue_reason"),
         "active_capacity_leases_in_project": payload.get(
-            "active_capacity_leases_in_project", 0
+            "active_capacity_leases_in_project"
         ),
         "newest_resume_notes": payload.get("newest_resume_notes"),
         "resume_notes_active": payload.get("resume_notes_active"),
