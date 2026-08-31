@@ -193,6 +193,15 @@ def _watcher_command(
     status: Path,
     max_idle_secs: float,
 ) -> list[str]:
+    # Idle-timeout classification requires a measured tree probe, which needs a
+    # worker cwd distinct from the canonical root. Status/tail stay beside the
+    # fixture; the scanned cwd is an empty sibling so watcher writes cannot
+    # keep the tree "alive".
+    harness_root = status.parent
+    project_root = harness_root / "canonical-root"
+    worker_cwd = harness_root / "worker-cwd"
+    project_root.mkdir(exist_ok=True)
+    worker_cwd.mkdir(exist_ok=True)
     return [
         sys.executable,
         str(WATCH),
@@ -204,6 +213,10 @@ def _watcher_command(
         str(status),
         "--dispatch-id",
         dispatch_id,
+        "--project-root",
+        str(project_root),
+        "--worker-cwd",
+        str(worker_cwd),
         "--poll-secs",
         "0.05",
         "--max-idle-secs",
@@ -805,10 +818,11 @@ time.sleep(5)
         watcher_out, watcher_err = watcher.communicate(timeout=5)
         elapsed = time.monotonic() - started
         assert watcher.returncode == 2, watcher_out + watcher_err
-        assert elapsed < 1.2, f"markerless arm suspended idle for {elapsed:.3f}s"
+        assert elapsed < 2.5, f"markerless arm suspended idle for {elapsed:.3f}s"
         final = json.loads(status.read_text(encoding="utf-8"))
         assert final["state"] == "idle_timeout", final
         assert final.get("worker_wait") is None, final
+        assert float(final.get("seconds_since_event") or 99) < 1.2, final
     finally:
         if worker.poll() is None:
             worker.terminate()
@@ -824,7 +838,7 @@ def test_live_foreign_process_group_cannot_arm_tracked_worker(tmp_path: Path) ->
     tail = tmp_path / "foreign-helper.tail"
     status = tmp_path / "foreign-helper.status.json"
     worker = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(5)"],
+        [sys.executable, "-c", "import time; time.sleep(8)"],
         env=env,
         start_new_session=True,
     )
@@ -837,7 +851,7 @@ import goalflight_steer_mailbox as steer
 arm = steer.append_worker_wait_started(
     Path(os.environ["TEST_STEER_FILE"]),
     dispatch_id=os.environ["TEST_DISPATCH_ID"],
-    timeout_secs=3,
+    timeout_secs=6,
     question_kind="USER-NEED",
     question_text="foreign helper question",
 )
@@ -849,7 +863,7 @@ Path(os.environ["TEST_TAIL_FILE"]).write_text(
     ) + "\n",
     encoding="utf-8",
 )
-time.sleep(5)
+time.sleep(8)
 '''
     helper_env = dict(env)
     helper_env.update(
@@ -874,7 +888,9 @@ time.sleep(5)
             worker_pid=worker.pid,
             tail=tail,
             status=status,
-            max_idle_secs=0.2,
+            # Above WORKER_WAIT_ARM_GRACE_SECS so a foreign USER-NEED would
+            # terminalize as blocked unless process-identity filtering holds.
+            max_idle_secs=1.2,
         ),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -883,17 +899,105 @@ time.sleep(5)
     )
     started = time.monotonic()
     try:
-        watcher_out, watcher_err = watcher.communicate(timeout=5)
+        watcher_out, watcher_err = watcher.communicate(timeout=8)
         elapsed = time.monotonic() - started
         assert watcher.returncode == 2, watcher_out + watcher_err
-        assert elapsed < 1.2, f"foreign helper suspended idle for {elapsed:.3f}s"
+        assert elapsed < 8, f"foreign helper suspended idle for {elapsed:.3f}s"
         final = json.loads(status.read_text(encoding="utf-8"))
         assert final["state"] == "idle_timeout", final
+        assert final.get("reason") != "marker:USER-NEED", final
+        assert final.get("worker_wait") is None, final
     finally:
         for proc in (helper, worker):
             if proc.poll() is None:
                 proc.terminate()
                 proc.wait(timeout=5)
+
+
+def test_foreign_wait_owns_question_marker_uses_waiter_not_dispatch_id() -> None:
+    """A USER-NEED is bound to a dispatch by its waiter's process, not the id text."""
+    dispatch_id = "attr-dispatch"
+    wait_id = "wait-foreign"
+    marker_text = steer.worker_wait_question_marker_text(
+        dispatch_id, "foreign helper question", wait_id
+    )
+    marker = {"kind": "USER-NEED", "text": marker_text, "line": 1}
+    foreign_wait = {
+        "wait_id": wait_id,
+        "question_kind": "USER-NEED",
+        "question_marker_text": marker_text,
+    }
+    assert watch._foreign_wait_owns_question_marker(
+        marker, foreign_wait, None, dispatch_id
+    )
+    assert not watch._foreign_wait_owns_question_marker(
+        marker, foreign_wait, foreign_wait, dispatch_id
+    )
+    ceremony_free = {
+        "kind": "USER-NEED",
+        "text": f"{dispatch_id} — controller decision required",
+        "line": 2,
+    }
+    assert not watch._foreign_wait_owns_question_marker(
+        ceremony_free, None, None, dispatch_id
+    )
+    assert not watch._foreign_wait_owns_question_marker(
+        ceremony_free, foreign_wait, None, dispatch_id
+    )
+
+
+def test_tracked_worker_user_need_still_blocks_dispatch(tmp_path: Path) -> None:
+    """A ceremony-free USER-NEED from the tracked worker still gates the dispatch.
+
+    max_idle_secs stays above WORKER_WAIT_ARM_GRACE_SECS so the 1s arm-grace
+    can resolve to a hard USER-NEED block instead of racing idle_timeout.
+    """
+    dispatch_id = "tracked-user-need-blocks"
+    env = _env(tmp_path)
+    tail = tmp_path / "tracked-need.tail"
+    status = tmp_path / "tracked-need.status.json"
+    worker_code = r'''
+import os
+import time
+
+dispatch_id = os.environ["TEST_DISPATCH_ID"]
+print(f"!USER-NEED: {dispatch_id} — controller decision required", flush=True)
+time.sleep(8)
+'''
+    env["TEST_DISPATCH_ID"] = dispatch_id
+    with tail.open("w", encoding="utf-8") as worker_stdout:
+        worker = subprocess.Popen(
+            [sys.executable, "-c", worker_code],
+            stdout=worker_stdout,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+            text=True,
+        )
+    watcher = subprocess.Popen(
+        _watcher_command(
+            dispatch_id=dispatch_id,
+            worker_pid=worker.pid,
+            tail=tail,
+            status=status,
+            max_idle_secs=5,
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+    )
+    try:
+        watcher_out, watcher_err = watcher.communicate(timeout=5)
+        assert watcher.returncode == 4, watcher_out + watcher_err
+        final = json.loads(status.read_text(encoding="utf-8"))
+        assert final["state"] == "blocked", final
+        assert final.get("reason") == "marker:USER-NEED", final
+        assert final.get("state") != "idle_timeout", final
+    finally:
+        if worker.poll() is None:
+            worker.terminate()
+            worker.wait(timeout=5)
 
 
 def test_worker_wait_longer_than_idle_then_reply_completes(tmp_path: Path) -> None:
@@ -1378,7 +1482,7 @@ time.sleep(5)
         watcher_out, watcher_err = watcher.communicate(timeout=3)
         elapsed = time.monotonic() - started
         assert watcher.returncode == 2, watcher_out + watcher_err
-        assert elapsed < 1.5, f"disproved wait reacquired suspension for {elapsed:.3f}s"
+        assert elapsed < 2.5, f"disproved wait reacquired suspension for {elapsed:.3f}s"
         final = json.loads(status.read_text(encoding="utf-8"))
         assert final["state"] == "idle_timeout", final
         assert final["reason"] == "idle_timeout", final

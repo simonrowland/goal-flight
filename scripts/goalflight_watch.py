@@ -1044,28 +1044,34 @@ def _read_active_worker_wait(
     now_mono: float,
     worker_pid: int | None = None,
     worker_pgid: int | None = None,
-) -> tuple[dict | None, bool]:
+) -> tuple[dict | None, dict | None, bool]:
     try:
         entries = goalflight_steer_mailbox.read_steer_entries(
             path,
             lock_timeout_secs=0.05,
             quarantine_errors=False,
         )
-        return (
-            goalflight_steer_mailbox.active_worker_wait(
+        tracked = goalflight_steer_mailbox.active_worker_wait(
+            entries,
+            dispatch_id=dispatch_id,
+            now_mono=now_mono,
+            worker_pid=worker_pid,
+            worker_pgid=worker_pgid,
+        )
+        if tracked is not None or (worker_pid is None and worker_pgid is None):
+            live_any = tracked
+        else:
+            live_any = goalflight_steer_mailbox.active_worker_wait(
                 entries,
                 dispatch_id=dispatch_id,
                 now_mono=now_mono,
-                worker_pid=worker_pid,
-                worker_pgid=worker_pgid,
-            ),
-            True,
-        )
+            )
+        return tracked, live_any, True
     except (OSError, RuntimeError, ValueError):
-        return None, False
+        return None, None, False
     except Exception as exc:
         if goalflight_steer_mailbox.is_carrier_error(exc):
-            return None, False
+            return None, None, False
         raise
 
 
@@ -1077,7 +1083,7 @@ def _active_worker_wait(
     worker_pid: int | None = None,
     worker_pgid: int | None = None,
 ) -> dict | None:
-    wait_state, _read_succeeded = _read_active_worker_wait(
+    wait_state, _live_any, _read_succeeded = _read_active_worker_wait(
         path,
         dispatch_id,
         now_mono=now_mono,
@@ -1085,6 +1091,24 @@ def _active_worker_wait(
         worker_pgid=worker_pgid,
     )
     return wait_state
+
+
+def _foreign_wait_owns_question_marker(
+    marker: dict | None,
+    live_any_wait: dict | None,
+    tracked_wait: dict | None,
+    dispatch_id: str,
+) -> bool:
+    """True when this USER-NEED/USER-CONFIRM belongs to a live waiter we do not track.
+
+    Dispatch-id binding on the tail line is not process identity. A helper can
+    write the tracked id into the mailbox and the tail; only the waiter's pid
+    / process group bind that question to this worker. A ceremony-free
+    attention line with no live wait arm is not foreign: it still blocks.
+    """
+    if tracked_wait is not None or live_any_wait is None:
+        return False
+    return _worker_wait_marker_matches(marker, live_any_wait, dispatch_id)
 
 
 def _cached_worker_wait_is_valid(
@@ -4195,7 +4219,7 @@ def main() -> int:
             last_change = active_monotonic()
         now = time.time()
         loop_mono = active_monotonic()
-        fresh_worker_wait, wait_read_succeeded = _read_active_worker_wait(
+        fresh_worker_wait, live_any_wait, wait_read_succeeded = _read_active_worker_wait(
             steer_mailbox,
             args.dispatch_id,
             now_mono=loop_mono,
@@ -4640,6 +4664,23 @@ def main() -> int:
                 terminal_seen_at = None
                 terminal_seen_size = None
                 payload.pop("terminal_marker", None)
+        elif (
+            terminal_seen
+            and wait_read_succeeded
+            and _foreign_wait_owns_question_marker(
+                terminal_seen,
+                live_any_wait,
+                worker_wait,
+                args.dispatch_id,
+            )
+        ):
+            # Exact question marker in this tail, but the live waiter is not
+            # the tracked worker. Do not gate this dispatch on a question it
+            # did not ask.
+            terminal_seen = None
+            terminal_seen_at = None
+            terminal_seen_size = None
+            payload.pop("terminal_marker", None)
         terminal_state = _marker_state(terminal_seen) if terminal_seen else None
         terminal_reason = f"marker:{terminal_seen['kind']}" if terminal_seen else None
         post_terminal_wait = (
