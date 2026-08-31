@@ -2560,6 +2560,71 @@ def test_real_host_closed_stdout_wakes_wait_with_quiet_child(
     assert result.exits == []
 
 
+def test_real_host_closed_stdout_stops_supervisor_promptly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader_fd, writer_fd = os.pipe()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+
+    class ClosePeerDuringWaitHost(supervise.RealHost):
+        close_timer: threading.Timer | None = None
+
+        def wait(
+            self,
+            children: list[object],
+            timeout_s: float,
+        ) -> supervise.WaitResult:
+            if self.close_timer is None:
+                self.close_timer = threading.Timer(0.05, os.close, args=(reader_fd,))
+                self.close_timer.start()
+            return super().wait(children, timeout_s)
+
+    host = ClosePeerDuringWaitHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    started = time.monotonic()
+    try:
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            heartbeat_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            coverage_s=supervise.DEFAULT_SUPERVISOR_HEARTBEAT_S,
+            items=[
+                (
+                    "backup",
+                    _python_child("import time; time.sleep(5)"),
+                )
+            ],
+        )
+        elapsed = time.monotonic() - started
+        children_alive_after_return = [child.alive for child in host._children]
+    finally:
+        if host.close_timer is not None:
+            host.close_timer.cancel()
+            host.close_timer.join(timeout=1.0)
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        try:
+            os.close(reader_fd)
+        except OSError:
+            pass
+        host.kill_all()
+
+    assert elapsed < 1.0
+    assert code == 0
+    assert children_alive_after_return
+    assert not any(children_alive_after_return)
+    assert host.stdout_detector_status().peer_gone
+
+
 def test_real_host_stdout_registration_failure_fails_closed_with_quiet_child(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
