@@ -27,12 +27,14 @@ class _Func:
 
 
 class _Kernel32:
-    def __init__(self, *, handle: int, exit_code: int):
+    def __init__(
+        self, *, handle: int, exit_code: int, exit_query_ok: bool = True
+    ):
         self.OpenProcess = _Func(lambda *_args: handle)
 
         def _exit(_handle, ptr):
             ptr._obj.value = exit_code
-            return True
+            return exit_query_ok
 
         self.GetExitCodeProcess = _Func(_exit)
         self.CloseHandle = _Func(lambda _handle: True)
@@ -92,6 +94,77 @@ def case_windows_pid_liveness_kernel32_load_failure_is_visible() -> None:
             assert exc.errno == 2
         else:
             raise AssertionError("kernel32 load failure must not become unknown")
+
+
+def case_windows_probe_failures_are_indeterminate() -> None:
+    kernel32 = _Kernel32(handle=0, exit_code=0)
+    with patch("goalflight_compat.is_windows", return_value=True), \
+        patch("ctypes.WinDLL", return_value=kernel32, create=True), \
+        patch("ctypes.get_last_error", return_value=8, create=True):
+        assert goalflight_compat.pid_liveness(4242) is None
+        assert goalflight_compat.pid_alive(4242) is True
+
+    kernel32 = _Kernel32(handle=123, exit_code=0, exit_query_ok=False)
+    with patch("goalflight_compat.is_windows", return_value=True), \
+        patch("ctypes.WinDLL", return_value=kernel32, create=True):
+        assert goalflight_compat.pid_liveness(4242) is None
+        assert goalflight_compat.pid_alive(4242) is True
+
+
+def case_windows_openprocess_invalid_parameter_is_dead() -> None:
+    kernel32 = _Kernel32(handle=0, exit_code=0)
+    with patch("goalflight_compat.is_windows", return_value=True), \
+        patch("ctypes.WinDLL", return_value=kernel32, create=True), \
+        patch("ctypes.get_last_error", return_value=87, create=True):
+        assert goalflight_compat.pid_liveness(4242) is False
+        assert goalflight_compat.pid_alive(4242) is False
+
+
+def case_windows_zombie_probe_preserves_unknown() -> None:
+    with patch("goalflight_compat.is_windows", return_value=True), \
+        patch("goalflight_compat.pid_liveness", return_value=None):
+        assert goalflight_compat.pid_is_zombie(4242) is None
+    with patch("goalflight_compat.is_windows", return_value=True), \
+        patch("goalflight_compat.pid_liveness", return_value=True):
+        assert goalflight_compat.pid_is_zombie(4242) is False
+    with patch("goalflight_compat.is_windows", return_value=True), \
+        patch("goalflight_compat.pid_liveness", return_value=False):
+        assert goalflight_compat.pid_is_zombie(4242) is True
+
+
+def case_pid_parameters_require_positive_integers() -> None:
+    invalid_pids = (True, 1.9, 0, -1, None, "1")
+    with patch("goalflight_compat.is_windows", return_value=False), \
+        patch("goalflight_compat.os.kill") as kill, \
+        patch("goalflight_compat.os.killpg") as killpg:
+        for value in invalid_pids:
+            assert goalflight_compat.pid_liveness(value) is False
+            assert goalflight_compat.pid_is_zombie(value) is None
+            assert goalflight_compat.kill_pid(value, process_group=False) is False
+        kill.assert_not_called()
+        killpg.assert_not_called()
+
+    with patch("goalflight_compat.is_windows", return_value=True), \
+        patch(
+            "ctypes.WinDLL",
+            side_effect=AssertionError("invalid PID reached Win32"),
+            create=True,
+        ):
+        for value in invalid_pids:
+            assert goalflight_compat.windows_process_identity(value) is None
+
+
+def case_kill_pid_refuses_init_targets() -> None:
+    with patch("goalflight_compat.is_windows", return_value=False), \
+        patch("goalflight_compat.os.kill") as kill, \
+        patch("goalflight_compat.os.killpg") as killpg:
+        assert goalflight_compat.kill_pid(1, process_group=False) is False
+        assert goalflight_compat.kill_pid(1, process_group=True) is False
+        assert goalflight_compat.kill_pid(4242, pgid=1, process_group=True) is False
+        for pgid in (True, 1.9, 0, -1, "1"):
+            assert goalflight_compat.kill_pid(4242, pgid=pgid, process_group=True) is False
+        kill.assert_not_called()
+        killpg.assert_not_called()
 
 
 def case_posix_pid_probe_error_is_indeterminate() -> None:
@@ -203,6 +276,11 @@ def main() -> None:
     case_windows_access_denied_means_alive()
     case_windows_pid_liveness_without_windll_is_unknown()
     case_windows_pid_liveness_kernel32_load_failure_is_visible()
+    case_windows_probe_failures_are_indeterminate()
+    case_windows_openprocess_invalid_parameter_is_dead()
+    case_windows_zombie_probe_preserves_unknown()
+    case_pid_parameters_require_positive_integers()
+    case_kill_pid_refuses_init_targets()
     case_posix_pid_probe_error_is_indeterminate()
     case_live_pid_probe_error_classifies_indeterminate()
     case_live_ps_probe_error_classifies_indeterminate()

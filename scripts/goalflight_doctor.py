@@ -2766,6 +2766,8 @@ def check_wsl_filesystems(repo: Path, *, fleet_dir: Path | None = None) -> dict:
     }
     details = []
     warnings = []
+    unknown = False
+    running_under_wsl = goalflight_compat.is_wsl()
     for label, path in paths.items():
         drvfs_path = goalflight_compat.is_wsl_drvfs_path(path)
         item = {
@@ -2775,14 +2777,22 @@ def check_wsl_filesystems(repo: Path, *, fleet_dir: Path | None = None) -> dict:
             "filesystem": filesystem_type(path),
         }
         details.append(item)
-        if goalflight_compat.is_wsl() and drvfs_path:
+        if running_under_wsl is True and drvfs_path is True:
             warnings.append(
                 f"{label} is under /mnt/<drive> (DrvFs); use a WSL-native path for reliable flock and worktrees"
             )
+        elif running_under_wsl is True and drvfs_path is None:
+            unknown = True
+    if warnings:
+        ok: bool | None = False
+    elif unknown:
+        ok = None
+    else:
+        ok = True
     return {
         "schema": "goalflight.wsl_filesystems.v1",
-        "is_wsl": goalflight_compat.is_wsl(),
-        "ok": not warnings,
+        "is_wsl": running_under_wsl,
+        "ok": ok,
         "details": details,
         "warnings": warnings,
         "recommendation": "Keep project, state, fleet, and worktree roots on the WSL-native filesystem.",
@@ -3760,6 +3770,17 @@ def collect_human_lines(payload: dict) -> list[str]:
                 False,
                 "WSL DrvFs guard",
                 "; ".join(wsl_filesystems.get("warnings") or []),
+            ),
+            *lines,
+        ]
+    elif wsl_filesystems.get("is_wsl") is True and wsl_filesystems.get("ok") is None:
+        # Payload keeps ok=None for unknown. Human/JSON verdict ignores INFO,
+        # so unknown must WARN or the all-clear returns.
+        lines = [
+            status_line(
+                False,
+                "WSL DrvFs guard",
+                "mount fstype unavailable; DrvFs not ruled out",
             ),
             *lines,
         ]
