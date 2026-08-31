@@ -463,6 +463,7 @@ def test_quiet_worker_with_sleeping_child_is_not_idle_killed(tmp_path: Path) -> 
                 status=status,
                 worker_pid=worker.pid,
                 dispatch_id="quiet-child",
+                liveness_indeterminate_secs="1.2",
             ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -561,6 +562,7 @@ def test_quiet_worker_writing_worktree_is_not_idle_killed(tmp_path: Path) -> Non
                 dispatch_id="quiet-tree",
                 project_root=project_root,
                 worker_cwd=worker_cwd,
+                liveness_indeterminate_secs="1.2",
             ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1275,7 +1277,7 @@ def test_canonical_root_writer_reaches_indeterminate_not_idle_timeout(
         worker.wait(timeout=5)
 
 
-def test_live_descendant_reaches_universal_outer_bound(tmp_path: Path) -> None:
+def test_live_descendant_survives_indeterminate_outer_bound(tmp_path: Path) -> None:
     project_root = tmp_path / "repo"
     worker_cwd = tmp_path / "worktree"
     project_root.mkdir()
@@ -1308,6 +1310,7 @@ def test_live_descendant_reaches_universal_outer_bound(tmp_path: Path) -> None:
         stderr=subprocess.DEVNULL,
     )
     _auto_reap_worker(worker)
+    watcher = None
     try:
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline and not child_pid_file.exists():
@@ -1326,7 +1329,7 @@ def test_live_descendant_reaches_universal_outer_bound(tmp_path: Path) -> None:
         )
         assert count is not None and count >= 1, count
         env["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = "0.0"
-        proc = subprocess.run(
+        watcher = subprocess.Popen(
             _watcher_cmd(
                 tail=tail,
                 status=status,
@@ -1338,32 +1341,43 @@ def test_live_descendant_reaches_universal_outer_bound(tmp_path: Path) -> None:
                 max_idle_secs="0.4",
                 liveness_indeterminate_secs="1.2",
             ),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=15,
             env=env,
         )
+        # Wait past the former universal outer bound. The real descendant walk
+        # remains positive throughout, so this is observed activity, not an
+        # unresolved liveness probe eligible for bounded cleanup.
+        time.sleep(2.0)
         payload = _read_status(status)
-        assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr, payload)
-        assert payload.get("state") == "liveness_indeterminate", payload
+        assert watcher.poll() is None, (
+            watcher.returncode,
+            watcher.stdout.read() if watcher.stdout else "",
+            watcher.stderr.read() if watcher.stderr else "",
+            payload,
+        )
+        assert payload.get("liveness_state") == "running_quiet", payload
+        assert payload.get("state") not in {
+            "idle_timeout",
+            "wedged",
+            "liveness_indeterminate",
+        }, payload
         assert int(payload.get("live_descendants") or 0) >= 1, payload
-        assert "descendants" not in (payload.get("liveness_unknown_probes") or []), payload
-        assert payload.get("worker_disposition") == "terminated_on_liveness_indeterminate", payload
-        assert payload.get("worker_termination_signals") == ["SIGTERM", "SIGKILL"], payload
-        assert worker.poll() is not None, payload
-        deadline = time.monotonic() + 2.0
-        while (
-            time.monotonic() < deadline
-            and goalflight_compat.pid_alive(child_pid)
-            and goalflight_compat.pid_is_zombie(child_pid) is not True
-        ):
-            time.sleep(0.05)
-        assert (
-            not goalflight_compat.pid_alive(child_pid)
-            or goalflight_compat.pid_is_zombie(child_pid) is True
-        ), child_pid
+        assert worker.poll() is None, payload
+        assert goalflight_compat.pid_alive(child_pid), child_pid
     finally:
-        worker.kill()
+        if watcher is not None and watcher.poll() is None:
+            watcher.terminate()
+            try:
+                watcher.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                watcher.kill()
+                watcher.communicate(timeout=5)
+        try:
+            os.killpg(worker.pid, signal.SIGKILL)
+        except OSError:
+            pass
         worker.wait(timeout=5)
 
 

@@ -3531,10 +3531,10 @@ def main() -> int:
         type=float,
         default=None,
         help=(
-            "Universal give-up bound for an event-silent live worker, whether "
-            "activity probes are positive or unavailable. Unknown never counts "
-            "as death. Default is max(--max-idle-secs, 7200), so a 55-minute "
-            "working worker survives with margin. Reaching this terminates the "
+            "Give-up bound for an event-silent worker whose activity probes "
+            "remain unavailable. Unknown never counts as idle, but is bounded; "
+            "positive CPU, descendants, or worktree writes remain live. Default "
+            "is max(--max-idle-secs, 7200). Reaching the bound terminates the "
             "unresolved worker scope, releases its managed capacity lease, and "
             "records liveness_indeterminate, not idle_timeout."
         ),
@@ -3766,8 +3766,8 @@ def main() -> int:
         and dispatch_record_nonterminal_at_startup
     )
 
-    def status_write_allowed() -> bool:
-        """Refuse to recreate an ACP status deliberately retired with its prompt."""
+    def status_write_allowed() -> bool | None:
+        """False refuses recreation; None preserves an unreadable-ledger unknown."""
 
         if status_path.exists() or ignore_prompt_path is None:
             return True
@@ -3803,7 +3803,9 @@ def main() -> int:
         nonlocal engine_session_id, engine_session_recorded
         nonlocal last_payload, final_status_written, working_breadcrumb_written
         nonlocal dispatch_retired
-        if not status_write_allowed():
+        if status_write_allowed() is False:
+            # Unknown is safe-to-keep: retiring requires affirmative evidence
+            # that the dispatch record is absent or terminal.
             dispatch_retired = True
             final_status_written = True
             return {"type": "DispatchRetired", "message": "status recreation refused"}
@@ -4021,7 +4023,9 @@ def main() -> int:
         # Recheck immediately before the atomic status write: cleanup retires
         # prompt first and status second, so a watcher started in that gap must
         # observe the paired absence instead of recreating the cleaned status.
-        if not status_write_allowed():
+        if status_write_allowed() is False:
+            # Recheck keeps the same tri-state rule as the first write. A
+            # transiently unreadable ledger is not proof cleanup retired it.
             dispatch_retired = True
             final_status_written = True
             return {"type": "DispatchRetired", "message": "status recreation refused"}
@@ -4345,11 +4349,13 @@ def main() -> int:
                             idle_tree_age_s = args.max_idle_secs
                         else:
                             idle_tree_age_s = max(0.0, now - tree_sample.newest)
-        low_power_relax = (
-            idle_window_expired
+        starvation_verdict = (
+            system_starved()
+            if idle_window_expired
             and cpu_confirmed_idle(cpu_pct, args.cpu_epsilon)
-            and system_starved()
+            else False
         )
+        low_power_relax = starvation_verdict is not False
         indeterminate_timeout_s = resolve_indeterminate_timeout_s(
             args.max_idle_secs,
             getattr(args, "liveness_indeterminate_secs", None),
@@ -4416,6 +4422,10 @@ def main() -> int:
             ),
             "updated_at": int(now),
         }
+        if starvation_verdict is None:
+            # A failed host-health probe cannot safely disable the only bounded
+            # starvation grace. Unknown is retried because it is not cached.
+            payload["system_starved"] = None
         if idle_window_expired:
             unknown_probes = []
             if live_descendants is None:

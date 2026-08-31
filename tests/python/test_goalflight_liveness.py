@@ -364,7 +364,7 @@ def test_unknown_probes_give_up_as_indeterminate_not_wedged() -> None:
     )
 
 
-def test_positive_probes_give_up_at_the_same_outer_bound() -> None:
+def test_positive_probes_remain_live_past_indeterminate_outer_bound() -> None:
     thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
     for positive in (
         {"pgroup_cpu": 5.0, "live_descendants": 0, "tree_age_s": 30.0},
@@ -395,8 +395,10 @@ def test_positive_probes_give_up_at_the_same_outer_bound() -> None:
                 tree_probe=TREE_PROBE_MEASURED,
                 indeterminate_timeout_s=20.0,
             )
-            == LIVENESS_INDETERMINATE_STATE
+            == "running_quiet"
         )
+
+
 def test_empty_measured_tree_is_stale_not_unknown() -> None:
     thresholds = LivenessThresholds(idle_timeout_s=10.0, cpu_epsilon_pct=0.1)
     assert (
@@ -550,15 +552,51 @@ def test_system_starved_darwin_low_power_low_idle() -> None:
     assert _system_starved_uncached(platform_name="darwin", check_output=fake_check_output) is True
 
 
-def test_system_starved_fail_safe_error_is_false() -> None:
+def test_system_starved_failed_read_is_unknown_and_not_cached() -> None:
     original = goalflight_liveness._system_starved_uncached
     goalflight_liveness._SYSTEM_STARVED_CACHE = None
-    try:
-        goalflight_liveness._system_starved_uncached = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
-        assert system_starved(now=lambda: 1.0, force_refresh=True) is False
-    finally:
-        goalflight_liveness._system_starved_uncached = original
-        goalflight_liveness._SYSTEM_STARVED_CACHE = None
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        sys_root = root / "sys"
+        governor = (
+            sys_root
+            / "devices/system/cpu/cpu0/cpufreq/scaling_governor"
+        )
+        governor.parent.mkdir(parents=True)
+        target = root / "governor-value"
+        governor.symlink_to(target)
+        proc_stat = root / "proc-stat"
+        first = "cpu 100 0 100 800 0 0 0 0\n"
+        second = "cpu 200 0 200 800 0 0 0 0\n"
+        proc_stat.write_text(first, encoding="utf-8")
+        calls = {"count": 0}
+
+        def probe():
+            calls["count"] += 1
+
+            def advance(_seconds: float) -> None:
+                proc_stat.write_text(second, encoding="utf-8")
+
+            return _system_starved_uncached(
+                platform_name="linux",
+                sys_root=sys_root,
+                proc_stat=proc_stat,
+                sleep=advance,
+            )
+
+        try:
+            goalflight_liveness._system_starved_uncached = probe
+            # Dangling governor symlink makes read_text() actually raise. The
+            # failed observation is unknown and must not populate the cache.
+            assert system_starved(now=lambda: 1.0) is None
+            assert goalflight_liveness._SYSTEM_STARVED_CACHE is None
+            target.write_text("powersave\n", encoding="utf-8")
+            proc_stat.write_text(first, encoding="utf-8")
+            assert system_starved(now=lambda: 1.1) is True
+            assert calls["count"] == 2, calls
+        finally:
+            goalflight_liveness._system_starved_uncached = original
+            goalflight_liveness._SYSTEM_STARVED_CACHE = None
 
 
 def test_heartbeat_dead_sample_decision_table() -> None:
@@ -940,11 +978,50 @@ def test_cpu_keep_waiting_transient_none_then_busy_keeps_waiting() -> None:
     assert keep is True and cpu == 7.5, (keep, cpu)
 
 
-def test_cpu_keep_waiting_all_none_is_wedged() -> None:
-    # ps permanently unavailable → every sample None → wedged: correct fallback
-    # to the pre-Phase-1 event-gap cancel (never an infinite hang).
+def test_cpu_keep_waiting_all_none_is_unknown() -> None:
+    # Three unavailable samples are still no CPU verdict; they are not zero.
     keep, cpu = _keep_waiting([None, None, None])
-    assert keep is False and cpu is None, (keep, cpu)
+    assert keep is None and cpu is None, (keep, cpu)
+
+
+def test_cpu_keep_waiting_real_ps_failure_is_unknown() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        bindir = Path(td)
+        ps = bindir / "ps"
+        ps.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        ps.chmod(0o755)
+        previous_path = os.environ.get("PATH")
+        previous_override = os.environ.pop(
+            "GOALFLIGHT_TEST_PGROUP_CPU_PCT", None
+        )
+        os.environ["PATH"] = str(bindir)
+        goalflight_liveness._cpu_samples.clear()
+        try:
+            async def sampler():
+                return await asyncio.to_thread(pgroup_cpu_pct, os.getpid())
+
+            keep, cpu = asyncio.run(
+                cpu_liveness_keep_waiting(
+                    sampler,
+                    0.1,
+                    attempts=3,
+                    resample_s=0.0,
+                    sleep=_noop_sleep,
+                )
+            )
+            assert keep is None and cpu is None, (keep, cpu)
+
+            gate = IdleLivenessGate(0.1, hard_wall_s=100.0, now=lambda: 0.0)
+            keep, cpu = asyncio.run(gate.keep_waiting(sampler))
+            assert keep is True and cpu is None, (keep, cpu)
+        finally:
+            if previous_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = previous_path
+            if previous_override is not None:
+                os.environ["GOALFLIGHT_TEST_PGROUP_CPU_PCT"] = previous_override
+            goalflight_liveness._cpu_samples.clear()
 
 
 def test_idle_gate_busy_keeps_waiting() -> None:
@@ -959,6 +1036,14 @@ def test_idle_gate_idle_is_wedged() -> None:
     assert keep is False and cpu == 0.0, (keep, cpu)
 
 
+def test_idle_gate_unknown_cpu_keeps_waiting() -> None:
+    gate = IdleLivenessGate(0.1, hard_wall_s=100.0, now=lambda: 0.0)
+    keep, cpu = asyncio.run(
+        gate.keep_waiting(_scripted_sampler([None, None, None]))
+    )
+    assert keep is True and cpu is None, (keep, cpu)
+
+
 def test_idle_gate_hard_wall_fires_after_sustained_quiet() -> None:
     clock = {"t": 0.0}
     gate = IdleLivenessGate(0.1, hard_wall_s=10.0, now=lambda: clock["t"])
@@ -971,16 +1056,29 @@ def test_idle_gate_hard_wall_fires_after_sustained_quiet() -> None:
 
 
 def test_idle_gate_hard_wall_also_bounds_idle_or_unknown_cpu() -> None:
-    for samples in ([0.0], [None, None, None]):
-        clock = {"t": 0.0}
-        gate = IdleLivenessGate(0.1, hard_wall_s=10.0, now=lambda: clock["t"])
-        keep, _ = asyncio.run(gate.keep_waiting(_scripted_sampler(samples)))
-        assert keep is False
-        assert gate.hard_wall_expired is False
-        clock["t"] = 10.0
-        keep, _ = asyncio.run(gate.keep_waiting(_scripted_sampler(samples)))
-        assert keep is False
-        assert gate.hard_wall_expired is True
+    idle_clock = {"t": 0.0}
+    idle_gate = IdleLivenessGate(
+        0.1, hard_wall_s=10.0, now=lambda: idle_clock["t"]
+    )
+    keep, _ = asyncio.run(idle_gate.keep_waiting(_scripted_sampler([0.0])))
+    assert keep is False
+    assert idle_gate.hard_wall_expired is False
+
+    unknown_clock = {"t": 0.0}
+    unknown_gate = IdleLivenessGate(
+        0.1, hard_wall_s=10.0, now=lambda: unknown_clock["t"]
+    )
+    keep, _ = asyncio.run(
+        unknown_gate.keep_waiting(_scripted_sampler([None, None, None]))
+    )
+    assert keep is True
+    assert unknown_gate.hard_wall_expired is False
+    unknown_clock["t"] = 10.0
+    keep, _ = asyncio.run(
+        unknown_gate.keep_waiting(_scripted_sampler([None, None, None]))
+    )
+    assert keep is False
+    assert unknown_gate.hard_wall_expired is True
 
 
 def test_idle_gate_event_resets_hard_wall() -> None:
@@ -1265,7 +1363,7 @@ def main() -> None:
     test_starved_short_idle_still_gets_factor_benefit()
     test_not_starved_zero_cpu_still_wedges_at_idle_timeout()
     test_system_starved_darwin_low_power_low_idle()
-    test_system_starved_fail_safe_error_is_false()
+    test_system_starved_failed_read_is_unknown_and_not_cached()
     test_heartbeat_dead_sample_decision_table()
     test_heartbeat_first_token_grace_requires_progress_before_wedge()
     test_heartbeat_wedges_after_first_progress_and_resets_on_new_progress()
@@ -1281,9 +1379,11 @@ def main() -> None:
     test_cpu_keep_waiting_busy_first_sample_keeps_waiting()
     test_cpu_keep_waiting_all_idle_is_wedged()
     test_cpu_keep_waiting_transient_none_then_busy_keeps_waiting()
-    test_cpu_keep_waiting_all_none_is_wedged()
+    test_cpu_keep_waiting_all_none_is_unknown()
+    test_cpu_keep_waiting_real_ps_failure_is_unknown()
     test_idle_gate_busy_keeps_waiting()
     test_idle_gate_idle_is_wedged()
+    test_idle_gate_unknown_cpu_keeps_waiting()
     test_idle_gate_hard_wall_fires_after_sustained_quiet()
     test_idle_gate_event_resets_hard_wall()
     test_cpu_keep_waiting_real_busy_subprocess_keeps_waiting()

@@ -84,6 +84,7 @@ CAPACITY_WAIT_SLEEP_SLICE_S = 0.5
 # bounded so PID/PGID reuse cannot consume a slot forever.
 INDETERMINATE_LIVE_RETENTION_S = 7200
 INDETERMINATE_LIVE_REASON = "liveness_indeterminate_worker_live"
+PROCESS_IDENTITY_SCHEMA = "start-token-v1"
 
 
 CAPACITY_STATE_UNREADABLE = "capacity_state_unreadable"
@@ -406,15 +407,18 @@ def load_state() -> dict:
         ) from exc
     if not isinstance(data, dict):
         raise CapacityStateUnreadable(f"capacity state is not an object: {path}")
-    data.setdefault("schema", SCHEMA)
-    data.setdefault("machine_id", machine_id())
-    data.setdefault("leases", {})
-    data.setdefault("cooldowns", {})
-    if not isinstance(data.get("leases"), dict) or not isinstance(
-        data.get("cooldowns"), dict
-    ):
+    # Only an absent file is authoritative measured-empty. An existing object
+    # without its lease map is incomplete state, not permission to admit.
+    if "leases" not in data or not isinstance(data.get("leases"), dict):
         raise CapacityStateUnreadable(
             f"capacity state has no readable lease map: {path}"
+        )
+    data.setdefault("schema", SCHEMA)
+    data.setdefault("machine_id", machine_id())
+    data.setdefault("cooldowns", {})
+    if not isinstance(data.get("cooldowns"), dict):
+        raise CapacityStateUnreadable(
+            f"capacity state has no readable cooldown map: {path}"
         )
     return data
 
@@ -645,17 +649,22 @@ def _indeterminate_retention_open(
     ``extend_active_lease_expiry`` cannot push the bound because it only
     moves ``expires_at``.
 
-    Live-worker case: ``pid_liveness`` True holds until death; this bound
-    is never applied. A same-uid live worker probes True on POSIX. With no
-    clock at all the hold is refused rather than infinite.
+    Live-worker case: an identity-qualified matching PID holds until death;
+    this bound is never applied. With no lease clock, first observation writes
+    ``liveness_unknown_since`` into the lease mapping. Mutating callers persist
+    that clock, giving unknown a full bounded window without refreshing it on
+    every reconciliation.
     """
     until = parse_iso(lease.get("accounted_live_until"))
     if until is None:
-        origin = parse_iso(lease.get("started_at")) or parse_iso(
-            lease.get("expires_at")
+        origin = (
+            parse_iso(lease.get("started_at"))
+            or parse_iso(lease.get("expires_at"))
+            or parse_iso(lease.get("liveness_unknown_since"))
         )
         if origin is None:
-            return False
+            origin = now or utc_now()
+            lease["liveness_unknown_since"] = iso(origin)
         until = origin + dt.timedelta(seconds=float(INDETERMINATE_LIVE_RETENTION_S))
     return (now or utc_now()) < until
 
@@ -665,6 +674,44 @@ def _probe_pid_liveness(pid: object) -> bool | None:
     if not pid:
         return False
     return goalflight_compat.pid_liveness(pid)
+
+
+def _process_start_identity(pid: object) -> dict | None:
+    """Capture the fine process-generation token used to reject PID reuse."""
+    try:
+        parsed_pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if parsed_pid <= 0:
+        return None
+    return goalflight_compat.process_start_identity(parsed_pid)
+
+
+def _lease_identity_for_pid(lease: dict, pid: object) -> dict | None:
+    try:
+        parsed_pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    for role in ("worker", "controller", "claimant"):
+        try:
+            role_pid = int(lease.get(f"{role}_pid"))
+        except (TypeError, ValueError):
+            continue
+        identity = lease.get(f"{role}_identity")
+        if role_pid == parsed_pid and isinstance(identity, dict):
+            return identity
+    return None
+
+
+def _pid_generation_matches(pid: object, lease: dict) -> bool | None:
+    """Match a live PID to its recorded start token; None means unavailable."""
+    expected = _lease_identity_for_pid(lease, pid)
+    expected_token = expected.get("start_token") if expected else None
+    current = _process_start_identity(pid)
+    current_token = current.get("start_token") if current else None
+    if not expected_token or not current_token:
+        return None
+    return current_token == expected_token
 
 
 def _pid_holds_capacity(
@@ -682,7 +729,18 @@ def _pid_holds_capacity(
     """
     live = _probe_pid_liveness(pid)
     if live is True:
-        return True
+        expected = _lease_identity_for_pid(lease, pid)
+        if expected is None:
+            # Legacy leases had only a PID, so preserve their conservative live
+            # behavior. New leases mark the identity schema even when capture
+            # failed; that explicit unknown gets bounded retention, not forever.
+            if lease.get("process_identity_schema") == PROCESS_IDENTITY_SCHEMA:
+                return _indeterminate_retention_open(lease, now=now)
+            return True
+        generation_matches = _pid_generation_matches(pid, lease)
+        if generation_matches is None:
+            return _indeterminate_retention_open(lease, now=now)
+        return generation_matches
     if live is False:
         return False
     return _indeterminate_retention_open(lease, now=now)
@@ -746,6 +804,14 @@ def attached_worker_group_holds_capacity(lease: dict) -> bool:
     """Keep an attached worker accounted until its full group is confirmed gone."""
     if not lease.get("worker_pgid"):
         return False
+    worker_pid = lease.get("worker_pid")
+    if (
+        _probe_pid_liveness(worker_pid) is True
+        and _pid_generation_matches(worker_pid, lease) is False
+    ):
+        # The live process group belongs to a reused leader generation, not the
+        # recorded worker. Group existence cannot overrule a start-token mismatch.
+        return False
     # Confirmed-live group: hold (descendants may outlive a dead leader).
     # Unprobeable group: the same 7200s bound as pid reclaim, not infinite.
     group_alive = _process_group_liveness(lease.get("worker_pgid"))
@@ -753,7 +819,11 @@ def attached_worker_group_holds_capacity(lease: dict) -> bool:
         return True
     if group_alive is None:
         return _indeterminate_retention_open(lease)
-    return _pid_holds_capacity(lease.get("worker_pid"), lease)
+    if _lease_identity_for_pid(lease, worker_pid) is None:
+        # A dead recorded group plus a live unqualified PID is the classic reuse
+        # shape. Keep it for a bounded indeterminate window, never forever.
+        return _indeterminate_retention_open(lease)
+    return _pid_holds_capacity(worker_pid, lease)
 
 
 def _lease_pids_dead(lease: dict) -> bool:
@@ -839,9 +909,17 @@ def detach_lease_to_worker(lease_id: str | None, worker_pid: int, reason: object
         lease = data.get("leases", {}).get(lease_id)
         if not lease:
             return False
+        worker_identity = _process_start_identity(worker_pid)
+        lease["process_identity_schema"] = PROCESS_IDENTITY_SCHEMA
         lease["worker_pid"] = worker_pid
+        lease.pop("worker_identity", None)
+        if worker_identity is not None:
+            lease["worker_identity"] = worker_identity
         lease.setdefault("detached_controller_pid", lease.get("controller_pid"))
         lease["controller_pid"] = worker_pid
+        lease.pop("controller_identity", None)
+        if worker_identity is not None:
+            lease["controller_identity"] = worker_identity
         lease["detached_at"] = iso()
         lease["detached_reason"] = reason
         save_state(data)
@@ -1259,9 +1337,14 @@ def cmd_acquire(args: argparse.Namespace) -> int:
             "mem_mb": rss_mb,
             "priority": priority,
             "state": "active",
+            "process_identity_schema": PROCESS_IDENTITY_SCHEMA,
             "started_at": iso(),
             "expires_at": iso(utc_now() + ttl),
         }
+        for role in ("controller", "claimant", "worker"):
+            identity = _process_start_identity(lease.get(f"{role}_pid"))
+            if identity is not None:
+                lease[f"{role}_identity"] = identity
         data.setdefault("leases", {})[lease_id] = lease
         save_state(data)
     print(json.dumps({"decision": "allow", "lease": lease, "profile": prof}, sort_keys=True))

@@ -33,14 +33,14 @@ LOW_POWER_RELAX_FACTOR = 3.0
 # hang. So a starved worker waits at most idle_timeout + 10min before wedging,
 # preserving the fail-fast / no-multi-hour-hang invariant regardless of config.
 LOW_POWER_RELAX_CAP_S = 600.0
-# Give-up bound when a liveness probe cannot determine its answer. Unknown
+# Give-up bound when every applicable liveness probe remains unknown. Unknown
 # never counts as death (the b-238 class: a failed `ps` on a busy box looks
 # like "no children"). Waiting forever stalls finalization. 7200s is 2 hours:
 # a 55-minute working worker (b-238) survives with ~65 minutes of margin,
 # and the bound matches the dispatch lease TTL cap. Known-idle still dies at
-# idle_timeout; positive or cannot-tell probes keep the worker until this outer
-# event-silence bound, then start bounded cleanup. Capacity remains held unless
-# that cleanup proves the full worker group is dead.
+# idle_timeout; positive activity remains live, while cannot-tell probes keep
+# the worker until this outer event-silence bound and then start bounded cleanup.
+# Capacity remains held unless that cleanup proves the full worker group is dead.
 INDETERMINATE_LIVENESS_FLOOR_S = 7200.0
 LIVENESS_INDETERMINATE_STATE = "liveness_indeterminate"
 TREE_PROBE_SKIPPED = "skipped"
@@ -173,7 +173,7 @@ def _darwin_idle_pct(
     return _parse_last_idle_pct(output)
 
 
-def _linux_powersave_governor(sys_root: Path = Path("/sys")) -> bool:
+def _linux_powersave_governor(sys_root: Path = Path("/sys")) -> bool | None:
     governor_paths = list(
         (sys_root / "devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_governor")
     )
@@ -184,7 +184,7 @@ def _linux_powersave_governor(sys_root: Path = Path("/sys")) -> bool:
         try:
             governors.append(governor_path.read_text(encoding="utf-8").strip().lower())
         except OSError:
-            return False
+            return None
     return bool(governors) and all(governor == "powersave" for governor in governors)
 
 
@@ -230,25 +230,42 @@ def _system_starved_uncached(
     platform_name: str | None = None,
     check_output: Callable[..., str] = subprocess.check_output,
     sleep: Callable[[float], None] = time.sleep,
-) -> bool:
+    sys_root: Path = Path("/sys"),
+    proc_stat: Path = Path("/proc/stat"),
+) -> bool | None:
     platform = platform_name or sys.platform
     if platform == "darwin":
         low_power = _darwin_low_power_mode_enabled(check_output)
         idle_pct = _darwin_idle_pct(check_output) if low_power else None
     elif platform.startswith("linux"):
-        low_power = _linux_powersave_governor()
-        idle_pct = _linux_idle_pct(sleep=sleep) if low_power else None
+        low_power = _linux_powersave_governor(sys_root)
+        if low_power is None:
+            return None
+        idle_pct = (
+            _linux_idle_pct(sleep=sleep, proc_stat=proc_stat)
+            if low_power
+            else None
+        )
     else:
         return False
-    return bool(low_power and idle_pct is not None and idle_pct < SYSTEM_STARVED_IDLE_PCT)
+    if not low_power:
+        return False
+    if idle_pct is None:
+        return None
+    return idle_pct < SYSTEM_STARVED_IDLE_PCT
 
 
 def system_starved(
     *,
     now: Callable[[], float] = time.monotonic,
     force_refresh: bool = False,
-) -> bool:
-    """Best-effort low-power + low-idle detector. Any failure returns False."""
+) -> bool | None:
+    """Low-power + low-idle verdict; None means the probe could not run.
+
+    Unknown is deliberately not cached as healthy. The watcher grants the same
+    bounded grace as starvation for that decision, then retries on its next
+    poll instead of suppressing the safeguard for the cache TTL.
+    """
     global _SYSTEM_STARVED_CACHE
     t = now()
     if (
@@ -260,7 +277,9 @@ def system_starved(
     try:
         starved = _system_starved_uncached()
     except Exception:
-        starved = False
+        return None
+    if starved is None:
+        return None
     _SYSTEM_STARVED_CACHE = (t, starved)
     return starved
 
@@ -631,8 +650,9 @@ def classify_liveness(
         seconds_since_event is not None and seconds_since_event >= give_up_s
     )
     if descendants_alive or tree_alive or cpu_alive:
-        if give_up_expired:
-            return LIVENESS_INDETERMINATE_STATE
+        # Positive activity is a liveness verdict, not an unresolved probe.
+        # The outer bound exists only to bound "could not tell"; killing here
+        # would turn affirmative CPU/child/tree evidence into worker death.
         return "running_quiet"
 
     unknown = (
@@ -815,7 +835,7 @@ async def cpu_liveness_keep_waiting(
     attempts: int = 3,
     resample_s: float = 0.5,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-) -> tuple[bool, float | None]:
+) -> tuple[bool | None, float | None]:
     """Decide whether a silent worker is running_quiet (keep waiting) vs wedged.
 
     Called when an ACP worker has emitted no events for a full idle window.
@@ -826,10 +846,9 @@ async def cpu_liveness_keep_waiting(
     CPU-sample-failure grace (codex 2026-05-20 P2): ``sampler`` returns None on
     a transient ``ps`` failure. One failed sample must NOT be read as "0 CPU =
     wedged" — that would reintroduce the false positive. Re-sampling rides out a
-    transient blip. Only when EVERY sample is None or at/below epsilon do we
-    return ``(False, last)`` → wedged, so the caller cancels. (If ``ps`` is
-    permanently unavailable on the platform, every sample is None and we
-    correctly fall back to the pre-Phase-1 event-gap cancel.)
+    transient blip. A numeric sample at/below epsilon proves idle and returns
+    ``(False, cpu)`` after the resample window. If every sample is ``None``, the
+    helper returns ``(None, None)``: unavailable CPU is not an idle verdict.
 
     This is the runner-side transient-failure grace. The watchers
     (``goalflight_watch.py``, ``watch-dispatch-tail.sh``) mirror the same intent
@@ -840,13 +859,18 @@ async def cpu_liveness_keep_waiting(
     real worker or real delays.
     """
     last_cpu: float | None = None
+    last_measured_cpu: float | None = None
     for attempt in range(max(1, attempts)):
         last_cpu = await sampler()
-        if last_cpu is not None and last_cpu > cpu_epsilon_pct:
-            return True, last_cpu
+        if last_cpu is not None:
+            last_measured_cpu = last_cpu
+            if last_cpu > cpu_epsilon_pct:
+                return True, last_cpu
         if attempt < attempts - 1:
             await sleep(resample_s)
-    return False, last_cpu
+    if last_measured_cpu is None:
+        return None, None
+    return False, last_measured_cpu
 
 
 class IdleLivenessGate:
@@ -895,4 +919,12 @@ class IdleLivenessGate:
             self._hard_wall_expired = True
             return False, None
         self._hard_wall_expired = False
-        return await cpu_liveness_keep_waiting(sampler, self.cpu_epsilon_pct)
+        verdict, cpu = await cpu_liveness_keep_waiting(
+            sampler, self.cpu_epsilon_pct
+        )
+        if verdict is None:
+            # The ACP idle callback consumes a boolean. Its safe action for an
+            # unavailable CPU verdict is to keep the worker until the separate,
+            # bounded indeterminate wall can act; False would assert a wedge.
+            return True, cpu
+        return verdict, cpu
