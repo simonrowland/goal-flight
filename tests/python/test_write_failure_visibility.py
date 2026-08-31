@@ -9,6 +9,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 import sys
 
@@ -269,6 +270,57 @@ def test_startup_claim_distinguishes_contract_from_transient(
         result = call()
         assert result["claimed"] is False
         assert result["reason"] == "claim_failed"
+
+
+@pytest.mark.parametrize("fault_site", ("claim", "post_claim"))
+def test_startup_integrity_conflict_returns_structured_slug(
+    isolated: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_site: str,
+) -> None:
+    identity = {"pid": 123, "start_token": "start"}
+    monkeypatch.setattr(
+        session_status,
+        "_resolve_optional_incarnation",
+        lambda *_args, **_kwargs: ({"pid": 123, "process_identity": identity}, None),
+    )
+    conflict = sqlite3.IntegrityError("historical nonce collision")
+    if fault_site == "claim":
+        monkeypatch.setattr(
+            session_status,
+            "claim_session",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(conflict),
+        )
+    else:
+        monkeypatch.setattr(
+            session_status,
+            "claim_session",
+            lambda *_args, **_kwargs: {"id": "nonce", "label": "alpha"},
+        )
+        monkeypatch.setattr(
+            session_status,
+            "live_session",
+            lambda *_args, **_kwargs: {"id": "nonce"},
+        )
+        monkeypatch.setattr(
+            session_status,
+            "_listener_depth_after_claim",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(conflict),
+        )
+
+    result = session_status.claim_controller_startup(
+        isolated,
+        pid=123,
+        label="alpha",
+        hold_lock=fault_site == "post_claim",
+    )
+
+    assert result == {
+        "claimed": False,
+        "reason": "claim_conflict",
+        "message": "controller startup could not claim 'alpha'",
+        "label": "alpha",
+    }
 
 
 @pytest.mark.parametrize(

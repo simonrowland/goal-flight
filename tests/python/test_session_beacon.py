@@ -458,15 +458,32 @@ def test_reused_pid_reconnects_without_takeover_when_identity_no_longer_matches(
         lambda pid: {"pid": pid, "start_token": tokens[pid]},
     )
     first = sessions.claim_session(root, pid=71001, label="controller")
-    tokens[71001] = "reused-generation"
-    result = sessions.claim_controller_startup(
+    holder = wake.register_lease_holder(
         root,
-        pid=71001,
-        label="controller",
-        role="controller",
-        session_id=first["id"],
+        controller_label="controller",
+        lease_nonce=first["lease_nonce"],
     )
+    identity_checks: list[tuple[int, str]] = []
+    monkeypatch.setattr(compat, "pid_liveness", lambda _pid: True)
+
+    def identity_mismatch(pid: int, start_token: str) -> bool:
+        identity_checks.append((pid, start_token))
+        return False
+
+    monkeypatch.setattr(compat, "process_identity_matches", identity_mismatch)
+    tokens[71001] = "reused-generation"
+    try:
+        result = sessions.claim_controller_startup(
+            root,
+            pid=71001,
+            label="controller",
+            role="controller",
+            session_id=first["id"],
+        )
+    finally:
+        holder.close()
     assert result["claimed"] is True
+    assert identity_checks == [(71001, "first-generation")]
     assert result["session"]["generation"] == first["generation"] + 1
     assert result["session"]["id"] != first["id"]
     ended = next(
@@ -476,6 +493,43 @@ def test_reused_pid_reconnects_without_takeover_when_identity_no_longer_matches(
     )
     assert ended["state"] == "EXPIRED"
     assert ended["ended_reason"] == "holder-dead"
+
+
+def test_name_only_reconnect_discards_historical_ambient_nonce(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A nonce from N-1 cannot collide while replacing generation N."""
+    root = _root(monkeypatch, tmp_path)
+    identities = {
+        71001: {"pid": 71001, "start_token": "returning"},
+        71002: {"pid": 71002, "start_token": "incumbent"},
+    }
+    monkeypatch.setattr(sessions, "_controller_process_identity", identities.get)
+    first = sessions.claim_controller_startup(
+        root, pid=71001, label="alpha", role="controller", environ={}
+    )
+    second = sessions.claim_controller_startup(
+        root, pid=71002, label="alpha", role="controller", environ={}
+    )
+    assert first["claimed"] is True and second["claimed"] is True
+
+    result = sessions.claim_controller_startup(
+        root,
+        pid=71001,
+        label="alpha",
+        role="controller",
+        environ={sessions.CONTROLLER_SESSION_ID_ENV: first["session"]["id"]},
+    )
+
+    assert result["claimed"] is True
+    assert result["session"]["generation"] == second["session"]["generation"] + 1
+    assert result["session"]["id"] not in {
+        first["session"]["id"],
+        second["session"]["id"],
+    }
+    rows = journal.Journal(root).lease_records(include_ended=True)
+    assert len(rows) == 3
+    assert len({row["nonce"] for row in rows}) == 3
 
 
 def test_controller_startup_reconnects_dead_pid_lease_without_takeover(

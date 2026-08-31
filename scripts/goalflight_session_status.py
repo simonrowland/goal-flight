@@ -1116,6 +1116,7 @@ def claim_controller_startup(
     hold_lock: bool = False,
 ) -> dict:
     """Best-effort startup registration; observability must never block work."""
+    resolved_label: str | None = None
     try:
         env = os.environ if environ is None else environ
         resolved_role = str(role or env.get("GOALFLIGHT_PROCESS_ROLE") or "controller").strip()
@@ -1155,7 +1156,14 @@ def claim_controller_startup(
             project_root,
             pid=resolved_pid,
             label=effective_label,
-            session_id=resolve_controller_session_id(session_id, environ=env),
+            # Startup reconnects by label and measured process identity. A
+            # carried nonce that is not the incumbent is only a historical
+            # record, and reusing it can violate the all-generation UNIQUE
+            # constraint. Discarding it here is simpler and truer to that
+            # identity contract than making allocation search old generations:
+            # same-principal renewal recovers the incumbent nonce from the
+            # journal, while every replacement receives a fresh nonce.
+            session_id=None,
             process_identity=process_identity,
             takeover=takeover,
             hold_lock=hold_lock,
@@ -1189,6 +1197,24 @@ def claim_controller_startup(
                 "reason": "controller_label_conflict",
                 "conflicting_beacons": live["conflicting_beacons"],
             }
+        result = {"claimed": True, "session": record}
+        if effective_label != resolved_label:
+            result["adopted_label"] = effective_label
+            result["requested_label"] = resolved_label
+        if resolution.get("warning"):
+            result["warnings"] = [resolution["warning"]]
+        depth = _listener_depth_after_claim(
+            project_root,
+            effective_label,
+            str(record["id"]),
+        )
+        if depth is not None:
+            supervisor = str(depth.get("supervisor") or "")
+            if supervisor == goalflight_wake.SUPERVISOR_RUNNING:
+                result["wake_supervisor"] = supervisor
+            else:
+                result["listener_depth"] = depth
+        return result
     except (
         goalflight_journal.JournalBusy,
         goalflight_journal.JournalDisappeared,
@@ -1198,6 +1224,19 @@ def claim_controller_startup(
             "claimed": False,
             "reason": "claim_failed",
             "error_type": type(exc).__name__,
+        }
+    except sqlite3.IntegrityError:
+        conflict_label = (
+            resolved_label
+            or str(label or "").strip()
+            or Path(project_root).name
+            or "controller"
+        )
+        return {
+            "claimed": False,
+            "reason": "claim_conflict",
+            "message": f"controller startup could not claim '{conflict_label}'",
+            "label": conflict_label,
         }
     except goalflight_journal.JournalError:
         raise
@@ -1215,24 +1254,6 @@ def claim_controller_startup(
             "reason": "claim_failed",
             "error_type": type(exc).__name__,
         }
-    result = {"claimed": True, "session": record}
-    if effective_label != resolved_label:
-        result["adopted_label"] = effective_label
-        result["requested_label"] = resolved_label
-    if resolution.get("warning"):
-        result["warnings"] = [resolution["warning"]]
-    depth = _listener_depth_after_claim(
-        project_root,
-        effective_label,
-        str(record["id"]),
-    )
-    if depth is not None:
-        supervisor = str(depth.get("supervisor") or "")
-        if supervisor == goalflight_wake.SUPERVISOR_RUNNING:
-            result["wake_supervisor"] = supervisor
-        else:
-            result["listener_depth"] = depth
-    return result
 
 
 def register_controller(
