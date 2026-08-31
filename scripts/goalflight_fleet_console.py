@@ -1822,6 +1822,12 @@ def _controller_contexts_by_session(
             "wake_mode": (
                 wake_mode if wake_mode in {"persistent", "portable"} else None
             ),
+            # Internal attention-plane evidence.  A partially covered pool
+            # still has live waiters, so the coarse controller classifier can
+            # remain ALIVE even though a supervised slot is permanently
+            # stopped.  Keep the computed status instead of reconstructing it
+            # from a test double or sampling the wake ledger a second time.
+            "wake_coverage": wake_coverage,
             "in_flight_count": in_flight_count,
             "last_seen": last_seen,
             "last_error": _controller_unknown_error(
@@ -3007,7 +3013,17 @@ def _controller_attention_rows(
             open_if_missing=False,
         )
         for session_id, context in sorted(contexts.items()):
-            if context.get("liveness_state") != "HUNG":
+            coverage = context.get("wake_coverage")
+            coverage = coverage if isinstance(coverage, dict) else {}
+            live = coverage.get("live_waiters")
+            target = coverage.get("target_waiters")
+            coverage_shortfall = (
+                isinstance(live, int)
+                and isinstance(target, int)
+                and live < target
+            )
+            is_hung = context.get("liveness_state") == "HUNG"
+            if not is_hung and not coverage_shortfall:
                 continue
             raw_label_value = context.get("label")
             raw_label = (
@@ -3031,6 +3047,9 @@ def _controller_attention_rows(
                     "display_label": display_label,
                     "generation": generation,
                     "generation_text": generation_text,
+                    "coverage": coverage,
+                    "coverage_shortfall": coverage_shortfall,
+                    "is_hung": is_hung,
                 }
             )
 
@@ -3057,6 +3076,13 @@ def _controller_attention_rows(
         generation = candidate["generation"]
         generation_text = str(candidate["generation_text"])
         session_id = str(candidate["session_id"])
+        is_hung = bool(candidate["is_hung"])
+        coverage_shortfall = bool(candidate["coverage_shortfall"])
+        if not is_hung and (
+            not coverage_shortfall
+            or supervisor != goalflight_wake.SUPERVISOR_RUNNING
+        ):
+            continue
         component_command = goalflight_wake.listener_start_command(
             root,
             controller_label=raw_label,
@@ -3078,28 +3104,38 @@ def _controller_attention_rows(
             )
         elif supervisor == goalflight_wake.SUPERVISOR_RUNNING:
             # spawn_due will not respawn a permanently stopped slot, so a
-            # live supervisor plus HUNG is an unrepairable shortfall. The
+            # live supervisor plus a measured shortfall is unrepairable. The
             # only safe action is the supervisor restart (b-244/b-260);
             # a direct listen beside it permanently stops that slot.
-            status = goalflight_wake.coverage_status(
-                root,
-                controller_label=raw_label,
-                lease_nonce=session_id,
-            )
+            status = candidate["coverage"]
+            if not isinstance(status, dict) or not status:
+                status = goalflight_wake.coverage_status(
+                    root,
+                    controller_label=raw_label,
+                    lease_nonce=session_id,
+                )
             missing = ",".join(
                 str(name)
                 for name in (status.get("missing_components") or [])
             )
             reason = str(status.get("reason") or "").strip()
-            detail_bits = []
+            sampled_live = status.get("live_waiters")
+            sampled_target = status.get("target_waiters")
+            detail_bits = (
+                [f"{sampled_live}/{sampled_target}"]
+                if isinstance(sampled_live, int)
+                and isinstance(sampled_target, int)
+                else []
+            )
             if missing:
                 detail_bits.append(f"missing={missing}")
             if reason:
                 detail_bits.append(f"reason={reason}")
-            extra = f" ({'; '.join(detail_bits)})" if detail_bits else ""
+            detail = f" {'; '.join(detail_bits)};" if detail_bits else ""
+            state = "HUNG" if is_hung else "wake coverage incomplete"
             headline = (
-                f"Controller {display_label}{generation_text} is HUNG: "
-                f"live supervisor will not repair a stopped slot{extra}"
+                f"Controller {display_label}{generation_text} {state}:"
+                f"{detail} live-supervisor stopped slot needs restart"
             )
         else:
             headline = (
