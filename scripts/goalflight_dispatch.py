@@ -5236,24 +5236,65 @@ def _resolve_controller_dispatch_owner(
     return nonce, pid, label
 
 
-def _unregistered_controller_warning() -> str:
-    reseat = shlex.join(
+def _controller_reconnect_slug(
+    args,
+    project_root: Path,
+    *,
+    sessions: list[dict] | None = None,
+) -> str:
+    """Pick the one name slug a bounce command should name."""
+    requested = getattr(args, "_requested_controller_label", None)
+    if requested:
+        return str(requested)
+    declared = _declared_controller_label(args, project_root)
+    if declared:
+        return declared
+    if sessions:
+        labels = [
+            str(session.get("label") or "")
+            for session in sessions
+            if session.get("label")
+        ]
+        unique = list(dict.fromkeys(labels))
+        if len(unique) == 1:
+            return unique[0]
+    resolved = goalflight_session_status.resolve_controller_label(
+        None,
+        project_root=project_root,
+    )
+    if resolved:
+        return resolved
+    return str(goalflight_task.resolve_project_root(str(project_root)).name[:64])
+
+
+def _controller_reconnect_command(label: str) -> str:
+    return shlex.join(
         [
             "python3",
             str(goalflight_compat.advertised_script("goalflight_session_status.py")),
             "--controller-startup",
             "--controller-pid-from-ancestry",
+            "--session-label",
+            label,
         ]
     )
-    return "\n".join(
-        [
-            "controller is not registered; the default path refuses before record or "
-            "launch, while an --unregistered-forced dispatch is recorded with no "
-            "owner and its terminal event will wake every controller in the project.",
-            reseat,
-            "Use --unregistered-forced to override and launch without a recorded owner.",
-        ]
+
+
+def _controller_not_connected_warning(label: str) -> str:
+    """One copy-pasteable reconnect instruction naming only the slug.
+
+    Running exactly this command reconnects by label. It must not mention
+    --takeover, a nonce, or --unregistered-forced: those are operator
+    choices, and a returning controller reconnects automatically by name.
+    """
+    return (
+        "controller not connected; reconnect as: "
+        + _controller_reconnect_command(label)
     )
+
+
+def _unregistered_controller_warning(label: str) -> str:
+    return _controller_not_connected_warning(label)
 
 
 def _controller_registry_unreadable_warning(reason: str) -> str:
@@ -5311,16 +5352,7 @@ def _registered_dispatch_command(args, session: dict) -> str:
 
 
 def _controller_not_in_ancestry_warning(session: dict) -> str:
-    return "\n".join(
-        [
-            "controller "
-            f"{session.get('label')} is kernel-live under pid {session.get('pid')}, "
-            "but that holder is not in this invocation's process ancestry; refusing "
-            "to attribute this dispatch to the incumbent.",
-            "Use --unregistered-forced to override and launch without a recorded "
-            "owner.",
-        ]
-    )
+    return _controller_not_connected_warning(str(session.get("label") or "controller"))
 
 
 def _controller_registration_warning(
@@ -5335,101 +5367,12 @@ def _controller_registration_warning(
         return _controller_registry_unreadable_warning(
             lookup.unreadable_reason or "unclassified registry read failure"
         )
-    sessions = lookup.sessions
-    if not sessions:
-        return _unregistered_controller_warning()
-
-    requested_label = getattr(args, "_requested_controller_label", None)
-    requested_pid = getattr(args, "_requested_controller_pid", None)
-    same_label = [
-        session
-        for session in sessions
-        if requested_label is not None
-        and str(session.get("label") or "") == str(requested_label)
-    ]
-    if len(sessions) == 1:
-        session = sessions[0]
-        if requested_pid is not None and int(session.get("pid") or 0) != int(
-            requested_pid
-        ):
-            return "\n".join(
-                [
-                    "controller "
-                    f"{session.get('label')} is kernel-live under pid "
-                    f"{session.get('pid')}, not requested pid {requested_pid}; "
-                    "refusing to adopt or displace the incumbent.",
-                    "Use --unregistered-forced to override and launch without a "
-                    "recorded owner.",
-                ]
-            )
-        if not _controller_session_is_in_ancestry(session):
-            return _controller_not_in_ancestry_warning(session)
-        return "\n".join(
-            [
-                "a kernel-live controller exists, but this dispatch invocation did "
-                "not identify it; live controller label: "
-                f"{session.get('label')}.",
-                _registered_dispatch_command(args, session),
-                "Use --unregistered-forced to override and launch without a "
-                "recorded owner.",
-            ]
-        )
-
-    if requested_pid is not None:
-        incumbent = next(
-            (
-                session
-                for session in same_label or sessions
-                if int(session.get("pid") or 0) != int(requested_pid)
-            ),
-            None,
-        )
-        if incumbent is not None and (same_label or len(sessions) == 1):
-            return "\n".join(
-                [
-                    "controller "
-                    f"{incumbent.get('label')} is kernel-live under pid "
-                    f"{incumbent.get('pid')}, not requested pid {requested_pid}; "
-                    "refusing to adopt or displace the incumbent.",
-                    "Use --unregistered-forced to override and launch without a "
-                    "recorded owner.",
-                ]
-            )
-
-    exact = [
-        session
-        for session in sessions
-        if (requested_label is None or str(session.get("label")) == str(requested_label))
-        and (requested_pid is None or int(session.get("pid") or 0) == int(requested_pid))
-    ]
-    if len(exact) == 1:
-        session = exact[0]
-        if not _controller_session_is_in_ancestry(session):
-            return _controller_not_in_ancestry_warning(session)
-        return "\n".join(
-            [
-                "a kernel-live controller exists, but this dispatch invocation did "
-                "not identify it; live controller label: "
-                f"{session.get('label')}.",
-                _registered_dispatch_command(args, session),
-                "Use --unregistered-forced to override and launch without a "
-                "recorded owner.",
-            ]
-        )
-
-    incumbents = ", ".join(
-        f"{session.get('label')} (pid {session.get('pid')})" for session in sessions
+    slug = _controller_reconnect_slug(
+        args,
+        project_root,
+        sessions=lookup.sessions,
     )
-    return "\n".join(
-        [
-            "controller identity is ambiguous; multiple kernel-live controllers "
-            f"exist for this project: {incumbents}.",
-            "Refusing to guess an owner; identify one with --controller-label, "
-            "--controller-pid, and --controller-session-id.",
-            "Use --unregistered-forced to override and launch without a recorded "
-            "owner.",
-        ]
-    )
+    return _controller_not_connected_warning(slug)
 
 
 def _prepare_attempt_controller_registration(
@@ -16857,10 +16800,10 @@ def _existing_cwd_arg(value: str) -> str:
     A nonexistent --cwd used to flow into resolve_project_root, whose
     not-a-checkout fallback renders the path as its own project root. The
     dispatch then landed on an empty controller registry and refused with
-    "controller is not registered", recommending --unregistered-forced -- an
-    operator following that advice launched an unowned dispatch into a phantom
-    project root for what was actually a path typo (t337-w3/w4/w5). Refusing
-    here fires before any registry lookup, so that advice is never reached.
+    an identity bounce -- an operator following that advice launched into a
+    phantom project root for what was actually a path typo (t337-w3/w4/w5).
+    Refusing here fires before any registry lookup, so that advice is never
+    reached.
     """
     expanded = Path(str(value)).expanduser()
     if not expanded.exists():
@@ -17076,8 +17019,9 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         "--takeover",
         action="store_true",
         help=(
-            "deliberately supersede a live different holder of --controller-label; "
-            "dead holders are replaced automatically"
+            "deliberately supersede a proven live different holder of "
+            "--controller-label; a returning session reconnects by name when "
+            "the incumbent is not a proven live different session"
         ),
     )
     parser.add_argument("--controller-beacon-pid", type=int, help=argparse.SUPPRESS)

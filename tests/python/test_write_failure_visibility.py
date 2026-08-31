@@ -9,6 +9,8 @@ import inspect
 import json
 import os
 from pathlib import Path
+import sqlite3
+import subprocess
 from types import SimpleNamespace
 import sys
 
@@ -236,14 +238,20 @@ def test_beacon_claim_distinguishes_contract_from_transient(
 
 
 @pytest.mark.parametrize(
-    ("error", "raises"),
-    ((ValueError("bad startup claim"), True), (OSError("temporary startup I/O"), False)),
+    "error",
+    (
+        ValueError("bad startup claim"),
+        OSError("temporary startup I/O"),
+        sqlite3.OperationalError("database or disk is full"),
+        json.JSONDecodeError("Expecting value", "{", 0),
+        journal.JournalIntegrityError("journal failed integrity check"),
+        journal.JournalUpgradeRequired("journal requires upgrade"),
+    ),
 )
-def test_startup_claim_distinguishes_contract_from_transient(
+def test_startup_claim_faults_are_structured_at_process_boundary(
     isolated: Path,
     monkeypatch: pytest.MonkeyPatch,
     error: Exception,
-    raises: bool,
 ) -> None:
     identity = {"pid": 123, "start_token": "start"}
     monkeypatch.setattr(
@@ -257,18 +265,190 @@ def test_startup_claim_distinguishes_contract_from_transient(
         "claim_session",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
     )
-    call = lambda: session_status.claim_controller_startup(
+    result = session_status.claim_controller_startup(
         isolated,
         pid=123,
         label="controller",
     )
-    if raises:
-        with pytest.raises(ValueError, match="bad startup claim"):
-            call()
+    assert result["claimed"] is False
+    assert result["reason"] == "claim_failed"
+    assert result["error_type"] == type(error).__name__
+
+
+def _run_controller_startup_main(
+    project: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> dict:
+    host = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        return_code = session_status.main(
+            [
+                "--project-root",
+                str(project),
+                "--controller-startup",
+                "--session-pid",
+                str(host.pid),
+                "--session-label",
+                "controller",
+            ]
+        )
+    finally:
+        host.kill()
+        host.wait(timeout=3)
+    streams = capsys.readouterr()
+    assert return_code == 0
+    assert "Traceback" not in streams.out
+    assert "Traceback" not in streams.err
+    return json.loads(streams.out)
+
+
+def _install_sqlite_full_claim_trigger(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE disk_fill (payload BLOB NOT NULL)")
+        connection.execute(
+            """CREATE TRIGGER fill_disk_during_controller_claim
+               BEFORE INSERT ON controller_leases
+               BEGIN
+                   INSERT INTO disk_fill VALUES (zeroblob(1048576));
+               END"""
+        )
+        connection.commit()
+
+
+def test_controller_startup_disk_full_returns_structured_result_without_traceback(
+    isolated: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    authority = journal.open_or_create_journal(isolated)
+    _install_sqlite_full_claim_trigger(authority.path)
+    original_connect = journal.Journal._connect
+
+    def connect_at_page_limit(self, *args, **kwargs):
+        connection = original_connect(self, *args, **kwargs)
+        if not getattr(self, "_read_only_client", False):
+            page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
+            connection.execute(f"PRAGMA max_page_count = {page_count}")
+        return connection
+
+    monkeypatch.setattr(journal.Journal, "_connect", connect_at_page_limit)
+
+    result = _run_controller_startup_main(isolated, capsys)
+
+    assert result == {
+        "claimed": False,
+        "reason": "claim_failed",
+        "error_type": "OperationalError",
+    }
+
+
+def test_controller_startup_corrupt_principal_returns_structured_result_without_traceback(
+    isolated: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    authority = journal.open_or_create_journal(isolated)
+    claimed = authority.claim_or_renew_lease(
+        "controller",
+        principal={"pid": 73002, "start_token": "corrupt-principal"},
+    )
+    assert claimed.committed and claimed.value is not None
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute(
+            "UPDATE controller_leases SET principal_json = '{' WHERE state = 'ACTIVE'"
+        )
+    result = _run_controller_startup_main(isolated, capsys)
+
+    assert result == {
+        "claimed": False,
+        "reason": "claim_failed",
+        "error_type": "JSONDecodeError",
+    }
+
+
+@pytest.mark.parametrize(
+    ("journal_fault", "error_type"),
+    (
+        ("upgrade", "JournalUpgradeRequired"),
+        ("integrity", "JournalIntegrityError"),
+    ),
+)
+def test_controller_startup_journal_error_returns_structured_result_without_traceback(
+    isolated: Path,
+    capsys: pytest.CaptureFixture[str],
+    journal_fault: str,
+    error_type: str,
+) -> None:
+    authority = journal.open_or_create_journal(isolated)
+    with sqlite3.connect(authority.path) as connection:
+        if journal_fault == "upgrade":
+            ahead = journal.CURRENT_SCHEMA_EPOCH + 1
+            connection.execute(
+                """UPDATE journal_epochs
+                   SET schema_epoch = ?, protocol_epoch = ?, registry_epoch = ?,
+                       minimum_reader_epoch = ?, minimum_writer_epoch = ?
+                   WHERE singleton = 1""",
+                (ahead, ahead, ahead, ahead, ahead),
+            )
+        else:
+            connection.execute("DROP TABLE journal_meta")
+    result = _run_controller_startup_main(isolated, capsys)
+
+    assert result == {
+        "claimed": False,
+        "reason": "claim_failed",
+        "error_type": error_type,
+    }
+
+
+@pytest.mark.parametrize("fault_site", ("claim", "post_claim"))
+def test_startup_integrity_conflict_returns_structured_slug(
+    isolated: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_site: str,
+) -> None:
+    identity = {"pid": 123, "start_token": "start"}
+    monkeypatch.setattr(
+        session_status,
+        "_resolve_optional_incarnation",
+        lambda *_args, **_kwargs: ({"pid": 123, "process_identity": identity}, None),
+    )
+    conflict = sqlite3.IntegrityError("historical nonce collision")
+    if fault_site == "claim":
+        monkeypatch.setattr(
+            session_status,
+            "claim_session",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(conflict),
+        )
     else:
-        result = call()
-        assert result["claimed"] is False
-        assert result["reason"] == "claim_failed"
+        monkeypatch.setattr(
+            session_status,
+            "claim_session",
+            lambda *_args, **_kwargs: {"id": "nonce", "label": "alpha"},
+        )
+        monkeypatch.setattr(
+            session_status,
+            "live_session",
+            lambda *_args, **_kwargs: {"id": "nonce"},
+        )
+        monkeypatch.setattr(
+            session_status,
+            "_listener_depth_after_claim",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(conflict),
+        )
+
+    result = session_status.claim_controller_startup(
+        isolated,
+        pid=123,
+        label="alpha",
+        hold_lock=fault_site == "post_claim",
+    )
+
+    assert result == {
+        "claimed": False,
+        "reason": "claim_conflict",
+        "message": "controller startup could not claim 'alpha'",
+        "label": "alpha",
+    }
 
 
 @pytest.mark.parametrize(

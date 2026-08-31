@@ -486,6 +486,105 @@ def _lease_holder_liveness(
     )
 
 
+def _combine_liveness_probes(*probes: bool | None) -> bool | None:
+    """Three-valued AND: False (dead) dominates; True only if every probe is True.
+
+    UNKNOWN (None) is not coerced to life or death. A dead PID behind an
+    UNKNOWN lock is still dead; a live PID behind an UNKNOWN lock stays
+    UNKNOWN.
+    """
+    if any(probe is False for probe in probes):
+        return False
+    if any(probe is None for probe in probes):
+        return None
+    return True
+
+
+def _incumbent_liveness_state(
+    lease: goalflight_journal.LeaseIdentity,
+) -> bool | None:
+    """Return True/False/None from lock, PID, and identity without collapsing.
+
+    A stranger may replace an incumbent only when a probe positively proves
+    that generation dead. Failure to prove life is not proof of death: None
+    stays None. Returning sessions are recognized separately by same-principal
+    renewal or ancestry, so UNKNOWN here must not become True (that stalls
+    reconnect as ``label_in_use``) and must not become False (that expires a
+    live generation whose probe was merely unavailable).
+    """
+    lock_alive = goalflight_wake.lease_holder_alive(
+        lease.project_root,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    pid = lease.principal.get("pid")
+    start_token = lease.principal.get("start_token")
+    if pid is None:
+        # principal_id leases have no process to re-measure; the lock is the
+        # only witness. True/False/None pass through unchanged.
+        return lock_alive
+    if not isinstance(pid, int) or pid <= 0:
+        return _combine_liveness_probes(lock_alive, None)
+    pid_alive = goalflight_compat.pid_liveness(pid)
+    if not isinstance(start_token, str) or not start_token:
+        return _combine_liveness_probes(lock_alive, pid_alive, None)
+    return _combine_liveness_probes(
+        lock_alive,
+        pid_alive,
+        goalflight_compat.process_identity_matches(pid, start_token),
+    )
+
+
+def _incumbent_principal_is_in_claimant_ancestry(
+    lease: goalflight_journal.LeaseIdentity,
+    principal: dict[str, object],
+) -> bool:
+    """Whether the declared claimant descends from the recorded generation."""
+    pid = lease.principal.get("pid")
+    start_token = lease.principal.get("start_token")
+    claimant_pid = principal.get("pid")
+    if (
+        not isinstance(pid, int)
+        or pid <= 0
+        or not isinstance(start_token, str)
+        or not start_token
+        or not isinstance(claimant_pid, int)
+        or claimant_pid <= 0
+    ):
+        return False
+    return any(
+        process.get("pid") == pid and process.get("start_token") == start_token
+        for process in _controller_process_ancestry(claimant_pid)
+    )
+
+
+def _claim_incumbent_liveness(
+    lease: goalflight_journal.LeaseIdentity | None,
+    principal: dict[str, object],
+    *,
+    takeover: bool = False,
+    returning_self: bool = False,
+) -> goalflight_journal.LeaseLivenessEvidence | None:
+    """Measure the incumbent without converting UNKNOWN into death.
+
+    ``alive=False`` is reserved for a positive death probe. ``alive=None`` is
+    the third state and is passed through for the caller to resolve. Same-
+    principal renewals, ancestry-proven returns, and explicit takeovers do
+    not depend on this three-probe evidence, so they keep the direct lock
+    measurement (UNKNOWN lock does not invent death or life there either).
+    """
+    measured = _lease_holder_liveness(lease)
+    if lease is None or measured is None:
+        return measured
+    if takeover or returning_self or _same_lease_principal(lease, principal):
+        return measured
+    return goalflight_journal.LeaseLivenessEvidence(
+        generation=lease.generation,
+        nonce=lease.nonce,
+        alive=_incumbent_liveness_state(lease),
+    )
+
+
 def _auto_claim_refusal_reason(
     *,
     role: str,
@@ -835,9 +934,33 @@ def claim_session(
         "hostname": socket.gethostname(),
     }
     incumbent = authority.active_lease(resolved_label)
-    incumbent_liveness = _lease_holder_liveness(incumbent)
     same_principal = _same_lease_principal(incumbent, principal)
-    if same_principal and incumbent is not None:
+    returning_self = bool(
+        incumbent is not None
+        and not same_principal
+        and _incumbent_principal_is_in_claimant_ancestry(incumbent, principal)
+    )
+    # Call-site resolution of UNKNOWN (alive=None from _claim_incumbent_liveness):
+    # a stranger needs a positive death probe before this label can move, so
+    # UNKNOWN does not authorize expiry. A claimant in the recorded holder's
+    # ancestry is other evidence of the same session: renew under the recorded
+    # principal and never enter the takeover gate. UNKNOWN must not be widened
+    # to alive=True here; that would refuse ordinary return-after-restart once
+    # a later probe (dead PID, released lock) proves the generation gone.
+    claim_principal = (
+        dict(incumbent.principal)
+        if returning_self and incumbent is not None and not takeover
+        else principal
+    )
+    holder_pid = claim_principal.get("pid")
+    holder_start_token = claim_principal.get("start_token")
+    incumbent_liveness = _claim_incumbent_liveness(
+        incumbent,
+        principal,
+        takeover=takeover,
+        returning_self=returning_self,
+    )
+    if (same_principal or returning_self) and incumbent is not None and not takeover:
         candidate_nonce = incumbent.nonce
     elif session_id and (incumbent is None or session_id != incumbent.nonce):
         candidate_nonce = session_id
@@ -847,7 +970,7 @@ def claim_session(
     needs_holder = bool(
         hold_lock
         and not (
-            same_principal
+            (same_principal or returning_self)
             and incumbent_liveness is not None
             and incumbent_liveness.alive is True
         )
@@ -860,20 +983,26 @@ def claim_session(
         )
     )
     if needs_holder:
+        if not isinstance(holder_pid, int) or not isinstance(holder_start_token, str):
+            raise RuntimeError("controller lease holder identity is unavailable")
         holder = _start_lock_holder(
             root,
             label=resolved_label,
             nonce=candidate_nonce,
-            pid=pid,
-            start_token=str(process_identity["start_token"]),
+            pid=holder_pid,
+            start_token=holder_start_token,
         )
-    result = authority.claim_or_renew_lease(
-        resolved_label,
-        principal=principal,
-        nonce=candidate_nonce if hold_lock else session_id,
-        takeover=takeover,
-        incumbent_liveness=incumbent_liveness,
-    )
+    try:
+        result = authority.claim_or_renew_lease(
+            resolved_label,
+            principal=claim_principal,
+            nonce=candidate_nonce if hold_lock else session_id,
+            takeover=takeover,
+            incumbent_liveness=incumbent_liveness,
+        )
+    except Exception:
+        _stop_lock_holder(holder)
+        raise
     if not result.committed or result.value is None:
         _stop_lock_holder(holder)
         raise RuntimeError(result.reason or "controller lease claim failed")
@@ -887,11 +1016,20 @@ def claim_session(
         except (OSError, RuntimeError, ValueError):
             _stop_lock_holder(holder)
             raise
+    lease_pid = lease.principal.get("pid")
+    lease_start_token = lease.principal.get("start_token")
+    lease_process_identity = (
+        {"pid": lease_pid, "start_token": lease_start_token}
+        if isinstance(lease_pid, int)
+        and isinstance(lease_start_token, str)
+        and lease_start_token
+        else process_identity
+    )
     return {
         "id": lease.nonce,
         "lease_nonce": lease.nonce,
         "generation": lease.generation,
-        "pid": pid,
+        "pid": lease_pid if isinstance(lease_pid, int) else pid,
         "started_at": lease.claimed_at,
         "heartbeat_at": lease.renewed_at,
         "renew_deadline_at": lease.renew_deadline_at,
@@ -899,7 +1037,7 @@ def claim_session(
         "beacon": True,
         "controller_registry": True,
         "label": lease.label,
-        "process_identity": process_identity,
+        "process_identity": lease_process_identity,
         "kernel_lock_held": bool(
             _lease_holder_liveness(lease) is not None
             and _lease_holder_liveness(lease).alive is True
@@ -1052,6 +1190,7 @@ def claim_controller_startup(
     hold_lock: bool = False,
 ) -> dict:
     """Best-effort startup registration; observability must never block work."""
+    resolved_label: str | None = None
     try:
         env = os.environ if environ is None else environ
         resolved_role = str(role or env.get("GOALFLIGHT_PROCESS_ROLE") or "controller").strip()
@@ -1091,7 +1230,14 @@ def claim_controller_startup(
             project_root,
             pid=resolved_pid,
             label=effective_label,
-            session_id=resolve_controller_session_id(session_id, environ=env),
+            # Startup reconnects by label and measured process identity. A
+            # carried nonce that is not the incumbent is only a historical
+            # record, and reusing it can violate the all-generation UNIQUE
+            # constraint. Discarding it here is simpler and truer to that
+            # identity contract than making allocation search old generations:
+            # same-principal renewal recovers the incumbent nonce from the
+            # journal, while every replacement receives a fresh nonce.
+            session_id=None,
             process_identity=process_identity,
             takeover=takeover,
             hold_lock=hold_lock,
@@ -1102,11 +1248,13 @@ def claim_controller_startup(
                 "reason": "controller_label_mismatch",
                 "existing_label": record.get("label"),
             }
+        record_pid = record.get("pid")
+        verification_pid = record_pid if isinstance(record_pid, int) else resolved_pid
         if hold_lock:
             live = live_session(
                 project_root,
                 label=effective_label,
-                pid=resolved_pid,
+                pid=verification_pid,
             )
         else:
             lease = goalflight_journal.Journal.open_reader(project_root).active_lease(
@@ -1114,7 +1262,7 @@ def claim_controller_startup(
             )
             live = (
                 {"id": lease.nonce}
-                if lease is not None and lease.principal.get("pid") == resolved_pid
+                if lease is not None and lease.principal.get("pid") == verification_pid
                 else None
             )
         if not isinstance(live, dict) or live.get("id") != record.get("id"):
@@ -1125,6 +1273,24 @@ def claim_controller_startup(
                 "reason": "controller_label_conflict",
                 "conflicting_beacons": live["conflicting_beacons"],
             }
+        result = {"claimed": True, "session": record}
+        if effective_label != resolved_label:
+            result["adopted_label"] = effective_label
+            result["requested_label"] = resolved_label
+        if resolution.get("warning"):
+            result["warnings"] = [resolution["warning"]]
+        depth = _listener_depth_after_claim(
+            project_root,
+            effective_label,
+            str(record["id"]),
+        )
+        if depth is not None:
+            supervisor = str(depth.get("supervisor") or "")
+            if supervisor == goalflight_wake.SUPERVISOR_RUNNING:
+                result["wake_supervisor"] = supervisor
+            else:
+                result["listener_depth"] = depth
+        return result
     except (
         goalflight_journal.JournalBusy,
         goalflight_journal.JournalDisappeared,
@@ -1135,9 +1301,25 @@ def claim_controller_startup(
             "reason": "claim_failed",
             "error_type": type(exc).__name__,
         }
-    except goalflight_journal.JournalError:
-        raise
-    except (ImportError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+    except sqlite3.IntegrityError:
+        conflict_label = (
+            resolved_label
+            or str(label or "").strip()
+            or Path(project_root).name
+            or "controller"
+        )
+        return {
+            "claimed": False,
+            "reason": "claim_conflict",
+            "message": f"controller startup could not claim '{conflict_label}'",
+            "label": conflict_label,
+        }
+    except Exception as exc:
+        # --controller-startup is a process boundary: storage exhaustion,
+        # malformed journal data, journal compatibility/integrity failures,
+        # optional dependency faults, and unexpected contract errors must all
+        # become one structured result. BaseException remains outside so real
+        # process-control signals such as KeyboardInterrupt/SystemExit work.
         detail = str(exc)
         if "label in use" in detail:
             return {
@@ -1151,24 +1333,6 @@ def claim_controller_startup(
             "reason": "claim_failed",
             "error_type": type(exc).__name__,
         }
-    result = {"claimed": True, "session": record}
-    if effective_label != resolved_label:
-        result["adopted_label"] = effective_label
-        result["requested_label"] = resolved_label
-    if resolution.get("warning"):
-        result["warnings"] = [resolution["warning"]]
-    depth = _listener_depth_after_claim(
-        project_root,
-        effective_label,
-        str(record["id"]),
-    )
-    if depth is not None:
-        supervisor = str(depth.get("supervisor") or "")
-        if supervisor == goalflight_wake.SUPERVISOR_RUNNING:
-            result["wake_supervisor"] = supervisor
-        else:
-            result["listener_depth"] = depth
-    return result
 
 
 def register_controller(
@@ -3290,15 +3454,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.controller_startup:
-        result = claim_controller_startup(
-            project_root,
-            pid=args.session_pid,
-            label=args.session_label,
-            pid_from_ancestry=args.controller_pid_from_ancestry,
-            session_id=args.controller_session_id,
-            takeover=args.takeover,
-            hold_lock=True,
-        )
+        # Outer process boundary: claim_controller_startup already structures
+        # unexpected faults, but this CLI arm must still never print a
+        # traceback. A controller that cannot parse startup output does not start.
+        try:
+            result = claim_controller_startup(
+                project_root,
+                pid=args.session_pid,
+                label=args.session_label,
+                pid_from_ancestry=args.controller_pid_from_ancestry,
+                session_id=args.controller_session_id,
+                takeover=args.takeover,
+                hold_lock=True,
+            )
+        except Exception as exc:
+            result = {
+                "claimed": False,
+                "reason": "claim_failed",
+                "error_type": type(exc).__name__,
+            }
         if result.get("claimed"):
             _index_controller_project(project_root)
         adopted_label = result.get("adopted_label")

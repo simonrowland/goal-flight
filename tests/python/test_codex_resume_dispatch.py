@@ -1086,11 +1086,11 @@ def test_main_reports_resume_rebuild_usage_error_without_traceback(
 
     assert rc == 64
     error = capsys.readouterr().err
-    assert "controller is not registered" in error
-    assert "--unregistered-forced" in error
-    assert error.endswith(
-        "goalflight_dispatch: resume home rebuild refused\n"
-    )
+    assert "controller not connected; reconnect as:" in error
+    assert "--session-label" in error
+    assert "--takeover" not in error
+    assert "goalflight_dispatch: resume home rebuild refused" in error
+    assert "Traceback" not in error
 
 
 def test_blocked_capacity_resume_status_preserves_full_lineage(
