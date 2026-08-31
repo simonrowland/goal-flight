@@ -638,10 +638,10 @@ def check_controller_lease_liveness(project_root: Path) -> dict:
                 "journal path presence is unreadable, so absence is unverified: "
                 f"{journal_path}"
             ),
-            "active_controller_leases_in_project": 0,
-            "active_but_dead_controller_leases_in_project": 0,
-            "unknown_controller_lease_holders_in_project": 0,
-            "leases": [],
+            "active_controller_leases_in_project": None,
+            "active_but_dead_controller_leases_in_project": None,
+            "unknown_controller_lease_holders_in_project": None,
+            "leases": None,
         }
     try:
         records = goalflight_journal.Journal.open_reader(resolved_root).lease_records()
@@ -655,10 +655,10 @@ def check_controller_lease_liveness(project_root: Path) -> dict:
             "present": True,
             "project_root": str(resolved_root),
             "error": f"{type(exc).__name__}: {exc}",
-            "active_controller_leases_in_project": 0,
-            "active_but_dead_controller_leases_in_project": 0,
-            "unknown_controller_lease_holders_in_project": 0,
-            "leases": [],
+            "active_controller_leases_in_project": None,
+            "active_but_dead_controller_leases_in_project": None,
+            "unknown_controller_lease_holders_in_project": None,
+            "leases": None,
         }
     except (goalflight_journal.JournalError, OSError, ValueError) as exc:
         return {
@@ -666,10 +666,10 @@ def check_controller_lease_liveness(project_root: Path) -> dict:
             "present": True,
             "project_root": str(resolved_root),
             "error": f"{type(exc).__name__}: {exc}",
-            "active_controller_leases_in_project": 0,
-            "active_but_dead_controller_leases_in_project": 0,
-            "unknown_controller_lease_holders_in_project": 0,
-            "leases": [],
+            "active_controller_leases_in_project": None,
+            "active_but_dead_controller_leases_in_project": None,
+            "unknown_controller_lease_holders_in_project": None,
+            "leases": None,
         }
 
     leases: list[dict[str, object]] = []
