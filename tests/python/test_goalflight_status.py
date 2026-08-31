@@ -26,6 +26,26 @@ def check(name: str, cond: bool) -> None:
         _FAILS.append(name)
 
 
+# check() deliberately records every failed condition instead of raising on the
+# first, so one run reports all of them; main() turns that into exit 1 and the
+# canonical suite (tests/run.sh routes this module as a direct script) goes red.
+# pytest, however, calls the test functions directly and never reaches main(),
+# so `pytest <file>::<test>` reported a guaranteed-false check as "1 passed".
+# That is the invocation a worker uses to show a new test passing. This
+# teardown reports failures recorded during each test to pytest while keeping
+# the collect-them-all behaviour intact.
+_REPORTED_FAILS = 0
+
+
+def teardown_function(function) -> None:
+    del function
+    global _REPORTED_FAILS
+    if len(_FAILS) > _REPORTED_FAILS:
+        new = _FAILS[_REPORTED_FAILS:]
+        _REPORTED_FAILS = len(_FAILS)
+        raise AssertionError(f"{len(new)} failed check(s): {new}")
+
+
 def sample_payload() -> dict:
     return {
         "schema": "goalflight.status.aggregate.v1",
