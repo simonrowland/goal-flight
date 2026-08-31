@@ -1849,7 +1849,8 @@ def test_live_waiters_distinguishes_deleted_ledger_from_genuine_zero(
         assert directory.is_dir()
         shutil.rmtree(directory)
         assert wake.live_waiters(root, controller_label="wake-test") is None
-        assert wake.coverage_status(root, controller_label="wake-test") == {
+        unavailable = wake.coverage_status(root, controller_label="wake-test")
+        assert unavailable == {
             "covered": False,
             "reason": "waiter-probe-unavailable",
             "live_waiters": None,
@@ -1857,6 +1858,11 @@ def test_live_waiters_distinguishes_deleted_ledger_from_genuine_zero(
             "waiters": [],
             "monitor": {"required": False, "state": "not-applicable"},
         }
+        assert wake.coverage_rearm_commands(
+            unavailable,
+            root,
+            controller_label="wake-test",
+        ) == []
     finally:
         holder.close()
 
@@ -2022,6 +2028,99 @@ def test_lockfile_content_never_claims_liveness(isolated: tuple[Path, dict[str, 
     assert not stale_path.exists()
 
 
+def test_indeterminate_waiter_identity_probe_preserves_live_path(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _env = isolated
+    registration = wake.register_waiter(
+        root,
+        controller_label="wake-test",
+        kind="listener",
+    )
+    path = registration.record.path
+    try:
+        monkeypatch.setattr(
+            wake.goalflight_compat,
+            "process_start_identity",
+            lambda _pid: None,
+        )
+
+        assert wake.live_waiters(root, controller_label="wake-test") is None
+        assert path.exists()
+    finally:
+        registration.close()
+
+
+def test_persistent_unavailable_waiters_still_publish_watchdog_state(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sibling identity UNKNOWN must not drop the watchdog key."""
+    root, _env = isolated
+    authority = journal.open_or_create_journal(root)
+    claimed = authority.claim_or_renew_lease(
+        "wake-test",
+        principal={"principal_id": "watchdog-key-unavailable"},
+    )
+    assert claimed.committed and claimed.value is not None
+    lease = claimed.value
+    holder = wake.register_lease_holder(
+        root,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    listener = wake.register_waiter(
+        root,
+        controller_label=lease.label,
+        kind="listener",
+        generation_key=lease.nonce,
+    )
+    try:
+        wake.activate_monitor_state(
+            root,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+            heartbeat_s=120,
+            dead_after_s=360,
+        )
+        monkeypatch.setattr(
+            wake.goalflight_compat,
+            "process_start_identity",
+            lambda _pid: None,
+        )
+        assert wake.live_waiters(
+            root,
+            controller_label=lease.label,
+            generation_key=lease.nonce,
+        ) is None
+        status = wake.coverage_status(
+            root,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        )
+        assert status["reason"] == "waiter-probe-unavailable"
+        assert status["live_waiters"] is None
+        assert status["wake_mode"] == "persistent"
+        assert status["watchdog"] == {
+            "required": True,
+            "state": "missing",
+            "observed": 0,
+        }
+        assert status["missing_components"] == ["watchdog"]
+        commands = wake.coverage_rearm_commands(
+            status,
+            root,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        )
+        assert commands
+        assert all("--watch-follow" in command for command in commands)
+    finally:
+        listener.close()
+        holder.close()
+
+
 def test_waiter_coverage_rejects_transient_fork_inheritance(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
@@ -2061,11 +2160,18 @@ time.sleep(60)
         while not orphaned.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert orphaned.exists(), "fork child did not outlive its recorded owner"
-        # Sandboxed macOS may deny `ps` for a zombie that libproc no longer
-        # exposes. UNKNOWN is deliberately the same fail-noisy direction.
-        assert wake.goalflight_compat.pid_is_zombie(holder.pid) is not False
-        assert wake.live_waiters(root, controller_label="wake-test") == []
-        assert not Path(path_text).exists()
+        # A confirmed zombie is dead and may be pruned. If the sandbox makes
+        # that probe indeterminate, retain the inherited lock path: UNKNOWN is
+        # not cleanup authority even though coverage must stay fail-noisy.
+        zombie = wake.goalflight_compat.pid_is_zombie(holder.pid)
+        assert zombie is not False
+        observed = wake.live_waiters(root, controller_label="wake-test")
+        if zombie is True:
+            assert observed == []
+            assert not Path(path_text).exists()
+        else:
+            assert observed is None
+            assert Path(path_text).exists()
         holder.wait(timeout=3)
     finally:
         if holder.poll() is None:

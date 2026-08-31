@@ -774,9 +774,11 @@ def test_unknown_coverage_is_not_rendered_as_zero_shortfall(
     assert wake.coverage_rearm_hint(plan) == ""
 
     result = doctor.check_wake_coverage(project)
-    assert result["ok"] is True
+    assert result["ok"] is None
     pool = result["pools"][0]
     assert pool["supervisor"] == wake.SUPERVISOR_RUNNING
+    assert pool["ok"] is None
+    assert pool.get("reason") == "waiter-probe-unavailable"
     for field in (
         "covered",
         "live_waiters",
@@ -788,6 +790,7 @@ def test_unknown_coverage_is_not_rendered_as_zero_shortfall(
         _minimal_doctor_payload(result)  # type: ignore[arg-type]
     )
     line = next(line for line in lines if "wake coverage hint-ctl" in line)
+    assert "coverage=unknown" in line
     assert "supervisor=running" in line
     assert "coverage-probe=" not in line
     assert "0/" not in line

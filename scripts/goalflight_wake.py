@@ -646,7 +646,7 @@ def claim_watchdog_death_report(
     *,
     controller_label: str,
     lease_nonce: str,
-) -> bool:
+) -> bool | None:
     """First doorbell in this lease generation announces a missing watchdog.
 
     Without this the announcement is LEVEL-triggered: a missing watchdog lock
@@ -678,7 +678,10 @@ def claim_watchdog_death_report(
     except FileExistsError:
         return False
     except OSError:
-        return False
+        # UNKNOWN must remain distinct from a proven prior claim. The witness
+        # can then surface the watchdog death instead of suppressing the only
+        # doorbell on an operation that never committed.
+        return None
     os.close(fd)
     return True
 
@@ -2324,6 +2327,7 @@ def live_waiters(
             else None
         )
         live: list[WaiterRecord] = []
+        indeterminate = False
         for name in names:
             path = directory / name
             record = _parse_waiter_path(path)
@@ -2338,24 +2342,76 @@ def live_waiters(
                 continue
             lock_state = _probe_locked_state_at(directory_fd, name)
             identity = goalflight_compat.process_start_identity(record.pid)
-            owner_matches = bool(
-                isinstance(identity, dict)
-                and identity.get("start_token")
-                and _start_hash(identity["start_token"]) == record.start_hash
-                and goalflight_compat.pid_is_zombie(record.pid) is False
-            )
-            if owner_matches and lock_state is True:
+            liveness = goalflight_compat.pid_liveness(record.pid)
+            zombie = goalflight_compat.pid_is_zombie(record.pid)
+            if liveness is False or zombie is True:
+                owner_matches: bool | None = False
+            elif isinstance(identity, dict) and identity.get("start_token"):
+                token_matches = (
+                    _start_hash(identity["start_token"]) == record.start_hash
+                )
+                owner_matches = (
+                    False
+                    if not token_matches
+                    else True
+                    if zombie is False
+                    else None
+                )
+            else:
+                owner_matches = None
+            if owner_matches is True and lock_state is True:
                 live.append(record)
-            elif prune_dead:
+            elif owner_matches is False or lock_state is False:
+                if not prune_dead:
+                    continue
                 try:
                     _unlink_at(directory_fd, name)
                 except OSError:
                     pass
+            else:
+                # A held lock with an unavailable process/identity probe may
+                # still belong to the recorded live waiter. Preserve its path
+                # and report UNKNOWN for the aggregate instead of converting
+                # missing evidence into cleanup authority. This intentionally
+                # has no TTL: the path does not count as live, while deleting
+                # it by age could erase the only witness for a live waiter.
+                # Any later determinate lock/identity probe performs cleanup.
+                indeterminate = True
+        if indeterminate:
+            return None
         return sorted(live, key=lambda row: (row.kind, row.pid, row.instance_id))
     except OSError:
         return None
     finally:
         os.close(directory_fd)
+
+
+def _watchdog_lock_state(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str | None,
+) -> str:
+    """Return live, missing, or unknown for this generation's watchdog lock.
+
+    The aggregate waiter probe may be UNKNOWN because a sibling listener
+    identity is unreadable. The watchdog lock is a separate path: probe it
+    alone rather than omitting the watchdog key or copying the aggregate
+    unknown onto a definite missing/live claim.
+    """
+    nonce = str(lease_nonce or "").strip()
+    label = str(controller_label or "").strip()
+    if not nonce or not label:
+        return "unknown"
+    observed = live_waiters(
+        project_root,
+        controller_label=label,
+        generation_key=nonce,
+        kinds={WATCHDOG_KIND},
+    )
+    if observed is None:
+        return "unknown"
+    return "live" if observed else "missing"
 
 
 def lease_holder_alive(
@@ -2445,7 +2501,7 @@ def coverage_status(
         target_waiters = (
             persistent_wake_target() if persistent else listener_slot_count()
         )
-        return {
+        payload: dict[str, object] = {
             "covered": False,
             "reason": "waiter-probe-unavailable",
             "live_waiters": None,
@@ -2461,8 +2517,26 @@ def coverage_status(
                     else "not-applicable"
                 ),
             },
-            **({"wake_mode": "persistent"} if persistent else {}),
         }
+        if persistent:
+            payload["wake_mode"] = "persistent"
+            watchdog_state = _watchdog_lock_state(
+                project_root,
+                controller_label=str(controller_label),
+                lease_nonce=lease_nonce,
+            )
+            payload["watchdog"] = {
+                "required": True,
+                "state": watchdog_state,
+                "observed": (
+                    None
+                    if watchdog_state == "unknown"
+                    else int(watchdog_state == "live")
+                ),
+            }
+            if watchdog_state == "missing":
+                payload["missing_components"] = ["watchdog"]
+        return payload
     monitor_waiters = [row for row in waiters if row.kind == MONITOR_KIND]
     portable_waiters = [row for row in waiters if row.kind == "listener"]
     watchdog_waiters = [row for row in waiters if row.kind == WATCHDOG_KIND]
@@ -2749,9 +2823,12 @@ def coverage_rearm_commands(
 ) -> list[str]:
     """Return exact tracked-task commands for the missing wake components."""
     live = status.get("live_waiters")
-    target = int(status.get("target_waiters") or listener_slot_count())
-    missing = max(0, target - (live if isinstance(live, int) else 0))
     if status.get("wake_mode") != "persistent":
+        if not isinstance(live, int):
+            # UNKNOWN depth is not a zero-live shortfall.
+            return []
+        target = int(status.get("target_waiters") or listener_slot_count())
+        missing = max(0, target - live)
         command = listener_start_command(
             project_root,
             controller_label=controller_label,
