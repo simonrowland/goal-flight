@@ -52,7 +52,30 @@ TEST_DIR = REPO_ROOT / "tests" / "python"
 # pytest-native module as a script calls its test functions with no fixtures
 # and reports a false failure.
 sys.path.insert(0, str(TEST_DIR))
-from support import has_main_driver  # noqa: E402
+from support import (  # noqa: E402
+    acp_sdk_unavailable_reason,
+    has_main_driver,
+    requires_acp_sdk,
+)
+
+SKIPPED = "skipped"
+
+
+def _interpreter_for(module: Path) -> Path:
+    """Mirror tests/python/test_script_style_modules.py::_interpreter_for.
+
+    Modules declaring REQUIRES_ACP_SDK run under a configured ACP venv, not the
+    interpreter running this gate. Without this the gate runs them under an
+    interpreter with no `acp` and reports FAILED where the canonical driver
+    routes or skips — inflating the failure count in the tool used to decide
+    whether a change is safe.
+    """
+    if requires_acp_sdk(module) and os.name != "nt":
+        configured = os.environ.get("GOALFLIGHT_ACP_PYTHON")
+        if configured:
+            return Path(configured).expanduser()
+        return Path.home() / ".goal-flight/venvs/acp-0.10/bin/python"
+    return Path(sys.executable)
 
 PASSED, FAILED, INCOMPLETE = "passed", "failed", "did-not-complete"
 
@@ -140,11 +163,18 @@ def run_module(module: Path, timeout: float) -> tuple[Path, str, str]:
     # Each module gets its own isolation base. tests/run.sh can share one
     # because it does not run modules concurrently; here they would collide on
     # dispatch ids and ledger records inside a shared state dir.
+    interpreter = _interpreter_for(module)
+    if requires_acp_sdk(module) and os.name != "nt":
+        unavailable = acp_sdk_unavailable_reason(str(interpreter))
+        if unavailable is not None:
+            # The canonical driver skips here. Reporting this as failed would
+            # blame the code for an absent SDK.
+            return module, SKIPPED, f"ACP SDK requirement unsatisfied: {unavailable}"
     base = Path(tempfile.mkdtemp(prefix="gf-affected-mod-"))
     if has_main_driver(module):
-        argv = [sys.executable, str(module)]
+        argv = [str(interpreter), str(module)]
     else:
-        argv = [sys.executable, "-m", "pytest", str(module), "-q", "-p", "no:cacheprovider"]
+        argv = [str(interpreter), "-m", "pytest", str(module), "-q", "-p", "no:cacheprovider"]
     try:
         proc = subprocess.run(
             argv,
@@ -267,7 +297,7 @@ def main() -> int:
     # subprocesses and time out under load rather than failing on their merits.
     # A gate that answers differently each run is not a gate, so anything that
     # did not pass is re-run once, alone, and only a second non-pass counts.
-    suspects = [r for r in results if r[1] != PASSED]
+    suspects = [r for r in results if r[1] not in (PASSED, SKIPPED)]
     if suspects and not args.no_rerun:
         print(f"re-running {len(suspects)} non-passing module(s) serially...")
         confirmed: list[tuple[Path, str, str]] = []
@@ -288,12 +318,13 @@ def main() -> int:
             )
 
     passed = [r for r in results if r[1] == PASSED]
+    skipped = [r for r in results if r[1] == SKIPPED]
     failed = [r for r in results if r[1] == FAILED]
     incomplete = [r for r in results if r[1] == INCOMPLETE]
 
     print(
-        f"\n{len(passed)} passed, {len(failed)} failed, {len(incomplete)} did-not-complete "
-        f"({len(modules)} selected of {total_modules} modules)"
+        f"\n{len(passed)} passed, {len(failed)} failed, {len(incomplete)} did-not-complete, "
+        f"{len(skipped)} skipped ({len(modules)} selected of {total_modules} modules)"
     )
     if unmatched:
         print(f"changed files that selected no module: {', '.join(unmatched)}")
