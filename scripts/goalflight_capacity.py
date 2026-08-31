@@ -1461,11 +1461,30 @@ def stale_active_leases(data: dict) -> list[dict]:
                 continue
             stale.append(lease)
             continue
-        if (
-            not _pid_holds_capacity(controller_pid, lease)
-            and not _pid_holds_capacity(lease.get("claimant_pid"), lease)
-        ):
-            stale.append(lease)
+        # No worker ever attached. The question is whether anything can still
+        # attach one -- which is the CLAIMANT's job, not the controller's.
+        #
+        # Keying on controller_pid made these leases immortal: a controller is a
+        # long-running session, so it outlives every lease it requests. Measured
+        # 2026-08-31 -- 29 leases with worker=none, claimant=dead,
+        # controller=alive, oldest 14.2h, 20 of them held by dispatches whose
+        # own state was `queued`. Queued work therefore held the capacity that
+        # queued work needed in order to launch, and the pool drained until
+        # nothing could start. release-stale refused them all, correctly by its
+        # own logic and uselessly in practice.
+        #
+        # A live claimant still protects the acquire-then-spawn window, which is
+        # the race this branch exists for. A claimant that cannot be probed is
+        # NOT proven gone and holds, so an indeterminate read never authorises
+        # reclamation.
+        claimant_pid = lease.get("claimant_pid")
+        if _pid_holds_capacity(claimant_pid, lease):
+            continue
+        if claimant_pid is None and _pid_holds_capacity(controller_pid, lease):
+            # Never had a distinct claimant: fall back to the requester so a
+            # controller-held lease is not reclaimed out from under itself.
+            continue
+        stale.append(lease)
     return stale
 
 
