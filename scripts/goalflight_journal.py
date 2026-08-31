@@ -3657,6 +3657,36 @@ class Journal:
     def _begin_cursor_read_snapshot(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN")
 
+    @staticmethod
+    def _cursor_pending_sql(
+        *,
+        waking_only: bool,
+        stream_ids: tuple[str, ...] | None,
+        limit: int,
+    ) -> tuple[str, list[object]]:
+        """Projected live rows past the recipient cursor, optionally one stream set."""
+        sql = """
+            SELECT e.*
+            FROM delivery_events AS e
+            LEFT JOIN controller_stream_cursors AS c
+              ON c.project_root = e.project_root
+             AND c.label = ?
+             AND c.stream_id = e.stream_id
+            WHERE e.project_root = ? AND e.recipient_label IN (?, '*')
+              AND e.projected_at IS NOT NULL
+              AND e.withdrawn_at IS NULL
+              AND e.stream_seq > COALESCE(c.position, 0)
+        """
+        if waking_only:
+            sql += " AND e.wake_class = 'waking'"
+        parameters: list[object] = []
+        if stream_ids:
+            sql += " AND e.stream_id IN (" + ",".join("?" for _ in stream_ids) + ")"
+            parameters.extend(stream_ids)
+        sql += " ORDER BY e.stream_id, e.stream_seq, e.rowid LIMIT ?"
+        parameters.append(limit)
+        return sql, parameters
+
     def cursor_peek(
         self,
         label: str,
@@ -3664,8 +3694,15 @@ class Journal:
         nonce: str | None = None,
         waking_only: bool = False,
         limit: int = 1000,
+        complete_addressed_streams: bool = False,
     ) -> CursorPeek:
-        """Return one server-side cursor snapshot without advancing it."""
+        """Return one server-side cursor snapshot without advancing it.
+
+        ``complete_addressed_streams`` is the --acked path: a global item
+        cap can cut between two positions addressed to this recipient on
+        one stream. Completing each mentioned stream (not every stream)
+        keeps the snapshot and the ack position on the same max.
+        """
         resolved_label = self._identity_token(label, label="controller label")
         resolved_nonce = (
             self._identity_token(nonce, label="lease nonce") if nonce is not None else None
@@ -3697,24 +3734,33 @@ class Journal:
             ).fetchone()
             if cursor is None or int(cursor["registry_generation"]) != int(lease["generation"]):
                 raise JournalIntegrityError("active lease is missing its generation-matched cursor")
-            sql = """
-                SELECT e.*
-                FROM delivery_events AS e
-                LEFT JOIN controller_stream_cursors AS c
-                  ON c.project_root = e.project_root
-                 AND c.label = ?
-                 AND c.stream_id = e.stream_id
-                WHERE e.project_root = ? AND e.recipient_label IN (?, '*')
-                  AND e.projected_at IS NOT NULL
-                  AND e.withdrawn_at IS NULL
-                  AND e.stream_seq > COALESCE(c.position, 0)
-            """
-            parameters: list[object] = [resolved_label, project_root, resolved_label]
-            if waking_only:
-                sql += " AND e.wake_class = 'waking'"
-            sql += " ORDER BY e.stream_id, e.stream_seq, e.rowid LIMIT ?"
-            parameters.append(limit)
-            rows = connection.execute(sql, parameters).fetchall()
+            sql, extra = self._cursor_pending_sql(
+                waking_only=waking_only, stream_ids=None, limit=limit
+            )
+            rows = connection.execute(
+                sql, [resolved_label, project_root, resolved_label, *extra]
+            ).fetchall()
+            if complete_addressed_streams and rows:
+                # Max per stream, not one located row: a cursor means
+                # seen-through-here. Two envelopes to this recipient on one
+                # stream are both in the recipient-visible range, so the ack
+                # position is their maximum. Treating them as one logical
+                # delivery would need payload identity in the journal; taking
+                # max is simpler and equivalent for that range. Streams the
+                # cap never mentioned stay untouched, so unshown mail is not
+                # skipped.
+                stream_ids = tuple(
+                    dict.fromkeys(str(row["stream_id"]) for row in rows)
+                )
+                sql, extra = self._cursor_pending_sql(
+                    waking_only=waking_only,
+                    stream_ids=stream_ids,
+                    limit=10_000,
+                )
+                rows = connection.execute(
+                    sql,
+                    [resolved_label, project_root, resolved_label, *extra],
+                ).fetchall()
             positions: dict[str, int] = {}
             for row in rows:
                 stream_id = str(row["stream_id"])

@@ -740,6 +740,23 @@ def controller_addressee_label(envelope: dict) -> str | None:
     return label.strip() if isinstance(label, str) and label.strip() else None
 
 
+def _same_addressed_payload(existing: dict, incoming: dict) -> bool:
+    """True when a carrier already holds this addressee+type+payload.
+
+    Fan-out that posts one envelope per controller can retry 18s later and
+    write a second seq to the same addressee. The consumer still has to drain
+    those rows; skipping the identical retry keeps new streams from wedging.
+    """
+    incoming_label = controller_addressee_label(incoming)
+    if incoming_label is None:
+        return False
+    return (
+        controller_addressee_label(existing) == incoming_label
+        and existing.get("type") == incoming.get("type")
+        and existing.get("payload") == incoming.get("payload")
+    )
+
+
 def controller_addressee_project_root(envelope: dict) -> str | None:
     addressee = envelope.get("addressee") if isinstance(envelope, dict) else None
     if not isinstance(addressee, dict) or addressee.get("kind") != CONTROLLER_ADDRESSEE_KIND:
@@ -1510,6 +1527,10 @@ def post_message(
         if not isinstance(addressee, dict):
             raise MessageError("addressee must be an object")
         envelope["addressee"] = dict(addressee)
+        if skip_if is None:
+            skip_if = lambda item, _incoming=envelope: _same_addressed_payload(
+                item, _incoming
+            )
     # Boundary validation, including canonical serialization, happens before any
     # carrier/ingestion state is touched. The final seq-bearing form is validated
     # and serialized again under the transaction lock.
@@ -2565,6 +2586,59 @@ def format_pending_counts(counts: dict[str, int]) -> str:
     )
 
 
+def _parse_since_timestamp(value: str) -> dt.datetime:
+    """RFC3339 / ISO-8601 lower bound for relay --since."""
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid --since timestamp {value!r}; use RFC3339"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _envelope_at_or_after(envelope: dict, since: dt.datetime) -> bool:
+    """Keep unparseable timestamps: withholding them would hide mail."""
+    ts = envelope.get("ts") if isinstance(envelope, dict) else None
+    if not isinstance(ts, str) or not ts:
+        return True
+    try:
+        posted = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if posted.tzinfo is None:
+        posted = posted.replace(tzinfo=dt.timezone.utc)
+    return posted.astimezone(dt.timezone.utc) >= since
+
+
+def format_stream_summaries(items: list[tuple[dict, dict]]) -> str:
+    """One headline and count per stream; no bodies."""
+    streams: dict[str, dict[str, object]] = {}
+    order: list[str] = []
+    for row, envelope in items:
+        stream_id = str(
+            (envelope.get("dispatch_id") if isinstance(envelope, dict) else None)
+            or row.get("stream_id")
+            or "unknown"
+        )
+        bucket = streams.get(stream_id)
+        if bucket is None:
+            bucket = {"count": 0, "headline": envelope_headline(envelope)}
+            streams[stream_id] = bucket
+            order.append(stream_id)
+        bucket["count"] = int(bucket["count"]) + 1
+    if not order:
+        return "summary: none"
+    lines = [
+        f"{sanitize_display(stream_id)} {streams[stream_id]['count']} "
+        f"{streams[stream_id]['headline']}"
+        for stream_id in order
+    ]
+    return "\n".join(lines)
+
+
 def build_aggregate(
     *,
     messages_dir: Path,
@@ -3241,6 +3315,7 @@ def controller_cursor_peek(
     controller_label: str,
     lease_nonce: str | None = None,
     limit: int,
+    complete_addressed_streams: bool = False,
 ):
     import goalflight_journal  # type: ignore
     import goalflight_task  # type: ignore
@@ -3250,6 +3325,7 @@ def controller_cursor_peek(
         controller_label,
         nonce=lease_nonce,
         limit=limit,
+        complete_addressed_streams=complete_addressed_streams,
     )
 
 
@@ -4792,6 +4868,8 @@ def _require_relay_controller_label(authority) -> str:
 def cmd_relay(args: argparse.Namespace) -> int:
     """Peek at journal-pending assignments, optionally draining that snapshot."""
     drain = bool(getattr(args, "drain", False))
+    summary_only = bool(getattr(args, "summary_only", False))
+    since_text = str(getattr(args, "since", None) or "").strip()
     project_root = _current_project_root()
     if project_root is None:
         print("relay: no current git project", file=sys.stderr)
@@ -4800,6 +4878,9 @@ def cmd_relay(args: argparse.Namespace) -> int:
         import goalflight_journal  # type: ignore
         import goalflight_task  # type: ignore
 
+        if drain and (summary_only or since_text):
+            raise MessageError("--drain cannot be combined with --summary-only or --since")
+        since = _parse_since_timestamp(since_text) if since_text else None
         root = goalflight_task.resolve_project_root(str(project_root))
         if drain:
             authority = goalflight_journal.Journal(root)
@@ -4812,6 +4893,12 @@ def cmd_relay(args: argparse.Namespace) -> int:
         peek = authority.cursor_peek(controller_label, nonce=lease.nonce, limit=1000)
         rows = list(peek.items)
         items_with_rows = _envelopes_with_rows(authority, rows)
+        if since is not None:
+            items_with_rows = [
+                (row, envelope)
+                for row, envelope in items_with_rows
+                if _envelope_at_or_after(envelope, since)
+            ]
         if drain:
             items_with_rows = order_drain_items(items_with_rows)
         envelopes = [envelope for _row, envelope in items_with_rows]
@@ -4831,14 +4918,19 @@ def cmd_relay(args: argparse.Namespace) -> int:
         print(f"relay: {exc}", file=sys.stderr)
         return 2
     positions = _cursor_positions(rows)
-    advance_command = _cursor_advance_command(
-        project_root=root,
-        controller_label=controller_label,
-        lease_nonce=lease.nonce,
-        cursor_version=peek.cursor_version,
-        positions=positions,
-        stream_snapshots=peek.stream_snapshots,
-    )
+    # --summary-only/--since are diagnostic: they must not look like a drain
+    # recipe for a filtered subset, which would skip unshown mail.
+    if summary_only or since_text:
+        advance_command = None
+    else:
+        advance_command = _cursor_advance_command(
+            project_root=root,
+            controller_label=controller_label,
+            lease_nonce=lease.nonce,
+            cursor_version=peek.cursor_version,
+            positions=positions,
+            stream_snapshots=peek.stream_snapshots,
+        )
     if drain:
         if not positions:
             if getattr(args, "json", False):
@@ -4950,36 +5042,56 @@ def cmd_relay(args: argparse.Namespace) -> int:
             project_root=root, controller_label=controller_label
         )
         return 0
+    counts: dict[str, int] = {}
+    for envelope in visible_envelopes:
+        dispatch_id = str(envelope.get("dispatch_id") or "unknown")
+        counts[dispatch_id] = counts.get(dispatch_id, 0) + 1
     if getattr(args, "json", False):
-        print(
-            json.dumps(
-                {
-                    "controller_label": controller_label,
-                    "registry_generation": peek.registry_generation,
-                    "cursor_version": peek.cursor_version,
-                    "positions": positions,
-                    "stream_snapshots": peek.stream_snapshots,
-                    "advance_command": advance_command,
-                    "items": visible_envelopes,
-                },
-                sort_keys=True,
-            )
-        )
+        payload = {
+            "controller_label": controller_label,
+            "registry_generation": peek.registry_generation,
+            "cursor_version": peek.cursor_version,
+            "positions": positions,
+            "stream_snapshots": peek.stream_snapshots,
+            "advance_command": advance_command,
+        }
+        if summary_only:
+            payload["counts"] = counts
+            seen: dict[str, dict[str, object]] = {}
+            summary_rows: list[dict[str, object]] = []
+            for row, envelope in visible_items:
+                stream_id = str(
+                    envelope.get("dispatch_id") or row.get("stream_id") or "unknown"
+                )
+                bucket = seen.get(stream_id)
+                if bucket is None:
+                    bucket = {
+                        "dispatch_id": stream_id,
+                        "count": 0,
+                        "headline": envelope_headline(envelope),
+                    }
+                    seen[stream_id] = bucket
+                    summary_rows.append(bucket)
+                bucket["count"] = int(bucket["count"]) + 1
+            payload["summary"] = summary_rows
+        else:
+            payload["items"] = visible_envelopes
+        print(json.dumps(payload, sort_keys=True))
         emit_listener_activity_signal(
             project_root=root, controller_label=controller_label
         )
         return 0
-    if getattr(args, "bodies", False):
+    if summary_only:
+        summary = format_stream_summaries(visible_items)
+        if summary:
+            print(summary)
+    elif getattr(args, "bodies", False):
         print(json.dumps(visible_envelopes))
     else:
         headlines = format_envelope_headlines(visible_envelopes)
         if headlines:
             print(headlines)
             print("bodies: re-run with --bodies")
-    counts: dict[str, int] = {}
-    for envelope in visible_envelopes:
-        dispatch_id = str(envelope.get("dispatch_id") or "unknown")
-        counts[dispatch_id] = counts.get(dispatch_id, 0) + 1
     print(format_pending_counts(counts))
     emit_listener_activity_signal(
         project_root=root, controller_label=controller_label
@@ -5019,8 +5131,12 @@ def _acked_positions(peek) -> dict[str, int]:
     """Highest deliverable seq per stream, from one peek.
 
     Advancing means "I have seen everything up to here", so the target is the
-    largest seq the peek reports per stream. Deriving it removes the step where a
-    caller transcribes nine STREAM=SEQ pairs by hand and mistypes one.
+    largest seq the peek reports per stream, not a single located item. Two
+    envelopes addressed to this controller on one stream are both in that
+    range; taking max acks both. Treating them as one logical delivery would
+    need payload identity in the journal and is not simpler. Deriving the max
+    also removes the step where a caller transcribes STREAM=SEQ pairs by hand
+    and mistypes one.
     """
     positions: dict[str, int] = {}
     for item in peek.items or []:
@@ -5089,6 +5205,7 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
                 controller_label=label,
                 lease_nonce=nonce,
                 limit=_ACKED_PEEK_LIMIT,
+                complete_addressed_streams=True,
             )
             advances = _acked_positions(peek)
             stream_snapshots = dict(peek.stream_snapshots)
@@ -8216,6 +8333,17 @@ def _run_cli(argv: list[str] | None = None) -> int:
         "--json",
         action="store_true",
         help="Emit one cursor snapshot with items and server-known positions",
+    )
+    relay.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Headline and count per stream; no bodies",
+    )
+    relay.add_argument(
+        "--since",
+        default=None,
+        metavar="TIMESTAMP",
+        help="Only envelopes with ts at or after this RFC3339 timestamp",
     )
     relay.set_defaults(func=cmd_relay)
 
