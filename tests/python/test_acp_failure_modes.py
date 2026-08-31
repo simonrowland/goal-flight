@@ -373,17 +373,24 @@ def _descendant_ps_fail_bindir(tmp: Path) -> Path:
     return bindir
 
 
-def _descendant_ps_table_bindir(tmp: Path, table: Path) -> Path:
+def _descendant_ps_table_bindir(
+    tmp: Path,
+    table: Path,
+    *,
+    delay_s: float = 0.0,
+) -> Path:
     bindir = tmp / "ps-table-bin"
     bindir.mkdir()
     real_ps = shutil.which("ps") or "/bin/ps"
     stub = bindir / "ps"
+    delay_command = f"      sleep {delay_s}\n" if delay_s > 0 else ""
     stub.write_text(
         "#!/bin/sh\n"
         "for arg in \"$@\"; do\n"
         "  case \"$arg\" in\n"
         "    pid=,ppid=*)\n"
-        f"      cat {shlex.quote(str(table))}\n"
+        + delay_command
+        + f"      cat {shlex.quote(str(table))}\n"
         "      exit $?\n"
         "      ;;\n"
         "  esac\n"
@@ -1261,7 +1268,7 @@ def case_runner_idle_callback_uses_same_outer_classifier() -> None:
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
 def case_runner_outer_bound_with_busy_cpu_and_idle_disabled() -> None:
     returncode, status, stdout, stderr = _run_fake_runner(
-        "long_reasoning_pause",
+        "long_reasoning_busy",
         progress_stall_s=30.0,
         heartbeat_interval=0.05,
         wedge_samples=99,
@@ -1280,8 +1287,96 @@ def case_runner_outer_bound_with_busy_cpu_and_idle_disabled() -> None:
     assert status["state"] == "liveness_indeterminate", status
     assert status["error"]["reason"] == "event_silence_outer_bound", status
     assert status["error"]["quiet_for_s"] >= 0.15, status
+    assert (
+        status["error"]["observed_state"]
+        == "positive_cpu_without_observable_progress"
+    ), status
+    assert status["error"]["recent_forward_progress_observed"] is False, status
+    assert status["error"]["wedge_progress_seen"] >= 1, status
+    assert status["error"]["outstanding_tool_calls"] == 0, status
+    assert status["pgroup_cpu_pct"] == 5.0, status
+    assert (
+        status["liveness_outer_bound_observation"]
+        == "positive_cpu_without_observable_progress"
+    ), status
     assert status["killed_by_heartbeat"] is True, status
     assert status["worker_alive"] is False, status
+    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_outer_bound_kills_zero_cpu_without_progress() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        process_table_file = tmp / "process-table.txt"
+        bindir = _descendant_ps_table_bindir(tmp, process_table_file)
+        returncode, status, stdout, stderr = _run_fake_runner(
+            "idle_silent",
+            progress_stall_s=30.0,
+            heartbeat_interval=0.05,
+            wedge_samples=99,
+            idle_timeout=0.0,
+            max_quiet_s=0.15,
+            max_tool_s=30.0,
+            extra_env={
+                "GOALFLIGHT_FAKE_ACP_PROCESS_TABLE_FILE": str(process_table_file),
+                "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "0.0",
+                "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+            },
+            timeout_s=30.0,
+        )
+        process_rows = process_table_file.read_text(encoding="utf-8").splitlines()
+        assert process_rows == [f"{status['worker_pid']} 1"], process_rows
+
+    assert returncode != 0, (stdout, stderr, status)
+    assert status["state"] == "wedged", status
+    assert status["error"]["reason"] == "confirmed_idle", status
+    assert status["error"]["observed_state"] == "confirmed_idle", status
+    assert status["error"]["recent_forward_progress_observed"] is False, status
+    assert status["error"]["wedge_progress_seen"] == 0, status
+    assert status["error"]["outstanding_tool_calls"] == 0, status
+    assert status["killed_by_heartbeat"] is True, status
+    assert status["worker_alive"] is False, status
+    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_outer_bound_rechecks_progress_after_probe() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        process_table_file = tmp / "process-table.txt"
+        process_table_file.write_text("", encoding="utf-8")
+        bindir = _descendant_ps_table_bindir(
+            tmp,
+            process_table_file,
+            delay_s=0.2,
+        )
+        returncode, status, stdout, stderr = _run_fake_runner(
+            "thought_stream_pause",
+            progress_stall_s=30.0,
+            heartbeat_interval=0.02,
+            wedge_samples=99,
+            idle_timeout=0.0,
+            max_quiet_s=0.05,
+            max_tool_s=30.0,
+            extra_env={
+                "GOALFLIGHT_FAKE_ACP_INTERVAL": "0.1",
+                "GOALFLIGHT_FAKE_ACP_THOUGHT_CHUNKS": "5",
+                "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "5.0",
+                "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+            },
+            timeout_s=30.0,
+        )
+
+    assert returncode != 0, (stdout, stderr, status)
+    assert status["state"] == "failed", status
+    assert status["error"]["reason"] == "empty_session", status
+    assert status["killed_by_heartbeat"] is False, status
+    assert status["wedge_progress_seen"] >= 5, status
+    assert status["worker_alive"] is False, status
+    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -2708,6 +2803,8 @@ def main() -> None:
     case_runner_outer_bound_classifies_measured_idle()
     case_runner_idle_callback_uses_same_outer_classifier()
     case_runner_outer_bound_with_busy_cpu_and_idle_disabled()
+    case_runner_outer_bound_kills_zero_cpu_without_progress()
+    case_runner_outer_bound_rechecks_progress_after_probe()
     case_runner_thought_stream_survives_progress_stall_wall()
     case_runner_auth_failure_output_records_blocked_terminal()
     case_runner_trivial_probe_working_engine_writes_file()
