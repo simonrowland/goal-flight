@@ -2128,7 +2128,37 @@ def test_unreadable_journal_probe_does_not_stop_the_supervisor() -> None:
     )
 
 
-def test_permanent_unarmed_exit_2_is_visible_terminal_not_healthy() -> None:
+def test_spawn_failure_enters_backoff_and_recovers() -> None:
+    host = FakeHost(stop_after_spawns=1)
+    real_spawn = host.spawn
+    attempts = 0
+
+    def fail_once(kind: str, command: str) -> FakeChild:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError(errno.EAGAIN, "spawn table temporarily unavailable")
+        return real_spawn(kind, command)
+
+    host.spawn = fail_once  # type: ignore[method-assign]
+    code = _run(host, _items("backup"), heartbeat_s=100.0, coverage_s=100.0)
+
+    assert code == 0
+    assert attempts == 2
+    restart = next(
+        record
+        for record in _records(host)
+        if record.get("type") == "restart"
+    )
+    assert restart["reason"] == "spawn-failed"
+    assert restart["error"] == "BlockingIOError"
+    assert str(restart["detail"]).endswith("spawn table temporarily unavailable")
+    assert restart["backoff_s"] == supervise.BACKOFF_INITIAL_S
+    assert all(record.get("type") != "stop" for record in _records(host))
+
+
+def test_short_exit_2_transients_keep_retrying_until_slot_recovers() -> None:
+    transient_failures = 5
     host = FakeHost(
         scripts={
             "backup": [
@@ -2138,30 +2168,37 @@ def test_permanent_unarmed_exit_2_is_visible_terminal_not_healthy() -> None:
                     output="listen: pending-report claim is poisoned",
                     armed=False,
                 )
-                for _ in range(supervise.PERMANENT_UNARMED_FAULTS)
+                for _ in range(transient_failures)
+            ]
+            + [
+                PlannedExit(
+                    lifetime_s=0.05,
+                    returncode=0,
+                    output="",
+                    armed=True,
+                )
             ],
-            "stream": [],
         },
+        # After the successful ring, one stable replacement proves the slot
+        # remains eligible instead of being stranded by the old three-strike
+        # latch.
+        stop_after_spawns=transient_failures + 2,
         stop_on_stop_reason="permanent-exit-2",
     )
-    code = _run(
-        host,
-        _items("stream", "backup"),
-        heartbeat_s=100.0,
-        coverage_s=0.05,
-    )
-    assert code != supervise.SUPERVISE_STOP_EXIT
-    stop = next(record for record in _records(host) if record.get("type") == "stop")
-    assert stop["reason"] == "permanent-exit-2"
-    assert stop.get("scope") == "slot"
-    assert stop["child"] == "backup"
-    assert host.alive_by_kind_at_stop.get("stream") is True
+    code = _run(host, _items("backup"), heartbeat_s=100.0, coverage_s=100.0)
+
+    assert code == 0
     assert [kind for kind, _command in host.spawns].count("backup") == (
-        supervise.PERMANENT_UNARMED_FAULTS
+        transient_failures + 2
     )
-    assert "live" not in stop
-    assert "target" not in stop
-    assert "goalflight_messages.py supervise" in str(stop["rearm"])
+    reasons = [
+        record.get("reason")
+        for record in _records(host)
+        if record.get("type") == "restart"
+    ]
+    assert reasons[:transient_failures] == ["exit-2"] * transient_failures
+    assert reasons[-1] == "rang"
+    assert all(record.get("type") != "stop" for record in _records(host))
 
 
 def test_supervise_items_are_the_configured_persistent_pool(
@@ -2905,7 +2942,7 @@ def test_partial_nonblocking_write_resumes_without_duplicate_prefix(
     os.close(reader_fd)
 
     forwarded = bytes(relieved + remaining)
-    assert len(relief_calls) > supervise.TRANSIENT_DETECTOR_FAILURE_LIMIT
+    assert len(relief_calls) > 1
     assert set(relief_calls) == {supervise.TRANSIENT_DETECTOR_RETRY_S}
     assert forwarded.count(b"a") == len(line)
     assert forwarded.endswith(b"\n")
@@ -3194,19 +3231,238 @@ def test_real_host_retries_transient_poll_interruption(
     assert not status.peer_gone
 
 
-@pytest.mark.parametrize(
-    ("poll_errno", "expected_calls"),
-    [
-        (errno.ENOMEM, 1),
-        (errno.EINVAL, 1),
-        (errno.EAGAIN, supervise.TRANSIENT_DETECTOR_FAILURE_LIMIT),
-    ],
-)
-def test_real_host_persistent_poll_failure_emits_recovery_and_fails_closed(
+def test_real_host_retries_transient_poll_eagain_until_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_poll = supervise.select.poll
+    supervisor_calls: list[int | None] = []
+
+    class EagainThreePoll:
+        def __init__(self) -> None:
+            self.inner = real_poll()
+
+        def register(self, fd: int, eventmask: int) -> None:
+            self.inner.register(fd, eventmask)
+
+        def poll(self, timeout: int | None = None) -> list[tuple[int, int]]:
+            if timeout and timeout > 0:
+                supervisor_calls.append(timeout)
+                if len(supervisor_calls) <= 3:
+                    raise OSError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+            return self.inner.poll(timeout)
+
+    class StopAfterSuccessfulPollHost(supervise.RealHost):
+        children_alive_after_poll = False
+
+        def wait(
+            self,
+            children: list[object],
+            timeout_s: float,
+        ) -> supervise.WaitResult:
+            result = super().wait(children, timeout_s)
+            self.children_alive_after_poll = bool(children) and all(
+                getattr(child, "alive", False) for child in children
+            )
+            self._stop = True
+            return result
+
+    monkeypatch.setattr(supervise.select, "poll", EagainThreePoll)
+    reader_fd, writer_fd = os.pipe()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    host = StopAfterSuccessfulPollHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    wire = bytearray()
+    try:
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            heartbeat_s=0.1,
+            coverage_s=0.1,
+            items=[
+                (
+                    "backup",
+                    _python_child("import time; time.sleep(5)"),
+                )
+            ],
+        )
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        while True:
+            chunk = os.read(reader_fd, 65536)
+            if not chunk:
+                break
+            wire.extend(chunk)
+        os.close(reader_fd)
+        host.kill_all()
+
+    assert code == 0
+    assert len(supervisor_calls) == 4
+    assert host.children_alive_after_poll
+    records = [json.loads(line) for line in wire.decode("utf-8").splitlines()]
+    assert all(record.get("type") != "stop" for record in records)
+    status = host.stdout_detector_status()
+    assert status.availability == "available"
+    assert status.failure is None
+    assert not status.peer_gone
+
+
+def test_real_host_poll_eagain_prefers_real_peer_gone_signal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_poll = supervise.select.poll
+    reader_fd, writer_fd = os.pipe()
+    reader_open = True
+    supervisor_calls = 0
+
+    class EagainThenPeerGonePoll:
+        def __init__(self) -> None:
+            self.inner = real_poll()
+
+        def register(self, fd: int, eventmask: int) -> None:
+            self.inner.register(fd, eventmask)
+
+        def poll(self, timeout: int | None = None) -> list[tuple[int, int]]:
+            nonlocal reader_open, supervisor_calls
+            if timeout and timeout > 0:
+                supervisor_calls += 1
+                if supervisor_calls == 1:
+                    os.close(reader_fd)
+                    reader_open = False
+                    raise OSError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+            return self.inner.poll(timeout)
+
+    monkeypatch.setattr(supervise.select, "poll", EagainThenPeerGonePoll)
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    host = _RecordingHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    started = time.monotonic()
+    try:
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            heartbeat_s=10.0,
+            coverage_s=10.0,
+            items=[
+                (
+                    "backup",
+                    _python_child("import time; time.sleep(5)"),
+                )
+            ],
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        if reader_open:
+            os.close(reader_fd)
+        host.kill_all()
+
+    assert code == 0
+    assert supervisor_calls == 1
+    assert elapsed < 0.5
+    status = host.stdout_detector_status()
+    assert status.peer_gone
+    assert status.failure is None
+
+
+def test_real_host_persistent_poll_eagain_stops_after_elapsed_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_poll = supervise.select.poll
+    supervisor_calls = 0
+    retry_budget_s = 0.05
+
+    class PersistentlyEagainPoll:
+        def __init__(self) -> None:
+            self.inner = real_poll()
+
+        def register(self, fd: int, eventmask: int) -> None:
+            self.inner.register(fd, eventmask)
+
+        def poll(self, timeout: int | None = None) -> list[tuple[int, int]]:
+            nonlocal supervisor_calls
+            if timeout and timeout > 0:
+                supervisor_calls += 1
+                raise OSError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+            return self.inner.poll(timeout)
+
+    monkeypatch.setattr(supervise.select, "poll", PersistentlyEagainPoll)
+    monkeypatch.setattr(
+        supervise,
+        "TRANSIENT_DETECTOR_RETRY_BUDGET_S",
+        retry_budget_s,
+    )
+    reader_fd, writer_fd = os.pipe()
+    peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, "stdout", peer_stdout)
+    host = _RecordingHost(
+        project_root=tmp_path,
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        nonce_reader=lambda: "nonce-1",
+    )
+    started = time.monotonic()
+    try:
+        code = supervise.run_supervisor(
+            project_root=tmp_path,
+            controller_label="bugs",
+            lease_nonce="nonce-1",
+            host=host,
+            heartbeat_s=10.0,
+            coverage_s=10.0,
+            items=[
+                (
+                    "backup",
+                    _python_child("import time; time.sleep(5)"),
+                )
+            ],
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        monkeypatch.setattr(sys, "stdout", original_stdout)
+        peer_stdout.close()
+        os.close(reader_fd)
+        host.kill_all()
+
+    assert code == supervise.SUPERVISE_STOP_EXIT
+    assert retry_budget_s <= elapsed < 0.5
+    assert supervisor_calls >= 3
+    status = host.stdout_detector_status()
+    assert status.failure is not None
+    assert status.failure.source == "poll"
+    assert "failed persistently for" in status.failure.detail
+    stop = next(
+        record for record in _records(host) if record.get("type") == "stop"
+    )
+    assert stop["reason"] == "stdout-peer-detector-unavailable"
+
+
+@pytest.mark.parametrize("poll_errno", [errno.ENOMEM, errno.EINVAL])
+def test_real_host_nontransient_poll_failure_emits_recovery_and_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     poll_errno: int,
-    expected_calls: int,
 ) -> None:
     real_poll = supervise.select.poll
     calls: list[int | None] = []
@@ -3258,7 +3514,7 @@ def test_real_host_persistent_poll_failure_emits_recovery_and_fails_closed(
 
     assert elapsed < 1.0
     supervisor_calls = [timeout for timeout in calls if timeout and timeout > 1000]
-    assert len(supervisor_calls) == expected_calls
+    assert len(supervisor_calls) == 1
     assert code == supervise.SUPERVISE_STOP_EXIT
     status = host.stdout_detector_status()
     assert status.availability == "unavailable"
@@ -3272,11 +3528,6 @@ def test_real_host_persistent_poll_failure_emits_recovery_and_fails_closed(
     assert stop["detector"] == "poll"
     assert stop["error"] == errno.errorcode[poll_errno]
     assert "goalflight_messages.py supervise" in stop["rearm"]
-    if poll_errno == errno.EAGAIN:
-        assert (
-            f"{supervise.TRANSIENT_DETECTOR_FAILURE_LIMIT} consecutive EAGAIN"
-            in str(status.failure.detail)
-        )
 
 
 def test_pollnval_preempts_ready_child_output_before_forwarding(

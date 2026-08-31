@@ -13,6 +13,7 @@ condition belongs.
 
 from __future__ import annotations
 
+import errno
 import sys
 from pathlib import Path
 
@@ -24,6 +25,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_wake as wake  # noqa: E402
+import goalflight_messages as messages  # noqa: E402
 
 
 def test_first_claim_wins_and_later_arms_stay_silent(tmp_path: Path) -> None:
@@ -52,6 +54,43 @@ def test_separate_controllers_do_not_share_a_claim(tmp_path: Path) -> None:
     assert wake.claim_watchdog_death_report(
         tmp_path, controller_label="beta", lease_nonce="n"
     ) is True
+
+
+def test_claim_creation_failure_is_unknown_not_already_claimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def deny_claim(*_args: object, **_kwargs: object) -> int:
+        raise PermissionError(errno.EACCES, "claim creation denied")
+
+    monkeypatch.setattr(wake.os, "open", deny_claim)
+
+    state = messages._watchdog_death_claim_state(
+        tmp_path,
+        controller_label="ctl",
+        lease_nonce="nonce-1",
+    )
+
+    assert state == "unknown"
+    assert state != "already-claimed"
+    monkeypatch.setattr(
+        messages,
+        "_wake_recovery_action",
+        lambda *_args, **_kwargs: {"kind": "arm-component"},
+    )
+    record = messages._watchdog_dead_record(
+        {
+            "live_waiters": 1,
+            "target_waiters": 4,
+            "missing_components": ["watchdog"],
+        },
+        project_root=tmp_path,
+        controller_label="ctl",
+        lease_nonce="nonce-1",
+        rearm_command="rearm-watchdog",
+        claim_state=state,
+    )
+    assert record["payload"]["claim_state"] == "unknown"
 
 
 @pytest.mark.parametrize(

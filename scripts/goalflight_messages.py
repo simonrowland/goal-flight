@@ -6121,12 +6121,15 @@ def _watchdog_dead_record(
     controller_label: str,
     lease_nonce: str,
     rearm_command: str,
+    claim_state: str = "claimed",
 ) -> dict[str, object]:
     """Describe coverage after the dead watchdog's witness releases its lock."""
     payload: dict[str, object] = {
         "type": "watchdog-dead",
         "reason": "missing-lock",
     }
+    if claim_state != "claimed":
+        payload["claim_state"] = claim_state
     action = _wake_recovery_action(
         project_root,
         controller_label=controller_label,
@@ -6150,6 +6153,24 @@ def _watchdog_dead_record(
         record,
         shrink_fields=("wake_recovery_hint", "rearm_command"),
     )
+
+
+def _watchdog_death_claim_state(
+    project_root: Path,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> str:
+    claimed = goalflight_wake.claim_watchdog_death_report(
+        project_root,
+        controller_label=controller_label,
+        lease_nonce=lease_nonce,
+    )
+    if claimed is True:
+        return "claimed"
+    if claimed is False:
+        return "already-claimed"
+    return "unknown"
 
 
 def _silence_broken_stdout(stream: object) -> None:
@@ -7512,7 +7533,7 @@ def cmd_listen(args) -> int:
             )
         return DETACHED_LISTENER_EXIT_CODE
 
-    def finish_watchdog_dead() -> int:
+    def finish_watchdog_dead(*, claim_state: str = "claimed") -> int:
         # Witness design: the existing backup doorbell checks the watchdog's
         # generation lock during its normal bounded mail wait. This makes a
         # lone watchdog death loud without a new task, daemon, or delivery
@@ -7540,6 +7561,7 @@ def cmd_listen(args) -> int:
                 controller_label=label,
                 lease_nonce=nonce,
             ),
+            claim_state=claim_state,
         )
         try:
             alive = _write_follow_record(payload, stream=sys.stdout)
@@ -7904,19 +7926,20 @@ def cmd_listen(args) -> int:
                     watchdog_observed_live
                     or time.monotonic() - listener_started >= watchdog_start_grace
                 )
+            ):
                 # A missing watchdog lock is a STANDING condition, not an event.
                 # Announcing it costs this doorbell its life, so only the first
                 # arm in the generation does: otherwise every replacement fires
                 # on arrival and the pool churns without ever carrying mail.
-                # Coverage still reports the gap on every status read, which is
-                # where a standing condition belongs.
-                and goalflight_wake.claim_watchdog_death_report(
+                # A failed claim is UNKNOWN, though, not proof that another arm
+                # already announced it. Surface that state on this doorbell.
+                claim_state = _watchdog_death_claim_state(
                     project_root,
                     controller_label=label,
                     lease_nonce=nonce,
                 )
-            ):
-                return finish_watchdog_dead()
+                if claim_state != "already-claimed":
+                    return finish_watchdog_dead(claim_state=claim_state)
             # With an arm-time backlog the cheap limit-1 peek would forever
             # see the oldest (already-reported) item; peek wide and ring only
             # for events beyond the arm-time high-water.

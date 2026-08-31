@@ -73,15 +73,19 @@ SUPERVISE_START_EXIT = 2
 #
 # Give-up: not on generic failures. A silently-stopped listener is worse
 # than a quiet retry. Cap the delay and collapse identical restart
-# records instead. PERMANENT_UNARMED_FAULTS remains the slot-stop for
-# repeated never-armed exit-2, where that slot cannot work.
+# records instead. Explicit did-not-arm diagnostics remain the slot-stop
+# for a child that proves it cannot run in this generation.
 BACKOFF_INITIAL_S = 1.0
 BACKOFF_CAP_S = 120.0
 LONG_LIVED_S = 30.0
 STREAM_LINE_MAX_BYTES = 511
-PERMANENT_UNARMED_FAULTS = 3
-TRANSIENT_DETECTOR_FAILURE_LIMIT = 3
 TRANSIENT_DETECTOR_RETRY_S = 0.01
+# ``poll`` EAGAIN/EWOULDBLOCK means the readiness service has no current
+# capacity; it says nothing about the peer. Retry across real elapsed time
+# instead of sampling the same instant three times. One second spans ordinary
+# scheduler and descriptor-pressure hiccups while keeping a persistently
+# unusable detector bounded far below the child/watchdog liveness intervals.
+TRANSIENT_DETECTOR_RETRY_BUDGET_S = 1.0
 # EAGAIN/EWOULDBLOCK on a nonblocking stdout write is "no current pipe
 # capacity", not peer loss. A live controller can pause 100ms–2s while
 # scheduling another turn; two 10ms sleeps (~20ms) cannot tell that pause
@@ -167,9 +171,7 @@ _ORPHANED_PARENT_MARKERS = (
 _ORPHANED_STDOUT_MARKERS = (
     "orphaned: controlling stdout closed",
 )
-_SLOT_STOP_REASONS = frozenset(
-    {"did-not-arm", "permanent-exit-2"}
-)
+_SLOT_STOP_REASONS = frozenset({"did-not-arm"})
 _DIAGNOSTIC_EVENT_TYPES = frozenset({"listener-exit", "listener-fault"})
 _ARMED_STDOUT_KINDS = frozenset(
     {
@@ -344,7 +346,6 @@ class _Slot:
     backoff_s: float = 0.0
     next_start: float = 0.0
     stopped_reason: str | None = None
-    unarmed_faults: int = 0
 
 
 def _unique_slot_labels(kinds: list[str]) -> list[str]:
@@ -1447,6 +1448,27 @@ def run_supervisor(
             strict=True,
         )
     ]
+    coverage_revision = 0
+    repeat_floor_s = max(0.0, float(next_repeat_floor_s))
+    restart_gates: dict[str, _RestartGate] = {}
+
+    def coverage_changed() -> None:
+        nonlocal coverage_revision
+        coverage_revision += 1
+
+    def emit_restart_records(records: list[dict[str, object]]) -> bool:
+        for outgoing in records:
+            if not _emit(host, outgoing):
+                return False
+        return True
+
+    def emit_restart(record: dict[str, object]) -> bool:
+        child = str(record.get("child") or "")
+        gate = restart_gates.setdefault(child, _RestartGate())
+        key = _restart_record_key(record)
+        return emit_restart_records(
+            gate.note(key, record, now=host.now, floor_s=repeat_floor_s)
+        )
 
     def stop_for_stdout_detector() -> int | None:
         """Define the one terminal policy for all peer-loss detector layers."""
@@ -1523,7 +1545,33 @@ def run_supervisor(
                 continue
             if slot.child is not None or host.now < slot.next_start:
                 continue
-            slot.child = host.spawn(slot.kind, slot.command)
+            try:
+                slot.child = host.spawn(slot.kind, slot.command)
+            except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+                slot.child = None
+                slot.backoff_s = next_backoff(
+                    slot.backoff_s,
+                    ran_s=0.0,
+                    action=ACTION_BACKOFF,
+                )
+                slot.next_start = host.now + slot.backoff_s
+                coverage_changed()
+                live, target = _live_target(slots)
+                record: dict[str, object] = {
+                    "kind": "supervise",
+                    "type": "restart",
+                    "child": slot.label,
+                    "exit": None,
+                    "reason": "spawn-failed",
+                    "error": type(exc).__name__,
+                    "detail": str(exc),
+                    "backoff_s": slot.backoff_s,
+                }
+                if emit_depth:
+                    record.update(live=live, target=target)
+                if not emit_restart(record):
+                    return stop_after_failed_write()
+                continue
             setattr(slot.child, "kind", slot.kind)
             setattr(slot.child, "alive", True)
             setattr(slot.child, "armed", False)
@@ -1534,13 +1582,8 @@ def run_supervisor(
         host.kill_all()
         return stopped
     seq = 0
-    coverage_revision = 0
     reported_revision = -1
     reported_counts: tuple[int, int] | None = None
-
-    def coverage_changed() -> None:
-        nonlocal coverage_revision
-        coverage_revision += 1
 
     def emit_coverage(*, force: bool = False) -> tuple[bool, bool]:
         nonlocal reported_counts, reported_revision
@@ -1609,10 +1652,8 @@ def run_supervisor(
     active_forwarding_read: _ForwardingFrontierRead | None = None
     pending_forwarding_read: _ForwardingFrontierRead | None = None
     next_gate = _RepeatGate()
-    restart_gates: dict[str, _RestartGate] = {}
     cursor_ledger = _CursorLedger()
     backlog_gates: dict[str, _ChildBacklogGate] = {}
-    repeat_floor_s = max(0.0, float(next_repeat_floor_s))
 
     def emit_pending_stream_wake(*, paired_frontier: bool = False) -> bool:
         nonlocal latest_frontier
@@ -1674,20 +1715,6 @@ def run_supervisor(
         if not next_gate.should_emit(key, now=host.now, floor_s=repeat_floor_s):
             return True
         return _emit(host, record)
-
-    def emit_restart_records(records: list[dict[str, object]]) -> bool:
-        for outgoing in records:
-            if not _emit(host, outgoing):
-                return False
-        return True
-
-    def emit_restart(record: dict[str, object]) -> bool:
-        child = str(record.get("child") or "")
-        gate = restart_gates.setdefault(child, _RestartGate())
-        key = _restart_record_key(record)
-        return emit_restart_records(
-            gate.note(key, record, now=host.now, floor_s=repeat_floor_s)
-        )
 
     def emit_pending_restarts() -> bool:
         outgoing: list[dict[str, object]] = []
@@ -1854,24 +1881,6 @@ def run_supervisor(
                 output=event.output,
                 armed=armed,
             )
-            # Do not use sampled ``armed`` as negative evidence (the P0-2
-            # flock-miss hazard). Count consecutive short non-journal
-            # exit-2s regardless of the sample; a long-lived run resets.
-            if (
-                action == ACTION_BACKOFF
-                and reason != "journal-unreadable"
-                and event.returncode == 2
-                and event.ran_s < LONG_LIVED_S
-            ):
-                slot.unarmed_faults += 1
-                if slot.unarmed_faults >= PERMANENT_UNARMED_FAULTS:
-                    action, reason = ACTION_STOP, "permanent-exit-2"
-            elif (
-                action == ACTION_REARM
-                or reason == "journal-unreadable"
-                or event.ran_s >= LONG_LIVED_S
-            ):
-                slot.unarmed_faults = 0
             slot.backoff_s = next_backoff(
                 slot.backoff_s, ran_s=event.ran_s, action=action
             )
@@ -2431,7 +2440,8 @@ class RealHost:
             remaining = 0.0
         ready: list[int] = []
         if fdmap and self.stdout_detector_status().failure is None:
-            bounded_failures = 0
+            transient_started: float | None = None
+            transient_deadline: float | None = None
             while True:
                 try:
                     events_ready = poller.poll(
@@ -2449,22 +2459,59 @@ class RealHost:
                         )
                         continue
                     if policy == "retry-bounded":
-                        bounded_failures += 1
-                        if bounded_failures < TRANSIENT_DETECTOR_FAILURE_LIMIT:
+                        now = time.monotonic()
+                        try:
+                            peer_gone = self.stdio_peer_gone()
+                        except (AttributeError, OSError, TypeError, ValueError):
+                            peer_gone = False
+                        if peer_gone:
+                            self.report_stdout_detector(
+                                "poll",
+                                "peer-gone",
+                                "controlling stdout peer-gone probe confirmed closure",
+                            )
+                            break
+                        if transient_started is None:
+                            transient_started = now
+                            transient_deadline = (
+                                now + TRANSIENT_DETECTOR_RETRY_BUDGET_S
+                            )
+                        # The semantic wait itself is complete. Preserve the
+                        # inconclusive detector observation and retry it on the
+                        # next supervisor iteration; an expired zero-time wait
+                        # is not evidence that the detector is unavailable.
+                        if now >= deadline:
+                            self.report_stdout_detector(
+                                "poll",
+                                "unknown",
+                                "stdout poll temporarily unavailable at wait deadline",
+                            )
+                            break
+                        assert transient_deadline is not None
+                        if now < transient_deadline:
+                            elapsed = now - transient_started
                             self.report_stdout_detector(
                                 "poll",
                                 "unknown",
                                 "stdout poll temporarily unavailable; retrying "
-                                f"({bounded_failures}/"
-                                f"{TRANSIENT_DETECTOR_FAILURE_LIMIT})",
+                                f"({elapsed:.3f}s/"
+                                f"{TRANSIENT_DETECTOR_RETRY_BUDGET_S:.3f}s)",
+                            )
+                            time.sleep(
+                                min(
+                                    TRANSIENT_DETECTOR_RETRY_S,
+                                    max(0.0, transient_deadline - now),
+                                    max(0.0, deadline - now),
+                                )
                             )
                             continue
+                        elapsed = now - transient_started
                         self.report_stdout_detector(
                             "poll",
                             "unavailable",
-                            "stdout poll failed persistently after "
-                            f"{bounded_failures} consecutive {error_name} "
-                            f"attempts: {exc}",
+                            "stdout poll failed persistently for "
+                            f"{elapsed:.3f}s under consecutive {error_name} "
+                            f"with no peer-gone evidence: {exc}",
                             error_name,
                         )
                         break

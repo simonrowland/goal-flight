@@ -646,7 +646,7 @@ def claim_watchdog_death_report(
     *,
     controller_label: str,
     lease_nonce: str,
-) -> bool:
+) -> bool | None:
     """First doorbell in this lease generation announces a missing watchdog.
 
     Without this the announcement is LEVEL-triggered: a missing watchdog lock
@@ -678,7 +678,10 @@ def claim_watchdog_death_report(
     except FileExistsError:
         return False
     except OSError:
-        return False
+        # UNKNOWN must remain distinct from a proven prior claim. The witness
+        # can then surface the watchdog death instead of suppressing the only
+        # doorbell on an operation that never committed.
+        return None
     os.close(fd)
     return True
 
@@ -2324,6 +2327,7 @@ def live_waiters(
             else None
         )
         live: list[WaiterRecord] = []
+        indeterminate = False
         for name in names:
             path = directory / name
             record = _parse_waiter_path(path)
@@ -2338,19 +2342,40 @@ def live_waiters(
                 continue
             lock_state = _probe_locked_state_at(directory_fd, name)
             identity = goalflight_compat.process_start_identity(record.pid)
-            owner_matches = bool(
-                isinstance(identity, dict)
-                and identity.get("start_token")
-                and _start_hash(identity["start_token"]) == record.start_hash
-                and goalflight_compat.pid_is_zombie(record.pid) is False
-            )
-            if owner_matches and lock_state is True:
+            liveness = goalflight_compat.pid_liveness(record.pid)
+            zombie = goalflight_compat.pid_is_zombie(record.pid)
+            if liveness is False or zombie is True:
+                owner_matches: bool | None = False
+            elif isinstance(identity, dict) and identity.get("start_token"):
+                token_matches = (
+                    _start_hash(identity["start_token"]) == record.start_hash
+                )
+                owner_matches = (
+                    False
+                    if not token_matches
+                    else True
+                    if zombie is False
+                    else None
+                )
+            else:
+                owner_matches = None
+            if owner_matches is True and lock_state is True:
                 live.append(record)
-            elif prune_dead:
+            elif owner_matches is False or lock_state is False:
+                if not prune_dead:
+                    continue
                 try:
                     _unlink_at(directory_fd, name)
                 except OSError:
                     pass
+            else:
+                # A held lock with an unavailable process/identity probe may
+                # still belong to the recorded live waiter. Preserve its path
+                # and report UNKNOWN for the aggregate instead of converting
+                # missing evidence into cleanup authority.
+                indeterminate = True
+        if indeterminate:
+            return None
         return sorted(live, key=lambda row: (row.kind, row.pid, row.instance_id))
     except OSError:
         return None

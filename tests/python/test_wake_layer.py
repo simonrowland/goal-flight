@@ -2022,6 +2022,30 @@ def test_lockfile_content_never_claims_liveness(isolated: tuple[Path, dict[str, 
     assert not stale_path.exists()
 
 
+def test_indeterminate_waiter_identity_probe_preserves_live_path(
+    isolated: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _env = isolated
+    registration = wake.register_waiter(
+        root,
+        controller_label="wake-test",
+        kind="listener",
+    )
+    path = registration.record.path
+    try:
+        monkeypatch.setattr(
+            wake.goalflight_compat,
+            "process_start_identity",
+            lambda _pid: None,
+        )
+
+        assert wake.live_waiters(root, controller_label="wake-test") is None
+        assert path.exists()
+    finally:
+        registration.close()
+
+
 def test_waiter_coverage_rejects_transient_fork_inheritance(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
@@ -2061,11 +2085,18 @@ time.sleep(60)
         while not orphaned.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert orphaned.exists(), "fork child did not outlive its recorded owner"
-        # Sandboxed macOS may deny `ps` for a zombie that libproc no longer
-        # exposes. UNKNOWN is deliberately the same fail-noisy direction.
-        assert wake.goalflight_compat.pid_is_zombie(holder.pid) is not False
-        assert wake.live_waiters(root, controller_label="wake-test") == []
-        assert not Path(path_text).exists()
+        # A confirmed zombie is dead and may be pruned. If the sandbox makes
+        # that probe indeterminate, retain the inherited lock path: UNKNOWN is
+        # not cleanup authority even though coverage must stay fail-noisy.
+        zombie = wake.goalflight_compat.pid_is_zombie(holder.pid)
+        assert zombie is not False
+        observed = wake.live_waiters(root, controller_label="wake-test")
+        if zombie is True:
+            assert observed == []
+            assert not Path(path_text).exists()
+        else:
+            assert observed is None
+            assert Path(path_text).exists()
         holder.wait(timeout=3)
     finally:
         if holder.poll() is None:
