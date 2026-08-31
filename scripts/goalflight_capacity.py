@@ -723,24 +723,21 @@ def _pid_holds_capacity(
     """Whether this pid still protects the lease against reclaim.
 
     Confirmed live holds until death (boolean ``pid_alive`` stays conservative
-    for kill/reap). Confirmed dead does not hold. Indeterminate holds only
-    inside the 7200s window derived by ``_indeterminate_retention_open`` so
-    EPERM/foreign-pid reuse cannot park a slot for that process's lifetime.
+    for kill/reap). A live PID is not an unknown probe: missing start-token
+    evidence must not authorise expiry, because that reclaims a process we
+    measured alive. Without a stored token we also cannot prove PID reuse, so
+    we hold until death. Acquire/attach persist the token so reuse is a
+    mismatch (False) instead of this hold. Confirmed dead does not hold.
+    Indeterminate (probe None) holds only inside the 7200s window derived by
+    ``_indeterminate_retention_open`` so EPERM/foreign-pid reuse cannot park a
+    slot for that process's lifetime.
     """
     live = _probe_pid_liveness(pid)
     if live is True:
-        expected = _lease_identity_for_pid(lease, pid)
-        if expected is None:
-            # Legacy leases had only a PID, so preserve their conservative live
-            # behavior. New leases mark the identity schema even when capture
-            # failed; that explicit unknown gets bounded retention, not forever.
-            if lease.get("process_identity_schema") == PROCESS_IDENTITY_SCHEMA:
-                return _indeterminate_retention_open(lease, now=now)
-            return True
         generation_matches = _pid_generation_matches(pid, lease)
-        if generation_matches is None:
-            return _indeterminate_retention_open(lease, now=now)
-        return generation_matches
+        if generation_matches is False:
+            return False
+        return True
     if live is False:
         return False
     return _indeterminate_retention_open(lease, now=now)
@@ -812,17 +809,21 @@ def attached_worker_group_holds_capacity(lease: dict) -> bool:
         # The live process group belongs to a reused leader generation, not the
         # recorded worker. Group existence cannot overrule a start-token mismatch.
         return False
-    # Confirmed-live group: hold (descendants may outlive a dead leader).
+    # Confirmed-live group: hold (descendants may outlive a dead leader). If
+    # identity cannot be established, we cannot tell original from reuse;
+    # expiry would reclaim a live original worker. Attach persists the token
+    # so reuse hits the mismatch short-circuit above instead of this hold.
     # Unprobeable group: the same 7200s bound as pid reclaim, not infinite.
     group_alive = _process_group_liveness(lease.get("worker_pgid"))
     if group_alive is True:
         return True
     if group_alive is None:
         return _indeterminate_retention_open(lease)
-    if _lease_identity_for_pid(lease, worker_pid) is None:
-        # A dead recorded group plus a live unqualified PID is the classic reuse
-        # shape. Keep it for a bounded indeterminate window, never forever.
-        return _indeterminate_retention_open(lease)
+    # Group is confirmed dead. Missing identity used to skip the PID probe and
+    # park the slot until started_at+7200s even when the worker was also
+    # confirmed dead. Consult the PID: confirmed-dead reclaims; confirmed-live
+    # holds (reuse without a token is indistinguishable from the original);
+    # unknown is bounded.
     return _pid_holds_capacity(worker_pid, lease)
 
 
@@ -898,6 +899,44 @@ def extend_active_lease_expiry(lease_id: str | None, seconds: float) -> bool:
         )
         save_state(data)
         return True
+
+
+def record_attached_worker(
+    lease: dict,
+    worker_pid: int,
+    worker_pgid: int | None = None,
+) -> None:
+    """Write pid/pgid and start token onto an in-memory lease.
+
+    Capture failure leaves identity unset rather than inventing a token. A
+    confirmed-live PID/group then holds until death; a confirmed-dead
+    PID/group is reclaimable. Expiring because the token is missing would
+    reclaim a live worker.
+    """
+    lease["worker_pid"] = worker_pid
+    if worker_pgid and worker_pgid > 1:
+        lease["worker_pgid"] = worker_pgid
+    identity = _process_start_identity(worker_pid)
+    lease["process_identity_schema"] = PROCESS_IDENTITY_SCHEMA
+    lease.pop("worker_identity", None)
+    if identity is not None:
+        lease["worker_identity"] = identity
+
+
+def attach_worker_to_capacity_lease(
+    lease_id: str | None,
+    worker_pid: int,
+    worker_pgid: int | None = None,
+) -> None:
+    """Persist worker pid/pgid and start token before RUNNING."""
+    if not lease_id:
+        return
+    with StateLock():
+        data = load_state()
+        lease = data.get("leases", {}).get(lease_id)
+        if lease:
+            record_attached_worker(lease, worker_pid, worker_pgid)
+            save_state(data)
 
 
 def detach_lease_to_worker(lease_id: str | None, worker_pid: int, reason: object) -> bool:

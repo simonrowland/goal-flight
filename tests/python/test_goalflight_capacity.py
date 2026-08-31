@@ -548,6 +548,80 @@ def case_pid_reuse_identity_mismatch_is_stale() -> None:
         worker.wait()
 
 
+def case_pid_reuse_identity_mismatch_without_pgid_is_stale() -> None:
+    """No-pgid path: mismatched start token is reclaimable via _pid_holds_capacity."""
+    worker = _spawn_live_worker()
+    try:
+        current = compat.process_start_identity(worker.pid)
+        assert current and current.get("start_token"), current
+        recorded = dict(current)
+        recorded["start_token"] = str(current["start_token"]) + ":prior"
+        lease = _past_ttl_lease(worker_pid=worker.pid, controller_pid=None)
+        lease["process_identity_schema"] = cap.PROCESS_IDENTITY_SCHEMA
+        lease["worker_identity"] = recorded
+        data = {"leases": {lease["lease_id"]: lease}, "cooldowns": {}}
+        assert "worker_pgid" not in lease
+        assert compat.pid_liveness(worker.pid) is True
+        assert lease in cap.stale_active_leases(data), (
+            "no-pgid live PID with mismatched token kept the lease"
+        )
+        lease["worker_identity"] = current
+        assert lease not in cap.stale_active_leases(data), (
+            "matching no-pgid generation did not retain genuine live worker"
+        )
+    finally:
+        _kill_if_alive(worker.pid)
+        worker.wait()
+
+
+def case_live_schema_without_token_holds_past_retention() -> None:
+    """Confirmed-live PID is not unknown; missing token must not expire it."""
+    worker = _spawn_live_worker()
+    try:
+        lease = _past_ttl_lease(worker_pid=worker.pid, controller_pid=_dead_pid())
+        lease["process_identity_schema"] = cap.PROCESS_IDENTITY_SCHEMA
+        now = cap.utc_now()
+        lease["started_at"] = cap.iso(
+            now - dt.timedelta(seconds=cap.INDETERMINATE_LIVE_RETENTION_S + 120)
+        )
+        lease["expires_at"] = cap.iso(
+            now - dt.timedelta(seconds=cap.INDETERMINATE_LIVE_RETENTION_S + 60)
+        )
+        data = {"leases": {lease["lease_id"]: lease}, "cooldowns": {}}
+        assert compat.pid_liveness(worker.pid) is True
+        assert lease not in cap.stale_active_leases(data), (
+            "confirmed-live PID without start token was expired after 7200s"
+        )
+        cap.prune_state(data)
+        survived = data["leases"].get(lease["lease_id"])
+        assert survived is not None and survived["state"] == "active", (
+            "confirmed-live schema-without-token worker was reclaimed"
+        )
+    finally:
+        _kill_if_alive(worker.pid)
+        worker.wait()
+
+
+def case_dead_attached_group_without_identity_is_stale() -> None:
+    """Confirmed-dead group+pid with no start token is reclaimable now."""
+    dead = _dead_pid()
+    lease = _past_ttl_lease(worker_pid=dead, controller_pid=None)
+    lease["worker_pgid"] = dead
+    lease["process_identity_schema"] = cap.PROCESS_IDENTITY_SCHEMA
+    now = cap.utc_now()
+    lease["started_at"] = cap.iso(now - dt.timedelta(seconds=30))
+    lease["expires_at"] = cap.iso(now - dt.timedelta(seconds=1))
+    data = {"leases": {lease["lease_id"]: lease}, "cooldowns": {}}
+    assert lease in cap.stale_active_leases(data), (
+        "confirmed-dead attached group without identity was held until 7200s"
+    )
+    cap.prune_state(data)
+    survivor = data["leases"].get(lease["lease_id"])
+    if survivor is not None:
+        assert survivor["state"] == "expired", survivor
+    assert cap.active_leases(data) == []
+
+
 def case_indeterminate_missing_clocks_starts_bounded_retention() -> None:
     """No PID verdict + no clocks holds now, then expires from first sight."""
     foreign = _indeterminate_foreign_pid()
@@ -588,6 +662,10 @@ def case_live_worker_survives_past_indeterminate_retention() -> None:
     worker = _spawn_live_worker()
     try:
         lease = _past_ttl_lease(worker_pid=worker.pid, controller_pid=_dead_pid())
+        identity = compat.process_start_identity(worker.pid)
+        assert identity and identity.get("start_token"), identity
+        lease["process_identity_schema"] = cap.PROCESS_IDENTITY_SCHEMA
+        lease["worker_identity"] = identity
         now = cap.utc_now()
         lease["expires_at"] = cap.iso(
             now - dt.timedelta(seconds=cap.INDETERMINATE_LIVE_RETENTION_S + 60)
@@ -917,6 +995,57 @@ def case_unowned_acquire_tracks_pre_attach_claimant(state_dir: Path) -> None:
     assert lease in cap.stale_active_leases(data), lease
     cap.prune_state(data)
     assert lease.get("state") == "expired", lease
+
+
+def case_attach_persists_worker_start_identity(state_dir: Path) -> None:
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    lease_id = "attach-identity"
+    try:
+        cap.save_state(
+            {
+                "schema": cap.SCHEMA,
+                "machine_id": cap.machine_id(),
+                "leases": {
+                    lease_id: {
+                        "lease_id": lease_id,
+                        "agent": "codex",
+                        "state": "active",
+                        "process_identity_schema": cap.PROCESS_IDENTITY_SCHEMA,
+                        "started_at": cap.iso(),
+                        "expires_at": cap.iso(
+                            cap.utc_now() + dt.timedelta(hours=1)
+                        ),
+                    }
+                },
+                "cooldowns": {},
+            }
+        )
+        cap.attach_worker_to_capacity_lease(lease_id, worker.pid, worker.pid)
+        lease = cap.load_state()["leases"][lease_id]
+        expected = compat.process_start_identity(worker.pid)
+        assert expected and expected.get("start_token"), expected
+        assert lease.get("worker_pid") == worker.pid, lease
+        assert lease.get("worker_pgid") == worker.pid, lease
+        assert lease.get("process_identity_schema") == cap.PROCESS_IDENTITY_SCHEMA
+        assert lease.get("worker_identity") == expected, lease
+
+        reused = dict(lease)
+        reused["worker_identity"] = dict(expected)
+        reused["worker_identity"]["start_token"] = (
+            str(expected["start_token"]) + ":prior"
+        )
+        data = {"leases": {reused["lease_id"]: reused}, "cooldowns": {}}
+        assert reused in cap.stale_active_leases(data), (
+            "attached live group without matching token still held after reuse"
+        )
+    finally:
+        _kill_if_alive(worker.pid)
+        worker.wait()
 
 
 def case_detach_persists_worker_start_identity(state_dir: Path) -> None:
@@ -1806,6 +1935,9 @@ def main() -> None:
     case_rate_limited_retained_lease_pruned()
     case_indeterminate_holder_bounded_not_indefinite()
     case_pid_reuse_identity_mismatch_is_stale()
+    case_pid_reuse_identity_mismatch_without_pgid_is_stale()
+    case_live_schema_without_token_holds_past_retention()
+    case_dead_attached_group_without_identity_is_stale()
     case_indeterminate_missing_clocks_starts_bounded_retention()
     case_live_worker_survives_past_indeterminate_retention()
     case_unprobeable_retained_scope_reclaims_after_until()
@@ -1841,6 +1973,7 @@ def main() -> None:
             case_aggregate_status_payload_does_not_persist_prune(state_dir)
             case_acquire_atomic_gate_still_blocks_over_cap(state_dir)
             case_unowned_acquire_tracks_pre_attach_claimant(state_dir)
+            case_attach_persists_worker_start_identity(state_dir)
             case_detach_persists_worker_start_identity(state_dir)
             case_adaptive_rate_pressure_reduces_codex_effective_cap(state_dir)
             case_adaptive_rate_pressure_status_surfaces_warning(state_dir)

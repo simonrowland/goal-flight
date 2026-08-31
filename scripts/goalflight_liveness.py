@@ -143,7 +143,7 @@ def _parse_last_idle_pct(output: str) -> float | None:
 
 def _darwin_low_power_mode_enabled(
     check_output: Callable[..., str] = subprocess.check_output,
-) -> bool:
+) -> bool | None:
     output = check_output(
         ["pmset", "-g"],
         stderr=subprocess.DEVNULL,
@@ -156,7 +156,10 @@ def _darwin_low_power_mode_enabled(
         parts = raw_line.strip().lower().split()
         if len(parts) >= 2 and parts[0] == "lowpowermode":
             return parts[-1] == "1"
-    return False
+    # pmset ran but did not report the key. That is not proof the machine is
+    # in high-power mode; treat as unknown so the watcher grants the same
+    # bounded starvation grace as a failed read.
+    return None
 
 
 def _darwin_idle_pct(
@@ -236,6 +239,8 @@ def _system_starved_uncached(
     platform = platform_name or sys.platform
     if platform == "darwin":
         low_power = _darwin_low_power_mode_enabled(check_output)
+        if low_power is None:
+            return None
         idle_pct = _darwin_idle_pct(check_output) if low_power else None
     elif platform.startswith("linux"):
         low_power = _linux_powersave_governor(sys_root)

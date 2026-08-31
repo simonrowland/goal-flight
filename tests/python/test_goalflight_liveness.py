@@ -562,9 +562,11 @@ def test_system_starved_failed_read_is_unknown_and_not_cached() -> None:
             sys_root
             / "devices/system/cpu/cpu0/cpufreq/scaling_governor"
         )
-        governor.parent.mkdir(parents=True)
-        target = root / "governor-value"
-        governor.symlink_to(target)
+        # Darwin glob omits dangling symlinks, so a missing target never
+        # reaches read_text and the probe collapses to "not starved". A
+        # directory at the governor path is returned by glob and read_text
+        # raises IsADirectoryError (OSError) — the unknown path this pins.
+        governor.mkdir(parents=True)
         proc_stat = root / "proc-stat"
         first = "cpu 100 0 100 800 0 0 0 0\n"
         second = "cpu 200 0 200 800 0 0 0 0\n"
@@ -586,17 +588,38 @@ def test_system_starved_failed_read_is_unknown_and_not_cached() -> None:
 
         try:
             goalflight_liveness._system_starved_uncached = probe
-            # Dangling governor symlink makes read_text() actually raise. The
-            # failed observation is unknown and must not populate the cache.
             assert system_starved(now=lambda: 1.0) is None
             assert goalflight_liveness._SYSTEM_STARVED_CACHE is None
-            target.write_text("powersave\n", encoding="utf-8")
+            governor.rmdir()
+            governor.write_text("powersave\n", encoding="utf-8")
             proc_stat.write_text(first, encoding="utf-8")
             assert system_starved(now=lambda: 1.1) is True
             assert calls["count"] == 2, calls
         finally:
             goalflight_liveness._system_starved_uncached = original
             goalflight_liveness._SYSTEM_STARVED_CACHE = None
+
+
+def test_system_starved_darwin_missing_lowpowermode_is_unknown() -> None:
+    def fake_check_output(argv, **_kwargs):
+        if argv == ["pmset", "-g"]:
+            return "System-wide power settings:\n sleep 0\n"
+        raise AssertionError(f"iostat must not run when low-power is unknown: {argv}")
+
+    assert _system_starved_uncached(
+        platform_name="darwin", check_output=fake_check_output
+    ) is None
+
+
+def test_system_starved_darwin_low_power_off_is_not_starved() -> None:
+    def fake_check_output(argv, **_kwargs):
+        if argv == ["pmset", "-g"]:
+            return "System-wide power settings:\n lowpowermode 0\n"
+        raise AssertionError(f"iostat must not run when low-power is off: {argv}")
+
+    assert _system_starved_uncached(
+        platform_name="darwin", check_output=fake_check_output
+    ) is False
 
 
 def test_heartbeat_dead_sample_decision_table() -> None:
@@ -1363,7 +1386,10 @@ def main() -> None:
     test_starved_short_idle_still_gets_factor_benefit()
     test_not_starved_zero_cpu_still_wedges_at_idle_timeout()
     test_system_starved_darwin_low_power_low_idle()
+    test_system_starved_darwin_missing_lowpowermode_is_unknown()
+    test_system_starved_darwin_low_power_off_is_not_starved()
     test_system_starved_failed_read_is_unknown_and_not_cached()
+    test_positive_probes_remain_live_past_indeterminate_outer_bound()
     test_heartbeat_dead_sample_decision_table()
     test_heartbeat_first_token_grace_requires_progress_before_wedge()
     test_heartbeat_wedges_after_first_progress_and_resets_on_new_progress()
@@ -1385,6 +1411,7 @@ def main() -> None:
     test_idle_gate_idle_is_wedged()
     test_idle_gate_unknown_cpu_keeps_waiting()
     test_idle_gate_hard_wall_fires_after_sustained_quiet()
+    test_idle_gate_hard_wall_also_bounds_idle_or_unknown_cpu()
     test_idle_gate_event_resets_hard_wall()
     test_cpu_keep_waiting_real_busy_subprocess_keeps_waiting()
     test_ps_cputime_field_parses_every_shape_ps_emits()
