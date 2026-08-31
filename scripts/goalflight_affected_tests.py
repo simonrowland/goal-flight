@@ -185,6 +185,38 @@ def main() -> int:
     ap.add_argument("--no-rerun", action="store_true", help="do not re-run non-passing modules serially")
     args = ap.parse_args()
 
+    # Refuse rather than report. The interpreter running this gate is the one
+    # used for every module, and pytest-native modules cannot run without
+    # pytest. A baseline run once launched under Xcode's python3 reported
+    # "0 passed, 22 failed" -- every module failing on "No module named pytest"
+    # and on PEP 604 annotations an older interpreter cannot evaluate. That
+    # rendered one environment fault as 22 definite test verdicts, which is
+    # exactly the mistake this gate exists to catch. An unusable interpreter is
+    # a runner problem, not a result.
+    try:
+        subprocess.run(
+            [sys.executable, "-c", "import pytest"],
+            capture_output=True, check=True, timeout=60,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        print(
+            f"goalflight_affected_tests: interpreter {sys.executable} cannot import "
+            f"pytest ({type(exc).__name__}); it cannot run pytest-native modules, and "
+            "every one of them would be reported as a failure. Re-run with an "
+            "interpreter that has pytest. No tests were run.",
+            file=sys.stderr,
+        )
+        return 2
+    if sys.version_info < (3, 10):
+        print(
+            f"goalflight_affected_tests: interpreter {sys.executable} is "
+            f"{sys.version_info.major}.{sys.version_info.minor}; this suite uses PEP 604 "
+            "annotations that it cannot evaluate, so every module would fail for that "
+            "reason alone. No tests were run.",
+            file=sys.stderr,
+        )
+        return 2
+
     since = None if args.since in ("", "none") else args.since
     if since and not _git("rev-parse", "--verify", since):
         print(f"goalflight_affected_tests: unknown ref {since!r}", file=sys.stderr)
