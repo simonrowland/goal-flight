@@ -233,15 +233,18 @@ For an unclaimed deliberate fixed-set join, use in the background:
 `python3 <skill-root>/scripts/goalflight_status.py --wait id1,id2 --wait-timeout <s>`.
 Exit 0 means every requested dispatch is terminal; exit 1 means pending/timeout;
 **exit 3 means mail arrived while you were waiting** and the wait returned early
-so you can read it. Workers may still be running -- that is why it is not 0 --
-and the re-arm command, pre-filled with the ids still pending, is printed on
-stderr.
+so you can read it. **exit 4 means the mail watermark stayed unreadable** after a
+short recovery grace — blocking mail may already exist and could not be proven
+absent, so the wait must not sleep through it. Workers may still be running --
+that is why neither 3 nor 4 is 0 -- and the re-arm command, pre-filled with the
+ids still pending, is printed on stderr for exit 3.
 
-Branch on all three. A controller that treats any non-zero as failure will read
-an early mail wake as a broken wait, abandon its workers, and go back to
-polling by hand. That is the exact behaviour this replaced: before the wake
-existed, worker escalations sat unread for hours while a human relayed messages
-between sessions.
+Branch on 0, 1, 3, and 4. A controller that treats any non-zero as failure will
+read an early mail wake as a broken wait, abandon its workers, and go back to
+polling by hand. Treating exit 4 as "no mail" is the same false-negative: the
+watermark could not be read. That is the exact behaviour this replaced: before
+the wake existed, worker escalations sat unread for hours while a human relayed
+messages between sessions.
 
 For a claimed controller confirmed to be unsupervised, background the one-shot
 journal listener. A live supervisor is restarted instead; UNKNOWN supervision must

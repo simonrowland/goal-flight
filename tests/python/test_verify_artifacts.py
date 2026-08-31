@@ -10,9 +10,13 @@ lookup (no aggregate/enumeration), and exit codes.
 
 from __future__ import annotations
 
+import io
+import os
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -47,6 +51,26 @@ def test_direct_open_present_and_absent() -> None:
         f.write_text("content", encoding="utf-8")
         assert_eq("present file", S._direct_open_exists(f), (True, 7))
         assert_eq("absent file", S._direct_open_exists(Path(d) / "nope.md"), (False, 0))
+        os.chmod(f, 0o000)
+        try:
+            assert_eq("unreadable file", S._direct_open_exists(f), (None, 0))
+        finally:
+            os.chmod(f, 0o600)
+
+
+def test_unreadable_ledger_listing_is_unknown_not_absent() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        state = Path(d) / "state"
+        runs = state / "runs.d"
+        runs.mkdir(parents=True)
+        with mock.patch.dict(os.environ, {"GOALFLIGHT_STATE_DIR": str(state)}):
+            os.chmod(runs, 0o000)
+            try:
+                out = S.verify_artifacts("unknown-ledger", project_root=None)
+            finally:
+                os.chmod(runs, 0o700)
+        assert_eq("ledger found unknown", out["found"], None)
+        assert_true("ledger unreadable reason", "ledger unreadable" in out["reason"])
 
 
 def _patch_ledger(records: list[dict]):
@@ -92,6 +116,84 @@ def test_verify_absent_artifact() -> None:
             assert_true("all_present false", out["all_present"] is False)
         finally:
             restore()
+
+
+def test_verify_unreadable_artifact_is_unknown() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        art = Path(d) / "private.md"
+        art.write_text("present but unreadable", encoding="utf-8")
+        restore = _patch_ledger([_record(d, "READY: vx — private.md")])
+        os.chmod(art, 0o000)
+        try:
+            out = S.verify_artifacts("vx", project_root=None)
+        finally:
+            os.chmod(art, 0o600)
+            restore()
+        assert_eq("artifact presence unknown", out["results"][0]["present"], None)
+        assert_true("unknown remains unknown in aggregate", out["all_present"] is None)
+
+
+def test_cli_unreadable_prompt_reports_unknown_not_no_declaration() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        prompt = Path(d) / "assembled.prompt"
+        prompt.write_text("READY: vx — artifact.md\n", encoding="utf-8")
+        record = _record(d, "READY: vx — artifact.md")
+        record["prompt_path"] = str(prompt)
+        restore = _patch_ledger([record])
+        os.chmod(prompt, 0o000)
+        buf = io.StringIO()
+        try:
+            with mock.patch.object(S, "this_project_root", return_value=d):
+                with redirect_stdout(buf):
+                    code = S.main(["--verify-artifacts", "vx"])
+        finally:
+            os.chmod(prompt, 0o600)
+            restore()
+    out = buf.getvalue()
+    assert_eq("unreadable prompt exit", code, 2)
+    assert_true("unreadable prompt unknown row", "[UNKNOWN] prompt unreadable; terminal marker unknown" in out)
+    assert_true("unreadable prompt aggregate", "all_present=unknown" in out)
+    assert_true("unreadable prompt not absent", "no artifact path declared" not in out)
+
+
+def test_cli_unreadable_artifact_reports_unknown_not_missing() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        art = Path(d) / "private.md"
+        art.write_text("present but unreadable", encoding="utf-8")
+        restore = _patch_ledger([_record(d, "READY: vx — private.md")])
+        os.chmod(art, 0o000)
+        buf = io.StringIO()
+        try:
+            with mock.patch.object(S, "this_project_root", return_value=d):
+                with redirect_stdout(buf):
+                    code = S.main(["--verify-artifacts", "vx"])
+        finally:
+            os.chmod(art, 0o600)
+            restore()
+    out = buf.getvalue()
+    assert_eq("unreadable artifact exit", code, 2)
+    assert_true("unreadable artifact mark", "[UNKNOWN]" in out)
+    assert_true("unreadable artifact aggregate", "all_present=unknown" in out)
+    assert_true("unreadable artifact not missing", "[MISSING]" not in out)
+
+
+def test_cli_readable_marker_without_artifact_reports_no_declaration() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        restore = _patch_ledger([_record(d, "COMPLETE: vx — done")])
+        buf = io.StringIO()
+        try:
+            with mock.patch.object(S, "this_project_root", return_value=d):
+                with redirect_stdout(buf):
+                    code = S.main(["--verify-artifacts", "vx"])
+        finally:
+            restore()
+    out = buf.getvalue()
+    assert_eq("no-declaration exit", code, 1)
+    assert_true(
+        "no-declaration text",
+        "no artifact path declared in the terminal marker" in out,
+    )
+    assert_true("no-declaration is not unknown", "[UNKNOWN]" not in out)
 
 
 def test_failure_marker_declares_no_artifacts() -> None:
@@ -145,8 +247,13 @@ def main() -> None:
     tests = [
         test_extract_marker_paths,
         test_direct_open_present_and_absent,
+        test_unreadable_ledger_listing_is_unknown_not_absent,
         test_verify_present_via_direct_open,
         test_verify_absent_artifact,
+        test_verify_unreadable_artifact_is_unknown,
+        test_cli_unreadable_prompt_reports_unknown_not_no_declaration,
+        test_cli_unreadable_artifact_reports_unknown_not_missing,
+        test_cli_readable_marker_without_artifact_reports_no_declaration,
         test_failure_marker_declares_no_artifacts,
         test_verify_uses_open_not_enumeration,
         test_not_found_exit_2_even_json,

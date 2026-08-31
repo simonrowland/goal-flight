@@ -703,7 +703,11 @@ def test_status_surfaces_milestone_probe_failure_as_unavailable() -> None:
             rc = S.main(["--json"])
         data = json.loads(buf.getvalue())
         assert rc == 0
-        assert data["milestone"]["active_cadence"] is False
+        # Probe failure cannot prove cadence active, inactive, due, or not due.
+        # All unmeasured fields stay unknown instead of swapping one guess for
+        # its opposite.
+        assert data["milestone"]["active_cadence"] is None
+        assert data["milestone"]["due"] is None
         assert data["milestone"]["reason"] == "milestone unavailable"
         assert data["milestone"]["error"] == "RuntimeError: boom second line"
     finally:
@@ -869,4 +873,3 @@ def test_cmd_check_json_and_exit_codes_unchanged() -> None:
         assert err.getvalue().startswith("goalflight_milestone: boom")
     finally:
         M.check_status = orig
-

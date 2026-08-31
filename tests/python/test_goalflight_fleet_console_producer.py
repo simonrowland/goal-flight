@@ -66,7 +66,9 @@ def _retainable_fleet_payload(generation_id: str, *, observed_at: str) -> dict:
     payload["sample_started_at"] = observed_at
     payload["sample_finished_at"] = observed_at
     payload["last_error"] = None
-    payload["incomplete"] = False
+    # A successful deep sample is still partial coverage when registry roots
+    # remain unsampled. The old fixture pinned the false-complete projection.
+    payload["incomplete"] = True
     payload["registry_total"] = 77
     payload["registry_deep_sampled"] = 3
     payload["registry_unsampled"] = 74
@@ -110,6 +112,19 @@ def _retainable_fleet_payload(generation_id: str, *, observed_at: str) -> dict:
     ]
     console.validate_projection(payload, "fleet")
     return payload
+
+
+def test_current_partial_registry_sample_is_incomplete_without_timeout() -> None:
+    """Pin partial-coverage incomplete without the timeout overlay that also sets it."""
+    payload = _retainable_fleet_payload(
+        "current-partial",
+        observed_at="2026-08-02T10:00:00+00:00",
+    )
+    assert payload["last_error"] is None
+    assert payload["incomplete"] is True
+    assert payload["registry_total"] == 77
+    assert payload["registry_deep_sampled"] == 3
+    assert payload["registry_unsampled"] == 74
 
 
 def test_default_budgets_follow_live_measurement_and_leave_reserve() -> None:

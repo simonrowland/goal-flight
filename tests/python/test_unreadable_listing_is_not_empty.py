@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from unittest import mock
 
 import pytest
 
@@ -111,8 +112,20 @@ def test_fleet_console_unreadable_index_is_not_empty_roots(tmp_path: Path) -> No
     project_dir.mkdir()
     (project_dir / journal.JOURNAL_FILE_NAME).write_bytes(b"")
     # Readable listing finds the conventional journal path.
-    roots = fleet._active_controller_roots_from_journals()
+    errors: list[str] = []
+    roots = fleet._active_controller_roots_from_journals(errors)
     assert isinstance(roots, set)
+    # The zero-byte journal used to be silently omitted, so this test passed
+    # while encoding the bug. Its unreadability must mark the fleet sample.
+    assert errors and errors[0].startswith("controller_journal:")
+    metadata = fleet._metadata(
+        "fleet",
+        generation_id="journal-error",
+        started_at="2026-08-31T00:00:00+00:00",
+        finished_at="2026-08-31T00:00:01+00:00",
+        errors=errors,
+    )
+    assert metadata["incomplete"] is True
 
     os.chmod(index, 0o000)
     try:
@@ -120,6 +133,101 @@ def test_fleet_console_unreadable_index_is_not_empty_roots(tmp_path: Path) -> No
             fleet._active_controller_roots_from_journals()
     finally:
         os.chmod(index, 0o700)
+
+
+def test_fleet_plane_local_status_failure_still_measures_queue(tmp_path: Path) -> None:
+    state_dir = Path(os.environ["GOALFLIGHT_STATE_DIR"])
+    queue = state_dir / "dispatch-queue"
+    queue.mkdir(parents=True, exist_ok=True)
+    (queue / "pending.json").write_text(
+        json.dumps(
+            {
+                "dispatch_id": "queued-1",
+                "project_root": str(tmp_path / "proj"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    with (
+        mock.patch.object(
+            fleet.goalflight_status,
+            "status_payload",
+            side_effect=RuntimeError("local status unreadable"),
+        ),
+        mock.patch.object(
+            fleet.goalflight_fleet_status_cli,
+            "build_fleet_status",
+            return_value={},
+        ),
+        mock.patch.object(fleet.goalflight_usage, "collect_usage", return_value=[]),
+        mock.patch.object(fleet.goalflight_task, "read_project_registry", return_value=[]),
+        mock.patch.object(fleet, "_active_controller_roots_from_journals", return_value=[]),
+    ):
+        payload = fleet.build_fleet_plane(generation_id="local-status-failure")
+    assert payload["machine"]["queue_depth"] == 1
+    assert payload["incomplete"] is True
+    assert payload["last_error"]
+    assert "local_status" in str(payload["last_error"])
+
+
+def test_fleet_console_queue_unreadable_or_malformed_is_unknown(tmp_path: Path) -> None:
+    upstream_errors: list[str] = []
+    by_root, depth = fleet._queue_summary(
+        {"dispatch": {"records": []}},
+        upstream_errors,
+    )
+    assert by_root == {}
+    assert depth is None
+    assert upstream_errors == []
+
+    measured_empty = tmp_path / "measured-empty"
+    measured_empty.mkdir()
+    empty_errors: list[str] = []
+    by_root, depth = fleet._queue_summary(
+        {"dispatch": {"state_dir": str(measured_empty)}},
+        empty_errors,
+    )
+    assert by_root == {}
+    assert depth == 0
+    assert empty_errors == []
+
+    state_dir = tmp_path / "state"
+    queue = state_dir / "dispatch-queue"
+    queue.mkdir(parents=True)
+    entry = queue / "pending.json"
+    entry.write_text(
+        json.dumps({"dispatch_id": "pending", "project_root": str(tmp_path / "project")}),
+        encoding="utf-8",
+    )
+    machine = {"dispatch": {"state_dir": str(state_dir)}}
+
+    errors: list[str] = []
+    os.chmod(queue, 0o000)
+    try:
+        by_root, depth = fleet._queue_summary(machine, errors)
+    finally:
+        os.chmod(queue, 0o700)
+    assert by_root == {}
+    assert depth is None
+    assert errors and errors[0].startswith("dispatch_queue:")
+    assert fleet._metadata(
+        "fleet",
+        generation_id="queue-error",
+        started_at="2026-08-31T00:00:00+00:00",
+        finished_at="2026-08-31T00:00:01+00:00",
+        errors=errors,
+    )["incomplete"] is True
+
+    entry.write_text("{", encoding="utf-8")
+    errors = []
+    by_root, depth = fleet._queue_summary(machine, errors)
+    assert by_root == {}
+    assert depth is None
+    assert errors and errors[0].startswith("dispatch_queue_entry:")
+
+    projects = [{"project_id": fleet._project_id(str(tmp_path / "project"))}]
+    fleet._attach_queue_rows(projects, by_root, queue_known=depth is not None)
+    assert projects[0]["queue"]["depth"] is None
 
 
 def test_restore_and_create_split_absent_from_unreadable(tmp_path: Path) -> None:

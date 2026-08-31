@@ -691,6 +691,7 @@ def test_fast_plane_project_classes_are_live_only_mutation_pair() -> None:
             "rate_pressure": {},
             "warnings": [],
             "dispatch": {
+                "state_dir": str(temp_root / "state"),
                 "records": [
                     {
                         "dispatch_id": "live-worker",
@@ -756,6 +757,10 @@ def test_fast_plane_project_classes_are_live_only_mutation_pair() -> None:
         payload["registry_total"] == 3
         and payload["registry_deep_sampled"] == 2
         and payload["registry_unsampled"] == 1,
+    )
+    assert_true(
+        "unsampled registry roots make fleet coverage incomplete",
+        payload["incomplete"] is True,
     )
     assert_true(
         "truncated sample names the unsampled live-capable-excluded root",
