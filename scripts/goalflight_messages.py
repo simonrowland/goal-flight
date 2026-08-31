@@ -830,7 +830,19 @@ def lookup_to_controller_label(
         }
     try:
         records, error = sessions._probe_registered_controller_records(Path(root_text))
-    except (goalflight_journal.JournalError, OSError) as exc:
+    except goalflight_journal.JournalDisappeared:
+        # Verified absence is an empty roster, not an unreadable one.
+        records, error = [], None
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalIOError,
+        OSError,
+    ) as exc:
+        records, error = None, type(exc).__name__
+    except goalflight_journal.JournalError as exc:
+        # Fail closed: do not invent "no such label" from a corrupt or
+        # upgrade-blocked journal. Name Busy/Disappeared/IOError above so
+        # this parent catch cannot flatten those three availability outcomes.
         records, error = None, type(exc).__name__
     if records is None:
         return {

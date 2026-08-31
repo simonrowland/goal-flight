@@ -24,8 +24,13 @@ sys.path.insert(0, str(ROOT / "tests" / "python"))
 
 import goalflight_journal as journal  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
+import goalflight_session_status as sessions  # noqa: E402
 import goalflight_task as task  # noqa: E402
 from support import isolated_machine_env  # noqa: E402
+
+
+class _FutureJournalUnavailable(journal.JournalUnavailable):
+    """Stand-in for a not-yet-written JournalUnavailable subclass."""
 
 SCRIPT = SCRIPTS / "goalflight_messages.py"
 
@@ -237,6 +242,72 @@ def test_lookup_unreadable_registry_returns_unknown_not_missing(
         os.chmod(journal_dir, 0o700)
     assert addressing["state"] == "unknown"
     assert addressing["state"] != "missing"
+
+
+def test_lookup_absent_registry_is_missing_not_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A vanished journal is an empty roster, never UNKNOWN."""
+    _isolate(monkeypatch, tmp_path)
+    project = _git_project(tmp_path / "project")
+    addressing = messages.lookup_to_controller_label(
+        "nobody",
+        project_root=project,
+        search_other_projects=False,
+    )
+    assert addressing["state"] == "missing"
+    assert addressing["state"] != "unknown"
+    assert "error" not in addressing
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_state"),
+    (
+        (journal.JournalDisappeared("gone"), "missing"),
+        (journal.JournalBusy("busy"), "unknown"),
+        (journal.JournalIOError("io"), "unknown"),
+        (journal.JournalIntegrityError("corrupt"), "unknown"),
+        (journal.JournalUpgradeRequired("upgrade"), "unknown"),
+        (journal.JournalError("generic"), "unknown"),
+        (journal.JournalUnavailable("abc"), "unknown"),
+        (_FutureJournalUnavailable("future"), "unknown"),
+        (OSError("os"), "unknown"),
+    ),
+)
+def test_lookup_preserves_availability_when_probe_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+    expected_state: str,
+) -> None:
+    """The lookup catch must not flatten disappeared into unknown, or escape.
+
+    Inject at ``_probe_registered_controller_records`` so this exercises the
+    handler in ``lookup_to_controller_label`` even when the probe itself
+    already swallows Busy/Disappeared/IOError. Reverting that handler to a
+    bare ``except JournalError`` maps Disappeared to unknown.
+    """
+    _isolate(monkeypatch, tmp_path)
+    project = _git_project(tmp_path / "project")
+
+    def raise_failure(_project_root, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(
+        sessions, "_probe_registered_controller_records", raise_failure
+    )
+    addressing = messages.lookup_to_controller_label(
+        "somebody",
+        project_root=project,
+        search_other_projects=False,
+    )
+    assert addressing["state"] == expected_state
+    if expected_state == "unknown":
+        assert addressing["state"] != "missing"
+        assert addressing["error"] == type(failure).__name__
+    else:
+        assert addressing["state"] != "unknown"
+        assert "error" not in addressing
 
 
 def test_lookup_unresolvable_project_root_returns_unknown_not_raise(
