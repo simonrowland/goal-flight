@@ -401,6 +401,71 @@ def test_goalflight_task_status_uses_latest_dispatch_breadcrumb() -> None:
         assert_true("newest breadcrumb wins", payload["items"][0]["derived_status"] == "working")
 
 
+def test_goalflight_task_inconclusive_breadcrumb_is_not_failed() -> None:
+    """Durable inconclusive breadcrumbs must not derive as worker-failed.
+
+    Reverting the watch mapper while leaving this consumer would still store
+    worker-failed; this pins the task-store side of that contract.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        project = Path(td) / "project-a"
+        state_dir = Path(td) / "state"
+        item = {
+            "id": "t-001",
+            "kind": "task",
+            "title": "Hung after COMPLETE",
+            "blocked_by": [],
+            "links": [],
+            "done": False,
+            "dispatches": [
+                {
+                    "dispatch_id": "codex-hang",
+                    "state": "worker-inconclusive",
+                    "ts": "2026-06-01T00:00:00+00:00",
+                    "last_worker_state": {"state": "inconclusive_timeout"},
+                }
+            ],
+        }
+        _write_tasks(project, [item])
+
+        proc = run_task(project, "status", "--json", env={"GOALFLIGHT_STATE_DIR": str(state_dir)})
+        assert_true(f"status exits 0: {proc.stderr}", proc.returncode == 0)
+        payload = json.loads(proc.stdout)
+        derived = payload["items"][0]["derived_status"]
+        assert_true("inconclusive breadcrumb stays inconclusive", derived == "worker-inconclusive")
+        assert_true("inconclusive is not worker-failed", derived != "worker-failed")
+        assert_true("inconclusive is not awaiting-review", derived != "awaiting-review")
+
+        failed_item = dict(item)
+        failed_item["id"] = "t-002"
+        failed_item["dispatches"] = [
+            {
+                "dispatch_id": "codex-dead",
+                "state": "worker-failed",
+                "ts": "2026-06-01T00:00:00+00:00",
+                "last_worker_state": {"state": "worker_dead"},
+            }
+        ]
+        _write_tasks(project, [item, failed_item])
+        proc = run_task(project, "status", "--json", env={"GOALFLIGHT_STATE_DIR": str(state_dir)})
+        assert_true(f"status exits 0 after failed row: {proc.stderr}", proc.returncode == 0)
+        by_id = {row["id"]: row["derived_status"] for row in json.loads(proc.stdout)["items"]}
+        assert_true("real failure still derives worker-failed", by_id["t-002"] == "worker-failed")
+        assert_true("inconclusive row unchanged beside a failure", by_id["t-001"] == "worker-inconclusive")
+
+        module = _load_goalflight_task_module()
+        store = module.TaskStore(project)
+        store.append_dispatch_breadcrumbs(
+            ["t-001"],
+            {
+                "dispatch_id": "codex-hang-2",
+                "state": "worker-inconclusive",
+                "ts": "2026-06-01T00:10:00+00:00",
+            },
+            "watcher",
+        )
+
+
 def test_goalflight_task_sync_writes_mirror_only_derived_status() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = Path(td) / "project-a"
@@ -2040,6 +2105,7 @@ def main() -> None:
     test_goalflight_task_status_uses_breadcrumb_when_ledger_missing()
     test_goalflight_task_status_filters_ledger_by_project_root()
     test_goalflight_task_status_uses_latest_dispatch_breadcrumb()
+    test_goalflight_task_inconclusive_breadcrumb_is_not_failed()
     test_goalflight_task_sync_writes_mirror_only_derived_status()
     test_goalflight_task_sync_appends_plural_task_ids()
     test_goalflight_task_list_filters_outstanding_awaiting_review_since()
@@ -2069,7 +2135,7 @@ def main() -> None:
     test_goalflight_task_sync_repairs_stale_mirror()
     test_goalflight_task_data_js_escapes_script_end_and_html()
     test_goalflight_task_sync_generates_markdown_views()
-    print("OK: 39 tasks mirror/task-store tests pass")
+    print("OK: 40 tasks mirror/task-store tests pass")
 
 
 if __name__ == "__main__":

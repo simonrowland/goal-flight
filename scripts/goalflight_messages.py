@@ -5940,6 +5940,7 @@ def _supervisor_frontier_snapshot(task_store) -> dict[str, object]:
                 "decision",
                 "waiting",
                 "worker-failed",
+                "worker-inconclusive",
                 "working",
             }
         ]
@@ -5955,6 +5956,7 @@ def _supervisor_frontier_snapshot(task_store) -> dict[str, object]:
         "decision",
         "waiting",
         "worker-failed",
+        "worker-inconclusive",
         "working",
     }:
         payload["state"] = derived
