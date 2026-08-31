@@ -39,7 +39,10 @@ import goalflight_compat as fcntl  # noqa: E402
 try:  # noqa: E402
     import goalflight_dispatch_states
     import goalflight_ledger
-except Exception:  # pragma: no cover - import failures surface at runtime.
+except Exception:  # pragma: no cover - import failures must not look idle.
+    # Capture/new can still run. Reads that need dispatch state
+    # (project_ledger_records / next / derived status) refuse: a failed
+    # import is unknown, never "no dispatch records".
     goalflight_dispatch_states = None  # type: ignore[assignment]
     goalflight_ledger = None  # type: ignore[assignment]
 
@@ -385,14 +388,59 @@ def _strip_managed_worktree(path: Path) -> Path:
     return resolved
 
 
-def _git_canonical_root(start: Path) -> Path | None:
+def _git_checkout_marker_present(start: Path) -> bool:
+    """True when ``start`` or an ancestor has a ``.git`` file or directory.
+
+    Used only after git itself could not name the checkout. A present marker
+    means this is not a known non-git identity: an unreadable ``.git`` or an
+    empty ``GIT_DIR`` still looks like "not a git repository" on stderr, and
+    treating that as "the start path is the project" writes a second store.
+    An OSError statting the marker is also unknown, not "absent".
+    """
+    current = _resolve_loose(start)
+    while True:
+        marker = current / ".git"
+        try:
+            os.lstat(marker)
+            return True
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
+def _git_canonical_root(start: Path, *, refuse_unknown: bool = False) -> Path | None:
     """Repo root as seen from ``start``, with worktrees collapsed to the main
-    checkout. None when ``start`` is not inside a git checkout.
+    checkout.
+
+    Return values, and which way indeterminate falls:
+    - ``Path``: git ran and named a checkout; worktrees collapse to the main
+      root so every worktree of one project shares one task store.
+    - ``None``: git ran and said ``start`` is not inside a repository, and no
+      ``.git`` marker is present on ``start`` or its ancestors. The caller may
+      treat ``start`` itself as the identity (tests, non-git dirs).
+    - raises ``TaskError`` when ``refuse_unknown=True``: git could not be asked,
+      failed for a reason other than "not a repository", or said "not a
+      repository" from a path that still has a ``.git`` marker (unreadable
+      gitdir, empty ``GIT_DIR``, and similar). A store must not guess a root:
+      writing into a different store looks like a successful capture of a
+      requirement that later "vanished". Losing a requirement is worse than
+      rejecting the write.
+    - ``None`` when ``refuse_unknown=False`` (legacy callers such as the
+      controller registry): the same git failure is still unknown, but those
+      callers already map unknown to "not a project" rather than opening a
+      store. Default stays False so their contract does not change.
 
     ``--git-common-dir`` is the worktree-invariant part: every worktree of one
     repo reports the SAME common dir, while ``--show-toplevel`` differs per
     worktree. Collapsing on the common dir is what makes all worktrees of a
-    project share one task store.
+    project share one task store. Git emits a relative common dir against the
+    command cwd (``start``), not against toplevel; joining to toplevel from a
+    subdirectory walked out of the repo.
     """
     try:
         top = Path(
@@ -400,21 +448,49 @@ def _git_canonical_root(start: Path) -> Path | None:
                 ["git", "rev-parse", "--show-toplevel"],
                 cwd=str(start),
                 text=True,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             ).strip()
         )
         common_raw = subprocess.check_output(
             ["git", "rev-parse", "--git-common-dir"],
             cwd=str(start),
             text=True,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         ).strip()
-    except (OSError, subprocess.CalledProcessError):
+    except OSError as exc:
+        if refuse_unknown:
+            raise TaskError(
+                f"unresolvable project root {start}: cannot canonicalize via git "
+                f"({exc}). Refusing to write to another store"
+            ) from exc
+        return None
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        if "not a git repository" in stderr.lower():
+            if refuse_unknown and _git_checkout_marker_present(start):
+                detail = stderr or f"git exited {exc.returncode}"
+                raise TaskError(
+                    f"unresolvable project root {start}: git rev-parse failed "
+                    f"({detail}). Refusing to write to another store"
+                ) from exc
+            return None
+        if refuse_unknown:
+            detail = stderr or f"git exited {exc.returncode}"
+            raise TaskError(
+                f"unresolvable project root {start}: git rev-parse failed ({detail}). "
+                "Refusing to write to another store"
+            ) from exc
         return None
 
     common = Path(common_raw)
     if not common.is_absolute():
-        common = top / common
+        # Relative --git-common-dir is vs the git cwd (start), not toplevel.
+        # start=repo/src + "../.git" joined to toplevel is parent-of-repo.
+        common = start / common
+    try:
+        common = common.resolve(strict=False)
+    except OSError:
+        pass
     return common.parent if common.name == ".git" else top
 
 
@@ -495,32 +571,36 @@ def resolve_project_root(value: str | None = None) -> Path:
 
     The git resolution is the collapsing step, so it has to run for an explicit
     path too -- rooted AT that path, not at the process cwd.
+
+    A path that is not a directory cannot be interrogated. Returning the path
+    itself used to accept a typo into a *different* store and exit 0: the
+    caller was told the capture worked, and the requirement later looked lost.
+    An unresolvable root now refuses, naming what it could not resolve.
+    Losing a requirement is worse than rejecting the write.
+
+    A genuine existing directory that is not a git checkout still resolves to
+    itself (tests, non-git trees). That is a known identity, not a fallback.
     """
     explicit = value or os.environ.get("GOALFLIGHT_PROJECT_ROOT")
     start = Path(explicit) if explicit else Path.cwd()
-    # A path that is not a directory (or not a checkout) cannot be interrogated;
-    # fall back to the previous behaviour rather than failing the caller.
-    # The fallback is named out loud (t-349): silently rendering "could not
-    # canonicalize" as "definitely this root" reads as a guard and is not one --
-    # a mistyped path used to surface only as a misleading
-    # "controller is not registered" refusal downstream.
-    if not start.is_dir():
-        print(
-            f"goalflight_task: WARN: resolve_project_root: {start} is not a "
-            "directory; cannot canonicalize via git -- treating the path itself "
-            "as the project root",
-            file=sys.stderr,
+    try:
+        is_dir = start.is_dir()
+    except OSError as exc:
+        raise TaskError(
+            f"unresolvable project root {start}: cannot stat ({exc}). "
+            "Refusing to write to another store"
+        ) from exc
+    if not is_dir:
+        raise TaskError(
+            f"unresolvable project root {start}: not a directory. "
+            "Refusing to write to another store"
         )
-        return _strip_managed_worktree(start)
-    canonical = _git_canonical_root(start)
+    canonical = _git_canonical_root(start, refuse_unknown=True)
     if canonical is None:
-        print(
-            f"goalflight_task: WARN: resolve_project_root: {start} is not inside "
-            "a git checkout; cannot canonicalize via git -- treating the path "
-            "itself as the project root",
-            file=sys.stderr,
-        )
-    return _strip_managed_worktree(canonical or start)
+        # Existing non-git directory: the path itself is the identity (tests,
+        # non-git trees). This is not a fallback from a failed probe.
+        return _strip_managed_worktree(start)
+    return _strip_managed_worktree(canonical)
 
 
 def _durable_state_base() -> Path:
@@ -1697,7 +1777,23 @@ def _parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], dict[str, int]]:
         if item_id in lines_by_id:
             raise TaskError(f"{path}:{lineno}: duplicate id {item_id} (first seen on line {lines_by_id[item_id]})")
         lines_by_id[item_id] = lineno
-        items.append(_migrate_item_for_read(obj))
+        item = _migrate_item_for_read(obj)
+        # Read-time type checks: a malformed field is not "absent". Treating
+        # a string blocked_by as [] (not blocked) or a dict dispatches as
+        # None (never dispatched) would dispatch work the store cannot prove
+        # is eligible. Losing that gate is worse than refusing the read.
+        blocked_by = item.get("blocked_by")
+        if not isinstance(blocked_by, LIST_TYPE):
+            raise TaskError(
+                f"{path}:{lineno}: item {item_id} blocked_by must be an array "
+                f"(got {type(blocked_by).__name__})"
+            )
+        if "dispatches" in item and not isinstance(item["dispatches"], LIST_TYPE):
+            raise TaskError(
+                f"{path}:{lineno}: item {item_id} dispatches must be an array "
+                f"(got {type(item['dispatches']).__name__})"
+            )
+        items.append(item)
     return items, lines_by_id
 
 
@@ -1748,10 +1844,16 @@ def _validate_items_for_write(items: list[dict[str, Any]], source: str = "tasks.
 
 
 def _fsync_dir(path: Path) -> None:
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
+    """fsync a directory so a rename is crash-durable.
+
+    An open/fsync failure used to be ignored, so a mutation could report
+    success without proving the directory entry was durable. The power-loss
+    consequence of that gap is unverified and is not claimed; the write is
+    still refused when durability cannot be established. Losing a requirement
+    is worse than rejecting the write. OSError propagates so callers that
+    snapshot-and-restore (save_items_atomic) can roll back.
+    """
+    fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
     finally:
@@ -1970,9 +2072,21 @@ def _breadcrumb_key(crumb: dict[str, Any]) -> str:
 
 
 def _latest_dispatch_breadcrumb(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Latest persisted dispatch breadcrumb, or None if never dispatched.
+
+    Missing ``dispatches`` (or an empty array) means the item was never
+    dispatched. A present non-array value is malformed, not "never
+    dispatched": treating it as None would make live work look idle and
+    re-dispatchable. Refuse; losing that gate is worse than rejecting the read.
+    """
+    if "dispatches" not in item:
+        return None
     dispatches = item.get("dispatches")
     if not isinstance(dispatches, LIST_TYPE):
-        return None
+        raise TaskError(
+            f"item {item.get('id', '<unknown>')}: dispatches must be an array "
+            f"(got {type(dispatches).__name__}); malformed is not undispatched"
+        )
     candidates = []
     for crumb in dispatches:
         if not isinstance(crumb, dict):
@@ -1985,9 +2099,14 @@ def _latest_dispatch_breadcrumb(item: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _latest_breadcrumb(item: dict[str, Any], *, role: str | None = None) -> dict[str, Any] | None:
+    if "dispatches" not in item:
+        return None
     dispatches = item.get("dispatches")
     if not isinstance(dispatches, LIST_TYPE):
-        return None
+        raise TaskError(
+            f"item {item.get('id', '<unknown>')}: dispatches must be an array "
+            f"(got {type(dispatches).__name__}); malformed is not undispatched"
+        )
     candidates = []
     for crumb in dispatches:
         if not isinstance(crumb, dict):
@@ -2079,9 +2198,21 @@ def unsatisfied_blockers(item: dict[str, Any], store: dict[str, dict[str, Any]])
     id that resolves to an open or awaiting-review row gates. A blocker id
     that does not resolve (missing/foreign/empty) gates — could-not-verify is
     not satisfied.
+
+    A missing or empty ``blocked_by`` is genuinely unblocked. A present
+    non-array value is malformed, not "not blocked"; refusing is the safe
+    direction for a store (losing a requirement/gate is worse than rejecting
+    the read).
     """
     blockers = item.get("blocked_by")
-    if not isinstance(blockers, LIST_TYPE) or not blockers:
+    if blockers is None:
+        return []
+    if not isinstance(blockers, LIST_TYPE):
+        raise TaskError(
+            f"item {item.get('id', '<unknown>')}: blocked_by must be an array "
+            f"(got {type(blockers).__name__}); malformed is not unblocked"
+        )
+    if not blockers:
         return []
     unsatisfied: list[str] = []
     seen: set[str] = set()
@@ -2289,14 +2420,33 @@ class TaskStore:
         )
 
     def _legacy_snapshot_paths(self) -> list[Path]:
+        """Surviving ``docs-private/log/tasks-*.jsonl`` snapshots, newest first.
+
+        An empty listing is a genuine empty: there are no snapshots. An OSError
+        while listing or statting is a failed scan, not emptiness — converting
+        it to ``[]`` made surviving requirements render as an empty store.
+        Losing a requirement is worse than rejecting the read.
+
+        ``Path.glob`` cannot carry this distinction: on an unreadable directory
+        it returns ``[]`` without raising (same pathlib behaviour
+        ``goalflight_ledger.py`` already documents). ``os.listdir`` raises.
+        """
+        log_dir = self.export_docs_dir / "log"
         try:
-            return sorted(
-                (self.export_docs_dir / "log").glob("tasks-*.jsonl"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-        except OSError:
-            return []
+            if not log_dir.is_dir():
+                return []
+            names = os.listdir(log_dir)
+            paths = [
+                log_dir / name
+                for name in names
+                if name.startswith("tasks-") and name.endswith(".jsonl")
+            ]
+            return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError as exc:
+            raise TaskError(
+                f"legacy snapshot scan failed under {log_dir}: {exc}. "
+                "Refusing to treat an unreadable scan as an empty store"
+            ) from exc
 
     @staticmethod
     def _generation_key(items: list[dict[str, Any]]) -> tuple[int, dt.datetime]:
@@ -2635,8 +2785,21 @@ class TaskStore:
                     path.unlink()
 
     def project_ledger_records(self) -> list[dict[str, Any]]:
+        """Machine-ledger dispatch records for this project.
+
+        An empty list means the ledger was readable and contains no records
+        for this project (genuinely nothing is running). A failed import of
+        the ledger module is unknown, not "nothing is running": converting
+        that failure to ``[]`` made live work look dispatchable again (two
+        workers on one task). Losing that gate is worse than refusing the
+        read.
+        """
         if goalflight_ledger is None:
-            return []
+            raise TaskError(
+                "dispatch ledger module failed to import; live work is unknown, "
+                "not idle. Refusing to treat an unreadable ledger as no dispatch "
+                "records"
+            )
         target = _strip_managed_worktree(self.project_root)
         records = []
         for record in goalflight_ledger.read_records():
@@ -3734,11 +3897,55 @@ def _capture_content_key(kind: str, lane: str, severity: Any, project_root: Path
       project would double-mint — the exact ambiguous-retry failure this key
       exists to remove. The item keeps the raw ``source`` for provenance.
     - tags/links/blocked_by/acceptance/prompt/pattern: annotations of a filing,
-      not its identity; a retry carries them identically, so hashing them adds
-      no protection and would only fork one finding into two items.
+      not its identity. They stay out of the key so a same-text retry cannot
+      fork one finding into two items. Changed annotations are merged onto
+      the existing item (see ``_merge_capture_annotations``); dropping them
+      while returning success is how re-explained requirements vanished.
     - ``id_family``: id shape, not content.
     """
     return f"capture:{_short_hash([kind, lane, severity or '', str(project_root), _norm_key(title)])}"
+
+
+def _merge_capture_annotations(item: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    """Apply newly supplied capture annotations onto an existing item.
+
+    The capture key is title/kind/lane/severity; annotations are not identity.
+    A retry with identical annotations writes nothing. A retry that carries
+    new blockers, tags, links, acceptance, prompt, or pattern must keep that
+    content: returning success while dropping it is how re-explained
+    requirements vanished. Losing a requirement is worse than rejecting a
+    write, so the changed fields are merged rather than ignored.
+
+    List fields union (existing order, then new). Scalar fields replace when
+    the retry actually supplied a value. Unspecified argparse defaults stay
+    as stored, so a legitimate identical retry still succeeds without
+    duplicating or rewriting.
+    """
+    changed: list[str] = []
+    for key, incoming in (
+        ("blocked_by", _split_csv(getattr(args, "blocked_by", None))),
+        ("links", _split_csv(getattr(args, "links", None))),
+        ("tags", _split_csv(getattr(args, "tags", None))),
+    ):
+        if not incoming:
+            continue
+        existing = item.get(key)
+        if not isinstance(existing, LIST_TYPE):
+            existing = []
+        merged = _dedupe_strs([*existing, *incoming])
+        # Compare against the stored array directly. This module defines
+        # ``def list(...)``, so ``list(existing)`` would query the store.
+        if merged != existing:
+            item[key] = merged
+            changed.append(key)
+    for key in ("acceptance", "prompt", "prompt_path", "pattern"):
+        value = getattr(args, key, None)
+        if value in (None, "", [], {}):
+            continue
+        if item.get(key) != value:
+            item[key] = value
+            changed.append(key)
+    return changed
 
 
 def _create_item(
@@ -3747,17 +3954,22 @@ def _create_item(
     actor: str,
     *,
     capture_key: str | None = None,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, list[str]]:
     """Reserve an id and append a new item from args. Shared by `new` and `capture`.
 
-    Returns ``(item_id, minted)``. With ``capture_key`` the mint is
-    content-idempotent: a live (not ``done``) item already carrying the same
-    key is proof this exact capture already landed, so the call writes NOTHING
-    and returns ``(existing_id, False)`` — the ambiguous-timeout retry learns
-    the mint succeeded instead of double-minting. The check runs under the
-    store lock so a concurrent duplicate cannot slip between check and append,
-    and the id is reserved only on the mint path so retries do not burn
-    sequence numbers. Lock order store→seq matches `_cmd_import`.
+    Returns ``(item_id, minted, merged_fields)``. With ``capture_key`` the mint
+    is content-idempotent: a live (not ``done``) item already carrying the same
+    key is proof this exact capture already landed. If the retry also carries
+    new annotations (blockers, tags, acceptance, ...), those fields are merged
+    onto the existing item and ``merged_fields`` names what changed. An
+    identical retry writes NOTHING and returns ``(existing_id, False, [])`` —
+    the ambiguous-timeout retry learns the mint succeeded instead of
+    double-minting. Returning success while dropping the new content is how
+    re-explained requirements vanished; losing a requirement is worse than
+    rejecting a write. The check runs under the store lock so a concurrent
+    duplicate cannot slip between check and append, and the id is reserved
+    only on the mint path so retries do not burn sequence numbers. Lock order
+    store→seq matches `_cmd_import`.
 
     Collision scope is the whole live store with NO time window: a window
     would reintroduce the very ambiguity this removes (a retry after the
@@ -3795,7 +4007,7 @@ def _create_item(
         # Reserve BEFORE the mutation: seq-file guards (non-regular .task-seq,
         # stale counters) must fire before the mutation's store validation.
         item_id = store.reserve_id(family)
-        return store.mutate_items(lambda items: append_item(items, item_id)), True
+        return store.mutate_items(lambda items: append_item(items, item_id)), True, []
 
     store._ensure_store_ready()
     with store.store_lock():
@@ -3805,14 +4017,18 @@ def _create_item(
         if not getattr(args, "allow_duplicate", False):
             for item in items:
                 if not item.get("done") and item.get("capture_key") == capture_key:
-                    return str(item["id"]), False
+                    merged = _merge_capture_annotations(item, args)
+                    if merged:
+                        _append_audit(item, "capture-merge", actor, fields=merged)
+                        store.save_items_atomic(items)
+                    return str(item["id"]), False, merged
         item_id = append_item(items, store.reserve_id(family))
         store.save_items_atomic(items)
-        return item_id, True
+        return item_id, True, []
 
 
 def _cmd_new(store: TaskStore, args: argparse.Namespace) -> int:
-    created, _minted = _create_item(store, args, _actor(args))
+    created, _minted, _merged = _create_item(store, args, _actor(args))
     if args.json:
         print(json.dumps({"id": created}, sort_keys=True))
     else:
@@ -3834,15 +4050,23 @@ def _cmd_capture(store: TaskStore, args: argparse.Namespace) -> int:
     # reports the EXISTING id — the caller learns the capture already landed
     # instead of minting a duplicate it then cannot distinguish.
     capture_key = _capture_content_key(args.kind, args.lane, getattr(args, "severity", None), store.project_root, args.title)
-    created, minted = _create_item(store, args, _actor(args), capture_key=capture_key)
+    created, minted, merged = _create_item(store, args, _actor(args), capture_key=capture_key)
     if args.json:
-        print(json.dumps({"id": created, "already_captured": not minted}, sort_keys=True))
+        payload: dict[str, Any] = {"already_captured": not minted, "id": created}
+        if merged:
+            payload["updated_fields"] = merged
+        print(json.dumps(payload, sort_keys=True))
     else:
         print(created)
     # One next-step hint to STDERR (keeps stdout / `--json | jq` clean; never an interrupt).
     if minted:
         print(
             f"captured {created} ({args.lane}). promote: python3 goalflight_task.py lane {created} <name>",
+            file=sys.stderr,
+        )
+    elif merged:
+        print(
+            f"already captured as {created} ({args.lane}); updated {', '.join(merged)}",
             file=sys.stderr,
         )
     else:
@@ -5633,17 +5857,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    store = TaskStore(resolve_project_root(args.project_root))
     try:
-        import goalflight_messages
+        store = TaskStore(resolve_project_root(args.project_root))
+        try:
+            import goalflight_messages
 
-        goalflight_messages.emit_wake_entry_notice(
-            project_root=store.project_root,
-            stream=sys.stderr,
-        )
-    except Exception:
-        pass
-    try:
+            goalflight_messages.emit_wake_entry_notice(
+                project_root=store.project_root,
+                stream=sys.stderr,
+            )
+        except Exception:
+            pass
         return args.func(store, args)
     except TaskError as exc:
         print(f"goalflight_task.py: {exc}", file=sys.stderr)

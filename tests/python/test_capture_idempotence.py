@@ -151,6 +151,74 @@ def test_done_item_does_not_block_recurrence() -> None:
         assert_true("recurrence retry reports existing", f"already captured as {recur_id}" in retry.stderr)
 
 
+def test_retry_with_new_annotations_preserves_the_change() -> None:
+    """Re-capturing with updated detail must not drop the new fields.
+
+    Same title/kind/lane is a retry (same id, no duplicate), but blockers,
+    tags, acceptance, links, and prompt are requirement content. Returning
+    success while dropping them is how re-explained requirements vanished.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        project = _new_project(td)
+        first = run_task(project, "capture", "Same title, more detail later")
+        assert_true(f"first capture ok: {first.stderr}", first.returncode == 0)
+        item_id = first.stdout.strip()
+
+        second = run_task(
+            project,
+            "capture",
+            "Same title, more detail later",
+            "--blocked-by",
+            "q-999",
+            "--tag",
+            "new-tag",
+            "--link",
+            "https://example.test/req",
+            "--acceptance",
+            "must preserve",
+            "--prompt",
+            "do the thing",
+            "--pattern",
+            "src/**/*.py",
+        )
+        assert_true(f"annotated retry exits 0: {second.stderr}", second.returncode == 0)
+        assert_true("annotated retry returns the SAME id", second.stdout.strip() == item_id)
+        assert_true(
+            "annotated retry says updated, not silently dropped",
+            f"already captured as {item_id}" in second.stderr
+            and "updated" in second.stderr,
+        )
+        items = _items(project)
+        assert_true("store still holds exactly one item", len(items) == 1)
+        item = items[0]
+        assert_true("the one item is the first mint", item["id"] == item_id)
+        assert_true("blocked_by preserved", "q-999" in item.get("blocked_by", []))
+        assert_true("tags preserved", "new-tag" in item.get("tags", []))
+        assert_true("links preserved", "https://example.test/req" in item.get("links", []))
+        assert_true("acceptance preserved", item.get("acceptance") == "must preserve")
+        assert_true("prompt preserved", item.get("prompt") == "do the thing")
+        assert_true("pattern preserved", item.get("pattern") == "src/**/*.py")
+
+        third = run_task(
+            project,
+            "capture",
+            "Same title, more detail later",
+            "--blocked-by",
+            "q-999",
+            "--tag",
+            "new-tag",
+            "--acceptance",
+            "must preserve",
+            "--json",
+        )
+        assert_true(f"identical annotated retry ok: {third.stderr}", third.returncode == 0)
+        payload = json.loads(third.stdout)
+        assert_true("identical retry already_captured", payload["already_captured"] is True)
+        assert_true("identical retry same id", payload["id"] == item_id)
+        assert_true("identical retry did not rewrite", "updated_fields" not in payload)
+        assert_true("still one item", len(_items(project)) == 1)
+
+
 def test_dedupe_retry_does_not_burn_id_sequence() -> None:
     with tempfile.TemporaryDirectory() as td:
         project = _new_project(td)
@@ -172,6 +240,7 @@ def main() -> None:
     test_allow_duplicate_mints_a_second_item()
     test_two_genuinely_different_captures_both_mint()
     test_done_item_does_not_block_recurrence()
+    test_retry_with_new_annotations_preserves_the_change()
     test_dedupe_retry_does_not_burn_id_sequence()
     print("OK: capture idempotence tests pass")
 

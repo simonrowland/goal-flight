@@ -122,6 +122,9 @@ def _write_tasks(project_root: Path, items: list[dict]) -> None:
     # Seed the CANONICAL store the tool reads (out of the project tree), plus
     # its dashboard mirror, so a subsequent read/mutation sees this state as
     # canonical rather than migrating an in-tree legacy file.
+    # The project directory itself must exist: an unresolvable --project-root
+    # is refused rather than forking a second store.
+    project_root.mkdir(parents=True, exist_ok=True)
     docs = _canonical_docs(project_root)
     dashboard = _canonical_dashboard(project_root)
     docs.mkdir(parents=True, exist_ok=True)
