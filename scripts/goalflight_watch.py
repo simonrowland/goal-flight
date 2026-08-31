@@ -711,7 +711,10 @@ def _post_terminal_candidate_action(
     Continued output from the same live worker disproves a terminal candidate
     once the short exit grace has elapsed. Without growth, the watcher keeps
     the candidate pending until either process identity says the worker died or
-    the ordinary max-idle path is confirmed.
+    post-terminal idle is confirmed (measured CPU idle plus tail silence for
+    ``max_idle_secs``, after the exit grace). That idle signal must not wait
+    on tree/descendant probes: skipped probes stay unknown, unknown is not a
+    wedge, and waiting for process death then trusts COMPLETE as success.
     """
     if not worker_alive:
         return "terminalize"
@@ -3724,6 +3727,7 @@ def main() -> int:
     exit_code = 1
     wedge_streak = 0
     indeterminate_streak = 0
+    post_terminal_quiet_streak = 0
     tracked_worker_pgid = args.pgid or process_group_id(args.pid)
     pgid = tracked_worker_pgid or args.pid
     prior_status = _read_json_object(status_path) if status_existed_at_startup else None
@@ -4644,6 +4648,18 @@ def main() -> int:
             and worker_is_alive
             and terminal_state == "complete"
         )
+        if (
+            post_terminal_wait
+            and cpu_confirmed_idle(cpu_pct, args.cpu_epsilon)
+            and args.max_idle_secs > 0
+            and seconds_since_event >= args.max_idle_secs
+        ):
+            post_terminal_quiet_streak += 1
+        else:
+            post_terminal_quiet_streak = 0
+        post_terminal_idle_confirmed = (
+            post_terminal_quiet_streak >= WEDGE_CONFIRM_SAMPLES
+        )
         if terminal_seen:
             payload["terminal_marker"] = terminal_seen
         post_terminal_wait_elapsed = (
@@ -4662,7 +4678,7 @@ def main() -> int:
                     post_terminal_wait_elapsed is not None
                     and post_terminal_wait_elapsed >= POST_TERMINAL_EXIT_GRACE_SECS
                 ),
-                idle_confirmed=idle_confirmed,
+                idle_confirmed=post_terminal_idle_confirmed,
             )
         if post_terminal_action == "discard":
             discarded_marker = terminal_seen
@@ -4693,6 +4709,7 @@ def main() -> int:
             terminal_seen_size = None
             wedge_streak = 0
             indeterminate_streak = 0
+            post_terminal_quiet_streak = 0
             write_payload(
                 payload,
                 reason="discarded_terminal_marker:worker_alive_tail_grew_since_marker",
@@ -4700,6 +4717,22 @@ def main() -> int:
             )
             time.sleep(args.poll_secs)
             continue
+        if post_terminal_wait and post_terminal_action == "terminalize":
+            # Marker said done; the process did not. That is indeterminate,
+            # not success — even when tree/descendant probes are skipped
+            # (cwd is the canonical root) so classify_liveness never wedges.
+            payload["state"] = "inconclusive_timeout"
+            payload["terminal_pending_state"] = terminal_state
+            if post_terminal_wait_elapsed is not None:
+                payload["post_terminal_wait_elapsed_secs"] = round(
+                    post_terminal_wait_elapsed, 3
+                )
+            payload["post_terminal_wait_limit_secs"] = POST_TERMINAL_EXIT_GRACE_SECS
+            exit_reason = f"{terminal_reason}:post_terminal_idle_timeout"
+            write_payload(payload, reason=exit_reason, terminal_write=True)
+            exit_code = _exit_code_for_state(payload["state"])
+            exit_reason = payload.get("reason", exit_reason)
+            break
         reply_wait_arm_grace = bool(
             terminal_seen
             and terminal_seen.get("kind") in REPLY_WAIT_MARKER_KINDS
@@ -4858,18 +4891,7 @@ def main() -> int:
         if liveness_state == "wedged":
             if idle_confirmed:
                 terminal_liveness_exit = False
-                if post_terminal_wait and post_terminal_action == "terminalize":
-                    payload["state"] = "inconclusive_timeout"
-                    payload["terminal_pending_state"] = terminal_state
-                    if post_terminal_wait_elapsed is not None:
-                        payload["post_terminal_wait_elapsed_secs"] = round(
-                            post_terminal_wait_elapsed, 3
-                        )
-                    payload["post_terminal_wait_limit_secs"] = POST_TERMINAL_EXIT_GRACE_SECS
-                    exit_reason = f"{terminal_reason}:post_terminal_idle_timeout"
-                    exit_code = _exit_code_for_state(payload["state"])
-                    terminal_liveness_exit = True
-                elif not post_terminal_wait:
+                if not post_terminal_wait:
                     if last_discarded_terminal_evidence:
                         evidence_kind = str(
                             last_discarded_terminal_evidence.get("kind") or "COMPLETE"
