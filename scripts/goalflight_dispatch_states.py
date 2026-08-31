@@ -331,6 +331,16 @@ def retry_policy_for_record(
         }
 
     if kind == LIMIT_KIND_TRANSIENT:
+        if retry_after is not None and retry_after > 0 and observed_ts is None:
+            # A relative delay without an observation time has no computable
+            # deadline.  Keep eligibility indeterminate so the existing drain
+            # caller falls back to its account cooldown instead of retrying now.
+            return {
+                "kind": kind,
+                "eligible": None,
+                "not_before": None,
+                "mode": "hold_retry_anchor_unknown",
+            }
         not_before_ts = (
             observed_ts + retry_after
             if retry_after is not None and observed_ts is not None

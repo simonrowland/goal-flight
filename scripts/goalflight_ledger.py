@@ -553,6 +553,12 @@ def preserve_first_terminal_time(record: dict, terminal_at: object = None) -> st
 
 
 def write_record(record: dict) -> Path:
+    """Persist one ledger row without destroying unreadable existing evidence.
+
+    A missing path may be created and a readable object may be updated.  A
+    present row whose bytes cannot be interpreted remains authoritative
+    evidence of an indeterminate outcome, so this writer refuses to replace it.
+    """
     if record.get("project_root") not in (None, ""):
         record["project_root"] = canonicalize_project_root_on_store(
             record["project_root"]
@@ -570,14 +576,19 @@ def write_record(record: dict) -> Path:
             raise OSError(
                 f"ledger record unreadable; refusing to overwrite {path}"
             ) from exc
-        except json.JSONDecodeError:
-            current = None
-        if isinstance(current, dict):
-            current_ended_at = current.get("ended_at")
-            if current_ended_at not in (None, ""):
-                # The on-disk value won the first projection. A stale caller
-                # cannot replace it, even if that caller carries a timestamp.
-                record["ended_at"] = current_ended_at
+        except json.JSONDecodeError as exc:
+            raise OSError(
+                f"ledger record unreadable; refusing to overwrite {path}"
+            ) from exc
+        if not isinstance(current, dict):
+            raise OSError(
+                f"ledger record unreadable; refusing to overwrite {path}"
+            )
+        current_ended_at = current.get("ended_at")
+        if current_ended_at not in (None, ""):
+            # The on-disk value won the first projection. A stale caller
+            # cannot replace it, even if that caller carries a timestamp.
+            record["ended_at"] = current_ended_at
     record["updated_at"] = utc_now()
     tmp = path.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as handle:
@@ -738,16 +749,24 @@ def read_records(*, skip_terminal: bool = False) -> list[dict]:
     lock/progress checks apply) or peeks as terminal (correctly skipped).
 
     Default ``skip_terminal=False`` keeps occupancy/status callers on the
-    full history.
+    full history.  An absent ledger directory returns an empty list; an
+    indeterminate directory presence raises ``OSError`` so callers fail closed
+    instead of treating an unreadable ledger as an observed empty one.
     """
     records: list[dict] = []
     listed = 0
     parsed = 0
     skipped_terminal = 0
     path = runs_dir(create=False)
-    if not path.exists():
+    presence = goalflight_fs.path_presence(path)
+    if presence == "absent":
         _LAST_READ_WORK.update(listed=0, parsed=0, skipped_terminal=0)
         return records
+    if presence == "unknown":
+        # The caller must fail closed: an unsearchable ancestor can conceal
+        # every queued, live, and terminal row at once.  Raising preserves the
+        # distinction from a successfully observed empty ledger.
+        raise OSError(f"ledger directory unreadable: {path}")
     # pathlib.Path.glob on an unreadable directory returns [] without raising
     # (observed). os.listdir raises OSError, which callers that distinguish
     # UNKNOWN from empty must see -- an unlistable ledger is not "no records".
@@ -815,19 +834,13 @@ def infer_shape(record: dict) -> str:
 
 
 def terminal_state_for(state: object, reason: object = None) -> str:
-    terminal = goalflight_dispatch_states.terminal_state_for(state, reason)
-    if terminal != "unknown":
-        return terminal
-    if state in {None, "", "queued", "running", "starting", "running_quiet", "handshaking", "waiting_capacity"}:
-        # queued/waiting_capacity = queued for a capacity slot (pre-spawn, live):
-        # non-terminal, so the reused-dispatch-id guard refuses duplicates
-        # while a launcher is queued.
-        return "unknown"
-    if state == "unreadable":
-        # Placeholder from read_records(): the file could not be parsed. That is
-        # "I could not find out", never a settled error/terminal.
-        return "unknown"
-    return "error"
+    """Return shared terminal authority without inventing an error verdict.
+
+    ``unknown`` covers live, attention, salvage, unreadable, and unrecognised
+    states.  Callers must keep those records non-terminal; known success and
+    failure states are still closed by the shared dispatch-state vocabulary.
+    """
+    return goalflight_dispatch_states.terminal_state_for(state, reason)
 
 
 def _split_task_ids(values: object) -> list[str]:
@@ -1130,7 +1143,13 @@ def retry_record_after_startup_race(
     return code, refusal
 
 
-def scan_surplus(records: list[dict], limit: int = 20) -> list[dict]:
+def scan_surplus(records: list[dict], limit: int = 20) -> list[dict] | None:
+    """Return surplus workers, or ``None`` when the process scan is unavailable.
+
+    An empty list means the process table was read successfully and contained
+    no unledgered worker-like process.  Indeterminate scans stay visible so an
+    operator never treats missing process-table access as proof of safety.
+    """
     known = {int(r["worker_pid"]) for r in records if r.get("worker_pid")}
     known.update(int(r["controller_pid"]) for r in records if r.get("controller_pid"))
     try:
@@ -1142,7 +1161,7 @@ def scan_surplus(records: list[dict], limit: int = 20) -> list[dict]:
             stderr=subprocess.DEVNULL,
         )
     except (OSError, subprocess.CalledProcessError):
-        return []
+        return None
     surplus: list[dict] = []
     for line in out.splitlines():
         parts = line.strip().split(None, 2)
@@ -1482,12 +1501,26 @@ def _missing_dispatch_payload(dispatch_id: str) -> dict[str, object]:
     return payload
 
 
+def _unreadable_dispatch_payload(dispatch_id: str) -> dict[str, object]:
+    """Retryable finish verdict for a row whose presence cannot be determined."""
+    return {
+        "ok": False,
+        "error": "ledger_record_unreadable",
+        "dispatch_id": dispatch_id,
+        "ledger_presence": "unknown",
+        "retryable": True,
+    }
+
+
 def cmd_finish(args: argparse.Namespace) -> int:
     path = record_path(args.dispatch_id, create=False)
-    if not path.exists():
+    record = read_record(args.dispatch_id)
+    if record is None:
         print(json.dumps(_missing_dispatch_payload(args.dispatch_id), sort_keys=True))
         return 1
-    record = json.loads(path.read_text())
+    if record_is_unreadable(record):
+        print(json.dumps(_unreadable_dispatch_payload(args.dispatch_id), sort_keys=True))
+        return 2
     requested_terminal = getattr(args, "terminal_state", None)
     terminal_state = requested_terminal or terminal_state_for(args.state, args.reason)
     committed = commit_terminal_authority(
@@ -2429,13 +2462,17 @@ def format_status_lines(
         else:
             suffix = ""
         lines.append(_record_status_line(row, suffix))
-    surplus = list(payload.get("surplus_processes") or [])[:limit]
-    if surplus:
-        lines.append("surplus worker-like processes:")
-        for proc in surplus:
-            lines.append(
-                f"- pid={proc['pid']} comm={proc['comm']} args={proc['args']}"
-            )
+    surplus_value = payload.get("surplus_processes")
+    if surplus_value is None:
+        lines.append("surplus worker-like process scan unavailable")
+    else:
+        surplus = list(surplus_value)[:limit]
+        if surplus:
+            lines.append("surplus worker-like processes:")
+            for proc in surplus:
+                lines.append(
+                    f"- pid={proc['pid']} comm={proc['comm']} args={proc['args']}"
+                )
     return lines
 
 
