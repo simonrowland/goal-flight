@@ -360,12 +360,35 @@ path = root / "scripts" / "goalflight_grok_bot_listen.py"
 spec = importlib.util.spec_from_file_location("grok_bot_listen", path)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-if mod._with_host_timeout([]) != ["--timeout-s", "900"]:
-    raise SystemExit("grok-bot listen wrapper must default --timeout-s 900")
-if mod._with_host_timeout(["--timeout-s", "0"]) != ["--timeout-s", "0"]:
+defaults = mod._with_host_defaults([])
+if defaults != [
+    "--timeout-s",
+    "900",
+    "--controller-label",
+    "goalflight-grokbot",
+    "--report-pending",
+]:
+    raise SystemExit(f"bare helper must inject timeout, label, report-pending; got {defaults}")
+if mod._with_host_timeout([]) != defaults:
+    raise SystemExit("_with_host_timeout must alias _with_host_defaults")
+timeout_override = mod._with_host_defaults(["--timeout-s", "0"])
+if "--timeout-s" not in timeout_override or timeout_override[timeout_override.index("--timeout-s") + 1] != "0":
     raise SystemExit("explicit --timeout-s 0 must stay mail-only")
-if mod._with_host_timeout(["--timeout-s=0"]) != ["--timeout-s=0"]:
+if "--controller-label" not in timeout_override or "goalflight-grokbot" not in timeout_override:
+    raise SystemExit("timeout override must still default controller-label")
+if "--report-pending" not in timeout_override:
+    raise SystemExit("timeout override must still default --report-pending")
+if mod._with_host_defaults(["--timeout-s=0"])[0] != "--timeout-s=0":
     raise SystemExit("equals-form --timeout-s=0 must not be rewritten")
+label_override = mod._with_host_defaults(["--controller-label", "other-slug"])
+if label_override.count("--controller-label") != 1 or "other-slug" not in label_override:
+    raise SystemExit("explicit --controller-label must win")
+if "goalflight-grokbot" in label_override:
+    raise SystemExit("must not inject goalflight-grokbot over an explicit label")
+if "--no-report-pending" not in mod._with_host_defaults(["--no-report-pending"]):
+    raise SystemExit("explicit --no-report-pending must be honored")
+if "--report-pending" in mod._with_host_defaults(["--no-report-pending"]):
+    raise SystemExit("must not inject --report-pending over --no-report-pending")
 PY
 if grep -q 'PostToolUse' "$REPO_ROOT/scripts/goalflight_grok_bot_listen.py"; then
   grep -q 'Do not port' "$REPO_ROOT/scripts/goalflight_grok_bot_listen.py" \
@@ -409,5 +432,40 @@ if "check mail" not in forbidden:
     raise SystemExit("must not ask the user to tell another session to check mail")
 PY
 echo "test12 pass: grok-bot inter-controller mail is journal-only; user is the former mailman"
+
+grep -q -- '--controller-pid <pid>' "$wrapper" \
+  || fail "wrapper dispatch stamp must include --controller-pid <pid>"
+grep -q -- '--controller-session-id <session-id>' "$wrapper" \
+  || fail "wrapper dispatch stamp must include --controller-session-id <session-id>"
+grep -q '~/.goal-flight/skill/scripts' "$wrapper" \
+  || fail "wrapper must run scripts from the skill pin scripts directory"
+grep -q 'GOALFLIGHT_GROK_BOT_WORKFLOWS' "$REPO_ROOT/README.md" \
+  || fail "README must caveat Mac grok-bot install with GOALFLIGHT_GROK_BOT_WORKFLOWS"
+grep -q 'does not invent a second Mac default' "$REPO_ROOT/README.md" \
+  || fail "README must refuse a second Mac default workflows root"
+grep -q 'check drift on the box' "$REPO_ROOT/README.md" \
+  || fail "README must say grok-bot drift check is box-side"
+grep -q 'default gstack and autoreview addons' "$wrapper" \
+  || fail "wrapper must note bare install applies default addons"
+python3 - "$REPO_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "scripts"))
+import goalflight_setup as mod
+
+if mod._grok_bot_mac_default_warn(platform="linux", env={}) is not None:
+    raise SystemExit("Darwin warn must stay silent on linux")
+warn = mod._grok_bot_mac_default_warn(platform="darwin", env={})
+if not warn or "/home/box/agent-data/workflows" not in warn:
+    raise SystemExit("Darwin + default box path must warn")
+if mod._grok_bot_mac_default_warn(
+    platform="darwin",
+    env={"GOALFLIGHT_GROK_BOT_WORKFLOWS": "/tmp/workflows"},
+) is not None:
+    raise SystemExit("Darwin warn must stay silent when override is set")
+PY
+echo "test13 pass: grok-bot helper defaults, Mac install caveat, and dispatch stamp"
 
 echo "goal-flight grok-bot host install tests passed"

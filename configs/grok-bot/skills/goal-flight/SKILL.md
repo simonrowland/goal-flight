@@ -33,9 +33,9 @@ rule cannot live only in compacted chat or a summarized SKILL.md.
 
 Live controllers load the detached pin at `~/.goal-flight/skill/` (or
 `$GOALFLIGHT_ROOT`), not a live source checkout and not a clone on the Grok Bot
-box. Resolve `<skill-root>` before running scripts. Doctor warns when an
-installed wrapper copy has drifted from that pin; resync with
-`./install.sh grok-bot`.
+box. Run scripts from that pin (`$GOALFLIGHT_ROOT/scripts` or
+`~/.goal-flight/skill/scripts`). Doctor warns when an installed wrapper copy
+has drifted from that pin; resync with `./install.sh grok-bot`.
 
 ## Operating Rules
 
@@ -107,11 +107,11 @@ independent reviewer.
 Grok Bot Cloud Agents remain an optional extra worker for GitHub-branch / PR
 chunks only. They are never the default for a local scientific-coding project.
 
-Stamp `--controller-label <claimed-label> --controller-pid
---controller-session-id` on every `goalflight_dispatch.py` launch. The
-claimed label is `goalflight-grokbot` unless this controller already
-joined under another unused slug. Never steal a live lease that belongs
-to another controller.
+Stamp `--controller-label <claimed-label> --controller-pid <pid>
+--controller-session-id <session-id>` on every `goalflight_dispatch.py`
+launch. The claimed label is `goalflight-grokbot` unless this controller
+already joined under another unused slug. Never steal a live lease that
+belongs to another controller.
 
 ## Executor context package
 
@@ -315,8 +315,16 @@ run:
 ./install.sh grok-bot /home/box/agent-data/workflows
 ```
 
+Bare `./install.sh grok-bot` applies the default gstack and autoreview addons; pass `--addons ''` to skip them.
+
 The checked-in destination is the Grok Bot workflows library
 (`/home/box/agent-data/workflows/goal-flight/SKILL.md` on the bot machine).
-Override with `GOALFLIGHT_GROK_BOT_WORKFLOWS` when installing from a Mac
-checkout whose library root is different. This path is the least-wrong
-verified location; do not assume `~/.grok/skills/` (that is Grok CLI).
+The default workflows root is that box path. From a Mac checkout pass
+`GOALFLIGHT_GROK_BOT_WORKFLOWS` or `./install.sh grok-bot <workflows-root>`.
+This repo does not invent a second Mac default library root. Do not assume
+`~/.grok/skills/` (that is Grok CLI).
+
+Doctor's `installed_skill_drift` for grok-bot hashes the box library (or
+the override). A Mac `doctor --project-root` without the override will
+not see `/home/box/...`; run the drift check on the box, or set
+`GOALFLIGHT_GROK_BOT_WORKFLOWS`.

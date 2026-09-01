@@ -18,6 +18,7 @@ One-shot install (wrapper copy into the Grok Bot workflows library):
 # when the workflows library root is not the bot-box default:
 ./install.sh grok-bot /home/box/agent-data/workflows
 # or: GOALFLIGHT_GROK_BOT_WORKFLOWS=/path/to/workflows ./install.sh grok-bot
+# Bare install also applies default gstack/autoreview addons; --addons '' skips.
 ```
 
 ## Install destination (verified, with uncertainty)
@@ -38,8 +39,12 @@ cannot see `/home/box/...` must pass the override; this repo does not invent a
 second default Mac path.
 
 Doctor's `installed_skill_drift` hashes the installed wrapper against
-`configs/grok-bot/skills/goal-flight/SKILL.md`. A WARN means resync with
-`./install.sh grok-bot`.
+`configs/grok-bot/skills/goal-flight/SKILL.md`. That installed path is
+the box library (or `GOALFLIGHT_GROK_BOT_WORKFLOWS`). A Mac
+`--project-root` doctor without the override will not see
+`/home/box/...`; run the drift check on the box, or set the override.
+A WARN means resync with `./install.sh grok-bot`. Do not invent a
+second Mac default library root.
 
 ## Resync after SKILL.md changes
 
@@ -318,9 +323,9 @@ Five-controller setups still use `post --to-controller` plus the portable
 listen pool. That layout is a project convention (lane claims, one integrator,
 cluster dispatch), not a Goal Flight primitive. A Grok Bot controller joining
 such a project must claim `goalflight-grokbot` (or another unused label)
-and stamp that claimed label with `--controller-pid
---controller-session-id` on every dispatch, and never steal the existing
-leases. Read
+and stamp that claimed label with `--controller-pid <pid>
+--controller-session-id <session-id>` on every dispatch, and never steal
+the existing leases. Read
 `docs-private/MULTI-CONTROLLER-ETIQUETTE.md` when the project has one.
 
 ## Advanced setup

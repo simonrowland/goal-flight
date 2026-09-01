@@ -305,6 +305,10 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.goal-flight && cd ~
 ./install.sh opencode /path/to/your/project
 ./install.sh codex
 ./install.sh grok-bot
+# default workflows root is /home/box/agent-data/workflows (Grok Bot box).
+# From a Mac checkout pass GOALFLIGHT_GROK_BOT_WORKFLOWS or:
+# ./install.sh grok-bot /path/to/workflows
+# This repo does not invent a second Mac default library root.
 ```
 
 After source `SKILL.md`, `commands/`, `protocols/`, `templates/`, or `adapters/`
@@ -325,6 +329,10 @@ Dry-run, link-to-Claude, and agents-standard paths are in
 
 After any install, run doctor:
 `python3 scripts/goalflight_doctor.py --project-root /path/to/your/project`.
+Grok Bot `installed_skill_drift` hashes the box workflows library (or
+`GOALFLIGHT_GROK_BOT_WORKFLOWS`). A Mac `--project-root` doctor without
+that override will not see `/home/box/...`; check drift on the box, or
+pass the override.
 
 ### Windows
 

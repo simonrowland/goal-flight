@@ -114,6 +114,27 @@ def _grok_bot_workflows_root() -> Path:
     return Path(GROK_BOT_WORKFLOWS_DEFAULT)
 
 
+def _grok_bot_mac_default_warn(
+    *,
+    platform: str | None = None,
+    env: dict[str, str] | None = None,
+) -> str | None:
+    """Warn when Darwin would write the box default /home/box/... path."""
+    plat = sys.platform if platform is None else platform
+    environ = os.environ if env is None else env
+    if plat != "darwin":
+        return None
+    if str(environ.get("GOALFLIGHT_GROK_BOT_WORKFLOWS") or "").strip():
+        return None
+    return (
+        "WARN grok-bot default workflows root is "
+        f"{GROK_BOT_WORKFLOWS_DEFAULT} (Grok Bot box). "
+        "From a Mac checkout pass GOALFLIGHT_GROK_BOT_WORKFLOWS or "
+        "./install.sh grok-bot <workflows-root>. "
+        "This repo does not invent a second Mac default library root."
+    )
+
+
 def _expand_target(raw: str, target_project: Path | None = None) -> Path:
     if TARGET_PROJECT_TOKEN in raw:
         if target_project is None:
@@ -2687,6 +2708,10 @@ def _dry_run(
     *,
     target_project: Path,
 ) -> None:
+    if agent == "grok-bot":
+        warn = _grok_bot_mac_default_warn()
+        if warn:
+            print(warn, file=sys.stderr)
     print(f"DRY-RUN setup agent={agent}")
     if destination_ids:
         print(f"DESTINATIONS selected={','.join(sorted(destination_ids))}")
@@ -2740,6 +2765,10 @@ def _apply(
     target_project: Path,
     gate_checked: bool = False,
 ) -> None:
+    if agent == "grok-bot":
+        warn = _grok_bot_mac_default_warn()
+        if warn:
+            print(warn, file=sys.stderr)
     if not yes:
         raise SetupError("refusing mutation without --yes")
     if not gate_checked:
