@@ -135,8 +135,7 @@ PROVIDER_FALLBACK: dict[str, list[str]] = {
 ACCOUNT_RATE_LIMIT_SCOPE = "account_rate_limit"
 MODEL_CAPACITY_SCOPE = "model_capacity"
 
-# Both goalflight_dispatch._record_queued_ledger_fast and
-# goalflight_ledger.cmd_record write this value when no --account was selected.
+# Dispatch ledger writers use this value when no --account was selected.
 # It is an absence marker, unlike qualified billing keys such as
 # "openai/default", which identify real configured accounts.
 ACCOUNT_PLACEHOLDERS = frozenset({"default"})

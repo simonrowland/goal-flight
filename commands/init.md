@@ -77,8 +77,10 @@ python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 
 Dispatch examples in this repo assume the direct default is background:
 `python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .`.
-Use `--submit --drain-on-submit` for durable queue launch and `--foreground`
-only for synchronous scripts/tests.
+The dispatcher launches immediately, waits for capacity, and refuses visibly with
+`DISPATCH-BLOCKED` plus a nonzero exit if capacity remains unavailable. Use
+`--foreground` only for synchronous scripts/tests. The drain command exists only
+to finish the pre-existing backlog.
 
    On native Windows, inspect the JSON `wsl` field before any dispatch-shaped
    setup. Goal Flight's full dispatch baseline is WSL, not a native-Win32 port.

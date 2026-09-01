@@ -1019,8 +1019,7 @@ def test_queued_terminal_reconcile_requeues_exactly_once_end_to_end(
     worker_code = (
         f"import sys; print({worker_text!r}, flush=True); sys.exit(1)"
     )
-    rc = D.main(
-        [
+    dispatch_argv = [
             "--agent",
             "codex",
             "--unregistered-forced",
@@ -1040,16 +1039,39 @@ def test_queued_terminal_reconcile_requeues_exactly_once_end_to_end(
             "0.05",
             "--max-idle-secs",
             "1",
-            "--submit",
-            "--no-drain-on-submit",
             "--",
             sys.executable,
             "-c",
             worker_code,
         ]
-    )
-    assert rc == 0
     queue_dir = D._dispatch_queue_dir()
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    queue_path = D._queue_entry_path(dispatch_id, queue_dir=queue_dir)
+    now = L.utc_now()
+    D._write_json_atomic(
+        queue_path,
+        {
+            "schema": D.DISPATCH_QUEUE_SCHEMA,
+            "state": "queued",
+            "dispatch_id": dispatch_id,
+            "agent": "codex",
+            "shape": "bash",
+            "project_root": str(tmp_path),
+            "process_cwd": str(tmp_path),
+            "created_at": now,
+            "updated_at": now,
+            "queue_path": str(queue_path),
+            "task_ids": [task_id],
+            "dispatch_argv": dispatch_argv,
+            "request": {
+                "agent": "codex",
+                "cwd": str(tmp_path),
+                "task_ids": [task_id],
+                "tail": str(tail),
+                "status_json": str(status),
+            },
+        },
+    )
     first = D._drain_queue_once(
         argparse.Namespace(
             queue_dir=str(queue_dir),
@@ -1335,6 +1357,7 @@ def test_future_requeue_not_before_is_left_queued(tmp_path: Path) -> None:
             capacity_wait_s=0.0,
             claim_stale_s=D.QUEUE_CLAIM_STALE_S,
             limit=0,
+            cross_project=True,
         )
     )
     assert payload["launched"] == 0
@@ -1429,6 +1452,7 @@ def test_not_before_contradicted_by_newer_healthy_probe_no_longer_gates(
             capacity_wait_s=0.0,
             claim_stale_s=D.QUEUE_CLAIM_STALE_S,
             limit=0,
+            cross_project=True,
         )
     )
     not_before_holds = [
@@ -1480,6 +1504,7 @@ def _drain_held_not_before(
             capacity_wait_s=0.0,
             claim_stale_s=D.QUEUE_CLAIM_STALE_S,
             limit=0,
+            cross_project=True,
         )
     )
     leftover = json.loads(queue_path.read_text(encoding="utf-8"))

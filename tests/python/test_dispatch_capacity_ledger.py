@@ -783,34 +783,6 @@ def case_foreground_blocks_until_terminal_state() -> None:
         assert "DISPATCH-LAUNCHED " not in proc.stdout, proc.stdout
 
 
-def case_submit_foreground_rejected() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        env = _env(tmp)
-        proc = subprocess.run(
-            [
-                sys.executable,
-                str(DISPATCH),
-                "--unregistered-forced",
-                "--submit",
-                "--foreground",
-                "--agent",
-                "test-dispatch",
-                "--prompt",
-                "COMPLETE: noop",
-                "--cwd",
-                str(tmp),
-            ],
-            cwd=ROOT,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert proc.returncode == 2, proc
-        assert "--foreground" in proc.stderr and "--submit" in proc.stderr, proc.stderr
-
-
 def case_capacity_block_does_not_spawn() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -1718,7 +1690,6 @@ def main() -> None:
     case_default_background_finalizes_ledger_and_rate_pressure_once()
     case_ledger_finalize_retries_after_transient_failure()
     case_foreground_blocks_until_terminal_state()
-    case_submit_foreground_rejected()
     case_capacity_block_does_not_spawn()
     case_capacity_wait_queues_until_slot_frees()
     case_capacity_wait_interrupt_writes_terminal_status()

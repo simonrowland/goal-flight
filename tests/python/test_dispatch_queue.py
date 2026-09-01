@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for queued dispatch submit/drain mode."""
+"""Regression tests for draining the pre-existing dispatch backlog."""
 
 from __future__ import annotations
 
@@ -666,12 +666,17 @@ def test_authority_park_visible_on_claim_status_drain_and_unparks() -> None:
             goalflight_task.TaskStore.load_items = _unreadable_load
             D._release_stale_capacity_for_drain = lambda: None
             D._run_drain_prelaunch_hook = lambda _agents: None
-            D.subprocess.run = lambda argv, **kwargs: subprocess.CompletedProcess(
-                argv,
-                2,
-                stdout="blocked_capacity\n",
-                stderr="",
-            )
+            def refuse_dispatch_only(argv, **kwargs):
+                if any(Path(str(arg)).name == "goalflight_dispatch.py" for arg in argv):
+                    return subprocess.CompletedProcess(
+                        argv,
+                        2,
+                        stdout="blocked_capacity\n",
+                        stderr="",
+                    )
+                return original_run(argv, **kwargs)
+
+            D.subprocess.run = refuse_dispatch_only
             try:
                 recovered = D._recover_claimed_queue_entries(queue, stale_s=0)
                 assert recovered["restored"] == 0, recovered
@@ -718,16 +723,6 @@ def test_authority_park_visible_on_claim_status_drain_and_unparks() -> None:
             )
             assert drain_status.get("reason") == "completion_authority_unavailable", drain_status
             assert drain_status.get("unpark_event") == "completion_authority_readable", drain_status
-
-            captured = io.StringIO()
-            with contextlib.redirect_stderr(captured):
-                D._report_why_this_entry_did_not_launch(
-                    argparse.Namespace(dispatch_id=drain_id),
-                    payload,
-                )
-            reported = captured.getvalue()
-            assert f"{drain_id} not launched: completion_authority_unavailable" in reported, reported
-            assert "completion_authority_readable" in reported, reported
 
             unpark = D._recover_claimed_queue_entries(queue, stale_s=0)
             restored_path = queue / f"{recover_id}.json"
@@ -1080,591 +1075,6 @@ def test_parked_status_write_failure_is_visible_on_claim() -> None:
             assert any(row.get("status_write_failed") for row in recovered["pending_reasons"]), recovered
 
 
-def test_submit_status_delay_requires_test_mode() -> None:
-    keys = (
-        "GOALFLIGHT_TEST_MODE",
-        "GOALFLIGHT_TEST_SUBMIT_STATUS_DELAY_S",
-        "GOALFLIGHT_TEST_SUBMIT_STATUS_RELEASE_FILE",
-    )
-    old_env = {key: os.environ.get(key) for key in keys}
-    old_sleep = D.time.sleep
-    sleeps: list[float] = []
-    try:
-        os.environ.pop("GOALFLIGHT_TEST_MODE", None)
-        os.environ.pop("GOALFLIGHT_TEST_SUBMIT_STATUS_RELEASE_FILE", None)
-        os.environ["GOALFLIGHT_TEST_SUBMIT_STATUS_DELAY_S"] = "5"
-        D.time.sleep = lambda seconds: sleeps.append(seconds)
-        D._test_submit_status_delay()
-        assert sleeps == [], sleeps
-
-        os.environ["GOALFLIGHT_TEST_MODE"] = "1"
-        D._test_submit_status_delay()
-        assert sleeps == [5.0], sleeps
-    finally:
-        D.time.sleep = old_sleep
-        for key, value in old_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-
-def test_submit_records_replayable_request_without_capacity_acquire() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        env = _env(tmp)
-        old_env = os.environ.copy()
-        old_acquire = D._acquire_capacity
-        try:
-            os.environ.clear()
-            os.environ.update(env)
-
-            def fail_acquire(*_args, **_kwargs):
-                raise AssertionError("submit must not acquire capacity")
-
-            D._acquire_capacity = fail_acquire
-            rc = D.main(
-                [
-                    "--agent",
-                    "test-dispatch",
-                    "--submit",
-                    "--unregistered-forced",
-                    "--no-drain-on-submit",
-                    "--dispatch-id",
-                    "submit-fast",
-                    "--tail",
-                    str(tmp / "submit.tail"),
-                    "--status-json",
-                    str(tmp / "submit.status.json"),
-                    "--cwd",
-                    str(tmp),
-                    "--",
-                    sys.executable,
-                    "-c",
-                    "print('COMPLETE: submit-fast — should launch later')",
-                ]
-            )
-        finally:
-            D._acquire_capacity = old_acquire
-            os.environ.clear()
-            os.environ.update(old_env)
-        assert rc == 0
-        queue_path = tmp / "state" / "dispatch-queue" / "submit-fast.json"
-        assert queue_path.exists(), "queued request missing"
-        entry = json.loads(queue_path.read_text(encoding="utf-8"))
-        assert entry["dispatch_id"] == "submit-fast", entry
-        assert entry["dispatch_argv"], entry
-        status = json.loads((tmp / "submit.status.json").read_text(encoding="utf-8"))
-        assert status["state"] == "queued", status
-        row = _record(_status(env), "submit-fast")
-        assert row and row.get("classification") == "queued_capacity", row
-
-
-def test_submit_default_runs_one_drain_pass_after_queue_write() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        env = _env(tmp)
-        old_env = os.environ.copy()
-        old_drain = D._drain_queue_once
-        calls = []
-        try:
-            os.environ.clear()
-            os.environ.update(env)
-
-            def fake_drain(args):
-                calls.append(args)
-                return {
-                    "schema": "test",
-                    "queue_dir": args.queue_dir,
-                    "launched": 0,
-                    "left_queued": 0,
-                    "failed": 0,
-                    "remaining": 1,
-                    "pending_claims": 0,
-                    "recovered_claims": {"restored": 0, "failed": 0},
-                    "details": [],
-                }
-
-            D._drain_queue_once = fake_drain
-            rc = D.main(
-                [
-                    "--agent",
-                    "test-dispatch",
-                    "--submit",
-                    "--unregistered-forced",
-                    "--dispatch-id",
-                    "submit-drain-default",
-                    "--tail",
-                    str(tmp / "default.tail"),
-                    "--status-json",
-                    str(tmp / "default.status.json"),
-                    "--cwd",
-                    str(tmp),
-                    "--",
-                    sys.executable,
-                    "-c",
-                    "print('COMPLETE: submit-drain-default — default drain later')",
-                ]
-            )
-        finally:
-            D._drain_queue_once = old_drain
-            os.environ.clear()
-            os.environ.update(old_env)
-        assert rc == 0
-        assert len(calls) == 1
-        assert Path(calls[0].queue_dir) == tmp / "state" / "dispatch-queue"
-        assert calls[0].capacity_wait_s == 0.0
-        assert calls[0].limit == 1
-        assert (tmp / "state" / "dispatch-queue" / "submit-drain-default.json").exists()
-
-
-def test_submit_drain_on_submit_error_does_not_fail_submit() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        env = _env(tmp)
-        old_env = os.environ.copy()
-        old_drain = D._drain_queue_once
-        stderr = io.StringIO()
-        try:
-            os.environ.clear()
-            os.environ.update(env)
-
-            def fail_drain(_args):
-                raise RuntimeError("synthetic drain failure")
-
-            D._drain_queue_once = fail_drain
-            with contextlib.redirect_stderr(stderr):
-                rc = D.main(
-                    [
-                        "--agent",
-                        "test-dispatch",
-                        "--submit",
-                        "--unregistered-forced",
-                        "--dispatch-id",
-                        "submit-drain-fails",
-                        "--tail",
-                        str(tmp / "drain-fails.tail"),
-                        "--status-json",
-                        str(tmp / "drain-fails.status.json"),
-                        "--cwd",
-                        str(tmp),
-                        "--",
-                        sys.executable,
-                        "-c",
-                        "print('COMPLETE: submit-drain-fails — drain failure stays queued')",
-                    ]
-                )
-        finally:
-            D._drain_queue_once = old_drain
-            os.environ.clear()
-            os.environ.update(old_env)
-        assert rc == 0
-        assert "drain-on-submit warning" in stderr.getvalue()
-        assert (tmp / "state" / "dispatch-queue" / "submit-drain-fails.json").exists()
-
-
-def test_submit_default_drain_launches_once_and_duplicate_submit_does_not_double_launch() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        env = _env(tmp)
-        marker = tmp / "default-drain-count.txt"
-        release = tmp / "default-drain-release.txt"
-        worker_code = (
-            "from pathlib import Path; import time\n"
-            f"p=Path({str(marker)!r})\n"
-            f"release=Path({str(release)!r})\n"
-            "p.write_text((p.read_text() if p.exists() else '') + 'x')\n"
-            f"deadline=time.monotonic()+{_ASYNC_WAIT_TIMEOUT_S!r}\n"
-            "while not release.exists():\n"
-            "    if time.monotonic() >= deadline: raise TimeoutError('default drain release not received')\n"
-            "    time.sleep(0.01)\n"
-            "print('COMPLETE: submit-default-launch — default drain launched', flush=True)\n"
-        )
-        cmd = [
-            sys.executable,
-            str(DISPATCH),
-            "--agent",
-            "test-dispatch",
-            "--submit",
-            "--unregistered-forced",
-            "--dispatch-id",
-            "submit-default-launch",
-            "--tail",
-            str(tmp / "default-launch.tail"),
-            "--status-json",
-            str(tmp / "default-launch.status.json"),
-            "--poll-secs",
-            "0.1",
-            "--cwd",
-            str(tmp),
-            "--",
-            sys.executable,
-            "-c",
-            worker_code,
-        ]
-        first = _run(cmd, env)
-        assert first.returncode == 0, (first.stdout, first.stderr)
-        try:
-            assert _wait_for(lambda: marker.exists() and marker.read_text() == "x"), first.stdout
-            assert not (tmp / "state" / "dispatch-queue" / "submit-default-launch.json").exists()
-
-            duplicate = _run(cmd, env)
-            assert duplicate.returncode == 64, (duplicate.stdout, duplicate.stderr)
-            assert "already has a non-terminal ledger record" in duplicate.stderr
-        finally:
-            release.write_text("release", encoding="utf-8")
-            _wait_for_dispatch_shutdown(
-                env,
-                "submit-default-launch",
-                tmp / "default-launch.status.json",
-            )
-        assert marker.read_text() == "x", "duplicate submit launched the worker again"
-
-
-def test_submit_is_idempotent_for_matching_args_and_rejects_collisions() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        env = _env(tmp)
-        cmd = [
-            sys.executable,
-            str(DISPATCH),
-            "--agent",
-            "test-dispatch",
-            "--submit",
-            "--unregistered-forced",
-            "--no-drain-on-submit",
-            "--dispatch-id",
-            "submit-idempotent",
-            "--tail",
-            str(tmp / "idem.tail"),
-            "--status-json",
-            str(tmp / "idem.status.json"),
-            "--cwd",
-            str(tmp),
-            "--",
-            sys.executable,
-            "-c",
-            "print('COMPLETE: submit-idempotent — same')",
-        ]
-        first = _run(cmd, env)
-        assert first.returncode == 0, (first.stdout, first.stderr)
-        second = _run(cmd, env)
-        assert second.returncode == 0, (second.stdout, second.stderr)
-        assert "STATUS: queued already submit-idempotent" in second.stdout
-        collision = _run(
-            [*cmd[:-1], "print('COMPLETE: submit-idempotent — different')"],
-            env,
-        )
-        assert collision.returncode == 64, (collision.stdout, collision.stderr)
-        assert "queued request already exists" in collision.stderr
-
-
-def test_submit_ignores_matching_failed_claim_tombstone_for_requeue() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        env = _env(tmp)
-        cmd = [
-            sys.executable,
-            str(DISPATCH),
-            "--agent",
-            "test-dispatch",
-            "--submit",
-            "--unregistered-forced",
-            "--no-drain-on-submit",
-            "--dispatch-id",
-            "submit-after-failed-tombstone",
-            "--tail",
-            str(tmp / "failed-tombstone.tail"),
-            "--status-json",
-            str(tmp / "failed-tombstone.status.json"),
-            "--cwd",
-            str(tmp),
-            "--",
-            sys.executable,
-            "-c",
-            "print('COMPLETE: submit-after-failed-tombstone — same after failed tombstone')",
-        ]
-        first = _run(cmd, env)
-        assert first.returncode == 0, (first.stdout, first.stderr)
-        queue_path = tmp / "state" / "dispatch-queue" / "submit-after-failed-tombstone.json"
-        entry = json.loads(queue_path.read_text(encoding="utf-8"))
-        entry["state"] = "failed"
-        failed = queue_path.with_name(f"{queue_path.name}.claimed-123.failed")
-        failed.write_text(json.dumps(entry), encoding="utf-8")
-        queue_path.unlink()
-
-        second = _run(cmd, env)
-        assert second.returncode == 0, (second.stdout, second.stderr)
-        assert "DISPATCH-QUEUED" in second.stdout, second.stdout
-        assert queue_path.exists(), "failed tombstone blocked fresh requeue"
-
-
-def test_duplicate_submit_runs_opportunistic_drain() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        env = _env(tmp)
-        old_env = os.environ.copy()
-        old_drain = D._drain_queue_once
-        calls = []
-        try:
-            os.environ.clear()
-            os.environ.update(env)
-
-            seed_rc = D.main(
-                [
-                    "--agent",
-                    "test-dispatch",
-                    "--submit",
-                    "--unregistered-forced",
-                    "--no-drain-on-submit",
-                    "--dispatch-id",
-                    "duplicate-drain-nudge",
-                    "--tail",
-                    str(tmp / "dup-drain.tail"),
-                    "--status-json",
-                    str(tmp / "dup-drain.status.json"),
-                    "--cwd",
-                    str(tmp),
-                    "--",
-                    sys.executable,
-                    "-c",
-                    "print('COMPLETE: duplicate-drain-nudge — duplicate drain nudge')",
-                ]
-            )
-            assert seed_rc == 0
-
-            def fake_drain(args):
-                calls.append(args)
-                return {
-                    "schema": "test",
-                    "queue_dir": args.queue_dir,
-                    "launched": 0,
-                    "left_queued": 0,
-                    "failed": 0,
-                    "remaining": 1,
-                    "pending_claims": 0,
-                    "recovered_claims": {"restored": 0, "cleared": 0, "pending_launch": 0},
-                    "details": [],
-                }
-
-            D._drain_queue_once = fake_drain
-            duplicate_rc = D.main(
-                [
-                    "--agent",
-                    "test-dispatch",
-                    "--submit",
-                    "--unregistered-forced",
-                    "--dispatch-id",
-                    "duplicate-drain-nudge",
-                    "--tail",
-                    str(tmp / "dup-drain.tail"),
-                    "--status-json",
-                    str(tmp / "dup-drain.status.json"),
-                    "--cwd",
-                    str(tmp),
-                    "--",
-                    sys.executable,
-                    "-c",
-                    "print('COMPLETE: duplicate-drain-nudge — duplicate drain nudge')",
-                ]
-            )
-        finally:
-            D._drain_queue_once = old_drain
-            os.environ.clear()
-            os.environ.update(old_env)
-        assert duplicate_rc == 0
-        assert len(calls) == 1, "duplicate submit did not retry drain-on-submit"
-
-
-def test_concurrent_submit_same_id_is_idempotent() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        env = _env(tmp)
-        cmd = [
-            sys.executable,
-            str(DISPATCH),
-            "--agent",
-            "test-dispatch",
-            "--submit",
-            "--unregistered-forced",
-            "--no-drain-on-submit",
-            "--dispatch-id",
-            "submit-race",
-            "--tail",
-            str(tmp / "race.tail"),
-            "--status-json",
-            str(tmp / "race.status.json"),
-            "--cwd",
-            str(tmp),
-            "--",
-            sys.executable,
-            "-c",
-            "print('COMPLETE: submit-race — same race')",
-        ]
-        procs = [
-            subprocess.Popen(
-                cmd,
-                cwd=ROOT,
-                env=env,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            for _ in range(8)
-        ]
-        results = []
-        for proc in procs:
-            stdout, stderr = proc.communicate(timeout=_ASYNC_WAIT_TIMEOUT_S)
-            results.append((proc.returncode, stdout, stderr))
-        for rc, _stdout, _stderr in results:
-            assert rc == 0, (rc, _stdout, _stderr)
-            assert "Traceback" not in _stdout + _stderr
-        queue_dir = tmp / "state" / "dispatch-queue"
-        entries = sorted(queue_dir.glob("submit-race*.json"))
-        assert len(entries) == 1, [p.name for p in entries]
-        assert not list(queue_dir.glob("submit-race.json.tmp.*"))
-
-
-def test_submit_write_error_is_clean() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        env = _env(tmp)
-        state = tmp / "state"
-        state.mkdir()
-        state.chmod(0o500)
-        try:
-            proc = _run(
-                [
-                    sys.executable,
-                    str(DISPATCH),
-                    "--agent",
-                    "test-dispatch",
-                    "--submit",
-                    "--unregistered-forced",
-                    "--no-drain-on-submit",
-                    "--dispatch-id",
-                    "submit-readonly",
-                    "--tail",
-                    str(tmp / "readonly.tail"),
-                    "--status-json",
-                    str(tmp / "readonly.status.json"),
-                    "--cwd",
-                    str(tmp),
-                    "--",
-                    sys.executable,
-                    "-c",
-                    "print('COMPLETE: submit-readonly — should not queue')",
-                ],
-                env,
-            )
-            assert proc.returncode != 0, (proc.stdout, proc.stderr)
-            assert "goalflight_dispatch: submit failed for submit-readonly" in proc.stderr
-            assert "Traceback" not in proc.stdout + proc.stderr
-            assert not (tmp / "readonly.status.json").exists()
-            files = [p for p in state.rglob("*") if p.is_file()]
-            assert files == [], [str(p) for p in files]
-        finally:
-            state.chmod(0o700)
-
-
-def test_submit_status_write_error_removes_queue_entry() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        env = _env(tmp)
-        blocked = tmp / "blocked-status"
-        blocked.mkdir()
-        blocked.chmod(0o500)
-        try:
-            proc = _run(
-                [
-                    sys.executable,
-                    str(DISPATCH),
-                    "--agent",
-                    "test-dispatch",
-                    "--submit",
-                    "--unregistered-forced",
-                    "--no-drain-on-submit",
-                    "--dispatch-id",
-                    "submit-status-fails",
-                    "--tail",
-                    str(tmp / "status-fails.tail"),
-                    "--status-json",
-                    str(blocked / "status.json"),
-                    "--cwd",
-                    str(tmp),
-                    "--",
-                    sys.executable,
-                    "-c",
-                    "print('COMPLETE: submit-status-fails — should not leave queue')",
-                ],
-                env,
-            )
-            assert proc.returncode != 0, (proc.stdout, proc.stderr)
-            assert "goalflight_dispatch: submit failed for submit-status-fails" in proc.stderr
-            assert "Traceback" not in proc.stdout + proc.stderr
-            assert not (tmp / "state" / "dispatch-queue" / "submit-status-fails.json").exists()
-            assert not (blocked / "status.json").exists()
-        finally:
-            blocked.chmod(0o700)
-
-
-def test_submit_rejects_active_waiting_capacity_ledger() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        env = _env(tmp)
-        old_env = os.environ.copy()
-        try:
-            os.environ.clear()
-            os.environ.update(env)
-            D.goalflight_ledger.write_record(
-                {
-                    "schema": D.goalflight_ledger.SCHEMA,
-                    "dispatch_id": "dup-wait",
-                    "agent": "test-dispatch",
-                    "engine": "test-dispatch",
-                    "shape": "bash",
-                    "account": "default",
-                    "transport": "dispatch",
-                    "project_root": str(tmp),
-                    "worker_pid": None,
-                    "stdout_path": str(tmp / "waiting.tail"),
-                    "status_path": str(tmp / "waiting.status.json"),
-                    "state": "waiting_capacity",
-                    "started_at": D.goalflight_ledger.utc_now(),
-                }
-            )
-        finally:
-            os.environ.clear()
-            os.environ.update(old_env)
-        proc = _run(
-            [
-                sys.executable,
-                str(DISPATCH),
-                "--agent",
-                "test-dispatch",
-                "--submit",
-                "--unregistered-forced",
-                "--no-drain-on-submit",
-                "--dispatch-id",
-                "dup-wait",
-                "--tail",
-                str(tmp / "dup.tail"),
-                "--status-json",
-                str(tmp / "dup.status.json"),
-                "--cwd",
-                str(tmp),
-                "--",
-                sys.executable,
-                "-c",
-                "print('COMPLETE: dup-wait — should not queue')",
-            ],
-            env,
-        )
-        assert proc.returncode == 64, (proc.stdout, proc.stderr)
-        assert "already has a non-terminal ledger record" in proc.stderr
-        assert not (tmp / "state" / "dispatch-queue" / "dup-wait.json").exists()
-
-
 def test_drain_launches_queued_request_once_and_exits() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -1676,33 +1086,30 @@ def test_drain_launches_queued_request_once_and_exits() -> None:
             "p.write_text((p.read_text() if p.exists() else '') + 'x')\n"
             "print('COMPLETE: drain-launch — queued launch done', flush=True)\n"
         )
-        submit = _run(
-            [
-                sys.executable,
-                str(DISPATCH),
-                "--agent",
-                "test-dispatch",
-                "--submit",
-                "--unregistered-forced",
-                "--no-drain-on-submit",
-                "--dispatch-id",
-                "drain-launch",
-                "--tail",
-                str(tmp / "drain.tail"),
-                "--status-json",
-                str(tmp / "drain.status.json"),
-                "--poll-secs",
-                "0.1",
-                "--cwd",
-                str(tmp),
-                "--",
-                sys.executable,
-                "-c",
-                worker_code,
-            ],
-            env,
-        )
-        assert submit.returncode == 0, (submit.stdout, submit.stderr)
+        queue = tmp / "state" / "dispatch-queue"
+        queue.mkdir(parents=True)
+        queue_path = _write_queue_entry(queue, "drain-launch", filename="drain-launch")
+        entry = json.loads(queue_path.read_text(encoding="utf-8"))
+        entry["dispatch_argv"] = [
+            "--agent",
+            "test-dispatch",
+            "--unregistered-forced",
+            "--dispatch-id",
+            "drain-launch",
+            "--tail",
+            str(tmp / "drain.tail"),
+            "--status-json",
+            str(tmp / "drain.status.json"),
+            "--poll-secs",
+            "0.1",
+            "--cwd",
+            str(tmp),
+            "--",
+            sys.executable,
+            "-c",
+            worker_code,
+        ]
+        D._write_json_atomic(queue_path, entry)
         drain = _run([sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"], env)
         assert drain.returncode == 0, (drain.stdout, drain.stderr)
         payload = json.loads(drain.stdout)
@@ -1742,33 +1149,35 @@ def test_registered_queue_refusal_after_controller_exit_restores_runnable_entry(
                 lease_nonce=claimed.value.nonce,
             )
             try:
-                submit = _run(
-                    [
-                        sys.executable,
-                        str(DISPATCH),
-                        "--agent",
-                        "test-dispatch",
-                        "--submit",
-                        "--no-drain-on-submit",
-                        "--dispatch-id",
-                        dispatch_id,
-                        "--cwd",
-                        str(tmp),
-                        "--",
-                        sys.executable,
-                        "-c",
-                        (
-                            "from pathlib import Path; "
-                            f"Path({str(marker)!r}).write_text('ran'); "
-                            f"print('COMPLETE: {dispatch_id} — ran')"
-                        ),
-                    ],
-                    env,
-                )
+                queue_path.parent.mkdir(parents=True)
+                _write_queue_entry(queue_path.parent, dispatch_id, filename=dispatch_id)
+                entry = json.loads(queue_path.read_text(encoding="utf-8"))
+                entry["dispatch_argv"] = [
+                    "--agent",
+                    "test-dispatch",
+                    "--dispatch-id",
+                    dispatch_id,
+                    "--cwd",
+                    str(tmp),
+                    "--controller-label",
+                    "queue-controller",
+                    "--controller-beacon-pid",
+                    str(os.getpid()),
+                    "--controller-session-id",
+                    claimed.value.nonce,
+                    "--",
+                    sys.executable,
+                    "-c",
+                    (
+                        "from pathlib import Path; "
+                        f"Path({str(marker)!r}).write_text('ran'); "
+                        f"print('COMPLETE: {dispatch_id} — ran')"
+                    ),
+                ]
+                D._write_json_atomic(queue_path, entry)
             finally:
                 holder.close()
 
-            assert submit.returncode == 0, (submit.stdout, submit.stderr)
             assert queue_path.is_file()
             drain = _run(
                 [
@@ -1786,13 +1195,11 @@ def test_registered_queue_refusal_after_controller_exit_restores_runnable_entry(
             assert payload["launched"] == 0, payload
             assert payload["left_queued"] == 1, payload
             assert payload["pending_claims"] == 0, payload
-            assert payload["details"] == [
-                {
-                    "dispatch_id": dispatch_id,
-                    "state": "queued",
-                    "reason": "launch_refused_pre_spawn:64",
-                }
-            ]
+            assert len(payload["details"]) == 1, payload
+            detail = payload["details"][0]
+            assert detail["dispatch_id"] == dispatch_id, detail
+            assert detail["state"] == "queued", detail
+            assert detail["reason"] == "launch_refused_pre_spawn:64", detail
             assert queue_path.is_file(), "refusal removed the runnable queue entry"
             assert list(queue_path.parent.glob(f"{dispatch_id}.json.claimed-*")) == []
             assert not marker.exists(), "refused queued worker still launched"
@@ -1801,93 +1208,6 @@ def test_registered_queue_refusal_after_controller_exit_restores_runnable_entry(
         finally:
             os.environ.clear()
             os.environ.update(old_env)
-
-
-def test_drain_waits_for_submit_status_recording() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        env = _env(tmp)
-        env["GOALFLIGHT_TEST_MODE"] = "1"
-        submit_ready = tmp / "submit-status.ready"
-        submit_release = tmp / "submit-status.release"
-        drain_ready = tmp / "drain-before-claim.ready"
-        env["GOALFLIGHT_TEST_SUBMIT_STATUS_READY_FILE"] = str(submit_ready)
-        env["GOALFLIGHT_TEST_SUBMIT_STATUS_RELEASE_FILE"] = str(submit_release)
-        env["GOALFLIGHT_TEST_DRAIN_BEFORE_CLAIM_FILE"] = str(drain_ready)
-        marker = tmp / "delayed-drain-ran.txt"
-        status_json = tmp / "delayed.status.json"
-        queue_path = tmp / "state" / "dispatch-queue" / "submit-drain-race.json"
-        worker_code = (
-            "from pathlib import Path\n"
-            f"Path({str(marker)!r}).write_text('ran')\n"
-            "print('COMPLETE: submit-drain-race — delayed drain')\n"
-        )
-        submit = subprocess.Popen(
-            [
-                sys.executable,
-                str(DISPATCH),
-                "--agent",
-                "test-dispatch",
-                "--submit",
-                "--unregistered-forced",
-                "--no-drain-on-submit",
-                "--dispatch-id",
-                "submit-drain-race",
-                "--tail",
-                str(tmp / "delayed.tail"),
-                "--status-json",
-                str(status_json),
-                "--poll-secs",
-                "0.1",
-                "--cwd",
-                str(tmp),
-                "--",
-                sys.executable,
-                "-c",
-                worker_code,
-            ],
-            cwd=ROOT,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        drain: subprocess.Popen[str] | None = None
-        try:
-            assert _wait_for(lambda: submit_ready.exists() and queue_path.exists()), (
-                "submit did not expose the queued carrier while holding its mutation lock"
-            )
-            drain = subprocess.Popen(
-                [sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"],
-                cwd=ROOT,
-                env=env,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            assert _wait_for(drain_ready.exists), "drain did not reach the queue claim boundary"
-            assert drain.poll() is None, "drain escaped the submit mutation lock before status recording"
-            assert queue_path.exists(), "drain claimed a queue entry before submit status recording"
-            submit_release.write_text("release", encoding="utf-8")
-            submit_stdout, submit_stderr = submit.communicate(timeout=_ASYNC_WAIT_TIMEOUT_S)
-            drain_stdout, drain_stderr = drain.communicate(timeout=_ASYNC_WAIT_TIMEOUT_S)
-        finally:
-            submit_release.write_text("release", encoding="utf-8")
-            if submit.poll() is None:
-                submit.kill()
-                submit.communicate(timeout=_ASYNC_WAIT_TIMEOUT_S)
-            if drain is not None and drain.poll() is None:
-                drain.kill()
-                drain.communicate(timeout=_ASYNC_WAIT_TIMEOUT_S)
-        assert submit.returncode == 0, (submit.returncode, submit_stdout, submit_stderr)
-        assert drain is not None
-        assert drain.returncode == 0, (drain.returncode, drain_stdout, drain_stderr)
-        payload = json.loads(drain_stdout)
-        assert payload["launched"] == 1, payload
-        final_status = json.loads(status_json.read_text(encoding="utf-8"))
-        assert final_status["state"] != "queued", final_status
-        assert not queue_path.exists()
-        _wait_for_dispatch_shutdown(env, "submit-drain-race", status_json)
 
 
 def test_drain_write_error_is_json_error_without_traceback() -> None:
@@ -1908,7 +1228,7 @@ def test_drain_write_error_is_json_error_without_traceback() -> None:
             state.chmod(0o700)
 
 
-def test_acp_submit_then_drain_replays_from_queue() -> None:
+def test_acp_drain_replays_preexisting_queue_entry() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         _write_fake_codex_acp(tmp)
@@ -1924,35 +1244,42 @@ def test_acp_submit_then_drain_replays_from_queue() -> None:
         env["GOALFLIGHT_FAKE_ACP_SCENARIO"] = "blocked_none"
         env["GOALFLIGHT_FAKE_ACP_INTERVAL"] = "0.01"
         env["GOALFLIGHT_ACP_PYTHON"] = sys.executable
-        submit = _run(
-            [
-                sys.executable,
-                str(DISPATCH),
-                "--agent",
-                "codex-acp",
-                "--shape",
-                "acp",
-                "--submit",
-                "--unregistered-forced",
-                "--no-drain-on-submit",
-                "--dispatch-id",
-                "acp-drain",
-                "--prompt",
-                "hello",
-                "--tail",
-                str(tmp / "acp.tail"),
-                "--status-json",
-                str(status_path),
-                "--cwd",
-                str(tmp),
-                "--max-idle-secs",
-                "5",
-                "--poll-secs",
-                "0.1",
-            ],
-            env,
+        queue = tmp / "state" / "dispatch-queue"
+        queue.mkdir(parents=True)
+        queue_path = _write_queue_entry(queue, "acp-drain", filename="acp-drain")
+        entry = json.loads(queue_path.read_text(encoding="utf-8"))
+        entry["agent"] = "codex-acp"
+        entry["shape"] = "acp"
+        entry["dispatch_argv"] = [
+            "--agent",
+            "codex-acp",
+            "--shape",
+            "acp",
+            "--unregistered-forced",
+            "--dispatch-id",
+            "acp-drain",
+            "--prompt",
+            "hello",
+            "--tail",
+            str(tmp / "acp.tail"),
+            "--status-json",
+            str(status_path),
+            "--cwd",
+            str(tmp),
+            "--max-idle-secs",
+            "5",
+            "--poll-secs",
+            "0.1",
+        ]
+        entry["request"].update(
+            {
+                "agent": "codex-acp",
+                "prompt": "hello",
+                "tail": str(tmp / "acp.tail"),
+                "status_json": str(status_path),
+            }
         )
-        assert submit.returncode == 0, (submit.stdout, submit.stderr)
+        D._write_json_atomic(queue_path, entry)
         launched = False
         last_status: dict = {}
         try:
@@ -1967,7 +1294,7 @@ def test_acp_submit_then_drain_replays_from_queue() -> None:
             assert launched, payload
             assert payload["remaining"] == 0, payload
             assert payload["pending_claims"] == 0, payload
-            assert not (tmp / "state" / "dispatch-queue" / "acp-drain.json").exists()
+            assert not queue_path.exists()
 
             def acp_started() -> bool:
                 nonlocal last_status
@@ -2234,39 +1561,38 @@ def test_drain_leaves_request_queued_when_capacity_full() -> None:
         )
         assert held.returncode == 0, held.stderr
         marker = tmp / "should-not-run"
-        submit = _run(
-            [
-                sys.executable,
-                str(DISPATCH),
-                "--agent",
-                "test-dispatch",
-                "--submit",
-                "--unregistered-forced",
-                "--no-drain-on-submit",
-                "--dispatch-id",
-                "drain-no-capacity",
-                "--tail",
-                str(tmp / "no-cap.tail"),
-                "--status-json",
-                str(tmp / "no-cap.status.json"),
-                "--cwd",
-                str(tmp),
-                "--",
-                sys.executable,
-                "-c",
-                f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')",
-            ],
-            env,
+        queue_dir = tmp / "state" / "dispatch-queue"
+        queue_dir.mkdir(parents=True)
+        queue_path = _write_queue_entry(
+            queue_dir,
+            "drain-no-capacity",
+            filename="drain-no-capacity",
         )
-        assert submit.returncode == 0, (submit.stdout, submit.stderr)
-        drain = _run([sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"], env)
-        assert drain.returncode == 0, (drain.stdout, drain.stderr)
-        payload = json.loads(drain.stdout)
+        entry = json.loads(queue_path.read_text(encoding="utf-8"))
+        entry["dispatch_argv"].insert(2, "--unregistered-forced")
+        entry["dispatch_argv"][-1] = (
+            f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')"
+        )
+        D._write_json_atomic(queue_path, entry)
+        old_env = os.environ.copy()
+        original_release = D._release_stale_capacity_for_drain
+        original_hook = D._run_drain_prelaunch_hook
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            D._release_stale_capacity_for_drain = lambda: None
+            D._run_drain_prelaunch_hook = lambda _agents: None
+            payload = D._drain_queue_once(_drain_args(queue_dir))
+        finally:
+            D._release_stale_capacity_for_drain = original_release
+            D._run_drain_prelaunch_hook = original_hook
+            os.environ.clear()
+            os.environ.update(old_env)
         assert payload["launched"] == 0, payload
         assert payload["remaining"] == 1, payload
-        assert (tmp / "state" / "dispatch-queue" / "drain-no-capacity.json").exists()
+        assert queue_path.exists()
         assert not marker.exists(), "worker launched despite full capacity"
-        status = json.loads((tmp / "no-cap.status.json").read_text(encoding="utf-8"))
+        status = json.loads((tmp / "drain-no-capacity.status.json").read_text(encoding="utf-8"))
         assert status["state"] == "queued", status
         row = _record(_status(env), "drain-no-capacity")
         assert row and row.get("classification") == "queued_capacity", row
@@ -2303,32 +1629,12 @@ def test_capacity_blocked_drain_claim_is_released_and_entry_stays_queued() -> No
         assert held.returncode == 0, held.stderr
         dispatch_id = "capacity-claim-release"
         queue_dir = tmp / "state" / "dispatch-queue"
-        queue_path = queue_dir / f"{dispatch_id}.json"
-        submit = _run(
-            [
-                sys.executable,
-                str(DISPATCH),
-                "--agent",
-                "test-dispatch",
-                "--submit",
-                "--unregistered-forced",
-                "--no-drain-on-submit",
-                "--dispatch-id",
-                dispatch_id,
-                "--tail",
-                str(tmp / f"{dispatch_id}.tail"),
-                "--status-json",
-                str(tmp / f"{dispatch_id}.status.json"),
-                "--cwd",
-                str(tmp),
-                "--",
-                sys.executable,
-                "-c",
-                "raise SystemExit('must not run')",
-            ],
-            env,
-        )
-        assert submit.returncode == 0, (submit.stdout, submit.stderr)
+        queue_dir.mkdir(parents=True)
+        queue_path = _write_queue_entry(queue_dir, dispatch_id, filename=dispatch_id)
+        entry = json.loads(queue_path.read_text(encoding="utf-8"))
+        entry["dispatch_argv"].insert(2, "--unregistered-forced")
+        entry["dispatch_argv"][-1] = "raise SystemExit('must not run')"
+        D._write_json_atomic(queue_path, entry)
         assert queue_path.exists(), "precondition: durable queue entry must exist before drain"
 
         claimed_paths: list[str] = []
@@ -2934,7 +2240,7 @@ def test_drain_orders_by_priority_then_created_at_fifo() -> None:
         assert [row["dispatch_id"] for row in payload["details"]] == expected
 
 
-def test_drain_degrades_unknown_priority_to_normal_and_survives_bad_json_prescan() -> None:
+def test_drain_degrades_unknown_priority_and_retains_bad_json_prescan() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _env(tmp)
@@ -2982,17 +2288,18 @@ def test_drain_degrades_unknown_priority_to_normal_and_survives_bad_json_prescan
             os.environ.update(old_env)
         assert launched == ["critical-newer", "missing-priority", "garbage-priority"], payload
         assert payload["launched"] == 3, payload
-        assert payload["failed"] == 1, payload
-        assert payload["remaining"] == 1, payload
+        assert payload["failed"] == 0, payload
+        assert payload["remaining"] == 2, payload
         assert (tmp / "state" / "dispatch-queue" / "000-bulk-oldest.json").exists()
-        assert list((tmp / "state" / "dispatch-queue").glob("012-bad-json.json.claimed-*.failed"))
+        assert bad_json.exists(), "canonical drain must retain unreadable backlog entries"
+        unreadable = next(
+            row for row in payload["details"] if row.get("dispatch_id") == "012-bad-json"
+        )
+        assert unreadable["reason"] == "unreadable_queue_entry", unreadable
 
 
-def test_drain_does_not_tombstone_valid_entry_on_stale_prescan_read_error() -> None:
-    """Regression: the pre-scan read is used only for sort ordering; a stale
-    pre-scan read_error (e.g. the entry was mid-restore by a concurrent
-    stale-claim recovery at scan time) must NOT tombstone a now-valid entry.
-    Readability is decided authoritatively from the claimed file."""
+def test_drain_retains_valid_entry_on_stale_prescan_read_error() -> None:
+    """A stale pre-scan error must fail closed without tombstoning the entry."""
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _env(tmp)
@@ -3024,10 +2331,14 @@ def test_drain_does_not_tombstone_valid_entry_on_stale_prescan_read_error() -> N
             D._queue_entry_drain_candidate = old_candidate
             os.environ.clear()
             os.environ.update(old_env)
-        assert launched == ["stale-scan-survivor"], payload
-        assert payload["launched"] == 1, payload
+        assert launched == [], payload
+        assert payload["launched"] == 0, payload
+        assert payload["left_queued"] == 1, payload
         assert payload["failed"] == 0, payload
+        assert payload["remaining"] == 1, payload
+        assert (queue / "000-stale-scan-survivor.json").exists(), payload
         assert not list((tmp / "state" / "dispatch-queue").glob("*.failed")), payload
+        assert payload["details"][-1]["reason"] == "unreadable_queue_entry", payload
 
 
 def test_stale_claim_without_worker_record_is_recovered() -> None:
@@ -4054,12 +3365,14 @@ def test_drain_requires_token_matched_ledger_before_clearing_claim() -> None:
             _write_queue_entry(queue, "stdout-only-launch", filename="stdout-only-launch")
 
             def fake_run(argv, **_kwargs):
-                return subprocess.CompletedProcess(
-                    list(argv),
-                    0,
-                    stdout='DISPATCH-LAUNCHED {"dispatch_id":"stdout-only-launch"}\n',
-                    stderr="",
-                )
+                if any(Path(str(arg)).name == "goalflight_dispatch.py" for arg in argv):
+                    return subprocess.CompletedProcess(
+                        list(argv),
+                        0,
+                        stdout='DISPATCH-LAUNCHED {"dispatch_id":"stdout-only-launch"}\n',
+                        stderr="",
+                    )
+                return old_run(argv, **_kwargs)
 
             D.subprocess.run = fake_run
             payload = D._drain_queue_once(_drain_args(queue))
@@ -5339,12 +4652,20 @@ def test_b065_normal_drain_restore_honors_completed_linked_task() -> None:
                 D._run_drain_prelaunch_hook = lambda _agents: None
                 args = _drain_args(queue)
                 if branch == "capacity":
-                    D.subprocess.run = lambda argv, **kwargs: subprocess.CompletedProcess(
-                        argv,
-                        2,
-                        stdout="blocked_capacity\n",
-                        stderr="",
-                    )
+                    def refuse_dispatch(argv, **kwargs):
+                        if any(
+                            Path(str(arg)).name == "goalflight_dispatch.py"
+                            for arg in argv
+                        ):
+                            return subprocess.CompletedProcess(
+                                argv,
+                                2,
+                                stdout="blocked_capacity\n",
+                                stderr="",
+                            )
+                        return originals["run"](argv, **kwargs)
+
+                    D.subprocess.run = refuse_dispatch
                 else:
                     args.remote_node = "test-node"
                     args.remote_runner = object()
@@ -6597,21 +5918,11 @@ def main() -> None:
     test_poisoned_ended_at_none_string_can_backfill_from_journal()
     test_corrupt_task_store_row_does_not_abort_recover_or_drain()
     test_parked_status_write_failure_is_visible_on_claim()
-    test_submit_status_delay_requires_test_mode()
-    test_submit_records_replayable_request_without_capacity_acquire()
-    test_submit_is_idempotent_for_matching_args_and_rejects_collisions()
-    test_submit_ignores_matching_failed_claim_tombstone_for_requeue()
-    test_duplicate_submit_runs_opportunistic_drain()
-    test_concurrent_submit_same_id_is_idempotent()
-    test_submit_write_error_is_clean()
-    test_submit_status_write_error_removes_queue_entry()
     test_mark_claim_failed_reports_whether_it_committed()
-    test_submit_rejects_active_waiting_capacity_ledger()
     test_drain_launches_queued_request_once_and_exits()
     test_registered_queue_refusal_after_controller_exit_restores_runnable_entry()
-    test_drain_waits_for_submit_status_recording()
     test_drain_write_error_is_json_error_without_traceback()
-    test_acp_submit_then_drain_replays_from_queue()
+    test_acp_drain_replays_preexisting_queue_entry()
     test_unreadable_adapter_manifest_does_not_terminalize_queued_os_sandbox()
     test_absent_os_sandbox_capability_still_terminalizes_queued_row()
     test_drain_leaves_request_queued_when_capacity_full()
@@ -6624,8 +5935,8 @@ def main() -> None:
     test_launch_started_queued_ledger_is_not_restored()
     test_blocked_capacity_missing_carrier_republishes_or_surfaces()
     test_drain_orders_by_priority_then_created_at_fifo()
-    test_drain_degrades_unknown_priority_to_normal_and_survives_bad_json_prescan()
-    test_drain_does_not_tombstone_valid_entry_on_stale_prescan_read_error()
+    test_drain_degrades_unknown_priority_and_retains_bad_json_prescan()
+    test_drain_retains_valid_entry_on_stale_prescan_read_error()
     test_stale_claim_without_worker_record_is_recovered()
     test_reconcile_refusal_paths_surface_distinct_recovery_reasons()
     test_failed_claim_tombstone_is_not_recovered()
@@ -6645,9 +5956,6 @@ def main() -> None:
     test_token_mismatch_recovery_preserves_live_worker_record()
     test_token_mismatch_recovery_preserves_terminal_worker_record()
     test_worker_dead_tail_rate_limit_reaches_pressure_sensor()
-    test_submit_default_runs_one_drain_pass_after_queue_write()
-    test_submit_drain_on_submit_error_does_not_fail_submit()
-    test_submit_default_drain_launches_once_and_duplicate_submit_does_not_double_launch()
     test_b065_state_flips_to_terminal_so_wait_resolves()
     test_b065_linked_vs_unlinked_action_matrix()
     test_b065_superseded_does_not_demote_task_success()

@@ -3,7 +3,7 @@
 Covers: profile resolution + precedence, the codex --sandbox mapping (off ->
 danger-full-access), that the always-forbidden bypass flags never leak, the
 --read-only/--os-sandbox conflict guard, the required 'off' dispatch log, and
-that the profile survives submit->drain via the canonical replay argv.
+that the profile survives backlog drain via the canonical replay argv.
 
 Repo convention: case_* functions invoked by main(), run as `python <file>.py`.
 """
