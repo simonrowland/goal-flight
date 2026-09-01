@@ -1381,6 +1381,7 @@ def run_supervisor(
     chatty: bool = False,
     forwarding_frontier: Callable[[], dict[str, object]] | None = None,
     next_repeat_floor_s: float = DEFAULT_NEXT_REPEAT_FLOOR_S,
+    on_startup_probe: Callable[[Path, str, str], str | None] | None = None,
 ) -> int:
     """Run until the lease dies, stdout breaks, or the host asks to stop."""
     nonce = str(lease_nonce or "").strip()
@@ -1577,10 +1578,11 @@ def run_supervisor(
             setattr(slot.child, "armed", False)
         return None
 
-    stopped = spawn_due()
-    if stopped is not None:
-        host.kill_all()
-        return stopped
+    if on_startup_probe is None:
+        stopped = spawn_due()
+        if stopped is not None:
+            host.kill_all()
+            return stopped
     seq = 0
     reported_revision = -1
     reported_counts: tuple[int, int] | None = None
@@ -1627,7 +1629,19 @@ def run_supervisor(
             record.update(live=live, target=target)
         return _emit(host, record)
 
-    if emit_depth:
+    if on_startup_probe is not None:
+        # A migration must prove the controlling stdout before the caller may
+        # release known-good incumbent coverage. Process construction alone is
+        # not proof, so migration children are not spawned before this write.
+        startup_probe_ok = _emit(
+            host,
+            {
+                "kind": "supervise",
+                "type": "probe",
+                "reason": "stdout-peer-liveness",
+            },
+        )
+    elif emit_depth:
         startup_probe_ok, _coverage_emitted = emit_coverage(force=True)
     else:
         # Terse startup still needs an actual stdout write to detect a dead
@@ -1641,7 +1655,33 @@ def run_supervisor(
                 "reason": "stdout-peer-liveness",
             },
         )
-    if not startup_probe_ok or (debug and not emit_heartbeat()):
+    if not startup_probe_ok:
+        return stop_after_failed_write()
+    if on_startup_probe is not None:
+        try:
+            migration_failure = on_startup_probe(
+                Path(project_root), controller_label, nonce
+            )
+        except Exception as exc:  # startup boundary: failure must be visible
+            migration_failure = f"{type(exc).__name__}: {exc}"
+        if migration_failure:
+            emitted = emit_stop(
+                reason="migration-release-failed",
+                scope="supervisor",
+                detail=str(migration_failure)[:180],
+            )
+            host.kill_all()
+            return SUPERVISE_START_EXIT if emitted else SUPERVISE_STOP_EXIT
+    if on_startup_probe is not None:
+        stopped = spawn_due()
+        if stopped is not None:
+            host.kill_all()
+            return stopped
+    if on_startup_probe is not None and emit_depth:
+        coverage_ok, _coverage_emitted = emit_coverage(force=True)
+        if not coverage_ok:
+            return stop_after_failed_write()
+    if debug and not emit_heartbeat():
         return stop_after_failed_write()
     next_heartbeat = host.now + max(0.01, float(heartbeat_s))
     next_coverage = host.now + max(0.01, float(coverage_s))
@@ -2698,6 +2738,7 @@ def cmd_supervise(
     args: Any,
     *,
     forwarding_frontier: Callable[[Path], dict[str, object]] | None = None,
+    on_startup_probe: Callable[[Path, str, str], str | None] | None = None,
 ) -> int:
     """CLI entry used by goalflight_messages.py supervise."""
     import goalflight_session_status as sessions  # type: ignore
@@ -2731,6 +2772,31 @@ def cmd_supervise(
     if not live_nonce:
         print(f"supervise: {refusal}", file=sys.stderr)
         return int(refusal_code or SUPERVISE_START_EXIT)
+    if on_startup_probe is not None:
+        listing = wake._process_listing()
+        if listing is not None:
+            listing = [
+                (pid, command)
+                for pid, command in listing
+                if pid != os.getpid()
+            ]
+        existing = wake._supervisor_generation_state_from_listing(
+            listing,
+            project_root=project_root,
+            controller_label=label,
+            lease_nonce=live_nonce,
+        )
+        if existing != wake.SUPERVISOR_ABSENT:
+            detail = (
+                "an existing supervisor remains live"
+                if existing == wake.SUPERVISOR_RUNNING
+                else "existing supervisor state is indeterminate"
+            )
+            print(
+                f"supervise: did-not-arm: {detail}; existing wake coverage retained",
+                file=sys.stderr,
+            )
+            return SUPERVISE_START_EXIT
     test_mode = os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
     heartbeat_s = float(
         getattr(args, "heartbeat_secs", DEFAULT_SUPERVISOR_HEARTBEAT_S)
@@ -2775,4 +2841,5 @@ def cmd_supervise(
             if forwarding_frontier is not None
             else None
         ),
+        on_startup_probe=on_startup_probe,
     )
