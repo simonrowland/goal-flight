@@ -250,13 +250,13 @@ def _session_start_embedded_python() -> str:
     return text[start:end]
 
 
-def _run_session_start_hook(
+def _invoke_session_start_hook(
     project: Path,
     env: dict[str, str],
     *,
     source: str,
-) -> str:
-    completed = subprocess.run(
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
         ["/bin/sh", str(SESSION_START_HOOK)],
         cwd=project,
         env=env,
@@ -273,9 +273,41 @@ def _run_session_start_hook(
         check=True,
         start_new_session=True,
     )
+
+
+def _run_session_start_hook(
+    project: Path,
+    env: dict[str, str],
+    *,
+    source: str,
+) -> str:
+    completed = _invoke_session_start_hook(project, env, source=source)
     assert completed.stderr == ""
     payload = json.loads(completed.stdout)
     return str(payload["hookSpecificOutput"]["additionalContext"])
+
+
+def _session_start_test_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    label: str,
+) -> dict[str, str]:
+    for key in AMBIENT_IDENTITY_ENV:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("GOALFLIGHT_WAKE_LEDGER", raising=False)
+    assignments = isolated_machine_env(tmp_path)
+    assignments.update(
+        {
+            "GOALFLIGHT_CONTROLLER_LABEL": label,
+            "GOALFLIGHT_PROCESS_ROLE": "controller",
+            "GOALFLIGHT_TEST_MODE": "1",
+            "GOALFLIGHT_WATCHDOG_RECENT_SECONDS": "0",
+        }
+    )
+    for key, value in assignments.items():
+        monkeypatch.setenv(key, value)
+    return dict(os.environ)
 
 
 def _ps_listing_env(
@@ -502,17 +534,134 @@ def test_session_start_journal_activity_bounds_open_retry_budget(
     project = tmp_path / "project"
     project.mkdir()
     (project / "SKILL.md").write_text("hook open-budget seam\n", encoding="utf-8")
-    assert journal_activity(str(ROOT), str(project)) is False  # type: ignore[operator]
+    assert journal_activity(str(ROOT), str(project)) == "unknown"  # type: ignore[operator]
     kwargs = recorded["kwargs"]
     assert isinstance(kwargs, dict)
     assert "open_retry_budget_s" in kwargs
     open_budget = float(kwargs["open_retry_budget_s"])
-    assert 0 <= open_budget <= 3.0
+    assert 0 <= open_budget <= 1.0
     assert open_budget < journal.JOURNAL_OPEN_RETRY_BUDGET_S
     retry_budget = float(
         kwargs.get("retry_budget_s", journal.JOURNAL_READER_RETRY_BUDGET_S)
     )
     assert retry_budget <= journal.JOURNAL_READER_RETRY_BUDGET_S
+    assert float(kwargs["transaction_budget_s"]) <= 1.0
+
+
+def test_session_start_probe_failure_emits_without_claiming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "probe-failure-project"
+    project.mkdir()
+    (project / "SKILL.md").write_text("hook probe failure\n", encoding="utf-8")
+    (project / "scripts").symlink_to(SCRIPTS, target_is_directory=True)
+    status_script = tmp_path / "failed-status.py"
+    status_script.write_text("import time\ntime.sleep(4)\n", encoding="utf-8")
+
+    env = _session_start_test_env(
+        tmp_path / "probe-failure-machine",
+        monkeypatch,
+        label="probe-failure-controller",
+    )
+    env["GOALFLIGHT_WATCHDOG_STATUS_SCRIPT"] = str(status_script)
+
+    completed = _invoke_session_start_hook(project, env, source="startup")
+    assert completed.stderr == ""
+    payload = json.loads(completed.stdout)
+    context = str(payload["hookSpecificOutput"]["additionalContext"])
+    assert "could not determine Goal Flight activity" in context
+    assert "ARM THE EVENT WAKE FIRST" in context
+    assert "CONTINUE IN-SKILL" in context
+    assert "did not claim a controller lease" in context
+    authority = journal.open_or_create_journal(project)
+    assert authority.active_lease("probe-failure-controller") is None
+
+
+def test_session_start_probe_failures_share_hook_wall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = tmp_path / "shared-wall-project"
+    project.mkdir()
+    (project / "SKILL.md").write_text("hook shared wall\n", encoding="utf-8")
+    (project / "scripts").symlink_to(SCRIPTS, target_is_directory=True)
+    code = _session_start_embedded_python().replace(
+        "try:\n    main()\nexcept Exception:\n    pass",
+        "",
+        1,
+    )
+    ns: dict[str, object] = {}
+    exec(compile(code, str(SESSION_START_HOOK), "exec"), ns)
+    monkeypatch.setenv(
+        "GOALFLIGHT_HOOK_INPUT",
+        json.dumps(
+            {
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+                "cwd": str(project),
+            }
+        ),
+    )
+    monkeypatch.setenv("GOALFLIGHT_PLUGIN_ROOT", str(ROOT))
+    monkeypatch.setenv("GOALFLIGHT_WATCHDOG_RECENT_SECONDS", "0")
+    ns["has_recent_resume_note"] = lambda: False
+    ns["controller_wake_instruction"] = lambda *_args: "Wake ownership unknown."
+    timeouts: list[float] = []
+
+    def slow_unknown(*_args, timeout_s: float = 3.0) -> str:
+        timeouts.append(timeout_s)
+        time.sleep(timeout_s)
+        return "unknown"
+
+    def unexpected_claim(*_args, **_kwargs) -> dict[str, object]:
+        raise AssertionError("unknown activity must not claim")
+
+    ns["journal_activity"] = slow_unknown
+    ns["session_status_active"] = slow_unknown
+    ns["claim_controller_entry"] = unexpected_claim
+    main = ns["main"]
+    assert callable(main)
+
+    started = time.monotonic()
+    main()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 5.0
+    assert len(timeouts) == 2
+    assert sum(timeouts) <= 4.1
+    payload = json.loads(capsys.readouterr().out)
+    context = str(payload["hookSpecificOutput"]["additionalContext"])
+    assert "could not determine Goal Flight activity" in context
+
+
+def test_session_start_proven_inactive_is_silent_without_claiming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "inactive-project"
+    project.mkdir()
+    (project / "SKILL.md").write_text("hook inactive\n", encoding="utf-8")
+    (project / "scripts").symlink_to(SCRIPTS, target_is_directory=True)
+    status_script = tmp_path / "inactive-status.py"
+    status_script.write_text(
+        'print("no active goal-flight session (test)")\n',
+        encoding="utf-8",
+    )
+
+    env = _session_start_test_env(
+        tmp_path / "inactive-machine",
+        monkeypatch,
+        label="inactive-controller",
+    )
+    env["GOALFLIGHT_WATCHDOG_STATUS_SCRIPT"] = str(status_script)
+
+    completed = _invoke_session_start_hook(project, env, source="startup")
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+    authority = journal.open_or_create_journal(project)
+    assert authority.active_lease("inactive-controller") is None
 
 
 def test_real_process_table_with_spaced_root_never_proves_absence(
