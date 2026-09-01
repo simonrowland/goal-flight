@@ -2717,7 +2717,7 @@ async def _run_acp_dispatch_impl(
         write_status(status_path, payload)
         return payload
     except Exception as exc:
-        if preserve_capacity_refusal_attempt:
+        if not preserve_capacity_refusal_attempt:
             payload.update(
                 {
                     "state": "failed",
@@ -2726,7 +2726,23 @@ async def _run_acp_dispatch_impl(
                     "updated_at": _now(),
                 }
             )
-            _commit_prelaunch_terminal(payload, project_root=project_root)
+            with contextlib.redirect_stdout(io.StringIO()):
+                terminal_code = goalflight_ledger.cmd_finish(
+                    argparse.Namespace(
+                        dispatch_id=dispatch_id,
+                        state="failed",
+                        reason=payload["error"],
+                        terminal_state=None,
+                        elapsed_s=None,
+                        worker_still_alive=False,
+                    )
+                )
+            if terminal_code != 0:
+                payload["terminal_pending_state"] = "failed"
+                payload["state"] = "terminal_pending"
+                payload["terminal_commit_error"] = (
+                    f"journal terminal emitter exited {terminal_code}"
+                )
             write_status(status_path, payload)
         raise
     if acquire_payload.get("decision") != "allow":

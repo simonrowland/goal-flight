@@ -75,6 +75,7 @@ def _env(tmp: Path) -> dict[str, str]:
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_FLEET_DIR"] = str(tmp / "fleet")
     env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
+    env["GOALFLIGHT_CAPACITY_MAX_TOTAL"] = "1"
     env["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
     return env
 

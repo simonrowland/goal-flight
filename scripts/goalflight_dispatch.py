@@ -16206,11 +16206,12 @@ def _run_acp_detached_launcher(
                     flush=True,
                 )
                 return 0
+            child_alive = goalflight_compat.pid_alive(child_pid)
             with contextlib.suppress(OSError, json.JSONDecodeError):
                 status_payload = json.loads(status_json.read_text(encoding="utf-8"))
                 last_state = status_payload.get("state")
                 if str(last_state).startswith("blocked_capacity"):
-                    if goalflight_compat.pid_alive(child_pid):
+                    if child_alive:
                         time.sleep(0.2)
                         continue
                     print(
@@ -16233,7 +16234,7 @@ def _run_acp_detached_launcher(
                         if forwarded_signals
                         else 2
                     )
-            if not goalflight_compat.pid_alive(child_pid):
+            if not child_alive:
                 break
             time.sleep(0.2)
     if forwarded_signals:
@@ -16331,6 +16332,19 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
     acp_remove = list(env_remove) + list(web_qa_remove)
     with _temporary_env(acp_env, remove=acp_remove):
         payload = asyncio.run(run_acp_dispatch(cfg))
+    if (
+        payload.get("state") == "blocked_capacity"
+        and not cfg.preserve_capacity_refusal_attempt
+    ):
+        # The ACP runner commits journal authority before returning; finish the
+        # already-created runs.d mirror so observers see the same terminal row.
+        _finish_ledger(
+            str(payload.get("dispatch_id") or cfg.dispatch_id),
+            "blocked_capacity",
+            payload.get("reason") or payload.get("error"),
+            elapsed_s=round(time.time() - started, 3),
+            worker_still_alive=False,
+        )
     worker_pid = payload.get("worker_pid")
     if worker_pid:
         _print_status_reminder(
