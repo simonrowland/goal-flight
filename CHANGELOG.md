@@ -8,6 +8,10 @@ incremented when meaningful skill behaviour changes.
 
 ### Fixed
 
+- `goalflight_dispatch.py resume` reattaches to the existing worktree instead
+  of acquiring a sibling pooled seat, so quota-exhausted / dead / plan-approval
+  pauses continue in place. `--account` is honored; default seat order skips
+  recently quota-exhausted accounts until their reset.
 - `supervise` backlog cap keys on envelope identity, not raw line count.
   Duplicate copies of one cursor snapshot still collapse as `cursor-lag` /
   `child-backlog`. Distinct envelopes (new cursor versions, unique headlines,

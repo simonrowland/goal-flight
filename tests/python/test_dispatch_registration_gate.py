@@ -1139,6 +1139,7 @@ def test_help_documents_unregistered_override() -> None:
     assert "--controller-label" in resume_help.stdout
     assert "--controller-pid" in resume_help.stdout
     assert "--controller-session-id" in resume_help.stdout
+    assert "--account" in resume_help.stdout
 
 
 def _stamp_args(**overrides) -> argparse.Namespace:

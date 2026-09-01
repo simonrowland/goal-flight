@@ -1714,6 +1714,10 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     existing = getattr(args, "_worktree_seat", None)
     if existing is not None:
         return existing
+    if getattr(args, "parent_dispatch_id", None):
+        # Resume reattaches to the recorded worker_cwd. Acquiring a pooled
+        # seat here would mint a sibling tree and reset partial work.
+        return None
     base = _requested_worktree_base(args)
     if base is None:
         return None
@@ -3307,6 +3311,7 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
     except OSError as exc:
         return None, f"dispatch ledger could not be read ({type(exc).__name__}: {exc})", None
     own_id = getattr(args, "dispatch_id", None)
+    parent_id = getattr(args, "parent_dispatch_id", None)
     host = socket.gethostname()
     unknown: list[str] = []
     for record in records:
@@ -3315,6 +3320,8 @@ def _worktree_incumbent_reason(args) -> tuple[str | None, str | None, str | None
         record_id = record.get("dispatch_id")
         if own_id and record_id == own_id:
             continue  # the drained/resumed launch re-enters with its own queued record
+        if parent_id and record_id == parent_id:
+            continue  # resume continues in the parent's tree, including plan-approval pauses
         if goalflight_ledger.record_is_unreadable(record):
             unknown.append(f"ledger record {record.get('path') or record_id} is unreadable")
             continue
@@ -4017,6 +4024,19 @@ def _assert_codex_resume_source_not_live(record: dict, dispatch_id: str) -> None
 
     source_state = status.get("state") or record.get("state")
     source_reason = status.get("reason") or record.get("reason")
+    source_classification = status.get("classification") or record.get(
+        "classification"
+    )
+    # Dead/absent pid plus a parked or settled source is resumable: quota
+    # death, stale_dead, and a plan-approval pause (USER-NEED / !READY /
+    # awaiting_user_confirm) after the worker exited. Only a live process or
+    # an unknown still-running story is refused.
+    if goalflight_dispatch_states.is_attention_state(source_state):
+        return
+    if goalflight_dispatch_states.is_terminal_state(source_state):
+        return
+    if source_classification in {"stale_dead", "worker_dead"}:
+        return
     if status.get("worker_alive") is True or (
         goalflight_ledger.terminal_state_for(source_state, source_reason) == "unknown"
     ):
@@ -4425,6 +4445,7 @@ def _rebuild_codex_resume_home(
     session_id: str,
     *,
     home_owner_dispatch_id: str | None = None,
+    explicit_account: str | None = None,
 ) -> tuple[str, str]:
     """Refresh auth/config in the original home while preserving its rollout."""
     if not expected_home.is_dir():
@@ -4451,7 +4472,7 @@ def _rebuild_codex_resume_home(
     try:
         rebuilt_home, effective_account = resolve_codex_home(
             project_root,
-            None,
+            explicit_account,
             home_owner_dispatch_id or parent_dispatch_id,
         )
         if (
@@ -4485,11 +4506,25 @@ def _rebuild_codex_resume_home(
 def _cmd_resume(argv: list[str]) -> int:
     parser = _TerseArgumentParser(
         prog=f"{Path(sys.argv[0]).name} resume",
-        description="Resume a recorded worker-CLI session as a tracked dispatch.",
-        usage_hint="try resume <dispatch-id> --prompt-file <path>",
+        description=(
+            "Resume a recorded worker-CLI session as a tracked dispatch. "
+            "Reattaches to the existing worktree, prompt, branch, and partial "
+            "artifacts; does not mint a sibling worktree. Continues quota-"
+            "exhausted, dead, stale_dead, and plan-approval pauses. "
+            "Pass --account to continue on a specific surviving seat."
+        ),
+        usage_hint="try resume <dispatch-id> --prompt-file <path> [--account <seat>]",
     )
     parser.add_argument("dispatch_id")
     parser.add_argument("--prompt-file", required=True)
+    parser.add_argument(
+        "--account",
+        help=(
+            "Seat to bill the resumed worker to. Honored as a pin. "
+            "When omitted, default selection skips recently quota-exhausted "
+            "seats until their reset."
+        ),
+    )
     parser.add_argument(
         "--controller-label",
         help="Controller label used to select a kernel-live project lease.",
@@ -4659,20 +4694,31 @@ def _resume_launch_argv(
         replace["--codex-home-owner-dispatch-id"] = source[
             "codex_home_owner_dispatch_id"
         ]
-    else:
-        # Stay on the seat that owns the session files. Codex rebuilds a
-        # per-dispatch home; grok/cursor/claude sessions live in the seat HOME.
+    resume_account = getattr(resume_args, "account", None)
+    if isinstance(resume_account, str) and resume_account.strip():
+        replace["--account"] = resume_account.strip()
+    elif source["engine"] != "codex":
+        # Stay on the seat that owns the session files unless that seat is
+        # recently quota-exhausted. Codex rebuilds a per-dispatch home;
+        # grok/cursor/claude sessions live in the seat HOME.
         account = record.get("effective_account") or record.get("account")
-        if isinstance(account, str) and account and account != "default":
+        if (
+            isinstance(account, str)
+            and account
+            and account != "default"
+            and not _account_quota_blocked(account, engine=source["engine"])
+        ):
             replace["--account"] = account
     argv = _reconstruct_launch_argv(
         base,
         replace=replace,
         inject=inject,
         strip_flags=_replay_strip_flags() + ("--unregistered-forced", "--occupied-worktree-forced"),
-        strip_options=("--tail", "--status-json", "--prompt"),
+        strip_options=("--tail", "--status-json", "--prompt", "--worktree"),
     )
-    if source["engine"] == "codex":
+    if "--account" not in replace:
+        # Drop a recorded pin onto a now-exhausted (or Codex-rotating) seat
+        # so default selection can skip recently exhausted accounts.
         argv = _remove_option_before_worker_remainder(argv, "--account")
     return argv
 
@@ -5486,6 +5532,79 @@ def _account_home(account: str, engine: str) -> Path:
     return Path.home() / ".goal-flight" / "accounts" / account / engine
 
 
+def _configured_account_names(engine: str) -> list[str]:
+    """Serial listing of configured ``accounts/<name>/<engine>`` seats."""
+    root = Path.home() / ".goal-flight" / "accounts"
+    try:
+        children = sorted(
+            (child for child in root.iterdir() if child.is_dir()),
+            key=lambda path: path.name,
+        )
+    except OSError:
+        return []
+    return [child.name for child in children if (child / engine).exists()]
+
+
+def _account_quota_blocked(
+    account: str | None,
+    *,
+    engine: str | None = None,
+    now: float | None = None,
+) -> bool:
+    """True when this seat recently proved quota_exhausted and has not reset."""
+    if not isinstance(account, str):
+        return False
+    seat = account.strip()
+    if not seat or seat == "default":
+        return False
+    current = time.time() if now is None else float(now)
+    cooldown = _effective_account_cooldown(seat)
+    cooldown_ts = _parse_timestamp_s(cooldown) if cooldown else None
+    if cooldown_ts is not None and current < cooldown_ts:
+        return True
+    try:
+        records = goalflight_ledger.read_records()
+    except OSError:
+        return False
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        billed = record.get("effective_account") or record.get("account")
+        if billed != seat:
+            continue
+        if engine:
+            recorded_engine = goalflight_ledger.infer_engine(
+                record.get("engine") or record.get("agent")
+            )
+            if recorded_engine != engine:
+                continue
+        policy = goalflight_dispatch_states.retry_policy_for_record(
+            record, now=current
+        )
+        if (
+            isinstance(policy, dict)
+            and policy.get("kind") == goalflight_dispatch_states.LIMIT_KIND_EXHAUSTED
+            and policy.get("eligible") is False
+        ):
+            return True
+    return False
+
+
+def _first_unblocked_account(
+    engine: str,
+    *,
+    exclude: set[str] | None = None,
+    now: float | None = None,
+) -> str | None:
+    blocked = exclude or set()
+    for name in _configured_account_names(engine):
+        if name in blocked:
+            continue
+        if not _account_quota_blocked(name, engine=engine, now=now):
+            return name
+    return None
+
+
 def _apply_home_env(env: dict[str, str], home: Path) -> None:
     env["HOME"] = str(home)
     env["XDG_CONFIG_HOME"] = str(home / ".config")
@@ -5544,6 +5663,8 @@ def grok_selected_account(args) -> str | None:
         except BaseException:
             # Selection is an optimisation; never let it fail a dispatch.
             selected = None
+        if selected and _account_quota_blocked(selected, engine="grok"):
+            selected = _first_unblocked_account("grok", exclude={selected})
     args._grok_selected_account = selected
     return selected
 
@@ -5680,33 +5801,61 @@ def _codex_seat_api():
     return _CODEX_SEAT_API_CACHE
 
 
-def resolve_codex_home(
+def _call_resolve_codex_seat(
+    api,
     project_root: Path | str,
     explicit_account: str | None,
     dispatch_id: str,
 ) -> tuple[str | None, str | None]:
-    """Resolve one launch snapshot without ever failing the dispatch."""
-    api = _codex_seat_api()
-    if api is None:
-        return None, None
     try:
         resolved = api.resolve_codex_seat(
             str(project_root),
             explicit_account,
             dispatch_id,
         )
-        if not isinstance(resolved, tuple) or len(resolved) != 2:
-            return None, None
-        home, effective_account = resolved
-        if home is None and effective_account is None:
-            return None, None
-        if not isinstance(home, str) or not home:
-            return None, None
-        if not isinstance(effective_account, str) or not effective_account:
-            return None, None
-        return home, effective_account
     except BaseException:
         return None, None
+    if not isinstance(resolved, tuple) or len(resolved) != 2:
+        return None, None
+    home, effective_account = resolved
+    if home is None and effective_account is None:
+        return None, None
+    if not isinstance(home, str) or not home:
+        return None, None
+    if not isinstance(effective_account, str) or not effective_account:
+        return None, None
+    return home, effective_account
+
+
+def resolve_codex_home(
+    project_root: Path | str,
+    explicit_account: str | None,
+    dispatch_id: str,
+) -> tuple[str | None, str | None]:
+    """Resolve one launch snapshot without ever failing the dispatch.
+
+    An explicit ``--account`` is honored as a pin. Unpinned selection skips
+    recently quota-exhausted seats until their reset rather than dying on
+    the first serial seat.
+    """
+    api = _codex_seat_api()
+    if api is None:
+        return None, None
+    if explicit_account:
+        return _call_resolve_codex_seat(
+            api, project_root, explicit_account, dispatch_id
+        )
+    resolved = _call_resolve_codex_seat(api, project_root, None, dispatch_id)
+    home, account = resolved
+    if account is None or not _account_quota_blocked(account, engine="codex"):
+        return resolved
+    alternative = _first_unblocked_account("codex", exclude={account})
+    if alternative is None:
+        return resolved
+    retried = _call_resolve_codex_seat(
+        api, project_root, alternative, dispatch_id
+    )
+    return retried if retried != (None, None) else resolved
 
 
 def cleanup_codex_dispatch_home(dispatch_id: str) -> None:
@@ -17320,7 +17469,7 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
 # list against the dispatch table so a new subcommand cannot be added silently.
 _SUBCOMMAND_HELP: tuple[tuple[str, str], ...] = (
     ("steer", "append, list, or wait on a live worker's mailbox"),
-    ("resume", "continue a recorded worker session as a tracked dispatch"),
+    ("resume", "continue a recorded worker session in its existing worktree"),
     ("reconcile-abandoned", "dry-run report of abandoned dispatches; drain writes"),
     ("drain", "launch queued dispatch requests"),
     ("dashboard-refresh", "rebuild the dashboard projection"),
@@ -18143,6 +18292,7 @@ def main(argv: list[str] | None = None) -> int:
                             resume_home,
                             args.codex_session_id,
                             home_owner_dispatch_id=codex_home_owner_dispatch_id,
+                            explicit_account=getattr(args, "account", None),
                         )
                     )
             else:
