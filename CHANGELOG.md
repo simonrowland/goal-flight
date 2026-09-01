@@ -24,7 +24,7 @@ incremented when meaningful skill behaviour changes.
   workflows library. Grok Bot Executors are a first-class host delegate
   lane on this port (not Claude's last-resort Host Agent rule); kimi3
   reviews go through `--agent moonshot`. Wake is exit-as-wake: a tracked
-  `goalflight_messages.py listen --report-pending --timeout-s 900` on the
+  `goalflight_grok_bot_listen.py --report-pending --timeout-s 900` on the
   user's Mac (label `goalflight-grokbot`; MVP depth 1; portable pool is
   4). The 900s quiet timeout is this host's frontier ping, not Claude's
   120s follow-stream heartbeat. Do not arm unbounded `supervise`
@@ -35,7 +35,10 @@ incremented when meaningful skill behaviour changes.
   box and must name `machineId` plus Mac absolute paths. Compaction is
   write-early file state (`state-handoff.md` Before compact or sleep on
   the 900s frontier ping and before long waves); there is no `/compact`
-  UI and no keep-vs-toss prompt. No native
+  UI and no keep-vs-toss prompt. Do not port the Claude context-meter or
+  SessionStart hooks; every listen ring/timeout is a mini-resume plus a
+  Hard Invariants quote-check (`goalflight_grok_bot_listen.py` banner).
+  No native
   mail transport in this port. Unsupported the same way Cursor /
   OpenCode / Codex orchestrator ports are. See `docs/hosts/grok-bot.md`.
 - **Watchlist two-tier wedge detector (`goalflight_wedge_watch.py`).** Cheap

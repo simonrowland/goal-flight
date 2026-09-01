@@ -272,16 +272,16 @@
       "notes": "Verified on the Grok Bot box as the user-created workflows library. Mac-side library roots are not a second invented default; set the override when install does not run on that box."
     },
     "wake": {
-      "path": "goalflight_messages.py listen --report-pending --timeout-s 900",
+      "path": "goalflight_grok_bot_listen.py --report-pending --timeout-s 900",
       "contract": "exit-as-wake",
       "controller_label": "goalflight-grokbot",
       "arm_on": "user Mac project-root + --controller-label goalflight-grokbot",
       "timeout_s": 900,
-      "timeout_purpose": "frontier reminder (anti-stall); host-local listen default, not the 120s Claude follow-stream heartbeat",
+      "timeout_purpose": "frontier reminder and 80% hint substitute; host-local listen default, not the 120s Claude follow-stream heartbeat",
       "mvp_depth": 1,
       "full_depth": 4,
-      "on_ring": "relay --drain, act, re-arm",
-      "on_timeout": "handoff write + status + task next, re-arm",
+      "on_ring": "drain, act, handoff write, quote-check, re-arm, task next",
+      "on_timeout": "handoff write, quote-check, re-arm, task next",
       "detached": "forbidden; listen exit 4",
       "not": [
         "unbounded supervise as a Grok Bot background shell",
@@ -290,17 +290,30 @@
         "Settings monitor widget",
         "same-turn regex-wait on live supervise as the session monitor",
         "native mail transport",
-        "global supervise/follow cadence change"
+        "global supervise/follow cadence change",
+        "Claude context-meter / PostToolUse additionalContext",
+        "SessionStart hook"
       ],
       "terminals": ["COMPLETE", "READY", "FAILED", "BLOCKED", "USER-NEED"],
-      "notes": "Grok Bot notifies on tracked Task/executor or Shell completion only. Success terminal is COMPLETE. Journal remains durable truth; missed wake is latency. Resume pulls status + task next + relay --new. Full listen pool: put --timeout-s 900 on one slot only. Listen exit 1 also writes the state-handoff Before compact or sleep block — there is no /compact warning."
+      "notes": "Grok Bot notifies on tracked Task/executor or Shell completion only. Success terminal is COMPLETE. Journal remains durable truth; missed wake is latency. Resume pulls status + task next + relay --new. Full listen pool: put --timeout-s 900 on one slot only. Every listen exit is a mini-resume: flush state-handoff Before compact or sleep, then quote-check. The grok-bot listen wrapper prints that quote-check on stdout."
     },
     "compaction": {
+      "strategy": "autocompact + keep handoff current",
       "controller_authored_compact": false,
       "keep_vs_toss_prompt": false,
       "host_may_summarize_unannounced": true,
+      "context_meter": false,
+      "session_start_hook": false,
+      "eighty_percent_substitute": "listen --timeout-s 900",
       "directed_compact_is": "protocols/state-handoff.md Before compact or sleep",
-      "write_on": ["listen exit 1 (900s frontier ping)", "before long waves"],
+      "write_on": ["listen exit 0 (ring)", "listen exit 1 (900s frontier ping)", "before long waves"],
+      "quote_check_on": "every listen ring or timeout",
+      "quote_check_externalized": [
+        "wrapper Freshness preamble",
+        "goalflight_grok_bot_listen.py exit banner",
+        "optional operator profile sentence"
+      ],
+      "mini_resume_on_wake": true,
       "resume_notes_slots": ["ENVIRONMENT", "IDEAS", "DECISIONS", "FACTS", "CARRIERS"],
       "no_task_tables_in_resume_notes": true,
       "chat_summaries": "hints, not substitutes",
@@ -310,7 +323,10 @@
       "not": [
         "invent a compact UI",
         "ask the user to compact",
-        "emulate Claude compact prompt in chat"
+        "emulate Claude compact prompt in chat",
+        "port scripts/hooks/goalflight-context-meter.sh",
+        "port SessionStart watchdog",
+        "fake window-percent meter"
       ]
     },
     "same_provider_policy_notes": "forbid_self_review: a Grok Bot controller must not Type-1-review a grok-code worker. Independent reviews go to --agent moonshot (kimi3 / Kimi Code CLI) or --agent codex, or gstack on those engines.",

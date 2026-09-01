@@ -154,16 +154,18 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 wake = json.loads((root / "adapters" / "grok-bot.json").read_text())["host_projection"]["wake"]
-if wake.get("path") != "goalflight_messages.py listen --report-pending --timeout-s 900":
-    raise SystemExit("host_projection.wake.path must be listen --report-pending --timeout-s 900")
+if wake.get("path") != "goalflight_grok_bot_listen.py --report-pending --timeout-s 900":
+    raise SystemExit("host_projection.wake.path must be goalflight_grok_bot_listen.py --report-pending --timeout-s 900")
 if wake.get("contract") != "exit-as-wake":
     raise SystemExit("host_projection.wake.contract must be exit-as-wake")
 if wake.get("controller_label") != "goalflight-grokbot":
     raise SystemExit("wake.controller_label must be goalflight-grokbot")
 if wake.get("timeout_s") != 900:
     raise SystemExit("wake.timeout_s must be 900")
-if wake.get("on_timeout") != "handoff write + status + task next, re-arm":
-    raise SystemExit("wake.on_timeout must write handoff, then status + task next, re-arm")
+if "quote-check" not in str(wake.get("on_ring") or ""):
+    raise SystemExit("wake.on_ring must quote-check after a ring")
+if wake.get("on_timeout") != "handoff write, quote-check, re-arm, task next":
+    raise SystemExit("wake.on_timeout must write handoff, quote-check, re-arm, task next")
 if wake.get("mvp_depth") != 1 or wake.get("full_depth") != 4:
     raise SystemExit("wake depth must be MVP 1 / full 4")
 if wake.get("finished_alias"):
@@ -287,6 +289,16 @@ if compact.get("no_task_tables_in_resume_notes") is not True:
     raise SystemExit("RESUME-NOTES must not carry task tables")
 if "before long waves" not in " ".join(compact.get("write_on") or []):
     raise SystemExit("must write handoff before long waves")
+if compact.get("strategy") != "autocompact + keep handoff current":
+    raise SystemExit("grok-bot strategy must be autocompact + keep handoff current")
+if compact.get("context_meter") is not False:
+    raise SystemExit("must not port the Claude context-meter")
+if compact.get("session_start_hook") is not False:
+    raise SystemExit("must not add a SessionStart hook on grok-bot")
+if compact.get("eighty_percent_substitute") != "listen --timeout-s 900":
+    raise SystemExit("900s listen timeout is the 80% hint substitute")
+if compact.get("mini_resume_on_wake") is not True:
+    raise SystemExit("every listen wake must be a mini-resume")
 forbidden = " ".join(compact.get("not") or [])
 if "invent a compact UI" not in forbidden:
     raise SystemExit("must not invent a compact UI")
@@ -294,7 +306,53 @@ if "ask the user to compact" not in forbidden:
     raise SystemExit("must not ask the user to compact")
 if "emulate Claude compact prompt" not in forbidden:
     raise SystemExit("must not emulate Claude compact prompt")
+if "goalflight-context-meter.sh" not in forbidden:
+    raise SystemExit("must refuse porting goalflight-context-meter.sh")
+if "fake window-percent meter" not in forbidden:
+    raise SystemExit("must refuse a fake window-percent meter")
 PY
 echo "test10 pass: grok-bot compaction is write-early handoff, not /compact"
+
+for meter_file in "$wrapper" "$host_doc"; do
+  grep -q 'autocompact + keep handoff current' "$meter_file" \
+    || fail "$meter_file must choose autocompact + keep handoff current"
+  grep -q 'goalflight-context-meter.sh' "$meter_file" \
+    || fail "$meter_file must name the Claude context-meter only to refuse it"
+  grep -q 'SessionStart' "$meter_file" \
+    || fail "$meter_file must refuse a SessionStart hook"
+  grep -q 'QUOTE-CHECK:' "$meter_file" \
+    || fail "$meter_file must externalize the Hard Invariants quote-check banner"
+  grep -q 'goalflight_grok_bot_listen.py' "$meter_file" \
+    || fail "$meter_file must arm the grok-bot listen wrapper"
+  grep -q 'mini-resume' "$meter_file" \
+    || fail "$meter_file must treat every listen wake as a mini-resume"
+  grep -q '80%' "$meter_file" \
+    || fail "$meter_file must name the 900s timeout as the 80% hint substitute"
+done
+banner_out="$(python3 "$REPO_ROOT/scripts/goalflight_grok_bot_listen.py" --help 2>&1)" || true
+printf '%s\n' "$banner_out" | grep -q 'QUOTE-CHECK: disk-read SKILL.md Hard Invariants' \
+  || fail "goalflight_grok_bot_listen.py must print the quote-check banner after listen exits"
+python3 - "$REPO_ROOT" <<'PY'
+import importlib.util
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+path = root / "scripts" / "goalflight_grok_bot_listen.py"
+spec = importlib.util.spec_from_file_location("grok_bot_listen", path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+if mod._with_host_timeout([]) != ["--timeout-s", "900"]:
+    raise SystemExit("grok-bot listen wrapper must default --timeout-s 900")
+if mod._with_host_timeout(["--timeout-s", "0"]) != ["--timeout-s", "0"]:
+    raise SystemExit("explicit --timeout-s 0 must stay mail-only")
+if mod._with_host_timeout(["--timeout-s=0"]) != ["--timeout-s=0"]:
+    raise SystemExit("equals-form --timeout-s=0 must not be rewritten")
+PY
+if grep -q 'PostToolUse' "$REPO_ROOT/scripts/goalflight_grok_bot_listen.py"; then
+  grep -q 'Do not port' "$REPO_ROOT/scripts/goalflight_grok_bot_listen.py" \
+    || fail "listen wrapper must not implement PostToolUse"
+fi
+echo "test11 pass: grok-bot uses listen-exit quote-check, not a context meter"
 
 echo "goal-flight grok-bot host install tests passed"

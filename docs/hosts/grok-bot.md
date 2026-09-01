@@ -53,9 +53,11 @@ Resync from the source repo (or the pinned `~/.goal-flight/skill/`) with
 
 ## How a Grok Bot controller operates
 
-Load order: `AGENTS.md` → this host wrapper → repository `SKILL.md` →
-`protocols/guidance-extended.md` by default (non-frontier) → newest
-`docs-private/RESUME-NOTES-*.md` when resuming.
+Load order: `AGENTS.md` → this host wrapper (Freshness: disk-read
+`SKILL.md` Hard Invariants; if you cannot quote them, resume before
+acting) → repository `SKILL.md` → `protocols/guidance-extended.md` by
+default (non-frontier) → newest `docs-private/RESUME-NOTES-*.md` when
+resuming.
 
 - Facts come from `goalflight_status.py`, `goalflight_task.py list/next`, and
   doctor. Conversation is not the backlog.
@@ -83,9 +85,11 @@ Load order: `AGENTS.md` → this host wrapper → repository `SKILL.md` →
 - Grok Bot Cloud Agents = optional extra worker for GitHub-branch / PR chunks
   only; never the default for a local scientific-coding project.
 - Do not pin Grok model ids.
-- Grok Bot has no `/compact` and no keep-vs-toss prompt. Write the
-  `state-handoff.md` Before compact or sleep block on the 15-minute
-  frontier ping and before long waves. Do not ask the user to compact.
+- Grok Bot has no `/compact` and no keep-vs-toss prompt. Autocompact +
+  keep handoff current. Do not port the Claude context-meter or
+  SessionStart hooks. Write the `state-handoff.md` Before compact or
+  sleep block on every listen ring/timeout and before long waves, then
+  quote-check Hard Invariants from disk. Do not ask the user to compact.
 
 ## Executor context package
 
@@ -147,25 +151,28 @@ it does not stall. That is **not** Claude's follow-stream heartbeat
 not change the global `supervise` / `follow` cadence in this port; 900s
 is a grok-bot wrapper-local default on the listen arm.
 
-**Canonical grok-bot arm** — one tracked `listen --report-pending
---timeout-s 900` on the **user's Mac** (the project checkout), with
-`--project-root` and `--controller-label goalflight-grokbot`. Never
-detach it (`nohup`, `&`, disown): a detached listener refuses with
-**exit 4** and cannot wake an untracked parent.
+**Canonical grok-bot arm** — one tracked
+`goalflight_grok_bot_listen.py --report-pending --timeout-s 900` on the
+**user's Mac** (the project checkout), with `--project-root` and
+`--controller-label goalflight-grokbot`. That helper wraps
+`listen --report-pending` and prints the quote-check banner on every
+exit. Never detach it (`nohup`,
+`&`, disown): a detached listener refuses with **exit 4** and cannot
+wake an untracked parent.
 
 ```bash
-python3 <skill-root>/scripts/goalflight_messages.py listen \
+python3 <skill-root>/scripts/goalflight_grok_bot_listen.py \
   --project-root "$PWD" \
   --controller-label goalflight-grokbot \
   --report-pending \
   --timeout-s 900
 ```
 
-On ring (**exit 0**): drain with `relay --drain`, act, re-arm. On
-timeout (**exit 1**): run the directed-compact write (Compaction
-below), pull `goalflight_status.py` and `goalflight_task.py next`, then
-re-arm — that exit *is* the 15-minute frontier reminder and the last
-reliable moment before an unannounced host summary. The portable
+Every ring (**exit 0**) or timeout (**exit 1**) is a **mini-resume**:
+drain if it rang (`relay --drain`, act), flush RESUME-NOTES (Compaction
+below), quote-check Hard Invariants from a fresh disk read, re-arm,
+then `goalflight_task.py next`. The 900s quiet timeout is this host's
+substitute for Claude's 80% context-meter hint. The portable
 four-listen pool is full depth
 (resilience; see `protocols/controller-mail.md`). One listen is the MVP.
 If you arm more than one listen, put `--timeout-s 900` on a single slot
@@ -175,8 +182,8 @@ restarting:
 
 | Code | Meaning for this host | Action |
 |---:|---|---|
-| 0 | Ring | `relay --drain`, act, re-arm |
-| 1 | 15-minute frontier ping (quiet timeout) | Handoff write + status + task next, re-arm |
+| 0 | Ring | Drain, act, handoff write, quote-check, re-arm, task next |
+| 1 | 15-minute frontier ping (quiet timeout) | Handoff write, quote-check, re-arm, task next |
 | 2 | Journal unreadability | Repair/escalate; do not restart-loop |
 | 3 | Contention / stale lease | Reconcile the live lease; re-arm only under it |
 | 4 | Detached refusal (`nohup` / `&` / disown) | Launch a tracked listener; do not detach again |
@@ -199,6 +206,14 @@ Bot-native mail transport.
 
 ## Compaction
 
+Grok Bot = **autocompact + keep handoff current**. Do **not** port
+`scripts/hooks/goalflight-context-meter.sh` or Claude PostToolUse
+`additionalContext` 80/90/95% bands. That hook is Claude-Code-specific.
+Grok Bot has no PostToolUse `additionalContext` injection and no
+trustworthy window %. A fake meter is worse than none. Claude
+context-meter and SessionStart watchdog stay Claude-only. There is no
+SessionStart hook on grok-bot.
+
 Claude's directed compact is a controller-authored keep-vs-toss prompt,
 then `/compact`, then `/goal-flight resume`. Grok Bot has **no**
 controller-authored `/compact` and **no** keep-vs-toss prompt. The host
@@ -215,8 +230,25 @@ The directed-compact step on this host **is**
   deferred / held when relevant)
 - `goalflight_status.py`
 
-Write that on the 15-minute frontier heartbeat (listen exit 1) and
-before long waves. There is no warning before the host summarizes.
+The 15-minute listen timeout is the substitute for Claude's 80% hint.
+On **every** ring or timeout, flush that handoff, then quote-check. Also
+write before long waves. There is no warning before the host summarizes.
+
+The Hard Invariants quoting rule cannot live only in compacted SKILL.md.
+Externalize it:
+
+1. Wrapper Freshness preamble (always loaded): disk-read SKILL.md Hard
+   Invariants; if you cannot quote them, stale → resume before acting.
+2. Listen/heartbeat stdout banner (doorbell is outside the chat):
+   `goalflight_grok_bot_listen.py` prints
+   `QUOTE-CHECK: disk-read SKILL.md Hard Invariants; if you cannot quote them, stale — resume before acting.`
+   on every listen exit.
+3. Optional operator-side Grok Bot profile sentence:
+   `On every Goal Flight listen exit, disk-read SKILL.md Hard Invariants; if you cannot quote them, resume before acting.`
+
+Every 15-minute wake is a mini-resume: drain if it rang, flush
+RESUME-NOTES, quote-check from disk, re-arm doorbells,
+`goalflight_task.py next`.
 
 Resume reload and rebuild are unchanged. Chat summaries are hints, not
 substitutes. Grok Bot profile, `update_state` memory, and routines may
