@@ -588,10 +588,10 @@ def test_journal_terminal_supersedes_contradictory_sidecar_marker() -> None:
     assert_eq("matching journal marker remains complete", matching["terminal_marker"]["kind"], "COMPLETE")
 
 
-def test_unreadable_journal_never_promotes_file_terminal() -> None:
+def test_unreadable_journal_preserves_corroborated_file_terminal() -> None:
     marker = {
         "kind": "COMPLETE",
-        "text": "journal-error — stale file terminal",
+        "text": "journal-error — corroborated file terminal",
         "line": 1,
     }
     record = status._wait_record_from_snapshots(
@@ -610,8 +610,78 @@ def test_unreadable_journal_never_promotes_file_terminal() -> None:
         {"_wait_journal_error": True},
     )
     assert_true("journal error record exists", isinstance(record, dict))
-    assert_eq("journal error remains nonterminal", status.done_code(record), 2)
-    assert_eq("file marker suppressed on authority failure", record.get("terminal_marker"), None)
+    assert_eq("corroborated terminal survives journal error", status.done_code(record), 0)
+    assert_eq(
+        "corroborated terminal outranks live process",
+        status.done_code(record, worker_alive=True),
+        0,
+    )
+    assert_eq("corroborated state survives", record.get("state"), "complete")
+    assert_eq("corroborated marker survives", record.get("terminal_marker"), marker)
+    assert_eq("journal error remains visible", record.get("_wait_journal_error"), True)
+    assert_eq(
+        "file provenance remains visible",
+        record.get("_wait_file_snapshots_corroborated"),
+        True,
+    )
+
+
+def test_unreadable_journal_requires_matching_terminal_snapshots() -> None:
+    complete = {
+        "kind": "COMPLETE",
+        "text": "journal-conflict — complete",
+        "line": 1,
+    }
+    blocked = {
+        "kind": "BLOCKED",
+        "text": "journal-conflict — blocked",
+        "line": 1,
+    }
+    conflicting = status._wait_record_from_snapshots(
+        "journal-conflict",
+        {
+            "dispatch_id": "journal-conflict",
+            "state": "complete",
+            "terminal_state": "complete",
+            "terminal_marker": complete,
+        },
+        {
+            "dispatch_id": "journal-conflict",
+            "state": "blocked",
+            "terminal_marker": blocked,
+        },
+        {"_wait_journal_error": True},
+    )
+    assert_eq("conflicting snapshots stay indeterminate", status.done_code(conflicting), 2)
+    assert_eq("conflicting marker is suppressed", conflicting.get("terminal_marker"), None)
+
+    nonterminal = status._wait_record_from_snapshots(
+        "journal-conflict",
+        {
+            "dispatch_id": "journal-conflict",
+            "state": "running",
+            "terminal_marker": complete,
+        },
+        {
+            "dispatch_id": "journal-conflict",
+            "state": "complete",
+            "terminal_marker": complete,
+        },
+        {"_wait_journal_error": True},
+    )
+    assert_eq("nonterminal ledger cannot be promoted", status.done_code(nonterminal), 2)
+
+    one_sided = status._wait_record_from_snapshots(
+        "journal-conflict",
+        {
+            "dispatch_id": "journal-conflict",
+            "state": "complete",
+            "terminal_marker": complete,
+        },
+        {},
+        {"_wait_journal_error": True},
+    )
+    assert_eq("one terminal snapshot stays indeterminate", status.done_code(one_sided), 2)
 
 
 def test_wait_journal_presence_distinguishes_absent_from_unobservable() -> None:
@@ -712,7 +782,8 @@ def main() -> None:
         test_live_sidecar_still_overlays_nonterminal_ledger,
         test_terminal_journal_outbox_wins_live_ledger,
         test_journal_terminal_supersedes_contradictory_sidecar_marker,
-        test_unreadable_journal_never_promotes_file_terminal,
+        test_unreadable_journal_preserves_corroborated_file_terminal,
+        test_unreadable_journal_requires_matching_terminal_snapshots,
         test_wait_journal_presence_distinguishes_absent_from_unobservable,
         test_narrow_snapshot_reuses_one_sidecar_generation,
         test_wait_hot_loop_never_calls_machine_status_payload,

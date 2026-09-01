@@ -1325,10 +1325,12 @@ def done_code(record: dict, *, worker_alive: bool | None = None) -> int:
         record.get("classification")
     ):
         return 0
-    # The P2 journal transition/outbox pair is the terminal authority. Unlike
-    # a marker scraped from worker prose, it cannot be contradicted by a still-
-    # live process (attention commits commonly leave that process parked).
-    if record.get("_wait_journal_terminal"):
+    # Durable terminal authority cannot be contradicted by a still-live
+    # process. This includes a P2 journal transition/outbox pair and two
+    # independently published file snapshots that corroborate each other.
+    if record.get("_wait_journal_terminal") or record.get(
+        "_wait_file_snapshots_corroborated"
+    ):
         return 0
     marker_code = terminal_marker_done_code(record, worker_alive=worker_alive)
     if marker_code is not None:
@@ -1587,13 +1589,41 @@ def _wait_record_from_snapshots(
         record.setdefault("stdout_path", tail_path)
 
     if (authority or {}).get("_wait_journal_error"):
-        # Never promote a file-side terminal while P2 authority is unreadable.
-        # Keeping the row nonterminal makes the existing wait timeout surface
-        # the problem loudly instead of manufacturing success.
+        ledger_state = str((raw or {}).get("state") or "")
+        sidecar_state = str(sidecar.get("state") or "")
+        ledger_marker = _position_validated_marker(raw)
+        sidecar_marker = _position_validated_marker(sidecar)
+        marker_kind = (ledger_marker or {}).get("kind")
+        marker_matches_state = (
+            marker_kind in _OUTPUT_TAIL_SUCCESS_MARKERS
+            if ledger_state in dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
+            else marker_kind in _OUTPUT_TAIL_BLOCKING_MARKERS
+        )
+        if (
+            raw is not None
+            and ledger_state == sidecar_state
+            and dispatch_states.is_terminal_state(ledger_state)
+            and ledger_marker is not None
+            and ledger_marker == sidecar_marker
+            and _terminal_marker_matches_dispatch(ledger_marker, dispatch_id)
+            and marker_matches_state
+        ):
+            record.update(
+                state=ledger_state,
+                classification=ledger_state,
+                terminal_state=ledger_state,
+                terminal_marker=ledger_marker,
+                _wait_journal_error=True,
+                _wait_file_snapshots_corroborated=True,
+            )
+            return _decorate_trace_status(record)
+
+        # A missing or contradictory file snapshot cannot replace the journal.
         for key in ("terminal_state", "terminal_marker", "last_marker", "markers"):
             record.pop(key, None)
         record["state"] = "journal_unavailable"
         record["classification"] = "journal_unavailable"
+        record["_wait_journal_error"] = True
         return _decorate_trace_status(record)
 
     lifecycle = str((authority or {}).get("lifecycle_state") or "")
