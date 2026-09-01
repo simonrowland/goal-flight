@@ -166,10 +166,17 @@ controller joining that project must:
 - send merge-request mail; leave origin push to the project's integrator
 - never steal those existing leases
 
-SendToAgent / named teammate pings may wake another Grok Bot controller that
-shares the project. They are not the work plane. Controller-mail remains
-`goalflight_messages.py`: leases, journal, `post --to-controller`,
-merge-request / patch. Do not replace the journal with SendToAgent.
+Inter-controller traffic is **only**
+`goalflight_messages.py post --to-controller`. This controller joins that
+journal. Do not ask the user to paste mail, and do not ask them to tell
+another session to check mail. The operator is the former mailman.
+
+SendToAgent (Grok Bot teammate DMs) is an optional extra ping among
+grok-bot agents. It is never the work inbox and never the bridge to
+Claude `battery-*` controllers. Do not replace the journal with
+SendToAgent.
+
+Deafness is re-arm listen, not user-as-mailman.
 
 ## Wake path
 

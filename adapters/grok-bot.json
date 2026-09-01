@@ -360,6 +360,19 @@
         "no_clone_onto_box": true,
         "no_parallel_package_format": true
       }
+    },
+    "mail": {
+      "inter_controller": "goalflight_messages.py post --to-controller",
+      "grok_bot_joins_journal": true,
+      "send_to_agent": "optional extra ping among grok-bot agents only",
+      "send_to_agent_is_work_inbox": false,
+      "send_to_agent_bridges_battery_controllers": false,
+      "deafness": "re-arm listen, not user-as-mailman",
+      "not": [
+        "ask the user to paste mail",
+        "ask the user to tell another session to check mail",
+        "user-as-mailman"
+      ]
     }
   }
 }

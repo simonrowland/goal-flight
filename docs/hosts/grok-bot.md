@@ -295,12 +295,24 @@ A token-pause or host update typically shows up as listen **exit 5**
 the next 15-minute listen arm/timeout attempt, should claim and re-arm.
 Do not wait for the human to remember compaction.
 
+The operator is the **former mailman**. Do not ask them to paste messages
+between controllers or to tell another session to check mail. Deafness
+is re-arm listen, not user-as-mailman.
+
 ## Multi-controller mail
 
-SendToAgent / named teammate agents are an extra ping between Grok Bot
-controllers that share one project. Controller-mail remains the work plane
-(`goalflight_messages.py`: leases, journal, `post --to-controller`,
-merge-request / patch).
+Inter-controller traffic is **only**
+`goalflight_messages.py post --to-controller`. Grok-bot controllers join
+that journal. Do not ask the user to paste mail, and do not ask them to
+tell another session to check mail.
+
+SendToAgent (Grok Bot teammate DMs) is an optional extra ping among
+grok-bot agents. It is never the work inbox and never the bridge to
+Claude `battery-*` controllers.
+
+Deafness is re-arm listen, not user-as-mailman. A controller that is not
+seeing mail has an unarmed or dead doorbell (`wake unarmed`); re-arm
+it. Do not route the missing wake through the operator.
 
 Five-controller setups still use `post --to-controller` plus the portable
 listen pool. That layout is a project convention (lane claims, one integrator,

@@ -373,4 +373,41 @@ if grep -q 'PostToolUse' "$REPO_ROOT/scripts/goalflight_grok_bot_listen.py"; the
 fi
 echo "test11 pass: grok-bot uses listen-exit quote-check, not a context meter"
 
+for mail_file in "$wrapper" "$host_doc"; do
+  grep -q 'post --to-controller' "$mail_file" \
+    || fail "$mail_file must make post --to-controller the inter-controller inbox"
+  grep -q 'Do not ask the user to paste' "$mail_file" \
+    || fail "$mail_file must forbid asking the user to paste mail"
+  grep -q 'check mail' "$mail_file" \
+    || fail "$mail_file must forbid asking the user to tell another session to check mail"
+  grep -q 'never the work inbox' "$mail_file" \
+    || fail "$mail_file must keep SendToAgent out of the work inbox"
+  grep -q 'battery-\*' "$mail_file" \
+    || fail "$mail_file must forbid SendToAgent as a bridge to battery-* controllers"
+  grep -q 'not user-as-mailman' "$mail_file" \
+    || fail "$mail_file must treat deafness as re-arm listen, not user-as-mailman"
+done
+python3 - "$REPO_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+mail = json.loads((root / "adapters" / "grok-bot.json").read_text())["host_projection"]["mail"]
+if mail.get("inter_controller") != "goalflight_messages.py post --to-controller":
+    raise SystemExit("inter-controller traffic must be post --to-controller")
+if mail.get("send_to_agent_is_work_inbox") is not False:
+    raise SystemExit("SendToAgent must not be the work inbox")
+if mail.get("send_to_agent_bridges_battery_controllers") is not False:
+    raise SystemExit("SendToAgent must not bridge battery-* controllers")
+if "user-as-mailman" not in str(mail.get("deafness") or ""):
+    raise SystemExit("deafness must be re-arm listen, not user-as-mailman")
+forbidden = " ".join(mail.get("not") or [])
+if "paste mail" not in forbidden:
+    raise SystemExit("must not ask the user to paste mail")
+if "check mail" not in forbidden:
+    raise SystemExit("must not ask the user to tell another session to check mail")
+PY
+echo "test12 pass: grok-bot inter-controller mail is journal-only; user is the former mailman"
+
 echo "goal-flight grok-bot host install tests passed"

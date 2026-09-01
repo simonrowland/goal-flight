@@ -40,7 +40,9 @@ incremented when meaningful skill behaviour changes.
   Hard Invariants quote-check (`goalflight_grok_bot_listen.py` banner).
   The operator is not the compaction mailman; the one wake-hygiene job
   is re-arming listen doorbells after a host update or token-pause,
-  surfaced as roster `wake unarmed`. No native
+  surfaced as roster `wake unarmed`. Inter-controller traffic is only
+  `post --to-controller`; do not ask the user to paste or to tell
+  another session to check mail. No native
   mail transport in this port. Unsupported the same way Cursor /
   OpenCode / Codex orchestrator ports are. See `docs/hosts/grok-bot.md`.
 - **Watchlist two-tier wedge detector (`goalflight_wedge_watch.py`).** Cheap
