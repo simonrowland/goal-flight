@@ -117,4 +117,47 @@ if "kimi3" in json.dumps(manifest.get("agent_id")):
 PY
 echo "test7 pass: grok-bot routing treats Executor as first-class; kimi3 is moonshot"
 
+host_doc="$REPO_ROOT/docs/hosts/grok-bot.md"
+for wake_file in "$wrapper" "$host_doc"; do
+  grep -q 'listen --report-pending' "$wake_file" \
+    || fail "$wake_file must arm listen --report-pending"
+  grep -q 'relay --drain' "$wake_file" \
+    || fail "$wake_file must drain on ring with relay --drain"
+  grep -q '!COMPLETE' "$wake_file" \
+    || fail "$wake_file must name !COMPLETE as a worker terminal"
+  grep -E 'no `!FINISHED`|There is no `!FINISHED`' "$wake_file" >/dev/null \
+    || fail "$wake_file must reject !FINISHED as a first-class marker"
+  grep -Ei 'alias|treat it as `!COMPLETE`' "$wake_file" >/dev/null \
+    || fail "$wake_file must alias FINISHED to !COMPLETE"
+  grep -q 'exit 4' "$wake_file" \
+    || fail "$wake_file must refuse detached listen (exit 4)"
+  if grep -E 'arm unbounded `supervise`|Do \*\*not\*\* arm unbounded `supervise`' "$wake_file" >/dev/null; then
+    :
+  else
+    fail "$wake_file must forbid unbounded supervise as the grok-bot arm"
+  fi
+done
+python3 - "$REPO_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+wake = json.loads((root / "adapters" / "grok-bot.json").read_text())["host_projection"]["wake"]
+if wake.get("path") != "goalflight_messages.py listen --report-pending":
+    raise SystemExit("host_projection.wake.path must be listen --report-pending")
+if wake.get("contract") != "exit-as-wake":
+    raise SystemExit("host_projection.wake.contract must be exit-as-wake")
+if wake.get("mvp_depth") != 1 or wake.get("full_depth") != 4:
+    raise SystemExit("wake depth must be MVP 1 / full 4")
+if wake.get("finished_alias") != "COMPLETE":
+    raise SystemExit("FINISHED must alias to COMPLETE")
+if "native mail transport" not in " ".join(wake.get("not") or []):
+    raise SystemExit("wake.not must keep native mail transport out of this port")
+forbidden = " ".join(wake.get("not") or [])
+if "unbounded supervise" not in forbidden:
+    raise SystemExit("wake.not must forbid unbounded supervise")
+PY
+echo "test8 pass: grok-bot wake path is listen doorbell, not supervise or a new bus"
+
 echo "goal-flight grok-bot host install tests passed"

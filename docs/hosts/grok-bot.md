@@ -81,17 +81,62 @@ Load order: `AGENTS.md` → this host wrapper → repository `SKILL.md` →
 
 ## Wake path
 
-`supervise` needs a host monitor where each flushed stdout line is a
-controller notification, unbounded, `persistent: true`. Grok Bot does not
-have Claude Code's persistent stdout monitor.
+How a Grok Bot controller learns a worker finished: use the existing
+journal doorbell (`listen`), not a new event bus and not a Settings widget.
 
-Documented wake path: the portable `goalflight_messages.py listen` doorbell
-(exit-as-wake). On each ring, process mail, then restore listen depth. Do not
-implement a Grok Bot-native mail transport.
+**Journal is durable truth.** Worker terminals are the markers in
+`protocols/worker-markers.md`: `!COMPLETE` / `!READY` / `!FAILED` /
+`!BLOCKED` / `!USER-NEED` (leading `!` optional). There is no `!FINISHED`
+in that protocol; if the word appears, alias it to `!COMPLETE`. The watcher
+already harvests those into the terminal-outbox / controller mail.
 
-Grok Bot may revive the parent when a background Task / Executor finishes.
-That helps host-native Executor work. It is not a substitute for listen
-doorbells.
+**Host monitor is exit-as-wake.** Grok Bot revives the parent chat when a
+Task / executor or a tracked Shell completes. That is the same contract as
+`goalflight_messages.py listen`, not Claude's persistent line-break
+`supervise` / `follow`. There is no separate Settings "monitor widget"; the
+running background task / subagent card is the UI.
+
+**Canonical grok-bot arm** — one tracked `listen --report-pending` on the
+**user's Mac** (the project checkout), with `--project-root` and
+`--controller-label`. Never detach it (`nohup`, `&`, disown): a detached
+listener refuses with **exit 4** and cannot wake an untracked parent.
+
+```bash
+python3 <skill-root>/scripts/goalflight_messages.py listen \
+  --project-root "$PWD" \
+  --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
+  --report-pending
+```
+
+On ring (**exit 0**): drain with `relay --drain`, act, re-arm. The portable
+four-listen pool is full depth (resilience; see
+`protocols/controller-mail.md`). One listen is the MVP. Branch on listen
+exit codes instead of blindly restarting:
+
+| Code | Meaning for this host | Action |
+|---:|---|---|
+| 0 | Ring | `relay --drain`, act, re-arm |
+| 1 | Timeout | Re-arm only if coverage is still required |
+| 2 | Journal unreadability | Repair/escalate; do not restart-loop |
+| 3 | Contention / stale lease | Reconcile the live lease; re-arm only under it |
+| 4 | Detached refusal (`nohup` / `&` / disown) | Launch a tracked listener; do not detach again |
+| 5 | Did-not-arm (dead nonce) | Do not re-arm that nonce |
+
+**Do not arm unbounded `supervise` as a Grok Bot background shell** expecting
+per-line wakes. Grok Bot only notifies on job completion. Supervise
+heartbeats (~120s) would either never complete or, if every line were
+awaited, spam turns. If you add a helper, it must wrap `listen` or exit on
+the first actionable event (ignore heartbeat / frontier keepalives).
+
+A same-turn regex-wait on a live `supervise` process (host AwaitShell-style
+blocking) is a same-turn block, not a session-life monitor. Do not recommend
+it as the default.
+
+**Missed wake is latency, not data loss.** Resume still pulls
+`goalflight_status.py`, `goalflight_task.py next`, and `relay --new`.
+
+This port documents the listen doorbell mapping only. Do not implement a Grok
+Bot-native mail transport.
 
 ## Multi-controller mail
 

@@ -23,7 +23,11 @@ incremented when meaningful skill behaviour changes.
   and `./install.sh grok-bot` copying the wrapper into the Grok Bot
   workflows library. Grok Bot Executors are a first-class host delegate
   lane on this port (not Claude's last-resort Host Agent rule); kimi3
-  reviews go through `--agent moonshot`. Unsupported the same way Cursor /
+  reviews go through `--agent moonshot`. Wake is exit-as-wake: a tracked
+  `goalflight_messages.py listen --report-pending` on the user's Mac
+  (MVP depth 1; portable pool is 4). Do not arm unbounded `supervise`
+  expecting per-line wakes; `!FINISHED` aliases to `!COMPLETE`. No native
+  mail transport in this port. Unsupported the same way Cursor /
   OpenCode / Codex orchestrator ports are. See `docs/hosts/grok-bot.md`.
 - **Watchlist two-tier wedge detector (`goalflight_wedge_watch.py`).** Cheap
   path is one `stat` of the tail (mtime + size). After the tail has been
