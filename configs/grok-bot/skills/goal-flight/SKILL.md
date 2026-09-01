@@ -40,6 +40,10 @@ installed wrapper copy has drifted from that pin; resync with
 - Treat Grok Bot session state, named-teammate memory, and host config as advisory.
 - Do not rewrite the root `SKILL.md` during setup. Setup registers this wrapper
   only.
+- Grok Bot Task / executor workers start blank (no chat, memory, SKILL.md, or
+  this conversation). Every judgment-bearing Task prompt reuses the Claude
+  host-subagent pin — do not invent a parallel package. See Executor context
+  package below.
 - Claim controller label `goalflight-grokbot` and stamp that claimed label
   on every `goalflight_dispatch.py` launch. Never steal a live lease.
 - Wake on worker terminals (`!COMPLETE` is the success marker) through the
@@ -94,6 +98,47 @@ Stamp `--controller-label <claimed-label> --controller-pid
 claimed label is `goalflight-grokbot` unless this controller already
 joined under another unused slug. Never steal a live lease that belongs
 to another controller.
+
+## Executor context package
+
+Grok Bot Task / executor subagents start **blank**. They have no chat
+history, no memory, no installed SKILL.md, and none of this conversation.
+Reuse the existing Claude host-subagent pin. Do not invent a parallel
+package format and do not add a grok-executor template (Cursor / Grok CLI
+wrappers do not have one).
+
+CLI workers (`--agent codex`, `grok-code`, `moonshot`, …) keep the
+existing five-layer `--prompt-file` dispatch (compose via
+`prompts/dispatch-wrapper.md`; do not paste that recipe file into a Task).
+Executors receive **that same composed prompt-file body** in the Task
+prompt (paste it, or cite its stable Mac path as the `--prompt-file`
+equivalent).
+
+Compose every judgment-bearing grok-executor Task prompt in this order:
+
+1. **Open** with `protocols/subagent-preamble.md` verbatim. Fill only the
+   two slots: repository path and north star. The repository path is the
+   Mac checkout, e.g. `/Users/simonrowland/Repos/<project>`.
+2. **Grok-bot-only pin** (the only new clause), immediately after the
+   preamble: executors default to the Grok Bot computer, **not** the
+   user's Mac. Name `machineId` / "the user's registered computer" and
+   absolute paths under `/Users/simonrowland/Repos/...`. Every Read and
+   Shell in this Task — including the preamble's AGENTS.md /
+   ORIENTATION.md reads — uses `machineId`. Do not clone the repo onto
+   the box.
+3. **Always** pointer to `docs-private/rag/ORIENTATION.md` when that file
+   exists (orientation only; never scope expansion). The preamble already
+   carries this pointer; keep it.
+4. **If the lane is triggered**, apply `protocols/worker-context-package.md`
+   in full: verbatim brief prepend (never link-instead-of-paste), quoted
+   ground-truth spec, named guard tests, standing re-read. Then the
+   `--prompt-file` equivalent: the same five-layer body CLI would get.
+   Citing a Mac path is allowed for that composed prompt file; it does
+   not replace the verbatim brief or quoted spec.
+
+Mechanical Task prompts may carry the preamble harmlessly. Judgment-bearing
+prompts (interpret evidence, review, compare designs, tradeoffs, or write
+code against a spec) are not optional.
 
 ## Multi-controller etiquette
 

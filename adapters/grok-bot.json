@@ -51,7 +51,7 @@
         "safe probes only"
       ]
     },
-    "read_file": {"host_tools": ["workspace file read"], "constraints": ["workspace reads only"]},
+    "read_file": {"host_tools": ["workspace file read"], "constraints": ["executor Reads of the Mac checkout go through machineId; do not assume box-local files"]},
     "write_file": {"host_tools": ["workspace edit"], "constraints": ["authorized edit scope only"]},
     "search": {"host_tools": ["workspace search"], "constraints": ["filtered search"]},
     "delegate": {
@@ -64,7 +64,8 @@
         "choose Executor vs CLI from token/budget and task shape; do not treat Executor as last-resort",
         "CLI code workers: --agent codex, grok-code, or moonshot (kimi3 via adapters/moonshot.json; no kimi3 agent id)",
         "independent reviews: --agent moonshot or --agent codex; forbid_self_review blocks Type-1 review of grok-code",
-        "Cloud Agents are optional GitHub-branch/PR workers only, never the default"
+        "Cloud Agents are optional GitHub-branch/PR workers only, never the default",
+        "judgment-bearing Task prompts open with protocols/subagent-preamble.md; apply worker-context-package.md only when the lane is triggered; executors start blank on the Grok Bot box and must name machineId plus Mac absolute paths for every Read/Shell"
       ]
     },
     "ask_user": {"host_tools": ["USER-NEED marker"], "constraints": ["block on ambiguity"]},
@@ -307,7 +308,19 @@
         "independent": ["moonshot", "codex"],
         "notes": "kimi3 reviews use --agent moonshot. Do not invent a kimi3 agent id."
       },
-      "host_native_executor": ["recon", "synthesis", "mail", "status", "planning"]
+      "host_native_executor": ["recon", "synthesis", "mail", "status", "planning"],
+      "executor_context_package": {
+        "reuse": ["protocols/subagent-preamble.md"],
+        "triggered_lane_package": "protocols/worker-context-package.md",
+        "cli_prompt": "compose five-layer --prompt-file via prompts/dispatch-wrapper.md; paste or cite that composed body in the Task prompt, not the recipe file",
+        "orientation": "docs-private/rag/ORIENTATION.md when present (orientation only)",
+        "default_computer": "Grok Bot box",
+        "work_computer": "user registered computer via machineId",
+        "mac_path_prefix": "/Users/simonrowland/Repos/",
+        "machine_pin_applies_to": "every Read/Shell including preamble orientation reads",
+        "no_clone_onto_box": true,
+        "no_parallel_package_format": true
+      }
     }
   }
 }

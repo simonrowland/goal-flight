@@ -28,7 +28,11 @@ incremented when meaningful skill behaviour changes.
   user's Mac (label `goalflight-grokbot`; MVP depth 1; portable pool is
   4). The 900s quiet timeout is this host's frontier ping, not Claude's
   120s follow-stream heartbeat. Do not arm unbounded `supervise`
-  expecting per-line wakes. Success terminal is `!COMPLETE`. No native
+  expecting per-line wakes. Success terminal is `!COMPLETE`. Judgment-bearing
+  Grok Bot Task / executor prompts reuse the Claude host-subagent pin
+  (`protocols/subagent-preamble.md` + triggered
+  `protocols/worker-context-package.md`); executors start blank on the
+  box and must name `machineId` plus Mac absolute paths. No native
   mail transport in this port. Unsupported the same way Cursor /
   OpenCode / Codex orchestrator ports are. See `docs/hosts/grok-bot.md`.
 - **Watchlist two-tier wedge detector (`goalflight_wedge_watch.py`).** Cheap

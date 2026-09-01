@@ -61,14 +61,18 @@ Load order: `AGENTS.md` → this host wrapper → repository `SKILL.md` →
   doctor. Conversation is not the backlog.
 - Controller label is `goalflight-grokbot`. Stamp it on every dispatch.
 - Dispatch CLI workers on the user's registered computer (the Mac checkout)
-  via Grok Bot Shell with a `machineId`. Do not spawn workers on the Grok Bot
-  box and do not clone the repo onto the box.
+  via Grok Bot Shell with a `machineId`. Do not spawn CLI workers on the
+  Grok Bot box and do not clone the repo onto the box. Task / executor
+  subagents start on the box and must be pinned to that Mac in the prompt
+  (see Executor context package).
 - Wrap the existing CLIs: `goalflight_dispatch.py`, `goalflight_messages.py`,
   `goalflight_task.py`, status, doctor. Do not add a parallel store.
 - Grok Bot Task / executor subagents are a **first-class** host `delegate`
-  surface, distinct from CLI ACP / bash-tail workers. Choose Executor vs CLI
-  from token/budget and task shape. Do **not** apply the Claude-host
-  "Host Agent as code executor = LAST RESORT" rule here.
+  surface, distinct from CLI ACP / bash-tail workers. They start blank;
+  judgment-bearing Task prompts reuse the Claude host-subagent pin (see
+  Executor context package). Choose Executor vs CLI from token/budget and
+  task shape. Do **not** apply the Claude-host "Host Agent as code executor
+  = LAST RESORT" rule here.
 - Code-writing: CLI (`--agent codex`, `--agent grok-code`, `--agent moonshot`)
   when capacity is healthy; Executor when that lane is cheaper/available or
   the chunk is host-native (recon, synthesis, mail, status).
@@ -79,6 +83,41 @@ Load order: `AGENTS.md` → this host wrapper → repository `SKILL.md` →
 - Grok Bot Cloud Agents = optional extra worker for GitHub-branch / PR chunks
   only; never the default for a local scientific-coding project.
 - Do not pin Grok model ids.
+
+## Executor context package
+
+Grok Bot Task / executor subagents start **blank**: no chat, no memory, no
+SKILL.md, and none of the controller conversation. Reuse the existing
+Claude host-subagent pin. Do not invent a parallel package format. Do not
+add a grok-executor template — Cursor and Grok CLI wrappers have none.
+
+CLI workers keep the existing five-layer `--prompt-file` dispatch
+(compose via `prompts/dispatch-wrapper.md`; do not paste that recipe
+file into a Task). Executors get **that same composed prompt-file body**
+in the Task prompt (paste it, or cite its stable Mac path).
+
+Compose every judgment-bearing grok-executor Task prompt in this order:
+
+1. Open with `protocols/subagent-preamble.md` verbatim. Fill only
+   repository path + north star. Repository path is the Mac checkout,
+   e.g. `/Users/simonrowland/Repos/<project>`.
+2. Immediately after the preamble, the grok-bot-only pin: executors
+   default to the Grok Bot computer, **not** the user's Mac. Name
+   `machineId` / "the user's registered computer" and absolute paths
+   under `/Users/simonrowland/Repos/...`. Every Read and Shell —
+   including the preamble's AGENTS.md / ORIENTATION.md reads — uses
+   `machineId`. Do not clone the repo onto the box.
+3. Always pointer to `docs-private/rag/ORIENTATION.md` when present
+   (orientation only).
+4. If the lane is triggered, apply `protocols/worker-context-package.md`
+   in full: verbatim brief prepend (never link-instead-of-paste), quoted
+   ground-truth spec, named guard tests, standing re-read. Then the
+   `--prompt-file` equivalent: the same five-layer body CLI would get.
+   Citing a Mac path is allowed for that composed prompt file; it does
+   not replace the verbatim brief or quoted spec.
+
+Live Codex dispatch on the user's Mac is a host smoke, not part of this
+port's hermetic coverage.
 
 ## Wake path
 

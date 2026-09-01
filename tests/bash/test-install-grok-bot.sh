@@ -180,4 +180,54 @@ if "global supervise/follow cadence change" not in forbidden:
 PY
 echo "test8 pass: grok-bot wake path is listen doorbell + 900s frontier ping"
 
+for ctx_file in "$wrapper" "$host_doc"; do
+  grep -q 'protocols/subagent-preamble.md' "$ctx_file" \
+    || fail "$ctx_file must open executor prompts with subagent-preamble.md"
+  grep -q 'protocols/worker-context-package.md' "$ctx_file" \
+    || fail "$ctx_file must apply worker-context-package.md when the lane is triggered"
+  grep -Ei 'if the lane is triggered|If the lane is triggered' "$ctx_file" >/dev/null \
+    || fail "$ctx_file must gate the lane package on a trigger, not apply it always"
+  grep -q 'docs-private/rag/ORIENTATION.md' "$ctx_file" \
+    || fail "$ctx_file must pointer to rag/ORIENTATION.md when present"
+  grep -q 'machineId' "$ctx_file" \
+    || fail "$ctx_file must name machineId for grok-executor Mac targeting"
+  grep -q '/Users/simonrowland/Repos' "$ctx_file" \
+    || fail "$ctx_file must cite Mac absolute paths under /Users/simonrowland/Repos"
+  grep -q -- '--prompt-file' "$ctx_file" \
+    || fail "$ctx_file must keep five-layer --prompt-file for CLI and paste it for executors"
+  if grep -qi 'parallel package' "$ctx_file"; then
+    :
+  else
+    fail "$ctx_file must refuse a parallel executor package format"
+  fi
+done
+[ ! -e "$REPO_ROOT/templates/grok-executor-prompt.md.tpl" ] \
+  || fail "do not add a grok-executor template; Cursor/Grok CLI wrappers have none"
+python3 - "$REPO_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+routing = json.loads((root / "adapters" / "grok-bot.json").read_text())["host_projection"]["routing"]
+pkg = routing.get("executor_context_package") or {}
+if "protocols/subagent-preamble.md" not in (pkg.get("reuse") or []):
+    raise SystemExit("executor_context_package must reuse subagent-preamble.md")
+if pkg.get("triggered_lane_package") != "protocols/worker-context-package.md":
+    raise SystemExit("triggered_lane_package must be worker-context-package.md")
+if "protocols/worker-context-package.md" in (pkg.get("reuse") or []):
+    raise SystemExit("do not always-on reuse the lane package; it is trigger-gated")
+if pkg.get("default_computer") != "Grok Bot box":
+    raise SystemExit("executors default to the Grok Bot box")
+if pkg.get("work_computer") != "user registered computer via machineId":
+    raise SystemExit("executor work computer must be the user Mac via machineId")
+if not str(pkg.get("mac_path_prefix") or "").startswith("/Users/simonrowland/Repos"):
+    raise SystemExit("mac_path_prefix must be /Users/simonrowland/Repos/")
+if pkg.get("no_clone_onto_box") is not True:
+    raise SystemExit("must forbid cloning onto the Grok Bot box")
+if pkg.get("no_parallel_package_format") is not True:
+    raise SystemExit("must refuse a parallel package format")
+PY
+echo "test9 pass: grok-executor Task prompts reuse the Claude host-subagent pin"
+
 echo "goal-flight grok-bot host install tests passed"
