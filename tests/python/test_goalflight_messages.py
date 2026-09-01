@@ -2100,6 +2100,235 @@ def _restore_test_controller(previous: dict[str, str | None]) -> None:
             os.environ[key] = value
 
 
+def test_supervise_failed_migration_retains_existing_coverage_and_reports() -> None:
+    import goalflight_wake
+    import goalflight_wake_supervise as supervise
+
+    incumbent = goalflight_wake.WaiterRecord(
+        kind="listener",
+        label_hash="a" * 16,
+        pid=41001,
+        start_hash="b" * 16,
+        instance_id="c" * 32,
+        path=ROOT / "incumbent.lock",
+        generation_hash="d" * 24,
+    )
+    args = mock.Mock(
+        project_root=str(ROOT),
+        controller_label="migration-test",
+        lease_nonce="migration-nonce",
+    )
+
+    def replacement_fails(_args, **kwargs) -> int:
+        assert callable(kwargs.get("on_startup_probe"))
+        return 17
+
+    stderr = io.StringIO()
+    with (
+        mock.patch.object(
+            _carrier_messages.goalflight_wake,
+            "live_waiters",
+            return_value=[incumbent],
+        ),
+        mock.patch.object(supervise, "cmd_supervise", replacement_fails),
+        mock.patch.object(_carrier_messages.os, "kill") as kill,
+        contextlib.redirect_stderr(stderr),
+    ):
+        result = _carrier_messages.cmd_supervise(args)
+
+    assert result == 17
+    kill.assert_not_called()
+    assert "did not emit the stdout-peer-liveness probe" in stderr.getvalue()
+    assert "existing wake coverage retained" in stderr.getvalue()
+
+
+def test_supervise_proven_migration_releases_existing_coverage_once() -> None:
+    import goalflight_wake
+    import goalflight_wake_supervise as supervise
+
+    start_token = "migration-incumbent-start"
+    incumbent = goalflight_wake.WaiterRecord(
+        kind="listener",
+        label_hash="a" * 16,
+        pid=41002,
+        start_hash=goalflight_wake._start_hash(start_token),
+        instance_id="c" * 32,
+        path=ROOT / "incumbent.lock",
+        generation_hash="d" * 24,
+    )
+    args = mock.Mock(
+        project_root=str(ROOT),
+        controller_label="migration-test",
+        lease_nonce="migration-nonce",
+    )
+    events: list[object] = []
+
+    def replacement_proves_live(_args, **kwargs) -> int:
+        events.append("probe")
+        on_probe = kwargs["on_startup_probe"]
+        assert on_probe(ROOT, "migration-test", "resolved-migration-nonce") is None
+        events.append("replacement-continues")
+        assert on_probe(ROOT, "migration-test", "resolved-migration-nonce") is None
+        return 0
+
+    def record_release(pid: int, signum: int) -> None:
+        events.append(("release", pid, signum))
+
+    stderr = io.StringIO()
+    with (
+        mock.patch.object(
+            _carrier_messages.goalflight_wake,
+            "live_waiters",
+            side_effect=[[incumbent], [incumbent], []],
+        ) as live_waiters,
+        mock.patch.object(supervise, "cmd_supervise", replacement_proves_live),
+        mock.patch.object(
+            _carrier_messages.goalflight_compat,
+            "process_start_identity",
+            return_value={"start_token": start_token},
+        ),
+        mock.patch.object(_carrier_messages.os, "kill", side_effect=record_release) as kill,
+        mock.patch.object(_carrier_messages.time, "sleep"),
+        contextlib.redirect_stderr(stderr),
+    ):
+        result = _carrier_messages.cmd_supervise(args)
+
+    assert result == 0
+    assert events == [
+        "probe",
+        ("release", incumbent.pid, _carrier_messages.signal.SIGTERM),
+        "replacement-continues",
+    ]
+    kill.assert_called_once_with(incumbent.pid, _carrier_messages.signal.SIGTERM)
+    assert live_waiters.call_count == 3
+    assert all(
+        call.kwargs["generation_key"] == "resolved-migration-nonce"
+        for call in live_waiters.call_args_list
+    )
+    assert stderr.getvalue() == ""
+
+
+def test_supervise_uncertain_release_arms_proven_replacement() -> None:
+    import goalflight_wake
+    import goalflight_wake_supervise as supervise
+
+    start_token = "migration-incumbent-start"
+    incumbent = goalflight_wake.WaiterRecord(
+        kind="listener",
+        label_hash="a" * 16,
+        pid=41003,
+        start_hash=goalflight_wake._start_hash(start_token),
+        instance_id="c" * 32,
+        path=ROOT / "incumbent.lock",
+        generation_hash="d" * 24,
+    )
+    args = mock.Mock(
+        project_root=str(ROOT),
+        controller_label="migration-test",
+        lease_nonce=None,
+    )
+    continued = False
+
+    def replacement_proves_live(_args, **kwargs) -> int:
+        nonlocal continued
+        on_probe = kwargs["on_startup_probe"]
+        assert on_probe(ROOT, "migration-test", "resolved-migration-nonce") is None
+        continued = True
+        return 0
+
+    stderr = io.StringIO()
+    with (
+        mock.patch.object(
+            _carrier_messages.goalflight_wake,
+            "live_waiters",
+            return_value=[incumbent],
+        ),
+        mock.patch.object(supervise, "cmd_supervise", replacement_proves_live),
+        mock.patch.object(
+            _carrier_messages.goalflight_compat,
+            "process_start_identity",
+            return_value={"start_token": start_token},
+        ),
+        mock.patch.object(_carrier_messages.os, "kill") as kill,
+        mock.patch.object(
+            _carrier_messages.time,
+            "monotonic",
+            side_effect=[0.0, 4.0],
+        ),
+        contextlib.redirect_stderr(stderr),
+    ):
+        result = _carrier_messages.cmd_supervise(args)
+
+    assert result == 0
+    assert continued
+    kill.assert_called_once_with(incumbent.pid, _carrier_messages.signal.SIGTERM)
+    assert "could not be confirmed" in stderr.getvalue()
+    assert "arming replacement to avoid zero coverage" in stderr.getvalue()
+
+
+def test_supervise_migration_skips_released_or_reused_incumbent_pid() -> None:
+    import goalflight_wake
+    import goalflight_wake_supervise as supervise
+
+    incumbent = goalflight_wake.WaiterRecord(
+        kind="listener",
+        label_hash="a" * 16,
+        pid=41004,
+        start_hash=goalflight_wake._start_hash("original-owner"),
+        instance_id="c" * 32,
+        path=ROOT / "incumbent.lock",
+        generation_hash="d" * 24,
+    )
+    args = mock.Mock(
+        project_root=str(ROOT),
+        controller_label="migration-test",
+        lease_nonce="migration-nonce",
+    )
+
+    def replacement_proves_live(_args, **kwargs) -> int:
+        failure = kwargs["on_startup_probe"](
+            ROOT,
+            "migration-test",
+            "resolved-migration-nonce",
+        )
+        assert failure is None
+        return 0
+
+    cases = [
+        ({"start_token": "reused-owner"}, True),
+        (None, False),
+    ]
+    for identity, liveness in cases:
+        with (
+            mock.patch.object(
+                _carrier_messages.goalflight_wake,
+                "live_waiters",
+                return_value=[incumbent],
+            ),
+            mock.patch.object(supervise, "cmd_supervise", replacement_proves_live),
+            mock.patch.object(
+                _carrier_messages.goalflight_compat,
+                "process_start_identity",
+                return_value=identity,
+            ),
+            mock.patch.object(
+                _carrier_messages.goalflight_compat,
+                "pid_liveness",
+                return_value=liveness,
+            ),
+            mock.patch.object(
+                _carrier_messages.goalflight_compat,
+                "pid_is_zombie",
+                return_value=False,
+            ),
+            mock.patch.object(_carrier_messages.os, "kill") as kill,
+        ):
+            result = _carrier_messages.cmd_supervise(args)
+
+        assert result == 0
+        kill.assert_not_called()
+
+
 def test_mcp_stdio_tools_call() -> None:
     import json
     import subprocess

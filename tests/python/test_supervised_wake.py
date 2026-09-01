@@ -349,6 +349,7 @@ def _run(
     chatty: bool = False,
     forwarding_frontier: Callable[[], dict[str, object]] | None = None,
     next_repeat_floor_s: float = supervise.DEFAULT_NEXT_REPEAT_FLOOR_S,
+    on_startup_probe: Callable[[Path, str, str], str | None] | None = None,
 ) -> int:
     host.lease_nonce = nonce
     return supervise.run_supervisor(
@@ -364,7 +365,49 @@ def _run(
         chatty=chatty,
         forwarding_frontier=forwarding_frontier,
         next_repeat_floor_s=next_repeat_floor_s,
+        on_startup_probe=on_startup_probe,
     )
+
+
+def test_migration_releases_only_after_probe_and_before_child_spawn() -> None:
+    host = FakeHost(stop_after_spawns=1)
+    callback_state: list[tuple[list[str], list[tuple[str, str]], Path, str, str]] = []
+
+    def after_probe(project_root: Path, label: str, nonce: str) -> str | None:
+        callback_state.append(
+            (list(host.actions), list(host.spawns), project_root, label, nonce)
+        )
+        return None
+
+    code = _run(host, _items("stream"), on_startup_probe=after_probe)
+
+    assert code == 0
+    assert callback_state == [
+        (
+            ["write:probe"],
+            [],
+            Path("/tmp/supervise-test"),
+            "bugs",
+            "nonce-1",
+        )
+    ]
+    assert len(host.spawns) == 1
+
+
+def test_failed_migration_probe_keeps_release_callback_and_children_unstarted() -> None:
+    host = FakeHost(fail_write_type="probe")
+    releases: list[tuple[Path, str, str]] = []
+
+    def after_probe(project_root: Path, label: str, nonce: str) -> str | None:
+        releases.append((project_root, label, nonce))
+        return None
+
+    code = _run(host, _items("stream"), on_startup_probe=after_probe)
+
+    assert code == 0
+    assert releases == []
+    assert host.spawns == []
+    assert host.actions == ["write:probe", "kill"]
 
 
 def test_supervise_commands_call_the_rearm_generator(
@@ -894,6 +937,79 @@ def test_supervise_cli_default_heartbeat_lands_and_bounds_refuse(
     assert supervise.cmd_supervise(args) == supervise.SUPERVISE_START_EXIT
     assert len(calls) == 3
     assert "between 60 and 14400" in capsys.readouterr().err
+
+    args.heartbeat_secs = 3600.0
+    migration_callback = lambda _root, _label, _nonce: None
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
+    assert supervise.cmd_supervise(
+        args,
+        on_startup_probe=migration_callback,
+    ) == 0
+    assert calls[3]["on_startup_probe"] is migration_callback
+
+
+def test_supervise_migration_refuses_second_live_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_DISPATCH_ID", raising=False)
+    monkeypatch.setattr(supervise, "_stdout_is_regular_file", lambda _stream: None)
+    monkeypatch.setattr(
+        goalflight_task, "resolve_project_root", lambda _value: tmp_path
+    )
+    monkeypatch.setattr(
+        sessions,
+        "resolve_controller_label",
+        lambda *_args, **_kwargs: "bugs",
+    )
+    monkeypatch.setattr(
+        supervise,
+        "resolve_startup_lease_nonce",
+        lambda **_kwargs: ("nonce-1", None, None),
+    )
+    command = shlex.join(
+        [
+            sys.executable,
+            str(SCRIPTS / "goalflight_messages.py"),
+            "supervise",
+            "--project-root",
+            str(tmp_path),
+            "--controller-label",
+            "bugs",
+            "--lease-nonce",
+            "nonce-1",
+        ]
+    )
+    monkeypatch.setattr(
+        wake,
+        "_process_listing",
+        lambda: [(os.getpid(), command), (49001, command)],
+    )
+    monkeypatch.setattr(
+        supervise,
+        "RealHost",
+        lambda **_kwargs: pytest.fail("second supervisor constructed a host"),
+    )
+    args = SimpleNamespace(
+        project_root=str(tmp_path),
+        controller_label="bugs",
+        lease_nonce="nonce-1",
+        heartbeat_secs=3600.0,
+        coverage_secs=3600.0,
+        debug=False,
+        chatty=False,
+    )
+
+    result = supervise.cmd_supervise(
+        args,
+        on_startup_probe=lambda _root, _label, _nonce: None,
+    )
+
+    assert result == supervise.SUPERVISE_START_EXIT
+    stderr = capsys.readouterr().err
+    assert "existing supervisor remains live" in stderr
+    assert "existing wake coverage retained" in stderr
 
 
 def test_dead_child_is_restarted() -> None:

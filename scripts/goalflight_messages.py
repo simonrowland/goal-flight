@@ -5681,6 +5681,7 @@ FOLLOW_FRONTIER_STALE_SECS = 60.0 * 60.0
 FOLLOW_WRITE_RETRY_SECS = 1.0
 FOLLOW_WRITE_STALL_SECS = 60.0
 FOLLOW_STATE_START_GRACE_SECS = 15.0
+SUPERVISE_MIGRATION_RELEASE_TIMEOUT_S = 3.0
 # Persistent listeners live for hours, so a busy journal is a load symptom to
 # outlast, not a fault to die on. 2026-08-25, loadavg ~94: the follower burned
 # the default 1.0s flat-jitter busy budget in 34 connect attempts and exited 2
@@ -8393,10 +8394,179 @@ def cmd_supervise(args) -> int:
     import goalflight_wake_supervise as supervise
     import goalflight_task  # type: ignore
 
+    probe_seen = False
+    incumbents_released = False
+
+    def release_incumbents_after_probe(
+        project_root: Path,
+        label: str,
+        lease_nonce: str,
+    ) -> str | None:
+        """Release the incumbents observed after proof and before child spawn."""
+        nonlocal probe_seen, incumbents_released
+        probe_seen = True
+        if incumbents_released:
+            return None
+        try:
+            observed = goalflight_wake.live_waiters(
+                project_root,
+                controller_label=label,
+                generation_key=lease_nonce,
+                kinds={
+                    "listener",
+                    goalflight_wake.MONITOR_KIND,
+                    goalflight_wake.WATCHDOG_KIND,
+                },
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return (
+                "existing wake coverage could not be measured before release; "
+                f"coverage retained: {type(exc).__name__}: {exc}"
+            )
+        if observed is None:
+            return (
+                "existing wake coverage is indeterminate before release; "
+                "coverage retained"
+            )
+        targets = frozenset(observed)
+        if not targets:
+            incumbents_released = True
+            return None
+        try:
+            refreshed = goalflight_wake.live_waiters(
+                project_root,
+                controller_label=label,
+                generation_key=lease_nonce,
+                kinds={
+                    "listener",
+                    goalflight_wake.MONITOR_KIND,
+                    goalflight_wake.WATCHDOG_KIND,
+                },
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return (
+                "existing wake coverage could not be revalidated before release; "
+                f"coverage retained: {type(exc).__name__}: {exc}"
+            )
+        if refreshed is None:
+            return (
+                "existing wake coverage identity is indeterminate before release; "
+                "coverage retained"
+            )
+        target_records = {
+            record.pid: record for record in targets.intersection(refreshed)
+        }
+        verified_records: dict[int, object] = {}
+        identity_unknown: list[str] = []
+        for pid, record in sorted(target_records.items()):
+            try:
+                identity = goalflight_compat.process_start_identity(pid)
+                start_token = (
+                    identity.get("start_token")
+                    if isinstance(identity, dict)
+                    else None
+                )
+                if start_token is None:
+                    liveness = goalflight_compat.pid_liveness(pid)
+                    zombie = goalflight_compat.pid_is_zombie(pid)
+                    if liveness is False or zombie is True:
+                        # The incumbent exited after the ledger snapshot. Its
+                        # lock is released, so continue arming the replacement.
+                        continue
+                    identity_unknown.append(f"pid {pid} owner is unavailable")
+                    continue
+                if goalflight_wake._start_hash(start_token) == record.start_hash:
+                    verified_records[pid] = record
+                # A different start token proves the incumbent exited and its
+                # PID was reused. It is already released; never signal the new
+                # owner and never abort the proven replacement.
+            except (OSError, RuntimeError, TypeError, ValueError):
+                identity_unknown.append(f"pid {pid} owner is unavailable")
+        if identity_unknown:
+            return (
+                "existing wake coverage identity is indeterminate before release; "
+                "coverage retained: " + "; ".join(identity_unknown)
+            )
+        if not verified_records:
+            incumbents_released = True
+            return None
+
+        failures: list[str] = []
+        signal_sent = False
+        for pid in sorted(verified_records):
+            if pid == os.getpid():
+                failures.append(f"refused to signal current process {pid}")
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                signal_sent = True
+            except ProcessLookupError:
+                continue
+            except OSError as exc:
+                failures.append(f"pid {pid}: {type(exc).__name__}: {exc}")
+        if failures and not signal_sent:
+            return "existing wake coverage release failed: " + "; ".join(failures)
+        if failures:
+            print(
+                "supervise: some existing wake coverage could not be released; "
+                "arming replacement to avoid zero coverage: " + "; ".join(failures),
+                file=sys.stderr,
+            )
+
+        remaining = frozenset(verified_records.values())
+        try:
+            deadline = time.monotonic() + SUPERVISE_MIGRATION_RELEASE_TIMEOUT_S
+            while remaining and time.monotonic() < deadline:
+                time.sleep(0.05)
+                try:
+                    current = goalflight_wake.live_waiters(
+                        project_root,
+                        controller_label=label,
+                        generation_key=lease_nonce,
+                        kinds={
+                            "listener",
+                            goalflight_wake.MONITOR_KIND,
+                            goalflight_wake.WATCHDOG_KIND,
+                        },
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    continue
+                if current is not None:
+                    remaining = targets.intersection(current)
+        except Exception as exc:
+            print(
+                "supervise: existing wake coverage release check failed; "
+                "arming replacement to avoid zero coverage: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+        if remaining:
+            print(
+                f"supervise: release of {len(remaining)} existing wake waiter(s) "
+                f"could not be confirmed after "
+                f"{SUPERVISE_MIGRATION_RELEASE_TIMEOUT_S:g}s; arming replacement "
+                "to avoid zero coverage",
+                file=sys.stderr,
+            )
+        incumbents_released = True
+        return None
+
     def forwarding_frontier(project_root: Path) -> dict[str, object]:
         return _supervisor_frontier_snapshot(goalflight_task.TaskStore(project_root))
 
-    return supervise.cmd_supervise(args, forwarding_frontier=forwarding_frontier)
+    result = supervise.cmd_supervise(
+        args,
+        forwarding_frontier=forwarding_frontier,
+        on_startup_probe=release_incumbents_after_probe,
+    )
+    if not probe_seen:
+        print(
+            "supervise: replacement did not emit the stdout-peer-liveness probe; "
+            "existing wake coverage retained",
+            file=sys.stderr,
+        )
+        return result if result != 0 else supervise.SUPERVISE_START_EXIT
+    return result
 
 
 def cmd_mirror(args: argparse.Namespace) -> int:
