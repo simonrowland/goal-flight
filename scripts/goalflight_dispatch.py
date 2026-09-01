@@ -114,6 +114,15 @@ WATCH_PY = SCRIPT_DIR / "goalflight_watch.py"
 # advertised skill root instead (see _status_reminder_lines). Re-adding a
 # SCRIPT_DIR-derived constant here would quietly re-open that regression.
 DAEMON_SPAWN_ARG = "__goalflight_spawn_daemon"
+# Routed by exact argv[0] match in main(). Kept beside the routes so a new
+# subcommand cannot be added without the misplacement guard learning it.
+_ROUTED_SUBCOMMANDS = (
+    "steer",
+    "resume",
+    "reconcile-abandoned",
+    "drain",
+    "dashboard-refresh",
+)
 DISPATCH_QUEUE_SCHEMA = "goalflight.dispatch-queue.v1"
 QUEUE_CLAIM_STALE_S = 300.0
 LAUNCH_TIMEOUT_S = QUEUE_CLAIM_STALE_S
@@ -17007,6 +17016,38 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_drain(argv[1:])
     if argv and argv[0] == "dashboard-refresh":
         return _cmd_dashboard_refresh(argv[1:])
+
+    # A subcommand is routed by an EXACT argv[0] match above. If one appears
+    # anywhere else in the option region, the routes are already missed and the
+    # launch parser's `worker` (nargs=REMAINDER) silently captures it as a raw
+    # worker command -- so the daemon execs a program with that name.
+    #
+    # Observed 2026-09-01: a controller ran
+    #   goalflight_dispatch.py --controller-label X ... resume <id> --cwd ...
+    # and got "worker daemon spawn failed: FileNotFoundError: No such file or
+    # directory: 'resume'". A positional-order mistake reported as a filesystem
+    # error at the wrong layer; the operator reasonably concluded resume was
+    # broken and spent the next hour recovering four workers' reports by hand.
+    #
+    # SKILL.md tells controllers to reach for `resume` FIRST when a worker dies
+    # for a reason unrelated to its work, so this trap sits directly on the
+    # documented recovery path.
+    #
+    # Scoped to option_argv (everything before `--`) so the raw-worker escape
+    # hatch can still legitimately exec a program of that name after `--`.
+    _misplaced = [w for w in _ROUTED_SUBCOMMANDS if w in option_argv]
+    if _misplaced:
+        word = _misplaced[0]
+        print(
+            f"goalflight_dispatch: {word!r} is a subcommand and must come FIRST, "
+            f"before any option. You wrote it after {option_argv[0]!r}, so it "
+            "would be exec'd as a raw worker command instead of routed.\n"
+            f"  correct:   goalflight_dispatch.py {word} <id> [options...]\n"
+            f"  you wrote: goalflight_dispatch.py {option_argv[0]} ... {word} ...\n"
+            "(to run a program literally named this, put it after `--`)",
+            file=sys.stderr,
+        )
+        return 64
 
     parser = _build_launch_parser()
     args = parser.parse_args(argv)

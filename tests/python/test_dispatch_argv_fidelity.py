@@ -915,3 +915,49 @@ def test_drain_terminalizes_permanently_inert_queued_argv(
     assert second["launched"] == 0, second
     assert second["left_queued"] == 0, second
     assert not queue_path.exists()
+
+
+def test_misplaced_subcommand_refuses_instead_of_exec_ing_it(capsys) -> None:
+    """A subcommand after an option must refuse, not become a raw worker.
+
+    main() routes subcommands on an exact argv[0] match. If one appears later,
+    every route is missed and the launch parser's `worker` (nargs=REMAINDER)
+    captures it, so the daemon execs a program with that name.
+
+    Observed 2026-09-01: a controller ran
+        goalflight_dispatch.py --controller-label X ... resume <id> --cwd ...
+    and got "worker daemon spawn failed: FileNotFoundError: No such file or
+    directory: 'resume'" -- a positional-order mistake surfaced as a filesystem
+    error at the wrong layer, which read as "resume is broken". SKILL.md tells
+    controllers to reach for `resume` FIRST on a dead worker, so this trap sits
+    directly on the documented recovery path.
+    """
+    code = D.main(
+        [
+            "--controller-label",
+            "probe",
+            "resume",
+            "some-dispatch-id",
+            "--cwd",
+            ".",
+            "--prompt",
+            "x",
+        ]
+    )
+    err = capsys.readouterr().err
+    assert code == 64, (code, err)
+    assert "'resume' is a subcommand and must come FIRST" in err, err
+    assert "FileNotFoundError" not in err, err
+
+
+def test_subcommand_first_is_still_routed_not_refused(capsys) -> None:
+    """The guard must not fire on the CORRECT ordering.
+
+    Routing happens before the guard, so `resume` in position 0 reaches the
+    resume parser -- which then refuses for its own reason (a missing required
+    argument), never with the misplacement message.
+    """
+    with pytest.raises(SystemExit):
+        D.main(["resume"])
+    out = capsys.readouterr()
+    assert "must come FIRST" not in (out.err + out.out), out
