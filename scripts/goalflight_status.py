@@ -740,8 +740,8 @@ def _drain_process_running() -> bool | None:
         # Match a real drain invocation only: an argv whose program token's
         # basename is goalflight_dispatch.py immediately followed by the exact
         # `drain` subcommand. Substring matching false-positives on lookalike
-        # paths, the `--no-drain-on-submit` flag, or a prompt arg containing the
-        # word, which would wrongly suppress the no-drainer WARN.
+        # paths or a prompt arg containing the word, which would wrongly
+        # suppress the no-drainer WARN.
         for idx, token in enumerate(tokens[:-1]):
             if Path(token).name == "goalflight_dispatch.py" and tokens[idx + 1] == "drain":
                 return True

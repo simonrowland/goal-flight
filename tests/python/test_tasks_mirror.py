@@ -1007,41 +1007,35 @@ def test_goalflight_task_set_blocked_by_rejects_invalid_item_ids_without_mutatio
             assert_true("invalid blocked_by replacement leaves item unchanged", _read_items(project) == before)
 
 
-def test_goalflight_task_set_prompt_path_dispatch_frontier_dry_run_uses_prompt_summary() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        project = Path(td) / "project-a"
-        prompts = project / "prompts"
-        prompts.mkdir(parents=True)
-        prompt_file = prompts / "frontier.md"
-        prompt_file.write_text("frontier prompt\n", encoding="utf-8")
-        items = [
-            {
-                "schema_version": 1,
-                "id": "t-040",
-                "kind": "task",
-                "title": "Frontier prompt task",
-                "blocked_by": [],
-                "links": [],
-                "done": False,
-                "created_at": "2020-01-01T00:00:00+00:00",
-                "audit": [{"at": "2020-01-01T00:00:00+00:00", "actor": "test", "action": "new"}],
-            },
-        ]
-        _write_tasks(project, items)
-        proc = run_task(project, "sync")
-        assert_true(f"seed sync exits 0: {proc.stderr}", proc.returncode == 0)
+def test_goalflight_task_show_prompt_rejects_unsafe_stored_paths() -> None:
+    cases = [
+        ("absolute outside", lambda root, _project, _prompts: root / "outside.md", "resolves outside project root"),
+        ("dot-dot outside", lambda _root, _project, _prompts: Path("../outside.md"), "contains '..' component"),
+        ("symlink path", lambda _root, _project, prompts: prompts / "link.md", "refusing to open non-regular file"),
+    ]
+    for name, path_factory, expected in cases:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "project"
+            prompts = project / "docs-private" / "prompts"
+            prompts.mkdir(parents=True)
+            (root / "outside.md").write_text("outside prompt\n", encoding="utf-8")
+            (prompts / "inside.md").write_text("inside prompt\n", encoding="utf-8")
+            (prompts / "link.md").symlink_to(prompts / "inside.md")
+            prompt_path = path_factory(root, project, prompts)
+            item_id = run_task(
+                project,
+                "new",
+                f"Prompt path {name}",
+                "--prompt-path",
+                str(prompt_path),
+                "--by",
+                "tester",
+            ).stdout.strip()
 
-        proc = run_task(project, "set-prompt-path", "t-040", "prompts/frontier.md")
-        assert_true(f"set-prompt-path exits 0: {proc.stderr}", proc.returncode == 0)
-        item = _read_items(project)[0]
-        assert_true("set-prompt-path retrofits prompt_path", item["prompt_path"] == "prompts/frontier.md")
-
-        proc = run_task(project, "dispatch-frontier", "--dry-run")
-        assert_true(f"dispatch-frontier --dry-run exits 0: {proc.stderr}", proc.returncode == 0)
-        resolved = prompt_file.resolve(strict=False)
-        assert_true("dispatch-frontier dry-run emits prompt path summary", f"t-040 -> {resolved} -> codex" in proc.stdout)
-        assert_true("dispatch-frontier dry-run omits dispatch flag", "--prompt-file" not in proc.stdout)
-        assert_true("dispatch-frontier dry-run keeps item and agent", "t-040 ->" in proc.stdout and "-> codex" in proc.stdout)
+            proc = run_task(project, "show", item_id, "--prompt")
+            assert_true(f"show rejects {name}", proc.returncode == 1)
+            assert_true(f"show reports {name}", expected in proc.stderr)
 
 
 def test_goalflight_task_two_state_accept_and_review_breadcrumb() -> None:
@@ -2113,7 +2107,7 @@ def main() -> None:
     test_goalflight_task_edit_existing_item_fields_and_audit()
     test_goalflight_task_set_prompt_path_rejects_unsafe_paths_without_mutation()
     test_goalflight_task_set_blocked_by_rejects_invalid_item_ids_without_mutation()
-    test_goalflight_task_set_prompt_path_dispatch_frontier_dry_run_uses_prompt_summary()
+    test_goalflight_task_show_prompt_rejects_unsafe_stored_paths()
     test_goalflight_task_two_state_accept_and_review_breadcrumb()
     test_goalflight_task_review_captures_confirmed_bug_item()
     test_goalflight_task_harvest_idempotent_with_source_links_and_history()

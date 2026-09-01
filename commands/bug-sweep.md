@@ -27,12 +27,11 @@ spending controller context on typos/noise.
 1. **Frame + matrix** — write a shared `audit-frame.txt` (protocol, BLOCKING
    rule keyed to the queued backlog, finding schema) + an `audit-matrix.txt` of
    N `domain × lens` rows under `docs-private/reviews/<date>-<slug>/`. Row count
-   = coverage need; lanes only set wall-clock (rows > lanes drain in waves).
+   = coverage need; lanes only set wall-clock (rows > lanes launch in later controller passes).
 2. **Lane-fill audit** — one READ-ONLY one-shot worker per row, lane-split by
    difficulty (subtle/critical → stronger engine; breadth → cheaper/wider pool).
-   Findings inline to tails. **Launch via the durable queue**
-   (`--submit --drain-on-submit`; use `--no-drain-on-submit` only when an
-   external drainer owns launch) so workers survive; **codex
+   Findings inline to tails. Launch each worker directly; a capacity refusal is
+   visible and nonzero, and no queue entry is created. **codex
    workers: instruct "no context-mode / ctx_* tools"** to avoid the exec-mode
    wedge.
 3. **Harvest** — parse the tails into append-only `BUG-LOG.jsonl` (read-only

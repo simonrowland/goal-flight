@@ -6164,9 +6164,7 @@ class _JournalBusyTolerance:
     scheduler delay, not five minutes. Degradation is reported on the
     state transition only: one notice when the window opens and one when it
     closes. A notice per retry would be a wall of repeated alerts, which is
-    what makes such output easy to ignore (see
-    _report_why_this_entry_did_not_launch in goalflight_dispatch for the same
-    reasoning).
+    what makes such output easy to ignore.
     """
 
     def __init__(self, tolerance_s: float, backoff_cap_s: float) -> None:

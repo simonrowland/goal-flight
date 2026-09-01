@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capacity refusal must preserve detached dispatches in the durable queue."""
+"""Capacity refusals stay visible; only pre-existing queue carriers retry."""
 
 from __future__ import annotations
 
@@ -180,13 +180,13 @@ def _acp_dispatch_command(
     ]
 
 
-def _wait_for(predicate, *, timeout: float = 20.0) -> None:
+def _wait_for(predicate, *, label: str, timeout: float = 20.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
             return
         time.sleep(0.05)
-    assert predicate(), "condition not met before timeout"
+    assert predicate(), f"{label} not met before timeout"
 
 
 def _read_json(path: Path) -> dict:
@@ -197,149 +197,65 @@ def _read_json(path: Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def _assert_detached_refusal_queues(
+def _write_queue_entry(
     tmp: Path,
-    env: dict[str, str],
+    *,
     dispatch_id: str,
-) -> None:
-    result = _run(
-        _dispatch_command(
-            tmp,
-            dispatch_id,
-            "raise SystemExit('must not run')",
-            extra=["--capacity-wait-s", "0", "--no-drain-on-submit"],
-        ),
-        env,
-    )
-    assert result.returncode == 0, (result.stdout, result.stderr)
+    agent: str,
+    shape: str,
+    replay_argv: list[str],
+) -> Path:
     queue_path = tmp / "state" / "dispatch-queue" / f"{dispatch_id}.json"
-    assert queue_path.exists(), "positive detached control did not queue"
-    assert _read_json(tmp / f"{dispatch_id}.status.json").get("state") == "queued"
+    queue_path.parent.mkdir(parents=True)
+    D._write_json_atomic(
+        queue_path,
+        {
+            "schema": D.DISPATCH_QUEUE_SCHEMA,
+            "state": "queued",
+            "dispatch_id": dispatch_id,
+            "agent": agent,
+            "shape": shape,
+            "project_root": str(tmp),
+            "process_cwd": str(tmp),
+            "worker_cwd": str(tmp),
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "queue_path": str(queue_path),
+            "dispatch_argv": replay_argv,
+            "request": {
+                "agent": agent,
+                "cwd": str(tmp),
+                "tail": str(tmp / f"{dispatch_id}.tail"),
+                "status_json": str(tmp / f"{dispatch_id}.status.json"),
+            },
+        },
+    )
+    return queue_path
 
 
-def test_detached_capacity_refusal_is_durable_and_replayable() -> None:
+def test_detached_capacity_refusal_is_visible_and_not_queued() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _env(tmp)
-        held_lease = _hold_capacity(tmp, env, "held-for-detached-fallback")
-        dispatch_id = "detached-capacity-fallback"
-        marker = tmp / "worker-ran"
+        _hold_capacity(tmp, env, "held-for-visible-refusal")
+        dispatch_id = "detached-visible-capacity-refusal"
         status_path = tmp / f"{dispatch_id}.status.json"
         queue_path = tmp / "state" / "dispatch-queue" / f"{dispatch_id}.json"
-        worker_code = (
-            "from pathlib import Path; "
-            f"Path({str(marker)!r}).write_text('once', encoding='utf-8'); "
-            f"print('COMPLETE: {dispatch_id} — replay accepted', flush=True)"
-        )
 
         refused = _run(
             _dispatch_command(
                 tmp,
                 dispatch_id,
-                worker_code,
-                extra=["--capacity-wait-s", "0", "--no-drain-on-submit"],
+                "raise SystemExit('must not run')",
+                extra=["--capacity-wait-s", "0"],
             ),
             env,
         )
-        assert refused.returncode == 0, (refused.stdout, refused.stderr)
-        assert queue_path.exists(), "capacity-refused detached work was not queued"
-        assert not marker.exists(), "capacity-refused worker launched despite the held slot"
-        assert _read_json(status_path).get("state") == "queued", _read_json(status_path)
-        ledger_path = tmp / "state" / "runs.d" / f"{dispatch_id}.json"
-        assert _read_json(ledger_path).get("state") == "queued", _read_json(ledger_path)
-        _release_capacity(env, held_lease)
-        drained = _run(
-            [sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"],
-            env,
-            cwd=tmp,
-        )
-        assert drained.returncode == 0, (drained.stdout, drained.stderr)
-        drain_payload = json.loads(drained.stdout)
-        assert drain_payload["launched"] == 1, drain_payload
-        assert not queue_path.exists(), "accepted replay left a duplicate queue carrier"
-        _wait_for(lambda: marker.exists() and marker.read_text(encoding="utf-8") == "once")
-        _wait_for(
-            lambda: _read_json(status_path).get("state") == "complete"
-            and _read_json(status_path).get("worker_alive") is not True
-        )
 
-
-def test_detached_acp_capacity_refusal_is_durable_and_replayable() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        env = _env(tmp)
-        spawned = tmp / "acp-worker-spawned"
-        _write_fake_codex_acp(tmp, spawned)
-        env["PATH"] = f"{tmp}{os.pathsep}{env.get('PATH', '')}"
-        env["GOALFLIGHT_ACP_PYTHON"] = sys.executable
-        held_lease = _hold_capacity(tmp, env, "held-for-acp-fallback")
-        dispatch_id = "detached-acp-capacity-fallback"
-        status_path = tmp / f"{dispatch_id}.status.json"
-        queue_path = tmp / "state" / "dispatch-queue" / f"{dispatch_id}.json"
-
-        refused = _run(
-            _acp_dispatch_command(
-                tmp,
-                dispatch_id,
-                extra=["--capacity-wait-s", "0", "--no-drain-on-submit"],
-            ),
-            env,
-        )
-        assert refused.returncode == 0, (refused.stdout, refused.stderr)
-        assert "DISPATCH-QUEUED" in refused.stdout, refused.stdout
-        assert queue_path.exists(), "capacity-refused detached ACP work was not queued"
-        assert not spawned.exists(), "ACP adapter spawned despite the held slot"
-        assert _read_json(status_path).get("state") == "queued", _read_json(status_path)
-        ledger_path = tmp / "state" / "runs.d" / f"{dispatch_id}.json"
-        assert _read_json(ledger_path).get("state") == "queued", _read_json(ledger_path)
-        old_journal = os.environ.get("GOALFLIGHT_JOURNAL_DIR")
-        os.environ["GOALFLIGHT_JOURNAL_DIR"] = env["GOALFLIGHT_JOURNAL_DIR"]
-        try:
-            attempt = D.goalflight_journal.Journal(tmp).attempt_for_dispatch(dispatch_id)
-        finally:
-            if old_journal is None:
-                os.environ.pop("GOALFLIGHT_JOURNAL_DIR", None)
-            else:
-                os.environ["GOALFLIGHT_JOURNAL_DIR"] = old_journal
-        assert attempt is not None and attempt.lifecycle_state == "PREPARED", attempt
-
-        held_drain = _run(
-            [sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"],
-            env,
-            cwd=tmp,
-        )
-        assert held_drain.returncode == 0, (held_drain.stdout, held_drain.stderr)
-        held_payload = json.loads(held_drain.stdout)
-        assert held_payload["launched"] == 0, held_payload
-        assert held_payload["left_queued"] == 1, held_payload
-        assert held_payload["pending_claims"] == 0, held_payload
-        assert queue_path.exists(), "ACP queue child lost the refused carrier"
-        assert not list(queue_path.parent.glob("*.claimed.*")), "ACP left a claim stranded"
-        assert not spawned.exists(), "ACP queue child spawned despite held capacity"
-
-        _release_capacity(env, held_lease)
-        replay_marker = tmp / "acp-replay-complete"
-        replay_release = tmp / "acp-replay-release"
-        replay_env = dict(env)
-        replay_env["GOALFLIGHT_TEST_MODE"] = "1"
-        replay_env["GOALFLIGHT_TEST_ACP_DISPATCH_COMPLETE_FILE"] = str(replay_marker)
-        replay_env["GOALFLIGHT_TEST_ACP_DISPATCH_RELEASE_FILE"] = str(replay_release)
-        drained = _run(
-            [sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"],
-            replay_env,
-            cwd=tmp,
-        )
-        assert drained.returncode == 0, (drained.stdout, drained.stderr)
-        drain_payload = json.loads(drained.stdout)
-        assert drain_payload["launched"] == 1, drain_payload
-        assert not queue_path.exists(), "accepted ACP replay left a duplicate carrier"
-        replay_release.write_text("release", encoding="utf-8")
-        _wait_for(
-            lambda: _read_json(status_path).get("state") == "complete"
-            and _read_json(status_path).get("worker_alive") is not True
-        )
-        assert replay_marker.exists(), "ACP replay did not exercise the ACP test shape"
-        assert not spawned.exists(), "ACP replay bypass seam unexpectedly spawned the adapter"
+        assert refused.returncode == 2, (refused.stdout, refused.stderr)
+        assert "DISPATCH-BLOCKED" in refused.stdout, refused.stdout
+        assert _read_json(status_path).get("state") == "blocked_capacity"
+        assert not queue_path.exists(), "capacity refusal silently created a queue entry"
 
 
 def test_capacity_refusal_guard_mirrors() -> None:
@@ -369,10 +285,7 @@ def test_capacity_refusal_guard_mirrors() -> None:
             queue_path = tmp / "state" / "dispatch-queue" / f"{dispatch_id}.json"
             assert not queue_path.exists(), f"{dispatch_id} incorrectly created a queue entry"
 
-        _assert_detached_refusal_queues(tmp, env, "guard-positive-detached-control")
-
-
-def test_acp_capacity_refusal_guard_mirrors_and_interrupt() -> None:
+def test_acp_capacity_refusal_foreground() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _env(tmp)
@@ -380,77 +293,54 @@ def test_acp_capacity_refusal_guard_mirrors_and_interrupt() -> None:
         _write_fake_codex_acp(tmp, spawned)
         env["PATH"] = f"{tmp}{os.pathsep}{env.get('PATH', '')}"
         env["GOALFLIGHT_ACP_PYTHON"] = sys.executable
-        _hold_capacity(tmp, env, "held-for-acp-guards")
-
-        for dispatch_id, guard, expected_rc in (
-            ("acp-foreground-refusal", ["--foreground"], 1),
-            ("acp-from-queue-refusal", ["--from-queue"], 2),
-        ):
+        dispatch_id = "acp-foreground-refusal"
+        held_lease = _hold_capacity(tmp, env, f"held-for-{dispatch_id}")
+        try:
             result = _run(
                 _acp_dispatch_command(
                     tmp,
                     dispatch_id,
-                    extra=["--capacity-wait-s", "0", *guard],
+                    extra=["--capacity-wait-s", "0", "--foreground"],
                 ),
                 env,
             )
-            assert result.returncode == expected_rc, (
-                dispatch_id,
-                result.stdout,
-                result.stderr,
-            )
-            status = _read_json(tmp / f"{dispatch_id}.status.json")
-            assert status.get("state") == "blocked_capacity", (dispatch_id, status)
-            queue_path = tmp / "state" / "dispatch-queue" / f"{dispatch_id}.json"
-            assert not queue_path.exists(), f"{dispatch_id} incorrectly re-enqueued"
-
-        interrupted_id = "acp-detached-wait-interrupted"
-        interrupted_status = tmp / f"{interrupted_id}.status.json"
-        proc = subprocess.Popen(
-            _acp_dispatch_command(
-                tmp,
-                interrupted_id,
-                extra=["--capacity-wait-s", "30"],
-            ),
-            cwd=ROOT,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        try:
-            _wait_for(
-                lambda: _read_json(interrupted_status).get("state")
-                == "waiting_capacity"
-            )
-            proc.send_signal(signal.SIGTERM)
-            stdout, stderr = proc.communicate(timeout=20)
         finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait(timeout=10)
-        assert proc.returncode == 143, (stdout, stderr)
-        interrupted = _read_json(interrupted_status)
-        assert interrupted.get("state") == "blocked_capacity", interrupted
-        assert (interrupted.get("reason") or {}).get("reason") == "wait_interrupted"
-        interrupted_queue = (
-            tmp / "state" / "dispatch-queue" / f"{interrupted_id}.json"
-        )
-        assert not interrupted_queue.exists(), "ACP interrupt was mistaken for refusal"
-        assert not spawned.exists(), "guarded ACP path spawned the adapter"
+            _release_capacity(env, held_lease)
+        assert result.returncode == 1, (dispatch_id, result.stdout, result.stderr)
+        status = _read_json(tmp / f"{dispatch_id}.status.json")
+        assert status.get("state") == "blocked_capacity", (dispatch_id, status)
+        queue_path = tmp / "state" / "dispatch-queue" / f"{dispatch_id}.json"
+        assert not queue_path.exists(), f"{dispatch_id} incorrectly re-enqueued"
 
-        positive_id = "acp-guard-positive-detached-control"
-        positive = _run(
-            _acp_dispatch_command(
-                tmp,
-                positive_id,
-                extra=["--capacity-wait-s", "0", "--no-drain-on-submit"],
-            ),
-            env,
-        )
-        assert positive.returncode == 0, (positive.stdout, positive.stderr)
-        positive_queue = tmp / "state" / "dispatch-queue" / f"{positive_id}.json"
-        assert positive_queue.exists(), "positive detached ACP control did not queue"
+
+def test_acp_detached_capacity_refusal_is_visible_and_not_queued() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        spawned = tmp / "guard-acp-worker-spawned"
+        _write_fake_codex_acp(tmp, spawned)
+        env["PATH"] = f"{tmp}{os.pathsep}{env.get('PATH', '')}"
+        env["GOALFLIGHT_ACP_PYTHON"] = sys.executable
+        dispatch_id = "acp-detached-visible-refusal"
+        held_lease = _hold_capacity(tmp, env, f"held-for-{dispatch_id}")
+        try:
+            result = _run(
+                _acp_dispatch_command(
+                    tmp,
+                    dispatch_id,
+                    extra=["--capacity-wait-s", "0"],
+                ),
+                env,
+            )
+        finally:
+            _release_capacity(env, held_lease)
+        assert result.returncode == 2, (dispatch_id, result.stdout, result.stderr)
+        assert "DISPATCH-BLOCKED" in result.stdout, result.stdout
+        status = _read_json(tmp / f"{dispatch_id}.status.json")
+        assert status.get("state") == "blocked_capacity", (dispatch_id, status)
+        queue_path = tmp / "state" / "dispatch-queue" / f"{dispatch_id}.json"
+        assert not queue_path.exists(), f"{dispatch_id} incorrectly re-enqueued"
+        assert not spawned.exists(), "ACP worker spawned despite capacity refusal"
 
 
 def test_detached_capacity_wait_interrupt_does_not_enqueue() -> None:
@@ -474,7 +364,10 @@ def test_detached_capacity_wait_interrupt_does_not_enqueue() -> None:
             stderr=subprocess.PIPE,
         )
         try:
-            _wait_for(lambda: _read_json(status_path).get("state") == "waiting_capacity")
+            _wait_for(
+                lambda: _read_json(status_path).get("state") == "waiting_capacity",
+                label="bash waiting-capacity status",
+            )
             proc.send_signal(signal.SIGTERM)
             stdout, stderr = proc.communicate(timeout=20)
         finally:
@@ -487,47 +380,64 @@ def test_detached_capacity_wait_interrupt_does_not_enqueue() -> None:
         assert (status.get("reason") or {}).get("reason") == "wait_interrupted", status
         queue_path = tmp / "state" / "dispatch-queue" / f"{dispatch_id}.json"
         assert not queue_path.exists(), "operator interrupt was mistaken for capacity refusal"
-        _assert_detached_refusal_queues(tmp, env, "interrupt-positive-detached-control")
 
 
-def test_submit_drain_capacity_refusal_still_restores_one_entry() -> None:
+def test_preexisting_queue_capacity_refusal_still_restores_one_entry() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env = _env(tmp)
-        held_lease = _hold_capacity(tmp, env, "held-for-submit-regression")
-        dispatch_id = "submit-capacity-regression"
+        held_lease = _hold_capacity(tmp, env, "held-for-queue-regression")
+        dispatch_id = "preexisting-queue-capacity-regression"
         queue_dir = tmp / "state" / "dispatch-queue"
-        queue_path = queue_dir / f"{dispatch_id}.json"
-        marker = tmp / "submit-worker-ran"
+        marker = tmp / "queued-worker-ran"
         worker_code = (
             "from pathlib import Path; "
             f"Path({str(marker)!r}).write_text('once', encoding='utf-8'); "
-            f"print('COMPLETE: {dispatch_id} — restored submit ran', flush=True)"
+            f"print('COMPLETE: {dispatch_id} — restored queue entry ran', flush=True)"
+        )
+        replay_argv = _dispatch_command(tmp, dispatch_id, worker_code)[2:]
+        queue_path = _write_queue_entry(
+            tmp,
+            dispatch_id=dispatch_id,
+            agent="test-dispatch",
+            shape="bash",
+            replay_argv=replay_argv,
         )
 
-        submitted = _run(
-            _dispatch_command(
-                tmp,
-                dispatch_id,
-                worker_code,
-                extra=["--submit", "--no-drain-on-submit"],
-            ),
-            env,
+        old_env = os.environ.copy()
+        original_release = D._release_stale_capacity_for_drain
+        original_hook = D._run_drain_prelaunch_hook
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            D._release_stale_capacity_for_drain = lambda: None
+            D._run_drain_prelaunch_hook = lambda _agents: None
+            payload = D._drain_queue_once(
+                SimpleNamespace(
+                    queue_dir=str(queue_dir),
+                    remote_node=None,
+                    capacity_wait_s=0.0,
+                    claim_stale_s=D.QUEUE_CLAIM_STALE_S,
+                    limit=1,
+                    dispatch_id=None,
+                )
+            )
+        finally:
+            D._release_stale_capacity_for_drain = original_release
+            D._run_drain_prelaunch_hook = original_hook
+            os.environ.clear()
+            os.environ.update(old_env)
+        assert payload["launched"] == 0, f"launched={payload['launched']} payload={payload}"
+        assert payload["left_queued"] == 1, (
+            f"detail={payload['details'][0] if payload['details'] else None} "
+            f"left={payload['left_queued']} launched={payload['launched']} "
+            f"failed={payload['failed']} remaining={payload['remaining']} "
+            f"pending={payload['pending_claims']} busy={payload['skipped_busy']} "
+            f"error={payload['skipped_error']} details={payload['details']} "
+            f"holds={payload['holds']}"
         )
-        assert submitted.returncode == 0, (submitted.stdout, submitted.stderr)
-        assert queue_path.exists(), "submit did not create its durable entry"
-
-        drained = _run(
-            [sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"],
-            env,
-            cwd=tmp,
-        )
-        assert drained.returncode == 0, (drained.stdout, drained.stderr)
-        payload = json.loads(drained.stdout)
-        assert payload["launched"] == 0, payload
-        assert payload["left_queued"] == 1, payload
-        assert payload["pending_claims"] == 0, payload
-        assert queue_path.exists(), "capacity refusal lost the submit queue entry"
+        assert payload["pending_claims"] == 0, f"pending_claims={payload['pending_claims']} payload={payload}"
+        assert queue_path.exists(), "capacity refusal lost the pre-existing queue entry"
         assert list(queue_dir.glob("*.json")) == [queue_path], "drain duplicated the queue entry"
         assert not list(queue_dir.glob("*.claimed.*")), "drain stranded a claimed carrier"
 
@@ -542,15 +452,80 @@ def test_submit_drain_capacity_refusal_still_restores_one_entry() -> None:
         assert launched.returncode == 0, (launched.stdout, launched.stderr)
         launched_payload = json.loads(launched.stdout)
         assert launched_payload["launched"] == 1, launched_payload
-        assert not queue_path.exists(), "restored submit entry was not consumed"
-        _wait_for(lambda: marker.exists() and marker.read_text(encoding="utf-8") == "once")
+        assert not queue_path.exists(), "restored queue entry was not consumed"
+        _wait_for(
+            lambda: marker.exists() and marker.read_text(encoding="utf-8") == "once",
+            label="restored backlog worker marker",
+        )
         _wait_for(
             lambda: _read_json(tmp / f"{dispatch_id}.status.json").get("state") == "complete"
-            and _read_json(tmp / f"{dispatch_id}.status.json").get("worker_alive") is not True
+            and _read_json(tmp / f"{dispatch_id}.status.json").get("worker_alive") is not True,
+            label="restored backlog terminal status",
         )
 
 
-def test_detached_default_wait_is_zero_without_overriding_explicit_budgets() -> None:
+def test_acp_preexisting_queue_capacity_refusal_restores_claim() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env = _env(tmp)
+        spawned = tmp / "queued-acp-worker-spawned"
+        _write_fake_codex_acp(tmp, spawned)
+        env["PATH"] = f"{tmp}{os.pathsep}{env.get('PATH', '')}"
+        env["GOALFLIGHT_ACP_PYTHON"] = sys.executable
+        held_lease = _hold_capacity(tmp, env, "held-for-acp-queue-regression")
+        dispatch_id = "preexisting-acp-queue-capacity-regression"
+        queue_dir = tmp / "state" / "dispatch-queue"
+        replay_argv = _acp_dispatch_command(tmp, dispatch_id)[2:]
+        queue_path = _write_queue_entry(
+            tmp,
+            dispatch_id=dispatch_id,
+            agent="codex-acp",
+            shape="acp",
+            replay_argv=replay_argv,
+        )
+
+        old_env = os.environ.copy()
+        original_release = D._release_stale_capacity_for_drain
+        original_hook = D._run_drain_prelaunch_hook
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            D._release_stale_capacity_for_drain = lambda: None
+            D._run_drain_prelaunch_hook = lambda _agents: None
+            payload = D._drain_queue_once(
+                SimpleNamespace(
+                    queue_dir=str(queue_dir),
+                    remote_node=None,
+                    capacity_wait_s=0.0,
+                    claim_stale_s=D.QUEUE_CLAIM_STALE_S,
+                    limit=1,
+                    dispatch_id=None,
+                )
+            )
+        finally:
+            D._release_stale_capacity_for_drain = original_release
+            D._run_drain_prelaunch_hook = original_hook
+            os.environ.clear()
+            os.environ.update(old_env)
+            _release_capacity(env, held_lease)
+
+        assert payload["launched"] == 0, f"launched={payload['launched']} payload={payload}"
+        assert payload["left_queued"] == 1, (
+            f"detail={payload['details'][0] if payload['details'] else None} "
+            f"left={payload['left_queued']} launched={payload['launched']} "
+            f"failed={payload['failed']} remaining={payload['remaining']} "
+            f"pending={payload['pending_claims']} busy={payload['skipped_busy']} "
+            f"error={payload['skipped_error']} details={payload['details']} "
+            f"holds={payload['holds']}"
+        )
+        assert payload["pending_claims"] == 0, f"pending_claims={payload['pending_claims']} payload={payload}"
+        assert queue_path.exists(), "ACP refusal lost the pre-existing queue entry"
+        assert list(queue_dir.glob("*.json")) == [queue_path], "drain duplicated the ACP queue entry"
+        assert not list(queue_dir.glob("*.json.claimed-*")), "drain stranded the ACP queue claim"
+        assert not spawned.exists(), "ACP worker spawned despite capacity refusal"
+
+
+def test_detached_default_wait_matches_foreground_and_keeps_overrides() -> None:
     old = os.environ.pop("GOALFLIGHT_CAPACITY_WAIT_S", None)
     try:
         detached = SimpleNamespace(
@@ -562,7 +537,7 @@ def test_detached_default_wait_is_zero_without_overriding_explicit_budgets() -> 
         explicit = SimpleNamespace(
             priority="normal", capacity_wait_s=7.0, foreground=False, from_queue=False
         )
-        assert D._capacity_wait_seconds(detached) == 0.0
+        assert D._capacity_wait_seconds(detached) == 600.0
         assert D._capacity_wait_seconds(foreground) == 600.0
         assert D._capacity_wait_seconds(explicit) == 7.0
         os.environ["GOALFLIGHT_CAPACITY_WAIT_S"] = "4.5"
@@ -599,6 +574,8 @@ def test_acp_cfg_uses_the_shared_detached_wait_policy() -> None:
             permission_allow_tool_title_pattern=[],
             interactive=False,
             unregistered_forced=True,
+            queue_launch_token=None,
+            queue_claim_path=None,
         )
         old_state = os.environ.get("GOALFLIGHT_STATE_DIR")
         old_wait = os.environ.pop("GOALFLIGHT_CAPACITY_WAIT_S", None)
@@ -609,8 +586,20 @@ def test_acp_cfg_uses_the_shared_detached_wait_policy() -> None:
                 status_json=tmp / "acp-wait-policy.status.json",
                 base=tmp,
             )
-            assert cfg.capacity_wait_s == 0.0
-            assert cfg.preserve_capacity_refusal_attempt is True
+            assert cfg.capacity_wait_s == 600.0
+            assert cfg.preserve_capacity_refusal_attempt is False
+            args.from_queue = True
+            args.queue_launch_token = "queue-token"
+            args.queue_claim_path = str(tmp / "queued.claimed")
+            queued = D._build_acp_cfg(
+                args,
+                status_json=tmp / "acp-queued-wait.status.json",
+                base=tmp,
+            )
+            assert queued.preserve_capacity_refusal_attempt is True
+            args.from_queue = False
+            args.queue_launch_token = None
+            args.queue_claim_path = None
             args.capacity_wait_s = 3.25
             explicit = D._build_acp_cfg(
                 args,
@@ -638,12 +627,13 @@ def test_acp_cfg_uses_the_shared_detached_wait_policy() -> None:
 
 
 if __name__ == "__main__":
-    test_detached_capacity_refusal_is_durable_and_replayable()
-    test_detached_acp_capacity_refusal_is_durable_and_replayable()
+    test_detached_capacity_refusal_is_visible_and_not_queued()
     test_capacity_refusal_guard_mirrors()
-    test_acp_capacity_refusal_guard_mirrors_and_interrupt()
+    test_acp_capacity_refusal_foreground()
+    test_acp_detached_capacity_refusal_is_visible_and_not_queued()
     test_detached_capacity_wait_interrupt_does_not_enqueue()
-    test_submit_drain_capacity_refusal_still_restores_one_entry()
-    test_detached_default_wait_is_zero_without_overriding_explicit_budgets()
+    test_preexisting_queue_capacity_refusal_still_restores_one_entry()
+    test_acp_preexisting_queue_capacity_refusal_restores_claim()
+    test_detached_default_wait_matches_foreground_and_keeps_overrides()
     test_acp_cfg_uses_the_shared_detached_wait_policy()
     print("ok: dispatch capacity refusal requeue")

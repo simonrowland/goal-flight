@@ -689,9 +689,8 @@ def test_queue_pending_with_unobservable_drainer_reports_unknown() -> None:
 
 def test_drain_process_running_matches_only_real_invocation() -> None:
     """_drain_process_running must match a real `goalflight_dispatch.py drain`
-    argv only -- never a lookalike path, the --no-drain-on-submit flag, or a
-    prompt arg that merely contains the word (those would wrongly suppress the
-    no-drainer WARN)."""
+    argv only -- never a lookalike path or a prompt arg that merely contains
+    the word (those would wrongly suppress the no-drainer WARN)."""
     orig_run = S.subprocess.run
 
     class _Proc:
@@ -714,12 +713,11 @@ def test_drain_process_running_matches_only_real_invocation() -> None:
 
         # Negatives: lookalikes that must NOT count as a live drainer.
         S.subprocess.run = make_ps([
-            "python3 scripts/goalflight_dispatch.py --submit --no-drain-on-submit --agent codex",
+            "python3 scripts/goalflight_dispatch.py --agent codex --prompt drain",
             "python3 scripts/not_goalflight_dispatch.py drain --json",
             "codex exec 'review goalflight_dispatch.py and drain the queue'",
-            "python3 scripts/goalflight_dispatch.py --submit --drain-on-submit",
         ])
-        check("no false-positive on submit/lookalike/prompt commands",
+        check("no false-positive on lookalike/prompt commands",
               S._drain_process_running() is False)
     finally:
         S.subprocess.run = orig_run

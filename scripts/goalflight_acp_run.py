@@ -2637,24 +2637,24 @@ async def _run_acp_dispatch_impl(
     preserve_capacity_refusal_attempt = bool(
         getattr(cfg, "preserve_capacity_refusal_attempt", False)
     )
-    if preserve_capacity_refusal_attempt:
-        # Prepare before acquisition. A refused detached dispatch can then be
-        # handed to the durable queue with the same launch token, while the
-        # STARTING CAS below remains the sole pre-spawn launch claim.
-        _record_acp_ledger_state(
-            cfg,
-            dispatch_id=dispatch_id,
-            project_root=project_root,
-            controller_pid=controller_pid,
-            controller_session_id=controller_session_id,
-            controller_label=controller_label,
-            status_path=status_path,
-            payload=payload,
-            effective_account=None,
-            lease_id=None,
-            worker_pid=None,
-            state="waiting_capacity",
-        )
+    # Publish ownership before waiting so duplicate dispatch-id guards can see
+    # direct launches as well as claimed backlog entries. Only the latter keep
+    # their journal attempt PREPARED after a refusal; the queue claim is their
+    # durable retry carrier.
+    _record_acp_ledger_state(
+        cfg,
+        dispatch_id=dispatch_id,
+        project_root=project_root,
+        controller_pid=controller_pid,
+        controller_session_id=controller_session_id,
+        controller_label=controller_label,
+        status_path=status_path,
+        payload=payload,
+        effective_account=None,
+        lease_id=None,
+        worker_pid=None,
+        state="waiting_capacity",
+    )
     wait_budget_s = goalflight_capacity.resolve_capacity_wait_s(
         lane=acquire_args.priority,
         wait_s=getattr(cfg, "capacity_wait_s", None),

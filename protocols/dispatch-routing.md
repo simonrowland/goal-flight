@@ -248,7 +248,7 @@ dispatch-gate concern, not a scouting concern.
 ### Background by default; don't block the controller
 
 The controller dispatches workers in the background and self-paces from the
-ownership event listener and queue drains. Arm the wait; let it wake you. A timer
+ownership event listener and visible capacity outcomes. Arm the wait; let it wake you. A timer
 is a fallback for state no channel can report, such as external CI, a remote
 queue, or a deploy. A timer that asks whether a worker finished is polling an
 available channel. Background every controller tool call expected to run longer
@@ -263,11 +263,16 @@ exit; `--wait-timeout 0` is explicit unbounded waiting. `goalflight_dispatch.py
 --foreground` blocks until terminal state and should stay rare because it locks
 the controller terminal and queues typed steers behind the wait.
 
-Durable queue dispatch:
+Direct detached dispatch:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_dispatch.py --submit --drain-on-submit --agent codex --prompt-file p.md --cwd .
+python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .
 ```
+
+This launches immediately and waits for the lane's capacity window. If capacity
+remains unavailable, it writes `blocked_capacity`, prints `DISPATCH-BLOCKED`,
+and exits nonzero without creating a queue entry. Dispatch frontier items
+individually; there is no bulk fan-out command.
 
 Synchronous scripts/tests that need the worker exit code must opt in:
 
@@ -302,15 +307,16 @@ python3 <skill-root>/scripts/goalflight_messages.py \
   supervisor. Full arming order and JSON-line contracts:
   `protocols/controller-mail.md`.
 
-## Durable dispatch queue
+## Legacy dispatch backlog
 
-- `goalflight_dispatch.py --submit` enqueues without blocking. `dispatch_id` is
-  the idempotency key: same id plus same replay args is a no-op with rc=0; same
-  id plus different args is a collision with rc=64.
-- `goalflight_dispatch.py drain` is short-lived. It launches only work that fits
-  current capacity caps, refreshes stale capacity first, and exits after one
-  pass (normally about a second), so cron or another supervisor may re-run it.
-- Queue rows start as `queued` in status JSON and the dispatch ledger. During a
+- New dispatches never enqueue. They launch immediately after capacity admission
+  or refuse visibly with `blocked_capacity`, `DISPATCH-BLOCKED`, and a nonzero
+  exit.
+- `goalflight_dispatch.py drain` remains short-lived only to finish the
+  pre-existing backlog. It launches work that fits current capacity caps,
+  refreshes stale capacity first, and exits after one pass, so the standing
+  daemon may re-run it until the backlog is empty.
+- Existing queue rows start as `queued` in status JSON and the dispatch ledger. During a
   drain claim the queue file carries `claimed` plus recovery metadata until the
   worker reaches `starting` / `running` or stale-claim recovery resolves it.
 - `goalflight_status.py --done <dispatch-id>` treats `queued` /
@@ -928,10 +934,9 @@ Behaviour — non-destructive and self-healing:
   **blocks on the cooldown** (`decision=wait`) and the entry is **restored to the
   queue** — so nothing new launches for that vendor. **In-flight workers are not
   killed** — they finish.
-- Queued `--submit` entries are **held in the durable queue, not lost** (claim →
-  acquire-blocks → restore); the instant the cooldown clears or expires, the next
-  `drain` relaunches them (idempotent by dispatch-id — no double-launch, no
-  re-bounce).
+- Pre-existing queue entries are held during cooldown (claim → acquire-blocks →
+  restore); the instant the cooldown clears or expires, the next backlog drain
+  relaunches them (idempotent by dispatch-id — no double-launch, no re-bounce).
 - Add margin past the nominal reset (e.g. +10 min) so launches don't resume
   exactly at the boundary and immediately re-exhaust.
 - Cooldown is **machine-local, file-backed runtime state** (`capacity.json` in

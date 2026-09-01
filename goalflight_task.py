@@ -5140,7 +5140,17 @@ def _post_next_nudge(rows: list[dict[str, Any]], project_root: Path) -> None:
 
 def _continue_directive(store: TaskStore, row: dict[str, Any]) -> str:
     title = str(row.get("title") or "").strip().replace("\n", " ")
-    prompt_path = _pipe_prompt_path(store, row, require_exists=False)
+    stored_prompt_path = row.get("prompt_path")
+    prompt_path = (
+        _resolve_item_prompt_path(
+            store,
+            stored_prompt_path,
+            item_id=str(row.get("id") or "(unknown)"),
+            require_exists=False,
+        )
+        if isinstance(stored_prompt_path, str) and stored_prompt_path
+        else None
+    )
     prompt_ref = str(prompt_path) if prompt_path is not None else "-"
     return f"CONTINUE: {row['id']} {title} (prompt: {prompt_ref})"
 
@@ -5217,168 +5227,6 @@ def _cmd_next(store: TaskStore, args: argparse.Namespace) -> int:
             project_root=store.project_root,
         )
     return 0
-
-
-def _pipe_prompt_path(store: TaskStore, row: dict[str, Any], *, require_exists: bool = True) -> Path | None:
-    prompt_path = row.get("prompt_path")
-    if not isinstance(prompt_path, str) or not prompt_path:
-        return None
-    return _resolve_item_prompt_path(
-        store,
-        prompt_path,
-        item_id=str(row.get("id") or "(unknown)"),
-        require_exists=require_exists,
-    )
-
-
-def _pipe_dispatch_cmd(
-    store: TaskStore,
-    row: dict[str, Any],
-    *,
-    agent: str,
-    dispatch_program: Path,
-    drain_on_submit: bool,
-) -> list[str]:
-    cmd = [
-        sys.executable,
-        str(dispatch_program),
-        "--submit",
-        "--agent",
-        agent,
-        "--cwd",
-        str(store.project_root),
-        "--task",
-        str(row["id"]),
-    ]
-    cmd.append("--drain-on-submit" if drain_on_submit else "--no-drain-on-submit")
-    prompt_path = _pipe_prompt_path(store, row)
-    if prompt_path is not None:
-        cmd.extend(["--prompt-file", str(prompt_path)])
-    else:
-        prompt = row.get("prompt")
-        if not isinstance(prompt, str) or not prompt:
-            raise TaskError(f"{row['id']}: no prompt or prompt_path")
-        cmd.extend(["--prompt", prompt])
-    return cmd
-
-
-def _run_pipe_child(cmd: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-
-
-def _emit_pipe_child_output(proc: subprocess.CompletedProcess[str], *, json_mode: bool) -> None:
-    if proc.stdout:
-        print(proc.stdout, end="", file=sys.stderr if json_mode else sys.stdout)
-    if proc.stderr:
-        print(proc.stderr, end="", file=sys.stderr)
-
-
-def _cmd_pipe(store: TaskStore, args: argparse.Namespace) -> int:
-    rows = store.next_frontier()
-    dispatch_program = Path(
-        os.environ.get("GOALFLIGHT_TASK_PIPE_DISPATCH")
-        or str(ROOT / "scripts" / "goalflight_dispatch.py")
-    ).expanduser()
-    piped: list[dict[str, str]] = []
-    skipped: list[dict[str, str]] = []
-    for row in rows:
-        prompt_path = _pipe_prompt_path(store, row)
-        prompt = row.get("prompt")
-        has_inline_prompt = isinstance(prompt, str) and bool(prompt)
-        if prompt_path is None and not has_inline_prompt:
-            skipped.append({"id": str(row["id"]), "reason": "no prompt"})
-            continue
-        agent = str(row.get("agent") or args.agent)
-        prompt_ref = str(prompt_path) if prompt_path is not None else "<inline>"
-        piped.append({"id": str(row["id"]), "prompt": prompt_ref, "agent": agent})
-
-    if args.dry_run:
-        if args.json:
-            print(json.dumps({"piped": piped, "skipped": skipped}, ensure_ascii=False, sort_keys=True))
-        else:
-            for entry in piped:
-                prompt_ref = entry["prompt"]
-                print(f"{entry['id']} -> {prompt_ref} -> {entry['agent']}")
-            for entry in skipped:
-                print(f"{entry['id']} not piped ({entry['reason']})")
-        return 0
-
-    results: list[dict[str, Any]] = []
-    piped_by_id = {entry["id"]: entry for entry in piped}
-    exit_code = 0
-
-    # Fan-out safety gate. This command spawns ONE worker per frontier item —
-    # each leases capacity, costs money, and runs in the target cwd. Auto-spawning
-    # a fleet must never be the default: refuse without explicit opt-in. (--dry-run
-    # returned above, so reaching here means a real dispatch was requested.)
-    if piped and not getattr(args, "autodispatch_confirm", False):
-        task_ids = ", ".join(entry["id"] for entry in piped)
-        print(
-            f"about to dispatch {len(piped)} worker(s) (tasks: {task_ids}) "
-            f"into {store.project_root}",
-            file=sys.stderr,
-        )
-        print(
-            f"This QUEUES those {len(piped)} task(s) as workers — it is NOT a queue "
-            "drainer despite the name. The always-on com.goalflight.drain launchd "
-            "daemon then LAUNCHES every queued worker (~60s cadence), so all "
-            f"{len(piped)} will run even after this command returns. They run in the "
-            "SHARED project root (collision risk if agents already hold that "
-            "worktree) with the RAW task prompt (no mandate/5-layer briefing).",
-            file=sys.stderr,
-        )
-        print("Re-run with --autodispatch-confirm to proceed (or --dry-run to preview).", file=sys.stderr)
-        return 2
-
-    for row in rows:
-        item_id = str(row["id"])
-        entry = piped_by_id.get(item_id)
-        if entry is None:
-            continue
-        cmd = _pipe_dispatch_cmd(
-            store,
-            row,
-            agent=entry["agent"],
-            dispatch_program=dispatch_program,
-            drain_on_submit=False,
-        )
-        proc = _run_pipe_child(cmd, cwd=ROOT)
-        results.append({"id": item_id, "returncode": proc.returncode})
-        if proc.returncode != 0:
-            _emit_pipe_child_output(proc, json_mode=args.json)
-            exit_code = proc.returncode
-            break
-
-    if piped and exit_code == 0:
-        proc = _run_pipe_child(
-            [sys.executable, str(dispatch_program), "drain", "--limit", "1"],
-            cwd=ROOT,
-        )
-        results.append({"drain": True, "returncode": proc.returncode})
-        if proc.returncode != 0:
-            _emit_pipe_child_output(proc, json_mode=args.json)
-            exit_code = proc.returncode
-
-    if args.json:
-        print(json.dumps({"piped": piped, "skipped": skipped, "results": results}, ensure_ascii=False, sort_keys=True))
-    else:
-        for entry in piped:
-            print(f"{entry['id']} piped ({entry['agent']})")
-        for entry in skipped:
-            print(f"{entry['id']} not piped ({entry['reason']})")
-        if piped:
-            if exit_code == 0:
-                print("drain pass completed")
-            else:
-                print(f"pipe stopped after recoverable dispatch/drain failure (exit {exit_code})")
-    return exit_code
 
 
 def _cmd_status(store: TaskStore, args: argparse.Namespace) -> int:
@@ -5816,38 +5664,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     next_cmd = sub.add_parser(
         "next",
-        help="READ-ONLY (safe, free): print the flat dispatchable frontier. Does NOT dispatch — to fan it out use dispatch-frontier.",
+        help="READ-ONLY (safe, free): print the flat dispatchable frontier. Dispatch items individually with goalflight_dispatch.py.",
         epilog="example: goalflight_task.py next --json",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     next_cmd.add_argument("--by", help=argparse.SUPPRESS)
     next_cmd.add_argument("--json", action="store_true")
     next_cmd.set_defaults(func=_cmd_next)
-
-    pipe = sub.add_parser(
-        "dispatch-frontier",
-        aliases=["pipe"],
-        help="⚠ DISPATCHES WORKERS: fan out the prompt-ready frontier as one worker "
-             "per item (spawns processes, leases capacity, costs money, runs in --cwd). "
-             "Requires --autodispatch-confirm. NOT a queue drainer (the com.goalflight.drain "
-             "daemon drains automatically).",
-        epilog=(
-            "examples:\n"
-            "  goalflight_task.py dispatch-frontier --dry-run          # safe preview, no dispatch\n"
-            "  goalflight_task.py dispatch-frontier --autodispatch-confirm\n"
-            "note: 'pipe' is a legacy alias for this command; the name misleads "
-            "(it does not 'flush a pipe' — it fans out the frontier as workers)."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    pipe.add_argument("--by", help=argparse.SUPPRESS)
-    pipe.add_argument("--agent", default="codex", help="Default agent when an item has no agent field.")
-    pipe.add_argument("--dry-run", action="store_true",
-                      help="Preview what WOULD dispatch (id -> prompt -> agent) without spawning anything. Safe/free.")
-    pipe.add_argument("--autodispatch-confirm", action="store_true",
-                      help="Required to actually fan out: confirm dispatching N workers into the target cwd.")
-    pipe.add_argument("--json", action="store_true")
-    pipe.set_defaults(func=_cmd_pipe)
 
     status = sub.add_parser(
         "status",

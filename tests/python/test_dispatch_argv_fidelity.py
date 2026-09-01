@@ -2,7 +2,7 @@
 """b-217 / b-227: queued and resumed launches must keep dispatch-affecting flags.
 
 Two reconstruction sites used to rebuild a launch argv from a remembered list.
-Each dropped whatever its author did not think to copy: submit collapsed
+Each dropped whatever its author did not think to copy: queue replay collapsed
 ``--cwd`` through ``resolve_project_root``, and resume omitted ``--os-sandbox``,
 ``--read-only``, and the original worker cwd. Assert on the launched argv
 (``-C`` / dispatch flags), not on artifacts — artifacts pass while the process
@@ -22,11 +22,12 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import goalflight_task as T  # noqa: E402
 import goalflight_dispatch as D  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
-import goalflight_task  # noqa: E402
 
 
 SESSION_ID = "12345678-1234-4abc-8def-1234567890ab"
@@ -35,6 +36,24 @@ pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
     reason="worktree cwd and worker-CLI resume are local POSIX-only",
 )
+
+
+def test_submit_flag_is_rejected_by_argparse() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        D._build_launch_parser().parse_args(["--submit"])
+    assert exc_info.value.code == 2
+
+
+def test_removed_bulk_dispatch_commands_are_rejected_and_absent_from_help() -> None:
+    parser = T.build_parser()
+    help_text = parser.format_help()
+    frontier_command = "dispatch" + "-frontier"
+    assert frontier_command not in help_text
+    assert "pipe" not in help_text
+    for command in (frontier_command, "pipe"):
+        with pytest.raises(SystemExit) as exc_info:
+            parser.parse_args([command])
+        assert exc_info.value.code == 2
 
 
 @pytest.fixture(autouse=True)
@@ -162,99 +181,6 @@ def _replay_namespace(cwd: str, **over) -> argparse.Namespace:
     return argparse.Namespace(**base)
 
 
-def test_submit_explicit_worktree_cwd_launches_with_that_C(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Queued replay must keep the worktree as the worker ``-C``, not the main repo.
-
-    ``resolve_project_root`` collapses worktrees on purpose (one task store).
-    That collapse must not leak into the launched worker argv.
-    """
-    main, worktree = _make_repo_with_worktree(tmp_path)
-    assert goalflight_task.resolve_project_root(str(worktree)) == main
-
-    prompt = worktree / "brief.md"
-    prompt.write_text("do the work\n", encoding="utf-8")
-    dispatch_id = "cwd-fidelity"
-    rc = D.main(
-        [
-            "--agent",
-            "codex",
-            "--submit",
-            "--no-drain-on-submit",
-            "--unregistered-forced",
-            "--dispatch-id",
-            dispatch_id,
-            "--prompt-file",
-            str(prompt),
-            "--cwd",
-            str(worktree),
-            "--ignore-git-warn",
-            "--no-orientation",
-        ]
-    )
-    assert rc == 0
-
-    queue_path = tmp_path / "state" / "dispatch-queue" / f"{dispatch_id}.json"
-    entry = json.loads(queue_path.read_text(encoding="utf-8"))
-    stored_cwd = _option_value(list(entry["dispatch_argv"]), "--cwd")
-    assert stored_cwd is not None, entry["dispatch_argv"]
-    assert Path(stored_cwd).resolve() == worktree
-    assert Path(stored_cwd).resolve() != main
-
-    captured: list[list[str]] = []
-    old_run = D.subprocess.run
-
-    def fake_run(argv, **kwargs):
-        argv = list(argv)
-        if not any("goalflight_dispatch.py" in str(part) for part in argv):
-            return old_run(argv, **kwargs)
-        captured.append(argv)
-        try:
-            launched_id = argv[argv.index("--dispatch-id") + 1]
-            token = argv[argv.index("--queue-launch-token") + 1]
-        except (ValueError, IndexError):
-            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-        L.write_record(
-            {
-                "schema": L.SCHEMA,
-                "dispatch_id": launched_id,
-                "agent": "codex",
-                "engine": "codex",
-                "shape": "bash",
-                "transport": "dispatch",
-                "project_root": str(main),
-                "worker_pid": os.getpid(),
-                "worker_identity": L.process_identity(os.getpid()),
-                "stdout_path": str(tmp_path / "t.tail"),
-                "status_path": str(tmp_path / "t.status.json"),
-                "state": "running",
-                "terminal_state": "unknown",
-                "queue_launch_token": token,
-                "started_at": L.utc_now(),
-            }
-        )
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            stdout=f"DISPATCH-LAUNCHED {launched_id}\n",
-            stderr="",
-        )
-
-    monkeypatch.setattr(D.subprocess, "run", fake_run)
-    drain_rc = D.main(["drain", "--capacity-wait-s", "0", "--json"])
-    assert drain_rc == 0
-    assert captured, "drain did not launch the queued dispatch"
-
-    launched = captured[0]
-    launched_cwd = _option_value(launched, "--cwd")
-    assert launched_cwd is not None, launched
-    assert Path(launched_cwd).resolve() == worktree
-    assert _codex_dash_c(launched_cwd) == str(Path(launched_cwd))
-    assert Path(_codex_dash_c(launched_cwd)).resolve() == worktree
-    assert Path(_codex_dash_c(launched_cwd)).resolve() != main
-
-
 def test_canonical_replay_from_original_argv_does_not_collapse_worktree_cwd(
     tmp_path: Path,
 ) -> None:
@@ -270,8 +196,6 @@ def test_canonical_replay_from_original_argv_does_not_collapse_worktree_cwd(
             "/tmp/p.md",
             "--dispatch-id",
             "cwd-replay",
-            "--submit",
-            "--no-drain-on-submit",
         ],
     )
     argv = D._canonical_replay_argv(
@@ -284,8 +208,6 @@ def test_canonical_replay_from_original_argv_does_not_collapse_worktree_cwd(
     assert stored is not None, argv
     assert Path(stored).resolve() == worktree
     assert Path(stored).resolve() != main
-    assert "--submit" not in argv
-    assert "--no-drain-on-submit" not in argv
     assert _codex_dash_c(stored) == str(Path(stored))
 
 
@@ -607,8 +529,6 @@ def test_preserve_class_flags_survive_original_argv_replay(tmp_path: Path) -> No
         "class-replay",
         "--prompt-file",
         "/tmp/p.md",
-        "--submit",
-        "--no-drain-on-submit",
     ]
     dummies = {
         "--cwd": str(tmp_path),
@@ -677,8 +597,6 @@ def test_preserve_class_flags_survive_original_argv_replay(tmp_path: Path) -> No
             assert Path(got).resolve() == Path(value).resolve(), (flag, got, value)
         else:
             assert got == value, (flag, got, value)
-    assert "--submit" not in replay
-    assert "--no-drain-on-submit" not in replay
     assert "--readonly" in replay
     assert "--session-label" in replay
     assert _option_value(replay, "--session-label") == "lab"

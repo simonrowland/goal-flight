@@ -363,63 +363,6 @@ def test_dispatch_startup_sweep_marker_serializes_concurrent_first_run() -> None
         assert _mode(legacy_prompt) == 0o600
 
 
-def test_partial_submit_cleanup_retires_assembled_prompt_with_status() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        queue_path = tmp / "queued.json"
-        status_json = tmp / "cleanup.status.json"
-        queue_path.write_text("{}\n", encoding="utf-8")
-        status_json.write_text("{}\n", encoding="utf-8")
-        watcher_prompt = dispatch_mod._persist_acp_watcher_prompt(
-            status_json=status_json,
-            prompt_text="persisted until its status is retired",
-        )
-
-        original_unlink = Path.unlink
-        retired: list[Path] = []
-
-        def tracked_unlink(path: Path, *args, **kwargs):
-            if path in {watcher_prompt, status_json}:
-                retired.append(path)
-            return original_unlink(path, *args, **kwargs)
-
-        with patch.object(Path, "unlink", tracked_unlink):
-            dispatch_mod._cleanup_partial_submit(queue_path, status_json)
-
-        assert not queue_path.exists()
-        assert not status_json.exists()
-        assert not watcher_prompt.exists()
-        assert retired.index(watcher_prompt) < retired.index(status_json), retired
-
-
-def test_partial_submit_cleanup_repairs_orphaned_prompt_sidecar() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        queue_path = tmp / "queued.json"
-        status_json = tmp / "orphan.status.json"
-        watcher_prompt = dispatch_mod._persist_acp_watcher_prompt(
-            status_json=status_json,
-            prompt_text="orphaned prompt material",
-        )
-        original_unlink = Path.unlink
-        prompt_attempts = 0
-
-        def transient_prompt_unlink(path: Path, *args, **kwargs):
-            nonlocal prompt_attempts
-            if path == watcher_prompt:
-                prompt_attempts += 1
-                if prompt_attempts == 1:
-                    raise OSError("transient sidecar unlink failure")
-            return original_unlink(path, *args, **kwargs)
-
-        with patch.object(Path, "unlink", transient_prompt_unlink):
-            dispatch_mod._cleanup_partial_submit(queue_path, status_json)
-
-        assert prompt_attempts == 2
-        assert not watcher_prompt.exists()
-        assert not status_json.exists()
-
-
 def test_watcher_with_retired_prompt_and_status_exits_without_status_write() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -599,109 +542,6 @@ def test_missing_status_without_nonterminal_record_returns_before_scan() -> None
 
         assert rc == 0
         assert output.getvalue().count("dispatch retired") == 1
-        assert not status_json.exists()
-
-
-def test_cleanup_gap_watcher_exits_without_recreating_status() -> None:
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        queue_path = tmp / "queued.json"
-        status_json = tmp / "gap.status.json"
-        tail = tmp / "gap.tail"
-        queue_path.write_text("{}\n", encoding="utf-8")
-        status_json.write_text("{}\n", encoding="utf-8")
-        tail.write_text("worker output\n", encoding="utf-8")
-        watcher_prompt = dispatch_mod._persist_acp_watcher_prompt(
-            status_json=status_json,
-            prompt_text="prompt retired before status",
-        )
-
-        sidecar_removed = threading.Event()
-        watcher_scanning = threading.Event()
-        status_removed = threading.Event()
-        original_unlink = Path.unlink
-
-        def coordinated_unlink(path: Path, *args, **kwargs):
-            result = original_unlink(path, *args, **kwargs)
-            if path == watcher_prompt:
-                sidecar_removed.set()
-                assert watcher_scanning.wait(timeout=5), "watcher did not enter cleanup gap"
-            elif path == status_json:
-                status_removed.set()
-            return result
-
-        class GapScanner:
-            def __init__(self, *_args, **_kwargs):
-                pass
-
-            def scan(self, **_kwargs):
-                watcher_scanning.set()
-                assert status_removed.wait(timeout=5), "cleanup did not retire status"
-                return goalflight_watch.TailScanResult(
-                    markers=[],
-                    mail_markers=[],
-                    terminal=None,
-                    size=tail.stat().st_size,
-                    content_bytes=0,
-                    validation_bytes=0,
-                    lines_materialized=0,
-                    resynced=False,
-                    resync_reason=None,
-                    fence_unbalanced=False,
-                )
-
-        class NoTrace:
-            def __init__(self, **_kwargs):
-                pass
-
-            def sample(self, **_kwargs):
-                return {"trace_active": False}
-
-        watcher_result: list[int] = []
-        watcher_output = io.StringIO()
-        argv = [
-            str(ROOT / "scripts" / "goalflight_watch.py"),
-            "--pid",
-            "4242",
-            "--tail",
-            str(tail),
-            "--status-json",
-            str(status_json),
-            "--dispatch-id",
-            "cleanup-gap",
-            "--ignore-prompt-file",
-            str(watcher_prompt),
-            "--poll-secs",
-            "0.01",
-        ]
-
-        def run_watcher() -> None:
-            with patch.object(sys, "argv", argv), \
-                    patch.object(goalflight_watch, "IncrementalTailScanner", GapScanner), \
-                    patch.object(goalflight_watch, "TraceLiveness", NoTrace), \
-                    patch.object(goalflight_watch, "worker_alive", return_value=(False, "dead", None)), \
-                    patch.object(goalflight_watch.signal, "signal", return_value=None), \
-                    patch.object(goalflight_watch.atexit, "register", return_value=None), \
-                    contextlib.redirect_stdout(watcher_output):
-                watcher_result.append(goalflight_watch.main())
-
-        with patch.object(Path, "unlink", coordinated_unlink):
-            cleanup = threading.Thread(
-                target=dispatch_mod._cleanup_partial_submit,
-                args=(queue_path, status_json),
-            )
-            cleanup.start()
-            assert sidecar_removed.wait(timeout=5), "cleanup did not retire prompt sidecar"
-            watcher = threading.Thread(target=run_watcher)
-            watcher.start()
-            cleanup.join(timeout=5)
-            watcher.join(timeout=5)
-
-        assert not cleanup.is_alive(), "cleanup remained blocked"
-        assert not watcher.is_alive(), "watcher remained active after dispatch retirement"
-        assert watcher_result == [0], watcher_result
-        assert watcher_output.getvalue().count("dispatch retired") == 1
-        assert not watcher_prompt.exists()
         assert not status_json.exists()
 
 
@@ -955,6 +795,12 @@ def test_acp_capacity_wait_queues_until_slot_frees() -> None:
                 thread, result = _run_acp_thread(cfg)
                 waiting = _wait_for_status(status_json, "waiting_capacity", timeout_s=5.0)
                 assert waiting["reason"]["decision"] == "wait", waiting
+                ledger = json.loads(
+                    dispatch_mod.goalflight_ledger.record_path("queued-acp").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                assert ledger["state"] == "waiting_capacity", ledger
                 _release_capacity(state_dir, lease_id)
                 thread.join(timeout=20)
                 if thread.is_alive():
@@ -967,6 +813,45 @@ def test_acp_capacity_wait_queues_until_slot_frees() -> None:
         final = json.loads(status_json.read_text())
         assert payload["state"] == "complete", payload
         assert final["state"] == "complete", final
+
+
+def test_acp_capacity_acquire_error_terminalizes_direct_attempt() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        dispatch_id = "acp-capacity-acquire-error"
+        status_json = tmp / f"{dispatch_id}.status.json"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id=dispatch_id,
+            status_json=status_json,
+            capacity_wait_s=0.0,
+        )
+        saved = _install_fake_acp_after_capacity()
+        try:
+            with (
+                patch.dict(os.environ, _capacity_env(state_dir), clear=True),
+                patch.object(
+                    goalflight_acp_run.goalflight_capacity,
+                    "acquire_with_wait_async",
+                    side_effect=RuntimeError("capacity backend failed"),
+                ),
+            ):
+                try:
+                    asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+                except RuntimeError as exc:
+                    assert str(exc) == "capacity backend failed"
+                else:
+                    raise AssertionError("capacity acquisition error did not propagate")
+                ledger_path = dispatch_mod.goalflight_ledger.record_path(dispatch_id)
+        finally:
+            _restore_fake_acp(saved)
+
+        status = json.loads(status_json.read_text(encoding="utf-8"))
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        assert status["state"] == "failed", status
+        assert ledger["state"] == "failed", ledger
+        assert ledger["terminal_state"] == "failed", ledger
 
 
 def test_acp_capacity_wait_deadline_blocks() -> None:
@@ -1265,16 +1150,14 @@ def main() -> None:
     test_dispatch_help_skips_legacy_prompt_sweep_mutation_pair()
     test_dispatch_startup_sweep_is_once_and_best_effort_mutation_pair()
     test_dispatch_startup_sweep_marker_serializes_concurrent_first_run()
-    test_partial_submit_cleanup_retires_assembled_prompt_with_status()
-    test_partial_submit_cleanup_repairs_orphaned_prompt_sidecar()
     test_watcher_with_retired_prompt_and_status_exits_without_status_write()
     test_watcher_both_absent_returns_before_scanner_initialization()
     test_nonterminal_dispatch_record_authorizes_missing_status_creation()
     test_missing_status_without_nonterminal_record_returns_before_scan()
-    test_cleanup_gap_watcher_exits_without_recreating_status()
     test_watcher_prompt_history_retains_original_and_bounded_recent_turns()
     test_capacity_env_ignores_constructed_live_journal()
     test_acp_capacity_wait_queues_until_slot_frees()
+    test_acp_capacity_acquire_error_terminalizes_direct_attempt()
     test_acp_capacity_wait_deadline_blocks()
     test_acp_capacity_wait_zero_single_shot()
     test_acp_capacity_wait_sigterm_terminalizes()

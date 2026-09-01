@@ -11,8 +11,7 @@ is diagnostic (names the incumbent, fail-closes when unlistable). Exempt
 genuinely read-only dispatches.
 
 Every precondition here is built for real (b-235): incumbents are genuine
-dispatched workers with genuine ledger records, read by the real reader; the
-queued-owner case is a genuine ``--submit`` that never spawns a worker.
+dispatched workers with genuine ledger records, read by the real reader.
 """
 
 from __future__ import annotations
@@ -316,7 +315,7 @@ def _wait_until_terminal(tmp: Path, dispatch_id: str) -> dict:
     return record
 
 
-def test_second_writer_refused_naming_incumbent_then_override_launches() -> None:
+def test_second_writer_refused_then_override_reaches_capacity_gate() -> None:
     with _temp_dir() as td:
         tmp = Path(td)
         tree = tmp / "tree"
@@ -347,14 +346,17 @@ def test_second_writer_refused_naming_incumbent_then_override_launches() -> None
                     tree,
                     "occ-second",
                     _quick_writer("occ-second"),
-                    extra=["--occupied-worktree-forced"],
+                    extra=["--occupied-worktree-forced", "--capacity-wait-s", "0"],
                 ),
                 env,
             )
-            assert forced.returncode == 0, (forced.stdout, forced.stderr)
+            assert forced.returncode == 2, (forced.stdout, forced.stderr)
             assert "--occupied-worktree-forced accepted" in forced.stderr, forced.stderr
             assert "occ-incumbent" in forced.stderr, forced.stderr
-            _wait_until_terminal(tmp, "occ-second")
+            assert "DISPATCH-BLOCKED" in forced.stdout, forced.stdout
+            blocked = _ledger_record(tmp, "occ-second")
+            assert blocked.get("state") == "blocked_capacity", blocked
+            assert not list((tmp / "state" / "dispatch-queue").glob("occ-second*.json"))
         finally:
             release_incumbent.write_text("release", encoding="utf-8")
         _wait_until_terminal(tmp, "occ-incumbent")
@@ -441,48 +443,6 @@ def test_terminal_incumbent_vacates_the_tree() -> None:
         assert "DISPATCH-END" in second.stdout, second.stdout
 
 
-def test_queued_incumbent_owns_tree_before_any_worker_spawns() -> None:
-    """A queued dispatch owns its tree pre-spawn; only the ledger can see it."""
-    with _temp_dir() as td:
-        tmp = Path(td)
-        tree = tmp / "tree"
-        tree.mkdir()
-        env = _env(tmp)
-        submit = _run(
-            [
-                sys.executable,
-                str(DISPATCH),
-                "--unregistered-forced",
-                "--cwd",
-                str(tree),
-                "--agent",
-                "test",
-                "--dispatch-id",
-                "occ-queued",
-                "--tail",
-                str(tmp / "occ-queued.tail"),
-                "--status-json",
-                str(tmp / "occ-queued.status.json"),
-                "--submit",
-                "--no-drain-on-submit",
-                "--",
-                sys.executable,
-                "-c",
-                _quick_writer("occ-queued"),
-            ],
-            env,
-        )
-        assert submit.returncode == 0, (submit.stdout, submit.stderr)
-        queued = _ledger_record(tmp, "occ-queued")
-        assert queued.get("state") == "queued", queued
-        assert not queued.get("worker_pid"), queued
-
-        refused = _run(_dispatch_cmd(tmp, tree, "occ-writer", _quick_writer("occ-writer")), env)
-        assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
-        assert "occ-queued" in refused.stderr, refused.stderr
-        assert not _ledger_record(tmp, "occ-writer"), refused.stderr
-
-
 def test_unreadable_ledger_record_is_unknown_not_unoccupied() -> None:
     with _temp_dir() as td:
         tmp = Path(td)
@@ -513,39 +473,6 @@ def test_unreadable_ledger_record_is_unknown_not_unoccupied() -> None:
         )
         assert forced.returncode == 0, (forced.stdout, forced.stderr)
         assert "--occupied-worktree-forced accepted" in forced.stderr, forced.stderr
-
-
-def test_submit_into_occupied_tree_is_refused() -> None:
-    """--submit is still a writer claiming the tree; refuse before queueing."""
-    with _temp_dir() as td:
-        tmp = Path(td)
-        tree = tmp / "tree"
-        tree.mkdir()
-        env = _env(tmp)
-        release_incumbent = tmp / "release-incumbent"
-        incumbent = _run(
-            _dispatch_cmd(tmp, tree, "sub-incumbent", _blocking_worker(release_incumbent, "sub-incumbent")),
-            env,
-        )
-        assert incumbent.returncode == 0, (incumbent.stdout, incumbent.stderr)
-        try:
-            _wait_until_running(tmp, "sub-incumbent")
-            refused = _run(
-                _dispatch_cmd(
-                    tmp,
-                    tree,
-                    "sub-second",
-                    _quick_writer("sub-second"),
-                    extra=["--submit", "--no-drain-on-submit"],
-                ),
-                env,
-            )
-            assert refused.returncode == 64, (refused.returncode, refused.stdout, refused.stderr)
-            assert "sub-incumbent" in refused.stderr, refused.stderr
-            assert not _ledger_record(tmp, "sub-second"), refused.stderr
-        finally:
-            release_incumbent.write_text("release", encoding="utf-8")
-        _wait_until_terminal(tmp, "sub-incumbent")
 
 
 def test_preset_bash_writer_refused_into_occupied_worktree() -> None:
@@ -1248,7 +1175,7 @@ def test_worker_inherits_occupancy_lock_fd() -> None:
         assert int(held.read_text(encoding="utf-8")) >= 0
 
 
-def test_sigkill_of_worker_releases_occupancy_lock() -> None:
+def test_sigkill_releases_occupancy_before_capacity_lease_cleanup() -> None:
     with _temp_dir() as td:
         tmp = Path(td)
         tree = tmp / "tree"
@@ -1271,14 +1198,16 @@ def test_sigkill_of_worker_releases_occupancy_lock() -> None:
             ),
             env,
         )
-        assert second.returncode == 0, (second.stdout, second.stderr)
-        assert "DISPATCH-END" in second.stdout, second.stdout
+        assert second.returncode == 2, (second.stdout, second.stderr)
+        assert "DISPATCH-BLOCKED" in second.stdout, second.stdout
+        assert "already owned" not in second.stderr, second.stderr
+        assert not list((tmp / "state" / "dispatch-queue").glob("occ-after-kill*.json"))
         watcher_pid = record.get("watcher_pid")
         if watcher_pid:
             _wait_for(lambda pid=watcher_pid: _pid_gone(pid), timeout=5.0)
 
 
-def test_concurrent_dispatches_into_different_trees_both_run() -> None:
+def test_concurrent_different_trees_reach_capacity_independently() -> None:
     with _temp_dir() as td:
         tmp = Path(td)
         tree_a = tmp / "tree-a"
@@ -1293,14 +1222,14 @@ def test_concurrent_dispatches_into_different_trees_both_run() -> None:
             "import time\n"
             f"Path({str(marker_a)!r}).write_text('a', encoding='utf-8')\n"
             "time.sleep(0.3)\n"
-            "print('COMPLETE: tree-a — wrote', flush=True)\n"
+            "print('COMPLETE: diff-a — wrote', flush=True)\n"
         )
         writer_b = (
             "from pathlib import Path\n"
             "import time\n"
             f"Path({str(marker_b)!r}).write_text('b', encoding='utf-8')\n"
             "time.sleep(0.3)\n"
-            "print('COMPLETE: tree-b — wrote', flush=True)\n"
+            "print('COMPLETE: diff-b — wrote', flush=True)\n"
         )
         pa = _popen(
             _dispatch_cmd(tmp, tree_a, "diff-a", writer_a, foreground=True),
@@ -1319,52 +1248,14 @@ def test_concurrent_dispatches_into_different_trees_both_run() -> None:
         assert 64 not in {pa.returncode, pb.returncode}, (
             pa.returncode, pb.returncode, err_a[-400:], err_b[-400:]
         )
-        assert marker_a.exists() and marker_b.exists(), (out_a[-400:], out_b[-400:])
-        # Occupancy must not serialize distinct trees: both writers launched.
-        assert "DISPATCH-START" in out_a and "DISPATCH-START" in out_b, (out_a, out_b)
-
-
-def test_concurrent_submit_does_not_dual_queue() -> None:
-    with _temp_dir() as td:
-        tmp = Path(td)
-        tree = tmp / "tree"
-        tree.mkdir()
-        env = _env(tmp)
-        cmd_a = _dispatch_cmd(
-            tmp,
-            tree,
-            "sub-a",
-            _quick_writer("sub-a"),
-            extra=["--submit", "--no-drain-on-submit"],
+        assert sorted((pa.returncode, pb.returncode)) == [0, 2], (
+            pa.returncode, pb.returncode, out_a[-400:], out_b[-400:]
         )
-        cmd_b = _dispatch_cmd(
-            tmp,
-            tree,
-            "sub-b",
-            _quick_writer("sub-b"),
-            extra=["--submit", "--no-drain-on-submit"],
-        )
-        pa = _popen(cmd_a, env)
-        pb = _popen(cmd_b, env)
-        try:
-            out_a, err_a = _communicate(pa)
-            out_b, err_b = _communicate(pb)
-        finally:
-            _reap(pa)
-            _reap(pb)
-        queued = [
-            did
-            for did in ("sub-a", "sub-b")
-            if _ledger_record(tmp, did).get("state") == "queued"
-        ]
-        assert len(queued) == 1, (
-            queued,
-            pa.returncode,
-            pb.returncode,
-            err_a[-400:],
-            err_b[-400:],
-        )
-        assert 64 in {pa.returncode, pb.returncode}, (pa.returncode, pb.returncode, err_a, err_b)
+        assert sum((marker_a.exists(), marker_b.exists())) == 1, (out_a[-400:], out_b[-400:])
+        blocked_out = out_a if pa.returncode == 2 else out_b
+        blocked_err = err_a if pa.returncode == 2 else err_b
+        assert "DISPATCH-BLOCKED" in blocked_out, blocked_out
+        assert "already owned" not in blocked_err, blocked_err
 
 
 def test_declared_read_only_raw_incumbent_occupies_the_tree() -> None:
@@ -1595,11 +1486,10 @@ def test_concurrent_four_writers_are_refused_on_every_trial() -> None:
 
 
 if __name__ == "__main__":
-    test_second_writer_refused_naming_incumbent_then_override_launches()
+    test_second_writer_refused_then_override_reaches_capacity_gate()
     test_declared_read_only_raw_worker_is_refused_into_occupied_worktree()
     test_enforced_read_only_reviewer_skips_occupancy()
     test_terminal_incumbent_vacates_the_tree()
-    test_queued_incumbent_owns_tree_before_any_worker_spawns()
     test_unreadable_ledger_record_is_unknown_not_unoccupied()
     test_unreadable_ledger_dir_is_unknown_not_unoccupied()
     test_genuine_duplicate_dispatch_id_is_still_refused()
@@ -1614,7 +1504,6 @@ if __name__ == "__main__":
     test_cwd_after_double_dash_in_argv_is_path_evidence()
     test_live_cwdless_matching_project_root_second_writer_is_refused()
     test_synthetic_queued_record_with_target_cwd_still_blocks()
-    test_submit_into_occupied_tree_is_refused()
     test_preset_bash_writer_refused_into_occupied_worktree()
     test_acp_writer_refused_into_occupied_worktree()
     test_live_watcher_stopped_incumbent_still_occupies()
@@ -1626,10 +1515,9 @@ if __name__ == "__main__":
     test_enforced_read_only_incumbent_does_not_block_a_writer()
     test_concurrent_second_writer_is_refused_on_every_trial()
     test_worker_inherits_occupancy_lock_fd()
-    test_sigkill_of_worker_releases_occupancy_lock()
+    test_sigkill_releases_occupancy_before_capacity_lease_cleanup()
     test_occupancy_lock_fd_stays_out_of_sidecar_fd_tables()
-    test_concurrent_dispatches_into_different_trees_both_run()
-    test_concurrent_submit_does_not_dual_queue()
+    test_concurrent_different_trees_reach_capacity_independently()
     test_concurrent_three_writers_are_refused_on_every_trial()
     test_concurrent_four_writers_are_refused_on_every_trial()
     print("PASS: test_dispatch_worktree_occupancy")

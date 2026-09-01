@@ -188,14 +188,16 @@ Full detail + the drainer daemon + the incident writeup: `protocols/dispatch-dan
 read/derive from the store only. `next` prints the frontier; it does NOT dispatch it.
 
 **⚠ DISPATCHES WORKERS (spawns processes, leases capacity, costs money, may mutate a
-worktree):** `dispatch-frontier` (legacy alias `pipe`) fans out the WHOLE frontier as
-one worker per item — it is NOT a drainer, needs `--autodispatch-confirm`, and runs in
-the shared project root with the raw prompt (no mandate). `/goal-flight execute` and
-`goalflight_dispatch.py` also spawn workers — dispatcher default is a detached launch; `--submit` writes a durable queue entry AND runs one immediate drain pass by default (`--no-drain-on-submit` for queue-only).
+worktree):** `/goal-flight execute` and `goalflight_dispatch.py`. The dispatcher
+launches one worker immediately in detached mode, waits for the lane's capacity
+window, then writes `blocked_capacity`, prints `DISPATCH-BLOCKED`, and exits nonzero
+if capacity remains unavailable. Dispatch frontier items individually; there is no
+bulk fan-out command.
 
-**Always-on drainer:** the `com.goalflight.drain` launchd daemon runs `goalflight_dispatch.py
-drain --json` every ~60s and LAUNCHES anything queued — queuing is not free, and the
-ledger/queue are shared across projects (identify origin by `project_root`).
+**Backlog drainer:** the `com.goalflight.drain` launchd daemon runs
+`goalflight_dispatch.py drain --json` every ~60s only to finish queue entries created
+before direct-only dispatch. The ledger/queue are shared across projects (identify
+origin by `project_root`).
 `drain --queue-dir <path>` scopes to envelopes already in that directory (it does
 not restore ledger orphans into a private dir). Launch one id with
 `drain --dispatch-id <id>`.
@@ -400,27 +402,17 @@ abandoned tree, and "clean and merged" alone will delete live work.
 python3 <skill-root>/scripts/goalflight_dispatch.py resume <dispatch_id> --prompt-file <brief> --cwd <worktree>
 ```
 
-**Reach for this FIRST whenever a dispatch dies for a reason that is not about
-its work** — `transient_throttle`, `quota_exhausted`, a killed process, a
-sandbox `BLOCKED:` after the work was done. Resume continues the worker's
-recorded session, so its accumulated context survives; a fresh dispatch throws
-that away and re-reads everything.
+A dead worker is not automatically a lost worker: resume when its accumulated context outvalues a clean read (quota death mid-task, partial edits only its author understands), redispatch when the premise moved (fix rounds, steers, reviews — a reviewer must never resume the implementer). See `protocols/dispatch-resume.md`.
 
 **Before deciding, look at the worktree** — `git -C <worktree> status --short`.
 A throttled worker very often left uncommitted work that is complete or nearly
 so. Discarding it is the expensive mistake, and a clean-looking worktree is NOT
 proof the worker did nothing: it may simply not have reached its first commit.
 
-- **Resume** when accumulated context outvalues a clean read: quota/throttle
-  death mid-task, partial edits only its author understands, a long
-  investigation whose findings are not yet written down.
-- **Redispatch** when the premise moved: fix rounds, steers, reviews — and **a
-  reviewer must never resume the implementer.**
-- **Never do both.** Two workers in one worktree is a known incident shape. If a
+- **Never resume and redispatch.** Two workers in one worktree is a known incident shape. If a
   replacement is already queued for that worktree, do not also resume.
-
-See `protocols/dispatch-resume.md`.
-Dispatch defaults detached; `--foreground` only for sync scripts/tests. Queue: `--submit --drain-on-submit`.
+Dispatch defaults detached; `--foreground` only for sync scripts/tests. Capacity
+refusal is visible and nonzero. `drain` exists only for the pre-existing backlog.
 Do not hand-iterate (>~3 edit/test cycles) what a goal-loop should converge.
 
 Controller entry auto-claims without stealing a live different lease. Prefer one persistent `goalflight_messages.py supervise` monitor that owns the stream, backup doorbell pool, and watchdog and multiplexes them into a single stdout feed, re-arming children itself. By default it replaces each stream keepalive plus already-materialized advisory frontier with one actionable `kind=next` record and suppresses a verbatim-identical payload until the 15-minute floor (content change still wakes immediately): only a freshly empty projection says `Nothing pending`; unavailable or not-yet-observed state retains `goal-flight next`. Default terse mode emits no coverage record and suppresses `live` / `target`; startup writes `{"type":"probe","reason":"stdout-peer-liveness"}`. `--chatty` wires both the raw-forwarding `chatty` control and the distinct `emit_depth` control; `--debug` restores per-tick heartbeat records only. Arm it with **no timeout** for the session life. Never set, tune, or reason about a timeout: a bounded monitor is killed outside the supervisor (no `type=stop`; controller goes deaf without a diagnostic). On Claude Code use `persistent: true` (`timeout_ms` inert; a host-required value is a placeholder, never a knob). In the decomposed fallback, only after supervisor absence is proven, arm one generation-bound `goalflight_messages.py follow --project-root "$PWD" --controller-label <label> --lease-nonce <nonce>` through the host's persistent monitor, never shell `&`; then arm two tracked `listen --listener-slots 2 --report-pending` backup doorbells and one separately tracked `listen --watch-follow` watchdog. The watchdog holds its own generation lock, never consumes a delivery slot, reads durable record age, and treats three missed heartbeat intervals as channel death; the backup witnesses a missing watchdog lock, but all-tracked-task death remains unwitnessed. In the decomposed unsupervised path, `listener-dead` and `watchdog-dead` records carry the exact component re-arm command. Under `supervise`, they keep the reason but omit the component action; recovery is a supervisor restart. Persistent coverage is the shared four-component `live/4` fact and is detectable, not reap-proof. On codex, grok, cursor, opencode, or any host without such a monitor, retain the portable pool of four `listen --report-pending` calls; on each ring (exit 0), process reported or authoritative mail, cursor-CAS settled server-known positions, then restore depth. Exit 5 is settled did-not-arm (dead or mismatched lease nonce): do not treat it as a ring and do not re-arm that nonce. Exit 2 is retryable journal unreadability, not a dead nonce. Background fixed-id `goalflight_status.py --wait <ids>` only for an unclaimed join; exit 3 is mail, not completion. Timers cover non-notifiable external state, never worker completion. Full arming and JSON-line contracts: `protocols/controller-mail.md`.

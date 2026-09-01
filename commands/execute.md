@@ -188,11 +188,10 @@ Canonical direct dispatch is background:
 python3 <skill-root>/scripts/goalflight_dispatch.py --agent <ready-agent> --prompt-file p.md --cwd .
 ```
 
-For durable queue launch, submit and drain one non-blocking pass:
-
-```bash
-python3 <skill-root>/scripts/goalflight_dispatch.py --submit --drain-on-submit --agent <ready-agent> --prompt-file p.md --cwd .
-```
+Each invocation launches immediately and waits for its lane's capacity window. If
+capacity remains unavailable it writes `blocked_capacity`, prints
+`DISPATCH-BLOCKED`, and exits nonzero. Dispatch frontier items individually; do not
+create new queue entries. `drain` remains only to finish the pre-existing backlog.
 
 Use `--foreground` only for synchronous scripts/tests that need the worker exit
 code:

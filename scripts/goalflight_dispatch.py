@@ -26,9 +26,6 @@ never spell them out (and cannot fat-finger `--dangerously-bypass`). Paths and a
 dispatch id are auto-derived under the state dir; override with --tail /
 --status-json / --dispatch-id if you want.
 
-Durable queue path:
-    python3 goalflight_dispatch.py --submit --drain-on-submit --agent codex --prompt-file p.md --cwd .
-
 Escape hatch (any worker): pass the raw command after `--`:
     python3 goalflight_dispatch.py --agent custom --tail t --status-json s -- <cmd...>
 
@@ -2952,11 +2949,8 @@ def _refuse_launch_blocked_by_completion_authority(args) -> None:
     drain used to spawn without asking ``_entry_completion_authority``, whose
     production callers were restore / reconcile / terminal-commit only.
 
-    ``--submit`` is not a spawn: occupancy-forced may still queue into an
-    occupied tree. Drain consults this gate before the child runs.
+    Drain consults this gate before the child runs.
     """
-    if getattr(args, "submit", False):
-        return
     if not getattr(args, "task_ids", None):
         return
     decision = _entry_completion_authority(_launch_authority_entry(args))
@@ -3405,9 +3399,8 @@ def _bind_worktree_occupancy_lock(args, lock) -> None:
 def _release_worktree_occupancy_lock(args) -> None:
     """Drop this process's occupancy fd and the env name that pointed at it.
 
-    Submit holds the kernel lock only while the submit process is writing the
-    queue row. Leaving ``GOALFLIGHT_OCCUPANCY_LOCK_FD`` set after that fd is
-    closed makes the next in-process launch treat occupancy as unknown.
+    Leaving ``GOALFLIGHT_OCCUPANCY_LOCK_FD`` set after its fd is closed makes
+    the next in-process launch treat occupancy as unknown.
     """
     lock = getattr(args, "_worktree_occupancy_lock", None)
     fd: int | None = None
@@ -3499,12 +3492,6 @@ def _prepare_attempt_worktree_occupancy(args) -> str | None:
     """
     if _occupancy_exempt_read_only(args):
         return None
-    if getattr(args, "submit", False) and _requested_worktree_base(args):
-        # A queued --worktree job does not have a seat yet. Occupying --cwd
-        # (the project root) would serialize every pooled submit onto one
-        # tree; drain binds the seat and then occupies that path.
-        return None
-
     occupied, unknown, occupied_state = _worktree_incumbent_reason(args)
     lock = None
     lock_busy = None
@@ -3524,8 +3511,8 @@ def _prepare_attempt_worktree_occupancy(args) -> str | None:
         except goalflight_worktree_pool.WorktreePathLockBusy as exc:
             own = str(getattr(args, "dispatch_id", None) or "")
             if own and getattr(exc, "occupant_id", None) == own:
-                # Same dispatch already occupies the tree (duplicate submit,
-                # opportunistic drain). Not a second writer.
+                # Same dispatch already occupies the tree (duplicate replay or
+                # backlog drain). Not a second writer.
                 return None
             lock_busy = str(exc)
         except goalflight_worktree_pool.WorktreePathLockUnknown as exc:
@@ -5772,16 +5759,7 @@ _CAPACITY_WAIT_POLL_S = goalflight_capacity.CAPACITY_WAIT_POLL_S
 
 
 def _capacity_wait_seconds(args) -> float:
-    """Resolve the inline acquire budget before durable queue fallback."""
-    if (
-        not getattr(args, "foreground", False)
-        and getattr(args, "capacity_wait_s", None) is None
-        and "GOALFLIGHT_CAPACITY_WAIT_S" not in os.environ
-    ):
-        # Detached work is durable after a capacity refusal, so keeping its
-        # launcher alive for the lane default only delays the queue handoff.
-        # Explicit CLI/env budgets still opt into inline polling.
-        return 0.0
+    """Resolve the inline acquire budget from CLI, env, or lane default."""
     return goalflight_capacity.resolve_capacity_wait_s(
         lane=getattr(args, "priority", None) or "normal",
         wait_s=getattr(args, "capacity_wait_s", None),
@@ -5789,21 +5767,14 @@ def _capacity_wait_seconds(args) -> float:
     )
 
 
-def _detached_capacity_queue_eligible(args) -> bool:
-    """Whether this launcher may hand a capacity refusal to the durable queue."""
-    return bool(
-        not goalflight_compat.is_windows()
-        and not getattr(args, "from_queue", False)
-        and not getattr(args, "foreground", False)
-    )
-
-
 def _capacity_refusal_attempt_stays_prepared(args) -> bool:
     """Whether a durable carrier owns retry while this attempt stays PREPARED."""
-    if goalflight_compat.is_windows() or getattr(args, "foreground", False):
+    if (
+        goalflight_compat.is_windows()
+        or getattr(args, "foreground", False)
+        or not getattr(args, "from_queue", False)
+    ):
         return False
-    if not getattr(args, "from_queue", False):
-        return True
     return bool(
         getattr(args, "queue_launch_token", None)
         and getattr(args, "queue_claim_path", None)
@@ -5815,13 +5786,6 @@ def _is_capacity_refusal(payload: dict | None) -> bool:
         return False
     reason = payload.get("reason")
     return not isinstance(reason, dict) or reason.get("reason") != "wait_interrupted"
-
-
-def _queue_detached_capacity_refusal(args, payload: dict | None, *, base: Path) -> bool:
-    """Apply the one durable fallback shared by bash and ACP launchers."""
-    if not _detached_capacity_queue_eligible(args) or not _is_capacity_refusal(payload):
-        return False
-    return _submit_dispatch(args, _raw_worker_args(args), base=base) == 0
 
 
 def _resolved_engine_session_id(args) -> str | None:
@@ -6278,99 +6242,6 @@ def _attempt_claiming_worker_argv(
     return worker_argv, True
 
 
-def _record_queued_ledger_fast(args, *, project_root: Path, prompt_path: str | None, status_json: Path, tail: Path) -> None:
-    dispatch_id = args.dispatch_id
-    now = goalflight_ledger.utc_now()
-    record = {
-        "schema": goalflight_ledger.SCHEMA,
-        "dispatch_id": dispatch_id,
-        "prompt_id": None,
-        "prompt_path": prompt_path,
-        "prompt_sha256": goalflight_ledger.sha256_file(prompt_path),
-        "agent": args.agent,
-        "engine": _account_engine(args.agent) or args.agent,
-        "shape": args.shape,
-        "account": args.account or "default",
-        "transport": "dispatch",
-        "project_root": str(project_root),
-        "controller_pid": _controller_pid(args),
-        "controller_session_id": _controller_session_id(args),
-        "controller_label": _controller_label(args),
-        "controller_identity": None,
-        "worker_pid": None,
-        "worker_identity": None,
-        "worker_pgid": None,
-        "acp_session_id": None,
-        "logical_session_id": dispatch_id,
-        "lease_id": None,
-        "remote_lease_id": None,
-        "stdout_path": str(tail),
-        "stderr_path": None,
-        "status_path": str(status_json),
-        "os_sandbox": _os_sandbox_posture(args, worker_pid=None),
-        "worker_cwd": str(_worker_cwd(args)),
-        "dispatch_argv": _canonical_replay_argv(
-            args,
-            _raw_worker_args(args) if getattr(args, "worker", None) is not None else [],
-            tail=tail,
-            status_json=status_json,
-        ),
-        "state": "queued",
-        "terminal_state": goalflight_ledger.terminal_state_for("queued"),
-        "started_at": now,
-        "hostname": socket.gethostname(),
-    }
-    record.update(_prelaunch_status_metadata(args))
-    record["schema"] = goalflight_ledger.SCHEMA
-    task_ids = list(getattr(args, "task_ids", []) or [])
-    if task_ids:
-        record["task_ids"] = task_ids
-    if getattr(args, "launch_detached", False):
-        record["detached"] = True
-    if getattr(args, "queue_launch_token", None):
-        record["queue_launch_token"] = args.queue_launch_token
-    with goalflight_ledger.StateLock():
-        path = goalflight_ledger.record_path(dispatch_id)
-        if path.exists():
-            try:
-                existing = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                existing = {}
-            if existing.get("started_at"):
-                record["started_at"] = existing["started_at"]
-        goalflight_ledger.write_record(record)
-    _export_dashboard_status_for_project(project_root)
-    _start_dashboard_refresh_for_project(project_root)
-
-
-def _record_queued_status(args, *, project_root: Path, status_json: Path, tail: Path, queue_path: Path) -> None:
-    write_status(
-        status_json,
-        {
-            **_prelaunch_status_metadata(args),
-            "state": "queued",
-            "reason": "dispatch_queue",
-            "queue_path": str(queue_path),
-            "project_root": str(project_root),
-            "worker_cwd": str(_worker_cwd(args)),
-            "worker_pid": None,
-            "worker_alive": False,
-            "tail_path": str(tail),
-            "os_sandbox": _os_sandbox_posture(args, worker_pid=None),
-            "updated_at": int(time.time()),
-        },
-    )
-    _record_queued_ledger_fast(
-        args,
-        project_root=project_root,
-        prompt_path=str(Path(args.prompt_file).expanduser()) if args.prompt_file else None,
-        status_json=status_json,
-        tail=tail,
-    )
-    _export_dashboard_status_for_project(project_root)
-    _start_dashboard_refresh_for_project(project_root)
-
-
 DISPATCH_REFUSED_PREFIX = "DISPATCH-REFUSED "
 PROVEN_PRE_WORKER_REFUSAL_PREFIX = "DISPATCH-PRE-WORKER-REFUSED "
 
@@ -6567,9 +6438,7 @@ def _record_unsupported_sandbox_rejection(
     try:
         _refuse_reused_dispatch_id_for_launch(
             args.dispatch_id,
-            allow_queued=bool(
-                getattr(args, "from_queue", False) or getattr(args, "submit", False)
-            ),
+            allow_queued=bool(getattr(args, "from_queue", False)),
         )
         tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
         status_json = (
@@ -6734,10 +6603,7 @@ LAUNCH_ARGV_CLASS: dict[str, str] = {
     "--dispatch-id": "replace",
     "--tail": "replace",
     "--status-json": "replace",
-    "--submit": "strip",
     "--foreground": "strip",
-    "--drain-on-submit": "strip",
-    "--no-drain-on-submit": "strip",
     "--takeover": "strip",
     "--acp-detached-child": "strip",
     "--from-queue": "inject",
@@ -6993,36 +6859,6 @@ def _existing_queue_entry_paths(queue_path: Path) -> list[Path]:
     return paths
 
 
-def _queue_entry_counts_as_active(path: Path, entry: dict) -> bool:
-    if path.name.endswith(".failed"):
-        return False
-    state = entry.get("state")
-    return state in (None, "queued", "claimed")
-
-
-def _cleanup_partial_submit(queue_path: Path, status_json: Path) -> None:
-    prompt_sidecar = _acp_watcher_prompt_path(status_json)
-    with contextlib.suppress(OSError):
-        queue_path.unlink()
-    with contextlib.suppress(OSError):
-        # Retire the sidecar first: a crash may leave status + sidecar paired,
-        # but must not leave prompt material orphaned after status disappears.
-        prompt_sidecar.unlink()
-    with contextlib.suppress(OSError):
-        status_json.unlink()
-    if prompt_sidecar.exists() and not status_json.exists():
-        # Re-pair a pre-existing orphan, or retry a transient first unlink.
-        with contextlib.suppress(OSError):
-            prompt_sidecar.unlink()
-    with contextlib.suppress(OSError):
-        status_json.with_suffix(status_json.suffix + ".tmp").unlink()
-    # glob-empty here only skips leftover ``*.tmp.*`` cleanup; it does not
-    # delete live envelopes. Unreadable parent leaves tmps in place.
-    for tmp in queue_path.parent.glob(f"{queue_path.name}.tmp.*"):
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-
-
 _TEST_RELEASE_TIMEOUT_S = 30.0
 
 
@@ -7064,60 +6900,6 @@ def _test_wait_for_release(
     return True
 
 
-def _test_submit_status_delay() -> None:
-    if _test_wait_for_release(
-        ready_env="GOALFLIGHT_TEST_SUBMIT_STATUS_READY_FILE",
-        release_env="GOALFLIGHT_TEST_SUBMIT_STATUS_RELEASE_FILE",
-        label="submit status",
-    ):
-        return
-    raw = goalflight_compat.allowed_env_override(
-        "GOALFLIGHT_TEST_SUBMIT_STATUS_DELAY_S",
-        "",
-        test_mode=True,
-    )
-    if not raw:
-        return
-    try:
-        delay_s = float(raw)
-    except ValueError:
-        return
-    if delay_s > 0:
-        time.sleep(delay_s)
-
-
-def _drain_on_submit(args, queue_path: Path) -> None:
-    if not getattr(args, "drain_on_submit", True):
-        return
-    drain_args = argparse.Namespace(
-        queue_dir=str(queue_path.parent),
-        capacity_wait_s=0.0,
-        claim_stale_s=QUEUE_CLAIM_STALE_S,
-        limit=1,
-    )
-    try:
-        # Fold other dispatches' no-op claim alerts into one summary line. A
-        # submit walks the whole shared queue, and a wall of rows the caller
-        # cannot act on is what makes this output easy to ignore.
-        with _claim_alert_focus(str(getattr(args, "dispatch_id", "") or "")):
-            payload = _drain_queue_once(drain_args)
-    except Exception as exc:
-        print(
-            "goalflight_dispatch: drain-on-submit warning: "
-            f"{type(exc).__name__}: {exc}; queued request remains durable (recoverable on a later drain pass)",
-            file=sys.stderr,
-        )
-        return
-    if int(payload.get("failed") or 0) > 0:
-        print(
-            "goalflight_dispatch: drain-on-submit warning: "
-            f"{payload.get('failed')} drain failure(s); queued request remains durable (recoverable on a later drain pass)",
-            file=sys.stderr,
-        )
-    _report_why_this_entry_did_not_launch(args, payload)
-    _warn_if_stranded_without_drainer(queue_path)
-
-
 # Reasons that mean the drain CONFIRMED a launch even though the entry's state
 # is not "launched".
 #
@@ -7155,134 +6937,6 @@ def _drain_decision_detail(dispatch_id: str, decision: dict) -> dict:
     }
     detail.update(_completion_authority_park_fields(reason))
     return detail
-
-
-def _drain_detail_is_a_confirmed_launch(entry: dict) -> bool:
-    """True when THIS launch attempt is confirmed running.
-
-    Every shape admitted here is bound to the current attempt by a
-    token-matched ledger record, which is what makes suppressing its message
-    safe.
-
-    SUCCESS TERMINAL STATES ARE DELIBERATELY EXCLUDED, and the reason is worth
-    keeping. A revision of this function also silenced `complete`/`released`,
-    on the grounds that several detail sites copy a completion decision's
-    `state` verbatim and a finished dispatch should not be called "not
-    launched". That was unsafe: dispatch ids are reusable once terminal, and
-    completion authority resolves a terminal record by dispatch id WITHOUT
-    comparing `queue_launch_token`, so a `complete` from an EARLIER attempt can
-    be attached to a new one. Suppressing it would turn a pre-spawn refusal of
-    the current attempt into total silence — trading a misleading message for a
-    vanished failure, which is the worse direction.
-
-    The residual is known and NOT merely cosmetic, so do not "tidy" it by
-    suppressing terminal states here. When a reused id refuses before its new
-    ledger row is written, stale completion authority can restore-and-unlink
-    the CURRENT carrier while the earlier terminal record still reads as
-    authoritative. Printing "not launched: existing_terminal_record" is then
-    the only surviving signal that something is wrong; silencing it would leave
-    an unattended controller believing the current work was resolved. The real
-    fix is to bind completion authority to `queue_launch_token` — a separate
-    change with its own contract, since the recovery tests already require a
-    token match before treating a terminal record as current evidence.
-    """
-    return (
-        str(entry.get("state") or "") == "launched"
-        or str(entry.get("reason") or "") in _DRAIN_CONFIRMED_LAUNCH_REASONS
-    )
-
-
-def _report_why_this_entry_did_not_launch(args, payload: dict) -> None:
-    """Say WHY this dispatch is still queued, not merely that it is.
-
-    The drain already computes a per-entry reason and returns it; printing only a
-    failure count throws that away, leaving a controller unable to tell a
-    capacity wait from a permanently parked entry without importing this module
-    and calling the drain by hand. Observed 2026-08-24: three dispatches sat at
-    `queued` behind `active_queue_carrier` — claim carriers whose claimant pids
-    were all dead — and the submit output said only "1 drain failure(s)".
-
-    Only this dispatch's own reason is printed. Other entries' reasons belong to
-    whoever submitted them, and a wall of them is what makes the existing
-    CLAIM-RECOVERY-ALERT output easy to ignore.
-    """
-    dispatch_id = str(getattr(args, "dispatch_id", "") or "").strip()
-    if not dispatch_id:
-        return
-    # The per-entry list is `details`. An earlier version of this read a
-    # `skipped` key that the payload has never contained, so it reported nothing
-    # and the diagnostic was inert while looking present — worse than absent,
-    # because silence then reads as "no reason to give". Its tests passed only
-    # because they built the payload from the same wrong assumption.
-    for entry in payload.get("details") or []:
-        if str(entry.get("dispatch_id") or "") != dispatch_id:
-            continue
-        if _drain_detail_is_a_confirmed_launch(entry):
-            # This entry LAUNCHED. Saying "not launched" here states the
-            # opposite of what happened, which is worse than the silence this
-            # function was written to replace: a controller reads it as a
-            # refusal and goes looking for a blockage that does not exist.
-            # Observed 2026-08-24 — a probe dispatch printed "not launched:
-            # unspecified" and was running as pid 83652 at the time.
-            return
-        reason = str(entry.get("reason") or "unspecified")
-        if reason == "not_before":
-            detail = "; ".join(
-                str(part)
-                for part in (entry.get("not_before"), entry.get("headroom"))
-                if part
-            )
-        else:
-            detail = (
-                entry.get("process_evidence")
-                or entry.get("not_before")
-                or entry.get("detail")
-                or entry.get("unpark_event")
-                or entry.get("park_exit_state")
-                or ""
-            )
-        suffix = f" [{detail}]" if detail else ""
-        print(
-            f"goalflight_dispatch: {dispatch_id} not launched: {reason}{suffix}",
-            file=sys.stderr,
-        )
-        return
-
-
-def _warn_if_stranded_without_drainer(queue_path: Path) -> None:
-    """Warn when THIS request is still queued and nothing will launch it.
-
-    Ordering is load-bearing: this runs AFTER the entry is lodged and after the
-    drain-on-submit pass. Checking earlier is useless — on an idle queue the
-    depth is 0, so a queue-depth guard suppresses exactly the warning that
-    matters. Evaluated here, `queue_path.exists()` is a precise "my entry is
-    still queued" signal: a successful drain claims the file (renames it), so a
-    surviving file means nothing launched it.
-
-    Field evidence (2026-07-20): the launchd drainer was absent, three dispatches
-    parked silently, and the pull-only status WARN never reached the controller —
-    who was standing right here with the context to fix it.
-    """
-    if not queue_path.exists():
-        return  # drain claimed it — nothing stranded
-    try:
-        import goalflight_status
-
-        if goalflight_status._drainer_live():
-            return  # a drainer exists; it will pick this up on its next pass
-    except Exception:
-        return  # never let an advisory check break a dispatch
-    root = _skill_root()
-    dispatch_py = root / "scripts" / "goalflight_dispatch.py"
-    drainer_sh = root / "scripts" / "install-drainer.sh"
-    print(
-        "goalflight_dispatch: WARNING — request is STILL QUEUED after the "
-        "drain-on-submit pass and no live drainer was detected, so nothing will "
-        "launch it. (A peer drainer may still claim it momentarily.) Remedy:\n"
-        f"  python3 {shlex.quote(str(dispatch_py))} drain --json   # launch it now\n"
-        f"  bash {shlex.quote(str(drainer_sh))}                       # restore the standing drainer",
-        file=sys.stderr,
-    )
 
 
 def _queue_launch_token(entry: dict | None = None) -> str:
@@ -7949,116 +7603,12 @@ def _persist_orphan_first_seen(entry: dict, *, now_iso: str | None = None) -> st
     return now_iso or goalflight_ledger.utc_now()
 
 
-# Which dispatch this process is submitting, while a drain pass runs.
-#
-# A drain walks the WHOLE shared queue, so it meets claim carriers belonging to
-# every project on the box. Printing a row for each one buries the caller's own
-# dispatch under a wall it cannot act on. That is the same reasoning already
-# applied to per-entry drain reasons in `_report_why_this_entry_did_not_launch`:
-# other entries' reasons belong to whoever submitted them.
-#
-# What still prints unconditionally: any alert that CHANGED state (quarantine),
-# whoever owns it. Silently losing a state mutation is worse than a noisy line.
-# Only pure `preserve*` no-ops -- where the drain looked, touched nothing, and
-# said so -- are foldable, and only for dispatches that are not ours.
-_ALERT_FOCUS: dict | None = None
-
-# Reasons the drain emits after looking at a carrier and changing NOTHING.
-# Only these fold; anything unlisted prints, so a new alert is loud by default.
-#
-# This is an explicit allowlist keyed on REASON, not a prefix match on the
-# action string. An earlier version tested `action.startswith("preserve")`,
-# which is a lexical proxy for a structural fact. It was wrong: both
-# `identity_indeterminate` and `launched_carrier_cleanup_pending` are spelled
-# action "preserve", but the latter is emitted after a launch ATTEMPT -- the
-# carrier is untouched while a worker was actually started. Folding that would
-# hide a launch. How an alert is spelled is not evidence of what the code did.
-_FOLDABLE_CLAIM_ALERT_REASONS = frozenset(
-    {
-        "identity_indeterminate",
-        "claim_carrier_missing_unlinked",
-    }
-)
-# How many dispatch ids to keep per folded reason, so the summary stays
-# self-diagnosing without growing back into a wall.
-_FOLD_SAMPLE_LIMIT = 3
-
-
 def _emit_claim_recovery_alert(payload: dict) -> None:
-    """Print a claim alert, or fold it into this drain pass's summary."""
-    focus = _ALERT_FOCUS
-    reason = str(payload.get("reason") or "")
-    foldable = reason in _FOLDABLE_CLAIM_ALERT_REASONS
-    own = focus is not None and str(payload.get("dispatch_id") or "") in focus["own"]
-    if focus is None or own or not foldable:
-        print(
-            "CLAIM-RECOVERY-ALERT " + json.dumps(payload, sort_keys=True),
-            file=sys.stderr,
-            flush=True,
-        )
-        return
-    key = reason or "unknown"
-    focus["folded"][key] = focus["folded"].get(key, 0) + 1
-    sample = focus["samples"].setdefault(key, [])
-    if len(sample) < _FOLD_SAMPLE_LIMIT:
-        sample.append(str(payload.get("dispatch_id") or "?"))
-
-
-@contextlib.contextmanager
-def _claim_alert_focus(dispatch_id: str):
-    """Fold foreign no-op claim alerts for the duration of one drain pass.
-
-    A no-focus caller (the drain daemon, or a unit test driving these helpers
-    directly) keeps the unfolded behaviour, so this only ever narrows what an
-    interactive submit prints.
-    """
-    global _ALERT_FOCUS
-    dispatch_id = str(dispatch_id or "").strip()
-    if not dispatch_id:
-        yield
-        return
-    if _ALERT_FOCUS is not None:
-        # An outer pass already owns the fold, and it keeps owning it: an inner
-        # exit publishing a partial summary would reset the counter the outer
-        # pass is still accumulating into. But the inner dispatch IS ours, so
-        # register it as own for the duration -- otherwise its own alerts fold
-        # as if they belonged to somebody else.
-        added = dispatch_id not in _ALERT_FOCUS["own"]
-        if added:
-            _ALERT_FOCUS["own"].add(dispatch_id)
-        try:
-            yield
-        finally:
-            if added and _ALERT_FOCUS is not None:
-                _ALERT_FOCUS["own"].discard(dispatch_id)
-        return
-    _ALERT_FOCUS = {"own": {dispatch_id}, "folded": {}, "samples": {}}
-    try:
-        yield
-    finally:
-        focus, _ALERT_FOCUS = _ALERT_FOCUS, None
-        folded = focus["folded"]
-        if folded:
-            print(
-                "CLAIM-RECOVERY-SUMMARY "
-                + json.dumps(
-                    {
-                        "folded": sum(folded.values()),
-                        "reasons": folded,
-                        # Bounded id samples, because the fold is otherwise
-                        # unrecoverable. Do NOT point the reader at
-                        # `drain --json` to see the rest: a drain CLAIMS queue
-                        # entries and can LAUNCH WORKERS, so it is not a
-                        # read-only diagnostic and would not reproduce this
-                        # pass anyway.
-                        "sample_ids": focus["samples"],
-                        "detail": "no-op claim alerts for other dispatches",
-                    },
-                    sort_keys=True,
-                ),
-                file=sys.stderr,
-                flush=True,
-            )
+    print(
+        "CLAIM-RECOVERY-ALERT " + json.dumps(payload, sort_keys=True),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _alert_identity_indeterminate(dispatch_id: str, *, where: str, reason: str) -> None:
@@ -8082,131 +7632,6 @@ def _alert_launched_carrier_pending(dispatch_id: str, *, where: str) -> None:
             "where": where,
         },
     )
-
-
-def _submit_dispatch(args, raw_argv: list[str], *, base: Path) -> int:
-    project_root = _project_root(args)
-    submit_base_sha = _git_head_for_cwd(project_root)
-    tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
-    status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
-    queue_path = _queue_entry_path(args.dispatch_id)
-    dispatch_argv = _canonical_replay_argv(args, raw_argv, tail=tail, status_json=status_json)
-    entry = {
-        "schema": DISPATCH_QUEUE_SCHEMA,
-        "state": "queued",
-        "dispatch_id": args.dispatch_id,
-        "agent": args.agent,
-        "shape": args.shape,
-        "project_root": str(project_root),
-        "process_cwd": str(Path.cwd().resolve()),
-        "worker_cwd": str(_worker_cwd(args)),
-        "created_at": goalflight_ledger.utc_now(),
-        "updated_at": goalflight_ledger.utc_now(),
-        "queue_path": str(queue_path),
-        "base_sha": submit_base_sha,
-        "dispatch_argv": dispatch_argv,
-        **({"task_ids": list(args.task_ids)} if getattr(args, "task_ids", None) else {}),
-        "request": {
-            "agent": args.agent,
-            "prompt_file": str(Path(args.prompt_file).expanduser()) if args.prompt_file else None,
-            "prompt": args.prompt,
-            "task_ids": list(getattr(args, "task_ids", []) or []),
-            "priority": args.priority,
-            "fast": bool(getattr(args, "fast", False)),
-            "dispatch_id": args.dispatch_id,
-            "cwd": str(_worker_cwd(args)),
-            "model": args.model,
-            "shape": args.shape,
-            "read_only": bool(args.read_only),
-            "os_sandbox": getattr(args, "os_sandbox", None),
-            "web_qa": bool(getattr(args, "web_qa", False)),
-            "base_sha": submit_base_sha,
-            "account": args.account,
-            "billing": args.billing,
-            "capacity_wait_s": args.capacity_wait_s,
-            "tail": str(tail),
-            "status_json": str(status_json),
-            "poll_secs": args.poll_secs,
-            "max_idle_secs": args.max_idle_secs,
-            "permission_mode": args.permission_mode,
-            "no_orientation": bool(getattr(args, "no_orientation", False)),
-            "controller_label": _controller_label(args),
-            "controller_beacon_pid": _controller_pid(args),
-            "unregistered_forced": bool(
-                getattr(args, "unregistered_forced", False)
-            ),
-            "raw_worker": raw_argv,
-        },
-    }
-    duplicate_active = False
-    try:
-        with _queue_mutation_lock(queue_path.parent):
-            existing_paths = _existing_queue_entry_paths(queue_path)
-            if existing_paths:
-                conflicts = []
-                matches = []
-                for existing_path in existing_paths:
-                    try:
-                        existing = json.loads(existing_path.read_text(encoding="utf-8"))
-                    except (OSError, json.JSONDecodeError) as exc:
-                        conflicts.append(f"{existing_path.name}:unreadable:{type(exc).__name__}")
-                        continue
-                    if (
-                        existing.get("dispatch_id") == args.dispatch_id
-                        and existing.get("dispatch_argv") == dispatch_argv
-                    ):
-                        if _queue_entry_counts_as_active(existing_path, existing):
-                            matches.append(existing_path)
-                    else:
-                        conflicts.append(existing_path.name)
-                if matches and not conflicts:
-                    duplicate_active = True
-                elif matches or conflicts:
-                    print(f"goalflight_dispatch: queued request already exists for {args.dispatch_id}", file=sys.stderr)
-                    return 64
-            if not duplicate_active:
-                _write_json_atomic(queue_path, entry)
-                _test_submit_status_delay()
-                try:
-                    _record_queued_status(
-                        args,
-                        project_root=project_root,
-                        status_json=status_json,
-                        tail=tail,
-                        queue_path=queue_path,
-                    )
-                except (OSError, RuntimeError):
-                    _cleanup_partial_submit(queue_path, status_json)
-                    raise
-    except (OSError, RuntimeError) as exc:
-        print(
-            f"goalflight_dispatch: submit failed for {args.dispatch_id}: "
-            f"{type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
-        return 1
-    if duplicate_active:
-        print(f"STATUS: queued already {args.dispatch_id}")
-        _release_worktree_occupancy_lock(args)
-        _drain_on_submit(args, queue_path)
-        return 0
-    print(
-        "DISPATCH-QUEUED "
-        + json.dumps(
-            {
-                "dispatch_id": args.dispatch_id,
-                "agent": args.agent,
-                "shape": args.shape,
-                "queue_path": str(queue_path),
-                "status_json": str(status_json),
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
-    _release_worktree_occupancy_lock(args)
-    _drain_on_submit(args, queue_path)
-    return 0
 
 
 def _attach_worker_to_lease(lease_id: str | None, worker_pid: int) -> None:
@@ -13478,7 +12903,8 @@ def _remote_drain_base_sha(entry: dict) -> str:
             return value
         raise _RemoteDrainBlocked(f"invalid remote drain base sha in {source}: {raw}", code="invalid_base_sha")
     raise _RemoteDrainBlocked(
-        "remote drain requires a queued submit-time base_sha; re-submit the entry from the intended base",
+        "remote drain requires the queued entry's original base_sha; repair or retire "
+        "the legacy envelope, then dispatch the work directly from the intended base",
         code="base_sha_unavailable",
     )
 
@@ -16455,9 +15881,9 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         dispatch_id=args.dispatch_id,
         task_ids=list(getattr(args, "task_ids", []) or []),
         priority=getattr(args, "priority", "normal"),
-        # ACP and bash use the same inline-wait policy. Detached launchers
-        # default to zero because the durable drainer owns retries; explicit
-        # CLI and environment budgets remain opt-in inline waits.
+        # ACP and bash use the same inline-wait policy, including lane defaults
+        # for detached launchers. Only a claimed backlog entry has a durable
+        # carrier that owns retry after a capacity refusal.
         capacity_wait_s=_capacity_wait_seconds(args),
         preserve_capacity_refusal_attempt=_capacity_refusal_attempt_stays_prepared(args),
         prompt_id=None,
@@ -16722,7 +16148,6 @@ def _run_acp_detached_launcher(
     env_remove: list[str],
     capacity_wait_s: float,
 ) -> int:
-    _mark_queue_claim_worker_spawn_intent(args)
     env = os.environ.copy()
     env.update(account_env)
     for key in env_remove:
@@ -16742,24 +16167,6 @@ def _run_acp_detached_launcher(
     # Worker inherited the occupancy fd. Drop this process's copy so a later
     # in-process launch does not see a closed descriptor as occupancy unknown.
     _release_worktree_occupancy_lock(args)
-    _mark_queue_claim_worker_spawned(args, child_pid)
-
-    def report_queued() -> None:
-        print(
-            "DISPATCH-QUEUED "
-            + json.dumps(
-                {
-                    "dispatch_id": args.dispatch_id,
-                    "agent": args.agent,
-                    "shape": "acp",
-                    "queue_path": str(_queue_entry_path(str(args.dispatch_id))),
-                    "status_json": str(status_json),
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
-
     wait_s = max(20.0, float(capacity_wait_s) + 20.0)
     deadline = time.time() + wait_s
     last_state = None
@@ -16773,6 +16180,13 @@ def _run_acp_detached_launcher(
                 and record.get("queue_launch_token")
                 == getattr(args, "queue_launch_token", None)
             ):
+                # The daemonized child is only the ACP launcher. Marking it as
+                # the worker would make a capacity-refused backlog claim look
+                # post-spawn and therefore unrestorable. Publish the actual
+                # ACP worker identity only after its token-matched ledger row
+                # confirms launch.
+                _mark_queue_claim_worker_spawn_intent(args)
+                _mark_queue_claim_worker_spawned(args, int(record["worker_pid"]))
                 if getattr(args, "background_default_notice", False):
                     _print_background_default_notice()
                 print(
@@ -16795,28 +16209,10 @@ def _run_acp_detached_launcher(
             with contextlib.suppress(OSError, json.JSONDecodeError):
                 status_payload = json.loads(status_json.read_text(encoding="utf-8"))
                 last_state = status_payload.get("state")
-                if (
-                    not forwarded_signals
-                    and last_state == "queued"
-                    and not getattr(args, "from_queue", False)
-                ):
-                    if getattr(args, "background_default_notice", False):
-                        _print_background_default_notice()
-                    report_queued()
-                    return 0
                 if str(last_state).startswith("blocked_capacity"):
-                    # A direct detached child may still be converting this
-                    # refusal into a durable queue entry. Only report terminal
-                    # refusal once that child exits.
                     if goalflight_compat.pid_alive(child_pid):
                         time.sleep(0.2)
                         continue
-                    if (
-                        not forwarded_signals
-                        and _queue_entry_path(str(args.dispatch_id)).exists()
-                    ):
-                        report_queued()
-                        return 0
                     print(
                         "DISPATCH-BLOCKED "
                         + json.dumps(
@@ -16852,7 +16248,6 @@ def _run_acp_detached_launcher(
 
 def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
     from goalflight_acp_run import (
-        _commit_prelaunch_terminal,
         acp_dispatch_exit_code,
         run_acp_dispatch,
     )
@@ -16936,14 +16331,6 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
     acp_remove = list(env_remove) + list(web_qa_remove)
     with _temporary_env(acp_env, remove=acp_remove):
         payload = asyncio.run(run_acp_dispatch(cfg))
-    if _detached_capacity_queue_eligible(args) and _is_capacity_refusal(payload):
-        if _queue_detached_capacity_refusal(args, payload, base=base):
-            return 0
-        # The ACP runner left this attempt PREPARED solely for the queue
-        # handoff. If that durable write fails, close the attempt instead of
-        # leaving an invisible prepared launch with no carrier.
-        _commit_prelaunch_terminal(payload, project_root=_project_root(args))
-        write_status(status_json, payload)
     worker_pid = payload.get("worker_pid")
     if worker_pid:
         _print_status_reminder(
@@ -17113,7 +16500,7 @@ def _validate_claude_auth_before_attempt(
 
 def _apply_fast_mode(args) -> None:
     """Normalize --fast after arg parsing: force the urgent lane (critical
-    priority -> skip the queue) for every engine/shape. Idempotent: runs again on
+    priority -> shortest default capacity wait) for every engine/shape. Idempotent: runs again on
     detached/queue replay; the note prints only on the user's initial invocation
     to avoid tail noise."""
     if not getattr(args, "fast", False):
@@ -17123,7 +16510,7 @@ def _apply_fast_mode(args) -> None:
     if not (getattr(args, "from_queue", False)
             or getattr(args, "launch_detached", False)
             or getattr(args, "acp_detached_child", False)):
-        print("FAST: urgent — forcing --priority critical to skip the queue", file=sys.stderr)
+        print("FAST: urgent — forcing --priority critical", file=sys.stderr)
 
 
 def build_worker(args, prompt_path, raw_argv: list[str]):
@@ -17407,7 +16794,7 @@ def _build_launch_parser() -> argparse.ArgumentParser:
                              "machine+pool slots for others); critical = fix dispatches (may borrow "
                              "beyond the operating cap, never past the RAM ceiling). Default normal.")
     parser.add_argument("--fast", action="store_true",
-                        help="Urgent: forces --priority critical (skip the queue) for a SINGLE urgent "
+                        help="Urgent: forces --priority critical for a SINGLE urgent "
                              "dispatch. NOTE: critical may borrow beyond the operating cap (never past "
                              "the RAM ceiling) — do NOT use across a wide fan-out, or every worker "
                              "borrows past the cap and starves normal/bulk work.")
@@ -17433,14 +16820,10 @@ def _build_launch_parser() -> argparse.ArgumentParser:
                         help="Do not auto-add the docs-private/rag/ORIENTATION.md pointer preamble.")
     parser.add_argument("--capacity-wait-s", type=float, default=None,
                         help="How long to poll inline for a capacity slot "
-                             "(re-attempts acquire every ~15s; sleep-excluding clock). Detached "
-                             "dispatches default to 0 and fall back to the durable queue; foreground "
-                             "defaults by lane: bulk 900 / normal 600 / critical 120. 0 = fail instantly. "
+                             "(re-attempts acquire every ~15s; sleep-excluding clock). Defaults "
+                             "by lane: bulk 900 / normal 600 / critical 120. 0 = fail instantly. "
                              "Env override: GOALFLIGHT_CAPACITY_WAIT_S.")
-    dispatch_mode = parser.add_mutually_exclusive_group()
-    dispatch_mode.add_argument("--submit", action="store_true",
-                               help="Write a durable dispatch request to the queue and exit without acquiring capacity.")
-    dispatch_mode.add_argument(
+    parser.add_argument(
         "--foreground",
         action="store_true",
         default=False,
@@ -17450,12 +16833,6 @@ def _build_launch_parser() -> argparse.ArgumentParser:
             "worker is launched and the dispatcher returns immediately."
         ),
     )
-    drain_submit = parser.add_mutually_exclusive_group()
-    drain_submit.add_argument("--drain-on-submit", dest="drain_on_submit", action="store_true",
-                              help="After --submit writes the durable request, run one non-blocking "
-                                   "drain pass for up to one queued entry (default).")
-    drain_submit.add_argument("--no-drain-on-submit", dest="drain_on_submit", action="store_false",
-                              help="With --submit, only write the durable request; wait for the scheduled drainer.")
     parser.add_argument("--account",
                         help="Which subscription account/profile to bill the worker to (shared remote "
                              "worker pools). Codex resolves to CODEX_HOME=~/.goal-flight/accounts/<name>/codex; "
@@ -17586,7 +16963,6 @@ def _build_launch_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("worker", nargs=argparse.REMAINDER,
                         help="Optional `-- <cmd...>` raw worker (overrides the preset)")
-    parser.set_defaults(drain_on_submit=True)
     return parser
 
 
@@ -17714,25 +17090,24 @@ def main(argv: list[str] | None = None) -> int:
                 )
             _refuse_reused_dispatch_id_for_launch(
                 args.dispatch_id,
-                allow_queued=args.from_queue or args.submit,
+                allow_queued=args.from_queue,
             )
-            if not getattr(args, "submit", False):
-                try:
-                    _bind_dispatch_worktree(args)
-                except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
-                    print(f"goalflight_dispatch: {e}", file=sys.stderr)
-                    print(
-                        "goalflight_dispatch: refusing to git worktree add; "
-                        "wait for a seat or raise GOALFLIGHT_WORKTREE_SEATS",
-                        file=sys.stderr,
-                    )
-                    return 2
-                except goalflight_worktree_pool.WorktreeSeatError as e:
-                    print(
-                        f"goalflight_dispatch: worktree seat error: {e}",
-                        file=sys.stderr,
-                    )
-                    return 1
+            try:
+                _bind_dispatch_worktree(args)
+            except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
+                print(f"goalflight_dispatch: {e}", file=sys.stderr)
+                print(
+                    "goalflight_dispatch: refusing to git worktree add; "
+                    "wait for a seat or raise GOALFLIGHT_WORKTREE_SEATS",
+                    file=sys.stderr,
+                )
+                return 2
+            except goalflight_worktree_pool.WorktreeSeatError as e:
+                print(
+                    f"goalflight_dispatch: worktree seat error: {e}",
+                    file=sys.stderr,
+                )
+                return 1
             occupancy_warning = _prepare_attempt_worktree_occupancy(args)
             if occupancy_warning is not None:
                 args.dispatch_warnings = [
@@ -17745,11 +17120,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not goalflight_compat.is_windows():
                 _validate_claude_auth_before_attempt(args, account_env)
-            if args.submit:
-                try:
-                    return _submit_dispatch(args, raw, base=base)
-                finally:
-                    _release_worktree_occupancy_lock(args)
             if (
                 not args.foreground
                 and not getattr(args, "launch_detached", False)
@@ -17817,16 +17187,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _refuse_reused_dispatch_id_for_launch(
             args.dispatch_id,
-            allow_queued=args.from_queue or args.submit,
+            allow_queued=args.from_queue,
         )
-        if not getattr(args, "submit", False):
-            _bind_dispatch_worktree(args)
+        _bind_dispatch_worktree(args)
         occupancy_warning = _prepare_attempt_worktree_occupancy(args)
         if occupancy_warning is not None:
             dispatch_warnings = [*dispatch_warnings, occupancy_warning]
         # Occupancy-forced is a worktree hatch. Same-task live siblings still
         # refuse here so a second direct launch cannot spawn just because the
-        # tree lock was waived. --submit is excluded: queuing is not a spawn.
+        # tree lock was waived.
         _refuse_launch_blocked_by_completion_authority(args)
     except goalflight_worktree_pool.WorktreeSeatUnavailable as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
@@ -17857,11 +17226,6 @@ def main(argv: list[str] | None = None) -> int:
     except DispatchUsageError as e:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64
-    if args.submit:
-        try:
-            return _submit_dispatch(args, raw, base=base)
-        finally:
-            _release_worktree_occupancy_lock(args)
     tail = Path(args.tail) if args.tail else base / f"{args.dispatch_id}.tail"
     status_json = Path(args.status_json) if args.status_json else base / f"{args.dispatch_id}.status.json"
 
@@ -17965,7 +17329,6 @@ def main(argv: list[str] | None = None) -> int:
     dispatch_started = time.time()
     background_default_notice = bool(
         not args.foreground
-        and not args.submit
         and not getattr(args, "from_queue", False)
         and not getattr(args, "launch_detached", False)
     )
@@ -17993,7 +17356,6 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     try:
-        assert not args.submit, "--submit must bypass inline capacity acquisition"
         # Pre-record the ledger BEFORE the capacity queue: the (possibly
         # minutes-long) wait window must be visible to goalflight_status
         # (classified queued_capacity = live) and must trip the reused-id
@@ -18092,16 +17454,6 @@ def main(argv: list[str] | None = None) -> int:
                 and args.queue_launch_token
                 and args.queue_claim_path
             )
-            if capacity_refused:
-                # Reuse the canonical queue writer. It rewrites the live
-                # waiting_capacity ledger row to exact state="queued", which
-                # is the state allow_queued accepts on the drain replay. The
-                # PREPARED journal attempt stays non-terminal and its launch
-                # token is reused by the drain. Keep the finally block from
-                # terminalizing the new queued ledger row.
-                if _queue_detached_capacity_refusal(args, blocked, base=base):
-                    ledger_recorded = False
-                    return 0
             raise
         if _account_engine(args.agent) == "grok" and not args.account:
             # Same contract as the codex pointer: args.account stays None so the
@@ -18684,9 +18036,9 @@ def _ensure_acp_sdk_interpreter(argv: list[str] | None = None) -> None:
     Done at __main__ entry, before main() parses args or takes any lease, so
     the execv restart repeats no side effects. Only fires for acp-shaped
     invocations, so bash-shape dispatch is untouched. UNAVAILABLE is not
-    fail-closed here: main() must still queue, refuse a permanent os-sandbox
-    mismatch, and honour the test ACP seam. Spawn-time require_acp_sdk is
-    the fail-closed gate for a real ACP session.
+    fail-closed here: main() must still refuse a permanent os-sandbox mismatch
+    and honour the test ACP seam. Spawn-time require_acp_sdk is the fail-closed
+    gate for a real ACP session.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -18713,8 +18065,8 @@ def _ensure_acp_sdk_interpreter(argv: list[str] | None = None) -> None:
         from goalflight_acp_client import ACP_SDK_REEXEC  # noqa: PLC0415
     except ImportError:
         # The SDK genuinely is not importable here. Proceeding silently is
-        # correct and deliberate: main() still handles submit, the test ACP
-        # seam, and permanent os-sandbox refusal, and a real ACP session imports
+        # correct and deliberate: main() still handles the test ACP seam and
+        # permanent os-sandbox refusal, and a real ACP session imports
         # goalflight_acp_run again at _run_acp_shape WITHOUT this guard, so a
         # broken SDK still fails there rather than being papered over.
         return
@@ -18737,8 +18089,8 @@ def _ensure_acp_sdk_interpreter(argv: list[str] | None = None) -> None:
         )
         return
     # Re-exec here so a later SDK import sees the venv. Do not fail-close on
-    # UNAVAILABLE: main() still has submit, the test ACP seam, and permanent
-    # os-sandbox refusal to handle. Spawn-time require_acp_sdk fail-closes.
+    # UNAVAILABLE: main() still has the test ACP seam and permanent os-sandbox
+    # refusal to handle. Spawn-time require_acp_sdk fail-closes.
     if goalflight_acp_run._acp_reexec_target().state != ACP_SDK_REEXEC:
         return
     goalflight_acp_run._ensure_acp_sdk_python()

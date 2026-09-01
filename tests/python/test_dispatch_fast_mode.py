@@ -1,4 +1,4 @@
-"""--fast is an urgent lane only: it skips the queue without buying a premium tier.
+"""--fast is an urgent lane only: it selects critical without buying a premium tier.
 
 The flag must force --priority critical for every engine/shape, remain idempotent,
 survive detached replay, leave priority untouched when absent, and never add a
@@ -54,7 +54,7 @@ def test_fast_forces_critical_for_codex() -> None:
 def test_fast_forces_critical_for_unsupported_engine() -> None:
     g = argparse.Namespace(agent="grok-code", fast=True, priority="bulk")
     D._apply_fast_mode(g)
-    assert_true("unsupported engine still skips queue", g.priority == "critical")
+    assert_true("unsupported engine still selects critical", g.priority == "critical")
 
 
 def test_fast_mode_is_idempotent() -> None:

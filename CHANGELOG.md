@@ -6,6 +6,13 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Changed
+
+- Worker dispatch now launches immediately and reports capacity refusal as
+  `blocked_capacity` / `DISPATCH-BLOCKED` with a nonzero exit. New durable-queue
+  producers and the bulk frontier dispatcher were removed; the drain consumer
+  remains available to finish the pre-existing backlog.
+
 ### Fixed
 
 - `supervise` backlog cap keys on envelope identity, not raw line count.

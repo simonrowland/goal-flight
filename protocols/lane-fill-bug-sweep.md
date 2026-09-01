@@ -20,10 +20,11 @@ surface REAL blockers → routing table → grouped fixes → serial integrator`
    (the BLOCKING yardstick). Write-once-read-many: keeps per-worker prompts tiny.
 2. **Matrix (targets)** — N rows of `domain × lens`, one per worker, disjoint and exhaustive.
    Row count is driven by COVERAGE (the domains × lenses the audit needs), NOT by how many
-   lanes you have. Lanes only set wall-clock: the durable queue + drainer process rows in
-   waves (≈ ceil(rows / lanes)), priority-ordered, so oversubscription is safe — e.g. 30 rows
-   over 6 lanes runs in ~5 waves on a constrained box. Sizing the matrix to a multiple of the
-   available lanes is an OPTIONAL wall-clock tuning (cleaner waves), never a cap on coverage.
+   lanes you have. Lanes only set wall-clock: dispatch rows individually with
+   `goalflight_dispatch.py`; each launch waits for its lane's capacity window and refuses
+   visibly when capacity stays unavailable. Do not oversubscribe speculatively: retry refused
+   rows in a later controller pass. Sizing the matrix to a multiple of the available lanes is
+   an OPTIONAL wall-clock tuning (cleaner waves), never a cap on coverage.
    Lane-split by difficulty: subtle/critical rows → the stronger engine, breadth rows → the
    cheaper/wider pool ("fill all lanes" = saturate the pools you have, in waves if needed).
 3. **Audit** — one worker per row, READ-ONLY, **one-shot** (breadth comes from the matrix
@@ -56,12 +57,13 @@ surface REAL blockers → routing table → grouped fixes → serial integrator`
    rest stays in files.
 
 ## Dispatch (load-bearing reliability rules, dogfood-proven)
-- **Launch sweep/fix workers via the durable queue** (`--submit --drain-on-submit`).
-  Use `--submit --no-drain-on-submit` only when an external launchd/systemd
-  drainer owns launch. A bash-tail worker launched inside a short-lived
-  foreground controller can be reaped by `cleanup_ghosts` / release-stale once
-  that controller exits — see the D007/D008 class. Detached dispatch and
-  out-of-session launch avoid that failure mode.
+- **Launch each sweep/fix worker directly in detached mode.** Each invocation
+  waits for its lane's capacity window; exhausted capacity produces visible
+  `DISPATCH-BLOCKED` output and a nonzero exit without creating a queue entry.
+  A bash-tail worker launched inside a short-lived foreground controller can be
+  reaped by `cleanup_ghosts` / release-stale once that controller exits — see
+  the D007/D008 class. Detached dispatch and out-of-session launch avoid that
+  failure mode. The drain exists only to finish the pre-existing backlog.
 - **codex AND cursor workers: context-mode is OFF by default.** Two engines, two
   different failure modes, one posture.
   - **codex** — goal-flight passes `-c mcp_servers.context-mode.enabled=false` to
