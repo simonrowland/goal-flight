@@ -851,7 +851,57 @@ def test_acp_capacity_acquire_error_terminalizes_direct_attempt() -> None:
         ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
         assert status["state"] == "failed", status
         assert ledger["state"] == "failed", ledger
-        assert ledger["terminal_state"] == "failed", ledger
+        assert ledger["terminal_state"] == "error", ledger
+
+
+def test_acp_capacity_acquire_error_keeps_queue_attempt_prepared() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        state_dir = tmp / "state"
+        dispatch_id = "queued-acp-capacity-acquire-error"
+        status_json = tmp / f"{dispatch_id}.status.json"
+        cfg = _acp_cfg(
+            tmp,
+            dispatch_id=dispatch_id,
+            status_json=status_json,
+            capacity_wait_s=0.0,
+        )
+        cfg.preserve_capacity_refusal_attempt = True
+        saved = _install_fake_acp_after_capacity()
+        try:
+            with (
+                patch.dict(os.environ, _capacity_env(state_dir), clear=True),
+                patch.object(
+                    goalflight_acp_run.goalflight_capacity,
+                    "acquire_with_wait_async",
+                    side_effect=RuntimeError("capacity backend failed"),
+                ),
+            ):
+                try:
+                    asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
+                except RuntimeError as exc:
+                    assert str(exc) == "capacity backend failed"
+                else:
+                    raise AssertionError("capacity acquisition error did not propagate")
+
+                status = json.loads(status_json.read_text(encoding="utf-8"))
+                ledger = json.loads(
+                    dispatch_mod.goalflight_ledger.record_path(dispatch_id).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                attempt = goalflight_journal.open_or_create_journal(
+                    ROOT
+                ).attempt_for_dispatch(dispatch_id)
+        finally:
+            _restore_fake_acp(saved)
+
+        assert attempt is not None
+        assert attempt.lifecycle_state == goalflight_journal.ATTEMPT_PREPARED
+        assert status["state"] == "starting", status
+        assert "terminal_state" not in status, status
+        assert ledger["state"] == "waiting_capacity", ledger
+        assert ledger["terminal_state"] == "unknown", ledger
 
 
 def test_acp_capacity_wait_deadline_blocks() -> None:
@@ -934,8 +984,12 @@ def _main_capture_for(agent: str) -> tuple[int, dict[str, object]]:
     captured: dict[str, object] = {}
     old_argv = sys.argv[:]
     old_run = dispatch_mod._run_acp_shape
+    old_assign_session = dispatch_mod._ensure_assigned_engine_session
     old_auth_preflight = dispatch_mod._validate_claude_auth_before_attempt
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+
+    class ShapeResolved(Exception):
+        pass
 
     def fake_run(args, *, base: Path, account_env: dict[str, str]) -> int:
         captured["agent"] = args.agent
@@ -944,11 +998,19 @@ def _main_capture_for(agent: str) -> tuple[int, dict[str, object]]:
         captured["account_env"] = dict(account_env)
         return 0
 
+    def stop_before_bash_launch(args) -> None:
+        if args.shape == "bash":
+            captured["agent"] = args.agent
+            captured["shape"] = args.shape
+            raise ShapeResolved
+        old_assign_session(args)
+
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         try:
             os.environ["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
             dispatch_mod._run_acp_shape = fake_run
+            dispatch_mod._ensure_assigned_engine_session = stop_before_bash_launch
             dispatch_mod._validate_claude_auth_before_attempt = lambda *_args, **_kwargs: None
             sys.argv = [
                 "goalflight_dispatch.py",
@@ -960,9 +1022,13 @@ def _main_capture_for(agent: str) -> tuple[int, dict[str, object]]:
                 "--cwd",
                 str(tmp),
             ]
-            rc = dispatch_mod.main()
+            try:
+                rc = dispatch_mod.main()
+            except ShapeResolved:
+                rc = 0
         finally:
             dispatch_mod._run_acp_shape = old_run
+            dispatch_mod._ensure_assigned_engine_session = old_assign_session
             dispatch_mod._validate_claude_auth_before_attempt = old_auth_preflight
             sys.argv = old_argv
             if old_state_dir is None:
@@ -984,13 +1050,12 @@ def test_auto_shape_routes_claude_to_acp_and_cursor_to_bash() -> None:
     original test was that auto-resolution routes deliberately per engine, and
     that is still the property worth pinning.
     """
-    # The helper stubs _run_acp_shape, so it captures only when the ACP path is
-    # taken. Cursor going to bash means that stub is never reached — an EMPTY
-    # capture is precisely the assertion, and a populated one would mean cursor
-    # had slipped back onto acp.
+    # Stop the bash route after shape resolution: this test must not launch a
+    # real cursor worker merely to observe which transport main() selected.
     rc, captured = _main_capture_for("cursor")
     assert rc == 0
-    assert captured == {}, f"cursor must not enter the acp path, got {captured}"
+    assert captured["shape"] == "bash"
+    assert captured["agent"] == "cursor"
 
     rc, captured = _main_capture_for("claude-acp")
     assert rc == 0
@@ -1158,6 +1223,7 @@ def main() -> None:
     test_capacity_env_ignores_constructed_live_journal()
     test_acp_capacity_wait_queues_until_slot_frees()
     test_acp_capacity_acquire_error_terminalizes_direct_attempt()
+    test_acp_capacity_acquire_error_keeps_queue_attempt_prepared()
     test_acp_capacity_wait_deadline_blocks()
     test_acp_capacity_wait_zero_single_shot()
     test_acp_capacity_wait_sigterm_terminalizes()
