@@ -21,6 +21,7 @@ run_setup() {
 
 list_out="$(run_setup --list-agents)"
 printf '%s\n' "$list_out" | grep -q 'controller codex-desktop-controller' || fail "codex desktop controller not listed"
+printf '%s\n' "$list_out" | grep -q 'controller grok-bot-workflows-controller' || fail "grok-bot controller not listed"
 printf '%s\n' "$list_out" | grep -q 'worker codex-cli-worker' || fail "codex cli worker not listed"
 printf '%s\n' "$list_out" | grep -q 'addon context-mode' || fail "context-mode add-on not listed"
 printf '%s\n' "$list_out" | grep -q 'addon gstack' || fail "gstack add-on not listed"
@@ -31,7 +32,7 @@ import pathlib
 import sys
 
 root = pathlib.Path(sys.argv[1])
-adapters = ["claude-code", "codex", "cursor", "grok", "opencode"]
+adapters = ["claude-code", "codex", "cursor", "grok", "grok-bot", "opencode"]
 missing = []
 for name in adapters:
     manifest = json.loads((root / "adapters" / f"{name}.json").read_text())
@@ -487,5 +488,27 @@ if python3 "$REPO_ROOT/scripts/goalflight_setup.py" --repo-root "$FIXTURE_REPO" 
   fail "ungated write action should fail"
 fi
 grep -q 'refusing ungated write action' /tmp/goal-flight-setup-ungated.out || fail "ungated write refusal missing"
+
+GROK_BOT_WORKFLOWS="$TMP_ROOT/grok-bot-workflows"
+mkdir -p "$GROK_BOT_WORKFLOWS"
+grok_bot_dry="$(GOALFLIGHT_GROK_BOT_WORKFLOWS="$GROK_BOT_WORKFLOWS" run_setup --grok-bot --addons '')"
+printf '%s\n' "$grok_bot_dry" | grep -q 'DRY-RUN setup agent=grok-bot' || fail "grok-bot dry-run header missing"
+printf '%s\n' "$grok_bot_dry" | grep -q 'DESTINATIONS selected=grok-bot-workflows-controller' || fail "grok-bot shortcut should select workflows controller"
+printf '%s\n' "$grok_bot_dry" | grep -q 'CONTROLLER_SURFACE grok-bot desktop' || fail "grok-bot controller surface missing"
+printf '%s\n' "$grok_bot_dry" | grep -q "configs/grok-bot/skills/goal-flight/SKILL.md" || fail "grok-bot wrapper source missing"
+printf '%s\n' "$grok_bot_dry" | grep -q "$GROK_BOT_WORKFLOWS/goal-flight/SKILL.md" || fail "grok-bot workflows target missing"
+printf '%s\n' "$grok_bot_dry" | grep -q 'PLUGIN skip supported=false' || fail "grok-bot plugin must stay skipped"
+if printf '%s\n' "$grok_bot_dry" | grep -q 'WORKER_CHECK'; then
+  fail "grok-bot controller-only setup should not plan a worker check"
+fi
+[ ! -e "$GROK_BOT_WORKFLOWS/goal-flight/SKILL.md" ] || fail "dry-run mutated grok-bot workflows skill"
+install_grok_bot_alias_dry="$(bash "$REPO_ROOT/install.sh" --grok-bot --addons '')"
+printf '%s\n' "$install_grok_bot_alias_dry" | grep -q 'DRY-RUN setup agent=grok-bot' || fail "install.sh --grok-bot alias did not select grok-bot setup"
+grok_bot_apply="$(GOALFLIGHT_GROK_BOT_WORKFLOWS="$GROK_BOT_WORKFLOWS" run_setup --apply --yes --grok-bot --addons '')"
+grok_bot_manifest="$(printf '%s\n' "$grok_bot_apply" | awk '/^BACKUP_MANIFEST /{print $2}')"
+[ -f "$GROK_BOT_WORKFLOWS/goal-flight/SKILL.md" ] || fail "grok-bot skill not installed"
+grep -q 'Grok Bot' "$GROK_BOT_WORKFLOWS/goal-flight/SKILL.md" || fail "grok-bot skill content missing"
+run_setup --uninstall --from-manifest "$grok_bot_manifest" >/tmp/goal-flight-setup-grok-bot-uninstall.out
+[ ! -e "$GROK_BOT_WORKFLOWS/goal-flight/SKILL.md" ] || fail "grok-bot uninstall left skill"
 
 echo "goal-flight setup registrar tests passed"

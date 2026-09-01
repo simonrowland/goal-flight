@@ -57,7 +57,7 @@ def case_cli_real_repo_silent_and_verbose() -> None:
     with redirect_stdout(out), redirect_stderr(err):
         rc = V.main(["--repo", str(ROOT), "--verbose"])
     assert rc == 0
-    assert out.getvalue() == "schema_validates=17/17\n"
+    assert out.getvalue() == "schema_validates=18/18\n"
     assert err.getvalue() == ""
 
 

@@ -17,6 +17,12 @@ incremented when meaningful skill behaviour changes.
 
 ### Added
 
+- **Grok Bot host port.** Controller-only wrapper at
+  `configs/grok-bot/skills/goal-flight/SKILL.md`, adapter
+  `adapters/grok-bot.json` (distinct from Grok CLI `adapters/grok.json`),
+  and `./install.sh grok-bot` copying the wrapper into the Grok Bot
+  workflows library. Unsupported the same way Cursor / OpenCode / Codex
+  orchestrator ports are. See `docs/hosts/grok-bot.md`.
 - **Watchlist two-tier wedge detector (`goalflight_wedge_watch.py`).** Cheap
   path is one `stat` of the tail (mtime + size). After the tail has been
   idle longer than a data-derived probation (1080s, above p99=965.7s of

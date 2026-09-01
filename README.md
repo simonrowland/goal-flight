@@ -18,7 +18,7 @@ one-commit-per-chunk work on your branch; nothing is pushed without your permiss
 **Hosts and workers.** [Claude Code](https://claude.ai/code) is the supported
 orchestrator. [Codex](https://github.com/openai/codex) is the standard worker; cursor,
 grok, claude-cli, and other worker adapters also serve. Unsupported orchestrator ports
-for Codex, Cursor, and OpenCode ship in-repo.
+for Codex, Cursor, OpenCode, and Grok Bot ship in-repo.
 
 **What the orchestrator session is for**: requirements gathering, architecture decisions,
 question escalation, and monitoring — not execution. The orchestrator holds enough context
@@ -39,7 +39,7 @@ Install once:
 git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-flight
 ```
 
-(Orchestrator ports for Codex / Cursor / OpenCode exist but are unsupported — install
+(Orchestrator ports for Codex / Cursor / OpenCode / Grok Bot exist but are unsupported — install
 commands are under [Host install notes](#host-install-notes).)
 
 Primary platform is macOS. Linux hosts work too ([docs/hosts/linux.md](docs/hosts/linux.md));
@@ -296,7 +296,7 @@ Also recommended:
 
 ## Host install notes
 
-Orchestrator ports for Codex, Cursor, and OpenCode are implemented and unsupported; the
+Orchestrator ports for Codex, Cursor, OpenCode, and Grok Bot are implemented and unsupported; the
 Claude Code wrapper is the maintained path. To install a port anyway:
 
 ```bash
@@ -304,6 +304,7 @@ git clone https://github.com/simonrowland/goal-flight.git ~/.goal-flight && cd ~
 ./install.sh cursor /path/to/your/project
 ./install.sh opencode /path/to/your/project
 ./install.sh codex
+./install.sh grok-bot
 ```
 
 After source `SKILL.md`, `commands/`, `protocols/`, `templates/`, or `adapters/`
@@ -315,10 +316,12 @@ which usually correlates with the other directories being stale too. Run
 the resync command in the probe's `resync_command` field; text mode prints
 `installed_skill_md_hash` WARNs.
 
-Same flags via `setup.sh`: `--cursor-install`, `--opencode-install`, and
-`--codex-install` (each implies `--apply --yes`). Dry-run, link-to-Claude, and
-agents-standard paths are in [docs/hosts/cursor.md](docs/hosts/cursor.md) and
-[docs/hosts/opencode.md](docs/hosts/opencode.md).
+Same flags via `setup.sh`: `--cursor-install`, `--opencode-install`,
+`--codex-install`, and `--grok-bot-install` (each implies `--apply --yes`).
+Dry-run, link-to-Claude, and agents-standard paths are in
+[docs/hosts/cursor.md](docs/hosts/cursor.md),
+[docs/hosts/opencode.md](docs/hosts/opencode.md), and
+[docs/hosts/grok-bot.md](docs/hosts/grok-bot.md).
 
 After any install, run doctor:
 `python3 scripts/goalflight_doctor.py --project-root /path/to/your/project`.

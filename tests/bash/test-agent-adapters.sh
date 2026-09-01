@@ -19,7 +19,7 @@ rm -f /tmp/goal-flight-adapters-$$.out /tmp/goal-flight-adapters-$$.err
 
 python3 "$REPO_ROOT/scripts/goalflight_validate_adapters.py" --verbose \
   >/tmp/goal-flight-adapters-$$.out
-grep -q "schema_validates=17/17" /tmp/goal-flight-adapters-$$.out || {
+grep -q "schema_validates=18/18" /tmp/goal-flight-adapters-$$.out || {
   cat /tmp/goal-flight-adapters-$$.out
   rm -f /tmp/goal-flight-adapters-$$.out
   exit 1
@@ -231,6 +231,7 @@ expect_denied_contract(
 )
 
 expect_denied("unsupported", load("amp"), "unsupported", role="controller")
+expect_denied("grok-bot-worker-unsupported", load("grok-bot"), "unsupported", role="worker")
 expect_denied(
     "candidate",
     load("amp"),

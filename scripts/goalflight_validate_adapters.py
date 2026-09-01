@@ -26,6 +26,7 @@ EXPECTED_ADAPTERS = {
     "codex",
     "cursor",
     "grok",
+    "grok-bot",
     "moonshot",
     "gemini",
     "qwen",
