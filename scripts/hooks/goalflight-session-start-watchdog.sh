@@ -200,6 +200,13 @@ import sys
 import time
 
 
+PROBE_ACTIVE = "active"
+PROBE_INACTIVE = "inactive"
+PROBE_UNKNOWN = "unknown"
+PROBE_MAX_SECONDS = 3.0
+HOOK_WORK_BUDGET_SECONDS = 4.0
+
+
 def load_payload() -> dict:
     raw = os.environ.get("GOALFLIGHT_HOOK_INPUT") or "{}"
     try:
@@ -259,14 +266,24 @@ def has_recent_resume_note() -> bool:
     return False
 
 
-def session_status_active(repo_root: str) -> bool:
+def remaining_probe_budget(deadline: float) -> float:
+    return max(0.0, min(PROBE_MAX_SECONDS, deadline - time.monotonic()))
+
+
+def session_status_active(
+    repo_root: str,
+    *,
+    timeout_s: float = PROBE_MAX_SECONDS,
+) -> str:
     if os.environ.get("GOALFLIGHT_WATCHDOG_SKIP_STATUS_SCRIPT") == "1":
-        return False
+        return PROBE_INACTIVE
+    if timeout_s <= 0:
+        return PROBE_UNKNOWN
     script = os.environ.get("GOALFLIGHT_WATCHDOG_STATUS_SCRIPT") or os.path.join(
         repo_root, "scripts", "goalflight_session_status.py"
     )
     if not script or not os.path.isfile(script):
-        return False
+        return PROBE_UNKNOWN
     try:
         result = subprocess.run(
             [sys.executable, script, "--text"],
@@ -276,18 +293,31 @@ def session_status_active(repo_root: str) -> bool:
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            # SessionStart fail-open wall: observability must never block work.
-            # Intentionally tighter than JOURNAL_WRITER_RETRY_BUDGET_S (5s),
-            # which is the in-process durable-writer contract, not this hook.
-            timeout=3,
+            # The caller supplies only this probe's remaining share of the
+            # SessionStart wall; observability must never block work.
+            timeout=min(PROBE_MAX_SECONDS, timeout_s),
             check=False,
         )
     except Exception:
-        return False
-    return result.returncode == 0 and result.stdout.lower().startswith("active goal-flight session")
+        return PROBE_UNKNOWN
+    if result.returncode != 0:
+        return PROBE_UNKNOWN
+    lines = [line.strip().lower() for line in result.stdout.splitlines()]
+    if any(line.startswith("active goal-flight session") for line in lines):
+        return PROBE_ACTIVE
+    if any(line.startswith("no active goal-flight session") for line in lines):
+        return PROBE_INACTIVE
+    return PROBE_UNKNOWN
 
 
-def claim_controller_entry(repo_root: str, cwd: str) -> dict:
+def claim_controller_entry(
+    repo_root: str,
+    cwd: str,
+    *,
+    timeout_s: float = PROBE_MAX_SECONDS,
+) -> dict:
+    if timeout_s <= 0:
+        return {}
     script = os.path.join(repo_root, "scripts", "goalflight_session_status.py")
     try:
         result = subprocess.run(
@@ -305,10 +335,9 @@ def claim_controller_entry(repo_root: str, cwd: str) -> dict:
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            # Same 3s SessionStart wall as session_status_active. A 5s writer
-            # budget cannot complete inside this kill; fail-open via timeout
-            # rather than stretching SessionStart to the in-process writer bound.
-            timeout=3,
+            # Share the SessionStart wall with activity discovery. A 5s writer
+            # budget cannot complete inside this hook timeout.
+            timeout=min(PROBE_MAX_SECONDS, timeout_s),
             check=False,
         )
         payload = json.loads(result.stdout or "{}")
@@ -353,29 +382,40 @@ def controller_wake_instruction(repo_root: str, claim_result: dict) -> str:
         )
 
 
-def journal_activity(repo_root: str, cwd: str) -> bool:
+def journal_activity(
+    repo_root: str,
+    cwd: str,
+    *,
+    timeout_s: float = PROBE_MAX_SECONDS,
+) -> str:
+    if timeout_s <= 0:
+        return PROBE_UNKNOWN
     try:
         sys.path.insert(0, repo_root)
         sys.path.insert(0, os.path.join(repo_root, "scripts"))
         import goalflight_journal
         import goalflight_task
+    except Exception:
+        return PROBE_UNKNOWN
 
+    try:
         root = goalflight_task.resolve_project_root_for_read(cwd)
         if root is None:
-            # Unresolved cwd is not evidence of journal activity.
-            return False
+            return PROBE_UNKNOWN
         # Peek-only: must not take the write lock or inherit the 5s writer
-        # budget. Open retries default to JOURNAL_OPEN_RETRY_BUDGET_S (75s);
-        # cap them to the same 3s SessionStart wall as the subprocess calls.
-        # Busy stays at the 1.0s reader default. Fail-open prefers a fast
-        # False over a stall.
+        # budget. Divide this probe's remaining share across open and two reads.
+        # The caller preserves UNKNOWN rather than rendering an unreadable
+        # journal as proven inactive.
+        operation_budget_s = min(1.0, timeout_s / 3.0)
         authority = goalflight_journal.Journal.open_reader(
             root,
-            open_retry_budget_s=3.0,
+            retry_budget_s=operation_budget_s,
+            open_retry_budget_s=operation_budget_s,
+            transaction_budget_s=operation_budget_s,
         )
         if authority.attention_items():
-            return True
-        return bool(
+            return PROBE_ACTIVE
+        active = bool(
             authority.read_all(
                 """SELECT 1 FROM dispatch_attempts
                    WHERE project_root = ? AND lifecycle_state IN ('PREPARED', 'STARTING', 'RUNNING')
@@ -383,8 +423,11 @@ def journal_activity(repo_root: str, cwd: str) -> bool:
                 (str(root),),
             )
         )
+        return PROBE_ACTIVE if active else PROBE_INACTIVE
+    except goalflight_journal.JournalDisappeared:
+        return PROBE_INACTIVE
     except Exception:
-        return False
+        return PROBE_UNKNOWN
 
 
 def main() -> None:
@@ -397,10 +440,41 @@ def main() -> None:
     if not repo_root:
         return
     os.environ["GOALFLIGHT_REPO_ROOT"] = repo_root
-    claim_result = claim_controller_entry(repo_root, str(cwd))
-
-    if not (journal_activity(repo_root, str(cwd)) or has_recent_resume_note() or session_status_active(repo_root)):
+    # hooks.json gives the shell 5s. Reserve 1s for startup, imports, and JSON
+    # emission; every probe and the optional claim share the remaining wall.
+    deadline = time.monotonic() + HOOK_WORK_BUDGET_SECONDS
+    if has_recent_resume_note():
+        activity_state = PROBE_ACTIVE
+    else:
+        journal_state = journal_activity(
+            repo_root,
+            str(cwd),
+            timeout_s=remaining_probe_budget(deadline),
+        )
+        if journal_state == PROBE_ACTIVE:
+            activity_state = PROBE_ACTIVE
+        else:
+            status_state = session_status_active(
+                repo_root,
+                timeout_s=remaining_probe_budget(deadline),
+            )
+            if status_state == PROBE_ACTIVE:
+                activity_state = PROBE_ACTIVE
+            elif PROBE_UNKNOWN in (journal_state, status_state):
+                activity_state = PROBE_UNKNOWN
+            else:
+                activity_state = PROBE_INACTIVE
+    if activity_state == PROBE_INACTIVE:
         return
+    claim_result = (
+        claim_controller_entry(
+            repo_root,
+            str(cwd),
+            timeout_s=remaining_probe_budget(deadline),
+        )
+        if activity_state == PROBE_ACTIVE
+        else {}
+    )
 
     prompt_file = os.environ.get("GOALFLIGHT_WATCHDOG_PROMPT_FILE")
     if not prompt_file:
@@ -417,7 +491,13 @@ def main() -> None:
             else ""
         )
     )
-    if wake_state == "running":
+    if activity_state == PROBE_UNKNOWN:
+        wake_preamble = (
+            "Do not claim controller ownership or arm a direct wake component "
+            "until status proves the run active; if it does, ARM THE EVENT WAKE FIRST "
+            "through the host's persistent monitor. "
+        )
+    elif wake_state == "running":
         wake_preamble = (
             "A live `supervise` process already owns this controller generation's "
             "event wake; no controller wake action is required. "
@@ -438,16 +518,32 @@ def main() -> None:
             "first; arm a bare component only where no persistent monitor "
             "exists: "
         )
-    claimed_instruction = (
-        f"For a claimed controller: {wake_instruction} "
-        if wake_instruction
-        else ""
-    )
-    context = (
+    claimed_instruction = ""
+    if wake_instruction:
+        claimed_instruction = (
+            f"For a claimed controller: {wake_instruction} "
+            if activity_state == PROBE_ACTIVE
+            else f"{wake_instruction} "
+        )
+    activity_intro = (
         "An active goal-flight run was detected on this session start. "
-        f"{wake_preamble}"
+        if activity_state == PROBE_ACTIVE
+        else (
+            "SessionStart could not determine Goal Flight activity, so it emitted "
+            "wake-first context instead of treating the project as inactive. "
+        )
+    )
+    claim_context = (
         "the SessionStart hook already attempted a role-aware lease claim; inspect its result "
         f"({json.dumps(claim_result, sort_keys=True)}). Carry the returned `session.lease_nonce`. "
+        if activity_state == PROBE_ACTIVE
+        else (
+            "The SessionStart hook did not claim a controller lease because activity was "
+            f"unreadable; its result is ({json.dumps(claim_result, sort_keys=True)}). "
+        )
+    )
+    context = (
+        f"{activity_intro}{wake_preamble}{claim_context}"
         f"{claimed_instruction}An "
         "unclaimed fixed-set controller runs the printed `goalflight_status.py --wait <ids>` "
         "command. Do not block the controller turn on either wait. CONTINUE IN-SKILL: re-invoke "
