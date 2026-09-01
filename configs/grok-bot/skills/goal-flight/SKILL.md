@@ -40,14 +40,20 @@ installed wrapper copy has drifted from that pin; resync with
 - Treat Grok Bot session state, named-teammate memory, and host config as advisory.
 - Do not rewrite the root `SKILL.md` during setup. Setup registers this wrapper
   only.
-- Wake on worker terminals through the existing journal doorbell. Arm a tracked
-  `goalflight_messages.py listen --report-pending` on the user's Mac (project
-  root + `--controller-label`); never detach it. On ring, `relay --drain`, act,
-  re-arm. Do not invent a second event bus, a Settings monitor widget, or a
-  Grok Bot-native mail transport. Do not arm unbounded `supervise` as a
-  background shell expecting per-line wakes — this host only notifies on job
-  completion. Missed wake is latency: resume still pulls status, task next, and
-  `relay --new`. See Wake path below.
+- Claim controller label `goalflight-grokbot` and stamp that claimed label
+  on every `goalflight_dispatch.py` launch. Never steal a live lease.
+- Wake on worker terminals (`!COMPLETE` is the success marker) through the
+  existing journal doorbell. Canonical arm is one tracked listen on the
+  user's Mac: `listen --report-pending --timeout-s 900 --controller-label
+  goalflight-grokbot`. The 900s quiet timeout is this host's frontier ping
+  (anti-stall), not Claude's 120s follow-stream heartbeat. Optional full
+  pool (depth 4): 900s on one slot only; others `--timeout-s 0`. On ring,
+  `relay --drain`, act, re-arm. On timeout (exit 1), pull status + task
+  next, then re-arm. Never detach. Do not invent a second event bus, a
+  Settings monitor widget, or a Grok Bot-native mail transport. Do not arm
+  unbounded `supervise` as a background shell. Missed wake is latency:
+  resume still pulls status, task next, and `relay --new`. See Wake path
+  below.
 
 ## Dispatch and workers
 
@@ -83,9 +89,11 @@ independent reviewer.
 Grok Bot Cloud Agents remain an optional extra worker for GitHub-branch / PR
 chunks only. They are never the default for a local scientific-coding project.
 
-Stamp `--controller-label --controller-pid --controller-session-id` on every
-`goalflight_dispatch.py` launch. Claim a Grok Bot controller label of your own.
-Never steal a live lease that belongs to another controller.
+Stamp `--controller-label <claimed-label> --controller-pid
+--controller-session-id` on every `goalflight_dispatch.py` launch. The
+claimed label is `goalflight-grokbot` unless this controller already
+joined under another unused slug. Never steal a live lease that belongs
+to another controller.
 
 ## Multi-controller etiquette
 
@@ -95,7 +103,7 @@ example uses integrator / engine / bugs / webui / perf labels), a Grok Bot
 controller joining that project must:
 
 - read the project's `docs-private/MULTI-CONTROLLER-ETIQUETTE.md` when present
-- claim a new label and its own worktree / branch
+- claim `goalflight-grokbot` (or another unused label) and its own worktree / branch
 - send merge-request mail; leave origin push to the project's integrator
 - never steal those existing leases
 
@@ -108,10 +116,9 @@ merge-request / patch. Do not replace the journal with SendToAgent.
 
 Journal mail is durable truth. Worker terminals are the existing markers in
 `protocols/worker-markers.md`: `!COMPLETE` / `!READY` / `!FAILED` /
-`!BLOCKED` / `!USER-NEED` (leading `!` optional). There is no `!FINISHED`;
-if someone says FINISHED, treat it as `!COMPLETE`. The watcher already
-harvests those into the terminal-outbox / controller mail. Do not invent a
-second event bus.
+`!BLOCKED` / `!USER-NEED` (leading `!` optional). `!COMPLETE` is the
+success terminal. The watcher already harvests those into the
+terminal-outbox / controller mail. Do not invent a second event bus.
 
 Grok Bot notifies on **job completion** (Task / executor or a tracked Shell
 exits and revives the parent chat). That is the same contract as
@@ -119,27 +126,40 @@ exits and revives the parent chat). That is the same contract as
 per-line `supervise` / `follow`. There is no Settings "monitor widget"; the
 running background task / subagent card is the UI.
 
-Canonical arm — tracked `listen --report-pending` on the **user's Mac**
-(project-root + `--controller-label`), never detached (`nohup` → listen
-exit 4):
+This host uses the portable listen / heartbeat process pool. The frontier
+ping is `listen --timeout-s 900` (15 minutes of quiet), so the controller
+is reminded of the task frontier and does not stall. That is **not**
+Claude's follow-stream heartbeat (120s; the stream range is 60–300s and
+would spam Grok Bot turns). Do not change the global `supervise` / `follow`
+cadence for this host; 900s is a wrapper-local default on the listen arm.
+
+Canonical arm — one tracked listen on the **user's Mac**, label
+`goalflight-grokbot`, never detached (`nohup` → listen exit 4):
 
 ```shell
 python3 <skill-root>/scripts/goalflight_messages.py listen \
   --project-root "$PWD" \
-  --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
-  --report-pending
+  --controller-label goalflight-grokbot \
+  --report-pending \
+  --timeout-s 900
 ```
 
-On ring (exit 0): `relay --drain`, act, re-arm. The portable four-listen
-pool is full depth; one listen is the MVP. Branch on listen exit codes
-(`protocols/controller-mail.md`); exit 5 is did-not-arm (do not re-arm
+On ring (exit 0): `relay --drain`, act, re-arm. On timeout (exit 1): pull
+`goalflight_status.py` and `goalflight_task.py next`, then re-arm — that
+exit *is* the 15-minute frontier reminder. The portable four-listen pool
+is full depth; one listen is the MVP. If you arm more than one listen,
+put `--timeout-s 900` on a single slot (the frontier ping) and leave the
+others at `--timeout-s 0` so four quiet timeouts do not fire together.
+Branch on listen exit codes. Exit 1 on this host is the frontier
+reminder above (status + task next, re-arm), not the portable
+"re-arm only if coverage is still required" row. Codes 2–5 follow
+`protocols/controller-mail.md`; exit 5 is did-not-arm (do not re-arm
 that nonce).
 
 Do **not** arm unbounded `supervise` as a Grok Bot background shell and
-expect per-line wakes. Supervise heartbeats (~120s) would never complete
-or, if every line were awaited, spam turns. A helper, if added, must wrap
-`listen` or exit on the first actionable event (ignore heartbeat /
-frontier). A same-turn regex-wait on a live `supervise` process is a
+expect per-line wakes. A helper, if added, must wrap `listen` or exit on
+the first actionable event (ignore stream heartbeat / frontier
+keepalives). A same-turn regex-wait on a live `supervise` process is a
 same-turn block, not a session-life monitor; do not use it as the default.
 
 Missed wake is latency, not data loss. Resume still pulls

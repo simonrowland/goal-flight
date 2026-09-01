@@ -121,20 +121,30 @@ host_doc="$REPO_ROOT/docs/hosts/grok-bot.md"
 for wake_file in "$wrapper" "$host_doc"; do
   grep -q 'listen --report-pending' "$wake_file" \
     || fail "$wake_file must arm listen --report-pending"
+  grep -q -- '--timeout-s 900' "$wake_file" \
+    || fail "$wake_file must default listen --timeout-s 900"
+  grep -q 'goalflight-grokbot' "$wake_file" \
+    || fail "$wake_file must claim controller label goalflight-grokbot"
   grep -q 'relay --drain' "$wake_file" \
     || fail "$wake_file must drain on ring with relay --drain"
   grep -q '!COMPLETE' "$wake_file" \
-    || fail "$wake_file must name !COMPLETE as a worker terminal"
-  grep -E 'no `!FINISHED`|There is no `!FINISHED`' "$wake_file" >/dev/null \
-    || fail "$wake_file must reject !FINISHED as a first-class marker"
-  grep -Ei 'alias|treat it as `!COMPLETE`' "$wake_file" >/dev/null \
-    || fail "$wake_file must alias FINISHED to !COMPLETE"
+    || fail "$wake_file must name !COMPLETE as the success terminal"
+  grep -E 'exit 1|timeout \(exit 1\)' "$wake_file" >/dev/null \
+    || fail "$wake_file must treat listen exit 1 as the frontier reminder"
+  grep -q 'goalflight_task.py next' "$wake_file" \
+    || fail "$wake_file must pull task next on the 900s frontier ping"
+  if grep -q '!FINISHED' "$wake_file"; then
+    fail "$wake_file must not reify the misremembered !FINISHED marker"
+  fi
   grep -q 'exit 4' "$wake_file" \
     || fail "$wake_file must refuse detached listen (exit 4)"
   if grep -E 'arm unbounded `supervise`|Do \*\*not\*\* arm unbounded `supervise`' "$wake_file" >/dev/null; then
     :
   else
     fail "$wake_file must forbid unbounded supervise as the grok-bot arm"
+  fi
+  if grep -E 'Supervise heartbeats \(~120s\)|supervise heartbeats \(~120s\)' "$wake_file" >/dev/null; then
+    fail "$wake_file must not treat the 120s Claude stream heartbeat as the grok-bot ping"
   fi
 done
 python3 - "$REPO_ROOT" <<'PY'
@@ -144,20 +154,30 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 wake = json.loads((root / "adapters" / "grok-bot.json").read_text())["host_projection"]["wake"]
-if wake.get("path") != "goalflight_messages.py listen --report-pending":
-    raise SystemExit("host_projection.wake.path must be listen --report-pending")
+if wake.get("path") != "goalflight_messages.py listen --report-pending --timeout-s 900":
+    raise SystemExit("host_projection.wake.path must be listen --report-pending --timeout-s 900")
 if wake.get("contract") != "exit-as-wake":
     raise SystemExit("host_projection.wake.contract must be exit-as-wake")
+if wake.get("controller_label") != "goalflight-grokbot":
+    raise SystemExit("wake.controller_label must be goalflight-grokbot")
+if wake.get("timeout_s") != 900:
+    raise SystemExit("wake.timeout_s must be 900")
+if wake.get("on_timeout") != "status + task next, re-arm":
+    raise SystemExit("wake.on_timeout must pull status + task next, then re-arm")
 if wake.get("mvp_depth") != 1 or wake.get("full_depth") != 4:
     raise SystemExit("wake depth must be MVP 1 / full 4")
-if wake.get("finished_alias") != "COMPLETE":
-    raise SystemExit("FINISHED must alias to COMPLETE")
+if wake.get("finished_alias"):
+    raise SystemExit("do not reify a FINISHED alias; success terminal is COMPLETE")
 if "native mail transport" not in " ".join(wake.get("not") or []):
     raise SystemExit("wake.not must keep native mail transport out of this port")
 forbidden = " ".join(wake.get("not") or [])
 if "unbounded supervise" not in forbidden:
     raise SystemExit("wake.not must forbid unbounded supervise")
+if "120s" not in forbidden:
+    raise SystemExit("wake.not must reject the 120s Claude stream heartbeat as a grok-bot arm")
+if "global supervise/follow cadence change" not in forbidden:
+    raise SystemExit("wake.not must keep the 900s timeout host-local")
 PY
-echo "test8 pass: grok-bot wake path is listen doorbell, not supervise or a new bus"
+echo "test8 pass: grok-bot wake path is listen doorbell + 900s frontier ping"
 
 echo "goal-flight grok-bot host install tests passed"

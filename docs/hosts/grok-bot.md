@@ -59,6 +59,7 @@ Load order: `AGENTS.md` → this host wrapper → repository `SKILL.md` →
 
 - Facts come from `goalflight_status.py`, `goalflight_task.py list/next`, and
   doctor. Conversation is not the backlog.
+- Controller label is `goalflight-grokbot`. Stamp it on every dispatch.
 - Dispatch CLI workers on the user's registered computer (the Mac checkout)
   via Grok Bot Shell with a `machineId`. Do not spawn workers on the Grok Bot
   box and do not clone the repo onto the box.
@@ -86,9 +87,9 @@ journal doorbell (`listen`), not a new event bus and not a Settings widget.
 
 **Journal is durable truth.** Worker terminals are the markers in
 `protocols/worker-markers.md`: `!COMPLETE` / `!READY` / `!FAILED` /
-`!BLOCKED` / `!USER-NEED` (leading `!` optional). There is no `!FINISHED`
-in that protocol; if the word appears, alias it to `!COMPLETE`. The watcher
-already harvests those into the terminal-outbox / controller mail.
+`!BLOCKED` / `!USER-NEED` (leading `!` optional). `!COMPLETE` is the
+success terminal. The watcher already harvests those into the
+terminal-outbox / controller mail.
 
 **Host monitor is exit-as-wake.** Grok Bot revives the parent chat when a
 Task / executor or a tracked Shell completes. That is the same contract as
@@ -96,37 +97,51 @@ Task / executor or a tracked Shell completes. That is the same contract as
 `supervise` / `follow`. There is no separate Settings "monitor widget"; the
 running background task / subagent card is the UI.
 
-**Canonical grok-bot arm** — one tracked `listen --report-pending` on the
-**user's Mac** (the project checkout), with `--project-root` and
-`--controller-label`. Never detach it (`nohup`, `&`, disown): a detached
-listener refuses with **exit 4** and cannot wake an untracked parent.
+**Portable listen / heartbeat pool.** Use the existing listen doorbells.
+This host's frontier ping is `listen --timeout-s 900` (15 minutes of
+quiet): the timeout exit reminds the controller of the task frontier so
+it does not stall. That is **not** Claude's follow-stream heartbeat
+(120s; the stream range is 60–300s and would spam Grok Bot turns). Do
+not change the global `supervise` / `follow` cadence in this port; 900s
+is a grok-bot wrapper-local default on the listen arm.
+
+**Canonical grok-bot arm** — one tracked `listen --report-pending
+--timeout-s 900` on the **user's Mac** (the project checkout), with
+`--project-root` and `--controller-label goalflight-grokbot`. Never
+detach it (`nohup`, `&`, disown): a detached listener refuses with
+**exit 4** and cannot wake an untracked parent.
 
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py listen \
   --project-root "$PWD" \
-  --controller-label "$GOALFLIGHT_CONTROLLER_LABEL" \
-  --report-pending
+  --controller-label goalflight-grokbot \
+  --report-pending \
+  --timeout-s 900
 ```
 
-On ring (**exit 0**): drain with `relay --drain`, act, re-arm. The portable
-four-listen pool is full depth (resilience; see
-`protocols/controller-mail.md`). One listen is the MVP. Branch on listen
-exit codes instead of blindly restarting:
+On ring (**exit 0**): drain with `relay --drain`, act, re-arm. On
+timeout (**exit 1**): pull `goalflight_status.py` and
+`goalflight_task.py next`, then re-arm — that exit *is* the 15-minute
+frontier reminder. The portable four-listen pool is full depth
+(resilience; see `protocols/controller-mail.md`). One listen is the MVP.
+If you arm more than one listen, put `--timeout-s 900` on a single slot
+and leave the others at `--timeout-s 0` so four quiet timeouts do not
+fire together. Branch on listen exit codes instead of blindly
+restarting:
 
 | Code | Meaning for this host | Action |
 |---:|---|---|
 | 0 | Ring | `relay --drain`, act, re-arm |
-| 1 | Timeout | Re-arm only if coverage is still required |
+| 1 | 15-minute frontier ping (quiet timeout) | Pull status + task next, re-arm |
 | 2 | Journal unreadability | Repair/escalate; do not restart-loop |
 | 3 | Contention / stale lease | Reconcile the live lease; re-arm only under it |
 | 4 | Detached refusal (`nohup` / `&` / disown) | Launch a tracked listener; do not detach again |
 | 5 | Did-not-arm (dead nonce) | Do not re-arm that nonce |
 
 **Do not arm unbounded `supervise` as a Grok Bot background shell** expecting
-per-line wakes. Grok Bot only notifies on job completion. Supervise
-heartbeats (~120s) would either never complete or, if every line were
-awaited, spam turns. If you add a helper, it must wrap `listen` or exit on
-the first actionable event (ignore heartbeat / frontier keepalives).
+per-line wakes. Grok Bot only notifies on job completion. If you add a
+helper, it must wrap `listen` or exit on the first actionable event
+(ignore stream heartbeat / frontier keepalives).
 
 A same-turn regex-wait on a live `supervise` process (host AwaitShell-style
 blocking) is a same-turn block, not a session-life monitor. Do not recommend
@@ -148,9 +163,10 @@ merge-request / patch).
 Five-controller setups still use `post --to-controller` plus the portable
 listen pool. That layout is a project convention (lane claims, one integrator,
 cluster dispatch), not a Goal Flight primitive. A Grok Bot controller joining
-such a project must claim its own label, stamp
-`--controller-label --controller-pid --controller-session-id` on every
-dispatch, and never steal the existing leases. Read
+such a project must claim `goalflight-grokbot` (or another unused label)
+and stamp that claimed label with `--controller-pid
+--controller-session-id` on every dispatch, and never steal the existing
+leases. Read
 `docs-private/MULTI-CONTROLLER-ETIQUETTE.md` when the project has one.
 
 ## Advanced setup

@@ -271,23 +271,28 @@
       "notes": "Verified on the Grok Bot box as the user-created workflows library. Mac-side library roots are not a second invented default; set the override when install does not run on that box."
     },
     "wake": {
-      "path": "goalflight_messages.py listen --report-pending",
+      "path": "goalflight_messages.py listen --report-pending --timeout-s 900",
       "contract": "exit-as-wake",
-      "arm_on": "user Mac project-root + --controller-label",
+      "controller_label": "goalflight-grokbot",
+      "arm_on": "user Mac project-root + --controller-label goalflight-grokbot",
+      "timeout_s": 900,
+      "timeout_purpose": "frontier reminder (anti-stall); host-local listen default, not the 120s Claude follow-stream heartbeat",
       "mvp_depth": 1,
       "full_depth": 4,
       "on_ring": "relay --drain, act, re-arm",
+      "on_timeout": "status + task next, re-arm",
       "detached": "forbidden; listen exit 4",
       "not": [
         "unbounded supervise as a Grok Bot background shell",
         "per-line persistent stdout monitor",
+        "Claude 120s follow-stream heartbeat as a Grok Bot arm",
         "Settings monitor widget",
         "same-turn regex-wait on live supervise as the session monitor",
-        "native mail transport"
+        "native mail transport",
+        "global supervise/follow cadence change"
       ],
       "terminals": ["COMPLETE", "READY", "FAILED", "BLOCKED", "USER-NEED"],
-      "finished_alias": "COMPLETE",
-      "notes": "Grok Bot notifies on tracked Task/executor or Shell completion only. Journal remains durable truth; missed wake is latency. Resume pulls status + task next + relay --new."
+      "notes": "Grok Bot notifies on tracked Task/executor or Shell completion only. Success terminal is COMPLETE. Journal remains durable truth; missed wake is latency. Resume pulls status + task next + relay --new. Full listen pool: put --timeout-s 900 on one slot only."
     },
     "same_provider_policy_notes": "forbid_self_review: a Grok Bot controller must not Type-1-review a grok-code worker. Independent reviews go to --agent moonshot (kimi3 / Kimi Code CLI) or --agent codex, or gstack on those engines.",
     "model_notes": "No model id is pinned. Do not reintroduce a pin here. kimi3 is the moonshot dispatch preset (adapters/moonshot.json default_model kimi-code/k3), not a new agent_id.",
