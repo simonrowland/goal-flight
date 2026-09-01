@@ -78,6 +78,7 @@ def test_normalizes_codex_epoch_and_walled_state():
         "provider": "codex",
         "account": "seat-a",
         "remaining": "36%",
+        "used": "64%",
         "reset_at": 2_000_000_000.0,
         "flags": [],
     }
@@ -286,10 +287,18 @@ def test_engines_without_windows_keep_the_cycle_reading():
 
 
 def test_remaining_column_header_names_the_direction():
-    """The column shows leftover headroom; the header has to say so.
+    """The column shows CONSUMED usage; the header has to say so.
 
-    `2%` is 2% left, not 2% consumed. An unlabelled PROBE READING is read
-    backwards on the exact decision the table exists to inform.
+    Direction flipped 2026-09-01 on owner instruction, to match what vendor
+    consoles report: grok-bot showed "0% usage" while this table showed "0%"
+    meaning none left, and the same numeral meant opposite things in the two
+    places an operator reads.
+
+    The contract this test guards is unchanged and is the whole point: the
+    header must NAME the direction. `2%` is meaningless alone -- read backwards
+    it inverts the exact decision the table exists to inform. The payload still
+    carries `remaining` for --json consumers and for the internal
+    binding-constraint ranking; only the rendered column flipped.
     """
     rendered = usage.render_table(
         [
@@ -297,6 +306,7 @@ def test_remaining_column_header_names_the_direction():
                 "provider": "codex",
                 "account": "25ca6b",
                 "remaining": "2%",
+                "used": "98%",
                 "reset_at": None,
                 "flags": [],
             }
@@ -304,9 +314,11 @@ def test_remaining_column_header_names_the_direction():
         now=2_000_000_000,
     )
     header = rendered.splitlines()[0]
-    assert "REMAINING" in header
+    assert "USED" in header
+    assert "REMAINING" not in header
     assert "PROBE READING" not in rendered
-    assert "2%" in rendered
+    # the CONSUMED figure is what renders, not the leftover one
+    assert "98%" in rendered
 
 
 def test_normalizes_cursor_ui_only_shape():
@@ -328,9 +340,11 @@ def test_normalizes_cursor_ui_only_shape():
         "provider": "cursor",
         "account": None,
         "remaining": "UI-only",
+        "used": None,
         "reset_at": None,
         "flags": [],
     }
+    assert "UI-only" in usage.render_table([row], now=2_000_000_000)
 
 
 def test_normalizes_current_and_drifted_claude_shapes_without_email():
@@ -365,12 +379,14 @@ def test_normalizes_current_and_drifted_claude_shapes_without_email():
         "provider": "claude",
         "account": "work",
         "remaining": "session 75%, week 20%",
+        "used": None,
         "reset_at": now + 300,
         "flags": [],
     }
     assert rows[1]["remaining"] == "3/5"
     assert rows[1]["reset_at"] == 2_000_001_000.0
     assert "email" not in rows[0]
+    assert "session 75%, week 20%" in usage.render_table(rows, now=now)
 
 
 def test_logged_out_and_reader_auth_errors_are_flagged():
@@ -670,6 +686,7 @@ def test_json_cli_shape_and_unavailable_exit_zero(
     # fail this test for the wrong reason.
     assert len(rows) == len(usage.READERS)
     assert rows[0]["remaining"] == "99%"
+    assert rows[0]["used"] == "1%"
     assert all(tuple(row) == usage.REPORT_ROW_KEYS for row in rows)
     assert [row["provider"] for row in rows[1:]] == [
         spec.provider for spec in usage.READERS if spec.key != "codex"
@@ -685,6 +702,7 @@ def test_table_renders_health_flags():
             "provider": "codex",
             "account": "wall",
             "remaining": "0%",
+            "used": "100%",
             "reset_at": None,
             "flags": ["walled"],
         },
@@ -700,7 +718,7 @@ def test_table_renders_health_flags():
 
     rendered = usage.render_table(rows, now=2_000_000_000)
     assert "RESETS (local HH:MM)" in rendered
-    assert "0%  ⛔wall" in rendered
+    assert "100%  ⛔wall" in rendered
     assert "unavailable  ⚠unavailable" in rendered
     assert "needs-login  ⚠auth" in rendered
     assert rendered.endswith("soonest reset: none")
@@ -778,6 +796,7 @@ def test_probe_wall_and_newer_served_dispatch_render_as_timestamped_conflict(
     assert served["evidence"]["verdict"] == "healthy"
     assert served["evidence"]["winner"] == "dispatch"
     assert served["evidence"]["conflict"] is False
+    assert served["used"] is None
     assert "walled" not in served["flags"]
     assert exhausted["evidence"]["dispatch"]["state"] == "quota_exhausted"
     assert exhausted["evidence"]["dispatch"]["reset_at"] == "2026-08-08T17:17:00+00:00"
@@ -792,6 +811,9 @@ def test_probe_wall_and_newer_served_dispatch_render_as_timestamped_conflict(
     assert "dispatch: served" in rendered
     assert "Aug 05 14:28" in rendered
     assert "Aug 05 14:29" in rendered
+    served_line = next(line for line in rendered.splitlines() if "cf9f50" in line)
+    assert "ok" in served_line
+    assert "100%" not in served_line
 
 
 def test_stale_served_dispatch_shows_without_false_conflict(
@@ -973,7 +995,9 @@ def test_token_lapsed_renders_auto_heal_not_needs_login(tmp_path):
     )
     rows = run_reader(spec, readers_dir=tmp_path, timeout_s=10.0, now=0.0)
     assert rows[0]["remaining"] == "lapsed (auto-heals)"
+    assert rows[0]["used"] is None
     assert "auth-broken" not in (rows[0].get("flags") or ())
+    assert "lapsed (auto-heals)" in usage.render_table(rows, now=0.0)
 
 
 def test_reader_timeout_is_distinct_from_reader_failure(tmp_path):
@@ -1013,9 +1037,11 @@ def test_grok_row_renders_as_a_resetting_window():
         "provider": "grok",
         "account": None,
         "remaining": "59% · prepaid=0",
+        "used": "41% · prepaid=0",
         "reset_at": 2_000_000_000.0,
         "flags": [],
     }
+    assert "41% · prepaid=0" in usage.render_table([row], now=2_000_000_000)
 
 
 def test_grok_reader_failure_never_renders_as_headroom():
@@ -1176,18 +1202,21 @@ def test_non_grok_prepaid_balance_uses_generic_wall_and_display_path() -> None:
 
     assert row["flags"] == []
     assert row["remaining"] == "0% · prepaid=25"
-    assert "0% · prepaid=25" in usage.render_table([row], now=2_000_000_000)
+    assert row["used"] == "100% · prepaid=25"
+    rendered = usage.render_table([row], now=2_000_000_000)
+    assert "100% · prepaid=25" in rendered
+    assert "  0% · prepaid=25" not in rendered
 
 
 def test_probe_reading_shows_the_deciding_balance_and_omits_spend_attribution() -> None:
-    """reader record -> normalized remaining -> REMAINING column.
+    """reader record -> normalized used amount -> USED column.
 
     Only the balance earns a place in the row. `product_usage` percentages are
     shares of one already-spent budget and sum to 100 (measured: GrokBuild 95,
     GrokVoice 3, GrokChat 2) -- a receipt for where consumed credit went, not
-    per-product headroom. Rendering it next to a remaining-percent column reads
-    as "one lane is nearly spent, the others are free" when there is one budget
-    and it is gone. `on_demand_*` drives no verdict either.
+    per-product headroom. Rendering those shares beside the consumed total still
+    implies independent product pools when there is one budget and it is gone.
+    `on_demand_*` drives no verdict either.
 
     Asserted as substrings, not as one exact line: the column pads to the widest
     row, so an exact-string assertion passes with the full fleet and fails on a
@@ -1214,11 +1243,13 @@ def test_probe_reading_shows_the_deciding_balance_and_omits_spend_attribution() 
     )[0]
 
     rendered = usage.render_table([row], now=2_000_000_000)
-    assert "0% · prepaid=0" in rendered
+    assert row["remaining"] == "0% · prepaid=0"
+    assert row["used"] == "100% · prepaid=0"
+    assert "100% · prepaid=0" in rendered
     assert "⛔wall" in rendered, "a zero balance must not clear the wall"
     for omitted in ("components", "GrokBuild", "GrokVoice", "GrokChat", "on_demand"):
         assert omitted not in rendered, f"{omitted} must not reach the row"
-    assert "PROVIDER/ACCOUNT  REMAINING" in rendered
+    assert "PROVIDER/ACCOUNT  USED" in rendered
 
 
 def test_grok_rows_are_per_account_and_host_stays_unlabelled():
@@ -1435,10 +1466,14 @@ def test_fresh_dispatch_exhaustion_outranks_stale_healthy_probe(
     rendered = usage.render_table(rows, now=now)
     seat = rows[0]
     assert seat["remaining"] == "exhausted"
+    assert seat["used"] is None
     assert "walled" in seat["flags"]
     assert seat["evidence"]["verdict"] == "exhausted"
     assert seat["evidence"]["winner"] == "dispatch"
     assert "winner: dispatch → exhausted" in rendered
+    seat_line = next(line for line in rendered.splitlines() if "25ca6b" in line)
+    assert "exhausted  ⛔wall" in seat_line
+    assert "8%" not in seat_line
 
 
 def test_unavailable_probe_renders_unknown_not_stale_exhaustion(
