@@ -981,6 +981,24 @@ def _open_readonly_connection(
         ) from fallback_exc
 
 
+def _nudge_wake_webhook_after_projection(row: object) -> None:
+    """Best-effort HTTP nudge after a waking delivery is listen-visible.
+
+    Invoked only after ``_domain_write`` commits. Import and POST failures
+    stay here so projection callers never see them.
+    """
+    if not isinstance(row, dict):
+        return
+    try:
+        import goalflight_wake_webhook
+    except ImportError:
+        return
+    try:
+        goalflight_wake_webhook.nudge_projected_delivery(row)
+    except Exception:
+        return
+
+
 class Journal:
     """Short-lived SQLite transactions with explicit retry/fence outcomes.
 
@@ -3554,7 +3572,8 @@ class Journal:
                 """,
                 (projected_at, project_root, effective_recipient, origin, event_id),
             )
-            if updated.rowcount == 1:
+            newly_projected = updated.rowcount == 1
+            if newly_projected:
                 # Visibility is a second inbox-view mutation after the durable
                 # assignment insert.  Invalidating both closes the prepare /
                 # projection window for commands emitted concurrently.
@@ -3585,9 +3604,15 @@ class Journal:
             # projected the event. Post reporting must not re-query after the
             # commit and accidentally describe a later delivery or drain.
             result["recipient_cursors"] = [dict(cursor) for cursor in cursor_rows]
+            result["newly_projected"] = newly_projected
             return result
 
-        return self._domain_write(action)
+        # POST after commit: a webhook failure must not roll back the journal.
+        # This is the listen-visible harvest hook (same projection listen waits
+        # on), not a second inbox.
+        committed = self._domain_write(action)
+        _nudge_wake_webhook_after_projection(committed.value)
+        return committed
 
     def withdraw_delivery_event(
         self,

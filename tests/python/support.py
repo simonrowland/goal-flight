@@ -34,6 +34,13 @@ AMBIENT_IDENTITY_ENV = (
     "GOALFLIGHT_WORKTREE_LOCK_FD",
     "GOALFLIGHT_OCCUPANCY_LOCK_FD",
 )
+AMBIENT_WEBHOOK_ENV = (
+    "GOALFLIGHT_WAKE_WEBHOOK_URL",
+    "GOALFLIGHT_WAKE_WEBHOOK_SECRET",
+    "GOALFLIGHT_WAKE_WEBHOOK_AUTH",
+    "GOALFLIGHT_WAKE_WEBHOOK_TIMEOUT_S",
+    "GOALFLIGHT_WAKE_WEBHOOK_CONFIG",
+)
 MACHINE_PATH_ENV = (
     "GOALFLIGHT_DISPATCH_DIR",
     "GOALFLIGHT_STATE_DIR",
@@ -68,6 +75,9 @@ def isolated_machine_env(root: Path) -> dict[str, str]:
         # unless XDG_STATE_HOME is redirected too.
         "XDG_STATE_HOME": str(root / "xdg"),
         "GOALFLIGHT_CAPACITY_CONF": os.devnull,
+        # Same reason as capacity: a live ~/.goal-flight/wake-webhook.json
+        # must not fire HTTP from the suite. /dev/null reads empty.
+        "GOALFLIGHT_WAKE_WEBHOOK_CONFIG": os.devnull,
         "PYTHONUNBUFFERED": "1",
     }
     for key, value in mapping.items():
