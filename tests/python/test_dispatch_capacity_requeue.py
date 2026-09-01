@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+
 from support import skip_posix_on_native_windows
 
 skip_posix_on_native_windows("capacity requeue tests launch POSIX bash workers")
@@ -17,6 +20,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 DISPATCH = ROOT / "scripts" / "goalflight_dispatch.py"
@@ -338,9 +342,65 @@ def test_acp_detached_capacity_refusal_is_visible_and_not_queued() -> None:
         assert "DISPATCH-BLOCKED" in result.stdout, result.stdout
         status = _read_json(tmp / f"{dispatch_id}.status.json")
         assert status.get("state") == "blocked_capacity", (dispatch_id, status)
+        ledger = _read_json(tmp / "state" / "runs.d" / f"{dispatch_id}.json")
+        assert ledger.get("state") == "blocked_capacity", (dispatch_id, ledger)
         queue_path = tmp / "state" / "dispatch-queue" / f"{dispatch_id}.json"
         assert not queue_path.exists(), f"{dispatch_id} incorrectly re-enqueued"
         assert not spawned.exists(), "ACP worker spawned despite capacity refusal"
+
+
+def test_acp_detached_launcher_reads_final_capacity_status_before_exit() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        status_path = tmp / "acp-capacity-race.status.json"
+        status_path.write_text(json.dumps({"state": "waiting_capacity"}), encoding="utf-8")
+        args = SimpleNamespace(
+            _original_argv=[],
+            agent="codex-acp",
+            background_default_notice=False,
+            cwd=str(tmp),
+            dispatch_id="acp-capacity-race",
+            queue_launch_token=None,
+        )
+
+        @contextlib.contextmanager
+        def no_signals(_pid: int):
+            yield []
+
+        def die_after_final_status(_pid: int) -> bool:
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "state": "blocked_capacity",
+                        "reason": {"reason": "machine_worker_cap"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return False
+
+        stdout = io.StringIO()
+        with (
+            patch.object(D, "_acp_detached_child_argv", return_value=[]),
+            patch.object(D, "_apply_web_qa_env"),
+            patch.object(D, "_find_dispatch_record", return_value={}),
+            patch.object(D, "_forward_detached_launcher_signals", no_signals),
+            patch.object(D, "_release_worktree_occupancy_lock"),
+            patch.object(D, "_spawn_daemonized_process", return_value=424242),
+            patch.object(D.goalflight_compat, "pid_alive", die_after_final_status),
+            contextlib.redirect_stdout(stdout),
+        ):
+            result = D._run_acp_detached_launcher(
+                args,
+                status_json=status_path,
+                tail_path=tmp / "acp-capacity-race.tail",
+                account_env={},
+                env_remove=[],
+                capacity_wait_s=0,
+            )
+
+        assert result == 2, stdout.getvalue()
+        assert "DISPATCH-BLOCKED" in stdout.getvalue(), stdout.getvalue()
 
 
 def test_detached_capacity_wait_interrupt_does_not_enqueue() -> None:
@@ -631,6 +691,7 @@ if __name__ == "__main__":
     test_capacity_refusal_guard_mirrors()
     test_acp_capacity_refusal_foreground()
     test_acp_detached_capacity_refusal_is_visible_and_not_queued()
+    test_acp_detached_launcher_reads_final_capacity_status_before_exit()
     test_detached_capacity_wait_interrupt_does_not_enqueue()
     test_preexisting_queue_capacity_refusal_still_restores_one_entry()
     test_acp_preexisting_queue_capacity_refusal_restores_claim()
