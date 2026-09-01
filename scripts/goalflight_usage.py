@@ -68,7 +68,7 @@ READERS = (
     ReaderSpec("claude", "claude", "claude_usage.py", ("--skip-tui",)),
 )
 
-ROW_KEYS = ("provider", "account", "remaining", "reset_at", "flags")
+ROW_KEYS = ("provider", "account", "remaining", "used", "reset_at", "flags")
 REPORT_ROW_KEYS = ROW_KEYS + ("evidence",)
 AUTH_MARKERS = (
     "auth",
@@ -354,11 +354,18 @@ def _row(
     remaining: str,
     reset_at: float | None,
     flags: Sequence[str] = (),
+    used: str | None = None,
 ) -> dict[str, object]:
+    # `used` is the operator-facing reading (consumed), matching what vendor
+    # consoles show. `remaining` stays in the payload unchanged so --json
+    # consumers and the internal binding-constraint ranking are untouched --
+    # only the rendered column flips. Rows with no numeric reading ("ok",
+    # "lapsed", "Ultra · quota UI-only") pass used=None and render as-is.
     return {
         "provider": provider,
         "account": account,
         "remaining": remaining,
+        "used": used,
         "reset_at": reset_at,
         "flags": list(dict.fromkeys(flags)),
     }
@@ -466,6 +473,11 @@ def _apply_reported_headroom(
     if details:
         remaining = str(row.get("remaining") or "unknown")
         row["remaining"] = " · ".join((remaining, *details))
+        # The rendered column reads `used`, so the same detail suffix has to be
+        # composed onto it too. Composing only onto `remaining` silently dropped
+        # `prepaid=` and the session/week breakdown from the table.
+        if row.get("used"):
+            row["used"] = " · ".join((str(row["used"]), *details))
 
 
 def _normalize_codex(record: Mapping[str, Any], now: float) -> dict[str, object]:
@@ -497,6 +509,7 @@ def _normalize_codex(record: Mapping[str, Any], now: float) -> dict[str, object]
         "codex",
         account=account,
         remaining=f"{_format_number(remaining_value)}%",
+        used=f"{_format_number(min(100.0, max(0.0, used)))}%",
         reset_at=reset_at,
         flags=flags,
     )
@@ -533,6 +546,7 @@ def _normalize_grok(record: Mapping[str, Any], now: float) -> dict[str, object]:
         "grok",
         account=account,
         remaining=f"{_format_number(remaining_value)}%",
+        used=f"{_format_number(min(100.0, max(0.0, used)))}%",
         reset_at=reset_at,
         flags=flags,
     )
@@ -1046,6 +1060,7 @@ def _apply_headroom_to_row(
             flags.append("walled")
         if winner == SOURCE_DISPATCH:
             row["remaining"] = "exhausted"
+            row["used"] = None
             reset_at = parse_reset(
                 dispatch.get("reset_at") if isinstance(dispatch, Mapping) else None
             )
@@ -1057,6 +1072,7 @@ def _apply_headroom_to_row(
             remaining = str(row.get("remaining") or "")
             if remaining.startswith("0%") or remaining in {"exhausted", "0"}:
                 row["remaining"] = "ok"
+                row["used"] = None
     elif verdict == HEADROOM_UNKNOWN:
         # Do not inherit a wall from a dispatch record we refused to promote,
         # and do not invent a healthy percentage.
@@ -1253,7 +1269,7 @@ def render_table(
     current_time = time.time() if now is None else now
     headers = (
         "PROVIDER/ACCOUNT",
-        "REMAINING",
+        "USED",
         "RESETS (local HH:MM)",
         "EVIDENCE",
     )
@@ -1265,7 +1281,10 @@ def render_table(
             rendered = [FLAG_TEXT[flag] for flag in flags if flag in FLAG_TEXT]
             if rendered:
                 flag_text = f"  {' '.join(rendered)}"
-        remaining = f"{row.get('remaining') or 'unknown'}{flag_text}"
+        # Prefer the consumed reading; fall back to the existing text for
+        # rows that carry no numeric percentage at all.
+        reading = row.get("used") or row.get("remaining") or "unknown"
+        remaining = f"{reading}{flag_text}"
         reset_at = parse_reset(row.get("reset_at"))
         reset_text = "—"
         if reset_at is not None:
