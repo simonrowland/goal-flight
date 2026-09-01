@@ -64,12 +64,20 @@ Load order: `AGENTS.md` → this host wrapper → repository `SKILL.md` →
   box and do not clone the repo onto the box.
 - Wrap the existing CLIs: `goalflight_dispatch.py`, `goalflight_messages.py`,
   `goalflight_task.py`, status, doctor. Do not add a parallel store.
-- Grok Bot Task / executor subagents = recon / analysis / review only.
+- Grok Bot Task / executor subagents are a **first-class** host `delegate`
+  surface, distinct from CLI ACP / bash-tail workers. Choose Executor vs CLI
+  from token/budget and task shape. Do **not** apply the Claude-host
+  "Host Agent as code executor = LAST RESORT" rule here.
+- Code-writing: CLI (`--agent codex`, `--agent grok-code`, `--agent moonshot`)
+  when capacity is healthy; Executor when that lane is cheaper/available or
+  the chunk is host-native (recon, synthesis, mail, status).
+- Reviews: kimi3 or codex as independent reviewers. kimi3 is
+  `--agent moonshot` (`adapters/moonshot.json`, default model `kimi-code/k3`).
+  Do not invent a `kimi3` agent id. `forbid_self_review` still applies: a
+  Grok Bot controller must not Type-1-review a `grok-code` worker.
 - Grok Bot Cloud Agents = optional extra worker for GitHub-branch / PR chunks
   only; never the default for a local scientific-coding project.
-- Same-provider review is `forbid_self_review`. A Grok Bot controller must not
-  Type-1-review a `grok-code` worker. Independent engine (codex / gstack)
-  remains the default. Do not pin Grok model ids.
+- Do not pin Grok model ids.
 
 ## Wake path
 
@@ -81,8 +89,9 @@ Documented wake path: the portable `goalflight_messages.py listen` doorbell
 (exit-as-wake). On each ring, process mail, then restore listen depth. Do not
 implement a Grok Bot-native mail transport.
 
-Grok Bot may revive the parent when a background Task finishes. That helps
-executor recon. It is not a substitute for listen doorbells.
+Grok Bot may revive the parent when a background Task / Executor finishes.
+That helps host-native Executor work. It is not a substitute for listen
+doorbells.
 
 ## Multi-controller mail
 

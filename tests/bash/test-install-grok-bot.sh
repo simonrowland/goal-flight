@@ -84,4 +84,37 @@ run_setup --uninstall --from-manifest "$grok_bot_manifest" \
   || fail "grok-bot uninstall left skill"
 echo "test6 pass: uninstall restores the workflows library"
 
+wrapper="$REPO_ROOT/configs/grok-bot/skills/goal-flight/SKILL.md"
+if grep -q 'LAST RESORT' "$wrapper"; then
+  fail "grok-bot wrapper must not copy the Claude-host LAST RESORT executor rule"
+fi
+grep -q 'first-class' "$wrapper" \
+  || fail "grok-bot wrapper must call Executors first-class"
+grep -q -- '--agent moonshot' "$wrapper" \
+  || fail "grok-bot wrapper must route kimi3 reviews through --agent moonshot"
+python3 - "$REPO_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+manifest = json.loads((root / "adapters" / "grok-bot.json").read_text())
+delegate = manifest["tool_name_map"]["delegate"]
+if "Grok Bot Task/executor" not in delegate["host_tools"]:
+    raise SystemExit("delegate host_tools must name Grok Bot Task/executor")
+joined = " ".join(delegate["constraints"])
+if "first-class" not in joined:
+    raise SystemExit("delegate constraints must call Executor first-class")
+if "last-resort" not in joined:
+    raise SystemExit("delegate constraints must reject last-resort framing")
+if "moonshot" not in joined:
+    raise SystemExit("delegate constraints must name --agent moonshot for kimi3")
+routing = manifest.get("host_projection", {}).get("routing") or {}
+if routing.get("executor_is_first_class") is not True:
+    raise SystemExit("host_projection.routing.executor_is_first_class must be true")
+if "kimi3" in json.dumps(manifest.get("agent_id")):
+    raise SystemExit("must not invent a kimi3 agent_id")
+PY
+echo "test7 pass: grok-bot routing treats Executor as first-class; kimi3 is moonshot"
+
 echo "goal-flight grok-bot host install tests passed"

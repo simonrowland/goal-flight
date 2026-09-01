@@ -43,25 +43,41 @@ installed wrapper copy has drifted from that pin; resync with
 
 ## Dispatch and workers
 
-Dispatch CLI workers with the existing scripts (`goalflight_dispatch.py` to the
-codex / grok CLI / cursor / claude adapters). Do not add a parallel task store.
+Grok Bot Executors (Task / executor subagents) are a **first-class** dispatch
+target on this host. Do not copy the Claude-host rule that treats the host
+Agent as a last-resort code executor. That rule stays in the portable
+`SKILL.md` for Claude Code only.
 
-Run those CLI workers on the user's registered computer (the Mac checkout),
-not on the Grok Bot box, and not by cloning the repository onto the box. Grok
-Bot Shell can target that machine with a `machineId`.
+Choose the lane from token/budget (rate pressure, provider spend, session
+limits) and from the task (code vs review vs recon vs planning). Both lanes
+are valid:
 
-- Grok Bot Task / executor subagents are recon, analysis, and review only.
-  They are not code executors. Same rule as the host Agent in the portable core.
-- Grok Bot Cloud Agents are an optional extra worker for GitHub-branch / PR
-  chunks only. They are never the default for a local scientific-coding project.
-- Independent review stays on a different engine (codex / gstack). This host
-  inherits `forbid_self_review`: a Grok Bot controller must not Type-1-review a
-  `grok-code` worker.
-- Do not pin Grok model ids.
+- existing CLI workers via `goalflight_dispatch.py` on the user's registered
+  computer (the Mac checkout), targeted with Grok Bot Shell `machineId`
+- Grok Bot Task / executor subagents (host `delegate` surface)
+
+Do not add a parallel task store. Do not clone the repository onto the Grok
+Bot box. Do not pin Grok model ids.
+
+### Grok Bot routing
+
+| Task | Prefer when capacity is healthy | Alternate / host-native |
+|---|---|---|
+| Code-writing | CLI: `--agent codex`, `--agent grok-code`, or `--agent moonshot` (Kimi Code / kimi3; do not invent a `kimi3` agent id) | Grok Bot Executor when that lane is cheaper or the only one with budget; also for host-native chunks (recon, synthesis, mail, status) |
+| Reviews | Independent CLI: `--agent moonshot` (kimi3) or `--agent codex` | gstack `/review` on an independent engine |
+| Research / web search | `--agent grok-research` (read-only CLI) | controller-direct or Executor recon |
+| Planning / status / mail | Grok Bot Executor or controller-direct | CLI only when the chunk is a large write |
+
+`forbid_self_review` still applies: a Grok Bot controller must not Type-1-review
+a `grok-code` worker. Use moonshot/kimi3 or codex (or gstack) as the
+independent reviewer.
+
+Grok Bot Cloud Agents remain an optional extra worker for GitHub-branch / PR
+chunks only. They are never the default for a local scientific-coding project.
 
 Stamp `--controller-label --controller-pid --controller-session-id` on every
-dispatch. Claim a Grok Bot controller label of your own. Never steal a live
-lease that belongs to another controller.
+`goalflight_dispatch.py` launch. Claim a Grok Bot controller label of your own.
+Never steal a live lease that belongs to another controller.
 
 ## Multi-controller etiquette
 
@@ -91,8 +107,9 @@ On each ring (exit 0), process reported or authoritative mail, then restore
 listen depth. Five-controller setups still use `post --to-controller` plus that
 listen pool.
 
-Grok Bot may revive the parent when a background Task finishes. That is useful
-for executor recon. It is not a substitute for listen doorbells.
+Grok Bot may revive the parent when a background Task / Executor finishes.
+That is useful for host-native Executor work. It is not a substitute for
+listen doorbells.
 
 ## Setup
 
