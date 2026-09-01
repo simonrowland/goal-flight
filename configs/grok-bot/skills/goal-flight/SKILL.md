@@ -67,8 +67,11 @@ installed wrapper copy has drifted from that pin; resync with
   UI, a context-consumption meter, or a Grok Bot-native mail transport.
   Do not port Claude PostToolUse / SessionStart hooks. Do not arm
   unbounded `supervise` as a background shell. Missed wake is latency:
-  resume still pulls status, task next, and `relay --new`. See Wake path
-  and Compaction below.
+  resume still pulls status, task next, and `relay --new`. The operator
+  is not the compaction mailman. The one operator wake-hygiene job is
+  re-arming listen doorbells after a host update or token-pause, surfaced
+  as roster `wake unarmed` — not a second reminder channel. See
+  Compaction and Operator role in `docs/hosts/grok-bot.md`.
 
 ## Dispatch and workers
 
@@ -283,6 +286,13 @@ repository `SKILL.md` → `commands/resume.md`. Then:
 3. store baseline (`goalflight_status.py` + `goalflight_task.py list`)
 4. newest RESUME-NOTES
 5. `goalflight_task.py next`
+
+The operator is not the compaction mailman. After a host update or
+token-pause, listen may exit 5 (dead lease nonce) or tracked tasks may
+be reaped. The next user message or next 15-minute arm/timeout should
+claim and re-arm. Surface a deaf controller as roster `wake unarmed`
+(`wake_armed` / `wake_covered` / `supervisor` absent). Do not invent a
+second reminder channel.
 
 ## Setup
 

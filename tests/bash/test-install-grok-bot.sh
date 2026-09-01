@@ -265,7 +265,17 @@ for compact_file in "$wrapper" "$host_doc"; do
     || fail "$compact_file must require a fresh SKILL.md Hard Invariants disk read"
   grep -q 'update_state' "$compact_file" \
     || fail "$compact_file must call host profile/update_state/routines advisory"
+  grep -q 'not the compaction mailman' "$compact_file" \
+    || fail "$compact_file must keep the operator off compaction"
+  grep -q 'wake unarmed' "$compact_file" \
+    || fail "$compact_file must surface wake-hygiene as roster wake unarmed"
+  grep -q 'exit 5' "$compact_file" \
+    || fail "$compact_file must map token-pause/update to listen exit 5"
+  grep -q 'second reminder channel' "$compact_file" \
+    || fail "$compact_file must refuse a second reminder channel"
 done
+grep -q '## Operator role' "$host_doc" \
+  || fail "docs/hosts/grok-bot.md must have an Operator role section"
 python3 - "$REPO_ROOT" <<'PY'
 import json
 import sys
@@ -310,6 +320,14 @@ if "goalflight-context-meter.sh" not in forbidden:
     raise SystemExit("must refuse porting goalflight-context-meter.sh")
 if "fake window-percent meter" not in forbidden:
     raise SystemExit("must refuse a fake window-percent meter")
+if compact.get("operator_is_compaction_mailman") is not False:
+    raise SystemExit("operator is not the compaction mailman")
+if compact.get("no_second_reminder_channel") is not True:
+    raise SystemExit("must not invent a second reminder channel")
+if "wake unarmed" not in str(compact.get("operator_signal") or ""):
+    raise SystemExit("operator signal must be roster wake unarmed")
+if "exit 5" not in str(compact.get("token_pause_or_update") or ""):
+    raise SystemExit("token-pause/update must map to listen exit 5")
 PY
 echo "test10 pass: grok-bot compaction is write-early handoff, not /compact"
 

@@ -320,6 +320,11 @@
       "advisory_host_memory": ["profile", "update_state", "routines"],
       "canonical_memory": "repo_files",
       "resume_wake": "skip commands/resume.md STEP 1.5 supervise; arm portable listen pool",
+      "operator_is_compaction_mailman": false,
+      "operator_wake_hygiene": "re-arm listen after host update or token-pause",
+      "operator_signal": "roster wake unarmed (wake_armed/wake_covered/supervisor)",
+      "no_second_reminder_channel": true,
+      "token_pause_or_update": "listen exit 5 or reaped tracked tasks; next user message or next 15-minute arm/timeout claims and re-arms",
       "not": [
         "invent a compact UI",
         "ask the user to compact",

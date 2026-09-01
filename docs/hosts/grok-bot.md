@@ -86,10 +86,13 @@ resuming.
   only; never the default for a local scientific-coding project.
 - Do not pin Grok model ids.
 - Grok Bot has no `/compact` and no keep-vs-toss prompt. Autocompact +
-  keep handoff current. Do not port the Claude context-meter or
-  SessionStart hooks. Write the `state-handoff.md` Before compact or
-  sleep block on every listen ring/timeout and before long waves, then
-  quote-check Hard Invariants from disk. Do not ask the user to compact.
+  keep handoff current. The operator is not the compaction mailman.
+  Do not port the Claude context-meter or SessionStart hooks. Write the
+  `state-handoff.md` Before compact or sleep block on every listen
+  ring/timeout and before long waves, then quote-check Hard Invariants
+  from disk. Do not ask the user to compact. The one operator
+  wake-hygiene job is re-arming listen doorbells after a host update or
+  token-pause, surfaced as roster `wake unarmed` — see Operator role.
 
 ## Executor context package
 
@@ -265,6 +268,32 @@ If this controller cannot quote `SKILL.md` Hard Invariants from a
 3. store baseline (`goalflight_status.py` + `goalflight_task.py list`)
 4. newest RESUME-NOTES
 5. `goalflight_task.py next`
+
+## Operator role
+
+The operator is **not** the compaction mailman. No `/compact`, no
+keep-vs-toss ask. Autocompact plus the 15-minute doorbell mini-resume
+(flush RESUME-NOTES, quote-check Hard Invariants from disk, task next)
+owns that job. Do not ask the user to manage compactions.
+
+The operator **is** allowed one wake-hygiene job, the same one Claude
+already has: after a host update or token-exhaustion pause, re-arm the
+listen doorbells (Claude re-arms Monitor / `supervise`). Surface that
+via roster fields already measured — `wake_armed`, `wake_covered`,
+`supervisor` absent — the same signal as a battery-engine
+`wake unarmed` note. `goalflight_session_status.py` already prints
+`wake unarmed` / `wake unarmed with N non-terminal dispatches`. Do not
+invent a second reminder channel.
+
+On grok-bot the listen pool is the arm. `supervisor: absent` is expected
+when no `supervise` process is running; that alone is not the alarm.
+The operator-facing alarm is `wake unarmed` (`wake_armed` false, usually
+with `wake_covered` false).
+
+A token-pause or host update typically shows up as listen **exit 5**
+(dead lease nonce) or as reaped tracked tasks. The next user message, or
+the next 15-minute listen arm/timeout attempt, should claim and re-arm.
+Do not wait for the human to remember compaction.
 
 ## Multi-controller mail
 

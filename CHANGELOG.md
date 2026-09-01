@@ -38,7 +38,9 @@ incremented when meaningful skill behaviour changes.
   UI and no keep-vs-toss prompt. Do not port the Claude context-meter or
   SessionStart hooks; every listen ring/timeout is a mini-resume plus a
   Hard Invariants quote-check (`goalflight_grok_bot_listen.py` banner).
-  No native
+  The operator is not the compaction mailman; the one wake-hygiene job
+  is re-arming listen doorbells after a host update or token-pause,
+  surfaced as roster `wake unarmed`. No native
   mail transport in this port. Unsupported the same way Cursor /
   OpenCode / Codex orchestrator ports are. See `docs/hosts/grok-bot.md`.
 - **Watchlist two-tier wedge detector (`goalflight_wedge_watch.py`).** Cheap
