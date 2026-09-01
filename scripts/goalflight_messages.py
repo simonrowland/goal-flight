@@ -914,8 +914,42 @@ def _controller_registry_unknown_detail(addressing: Mapping[str, object]) -> str
     )
 
 
+def _post_result_ok(result: Mapping[str, object]) -> bool:
+    """Did this post actually reach its destination?
+
+    A caller reading only stdout previously could not tell. A refusal printed
+    a result-SHAPED object ({"recorded": false, "controller_delivery": {...}}),
+    and an argparse rejection printed nothing at all to stdout, so both a
+    refused send and a send that reached nobody looked like output rather than
+    failure. The verdict lived only in the exit code and stderr, which pipelines
+    routinely drop. Observed 2026-09-01: an operator read a refused
+    controller-handoff send as delivered.
+
+    ok is therefore the conjunction the caller actually cares about:
+      recorded AND (controller delivery was not requested OR it was delivered)
+    A message recorded but addressed to a controller nobody resolved is NOT ok
+    -- that is the reached-nobody case, and it is the one most worth catching.
+    """
+    if not result.get("recorded"):
+        return False
+    delivery = result.get("controller_delivery")
+    if isinstance(delivery, Mapping) and delivery.get("requested"):
+        return bool(delivery.get("delivered"))
+    return True
+
+
 def _print_post_result(result: Mapping[str, object], args: argparse.Namespace) -> None:
-    print(json.dumps(result, indent=2 if getattr(args, "json", False) else None))
+    # Stamp only on CONTROLLER-ADDRESSED sends. The worker-delivery record-only
+    # report has a pinned top-level key set that a consumer depends on
+    # (test_worker_delivery_post_report_shape_is_unchanged asserts exact set
+    # equality), and that path never had the ambiguity this solves: it does not
+    # request controller delivery, so there is no reached-nobody case to miss.
+    payload: Mapping[str, object] = result
+    if "controller_delivery" in result:
+        stamped: dict[str, object] = {"ok": _post_result_ok(result)}
+        stamped.update(result)
+        payload = stamped
+    print(json.dumps(payload, indent=2 if getattr(args, "json", False) else None))
 
 
 def _to_controller_refusal_result(
