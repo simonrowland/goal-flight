@@ -32,7 +32,10 @@ incremented when meaningful skill behaviour changes.
   Grok Bot Task / executor prompts reuse the Claude host-subagent pin
   (`protocols/subagent-preamble.md` + triggered
   `protocols/worker-context-package.md`); executors start blank on the
-  box and must name `machineId` plus Mac absolute paths. No native
+  box and must name `machineId` plus Mac absolute paths. Compaction is
+  write-early file state (`state-handoff.md` Before compact or sleep on
+  the 900s frontier ping and before long waves); there is no `/compact`
+  UI and no keep-vs-toss prompt. No native
   mail transport in this port. Unsupported the same way Cursor /
   OpenCode / Codex orchestrator ports are. See `docs/hosts/grok-bot.md`.
 - **Watchlist two-tier wedge detector (`goalflight_wedge_watch.py`).** Cheap

@@ -52,12 +52,13 @@ installed wrapper copy has drifted from that pin; resync with
   goalflight-grokbot`. The 900s quiet timeout is this host's frontier ping
   (anti-stall), not Claude's 120s follow-stream heartbeat. Optional full
   pool (depth 4): 900s on one slot only; others `--timeout-s 0`. On ring,
-  `relay --drain`, act, re-arm. On timeout (exit 1), pull status + task
-  next, then re-arm. Never detach. Do not invent a second event bus, a
-  Settings monitor widget, or a Grok Bot-native mail transport. Do not arm
-  unbounded `supervise` as a background shell. Missed wake is latency:
-  resume still pulls status, task next, and `relay --new`. See Wake path
-  below.
+  `relay --drain`, act, re-arm. On timeout (exit 1), run the directed-compact
+  write (`protocols/state-handoff.md` Before compact or sleep), pull status
+  + task next, then re-arm. Never detach. Do not invent a second event bus,
+  a Settings monitor widget, a compact UI, or a Grok Bot-native mail
+  transport. Do not arm unbounded `supervise` as a background shell.
+  Missed wake is latency: resume still pulls status, task next, and
+  `relay --new`. See Wake path and Compaction below.
 
 ## Dispatch and workers
 
@@ -189,15 +190,17 @@ python3 <skill-root>/scripts/goalflight_messages.py listen \
   --timeout-s 900
 ```
 
-On ring (exit 0): `relay --drain`, act, re-arm. On timeout (exit 1): pull
-`goalflight_status.py` and `goalflight_task.py next`, then re-arm — that
-exit *is* the 15-minute frontier reminder. The portable four-listen pool
+On ring (exit 0): `relay --drain`, act, re-arm. On timeout (exit 1): run
+the directed-compact write (Compaction below), pull `goalflight_status.py`
+and `goalflight_task.py next`, then re-arm — that exit *is* the 15-minute
+frontier reminder and the last reliable moment before an unannounced host
+summary. The portable four-listen pool
 is full depth; one listen is the MVP. If you arm more than one listen,
 put `--timeout-s 900` on a single slot (the frontier ping) and leave the
 others at `--timeout-s 0` so four quiet timeouts do not fire together.
 Branch on listen exit codes. Exit 1 on this host is the frontier
-reminder above (status + task next, re-arm), not the portable
-"re-arm only if coverage is still required" row. Codes 2–5 follow
+reminder above (handoff write + status + task next, re-arm), not the
+portable "re-arm only if coverage is still required" row. Codes 2–5 follow
 `protocols/controller-mail.md`; exit 5 is did-not-arm (do not re-arm
 that nonce).
 
@@ -209,6 +212,41 @@ same-turn block, not a session-life monitor; do not use it as the default.
 
 Missed wake is latency, not data loss. Resume still pulls
 `goalflight_status.py`, `goalflight_task.py next`, and `relay --new`.
+
+## Compaction
+
+Grok Bot has **no** controller-authored `/compact` and **no** keep-vs-toss
+prompt. The host may summarize the chat on its own. Do not invent a compact UI.
+Do not ask the user to compact. Do not emulate Claude's compact prompt in chat.
+
+The directed-compact step on this host **is**
+`protocols/state-handoff.md` "Before compact or sleep":
+
+- update newest `docs-private/RESUME-NOTES-<YYYY-MM-DD>.md` with
+  ENVIRONMENT / IDEAS / DECISIONS / FACTS / CARRIERS only — no task tables,
+  dispatch codes, or next-task lists
+- store baseline via `goalflight_task.py list` (outstanding, plus
+  deferred / held when relevant)
+- `goalflight_status.py`
+
+Write that on the 15-minute frontier heartbeat (listen exit 1) and
+before long waves. There is no warning before the host summarizes.
+
+Resume reload and rebuild are unchanged. Chat summaries are hints, not
+substitutes. Grok Bot profile, `update_state` memory, and routines may
+persist across summaries; they are advisory. Repository files remain
+the canonical memory backend.
+
+If this controller cannot quote `SKILL.md` Hard Invariants from a
+**fresh disk read**, reload `AGENTS.md` → this grok-bot wrapper →
+repository `SKILL.md` → `commands/resume.md`. Then:
+
+1. `goalflight_session_status.py --text`
+2. **Skip** `commands/resume.md` STEP 1.5 (`supervise`). Arm listen
+   doorbells (portable pool) instead.
+3. store baseline (`goalflight_status.py` + `goalflight_task.py list`)
+4. newest RESUME-NOTES
+5. `goalflight_task.py next`
 
 ## Setup
 

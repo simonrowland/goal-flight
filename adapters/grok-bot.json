@@ -281,7 +281,7 @@
       "mvp_depth": 1,
       "full_depth": 4,
       "on_ring": "relay --drain, act, re-arm",
-      "on_timeout": "status + task next, re-arm",
+      "on_timeout": "handoff write + status + task next, re-arm",
       "detached": "forbidden; listen exit 4",
       "not": [
         "unbounded supervise as a Grok Bot background shell",
@@ -293,7 +293,25 @@
         "global supervise/follow cadence change"
       ],
       "terminals": ["COMPLETE", "READY", "FAILED", "BLOCKED", "USER-NEED"],
-      "notes": "Grok Bot notifies on tracked Task/executor or Shell completion only. Success terminal is COMPLETE. Journal remains durable truth; missed wake is latency. Resume pulls status + task next + relay --new. Full listen pool: put --timeout-s 900 on one slot only."
+      "notes": "Grok Bot notifies on tracked Task/executor or Shell completion only. Success terminal is COMPLETE. Journal remains durable truth; missed wake is latency. Resume pulls status + task next + relay --new. Full listen pool: put --timeout-s 900 on one slot only. Listen exit 1 also writes the state-handoff Before compact or sleep block — there is no /compact warning."
+    },
+    "compaction": {
+      "controller_authored_compact": false,
+      "keep_vs_toss_prompt": false,
+      "host_may_summarize_unannounced": true,
+      "directed_compact_is": "protocols/state-handoff.md Before compact or sleep",
+      "write_on": ["listen exit 1 (900s frontier ping)", "before long waves"],
+      "resume_notes_slots": ["ENVIRONMENT", "IDEAS", "DECISIONS", "FACTS", "CARRIERS"],
+      "no_task_tables_in_resume_notes": true,
+      "chat_summaries": "hints, not substitutes",
+      "advisory_host_memory": ["profile", "update_state", "routines"],
+      "canonical_memory": "repo_files",
+      "resume_wake": "skip commands/resume.md STEP 1.5 supervise; arm portable listen pool",
+      "not": [
+        "invent a compact UI",
+        "ask the user to compact",
+        "emulate Claude compact prompt in chat"
+      ]
     },
     "same_provider_policy_notes": "forbid_self_review: a Grok Bot controller must not Type-1-review a grok-code worker. Independent reviews go to --agent moonshot (kimi3 / Kimi Code CLI) or --agent codex, or gstack on those engines.",
     "model_notes": "No model id is pinned. Do not reintroduce a pin here. kimi3 is the moonshot dispatch preset (adapters/moonshot.json default_model kimi-code/k3), not a new agent_id.",

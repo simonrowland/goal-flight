@@ -83,6 +83,9 @@ Load order: `AGENTS.md` → this host wrapper → repository `SKILL.md` →
 - Grok Bot Cloud Agents = optional extra worker for GitHub-branch / PR chunks
   only; never the default for a local scientific-coding project.
 - Do not pin Grok model ids.
+- Grok Bot has no `/compact` and no keep-vs-toss prompt. Write the
+  `state-handoff.md` Before compact or sleep block on the 15-minute
+  frontier ping and before long waves. Do not ask the user to compact.
 
 ## Executor context package
 
@@ -159,9 +162,11 @@ python3 <skill-root>/scripts/goalflight_messages.py listen \
 ```
 
 On ring (**exit 0**): drain with `relay --drain`, act, re-arm. On
-timeout (**exit 1**): pull `goalflight_status.py` and
-`goalflight_task.py next`, then re-arm — that exit *is* the 15-minute
-frontier reminder. The portable four-listen pool is full depth
+timeout (**exit 1**): run the directed-compact write (Compaction
+below), pull `goalflight_status.py` and `goalflight_task.py next`, then
+re-arm — that exit *is* the 15-minute frontier reminder and the last
+reliable moment before an unannounced host summary. The portable
+four-listen pool is full depth
 (resilience; see `protocols/controller-mail.md`). One listen is the MVP.
 If you arm more than one listen, put `--timeout-s 900` on a single slot
 and leave the others at `--timeout-s 0` so four quiet timeouts do not
@@ -171,7 +176,7 @@ restarting:
 | Code | Meaning for this host | Action |
 |---:|---|---|
 | 0 | Ring | `relay --drain`, act, re-arm |
-| 1 | 15-minute frontier ping (quiet timeout) | Pull status + task next, re-arm |
+| 1 | 15-minute frontier ping (quiet timeout) | Handoff write + status + task next, re-arm |
 | 2 | Journal unreadability | Repair/escalate; do not restart-loop |
 | 3 | Contention / stale lease | Reconcile the live lease; re-arm only under it |
 | 4 | Detached refusal (`nohup` / `&` / disown) | Launch a tracked listener; do not detach again |
@@ -191,6 +196,43 @@ it as the default.
 
 This port documents the listen doorbell mapping only. Do not implement a Grok
 Bot-native mail transport.
+
+## Compaction
+
+Claude's directed compact is a controller-authored keep-vs-toss prompt,
+then `/compact`, then `/goal-flight resume`. Grok Bot has **no**
+controller-authored `/compact` and **no** keep-vs-toss prompt. The host
+may summarize the chat on its own. Do not invent a compact UI.
+Do not ask the user to compact. Do not emulate Claude's compact prompt in chat.
+
+The directed-compact step on this host **is**
+`protocols/state-handoff.md` "Before compact or sleep":
+
+- update newest `docs-private/RESUME-NOTES-<YYYY-MM-DD>.md` with
+  ENVIRONMENT / IDEAS / DECISIONS / FACTS / CARRIERS only — no task tables,
+  dispatch codes, or next-task lists
+- store baseline via `goalflight_task.py list` (outstanding, plus
+  deferred / held when relevant)
+- `goalflight_status.py`
+
+Write that on the 15-minute frontier heartbeat (listen exit 1) and
+before long waves. There is no warning before the host summarizes.
+
+Resume reload and rebuild are unchanged. Chat summaries are hints, not
+substitutes. Grok Bot profile, `update_state` memory, and routines may
+persist across summaries; they are advisory. Repository files remain
+the canonical memory backend.
+
+If this controller cannot quote `SKILL.md` Hard Invariants from a
+**fresh disk read**, reload `AGENTS.md` → grok-bot wrapper → repository
+`SKILL.md` → `commands/resume.md`. Then:
+
+1. `goalflight_session_status.py --text`
+2. **Skip** `commands/resume.md` STEP 1.5 (`supervise`). Arm listen
+   doorbells (portable pool) instead.
+3. store baseline (`goalflight_status.py` + `goalflight_task.py list`)
+4. newest RESUME-NOTES
+5. `goalflight_task.py next`
 
 ## Multi-controller mail
 

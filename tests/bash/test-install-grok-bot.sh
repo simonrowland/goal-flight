@@ -162,8 +162,8 @@ if wake.get("controller_label") != "goalflight-grokbot":
     raise SystemExit("wake.controller_label must be goalflight-grokbot")
 if wake.get("timeout_s") != 900:
     raise SystemExit("wake.timeout_s must be 900")
-if wake.get("on_timeout") != "status + task next, re-arm":
-    raise SystemExit("wake.on_timeout must pull status + task next, then re-arm")
+if wake.get("on_timeout") != "handoff write + status + task next, re-arm":
+    raise SystemExit("wake.on_timeout must write handoff, then status + task next, re-arm")
 if wake.get("mvp_depth") != 1 or wake.get("full_depth") != 4:
     raise SystemExit("wake depth must be MVP 1 / full 4")
 if wake.get("finished_alias"):
@@ -229,5 +229,72 @@ if pkg.get("no_parallel_package_format") is not True:
     raise SystemExit("must refuse a parallel package format")
 PY
 echo "test9 pass: grok-executor Task prompts reuse the Claude host-subagent pin"
+
+for compact_file in "$wrapper" "$host_doc"; do
+  grep -q 'protocols/state-handoff.md' "$compact_file" \
+    || fail "$compact_file must map directed compact to state-handoff.md"
+  grep -q 'Before compact or sleep' "$compact_file" \
+    || fail "$compact_file must name the Before compact or sleep write"
+  grep -q 'ENVIRONMENT' "$compact_file" \
+    || fail "$compact_file must name ENVIRONMENT in RESUME-NOTES slots"
+  grep -q 'IDEAS' "$compact_file" \
+    || fail "$compact_file must name IDEAS in RESUME-NOTES slots"
+  grep -q 'DECISIONS' "$compact_file" \
+    || fail "$compact_file must name DECISIONS in RESUME-NOTES slots"
+  grep -q 'FACTS' "$compact_file" \
+    || fail "$compact_file must name FACTS in RESUME-NOTES slots"
+  grep -q 'CARRIERS' "$compact_file" \
+    || fail "$compact_file must name CARRIERS in RESUME-NOTES slots"
+  grep -q 'no task tables' "$compact_file" \
+    || fail "$compact_file must forbid task tables in RESUME-NOTES"
+  grep -q 'before long waves' "$compact_file" \
+    || fail "$compact_file must write handoff before long waves"
+  grep -q 'keep-vs-toss' "$compact_file" \
+    || fail "$compact_file must state there is no keep-vs-toss prompt"
+  grep -q 'Do not ask the user to compact' "$compact_file" \
+    || fail "$compact_file must forbid asking the user to compact"
+  grep -q 'Do not invent a compact UI' "$compact_file" \
+    || fail "$compact_file must forbid inventing a compact UI"
+  grep -q 'Skip' "$compact_file" \
+    || fail "$compact_file must skip resume.md STEP 1.5 supervise"
+  grep -q 'Chat summaries are hints' "$compact_file" \
+    || fail "$compact_file must treat chat summaries as hints"
+  grep -q 'Hard Invariants' "$compact_file" \
+    || fail "$compact_file must require a fresh SKILL.md Hard Invariants disk read"
+  grep -q 'update_state' "$compact_file" \
+    || fail "$compact_file must call host profile/update_state/routines advisory"
+done
+python3 - "$REPO_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+compact = json.loads((root / "adapters" / "grok-bot.json").read_text())["host_projection"]["compaction"]
+if compact.get("controller_authored_compact") is not False:
+    raise SystemExit("grok-bot has no controller-authored /compact")
+if compact.get("keep_vs_toss_prompt") is not False:
+    raise SystemExit("grok-bot has no keep-vs-toss prompt")
+if compact.get("host_may_summarize_unannounced") is not True:
+    raise SystemExit("host may summarize unannounced")
+if "Before compact or sleep" not in str(compact.get("directed_compact_is") or ""):
+    raise SystemExit("directed compact is the state-handoff Before compact write")
+if compact.get("canonical_memory") != "repo_files":
+    raise SystemExit("canonical memory remains repo_files")
+if "STEP 1.5" not in str(compact.get("resume_wake") or ""):
+    raise SystemExit("resume_wake must skip commands/resume.md STEP 1.5")
+if compact.get("no_task_tables_in_resume_notes") is not True:
+    raise SystemExit("RESUME-NOTES must not carry task tables")
+if "before long waves" not in " ".join(compact.get("write_on") or []):
+    raise SystemExit("must write handoff before long waves")
+forbidden = " ".join(compact.get("not") or [])
+if "invent a compact UI" not in forbidden:
+    raise SystemExit("must not invent a compact UI")
+if "ask the user to compact" not in forbidden:
+    raise SystemExit("must not ask the user to compact")
+if "emulate Claude compact prompt" not in forbidden:
+    raise SystemExit("must not emulate Claude compact prompt")
+PY
+echo "test10 pass: grok-bot compaction is write-early handoff, not /compact"
 
 echo "goal-flight grok-bot host install tests passed"
