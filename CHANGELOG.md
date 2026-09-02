@@ -6,6 +6,20 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Changed
+
+- Default `goalflight_messages.py supervise` stdout is terse and Monitor-safe.
+  Do not grep the feed. Quiet generations emit one owned
+  stream/backup/watchdog arm line, then only actionable wakes (new
+  controller-addressed mail, real faults, did-not-arm, child death that
+  needs re-arm, coverage loss such as 4/4 → 0/4, a changed frontier).
+  Periodic heartbeat, unchanged coverage, empty/unknown `kind=next`,
+  healthy `rang` restarts, and poll ticks stay off stdout. Heartbeat
+  remains an internal last-ditch peer-liveness write and prints only with
+  `--debug`. `--chatty` restores raw keepalives and frontiers. Exit is
+  never mute: reader-gone / EPIPE / monitor-drop prints a reason on
+  stderr (b-248, b-249, b-202).
+
 ### Fixed
 
 - `supervise` backlog cap keys on envelope identity, not raw line count.

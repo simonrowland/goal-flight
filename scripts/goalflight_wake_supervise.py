@@ -101,13 +101,12 @@ STDOUT_BACKPRESSURE_BUDGET_S = 5.0
 # events and kind=next wake them — so after the b-248 rounds its only
 # load-bearing role is the periodic AUTHORITATIVE peer-probe write.
 # Prompt peer-gone detection is selector/POLLHUP-based with the
-# fail-closed detector choke point. This write still protects the
-# all-poll-detectors-fail-silent fallback, where EPIPE on the next write
-# is the last detector. Worst-case detection delay is one heartbeat
-# period (now 3600s). That is acceptable for an already-multiply-degraded
-# case: the fast poll path and POLLHUP already failed silent, so waiting
-# one hour for the last-ditch write is better than waking the controller
-# every 25 minutes for a record it never acts on.
+# fail-closed detector choke point. The last-ditch write still protects
+# the all-poll-detectors-fail-silent fallback (EPIPE on the next write).
+# Default terse mode must not print that write: a controller-visible
+# heartbeat is a Monitor wake (b-249 / b-202). --debug restores the
+# printed record. Worst-case detection delay without a printed beat is
+# one heartbeat period (now 3600s) plus the next real event write.
 DEFAULT_SUPERVISOR_HEARTBEAT_S = 3600.0
 MIN_SUPERVISOR_HEARTBEAT_S = 60.0
 MAX_SUPERVISOR_HEARTBEAT_S = 4.0 * 3600
@@ -122,8 +121,9 @@ STREAM_FRONTIER_GRACE_S = 1.0
 # cached frontier as kind=next on every 120s keepalive, so a verbatim-
 # identical payload cost a full controller wake (b-271). Keep the
 # keepalive cadence for CHANGED content; suppress unchanged repeats
-# until this floor so the anti-stall beat still exists. --chatty
-# restores the raw heartbeat/frontier feed and therefore the raw cadence.
+# until this floor so the anti-stall beat still exists. Empty/unknown
+# idle next records are not controller wakes. --chatty restores the
+# raw heartbeat/frontier feed and therefore the raw cadence.
 DEFAULT_NEXT_REPEAT_FLOOR_S = 15.0 * 60.0
 # A stuck child can re-emit an unread backlog every cycle (incident: 330
 # envelopes from cursor 5220 while a sibling had reached 5550). Cap the
@@ -173,6 +173,7 @@ _ORPHANED_STDOUT_MARKERS = (
 )
 _SLOT_STOP_REASONS = frozenset({"did-not-arm"})
 _DIAGNOSTIC_EVENT_TYPES = frozenset({"listener-exit", "listener-fault"})
+_IDLE_NEXT_STATES = frozenset({"empty", "unknown"})
 _ARMED_STDOUT_KINDS = frozenset(
     {
         "armed",
@@ -311,6 +312,7 @@ class SuperviseHost(Protocol):
     def running(self) -> bool: ...
     def live_nonce(self) -> str | None: ...
     def write_stdout(self, line: str) -> bool: ...
+    def touch_stdout(self) -> bool: ...
     def stdio_peer_gone(self) -> bool: ...
     def report_stdout_detector(
         self, source: str, outcome: str, detail: str = "", error: str = ""
@@ -645,6 +647,70 @@ def _emit(host: SuperviseHost, record: dict[str, object]) -> bool:
         _supervise_line(record),
         source=f"write-{record_type}",
     )
+
+
+def _note_supervise_exit(reason: str, detail: str = "") -> None:
+    """Never exit mute: stderr carries the reason when stdout cannot."""
+    message = f"goalflight supervise: {reason}"
+    if detail:
+        message = f"{message}: {detail}"
+    try:
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+def _owned_coverage_label(slots: list[_Slot]) -> str:
+    seen: list[str] = []
+    for slot in slots:
+        if slot.kind not in seen:
+            seen.append(slot.kind)
+    return "/".join(seen)
+
+
+def _next_is_actionable_wake(record: dict[str, object]) -> bool:
+    """Idle empty/unknown next records are not controller wakes."""
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    return str(payload.get("state") or "") not in _IDLE_NEXT_STATES
+
+
+def _silent_peer_write(host: SuperviseHost) -> bool:
+    """Last-ditch peer probe that must not complete a Monitor-visible line."""
+    touch = getattr(host, "touch_stdout", None)
+    if callable(touch):
+        try:
+            written = bool(touch())
+        except OSError as exc:
+            policy, error_name = _detector_error_policy(exc)
+            if policy == "peer-gone":
+                _report_stdout_detector(
+                    host,
+                    source="write-peer-probe",
+                    outcome="peer-gone",
+                    detail="controlling stdout closed during peer probe",
+                    error=error_name,
+                )
+                return False
+            _report_stdout_detector(
+                host,
+                source="write-peer-probe",
+                outcome="unavailable",
+                detail=f"stdout peer probe failed: {error_name}: {exc}",
+                error=error_name,
+            )
+            return False
+        _report_stdout_detector(
+            host,
+            source="write-peer-probe",
+            outcome="available" if written else "peer-gone",
+            detail="" if written else "controlling stdout closed during peer probe",
+        )
+        return written
+    _probe_stdout_detector(host, source="write-peer-probe")
+    return not host.stdout_detector_status().peer_gone
 
 
 def _supervisor_rearm_command(
@@ -1463,6 +1529,8 @@ def run_supervisor(
         return True
 
     def emit_restart(record: dict[str, object]) -> bool:
+        if not chatty and str(record.get("reason") or "") == "rang":
+            return True
         child = str(record.get("child") or "")
         gate = restart_gates.setdefault(child, _RestartGate())
         key = _restart_record_key(record)
@@ -1499,6 +1567,10 @@ def run_supervisor(
             host.kill_all()
             return SUPERVISE_STOP_EXIT
         if status.peer_gone:
+            _note_supervise_exit(
+                "reader-gone",
+                "controlling stdout closed (EPIPE/monitor-drop)",
+            )
             host.kill_all()
             return 0
         # Unknown probe observations are allowed only while the registered
@@ -1584,25 +1656,52 @@ def run_supervisor(
     seq = 0
     reported_revision = -1
     reported_counts: tuple[int, int] | None = None
+    last_observed_live: int | None = None
 
     def emit_coverage(*, force: bool = False) -> tuple[bool, bool]:
-        nonlocal reported_counts, reported_revision
-        if not emit_depth:
-            # Option A: coverage carries only listener depth, so terse mode has
-            # no informational record to emit. Its depth/revision suppression
-            # key therefore applies only when those values are in the payload.
-            # Startup uses an explicit probe below for the required peer write;
-            # restart and stop paths already attempt their own meaningful write.
-            return True, False
+        nonlocal reported_counts, reported_revision, last_observed_live
         live, target = _live_target(slots)
         counts = (live, target)
-        if (
-            not force
-            and counts == reported_counts
-            and coverage_revision == reported_revision
-        ):
+        previous_live = last_observed_live
+        last_observed_live = live
+        if emit_depth:
+            if (
+                not force
+                and counts == reported_counts
+                and coverage_revision == reported_revision
+            ):
+                return True, False
+            record: dict[str, object] = {
+                "kind": "supervise",
+                "type": "coverage",
+                "live": live,
+                "target": target,
+            }
+            emitted = _emit(host, record)
+            if emitted:
+                reported_counts = counts
+                reported_revision = coverage_revision
+            return emitted, emitted
+        # Terse: only operator-actionable loss (e.g. 4/4 → 0/4), or --debug ticks.
+        # A healthy rang/re-arm gap is live=0 with backoff 0 and no slot stop.
+        # That is not operator action — restart records cover real deaths.
+        rang_only_gap = all(
+            slot.stopped_reason is None and slot.backoff_s <= 0
+            for slot in slots
+            if slot.child is None
+        )
+        actionable_loss = (
+            previous_live is not None
+            and previous_live > 0
+            and live == 0
+            and target > 0
+            and not rang_only_gap
+        )
+        if not force and not actionable_loss:
             return True, False
-        record: dict[str, object] = {
+        if force and not debug and not actionable_loss:
+            return True, False
+        record = {
             "kind": "supervise",
             "type": "coverage",
             "live": live,
@@ -1618,6 +1717,8 @@ def run_supervisor(
         nonlocal seq
         live, target = _live_target(slots)
         seq += 1
+        if not debug:
+            return _silent_peer_write(host)
         record: dict[str, object] = {
             "kind": "supervise",
             "type": "heartbeat",
@@ -1630,15 +1731,14 @@ def run_supervisor(
     if emit_depth:
         startup_probe_ok, _coverage_emitted = emit_coverage(force=True)
     else:
-        # Terse startup still needs an actual stdout write to detect a dead
-        # controller. Name that operational write instead of emitting empty
-        # coverage or changing the scheduled heartbeat interval.
+        # First successful arm is the one controller-visible startup write.
+        # Heartbeat stays an internal peer probe unless --debug.
         startup_probe_ok = _emit(
             host,
             {
                 "kind": "supervise",
-                "type": "probe",
-                "reason": "stdout-peer-liveness",
+                "type": "arm",
+                "owned": _owned_coverage_label(slots),
             },
         )
     if not startup_probe_ok or (debug and not emit_heartbeat()):
@@ -1711,6 +1811,8 @@ def run_supervisor(
         if isinstance(frontier, dict):
             latest_frontier = frontier
         record = _actionable_stream_wake(frontier)
+        if not _next_is_actionable_wake(record):
+            return True
         key = _next_payload_key(record)
         if not next_gate.should_emit(key, now=host.now, floor_s=repeat_floor_s):
             return True
@@ -2181,6 +2283,10 @@ class RealHost:
         for child in alive:
             if child.pid in pids:
                 child.armed = True
+
+    def touch_stdout(self) -> bool:
+        """Detect a dead controlling reader without completing a stdout line."""
+        return not self.stdio_peer_gone()
 
     def write_stdout(self, line: str) -> bool:
         text = line if line.endswith("\n") else line + "\n"

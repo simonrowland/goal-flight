@@ -429,9 +429,11 @@ reads the mail cursor. This makes persistent coverage a shared four-component
 `live/4` fact. It stays persistent after stream death, so the surviving backup pool and
 watchdog report `3/4`, not portable `1/4`.
 Unchanged frontiers have a 15-minute floor and changed frontiers emit on the next
-idle beat. Terse `supervise` then suppresses a verbatim-identical `kind=next`
-payload until that same floor; a content change still wakes immediately, and
-`--chatty` restores the raw keepalive and frontier feed. Failure restarts
+idle beat. Do not grep `supervise`: default is terse and Monitor-safe. It emits
+one owned stream/backup/watchdog arm line, then only actionable wakes. Terse
+`supervise` suppresses empty/unknown idle `kind=next` records and a
+verbatim-identical payload until that same floor; a content change still wakes
+immediately, and `--chatty` restores the raw keepalive and frontier feed. Failure restarts
 escalate 1s → 2 → 4 … to 120s (reset on a successful or long-lived run; exit 0
 stays at zero delay). The first `type=restart` of a key emits immediately;
 verbatim-identical copies then reuse that floor so a crash loop does not emit
@@ -448,15 +450,20 @@ An event defers the next idle heartbeat, avoiding a contradictory event plus
 
 The supervisor's own heartbeat is a separate record and clock from the stream
 heartbeat above. It defaults to 3600 seconds, may be configured from 60–14400
-seconds, and is the real-write fallback that detects a closed controlling pipe
-when the fast per-tick poll has no evidence. The supervisor wait also watches
-stdout for `POLLERR|POLLHUP|POLLNVAL`, so positive closure evidence wakes it
-independently of the heartbeat. When `live` / `target` are enabled, coverage
+seconds, and is the last-ditch peer-liveness write that detects a closed
+controlling pipe when the fast per-tick poll has no evidence. Default terse
+mode does not print that write — `--debug` restores the controller-visible
+heartbeat and per-tick coverage. The supervisor wait also watches stdout for
+`POLLERR|POLLHUP|POLLNVAL`, so positive closure evidence wakes it independently
+of the heartbeat. When `live` / `target` are enabled (`--chatty`), coverage
 emits at startup, on each `(live,target)` change, and immediately on a slot
 stop or restart; unchanged periodic coverage is suppressed unless `--debug`
-restores per-tick heartbeat records. Default terse mode emits no coverage
-record; startup writes a named
-`{"type":"probe","reason":"stdout-peer-liveness"}` peer-liveness probe. Every supervisor
+restores per-tick records. Default terse mode emits no periodic coverage;
+startup writes one
+`{"kind":"supervise","type":"arm","owned":"stream/backup/watchdog"}` line.
+A later coverage record is only for operator-actionable loss (for example
+4/4 → 0/4). Exit is never mute: reader-gone / EPIPE / monitor-drop prints a
+reason on stderr. Every supervisor
 `type=stop` and every `type=exit` caused by `SIGTERM`, `SIGINT`, or `SIGHUP`
 carries the exact re-arm command. The stream stays at 120 seconds and the
 watchdog still declares stream death after three missed stream intervals.

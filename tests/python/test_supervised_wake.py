@@ -145,6 +145,12 @@ class FakeHost:
                 self.stop = True
         return True
 
+    def touch_stdout(self) -> bool:
+        self.actions.append("write:peer-probe")
+        if self.fail_write_type == "peer-probe":
+            return False
+        return not self.stdio_peer_gone()
+
     def stdio_peer_gone(self) -> bool:
         self._peer_checks += 1
         return (
@@ -700,9 +706,18 @@ def test_debug_restores_unconditional_per_tick_counts() -> None:
         debug=True,
     )
     terse_records = _records(terse_host)
-    assert [
+    coverages = [
         record for record in terse_records if record.get("type") == "coverage"
-    ] == [], "terse mode must emit no coverage record, empty or otherwise"
+    ]
+    heartbeats = [
+        record for record in terse_records if record.get("type") == "heartbeat"
+    ]
+    assert coverages, "--debug restores per-tick coverage on the terse path"
+    assert heartbeats, "--debug restores per-tick heartbeat on the terse path"
+    assert all(
+        isinstance(record.get("live"), int) and isinstance(record.get("target"), int)
+        for record in coverages
+    )
     assert not any(
         record.get("kind") == "supervise"
         and set(record) == {"kind", "type"}
@@ -719,13 +734,28 @@ def test_slow_heartbeat_is_the_real_write_with_unchanged_state() -> None:
         coverage_s=0.05,
         emit_depth=True,
     )
+    assert not any(
+        record.get("type") == "heartbeat" for record in _records(host)
+    )
+    assert "write:peer-probe" in host.actions
+    debug_host = FakeHost(stop_after_waits=1)
+    _run(
+        debug_host,
+        _items("stream"),
+        heartbeat_s=0.12,
+        coverage_s=0.05,
+        emit_depth=True,
+        debug=True,
+    )
     heartbeats = [
-        record for record in _records(host) if record.get("type") == "heartbeat"
+        record
+        for record in _records(debug_host)
+        if record.get("type") == "heartbeat"
     ]
     assert heartbeats == [
         {
             "kind": "supervise",
-            "live": 1,
+            "live": 0,
             "seq": 1,
             "target": 1,
             "type": "heartbeat",
@@ -740,6 +770,7 @@ def test_failed_slow_heartbeat_write_tears_down_immediately() -> None:
         _items("stream"),
         heartbeat_s=0.12,
         coverage_s=0.05,
+        debug=True,
     )
     assert code == 0
     assert host._waits < 6
@@ -748,8 +779,25 @@ def test_failed_slow_heartbeat_write_tears_down_immediately() -> None:
     assert sum(action == "write:heartbeat" for action in host.actions) == 1
 
 
-def test_default_startup_probe_write_failure_tears_down() -> None:
-    host = FakeHost(fail_write_type="probe", stop_after_waits=1)
+def test_failed_silent_peer_probe_tears_down_without_heartbeat_line() -> None:
+    host = FakeHost(stop_after_waits=6, fail_write_type="peer-probe")
+    code = _run(
+        host,
+        _items("stream"),
+        heartbeat_s=0.12,
+        coverage_s=0.05,
+    )
+    assert code == 0
+    assert host._waits < 6
+    assert "write:peer-probe" in host.actions
+    assert "write:heartbeat" not in host.actions
+    assert not any(
+        record.get("type") == "heartbeat" for record in _records(host)
+    )
+
+
+def test_default_startup_arm_write_failure_tears_down() -> None:
+    host = FakeHost(fail_write_type="arm", stop_after_waits=1)
     code = _run(
         host,
         _items("stream"),
@@ -757,7 +805,7 @@ def test_default_startup_probe_write_failure_tears_down() -> None:
         coverage_s=100.0,
     )
     assert code == 0
-    assert host.actions == ["write:probe", "kill"]
+    assert host.actions == ["write:arm", "kill"]
     assert host.children and not any(child.alive for child in host.children)
 
 
@@ -1250,12 +1298,8 @@ def test_late_frontier_does_not_create_a_second_wake() -> None:
     _run(host, _items("stream"), heartbeat_s=100.0, coverage_s=100.0)
 
     actionable = [record for record in _records(host) if record.get("kind") == "next"]
-    assert len(actionable) == 2
-    assert actionable[0]["payload"]["directive"] == "Nothing pending"
-    assert actionable[1]["payload"] == {
-        "directive": "goal-flight next",
-        "state": "unknown",
-    }
+    assert actionable == []
+    assert [record.get("type") for record in _records(host)] == ["arm"]
 
 
 def test_forwarding_projection_failure_cannot_turn_legacy_empty_into_idle() -> None:
@@ -1551,13 +1595,9 @@ def test_successful_run_resets_failure_backoff(tmp_path: Path) -> None:
         coverage_s=10_000.0,
     )
     restarts = [record for record in _records(host) if record.get("type") == "restart"]
-    assert [int(record["exit"]) for record in restarts] == [1, 0, 1]
-    assert [record.get("reason") for record in restarts] == [
-        "exit-1",
-        "rang",
-        "exit-1",
-    ]
-    assert [float(record["backoff_s"]) for record in restarts] == [1.0, 0.0, 1.0]
+    assert [int(record["exit"]) for record in restarts] == [1, 1]
+    assert [record.get("reason") for record in restarts] == ["exit-1", "exit-1"]
+    assert [float(record["backoff_s"]) for record in restarts] == [1.0, 1.0]
     # Four spawns: the last one trips stop_after_spawns and is not waited on.
     assert counter.read_text() == "4"
 
@@ -1593,7 +1633,22 @@ def test_exit_0_rearms_at_zero_backoff() -> None:
         coverage_s=10_000.0,
         next_repeat_floor_s=0.0,
     )
-    restarts = [record for record in _records(host) if record.get("type") == "restart"]
+    assert [kind for kind, _command in host.spawns] == ["backup", "backup", "backup"]
+    assert not [
+        record for record in _records(host) if record.get("type") == "restart"
+    ]
+    chatty_host = RealCrashHost(stop_after_spawns=3)
+    _run(
+        chatty_host,
+        [("backup", success)],
+        heartbeat_s=10_000.0,
+        coverage_s=10_000.0,
+        next_repeat_floor_s=0.0,
+        chatty=True,
+    )
+    restarts = [
+        record for record in _records(chatty_host) if record.get("type") == "restart"
+    ]
     assert len(restarts) == 2
     assert all(record.get("reason") == "rang" for record in restarts)
     assert all(record.get("exit") == 0 for record in restarts)
@@ -2025,8 +2080,8 @@ def test_default_supervisor_output_suppresses_depth_and_opt_in_restores_it() -> 
     assert default_records == [
         {
             "kind": "supervise",
-            "type": "probe",
-            "reason": "stdout-peer-liveness",
+            "type": "arm",
+            "owned": "stream",
         }
     ]
     assert {"kind": "supervise", "type": "coverage"} not in default_records
@@ -2060,11 +2115,142 @@ def test_debug_without_depth_keeps_meaningful_startup_diagnostics() -> None:
     assert _records(host) == [
         {
             "kind": "supervise",
-            "type": "probe",
-            "reason": "stdout-peer-liveness",
+            "type": "arm",
+            "owned": "stream",
         },
         {"kind": "supervise", "type": "heartbeat", "seq": 1},
     ]
+
+
+def test_quiet_generation_emits_only_the_arm_line() -> None:
+    host = FakeHost(
+        scripts={
+            "stream": [
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (0.0, '{"kind":"heartbeat","payload":{"seq":1}}'),
+                        (0.01, '{"kind":"frontier","payload":{"state":"empty"}}'),
+                        (0.2, '{"kind":"heartbeat","payload":{"seq":2}}'),
+                        (0.21, '{"kind":"frontier","payload":{"state":"empty"}}'),
+                    ],
+                )
+            ],
+            "backup": [PlannedExit(lifetime_s=80.0, returncode=0, armed=True)],
+            "watchdog": [PlannedExit(lifetime_s=80.0, returncode=0, armed=True)],
+        },
+        stop_after_waits=6,
+    )
+    _run(
+        host,
+        _items("stream", "backup", "watchdog"),
+        heartbeat_s=0.15,
+        coverage_s=0.15,
+    )
+    assert _records(host) == [
+        {"kind": "supervise", "owned": "stream/backup/watchdog", "type": "arm"}
+    ]
+    assert "write:heartbeat" not in host.actions
+    assert "write:coverage" not in host.actions
+    assert "write:peer-probe" in host.actions
+
+
+def test_terse_forwards_mail_and_fault_lines() -> None:
+    host = FakeHost(
+        scripts={
+            "stream": [
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (
+                            0.0,
+                            '{"kind":"event","payload":{"type":"merge-request","id":"m-1"}}',
+                        ),
+                        (
+                            0.01,
+                            '{"kind":"event","payload":{"type":"listener-fault","reason":"journal"}}',
+                        ),
+                    ],
+                )
+            ],
+            "backup": [
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (0.0, "FROM worker subject=merge-request ready"),
+                    ],
+                )
+            ],
+        },
+        stop_when_lines_contain=(
+            "merge-request",
+            "listener-fault",
+            "FROM worker subject=merge-request ready",
+        ),
+    )
+    _run(
+        host,
+        _items("stream", "backup"),
+        heartbeat_s=100.0,
+        coverage_s=100.0,
+    )
+    joined = "".join(host.lines)
+    assert '"type":"merge-request"' in joined
+    assert '"type":"listener-fault"' in joined
+    assert "FROM worker subject=merge-request ready" in joined
+
+
+def test_reader_gone_exit_prints_reason(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    host = FakeHost(peer_gone_after_checks=1)
+    code = _run(host, _items("stream"), heartbeat_s=100.0, coverage_s=100.0)
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "reader-gone" in err
+    assert "EPIPE" in err or "monitor-drop" in err
+    assert err.strip() != ""
+
+
+def test_terse_coverage_emits_only_on_total_loss() -> None:
+    host = FakeHost(
+        scripts={
+            "stream": [
+                PlannedExit(
+                    lifetime_s=0.4,
+                    returncode=1,
+                    output="fault",
+                    armed=True,
+                    stdout_lines=[
+                        (0.0, '{"kind":"heartbeat","payload":{"seq":1}}'),
+                    ],
+                )
+            ],
+            "backup": [
+                PlannedExit(lifetime_s=0.4, returncode=1, output="fault", armed=True)
+            ],
+            "watchdog": [
+                PlannedExit(lifetime_s=0.4, returncode=1, output="fault", armed=True)
+            ],
+        },
+        stop_when_lines_contain=('"type":"coverage"', '"live":0'),
+    )
+    _run(
+        host,
+        _items("stream", "backup", "watchdog"),
+        heartbeat_s=100.0,
+        coverage_s=100.0,
+    )
+    coverages = [record for record in _records(host) if record.get("type") == "coverage"]
+    assert coverages
+    assert coverages[-1]["live"] == 0
+    assert coverages[-1]["target"] == 3
 
 
 def test_opt_in_live_counts_armed_components_not_pids() -> None:
@@ -2196,8 +2382,7 @@ def test_short_exit_2_transients_keep_retrying_until_slot_recovers() -> None:
         for record in _records(host)
         if record.get("type") == "restart"
     ]
-    assert reasons[:transient_failures] == ["exit-2"] * transient_failures
-    assert reasons[-1] == "rang"
+    assert reasons == ["exit-2"] * transient_failures
     assert all(record.get("type") != "stop" for record in _records(host))
 
 
@@ -2226,6 +2411,7 @@ def test_controller_mail_documents_supervise_front_door() -> None:
     assert "goalflight_messages.py supervise" in doctrine
     assert "--controller-label" in doctrine
     assert "live/" in doctrine
+    assert "do **not** grep" in doctrine.lower()
     assert "no timeout" in doctrine.lower()
     assert "`persistent: true`" in doctrine
     assert "`timeout_ms` inert" in doctrine
@@ -2298,6 +2484,7 @@ def test_supervise_cli_is_the_one_command_front_door(tmp_path: Path) -> None:
     assert "production 60-14400" in help_text.stdout
     assert "--debug" in help_text.stdout
     assert "--chatty" in help_text.stdout
+    assert "do not grep" in help_text.stdout
     assert "restore raw stream keepalives" in help_text.stdout
     top = subprocess.run(
         [sys.executable, str(SCRIPTS / "goalflight_messages.py"), "--help"],
@@ -2321,9 +2508,17 @@ def isolated(
             "GOALFLIGHT_CONTROLLER_LABEL": label,
             "GOALFLIGHT_PROCESS_ROLE": "controller",
             "GOALFLIGHT_WAKE_ENTRY_POLL_S": "0",
+            "GOALFLIGHT_CAPACITY_CONF": os.devnull,
         }
     )
     for key in AMBIENT_IDENTITY_ENV:
+        monkeypatch.delenv(key, raising=False)
+    for key in (
+        "GOALFLIGHT_WEBHOOK_URL",
+        "GOALFLIGHT_NOTIFY_URL",
+        "GOALFLIGHT_HTTP_HOOK",
+        "GOALFLIGHT_WEBHOOK",
+    ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("GOALFLIGHT_WAKE_LEDGER", raising=False)
     for key, value in env.items():
@@ -2600,6 +2795,7 @@ def test_real_host_closed_stdout_wakes_wait_with_quiet_child(
 def test_real_host_closed_stdout_stops_supervisor_promptly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     reader_fd, writer_fd = os.pipe()
     peer_stdout = os.fdopen(writer_fd, "w", buffering=1)
@@ -2660,6 +2856,9 @@ def test_real_host_closed_stdout_stops_supervisor_promptly(
     assert children_alive_after_return
     assert not any(children_alive_after_return)
     assert host.stdout_detector_status().peer_gone
+    err = capsys.readouterr().err
+    assert "reader-gone" in err
+    assert err.strip() != ""
 
 
 def test_real_host_stdout_registration_failure_fails_closed_with_quiet_child(
@@ -2778,7 +2977,7 @@ def test_full_nonblocking_pipe_eagain_retries_then_keeps_children_alive(
             return super().write_stdout(line)
 
     host = BackpressuredHost(
-        stop_when_lines_contain=('"type":"probe"',)
+        stop_when_lines_contain=('"type":"arm"',)
     )
     try:
         code = _run(host, _items("stream"))
@@ -3878,22 +4077,51 @@ class _ChattyRecordHost(_RecordingHost):
         return alive
 
 
-def test_actual_follow_child_emits_one_actionable_wake_per_idle_beat(
+class _ArmThenIdleHost(_RecordingHost):
+    """Stop shortly after the arm line so a quiet generation cannot hang tests."""
+
+    def __init__(
+        self, *args: object, idle_after_arm_s: float = 0.45, **kwargs: object
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.idle_after_arm_s = idle_after_arm_s
+        self._armed_at: float | None = None
+
+    def write_stdout(self, line: str) -> bool:
+        alive = super().write_stdout(line)
+        if self._armed_at is None and any(
+            record.get("type") == "arm" for record in _records(self)  # type: ignore[arg-type]
+        ):
+            self._armed_at = time.monotonic()
+        return alive
+
+    def wait(
+        self, children: list[object], timeout_s: float
+    ) -> supervise.WaitResult:
+        result = super().wait(children, timeout_s)
+        if (
+            self._armed_at is not None
+            and time.monotonic() - self._armed_at >= self.idle_after_arm_s
+        ):
+            self._stop = True
+        return result
+
+
+def test_actual_follow_child_stays_quiet_on_empty_generation(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Drive follow's real computation and stdout contract through RealHost."""
+    """Drive follow's real computation: idle beats must not wake the Monitor."""
     project, env, lease = isolated
     monkeypatch.setattr(supervise.wake, "live_waiters", lambda *args, **kwargs: [])
     task.TaskStore(project).save_items_atomic([])
     command = _follow_child_command(project, lease)
-    host = _NextCountHost(
+    host = _ArmThenIdleHost(
         project_root=project,
         controller_label=lease.label,
         lease_nonce=lease.nonce,
         env=env,
         nonce_reader=lambda: lease.nonce,
-        next_target=3,
     )
     with wake.register_lease_holder(
         project, controller_label=lease.label, lease_nonce=lease.nonce
@@ -3913,19 +4141,11 @@ def test_actual_follow_child_emits_one_actionable_wake_per_idle_beat(
             host.kill_all()
 
     records = _records(host)  # type: ignore[arg-type]
-    actionable = [record for record in records if record.get("kind") == "next"]
     assert code == 0
-    assert len(actionable) == 3
-    assert [record["payload"]["state"] for record in actionable] == [
-        "empty",
-        "unknown",
-        "unknown",
+    assert [record.get("type") for record in records if record.get("kind") == "supervise"] == [
+        "arm"
     ]
-    assert actionable[0]["payload"]["directive"] == "Nothing pending"
-    assert all(
-        record["payload"]["directive"] == "goal-flight next"
-        for record in actionable[1:]
-    )
+    assert not [record for record in records if record.get("kind") == "next"]
     assert not [record for record in records if record.get("kind") == "heartbeat"]
     assert not [record for record in records if record.get("kind") == "frontier"]
 
@@ -4140,13 +4360,13 @@ def test_forwarding_projection_refreshes_after_active_only_transition(
         "print('{\"kind\":\"heartbeat\",\"payload\":{\"seq\":2}}', flush=True)\n"
         "time.sleep(3)\n"
     )
-    host = _NextCountHost(
+    host = _ArmThenIdleHost(
         project_root=project,
         controller_label=lease.label,
         lease_nonce=lease.nonce,
         env=env,
         nonce_reader=lambda: lease.nonce,
-        next_target=2,
+        idle_after_arm_s=0.55,
     )
     with wake.register_lease_holder(
         project, controller_label=lease.label, lease_nonce=lease.nonce
@@ -4172,15 +4392,11 @@ def test_forwarding_projection_refreshes_after_active_only_transition(
     ]
     assert code == 0
     assert calls == 2
-    assert [record["payload"]["state"] for record in actionable] == [
-        "working",
-        "empty",
-    ]
+    assert [record["payload"]["state"] for record in actionable] == ["working"]
     assert actionable[0]["payload"]["id"] == "t-transitioning"
-    assert actionable[1]["payload"] == {
-        "directive": "Nothing pending",
-        "state": "empty",
-    }
+    assert not any(
+        record["payload"].get("state") == "empty" for record in actionable
+    )
 
 
 def test_forwarding_projection_read_cannot_exceed_the_grace_deadline(
@@ -4203,13 +4419,13 @@ def test_forwarding_projection_read_cannot_exceed_the_grace_deadline(
         "print('{\"kind\":\"frontier\",\"payload\":{\"state\":\"empty\"}}', flush=True)\n"
         "time.sleep(4)\n"
     )
-    host = _NextCountHost(
+    host = _ArmThenIdleHost(
         project_root=project,
         controller_label=lease.label,
         lease_nonce=lease.nonce,
         env=env,
         nonce_reader=lambda: lease.nonce,
-        next_target=1,
+        idle_after_arm_s=0.35,
     )
     started = time.monotonic()
     with wake.register_lease_holder(
@@ -4231,17 +4447,13 @@ def test_forwarding_projection_read_cannot_exceed_the_grace_deadline(
             release.set()
     elapsed = time.monotonic() - started
 
-    actionable = next(
+    assert code == 0
+    assert elapsed < supervise.STREAM_FRONTIER_GRACE_S + 1.5
+    assert not [
         record
         for record in _records(host)  # type: ignore[arg-type]
         if record.get("kind") == "next"
-    )
-    assert code == 0
-    assert elapsed < supervise.STREAM_FRONTIER_GRACE_S + 1.5
-    assert actionable["payload"] == {
-        "directive": "goal-flight next",
-        "state": "unknown",
-    }
+    ]
 
 
 def test_subprocess_stream_pairs_keep_timing_and_quoted_heartbeats_structural(
@@ -4311,7 +4523,7 @@ def test_subprocess_stream_pairs_keep_timing_and_quoted_heartbeats_structural(
         lease_nonce=lease.nonce,
         env=env,
         nonce_reader=lambda: lease.nonce,
-        next_target=3,
+        next_target=2,
     )
     try:
         code = supervise.run_supervisor(
@@ -4332,16 +4544,11 @@ def test_subprocess_stream_pairs_keep_timing_and_quoted_heartbeats_structural(
     records = _records(host)  # type: ignore[arg-type]
     actionable = [record for record in records if record.get("kind") == "next"]
     assert code == 0
-    assert len(actionable) == 3
+    assert len(actionable) == 2
     assert [record["payload"].get("id") for record in actionable] == [
         "t-001",
         "t-002",
-        None,
     ]
-    assert actionable[-1]["payload"] == {
-        "directive": "Nothing pending",
-        "state": "empty",
-    }
     assert not [record for record in records if record.get("kind") == "heartbeat"]
     assert any(
         record.get("kind") == "event"
@@ -4499,9 +4706,8 @@ def test_fast_ring_between_lock_samples_is_rearmed_not_stopped(
     records = _records(host)
     stops = [record for record in records if record.get("type") == "stop"]
     assert all(record.get("reason") != "did-not-arm" for record in stops)
-    restart = next(record for record in records if record.get("type") == "restart")
-    assert restart["reason"] == "rang"
-    assert restart["child"] == "backup"
+    assert not [record for record in records if record.get("type") == "restart"]
+    assert any('"kind":"ring"' in line for line in host.lines)
     assert code != supervise.SUPERVISE_STOP_EXIT
     assert any(
         child.armed
@@ -4571,9 +4777,7 @@ def test_relayed_mail_headline_does_not_classify_a_successful_ring(
     reasons = [record.get("reason") for record in records]
     assert forbidden_reason not in reasons
     assert all(record.get("type") != "stop" for record in records)
-    restart = next(record for record in records if record.get("type") == "restart")
-    assert restart["reason"] == "rang"
-    assert restart["child"] == "backup"
+    assert not [record for record in records if record.get("type") == "restart"]
     assert code != supervise.SUPERVISE_STOP_EXIT
     assert any(token in (text or "") for text in "".join(host.lines).splitlines())
     assert all(token not in (blob or "") for blob in diagnostics)
@@ -4780,8 +4984,7 @@ def test_probe_live_session_unreadable_does_not_kill_the_pool(
     reasons = [record.get("reason") for record in records]
     assert "dead-lease-nonce" not in reasons
     assert code != supervise.SUPERVISE_STOP_EXIT
-    restart = next(record for record in records if record.get("type") == "restart")
-    assert restart["reason"] == "rang"
+    assert not [record for record in records if record.get("type") == "restart"]
 
 
 def test_unreadable_startup_with_explicit_nonce_starts(

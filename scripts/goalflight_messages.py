@@ -8637,13 +8637,16 @@ def _run_cli(argv: list[str] | None = None) -> int:
     supervise = sub.add_parser(
         "supervise",
         help=(
-            "one tracked task that owns the persistent wake pool and multiplexes "
-            "child stdout into a single feed"
+            "one tracked task that owns the persistent wake pool; default stdout "
+            "is terse — do not grep"
         ),
         description=(
             "Own the persistent wake pool as one tracked stdout feed: spawn the "
             "stream, backup doorbells, and watchdog, multiplex their lines, and "
-            "restart them."
+            "restart them. Do not grep this feed: default is terse and "
+            "Monitor-safe. It emits one owned stream/backup/watchdog arm line, "
+            "then only actionable wakes. --chatty restores raw keepalives and "
+            "frontiers; --debug restores per-tick heartbeat and coverage."
         ),
     )
     supervise.add_argument("--project-root", default=None)
@@ -8669,14 +8672,14 @@ def _run_cli(argv: list[str] | None = None) -> int:
     supervise.add_argument(
         "--debug",
         action="store_true",
-        help="emit unchanged heartbeat and coverage records on every tick",
+        help="emit per-tick heartbeat and coverage records (default is silent)",
     )
     supervise.add_argument(
         "--chatty",
         action="store_true",
         help=(
-            "restore raw stream keepalives and advisory frontier lines instead "
-            "of the default actionable next wake"
+            "restore raw stream keepalives and advisory frontier lines; default "
+            "is terse — do not grep"
         ),
     )
     supervise.set_defaults(func=cmd_supervise)
