@@ -1767,12 +1767,6 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             cwd, project_root=project_root, controller_label=label
         )
         if kind == "in-place":
-            if skip_reset:
-                raise goalflight_worktree_pool.WorktreeCwdRefused(
-                    f"resume refused: recorded worker cwd {cwd} is the shared "
-                    "project checkout, not a captive s-N seat; refusing to run "
-                    "without a seat lock"
-                )
             return None
         if kind == "ring-seat":
             parent_dispatch_id = getattr(args, "parent_dispatch_id", None)

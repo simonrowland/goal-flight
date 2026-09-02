@@ -1512,26 +1512,6 @@ def test_bind_dispatch_worktree_reacquires_recorded_seat_without_reset(
     assert args.cwd == str(seat)
 
 
-def test_bind_resume_refuses_shared_project_checkout(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.setattr(D, "_project_root", lambda _args: tmp_path)
-    monkeypatch.setattr(D, "_controller_ring_label", lambda *_args: "controller")
-    monkeypatch.setattr(WP, "classify_dispatch_cwd", lambda *_args, **_kwargs: "in-place")
-    args = SimpleNamespace(
-        worktree="HEAD",
-        parent_dispatch_id="parent-dispatch",
-        dispatch_id="child-dispatch",
-        cwd=str(tmp_path),
-        skip_seat_reset=True,
-        in_place=False,
-        _worktree_seat=None,
-    )
-    with pytest.raises(WP.WorktreeCwdRefused, match="not a captive s-N seat"):
-        D._bind_dispatch_worktree(args)
-
-
 def test_resume_of_quota_exhausted_dispatch_honors_account(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
