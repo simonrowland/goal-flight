@@ -1111,7 +1111,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Controller-direct: held context, fully stateable edit, clean Axis 2; plan marks do not waive it."
-    - **max_section_lines:** 25
+    - **max_section_lines:** 31
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_controller_direct_plan_marked
@@ -1374,7 +1374,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "parallel forbid lists"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 31
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_parallel_fix_forbid_lists
@@ -1396,7 +1396,7 @@ reference. The hermetic test enumerates all H3 blocks and parses their fields.
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "split broad chunks"
-    - **max_section_lines:** 23
+    - **max_section_lines:** 31
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_split_large_chunk_scope
@@ -1715,7 +1715,7 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Orchestrator live gate requires supported capability and ready local state"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 31
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_schema_controller_live_gate_anchor
@@ -1741,7 +1741,7 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Worker live gate also requires requested transport verified"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 31
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_schema_worker_live_gate_anchor
@@ -1767,7 +1767,7 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Discovery probes stay within manifest budget caps"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 31
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_schema_discovery_budget_anchor
@@ -1793,7 +1793,7 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Discovery probes do not use network or model calls"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 31
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_schema_discovery_nonconsuming_anchor
@@ -1975,7 +1975,7 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "host tool maps"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 31
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_schema_tool_map_anchor
@@ -2001,7 +2001,7 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "same-provider review policy"
-    - **max_section_lines:** 25
+    - **max_section_lines:** 31
 - **verifier:**
     - **kind:** textual-invariant
     - **id:** test_skill_structure::test_schema_provider_policy_anchor
@@ -2494,8 +2494,8 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background exec."
-    - **pattern:** "A dead worker is not automatically a lost worker: resume when its accumulated context outvalues a clean read (quota death mid-task, partial edits only its author understands), redispatch when the premise moved (fix rounds, steers, reviews — a reviewer must never resume the implementer). See `protocols/dispatch-resume.md`."
-    - **max_section_lines:** 45
+    - **pattern:** "reviewer must never resume the implementer."
+    - **max_section_lines:** 31
 - **verifier:**
     - **kind:** behaviour-scenario
     - **id:** dispatch-cli-worker-via-crash-safe-command

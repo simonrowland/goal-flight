@@ -1,0 +1,3 @@
+# Ad-hoc checkout litter only. Captive seats under worktrees/<label>/s-N
+# must stay indexable so reuse keeps the same codedb project key.
+.cache/worktrees/

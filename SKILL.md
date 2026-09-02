@@ -297,7 +297,7 @@ Evidence: `docs-private/research/goal-flight-gotchas-audit/addendum.md`.
 - **Command-form drift.** Adapter `forbidden_args` + the current invocation override old docs.
 - **Worker bypass.** On sandbox/permission/write/commit block, return `BLOCKED:`; alternate delivery is orchestrator-only.
 - **False worker death.** Reconcile pid+start-time, status, ledger, tail marker, output mtime, and dirty tree before discarding work.
-- **Throttled/quota-killed is not failed — RESUME it.** `transient_throttle`, `quota_exhausted` and sandbox `BLOCKED:` say nothing about the work's quality, and the worktree usually holds finished or nearly-finished uncommitted edits. Run `git -C <worktree> status --short`, then `goalflight_dispatch.py resume <id> --prompt-file <brief> --cwd <worktree>`. Redispatching instead silently discards that work. (Controllers keep re-learning this one; it is an affordance gap, not a knowledge gap.)
+- **Throttled/quota-killed is not failed — RESUME it.** `transient_throttle`, `quota_exhausted` and sandbox `BLOCKED:` say nothing about the work's quality, and the worktree usually holds finished or nearly-finished uncommitted edits. Run `git -C <worktree> status --short`, then `goalflight_dispatch.py resume <id> --prompt-file <brief>`. Redispatching instead silently discards that work. (Controllers keep re-learning this one; it is an affordance gap, not a knowledge gap.)
 - **Quiet is not dead.** Network waits and child tests may show no output/CPU; confirm terminal markers, process tree, and idle.
 - **Terminal marker not final until reconciled.** COMPLETE/RESULT/READY still needs idle/controller-dead logic.
 - **Rollover loses notifications, not state.** Status JSON, ledgers, resume/reconcile are authoritative.
@@ -368,13 +368,18 @@ Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background
 ### ★ Worker worktrees: use the POOL, never `git worktree add`
 
 ```bash
-python3 <skill-root>/scripts/goalflight_dispatch.py --worktree main   ... # NOT git worktree add
+python3 <skill-root>/scripts/goalflight_dispatch.py --agent <ready-agent> --prompt-file p.md
 ```
 
-`--worktree <ref>` acquires a **pooled seat** prepared at that ref. Seats are
-**REUSED**, so the pool sustains that many *concurrent* workers indefinitely —
-it is not a budget of total dispatches. Exhaustion refuses and names every held
-seat; it never silently falls back to `git worktree add`.
+Every dispatch acquires a **captive per-controller seat** at
+`worktrees/<controller-label>/s-N`. Isolation is not a mode. `--at <ref>`
+(alias `--worktree <ref>`) prepares that seat at a git ref; it is not an
+opt-in. Omit `--cwd`. `--cwd` is a lock: this controller's existing seat, the
+project root (`--in-place`), or resume's recorded `worker_cwd`. Anything else
+is refused and never created. Seats are **REUSED**, so the ring sustains that
+many *concurrent* workers indefinitely — it is not a budget of total
+dispatches. Exhaustion refuses and names every held seat; it never silently
+falls back to `git worktree add`.
 
 **★ THE SEAT COUNT IS NOT A PARALLELISM CAP. Do not treat it as one.**
 Wide fan-out is wanted — parallelism is how this tool earns its keep. What is
@@ -400,7 +405,7 @@ abandoned tree, and "clean and merged" alone will delete live work.
 ### ★ A dead worker is usually a RESUMABLE worker — check before redispatching
 
 ```bash
-python3 <skill-root>/scripts/goalflight_dispatch.py resume <dispatch_id> --prompt-file <brief> --cwd <worktree>
+python3 <skill-root>/scripts/goalflight_dispatch.py resume <dispatch_id> --prompt-file <brief>
 ```
 
 A dead worker is not automatically a lost worker: resume when its accumulated context outvalues a clean read (quota death mid-task, partial edits only its author understands), redispatch when the premise moved (fix rounds, steers, reviews — a reviewer must never resume the implementer). See `protocols/dispatch-resume.md`.

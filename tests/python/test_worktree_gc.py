@@ -421,7 +421,7 @@ def test_pool_seat_is_never_reclaimed_as_litter(
     lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "register-seat")
     wt = lease.path
     lease.release()
-    assert wt.name == "wt-1"
+    assert wt.name == "s-1"
 
     _done, report = _run(repo)
     entry = _entry(report, wt)

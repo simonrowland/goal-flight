@@ -25,6 +25,23 @@ incremented when meaningful skill behaviour changes.
   prints only with `--debug`. `--chatty` restores raw keepalives and
   frontiers. Exit is never mute: reader-gone / EPIPE / monitor-drop
   prints a reason on stderr (b-248, b-249, b-202).
+- **Captive per-controller worktree ring.** The natural dispatch command
+  (`goalflight_dispatch.py --agent <preset> --prompt-file p.md`, no `--cwd`)
+  acquires `worktrees/<controller-label>/s-N`. Isolation is not a mode:
+  sequential and parallel execute share this acquire path. `--at <ref>`
+  (alias `--worktree <ref>`) prepares the seat at a git ref; it is not an
+  opt-in. `--cwd` is a lock: this controller's existing seat, the project
+  root (`--in-place`), or resume's recorded `worker_cwd`. Any other path is
+  refused and never created. The ring grows to that controller's live
+  high-water mark and never shrinks. `GOALFLIGHT_WORKTREE_SEATS` remains a
+  fuse (default 24), not a fan-out knob. Acquire preserves
+  `.goal-flight/seat/` notes, quarantines leftover product files, and never
+  `git clean -fdx`. Resume injects `--skip-seat-reset` so partial work is
+  not wiped. codedb doctrine is inverted: index the captive ring (stable
+  path → same project key); do not exclude `worktrees/s-*`. Doctor now
+  reports nested `worktrees/<label>/s-N`. Legacy `worktrees/wt-N` stays
+  registered for GC during overlap. Historical `.cache/worktrees/*` trees
+  are not converted and cannot be minted by new dispatches.
 
 ### Fixed
 

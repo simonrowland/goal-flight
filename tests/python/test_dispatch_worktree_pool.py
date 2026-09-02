@@ -93,10 +93,6 @@ def _dispatch_cmd(tmp: Path, repo: Path, dispatch_id: str, *worker: str) -> list
         "test-dispatch",
         "--dispatch-id",
         dispatch_id,
-        "--cwd",
-        str(repo),
-        "--worktree",
-        "HEAD",
         "--launch-detached",
         "--poll-secs",
         "0.2",
@@ -121,7 +117,7 @@ def test_worktree_exhaustion_refuses_honestly_and_does_not_add(
     try:
         proc = subprocess.run(
             _dispatch_cmd(tmp_path, repo, "need-a-seat", sys.executable, "-c", "print('nope')"),
-            cwd=str(ROOT),
+            cwd=str(repo),
             env=env,
             text=True,
             stdout=subprocess.PIPE,
@@ -132,9 +128,9 @@ def test_worktree_exhaustion_refuses_honestly_and_does_not_add(
         assert proc.returncode == 2, combined
         assert "all 1 worktree seats are held" in combined, combined
         assert "held-occupant" in combined, combined
-        assert "wt-1" in combined, combined
+        assert "s-1" in combined, combined
         assert "refusing to git worktree add" in combined, combined
-        assert not (repo / "worktrees" / "wt-2").exists()
+        assert not (repo / "worktrees" / "repo" / "s-2").exists()
     finally:
         holder.release()
 
@@ -168,7 +164,7 @@ def test_seat_survives_for_worker_lifetime_then_frees_on_death(
             worker,
             str(marker),
         ),
-        cwd=str(ROOT),
+        cwd=str(repo),
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -178,7 +174,7 @@ def test_seat_survives_for_worker_lifetime_then_frees_on_death(
     combined = proc.stdout + proc.stderr
     assert proc.returncode == 0, combined
     launched = _launched_payload(proc.stdout)
-    assert launched.get("worktree_seat") == "wt-1", launched
+    assert launched.get("worktree_seat") == "s-1", launched
     deadline = time.time() + 10
     while time.time() < deadline and not marker.exists():
         time.sleep(0.05)
@@ -188,7 +184,7 @@ def test_seat_survives_for_worker_lifetime_then_frees_on_death(
         try:
             goalflight_worktree_pool.acquire_worktree_seat(repo, "blocked-while-live")
         except goalflight_worktree_pool.WorktreeSeatUnavailable as exc:
-            assert "inherit-seat" in str(exc) or "wt-1" in str(exc)
+            assert "inherit-seat" in str(exc) or "s-1" in str(exc)
         else:
             raise AssertionError("live worker did not hold the kernel seat")
         os.kill(worker_pid, signal.SIGKILL)
@@ -203,7 +199,7 @@ def test_seat_survives_for_worker_lifetime_then_frees_on_death(
             repo, "after-worker-death"
         )
         try:
-            assert replacement.path.name == "wt-1"
+            assert replacement.path.name == "s-1"
         finally:
             replacement.release()
     finally:
@@ -240,7 +236,7 @@ def test_dispatch_quarantines_dirty_seat_instead_of_destroying(
             "-c",
             worker,
         ),
-        cwd=str(ROOT),
+        cwd=str(repo),
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -250,7 +246,7 @@ def test_dispatch_quarantines_dirty_seat_instead_of_destroying(
     combined = proc.stdout + proc.stderr
     assert proc.returncode == 0, combined
     launched = _launched_payload(proc.stdout)
-    assert launched.get("worktree_seat") == "wt-1", launched
+    assert launched.get("worktree_seat") == "s-1", launched
     deadline = time.time() + 10
     while time.time() < deadline and not marker.exists():
         time.sleep(0.05)
@@ -262,7 +258,7 @@ def test_dispatch_quarantines_dirty_seat_instead_of_destroying(
         "refs/heads/goalflight/quarantine/",
     ).splitlines()
     assert len(branches) == 1, branches
-    assert "wt-1" in branches[0]
+    assert "s-1" in branches[0]
     assert _git(repo, "show", f"{branches[0]}:abandoned.txt") == "preserve me"
 
 
@@ -294,7 +290,7 @@ def test_cwd_without_worktree_does_not_acquire_a_seat(
             "-c",
             f"from pathlib import Path; Path({str(marker)!r}).write_text('ok')",
         ],
-        cwd=str(ROOT),
+        cwd=str(repo),
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -347,7 +343,7 @@ def test_worktree_launch_does_not_fail_caffeinate_on_stale_lock_fd(
             "-c",
             worker,
         ),
-        cwd=str(ROOT),
+        cwd=str(repo),
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -396,7 +392,7 @@ def test_two_worktree_launches_do_not_serialize_on_occupancy(
 
     pa = subprocess.Popen(
         _dispatch_cmd(tmp_path, repo, "wt-conc-a", sys.executable, "-c", worker(marker_a)),
-        cwd=str(ROOT),
+        cwd=str(repo),
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -404,7 +400,7 @@ def test_two_worktree_launches_do_not_serialize_on_occupancy(
     )
     pb = subprocess.Popen(
         _dispatch_cmd(tmp_path, repo, "wt-conc-b", sys.executable, "-c", worker(marker_b)),
-        cwd=str(ROOT),
+        cwd=str(repo),
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -422,8 +418,8 @@ def test_two_worktree_launches_do_not_serialize_on_occupancy(
         cwd_a = marker_a.read_text(encoding="utf-8").strip()
         cwd_b = marker_b.read_text(encoding="utf-8").strip()
         assert cwd_a != cwd_b, (cwd_a, cwd_b)
-        assert Path(cwd_a).name.startswith("wt-")
-        assert Path(cwd_b).name.startswith("wt-")
+        assert Path(cwd_a).name.startswith("s-")
+        assert Path(cwd_b).name.startswith("s-")
         release.write_text("go", encoding="utf-8")
         out_a, err_a = pa.communicate(timeout=30)
         out_b, err_b = pb.communicate(timeout=30)
@@ -459,7 +455,7 @@ def test_raw_worker_process_cwd_is_the_leased_seat(
             "-c",
             worker,
         ),
-        cwd=str(ROOT),
+        cwd=str(repo),
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -534,7 +530,7 @@ def test_dispatch_payload_includes_worktree_branch(
             "-c",
             worker,
         ),
-        cwd=str(ROOT),
+        cwd=str(repo),
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -546,7 +542,7 @@ def test_dispatch_payload_includes_worktree_branch(
     started, launched = _payloads(proc.stdout)
     assert started.get("worktree_branch") == "seat/report-branch", started
     assert launched.get("worktree_branch") == "seat/report-branch", launched
-    assert launched.get("worktree_seat") == "wt-1", launched
+    assert launched.get("worktree_seat") == "s-1", launched
     deadline = time.time() + 10
     while time.time() < deadline and not marker.exists():
         time.sleep(0.05)
@@ -599,7 +595,7 @@ def test_detached_ahead_seat_is_skipped_for_a_free_sibling(
 
     second = goalflight_worktree_pool.acquire_worktree_seat(repo, "use-wt-2")
     try:
-        assert second.path.name == "wt-2"
+        assert second.path.name == "s-2"
         assert second.branch == "seat/use-wt-2"
         assert _git(first.path, "rev-parse", "HEAD") == sha
         assert _git(first.path, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
@@ -693,3 +689,159 @@ def test_claude_preset_has_no_cwd_flag_seat_is_process_cwd() -> None:
     assert argv[:1] == ["claude"]
     assert "--cwd" not in argv
     assert "-C" not in argv
+
+
+def test_default_dispatch_acquires_captive_seat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, seats=2)
+    marker = tmp_path / "default-cwd"
+    worker = (
+        "from pathlib import Path; import os; "
+        f"Path({str(marker)!r}).write_text(os.getcwd())"
+    )
+    proc = subprocess.run(
+        _dispatch_cmd(tmp_path, repo, "default-seat", sys.executable, "-c", worker),
+        cwd=str(repo),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, combined
+    launched = _launched_payload(proc.stdout)
+    assert launched.get("worktree_seat") == "s-1", launched
+    seat = Path(launched["worktree_path"]).resolve()
+    assert seat.name == "s-1"
+    assert seat.parent.name == repo.name
+    deadline = time.time() + 10
+    while time.time() < deadline and not marker.exists():
+        time.sleep(0.05)
+    assert marker.exists(), combined
+    assert Path(marker.read_text(encoding="utf-8")).resolve() == seat
+    listed = _git(repo, "worktree", "list", "--porcelain")
+    assert str(seat) in listed
+    assert "bt-" not in listed
+
+
+def test_sequential_default_dispatch_reuses_one_seat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "4")
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, seats=4)
+    paths = []
+    for name in ("seq-a", "seq-b"):
+        marker = tmp_path / f"{name}.cwd"
+        worker = (
+            "from pathlib import Path; import os; "
+            f"Path({str(marker)!r}).write_text(os.getcwd()); "
+            "print('COMPLETE: seq — ok', flush=True)"
+        )
+        proc = subprocess.run(
+            _dispatch_cmd(tmp_path, repo, name, sys.executable, "-c", worker),
+            cwd=str(repo),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        launched = _launched_payload(proc.stdout)
+        paths.append(Path(launched["worktree_path"]).resolve())
+        deadline = time.time() + 10
+        while time.time() < deadline and not marker.exists():
+            time.sleep(0.05)
+    assert paths[0] == paths[1]
+    assert paths[0].name == "s-1"
+    assert not (paths[0].parent / "s-2").exists()
+
+
+def test_cwd_to_cache_worktree_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "2")
+    repo = _make_repo(tmp_path)
+    env = _env(tmp_path, seats=2)
+    cache = repo / ".cache" / "worktrees" / "foo"
+    cache.mkdir(parents=True)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(DISPATCH),
+            "--unregistered-forced",
+            "--agent",
+            "test-dispatch",
+            "--dispatch-id",
+            "cwd-refuse",
+            "--cwd",
+            str(cache),
+            "--launch-detached",
+            "--tail",
+            str(tmp_path / "cwd-refuse.tail"),
+            "--status-json",
+            str(tmp_path / "cwd-refuse.status.json"),
+            "--",
+            sys.executable,
+            "-c",
+            "print('nope')",
+        ],
+        cwd=str(repo),
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, combined
+    assert "not a seat" in combined or "refusing" in combined.lower()
+    assert not (cache / ".git").exists()
+    assert not (repo / "worktrees").exists()
+
+
+def test_resume_injects_skip_seat_reset(tmp_path: Path) -> None:
+    import argparse
+    import goalflight_dispatch as D
+
+    worktree = tmp_path / "historical-bt"
+    worktree.mkdir()
+    prompt = tmp_path / "resume.md"
+    prompt.write_text("continue\n", encoding="utf-8")
+    source = {
+        "engine": "grok",
+        "agent": "grok-code",
+        "session_id": "sess",
+        "shape": "bash",
+        "record": {
+            "worker_cwd": str(worktree),
+            "dispatch_argv": [
+                "--agent",
+                "grok-code",
+                "--cwd",
+                str(worktree),
+            ],
+        },
+    }
+    resume_args = argparse.Namespace(
+        dispatch_id="parent-resume",
+        cwd=None,
+        unregistered_forced=True,
+        controller_label=None,
+        controller_pid=None,
+        controller_session_id=None,
+    )
+    argv = D._resume_launch_argv(
+        source,
+        child_dispatch_id="child-resume",
+        prompt_path=prompt,
+        resume_args=resume_args,
+    )
+    assert "--skip-seat-reset" in argv
+    cwd = D._option_value_before_worker_remainder(argv, "--cwd")
+    assert Path(str(cwd)).resolve() == worktree.resolve()

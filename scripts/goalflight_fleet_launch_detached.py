@@ -691,6 +691,7 @@ def _launch(args: argparse.Namespace) -> int:
             args.dispatch_id,
             base=args.base_sha,
             managed_root=state_dir / "worktrees",
+            controller_label=args.node_id,
         )
     except goalflight_worktree_pool.WorktreeSeatError as exc:
         _update_launch_marker(

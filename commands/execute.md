@@ -185,7 +185,7 @@ pinned lane get the same brief prepended.
 Canonical direct dispatch is background:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_dispatch.py --agent <ready-agent> --prompt-file p.md --cwd .
+python3 <skill-root>/scripts/goalflight_dispatch.py --agent <ready-agent> --prompt-file p.md
 ```
 
 Each invocation launches immediately and waits for its lane's capacity window. If
@@ -197,16 +197,15 @@ Use `--foreground` only for synchronous scripts/tests that need the worker exit
 code:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_dispatch.py --agent <ready-agent> --prompt-file p.md --cwd . --foreground
+python3 <skill-root>/scripts/goalflight_dispatch.py --agent <ready-agent> --prompt-file p.md --foreground
 ```
 
-For `--parallel N` where `N >= 2`, ACP code-writing dispatches must pass
-`--worktree create`; the runner leases one lazy, reusable seat from
-`worktrees/wt-1` … `worktrees/wt-N` and routes the worker `--cwd` there.
-`GOALFLIGHT_WORKTREE_SEATS` sets the deliberate per-repository hard ceiling
-(default 4). A full pool fails with occupant dispatch ids instead of creating
-another checkout. Sequential dispatch (`--parallel 1` or no flag) stays in the
-project root.
+Every dispatch — sequential and `--parallel N` — acquires one captive seat from
+`worktrees/<controller-label>/s-1` … `s-HWM`. Isolation is not a mode. Do not
+pass `--cwd` and do not pass `--worktree create`. `--at <ref>` prepares the
+seat at that git ref. `GOALFLIGHT_WORKTREE_SEATS` is a per-repository fuse
+(default 24), not a fan-out knob and not a per-controller cap. A full ring
+fails with occupant dispatch ids instead of creating another checkout (hard ceiling). Do not lower the fuse to shape concurrency.
 
 Parallel worktrees start from committed `HEAD`; they do not include uncommitted
 controller-root edits. Preserve unrelated WIP. Dispatch from committed `HEAD`

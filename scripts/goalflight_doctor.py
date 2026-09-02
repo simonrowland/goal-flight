@@ -2932,7 +2932,18 @@ def check_worktrees(project_root: Path) -> dict:
                 rel = path.resolve().relative_to(managed_root)
             except (ValueError, OSError):
                 continue
-        if rel is None or len(rel.parts) != 1:
+        ring_label = None
+        if rel is None:
+            continue
+        if len(rel.parts) == 1:
+            leaf_name = rel.parts[0]
+        elif (
+            len(rel.parts) == 2
+            and re.fullmatch(r"s-[1-9][0-9]*", rel.parts[1])
+        ):
+            ring_label = rel.parts[0]
+            leaf_name = rel.parts[1]
+        else:
             continue
         if path.is_symlink():
             escaped.append(str(path))
@@ -2943,7 +2954,6 @@ def check_worktrees(project_root: Path) -> dict:
         except (ValueError, OSError):
             escaped.append(str(path))
             continue
-        leaf_name = rel.parts[0]
         path_text = str(resolved_path)
         paths.append(path_text)
         status = run(["git", "status", "--short"], cwd=resolved_path, timeout=4)
@@ -2956,10 +2966,14 @@ def check_worktrees(project_root: Path) -> dict:
             "head": head.get("stdout") or None,
             "branch": branch.get("stdout") or None,
         }
-        if re.fullmatch(r"wt-[1-9][0-9]*", leaf_name):
+        if re.fullmatch(r"(?:wt|s)-[1-9][0-9]*", leaf_name):
             detail["seat"] = leaf_name
+            if ring_label:
+                detail["controller_ring"] = ring_label
             lock_path = goalflight_worktree_pool.worktree_seat_lock_path(
-                project_root, leaf_name
+                project_root,
+                leaf_name,
+                controller_label=ring_label,
             )
             lock_file = None
             try:
@@ -2999,10 +3013,45 @@ def check_worktrees(project_root: Path) -> dict:
                 continue
             if not child.is_dir():
                 continue
-            child_abs = str(child.absolute())
-            child_resolved = str(child.resolve())
-            if child_abs not in registered and child_resolved not in registered_resolved:
-                blocking_paths.append(child_abs)
+            if re.fullmatch(r"wt-[1-9][0-9]*", child.name):
+                child_abs = str(child.absolute())
+                child_resolved = str(child.resolve())
+                if (
+                    child_abs not in registered
+                    and child_resolved not in registered_resolved
+                ):
+                    blocking_paths.append(child_abs)
+                continue
+            # Per-controller ring: worktrees/<label>/s-N. A directory with
+            # no captive seats is still the old ad-hoc orphan case.
+            try:
+                grandchildren = sorted(child.iterdir())
+            except OSError:
+                continue
+            seat_children = [
+                seat
+                for seat in grandchildren
+                if seat.is_dir()
+                and not seat.is_symlink()
+                and re.fullmatch(r"s-[1-9][0-9]*", seat.name)
+            ]
+            if not seat_children:
+                child_abs = str(child.absolute())
+                child_resolved = str(child.resolve())
+                if (
+                    child_abs not in registered
+                    and child_resolved not in registered_resolved
+                ):
+                    blocking_paths.append(child_abs)
+                continue
+            for seat in seat_children:
+                seat_abs = str(seat.absolute())
+                seat_resolved = str(seat.resolve())
+                if (
+                    seat_abs not in registered
+                    and seat_resolved not in registered_resolved
+                ):
+                    blocking_paths.append(seat_abs)
 
     active_dispatches: set[tuple[str, str]] = set()
     capacity_error = None

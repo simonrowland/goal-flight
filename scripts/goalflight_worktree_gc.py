@@ -10,10 +10,11 @@ Routine merge-down command (run from the repo after integrating a worker branch)
     python3 scripts/goalflight_worktree_gc.py --into main
     python3 scripts/goalflight_worktree_gc.py --into main --apply
 
-Registered pool seats (``<repo>/worktrees/wt-N`` with a matching seat lock)
-are maintained by ``goalflight_worktree_pool`` and are never reclaimed as
-litter. A directory merely *named* ``wt-N`` is ordinary litter: exemption is
-by registration, not basename. If registration cannot be determined, the
+Registered pool seats (captive ``<repo>/worktrees/<label>/s-N`` and legacy
+``<repo>/worktrees/wt-N`` with a matching seat lock) are maintained by
+``goalflight_worktree_pool`` and are never reclaimed as litter. A directory
+merely *named* ``s-N`` or ``wt-N`` is ordinary litter: exemption is by
+registration, not basename. If registration cannot be determined, the
 verdict is UNKNOWN and the tree is retained.
 
 Removal requires the CONJUNCTION of all four conditions:
