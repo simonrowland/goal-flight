@@ -468,4 +468,77 @@ if mod._grok_bot_mac_default_warn(
 PY
 echo "test13 pass: grok-bot helper defaults, Mac install caveat, and dispatch stamp"
 
+# Slash-verb pin: the installed wrapper is the /goal-flight skill.
+# Do not grow a parallel grok-bot pytest suite here.
+wrapper="$REPO_ROOT/configs/grok-bot/skills/goal-flight/SKILL.md"
+head_block="$(sed -n '1,8p' "$wrapper")"
+printf '%s\n' "$head_block" | grep -q 'version: 1.6.0' \
+  || fail "wrapper frontmatter must pin version 1.6.0 when VERSION is 1.6.0"
+printf '%s\n' "$head_block" | grep -q '/goal-flight' \
+  || fail "wrapper description must name /goal-flight"
+printf '%s\n' "$head_block" | grep -qi 'long-running grok-bot' \
+  || fail "wrapper description must name long-running grok-bot orchestration"
+printf '%s\n' "$head_block" | grep -qi 'Use when' \
+  || fail "wrapper description must be when-to-use, not a product blurb"
+grep -q 'disable-model-invocation: true' "$wrapper" \
+  || fail "wrapper must set disable-model-invocation: true"
+grep -q '## Slash commands' "$wrapper" \
+  || fail "wrapper must fold the /goal-flight slash verbs"
+for verb in usage connected status doctor resume; do
+  grep -q "\`$verb\`" "$wrapper" \
+    || fail "wrapper slash table must name $verb"
+done
+grep -q 'lists the verbs below, then runs `status`' "$wrapper" \
+  || fail "bare /goal-flight must list verbs then run status"
+grep -q 'goalflight_usage.py' "$wrapper" \
+  || fail "usage must call goalflight_usage.py"
+grep -q 'goalflight_controllers.py' "$wrapper" \
+  || fail "connected must call goalflight_controllers.py"
+grep -q -- '--list-controllers' "$wrapper" \
+  || fail "connected fallback must be session_status --list-controllers"
+grep -q 'goalflight_status.py' "$wrapper" \
+  || fail "status must call goalflight_status.py"
+grep -E 'goalflight_session_status.py.*--text' "$wrapper" >/dev/null \
+  || fail "status must include session_status --text"
+grep -q 'goalflight_doctor.py --project-root' "$wrapper" \
+  || fail "doctor must call goalflight_doctor.py --project-root"
+grep -q 'local-exec' "$wrapper" \
+  || fail "slash contract must require local-exec on the registered computer"
+grep -q 'GOALFLIGHT_PROJECT_ROOT' "$wrapper" \
+  || fail "wrapper must name GOALFLIGHT_PROJECT_ROOT as the project pin"
+grep -q 'Do not steal a live lease' "$wrapper" \
+  || fail "slash contract must forbid stealing a live lease"
+grep -q 'Do not drain another controller' "$wrapper" \
+  || fail "slash contract must forbid draining another controller's mail"
+grep -q 'lane you do not own' "$wrapper" \
+  || fail "slash contract must forbid bare next on an unowned lane"
+if grep -q 'goalflight_dispatch.py resume' "$wrapper"; then
+  grep -E 'Never `goalflight_dispatch.py resume`|not `goalflight_dispatch.py resume`|Never conflate' "$wrapper" >/dev/null \
+    || fail "wrapper must refuse dispatch resume for the slash resume verb"
+else
+  fail "wrapper must name goalflight_dispatch.py resume only to refuse it"
+fi
+grep -q -- '--takeover' "$wrapper" \
+  || fail "controller resume must prove holder dead/sibling before --takeover"
+grep -q -- '--listener-slots 4' "$wrapper" \
+  || fail "resume fallback listen must use --listener-slots 4"
+grep -q 'goalflight_grok_bot_listen.py' "$wrapper" \
+  || fail "resume must prefer goalflight_grok_bot_listen.py when present"
+# Re-install after the wrapper edit path: copy still matches source hash.
+slash_root="$TMP_ROOT/slash-workflows"
+slash_out="$(bash "$REPO_ROOT/install.sh" grok-bot "$slash_root" --addons '' 2>&1)"
+printf '%s\n' "$slash_out" | grep -q '^APPLY ' \
+  || fail "install.sh grok-bot must still apply after slash fold"
+[ -f "$slash_root/goal-flight/SKILL.md" ] \
+  || fail "install.sh grok-bot did not write the unified wrapper"
+src_hash="$(python3 -c "import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())" "$wrapper")"
+dst_hash="$(python3 -c "import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())" "$slash_root/goal-flight/SKILL.md")"
+[ "$src_hash" = "$dst_hash" ] \
+  || fail "installed grok-bot skill hash must match configs/grok-bot wrapper"
+grep -q '## Slash commands' "$slash_root/goal-flight/SKILL.md" \
+  || fail "installed wrapper must include the folded slash verbs"
+grep -q 'first-class' "$slash_root/goal-flight/SKILL.md" \
+  || fail "installed wrapper must still carry the host contract"
+echo "test14 pass: unified wrapper is the /goal-flight pin; install hash matches"
+
 echo "goal-flight grok-bot host install tests passed"
