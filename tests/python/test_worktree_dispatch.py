@@ -115,8 +115,12 @@ def test_worktree_create_routes_distinct_cwds_and_stale_probe() -> None:
             # `repo` for comparison so the assertion isn't fooled by the /private prefix.
             resolved_repo = repo.resolve()
             assert_true("distinct worktrees", wt_one != wt_two)
-            assert_true("first under managed root", wt_one.parent == resolved_repo / "worktrees")
-            assert_true("second under managed root", wt_two.parent == resolved_repo / "worktrees")
+            ring = resolved_repo / "worktrees" / goalflight_worktree_pool.default_controller_ring_label(
+                None, project_root=resolved_repo
+            )
+            assert_true("first under captive ring", wt_one.parent == ring)
+            assert_true("second under captive ring", wt_two.parent == ring)
+            assert_true("captive seat names", {wt_one.name, wt_two.name} == {"s-1", "s-2"})
             assert_true("first cfg cwd unchanged", args_one.cwd == str(repo))
             assert_true("second cfg cwd unchanged", args_two.cwd == str(repo))
 
@@ -398,7 +402,14 @@ def test_runner_worktree_status_and_capacity_contract() -> None:
             # Worktree path is built from repo.resolve() in the runner (macOS
             # /var/folders → /private/var/folders resolution); compare against
             # the same.
-            worktree_path = repo.resolve() / "worktrees" / "wt-1"
+            worktree_path = (
+                repo.resolve()
+                / "worktrees"
+                / goalflight_worktree_pool.default_controller_ring_label(
+                    None, project_root=repo.resolve()
+                )
+                / "s-1"
+            )
             assert_true("runner complete", payload["state"] == "complete")
             assert_true("status worktree path", status["worktree_path"] == str(worktree_path))
             assert_true("status worker cwd", status["worker_cwd"] == str(worktree_path))
@@ -484,7 +495,14 @@ def test_runner_worktree_create_failure_writes_failed_status() -> None:
             os.environ["GOALFLIGHT_CAPACITY_WAIT_S"] = "0"
             os.environ[goalflight_worktree_pool.WORKTREE_SEATS_ENV] = "1"
             repo = make_repo(root)
-            existing = repo / "worktrees" / "wt-1"
+            existing = (
+                repo
+                / "worktrees"
+                / goalflight_worktree_pool.default_controller_ring_label(
+                    None, project_root=repo
+                )
+                / "s-1"
+            )
             existing.mkdir(parents=True)
             status_path = repo / "existing-status.json"
             args = runner_args(repo, "acp-existing", status_path)

@@ -206,8 +206,7 @@ Every dispatch — sequential and `--parallel N` — acquires one captive seat f
 pass `--cwd` and do not pass `--worktree create`. `--at <ref>` prepares the
 seat at that git ref. `GOALFLIGHT_WORKTREE_SEATS` is a per-repository fuse
 (default 24), not a fan-out knob and not a per-controller cap. A full ring
-fails with occupant dispatch ids instead of creating another checkout (hard
-ceiling). Do not lower the fuse to shape concurrency.
+fails with occupant dispatch ids instead of creating another checkout (hard ceiling). Do not lower the fuse to shape concurrency.
 
 Parallel worktrees start from committed `HEAD`; they do not include uncommitted
 controller-root edits. Preserve unrelated WIP. Dispatch from committed `HEAD`
