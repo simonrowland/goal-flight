@@ -188,7 +188,7 @@ Right-size the shape — three loop failure modes to avoid:
 Canonical direct dispatch is detached/background:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .
+python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md
 ```
 
 The dispatcher prints `DISPATCH-LAUNCHED` with the dispatch id, status JSON,
@@ -266,13 +266,13 @@ the controller terminal and queues typed steers behind the wait.
 Durable queue dispatch:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_dispatch.py --submit --drain-on-submit --agent codex --prompt-file p.md --cwd .
+python3 <skill-root>/scripts/goalflight_dispatch.py --submit --drain-on-submit --agent codex --prompt-file p.md
 ```
 
 Synchronous scripts/tests that need the worker exit code must opt in:
 
 ```bash
-python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd . --foreground
+python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --foreground
 ```
 
 ## Event wake arming (the supervisor owns it)

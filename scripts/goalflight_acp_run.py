@@ -1800,6 +1800,7 @@ def create_and_route_dispatch_worktree(
         dispatch_id,
         base=str(getattr(cfg, "worktree_base", None) or "HEAD"),
         managed_root=Path(configured_root) if configured_root else None,
+        controller_label=getattr(cfg, "controller_label", None),
     )
 
 

@@ -70,7 +70,13 @@ def seat_limit(limit: int):
 
 def pooled_worktrees(repo: Path) -> list[Path]:
     root = repo.resolve() / "worktrees"
-    return sorted(path for path in root.glob("wt-*") if path.is_dir())
+    if not root.is_dir():
+        return []
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_dir() and goalflight_worktree_pool.is_pool_seat_path(path)
+    )
 
 
 def start_seat_holder(repo: Path, dispatch_id: str) -> tuple[subprocess.Popen[str], Path]:
@@ -107,15 +113,15 @@ def test_hard_ceiling_is_lazy_and_reuses_seats() -> None:
         repo = make_repo(Path(td))
 
         first = goalflight_worktree_pool.acquire_worktree_seat(repo, "dispatch-one")
-        assert_true("first seat name", first.path.name == "wt-1")
-        assert_true("one lazy checkout", [p.name for p in pooled_worktrees(repo)] == ["wt-1"])
+        assert_true("first seat name", first.path.name == "s-1")
+        assert_true("one lazy checkout", [p.name for p in pooled_worktrees(repo)] == ["s-1"])
 
         second = goalflight_worktree_pool.acquire_worktree_seat(repo, "dispatch-two")
-        assert_true("second seat name", second.path.name == "wt-2")
+        assert_true("second seat name", second.path.name == "s-2")
         assert_true("distinct concurrent seats", first.path != second.path)
         assert_true(
             "pool grows with concurrency",
-            [p.name for p in pooled_worktrees(repo)] == ["wt-1", "wt-2"],
+            [p.name for p in pooled_worktrees(repo)] == ["s-1", "s-2"],
         )
 
         try:
@@ -124,15 +130,18 @@ def test_hard_ceiling_is_lazy_and_reuses_seats() -> None:
             message = str(exc)
             assert_true(
                 "ceiling names first occupant",
-                "wt-1" in message and "dispatch-one" in message,
+                "s-1" in message and "dispatch-one" in message,
             )
             assert_true(
                 "ceiling names second occupant",
-                "wt-2" in message and "dispatch-two" in message,
+                "s-2" in message and "dispatch-two" in message,
             )
         else:
             raise AssertionError("third concurrent dispatch exceeded a two-seat ceiling")
-        assert_true("no seat N+1", not (repo.resolve() / "worktrees" / "wt-3").exists())
+        assert_true(
+            "no seat N+1",
+            not any(path.name == "s-3" for path in pooled_worktrees(repo)),
+        )
 
         first.release()
         second.release()
@@ -143,10 +152,13 @@ def test_hard_ceiling_is_lazy_and_reuses_seats() -> None:
             lease = goalflight_worktree_pool.acquire_worktree_seat(
                 repo, f"sequential-{index}"
             )
-            assert_true("sequential reuse chooses existing seat", lease.path.name == "wt-1")
+            assert_true("sequential reuse chooses existing seat", lease.path.name == "s-1")
             lease.release()
             assert_true("sequential count stays bounded", len(pooled_worktrees(repo)) <= 2)
-        assert_true("ceiling remains exact", not (repo.resolve() / "worktrees" / "wt-3").exists())
+        assert_true(
+            "ceiling remains exact",
+            not any(path.name == "s-3" for path in pooled_worktrees(repo)),
+        )
 
 
 def test_process_concurrency_gets_distinct_seats_and_names_all_occupants() -> None:
@@ -161,7 +173,7 @@ def test_process_concurrency_gets_distinct_seats_and_names_all_occupants() -> No
             assert_true("processes receive distinct seats", first_path != second_path)
             assert_true(
                 "process concurrency fills exact range",
-                {first_path.name, second_path.name} == {"wt-1", "wt-2"},
+                {first_path.name, second_path.name} == {"s-1", "s-2"},
             )
             try:
                 goalflight_worktree_pool.acquire_worktree_seat(repo, "process-three")
@@ -169,17 +181,17 @@ def test_process_concurrency_gets_distinct_seats_and_names_all_occupants() -> No
                 detail = str(exc)
                 assert_true(
                     "failure names process one",
-                    "wt-1" in detail and "process-one" in detail,
+                    "s-1" in detail and "process-one" in detail,
                 )
                 assert_true(
                     "failure names process two",
-                    "wt-2" in detail and "process-two" in detail,
+                    "s-2" in detail and "process-two" in detail,
                 )
             else:
                 raise AssertionError("third process exceeded a two-seat ceiling")
             assert_true(
-                "process pressure creates no wt-3",
-                not (repo / "worktrees" / "wt-3").exists(),
+                "process pressure creates no s-3",
+                not any(path.name == "s-3" for path in pooled_worktrees(repo)),
             )
         finally:
             for proc in holders:
@@ -198,7 +210,7 @@ def test_dirty_seat_is_quarantined_then_reset_on_acquire() -> None:
 
         reused = goalflight_worktree_pool.acquire_worktree_seat(repo, "next")
         try:
-            assert_true("same seat reused", reused.path.name == "wt-1")
+            assert_true("same seat reused", reused.path.name == "s-1")
             assert_true(
                 "tracked file reset to base",
                 (reused.path / "tracked.txt").read_text(encoding="utf-8") == "base\n",
@@ -213,7 +225,7 @@ def test_dirty_seat_is_quarantined_then_reset_on_acquire() -> None:
             ).splitlines()
             assert_true("one visible quarantine branch", len(branches) == 1)
             branch = branches[0]
-            assert_true("branch names seat", "wt-1" in branch)
+            assert_true("branch names seat", "s-1" in branch)
             assert_true(
                 "quarantine diff non-empty",
                 bool(git(repo, "diff", "--name-only", f"main..{branch}")),
@@ -254,7 +266,7 @@ def test_sigkill_releases_kernel_lease_without_cleanup() -> None:
         try:
             assert proc.stdout is not None
             held_path = Path(proc.stdout.readline().strip())
-            assert_true("child acquired seat", held_path.name == "wt-1")
+            assert_true("child acquired seat", held_path.name == "s-1")
             try:
                 goalflight_worktree_pool.acquire_worktree_seat(repo, "blocked-worker")
             except goalflight_worktree_pool.WorktreeSeatUnavailable as exc:
@@ -392,8 +404,12 @@ def test_default_seat_count_is_not_a_per_controller_cap() -> None:
         goalflight_worktree_pool.DEFAULT_WORKTREE_SEATS == 24,
     )
     assert_true(
-        "wt-1 basename matches the seat name pattern",
+        "wt-1 basename matches the legacy seat name pattern",
         goalflight_worktree_pool.is_pool_seat_path("/repo/worktrees/wt-1"),
+    )
+    assert_true(
+        "s-1 basename matches the captive seat name pattern",
+        goalflight_worktree_pool.is_pool_seat_path("/repo/worktrees/ctrl/s-1"),
     )
     assert_true(
         "ad-hoc task tree is not a pool seat name",
@@ -425,11 +441,11 @@ def test_registration_ignores_basename_without_a_lock() -> None:
                     lease.path, project_root=repo
                 )
                 assert_true("acquired seat is registered", yes == "yes")
-                assert_true("reason names the seat", "wt-1" in yes_reason)
+                assert_true("reason names the seat", "s-1" in yes_reason)
             finally:
                 lease.release()
             still_yes, _ = goalflight_worktree_pool.registered_pool_seat_verdict(
-                repo / "worktrees" / "wt-1", project_root=repo
+                lease.path, project_root=repo
             )
             assert_true("released seat stays registered", still_yes == "yes")
 
@@ -438,7 +454,7 @@ def test_registration_ignores_basename_without_a_lock() -> None:
             try:
                 unknown, unknown_reason = (
                     goalflight_worktree_pool.registered_pool_seat_verdict(
-                        repo / "worktrees" / "wt-1", project_root=repo
+                        lease.path, project_root=repo
                     )
                 )
             finally:
@@ -453,6 +469,141 @@ def test_registration_ignores_basename_without_a_lock() -> None:
             )
 
 
+def test_notes_survive_acquire_reset_and_result_is_quarantined() -> None:
+    with tempfile.TemporaryDirectory() as td, seat_limit(1):
+        repo = make_repo(Path(td))
+        first = goalflight_worktree_pool.acquire_worktree_seat(repo, "notes-one")
+        notes = first.path / ".goal-flight" / "seat" / "memory.md"
+        notes.parent.mkdir(parents=True)
+        notes.write_text("keep me\n", encoding="utf-8")
+        (first.path / "RESULT.md").write_text("old result\n", encoding="utf-8")
+        first.release()
+
+        reused = goalflight_worktree_pool.acquire_worktree_seat(repo, "notes-two")
+        try:
+            assert_true("same captive seat", reused.path.name == "s-1")
+            assert_true("notes survived reset", notes.is_file())
+            assert_true(
+                "notes content kept",
+                notes.read_text(encoding="utf-8") == "keep me\n",
+            )
+            assert_true("RESULT.md cleared", not (reused.path / "RESULT.md").exists())
+            branches = git(
+                repo,
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/heads/goalflight/quarantine/",
+            ).splitlines()
+            assert_true("quarantine captured RESULT.md", len(branches) == 1)
+            assert_true(
+                "RESULT.md in quarantine",
+                git(repo, "show", f"{branches[0]}:RESULT.md") == "old result",
+            )
+        finally:
+            reused.release()
+
+
+def test_skip_reset_keeps_dirty_product_files() -> None:
+    with tempfile.TemporaryDirectory() as td, seat_limit(1):
+        repo = make_repo(Path(td))
+        first = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-src")
+        (first.path / "RESULT.md").write_text("in progress\n", encoding="utf-8")
+        path = first.path
+        first.release()
+
+        resumed = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "resume-dst", reset=False, occupy_path=path
+        )
+        try:
+            assert_true("occupied same seat", resumed.path == path)
+            assert_true(
+                "dirty product survived skip-reset",
+                (path / "RESULT.md").read_text(encoding="utf-8") == "in progress\n",
+            )
+        finally:
+            resumed.release()
+
+
+def test_two_controller_labels_get_separate_rings() -> None:
+    with tempfile.TemporaryDirectory() as td, seat_limit(2):
+        repo = make_repo(Path(td))
+        a = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "ctrl-a", controller_label="alpha"
+        )
+        b = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "ctrl-b", controller_label="beta"
+        )
+        try:
+            assert_true("both get s-1", a.path.name == "s-1" and b.path.name == "s-1")
+            assert_true("separate ring directories", a.path.parent != b.path.parent)
+            assert_true("alpha ring", a.path.parent.name == "alpha")
+            assert_true("beta ring", b.path.parent.name == "beta")
+        finally:
+            a.release()
+            b.release()
+
+
+def test_classify_dispatch_cwd_lock() -> None:
+    with tempfile.TemporaryDirectory() as td, seat_limit(1):
+        repo = make_repo(Path(td))
+        lease = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "cwd-lock", controller_label="alpha"
+        )
+        try:
+            assert_true(
+                "project root is in-place",
+                goalflight_worktree_pool.classify_dispatch_cwd(
+                    repo, project_root=repo, controller_label="alpha"
+                )
+                == "in-place",
+            )
+            assert_true(
+                "own seat is ring-seat",
+                goalflight_worktree_pool.classify_dispatch_cwd(
+                    lease.path, project_root=repo, controller_label="alpha"
+                )
+                == "ring-seat",
+            )
+            other = repo / ".cache" / "worktrees" / "foo"
+            other.mkdir(parents=True)
+            assert_true(
+                "cache tree is refused",
+                goalflight_worktree_pool.classify_dispatch_cwd(
+                    other, project_root=repo, controller_label="alpha"
+                )
+                == "refuse",
+            )
+            foreign = goalflight_worktree_pool.classify_dispatch_cwd(
+                lease.path, project_root=repo, controller_label="beta"
+            )
+            assert_true("other controller seat is refused", foreign == "refuse")
+        finally:
+            lease.release()
+
+
+def test_hwm_stays_after_release() -> None:
+    with tempfile.TemporaryDirectory() as td, seat_limit(4):
+        repo = make_repo(Path(td))
+        first = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "hwm-a", controller_label="lab"
+        )
+        second = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "hwm-b", controller_label="lab"
+        )
+        assert_true("grew to two", {first.path.name, second.path.name} == {"s-1", "s-2"})
+        first.release()
+        second.release()
+        third = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "hwm-c", controller_label="lab"
+        )
+        try:
+            assert_true("reuses existing seat", third.path.name in {"s-1", "s-2"})
+            assert_true("does not mint s-3", not (third.path.parent / "s-3").exists())
+            assert_true("captive pair remains", len(pooled_worktrees(repo)) == 2)
+        finally:
+            third.release()
+
+
 def main() -> None:
     tests = [
         test_hard_ceiling_is_lazy_and_reuses_seats,
@@ -464,6 +615,11 @@ def main() -> None:
         test_parent_release_keeps_inherited_worker_lease_until_worker_dies,
         test_default_seat_count_is_not_a_per_controller_cap,
         test_registration_ignores_basename_without_a_lock,
+        test_notes_survive_acquire_reset_and_result_is_quarantined,
+        test_skip_reset_keeps_dirty_product_files,
+        test_two_controller_labels_get_separate_rings,
+        test_classify_dispatch_cwd_lock,
+        test_hwm_stays_after_release,
     ]
     for test in tests:
         test()

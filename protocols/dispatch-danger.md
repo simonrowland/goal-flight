@@ -18,16 +18,15 @@ Safe to run anytime, as often as you like.
   **entire** prompt-ready frontier as **one worker per item**. It is **not** a queue
   drainer (the name `pipe` misleads — it does not "flush a pipe"). It refuses without
   `--autodispatch-confirm`; `--dry-run` previews safely. Two sharp edges:
-  - Workers run in `--cwd`, which defaults to the **shared project root**. Concurrent
+  - Workers run on a captive seat by default. Concurrent
     agents on one worktree is the collision anti-pattern — it turns a mis-dispatch into
-    corrupted merges. Prefer isolating workers in their own worktree.
+    corrupted merges. Do not pass `--cwd` to mint a new tree.
   - Workers get the **raw task prompt** with **no mandate / 5-layer briefing** (unlike
     `execute`, which renders `prompts/dispatch-wrapper.md`). They run without the
     project's north-star frame — a correctness risk, not just hygiene.
 - **`/goal-flight execute [--parallel N]`** — dispatches queued chunks with the full
-  `prompts/dispatch-wrapper.md` mandate. `--parallel N≥2` isolates each worker in a
-  leased pooled seat (`scripts/goalflight_acp_run.py --worktree create`); sequential
-  dispatch stays in the project root.
+  `prompts/dispatch-wrapper.md` mandate. Sequential and parallel execute
+  acquire the same captive per-controller seat; isolation is not a mode.
 - **Dispatcher CLI (`scripts/goalflight_dispatch.py`)** — without `--submit`, launches
   one worker in default detached mode. With `--submit`, writes a durable queue entry
   **and** runs one immediate non-blocking drain pass — drain-on-submit is the

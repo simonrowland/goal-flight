@@ -9,11 +9,11 @@ process to block until terminal state. It fixes the
 (observed 2026-05-30).
 
 Easy path (agent preset — the common case):
-    python3 goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .      # background/default
+    python3 goalflight_dispatch.py --agent codex --prompt-file p.md      # background/default; captive seat
     python3 goalflight_dispatch.py --agent codex --prompt-file p.md --read-only   # review/analysis
-    python3 goalflight_dispatch.py --agent grok-code --prompt-file p.md --cwd .
-    python3 goalflight_dispatch.py --agent grok-code --prompt-file p.md --cwd . --worktree HEAD  # pooled seat
-    python3 goalflight_dispatch.py --agent codex --prompt-file p.md --cwd . --foreground  # synchronous scripts/tests
+    python3 goalflight_dispatch.py --agent grok-code --prompt-file p.md
+    python3 goalflight_dispatch.py --agent grok-code --prompt-file p.md --at HEAD  # prepare seat at ref
+    python3 goalflight_dispatch.py --agent codex --prompt-file p.md --foreground  # synchronous scripts/tests
 
 After launch, stderr is one line (dispatch id + status path). DISPATCH-LAUNCHED
 JSON on stdout carries the rest. Pass --hints for the teaching block (status /
@@ -27,7 +27,7 @@ dispatch id are auto-derived under the state dir; override with --tail /
 --status-json / --dispatch-id if you want.
 
 Durable queue path:
-    python3 goalflight_dispatch.py --submit --drain-on-submit --agent codex --prompt-file p.md --cwd .
+    python3 goalflight_dispatch.py --submit --drain-on-submit --agent codex --prompt-file p.md
 
 Escape hatch (any worker): pass the raw command after `--`:
     python3 goalflight_dispatch.py --agent custom --tail t --status-json s -- <cmd...>
@@ -1069,7 +1069,7 @@ class _TerseArgumentParser(argparse.ArgumentParser):
 
 
 _DISPATCH_USAGE_HINT = (
-    "try --agent <preset> --prompt-file <path> [--cwd .] (or --help)"
+    "try --agent <preset> --prompt-file <path> (or --help)"
 )
 
 
@@ -1699,8 +1699,23 @@ def _inherited_seat_lock_present() -> bool:
     return True
 
 
+def _controller_ring_label(args, project_root: Path) -> str:
+    """Stable per-controller ring label. Never invent a per-launch name."""
+    declared = _declared_controller_label(args, project_root)
+    if declared:
+        return goalflight_worktree_pool.sanitize_controller_ring_label(declared)
+    return goalflight_worktree_pool.default_controller_ring_label(
+        None, project_root=project_root
+    )
+
+
 def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease | None:
-    """Acquire a pooled seat when ``--worktree`` is set. Never falls back to add.
+    """Acquire a captive seat. Isolation is not a mode.
+
+    Default dispatch (no ``--cwd``, no ``--in-place``) takes one seat in this
+    controller's ring. ``--cwd`` is a lock: project root (in-place), a seat
+    in this ring, or resume's recorded tree. Anything else is refused and
+    never created. Never falls back to unmanaged ``git worktree add``.
 
     The seat lock fd is left open on the returned lease. The caller must put
     ``GOALFLIGHT_WORKTREE_LOCK_FD`` in the worker env and pass that fd through
@@ -1708,24 +1723,77 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     the lease lifetime.
 
     Occupancy must bind AFTER this so the kernel lock is on the seat path,
-    not the project ``--cwd``. Caching the lease lets the launch path call
-    this once before occupancy and again when wiring env/summary.
+    not the project root. Caching the lease lets the launch path call this
+    once before occupancy and again when wiring env/summary.
     """
     existing = getattr(args, "_worktree_seat", None)
     if existing is not None:
         return existing
-    base = _requested_worktree_base(args)
-    if base is None:
+    if getattr(args, "submit", False):
         return None
     if _inherited_seat_lock_present():
         # Fleet / parent already leased a seat and passed the fd. Re-acquire
         # would LOCK_EX-succeed in this process (flock is per-process) and
         # reset a tree the worker is already in.
         return None
+    project_root = _project_root(args)
+    label = _controller_ring_label(args, project_root)
+    skip_reset = bool(getattr(args, "skip_seat_reset", False))
+    in_place = bool(getattr(args, "in_place", False))
+    cwd_raw = getattr(args, "cwd", None)
+    base = _requested_worktree_base(args)
+
+    if in_place:
+        if cwd_raw:
+            kind = goalflight_worktree_pool.classify_dispatch_cwd(
+                Path(str(cwd_raw)),
+                project_root=project_root,
+                controller_label=label,
+            )
+            if kind != "in-place":
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    "--in-place requires --cwd to be omitted or exactly the "
+                    f"project root {project_root}; got {cwd_raw}"
+                )
+        return None
+
+    if cwd_raw:
+        cwd = Path(str(cwd_raw)).expanduser().resolve(strict=False)
+        kind = goalflight_worktree_pool.classify_dispatch_cwd(
+            cwd, project_root=project_root, controller_label=label
+        )
+        if kind == "in-place":
+            return None
+        if kind == "ring-seat":
+            lease = goalflight_worktree_pool.acquire_worktree_seat(
+                project_root,
+                str(args.dispatch_id),
+                base=base,
+                controller_label=label,
+                reset=not skip_reset,
+                occupy_path=cwd,
+            )
+            args.cwd = str(lease.path)
+            args._worktree_seat = lease
+            return lease
+        if skip_reset:
+            # Resume of a recorded worker_cwd, including historical ad-hoc
+            # trees. Occupy that path; do not mint and do not reset.
+            return None
+        raise goalflight_worktree_pool.WorktreeCwdRefused(
+            f"--cwd {cwd} is not a seat in this controller ring "
+            f"(worktrees/{label}/s-N) and is not the project root. "
+            "Omit --cwd to acquire a captive seat, or pass --in-place "
+            f"for {project_root}. Isolation is not a mode; refusing to "
+            "create that path or git worktree add."
+        )
+
     lease = goalflight_worktree_pool.acquire_worktree_seat(
-        _project_root(args),
+        project_root,
         str(args.dispatch_id),
         base=base,
+        controller_label=label,
+        reset=not skip_reset,
     )
     args.cwd = str(lease.path)
     args._worktree_seat = lease
@@ -3499,10 +3567,10 @@ def _prepare_attempt_worktree_occupancy(args) -> str | None:
     """
     if _occupancy_exempt_read_only(args):
         return None
-    if getattr(args, "submit", False) and _requested_worktree_base(args):
-        # A queued --worktree job does not have a seat yet. Occupying --cwd
-        # (the project root) would serialize every pooled submit onto one
-        # tree; drain binds the seat and then occupies that path.
+    if getattr(args, "submit", False):
+        # A queued job does not have a seat yet. Occupying --cwd (the
+        # project root) would serialize every submit onto one tree; drain
+        # binds the captive seat and then occupies that path.
         return None
 
     occupied, unknown, occupied_state = _worktree_incumbent_reason(args)
@@ -4511,9 +4579,9 @@ def _cmd_resume(argv: list[str]) -> int:
     parser.add_argument(
         "--cwd",
         help=(
-            "Worker tree for this resume. Required when the parent record "
-            "has no worker_cwd and no --cwd in dispatch_argv; the shared "
-            "checkout is not a fallback."
+            "Worker tree for this resume. Optional when the parent record "
+            "has worker_cwd or --cwd in dispatch_argv. The shared checkout "
+            "is not a fallback."
         ),
     )
     args = parser.parse_args(argv)
@@ -4643,7 +4711,7 @@ def _resume_launch_argv(
         "--engine-session-id": source["session_id"],
         "--cwd": str(cwd),
     }
-    inject: list[str] = []
+    inject: list[str] = ["--skip-seat-reset"]
     if resume_args.unregistered_forced:
         inject.append("--unregistered-forced")
     for flag, value in (
@@ -6697,6 +6765,9 @@ LAUNCH_ARGV_CLASS: dict[str, str] = {
     "--task": "preserve",
     "--cwd": "preserve",
     "--worktree": "preserve",
+    "--at": "preserve",
+    "--in-place": "preserve",
+    "--skip-seat-reset": "inject",
     "--model": "preserve",
     "--read-only": "preserve",
     "--readonly": "preserve",
@@ -6758,6 +6829,7 @@ _REPLAY_VALUE_OPTIONS = {
     "--task",
     "--cwd",
     "--worktree",
+    "--at",
     "--model",
     "--os-sandbox",
     "--priority",
@@ -6928,6 +7000,10 @@ def _canonical_replay_argv(args, raw_argv: list[str], *, tail: Path, status_json
     worktree_base = _requested_worktree_base(args)
     if worktree_base:
         argv += ["--worktree", worktree_base]
+    if getattr(args, "in_place", False):
+        argv.append("--in-place")
+    if getattr(args, "skip_seat_reset", False):
+        argv.append("--skip-seat-reset")
     if args.capacity_wait_s is not None:
         argv += ["--capacity-wait-s", str(args.capacity_wait_s)]
     if args.account:
@@ -17374,17 +17450,39 @@ def _build_launch_parser() -> argparse.ArgumentParser:
         default=[],
         help="Comma-separated linked task/bug ids (t-/b-). May be repeated.",
     )
-    parser.add_argument("--cwd", type=_existing_cwd_arg, help="Worker working directory")
+    parser.add_argument(
+        "--cwd",
+        type=_existing_cwd_arg,
+        help=(
+            "Lock an existing tree: this controller's captive seat, the "
+            "project root (in-place), or resume's recorded worker_cwd. "
+            "Refuses any other path and never creates it."
+        ),
+    )
+    parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Run in the project root without acquiring a captive seat.",
+    )
     parser.add_argument(
         "--worktree",
-        metavar="BASE",
+        "--at",
+        dest="worktree",
+        metavar="REF",
         help=(
-            "Acquire one pooled worktree seat prepared at git ref BASE "
-            "(HEAD, main, a commit) and run the worker there. The seat lease "
-            "fd is inherited by the worker; exhaustion refuses with every held "
-            "seat named and never falls back to `git worktree add`. Additive: "
-            "omit this flag and --cwd behaves as before."
+            "Prepare the captive seat at git ref REF (HEAD, main, a commit). "
+            "This is not an opt-in to the pool: every dispatch acquires a "
+            "seat unless --in-place or --cwd names the project root. "
+            "Default ref is origin/main when it exists, else HEAD. "
+            "Exhaustion names occupants and never falls back to "
+            "`git worktree add`."
         ),
+    )
+    parser.add_argument(
+        "--skip-seat-reset",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--model", default=None,
                         help="Worker model id (grok-code/grok-research/moonshot/codex --model passthrough). "
@@ -17911,7 +18009,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"goalflight_dispatch: {e}", file=sys.stderr)
         return 64
     if not worker_argv:
-        print("goalflight_dispatch: no worker — use `--agent codex --prompt-file X [--cwd .]` "
+        print("goalflight_dispatch: no worker — use `--agent codex --prompt-file X` "
               "or `-- <cmd...>`", file=sys.stderr)
         return 64
 

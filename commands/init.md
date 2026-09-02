@@ -76,7 +76,7 @@ python3 <skill-root>/scripts/goalflight_doctor.py --project-root "$PWD" --json
 ```
 
 Dispatch examples in this repo assume the direct default is background:
-`python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md --cwd .`.
+`python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex --prompt-file p.md`.
 Use `--submit --drain-on-submit` for durable queue launch and `--foreground`
 only for synchronous scripts/tests.
 

@@ -189,9 +189,12 @@ def test_worktree_leaf_symlink_is_rejected() -> None:
         repo = make_repo(root)
         outside = root / "outside"
         outside.mkdir()
-        managed = repo / "worktrees"
-        managed.mkdir()
-        (managed / "wt-1").symlink_to(outside, target_is_directory=True)
+        label = goalflight_worktree_pool.default_controller_ring_label(
+            None, project_root=repo
+        )
+        managed = repo / "worktrees" / label
+        managed.mkdir(parents=True)
+        (managed / "s-1").symlink_to(outside, target_is_directory=True)
 
         try:
             goalflight_worktree_pool.acquire_worktree_seat(repo, "acp-test-leaf")
@@ -263,19 +266,32 @@ def test_doctor_flags_orphaned_blocking_path() -> None:
 def test_execute_parallel_docs_require_worktree_create() -> None:
     text = (ROOT / "commands" / "execute.md").read_text()
     protocol = (ROOT / "protocols" / "worktrees-parallel.md").read_text()
-    assert_true("parallel uses worktree create", "`--worktree create`" in text)
-    assert_true("parallel threshold documented", "`--parallel N` where `N >= 2`" in text)
-    assert_true("sequential stays root", "Sequential dispatch" in text and "project root" in text)
+    assert_true("isolation is not a mode", "Isolation is not a mode" in text)
+    assert_true(
+        "canonical snippet has no --cwd",
+        "--agent <ready-agent> --prompt-file p.md" in text
+        and "--cwd ." not in text,
+    )
     assert_true("HEAD-only base documented", "committed `HEAD`" in text)
     assert_true("preserve unrelated WIP", "Preserve unrelated WIP." in text)
     assert_true(
         "never move another owner's WIP",
         "Never stash, move, or discard another owner's WIP" in text,
     )
-    assert_true("slot range documented", "`worktrees/wt-1`" in text)
+    assert_true("captive slot range documented", "worktrees/<controller-label>/s-1" in text)
     assert_true("hard ceiling documented", "hard ceiling" in text)
-    assert_true("index exclude documented", "`worktrees/wt-*`" in protocol)
+    assert_true("fuse default documented", "default 24" in text)
+    assert_true("index the captive ring", "Index the captive ring" in protocol)
+    assert_true(
+        "do not exclude captive seats",
+        "Do **not** exclude `worktrees/s-*`" in protocol,
+    )
     assert_true("codedb ignore location documented", "`.codedbignore`" in protocol)
+    assert_true(
+        "protocol forbids sequential-root split",
+        "sequential dispatch" not in protocol.lower()
+        or "stays in the project root" not in protocol,
+    )
 
 
 class FakeProc:
