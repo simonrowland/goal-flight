@@ -385,11 +385,14 @@ stdout monitor. Do not launch `follow` there: a stream whose lines are not watch
 provides no wakes.
 
 Hosts whose `listen` tasks die when a local-exec session drops (Grok Bot via a
-registered Mac) may also arm an optional outbound HTTP nudge so an external
-routine can wake the controller without depending on that process. The journal
-is still durable truth; the POST is promptness only and is not a second inbox.
-See `docs/hosts/grok-bot.md`. This complements exit-as-wake `listen`. It does
-not replace `listen` when local-exec is up.
+registered Mac) keep two independent doorbells: portable exit-as-wake `listen`
+and an optional outbound HTTP webhook. Either may fire; both may fire.
+Duplicate wakes are OK (peek the journal; stay quiet if nothing is pending).
+The webhook is an alternative doorbell, not a second inbox — mail bodies never
+leave the laptop journal. The operator is not the mailman. Deafness is both
+`listen` unarmed *and* the webhook failing or unconfigured. See
+`docs/hosts/grok-bot.md`. Claude keeps `supervise` on Monitor; do not treat the
+webhook as a Monitor replacement.
 
 Arm a pool of four tracked background tasks for the active lease. Four is the default
 slot count — depth is resilience, not efficiency, and survives three missed re-arms.

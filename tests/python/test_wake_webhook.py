@@ -1,8 +1,9 @@
-"""Optional outbound wake-webhook nudge on listen-visible mail harvest.
+"""Durable outbound wake-webhook doorbell on listen-visible mail harvest.
 
 The journal is durable truth. When GOALFLIGHT_WAKE_WEBHOOK_URL is unset,
-harvest must not open a socket. When it is set, one POST follows a newly
-projected waking delivery. A failed POST must not drop the journal write.
+harvest must not open a socket and must not enqueue. When it is set, a
+wake-outbox row is written in the same transaction as projection and a
+sender POSTs at-least-once. A failed POST must not drop the journal write.
 """
 
 from __future__ import annotations
@@ -11,9 +12,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import threading
+import uuid
 import urllib.request
 
 import pytest
@@ -23,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import goalflight_doctor as doctor  # noqa: E402
 import goalflight_journal as journal  # noqa: E402
 import goalflight_messages as messages  # noqa: E402
 import goalflight_wake_webhook as webhook  # noqa: E402
@@ -110,6 +114,28 @@ def test_classify_nudge_kind_splits_mail_wake_complete() -> None:
     assert webhook.classify_nudge_kind("blocked") == "complete"
     assert webhook.classify_nudge_kind("user_need") == "wake"
     assert webhook.classify_nudge_kind("steering") == "wake"
+
+
+def test_should_enqueue_skips_heartbeat_next_and_quiet() -> None:
+    waking_mail = {
+        "wake_class": "waking",
+        "event_type": "controller-notice",
+        "newly_projected": True,
+    }
+    assert webhook.should_enqueue_delivery(waking_mail) is True
+    assert webhook.should_enqueue_delivery({**waking_mail, "event_type": "result"}) is True
+    assert (
+        webhook.should_enqueue_delivery({**waking_mail, "wake_class": "quiet"}) is False
+    )
+    assert (
+        webhook.should_enqueue_delivery({**waking_mail, "event_type": "heartbeat"})
+        is False
+    )
+    assert webhook.should_enqueue_delivery({**waking_mail, "event_type": "next"}) is False
+    assert (
+        webhook.should_enqueue_delivery({**waking_mail, "event_type": "coverage"})
+        is False
+    )
 
 
 def test_load_config_unset_means_none(
@@ -209,6 +235,7 @@ def test_unset_url_means_zero_http_on_mail_harvest(
     )
     assert len(rows) == 1
     assert rows[0]["projected_at"] is not None
+    assert authority.due_wake_webhook_outbox() == []
 
 
 def test_mail_harvest_posts_one_nudge(
@@ -251,6 +278,13 @@ def test_mail_harvest_posts_one_nudge(
             "dispatch_id": "mail-1",
         }
         assert "nudge-mail" not in json.dumps(body)
+        outbox = authority.read_all(
+            "SELECT delivered_at, abandoned_at FROM wake_webhook_outbox WHERE stream_id = ?",
+            ("mail-1",),
+        )
+        assert len(outbox) == 1
+        assert outbox[0]["delivered_at"] is not None
+        assert outbox[0]["abandoned_at"] is None
 
 
 def test_complete_harvest_posts_complete_kind(
@@ -297,6 +331,19 @@ def test_journal_write_survives_failed_post(
     )
     assert len(rows) == 1
     assert rows[0]["projected_at"] is not None
+    pending = authority.read_all(
+        """
+        SELECT event_type, delivered_at, abandoned_at, delivery_attempts, retry_at
+        FROM wake_webhook_outbox WHERE stream_id = ?
+        """,
+        ("fail-1",),
+    )
+    assert len(pending) == 1
+    assert pending[0]["event_type"] == "controller-notice"
+    assert pending[0]["delivered_at"] is None
+    assert pending[0]["abandoned_at"] is None
+    assert int(pending[0]["delivery_attempts"]) >= 1
+    assert pending[0]["retry_at"] is not None
 
     monkeypatch.setenv("GOALFLIGHT_WAKE_WEBHOOK_URL", "http://127.0.0.1:1/closed")
     monkeypatch.setenv("GOALFLIGHT_WAKE_WEBHOOK_TIMEOUT_S", "0.2")
@@ -344,3 +391,224 @@ def test_quiet_projection_does_not_post(monkeypatch: pytest.MonkeyPatch) -> None
         )
         is False
     )
+    assert (
+        webhook.nudge_projected_delivery(
+            {
+                "newly_projected": True,
+                "wake_class": "waking",
+                "event_type": "heartbeat",
+                "recipient_label": "alice",
+                "project_root": "/tmp/p",
+                "stream_id": "s",
+            }
+        )
+        is False
+    )
+    assert (
+        webhook.nudge_projected_delivery(
+            {
+                "newly_projected": True,
+                "wake_class": "waking",
+                "event_type": "next",
+                "recipient_label": "alice",
+                "project_root": "/tmp/p",
+                "stream_id": "s",
+            }
+        )
+        is False
+    )
+
+
+def _force_outbox_due(authority: journal.Journal, stream_id: str) -> None:
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute(
+            """
+            UPDATE wake_webhook_outbox
+            SET retry_at = '1970-01-01T00:00:00+00:00'
+            WHERE stream_id = ? AND delivered_at IS NULL AND abandoned_at IS NULL
+            """,
+            (stream_id,),
+        )
+        connection.commit()
+
+
+def test_retry_succeeds_after_failed_post(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = _git_project(tmp_path)
+    authority = journal.Journal.create(project)
+    _claim(authority, "alice")
+    with _WebhookServer(status=500) as failing:
+        monkeypatch.setenv("GOALFLIGHT_WAKE_WEBHOOK_URL", failing.url)
+        posted = _post_mail(project, tmp_path / "messages", "alice", dispatch_id="retry-1")
+        assert posted["recorded"] is True
+        assert len(failing.requests) == 1
+    _force_outbox_due(authority, "retry-1")
+    with _WebhookServer() as recovering:
+        monkeypatch.setenv("GOALFLIGHT_WAKE_WEBHOOK_URL", recovering.url)
+        summary = webhook.flush_due(authority)
+        assert summary["delivered"] == 1
+        assert summary["retried"] == 0
+        assert len(recovering.requests) == 1
+        body = json.loads(recovering.requests[0]["body"])
+        assert body["kind"] == "mail"
+        assert "nudge-mail" not in json.dumps(body)
+    delivered = authority.read_all(
+        "SELECT delivered_at FROM wake_webhook_outbox WHERE stream_id = ?",
+        ("retry-1",),
+    )
+    assert delivered[0]["delivered_at"] is not None
+
+
+def test_drained_event_abandons_outbox_without_another_post(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = _git_project(tmp_path)
+    authority = journal.Journal.create(project)
+    lease = _claim(authority, "alice")
+    with _WebhookServer(status=500) as failing:
+        monkeypatch.setenv("GOALFLIGHT_WAKE_WEBHOOK_URL", failing.url)
+        posted = _post_mail(project, tmp_path / "messages", "alice", dispatch_id="drain-1")
+        assert posted["recorded"] is True
+        assert len(failing.requests) == 1
+    peek = authority.cursor_peek("alice", nonce=lease.nonce)
+    advanced = authority.advance_cursor(
+        "alice",
+        nonce=lease.nonce,
+        expected_cursor_version=peek.cursor_version,
+        expected_stream_snapshots=peek.stream_snapshots,
+        advances={"drain-1": 1},
+        actor="controller:test:relay-drain",
+    )
+    assert advanced.committed
+    _force_outbox_due(authority, "drain-1")
+    with _WebhookServer() as recovering:
+        monkeypatch.setenv("GOALFLIGHT_WAKE_WEBHOOK_URL", recovering.url)
+        summary = webhook.flush_due(authority)
+        assert summary["abandoned"] == 1
+        assert summary["attempted"] == 0
+        assert recovering.requests == []
+    abandoned = authority.read_all(
+        "SELECT abandoned_at, abandon_reason FROM wake_webhook_outbox WHERE stream_id = ?",
+        ("drain-1",),
+    )
+    assert abandoned[0]["abandoned_at"] is not None
+    assert abandoned[0]["abandon_reason"] == "no-longer-listen-visible"
+
+
+def test_later_harvest_retries_due_outbox(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The harvest/projection path is the sender; listen is not blocked on HTTP."""
+    project = _git_project(tmp_path)
+    authority = journal.Journal.create(project)
+    _claim(authority, "alice")
+    with _WebhookServer(status=500) as failing:
+        monkeypatch.setenv("GOALFLIGHT_WAKE_WEBHOOK_URL", failing.url)
+        posted = _post_mail(project, tmp_path / "messages", "alice", dispatch_id="first-1")
+        assert posted["recorded"] is True
+        assert len(failing.requests) == 1
+    _force_outbox_due(authority, "first-1")
+    with _WebhookServer() as recovering:
+        monkeypatch.setenv("GOALFLIGHT_WAKE_WEBHOOK_URL", recovering.url)
+        later = _post_mail(project, tmp_path / "messages", "alice", dispatch_id="second-1")
+        assert later["recorded"] is True
+        kinds = [json.loads(req["body"])["dispatch_id"] for req in recovering.requests]
+        assert "first-1" in kinds
+        assert "second-1" in kinds
+        assert all("nudge-mail" not in req["body"].decode() for req in recovering.requests)
+
+
+def test_wildcard_orphan_still_posts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = _git_project(tmp_path)
+    authority = journal.Journal.create(project)
+    event_id = str(uuid.uuid4())
+    recorded = authority.record_delivery_event(
+        recipient_label="*",
+        origin_node="test",
+        event_uuid=event_id,
+        stream_id="orphan-1",
+        stream_seq=1,
+        carrier_path=tmp_path / "carrier.jsonl",
+        event_type="user_need",
+        wake_class="waking",
+        created_at=journal.utc_now(),
+    )
+    assert recorded.committed
+    with _WebhookServer() as server:
+        monkeypatch.setenv("GOALFLIGHT_WAKE_WEBHOOK_URL", server.url)
+        marked = authority.mark_delivery_projected(
+            recipient_label="*",
+            origin_node="test",
+            event_uuid=event_id,
+        )
+        assert marked.committed
+        assert len(server.requests) == 1
+        body = json.loads(server.requests[0]["body"])
+        assert body["kind"] == "wake"
+        assert body["controller_label"] == "*"
+        assert "secret" not in json.dumps(body).lower()
+    abandoned = authority.read_all(
+        "SELECT abandoned_at, delivered_at FROM wake_webhook_outbox WHERE event_uuid = ?",
+        (event_id,),
+    )
+    assert len(abandoned) == 1
+    assert abandoned[0]["abandoned_at"] is None
+    assert abandoned[0]["delivered_at"] is not None
+
+
+def test_existing_journal_gains_outbox_without_upgrade_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv(journal.ALLOW_MIGRATION_ENV, raising=False)
+    project = _git_project(tmp_path)
+    authority = journal.Journal.create(project)
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute("DROP TABLE wake_webhook_outbox")
+        connection.commit()
+    reopened = journal.Journal(project)
+    tables = {
+        str(row["name"])
+        for row in reopened.read_all(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    assert "wake_webhook_outbox" in tables
+    columns = tuple(
+        str(row["name"])
+        for row in reopened.read_all("PRAGMA table_info(wake_webhook_outbox)")
+    )
+    assert columns == journal.CURRENT_SCHEMA_COLUMNS["wake_webhook_outbox"]
+
+
+def test_doctor_warns_when_grok_bot_host_missing_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("GOALFLIGHT_WAKE_WEBHOOK_URL", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_WAKE_WEBHOOK_CONFIG", os.devnull)
+    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_HOST", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_GROK_BOT_WORKFLOWS", str(tmp_path / "missing-workflows"))
+    healthy = doctor.check_wake_webhook()
+    assert healthy["ok"] is True
+    assert healthy["configured"] is False
+
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_HOST", "grok-bot")
+    warned = doctor.check_wake_webhook()
+    assert warned["ok"] is False
+    assert warned["grok_bot_host"] is True
+    assert "GOALFLIGHT_WAKE_WEBHOOK_URL" in str(warned.get("hint") or "")
+
+    workflows = tmp_path / "workflows" / "goal-flight"
+    workflows.mkdir(parents=True)
+    (workflows / "SKILL.md").write_text("# grok-bot\n", encoding="utf-8")
+    monkeypatch.delenv("GOALFLIGHT_CONTROLLER_HOST", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_GROK_BOT_WORKFLOWS", str(tmp_path / "workflows"))
+    skill_warned = doctor.check_wake_webhook()
+    assert skill_warned["ok"] is False
+
+    monkeypatch.setenv("GOALFLIGHT_WAKE_WEBHOOK_URL", "http://127.0.0.1:9/wake")
+    configured = doctor.check_wake_webhook()
+    assert configured["ok"] is True
+    assert configured["configured"] is True
