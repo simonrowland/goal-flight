@@ -21,6 +21,7 @@ META_DRIVER_NAME = "test_script_style_modules.py"
 sys.path.insert(0, str(TEST_DIR))
 from support import (  # noqa: E402
     AMBIENT_IDENTITY_ENV,
+    AMBIENT_WEBHOOK_ENV,
     acp_sdk_unavailable_reason,
     has_main_driver,
     isolated_machine_env,
@@ -169,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         if proc is None:
             command, pytest_result_required = _test_command(test, py)
             child_env = os.environ.copy()
-            for key in AMBIENT_IDENTITY_ENV:
+            for key in AMBIENT_IDENTITY_ENV + AMBIENT_WEBHOOK_ENV:
                 child_env.pop(key, None)
             child_env.pop("GOALFLIGHT_WAKE_LEDGER", None)
             child_env.update(isolated_machine_env(machine_base / f"test-{test_index}"))

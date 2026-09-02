@@ -28,6 +28,14 @@ incremented when meaningful skill behaviour changes.
 
 ### Added
 
+- Optional outbound wake webhook on listen-visible controller mail/wake
+  harvest. `GOALFLIGHT_WAKE_WEBHOOK_URL` / `GOALFLIGHT_WAKE_WEBHOOK_SECRET`
+  (or `~/.goal-flight/wake-webhook.json`) POST a small JSON nudge
+  (`kind`, `controller_label`, `project_root`, `dispatch_id`, `event_type`)
+  after journal delivery projection commits. Unset URL means zero HTTP.
+  POST failure is logged and ignored; the journal write already happened.
+  Complements exit-as-wake `listen` for Grok Bot local-exec; see
+  `docs/hosts/grok-bot.md`.
 - **Watchlist two-tier wedge detector (`goalflight_wedge_watch.py`).** Cheap
   path is one `stat` of the tail (mtime + size). After the tail has been
   idle longer than a data-derived probation (1080s, above p99=965.7s of

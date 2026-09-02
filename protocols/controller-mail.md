@@ -384,6 +384,13 @@ Use this path on codex, grok, cursor, opencode, and any other host with no persi
 stdout monitor. Do not launch `follow` there: a stream whose lines are not watched
 provides no wakes.
 
+Hosts whose `listen` tasks die when a local-exec session drops (Grok Bot via a
+registered Mac) may also arm an optional outbound HTTP nudge so an external
+routine can wake the controller without depending on that process. The journal
+is still durable truth; the POST is promptness only and is not a second inbox.
+See `docs/hosts/grok-bot.md`. This complements exit-as-wake `listen`. It does
+not replace `listen` when local-exec is up.
+
 Arm a pool of four tracked background tasks for the active lease. Four is the default
 slot count — depth is resilience, not efficiency, and survives three missed re-arms.
 Repeat this same command four times through the host's tracked-background-task
