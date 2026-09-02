@@ -1,39 +1,9 @@
 ---
 name: goal-flight
-version: 1.5.1
-description: "Portable Goal Flight workflow for long-running repo work: planning, dispatch, review, recovery, file-backed resume."
-tags:
-  - orchestration
-  - orchestrator
-  - dispatch
-  - review
-  - handoff
-paths:
-  commands: commands/
-  protocols: protocols/
-  scripts: scripts/
-  adapters: adapters/
-allowed-tools:
-  - Bash
-  - Read
-  - Edit
-  - Write
-  - Glob
-  - Grep
-  - Agent
-  - Skill
-  - AskUserQuestion
-  - TodoWrite
-triggers:
-  - /goal-flight
-  - start a long refactor
-  - begin chunked work
-  - set up orchestrator for unattended run
-  - decompose this plan into goal chunks
-  - resume the goal-flight run
-  - continue the goal queue
-  - recover a dispatched worker
-  - check mail
+version: 1.6.0
+description: "Use when the user invokes /goal-flight or asks for Goal Flight to plan, dispatch, review, recover, or resume a long-running orchestrated repository run from file-backed state."
+when_to_use: "User invoked /goal-flight, or asked to start, resume, or recover a Goal Flight orchestrated run. Not for generic coding or one-off edits."
+disable-model-invocation: true
 ---
 
 > ⚠️ **Read this skill end-to-end, including Worker Routing, State, and Context Discipline** before acting; also read Do Not. The back half carries routing, state, marker, rate-limit, permission, and safety contracts.

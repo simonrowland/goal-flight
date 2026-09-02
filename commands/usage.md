@@ -1,5 +1,5 @@
 ---
-description: "Show provider headroom and the soonest upcoming reset."
+description: "Use when the user invokes /goal-flight usage to show Goal Flight provider headroom and the soonest upcoming reset."
 ---
 
 # usage

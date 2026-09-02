@@ -1,5 +1,7 @@
 ---
-description: "Append one compact goal to the active queue."
+description: "Use when the user invokes /goal-flight goal during an active Goal Flight run to append one compact goal to the queue."
+argument-hint: "[SLUG]"
+disable-model-invocation: true
 ---
 
 # goal <SLUG>

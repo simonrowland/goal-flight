@@ -1,5 +1,7 @@
 ---
-description: "Initialize goal-flight state for a project."
+description: "Use when the user invokes /goal-flight init to scaffold Goal Flight project state for a long-running orchestrated repository run."
+argument-hint: "[topic]"
+disable-model-invocation: true
 ---
 
 # init <topic>

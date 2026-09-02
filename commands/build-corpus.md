@@ -1,5 +1,7 @@
 ---
-description: "Build or refresh the private dispatch-context corpus."
+description: "Use when the user invokes /goal-flight build-corpus to build or refresh the private Goal Flight dispatch-context corpus."
+argument-hint: "[--slice name] [--next-wave N] [--all] [--rebuild]"
+disable-model-invocation: true
 ---
 
 # build-corpus [--slice <name>] [--next-wave [<N>]] [--all] [--rebuild]

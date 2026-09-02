@@ -1,5 +1,5 @@
 ---
-description: "Run procedural readiness checks for goal-flight."
+description: "Use when the user invokes /goal-flight doctor to check Goal Flight host and project readiness."
 ---
 
 # doctor

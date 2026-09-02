@@ -1,5 +1,7 @@
 ---
-description: "Run a lane-fill bug-sweep campaign: audit → harvest → consolidate → adversarial verify → grouped fixes."
+description: "Use when the user invokes /goal-flight bug-sweep to run a Goal Flight lane-fill bug-sweep campaign."
+argument-hint: "[--mode milestone|qa|bug-hunt|predicate] [--anchor ref]"
+disable-model-invocation: true
 ---
 
 # bug-sweep [--mode <milestone|qa|bug-hunt|predicate>] [--anchor <ref>]

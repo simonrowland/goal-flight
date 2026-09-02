@@ -1,5 +1,6 @@
 ---
-description: "Resume from git state, status JSON, and dispatch ledger."
+description: "Use when the user invokes /goal-flight resume to rebuild an already-active Goal Flight run from file-backed state."
+disable-model-invocation: true
 ---
 
 # resume

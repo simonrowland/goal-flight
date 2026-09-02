@@ -1,3 +1,8 @@
+---
+description: "Use when the user invokes /goal-flight update to refresh the Goal Flight skill checkout and worker CLIs before an unattended run."
+disable-model-invocation: true
+---
+
 # /goal-flight update
 
 Refresh **goal-flight itself** + the worker CLIs it dispatches to. Two

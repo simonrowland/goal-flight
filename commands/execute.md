@@ -1,5 +1,7 @@
 ---
-description: "Execute queued goal chunks with capacity-aware workers."
+description: "Use when the user invokes /goal-flight execute during an active Goal Flight run to dispatch the next queued chunks."
+argument-hint: "[--parallel N]"
+disable-model-invocation: true
 ---
 
 # execute [--parallel <N>]

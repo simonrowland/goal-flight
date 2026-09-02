@@ -1,5 +1,7 @@
 ---
-description: "Spawn read-only question-finding workers before unattended work."
+description: "Use when the user invokes /goal-flight ask-questions to spawn read-only Goal Flight workers that surface blocking questions before an unattended run."
+argument-hint: "[--scope area]"
+disable-model-invocation: true
 ---
 
 # ask-questions [--scope <area>]

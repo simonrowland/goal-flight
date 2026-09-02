@@ -6,6 +6,16 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Changed
+
+- Skill and command YAML is when-to-use, not a product blurb. Dropped
+  unhonored gstack keys (`tags`, `triggers`, and directory-map `paths`
+  that collide with host file-glob `paths`). Omitted full-kit
+  `allowed-tools` — that field is a Claude pre-grant, not a sandbox.
+  Claude/Cursor dispatch surfaces set `disable-model-invocation: true`.
+  Version declarations agree with `VERSION` 1.6.0 (`SKILL.md` frontmatter
+  and the Codex `plugin.json` pin).
+
 ### Fixed
 
 - `supervise` backlog cap keys on envelope identity, not raw line count.

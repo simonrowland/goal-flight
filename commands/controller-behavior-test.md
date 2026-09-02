@@ -1,5 +1,7 @@
 ---
-description: "Run scripted orchestrator behavior scenarios (Codex-first bash-tail harness)."
+description: "Use when the user invokes /goal-flight controller-behavior-test to run scripted Goal Flight orchestrator behavior scenarios."
+argument-hint: "[--controller codex] [--scenario doctor-loads]"
+disable-model-invocation: true
 ---
 
 # controller-behavior-test [--controller codex] [--scenario doctor-loads]
