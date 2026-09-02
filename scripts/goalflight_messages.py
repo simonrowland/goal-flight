@@ -257,6 +257,10 @@ CONTROLLER_ADDRESSEE_TYPES = CONTROLLER_CHANNEL_TYPES | frozenset(
         "finding",
     }
 )
+# advisory's lifecycle aliases that are dispatch-scoped worker mail, not
+# controller correspondence. Everything else that canonicalizes to advisory
+# is the junk drawer (note, defect-notice, qa-bug, controller-note, …).
+WORKER_SAFE_ADVISORY_ALIASES = frozenset({"ack"})
 # Removed CONTROLLER_LISTENER_ESCALATION_TYPES: its partial set was superseded by registry wake classes.
 TASK_STORE_STATUS_NUDGE_KINDS = frozenset({"parallel-ready", "resume-ready", "done-suggest"})
 NON_ERROR_UNDELIVERED_STATUSES = frozenset({"terminal_recorded_only", "worker_view_queued"})
@@ -722,7 +726,8 @@ def validate_envelope(
         ):
             raise MessageError(
                 f"{path}.addressee: controller addressing is only valid for "
-                "controller-channel types or merge-request/patch/finding"
+                "controller-channel types or merge-request/patch/finding; "
+                "use --type controller-notice with --to-controller LABEL"
             )
     return _canonical_json_text(envelope, path=path, byte_limit=MAX_ENVELOPE_JSON_BYTES)
 
@@ -1493,6 +1498,127 @@ def _reject_steer_type_off_worker_mailbox(dispatch_id: str, msg_type: str) -> No
     )
 
 
+def _worker_own_inbox_post(dispatch_id: str) -> bool:
+    """True when this process is the worker posting to its own dispatch stream."""
+    return os.environ.get("GOALFLIGHT_DISPATCH_ID") == dispatch_id
+
+
+def _is_advisory_junk_drawer_type(msg_type: str) -> bool:
+    """advisory and its controller-mail aliases; not ack or addressee types."""
+    raw = str(msg_type or "")
+    if raw in CONTROLLER_ADDRESSEE_TYPES or raw in WORKER_SAFE_ADVISORY_ALIASES:
+        return False
+    return raw == "advisory" or canonical_event_type(raw) == "advisory"
+
+
+def _is_controller_directed_post_type(msg_type: str) -> bool:
+    raw = str(msg_type or "")
+    return raw in CONTROLLER_ADDRESSEE_TYPES or canonical_event_type(raw) in CONTROLLER_CHANNEL_TYPES
+
+
+def _complete_controller_addressee(addressee: object) -> bool:
+    if not isinstance(addressee, dict) or not addressee:
+        return False
+    label = addressee.get("label")
+    root = addressee.get("project_root")
+    return (
+        addressee.get("kind") == CONTROLLER_ADDRESSEE_KIND
+        and isinstance(label, str)
+        and bool(label.strip())
+        and isinstance(root, str)
+        and bool(root.strip())
+    )
+
+
+def _controller_mail_post_syntax(*, dispatch_id: str = "<id>") -> str:
+    stream = str(dispatch_id or "").strip() or "<id>"
+    return (
+        "python3 scripts/goalflight_messages.py post "
+        f"--dispatch-id {stream} --type controller-notice "
+        "--to-controller LABEL [--controller-project-root ROOT] "
+        "--subject '...' --text '...'"
+    )
+
+
+def _unaddressed_controller_mail_error(msg_type: str, *, dispatch_id: str = "") -> MessageError:
+    """Refuse unaddressed / wrong-type controller mail with copy-pasteable syntax."""
+    syntax = _controller_mail_post_syntax(dispatch_id=dispatch_id)
+    raw = str(msg_type or "")
+    if _is_advisory_junk_drawer_type(raw):
+        return MessageError(
+            f"type {raw!r} is not delivered as controller mail; "
+            "mail with no addressee is not delivered. "
+            "Use --type controller-notice and pass --to-controller LABEL. "
+            f"Correct syntax: {syntax}"
+        )
+    return MessageError(
+        "mail with no addressee is not delivered; pass --to-controller LABEL "
+        "(and --controller-project-root when the label lives on another project). "
+        f"Correct syntax: {syntax}"
+    )
+
+
+def _reject_unaddressed_controller_mail(
+    *,
+    msg_type: str,
+    dispatch_id: str,
+    addressee: object,
+    payload: object,
+    deliver_to_worker: bool,
+    project_journal_delivery: bool,
+) -> None:
+    """Fail closed before any carrier/journal write.
+
+    CLI controller mail and a Python caller that would record into nowhere
+    both raise MessageError. Worker dispatch types are not this path.
+    ``deliver_to_worker`` and a worker posting to its own inbox stay open.
+    Library omitted addressee on a controller type is allowed only when
+    journal targeting already has a recipient (dispatch owner or payload root).
+    Empty ``{}`` is never a recipient.
+    """
+    if _is_advisory_junk_drawer_type(msg_type):
+        if addressee is not None:
+            raise _unaddressed_controller_mail_error(msg_type, dispatch_id=dispatch_id)
+        return
+    if not _is_controller_directed_post_type(msg_type):
+        return
+    if _complete_controller_addressee(addressee):
+        return
+    if addressee is not None:
+        raise _unaddressed_controller_mail_error(msg_type, dispatch_id=dispatch_id)
+    if deliver_to_worker or _worker_own_inbox_post(dispatch_id):
+        return
+    if not project_journal_delivery:
+        raise _unaddressed_controller_mail_error(msg_type, dispatch_id=dispatch_id)
+    probe = {
+        "dispatch_id": dispatch_id,
+        "type": msg_type,
+        "payload": payload if isinstance(payload, dict) else {},
+    }
+    try:
+        targets = _journal_delivery_targets(probe)
+    except MessageError:
+        raise _unaddressed_controller_mail_error(msg_type, dispatch_id=dispatch_id) from None
+    if not targets:
+        raise _unaddressed_controller_mail_error(msg_type, dispatch_id=dispatch_id)
+
+
+def _reject_cli_unaddressed_controller_mail(args: argparse.Namespace) -> None:
+    """CLI ``post`` requires ``--to-controller`` for controller-directed types."""
+    msg_type = str(getattr(args, "type", "") or "")
+    dispatch_id = str(getattr(args, "dispatch_id", "") or "")
+    to_controller = getattr(args, "to_controller", None)
+    if _is_advisory_junk_drawer_type(msg_type):
+        raise _unaddressed_controller_mail_error(msg_type, dispatch_id=dispatch_id)
+    if to_controller:
+        return
+    if not _is_controller_directed_post_type(msg_type):
+        return
+    if _worker_own_inbox_post(dispatch_id):
+        return
+    raise _unaddressed_controller_mail_error(msg_type, dispatch_id=dispatch_id)
+
+
 def post_message(
     *,
     dispatch_id: str,
@@ -1516,6 +1642,14 @@ def post_message(
 ) -> dict:
     """Admit one monotonic stream envelope; shared by CLI, MCP, and tests."""
     _reject_steer_type_off_worker_mailbox(dispatch_id, msg_type)
+    _reject_unaddressed_controller_mail(
+        msg_type=msg_type,
+        dispatch_id=dispatch_id,
+        addressee=addressee,
+        payload=payload,
+        deliver_to_worker=deliver_to_worker,
+        project_journal_delivery=project_journal_delivery,
+    )
     validate_payload(payload)
     try:
         import goalflight_output_redact
@@ -2778,6 +2912,7 @@ def cmd_from_text(args: argparse.Namespace) -> int:
 
 def cmd_post(args: argparse.Namespace) -> int:
     to_controller = getattr(args, "to_controller", None)
+    _reject_cli_unaddressed_controller_mail(args)
     try:
         payload = json.loads(args.payload) if args.payload else {"text": args.text or ""}
     except (ValueError, RecursionError) as exc:
@@ -8412,7 +8547,13 @@ def _run_cli(argv: list[str] | None = None) -> int:
     post.add_argument(
         "--to-controller",
         metavar="LABEL",
-        help="address controller-channel mail to one durable controller registry name",
+        help=(
+            "required addressee for controller-channel mail and "
+            "merge-request/patch/finding. Unaddressed controller mail is "
+            "refused and not recorded. advisory and aliases such as note, "
+            "defect-notice, qa-bug, or controller-note cannot be addressed; "
+            "use --type controller-notice"
+        ),
     )
     post.add_argument(
         "--controller-project-root",

@@ -481,3 +481,125 @@ def test_nonzero_to_controller_json_statuses_are_distinct(
     assert rows[4] == (2, "controller_post_usage", False)
     statuses = [row[1] for row in rows]
     assert len(set(statuses)) == len(statuses)
+
+
+def test_cli_controller_notice_without_to_controller_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _isolate(monkeypatch, tmp_path)
+    project = _git_project(tmp_path / "project")
+    posted = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--messages-dir",
+            env["GOALFLIGHT_MESSAGES_DIR"],
+            "--fleet-dir",
+            env["GOALFLIGHT_FLEET_DIR"],
+            "post",
+            "--dispatch-id",
+            "missing-addressee",
+            "--type",
+            "controller-notice",
+            "--text",
+            "nowhere",
+            "--json",
+        ],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert posted.returncode == 2, posted.stderr
+    assert "post: refused:" in posted.stderr
+    assert "--to-controller LABEL" in posted.stderr
+    assert "--type controller-notice" in posted.stderr
+    assert "ok" not in posted.stdout
+    inbox = Path(env["GOALFLIGHT_MESSAGES_DIR"]) / "missing-addressee.jsonl"
+    assert not inbox.exists()
+
+
+def test_library_empty_addressee_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _isolate(monkeypatch, tmp_path)
+    messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+    with pytest.raises(messages.MessageError, match="--to-controller LABEL") as raised:
+        messages.post_message(
+            dispatch_id="empty-object",
+            msg_type="controller-coordination",
+            payload={"text": "empty addressee"},
+            messages_dir=messages_dir,
+            addressee={},
+        )
+    assert "--type controller-notice" in str(raised.value)
+    assert not (messages_dir / "empty-object.jsonl").exists()
+
+
+def test_cli_advisory_and_junk_aliases_name_controller_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _isolate(monkeypatch, tmp_path)
+    project = _git_project(tmp_path / "project")
+    for msg_type in ("advisory", "note", "controller-note", "defect-notice"):
+        posted = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--messages-dir",
+                env["GOALFLIGHT_MESSAGES_DIR"],
+                "post",
+                "--dispatch-id",
+                "topic-slug",
+                "--type",
+                msg_type,
+                "--text",
+                "should bounce",
+                "--json",
+            ],
+            cwd=str(project),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert posted.returncode == 2, posted.stderr
+        assert "--to-controller LABEL" in posted.stderr
+        assert "--type controller-notice" in posted.stderr
+        syntax = posted.stderr.split("Correct syntax:", 1)[-1]
+        assert "--type controller-notice" in syntax
+        assert "controller-note" not in syntax
+        assert not (Path(env["GOALFLIGHT_MESSAGES_DIR"]) / "topic-slug.jsonl").exists()
+
+
+def test_cli_worker_result_without_to_controller_still_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _isolate(monkeypatch, tmp_path)
+    project = _git_project(tmp_path / "project")
+    posted = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--messages-dir",
+            env["GOALFLIGHT_MESSAGES_DIR"],
+            "post",
+            "--dispatch-id",
+            "worker-result",
+            "--type",
+            "result",
+            "--text",
+            "complete",
+            "--json",
+        ],
+        cwd=str(project),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert posted.returncode == 0, posted.stderr
+    result = json.loads(posted.stdout)
+    assert result["recorded"] is True
+    assert (Path(env["GOALFLIGHT_MESSAGES_DIR"]) / "worker-result.jsonl").is_file()

@@ -58,16 +58,24 @@ marker text when one was harvested — including when the watcher called the run
 
 ## Send
 
+Controller mail requires an addressee. Unaddressed posts fail closed and do not
+record an envelope — including an omitted `--to-controller` and an empty
+`addressee: {}`. `advisory` (and aliases such as `note`, `defect-notice`,
+`qa-bug`, `controller-note`) cannot carry a controller addressee; use
+`controller-notice`. Worker dispatch types (`result`, `blocked`, `ack`) stay
+keyed by `--dispatch-id` and do not need `--to-controller`.
+
 ```bash
 python3 <skill-root>/scripts/goalflight_messages.py post \
-  --dispatch-id <topic-slug> --type user_need \
+  --dispatch-id <topic-slug> --type controller-notice \
   --to-controller <label> --subject '<one scannable line>' \
   --text '<body>'
 ```
 
 `--to-controller` uses a durable label. `--controller-project-root` defaults to the
 current canonical git project and is needed only for explicit cross-project mail.
-A send that reaches nobody is not success: the CLI exits non-zero and
+Passing `--controller-project-root` without `--to-controller` does not address
+mail. A send that reaches nobody is not success: the CLI exits non-zero and
 `controller_delivery.status` is the machine-readable miss (`controller_addressee_unresolved`,
 `controller_addressee_other_project`, or `controller_registry_unknown`). When the
 label is registered in another project, that error names `--controller-project-root`

@@ -187,6 +187,7 @@ def _journal_test_env(base: Path) -> dict[str, str]:
         "GOALFLIGHT_MESSAGES_DIR": str(base / "messages"),
         "GOALFLIGHT_FLEET_DIR": str(base / "fleet"),
         "GOALFLIGHT_STATE_DIR": str(base / "state"),
+        "GOALFLIGHT_DISPATCH_DIR": str(base / "state" / "dispatch"),
         "GOALFLIGHT_WAKE_LEDGER_DIR": str(base / "wake-ledger"),
         "GOAL_FLIGHT_PIDFILE_DIR": str(base / "pids"),
         "GOALFLIGHT_CAPACITY_CONF": os.devnull,
@@ -1331,31 +1332,22 @@ def test_controller_post_reaches_worker_steer_read_path() -> None:
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         messages_dir = base / "messages"
-        fleet_dir = base / "fleet"
         dispatch_id = "d-controller-live"
-        write_ledger_record(base, dispatch_id, base / "project", state="running", worker_pid=os.getpid())
-        steer_path = steer.steer_file(dispatch_id, state_dir=base / "state")
-        steer.append_steer_entry(steer_path, "earlier steer", dispatch_id=dispatch_id)
+        with mock.patch.dict(os.environ, _journal_test_env(base), clear=False):
+            write_ledger_record(base, dispatch_id, base / "project", state="running", worker_pid=os.getpid())
+            steer_path = steer.steer_file(dispatch_id, state_dir=base / "state")
+            steer.append_steer_entry(steer_path, "earlier steer", dispatch_id=dispatch_id)
+            result = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="controller-notice",
+                payload={"text": "worker-visible notice"},
+                messages_dir=messages_dir,
+                deliver_to_worker=True,
+            )
 
-        posted = run_messages_cli(
-            messages_dir,
-            fleet_dir,
-            [
-                "post",
-                "--dispatch-id",
-                dispatch_id,
-                "--type",
-                "controller-notice",
-                "--text",
-                "worker-visible notice",
-            ],
-        )
-
-        assert_true(f"controller post succeeds: {posted.stderr}", posted.returncode == 0)
-        result = json.loads(posted.stdout)
-        assert_true("record is reported", result["recorded"] is True)
-        assert_true("worker delivery is reported", result["delivery"]["delivered"] is True)
-        entries = steer.worker_entries(steer.read_steer_entries(steer_path))
+            assert_true("record is reported", result["recorded"] is True)
+            assert_true("worker delivery is reported", result["delivery"]["delivered"] is True)
+            entries = steer.worker_entries(steer.read_steer_entries(steer_path))
         delivered = entries[-1]
         assert_true("worker read path sees posted text", delivered["text"] == "worker-visible notice")
         assert_true("steer sequence remains independent", delivered["seq"] == 2)
@@ -1666,26 +1658,18 @@ def test_worker_delivery_post_report_shape_is_unchanged() -> None:
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
         messages_dir = base / "messages"
-        fleet_dir = base / "fleet"
         dispatch_id = "worker-report-shape"
         write_ledger_record(base, dispatch_id, base / "project", state="running", worker_pid=os.getpid())
 
-        posted = run_messages_cli(
-            messages_dir,
-            fleet_dir,
-            [
-                "post",
-                "--dispatch-id",
-                dispatch_id,
-                "--type",
-                "controller-notice",
-                "--text",
-                "worker channel only",
-            ],
-        )
+        with mock.patch.dict(os.environ, _journal_test_env(base), clear=False):
+            result = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="controller-notice",
+                payload={"text": "worker channel only"},
+                messages_dir=messages_dir,
+                deliver_to_worker=True,
+            )
 
-        assert_true(f"worker delivery succeeds: {posted.stderr}", posted.returncode == 0)
-        result = json.loads(posted.stdout)
         assert_true(
             "worker post top-level report shape is unchanged",
             set(result) == {"envelope", "line", "path", "recorded", "delivery"},
@@ -1812,25 +1796,27 @@ def test_controller_channel_types_project_and_remain_in_aggregate() -> None:
         fleet_dir.mkdir()
         write_ledger_record(base, dispatch_id, base / "project", state="running", worker_pid=os.getpid())
 
-        for msg_type in sorted(expected_types):
-            posted = run_messages_cli(
-                messages_dir,
-                fleet_dir,
-                ["post", "--dispatch-id", dispatch_id, "--type", msg_type, "--text", msg_type],
+        with mock.patch.dict(os.environ, _journal_test_env(base), clear=False):
+            for msg_type in sorted(expected_types):
+                posted = _carrier_messages.post_message(
+                    dispatch_id=dispatch_id,
+                    msg_type=msg_type,
+                    payload={"text": msg_type},
+                    messages_dir=messages_dir,
+                    deliver_to_worker=True,
+                )
+                assert_true(f"{msg_type} reaches worker", posted["recorded"] is True)
+            entries = steer.worker_entries(
+                steer.read_steer_entries(steer.steer_file(dispatch_id, state_dir=base / "state"))
             )
-            assert_true(f"{msg_type} reaches worker: {posted.stderr}", posted.returncode == 0)
-
-        entries = steer.worker_entries(
-            steer.read_steer_entries(steer.steer_file(dispatch_id, state_dir=base / "state"))
-        )
-        projected_types = {
-            entry["context"]["message_envelope"]["type"]
-            for entry in entries
-        }
-        assert_true("every controller channel type projects", projected_types == expected_types)
-        aggregate = build_aggregate(messages_dir=messages_dir, fleet_dir=fleet_dir)
-        aggregate_types = {item["type"] for item in aggregate["open_controller_channel"]}
-        assert_true("every projected type remains relay-visible", aggregate_types == expected_types)
+            projected_types = {
+                entry["context"]["message_envelope"]["type"]
+                for entry in entries
+            }
+            assert_true("every controller channel type projects", projected_types == expected_types)
+            aggregate = build_aggregate(messages_dir=messages_dir, fleet_dir=fleet_dir)
+            aggregate_types = {item["type"] for item in aggregate["open_controller_channel"]}
+            assert_true("every projected type remains relay-visible", aggregate_types == expected_types)
 
 
 def test_concurrent_controller_posts_preserve_worker_view_order() -> None:
@@ -1926,26 +1912,22 @@ def test_live_controller_post_delivery_failure_is_nonzero_and_recorded() -> None
         blocked_steer_path = base / "state" / "dispatch" / f"{dispatch_id}.steer.jsonl"
         blocked_steer_path.mkdir(parents=True)
 
-        posted = run_messages_cli(
-            messages_dir,
-            fleet_dir,
-            [
-                "post",
-                "--dispatch-id",
-                dispatch_id,
-                "--type",
-                "controller-notice",
-                "--text",
-                "record even when delivery fails",
-            ],
-        )
+        with mock.patch.dict(os.environ, _journal_test_env(base), clear=False):
+            result = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="controller-notice",
+                payload={"text": "record even when delivery fails"},
+                messages_dir=messages_dir,
+                deliver_to_worker=True,
+            )
 
-        assert_true("undeliverable live post is nonzero", posted.returncode != 0)
-        result = json.loads(posted.stdout)
         assert_true("failed delivery still reports record", result["recorded"] is True)
         assert_true("failed delivery is explicit", result["delivery"]["status"] == "worker_delivery_failed")
         assert_true("failed delivery is not claimed", result["delivery"]["delivered"] is False)
-        assert_true("call site says record versus delivery", "recorded but worker delivery failed" in posted.stderr)
+        assert_true(
+            "call site says record versus delivery",
+            "recorded but worker delivery failed" in result["delivery"]["detail"],
+        )
         envelopes = read_envelopes(messages_dir / f"{dispatch_id}.jsonl")
         assert_true(
             "record survives delivery failure",
@@ -1964,22 +1946,15 @@ def test_running_label_without_live_identity_is_not_delivery() -> None:
         dispatch_id = "d-controller-no-worker"
         write_ledger_record(base, dispatch_id, base / "project", state="running")
 
-        posted = run_messages_cli(
-            messages_dir,
-            fleet_dir,
-            [
-                "post",
-                "--dispatch-id",
-                dispatch_id,
-                "--type",
-                "controller-notice",
-                "--text",
-                "do not call a state label delivery",
-            ],
-        )
+        with mock.patch.dict(os.environ, _journal_test_env(base), clear=False):
+            result = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="controller-notice",
+                payload={"text": "do not call a state label delivery"},
+                messages_dir=messages_dir,
+                deliver_to_worker=True,
+            )
 
-        assert_true("running label without worker is nonzero", posted.returncode != 0)
-        result = json.loads(posted.stdout)
         assert_true("message remains recorded", result["recorded"] is True)
         assert_true("no worker delivery is claimed", result["delivery"]["delivered"] is False)
         assert_true("missing worker identity is explicit", result["delivery"]["dispatch_classification"] == "unknown_no_pid")
@@ -2005,22 +1980,15 @@ def test_detached_controller_dead_record_with_live_worker_still_delivers() -> No
             reason="controller_dead",
         )
 
-        posted = run_messages_cli(
-            messages_dir,
-            fleet_dir,
-            [
-                "post",
-                "--dispatch-id",
-                dispatch_id,
-                "--type",
-                "controller-notice",
-                "--text",
-                "detached worker still owns this mailbox",
-            ],
-        )
+        with mock.patch.dict(os.environ, _journal_test_env(base), clear=False):
+            result = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="controller-notice",
+                payload={"text": "detached worker still owns this mailbox"},
+                messages_dir=messages_dir,
+                deliver_to_worker=True,
+            )
 
-        assert_true(f"detached live worker post succeeds: {posted.stderr}", posted.returncode == 0)
-        result = json.loads(posted.stdout)
         assert_true("detached worker is classified live", result["delivery"]["dispatch_classification"] == "expected_live")
         assert_true("detached live worker receives view", result["delivery"]["delivered"] is True)
 
@@ -2036,22 +2004,15 @@ def test_terminal_controller_post_is_recorded_and_labelled_record_only() -> None
         dispatch_id = "d-controller-terminal"
         write_ledger_record(base, dispatch_id, base / "project", state="complete")
 
-        posted = run_messages_cli(
-            messages_dir,
-            fleet_dir,
-            [
-                "post",
-                "--dispatch-id",
-                dispatch_id,
-                "--type",
-                "controller-notice",
-                "--text",
-                "terminal history",
-            ],
-        )
+        with mock.patch.dict(os.environ, _journal_test_env(base), clear=False):
+            result = _carrier_messages.post_message(
+                dispatch_id=dispatch_id,
+                msg_type="controller-notice",
+                payload={"text": "terminal history"},
+                messages_dir=messages_dir,
+                deliver_to_worker=True,
+            )
 
-        assert_true(f"terminal post is a normal case: {posted.stderr}", posted.returncode == 0)
-        result = json.loads(posted.stdout)
         assert_true("terminal post is recorded", result["recorded"] is True)
         assert_true("terminal delivery is false", result["delivery"]["delivered"] is False)
         assert_true(
@@ -2167,6 +2128,7 @@ def test_mcp_delivery_failure_sets_tool_error_and_call_exit() -> None:
             "GOALFLIGHT_MESSAGES_DIR": str(messages_dir),
             "GOALFLIGHT_FLEET_DIR": str(fleet_dir),
             "GOALFLIGHT_STATE_DIR": str(base / "state"),
+            "GOALFLIGHT_DISPATCH_DIR": str(base / "state" / "dispatch"),
             "GOAL_FLIGHT_PIDFILE_DIR": str(base / "pids"),
             "GOALFLIGHT_TASK_STORE_DIR": str(base / "task-store"),
         }
@@ -2231,6 +2193,155 @@ def test_controller_relay_sanitizes_worker_text() -> None:
         == r"USER-NEED relay: [worker-legacy] user_need: needs FORGED\x1b[31m review",
     )
     assert_true("legacy controller relay has no raw CSI", "\x1b" not in (rendered or ""))
+
+
+def test_cli_unaddressed_controller_mail_is_refused_and_writes_nothing() -> None:
+    from goalflight_messages import MessageError
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        env = _journal_test_env(base)
+
+        notice = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            [
+                "post",
+                "--dispatch-id",
+                "unaddressed-notice",
+                "--type",
+                "controller-notice",
+                "--text",
+                "should bounce",
+                "--json",
+            ],
+        )
+        assert_true("unaddressed controller-notice exits 2", notice.returncode == 2)
+        assert_true("unaddressed notice names --to-controller", "--to-controller LABEL" in notice.stderr)
+        assert_true("unaddressed notice names controller-notice", "controller-notice" in notice.stderr)
+        assert_true("unaddressed notice writes nothing", not (messages_dir / "unaddressed-notice.jsonl").exists())
+        assert_true("unaddressed notice is not ok JSON", "ok" not in notice.stdout or "true" not in notice.stdout)
+
+        empty = None
+        with mock.patch.dict(os.environ, env, clear=False):
+            try:
+                _carrier_messages.post_message(
+                    dispatch_id="empty-addressee",
+                    msg_type="controller-notice",
+                    payload={"text": "empty object"},
+                    messages_dir=messages_dir,
+                    addressee={},
+                )
+            except MessageError as exc:
+                empty = exc
+        assert_true("empty addressee raises", empty is not None)
+        assert_true("empty addressee names --to-controller", "--to-controller LABEL" in str(empty))
+        assert_true("empty addressee writes nothing", not (messages_dir / "empty-addressee.jsonl").exists())
+
+        advisory = run_messages_cli(
+            messages_dir,
+            fleet_dir,
+            [
+                "post",
+                "--dispatch-id",
+                "advisory-nowhere",
+                "--type",
+                "advisory",
+                "--text",
+                "bug report",
+                "--json",
+            ],
+        )
+        assert_true("advisory CLI exits 2", advisory.returncode == 2)
+        assert_true("advisory names --to-controller", "--to-controller LABEL" in advisory.stderr)
+        assert_true("advisory names controller-notice", "--type controller-notice" in advisory.stderr)
+        assert_true("advisory writes nothing", not (messages_dir / "advisory-nowhere.jsonl").exists())
+        assert_true("advisory JSON is not ok:true", '"ok"' not in advisory.stdout)
+
+        for junk in ("note", "defect-notice", "qa-bug", "controller-note"):
+            posted = run_messages_cli(
+                messages_dir,
+                fleet_dir,
+                ["post", "--dispatch-id", f"junk-{junk}", "--type", junk, "--text", "nope"],
+            )
+            assert_true(f"{junk} CLI exits 2", posted.returncode == 2)
+            assert_true(f"{junk} names controller-notice", "controller-notice" in posted.stderr)
+            assert_true(f"{junk} names --to-controller", "--to-controller LABEL" in posted.stderr)
+            assert_true(f"{junk} writes nothing", not (messages_dir / f"junk-{junk}.jsonl").exists())
+
+
+def test_cli_addressed_controller_notice_still_succeeds() -> None:
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        init_git_project(project)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        label = "addressed-controller"
+        env = _journal_test_env(base)
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "addressed-post-test"},
+            )
+            assert_true("addressed controller lease claimed", claimed.committed)
+            posted = run_messages_cli(
+                messages_dir,
+                fleet_dir,
+                [
+                    "post",
+                    "--dispatch-id",
+                    "addressed-notice",
+                    "--type",
+                    "controller-notice",
+                    "--text",
+                    "reaches the label",
+                    "--to-controller",
+                    label,
+                    "--controller-project-root",
+                    str(project),
+                    "--json",
+                ],
+            )
+            assert_true(f"addressed controller-notice succeeds: {posted.stderr}", posted.returncode == 0)
+            result = json.loads(posted.stdout)
+            assert_true("addressed post is recorded", result["recorded"] is True)
+            assert_true("addressed delivery status", result["controller_delivery"]["status"] == "delivered_to_controller")
+
+
+def test_cli_worker_result_blocked_ack_without_to_controller_still_succeed() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        messages_dir = base / "messages"
+        fleet_dir = base / "fleet"
+        for msg_type, dispatch_id in (
+            ("result", "worker-result"),
+            ("blocked", "worker-blocked"),
+            ("ack", "worker-ack"),
+        ):
+            posted = run_messages_cli(
+                messages_dir,
+                fleet_dir,
+                [
+                    "post",
+                    "--dispatch-id",
+                    dispatch_id,
+                    "--type",
+                    msg_type,
+                    "--text",
+                    f"{msg_type} from worker",
+                    "--json",
+                ],
+            )
+            assert_true(f"{msg_type} worker post succeeds: {posted.stderr}", posted.returncode == 0)
+            result = json.loads(posted.stdout)
+            assert_true(f"{msg_type} is recorded", result["recorded"] is True)
+            assert_true(f"{msg_type} wrote a carrier", (messages_dir / f"{dispatch_id}.jsonl").is_file())
 
 
 def test_bounded_relay_sanitizes_c1_csi() -> None:

@@ -710,7 +710,7 @@ def test_merge_request_can_address_a_controller(
     )
     assert envelope["type"] == "merge-request"
     assert envelope["addressee"]["label"] == label
-    with pytest.raises(messages.MessageError, match="controller addressing"):
+    with pytest.raises(messages.MessageError, match="controller-notice"):
         messages.post_message(
             dispatch_id="nope",
             msg_type="advisory",
