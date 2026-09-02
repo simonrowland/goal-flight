@@ -260,6 +260,100 @@ def test_resume_verb_passes_grok_lineage(
     assert "--codex-resume-home" not in launch
 
 
+def test_resume_honors_explicit_grok_account(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "grok-quota-parent"
+    worktree = tmp_path / "b-3363"
+    worktree.mkdir()
+    record = _write_parent(
+        tmp_path,
+        dispatch_id=parent_id,
+        agent="grok-code",
+        engine="grok",
+        session_id=GROK_SESSION,
+        state="quota_exhausted",
+    )
+    record.update(
+        {
+            "worker_cwd": str(worktree),
+            "effective_account": "cf9f50",
+            "account": "cf9f50",
+            "terminal_state": "quota_exhausted",
+            "dispatch_argv": [
+                "--agent",
+                "grok-code",
+                "--cwd",
+                str(worktree),
+                "--worktree",
+                "HEAD",
+                "--account",
+                "cf9f50",
+            ],
+        }
+    )
+    L.write_record(record)
+    prompt = tmp_path / "brief.md"
+    prompt.write_text("continue on a live seat.\n", encoding="utf-8")
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda agent, _base: f"{agent}-child",
+    )
+    monkeypatch.setattr(
+        D,
+        "main",
+        lambda argv=None: captured.append(list(argv or [])) or 0,
+    )
+    assert (
+        D._cmd_resume(
+            [
+                parent_id,
+                "--prompt-file",
+                str(prompt),
+                "--unregistered-forced",
+                "--account",
+                "d78343",
+            ]
+        )
+        == 0
+    )
+    launch = captured[0]
+    assert launch[launch.index("--account") + 1] == "d78343"
+    assert "--worktree" not in launch
+    assert Path(launch[launch.index("--cwd") + 1]).resolve() == worktree.resolve()
+
+
+def test_grok_default_selection_skips_recently_exhausted_seat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    accounts = tmp_path / "home" / ".goal-flight" / "accounts"
+    for name in ("cf9f50", "d78343"):
+        (accounts / name / "grok").mkdir(parents=True)
+    L.write_record(
+        {
+            "schema": L.SCHEMA,
+            "dispatch_id": "grok-dead-seat",
+            "agent": "grok-code",
+            "engine": "grok",
+            "effective_account": "cf9f50",
+            "state": "quota_exhausted",
+            "terminal_state": "quota_exhausted",
+            "reset_at": "2033-09-07T02:18:00+00:00",
+            "started_at": L.utc_now(),
+        }
+    )
+    monkeypatch.setattr(
+        "grok_seats.select_seat",
+        lambda **_kwargs: "cf9f50",
+    )
+    args = _grok_args(account=None)
+    assert D.grok_selected_account(args) == "d78343"
+
+
 def test_resume_refuses_live_grok_source(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

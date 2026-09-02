@@ -496,6 +496,50 @@ def test_resume_binds_worker_cwd_without_dispatch_argv(
     assert _option_value(launch, "--os-sandbox") == "off"
 
 
+def test_resume_strips_worktree_and_keeps_recorded_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resume must not replay --worktree: that mints a sibling pooled seat."""
+    main, worktree = _make_repo_with_worktree(tmp_path)
+    parent_id = "resume-worktree-parent"
+    recorded = [
+        "--agent",
+        "codex",
+        "--shape",
+        "bash",
+        "--dispatch-id",
+        parent_id,
+        "--cwd",
+        str(worktree),
+        "--worktree",
+        "HEAD",
+        "--prompt-file",
+        str(worktree / "old.md"),
+        "--task",
+        "t-123",
+    ]
+    _write_codex_parent(
+        tmp_path,
+        dispatch_id=parent_id,
+        worktree=worktree,
+        dispatch_argv=recorded,
+        worker_cwd=str(worktree),
+    )
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("continue.\n", encoding="utf-8")
+    captured = _capture_resume(monkeypatch, "codex-resume-wt-child")
+    assert (
+        D._cmd_resume(
+            [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+        )
+        == 0
+    )
+    launch = captured[0]
+    assert "--worktree" not in launch
+    assert Path(_option_value(launch, "--cwd") or "").resolve() == worktree
+    assert Path(_option_value(launch, "--cwd") or "").resolve() != main
+
+
 def test_every_launch_flag_is_classified() -> None:
     """A new launch-parser flag must be classified, or it will be dropped silently.
 

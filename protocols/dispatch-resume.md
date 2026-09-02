@@ -43,7 +43,11 @@ you want to keep, not by what killed the worker.
   SAME engine session id. The child keeps `parent_dispatch_id` so ledger and
   journal stay one story. The Goal Flight launch id is new because each
   spawn is a new process, lease, and status file; the conversation handle is
-  not.
+  not. Resume reattaches to the existing worktree, branch, and partial
+  artifacts — it does not acquire a sibling pooled seat. Quota-exhausted,
+  dead-pid, stale_dead, and plan-approval pauses (USER-NEED / !READY) are
+  continuable. `--account <seat>` pins a surviving seat; default selection
+  skips recently quota-exhausted accounts until their reset.
 - Every wired worker CLI is resumable: Codex (`codex exec resume`), Grok
   (`--resume <id>`), cursor-agent (`--resume <chatId>`), Claude
   (`--resume <id>`), and Moonshot/Kimi (`-S <id>`). ACP dispatches resume

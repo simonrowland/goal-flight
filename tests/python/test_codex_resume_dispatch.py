@@ -1382,3 +1382,386 @@ def test_blocked_capacity_resume_status_preserves_full_lineage(
         assert payload["codex_session_id"] == SESSION_ID
         assert payload["codex_home"] == str(home)
         assert payload["codex_home_owner_dispatch_id"] == parent_id
+
+
+def _option_value(argv: list[str], flag: str) -> str | None:
+    prefix = flag + "="
+    for index, token in enumerate(argv):
+        if token == "--":
+            break
+        if token == flag:
+            if index + 1 >= len(argv):
+                return None
+            return argv[index + 1]
+        if token.startswith(prefix):
+            return token[len(prefix) :]
+    return None
+
+
+def test_resume_reuses_worktree_and_does_not_mint_a_new_seat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Failing-before / passing-after: resume keeps the parent tree.
+
+    A parent launched with ``--worktree HEAD`` used to reconstruct that flag.
+    The child then acquired a fresh pooled seat, reset it, and abandoned the
+    partial work. Resume must pin the recorded cwd and never call acquire.
+    """
+    parent_id = "wt-resume-parent"
+    worktree = tmp_path / "worktrees" / "wt-1"
+    worktree.mkdir(parents=True)
+    (worktree / "partial.txt").write_text("keep me\n", encoding="utf-8")
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    record.update(
+        {
+            "worker_cwd": str(worktree),
+            "state": "quota_exhausted",
+            "terminal_state": "quota_exhausted",
+            "dispatch_argv": [
+                "--agent",
+                "codex",
+                "--shape",
+                "bash",
+                "--dispatch-id",
+                parent_id,
+                "--cwd",
+                str(worktree),
+                "--worktree",
+                "HEAD",
+                "--prompt-file",
+                str(tmp_path / "old.md"),
+            ],
+        }
+    )
+    L.write_record(record)
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Continue in the same tree.\n", encoding="utf-8")
+    acquire_calls: list[tuple] = []
+
+    def refuse_acquire(*args, **kwargs):
+        acquire_calls.append((args, kwargs))
+        raise AssertionError("resume must not mint a sibling worktree")
+
+    monkeypatch.setattr(WP, "acquire_worktree_seat", refuse_acquire)
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda _agent, _base: "wt-resume-child",
+    )
+    monkeypatch.setattr(
+        D,
+        "main",
+        lambda argv=None: captured.append(list(argv or [])) or 0,
+    )
+
+    assert (
+        D._cmd_resume(
+            [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+        )
+        == 0
+    )
+    launch = captured[0]
+    assert "--worktree" not in launch
+    assert Path(_option_value(launch, "--cwd") or "").resolve() == worktree.resolve()
+    assert acquire_calls == []
+    assert (worktree / "partial.txt").read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_bind_dispatch_worktree_skips_acquire_on_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(
+        WP,
+        "acquire_worktree_seat",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id="parent-dispatch",
+        dispatch_id="child-dispatch",
+        cwd=str(tmp_path / "existing-tree"),
+        _worktree_seat=None,
+    )
+    assert D._bind_dispatch_worktree(args) is None
+    assert calls == []
+    assert args.cwd == str(tmp_path / "existing-tree")
+
+
+def test_resume_of_quota_exhausted_dispatch_honors_account(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "quota-parent"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    record.update(
+        {
+            "state": "quota_exhausted",
+            "terminal_state": "quota_exhausted",
+            "effective_account": "cf9f50",
+            "account": "cf9f50",
+            "reason": {
+                "limit_state": "quota_exhausted",
+                "reset_at": "2033-09-07T02:18:00+00:00",
+            },
+        }
+    )
+    L.write_record(record)
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("Continue after quota death.\n", encoding="utf-8")
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda _agent, _base: "quota-resume-child",
+    )
+    monkeypatch.setattr(
+        D,
+        "main",
+        lambda argv=None: captured.append(list(argv or [])) or 0,
+    )
+
+    assert (
+        D._cmd_resume(
+            [
+                parent_id,
+                "--prompt-file",
+                str(prompt),
+                "--unregistered-forced",
+                "--account",
+                "25ca6b",
+            ]
+        )
+        == 0
+    )
+    launch = captured[0]
+    assert _option_value(launch, "--account") == "25ca6b"
+    assert launch[launch.index("--parent-dispatch-id") + 1] == parent_id
+    assert Path(_option_value(launch, "--cwd") or "").resolve() == tmp_path.resolve()
+
+
+def test_resume_of_plan_approval_pause_reuses_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Plan-approval / !READY pause: resume is the continue, not a sibling tree."""
+    parent_id = "plan-parent"
+    worktree = tmp_path / "worktrees" / "b-3374"
+    worktree.mkdir(parents=True)
+    (worktree / "PLAN.md").write_text("# plan awaiting approval\n", encoding="utf-8")
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    record.update(
+        {
+            "worker_cwd": str(worktree),
+            "state": "awaiting_user_confirm",
+            "terminal_state": "unknown",
+            "classification": "stale_dead",
+            "dispatch_argv": [
+                "--agent",
+                "codex",
+                "--cwd",
+                str(worktree),
+                "--worktree",
+                "HEAD",
+                "--prompt-file",
+                str(tmp_path / "plan.md"),
+            ],
+        }
+    )
+    L.write_record(record)
+    prompt = tmp_path / "approve.md"
+    prompt.write_text("Controller approved the PLAN. Continue.\n", encoding="utf-8")
+    captured: list[list[str]] = []
+    monkeypatch.setattr(
+        D,
+        "_reserve_auto_dispatch_id",
+        lambda _agent, _base: "plan-resume-child",
+    )
+    monkeypatch.setattr(
+        D,
+        "main",
+        lambda argv=None: captured.append(list(argv or [])) or 0,
+    )
+
+    assert (
+        D._cmd_resume(
+            [parent_id, "--prompt-file", str(prompt), "--unregistered-forced"]
+        )
+        == 0
+    )
+    launch = captured[0]
+    assert "--worktree" not in launch
+    assert Path(_option_value(launch, "--cwd") or "").resolve() == worktree.resolve()
+    assert (worktree / "PLAN.md").is_file()
+
+
+def test_resume_occupancy_skips_parent_plan_approval_row(
+    tmp_path: Path,
+) -> None:
+    parent_id = "occ-plan-parent"
+    child_id = "occ-plan-child"
+    home = _dispatch_home(tmp_path, parent_id)
+    _write_rollout(home)
+    record = _write_parent_record(tmp_path, dispatch_id=parent_id, home=home)
+    record.update(
+        {
+            "worker_cwd": str(tmp_path),
+            "state": "awaiting_user_confirm",
+            "terminal_state": "unknown",
+            "hostname": __import__("socket").gethostname(),
+        }
+    )
+    L.write_record(record)
+    args = SimpleNamespace(
+        cwd=str(tmp_path),
+        dispatch_id=child_id,
+        parent_dispatch_id=parent_id,
+        read_only=False,
+        os_sandbox=None,
+    )
+    occupied, unknown, occupied_state = D._worktree_incumbent_reason(args)
+    assert occupied is None
+    assert unknown is None
+    assert occupied_state is None
+
+
+def test_resume_rebuild_honors_explicit_account(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "explicit-seat-parent"
+    home = _dispatch_home(tmp_path, dispatch_id)
+    rollout = _write_rollout(home)
+    (home / "auth.json").write_text("old-seat", encoding="utf-8")
+    calls: list[tuple[Path, str | None, str]] = []
+
+    def resolve(
+        project_root: Path,
+        explicit_account: str | None,
+        resolved_dispatch_id: str,
+    ) -> tuple[str, str]:
+        calls.append((project_root, explicit_account, resolved_dispatch_id))
+        home.mkdir(parents=True)
+        (home / "auth.json").write_text(str(explicit_account), encoding="utf-8")
+        return str(home), str(explicit_account)
+
+    monkeypatch.setattr(D, "resolve_codex_home", resolve)
+    monkeypatch.setattr(D, "cleanup_codex_dispatch_home", lambda _dispatch_id: None)
+
+    rebuilt, effective_account = D._rebuild_codex_resume_home(
+        tmp_path,
+        dispatch_id,
+        home,
+        SESSION_ID,
+        explicit_account="25ca6b",
+    )
+
+    assert calls == [(tmp_path, "25ca6b", dispatch_id)]
+    assert rebuilt == str(home)
+    assert effective_account == "25ca6b"
+    assert (home / "auth.json").read_text(encoding="utf-8") == "25ca6b"
+    assert S.rollout_path(home, SESSION_ID) == rollout
+
+
+def test_unpinned_codex_selection_skips_recently_exhausted_seat(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = Path(os.environ["GOALFLIGHT_CODEX_STATE_DIR"])
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "codex-seat-states.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "seats": {
+                    "4c9435": {"cooldown_until": "2033-09-07T02:18:00+00:00"},
+                    "25ca6b": {},
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    accounts = tmp_path / "home" / ".goal-flight" / "accounts"
+    for name in ("4c9435", "25ca6b"):
+        (accounts / name / "codex").mkdir(parents=True)
+    L.write_record(
+        {
+            "schema": L.SCHEMA,
+            "dispatch_id": "dead-seat-row",
+            "agent": "codex",
+            "engine": "codex",
+            "effective_account": "4c9435",
+            "state": "quota_exhausted",
+            "terminal_state": "quota_exhausted",
+            "reset_at": "2033-09-07T02:18:00+00:00",
+            "started_at": L.utc_now(),
+        }
+    )
+    seen: list[str | None] = []
+
+    def resolve_seat(_project_root, explicit_account, _dispatch_id):
+        seen.append(explicit_account)
+        if explicit_account is None:
+            return str(tmp_path / "home-4c9435"), "4c9435"
+        return str(tmp_path / f"home-{explicit_account}"), explicit_account
+
+    monkeypatch.setattr(
+        D,
+        "_codex_seat_api",
+        lambda: SimpleNamespace(resolve_codex_seat=resolve_seat),
+    )
+
+    home, account = D.resolve_codex_home(tmp_path, None, "fresh-dispatch")
+    assert seen[0] is None
+    assert "25ca6b" in seen
+    assert account == "25ca6b"
+    assert home.endswith("home-25ca6b")
+
+
+def test_explicit_account_is_honored_even_when_not_first(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    seen: list[str | None] = []
+
+    def resolve_seat(_project_root, explicit_account, _dispatch_id):
+        seen.append(explicit_account)
+        return str(tmp_path / "home-d78343"), explicit_account
+
+    monkeypatch.setattr(
+        D,
+        "_codex_seat_api",
+        lambda: SimpleNamespace(resolve_codex_seat=resolve_seat),
+    )
+    home, account = D.resolve_codex_home(tmp_path, "d78343", "pinned-dispatch")
+    assert seen == ["d78343"]
+    assert account == "d78343"
+    assert home.endswith("home-d78343")
+
+
+def test_account_quota_blocked_holds_until_reset(tmp_path: Path) -> None:
+    L.write_record(
+        {
+            "schema": L.SCHEMA,
+            "dispatch_id": "exhausted-row",
+            "agent": "codex",
+            "engine": "codex",
+            "effective_account": "86e5d2",
+            "state": "quota_exhausted",
+            "terminal_state": "quota_exhausted",
+            "reset_at": "2033-09-07T02:18:00+00:00",
+            "started_at": L.utc_now(),
+        }
+    )
+    assert D._account_quota_blocked("86e5d2", engine="codex") is True
+    assert D._account_quota_blocked("25ca6b", engine="codex") is False
