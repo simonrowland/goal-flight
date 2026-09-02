@@ -28,6 +28,18 @@ worker dispatch, review flights, or handoff notes that survive context loss.
 - Prefer Goal Flight ACP or Grok `--prompt-file` for worker/reviewer smokes;
   do not paste long transcripts into chat.
 
+## Skill root
+
+Live controllers load the installed skill pin at `$GOALFLIGHT_ROOT` or
+`~/.goal-flight/skill/`, not a live source checkout. Run every
+`python3 <skill-root>/scripts/...` command from that pin
+(`$GOALFLIGHT_ROOT/scripts` or `~/.goal-flight/skill/scripts`). When
+working inside the goal-flight repository itself, `<skill-root>` is the
+repository root. The project tree is `$GOALFLIGHT_PROJECT_ROOT`, a named
+checkout, or the live controller project — pass `--project-root` when the
+cwd is not that tree. Doctor warns when this installed Grok wrapper has
+drifted from the repo copy; resync with `./install.sh grok`.
+
 ## Setup
 
 From the cloned Goal Flight repository, run:
