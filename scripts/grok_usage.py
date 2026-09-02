@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import urllib.error
@@ -166,7 +167,13 @@ def _session_token(auth_path: Path) -> str:
             auth_state=AUTH_UNKNOWN,
         ) from exc
 
-    if not isinstance(document, dict) or not document:
+    if not isinstance(document, dict):
+        raise GrokUsageError(
+            "grok auth document is malformed",
+            probe_state=PROBE_UNKNOWN,
+            auth_state=AUTH_UNKNOWN,
+        )
+    if not document:
         raise GrokUsageError(
             "grok auth document is empty",
             probe_state=PROBE_UNUSABLE,
@@ -174,13 +181,13 @@ def _session_token(auth_path: Path) -> str:
         )
     entry = next(iter(document.values()))
     token = entry.get("key") if isinstance(entry, dict) else None
-    if not isinstance(token, str) or not token:
+    if not isinstance(token, str) or not token.strip():
         raise GrokUsageError(
             "grok auth document carries no session token",
             probe_state=PROBE_UNUSABLE,
             auth_state=AUTH_INVALID,
         )
-    return token
+    return token.strip()
 
 
 def _fetch(token: str, *, url: str, timeout_s: float) -> dict:
@@ -301,7 +308,10 @@ def read_usage(
     used_raw = config.get("creditUsagePercent")
     used_absent = "creditUsagePercent" not in config
     if not used_absent and (
-        isinstance(used_raw, bool) or not isinstance(used_raw, (int, float))
+        isinstance(used_raw, bool)
+        or not isinstance(used_raw, (int, float))
+        or not 0.0 <= used_raw <= 100.0
+        or not math.isfinite(float(used_raw))
     ):
         return {
             "label": LABEL,

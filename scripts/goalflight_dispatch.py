@@ -5722,12 +5722,14 @@ def grok_selected_account(args) -> str | None:
             import grok_seats
 
             selected = grok_seats.select_seat()
+            excluded: set[str] = set()
+            while selected and _account_quota_blocked(selected, engine="grok"):
+                excluded.add(selected)
+                selected = grok_seats.select_seat(exclude=excluded)
         except BaseException as exc:
             # An unknown probe is not permission to bill the host account. A
             # pinned --account bypasses selection; an unpinned launch refuses.
             raise DispatchUsageError("no usable grok seat") from exc
-        if selected and _account_quota_blocked(selected, engine="grok"):
-            selected = _first_unblocked_account("grok", exclude={selected})
     args._grok_selected_account = selected
     return selected
 

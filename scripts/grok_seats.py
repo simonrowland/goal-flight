@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -299,7 +300,7 @@ def _record_probe_state(record: object) -> str:
     state = record.get("probe_state")
     if state in PROBE_STATES:
         if state == "usable":
-            if isinstance(used, bool) or not isinstance(used, (int, float)):
+            if not _valid_percentage(used):
                 return "unknown"
             if float(used) >= EXHAUSTED_AT_PERCENT:
                 return "unusable"
@@ -308,13 +309,21 @@ def _record_probe_state(record: object) -> str:
     # carries the measurement needed to prove headroom. `ok:true` alone is not.
     if (
         record.get("ok") is True
-        and not isinstance(used, bool)
-        and isinstance(used, (int, float))
+        and _valid_percentage(used)
     ):
         return (
             "unusable" if float(used) >= EXHAUSTED_AT_PERCENT else "usable"
         )
     return "unknown"
+
+
+def _valid_percentage(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and 0.0 <= value <= 100.0
+        and math.isfinite(float(value))
+    )
 
 
 def states_are_fresh(document: dict | None, *, now: float | None = None) -> bool:
@@ -436,7 +445,7 @@ def _rank(entry: object) -> tuple[int, float] | None:
     ):
         return None
     used = entry.get("used_percent")
-    if isinstance(used, bool) or not isinstance(used, (int, float)):
+    if not _valid_percentage(used):
         return None
     if float(used) >= EXHAUSTED_AT_PERCENT:
         return None
@@ -449,6 +458,7 @@ def select_seat(
     now: float | None = None,
     allow_refresh: bool = True,
     refresher=None,
+    exclude: set[str] | None = None,
 ) -> str | None:
     """Return a usable seat label, None for a usable host, or raise if unknown."""
     try:
@@ -459,8 +469,11 @@ def select_seat(
         if not document:
             raise NoUsableSeat("no usable grok seat: probe state unavailable")
 
+        excluded = exclude or set()
         ranked: list[tuple[tuple[int, float], str]] = []
         for key, entry in document.get("seats", {}).items():
+            if key in excluded:
+                continue
             rank = _rank(entry)
             if rank is not None:
                 ranked.append((rank, key))

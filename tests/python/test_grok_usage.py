@@ -93,6 +93,26 @@ def test_contract_drift_is_not_measured_headroom(
     assert "used_percent" not in record
 
 
+@pytest.mark.parametrize(
+    "used_percent",
+    [float("nan"), float("inf"), float("-inf"), -0.1, 100.1],
+)
+def test_non_percentage_numeric_values_are_unknown(
+    tmp_path: Path, used_percent: float
+) -> None:
+    record = grok.read_usage(
+        auth_path=_auth(tmp_path),
+        fetcher=lambda url, timeout: {
+            "config": {"creditUsagePercent": used_percent}
+        },
+    )
+    assert record["ok"] is False
+    assert record["probe_state"] == "unknown"
+    assert record["auth_state"] == "valid"
+    assert "creditUsagePercent" in record["error"]
+    assert "used_percent" not in record
+
+
 def test_absent_percent_is_unknown_but_still_reports_what_it_measured(
     tmp_path: Path,
 ) -> None:
@@ -205,6 +225,28 @@ def test_empty_and_tokenless_auth_documents_are_reported(tmp_path: Path) -> None
     assert record["auth_state"] == "invalid"
 
 
+def test_whitespace_only_auth_token_is_invalid_and_unusable(tmp_path: Path) -> None:
+    auth = _auth(tmp_path, token="\n\t ")
+    record = grok.read_usage(auth_path=auth)
+    assert record["ok"] is False
+    assert record["probe_state"] == "unusable"
+    assert record["auth_state"] == "invalid"
+    assert "session token" in record["error"]
+
+
+@pytest.mark.parametrize("document", [[], None, "x"])
+def test_non_object_auth_document_is_malformed_and_unknown(
+    tmp_path: Path, document: object
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps(document))
+    record = grok.read_usage(auth_path=auth)
+    assert record["ok"] is False
+    assert record["probe_state"] == "unknown"
+    assert record["auth_state"] == "unknown"
+    assert "malformed" in record["error"]
+
+
 def test_unreadable_auth_is_unknown(tmp_path: Path, monkeypatch) -> None:
     auth = tmp_path / "auth.json"
     auth.write_text("{}")
@@ -250,13 +292,17 @@ def test_http_status_has_typed_probe_and_auth_outcomes(
 
 def test_transport_failures_are_reported_without_a_percentage(tmp_path: Path) -> None:
     def boom(url, timeout):
-        raise grok.GrokUsageError("billing endpoint returned HTTP 401")
+        raise grok.GrokUsageError(
+            "billing endpoint returned HTTP 401",
+            probe_state=grok.PROBE_UNUSABLE,
+            auth_state=grok.AUTH_INVALID,
+        )
 
     record = grok.read_usage(auth_path=_auth(tmp_path), fetcher=boom)
     assert record["ok"] is False
     assert record["error"] == "billing endpoint returned HTTP 401"
-    assert record["probe_state"] == "unknown"
-    assert record["auth_state"] == "unknown"
+    assert record["probe_state"] == "unusable"
+    assert record["auth_state"] == "invalid"
     assert "used_percent" not in record
 
 

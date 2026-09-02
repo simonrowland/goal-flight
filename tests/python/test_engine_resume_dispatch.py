@@ -346,12 +346,37 @@ def test_grok_default_selection_skips_recently_exhausted_seat(
             "started_at": L.utc_now(),
         }
     )
-    monkeypatch.setattr(
-        "grok_seats.select_seat",
-        lambda **_kwargs: "cf9f50",
-    )
+    calls: list[set[str] | None] = []
+
+    def select_seat(*, exclude=None):
+        calls.append(exclude)
+        return "d78343" if exclude == {"cf9f50"} else "cf9f50"
+
+    monkeypatch.setattr("grok_seats.select_seat", select_seat)
     args = _grok_args(account=None)
     assert D.grok_selected_account(args) == "d78343"
+    assert calls == [None, {"cf9f50"}]
+
+
+def test_grok_default_selection_refuses_when_the_only_usable_seat_is_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import grok_seats
+
+    calls: list[set[str] | None] = []
+
+    def select_seat(*, exclude=None):
+        calls.append(exclude)
+        if exclude == {"cf9f50"}:
+            raise grok_seats.NoUsableSeat("no usable grok seat")
+        return "cf9f50"
+
+    monkeypatch.setattr(grok_seats, "select_seat", select_seat)
+    monkeypatch.setattr(D, "_account_quota_blocked", lambda *_args, **_kwargs: True)
+
+    with pytest.raises(D.DispatchUsageError, match="no usable grok seat"):
+        D.grok_selected_account(_grok_args(account=None))
+    assert calls == [None, {"cf9f50"}]
 
 
 def test_grok_default_selection_refuses_when_no_seat_is_usable(

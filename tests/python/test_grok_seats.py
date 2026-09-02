@@ -78,6 +78,27 @@ def test_flip_threshold_starves_at_the_configured_percent(
             seats.select_seat(path=path, now=NOW, allow_refresh=False)
 
 
+@pytest.mark.parametrize(
+    "used_percent",
+    [float("nan"), float("inf"), float("-inf"), -0.1, 100.1],
+)
+def test_non_percentage_numeric_values_are_never_usable(
+    tmp_path: Path, used_percent: float
+) -> None:
+    entry = {
+        "ok": True,
+        "probe_state": "usable",
+        "auth_state": "valid",
+        "used_percent": used_percent,
+        "error": None,
+    }
+    assert seats._record_probe_state(entry) == "unknown"
+    assert seats._rank(entry) is None
+    path = _states(tmp_path / "s.json", {"seat": entry})
+    with pytest.raises(seats.NoUsableSeat):
+        seats.select_seat(path=path, now=NOW, allow_refresh=False)
+
+
 def test_starved_host_flips_to_a_seat_with_headroom(tmp_path: Path) -> None:
     path = _states(tmp_path / "s.json", {"": _entry(100.0), "seat": _entry(10.0)})
     assert seats.select_seat(path=path, now=NOW, allow_refresh=False) == "seat"
