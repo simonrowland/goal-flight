@@ -30,6 +30,18 @@ worker dispatch, review flights, or handoff notes that survive context loss.
 - Do not rewrite the root `SKILL.md` during setup. Setup registers checked-in
   wrappers and config only.
 
+## Skill root
+
+Live controllers load the installed skill pin at `$GOALFLIGHT_ROOT` or
+`~/.goal-flight/skill/`, not a live source checkout. Run every
+`python3 <skill-root>/scripts/...` command from that pin
+(`$GOALFLIGHT_ROOT/scripts` or `~/.goal-flight/skill/scripts`). When
+working inside the goal-flight repository itself, `<skill-root>` is the
+repository root. The project tree is `$GOALFLIGHT_PROJECT_ROOT`, a named
+checkout, or the live controller project — pass `--project-root` when the
+cwd is not that tree. Doctor warns when this installed Cursor wrapper has
+drifted from the repo copy; resync with `./install.sh cursor`.
+
 ## Setup
 
 Use setup for host registration and machine bootstrap. Use init for

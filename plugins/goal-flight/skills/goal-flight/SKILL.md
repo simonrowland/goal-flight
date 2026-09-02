@@ -11,7 +11,8 @@ worker dispatch, review flights, or handoff notes that survive context loss.
 ## Load Order
 
 1. Read the repository `AGENTS.md` first when present.
-2. Read the repository root `SKILL.md` as the canonical Goal Flight workflow.
+2. Read `<skill-root>/SKILL.md` as the canonical Goal Flight workflow, where
+   `<skill-root>` is resolved per `## Skill root` below.
 3. Read `protocols/guidance-extended.md` by default — non-frontier controllers
    benefit from its worked examples and expanded rationale for the core's rules;
    skip only when context is tight (the core alone is complete).
@@ -28,6 +29,18 @@ worker dispatch, review flights, or handoff notes that survive context loss.
   decisions and findings into the live conversation.
 - Do not rewrite the root `SKILL.md` during setup. Setup registers checked-in
   wrappers and config only.
+
+## Skill root
+
+Live controllers load the installed skill pin at `$GOALFLIGHT_ROOT` or
+`~/.goal-flight/skill/`, not a live source checkout. Run every
+`python3 <skill-root>/scripts/...` command from that pin
+(`$GOALFLIGHT_ROOT/scripts` or `~/.goal-flight/skill/scripts`). When
+working inside the goal-flight repository itself, `<skill-root>` is the
+repository root. The project tree is `$GOALFLIGHT_PROJECT_ROOT`, a named
+checkout, or the live controller project — pass `--project-root` when the
+cwd is not that tree. Doctor warns when this installed Codex plugin wrapper
+has drifted from the repo copy; resync with `./install.sh codex`.
 
 ## Setup
 
