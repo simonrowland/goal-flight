@@ -230,17 +230,33 @@ def _temp_dir(prefix: str | None = None, *, dir: Path | None = None) -> _Reaping
     return _ReapingTempDir(prefix=prefix, dir=dir)
 
 
-def _non_temp_tree(prefix: str) -> tempfile.TemporaryDirectory:
+@contextlib.contextmanager
+def _non_temp_tree(prefix: str):
     """A worker tree outside the macOS temp root.
 
     An explicit --read-only dispatch runs the OS-sandbox boundary check, which
     refuses cwds inside the allowed temp root (it cannot separate the workspace
     from everything else a temp root lets the worker write). The repo's
     gitignored docs-private/ is the established scratch location for this.
+
+    The tree is its own git toplevel so ``--cwd`` is in-place, not a nested
+    path under this repository (captive-ring lock).
     """
     scratch = ROOT / "docs-private"
     scratch.mkdir(exist_ok=True)
-    return _temp_dir(prefix=prefix, dir=scratch)
+    with _temp_dir(prefix=prefix, dir=scratch) as td:
+        tree = Path(td)
+        init = subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=str(tree),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if init.returncode != 0:
+            raise AssertionError(f"git init failed: {init.stderr or init.stdout}")
+        yield td
 
 
 def _ledger_record(tmp: Path, dispatch_id: str) -> dict:

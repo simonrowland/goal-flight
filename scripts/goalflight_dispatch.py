@@ -3567,10 +3567,13 @@ def _prepare_attempt_worktree_occupancy(args) -> str | None:
     """
     if _occupancy_exempt_read_only(args):
         return None
-    if getattr(args, "submit", False):
-        # A queued job does not have a seat yet. Occupying --cwd (the
-        # project root) would serialize every submit onto one tree; drain
-        # binds the captive seat and then occupies that path.
+    if getattr(args, "submit", False) and not getattr(args, "cwd", None) and not getattr(
+        args, "in_place", False
+    ):
+        # Default submit has no worker tree yet. Occupying the project
+        # root would serialize every queued job; drain acquires a captive
+        # seat and occupies that path. Explicit --cwd is already the
+        # worker tree and still serializes.
         return None
 
     occupied, unknown, occupied_state = _worktree_incumbent_reason(args)

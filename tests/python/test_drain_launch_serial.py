@@ -1607,12 +1607,11 @@ def test_real_worktree_seat_child_does_not_emit_proven_prefix_or_spend_budget(
 
     holder = pool.acquire_worktree_seat(repo, "seat-holder")
     try:
+        monkeypatch.chdir(repo)
         code = D.main(
             [
                 "--agent",
                 "test-dispatch",
-                "--cwd",
-                str(repo),
                 "--worktree",
                 "HEAD",
                 "--unregistered-forced",

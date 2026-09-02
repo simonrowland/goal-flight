@@ -584,9 +584,17 @@ def classify_dispatch_cwd(
 ) -> str:
     """Classify ``--cwd`` as ``in-place``, ``ring-seat``, or ``refuse``.
 
-    In-place requires ``cwd`` to be the git toplevel of that path *and*
-    equal to ``project_root``. A non-git directory is never in-place even
-    when ``resolve_project_root`` would treat it as its own root.
+    In-place is the project root of *this* dispatch:
+
+    - ``cwd`` is that path's git toplevel and equals ``project_root``, or
+    - ``cwd`` is not inside any git checkout and equals ``project_root``
+      (a non-git project identity, the same fallback
+      ``resolve_project_root`` uses).
+
+    A nested path under another git checkout — ``.cache/worktrees/foo``,
+    an ad-hoc linked worktree of the same repo, ``/tmp`` clones — is not
+    in-place. Those are the sprawl paths: refuse unless they are a seat
+    in this controller's ring.
     """
     try:
         resolved = Path(cwd).expanduser().resolve()
@@ -594,14 +602,17 @@ def classify_dispatch_cwd(
     except OSError:
         return "refuse"
     proc = _git_proc(resolved, "rev-parse", "--show-toplevel")
-    if (
-        proc is not None
-        and proc.returncode == 0
-        and proc.stdout.strip()
-    ):
-        top = Path(proc.stdout.strip()).resolve()
-        if top == resolved and top == root:
+    git_top: Path | None = None
+    if proc is not None and proc.returncode == 0 and proc.stdout.strip():
+        try:
+            git_top = Path(proc.stdout.strip()).resolve()
+        except OSError:
+            git_top = None
+    if git_top is not None:
+        if git_top == resolved and git_top == root:
             return "in-place"
+    elif resolved == root:
+        return "in-place"
     if is_controller_ring_seat(
         resolved, project_root=root, controller_label=controller_label
     ):

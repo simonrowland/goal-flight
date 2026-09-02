@@ -577,6 +577,15 @@ def test_classify_dispatch_cwd_lock() -> None:
                 lease.path, project_root=repo, controller_label="beta"
             )
             assert_true("other controller seat is refused", foreign == "refuse")
+            orphan = Path(td) / "nongit-project"
+            orphan.mkdir()
+            assert_true(
+                "non-git project root is in-place",
+                goalflight_worktree_pool.classify_dispatch_cwd(
+                    orphan, project_root=orphan, controller_label="alpha"
+                )
+                == "in-place",
+            )
         finally:
             lease.release()
 
