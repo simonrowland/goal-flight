@@ -48,11 +48,13 @@ second Mac default library root.
 
 ## Resync after SKILL.md changes
 
-When the source Goal Flight repo's `SKILL.md` or tracked files under
-`commands/`, `protocols/`, `templates/`, or `adapters/` change, Grok Bot's
-installed copy is not auto-synced unless it is a symlink to the source repo.
-Resync from the source repo (or the pinned `~/.goal-flight/skill/`) with
-`./install.sh grok-bot`. To check for drift, run
+`./install.sh grok-bot` re-copies exactly one file: the grok-bot wrapper
+`configs/grok-bot/skills/goal-flight/SKILL.md` (see `install_actions` in
+`adapters/grok-bot.json`). It does not resync the core `SKILL.md`,
+`commands/`, `protocols/`, `templates/`, or `adapters/` — those live in the
+detached pin `~/.goal-flight/skill/` and move when that pin is updated
+(`/goal-flight update`), not when the wrapper is reinstalled. Re-run the
+install only when the wrapper itself changed. To check for wrapper drift, run
 `python3 scripts/goalflight_doctor.py --project-root "$PWD" --json` and inspect
 `installed_skill_drift`; text mode prints `installed_skill_md_hash` WARNs.
 

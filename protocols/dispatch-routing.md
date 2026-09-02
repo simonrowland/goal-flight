@@ -89,6 +89,11 @@ Right-size the shape — three loop failure modes to avoid:
     --os-sandbox <off|read-only|workspace-write> \
     --status-json <status.json>
   ```
+  Standalone `goalflight_acp_run.py` launches (this form) and
+  `scripts/goalflight_dispatch.sh` do not bind a captive seat today; the
+  every-dispatch seat contract in `SKILL.md` §Dispatch Model holds for
+  `goalflight_dispatch.py` launches. Whether direct writable ACP should seat
+  by default is tracked in the store (b-318).
   The runner re-execs into `~/.goal-flight/venvs/acp-0.10/bin/python` when
   system `python3` cannot import `acp`; set `GOALFLIGHT_ACP_PYTHON` to override.
   That Python package is the controller-side client implementation. Workers do
