@@ -548,6 +548,95 @@ def test_session_start_journal_activity_bounds_open_retry_budget(
     assert float(kwargs["transaction_budget_s"]) <= 1.0
 
 
+@pytest.mark.parametrize(
+    ("claim_result", "expected_arm", "expected_fragment"),
+    [
+        pytest.param(
+            {
+                "claimed": True,
+                "session": {"lease_nonce": "test-nonce"},
+                "listener_depth": {
+                    "supervisor": "absent",
+                    "command": "test-supervise-command",
+                },
+            },
+            True,
+            "ARM THE EVENT WAKE FIRST",
+            id="claimed",
+        ),
+        pytest.param(
+            {"claimed": False, "reason": "label_in_use"},
+            False,
+            "claim was refused with reason `label_in_use`",
+            id="refused",
+        ),
+        pytest.param(
+            {},
+            False,
+            (
+                "claim state unknown: re-run "
+                "`goalflight_session_status.py --controller-startup` before arming"
+            ),
+            id="unknown",
+        ),
+    ],
+)
+def test_session_start_claim_outcome_controls_arm_preamble(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    claim_result: dict[str, object],
+    expected_arm: bool,
+    expected_fragment: str,
+) -> None:
+    project = tmp_path / "claim-outcome-project"
+    project.mkdir()
+    (project / "SKILL.md").write_text("hook claim outcome\n", encoding="utf-8")
+    (project / "scripts").symlink_to(SCRIPTS, target_is_directory=True)
+    code = _session_start_embedded_python().replace(
+        "try:\n    main()\nexcept Exception:\n    pass",
+        "",
+        1,
+    )
+    ns: dict[str, object] = {}
+    exec(compile(code, str(SESSION_START_HOOK), "exec"), ns)
+    monkeypatch.setenv(
+        "GOALFLIGHT_HOOK_INPUT",
+        json.dumps(
+            {
+                "hook_event_name": "SessionStart",
+                "source": "startup",
+                "cwd": str(project),
+            }
+        ),
+    )
+    monkeypatch.setenv("GOALFLIGHT_PLUGIN_ROOT", str(ROOT))
+    ns["has_recent_resume_note"] = lambda: True
+    ns["claim_controller_entry"] = lambda *_args, **_kwargs: claim_result
+    wake_instruction_calls: list[dict[str, object]] = []
+
+    def wake_instruction(_repo_root: str, result: dict[str, object]) -> str:
+        wake_instruction_calls.append(result)
+        return "Claimed-controller wake details."
+
+    ns["controller_wake_instruction"] = wake_instruction
+    main = ns["main"]
+    assert callable(main)
+    main()
+
+    payload = json.loads(capsys.readouterr().out)
+    context = str(payload["hookSpecificOutput"]["additionalContext"])
+    assert expected_fragment in context
+    assert ("ARM THE EVENT WAKE FIRST" in context) is expected_arm
+    assert len(wake_instruction_calls) == (1 if expected_arm else 0)
+    if claim_result.get("reason") == "label_in_use":
+        assert "adopt a dead or same-session holder" in context
+        assert (
+            "goalflight_session_status.py --controller-startup "
+            "--controller-pid-from-ancestry --takeover"
+        ) in context
+
+
 def test_session_start_probe_failure_emits_without_claiming(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -571,7 +660,11 @@ def test_session_start_probe_failure_emits_without_claiming(
     payload = json.loads(completed.stdout)
     context = str(payload["hookSpecificOutput"]["additionalContext"])
     assert "could not determine Goal Flight activity" in context
-    assert "ARM THE EVENT WAKE FIRST" in context
+    assert "ARM THE EVENT WAKE FIRST" not in context
+    assert (
+        "claim state unknown: re-run "
+        "`goalflight_session_status.py --controller-startup` before arming"
+    ) in context
     assert "CONTINUE IN-SKILL" in context
     assert "did not claim a controller lease" in context
     authority = journal.open_or_create_journal(project)
