@@ -462,6 +462,46 @@ def test_installed_skill_drift_allows_claude_link_mode() -> None:
             os.environ["HOME"] = old_home
 
 
+def test_installed_skill_drift_grok_copy_matches_wrapper() -> None:
+    """Doctor pin is the in-repo host wrapper, not root SKILL.md."""
+    old_home = os.environ.get("HOME")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            project = root / "project"
+            skill_root = root / "goal-flight"
+            os.environ["HOME"] = str(home)
+            _write_skill(skill_root / "SKILL.md", "root bible\n")
+            _write_skill(skill_root / "plugins/goal-flight/skills/goal-flight/SKILL.md", "codex skill\n")
+            _write_skill(skill_root / "configs/cursor/skills/goal-flight/SKILL.md", "cursor skill\n")
+            _write_skill(skill_root / "configs/opencode/skills/goal-flight/SKILL.md", "opencode skill\n")
+            _write_skill(skill_root / "configs/grok/skills/goal-flight/SKILL.md", "grok wrapper\n")
+            _write_skill(home / ".grok/skills/goal-flight/SKILL.md", "grok wrapper\n")
+
+            payload = goalflight_doctor.check_installed_skill_drift(skill_root, project)
+            entries = {entry["path"]: entry for entry in payload["entries"]}
+            grok_path = str(home / ".grok/skills/goal-flight/SKILL.md")
+            grok_entry = entries[grok_path]
+            assert_true("grok pin is the in-repo wrapper", grok_entry["source"] == str(skill_root / "configs/grok/skills/goal-flight/SKILL.md"))
+            assert_true("matching grok wrapper is not drift", grok_entry["drift"] is False)
+            assert_true("grok pin is not the root bible", grok_entry["source_hash"] != payload["source_root_hash"])
+
+            _write_skill(home / ".grok/skills/goal-flight/SKILL.md", "root bible\n")
+            stale = goalflight_doctor.check_installed_skill_drift(skill_root, project)
+            stale_entry = {entry["path"]: entry for entry in stale["entries"]}[grok_path]
+            assert_true("stale grok install that matches the bible still drifts", stale_entry["drift"] is True)
+            assert_true(
+                "stale grok pin stays the wrapper",
+                stale_entry["source"] == str(skill_root / "configs/grok/skills/goal-flight/SKILL.md"),
+            )
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+
+
 def test_installed_skill_drift_project_symlink_stays_copy_mode() -> None:
     old_home = os.environ.get("HOME")
     try:
@@ -1756,6 +1796,7 @@ def main() -> None:
         test_installed_skill_drift_covers_project_local_copy,
         test_installed_skill_drift_covers_grok_bot_copy,
         test_installed_skill_drift_allows_claude_link_mode,
+        test_installed_skill_drift_grok_copy_matches_wrapper,
         test_installed_skill_drift_project_symlink_stays_copy_mode,
         test_doctor_target_project_readiness_split,
         test_doctor_package_repo_validates_plugin_manifest,

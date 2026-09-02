@@ -1,6 +1,6 @@
 ---
 name: goal-flight-doctor
-description: "Run goal-flight readiness diagnostics for the current repository."
+description: "Use when the user invokes /goal-flight doctor or asks for Goal Flight readiness diagnostics on the current repository."
 ---
 
 # goal-flight-doctor

@@ -1,5 +1,7 @@
 ---
-description: "Register a project path as trusted for Codex CLI."
+description: "Use when the user invokes /goal-flight register-codex to register a project path as trusted for Codex CLI."
+argument-hint: "[project-path]"
+disable-model-invocation: true
 ---
 
 # register-codex [<project-path>]

@@ -1,6 +1,6 @@
 ---
 name: goal-flight-init
-description: "Initialize goal-flight project state for a repository task."
+description: "Use when the user invokes /goal-flight init or asks to start a durable Goal Flight run and scaffold project-local state for long-running orchestrated repository work."
 ---
 
 # goal-flight-init

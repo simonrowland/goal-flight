@@ -1,5 +1,6 @@
 ---
-description: "Nondestructive OpenCode orchestrator self-dispatch verification."
+description: "Use when the user invokes /goal-flight self-dispatch-test to verify the current host can dispatch read-only Goal Flight OpenCode workers to itself."
+disable-model-invocation: true
 ---
 
 # self-dispatch-test

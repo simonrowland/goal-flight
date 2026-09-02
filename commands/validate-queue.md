@@ -1,5 +1,6 @@
 ---
-description: "Schema-check a goal queue file."
+description: "Use when the user invokes /goal-flight validate-queue to schema-check a Goal Flight goal-queue file."
+argument-hint: "[queue-file]"
 ---
 
 # validate-queue [<queue-file>]

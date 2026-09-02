@@ -1,5 +1,7 @@
 ---
-description: "Break a plan into verified goal chunks."
+description: "Use when the user invokes /goal-flight decompose-plan to break a plan into verified Goal Flight queue chunks."
+argument-hint: "[plan-file]"
+disable-model-invocation: true
 ---
 
 # decompose-plan [<plan-file>]

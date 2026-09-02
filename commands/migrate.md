@@ -1,5 +1,7 @@
 ---
-description: "Preview and import existing markdown task lists into draft task-store items."
+description: "Use when the user invokes /goal-flight migrate to preview and import existing markdown task lists into Goal Flight draft task-store items."
+argument-hint: "[--source glob]"
+disable-model-invocation: true
 ---
 
 # migrate

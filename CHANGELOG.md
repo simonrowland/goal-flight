@@ -42,6 +42,13 @@ incremented when meaningful skill behaviour changes.
   reports nested `worktrees/<label>/s-N`. Legacy `worktrees/wt-N` stays
   registered for GC during overlap. Historical `.cache/worktrees/*` trees
   are not converted and cannot be minted by new dispatches.
+- Skill and command YAML is when-to-use, not a product blurb. Dropped
+  unhonored gstack keys (`tags`, `triggers`, and directory-map `paths`
+  that collide with host file-glob `paths`). Omitted full-kit
+  `allowed-tools` — that field is a Claude pre-grant, not a sandbox.
+  Claude/Cursor dispatch surfaces set `disable-model-invocation: true`.
+  Version declarations agree with `VERSION` 1.6.0 (`SKILL.md` frontmatter
+  and the Codex `plugin.json` pin).
 
 ### Fixed
 

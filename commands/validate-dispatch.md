@@ -1,5 +1,6 @@
 ---
-description: "Render and validate a dispatch wrapper without launching it."
+description: "Use when the user invokes /goal-flight validate-dispatch to render and check a Goal Flight dispatch wrapper without launching it."
+argument-hint: "[goal-slug]"
 ---
 
 # validate-dispatch [<goal-slug>]

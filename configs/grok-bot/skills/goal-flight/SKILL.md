@@ -1,6 +1,6 @@
 ---
 name: goal-flight
-description: "Goal Flight orchestration for Grok Bot: plan, dispatch, review, recover, and resume long-running repository work from file-backed state."
+description: "Use when the user invokes /goal-flight or asks for Goal Flight to plan, dispatch, review, recover, or resume a long-running orchestrated repository run from file-backed state."
 ---
 
 # goal-flight
