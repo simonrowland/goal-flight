@@ -49,6 +49,34 @@ incremented when meaningful skill behaviour changes.
   POST failure is logged and ignored; the journal write already happened.
   Complements exit-as-wake `listen` for Grok Bot local-exec; see
   `docs/hosts/grok-bot.md`.
+- **Grok Bot host port.** Controller-only wrapper at
+  `configs/grok-bot/skills/goal-flight/SKILL.md`, adapter
+  `adapters/grok-bot.json` (distinct from Grok CLI `adapters/grok.json`),
+  and `./install.sh grok-bot` copying the wrapper into the Grok Bot
+  workflows library. Grok Bot Executors are a first-class host delegate
+  lane on this port (not Claude's last-resort Host Agent rule); kimi3
+  reviews go through `--agent moonshot`. Wake is exit-as-wake: a tracked
+  `goalflight_grok_bot_listen.py --report-pending --timeout-s 900` on the
+  user's Mac (label `goalflight-grokbot`; MVP depth 1; portable pool is
+  4). The 900s quiet timeout is this host's frontier ping, not Claude's
+  120s follow-stream heartbeat. Do not arm unbounded `supervise`
+  expecting per-line wakes. Success terminal is `!COMPLETE`. Judgment-bearing
+  Grok Bot Task / executor prompts reuse the Claude host-subagent pin
+  (`protocols/subagent-preamble.md` + triggered
+  `protocols/worker-context-package.md`); executors start blank on the
+  box and must name `machineId` plus Mac absolute paths. Compaction is
+  write-early file state (`state-handoff.md` Before compact or sleep on
+  the 900s frontier ping and before long waves); there is no `/compact`
+  UI and no keep-vs-toss prompt. Do not port the Claude context-meter or
+  SessionStart hooks; every listen ring/timeout is a mini-resume plus a
+  Hard Invariants quote-check (`goalflight_grok_bot_listen.py` banner).
+  The operator is not the compaction mailman; the one wake-hygiene job
+  is re-arming listen doorbells after a host update or token-pause,
+  surfaced as roster `wake unarmed`. Inter-controller traffic is only
+  `post --to-controller`; do not ask the user to paste or to tell
+  another session to check mail. No native
+  mail transport in this port. Unsupported the same way Cursor /
+  OpenCode / Codex orchestrator ports are. See `docs/hosts/grok-bot.md`.
 - **Watchlist two-tier wedge detector (`goalflight_wedge_watch.py`).** Cheap
   path is one `stat` of the tail (mtime + size). After the tail has been
   idle longer than a data-derived probation (1080s, above p99=965.7s of

@@ -64,7 +64,7 @@ Extended: `protocols/guidance-extended.md` §activation-check
 ## Per-host pointers
 
 Per-host pointers tell non-native orchestrators where their installed wrapper lives.
-If you are a non-Claude orchestrator (codex, grok, cursor, opencode), load your
+If you are a non-Claude orchestrator (codex, grok, grok-bot, cursor, opencode), load your
 host wrapper first, then root `SKILL.md` as canonical workflow:
 
 | Host | Installed wrapper path |
@@ -72,6 +72,7 @@ host wrapper first, then root `SKILL.md` as canonical workflow:
 | codex | `~/.codex/plugins/cache/goal-flight/goal-flight/<version>/skills/goal-flight/SKILL.md` or `~/.codex/skills/goal-flight/SKILL.md` |
 | cursor | `.cursor/skills/goal-flight/SKILL.md`, `~/.cursor/skills/goal-flight/SKILL.md`, or `~/.agents/skills/goal-flight/SKILL.md` |
 | grok | `~/.grok/skills/goal-flight/SKILL.md` or generated path from `configs/grok/skills/goal-flight/SKILL.md` |
+| grok-bot | `/home/box/agent-data/workflows/goal-flight/SKILL.md` (workflows library; `GOALFLIGHT_GROK_BOT_WORKFLOWS` override) or `configs/grok-bot/skills/goal-flight/SKILL.md` |
 | opencode | `.opencode/skills/goal-flight/SKILL.md`, `~/.config/opencode/skills/goal-flight/SKILL.md`, or `~/.agents/skills/goal-flight/SKILL.md` |
 
 **Stale-wrapper warning:** non-native hosts hold a *copy* of `SKILL.md`. If

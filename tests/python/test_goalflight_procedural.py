@@ -283,6 +283,7 @@ def test_doctor_json_shape() -> None:
     assert_true("plugin section", "plugin" in payload and "manifest_exists" in payload["plugin"])
     assert_true("host install section", "host_goalflight_install" in payload)
     assert_true("codex host install probe", "codex" in payload["host_goalflight_install"])
+    assert_true("grok-bot host install probe", "grok-bot" in payload["host_goalflight_install"])
     assert_true("installed skill drift section", "installed_skill_drift" in payload)
     isd = payload["installed_skill_drift"]
     for key in ("source_root", "source_root_hash", "entries", "drift"):
@@ -360,6 +361,46 @@ def test_doctor_json_shape() -> None:
 def _write_skill(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
+
+
+def test_installed_skill_drift_covers_grok_bot_copy() -> None:
+    old_home = os.environ.get("HOME")
+    old_workflows = os.environ.get("GOALFLIGHT_GROK_BOT_WORKFLOWS")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            project = root / "project"
+            skill_root = root / "goal-flight"
+            workflows = root / "workflows"
+            os.environ["HOME"] = str(home)
+            os.environ["GOALFLIGHT_GROK_BOT_WORKFLOWS"] = str(workflows)
+            _write_skill(skill_root / "SKILL.md", "root skill\n")
+            _write_skill(skill_root / "plugins/goal-flight/skills/goal-flight/SKILL.md", "codex skill\n")
+            _write_skill(skill_root / "configs/cursor/skills/goal-flight/SKILL.md", "cursor skill\n")
+            _write_skill(skill_root / "configs/opencode/skills/goal-flight/SKILL.md", "opencode skill\n")
+            _write_skill(skill_root / "configs/grok/skills/goal-flight/SKILL.md", "grok skill\n")
+            _write_skill(skill_root / "configs/grok-bot/skills/goal-flight/SKILL.md", "grok-bot skill\n")
+            _write_skill(workflows / "goal-flight/SKILL.md", "old grok-bot skill\n")
+
+            payload = goalflight_doctor.check_installed_skill_drift(skill_root, project)
+            entries = {entry["path"]: entry for entry in payload["entries"]}
+            grok_bot_entry = entries[str(workflows / "goal-flight/SKILL.md")]
+            assert_true("grok-bot workflows copy detected", grok_bot_entry["host"] == "grok-bot")
+            assert_true("grok-bot stale copy warns", grok_bot_entry["drift"] is True)
+            assert_true(
+                "grok-bot resync names install.sh grok-bot",
+                grok_bot_entry["resync_command"] == "./install.sh grok-bot",
+            )
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+        if old_workflows is None:
+            os.environ.pop("GOALFLIGHT_GROK_BOT_WORKFLOWS", None)
+        else:
+            os.environ["GOALFLIGHT_GROK_BOT_WORKFLOWS"] = old_workflows
 
 
 def test_installed_skill_drift_covers_project_local_copy() -> None:
@@ -1713,6 +1754,7 @@ def main() -> None:
         test_ledger_record_finish_status,
         test_doctor_json_shape,
         test_installed_skill_drift_covers_project_local_copy,
+        test_installed_skill_drift_covers_grok_bot_copy,
         test_installed_skill_drift_allows_claude_link_mode,
         test_installed_skill_drift_project_symlink_stays_copy_mode,
         test_doctor_target_project_readiness_split,

@@ -1,0 +1,378 @@
+{
+  "schema": "goalflight.agent-adapter.v1",
+  "agent_id": "grok-bot",
+  "display_name": "Grok Bot",
+  "agent_family": "grok",
+  "providers": {
+    "controller_provider": "xai",
+    "model_provider": "xai",
+    "same_provider_policy": "forbid_self_review"
+  },
+  "support": {
+    "controller": {
+      "capability": "supported",
+      "evidence": [
+        "survey: Grok Bot desktop agents load user-created SKILL.md workflows and can Shell a registered Mac",
+        "repo: host wrapper at configs/grok-bot/skills/goal-flight/SKILL.md projects the portable core",
+        "note: this is a controller host port, not a replacement for adapters/grok.json (grok agent stdio)"
+      ],
+      "readiness_requirements": ["auth_optional", "status_contract"],
+      "fallback": "config_only"
+    },
+    "worker": {
+      "capability": "unsupported",
+      "transport": [],
+      "readiness_requirements": [],
+      "fallback": "unsupported"
+    }
+  },
+  "local_readiness_state": {
+    "storage": "machine-local, never checked in",
+    "path_pattern": "$XDG_STATE_HOME/goal-flight/readiness/<agent>.json",
+    "controller": "probe_required",
+    "worker": "unsupported",
+    "last_probe_ids": ["grok-bot-workflows-library"],
+    "updated_at": null
+  },
+  "live_gate": {
+    "function": "validate_adapter_gate",
+    "controller_allowed_expr": "support.controller.capability == supported && local_readiness.controller == ready",
+    "worker_allowed_expr": "support.worker.capability == supported && local_readiness.worker == ready && requested_transport is verified",
+    "default": "deny",
+    "support_status_enum": ["unsupported", "config_only", "probe_required", "candidate", "not_installed", "forbidden-arg", "failed", "blocked"],
+    "return_fields": ["allowed", "reason", "required_probe_ids", "blocked_fields", "safe_next_action", "live_controller_allowed", "live_worker_dispatch_allowed"]
+  },
+  "tool_name_map": {
+    "shell_exec": {
+      "host_tools": ["Grok Bot Shell"],
+      "constraints": [
+        "target the user's registered computer with a machineId",
+        "do not run CLI workers on the Grok Bot box",
+        "safe probes only"
+      ]
+    },
+    "read_file": {"host_tools": ["workspace file read"], "constraints": ["executor Reads of the Mac checkout go through machineId; do not assume box-local files"]},
+    "write_file": {"host_tools": ["workspace edit"], "constraints": ["authorized edit scope only"]},
+    "search": {"host_tools": ["workspace search"], "constraints": ["filtered search"]},
+    "delegate": {
+      "host_tools": [
+        "Grok Bot Task/executor",
+        "goalflight_dispatch.py CLI adapters"
+      ],
+      "constraints": [
+        "Executor is a first-class host delegate surface on grok-bot, distinct from CLI ACP/bash-tail workers",
+        "choose Executor vs CLI from token/budget and task shape; do not treat Executor as last-resort",
+        "CLI code workers: --agent codex, grok-code, or moonshot (kimi3 via adapters/moonshot.json; no kimi3 agent id)",
+        "independent reviews: --agent moonshot or --agent codex; forbid_self_review blocks Type-1 review of grok-code",
+        "Cloud Agents are optional GitHub-branch/PR workers only, never the default",
+        "judgment-bearing Task prompts open with protocols/subagent-preamble.md; apply worker-context-package.md only when the lane is triggered; executors start blank on the Grok Bot box and must name machineId plus Mac absolute paths for every Read/Shell"
+      ]
+    },
+    "ask_user": {"host_tools": ["USER-NEED marker"], "constraints": ["block on ambiguity"]},
+    "plan_update": {"host_tools": ["status markers"], "constraints": ["controller tracks plan externally"]},
+    "memory_search": {
+      "host_tools": ["repo resume notes", "Grok Bot session state"],
+      "constraints": ["repo files remain canonical"]
+    },
+    "browser_ui": {
+      "host_tools": ["browser tool if host exposes one"],
+      "constraints": ["only when available"]
+    }
+  },
+  "invocation": {
+    "skill_triggers": ["goal-flight", "Grok Bot controller"],
+    "commands": ["goal-flight host wrapper"],
+    "exec": {
+      "kind": "native_tool",
+      "binary": null,
+      "args": [],
+      "arg_policy": {
+        "required_safe_args": [],
+        "forbidden_args": ["--yolo", "-y", "--dangerously-*", "--dangerously-bypass-approvals-and-sandbox", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--always-approve", "--allow-all-tools", "--trust-all-tools", "--auto-approve", "--auto-accept", "--skip-permissions", "--no-sandbox", "--disable-sandbox", "--sandbox-disable"],
+        "requires_explicit_justification": ["--bare", "--auto", "--headless-with-approval-bypass"],
+        "reject_in": ["invocation", "probes", "generated_wrappers", "checked_in_configs"]
+      },
+      "stdin": "none",
+      "cwd_policy": "repo_required",
+      "output_contract": {
+        "parser": "status_json",
+        "completion_detection": "unsupported",
+        "final_event": null,
+        "final_regex": null,
+        "exit_code_policy": "ignored_never",
+        "resume_args": [],
+        "goal_mode_eligible": false
+      }
+    }
+  },
+  "permission_surface": {
+    "file_reads": ["workspace files"],
+    "file_writes": ["authorized edit scope only"],
+    "shell": {
+      "allowed_families": ["safe probes", "test runner"],
+      "forbidden_families": ["permission bypass", "destructive reset", "raw web fetch"]
+    },
+    "network": {
+      "allowed": false,
+      "user_gate": true,
+      "notes": "Auth/model calls are not discovery probes. CLI workers run on the registered Mac, not the Grok Bot box."
+    },
+    "browser_ui": {"allowed": false, "user_gate": true, "notes": "No verified browser UI contract."},
+    "memory_writes": {"allowed": false, "backend": "repo_files"},
+    "plugin_sandbox": {"mode": "none", "declared_permissions": []},
+    "os_sandbox": {
+      "supported_profiles": ["off"],
+      "default_profile": "off",
+      "implementation": "unsupported",
+      "platform_supported_profiles": {
+        "darwin": ["off"],
+        "linux": ["off"],
+        "wsl": ["off"],
+        "windows": ["off"]
+      },
+      "notes": "Grok Bot is a controller host port, not a dispatched CLI worker. Code workers keep their own adapter sandboxes."
+    },
+    "auto_approve_detection": {"probes": ["grok-bot-args-scan"], "strict_fail": true},
+    "secrets": [],
+    "irreversible_ops": ["git reset --hard", "force push", "rm -rf"]
+  },
+  "memory_backend": {
+    "canonical": "repo_files",
+    "repo_files": [".goal-flight/**"],
+    "host_native": {"role": "advisory", "backend": "Grok Bot session state"},
+    "mirror_writeback": false,
+    "source_epoch": "goal-flight-0.5.0",
+    "snapshot_id": "grok-bot-host-adapter",
+    "migration_lock_required_for_writeback": true,
+    "drift_policy": "warn_and_prefer_repo"
+  },
+  "packaging": {
+    "checked_in_wrappers": ["configs/grok-bot/"],
+    "generated_outputs": ["dist/grok-bot/"],
+    "install_actions": [
+      {
+        "kind": "copy",
+        "source": "configs/grok-bot/skills/goal-flight/SKILL.md",
+        "target": "${GOALFLIGHT_GROK_BOT_WORKFLOWS}/goal-flight/SKILL.md",
+        "writes_repo": false,
+        "writes_user_config": true,
+        "user_gate": true,
+        "backup_path": "$XDG_STATE_HOME/goal-flight/setup-backups/grok-bot.json",
+        "rollback": "restore_backup",
+        "destinations": ["grok-bot-workflows-controller"]
+      }
+    ],
+    "plugin_manifest": {"supported": false, "path": null, "api_status": "unsupported"},
+    "mcp": {"required": false, "servers": []},
+    "validation": ["json parse", "schema required groups", "candidate gate stays deny"]
+  },
+  "setup": {
+    "controller_destinations": [
+      {
+        "id": "grok-bot-workflows-controller",
+        "label": "Grok Bot workflows-library controller",
+        "role": "controller",
+        "surface": "desktop",
+        "default": true,
+        "probe_ids": [],
+        "install_action_sources": ["configs/grok-bot/skills/goal-flight/SKILL.md"],
+        "commands": ["./install.sh grok-bot", "./setup.sh --apply --yes --grok-bot"],
+        "paths": [
+          "/home/box/agent-data/workflows/goal-flight/SKILL.md",
+          "${GOALFLIGHT_GROK_BOT_WORKFLOWS}/goal-flight/SKILL.md"
+        ],
+        "requires_restart": false
+      }
+    ],
+    "worker_destinations": [],
+    "addons": [
+      {
+        "id": "gstack",
+        "label": "gstack skills",
+        "default": true,
+        "compatible_destination_ids": ["grok-bot-workflows-controller"],
+        "install_mode": "init_self_check",
+        "commands": ["test -d ~/.gstack/repos/gstack/.agents/skills"],
+        "paths": ["~/.gstack"]
+      },
+      {
+        "id": "gstack-browser",
+        "label": "gstack headless browser (web-QA)",
+        "default": false,
+        "compatible_destination_ids": ["grok-bot-workflows-controller"],
+        "install_mode": "init_self_check",
+        "commands": ["test -x \"${GSTACK_BROWSE_BIN:-}\" || test -x ~/.claude/skills/gstack/browse/dist/browse || test -x ~/.gstack/repos/gstack/browse/dist/browse"],
+        "paths": [
+          "~/.claude/skills/gstack/browse/dist/browse",
+          "~/.gstack/repos/gstack/browse/dist/browse",
+          "~/.claude/skills/gstack/qa",
+          "~/.gstack/repos/gstack/qa"
+        ]
+      },
+      {
+        "id": "autoreview",
+        "label": "autoreview chunk review",
+        "default": true,
+        "compatible_destination_ids": ["grok-bot-workflows-controller"],
+        "install_mode": "init_self_check",
+        "commands": ["test -x scripts/autoreview.sh"],
+        "paths": ["scripts/autoreview.sh", "scripts/autoreview_claude_acp", "~/.cursor/skills/autoreview"]
+      }
+    ]
+  },
+  "discovery": {
+    "budget": {
+      "max_path_probes": 4,
+      "max_version_probes": 0,
+      "max_help_probes": 0,
+      "max_ms_per_probe": 6000,
+      "max_total_ms_per_agent": 20000,
+      "max_total_ms_all_agents": 90000,
+      "max_stdout_bytes_per_probe": 4096,
+      "max_stderr_bytes_per_probe": 4096,
+      "network_default": "deny",
+      "model_consuming": "forbidden"
+    },
+    "probes": [
+      {
+        "id": "grok-bot-workflows-library",
+        "class": "path",
+        "argv": [
+          "sh",
+          "-lc",
+          "root=${GOALFLIGHT_GROK_BOT_WORKFLOWS:-/home/box/agent-data/workflows}; test -d \"$root\" && printf '%s' \"$root\""
+        ],
+        "safe_for_setup": true,
+        "network": false,
+        "model_consuming": false,
+        "env_scrub": true
+      }
+    ]
+  },
+  "status_contract": {
+    "schema": "goalflight.acp-run.v1",
+    "liveness_profile": "remote_api",
+    "heartbeat_required": true,
+    "dispatcher_owns_heartbeat": true,
+    "status_file": ".goal-flight/status/<dispatch_id>.json",
+    "transport_instance_id": "grok-bot:<pid>:<dispatch_id>",
+    "seq": "monotonic integer",
+    "parser_type": "plugin",
+    "marker_namespace": "goalflight:<dispatch_id>:<transport>:<seq>",
+    "stale_after_s": 180,
+    "terminal_states": ["complete", "failed", "blocked", "wedged"]
+  },
+  "host_projection": {
+    "controller_only": true,
+    "not_a_grok_cli_replacement": true,
+    "skill_pin": "${GOALFLIGHT_ROOT:-~/.goal-flight/skill}",
+    "workflows_library": {
+      "verified_bot_box": "/home/box/agent-data/workflows/goal-flight/SKILL.md",
+      "override_env": "GOALFLIGHT_GROK_BOT_WORKFLOWS",
+      "notes": "Verified on the Grok Bot box as the user-created workflows library. Mac-side library roots are not a second invented default; set the override when install does not run on that box."
+    },
+    "wake": {
+      "path": "goalflight_grok_bot_listen.py --report-pending --timeout-s 900",
+      "contract": "exit-as-wake",
+      "controller_label": "goalflight-grokbot",
+      "arm_on": "user Mac project-root + --controller-label goalflight-grokbot",
+      "timeout_s": 900,
+      "timeout_purpose": "frontier reminder and 80% hint substitute; host-local listen default, not the 120s Claude follow-stream heartbeat",
+      "mvp_depth": 1,
+      "full_depth": 4,
+      "on_ring": "drain, act, handoff write, quote-check, re-arm, task next",
+      "on_timeout": "handoff write, quote-check, re-arm, task next",
+      "detached": "forbidden; listen exit 4",
+      "not": [
+        "unbounded supervise as a Grok Bot background shell",
+        "per-line persistent stdout monitor",
+        "Claude 120s follow-stream heartbeat as a Grok Bot arm",
+        "Settings monitor widget",
+        "same-turn regex-wait on live supervise as the session monitor",
+        "native mail transport",
+        "global supervise/follow cadence change",
+        "Claude context-meter / PostToolUse additionalContext",
+        "SessionStart hook"
+      ],
+      "terminals": ["COMPLETE", "READY", "FAILED", "BLOCKED", "USER-NEED"],
+      "notes": "Grok Bot notifies on tracked Task/executor or Shell completion only. Success terminal is COMPLETE. Journal remains durable truth; missed wake is latency. Resume pulls status + task next + relay --new. Full listen pool: put --timeout-s 900 on one slot only. Every listen exit is a mini-resume: flush state-handoff Before compact or sleep, then quote-check. The grok-bot listen wrapper prints that quote-check on stdout."
+    },
+    "compaction": {
+      "strategy": "autocompact + keep handoff current",
+      "controller_authored_compact": false,
+      "keep_vs_toss_prompt": false,
+      "host_may_summarize_unannounced": true,
+      "context_meter": false,
+      "session_start_hook": false,
+      "eighty_percent_substitute": "listen --timeout-s 900",
+      "directed_compact_is": "protocols/state-handoff.md Before compact or sleep",
+      "write_on": ["listen exit 0 (ring)", "listen exit 1 (900s frontier ping)", "before long waves"],
+      "quote_check_on": "every listen ring or timeout",
+      "quote_check_externalized": [
+        "wrapper Freshness preamble",
+        "goalflight_grok_bot_listen.py exit banner",
+        "optional operator profile sentence"
+      ],
+      "mini_resume_on_wake": true,
+      "resume_notes_slots": ["ENVIRONMENT", "IDEAS", "DECISIONS", "FACTS", "CARRIERS"],
+      "no_task_tables_in_resume_notes": true,
+      "chat_summaries": "hints, not substitutes",
+      "advisory_host_memory": ["profile", "update_state", "routines"],
+      "canonical_memory": "repo_files",
+      "resume_wake": "skip commands/resume.md STEP 1.5 supervise; arm portable listen pool",
+      "operator_is_compaction_mailman": false,
+      "operator_wake_hygiene": "re-arm listen after host update or token-pause",
+      "operator_signal": "roster wake unarmed (wake_armed/wake_covered/supervisor)",
+      "no_second_reminder_channel": true,
+      "token_pause_or_update": "listen exit 5 or reaped tracked tasks; next user message or next 15-minute arm/timeout claims and re-arms",
+      "not": [
+        "invent a compact UI",
+        "ask the user to compact",
+        "emulate Claude compact prompt in chat",
+        "port scripts/hooks/goalflight-context-meter.sh",
+        "port SessionStart watchdog",
+        "fake window-percent meter"
+      ]
+    },
+    "same_provider_policy_notes": "forbid_self_review: a Grok Bot controller must not Type-1-review a grok-code worker. Independent reviews go to --agent moonshot (kimi3 / Kimi Code CLI) or --agent codex, or gstack on those engines.",
+    "model_notes": "No model id is pinned. Do not reintroduce a pin here. kimi3 is the moonshot dispatch preset (adapters/moonshot.json default_model kimi-code/k3), not a new agent_id.",
+    "routing": {
+      "executor_is_first_class": true,
+      "claude_last_resort_rule_does_not_apply": true,
+      "code_writing": {
+        "healthy_capacity": ["codex", "grok-code", "moonshot"],
+        "alternate": "Grok Bot Task/executor when cheaper, available, or host-native"
+      },
+      "reviews": {
+        "independent": ["moonshot", "codex"],
+        "notes": "kimi3 reviews use --agent moonshot. Do not invent a kimi3 agent id."
+      },
+      "host_native_executor": ["recon", "synthesis", "mail", "status", "planning"],
+      "executor_context_package": {
+        "reuse": ["protocols/subagent-preamble.md"],
+        "triggered_lane_package": "protocols/worker-context-package.md",
+        "cli_prompt": "compose five-layer --prompt-file via prompts/dispatch-wrapper.md; paste or cite that composed body in the Task prompt, not the recipe file",
+        "orientation": "docs-private/rag/ORIENTATION.md when present (orientation only)",
+        "default_computer": "Grok Bot box",
+        "work_computer": "user registered computer via machineId",
+        "mac_path_prefix": "/Users/simonrowland/Repos/",
+        "machine_pin_applies_to": "every Read/Shell including preamble orientation reads",
+        "no_clone_onto_box": true,
+        "no_parallel_package_format": true
+      }
+    },
+    "mail": {
+      "inter_controller": "goalflight_messages.py post --to-controller",
+      "grok_bot_joins_journal": true,
+      "send_to_agent": "optional extra ping among grok-bot agents only",
+      "send_to_agent_is_work_inbox": false,
+      "send_to_agent_bridges_battery_controllers": false,
+      "deafness": "re-arm listen, not user-as-mailman",
+      "not": [
+        "ask the user to paste mail",
+        "ask the user to tell another session to check mail",
+        "user-as-mailman"
+      ]
+    }
+  }
+}

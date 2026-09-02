@@ -44,6 +44,8 @@ MERGE_START = "# >>> goal-flight"
 MERGE_END = "# <<< goal-flight"
 SETUP_ALLOWED_GATE_REASONS = {"allowed", "candidate", "config_only", "not_installed", "probe_required", "unsupported"}
 TARGET_PROJECT_TOKEN = "${GOALFLIGHT_TARGET_PROJECT}"
+GROK_BOT_WORKFLOWS_TOKEN = "${GOALFLIGHT_GROK_BOT_WORKFLOWS}"
+GROK_BOT_WORKFLOWS_DEFAULT = "/home/box/agent-data/workflows"
 GSTACK_MINIMAL_SKILLS = ("review", "plan-eng-review", "office-hours")
 GSTACK_EXTERNAL_SKILL_SOURCES = {
     "grill-me": (
@@ -105,11 +107,41 @@ def _now_slug() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
+def _grok_bot_workflows_root() -> Path:
+    raw = os.environ.get("GOALFLIGHT_GROK_BOT_WORKFLOWS", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path(GROK_BOT_WORKFLOWS_DEFAULT)
+
+
+def _grok_bot_mac_default_warn(
+    *,
+    platform: str | None = None,
+    env: dict[str, str] | None = None,
+) -> str | None:
+    """Warn when Darwin would write the box default /home/box/... path."""
+    plat = sys.platform if platform is None else platform
+    environ = os.environ if env is None else env
+    if plat != "darwin":
+        return None
+    if str(environ.get("GOALFLIGHT_GROK_BOT_WORKFLOWS") or "").strip():
+        return None
+    return (
+        "WARN grok-bot default workflows root is "
+        f"{GROK_BOT_WORKFLOWS_DEFAULT} (Grok Bot box). "
+        "From a Mac checkout pass GOALFLIGHT_GROK_BOT_WORKFLOWS or "
+        "./install.sh grok-bot <workflows-root>. "
+        "This repo does not invent a second Mac default library root."
+    )
+
+
 def _expand_target(raw: str, target_project: Path | None = None) -> Path:
     if TARGET_PROJECT_TOKEN in raw:
         if target_project is None:
             raise SetupError(f"target path requires --target-project: {raw}")
         raw = raw.replace(TARGET_PROJECT_TOKEN, str(target_project))
+    if GROK_BOT_WORKFLOWS_TOKEN in raw:
+        raw = raw.replace(GROK_BOT_WORKFLOWS_TOKEN, str(_grok_bot_workflows_root()))
     return Path(os.path.expandvars(os.path.expanduser(raw)))
 
 
@@ -2676,6 +2708,10 @@ def _dry_run(
     *,
     target_project: Path,
 ) -> None:
+    if agent == "grok-bot":
+        warn = _grok_bot_mac_default_warn()
+        if warn:
+            print(warn, file=sys.stderr)
     print(f"DRY-RUN setup agent={agent}")
     if destination_ids:
         print(f"DESTINATIONS selected={','.join(sorted(destination_ids))}")
@@ -2729,6 +2765,10 @@ def _apply(
     target_project: Path,
     gate_checked: bool = False,
 ) -> None:
+    if agent == "grok-bot":
+        warn = _grok_bot_mac_default_warn()
+        if warn:
+            print(warn, file=sys.stderr)
     if not yes:
         raise SetupError("refusing mutation without --yes")
     if not gate_checked:
@@ -2769,7 +2809,7 @@ def _apply(
 
 
 def _expand_host_install_shortcuts(args: argparse.Namespace) -> None:
-    """Map one-shot install flags onto the existing cursor/opencode/codex setup paths."""
+    """Map one-shot install flags onto the existing host setup paths."""
     cursor_install = getattr(args, "cursor_install", None)
     if cursor_install is not None:
         args.apply = True
@@ -2786,6 +2826,13 @@ def _expand_host_install_shortcuts(args: argparse.Namespace) -> None:
         args.apply = True
         args.yes = True
         args.agent = args.agent or "codex"
+    grok_bot_install = getattr(args, "grok_bot_install", None)
+    if grok_bot_install is not None:
+        args.apply = True
+        args.yes = True
+        args.grok_bot = True
+        if grok_bot_install:
+            os.environ["GOALFLIGHT_GROK_BOT_WORKFLOWS"] = grok_bot_install
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2809,6 +2856,22 @@ def main(argv: list[str] | None = None) -> int:
         "--codex-install",
         action="store_true",
         help="one-shot Codex plugin + CLI worker install; implies --apply --yes --agent codex",
+    )
+    parser.add_argument(
+        "--grok-bot-install",
+        nargs="?",
+        const="",
+        metavar="WORKFLOWS_ROOT",
+        help=(
+            "one-shot Grok Bot controller wrapper install; implies --apply --yes. "
+            "Optional WORKFLOWS_ROOT overrides GOALFLIGHT_GROK_BOT_WORKFLOWS "
+            f"(default {GROK_BOT_WORKFLOWS_DEFAULT})"
+        ),
+    )
+    parser.add_argument(
+        "--grok-bot",
+        action="store_true",
+        help="shortcut for the Grok Bot workflows-library controller setup",
     )
     parser.add_argument("--cursor", action="store_true", help="shortcut for the default Cursor controller/worker setup")
     parser.add_argument(
@@ -2931,6 +2994,8 @@ def main(argv: list[str] | None = None) -> int:
             or getattr(args, "cursor_install", None) is not None
             or getattr(args, "opencode_install", None) is not None
             or getattr(args, "codex_install", False)
+            or args.grok_bot
+            or getattr(args, "grok_bot_install", None) is not None
         )
         if args.tui or (
             not args.agent
@@ -2992,6 +3057,20 @@ def main(argv: list[str] | None = None) -> int:
                 destinations.add("opencode-claude-link-controller")
             if not destinations:
                 destinations.update(_agent_default_destinations(repo_root, "opencode"))
+            addons = _parse_optional_csv(args.addons)
+            _validate_requested_addons(manifests, addons)
+            _run_selection(
+                repo_root,
+                manifests,
+                destinations,
+                addons,
+                apply=args.apply,
+                yes=args.yes,
+                target_project=target_project,
+            )
+            return 0
+        if args.grok_bot:
+            destinations = {"grok-bot-workflows-controller"}
             addons = _parse_optional_csv(args.addons)
             _validate_requested_addons(manifests, addons)
             _run_selection(

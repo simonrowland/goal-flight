@@ -21,6 +21,7 @@ run_setup() {
 
 list_out="$(run_setup --list-agents)"
 printf '%s\n' "$list_out" | grep -q 'controller codex-desktop-controller' || fail "codex desktop controller not listed"
+printf '%s\n' "$list_out" | grep -q 'controller grok-bot-workflows-controller' || fail "grok-bot controller not listed"
 printf '%s\n' "$list_out" | grep -q 'worker codex-cli-worker' || fail "codex cli worker not listed"
 printf '%s\n' "$list_out" | grep -q 'addon context-mode' || fail "context-mode add-on not listed"
 printf '%s\n' "$list_out" | grep -q 'addon gstack' || fail "gstack add-on not listed"
@@ -31,7 +32,7 @@ import pathlib
 import sys
 
 root = pathlib.Path(sys.argv[1])
-adapters = ["claude-code", "codex", "cursor", "grok", "opencode"]
+adapters = ["claude-code", "codex", "cursor", "grok", "grok-bot", "opencode"]
 missing = []
 for name in adapters:
     manifest = json.loads((root / "adapters" / f"{name}.json").read_text())

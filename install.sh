@@ -52,6 +52,9 @@ detect_host_from_args() {
     codex)
       DETECTED_HOST=codex
       ;;
+    grok-bot)
+      DETECTED_HOST=grok-bot
+      ;;
     claude-acp)
       DETECTED_HOST=claude
       ;;
@@ -63,12 +66,20 @@ detect_host_from_args() {
             DETECTED_HOST=codex
             return 0
             ;;
+          --grok-bot|--grok-bot-install)
+            DETECTED_HOST=grok-bot
+            return 0
+            ;;
           --agent=codex)
             DETECTED_HOST=codex
             return 0
             ;;
           --agent=claude)
             DETECTED_HOST=claude
+            return 0
+            ;;
+          --agent=grok-bot)
+            DETECTED_HOST=grok-bot
             return 0
             ;;
         esac
@@ -78,6 +89,10 @@ detect_host_from_args() {
         fi
         if [[ "$prev" == --agent && "$arg" == claude ]]; then
           DETECTED_HOST=claude
+          return 0
+        fi
+        if [[ "$prev" == --agent && "$arg" == grok-bot ]]; then
+          DETECTED_HOST=grok-bot
           return 0
         fi
         prev="$arg"
@@ -195,6 +210,15 @@ if [[ $# -ge 1 ]]; then
     grok)
       shift
       bash "${REPO_ROOT}/scripts/hosts/fleet/install_grok.sh" "$@"
+      exit $?
+      ;;
+    grok-bot)
+      shift
+      if [[ $# -ge 1 && "$1" != -* ]]; then
+        run_setup_and_traits --grok-bot-install "$1" "${@:2}"
+      else
+        run_setup_and_traits --grok-bot-install "$@"
+      fi
       exit $?
       ;;
     claude-acp)

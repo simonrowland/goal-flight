@@ -57,11 +57,12 @@ Optional: exercise host install paths locally:
 ./install.sh cursor /path/to/your/project    # dry-run by default via setup.sh
 ./install.sh opencode /path/to/your/project
 ./install.sh codex
+./install.sh grok-bot
 ```
 
 See `README.md`, `docs/architecture.md`, and host notes in
-`docs/hosts/cursor.md` and `docs/hosts/opencode.md` for architecture and install
-details.
+`docs/hosts/cursor.md`, `docs/hosts/opencode.md`, and `docs/hosts/grok-bot.md`
+for architecture and install details.
 
 ## Running tests
 

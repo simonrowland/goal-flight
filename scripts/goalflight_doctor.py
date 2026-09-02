@@ -1493,6 +1493,13 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _grok_bot_workflows_root() -> Path:
+    raw = os.environ.get("GOALFLIGHT_GROK_BOT_WORKFLOWS", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path("/home/box/agent-data/workflows")
+
+
 def check_host_goalflight_install() -> dict:
     home = Path.home()
     codex_plugin_cache = sorted(
@@ -1508,6 +1515,7 @@ def check_host_goalflight_install() -> dict:
     opencode_config = home / ".config/opencode/opencode.json"
     standard_agents_skill = home / ".agents/skills/goal-flight/SKILL.md"
     grok_skill = home / ".grok/skills/goal-flight/SKILL.md"
+    grok_bot_skill = _grok_bot_workflows_root() / "goal-flight/SKILL.md"
     claude_skill = home / ".claude/skills/goal-flight/SKILL.md"
     payload = {
         "codex": {
@@ -1532,6 +1540,10 @@ def check_host_goalflight_install() -> dict:
         "grok": {
             "ok": grok_skill.exists(),
             "skill": _path_state(grok_skill),
+        },
+        "grok-bot": {
+            "ok": grok_bot_skill.exists(),
+            "skill": _path_state(grok_bot_skill),
         },
         "claude": {
             "ok": claude_skill.exists(),
@@ -1618,6 +1630,7 @@ def check_installed_skill_drift(skill_root: Path, project_root: Path) -> dict:
     cursor_source = skill_root / "configs/cursor/skills/goal-flight/SKILL.md"
     opencode_source = skill_root / "configs/opencode/skills/goal-flight/SKILL.md"
     grok_source = skill_root / "configs/grok/skills/goal-flight/SKILL.md"
+    grok_bot_source = skill_root / "configs/grok-bot/skills/goal-flight/SKILL.md"
     candidates: list[dict] = [
         {
             "host": "codex",
@@ -1666,6 +1679,12 @@ def check_installed_skill_drift(skill_root: Path, project_root: Path) -> dict:
                 "./setup.sh --apply --yes --agent grok && "
                 "./install.sh grok <project>"
             ),
+        },
+        {
+            "host": "grok-bot",
+            "sources": [grok_bot_source],
+            "installed": _grok_bot_workflows_root() / "goal-flight/SKILL.md",
+            "resync_command": "./install.sh grok-bot",
         },
         {
             "host": "claude-code",
