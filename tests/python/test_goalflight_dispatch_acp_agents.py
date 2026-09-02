@@ -312,35 +312,69 @@ def test_detached_acp_child_inherits_outer_seat_fd_and_cwd() -> None:
             captured["pass_fds"] = goalflight_worktree_pool.pass_worktree_lock_fds(
                 kwargs["env"]
             )
+            child_args = _base_acp_args(
+                seat,
+                agent="fake-acp",
+                dispatch_id="detached-acp-seat-child",
+            )
+            child_args.worktree = "HEAD"
+            child_args._worktree_seat = None
+            child_args.unregistered_forced = True
+            with patch.dict(os.environ, kwargs["env"], clear=True):
+                child_cfg = dispatch_mod._build_acp_cfg(
+                    child_args,
+                    status_json=tmp / "child.status.json",
+                    base=tmp / "dispatch",
+                )
+                captured["child_cwd"] = child_cfg.cwd
+                captured["child_worktree"] = child_cfg.worktree
+                captured["child_payload"] = asyncio.run(
+                    goalflight_acp_run.run_acp_dispatch(child_cfg)
+                )
             return 424242
 
         record = {"worker_pid": 424243, "queue_launch_token": None}
-        clean_env = os.environ.copy()
+        clean_env = _capacity_env(tmp / "state")
         clean_env.pop(goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV, None)
         clean_env.pop(goalflight_worktree_pool.OCCUPANCY_LOCK_FD_ENV, None)
-        with (
-            patch.dict(os.environ, clean_env, clear=True),
-            patch.object(dispatch_mod, "_spawn_daemonized_process", side_effect=spawn),
-            patch.object(dispatch_mod, "_apply_web_qa_env"),
-            patch.object(dispatch_mod, "_find_dispatch_record", return_value=record),
-            patch.object(dispatch_mod, "_mark_queue_claim_worker_spawn_intent"),
-            patch.object(dispatch_mod, "_mark_queue_claim_worker_spawned"),
-            patch.object(dispatch_mod, "_release_worktree_occupancy_lock"),
-        ):
-            rc = dispatch_mod._run_acp_detached_launcher(
-                args,
-                status_json=tmp / "status.json",
-                tail_path=tmp / "tail.log",
-                account_env={},
-                env_remove=[],
-                capacity_wait_s=0,
-            )
+        saved = _install_fake_acp_after_capacity()
+        try:
+            with (
+                patch.dict(os.environ, clean_env, clear=True),
+                patch.object(dispatch_mod, "_spawn_daemonized_process", side_effect=spawn),
+                patch.object(dispatch_mod, "_apply_web_qa_env"),
+                patch.object(dispatch_mod, "_find_dispatch_record", return_value=record),
+                patch.object(dispatch_mod, "_mark_queue_claim_worker_spawn_intent"),
+                patch.object(dispatch_mod, "_mark_queue_claim_worker_spawned"),
+                patch.object(dispatch_mod, "_release_worktree_occupancy_lock"),
+                patch.object(
+                    goalflight_acp_run,
+                    "create_and_route_dispatch_worktree",
+                    side_effect=AssertionError(
+                        "detached ACP child attempted a second seat bind"
+                    ),
+                ) as inner_bind,
+            ):
+                rc = dispatch_mod._run_acp_detached_launcher(
+                    args,
+                    status_json=tmp / "status.json",
+                    tail_path=tmp / "tail.log",
+                    account_env={},
+                    env_remove=[],
+                    capacity_wait_s=0,
+                )
+        finally:
+            _restore_fake_acp(saved)
 
         child_argv = captured["argv"]
         assert rc == 0
         assert Path(child_argv[child_argv.index("--cwd") + 1]) == seat.resolve()
         assert captured["fd_env"] == str(lock_fd)
         assert captured["pass_fds"] == (lock_fd,)
+        assert captured["child_cwd"] == str(seat.resolve())
+        assert captured["child_worktree"] == "off"
+        assert captured["child_payload"]["state"] == "complete"
+        assert inner_bind.call_count == 0
         assert released
         assert args._worktree_seat is None
 

@@ -1684,6 +1684,31 @@ def _requested_worktree_base(args) -> str | None:
     return text or None
 
 
+def _is_git_toplevel_in_project(cwd: Path, project_root: Path) -> bool:
+    """True when ``cwd`` is a worktree root in ``project_root``'s repository."""
+    try:
+        resolved = cwd.expanduser().resolve()
+        top = Path(
+            subprocess.check_output(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=str(resolved),
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        ).resolve()
+        return (
+            top == resolved
+            and goalflight_worktree_pool._git_common_dir(resolved)
+            == goalflight_worktree_pool._git_common_dir(project_root.resolve())
+        )
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        goalflight_worktree_pool.WorktreeSeatError,
+    ):
+        return False
+
+
 def _inherited_seat_lock_present() -> bool:
     """True when this process already holds a pooled-seat lock fd.
 
@@ -1749,12 +1774,18 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
 
     if in_place:
         if cwd_raw:
+            cwd = Path(str(cwd_raw))
             kind = goalflight_worktree_pool.classify_dispatch_cwd(
-                Path(str(cwd_raw)),
+                cwd,
                 project_root=project_root,
                 controller_label=label,
             )
-            if kind != "in-place":
+            resumed_linked_worktree = bool(
+                skip_reset
+                and getattr(args, "parent_dispatch_id", None)
+                and _is_git_toplevel_in_project(cwd, project_root)
+            )
+            if kind != "in-place" and not resumed_linked_worktree:
                 raise goalflight_worktree_pool.WorktreeCwdRefused(
                     "--in-place requires --cwd to be omitted or exactly the "
                     f"project root {project_root}; got {cwd_raw}"

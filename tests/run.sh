@@ -51,6 +51,8 @@ run_isolated_test_env() {
   # through for tests that deliberately exercise a real conf.
   env -u GOALFLIGHT_STEER_FILE -u GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE \
     -u GOALFLIGHT_ISOLATED_TEST_FILE \
+    -u GOALFLIGHT_WORKTREE_LOCK_FD \
+    -u GOALFLIGHT_OCCUPANCY_LOCK_FD \
     -u GOALFLIGHT_WAKE_WEBHOOK_URL \
     -u GOALFLIGHT_WAKE_WEBHOOK_SECRET \
     -u GOALFLIGHT_WAKE_WEBHOOK_AUTH \

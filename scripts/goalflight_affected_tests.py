@@ -146,6 +146,8 @@ def isolated_env(base: Path) -> dict[str, str]:
         "GOALFLIGHT_STEER_FILE",
         "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE",
         "GOALFLIGHT_ISOLATED_TEST_FILE",
+        "GOALFLIGHT_WORKTREE_LOCK_FD",
+        "GOALFLIGHT_OCCUPANCY_LOCK_FD",
     ):
         env.pop(unset, None)
     env["GOALFLIGHT_CAPACITY_CONF"] = env.get("GOALFLIGHT_CAPACITY_CONF") or "/dev/null"

@@ -246,6 +246,44 @@ def test_resume_reacquires_exact_seat_and_blocks_fresh_dispatch(
         resumed.release()
 
 
+def test_resume_in_place_accepts_recorded_linked_worktree_without_seat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _make_repo(tmp_path)
+    linked = tmp_path / "linked"
+    _git(repo, "worktree", "add", "--detach", str(linked), "HEAD")
+    monkeypatch.chdir(repo)
+
+    args = SimpleNamespace(
+        worktree=None,
+        parent_dispatch_id="in-place-parent",
+        dispatch_id="in-place-child",
+        cwd=str(linked),
+        skip_seat_reset=True,
+        in_place=True,
+        controller_label=None,
+        _worktree_seat=None,
+    )
+
+    assert goalflight_dispatch._bind_dispatch_worktree(args) is None
+    assert args._worktree_seat is None
+    assert Path(args.cwd).resolve() == linked.resolve()
+    assert not (repo / "worktrees").exists()
+
+    args.skip_seat_reset = False
+    with pytest.raises(goalflight_worktree_pool.WorktreeCwdRefused):
+        goalflight_dispatch._bind_dispatch_worktree(args)
+
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    other_repo = _make_repo(other_root)
+    args.cwd = str(other_repo)
+    args.skip_seat_reset = True
+    monkeypatch.setattr(goalflight_dispatch, "_project_root", lambda _args: repo)
+    with pytest.raises(goalflight_worktree_pool.WorktreeCwdRefused):
+        goalflight_dispatch._bind_dispatch_worktree(args)
+
+
 def test_resume_refuses_a_recorded_seat_reclaimed_by_another_dispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
