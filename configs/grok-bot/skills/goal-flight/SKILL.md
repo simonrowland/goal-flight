@@ -133,26 +133,31 @@ Restart this Goal Flight controller session inside Grok Bot. Follow
   package below.
 - Claim controller label `goalflight-grokbot` and stamp that claimed label
   on every `goalflight_dispatch.py` launch. Never steal a live lease.
-- Wake on worker terminals (`!COMPLETE` is the success marker) through the
-  existing journal doorbell. Canonical arm is one tracked
+- Wake on worker terminals (`!COMPLETE` is the success marker) through two
+  independent doorbells: portable `listen` (exit-as-wake) and the optional
+  outbound wake webhook. The journal on the laptop stays the inbox; mail
+  bodies never leave it. Canonical listen arm is one tracked
   `goalflight_grok_bot_listen.py --report-pending --timeout-s 900
   --controller-label goalflight-grokbot` on the user's Mac (that helper
-  wraps `listen --report-pending` and prints the quote-check banner). The
-  900s quiet timeout is this host's frontier ping (anti-stall), not
-  Claude's 120s follow-stream heartbeat. Optional full pool (depth 4):
-  900s on one slot only; others `--timeout-s 0`. Every ring or timeout is
-  a mini-resume: drain if it rang, flush RESUME-NOTES (`state-handoff.md`
-  Before compact or sleep), quote-check Hard Invariants from disk, re-arm,
-  `goalflight_task.py next`. Never detach.
+  wraps `listen --report-pending` and prints the quote-check banner). Also
+  configure `GOALFLIGHT_WAKE_WEBHOOK_URL` (`docs/hosts/grok-bot.md`) so a
+  dropped local-exec session does not leave wakes dead. Deafness is both
+  listen unarmed and webhook failing. The 900s quiet timeout is this
+  host's frontier ping (anti-stall), not Claude's 120s follow-stream
+  heartbeat. Optional full pool (depth 4): 900s on one slot only; others
+  `--timeout-s 0`. Every ring or timeout is a mini-resume: drain if it
+  rang, flush RESUME-NOTES (`state-handoff.md` Before compact or sleep),
+  quote-check Hard Invariants from disk, re-arm, `goalflight_task.py next`.
+  Never detach.
   Do not invent a second event bus, a Settings monitor widget, a compact
   UI, a context-consumption meter, or a Grok Bot-native mail transport.
   Do not port Claude PostToolUse / SessionStart hooks. Do not arm
   unbounded `supervise` as a background shell. Missed wake is latency:
   resume still pulls status, task next, and `relay --new`. The operator
-  is not the compaction mailman. The one operator wake-hygiene job is
-  re-arming listen doorbells after a host update or token-pause, surfaced
-  as roster `wake unarmed` — not a second reminder channel. See
-  Compaction and Operator role in `docs/hosts/grok-bot.md`.
+  is not the compaction mailman. Operator wake-hygiene is re-arming
+  listen and keeping the webhook URL healthy, surfaced as roster
+  `wake unarmed` / doctor `wake webhook doorbell` — not a second reminder
+  channel. See Compaction and Operator role in `docs/hosts/grok-bot.md`.
 
 ## Dispatch and workers
 
