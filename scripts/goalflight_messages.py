@@ -1530,6 +1530,11 @@ def _complete_controller_addressee(addressee: object) -> bool:
     )
 
 
+def _addressee_is_missing(addressee: object) -> bool:
+    """Omitted, null, and empty/incomplete ``{}`` are the same missing address."""
+    return not _complete_controller_addressee(addressee)
+
+
 def _controller_mail_post_syntax(*, dispatch_id: str = "<id>") -> str:
     stream = str(dispatch_id or "").strip() or "<id>"
     return (
@@ -1567,55 +1572,35 @@ def _reject_unaddressed_controller_mail(
     deliver_to_worker: bool,
     project_journal_delivery: bool,
 ) -> None:
-    """Fail closed before any carrier/journal write.
+    """One pre-write gate: missing addressee is omitted, null, or ``{}``.
 
-    CLI controller mail and a Python caller that would record into nowhere
-    both raise MessageError. Worker dispatch types are not this path.
+    Worker ``result``/``blocked``/``ack`` never enter this path.
     ``deliver_to_worker`` and a worker posting to its own inbox stay open.
-    Library omitted addressee on a controller type is allowed only when
-    journal targeting already has a recipient (dispatch owner or payload root).
-    Empty ``{}`` is never a recipient.
+    Success means a journal recipient already exists (explicit addressee or
+    an implicit dispatch-owner / payload-root target). Otherwise refuse.
+    ``advisory`` and junk-drawer aliases cannot be addressed; an omitted
+    library advisory (quota / MCP) is not controller mail.
     """
+    missing = _addressee_is_missing(addressee)
     if _is_advisory_junk_drawer_type(msg_type):
-        if addressee is not None:
-            raise _unaddressed_controller_mail_error(msg_type, dispatch_id=dispatch_id)
-        return
-    if not _is_controller_directed_post_type(msg_type):
-        return
-    if _complete_controller_addressee(addressee):
-        return
-    if addressee is not None:
+        if missing and addressee is None:
+            return
         raise _unaddressed_controller_mail_error(msg_type, dispatch_id=dispatch_id)
+    if not _is_controller_directed_post_type(msg_type) or not missing:
+        return
     if deliver_to_worker or _worker_own_inbox_post(dispatch_id):
         return
-    if not project_journal_delivery:
-        raise _unaddressed_controller_mail_error(msg_type, dispatch_id=dispatch_id)
-    probe = {
-        "dispatch_id": dispatch_id,
-        "type": msg_type,
-        "payload": payload if isinstance(payload, dict) else {},
-    }
-    try:
-        targets = _journal_delivery_targets(probe)
-    except MessageError:
-        raise _unaddressed_controller_mail_error(msg_type, dispatch_id=dispatch_id) from None
-    if not targets:
-        raise _unaddressed_controller_mail_error(msg_type, dispatch_id=dispatch_id)
-
-
-def _reject_cli_unaddressed_controller_mail(args: argparse.Namespace) -> None:
-    """CLI ``post`` requires ``--to-controller`` for controller-directed types."""
-    msg_type = str(getattr(args, "type", "") or "")
-    dispatch_id = str(getattr(args, "dispatch_id", "") or "")
-    to_controller = getattr(args, "to_controller", None)
-    if _is_advisory_junk_drawer_type(msg_type):
-        raise _unaddressed_controller_mail_error(msg_type, dispatch_id=dispatch_id)
-    if to_controller:
-        return
-    if not _is_controller_directed_post_type(msg_type):
-        return
-    if _worker_own_inbox_post(dispatch_id):
-        return
+    if project_journal_delivery:
+        probe = {
+            "dispatch_id": dispatch_id,
+            "type": msg_type,
+            "payload": payload if isinstance(payload, dict) else {},
+        }
+        try:
+            if _journal_delivery_targets(probe):
+                return
+        except MessageError:
+            pass
     raise _unaddressed_controller_mail_error(msg_type, dispatch_id=dispatch_id)
 
 
@@ -1650,6 +1635,8 @@ def post_message(
         deliver_to_worker=deliver_to_worker,
         project_journal_delivery=project_journal_delivery,
     )
+    if addressee is not None and _addressee_is_missing(addressee):
+        addressee = None
     validate_payload(payload)
     try:
         import goalflight_output_redact
@@ -2912,7 +2899,12 @@ def cmd_from_text(args: argparse.Namespace) -> int:
 
 def cmd_post(args: argparse.Namespace) -> int:
     to_controller = getattr(args, "to_controller", None)
-    _reject_cli_unaddressed_controller_mail(args)
+    if _is_advisory_junk_drawer_type(args.type) or (
+        not to_controller
+        and _is_controller_directed_post_type(args.type)
+        and not _worker_own_inbox_post(args.dispatch_id)
+    ):
+        raise _unaddressed_controller_mail_error(args.type, dispatch_id=args.dispatch_id)
     try:
         payload = json.loads(args.payload) if args.payload else {"text": args.text or ""}
     except (ValueError, RecursionError) as exc:
@@ -3008,9 +3000,9 @@ def cmd_post(args: argparse.Namespace) -> int:
             addressee=addressee,
             fleet_dir=args.fleet_dir,
             update_aggregate=args.refresh_aggregate,
-            deliver_to_worker=(
-                addressee is None and _controller_delivery_requested(args.dispatch_id, args.type)
-            ),
+            # CLI controller mail is journal-addressed. Worker views are the
+            # library / MCP deliver_to_worker path, not an unaddressed post.
+            deliver_to_worker=False,
         )
     except MessageError as exc:
         if not to_controller:
