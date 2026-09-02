@@ -327,6 +327,28 @@ def test_seatless_grok_dispatch_redacts_every_capture_sink(tmp_path: Path) -> No
         home / ".grok" / "config.toml",
         '[ui]\npermission_mode = "always-approve"\n',
     )
+    # "Seatless" means no named seats, not no evidence: an unpinned grok launch
+    # is refused unless a MEASURED usable probe exists (a placeholder key cannot
+    # be probed, and unknown is never permission to bill the host). Give the
+    # isolated HOME a fresh usable host record so selection lands on the host.
+    _write(
+        home / ".goal-flight" / "grok-seat-states.json",
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": time.time(),
+                "seats": {
+                    "": {
+                        "ok": True,
+                        "used_percent": 1.0,
+                        "probe_state": "usable",
+                        "auth_state": "valid",
+                        "error": None,
+                    }
+                },
+            }
+        ),
+    )
     dispatch_id = "seatless-redact"
     dispatch_dir = tmp_path / "dispatch"
     tail = dispatch_dir / f"{dispatch_id}.tail"

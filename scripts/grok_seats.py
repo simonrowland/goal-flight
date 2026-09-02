@@ -342,15 +342,15 @@ def states_are_fresh(document: dict | None, *, now: float | None = None) -> bool
         return False
     if any(
         not isinstance(entry, dict)
-        or entry.get("probe_state") not in PROBE_STATES
-        or entry.get("auth_state") not in AUTH_STATES
-        or entry.get("probe_state") == "unknown"
-        or entry.get("auth_state") != "valid"
+        or _record_probe_state(entry) == "unknown"
+        or _record_auth_state(entry) != "valid"
         for entry in seats.values()
     ):
         # Unknown probes retry immediately; invalid auth retries too so a fresh
-        # login is observed without waiting out the cache TTL. Legacy boolean-
-        # only cache entries also refresh into the typed schema here.
+        # login is observed without waiting out the cache TTL. States are
+        # DERIVED, not read raw: the external rotator (scripts/ext) and older
+        # recovery hooks write ``ok`` + ``used_percent`` without the typed keys,
+        # and a measured legacy entry is a fresh usable seat, not a stale one.
         return False
     return True
 
@@ -439,9 +439,11 @@ def _rank(entry: object) -> tuple[int, float] | None:
     """
     if not isinstance(entry, dict):
         return None
+    # Derive, never read raw: a legacy ``ok`` + ``used_percent`` record from the
+    # external rotator is a measured usable seat and must rank like one.
     if (
-        entry.get("probe_state") != "usable"
-        or entry.get("auth_state") != "valid"
+        _record_probe_state(entry) != "usable"
+        or _record_auth_state(entry) != "valid"
     ):
         return None
     used = entry.get("used_percent")
