@@ -33,6 +33,7 @@ import goalflight_terminal  # noqa: E402
 def _state_dir(tmp: Path):
     isolated = {
         "GOALFLIGHT_STATE_DIR": str(tmp),
+        "GOALFLIGHT_DISPATCH_DIR": str(tmp / "dispatch"),
         "GOALFLIGHT_MESSAGES_DIR": str(tmp / "messages"),
         "GOAL_FLIGHT_PIDFILE_DIR": str(tmp / "pids"),
         "GOALFLIGHT_TASK_STORE_DIR": str(tmp / "task-store"),
@@ -54,6 +55,7 @@ def _state_dir(tmp: Path):
 def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(tmp)
+    env["GOALFLIGHT_DISPATCH_DIR"] = str(tmp / "dispatch")
     env["GOALFLIGHT_MESSAGES_DIR"] = str(tmp / "messages")
     env["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp / "pids")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
@@ -715,7 +717,8 @@ def case_relative_prompt_file_exports_resolved_absolute_path() -> None:
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         dispatch_id = "rel-prompt-env"
-        prompt_dir = tmp / "prompts"
+        repo, _worktree, _orientation = _repo_with_orientation(tmp)
+        prompt_dir = repo / "prompts"
         prompt_dir.mkdir()
         brief = prompt_dir / "brief.md"
         brief.write_text("Read the durable brief.\n", encoding="utf-8")
