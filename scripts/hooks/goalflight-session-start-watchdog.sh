@@ -85,17 +85,20 @@ ctx=d["hookSpecificOutput"]["additionalContext"]
 assert d["hookSpecificOutput"]["hookEventName"] == "SessionStart"
 assert "CronList" in ctx and "CronCreate" in ctx
 assert "goalflight-watchdog-prompt.md" in ctx
-assert "ARM THE EVENT WAKE FIRST" in ctx
+assert "ARM THE EVENT WAKE FIRST" not in ctx
+assert "RESOLVE CONTROLLER OWNERSHIP FIRST" in ctx
+assert "reason `role_does_not_claim`" in ctx
+assert "--controller-pid-from-ancestry --takeover" in ctx
 assert "goalflight_messages.py listen" not in ctx
-assert "do not arm a direct wake component" in ctx
+assert "Do not arm event wake" in ctx
 assert "goalflight_status.py --wait" in ctx
-assert "returned `session.lease_nonce`" in ctx
+assert "did not establish a controller lease" in ctx
 assert "crash-recovery fallback only" in ctx
 assert "`7 * * * *`" in ctx
-assert ctx.index("ARM THE EVENT WAKE FIRST") < ctx.index("CronList")
+assert ctx.index("RESOLVE CONTROLLER OWNERSHIP FIRST") < ctx.index("CronList")
 assert "15-min" not in ctx
 assert "Then poll" not in ctx
-' || fail "running dispatch should inject"
+' || fail "running dispatch without a controller claim should inject ownership guidance"
 
   python3 - "$repo_root/templates/goalflight-watchdog-prompt.md" <<'PY' || fail "canonical prompt contract"
 import pathlib
@@ -481,21 +484,35 @@ def main() -> None:
         repo_prompt = os.path.join(repo_root, "templates", "goalflight-watchdog-prompt.md")
         plugin_prompt = os.path.join(plugin_root, "templates", "goalflight-watchdog-prompt.md")
         prompt_file = repo_prompt if os.path.isfile(repo_prompt) else plugin_prompt
-    wake_instruction = controller_wake_instruction(repo_root, claim_result)
-    depth = claim_result.get("listener_depth")
-    wake_state = (
-        str(claim_result.get("wake_supervisor") or "")
-        or (
-            str(depth.get("supervisor") or "")
-            if isinstance(depth, dict)
-            else ""
+    claim_state = claim_result.get("claimed")
+    claim_reason = str(claim_result.get("reason") or "").strip()
+    wake_instruction = ""
+    wake_state = ""
+    if claim_state is True:
+        wake_instruction = controller_wake_instruction(repo_root, claim_result)
+        depth = claim_result.get("listener_depth")
+        wake_state = (
+            str(claim_result.get("wake_supervisor") or "")
+            or (
+                str(depth.get("supervisor") or "")
+                if isinstance(depth, dict)
+                else ""
+            )
         )
-    )
-    if activity_state == PROBE_UNKNOWN:
+    if claim_state is False and claim_reason:
         wake_preamble = (
-            "Do not claim controller ownership or arm a direct wake component "
-            "until status proves the run active; if it does, ARM THE EVENT WAKE FIRST "
-            "through the host's persistent monitor. "
+            "RESOLVE CONTROLLER OWNERSHIP FIRST: the controller claim was refused "
+            f"with reason `{claim_reason}`; inspect the current holder, then adopt "
+            "a dead or same-session holder by re-running "
+            "`goalflight_session_status.py --controller-startup "
+            "--controller-pid-from-ancestry --takeover`. Do not arm event wake "
+            "until a claim succeeds. "
+        )
+    elif claim_state is not True:
+        wake_preamble = (
+            "claim state unknown: re-run "
+            "`goalflight_session_status.py --controller-startup` before arming. "
+            "An unknown claim is not authorization to arm event wake. "
         )
     elif wake_state == "running":
         wake_preamble = (
@@ -530,18 +547,25 @@ def main() -> None:
         if activity_state == PROBE_ACTIVE
         else (
             "SessionStart could not determine Goal Flight activity, so it emitted "
-            "wake-first context instead of treating the project as inactive. "
+            "claim-state context instead of treating the project as inactive. "
         )
     )
-    claim_context = (
-        "the SessionStart hook already attempted a role-aware lease claim; inspect its result "
-        f"({json.dumps(claim_result, sort_keys=True)}). Carry the returned `session.lease_nonce`. "
-        if activity_state == PROBE_ACTIVE
-        else (
-            "The SessionStart hook did not claim a controller lease because activity was "
-            f"unreadable; its result is ({json.dumps(claim_result, sort_keys=True)}). "
+    if claim_state is True:
+        claim_context = (
+            "the SessionStart hook already attempted a role-aware lease claim; inspect its "
+            f"result ({json.dumps(claim_result, sort_keys=True)}). Carry the returned "
+            "`session.lease_nonce`. "
         )
-    )
+    elif claim_state is False and claim_reason:
+        claim_context = (
+            "The SessionStart hook did not establish a controller lease; inspect its result "
+            f"({json.dumps(claim_result, sort_keys=True)}). "
+        )
+    else:
+        claim_context = (
+            "The SessionStart hook did not claim a controller lease because claim state "
+            f"could not be established; its result is ({json.dumps(claim_result, sort_keys=True)}). "
+        )
     context = (
         f"{activity_intro}{wake_preamble}{claim_context}"
         f"{claimed_instruction}An "
