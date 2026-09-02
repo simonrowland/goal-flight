@@ -39,8 +39,12 @@ Live controllers load the installed skill pin at `$GOALFLIGHT_ROOT` or
 working inside the goal-flight repository itself, `<skill-root>` is the
 repository root. The project tree is `$GOALFLIGHT_PROJECT_ROOT`, a named
 checkout, or the live controller project — pass `--project-root` when the
-cwd is not that tree. Doctor warns when this installed Codex plugin wrapper
-has drifted from the repo copy; resync with `./install.sh codex`.
+cwd is not that tree. The pin is a detached `git worktree` of a goal-flight checkout at a release
+tag; nothing in install or setup creates it. Create it once with
+`git -C <goal-flight-checkout> worktree add ~/.goal-flight/skill <tag>` (or point
+`$GOALFLIGHT_ROOT` at any checkout), then `python3 <skill-root>/scripts/goalflight_skill_link.py --pin`.
+Doctor warns when this installed wrapper has drifted from the repo copy; resync
+it with the setup command in `## Setup` below.
 
 ## Setup
 
