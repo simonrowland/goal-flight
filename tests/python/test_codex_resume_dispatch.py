@@ -1406,10 +1406,11 @@ def test_resume_reuses_worktree_and_does_not_mint_a_new_seat(
 
     A parent launched with ``--worktree HEAD`` used to reconstruct that flag.
     The child then acquired a fresh pooled seat, reset it, and abandoned the
-    partial work. Resume must pin the recorded cwd and never call acquire.
+    partial work. Resume argv must pin the recorded cwd and leave exact-seat
+    locking to the reconstructed dispatch path.
     """
     parent_id = "wt-resume-parent"
-    worktree = tmp_path / "worktrees" / "wt-1"
+    worktree = tmp_path / "worktrees" / "controller" / "s-1"
     worktree.mkdir(parents=True)
     (worktree / "partial.txt").write_text("keep me\n", encoding="utf-8")
     home = _dispatch_home(tmp_path, parent_id)
@@ -1471,26 +1472,44 @@ def test_resume_reuses_worktree_and_does_not_mint_a_new_seat(
     assert (worktree / "partial.txt").read_text(encoding="utf-8") == "keep me\n"
 
 
-def test_bind_dispatch_worktree_skips_acquire_on_resume(
+def test_bind_dispatch_worktree_reacquires_recorded_seat_without_reset(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    calls: list[object] = []
+    seat = tmp_path / "worktrees" / "controller" / "s-1"
+    lease = SimpleNamespace(path=seat)
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def acquire(*args, **kwargs):
+        calls.append((args, kwargs))
+        return lease
+
     monkeypatch.setattr(
         WP,
         "acquire_worktree_seat",
-        lambda *args, **kwargs: calls.append((args, kwargs)),
+        acquire,
     )
+    monkeypatch.setattr(D, "_project_root", lambda _args: tmp_path)
+    monkeypatch.setattr(D, "_controller_ring_label", lambda *_args: "controller")
+    monkeypatch.setattr(WP, "classify_dispatch_cwd", lambda *_args, **_kwargs: "ring-seat")
     args = SimpleNamespace(
         worktree="HEAD",
         parent_dispatch_id="parent-dispatch",
         dispatch_id="child-dispatch",
-        cwd=str(tmp_path / "existing-tree"),
+        cwd=str(seat),
+        skip_seat_reset=True,
+        in_place=False,
         _worktree_seat=None,
     )
-    assert D._bind_dispatch_worktree(args) is None
-    assert calls == []
-    assert args.cwd == str(tmp_path / "existing-tree")
+    assert D._bind_dispatch_worktree(args) is lease
+    assert len(calls) == 1
+    call_args, call_kwargs = calls[0]
+    assert call_args == (tmp_path, "child-dispatch")
+    assert call_kwargs["controller_label"] == "controller"
+    assert call_kwargs["reset"] is False
+    assert call_kwargs["occupy_path"] == seat.resolve()
+    assert call_kwargs["expected_prior_dispatch_id"] == "parent-dispatch"
+    assert args.cwd == str(seat)
 
 
 def test_resume_of_quota_exhausted_dispatch_honors_account(
