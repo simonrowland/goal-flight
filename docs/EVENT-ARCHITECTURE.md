@@ -428,12 +428,15 @@ The watchdog never claims a delivery slot or
 reads the mail cursor. This makes persistent coverage a shared four-component
 `live/4` fact. It stays persistent after stream death, so the surviving backup pool and
 watchdog report `3/4`, not portable `1/4`.
-Unchanged frontiers have a 15-minute floor and changed frontiers emit on the next
-idle beat. Do not grep `supervise`: default is terse and Monitor-safe. It emits
-one owned stream/backup/watchdog arm line, then only actionable wakes. Terse
-`supervise` suppresses empty/unknown idle `kind=next` records and a
-verbatim-identical payload until that same floor; a content change still wakes
-immediately, and `--chatty` restores the raw keepalive and frontier feed. Failure restarts
+Do not grep `supervise`: default is terse and Monitor-safe. It emits
+one owned stream/backup/watchdog arm line, then only actionable wakes.
+The Monitor-visible beat is a task-store `kind=next` reminder (ids and
+short titles), not a keepalive ping. First observation and content change
+emit immediately; an unchanged frontier is never reprinted (b-271). The
+15-minute floor is that identity window. The 3600s supervisor interval is
+a silent peer probe, not a second next emit. Empty/unknown idle next
+records stay off stdout. `--chatty` restores the raw keepalive and
+frontier feed. `--debug` may print the old heartbeat record. Failure restarts
 escalate 1s → 2 → 4 … to 120s (reset on a successful or long-lived run; exit 0
 stays at zero delay). The first `type=restart` of a key emits immediately;
 verbatim-identical copies then reuse that floor so a crash loop does not emit

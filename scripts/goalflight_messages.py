@@ -5968,7 +5968,8 @@ def _supervisor_frontier_snapshot(task_store) -> dict[str, object]:
         ]
     except Exception as exc:
         return _unavailable_follow_frontier(exc)
-    selected = (frontier or active or [None])[0]
+    selected_rows = frontier or active
+    selected = selected_rows[0] if selected_rows else None
     record = _follow_frontier_record(selected)
     payload = record.get("payload")
     assert isinstance(payload, dict)
@@ -5982,11 +5983,26 @@ def _supervisor_frontier_snapshot(task_store) -> dict[str, object]:
         "working",
     }:
         payload["state"] = derived
-    return _decorate_follow_frontier(
+    decorated = _decorate_follow_frontier(
         record,
         task_store=task_store,
         projection_stat=projection_stat,
     )
+    decorated_payload = decorated.get("payload")
+    assert isinstance(decorated_payload, dict)
+    items: list[dict[str, object]] = []
+    for row in selected_rows[:4]:
+        item: dict[str, object] = {}
+        if row.get("id") not in (None, ""):
+            item["id"] = str(row["id"])
+        title = row.get("title")
+        if title not in (None, ""):
+            item["title"] = sanitize_display(str(title), limit=72)
+        if item:
+            items.append(item)
+    if items:
+        decorated_payload["items"] = items
+    return decorated
 
 
 def _follow_frontier_signature(record: dict[str, object]) -> str:
@@ -8645,8 +8661,10 @@ def _run_cli(argv: list[str] | None = None) -> int:
             "stream, backup doorbells, and watchdog, multiplex their lines, and "
             "restart them. Do not grep this feed: default is terse and "
             "Monitor-safe. It emits one owned stream/backup/watchdog arm line, "
-            "then only actionable wakes. --chatty restores raw keepalives and "
-            "frontiers; --debug restores per-tick heartbeat and coverage."
+            "then only actionable wakes plus a first-or-changed next reminder "
+            "(ids and short titles), not a keepalive ping. --chatty restores "
+            "raw keepalives and frontiers; --debug restores per-tick heartbeat "
+            "and coverage."
         ),
     )
     supervise.add_argument("--project-root", default=None)

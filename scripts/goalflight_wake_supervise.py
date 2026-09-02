@@ -117,14 +117,16 @@ PERSISTENT_BACKUP_SLOTS_ENV = "GOALFLIGHT_PERSISTENT_BACKUP_SLOTS"
 # for the next beat and remains advisory-only.
 STREAM_FRONTIER_GRACE_S = 1.0
 # Follow already withholds an unchanged frontier until
-# FOLLOW_FRONTIER_FLOOR_SECS (15 min). Terse mode used to re-emit that
-# cached frontier as kind=next on every 120s keepalive, so a verbatim-
-# identical payload cost a full controller wake (b-271). Keep the
-# keepalive cadence for CHANGED content; suppress unchanged repeats
-# until this floor so the anti-stall beat still exists. Empty/unknown
-# idle next records are not controller wakes. --chatty restores the
-# raw heartbeat/frontier feed and therefore the raw cadence.
+# FOLLOW_FRONTIER_FLOOR_SECS (15 min). The Monitor-visible reminder is a
+# task-store next line (ids + short titles), not a keepalive ping.
+# Emit on first observation and on content change only. An identical
+# payload is never reprinted (b-271); silence is correct. This 15-minute
+# floor is that identity window. The 3600s supervisor interval is a
+# silent peer probe, not a second next emit. Empty/unknown idle next
+# records are not controller wakes. --chatty restores the raw
+# heartbeat/frontier feed. --debug may print the old heartbeat record.
 DEFAULT_NEXT_REPEAT_FLOOR_S = 15.0 * 60.0
+NEXT_REMINDER_REPEAT_FLOOR_S = math.inf
 # A stuck child can re-emit an unread backlog every cycle (incident: 330
 # envelopes from cursor 5220 while a sibling had reached 5550). Cap the
 # forwarded *copies of one identity* so volume cannot kill the host
@@ -846,10 +848,33 @@ def _bounded_payload_text(value: object, *, max_bytes: int) -> str:
     return encoded[: max(0, max_bytes - 3)].decode("utf-8", "ignore") + "…"
 
 
+def _next_reminder_items(source_payload: dict[str, object]) -> list[dict[str, object]]:
+    """Bound id+title rows for one Monitor-visible next reminder line."""
+    items: list[dict[str, object]] = []
+    raw_items = source_payload.get("items")
+    rows = raw_items if isinstance(raw_items, list) else []
+    if not rows and (
+        source_payload.get("id") not in (None, "")
+        or source_payload.get("title") not in (None, "")
+    ):
+        rows = [source_payload]
+    for raw in rows[:4]:
+        if not isinstance(raw, dict):
+            continue
+        item: dict[str, object] = {}
+        if raw.get("id") not in (None, ""):
+            item["id"] = _bounded_payload_text(raw["id"], max_bytes=32)
+        if raw.get("title") not in (None, ""):
+            item["title"] = _bounded_payload_text(raw["title"], max_bytes=72)
+        if item:
+            items.append(item)
+    return items
+
+
 def _actionable_stream_wake(
     frontier: dict[str, object] | None,
 ) -> dict[str, object]:
-    """Replace an idle keepalive with the latest action-bearing frontier."""
+    """Replace an idle keepalive with a task-store next reminder."""
     source = frontier.get("payload") if isinstance(frontier, dict) else None
     source_payload = source if isinstance(source, dict) else {}
     state = str(source_payload.get("state") or "unknown")
@@ -867,6 +892,9 @@ def _actionable_stream_wake(
         payload["detail"] = _bounded_payload_text(
             source_payload["detail"], max_bytes=240
         )
+    items = _next_reminder_items(source_payload)
+    if items:
+        payload["items"] = items
     return {"kind": "next", "payload": payload}
 
 
@@ -895,12 +923,10 @@ def _restart_record_key(record: dict[str, object]) -> str:
 class _RepeatGate:
     """Emit the first copy of a key; suppress identical copies until floor_s.
 
-    kind=next uses this so an unchanged idle frontier does not wake the
-    controller every keepalive. Restart records use ``_RestartGate`` so a
-    crash loop at a fixed backoff does not flood the same channel: the
-    first copy still emits immediately and later copies collapse with an
-    occurrence count. One instance per stream (next); a changed key
-    emits immediately.
+    kind=next uses ``NEXT_REMINDER_REPEAT_FLOOR_S`` (inf) so an unchanged
+    frontier is never reprinted (b-271). A content change still wakes
+    immediately. Restart records use ``_RestartGate`` so a crash loop at
+    a fixed backoff does not flood the same channel.
     """
 
     last_key: str | None = None
@@ -1814,7 +1840,9 @@ def run_supervisor(
         if not _next_is_actionable_wake(record):
             return True
         key = _next_payload_key(record)
-        if not next_gate.should_emit(key, now=host.now, floor_s=repeat_floor_s):
+        if not next_gate.should_emit(
+            key, now=host.now, floor_s=NEXT_REMINDER_REPEAT_FLOOR_S
+        ):
             return True
         return _emit(host, record)
 

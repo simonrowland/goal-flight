@@ -1122,6 +1122,7 @@ def test_terse_supervisor_replaces_only_own_stream_heartbeat() -> None:
     assert next_record["payload"] == {
         "directive": "goal-flight next",
         "id": "t-022",
+        "items": [{"id": "t-022", "title": "Useful next task"}],
         "state": "projected",
         "title": "Useful next task",
     }
@@ -1132,8 +1133,9 @@ def test_terse_supervisor_replaces_only_own_stream_heartbeat() -> None:
 
 
 def test_terse_supervisor_suppresses_verbatim_next_until_floor() -> None:
-    """Unchanged next payloads are silent inside the floor; the beat still fires."""
+    """Unchanged next is never reprinted; a change emits immediately."""
     assert supervise.DEFAULT_NEXT_REPEAT_FLOOR_S == 900.0
+    assert supervise.NEXT_REMINDER_REPEAT_FLOOR_S == float("inf")
     assert messages.FOLLOW_FRONTIER_FLOOR_SECS == 900.0
     assert messages.FOLLOW_HEARTBEAT_SECS == 120.0
     same = (
@@ -1177,7 +1179,6 @@ def test_terse_supervisor_suppresses_verbatim_next_until_floor() -> None:
     actionable = [record for record in _records(host) if record.get("kind") == "next"]
     assert [record["payload"].get("id") for record in actionable] == [
         "t-022",
-        "t-022",
         "t-023",
     ]
     assert all(
@@ -1216,6 +1217,77 @@ def test_terse_supervisor_suppresses_verbatim_next_until_floor() -> None:
     assert sum(record.get("kind") == "heartbeat" for record in chatty_records) == 2
     assert sum(record.get("kind") == "frontier" for record in chatty_records) == 2
     assert not any(record.get("kind") == "next" for record in chatty_records)
+
+
+def test_quiet_mocked_next_emits_one_frontier_then_stays_quiet() -> None:
+    """A non-empty next reminder is not a ping: first/change only, no heartbeat."""
+    first = json.dumps(
+        {
+            "kind": "frontier",
+            "payload": {
+                "id": "t-100",
+                "items": [
+                    {"id": "t-100", "title": "Dispatch me"},
+                    {"id": "t-101", "title": "Also ready"},
+                ],
+                "state": "projected",
+                "title": "Dispatch me",
+            },
+        },
+        separators=(",", ":"),
+    )
+    changed = json.dumps(
+        {
+            "kind": "frontier",
+            "payload": {
+                "id": "t-200",
+                "items": [{"id": "t-200", "title": "Moved on"}],
+                "state": "projected",
+                "title": "Moved on",
+            },
+        },
+        separators=(",", ":"),
+    )
+    floor_s = 2.0
+    host = FakeHost(
+        scripts={
+            "stream": [
+                PlannedExit(
+                    lifetime_s=20.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (0.0, '{"kind":"heartbeat","payload":{"seq":1}}'),
+                        (0.01, first),
+                        (0.4, '{"kind":"heartbeat","payload":{"seq":2}}'),
+                        (0.41, first),
+                        (0.4 + floor_s + 0.2, '{"kind":"heartbeat","payload":{"seq":3}}'),
+                        (0.4 + floor_s + 0.21, first),
+                        (0.4 + floor_s + 0.8, '{"kind":"heartbeat","payload":{"seq":4}}'),
+                        (0.4 + floor_s + 0.81, changed),
+                    ],
+                )
+            ]
+        },
+        stop_when_lines_contain=('"id":"t-200"',),
+    )
+    _run(
+        host,
+        _items("stream"),
+        heartbeat_s=100.0,
+        coverage_s=100.0,
+        next_repeat_floor_s=floor_s,
+    )
+    actionable = [record for record in _records(host) if record.get("kind") == "next"]
+    assert [record["payload"].get("id") for record in actionable] == ["t-100", "t-200"]
+    assert actionable[0]["payload"]["items"] == [
+        {"id": "t-100", "title": "Dispatch me"},
+        {"id": "t-101", "title": "Also ready"},
+    ]
+    assert not any(record.get("type") == "heartbeat" for record in _records(host))
+    assert not any(record.get("kind") == "heartbeat" for record in _records(host))
+    assert not any(record.get("kind") == "frontier" for record in _records(host))
+    assert "write:heartbeat" not in host.actions
 
 
 def test_failed_actionable_wake_uses_detector_stop_and_rearm() -> None:
@@ -4303,6 +4375,7 @@ def test_actual_follow_keeps_working_item_empty_but_supervisor_forwards_it(
     assert forwarded["payload"] == {
         "directive": "goal-flight next",
         "id": "t-real-working",
+        "items": [{"id": "t-real-working", "title": "Real working item"}],
         "state": "working",
         "title": "Real working item",
     }

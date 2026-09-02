@@ -156,10 +156,13 @@ the Monitor sees silence, exits 0, and EPIPE-kills `supervise`.
 Default stdout emits one owned stream/backup/watchdog arm line, then only
 actionable wakes: new controller-addressed mail, real faults, did-not-arm,
 child death that needs re-arm, coverage loss such as 4/4 → 0/4, and a
-**changed** frontier as one
-`{"kind":"next","payload":{"directive":"goal-flight next","id":"...","state":"projected","title":"..."}}`
-record. A verbatim-identical `kind=next` payload is suppressed until the
-15-minute frontier floor. Empty and unknown idle next records stay off stdout.
+**first or changed** dispatchable frontier as one
+`{"kind":"next","payload":{"directive":"goal-flight next","id":"...","items":[{"id":"...","title":"..."}],"state":"projected","title":"..."}}`
+reminder (ids and short titles), not a keepalive ping. An unchanged
+frontier is never reprinted (b-271). The 15-minute floor is that identity
+window; the 3600s supervisor interval is a silent peer probe, not a second
+next emit. Journal remains the inbox; this reminder is Monitor-visible
+only. Empty and unknown idle next records stay off stdout.
 Periodic heartbeat, unchanged coverage, backoff chatter, healthy child
 start/stop, and poll ticks are not controller-visible. Heartbeat remains an
 internal last-ditch peer-liveness write and does not print unless `--debug`.
@@ -177,8 +180,10 @@ Each flushed line is a wake. In default terse mode, child kinds pass through as
 follows:
 
 - stream: events/faults/exits unchanged; each bare `heartbeat` plus advisory
-  `frontier` pair becomes one `kind=next` record only when that frontier is a
-  changed, non-idle payload and the 15-minute floor has elapsed for repeats
+  `frontier` pair becomes one `kind=next` reminder only when that frontier is
+  a first or changed non-idle payload (ids and short titles). Unchanged
+  frontiers are never reprinted; the 15-minute floor is that identity
+  window, and the 3600s supervisor clock does not emit a second next line
 - backup: pending headlines plus one `advance: <command>` line, or a ring
 - watchdog: JSON `{"kind":"event",...}` with `listener-dead` / related payload
 - supervise: `{"kind":"supervise","type":"arm"|"heartbeat"|"coverage"|"restart"|"stop"|"exit"|"cursor-lag"|"child-backlog"|"distinct-withheld",...}`;

@@ -14,11 +14,13 @@ incremented when meaningful skill behaviour changes.
   controller-addressed mail, real faults, did-not-arm, child death that
   needs re-arm, coverage loss such as 4/4 → 0/4, a changed frontier).
   Periodic heartbeat, unchanged coverage, empty/unknown `kind=next`,
-  healthy `rang` restarts, and poll ticks stay off stdout. Heartbeat
-  remains an internal last-ditch peer-liveness write and prints only with
-  `--debug`. `--chatty` restores raw keepalives and frontiers. Exit is
-  never mute: reader-gone / EPIPE / monitor-drop prints a reason on
-  stderr (b-248, b-249, b-202).
+  healthy `rang` restarts, and poll ticks stay off stdout. The long
+  cadence is one first-or-changed `kind=next` reminder (ids and short
+  titles), not a ping; unchanged frontiers are never reprinted (b-271).
+  The 3600s supervisor interval is a silent peer probe only. Heartbeat
+  prints only with `--debug`. `--chatty` restores raw keepalives and
+  frontiers. Exit is never mute: reader-gone / EPIPE / monitor-drop
+  prints a reason on stderr (b-248, b-249, b-202).
 
 ### Fixed
 
