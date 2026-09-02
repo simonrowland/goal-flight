@@ -7,6 +7,7 @@ omit is already locked in test_acp_model_passthrough.py and must stay).
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import os
 import stat
@@ -361,6 +362,24 @@ def test_launch_with_present_mode_reaches_the_worker(tmp_path: Path) -> None:
 def test_launch_host_default_refuses_absent_mode_before_spawn(tmp_path: Path) -> None:
     home = tmp_path / "home"
     config = _write(home / ".grok" / "config.toml", _fresh_config())
+    _write(
+        home / ".goal-flight" / "grok-seat-states.json",
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": config.stat().st_mtime,
+                "seats": {
+                    "": {
+                        "ok": True,
+                        "probe_state": "usable",
+                        "auth_state": "valid",
+                        "used_percent": 1.0,
+                        "error": None,
+                    }
+                },
+            }
+        ),
+    )
     prompt = _write(tmp_path / "prompt.md", "COMPLETE: no-op\n")
     spawn_log = tmp_path / "grok-spawned"
     fake_bin = tmp_path / "bin"

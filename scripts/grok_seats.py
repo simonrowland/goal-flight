@@ -15,15 +15,12 @@ than a background service.
 
 Three rules carry the design:
 
-* **A selection failure must never fail a dispatch.** Every error path returns
-  None, which means "no opinion, use the host default" -- exactly what happened
-  before this module existed. Grok headroom is an optimisation; losing it must
-  not cost a worker.
-* **Unknown usage is not zero and not exhausted.** The billing endpoint omits
-  ``creditUsagePercent`` for an account whose period just opened, so a seat can
-  be genuinely unmeasurable. Such a seat stays ELIGIBLE (there is no evidence it
-  is starved) but ranks behind any seat measured to have headroom, because a
-  measured number is better evidence than an absence.
+* **Unknown usage is not usable or exhausted.** A timeout, unreadable document,
+  or absent measurement proves neither state. It is retried on the next select,
+  but never receives work merely because no measured seat is available.
+* **Only measured headroom is selectable.** HTTP 402, auth rejection, parsed
+  token absence, and an explicit wall are unusable; a numeric reading below the
+  flip threshold is usable.
 * **A 401 may be recoverable.** An optional local rotator (loaded from ``ext``
   if present, otherwise a no-op) may recover a failed probe before this module
   records the seat unusable, and may mark a seat exhausted the moment a dispatch
@@ -35,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -53,12 +51,18 @@ STATE_PATH = Path.home() / ".goal-flight" / "grok-seat-states.json"
 STATE_TTL_S = 600.0
 PROBE_TIMEOUT_S = 10.0
 HOST_KEY = ""  # the host ~/.grok login, which has no seat label
+PROBE_STATES = {"usable", "unusable", "unknown"}
+AUTH_STATES = {"valid", "invalid", "unknown"}
 
 # Sentinels so a test can pass recover=None to disable the optional rotator
 # without being confused with "use the default loader".
 _UNSET = object()
 _RECOVER_CACHE = _UNSET
 _MARK_CACHE = _UNSET
+
+
+class NoUsableSeat(RuntimeError):
+    """No configured Grok login has a measured usable probe."""
 
 
 def _now() -> float:
@@ -252,18 +256,73 @@ def load_states(path: Path = STATE_PATH) -> dict | None:
     return document
 
 
-def _entry_is_auth_failure(entry: object) -> bool:
-    """True when a cached probe recorded an auth failure, not headroom.
+def _http_status(record: object) -> int | None:
+    if not isinstance(record, dict):
+        return None
+    prefix = "billing endpoint returned HTTP "
+    error = record.get("error")
+    if not isinstance(error, str) or not error.startswith(prefix):
+        return None
+    try:
+        return int(error.removeprefix(prefix))
+    except ValueError:
+        return None
 
-    Auth failures are not selectable, but their cached verdict is kept stale so
-    a re-authenticated host is observed by the next live probe.
-    """
-    if not isinstance(entry, dict) or entry.get("ok"):
-        return False
-    error = str(entry.get("error") or "").lower()
-    return any(
-        signal in error
-        for signal in ("401", "403", "auth", "no grok login", "session token")
+
+def _record_auth_state(record: object) -> str:
+    if not isinstance(record, dict):
+        return "unknown"
+    state = record.get("auth_state")
+    if state in AUTH_STATES:
+        return str(state)
+    status = _http_status(record)
+    if status in {401, 403}:
+        return "invalid"
+    if status == 402:
+        return "valid"
+    if record.get("error") in {
+        "no grok login found",
+        "grok auth document is empty",
+        "grok auth document carries no session token",
+    }:
+        return "invalid"
+    if record.get("ok") is True:
+        return "valid"
+    return "unknown"
+
+
+def _record_probe_state(record: object) -> str:
+    if not isinstance(record, dict):
+        return "unknown"
+    used = record.get("used_percent")
+    if record.get("walled") is True or _http_status(record) in {401, 402, 403}:
+        return "unusable"
+    state = record.get("probe_state")
+    if state in PROBE_STATES:
+        if state == "usable":
+            if not _valid_percentage(used):
+                return "unknown"
+            if float(used) >= EXHAUSTED_AT_PERCENT:
+                return "unusable"
+        return str(state)
+    # Compatibility for an older recovery hook: success is usable only when it
+    # carries the measurement needed to prove headroom. `ok:true` alone is not.
+    if (
+        record.get("ok") is True
+        and _valid_percentage(used)
+    ):
+        return (
+            "unusable" if float(used) >= EXHAUSTED_AT_PERCENT else "usable"
+        )
+    return "unknown"
+
+
+def _valid_percentage(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and 0.0 <= value <= 100.0
+        and math.isfinite(float(value))
     )
 
 
@@ -279,13 +338,19 @@ def states_are_fresh(document: dict | None, *, now: float | None = None) -> bool
     if not (0 <= age <= STATE_TTL_S):
         return False
     seats = document.get("seats")
-    if isinstance(seats, dict) and any(
-        isinstance(entry, dict) and entry.get("ok") is False
+    if not isinstance(seats, dict):
+        return False
+    if any(
+        not isinstance(entry, dict)
+        or entry.get("probe_state") not in PROBE_STATES
+        or entry.get("auth_state") not in AUTH_STATES
+        or entry.get("probe_state") == "unknown"
+        or entry.get("auth_state") != "valid"
         for entry in seats.values()
     ):
-        # Older caches used ok=False for every probe failure. Refresh once so a
-        # transient monitoring failure is rewritten as usable/unknown instead
-        # of remaining benched for the old cache's TTL.
+        # Unknown probes retry immediately; invalid auth retries too so a fresh
+        # login is observed without waiting out the cache TTL. Legacy boolean-
+        # only cache entries also refresh into the typed schema here.
         return False
     return True
 
@@ -325,8 +390,7 @@ def refresh_states(
         # as-is so we do not launch a recovery process per broken seat.
         if (
             recover_fn is not None
-            and not record.get("ok")
-            and "401" in str(record.get("error") or "")
+            and _http_status(record) == 401
         ):
             try:
                 recovered = recover_fn(
@@ -340,11 +404,18 @@ def refresh_states(
                     record = recovered
             except BaseException:
                 pass
+        probe_state = _record_probe_state(record)
+        auth_state = _record_auth_state(record)
+        if auth_state == "invalid":
+            probe_state = "unusable"
+        elif auth_state == "unknown" and probe_state == "usable":
+            probe_state = "unknown"
         seats[label or HOST_KEY] = {
-            # Cached `ok` describes whether the seat is usable, not whether the
-            # separate usage probe succeeded. The retained error and absent
-            # percentage distinguish usable/unknown from usable/measured.
-            "ok": bool(record.get("ok")) or not _entry_is_auth_failure(record),
+            # `ok` remains for existing usage readers. Selection uses the typed
+            # state exclusively so probe completion cannot imply usability.
+            "ok": probe_state == "usable",
+            "probe_state": probe_state,
+            "auth_state": auth_state,
             "used_percent": record.get("used_percent"),
             "error": record.get("error"),
         }
@@ -364,14 +435,18 @@ def refresh_states(
 def _rank(entry: object) -> tuple[int, float] | None:
     """Sort key for one seat, or None when the seat is not eligible.
 
-    Rank 0 = measured with headroom, ordered by least-used first.
-    Rank 1 = unmeasurable, so eligible but ranked behind any measured seat.
+    Only a measured usable probe receives a rank, ordered by least-used first.
     """
     if not isinstance(entry, dict):
         return None
+    if (
+        entry.get("probe_state") != "usable"
+        or entry.get("auth_state") != "valid"
+    ):
+        return None
     used = entry.get("used_percent")
-    if isinstance(used, bool) or not isinstance(used, (int, float)):
-        return (1, 0.0) if entry.get("ok") else None
+    if not _valid_percentage(used):
+        return None
     if float(used) >= EXHAUSTED_AT_PERCENT:
         return None
     return (0, float(used))
@@ -383,36 +458,34 @@ def select_seat(
     now: float | None = None,
     allow_refresh: bool = True,
     refresher=None,
+    exclude: set[str] | None = None,
 ) -> str | None:
-    """Return the grok seat label to bill, or None to use the host default.
-
-    None is returned both when the host is the best choice and when no decision
-    could be made -- they are the same action, and conflating them keeps every
-    failure path on the pre-existing behaviour.
-    """
+    """Return a usable seat label, None for a usable host, or raise if unknown."""
     try:
         document = load_states(path)
         if allow_refresh and not states_are_fresh(document, now=now):
             refresh = refresh_states if refresher is None else refresher
             document = refresh(path=path, now=now)
         if not document:
-            return None
+            raise NoUsableSeat("no usable grok seat: probe state unavailable")
 
+        excluded = exclude or set()
         ranked: list[tuple[tuple[int, float], str]] = []
         for key, entry in document.get("seats", {}).items():
+            if key in excluded:
+                continue
             rank = _rank(entry)
             if rank is not None:
                 ranked.append((rank, key))
         if not ranked:
-            # Everything is starved or unusable. Returning None keeps the host
-            # default, which fails loudly on its own rather than this module
-            # inventing a seat that cannot serve either.
-            return None
+            raise NoUsableSeat("no usable grok seat")
         ranked.sort(key=lambda item: (item[0], item[1]))
         best = ranked[0][1]
         return None if best == HOST_KEY else best
-    except Exception:
-        return None
+    except NoUsableSeat:
+        raise
+    except Exception as exc:
+        raise NoUsableSeat("no usable grok seat: probe failed") from exc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -426,7 +499,12 @@ def main(argv: list[str] | None = None) -> int:
     document = load_states() or {}
     if args.refresh or not states_are_fresh(document):
         document = refresh_states()
-    selected = select_seat(allow_refresh=False)
+    try:
+        selected = select_seat(allow_refresh=False)
+        selected_text = selected or "(host ~/.grok)"
+    except NoUsableSeat:
+        selected = None
+        selected_text = "(no usable seat)"
 
     if args.json:
         print(json.dumps({"selected": selected, "states": document}, indent=2))
@@ -437,10 +515,12 @@ def main(argv: list[str] | None = None) -> int:
         name = key or "(host ~/.grok)"
         used = entry.get("used_percent")
         shown = "unknown" if used is None else f"{float(used):.0f}%"
-        eligible = "eligible" if _rank(entry) is not None else "STARVED"
+        state = entry.get("probe_state")
+        if state not in PROBE_STATES:
+            state = "unknown"
         note = f"  [{entry.get('error')}]" if entry.get("error") else ""
-        print(f"  {name:18s} used={shown:8s} {eligible}{note}")
-    print(f"selected: {selected or '(host ~/.grok)'}")
+        print(f"  {name:18s} used={shown:8s} state={state}{note}")
+    print(f"selected: {selected_text}")
     return 0
 
 
