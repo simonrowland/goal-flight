@@ -5,7 +5,9 @@
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/goal-flight-grok-bot-test.XXXXXX")"
+# Normalise the path: macOS TMPDIR ends in "/", so "${TMPDIR}/x" carries a "//"
+# that setup.sh prints collapsed, and every grep on "$TMP_ROOT/..." would miss.
+TMP_ROOT="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/goal-flight-grok-bot-test.XXXXXX")" && pwd)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
 export HOME="$TMP_ROOT/home"
