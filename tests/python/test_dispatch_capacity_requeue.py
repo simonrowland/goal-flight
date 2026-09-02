@@ -451,9 +451,11 @@ def test_preexisting_queue_capacity_refusal_still_restores_one_entry() -> None:
         queue_dir = tmp / "state" / "dispatch-queue"
         marker = tmp / "queued-worker-ran"
         worker_code = (
-            "from pathlib import Path; "
-            f"Path({str(marker)!r}).write_text('once', encoding='utf-8'); "
-            f"print('COMPLETE: {dispatch_id} — restored queue entry ran', flush=True)"
+            "from pathlib import Path\n"
+            "from time import time_ns\n"
+            f"with Path({str(marker)!r}).open('a', encoding='utf-8') as stream:\n"
+            "    stream.write(str(time_ns()) + '\\n')\n"
+            f"print('COMPLETE: {dispatch_id} — restored queue entry ran', flush=True)\n"
         )
         replay_argv = _dispatch_command(tmp, dispatch_id, worker_code)[2:]
         queue_path = _write_queue_entry(
@@ -503,6 +505,7 @@ def test_preexisting_queue_capacity_refusal_still_restores_one_entry() -> None:
 
         held_record = _read_json(tmp / "state" / "runs.d" / f"{dispatch_id}.json")
         assert held_record.get("state") == "queued", held_record
+        assert not marker.exists(), "queued worker ran before capacity was released"
         _release_capacity(env, held_lease)
         launched = _run(
             [sys.executable, str(DISPATCH), "drain", "--capacity-wait-s", "0", "--json"],
@@ -514,7 +517,7 @@ def test_preexisting_queue_capacity_refusal_still_restores_one_entry() -> None:
         assert launched_payload["launched"] == 1, launched_payload
         assert not queue_path.exists(), "restored queue entry was not consumed"
         _wait_for(
-            lambda: marker.exists() and marker.read_text(encoding="utf-8") == "once",
+            marker.exists,
             label="restored backlog worker marker",
         )
         _wait_for(
@@ -522,6 +525,8 @@ def test_preexisting_queue_capacity_refusal_still_restores_one_entry() -> None:
             and _read_json(tmp / f"{dispatch_id}.status.json").get("worker_alive") is not True,
             label="restored backlog terminal status",
         )
+        run_records = marker.read_text(encoding="utf-8").splitlines()
+        assert len(run_records) == 1, f"queued worker ran {len(run_records)} times: {run_records!r}"
 
 
 def test_acp_preexisting_queue_capacity_refusal_restores_claim() -> None:
