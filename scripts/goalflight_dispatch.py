@@ -559,6 +559,15 @@ def _supported_os_sandbox_profile(args) -> str | None:
         return _effective_os_sandbox(args)
     if agent == "moonshot" and shape != "acp":
         return OS_SANDBOX_OFF
+    if agent in CURSOR_AGENTS and shape != "acp":
+        requested = _requested_os_sandbox(args)
+        if requested is None:
+            return None
+        from goalflight_adapter_readiness import validate_os_sandbox_request
+
+        if validate_os_sandbox_request(agent, requested) is None:
+            return requested
+        return None
     return None
 
 
@@ -572,6 +581,8 @@ def _enforced_os_sandbox_profile(args, *, worker_pid: int | None) -> str | None:
         return _effective_os_sandbox(args)
     if agent == "moonshot" and shape != "acp":
         return OS_SANDBOX_OFF
+    if agent in CURSOR_AGENTS and shape != "acp":
+        return _supported_os_sandbox_profile(args)
     return None
 
 
@@ -652,16 +663,18 @@ def _validate_os_sandbox_boundary(args) -> None:
 def _os_sandbox_enforced_by_launch(args) -> bool:
     """True when an explicit --os-sandbox actually constrains this launch path.
 
-    Bash-shape grok/cursor/claude ignore the flag (no CLI/OS mapping). ACP
-    honours it only when the adapter and platform can wrap the worker.
-    An accepted-but-inert safety flag is worse than a refusal.
+    Bash-shape grok/claude ignore the flag (no CLI/OS mapping). Cursor bash
+    uses the same runner:sandbox-exec wrap as ACP (macOS Seatbelt; no
+    cursor-cli sandbox flag). ACP honours the flag only when the adapter
+    and platform can wrap the worker. An accepted-but-inert safety flag is
+    worse than a refusal.
     """
     explicit = getattr(args, "os_sandbox", None)
     if explicit not in OS_SANDBOX_PROFILES:
         return True
     agent = str(getattr(args, "agent", "") or "")
     shape = getattr(args, "shape", "bash")
-    if shape == "acp":
+    if shape == "acp" or agent in CURSOR_AGENTS:
         from goalflight_adapter_readiness import validate_os_sandbox_request
 
         return validate_os_sandbox_request(agent, explicit) is None
@@ -706,7 +719,8 @@ def _validate_agent_os_sandbox(args) -> None:
                 "with an inert safety flag. "
                 "Use --read-only instead (grok: deny rules for Write/Edit/Bash; "
                 "bash-shape codex: codex --sandbox read-only). --os-sandbox is "
-                "honoured by bash-shape codex and by ACP shapes whose adapter "
+                "honoured by bash-shape codex, bash-shape cursor (macOS "
+                "sandbox-exec wrap), and by ACP shapes whose adapter "
                 "and platform can enforce it."
             )
         return
@@ -716,7 +730,8 @@ def _validate_agent_os_sandbox(args) -> None:
             f"shape={shape}; refusing to launch with an inert safety flag. "
             "Use --read-only instead (grok: deny rules for Write/Edit/Bash; "
             "bash-shape codex: codex --sandbox read-only). --os-sandbox is "
-            "honoured by bash-shape codex and by ACP shapes whose adapter "
+            "honoured by bash-shape codex, bash-shape cursor (macOS "
+            "sandbox-exec wrap), and by ACP shapes whose adapter "
             "and platform can enforce it."
         )
 
@@ -17126,11 +17141,49 @@ def _apply_fast_mode(args) -> None:
         print("FAST: urgent — forcing --priority critical to skip the queue", file=sys.stderr)
 
 
+def _wrap_cursor_os_sandbox(argv: list[str], args) -> list[str]:
+    """Wrap cursor-agent with sandbox-exec when the adapter+platform can enforce.
+
+    cursor-cli has no read-only/workspace-write primitive. Enforcement is the
+    same runner:sandbox-exec Seatbelt wrap ACP already uses for cursor/grok/
+    codex. Do not invent a cursor-cli --sandbox flag — the CLI refuses it.
+    Linux/other hosts: validate_os_sandbox_request fails closed, so this is a
+    no-op and dispatch refuses an explicit --os-sandbox as today.
+    """
+    if not argv:
+        return argv
+    agent = str(getattr(args, "agent", "") or "")
+    if agent not in CURSOR_AGENTS:
+        return argv
+    requested = _requested_os_sandbox(args)
+    if requested in {None, OS_SANDBOX_OFF}:
+        return argv
+    from goalflight_adapter_readiness import validate_os_sandbox_request
+
+    if validate_os_sandbox_request(agent, requested) is not None:
+        return argv
+    from goalflight_os_sandbox import prepare_os_sandbox_command
+
+    cwd = os.path.abspath(getattr(args, "cwd", None) or ".")
+    prepared = prepare_os_sandbox_command(
+        argv[0],
+        list(argv[1:]),
+        cwd=cwd,
+        os_sandbox=requested,
+        agent=agent,
+    )
+    return [prepared.command, *prepared.args]
+
+
 def build_worker(args, prompt_path, raw_argv: list[str]):
     """Return (argv, stdin_path). Explicit `-- <cmd>` overrides any preset.
     Presets encode the canonical SAFE, non-interactive invocation per worker.
     `prompt_path` is the already-materialized prompt file (or None for raw)."""
     if raw_argv:
+        # Raw `--` still honours --os-sandbox for cursor: the flag is a
+        # dispatch-level claim, not a preset-only wrap.
+        if str(getattr(args, "agent", "") or "") in CURSOR_AGENTS:
+            return _wrap_cursor_os_sandbox(list(raw_argv), args), None
         return raw_argv, None  # raw escape hatch; stdin = DEVNULL
     # codex's own --sandbox value for the effective OS sandbox profile.
     # "off" -> danger-full-access (Seatbelt disabled) for trusted local GPU/perf.
@@ -17290,7 +17343,8 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
         if model:
             argv += ["--model", str(model)]
         # Prompt via stdin: the file can be 5-20KB and argv would truncate.
-        return argv, prompt_path
+        # OS sandbox is a runner wrap, not a cursor-agent flag.
+        return _wrap_cursor_os_sandbox(argv, args), prompt_path
     if args.agent == "claude":
         if not prompt_path:
             raise DispatchUsageError("claude resume/launch requires a prompt file")
@@ -17395,13 +17449,15 @@ def _build_launch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--os-sandbox", type=_parse_os_sandbox_arg, default=None,
                         metavar="{workspace-write,read-only,off}",
                         help="OS sandbox profile. Honoured by bash-shape codex (maps to "
-                             "codex --sandbox) and by ACP shapes whose adapter and platform "
-                             "can wrap the worker (macOS sandbox-exec). Unset = workspace-write "
-                             "for bash-shape codex. An accepted-but-inert request is refused; "
-                             "grok bash should pass --read-only instead. 'off' disables codex's "
-                             "Seatbelt sandbox (codex --sandbox danger-full-access) for TRUSTED "
-                             "LOCAL GPU/perf work. Sanctioned adapter profile, DISTINCT from the "
-                             "always-forbidden --dangerously-*/--no-sandbox bypass flags.")
+                             "codex --sandbox), bash-shape cursor (macOS sandbox-exec wrap; "
+                             "cursor-cli has no read-only flag), and by ACP shapes whose "
+                             "adapter and platform can wrap the worker (macOS sandbox-exec). "
+                             "Unset = workspace-write for bash-shape codex. An accepted-but-inert "
+                             "request is refused; grok bash should pass --read-only instead. "
+                             "'off' disables codex's Seatbelt sandbox (codex --sandbox "
+                             "danger-full-access) for TRUSTED LOCAL GPU/perf work. Sanctioned "
+                             "adapter profile, DISTINCT from the always-forbidden "
+                             "--dangerously-*/--no-sandbox bypass flags.")
     parser.add_argument("--priority", choices=["critical", "normal", "bulk"], default="normal",
                         help="Capacity lane. bulk = review storms / batch work (reserves the last "
                              "machine+pool slots for others); critical = fix dispatches (may borrow "

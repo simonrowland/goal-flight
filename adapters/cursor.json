@@ -284,7 +284,7 @@
           "off"
         ]
       },
-      "notes": "Dispatch-level worker subprocess wrapper; not a cursor-agent flag. Permits temp and Cursor host-state writes while fencing project writes by profile."
+      "notes": "cursor-cli has no read-only/workspace-write primitive. Enforcement is runner:sandbox-exec (macOS Seatbelt wrap of the worker subprocess), not a cursor-agent flag. Permits temp and Cursor host-state writes while fencing project writes by profile. Linux/WSL/Windows keep off-only."
     },
     "auto_approve_detection": {
       "probes": [
