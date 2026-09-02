@@ -44,6 +44,12 @@ AUTH_PATH = Path(os.environ.get("GROK_HOME", Path.home() / ".grok")) / "auth.jso
 ACCOUNTS_DIR = Path.home() / ".goal-flight" / "accounts"
 DEFAULT_TIMEOUT_S = 15.0
 LABEL = "grok"
+PROBE_USABLE = "usable"
+PROBE_UNUSABLE = "unusable"
+PROBE_UNKNOWN = "unknown"
+AUTH_VALID = "valid"
+AUTH_INVALID = "invalid"
+AUTH_UNKNOWN = "unknown"
 
 
 def accounts() -> list[tuple[str | None, Path]]:
@@ -86,6 +92,17 @@ def accounts() -> list[tuple[str | None, Path]]:
 
 class GrokUsageError(RuntimeError):
     """A safe-to-report failure. The message never contains credential bytes."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        probe_state: str = PROBE_UNKNOWN,
+        auth_state: str = AUTH_UNKNOWN,
+    ) -> None:
+        super().__init__(message)
+        self.probe_state = probe_state
+        self.auth_state = auth_state
 
 
 def _balance(value: object) -> float | None:
@@ -137,16 +154,32 @@ def _session_token(auth_path: Path) -> str:
     try:
         document = json.loads(auth_path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
-        raise GrokUsageError("no grok login found") from exc
+        raise GrokUsageError(
+            "no grok login found",
+            probe_state=PROBE_UNUSABLE,
+            auth_state=AUTH_INVALID,
+        ) from exc
     except (OSError, ValueError) as exc:
-        raise GrokUsageError("grok auth document is unreadable") from exc
+        raise GrokUsageError(
+            "grok auth document is unreadable",
+            probe_state=PROBE_UNKNOWN,
+            auth_state=AUTH_UNKNOWN,
+        ) from exc
 
     if not isinstance(document, dict) or not document:
-        raise GrokUsageError("grok auth document is empty")
+        raise GrokUsageError(
+            "grok auth document is empty",
+            probe_state=PROBE_UNUSABLE,
+            auth_state=AUTH_INVALID,
+        )
     entry = next(iter(document.values()))
     token = entry.get("key") if isinstance(entry, dict) else None
     if not isinstance(token, str) or not token:
-        raise GrokUsageError("grok auth document carries no session token")
+        raise GrokUsageError(
+            "grok auth document carries no session token",
+            probe_state=PROBE_UNUSABLE,
+            auth_state=AUTH_INVALID,
+        )
     return token
 
 
@@ -161,18 +194,41 @@ def _fetch(token: str, *, url: str, timeout_s: float) -> dict:
     except urllib.error.HTTPError as exc:
         # Report the status only. A response body from an auth-bearing request
         # is not safe to echo.
-        raise GrokUsageError(f"billing endpoint returned HTTP {exc.code}") from exc
+        status = int(exc.code)
+        raise GrokUsageError(
+            f"billing endpoint returned HTTP {status}",
+            probe_state=(
+                PROBE_UNUSABLE if status in {401, 402, 403} else PROBE_UNKNOWN
+            ),
+            auth_state=(AUTH_INVALID if status in {401, 403} else AUTH_VALID),
+        ) from exc
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        raise GrokUsageError("billing endpoint unreachable") from exc
+        raise GrokUsageError(
+            "billing endpoint unreachable",
+            probe_state=PROBE_UNKNOWN,
+            auth_state=AUTH_VALID,
+        ) from exc
     except UnicodeError as exc:
-        raise GrokUsageError("billing response was not valid UTF-8") from exc
+        raise GrokUsageError(
+            "billing response was not valid UTF-8",
+            probe_state=PROBE_UNKNOWN,
+            auth_state=AUTH_VALID,
+        ) from exc
 
     try:
         payload = json.loads(body)
     except ValueError as exc:
-        raise GrokUsageError("billing response was not valid JSON") from exc
+        raise GrokUsageError(
+            "billing response was not valid JSON",
+            probe_state=PROBE_UNKNOWN,
+            auth_state=AUTH_VALID,
+        ) from exc
     if not isinstance(payload, dict):
-        raise GrokUsageError("billing response was not an object")
+        raise GrokUsageError(
+            "billing response was not an object",
+            probe_state=PROBE_UNKNOWN,
+            auth_state=AUTH_VALID,
+        )
     return payload
 
 
@@ -207,7 +263,14 @@ def read_usage(
             else _fetch(_session_token(auth_path), url=url, timeout_s=timeout_s)
         )
     except GrokUsageError as exc:
-        return {"label": LABEL, "account": account, "ok": False, "error": str(exc)}
+        return {
+            "label": LABEL,
+            "account": account,
+            "ok": False,
+            "probe_state": exc.probe_state,
+            "auth_state": exc.auth_state,
+            "error": str(exc),
+        }
 
     config = payload.get("config")
     if not isinstance(config, dict):
@@ -215,6 +278,8 @@ def read_usage(
             "label": LABEL,
             "account": account,
             "ok": False,
+            "probe_state": PROBE_UNKNOWN,
+            "auth_state": AUTH_VALID,
             "error": "billing response lacks config",
         }
 
@@ -242,6 +307,8 @@ def read_usage(
             "label": LABEL,
             "account": account,
             "ok": False,
+            "probe_state": PROBE_UNKNOWN,
+            "auth_state": AUTH_VALID,
             "error": "billing response re-typed creditUsagePercent",
         }
     used = None if used_absent else float(used_raw)
@@ -258,6 +325,8 @@ def read_usage(
         "label": LABEL,
         "account": account,
         "ok": True,
+        "probe_state": PROBE_UNKNOWN if used_absent else PROBE_USABLE,
+        "auth_state": AUTH_VALID,
         # None = the endpoint did not report it for this account (see above).
         "used_percent": used,
         "used_percent_absent": used_absent,

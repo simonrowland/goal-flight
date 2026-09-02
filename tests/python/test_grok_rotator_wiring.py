@@ -203,8 +203,20 @@ def test_next_select_routes_away_after_a_proven_quota(
                 "version": 1,
                 "updated_at": 1_786_000_000.0,
                 "seats": {
-                    "": {"ok": True, "used_percent": 100.0, "error": None},
-                    "seatA": {"ok": True, "used_percent": 3.0, "error": None},
+                    "": {
+                        "ok": False,
+                        "probe_state": "unusable",
+                        "auth_state": "valid",
+                        "used_percent": 100.0,
+                        "error": None,
+                    },
+                    "seatA": {
+                        "ok": True,
+                        "probe_state": "usable",
+                        "auth_state": "valid",
+                        "used_percent": 3.0,
+                        "error": None,
+                    },
                 },
             }
         ),
@@ -215,7 +227,9 @@ def test_next_select_routes_away_after_a_proven_quota(
     def marker(seat, **kwargs):
         document = json.loads(path.read_text(encoding="utf-8"))
         document["seats"][seat] = {
-            "ok": True,
+            "ok": False,
+            "probe_state": "unusable",
+            "auth_state": "valid",
             "used_percent": float(grok_seats.EXHAUSTED_AT_PERCENT),
             "error": "quota_exhausted (observed)",
         }
@@ -228,10 +242,8 @@ def test_next_select_routes_away_after_a_proven_quota(
         "effective_account": "seatA",
     }
     assert grok_seats.note_exhausted_if_proven(record, path=path, marker=marker)
-    assert (
+    with pytest.raises(grok_seats.NoUsableSeat):
         grok_seats.select_seat(path=path, now=1_786_000_000.0, allow_refresh=False)
-        is None
-    )
 
 
 def test_refresh_default_path_uses_the_optional_recover_loader(
@@ -326,8 +338,20 @@ def test_installed_rotator_mark_routes_the_next_select(
                 "version": 1,
                 "updated_at": 1_786_000_000.0,
                 "seats": {
-                    "": {"ok": True, "used_percent": 100.0, "error": None},
-                    "seatA": {"ok": True, "used_percent": 3.0, "error": None},
+                    "": {
+                        "ok": False,
+                        "probe_state": "unusable",
+                        "auth_state": "valid",
+                        "used_percent": 100.0,
+                        "error": None,
+                    },
+                    "seatA": {
+                        "ok": True,
+                        "probe_state": "usable",
+                        "auth_state": "valid",
+                        "used_percent": 3.0,
+                        "error": None,
+                    },
                 },
             }
         ),
@@ -335,10 +359,8 @@ def test_installed_rotator_mark_routes_the_next_select(
     )
     assert grok_seats.select_seat(path=path, now=1_786_000_000.0, allow_refresh=False) == "seatA"
     grok_rotate.mark_exhausted("seatA", path=path)
-    assert (
+    with pytest.raises(grok_seats.NoUsableSeat):
         grok_seats.select_seat(path=path, now=1_786_000_000.0, allow_refresh=False)
-        is None
-    )
 
 
 def test_terminal_writers_keep_the_mark_helper_wired() -> None:
@@ -354,5 +376,4 @@ def test_terminal_writers_keep_the_mark_helper_wired() -> None:
     finish_body = dispatch_src[finish_idx:next_def]
     assert "_maybe_mark_grok_quota_exhausted" in finish_body
     assert "_maybe_note_grok_quota(dispatch_id, state)" in watch_src
-
 

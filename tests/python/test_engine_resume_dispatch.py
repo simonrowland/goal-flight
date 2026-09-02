@@ -354,6 +354,19 @@ def test_grok_default_selection_skips_recently_exhausted_seat(
     assert D.grok_selected_account(args) == "d78343"
 
 
+def test_grok_default_selection_refuses_when_no_seat_is_usable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import grok_seats
+
+    def no_usable_seat(**_kwargs):
+        raise grok_seats.NoUsableSeat("no usable grok seat")
+
+    monkeypatch.setattr(grok_seats, "select_seat", no_usable_seat)
+    with pytest.raises(D.DispatchUsageError, match="no usable grok seat"):
+        D.grok_selected_account(_grok_args(account=None))
+
+
 def test_resume_refuses_live_grok_source(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

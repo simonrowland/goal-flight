@@ -5722,9 +5722,10 @@ def grok_selected_account(args) -> str | None:
             import grok_seats
 
             selected = grok_seats.select_seat()
-        except BaseException:
-            # Selection is an optimisation; never let it fail a dispatch.
-            selected = None
+        except BaseException as exc:
+            # An unknown probe is not permission to bill the host account. A
+            # pinned --account bypasses selection; an unpinned launch refuses.
+            raise DispatchUsageError("no usable grok seat") from exc
         if selected and _account_quota_blocked(selected, engine="grok"):
             selected = _first_unblocked_account("grok", exclude={selected})
     args._grok_selected_account = selected
@@ -12585,7 +12586,20 @@ def _seat_entry_probe_row(
     flags: tuple[str, ...] = ()
     probe_state = None
     remaining_text = "unknown"
-    if isinstance(used, (int, float)) and not isinstance(used, bool):
+    typed_probe_state = entry.get("probe_state")
+    if typed_probe_state == "unknown":
+        remaining_text = "unavailable"
+        flags = ("unavailable",)
+        probe_state = "unavailable"
+    elif typed_probe_state == "unusable":
+        if isinstance(used, (int, float)) and not isinstance(used, bool):
+            remaining_value = max(0.0, 100.0 - float(used))
+            remaining_text = f"{usage._format_number(remaining_value)}%"
+        else:
+            remaining_text = "unavailable"
+        flags = ("walled",)
+        probe_state = "walled"
+    elif isinstance(used, (int, float)) and not isinstance(used, bool):
         remaining_value = max(0.0, 100.0 - float(used))
         remaining_text = f"{usage._format_number(remaining_value)}%"
         if float(used) >= 100 or remaining_value <= 0:
