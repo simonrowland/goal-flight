@@ -92,7 +92,8 @@ supervisor, so no `type=stop` record appears and the controller goes deaf with
 no diagnostic.
 
 Confirm it is actually armed before moving on: the supervisor's first write is
-a `{"kind":"supervise","type":"probe","reason":"stdout-peer-liveness"}` record.
+a `{"kind":"supervise","type":"arm","owned":"stream/backup/watchdog"}` record.
+Do not grep that feed; default is terse.
 If `--list-controllers` still reports `supervisor: absent` after arming, treat
 that as a blocker and resolve it — do not proceed to STEP 2 deaf.
 

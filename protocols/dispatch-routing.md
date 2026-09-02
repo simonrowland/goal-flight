@@ -299,9 +299,8 @@ python3 <skill-root>/scripts/goalflight_messages.py \
   starting it alongside running listeners permanently stops its slots.
 - `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` is optional at the shipped default of 2;
   set it only to override doorbell depth.
-- If you filter the supervise stream, the allowlist must pass `kind=next` and
-  the `stop`/`exit`/`restart` records carrying `rearm` — a narrow filter
-  re-creates the silent death the supervisor exists to prevent.
+- Do not grep the supervise stream: default is terse and Monitor-safe. A pipe
+  through grep is how a bounded host monitor silently drops the pool (b-248).
 - Arm a bare component (`follow`/`listen`) only on a host with no persistent
   monitor, or after supervisor absence is proven — never against a live
   supervisor. Full arming order and JSON-line contracts:

@@ -149,22 +149,26 @@ that arm them separately; they are only offered after supervisor absence is prov
 If `supervise` is running, restart it; if detection is UNKNOWN, do not arm a
 component until supervision is resolved. Doctor and status still read those waiters.
 
-The default supervised feed is terse but remains anti-stall. On each stream
-keepalive it emits exactly one actionable
-`{"kind":"next","payload":{"directive":"goal-flight next","id":"...","state":"projected","title":"..."}}`
-record using the stream's already-materialized frontier, instead of forwarding
-the bare keepalive plus its `information-only` frontier. A verbatim-identical
-`kind=next` payload is then suppressed until the 15-minute frontier floor, so
-an unchanged projection does not cost a controller wake on every 120-second
-keepalive; a content change still wakes immediately. If no ready frontier
-exists but work is in flight, awaiting review, failed, waiting, or needs a
-decision, that item's id, title, and state occupy the same record. Only a
-freshly paired, genuinely empty projection emits
-`directive: "Nothing pending"`; an unavailable or not-yet-observed projection
-retains `directive: "goal-flight next"` so uncertainty cannot masquerade as idle.
-Use `supervise --chatty` to restore the raw stream keepalives and advisory
-frontier lines when diagnosing the feed. The supervisor's own separately
-rate-limited `kind=supervise`, `type=heartbeat` record is unchanged.
+Do **not** grep the supervised feed: default is terse and Monitor-safe. Piping
+through `grep` is how a bounded host monitor silently drops the pool (b-248):
+the Monitor sees silence, exits 0, and EPIPE-kills `supervise`.
+
+Default stdout emits one owned stream/backup/watchdog arm line, then only
+actionable wakes: new controller-addressed mail, real faults, did-not-arm,
+child death that needs re-arm, coverage loss such as 4/4 → 0/4, and a
+**first or changed** dispatchable frontier as one
+`{"kind":"next","payload":{"directive":"goal-flight next","id":"...","items":[{"id":"...","title":"..."}],"state":"projected","title":"..."}}`
+reminder (ids and short titles), not a keepalive ping. An unchanged
+frontier is never reprinted (b-271). The 15-minute floor is that identity
+window; the 3600s supervisor interval is a silent peer probe, not a second
+next emit. Journal remains the inbox; this reminder is Monitor-visible
+only. Empty and unknown idle next records stay off stdout.
+Periodic heartbeat, unchanged coverage, backoff chatter, healthy child
+start/stop, and poll ticks are not controller-visible. Heartbeat remains an
+internal last-ditch peer-liveness write and does not print unless `--debug`.
+Use `supervise --chatty` to restore raw stream keepalives and advisory
+frontier lines. `--debug` restores per-tick heartbeat and coverage. Exit is
+never mute: reader-gone / EPIPE / monitor-drop prints a reason on stderr.
 
 Do **not** run this with shell `&`, `nohup`, a detached dispatcher, or an ordinary
 background-task surface that reports output only when the process exits. The host
@@ -176,49 +180,50 @@ Each flushed line is a wake. In default terse mode, child kinds pass through as
 follows:
 
 - stream: events/faults/exits unchanged; each bare `heartbeat` plus advisory
-  `frontier` pair becomes one actionable `kind=next` record unless that payload
-  is verbatim-identical to the last emitted next and the 15-minute floor has
-  not elapsed
+  `frontier` pair becomes one `kind=next` reminder only when that frontier is
+  a first or changed non-idle payload (ids and short titles). Unchanged
+  frontiers are never reprinted; the 15-minute floor is that identity
+  window, and the 3600s supervisor clock does not emit a second next line
 - backup: pending headlines plus one `advance: <command>` line, or a ring
 - watchdog: JSON `{"kind":"event",...}` with `listener-dead` / related payload
-- supervise: `{"kind":"supervise","type":"heartbeat"|"coverage"|"probe"|"restart"|"stop"|"exit"|"cursor-lag"|"child-backlog"|"distinct-withheld",...}`;
-  default output keeps actionable `restart` records with their reason,
-  `cursor-lag` / `child-backlog` / `distinct-withheld` backlog records, and
-  `stop` / signal-driven `exit` records with the exact supervisor `rearm`
-  command while suppressing `live` / `target`. `--debug` independently restores
-  per-tick `heartbeat` emission, and chatty output restores `live` / `target`
-  diagnostics
+- supervise: `{"kind":"supervise","type":"arm"|"heartbeat"|"coverage"|"restart"|"stop"|"exit"|"cursor-lag"|"child-backlog"|"distinct-withheld",...}`;
+  default output keeps the startup `arm` line, actionable `restart` records
+  (not healthy `rang`), `cursor-lag` / `child-backlog` / `distinct-withheld`
+  backlog records, and `stop` / signal-driven `exit` records with the exact
+  supervisor `rearm` command while suppressing `live` / `target`. `--debug`
+  independently restores per-tick `heartbeat` and `coverage` emission, and
+  chatty output restores raw keepalives plus `live` / `target` diagnostics
 
-`coverage` carries only `live` / `target`, so it is emitted **only** when those
-are enabled. Suppressing the fields would leave a record with nothing in it,
-and every record reaching a controller costs that controller a turn — so the
-record goes, not just the fields.
+Default `coverage` is silent except for operator-actionable loss (for example
+4/4 → 0/4). `--chatty` restores change-driven `live` / `target` records.
+`--debug` restores per-tick coverage.
 
-Startup still needs one real stdout write to detect a controller that is
-already gone. When `coverage` is suppressed that write is a
-`{"kind":"supervise","type":"probe","reason":"stdout-peer-liveness"}` record,
-emitted once per supervisor start. It is named rather than empty so the wake it
-costs is explicable.
+Startup writes
+`{"kind":"supervise","type":"arm","owned":"stream/backup/watchdog"}`
+once. That is the one expected quiet-generation wake. A later heartbeat is an
+internal peer probe and does not print unless `--debug`.
 
-Supervisor coverage is state-driven: it emits at startup, whenever
-`(live,target)` changes, and immediately when a slot stops or restarts.
-Unchanged periodic coverage is silent unless `--debug` restores per-tick
-heartbeat records. The supervisor's own heartbeat is different from the stream child's
-heartbeat below: it defaults to 3600 seconds (60 minutes), and its real stdout
-write is the authoritative fallback when the fast `_stdio_peer_gone` poll has
-no evidence. `RealHost.wait()` also watches stdout for
-`POLLERR|POLLHUP|POLLNVAL`, so positive closure evidence wakes the loop
+Supervisor coverage is state-driven under `--chatty`: it emits at startup,
+whenever `(live,target)` changes, and immediately when a slot stops or
+restarts. Default terse mode emits coverage only for operator-actionable
+loss (for example 4/4 → 0/4). Unchanged periodic coverage is silent unless
+`--debug` restores per-tick heartbeat and coverage records. The supervisor's
+own heartbeat is different from the stream child's heartbeat below: it
+defaults to 3600 seconds (60 minutes) and remains an internal last-ditch
+peer write unless `--debug` prints it. `RealHost.wait()` also watches stdout
+for `POLLERR|POLLHUP|POLLNVAL`, so positive closure evidence wakes the loop
 independently of that heartbeat. Production supervisor heartbeat values stay
-within 60–14400 seconds. The stream child's 120-second heartbeat and the watchdog's
-three-missed-interval threshold do not change. `restart` and `stop` remain
-unconditional. Receipt of `SIGTERM`, `SIGINT`, or `SIGHUP` emits `type=exit`
+within 60–14400 seconds. The stream child's 120-second heartbeat and the
+watchdog's three-missed-interval threshold do not change. Actionable
+`restart` and `stop` remain unconditional; healthy `rang` restarts stay off
+default stdout. Receipt of `SIGTERM`, `SIGINT`, or `SIGHUP` emits `type=exit`
 before child teardown; SIGKILL cannot be caught and therefore cannot emit that
-recovery hint.
+recovery hint. Reader-gone / EPIPE / monitor-drop prints a reason on stderr.
 
 The replacement predicate is structural: the emitting child must be the stream
 and the parsed top-level JSON `kind` must be `heartbeat`. A stream event whose
-payload mentions heartbeat, a mail headline quoting one, and the supervisor's
-own heartbeat therefore continue to reach the controller.
+payload mentions heartbeat, or a mail headline quoting one, still reaches the
+controller. The supervisor's own heartbeat does not print unless `--debug`.
 
 The supervisor's child-exit taxonomy:
 
