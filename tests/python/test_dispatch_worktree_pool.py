@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,6 +24,7 @@ DISPATCH = ROOT / "scripts" / "goalflight_dispatch.py"
 SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import goalflight_dispatch  # noqa: E402
 import goalflight_worktree_pool  # noqa: E402
 
 
@@ -207,6 +209,79 @@ def test_seat_survives_for_worker_lifetime_then_frees_on_death(
             os.kill(worker_pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+
+def test_resume_reacquires_exact_seat_and_blocks_fresh_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
+    seat = parent.path
+    parent.release()
+
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id="resume-parent",
+        dispatch_id="resume-child",
+        cwd=str(seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+    )
+    resumed = goalflight_dispatch._bind_dispatch_worktree(args)
+    assert resumed is not None
+    try:
+        assert resumed.path == seat
+        assert args.cwd == str(seat)
+        with pytest.raises(
+            goalflight_worktree_pool.WorktreeSeatUnavailable,
+            match="resume-child",
+        ):
+            goalflight_worktree_pool.acquire_worktree_seat(repo, "fresh-dispatch")
+        assert not (seat.parent / "s-2").exists()
+    finally:
+        resumed.release()
+
+
+def test_resume_refuses_a_recorded_seat_reclaimed_by_another_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    parent = goalflight_worktree_pool.acquire_worktree_seat(repo, "resume-parent")
+    seat = parent.path
+    parent.release()
+    reclaimer = goalflight_worktree_pool.acquire_worktree_seat(repo, "reclaimer")
+
+    args = SimpleNamespace(
+        worktree="HEAD",
+        parent_dispatch_id="resume-parent",
+        dispatch_id="resume-child",
+        cwd=str(seat),
+        skip_seat_reset=True,
+        in_place=False,
+        controller_label=None,
+        _worktree_seat=None,
+    )
+    try:
+        with pytest.raises(
+            goalflight_worktree_pool.WorktreeSeatUnavailable,
+            match=rf"s-1=reclaimer pid={os.getpid()}",
+        ):
+            goalflight_dispatch._bind_dispatch_worktree(args)
+    finally:
+        reclaimer.release()
+
+    with pytest.raises(
+        goalflight_worktree_pool.WorktreeSeatUnavailable,
+        match=r"reclaimed by reclaimer.*expected recorded holder resume-parent",
+    ):
+        goalflight_dispatch._bind_dispatch_worktree(args)
+    assert args._worktree_seat is None
 
 
 def test_dispatch_quarantines_dirty_seat_instead_of_destroying(

@@ -1735,10 +1735,6 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     existing = getattr(args, "_worktree_seat", None)
     if existing is not None:
         return existing
-    if getattr(args, "parent_dispatch_id", None):
-        # Resume reattaches to the recorded worker_cwd. Acquiring a pooled
-        # seat here would mint a sibling tree and reset partial work.
-        return None
     if _inherited_seat_lock_present():
         # Fleet / parent already leased a seat and passed the fd. Re-acquire
         # would LOCK_EX-succeed in this process (flock is per-process) and
@@ -1771,8 +1767,15 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             cwd, project_root=project_root, controller_label=label
         )
         if kind == "in-place":
+            if skip_reset:
+                raise goalflight_worktree_pool.WorktreeCwdRefused(
+                    f"resume refused: recorded worker cwd {cwd} is the shared "
+                    "project checkout, not a captive s-N seat; refusing to run "
+                    "without a seat lock"
+                )
             return None
         if kind == "ring-seat":
+            parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
             lease = goalflight_worktree_pool.acquire_worktree_seat(
                 project_root,
                 str(args.dispatch_id),
@@ -1780,14 +1783,19 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                 controller_label=label,
                 reset=not skip_reset,
                 occupy_path=cwd,
+                expected_prior_dispatch_id=(
+                    str(parent_dispatch_id) if parent_dispatch_id else None
+                ),
             )
             args.cwd = str(lease.path)
             args._worktree_seat = lease
             return lease
         if skip_reset:
-            # Resume of a recorded worker_cwd, including historical ad-hoc
-            # trees. Occupy that path; do not mint and do not reset.
-            return None
+            raise goalflight_worktree_pool.WorktreeCwdRefused(
+                f"resume refused: recorded worker cwd {cwd} is not a captive "
+                f"seat in this controller ring (worktrees/{label}/s-N); "
+                "refusing to create or choose a replacement seat"
+            )
         raise goalflight_worktree_pool.WorktreeCwdRefused(
             f"--cwd {cwd} is not a seat in this controller ring "
             f"(worktrees/{label}/s-N) and is not the project root. "
@@ -16055,6 +16063,19 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
     )
 
     project_root = _project_root(args)
+    requested_worktree_base = _requested_worktree_base(args)
+    outer_seat_bound = (
+        getattr(args, "_worktree_seat", None) is not None
+        or _inherited_seat_lock_present()
+    )
+    acp_cwd = (
+        _worker_cwd(args)
+        if outer_seat_bound or not requested_worktree_base
+        else project_root
+    )
+    acp_worktree = "off" if outer_seat_bound else (
+        "create" if requested_worktree_base else "off"
+    )
     prompt_path = _resolve_prompt_file(args, base or _dispatch_base_dir())
     orientation_path = _project_orientation_path(
         project_root,
@@ -16096,13 +16117,10 @@ def _build_acp_cfg(args, *, status_json: Path, base: Path | None = None):
         model=getattr(args, "model", None),
         install_slot=None,
         account=getattr(args, "account", None),
-        cwd=str(
-            _project_root(args)
-            if _requested_worktree_base(args)
-            else _worker_cwd(args)
-        ),
-        worktree="create" if _requested_worktree_base(args) else "off",
-        worktree_base=_requested_worktree_base(args) or "HEAD",
+        project_root=str(project_root),
+        cwd=str(acp_cwd),
+        worktree=acp_worktree,
+        worktree_base=requested_worktree_base or "HEAD",
         session_id=_resolved_engine_session_id(args),
         resume_session_id=(
             _resolved_engine_session_id(args)
@@ -16322,6 +16340,15 @@ def _run_test_acp_shape_if_requested(args, *, base: Path, status_json: Path, tai
 def _acp_detached_child_argv(args) -> list[str]:
     argv = list(getattr(args, "_original_argv", []) or sys.argv[1:])
     argv = _remove_flag_before_worker_remainder(argv, "--launch-detached")
+    if (
+        getattr(args, "_worktree_seat", None) is not None
+        or _inherited_seat_lock_present()
+    ):
+        argv = _set_option_before_worker_remainder(
+            argv,
+            "--cwd",
+            str(_worker_cwd(args)),
+        )
     for flag, value in (
         ("--controller-label", _controller_label(args)),
         ("--controller-beacon-pid", _controller_pid(args)),
@@ -16384,6 +16411,11 @@ def _run_acp_detached_launcher(
     env.update(account_env)
     for key in env_remove:
         env.pop(key, None)
+    worktree_seat = getattr(args, "_worktree_seat", None)
+    if worktree_seat is not None:
+        env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
+            worktree_seat.fileno()
+        )
     _apply_web_qa_env(env, args, _project_root(args))
     child_argv = [sys.executable, str(Path(__file__).resolve()), *_acp_detached_child_argv(args)]
     child_pid = _spawn_daemonized_process(
@@ -16396,6 +16428,11 @@ def _run_acp_detached_launcher(
         label="acp",
         inherit_occupancy_lock=True,
     )
+    if worktree_seat is not None:
+        # The detached ACP launcher inherited the exact outer-bound seat fd.
+        # Drop this process's copy so the child/worker lifetime owns the seat.
+        worktree_seat.release()
+        args._worktree_seat = None
     # Worker inherited the occupancy fd. Drop this process's copy so a later
     # in-process launch does not see a closed descriptor as occupancy unknown.
     _release_worktree_occupancy_lock(args)
@@ -16562,8 +16599,18 @@ def _run_acp_shape(args, *, base: Path, account_env: dict[str, str]) -> int:
     web_qa_updates, web_qa_remove = _web_qa_env_plan(args, _project_root(args))
     acp_env = {**account_env, **web_qa_updates}
     acp_remove = list(env_remove) + list(web_qa_remove)
-    with _temporary_env(acp_env, remove=acp_remove):
-        payload = asyncio.run(run_acp_dispatch(cfg))
+    worktree_seat = getattr(args, "_worktree_seat", None)
+    if worktree_seat is not None:
+        acp_env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(
+            worktree_seat.fileno()
+        )
+    try:
+        with _temporary_env(acp_env, remove=acp_remove):
+            payload = asyncio.run(run_acp_dispatch(cfg))
+    finally:
+        if worktree_seat is not None:
+            worktree_seat.release()
+            args._worktree_seat = None
     if (
         payload.get("state") == "blocked_capacity"
         and not cfg.preserve_capacity_refusal_attempt

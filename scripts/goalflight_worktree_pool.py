@@ -1071,12 +1071,15 @@ def acquire_worktree_seat(
     controller_label: str | None = None,
     reset: bool = True,
     occupy_path: Path | None = None,
+    expected_prior_dispatch_id: str | None = None,
 ) -> WorktreeSeatLease:
     """Acquire one captive ``s-N`` seat. Never mint past the fuse or HWM.
 
     Isolation is not a mode. New acquires grow this controller's ring to the
     live nonterminal high-water mark and reuse those paths forever. Exhaustion
-    names occupants and refuses ``git worktree add``.
+    names occupants and refuses ``git worktree add``. Resume passes
+    ``expected_prior_dispatch_id`` so an intervening claimant cannot silently
+    turn the recorded path into a different worker's checkout.
     """
     project_root = project_root.resolve()
     _verify_project_root(project_root)
@@ -1169,6 +1172,15 @@ def acquire_worktree_seat(
                 prior_dispatch_id = str(
                     _lock_metadata(lock_file).get("dispatch_id") or "unknown-dispatch"
                 )
+                if (
+                    expected_prior_dispatch_id is not None
+                    and prior_dispatch_id != expected_prior_dispatch_id
+                ):
+                    raise WorktreeSeatUnavailable(
+                        f"resume refused: worktree seat {seat_name} was reclaimed by "
+                        f"{prior_dispatch_id}; expected recorded holder "
+                        f"{expected_prior_dispatch_id}; refusing to reset or recreate it"
+                    )
                 return _prepare_claimed_seat(
                     project_root=project_root,
                     worktree_path=worktree_path,

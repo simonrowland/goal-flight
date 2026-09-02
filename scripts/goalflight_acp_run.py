@@ -614,6 +614,7 @@ def _record_acp_ledger_state(
     lease_id: str | None,
     worker_pid: int | None,
     state: str,
+    worker_cwd: str | Path | None = None,
 ) -> dict | None:
     """Record one ACP lifecycle state through the shared journal authority.
 
@@ -648,6 +649,11 @@ def _record_acp_ledger_state(
                     ),
                     transport="acp",
                     project_root=str(project_root),
+                    worker_cwd=str(
+                        worker_cwd
+                        or getattr(cfg, "cwd", None)
+                        or project_root
+                    ),
                     controller_pid=controller_pid,
                     controller_session_id=controller_session_id,
                     controller_label=controller_label,
@@ -2344,7 +2350,9 @@ async def _run_acp_dispatch_impl(
     steer_file, steer_file_source = _resolve_steer_file(cfg, dispatch_id)
     original_prompt_file = _resolve_original_prompt_file(cfg)
     run_started = time.time()
-    project_root = Path(cfg.cwd).resolve()
+    project_root = Path(
+        getattr(cfg, "project_root", None) or cfg.cwd
+    ).resolve()
     cfg._controller_registration_script = "goalflight_acp_run.py"
     registration_error: str | None = None
     registration_warning: str | None = None
@@ -2655,6 +2663,7 @@ async def _run_acp_dispatch_impl(
         lease_id=None,
         worker_pid=None,
         state="waiting_capacity",
+        worker_cwd=worker_cwd,
     )
     wait_budget_s = goalflight_capacity.resolve_capacity_wait_s(
         lane=acquire_args.priority,
@@ -2848,6 +2857,7 @@ async def _run_acp_dispatch_impl(
             lease_id=lease_id,
             worker_pid=worker_pid,
             state=state,
+            worker_cwd=worker_cwd,
         )
 
     def attach_worker_to_lease(
