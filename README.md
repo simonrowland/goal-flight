@@ -15,10 +15,13 @@ commit is gated behind independent review. The run's state lives in durable proj
 restarts, and unattended overnight hours. A multi-hour run lands as reviewed,
 one-commit-per-chunk work on your branch; nothing is pushed without your permission.
 
-**Hosts and workers.** [Claude Code](https://claude.ai/code) is the supported
-orchestrator. [Codex](https://github.com/openai/codex) is the standard worker; cursor,
-grok, claude-cli, and other worker adapters also serve. Unsupported orchestrator ports
-for Codex, Cursor, OpenCode, and Grok Bot ship in-repo.
+**Hosts and workers.** [Claude Code](https://claude.ai/code) and Grok Bot are the
+featured orchestrators; Claude Code is the maintained path and Grok Bot ships a
+first-class controller wrapper with an exit-as-wake listen doorbell
+([docs/hosts/grok-bot.md](docs/hosts/grok-bot.md)).
+[Codex](https://github.com/openai/codex) is the standard worker; cursor, grok,
+claude-cli, and other worker adapters also serve. Further orchestrator ports for
+Codex, Cursor, and OpenCode ship in-repo and are unsupported.
 
 **What the orchestrator session is for**: requirements gathering, architecture decisions,
 question escalation, and monitoring — not execution. The orchestrator holds enough context
@@ -39,8 +42,8 @@ Install once:
 git clone https://github.com/simonrowland/goal-flight.git ~/.claude/skills/goal-flight
 ```
 
-(Orchestrator ports for Codex / Cursor / OpenCode / Grok Bot exist but are unsupported — install
-commands are under [Host install notes](#host-install-notes).)
+(Grok Bot installs as an orchestrator too; Codex / Cursor / OpenCode ports exist but are
+unsupported — install commands are under [Host install notes](#host-install-notes).)
 
 Primary platform is macOS. Linux hosts work too ([docs/hosts/linux.md](docs/hosts/linux.md));
 the macOS-only OS-sandbox backstop is absent there, so workers rely on their own sandbox
@@ -296,19 +299,21 @@ Also recommended:
 
 ## Host install notes
 
-Orchestrator ports for Codex, Cursor, OpenCode, and Grok Bot are implemented and unsupported; the
-Claude Code wrapper is the maintained path. To install a port anyway:
+Claude Code and Grok Bot are the featured orchestrators; the Claude Code wrapper is the
+maintained path and Grok Bot is installed the same way (see below). Further ports for
+Codex, Cursor, and OpenCode are implemented and unsupported. To install any of them:
 
 ```bash
 git clone https://github.com/simonrowland/goal-flight.git ~/.goal-flight && cd ~/.goal-flight
-./install.sh cursor /path/to/your/project
-./install.sh opencode /path/to/your/project
-./install.sh codex
 ./install.sh grok-bot
 # default workflows root is /home/box/agent-data/workflows (Grok Bot box).
 # From a Mac checkout pass GOALFLIGHT_GROK_BOT_WORKFLOWS or:
 # ./install.sh grok-bot /path/to/workflows
 # This repo does not invent a second Mac default library root.
+
+./install.sh cursor /path/to/your/project
+./install.sh opencode /path/to/your/project
+./install.sh codex
 ```
 
 After source `SKILL.md`, `commands/`, `protocols/`, `templates/`, or `adapters/`
@@ -323,9 +328,9 @@ the resync command in the probe's `resync_command` field; text mode prints
 Same flags via `setup.sh`: `--cursor-install`, `--opencode-install`,
 `--codex-install`, and `--grok-bot-install` (each implies `--apply --yes`).
 Dry-run, link-to-Claude, and agents-standard paths are in
-[docs/hosts/cursor.md](docs/hosts/cursor.md),
-[docs/hosts/opencode.md](docs/hosts/opencode.md), and
-[docs/hosts/grok-bot.md](docs/hosts/grok-bot.md).
+[docs/hosts/grok-bot.md](docs/hosts/grok-bot.md),
+[docs/hosts/cursor.md](docs/hosts/cursor.md), and
+[docs/hosts/opencode.md](docs/hosts/opencode.md).
 
 After any install, run doctor:
 `python3 scripts/goalflight_doctor.py --project-root /path/to/your/project`.
