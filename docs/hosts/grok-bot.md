@@ -64,6 +64,12 @@ acting) → repository `SKILL.md` → `protocols/guidance-extended.md` by
 default (non-frontier) → newest `docs-private/RESUME-NOTES-*.md` when
 resuming.
 
+`/goal-flight` on this host is that installed wrapper. Verbs: `usage`,
+`connected`, `status`, `doctor`, `resume` (controller resume, not
+`goalflight_dispatch.py resume`). Bare `/goal-flight` lists them, then
+runs `status`. The local-exec contract and verb CLIs live in the
+wrapper; this note does not invent a second skill name.
+
 - Facts come from `goalflight_status.py`, `goalflight_task.py list/next`, and
   doctor. Conversation is not the backlog.
 - Controller label is `goalflight-grokbot`. Stamp it on every dispatch.

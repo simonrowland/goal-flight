@@ -1,12 +1,15 @@
 ---
 name: goal-flight
-description: "Use when the user invokes /goal-flight or asks for Goal Flight to plan, dispatch, review, recover, or resume a long-running orchestrated repository run from file-backed state."
+version: 1.6.0
+description: "Use when the user invokes /goal-flight or asks for long-running grok-bot Goal Flight orchestration: plan, dispatch, review, recover, or resume from file-backed state."
+disable-model-invocation: true
 ---
 
 # goal-flight
 
-Use this skill when a repository task needs durable planning, resumable work,
-worker dispatch, review flights, or handoff notes that survive context loss.
+Use this skill when the user invokes `/goal-flight` or asks for long-running
+grok-bot Goal Flight orchestration: durable planning, resumable work, worker
+dispatch, review flights, or handoff notes that survive context loss.
 
 Grok Bot is a host projection over the portable Goal Flight core. It is not a
 rewrite of that core and it does not replace the Grok CLI adapter
@@ -31,11 +34,89 @@ rule cannot live only in compacted chat or a summarized SKILL.md.
 
 ## Skill pin
 
-Live controllers load the detached pin at `~/.goal-flight/skill/` (or
-`$GOALFLIGHT_ROOT`), not a live source checkout and not a clone on the Grok Bot
-box. Run scripts from that pin (`$GOALFLIGHT_ROOT/scripts` or
-`~/.goal-flight/skill/scripts`). Doctor warns when an installed wrapper copy
-has drifted from that pin; resync with `./install.sh grok-bot`.
+Live controllers load the detached pin at `$GOALFLIGHT_ROOT` or
+`~/.goal-flight/skill/`, not a live source checkout and not a clone on the
+Grok Bot box. Run scripts from that pin (`$GOALFLIGHT_ROOT/scripts` or
+`~/.goal-flight/skill/scripts`). The project tree is
+`$GOALFLIGHT_PROJECT_ROOT`, a named checkout, or the live controller
+project — pass `--project-root` when the cwd is not that tree. Doctor
+warns when an installed wrapper copy has drifted from this file; resync
+with `./install.sh grok-bot`.
+
+## Slash commands
+
+This file is the `/goal-flight` skill. Do not invent a second skill name.
+Bare `/goal-flight` lists the verbs below, then runs `status`.
+
+| Verb | Does |
+|---|---|
+| `usage` | Provider headroom: `goalflight_usage.py` |
+| `connected` | Fleet roster: `goalflight_controllers.py`; fallback `goalflight_session_status.py --list-controllers` |
+| `status` | `goalflight_status.py` plus `goalflight_session_status.py --text` |
+| `doctor` | `goalflight_doctor.py --project-root <project>` |
+| `resume` | Controller resume (`commands/resume.md`). Never `goalflight_dispatch.py resume`. |
+
+Run every CLI on the user's registered computer (local-exec / `machineId`).
+Never clone the repository onto the Grok Bot computer.
+
+Do not steal a live lease. Do not drain another controller's mail. Do not
+run bare `goalflight_task.py next` on a lane you do not own.
+
+### `usage`
+
+```shell
+python3 <skill-root>/scripts/goalflight_usage.py
+```
+
+### `connected`
+
+```shell
+python3 <skill-root>/scripts/goalflight_controllers.py
+```
+
+If that script is absent from the pin, fall back to:
+
+```shell
+python3 <skill-root>/scripts/goalflight_session_status.py --list-controllers
+```
+
+### `status`
+
+```shell
+python3 <skill-root>/scripts/goalflight_status.py --project-root <project>
+python3 <skill-root>/scripts/goalflight_session_status.py --project-root <project> --text
+```
+
+### `doctor`
+
+```shell
+python3 <skill-root>/scripts/goalflight_doctor.py --project-root <project>
+```
+
+Set `GOALFLIGHT_GROK_BOT_WORKFLOWS` when running doctor off-box so
+`installed_skill_drift` can hash the installed wrapper against this file.
+
+### `resume` (controller, not dispatch)
+
+Restart this Goal Flight controller session inside Grok Bot. Follow
+`commands/resume.md` with the grok-bot wake substitution. This verb is
+**not** `goalflight_dispatch.py resume`.
+
+1. **STEP 0.** Disk-read repository `SKILL.md` Hard Invariants and quote
+   them. If you cannot, you are stale: reload this wrapper plus the bible
+   before acting.
+2. Auto-claim / renew this controller's lease. If the label is held,
+   prove the holder is dead (`kill -0`) or a sibling of this launch
+   before `--takeover`. Ask the owner only when the holder is alive and
+   rooted in a different session. Never steal a live foreign lease.
+3. **Skip** `commands/resume.md` STEP 1.5 (`supervise`). Arm the wake on
+   the user's Mac: prefer `goalflight_grok_bot_listen.py` when that
+   helper is on the skill pin; else
+   `goalflight_messages.py listen --report-pending --timeout-s 900
+   --listener-slots 4`.
+4. Store baseline (`goalflight_status.py` + `goalflight_task.py list`),
+   read newest RESUME-NOTES, then `goalflight_task.py next` only for a
+   lane this controller owns.
 
 ## Operating Rules
 

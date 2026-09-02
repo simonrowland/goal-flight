@@ -77,7 +77,11 @@ incremented when meaningful skill behaviour changes.
   `configs/grok-bot/skills/goal-flight/SKILL.md`, adapter
   `adapters/grok-bot.json` (distinct from Grok CLI `adapters/grok.json`),
   and `./install.sh grok-bot` copying the wrapper into the Grok Bot
-  workflows library. Grok Bot Executors are a first-class host delegate
+  workflows library. That wrapper is the `/goal-flight` install pin:
+  verbs `usage`, `connected`, `status`, `doctor`, and controller
+  `resume` (not `goalflight_dispatch.py resume`). Bare `/goal-flight`
+  lists them, then runs `status`. CLIs run local-exec on the user's
+  registered computer. Grok Bot Executors are a first-class host delegate
   lane on this port (not Claude's last-resort Host Agent rule); kimi3
   reviews go through `--agent moonshot`. Wake is exit-as-wake: a tracked
   `goalflight_grok_bot_listen.py --report-pending --timeout-s 900` on the
