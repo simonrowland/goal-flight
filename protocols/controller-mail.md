@@ -384,6 +384,16 @@ Use this path on codex, grok, cursor, opencode, and any other host with no persi
 stdout monitor. Do not launch `follow` there: a stream whose lines are not watched
 provides no wakes.
 
+Hosts whose `listen` tasks die when a local-exec session drops (Grok Bot via a
+registered Mac) keep two independent doorbells: portable exit-as-wake `listen`
+and an optional outbound HTTP webhook. Either may fire; both may fire.
+Duplicate wakes are OK (peek the journal; stay quiet if nothing is pending).
+The webhook is an alternative doorbell, not a second inbox — mail bodies never
+leave the laptop journal. The operator is not the mailman. Deafness is both
+`listen` unarmed *and* the webhook failing or unconfigured. See
+`docs/hosts/grok-bot.md`. Claude keeps `supervise` on Monitor; do not treat the
+webhook as a Monitor replacement.
+
 Arm a pool of four tracked background tasks for the active lease. Four is the default
 slot count — depth is resilience, not efficiency, and survives three missed re-arms.
 Repeat this same command four times through the host's tracked-background-task

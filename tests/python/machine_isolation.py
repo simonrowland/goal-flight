@@ -26,6 +26,7 @@ messages dir              ``GOALFLIGHT_MESSAGES_DIR``                           
 task store                ``GOALFLIGHT_TASK_STORE_DIR``                         yes
 fleet dir                 ``GOALFLIGHT_FLEET_DIR``                              yes
 capacity conf             live ``~/.goal-flight/capacity.local.json``           ``/dev/null``
+wake webhook conf         live ``~/.goal-flight/wake-webhook.json`` / URL env   ``/dev/null`` + scrub
 XDG state home            ``XDG_STATE_HOME`` else ``~/.local/state``            yes
 ambient identity          ``GOALFLIGHT_DISPATCH_ID`` / prompt / steer / lease   scrubbed
 
@@ -60,7 +61,12 @@ from pathlib import Path
 from typing import TypeVar
 
 import pytest
-from support import AMBIENT_IDENTITY_ENV, MACHINE_PATH_ENV, isolated_machine_env
+from support import (
+    AMBIENT_IDENTITY_ENV,
+    AMBIENT_WEBHOOK_ENV,
+    MACHINE_PATH_ENV,
+    isolated_machine_env,
+)
 
 
 T = TypeVar("T")
@@ -74,7 +80,7 @@ def apply_isolated_machine_env(
     keep: tuple[str, ...] = (),
 ) -> dict[str, str]:
     """Pin machine paths and scrub ambient controller/worker identity."""
-    for key in AMBIENT_IDENTITY_ENV:
+    for key in AMBIENT_IDENTITY_ENV + AMBIENT_WEBHOOK_ENV:
         if key in keep:
             continue
         monkeypatch.delenv(key, raising=False)

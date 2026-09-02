@@ -17,6 +17,19 @@ incremented when meaningful skill behaviour changes.
 
 ### Added
 
+- Durable at-least-once wake webhook on listen-visible harvest
+  (`Journal.mark_delivery_projected`, the same projection `listen` waits
+  on). A configured URL enqueues a journal `wake_webhook_outbox` row in
+  the same transaction as projection; after commit a sender POSTs until
+  HTTP 2xx or the controller has advanced past / withdrawn the event.
+  Bounded backoff. Later harvests on that same projection path retry
+  due rows (no parallel daemon; listen is not blocked on HTTP). POST
+  failure never rolls back the journal. Unset URL means zero HTTP and
+  no enqueue; doctor warns when a Grok Bot host is in use without a
+  URL, or when a configured URL has undelivered outbox rows. Payload
+  stays the tiny nudge (`kind`, `controller_label`, `project_root`,
+  `dispatch_id`, `event_type`). Complements exit-as-wake `listen`; see
+  `docs/hosts/grok-bot.md`.
 - **Watchlist two-tier wedge detector (`goalflight_wedge_watch.py`).** Cheap
   path is one `stat` of the tail (mtime + size). After the tail has been
   idle longer than a data-derived probation (1080s, above p99=965.7s of

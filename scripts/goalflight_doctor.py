@@ -859,6 +859,107 @@ def check_wake_coverage(project_root: Path) -> dict:
     }
 
 
+def _grok_bot_workflows_root() -> Path:
+    raw = os.environ.get("GOALFLIGHT_GROK_BOT_WORKFLOWS", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path("/home/box/agent-data/workflows")
+
+
+def grok_bot_host_in_use() -> bool:
+    """True when this machine looks like a Grok Bot controller host."""
+    if os.environ.get("GOALFLIGHT_CONTROLLER_HOST", "").strip().lower() == "grok-bot":
+        return True
+    skill = _grok_bot_workflows_root() / "goal-flight/SKILL.md"
+    try:
+        return skill.is_file()
+    except OSError:
+        return False
+
+
+def check_wake_webhook(project_root: Path | None = None) -> dict:
+    """Warn when a Grok Bot host has no independent webhook doorbell URL.
+
+    Unset URL is correct for Claude ``supervise`` / Monitor hosts. Grok Bot
+    keeps portable ``listen`` *and* this webhook; missing URL means only
+    one doorbell is armed. A configured URL with undelivered outbox rows
+    is also a warning: the last POST failed and is waiting for the next
+    harvest retry.
+    """
+    try:
+        import goalflight_wake_webhook
+    except Exception as exc:  # noqa: BLE001 — doctor must not abort
+        return {
+            "ok": False,
+            "configured": False,
+            "grok_bot_host": grok_bot_host_in_use(),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    try:
+        config = goalflight_wake_webhook.load_config()
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "configured": False,
+            "grok_bot_host": grok_bot_host_in_use(),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    configured = config is not None
+    grok_bot = grok_bot_host_in_use()
+    pending = 0
+    if configured and project_root is not None:
+        try:
+            authority = goalflight_journal.Journal.open_reader(project_root)
+            rows = authority.read_all(
+                """
+                SELECT COUNT(*) AS n FROM wake_webhook_outbox
+                WHERE delivered_at IS NULL AND abandoned_at IS NULL
+                """
+            )
+            pending = int(rows[0]["n"]) if rows else 0
+        except Exception:
+            pending = 0
+    if configured:
+        if pending:
+            return {
+                "ok": False,
+                "configured": True,
+                "pending": pending,
+                "grok_bot_host": grok_bot,
+                "hint": (
+                    f"{pending} undelivered wake-webhook row(s); last POST "
+                    "failed and retries on the next listen-visible harvest. "
+                    "Deafness is listen unarmed and webhook failing."
+                ),
+            }
+        return {
+            "ok": True,
+            "configured": True,
+            "pending": 0,
+            "grok_bot_host": grok_bot,
+            "hint": None,
+        }
+    if grok_bot:
+        return {
+            "ok": False,
+            "configured": False,
+            "grok_bot_host": True,
+            "hint": (
+                "Grok Bot host has no GOALFLIGHT_WAKE_WEBHOOK_URL "
+                "(or ~/.goal-flight/wake-webhook.json). Portable listen is "
+                "one doorbell; the webhook is the independent alternative. "
+                "Deafness is both listen unarmed and webhook failing. "
+                "See docs/hosts/grok-bot.md."
+            ),
+        }
+    return {
+        "ok": True,
+        "configured": False,
+        "grok_bot_host": False,
+        "hint": None,
+    }
+
+
 def check_resume_notes_pattern(project_root: Path) -> dict:
     """Probe `docs-private/RESUME-NOTES-*.md` for the canonical filename
     pattern: RESUME-NOTES-<YYYY-MM-DD>[-rev<N>].md. Surfaces topic-prefixed
@@ -3285,6 +3386,7 @@ def doctor(
         "session_status": check_session_status(skill_root, repo),
         "controller_lease_liveness": check_controller_lease_liveness(repo),
         "wake_coverage": check_wake_coverage(repo),
+        "wake_webhook": check_wake_webhook(repo),
         "resume_notes_pattern": check_resume_notes_pattern(repo),
         "cursor": {
             "desktop_present": cursor_desktop,
@@ -3696,6 +3798,23 @@ def collect_human_lines(payload: dict) -> list[str]:
                     detail,
                 )
             )
+    wake_webhook = payload.get("wake_webhook")
+    if isinstance(wake_webhook, dict):
+        if wake_webhook.get("error"):
+            detail = str(wake_webhook["error"])
+        elif wake_webhook.get("configured"):
+            detail = "URL configured; alternative doorbell only, journal stays inbox"
+        elif wake_webhook.get("hint"):
+            detail = str(wake_webhook["hint"])
+        else:
+            detail = "unset (zero HTTP; enqueue only when a URL is configured)"
+        lines.append(
+            status_line(
+                wake_webhook.get("ok"),
+                "wake webhook doorbell",
+                detail,
+            )
+        )
     for row in (payload.get("grok") or {}).get("permission_modes") or []:
         config = row.get("config") or "config.toml"
         if row.get("status") == "present":

@@ -103,6 +103,12 @@ CURRENT_SCHEMA_COLUMNS = {
         "stream_seq", "carrier_path", "event_type", "wake_class", "created_at",
         "projected_at", "withdrawn_at",
     ),
+    "wake_webhook_outbox": (
+        "project_root", "recipient_label", "origin_node", "event_uuid",
+        "stream_id", "stream_seq", "event_type", "created_at", "enqueued_at",
+        "delivered_at", "abandoned_at", "abandon_reason",
+        "delivery_attempts", "last_error", "retry_at",
+    ),
     "attention_items": (
         "item_id", "project_root", "item_type", "state", "source_label",
         "source_generation", "trigger_side", "reason", "payload_json", "wake_class",
@@ -125,6 +131,9 @@ MAX_PARAMETER_VALUE_BYTES = 65_536
 MAX_TRANSACTION_PARAMETER_BYTES = 1_048_576
 OUTBOX_MAX_PROJECTION_ATTEMPTS = 3
 OUTBOX_RETRY_BASE_S = 1.0
+WAKE_WEBHOOK_OUTBOX_RETRY_BASE_S = 1.0
+WAKE_WEBHOOK_OUTBOX_RETRY_CAP_S = 60.0
+WAKE_WEBHOOK_OUTBOX_FLUSH_LIMIT = 8
 # The live incident cleared within roughly one minute while the journal stayed
 # healthy. Seventy-five seconds covers that measured minute plus 15 seconds of
 # scheduler/load margin. A smaller bound repeats the observed false teardown;
@@ -981,6 +990,46 @@ def _open_readonly_connection(
         ) from fallback_exc
 
 
+def _wake_webhook_enqueue_configured() -> bool:
+    """True when a webhook URL is configured. Never raises. No HTTP."""
+    try:
+        import goalflight_wake_webhook
+    except ImportError:
+        return False
+    try:
+        return goalflight_wake_webhook.load_config() is not None
+    except Exception:
+        return False
+
+
+def _wake_webhook_should_enqueue_row(row: Mapping[str, object]) -> bool:
+    """Listen-visible waking delivery that is not a Monitor-local ping."""
+    try:
+        import goalflight_wake_webhook
+    except ImportError:
+        return False
+    try:
+        return goalflight_wake_webhook.should_enqueue_delivery(row)
+    except Exception:
+        return False
+
+
+def _flush_wake_webhook_after_projection(authority: "Journal") -> None:
+    """Deliver due wake-outbox rows after projection commits.
+
+    Invoked only after ``_domain_write`` commits. Import and POST failures
+    stay here so projection callers never see them.
+    """
+    try:
+        import goalflight_wake_webhook
+    except ImportError:
+        return
+    try:
+        goalflight_wake_webhook.flush_due(authority)
+    except Exception:
+        return
+
+
 class Journal:
     """Short-lived SQLite transactions with explicit retry/fence outcomes.
 
@@ -1525,7 +1574,18 @@ class Journal:
             # shape validation: schema deltas are expected across epochs and
             # must not be misreported to an old client as journal corruption.
             self._assert_epoch_fence(connection, for_write=False)
+            created_wake_outbox = False
+            if not self._read_only_client:
+                created_wake_outbox = self._install_wake_webhook_outbox(connection)
             missing_before, malformed_before = self._current_schema_issues(connection)
+            if self._read_only_client:
+                # Readers must not require a writer-only additive table that
+                # this process cannot install. The first writer open creates it.
+                missing_before = [
+                    name
+                    for name in missing_before
+                    if name != "wake_webhook_outbox"
+                ]
             outbox_columns = tuple(
                 str(column[1])
                 for column in connection.execute("PRAGMA table_info(terminal_outbox)")
@@ -1562,7 +1622,10 @@ class Journal:
                     + ", ".join(malformed)
                 )
             repaired = (
-                retry_columns_migrated or seat_columns_migrated or bool(missing)
+                retry_columns_migrated
+                or seat_columns_migrated
+                or bool(missing)
+                or created_wake_outbox
             )
             if repaired:
                 # In-progress P3 builds could stamp epoch 3 before every final
@@ -1736,6 +1799,56 @@ class Journal:
             )
             migrated = True
         return migrated
+
+    @staticmethod
+    def _install_wake_webhook_outbox(connection: sqlite3.Connection) -> bool:
+        """Additive doorbell outbox. Safe on ordinary epoch-6 opens.
+
+        Existing journals must gain this empty table without
+        ``GOALFLIGHT_ALLOW_JOURNAL_MIGRATION``. A missing wake row is a
+        lost doorbell; requiring an explicit migrate would drop wakes
+        until an operator noticed.
+        """
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "wake_webhook_outbox" in tables:
+            return False
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS wake_webhook_outbox (
+                project_root TEXT NOT NULL,
+                recipient_label TEXT NOT NULL,
+                origin_node TEXT NOT NULL,
+                event_uuid TEXT NOT NULL,
+                stream_id TEXT NOT NULL,
+                stream_seq INTEGER NOT NULL
+                    CHECK (typeof(stream_seq) = 'integer' AND stream_seq >= 1),
+                event_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                enqueued_at TEXT NOT NULL,
+                delivered_at TEXT,
+                abandoned_at TEXT,
+                abandon_reason TEXT,
+                delivery_attempts INTEGER NOT NULL DEFAULT 0
+                    CHECK (typeof(delivery_attempts) = 'integer' AND delivery_attempts >= 0),
+                last_error TEXT,
+                retry_at TEXT,
+                PRIMARY KEY (project_root, recipient_label, origin_node, event_uuid),
+                CHECK (
+                    (delivered_at IS NULL OR abandoned_at IS NULL)
+                )
+            )"""
+        )
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS wake_webhook_outbox_due_idx
+               ON wake_webhook_outbox (
+                   delivered_at, abandoned_at, retry_at, enqueued_at
+               )"""
+        )
+        return True
 
     @staticmethod
     def _install_outbox_retry_columns(connection: sqlite3.Connection) -> bool:
@@ -1977,6 +2090,33 @@ class Journal:
                 ON delivery_events (
                     project_root, recipient_label, wake_class,
                     created_at, event_uuid, stream_id, stream_seq
+                )""",
+            """CREATE TABLE IF NOT EXISTS wake_webhook_outbox (
+                project_root TEXT NOT NULL,
+                recipient_label TEXT NOT NULL,
+                origin_node TEXT NOT NULL,
+                event_uuid TEXT NOT NULL,
+                stream_id TEXT NOT NULL,
+                stream_seq INTEGER NOT NULL
+                    CHECK (typeof(stream_seq) = 'integer' AND stream_seq >= 1),
+                event_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                enqueued_at TEXT NOT NULL,
+                delivered_at TEXT,
+                abandoned_at TEXT,
+                abandon_reason TEXT,
+                delivery_attempts INTEGER NOT NULL DEFAULT 0
+                    CHECK (typeof(delivery_attempts) = 'integer' AND delivery_attempts >= 0),
+                last_error TEXT,
+                retry_at TEXT,
+                PRIMARY KEY (project_root, recipient_label, origin_node, event_uuid),
+                CHECK (
+                    (delivered_at IS NULL OR abandoned_at IS NULL)
+                )
+            )""",
+            """CREATE INDEX IF NOT EXISTS wake_webhook_outbox_due_idx
+                ON wake_webhook_outbox (
+                    delivered_at, abandoned_at, retry_at, enqueued_at
                 )""",
             """CREATE TABLE IF NOT EXISTS attention_items (
                 item_id TEXT PRIMARY KEY,
@@ -3517,6 +3657,10 @@ class Journal:
         origin = self._identity_token(origin_node, label="origin node")
         event_id = self._canonical_uuid(event_uuid, label="event_uuid")
         project_root = str(self.project_root)
+        # Enqueue decision is env/file only and must happen before BEGIN.
+        # HTTP stays after commit so a failed POST cannot roll back the
+        # listen-visible harvest (the same projection ``listen`` waits on).
+        enqueue_configured = _wake_webhook_enqueue_configured()
 
         def action(connection: sqlite3.Connection) -> dict[str, object]:
             effective_recipient = recipient
@@ -3554,7 +3698,8 @@ class Journal:
                 """,
                 (projected_at, project_root, effective_recipient, origin, event_id),
             )
-            if updated.rowcount == 1:
+            newly_projected = updated.rowcount == 1
+            if newly_projected:
                 # Visibility is a second inbox-view mutation after the durable
                 # assignment insert.  Invalidating both closes the prepare /
                 # projection window for commands emitted concurrently.
@@ -3585,7 +3730,266 @@ class Journal:
             # projected the event. Post reporting must not re-query after the
             # commit and accidentally describe a later delivery or drain.
             result["recipient_cursors"] = [dict(cursor) for cursor in cursor_rows]
+            result["newly_projected"] = newly_projected
+            if (
+                newly_projected
+                and enqueue_configured
+                and _wake_webhook_should_enqueue_row(result)
+            ):
+                self._enqueue_wake_webhook_outbox(connection, result)
             return result
+
+        committed = self._domain_write(action)
+        if committed.committed:
+            _flush_wake_webhook_after_projection(self)
+        return committed
+
+    @staticmethod
+    def _enqueue_wake_webhook_outbox(
+        connection: sqlite3.Connection,
+        row: Mapping[str, object],
+    ) -> None:
+        """Record a would-wake row in the same TX as listen-visible projection."""
+        now = utc_now()
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO wake_webhook_outbox (
+                project_root, recipient_label, origin_node, event_uuid,
+                stream_id, stream_seq, event_type, created_at, enqueued_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(row["project_root"]),
+                str(row["recipient_label"]),
+                str(row["origin_node"]),
+                str(row["event_uuid"]),
+                str(row.get("stream_id") or ""),
+                int(row.get("stream_seq") or 1),
+                str(row.get("event_type") or ""),
+                str(row.get("created_at") or now),
+                now,
+            ),
+        )
+
+    def due_wake_webhook_outbox(self, *, limit: int = 8) -> list[dict[str, object]]:
+        """Pending doorbell rows whose backoff has elapsed."""
+        if not 1 <= limit <= 1000:
+            raise ValueError("wake webhook outbox limit must be between 1 and 1000")
+        rows = self.read_all(
+            """
+            SELECT *
+            FROM wake_webhook_outbox
+            WHERE delivered_at IS NULL AND abandoned_at IS NULL
+              AND (retry_at IS NULL OR retry_at <= ?)
+            ORDER BY COALESCE(retry_at, enqueued_at), enqueued_at, event_uuid
+            LIMIT ?
+            """,
+            (utc_now(), limit),
+        )
+        return [dict(row) for row in rows]
+
+    def wake_webhook_is_listen_visible(self, row: Mapping[str, object]) -> bool:
+        """True while the event is still a listen-visible waking delivery."""
+        origin = self._identity_token(str(row.get("origin_node") or ""), label="origin node")
+        event_id = self._canonical_uuid(str(row.get("event_uuid") or ""), label="event_uuid")
+        recipient = str(row.get("recipient_label") or "")
+        recipient = (
+            "*"
+            if recipient == "*"
+            else self._identity_token(recipient, label="recipient label")
+        )
+        project_root = str(self.project_root)
+
+        def visible_for(label: str) -> bool:
+            found = self.read_all(
+                """
+                SELECT 1
+                FROM delivery_events AS e
+                LEFT JOIN controller_stream_cursors AS c
+                  ON c.project_root = e.project_root
+                 AND c.label = ?
+                 AND c.stream_id = e.stream_id
+                WHERE e.project_root = ?
+                  AND e.origin_node = ? AND e.event_uuid = ?
+                  AND e.recipient_label IN (?, '*')
+                  AND e.projected_at IS NOT NULL
+                  AND e.withdrawn_at IS NULL
+                  AND e.wake_class = 'waking'
+                  AND e.stream_seq > COALESCE(c.position, 0)
+                LIMIT 1
+                """,
+                (label, project_root, origin, event_id, recipient if recipient != "*" else label),
+            )
+            return bool(found)
+
+        if recipient != "*":
+            return visible_for(recipient)
+        labels = [
+            str(lease.get("label") or "")
+            for lease in self.lease_records()
+            if str(lease.get("label") or "")
+        ]
+        if labels:
+            return any(visible_for(label) for label in labels if label)
+        # Orphan wildcard stays listen-visible until withdrawn. An empty
+        # roster is not "already drained" — a later claim still sees the row.
+        orphan = self.read_all(
+            """
+            SELECT 1 FROM delivery_events
+            WHERE project_root = ? AND origin_node = ? AND event_uuid = ?
+              AND recipient_label = '*'
+              AND projected_at IS NOT NULL AND withdrawn_at IS NULL
+              AND wake_class = 'waking'
+            LIMIT 1
+            """,
+            (project_root, origin, event_id),
+        )
+        return bool(orphan)
+
+    def mark_wake_webhook_delivered(
+        self,
+        *,
+        recipient_label: str,
+        origin_node: str,
+        event_uuid: str,
+    ) -> WriteResult[dict[str, object] | None]:
+        recipient = (
+            "*"
+            if recipient_label == "*"
+            else self._identity_token(recipient_label, label="recipient label")
+        )
+        origin = self._identity_token(origin_node, label="origin node")
+        event_id = self._canonical_uuid(event_uuid, label="event_uuid")
+        project_root = str(self.project_root)
+        now = utc_now()
+
+        def action(connection: sqlite3.Connection) -> dict[str, object] | None:
+            updated = connection.execute(
+                """
+                UPDATE wake_webhook_outbox
+                SET delivered_at = ?, last_error = NULL, retry_at = NULL
+                WHERE project_root = ? AND recipient_label = ?
+                  AND origin_node = ? AND event_uuid = ?
+                  AND delivered_at IS NULL AND abandoned_at IS NULL
+                """,
+                (now, project_root, recipient, origin, event_id),
+            )
+            if updated.rowcount != 1:
+                return None
+            return {
+                "recipient_label": recipient,
+                "origin_node": origin,
+                "event_uuid": event_id,
+                "delivered_at": now,
+            }
+
+        return self._domain_write(action)
+
+    def mark_wake_webhook_retry(
+        self,
+        *,
+        recipient_label: str,
+        origin_node: str,
+        event_uuid: str,
+        error: str,
+    ) -> WriteResult[dict[str, object] | None]:
+        recipient = (
+            "*"
+            if recipient_label == "*"
+            else self._identity_token(recipient_label, label="recipient label")
+        )
+        origin = self._identity_token(origin_node, label="origin node")
+        event_id = self._canonical_uuid(event_uuid, label="event_uuid")
+        project_root = str(self.project_root)
+        error_text = str(error or "POST failed")[:2000]
+
+        def action(connection: sqlite3.Connection) -> dict[str, object] | None:
+            row = connection.execute(
+                """
+                SELECT delivery_attempts FROM wake_webhook_outbox
+                WHERE project_root = ? AND recipient_label = ?
+                  AND origin_node = ? AND event_uuid = ?
+                  AND delivered_at IS NULL AND abandoned_at IS NULL
+                """,
+                (project_root, recipient, origin, event_id),
+            ).fetchone()
+            if row is None:
+                return None
+            attempts = int(row["delivery_attempts"]) + 1
+            delay = min(
+                WAKE_WEBHOOK_OUTBOX_RETRY_CAP_S,
+                WAKE_WEBHOOK_OUTBOX_RETRY_BASE_S * (2 ** max(0, attempts - 1)),
+            )
+            retry_at = _utc_after(delay)
+            updated = connection.execute(
+                """
+                UPDATE wake_webhook_outbox
+                SET delivery_attempts = ?, last_error = ?, retry_at = ?
+                WHERE project_root = ? AND recipient_label = ?
+                  AND origin_node = ? AND event_uuid = ?
+                  AND delivered_at IS NULL AND abandoned_at IS NULL
+                """,
+                (
+                    attempts,
+                    error_text,
+                    retry_at,
+                    project_root,
+                    recipient,
+                    origin,
+                    event_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise CASMismatch("wake webhook retry lost to another sender")
+            return {
+                "recipient_label": recipient,
+                "origin_node": origin,
+                "event_uuid": event_id,
+                "delivery_attempts": attempts,
+                "retry_at": retry_at,
+            }
+
+        return self._domain_write(action)
+
+    def mark_wake_webhook_abandoned(
+        self,
+        *,
+        recipient_label: str,
+        origin_node: str,
+        event_uuid: str,
+        reason: str,
+    ) -> WriteResult[dict[str, object] | None]:
+        recipient = (
+            "*"
+            if recipient_label == "*"
+            else self._identity_token(recipient_label, label="recipient label")
+        )
+        origin = self._identity_token(origin_node, label="origin node")
+        event_id = self._canonical_uuid(event_uuid, label="event_uuid")
+        project_root = str(self.project_root)
+        now = utc_now()
+        abandon_reason = str(reason or "no-longer-visible")[:200]
+
+        def action(connection: sqlite3.Connection) -> dict[str, object] | None:
+            updated = connection.execute(
+                """
+                UPDATE wake_webhook_outbox
+                SET abandoned_at = ?, abandon_reason = ?, retry_at = NULL
+                WHERE project_root = ? AND recipient_label = ?
+                  AND origin_node = ? AND event_uuid = ?
+                  AND delivered_at IS NULL AND abandoned_at IS NULL
+                """,
+                (now, abandon_reason, project_root, recipient, origin, event_id),
+            )
+            if updated.rowcount != 1:
+                return None
+            return {
+                "recipient_label": recipient,
+                "origin_node": origin,
+                "event_uuid": event_id,
+                "abandoned_at": now,
+                "abandon_reason": abandon_reason,
+            }
 
         return self._domain_write(action)
 

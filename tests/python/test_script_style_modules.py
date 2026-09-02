@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from machine_isolation import AMBIENT_IDENTITY_ENV, isolated_machine_env
+from machine_isolation import AMBIENT_IDENTITY_ENV, AMBIENT_WEBHOOK_ENV, isolated_machine_env
 from support import acp_sdk_unavailable_reason, requires_acp_sdk
 
 TEST_DIR = Path(__file__).resolve().parent
@@ -21,7 +21,10 @@ OUTCOME_PASS = "pass"
 OUTCOME_SKIP = "skip"
 OUTCOME_FLAKE = "flake"
 OUTCOME_FAIL = "fail"
-AMBIENT_RUNTIME_ENV = AMBIENT_IDENTITY_ENV
+# CONFIG is pinned to /dev/null by isolated_machine_env, not scrubbed.
+AMBIENT_RUNTIME_ENV = AMBIENT_IDENTITY_ENV + tuple(
+    key for key in AMBIENT_WEBHOOK_ENV if key != "GOALFLIGHT_WAKE_WEBHOOK_CONFIG"
+)
 
 
 @dataclass(frozen=True)
@@ -298,6 +301,7 @@ def test_isolated_env_scrubs_ambient_runtime_identity(
         tmp_path / "pids"
     )
     assert env["XDG_STATE_HOME"] == str(tmp_path / "xdg")
+    assert env["GOALFLIGHT_WAKE_WEBHOOK_CONFIG"] == os.devnull
 
 
 def test_flake_report_is_visible_without_becoming_a_failure() -> None:

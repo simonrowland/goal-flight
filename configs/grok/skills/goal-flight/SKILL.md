@@ -41,3 +41,10 @@ From the cloned Goal Flight repository, run:
 Grok setup installs this personal skill when a Grok orchestrator surface is
 selected. Worker execution remains through `grok agent stdio` under the Goal
 Flight ACP runner.
+
+Grok Bot controllers that arm `listen` through Mac local-exec should also
+configure the outbound wake webhook (`docs/hosts/grok-bot.md`) so a dropped
+local-exec session does not leave doorbells dead while the journal still
+receives mail. `listen` and the webhook are independent alternative doorbells;
+the journal stays the inbox. Deafness is both listen unarmed and webhook
+failing. The webhook does not replace `listen` when local-exec is up.
