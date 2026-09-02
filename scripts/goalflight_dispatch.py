@@ -1739,9 +1739,6 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
         # Resume reattaches to the recorded worker_cwd. Acquiring a pooled
         # seat here would mint a sibling tree and reset partial work.
         return None
-    base = _requested_worktree_base(args)
-    if base is None:
-        return None
     if _inherited_seat_lock_present():
         # Fleet / parent already leased a seat and passed the fd. Re-acquire
         # would LOCK_EX-succeed in this process (flock is per-process) and
