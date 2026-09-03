@@ -834,7 +834,7 @@ RETIRED_AGENT_LABELS = {
 #     `<name> @ <sha>` pin without the word `branch`
 # Every other hex-shaped token in the text is prose.
 GIT_BASE_PIN_BASE_LINE_RE = re.compile(
-    r"^[ \t]*(?:[-#>*]+[ \t]*)*(?:\*\*)?base(?:\s+sha)?\s*:\s*(?:\*\*)?\s*"
+    r"^[-#>*\t ]*(?:\*\*)?base(?:\s+sha)?\s*:\s*(?:\*\*)?\s*"
     r"[`'\"]?([0-9A-Fa-f]{7,40})[`'\"]?(?![0-9A-Za-z])",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -843,7 +843,7 @@ GIT_BASE_PIN_BRANCH_AT_RE = re.compile(
     re.IGNORECASE,
 )
 GIT_BASE_PIN_NAME_AT_RE = re.compile(
-    r"^[ \t]*(?:[-#>*]+[ \t]*)*\S+\s+@\s+`?([0-9A-Fa-f]{7,40})`?(?![0-9A-Za-z])",
+    r"^[-#>*\t ]*\S+\s+@\s+`?([0-9A-Fa-f]{7,40})`?(?![0-9A-Za-z])",
     re.IGNORECASE | re.MULTILINE,
 )
 GIT_BASE_PIN_MARKER_RES = (
