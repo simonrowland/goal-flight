@@ -2625,10 +2625,12 @@ def coverage_status(
             else "unavailable"
         )
         monitor_lock_live = bool(monitor_waiters)
+        # Unreadable is contention, not health and not absence. Fail closed
+        # as unavailable so coverage cannot claim a torn follow file is live.
         monitor_healthy = (
             monitor_lock_live
             and durable_monitor is not None
-            and durable_state not in {"fault", "stale"}
+            and durable_state not in {"fault", "stale", "unreadable"}
         )
         backup_target = persistent_backup_slot_count()
         backup_observed = len(portable_waiters)
@@ -2643,7 +2645,7 @@ def coverage_status(
         watchdog_live = bool(watchdog_waiters)
         monitor_state = (
             "unavailable"
-            if durable_monitor is None
+            if durable_monitor is None or durable_state == "unreadable"
             else durable_state
             if durable_state in {"fault", "stale"}
             else "live"
