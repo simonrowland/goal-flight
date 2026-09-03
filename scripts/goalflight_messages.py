@@ -6052,6 +6052,58 @@ def _is_supervised_child() -> bool:
     return os.environ.get("GOALFLIGHT_SUPERVISED") == "1"
 
 
+_UNREADABLE_FOLLOW_REASONS = frozenset(
+    {
+        "journal-unavailable",
+        "journal-io-failure",
+        "journal-unreadable",
+        "monitor-state-io",
+        "vanished-witness",
+        "busy",
+    }
+)
+
+
+def _follow_reason_is_unreadable(reason: object) -> bool:
+    token = str(reason or "").strip().lower()
+    return token in _UNREADABLE_FOLLOW_REASONS
+
+
+def _follow_status_reason(status: dict[str, object]) -> str:
+    fault = status.get("fault")
+    if isinstance(fault, dict):
+        return str(fault.get("reason") or "fault")
+    return str(status.get("reason") or status.get("state") or "stale")
+
+
+def _follow_status_is_readable_dead(status: dict[str, object]) -> bool:
+    """True only when a readable follow/lease state says the listener is gone.
+
+    Unreadable, busy, or vanished-witness observations are contention, not
+    death. A genuine death needs a readable stale/fault state whose age has
+    reached ``dead_after_s``.
+    """
+    if status.get("state") == "unreadable":
+        return False
+    reason = _follow_status_reason(status)
+    if _follow_reason_is_unreadable(reason):
+        return False
+    state = status.get("state")
+    if state == "fault":
+        # Follow itself recorded a readable death; age is not required.
+        return True
+    if state != "stale":
+        return False
+    try:
+        age = float(status.get("age_s") or 0.0)
+        dead_after = float(status.get("dead_after_s") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(age) or not math.isfinite(dead_after) or dead_after <= 0:
+        return False
+    return age >= dead_after
+
+
 def _wake_recovery_action(
     project_root: Path,
     *,
@@ -6059,8 +6111,23 @@ def _wake_recovery_action(
     lease_nonce: str,
     component_command: str,
     parent_gone: bool = False,
+    reason: str | None = None,
 ) -> dict[str, str | None]:
-    """Apply the shared supervisor detector before exposing recovery action."""
+    """Apply the shared supervisor detector before exposing recovery action.
+
+    Retryable journal unreadability must never become ``arm-component``.
+    """
+    if _follow_reason_is_unreadable(reason):
+        return {
+            "kind": "hold",
+            "state": None,
+            "command": None,
+            "instruction": (
+                "journal unreadability is retryable, not a dead listener; "
+                "confirm inbound coverage with relay --new before arming "
+                "another doorbell"
+            ),
+        }
     supervisor = goalflight_wake.supervisor_generation_state(
         project_root,
         controller_label=controller_label,
@@ -6289,26 +6356,32 @@ def _follow_dead_record(
     lease_nonce: str,
     rearm_command: str,
 ) -> dict[str, object]:
-    fault = status.get("fault")
-    reason = (
-        str(fault.get("reason") or "fault")
-        if isinstance(fault, dict)
-        else str(status.get("state") or "stale")
-    )
+    reason = _follow_status_reason(status)
+    readable_dead = _follow_status_is_readable_dead(status)
+    try:
+        age_s = round(float(status.get("age_s") or 0.0), 1)
+    except (TypeError, ValueError):
+        age_s = 0.0
+    try:
+        dead_after_s = float(status.get("dead_after_s") or 0.0)
+    except (TypeError, ValueError):
+        dead_after_s = 0.0
     payload: dict[str, object] = {
         "type": "listener-dead",
         "reason": _truncate_utf8(reason, 72),
-        "age_s": round(float(status.get("age_s") or 0.0), 1),
-        "dead_after_s": float(status.get("dead_after_s") or 0.0),
-        "backup_required": True,
+        "age_s": age_s,
+        "dead_after_s": dead_after_s,
     }
+    if readable_dead:
+        payload["backup_required"] = True
     action = _wake_recovery_action(
         project_root,
         controller_label=controller_label,
         lease_nonce=lease_nonce,
         component_command=rearm_command,
+        reason=reason,
     )
-    if action["kind"] == "arm-component":
+    if readable_dead and action["kind"] == "arm-component":
         payload["rearm_command"] = rearm_command
     elif action["kind"] == "verify-supervisor":
         payload["wake_recovery_hint"] = str(action["instruction"])
@@ -7022,6 +7095,8 @@ def _cmd_watch_follow(
         project_root,
         controller_label=label,
     )
+    monitor_unreadable = False
+    monitor_unreadable_since = 0.0
     state_grace = (
         0.1
         if os.environ.get("GOALFLIGHT_TEST_MODE") == "1"
@@ -7156,6 +7231,38 @@ def _cmd_watch_follow(
                 project_root,
                 controller_label=label,
             )
+            if follow_status and follow_status.get("state") == "unreadable":
+                if not monitor_unreadable:
+                    monitor_unreadable = True
+                    monitor_unreadable_since = time.monotonic()
+                    reason = _follow_status_reason(follow_status)
+                    detail = ""
+                    fault = follow_status.get("fault")
+                    if isinstance(fault, dict):
+                        detail = str(fault.get("detail") or "")
+                    alive = _write_follow_record(
+                        _follow_degraded_record(
+                            reason,
+                            detail or "durable follow state could not be read",
+                            journal_tolerance.tolerance_s,
+                        ),
+                        stream=sys.stdout,
+                    )
+                    if not alive:
+                        _silence_broken_stdout(sys.stdout)
+                        return 2
+                time.sleep(poll)
+                continue
+            if monitor_unreadable:
+                degraded_s = time.monotonic() - monitor_unreadable_since
+                monitor_unreadable = False
+                alive = _write_follow_record(
+                    _follow_recovered_record("monitor-state-io", degraded_s),
+                    stream=sys.stdout,
+                )
+                if not alive:
+                    _silence_broken_stdout(sys.stdout)
+                    return 2
             preexisting_dead_state = (
                 elapsed < state_grace
                 and current_state_stamp == startup_state_stamp
@@ -7177,7 +7284,7 @@ def _cmd_watch_follow(
             if (
                 not preexisting_dead_state
                 and follow_status is not None
-                and follow_status.get("state") in {"fault", "stale"}
+                and _follow_status_is_readable_dead(follow_status)
             ):
                 payload = _follow_dead_record(
                     follow_status,
@@ -7229,18 +7336,18 @@ def cmd_listen(args) -> int:
 
     Self-resolves the journal ACTIVE lease when ``--lease-nonce`` is omitted.
 
-    Arming never refuses for pool depth: a waiter takes the first free
-    listener slot with no upper bound. ``--listener-slots`` /
-    ``$GOALFLIGHT_LISTENER_SLOTS`` is the target depth the supervisor
-    chooses to run (live/target), not a ceiling.
+    ``--listener-slots`` / ``$GOALFLIGHT_LISTENER_SLOTS`` is a live-depth
+    ceiling. A new waiter must not raise concurrent listeners above that
+    target. Replacing a released (dead) slot is fine. An extra arm that
+    would exceed the cap fails closed with exit 3; the stderr names the
+    cap and says this is contention protection, not a ring.
 
-    Exit 3 no longer means a full-pool refusal - that overload is gone with
-    the ceiling. It is NOT reducible to "mail pending", though: this command
-    also returns 3 when the watchdog slot is already held, when the child is
-    orphaned (parent changed, or controlling stdout closed), and when the
-    lease generation has gone stale. A caller that branches on 3 must read the
-    accompanying stderr reason rather than assuming contention; re-arming
-    blindly on 3 will loop on the orphaned and stale-lease cases.
+    Exit 3 is also returned when the watchdog slot is already held, when
+    the child is orphaned (parent changed, or controlling stdout closed),
+    and when the lease generation has gone stale. A caller that branches
+    on 3 must read the accompanying stderr reason rather than assuming
+    mail; re-arming blindly on 3 will loop on the orphaned and stale-lease
+    cases.
 
     Exit 5 is settled did-not-arm: a dead or mismatched lease nonce, or no
     live controller lease. It is not a ring (0), not a retryable journal
@@ -7400,6 +7507,10 @@ def cmd_listen(args) -> int:
             generation_key=nonce,
             slots=listener_slots,
         )
+    except BlockingIOError as exc:
+        detail = exc.strerror or str(exc)
+        print(f"listen: refused: {detail}", file=sys.stderr)
+        return 3
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"listen: wake ledger registration failed: {exc}", file=sys.stderr)
         return 2
@@ -8539,9 +8650,11 @@ def _run_cli(argv: list[str] | None = None) -> int:
             type=int,
             default=None,
             help=(
-                "target doorbell depth (how many to run; live/target), not a "
-                "ceiling; defaults to GOALFLIGHT_LISTENER_SLOTS or "
-                f"{goalflight_wake.DEFAULT_LISTENER_SLOTS}"
+                "live-depth ceiling: a new waiter must not raise concurrent "
+                "doorbells above this target; replacing a dead slot is fine; "
+                "extras that would exceed the cap fail closed as contention "
+                "protection, not a ring; defaults to GOALFLIGHT_LISTENER_SLOTS "
+                f"or {goalflight_wake.DEFAULT_LISTENER_SLOTS}"
             ),
         )
         command_parser.add_argument(
@@ -8578,7 +8691,9 @@ def _run_cli(argv: list[str] | None = None) -> int:
             action="store_true",
             help=(
                 "watchdog-only mode: wake with listener-dead when durable "
-                "follow records stop; does not deliver mail or consume a listener slot"
+                "follow records stop; unreadable records are retryable "
+                "degradation, not a stopped listener; does not deliver mail "
+                "or consume a listener slot"
             ),
         )
 
@@ -8591,10 +8706,10 @@ def _run_cli(argv: list[str] | None = None) -> int:
         description=(
             "one-shot journal cursor listener; self-resolves the ACTIVE lease "
             "unless --lease-nonce pins one. Exit 0 is a ring, 2 is a retryable "
-            "fault, 3 is contention/stale after arming, 5 is settled did-not-arm "
-            "(dead or mismatched lease nonce). Exit 3 is never a full-pool "
-            "refusal. --listener-slots is how many doorbells to run "
-            "(live/target), not a ceiling."
+            "fault, 3 is contention/stale after arming or a listener-slots cap "
+            "refusal, 5 is settled did-not-arm (dead or mismatched lease nonce). "
+            "--listener-slots is a live-depth ceiling: extras that would exceed "
+            "the cap fail closed as contention protection, not a ring."
         ),
     )
     add_listen_arguments(listen)
@@ -8603,9 +8718,8 @@ def _run_cli(argv: list[str] | None = None) -> int:
         help="alias for listen (kept for live fleet and SessionStart invocations)",
         description=(
             "alias for listen. Exit 0 is a ring, 2 is a retryable "
-            "fault, 3 is contention/stale after arming, 5 is settled did-not-arm "
-            "(dead or mismatched lease nonce). Exit 3 is never a full-pool "
-            "refusal."
+            "fault, 3 is contention/stale after arming or a listener-slots cap "
+            "refusal, 5 is settled did-not-arm (dead or mismatched lease nonce)."
         ),
     )
     add_listen_arguments(listen_auto)

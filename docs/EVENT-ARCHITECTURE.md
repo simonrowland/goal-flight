@@ -424,7 +424,11 @@ independently locked `listen --watch-follow` watchdog polls generation-bound sta
 and emits `event`/`listener-dead` when state is stale, faulted, missing, or invalid.
 The decomposed unsupervised path includes the exact re-arm command; under `supervise`
 the record keeps the reason but omits that action, and recovery is a supervisor restart.
-The watchdog never claims a delivery slot or
+Unreadable follow state is not death: do not arm another doorbell on
+`journal-unavailable` / `journal-io-failure` / busy / vanished-witness. Before
+acting on `listener-dead`, take positive control with `relay --new` (does a new
+event round-trip, is mail arriving). If inbound coverage is intact, it is
+contention. The watchdog never claims a delivery slot or
 reads the mail cursor. This makes persistent coverage a shared four-component
 `live/4` fact. It stays persistent after stream death, so the surviving backup pool and
 watchdog report `3/4`, not portable `1/4`.
@@ -472,9 +476,11 @@ also carries projection `age_s`; an hour-old projection becomes `stale` even whe
 `tasks.jsonl` has not changed.
 
 `--listener-slots`, `GOALFLIGHT_LISTENER_SLOTS`, and
-`GOALFLIGHT_LISTENER_LOW_WATER` remain portable-pool controls. Persistent backup
-depth is `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 2; target depth, not a
-ceiling). `follow` rejects
+`GOALFLIGHT_LISTENER_LOW_WATER` remain portable-pool controls.
+`--listener-slots` is a live-depth ceiling: a new waiter must not raise
+concurrent doorbells above the target. Persistent backup
+depth is `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 2; how many backup
+children `supervise` starts). `follow` rejects
 the CLI knob and warns on the portable environment knobs; persistent depth is
 the stream, the backup doorbell pool, and the watchdog.
 

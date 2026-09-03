@@ -2082,6 +2082,65 @@ def test_opt_in_live_counts_armed_components_not_pids() -> None:
     assert coverages[-1]["live"] == coverages[-1]["target"] == 3
 
 
+def test_supervisor_listener_dead_passthrough_does_not_mint_extra_backups() -> None:
+    """Supervise respawns empty slots only; backup_required is not a spawn cue."""
+    host = FakeHost(
+        scripts={
+            "stream": [
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (0.0, '{"kind":"heartbeat","payload":{"seq":1}}'),
+                    ],
+                )
+            ],
+            "backup": [
+                PlannedExit(lifetime_s=80.0, returncode=0, armed=True),
+                PlannedExit(lifetime_s=80.0, returncode=0, armed=True),
+            ],
+            "watchdog": [
+                PlannedExit(
+                    lifetime_s=5.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (
+                            0.0,
+                            json.dumps(
+                                {
+                                    "kind": "event",
+                                    "payload": {
+                                        "type": "listener-dead",
+                                        "backup_required": True,
+                                        "rearm_command": "MUST NOT MINT BACKUP",
+                                    },
+                                }
+                            ),
+                        ),
+                    ],
+                ),
+                PlannedExit(lifetime_s=80.0, returncode=0, armed=True),
+            ],
+        },
+        stop_when_lines_contain=('"type":"listener-dead"',),
+        stop_after_waits=40,
+    )
+    _run(
+        host,
+        _items("stream", "backup", "backup", "watchdog"),
+        heartbeat_s=50.0,
+        coverage_s=50.0,
+    )
+    backup_spawns = [kind for kind, _command in host.spawns if kind == "backup"]
+    assert backup_spawns == ["backup", "backup"]
+    assert all(kind in {"stream", "backup", "watchdog"} for kind, _command in host.spawns)
+    joined = "".join(host.lines)
+    assert '"type":"listener-dead"' in joined
+    assert "MUST NOT MINT BACKUP" in joined
+
+
 def test_journal_unreadable_is_retryable_not_dead_nonce() -> None:
     host = FakeHost(
         scripts={

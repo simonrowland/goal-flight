@@ -2511,11 +2511,10 @@ def test_second_real_doorbell_takes_next_slot_and_first_wakes_body_free(
 ) -> None:
     env = _set_state_env(monkeypatch, tmp_path)
     env["GOALFLIGHT_TEST_LISTENER_START_TOKEN"] = "constructed-listener-token"
-    # Target depth 1 is how many to run, not a ceiling: a second doorbell
-    # must take the next free slot. Release it before the ring so the first
-    # uniquely receives the mail.
-    env["GOALFLIGHT_LISTENER_SLOTS"] = "1"
-    monkeypatch.setenv("GOALFLIGHT_LISTENER_SLOTS", "1")
+    # Target depth 2 lets a second waiter occupy the spare slot. Release it
+    # before the ring so the first uniquely receives the mail.
+    env["GOALFLIGHT_LISTENER_SLOTS"] = "2"
+    monkeypatch.setenv("GOALFLIGHT_LISTENER_SLOTS", "2")
     project = _project(tmp_path)
     authority = journal.open_or_create_journal(project)
     lease = _claim(authority)
@@ -2554,7 +2553,7 @@ def test_second_real_doorbell_takes_next_slot_and_first_wakes_body_free(
             project,
             controller_label="controller",
             generation_key=lease.nonce,
-            slots=1,
+            slots=2,
         )
         try:
             assert extra.slot_index == 1
