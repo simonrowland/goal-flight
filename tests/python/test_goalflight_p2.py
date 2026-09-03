@@ -945,7 +945,9 @@ def test_d13_registry_is_exhaustive_and_cli_mcp_compatible(
         capture_output=True,
         check=False,
     )
-    assert cli.returncode == 0, cli.stderr
+    assert cli.returncode == 2, cli.stderr
+    assert "controller-notice" in cli.stderr
+    assert "--to-controller" in cli.stderr
     mcp = mcp_messages.handle_request(
         {
             "jsonrpc": "2.0",
@@ -963,7 +965,7 @@ def test_d13_registry_is_exhaustive_and_cli_mcp_compatible(
         messages_dir=messages.default_messages_dir(),
     )
     assert "result" in mcp and "error" not in mcp
-    assert messages.inbox_path(messages.default_messages_dir(), "cli-advisory").is_file()
+    assert not messages.inbox_path(messages.default_messages_dir(), "cli-advisory").is_file()
     assert messages.inbox_path(messages.default_messages_dir(), "mcp-advisory").is_file()
 
     legacy_cli = subprocess.run(
@@ -987,7 +989,9 @@ def test_d13_registry_is_exhaustive_and_cli_mcp_compatible(
         capture_output=True,
         check=False,
     )
-    assert legacy_cli.returncode == 0, legacy_cli.stderr
+    assert legacy_cli.returncode == 2, legacy_cli.stderr
+    assert "controller-notice" in legacy_cli.stderr
+    assert "--to-controller" in legacy_cli.stderr
     legacy_mcp = mcp_messages.handle_request(
         {
             "jsonrpc": "2.0",
