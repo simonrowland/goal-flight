@@ -2547,6 +2547,12 @@ def test_second_real_doorbell_takes_next_slot_and_first_wakes_body_free(
                 break
             time.sleep(0.01)
         else:
+            if first.poll() is not None:
+                out, err = first.communicate()
+                pytest.fail(
+                    f"first listener exited {first.returncode} before arming: "
+                    f"stdout={out!r} stderr={err!r}"
+                )
             pytest.fail("first listener never armed coverage")
 
         extra = wake.register_listener_waiter(

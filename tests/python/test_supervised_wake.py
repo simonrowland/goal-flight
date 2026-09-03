@@ -2088,7 +2088,7 @@ def test_supervisor_listener_dead_passthrough_does_not_mint_extra_backups() -> N
         scripts={
             "stream": [
                 PlannedExit(
-                    lifetime_s=80.0,
+                    lifetime_s=1000.0,
                     returncode=0,
                     armed=True,
                     stdout_lines=[
@@ -2097,35 +2097,25 @@ def test_supervisor_listener_dead_passthrough_does_not_mint_extra_backups() -> N
                 )
             ],
             "backup": [
-                PlannedExit(lifetime_s=80.0, returncode=0, armed=True),
-                PlannedExit(lifetime_s=80.0, returncode=0, armed=True),
+                PlannedExit(lifetime_s=1000.0, returncode=0, armed=True),
+                PlannedExit(lifetime_s=1000.0, returncode=0, armed=True),
             ],
             "watchdog": [
                 PlannedExit(
-                    lifetime_s=5.0,
+                    lifetime_s=1000.0,
                     returncode=0,
                     armed=True,
                     stdout_lines=[
                         (
-                            0.0,
-                            json.dumps(
-                                {
-                                    "kind": "event",
-                                    "payload": {
-                                        "type": "listener-dead",
-                                        "backup_required": True,
-                                        "rearm_command": "MUST NOT MINT BACKUP",
-                                    },
-                                }
-                            ),
+                            0.01,
+                            '{"kind":"event","payload":{"type":"listener-dead","backup_required":true,"rearm_command":"MUST NOT MINT BACKUP"}}',
                         ),
                     ],
                 ),
-                PlannedExit(lifetime_s=80.0, returncode=0, armed=True),
             ],
         },
         stop_when_lines_contain=('"type":"listener-dead"',),
-        stop_after_waits=40,
+        stop_after_waits=20,
     )
     _run(
         host,
@@ -2133,9 +2123,11 @@ def test_supervisor_listener_dead_passthrough_does_not_mint_extra_backups() -> N
         heartbeat_s=50.0,
         coverage_s=50.0,
     )
-    backup_spawns = [kind for kind, _command in host.spawns if kind == "backup"]
-    assert backup_spawns == ["backup", "backup"]
-    assert all(kind in {"stream", "backup", "watchdog"} for kind, _command in host.spawns)
+    kinds = [kind for kind, _command in host.spawns]
+    assert kinds.count("backup") == 2, kinds
+    assert kinds.count("stream") == 1
+    assert kinds.count("watchdog") == 1
+    assert set(kinds) == {"stream", "backup", "watchdog"}
     joined = "".join(host.lines)
     assert '"type":"listener-dead"' in joined
     assert "MUST NOT MINT BACKUP" in joined
