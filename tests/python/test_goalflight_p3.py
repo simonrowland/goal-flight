@@ -2327,6 +2327,9 @@ def test_unowned_terminal_projection_wakes_armed_doorbell_three_runs(
     project = _project(tmp_path)
     authority = journal.open_or_create_journal(project)
     lease = _claim(authority, "controller")
+    holder = wake.register_lease_holder(
+        project, controller_label="controller", lease_nonce=lease.nonce
+    )
     command = [
         sys.executable,
         str(SCRIPTS / "goalflight_messages.py"),
@@ -2427,6 +2430,7 @@ def test_unowned_terminal_projection_wakes_armed_doorbell_three_runs(
                 listener.wait(timeout=2)
 
     assert len(measurements) == 3
+    holder.close()
 
 
 def test_cursor_cas_has_one_winner_under_32_way_contention(
@@ -2520,6 +2524,9 @@ def test_second_real_doorbell_takes_next_slot_and_first_wakes_body_free(
     lease = _claim(authority)
     before = authority.active_lease("controller")
     assert before is not None
+    holder = wake.register_lease_holder(
+        project, controller_label="controller", lease_nonce=lease.nonce
+    )
     command = [
         sys.executable,
         str(SCRIPTS / "goalflight_messages.py"),
@@ -2615,6 +2622,7 @@ def test_second_real_doorbell_takes_next_slot_and_first_wakes_body_free(
     assert after is not None
     assert after.renewed_at == before.renewed_at
     assert after.renew_deadline_at == before.renew_deadline_at
+    holder.close()
 
 
 def test_wait_path_terminal_commit_wakes_under_seeded_history_three_runs(
@@ -2805,6 +2813,9 @@ def test_listener_path_terminal_commit_wakes_under_seeded_history_three_runs(
     project = _project(tmp_path)
     authority = journal.open_or_create_journal(project)
     lease = _claim(authority)
+    holder = wake.register_lease_holder(
+        project, controller_label="controller", lease_nonce=lease.nonce
+    )
     dispatch_ids = [f"listener-latency-{index}" for index in range(3)]
 
     seeded_ids = [f"seeded-history-{index:04d}" for index in range(1397)] + dispatch_ids
@@ -2911,6 +2922,7 @@ def test_listener_path_terminal_commit_wakes_under_seeded_history_three_runs(
 
     assert len(measurements) == 3
     assert all(value < 5.0 for value in measurements)
+    holder.close()
 
 
 def test_lease_death_attention_materializes_on_listener_and_holder_lock_sides(
@@ -3211,6 +3223,9 @@ def test_hidden_consumers_use_journal_and_relay_is_peek_only(
     )
     assert lease_result.committed and lease_result.value is not None
     lease = lease_result.value
+    holder = wake.register_lease_holder(
+        project, controller_label="hidden", lease_nonce=lease.nonce
+    )
     messages.post_message(
         dispatch_id="hidden-stream",
         msg_type="controller-notice",
@@ -3337,6 +3352,7 @@ def test_hidden_consumers_use_journal_and_relay_is_peek_only(
             listener.kill()
             listener.communicate(timeout=3)
 
+    holder.close()
     retired = sessions.retire_controller(
         project,
         "hidden",
