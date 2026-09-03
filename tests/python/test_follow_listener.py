@@ -1135,7 +1135,7 @@ def test_watchdog_generation_lock_is_independent_of_listener_slot(
                 project,
                 controller_label=lease.label,
                 generation_key=lease.nonce,
-                slots=1,
+                slots=2,
             )
             try:
                 assert extra.slot_index == 1
@@ -1257,7 +1257,7 @@ def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
             project,
             controller_label=lease.label,
             generation_key=lease.nonce,
-            slots=1,
+            slots=2,
         )
         try:
             assert extra.slot_index == 1
@@ -1572,6 +1572,7 @@ def test_watchdog_reads_durable_age_and_wakes_with_exact_rearm(
     assert lines[-1]["kind"] == "event"
     assert lines[-1]["payload"]["type"] == "listener-dead"
     assert lines[-1]["payload"]["reason"] == "stale"
+    assert lines[-1]["payload"]["backup_required"] is True
     assert lines[-1]["payload"]["rearm_command"] == wake.follow_start_command(
         project,
         controller_label=lease.label,
@@ -1719,6 +1720,83 @@ def test_watchdog_wakes_when_durable_follow_state_never_appears(
     assert lines[-1]["kind"] == "event"
     assert lines[-1]["payload"]["type"] == "listener-dead"
     assert lines[-1]["payload"]["reason"] == "state-unavailable"
+    assert lines[-1]["payload"]["backup_required"] is True
+
+
+def test_monitor_status_distinguishes_unreadable_from_missing(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, _env, lease = isolated
+    assert (
+        wake.monitor_status(
+            project,
+            controller_label=lease.label,
+            lease_nonce=lease.nonce,
+        )
+        is None
+    )
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=60,
+        dead_after_s=180,
+    )
+    path = wake._monitor_state_path(project, controller_label=lease.label)
+    path.write_text("{not-json", encoding="utf-8")
+    status = wake.monitor_status(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+    )
+    assert status is not None
+    assert status["state"] == "unreadable"
+    assert status["reason"] == "monitor-state-io"
+    assert status.get("age_s") is None
+
+
+def test_watchdog_unreadable_follow_state_does_not_set_backup_required(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    wake.activate_monitor_state(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        heartbeat_s=60,
+        dead_after_s=180,
+    )
+    path = wake._monitor_state_path(project, controller_label=lease.label)
+    path.write_text("{not-json", encoding="utf-8")
+    completed = subprocess.run(
+        _watch_command(project, lease, timeout_s=1),
+        cwd=project,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+    assert completed.returncode == 1, completed.stderr
+    lines = [json.loads(line) for line in completed.stdout.splitlines() if line]
+    dead = [
+        row
+        for row in lines
+        if row.get("kind") == "event"
+        and isinstance(row.get("payload"), dict)
+        and row["payload"].get("type") == "listener-dead"
+    ]
+    assert not dead, dead
+    degraded = [
+        row
+        for row in lines
+        if row.get("kind") == "event"
+        and isinstance(row.get("payload"), dict)
+        and row["payload"].get("type") == "listener-degraded"
+    ]
+    assert degraded
+    assert degraded[0]["payload"]["reason"] == "monitor-state-io"
+    assert "backup_required" not in degraded[0]["payload"]
+    assert "rearm_command" not in degraded[0]["payload"]
 
 
 def test_default_death_threshold_requires_three_missed_heartbeats() -> None:

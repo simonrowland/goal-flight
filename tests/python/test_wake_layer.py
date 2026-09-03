@@ -1253,7 +1253,7 @@ def test_cursor_advance_with_leftovers_pops_one_more_pool_member(
             process.communicate(timeout=3)
 
 
-def test_listener_arm_past_target_is_not_refused_then_empty_pool_hint(
+def test_listener_arm_at_cap_then_empty_pool_hint(
     isolated: tuple[Path, dict[str, str]],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1289,16 +1289,14 @@ def test_listener_arm_past_target_is_not_refused_then_empty_pool_hint(
     try:
         waiters = _wait_for_listener_count(root, label="wake-test", count=3)
         assert len(waiters) == 3
-        extra = wake.register_listener_waiter(
-            root,
-            controller_label="wake-test",
-            generation_key=claimed.value.nonce,
-            slots=3,
-        )
-        assert extra.slot_index == 3
+        with pytest.raises(BlockingIOError, match="contention protection"):
+            wake.register_listener_waiter(
+                root,
+                controller_label="wake-test",
+                generation_key=claimed.value.nonce,
+                slots=3,
+            )
         assert all(process.poll() is None for process in processes)
-        extra.close()
-        extra = None
 
         for index in range(3):
             _post_notice(
@@ -1343,7 +1341,7 @@ def test_listener_arm_past_target_is_not_refused_then_empty_pool_hint(
             process.communicate(timeout=3)
 
 
-def test_listener_arm_has_no_slot_ceiling(
+def test_listener_arm_refuses_above_slot_ceiling(
     isolated: tuple[Path, dict[str, str]],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1354,14 +1352,14 @@ def test_listener_arm_has_no_slot_ceiling(
     env.pop("GOALFLIGHT_LISTENER_SLOTS", None)
     authority = journal.open_or_create_journal(root)
     claimed = authority.claim_or_renew_lease(
-        "wake-test", principal={"principal_id": "uncapped-arm"}
+        "wake-test", principal={"principal_id": "capped-arm"}
     )
     assert claimed.committed and claimed.value is not None
     nonce = claimed.value.nonce
     lease_holder = _hold_claimed_lease(root, claimed.value)
     holders: list[wake.WaiterRegistration] = []
     try:
-        for expected_slot in range(40):
+        for expected_slot in range(4):
             holder = wake.register_listener_waiter(
                 root,
                 controller_label="wake-test",
@@ -1376,21 +1374,36 @@ def test_listener_arm_has_no_slot_ceiling(
             )
             or []
         )
-        assert len(live) == 40
+        assert len(live) == 4
         status_payload = wake.coverage_status(
             root, controller_label="wake-test", lease_nonce=nonce
         )
-        assert status_payload["live_waiters"] == 40
+        assert status_payload["live_waiters"] == 4
         assert status_payload["target_waiters"] == wake.DEFAULT_LISTENER_SLOTS
-        forty_first = wake.register_listener_waiter(
+        with pytest.raises(BlockingIOError, match="contention protection"):
+            wake.register_listener_waiter(
+                root,
+                controller_label="wake-test",
+                generation_key=nonce,
+                slots=4,
+            )
+        holders[0].close()
+        replacement = wake.register_listener_waiter(
             root,
             controller_label="wake-test",
             generation_key=nonce,
             slots=4,
         )
-        holders.append(forty_first)
-        assert forty_first.slot_index == 40
-        contender = subprocess.run(
+        holders[0] = replacement
+        assert replacement.slot_index == 0
+        with pytest.raises(BlockingIOError, match="contention protection"):
+            wake.register_listener_waiter(
+                root,
+                controller_label="wake-test",
+                generation_key=nonce,
+                slots=4,
+            )
+        refused = subprocess.run(
             _listener_command(
                 root,
                 tmp_path,
@@ -1407,9 +1420,9 @@ def test_listener_arm_has_no_slot_ceiling(
             timeout=5,
             check=False,
         )
-        assert contender.returncode == 1, (contender.stdout, contender.stderr)
-        assert "hold live doorbells" not in contender.stderr
-        assert "full" not in contender.stderr.lower()
+        assert refused.returncode == 3, (refused.stdout, refused.stderr)
+        assert "listener-slots cap is 4" in refused.stderr
+        assert "contention protection, not a ring" in refused.stderr
         help_text = subprocess.run(
             [
                 sys.executable,
@@ -1425,14 +1438,10 @@ def test_listener_arm_has_no_slot_ceiling(
             check=False,
         )
         assert help_text.returncode == 0, help_text.stderr
-        # This test is about the CEILING, so pin the claim that is actually
-        # load-bearing here: arming is never refused for pool depth. The help
-        # text used to say "exit 3 means mail pending only" and this asserted
-        # it, but that claim is false - cmd_listen also returns 3 for a held
-        # watchdog slot, for both orphaned cases, and for a stale lease. Pinning
-        # a false sentence made the docs harder to correct than to leave wrong.
-        assert "never a full-pool refusal" in help_text.stdout
-        assert "not a ceiling" in help_text.stdout
+        assert "never a full-pool refusal" not in help_text.stdout
+        assert "not a ceiling" not in help_text.stdout
+        assert "live-depth ceiling" in help_text.stdout
+        assert "contention protection" in help_text.stdout
     finally:
         lease_holder.close()
         for holder in holders:
