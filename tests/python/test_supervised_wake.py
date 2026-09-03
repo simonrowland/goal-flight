@@ -2082,6 +2082,57 @@ def test_opt_in_live_counts_armed_components_not_pids() -> None:
     assert coverages[-1]["live"] == coverages[-1]["target"] == 3
 
 
+def test_supervisor_listener_dead_passthrough_does_not_mint_extra_backups() -> None:
+    """Supervise respawns empty slots only; backup_required is not a spawn cue."""
+    host = FakeHost(
+        scripts={
+            "stream": [
+                PlannedExit(
+                    lifetime_s=1000.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (0.0, '{"kind":"heartbeat","payload":{"seq":1}}'),
+                    ],
+                )
+            ],
+            "backup": [
+                PlannedExit(lifetime_s=1000.0, returncode=0, armed=True),
+                PlannedExit(lifetime_s=1000.0, returncode=0, armed=True),
+            ],
+            "watchdog": [
+                PlannedExit(
+                    lifetime_s=1000.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (
+                            0.01,
+                            '{"kind":"event","payload":{"type":"listener-dead","backup_required":true,"rearm_command":"MUST NOT MINT BACKUP"}}',
+                        ),
+                    ],
+                ),
+            ],
+        },
+        stop_when_lines_contain=('"type":"listener-dead"',),
+        stop_after_waits=20,
+    )
+    _run(
+        host,
+        _items("stream", "backup", "backup", "watchdog"),
+        heartbeat_s=50.0,
+        coverage_s=50.0,
+    )
+    kinds = [kind for kind, _command in host.spawns]
+    assert kinds.count("backup") == 2, kinds
+    assert kinds.count("stream") == 1
+    assert kinds.count("watchdog") == 1
+    assert set(kinds) == {"stream", "backup", "watchdog"}
+    joined = "".join(host.lines)
+    assert '"type":"listener-dead"' in joined
+    assert "MUST NOT MINT BACKUP" in joined
+
+
 def test_journal_unreadable_is_retryable_not_dead_nonce() -> None:
     host = FakeHost(
         scripts={

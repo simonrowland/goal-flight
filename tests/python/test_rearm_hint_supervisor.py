@@ -1491,6 +1491,8 @@ def test_unsupervised_dead_events_keep_direct_rearm_command(
         rearm_command="EXACT UNSUPERVISED COMMAND",
     )
     assert record["payload"]["rearm_command"] == "EXACT UNSUPERVISED COMMAND"
+    if builder is messages._follow_dead_record:
+        assert record["payload"]["backup_required"] is True
     if builder is messages._watchdog_dead_record:
         assert record["payload"]["live"] == 1
         assert record["payload"]["target"] == 8
@@ -1590,6 +1592,71 @@ def test_dead_events_with_unavailable_process_table_stay_numberless_and_safe(
     assert "missing_components" not in payload
     assert "MUST NOT LEAK" not in json.dumps(record)
     assert "could not tell whether `supervise`" in payload["wake_recovery_hint"]
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        {
+            "state": "unreadable",
+            "reason": "monitor-state-io",
+            "age_s": 2613.0,
+            "dead_after_s": 360.0,
+            "fault": {"reason": "journal-unavailable", "detail": "busy"},
+        },
+        {
+            "state": "fault",
+            "age_s": 2613.0,
+            "dead_after_s": 360.0,
+            "fault": {"reason": "journal-io-failure", "detail": "sqlite"},
+        },
+        {
+            "state": "stale",
+            "age_s": 2613.0,
+            "dead_after_s": 360.0,
+            "reason": "vanished-witness",
+        },
+    ],
+)
+def test_unreadable_follow_status_omits_backup_required_and_rearm(
+    isolated: tuple[Path, journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    status: dict[str, object],
+) -> None:
+    project, lease = isolated
+    monkeypatch.delenv("GOALFLIGHT_SUPERVISED", raising=False)
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
+    record = messages._follow_dead_record(
+        status,
+        project_root=project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        rearm_command="MUST NOT LEAK",
+    )
+    payload = record["payload"]
+    assert payload["type"] == "listener-dead"
+    assert payload.get("backup_required") is not True
+    assert "rearm_command" not in payload
+    assert "MUST NOT LEAK" not in json.dumps(record)
+
+
+def test_wake_recovery_action_does_not_arm_on_journal_unreadable(
+    isolated: tuple[Path, journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, lease = isolated
+    monkeypatch.delenv("GOALFLIGHT_SUPERVISED", raising=False)
+    monkeypatch.setattr(wake, "_process_listing", lambda: [])
+    action = messages._wake_recovery_action(
+        project,
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        component_command="MUST NOT ARM",
+        reason="journal-unavailable",
+    )
+    assert action["kind"] != "arm-component"
+    assert action.get("command") is None
+    assert "relay --new" in str(action.get("instruction") or "")
 
 
 def test_dead_event_contracts_scope_actions_to_unsupervised_paths() -> None:

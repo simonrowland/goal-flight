@@ -429,7 +429,7 @@ def test_detached_single_call_is_refused_not_a_floor(
                 pass
 
 
-def test_arming_past_target_is_not_refused(
+def test_arming_past_target_is_refused(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
     project, env = isolated
@@ -455,17 +455,12 @@ def test_arming_past_target_is_not_refused(
         assert plan["command"] == command
         assert "commands" not in plan
         assert "hint" not in plan
-        extra = wake.register_listener_waiter(
-            project,
-            controller_label="floor-ctl",
-            generation_key=lease.nonce,
-        )
-        try:
-            live = wake.live_waiters(project, controller_label="floor-ctl") or []
-            assert len(live) == wake.DEFAULT_LISTENER_SLOTS + 1
-            assert extra.slot_index == wake.DEFAULT_LISTENER_SLOTS
-        finally:
-            extra.close()
+        with pytest.raises(BlockingIOError, match="contention protection"):
+            wake.register_listener_waiter(
+                project,
+                controller_label="floor-ctl",
+                generation_key=lease.nonce,
+            )
         live = wake.live_waiters(project, controller_label="floor-ctl") or []
         assert len(live) == wake.DEFAULT_LISTENER_SLOTS
     finally:

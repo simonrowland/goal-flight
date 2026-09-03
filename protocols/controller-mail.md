@@ -292,7 +292,14 @@ bound durable liveness state. The separately tracked watchdog below reads that s
 each poll; stale, faulted, missing, or invalid state makes it emit a structural
 `event`/`listener-dead` record on stdout and exit. In the decomposed unsupervised
 path that record carries the exact persistent re-arm command; under `supervise` it
-keeps the reason but omits the component action, and recovery is a supervisor restart. Any event is also liveness
+keeps the reason but omits the component action, and recovery is a supervisor restart.
+Unreadable follow state (journal-unavailable, journal-io-failure, busy, vanished-witness)
+is retryable degradation, not death: it must not set `backup_required` or a
+`rearm_command`. Before acting on `listener-dead`, take positive control with
+`relay --new` (does a new event round-trip, is mail arriving). If inbound coverage
+is intact, the alarm is journal contention — heartbeats the supervisor cannot
+read, not a stopped listener. Do not arm another doorbell; extras stick and
+deepen the contention. Any event is also liveness
 evidence and defers the next idle heartbeat, so a batched heartbeat never claims "no
 mail" beside an event. An unchanged frontier emits only every 15 minutes; a change
 emits on the next idle beat.
@@ -333,9 +340,11 @@ backup command. Persistent coverage is four required slots: one live, healthy
 monitor stream, two backup doorbells, and one watchdog. Status, entry hints, and fleet
 output use that shared `live/4` predicate; after stream loss the surviving backup pool
 and watchdog report persistent coverage `3/4`, never a portable `1/4` pool. Override
-with `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 2; target depth, not a
-ceiling). A shortfall is degraded, not binary-dead: a controller with some
-doorbells still covered should top the pool up.
+with `GOALFLIGHT_PERSISTENT_BACKUP_SLOTS` (default 2; how many backup
+children `supervise` starts). `--listener-slots` is a live-depth ceiling.
+A shortfall is degraded, not binary-dead: a controller with some
+doorbells still covered should top the pool up, but must not raise live
+depth above the cap.
 
 This is a bounded witness chain, not complete failure coverage. A lone watchdog death
 is loud, and correlated stream-plus-watchdog death is still loud while the backup
