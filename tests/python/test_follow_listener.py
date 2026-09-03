@@ -1176,8 +1176,10 @@ def test_fleet_console_uses_shared_persistent_coverage_predicate(
         )
     context = contexts[lease.nonce]
     assert context["wake_mode"] == "persistent"
-    assert context["listener_live"] == 1
-    assert context["listener_target"] == wake.persistent_wake_target()
+    coverage = context["wake_coverage"]
+    assert isinstance(coverage, dict)
+    assert coverage["live_waiters"] == 1
+    assert coverage["target_waiters"] == wake.persistent_wake_target()
 
 
 def test_follow_backup_and_watchdog_coexist_and_sigkill_wakes(
