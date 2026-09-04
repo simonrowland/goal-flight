@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GOAL_FLIGHT_PIDFILE_DIR isolates the ACP/watcher pidfile directory.
+"""The test runners isolate every machine-global writable directory.
 
 A test that launches a watcher or ACP client without this override writes
 into /tmp/goal-flight-acp-pids.d, the machine-global directory every project
@@ -15,12 +15,15 @@ directory. An explicit outer value still passes through.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
 import shlex
 import subprocess
 import sys
 import time
+
+from support import AMBIENT_IDENTITY_ENV, AMBIENT_WEBHOOK_ENV, MACHINE_PATH_ENV
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
@@ -36,6 +39,15 @@ def _run_sh_isolation_snippet(text: str) -> str:
     fn = text.index("run_isolated_test_env() {", preamble_end)
     close = text.index("\n}\n", fn)
     return text[start:preamble_end] + "\n" + text[fn : close + 3]
+
+
+def _load_affected_tests_module():
+    path = ROOT / "scripts" / "goalflight_affected_tests.py"
+    spec = importlib.util.spec_from_file_location("goalflight_affected_tests_probe", path)
+    assert spec is not None and spec.loader is not None
+    affected = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(affected)
+    return affected
 
 
 def _run_isolated_probe(
@@ -81,6 +93,104 @@ def test_run_sh_pins_pidfile_dir_in_isolated_env() -> None:
         "the suite would write /tmp/goal-flight-acp-pids.d. missing: "
         + ", ".join(missing)
     )
+
+
+def test_run_sh_pins_all_machine_state_in_isolated_env() -> None:
+    snippet = _run_sh_isolation_snippet(RUN_SH.read_text(encoding="utf-8"))
+    missing = [
+        fragment
+        for fragment in (
+            'GOALFLIGHT_STATE_DIR="$_GF_STATE_BASE"',
+            'GOALFLIGHT_CODEX_STATE_DIR="$_GF_CODEX_STATE_BASE"',
+            "-u GOALFLIGHT_DISPATCH_DIR",
+            'GOALFLIGHT_WAKE_LEDGER_DIR="$_GF_WAKE_LEDGER_BASE"',
+            'GOALFLIGHT_FLEET_DIR="$_GF_FLEET_BASE"',
+            "-u GOALFLIGHT_WAKE_LEDGER",
+        )
+        if fragment not in snippet
+    ]
+    assert not missing, (
+        "tests/run.sh run_isolated_test_env lost machine-state isolation; "
+        "missing: " + ", ".join(missing)
+    )
+    missing_unsets = [
+        key
+        for key in AMBIENT_IDENTITY_ENV + AMBIENT_WEBHOOK_ENV
+        if key != "GOALFLIGHT_WAKE_WEBHOOK_CONFIG" and f"-u {key}" not in snippet
+    ]
+    assert not missing_unsets, (
+        "tests/run.sh run_isolated_test_env leaked ambient runtime identity; "
+        "missing unsets: " + ", ".join(missing_unsets)
+    )
+
+
+def test_affected_runner_uses_a_private_complete_machine_root(
+    monkeypatch, tmp_path: Path
+) -> None:
+    for key in MACHINE_PATH_ENV:
+        monkeypatch.setenv(key, str(tmp_path / "ambient" / key.lower()))
+    for key in AMBIENT_IDENTITY_ENV + AMBIENT_WEBHOOK_ENV:
+        monkeypatch.setenv(key, f"ambient-{key.lower()}")
+
+    affected = _load_affected_tests_module()
+    base = tmp_path / "module"
+    env = affected.isolated_env(base)
+    expected = {
+        "GOALFLIGHT_MESSAGES_DIR": base / "messages",
+        "GOALFLIGHT_FLEET_DIR": base / "fleet",
+        "GOALFLIGHT_JOURNAL_DIR": base / "journals",
+        "GOALFLIGHT_TASK_STORE_DIR": base / "task-store",
+        "GOALFLIGHT_STATE_DIR": base / "state",
+        "GOALFLIGHT_CODEX_STATE_DIR": base / "codex-state",
+        "GOALFLIGHT_WAKE_LEDGER_DIR": base / "wake-ledger",
+        "GOAL_FLIGHT_PIDFILE_DIR": base / "pids",
+        "GOALFLIGHT_PIDFILE_DIR": base / "pids",
+        "XDG_STATE_HOME": base / "xdg",
+    }
+    assert {key: Path(env[key]) for key in expected} == expected
+    assert "GOALFLIGHT_DISPATCH_DIR" not in env
+    assert env["GOALFLIGHT_CAPACITY_CONF"] == os.devnull
+    assert env["GOALFLIGHT_WAKE_WEBHOOK_CONFIG"] == os.devnull
+    assert env["PYTEST_CURRENT_TEST"] == "goalflight_affected_tests.py (call)"
+    assert "GOALFLIGHT_WAKE_LEDGER" not in env
+    assert all(key not in env for key in AMBIENT_IDENTITY_ENV)
+    assert all(
+        key not in env
+        for key in AMBIENT_WEBHOOK_ENV
+        if key != "GOALFLIGHT_WAKE_WEBHOOK_CONFIG"
+    )
+
+
+def test_affected_runner_direct_scripts_do_not_union_live_codex_state(
+    monkeypatch, tmp_path: Path
+) -> None:
+    home = tmp_path / "operator-home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    affected = _load_affected_tests_module()
+    base = tmp_path / "module"
+    env = affected.isolated_env(base)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "import goalflight_dispatch as dispatch\n"
+            "print('\\n'.join(str(path) for path in dispatch._quota_state_roots()))\n",
+            str(SCRIPTS),
+        ],
+        cwd=str(ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    roots = {Path(line) for line in proc.stdout.splitlines() if line.strip()}
+    assert roots == {base / "codex-state", base / "state"}, roots
+    assert home / ".goal-flight" not in roots
 
 
 def test_unscoped_acp_client_default_is_live_pidfile_dir() -> None:
