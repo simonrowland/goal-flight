@@ -55,7 +55,14 @@ incremented when meaningful skill behaviour changes.
 - `goalflight_dispatch.py resume` reattaches to the existing worktree instead
   of acquiring a sibling pooled seat, so quota-exhausted / dead / plan-approval
   pauses continue in place. `--account` is honored; default seat order skips
-  recently quota-exhausted accounts until their reset.
+  recently quota-exhausted accounts until their reset. It now re-acquires that
+  exact seat's lock with no reset, and refuses when another live dispatch holds
+  it or the seat was reclaimed, instead of running in `s-N` holding no lock.
+- Bash-shape `--agent cursor` (any model, including `--model kimi-k3-high`)
+  honours `--os-sandbox read-only` / `workspace-write` on macOS by wrapping
+  the worker in `sandbox-exec`. cursor-cli has no read-only primitive; the
+  runner does not pass a refused cursor sandbox flag. Moonshot (`--agent
+  moonshot`) is unchanged. Linux/other hosts still refuse the flag.
 - `supervise` backlog cap keys on envelope identity, not raw line count.
   Duplicate copies of one cursor snapshot still collapse as `cursor-lag` /
   `child-backlog`. Distinct envelopes (new cursor versions, unique headlines,

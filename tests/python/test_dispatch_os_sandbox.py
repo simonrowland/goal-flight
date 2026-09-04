@@ -11,14 +11,26 @@ Repo convention: case_* functions invoked by main(), run as `python <file>.py`.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import sys
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+import goalflight_adapter_readiness as readiness  # noqa: E402
 import goalflight_dispatch as d  # noqa: E402
+import goalflight_os_sandbox as sandbox  # noqa: E402
+
+_CURSOR_REFUSED_SANDBOX_FLAGS = (
+    "--sandbox",
+    "--os-sandbox",
+    "--no-sandbox",
+    "--disable-sandbox",
+    "--sandbox-disable",
+)
 
 
 def _args(**kw):
@@ -149,6 +161,170 @@ def case_profile_survives_submit_drain() -> None:
     assert "--os-sandbox" not in r_def and "--read-only" not in r_def, r_def
 
 
+@contextmanager
+def _force_darwin_sandbox_exec():
+    """Hermetic Darwin + sandbox-exec so argv wrap is testable on Linux CI."""
+
+    def _which(name: str) -> str | None:
+        if name == "sandbox-exec":
+            return "/usr/bin/sandbox-exec"
+        return None
+
+    with (
+        mock.patch.object(sandbox, "os_sandbox_platform_key", return_value="darwin"),
+        mock.patch.object(
+            sandbox,
+            "platform_supported_os_sandbox_profiles",
+            return_value=["off", "read-only", "workspace-write"],
+        ),
+        mock.patch.object(sandbox.goalflight_compat, "is_windows", return_value=False),
+        mock.patch.object(sandbox.shutil, "which", side_effect=_which),
+        mock.patch.object(readiness, "os_sandbox_platform_key", return_value="darwin"),
+        mock.patch.object(
+            readiness,
+            "platform_supported_os_sandbox_profiles",
+            return_value=["off", "read-only", "workspace-write"],
+        ),
+    ):
+        yield
+
+
+def _cursor_agent_tail(argv: list[str]) -> list[str]:
+    try:
+        return argv[argv.index("cursor-agent") :]
+    except ValueError as exc:
+        raise AssertionError(f"cursor-agent missing from argv: {argv}") from exc
+
+
+def case_cursor_read_only_argv_wraps_sandbox_exec_on_darwin() -> None:
+    """Controllers keep --os-sandbox read-only; runner wraps, cursor-cli does not."""
+    with _force_darwin_sandbox_exec():
+        for agent, model in (
+            ("cursor", None),
+            ("cursor", "kimi-k3-high"),
+            ("cursor-agent", "kimi-k3-high"),
+        ):
+            argv, stdin_path = d.build_worker(
+                _args(
+                    agent=agent,
+                    os_sandbox="read-only",
+                    cwd=str(REPO_ROOT),
+                    model=model,
+                ),
+                "/tmp/p.md",
+                [],
+            )
+            assert Path(argv[0]).name == "sandbox-exec", (agent, model, argv)
+            assert argv[1] == "-p", (agent, model, argv)
+            tail = _cursor_agent_tail(argv)
+            assert tail[0] == "cursor-agent", (agent, model, argv)
+            for flag in _CURSOR_REFUSED_SANDBOX_FLAGS:
+                assert flag not in tail, (agent, model, flag, tail)
+            assert not any("dangerously" in part for part in tail), (agent, model, tail)
+            if model:
+                assert tail[tail.index("--model") + 1] == model, (agent, model, tail)
+            assert stdin_path == "/tmp/p.md", stdin_path
+
+        workspace_argv, _ = d.build_worker(
+            _args(agent="cursor", os_sandbox="workspace-write", cwd=str(REPO_ROOT)),
+            "/tmp/p.md",
+            [],
+        )
+        assert Path(workspace_argv[0]).name == "sandbox-exec", workspace_argv
+        assert "--sandbox" not in _cursor_agent_tail(workspace_argv), workspace_argv
+
+        off_argv, _ = d.build_worker(
+            _args(agent="cursor", os_sandbox="off", cwd=str(REPO_ROOT)),
+            "/tmp/p.md",
+            [],
+        )
+        assert off_argv[0] == "cursor-agent", off_argv
+        assert "sandbox-exec" not in off_argv[0], off_argv
+
+        read_only_alias, _ = d.build_worker(
+            _args(agent="cursor", read_only=True, os_sandbox=None, cwd=str(REPO_ROOT)),
+            "/tmp/p.md",
+            [],
+        )
+        assert Path(read_only_alias[0]).name == "sandbox-exec", read_only_alias
+        assert "--sandbox" not in _cursor_agent_tail(read_only_alias), read_only_alias
+
+        d._validate_agent_os_sandbox(
+            _args(agent="cursor", shape="bash", os_sandbox="read-only", cwd=str(REPO_ROOT))
+        )
+
+        raw = ["cursor-agent", "-p", "--force", "--trust", "--output-format", "text"]
+        raw_wrapped, raw_stdin = d.build_worker(
+            _args(agent="cursor", os_sandbox="read-only", cwd=str(REPO_ROOT)),
+            "/tmp/p.md",
+            raw,
+        )
+        assert Path(raw_wrapped[0]).name == "sandbox-exec", raw_wrapped
+        assert raw_stdin is None, raw_stdin
+        assert "--sandbox" not in _cursor_agent_tail(raw_wrapped), raw_wrapped
+
+
+def case_cursor_read_only_argv_stays_unwrapped_off_darwin() -> None:
+    """Linux/other hosts keep documented off-only behavior; no invented CLI flag."""
+    if sandbox.os_sandbox_platform_key() == "darwin":
+        return
+    argv, _ = d.build_worker(
+        _args(agent="cursor", os_sandbox="read-only", cwd=str(REPO_ROOT), model="kimi-k3-high"),
+        "/tmp/p.md",
+        [],
+    )
+    assert argv[0] == "cursor-agent", argv
+    assert Path(argv[0]).name != "sandbox-exec", argv
+    for flag in _CURSOR_REFUSED_SANDBOX_FLAGS:
+        assert flag not in argv, (flag, argv)
+    assert argv[argv.index("--model") + 1] == "kimi-k3-high", argv
+    try:
+        d._validate_agent_os_sandbox(
+            _args(agent="cursor", shape="bash", os_sandbox="read-only", cwd=str(REPO_ROOT))
+        )
+    except d.UnsupportedAgentSandboxRequest as exc:
+        message = str(exc)
+        assert "--os-sandbox" in message, message
+        assert "agent=cursor" in message, message
+    else:
+        raise AssertionError("cursor bash --os-sandbox read-only must refuse off Darwin")
+
+
+def case_moonshot_argv_stays_unwrapped_on_darwin() -> None:
+    """Kimi-via-cursor is a cursor model; moonshot agent_id stays its own path."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="gf-moonshot-argv-") as tmp:
+        prompt = Path(tmp) / "p.md"
+        prompt.write_text("Inspect the tree.\n", encoding="utf-8")
+        with _force_darwin_sandbox_exec():
+            argv, stdin_path = d.build_worker(
+                _args(agent="moonshot", os_sandbox=None, cwd=str(REPO_ROOT)),
+                str(prompt),
+                [],
+            )
+        assert argv[:2] == ["/bin/sh", "-lc"], argv
+        assert not any(Path(part).name == "sandbox-exec" for part in argv), argv
+        assert "kimi" in argv[2], argv
+        assert stdin_path is None, stdin_path
+        d._validate_agent_os_sandbox(
+            _args(agent="moonshot", shape="bash", os_sandbox="off", cwd=str(REPO_ROOT))
+        )
+        try:
+            d._validate_agent_os_sandbox(
+                _args(
+                    agent="moonshot",
+                    shape="bash",
+                    os_sandbox="read-only",
+                    cwd=str(REPO_ROOT),
+                )
+            )
+        except d.UnsupportedAgentSandboxRequest as exc:
+            assert "supports only --os-sandbox off" in str(exc), exc
+        else:
+            raise AssertionError("moonshot --os-sandbox read-only must stay refused")
+
+
 def case_boundary_rejected_early_names_the_real_cause() -> None:
     """The sandbox refuses when cwd sits in a temp/agent-state root. Say so up front.
 
@@ -217,6 +393,9 @@ def main() -> None:
     case_claude_acp_read_only_fallback_notice_is_pinned()
     case_acp_supported_and_unrequested_warning_paths_are_unchanged()
     case_profile_survives_submit_drain()
+    case_cursor_read_only_argv_wraps_sandbox_exec_on_darwin()
+    case_cursor_read_only_argv_stays_unwrapped_off_darwin()
+    case_moonshot_argv_stays_unwrapped_on_darwin()
     case_boundary_rejected_early_names_the_real_cause()
     print("test_dispatch_os_sandbox: all cases passed")
 

@@ -705,8 +705,6 @@ def test_inert_os_sandbox_is_refused_per_combination() -> None:
         ("grok-code", "bash", "workspace-write"),
         ("grok-code", "bash", "off"),
         ("grok-research", "bash", "read-only"),
-        ("cursor", "bash", "read-only"),
-        ("cursor-agent", "bash", "workspace-write"),
         ("claude", "bash", "read-only"),
         ("claude", "acp", "read-only"),
         ("claude-acp", "acp", "workspace-write"),
@@ -716,6 +714,8 @@ def test_inert_os_sandbox_is_refused_per_combination() -> None:
             ("grok-acp", "acp", "read-only"),
             ("codex-acp", "acp", "workspace-write"),
             ("cursor", "acp", "read-only"),
+            ("cursor", "bash", "read-only"),
+            ("cursor-agent", "bash", "workspace-write"),
         )
     for agent, shape, profile in refused:
         args = argparse.Namespace(
@@ -751,6 +751,12 @@ def test_honored_os_sandbox_and_read_only_still_launch() -> None:
             agent="moonshot", shape="bash", os_sandbox="off", read_only=False
         ),
         argparse.Namespace(
+            agent="cursor", shape="bash", os_sandbox="off", read_only=False
+        ),
+        argparse.Namespace(
+            agent="cursor-agent", shape="bash", os_sandbox="off", read_only=False
+        ),
+        argparse.Namespace(
             agent="grok-acp", shape="acp", os_sandbox="off", read_only=False
         ),
         argparse.Namespace(
@@ -776,6 +782,25 @@ def test_honored_os_sandbox_and_read_only_still_launch() -> None:
             ),
             argparse.Namespace(
                 agent="cursor", shape="acp", os_sandbox="read-only", read_only=False
+            ),
+            argparse.Namespace(
+                agent="cursor", shape="bash", os_sandbox="read-only", read_only=False
+            ),
+            argparse.Namespace(
+                agent="cursor", shape="bash", os_sandbox="workspace-write", read_only=False
+            ),
+            argparse.Namespace(
+                agent="cursor-agent",
+                shape="bash",
+                os_sandbox="workspace-write",
+                read_only=False,
+            ),
+            argparse.Namespace(
+                agent="cursor",
+                shape="bash",
+                os_sandbox="read-only",
+                read_only=False,
+                model="kimi-k3-high",
             ),
         )
     for args in allowed:
