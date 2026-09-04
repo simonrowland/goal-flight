@@ -149,6 +149,10 @@ def isolated_env(base: Path) -> dict[str, str]:
         env.pop(unset, None)
     env.pop("GOALFLIGHT_WAKE_LEDGER", None)
     env.update(isolated_machine_env(base))
+    # Keep dispatch derived from the private state root. Some tests retarget
+    # GOALFLIGHT_STATE_DIR and assert on its default <state>/dispatch child;
+    # a runner-level dispatch override would steal those writes.
+    env.pop("GOALFLIGHT_DISPATCH_DIR", None)
     # The canonical suite launches direct-script modules from a pytest test,
     # so they inherit this sentinel and do not union live ~/.goal-flight seat
     # state into their isolated roots. Match that behavior outside pytest.

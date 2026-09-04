@@ -59,7 +59,7 @@ MACHINE_PATH_ENV = (
 
 
 def isolated_machine_env(root: Path) -> dict[str, str]:
-    """Return env assignments that pin every machine-global writable default."""
+    """Return private machine-state roots; dispatch derives from state."""
     state = root / "state"
     pids = root / "pids"
     mapping = {
@@ -69,7 +69,6 @@ def isolated_machine_env(root: Path) -> dict[str, str]:
         "GOALFLIGHT_TASK_STORE_DIR": str(root / "task-store"),
         "GOALFLIGHT_STATE_DIR": str(state),
         "GOALFLIGHT_CODEX_STATE_DIR": str(root / "codex-state"),
-        "GOALFLIGHT_DISPATCH_DIR": str(state / "dispatch"),
         "GOALFLIGHT_WAKE_LEDGER_DIR": str(root / "wake-ledger"),
         "GOAL_FLIGHT_PIDFILE_DIR": str(pids),
         "GOALFLIGHT_PIDFILE_DIR": str(pids),

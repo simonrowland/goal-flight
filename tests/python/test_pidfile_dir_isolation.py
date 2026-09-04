@@ -102,7 +102,7 @@ def test_run_sh_pins_all_machine_state_in_isolated_env() -> None:
         for fragment in (
             'GOALFLIGHT_STATE_DIR="$_GF_STATE_BASE"',
             'GOALFLIGHT_CODEX_STATE_DIR="$_GF_CODEX_STATE_BASE"',
-            'GOALFLIGHT_DISPATCH_DIR="$_GF_DISPATCH_BASE"',
+            "-u GOALFLIGHT_DISPATCH_DIR",
             'GOALFLIGHT_WAKE_LEDGER_DIR="$_GF_WAKE_LEDGER_BASE"',
             'GOALFLIGHT_FLEET_DIR="$_GF_FLEET_BASE"',
             "-u GOALFLIGHT_WAKE_LEDGER",
@@ -142,13 +142,13 @@ def test_affected_runner_uses_a_private_complete_machine_root(
         "GOALFLIGHT_TASK_STORE_DIR": base / "task-store",
         "GOALFLIGHT_STATE_DIR": base / "state",
         "GOALFLIGHT_CODEX_STATE_DIR": base / "codex-state",
-        "GOALFLIGHT_DISPATCH_DIR": base / "state" / "dispatch",
         "GOALFLIGHT_WAKE_LEDGER_DIR": base / "wake-ledger",
         "GOAL_FLIGHT_PIDFILE_DIR": base / "pids",
         "GOALFLIGHT_PIDFILE_DIR": base / "pids",
         "XDG_STATE_HOME": base / "xdg",
     }
     assert {key: Path(env[key]) for key in expected} == expected
+    assert "GOALFLIGHT_DISPATCH_DIR" not in env
     assert env["GOALFLIGHT_CAPACITY_CONF"] == os.devnull
     assert env["GOALFLIGHT_WAKE_WEBHOOK_CONFIG"] == os.devnull
     assert env["PYTEST_CURRENT_TEST"] == "goalflight_affected_tests.py (call)"

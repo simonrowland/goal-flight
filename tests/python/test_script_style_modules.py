@@ -151,6 +151,7 @@ def _isolated_env(root: Path, *, test_id: str) -> dict[str, str]:
     env = os.environ.copy()
     for key in AMBIENT_RUNTIME_ENV:
         env.pop(key, None)
+    env.pop("GOALFLIGHT_DISPATCH_DIR", None)
     env.pop("GOALFLIGHT_WAKE_LEDGER", None)
     env.update(isolated_machine_env(root))
     env[ISOLATED_TEST_FILE_ENV] = test_id

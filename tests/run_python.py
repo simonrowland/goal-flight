@@ -172,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
             child_env = os.environ.copy()
             for key in AMBIENT_IDENTITY_ENV + AMBIENT_WEBHOOK_ENV:
                 child_env.pop(key, None)
+            child_env.pop("GOALFLIGHT_DISPATCH_DIR", None)
             child_env.pop("GOALFLIGHT_WAKE_LEDGER", None)
             child_env.update(isolated_machine_env(machine_base / f"test-{test_index}"))
             child_env["GOALFLIGHT_ISOLATED_TEST_FILE"] = test.relative_to(TEST_DIR).as_posix()
