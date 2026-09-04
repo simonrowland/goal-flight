@@ -967,7 +967,7 @@ def test_d13_registry_is_exhaustive_and_cli_mcp_compatible(
         capture_output=True,
         check=False,
     )
-    assert advisory_cli.returncode == 2
+    assert advisory_cli.returncode == 2, advisory_cli.stderr
     assert "--to-controller LABEL" in advisory_cli.stderr
     assert "--type controller-notice" in advisory_cli.stderr
     assert not messages.inbox_path(messages.default_messages_dir(), "cli-advisory").is_file()
@@ -989,6 +989,7 @@ def test_d13_registry_is_exhaustive_and_cli_mcp_compatible(
     )
     assert "result" in mcp and "error" not in mcp
     assert messages.inbox_path(messages.default_messages_dir(), "cli-status").is_file()
+    assert not messages.inbox_path(messages.default_messages_dir(), "cli-advisory").is_file()
     assert messages.inbox_path(messages.default_messages_dir(), "mcp-advisory").is_file()
 
     legacy_cli = subprocess.run(
@@ -1012,8 +1013,9 @@ def test_d13_registry_is_exhaustive_and_cli_mcp_compatible(
         capture_output=True,
         check=False,
     )
-    assert legacy_cli.returncode == 2
+    assert legacy_cli.returncode == 2, legacy_cli.stderr
     assert "--type controller-notice" in legacy_cli.stderr
+    assert "--to-controller" in legacy_cli.stderr
     assert not messages.inbox_path(messages.default_messages_dir(), "cli-legacy").is_file()
     legacy_mcp = mcp_messages.handle_request(
         {

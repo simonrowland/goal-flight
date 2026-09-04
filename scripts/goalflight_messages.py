@@ -261,6 +261,31 @@ CONTROLLER_ADDRESSEE_TYPES = CONTROLLER_CHANNEL_TYPES | frozenset(
 # controller correspondence. Everything else that canonicalizes to advisory
 # is the junk drawer (note, defect-notice, qa-bug, controller-note, …).
 WORKER_SAFE_ADVISORY_ALIASES = frozenset({"ack"})
+# CLI ``post --type`` working set shown in --help. EVENT_TYPE_REGISTRY and the
+# alias map stay intact for library, MCP, and ingress. Hidden aliases still
+# parse (``steer`` is a first-class fleet-register type) but are not advertised.
+# ``advisory`` and the rest of its junk-drawer aliases bounce at the CLI.
+POST_CLI_TYPES = frozenset(
+    {
+        "ack",
+        "blocked",
+        "controller-answer",
+        "controller-coordination",
+        "controller-notice",
+        "controller-question",
+        "coordination",
+        "finding",
+        "merge-request",
+        "notice",
+        "patch",
+        "result",
+        "status",
+        "steering",
+        "user_need",
+    }
+)
+POST_CLI_HIDDEN_TYPES = frozenset({"steer"})
+_STDIN_TEXT_FILE_NAMES = frozenset({"-", "/dev/stdin"})
 # Removed CONTROLLER_LISTENER_ESCALATION_TYPES: its partial set was superseded by registry wake classes.
 TASK_STORE_STATUS_NUDGE_KINDS = frozenset({"parallel-ready", "resume-ready", "done-suggest"})
 NON_ERROR_UNDELIVERED_STATUSES = frozenset({"terminal_recorded_only", "worker_view_queued"})
@@ -2912,8 +2937,73 @@ def refresh_aggregate(
     return aggregate
 
 
+def read_text_file_argument(path: Path | str | None) -> str:
+    """Read a ``--text-file`` body. ``-`` and ``/dev/stdin`` are stdin.
+
+    Shared by ``from-text`` and ``post``. Mail bodies with quotes, backticks,
+    or ``$()`` belong here, not in argv, so the shell cannot substitute them.
+    """
+    if path is None:
+        return sys.stdin.read()
+    raw = os.fspath(path)
+    if raw in _STDIN_TEXT_FILE_NAMES:
+        return sys.stdin.read()
+    try:
+        return Path(raw).read_text()
+    except OSError as exc:
+        raise MessageError(f"--text-file {raw!r} is unreadable: {exc}") from exc
+
+
+def _post_text_file_syntax(*, dispatch_id: str = "") -> str:
+    stream = str(dispatch_id or "").strip() or "ID"
+    return (
+        "python3 scripts/goalflight_messages.py post "
+        f"--dispatch-id {stream} --type controller-notice "
+        "--to-controller LABEL --subject '...' "
+        "--text-file /dev/stdin <<'EOF'\n"
+        "body with `backticks` and apostrophes\n"
+        "EOF"
+    )
+
+
+def _reject_unsendable_post_type(msg_type: str, *, dispatch_id: str = "") -> None:
+    """Refuse junk-drawer / unknown CLI types with the sendable syntax."""
+    raw = str(msg_type or "")
+    if raw in POST_CLI_TYPES or raw in POST_CLI_HIDDEN_TYPES:
+        return
+    raise MessageError(
+        f"type {raw!r} is not a sendable post type; "
+        "use --type controller-notice and pass --to-controller LABEL. "
+        f"Correct syntax: {_post_text_file_syntax(dispatch_id=dispatch_id)}"
+    )
+
+
+def _post_payload_from_args(args: argparse.Namespace) -> dict:
+    """Build the post payload from ``--payload``, ``--text``, or ``--text-file``."""
+    text_file = getattr(args, "text_file", None)
+    payload_arg = getattr(args, "payload", None)
+    text_arg = getattr(args, "text", None)
+    if text_file is not None and payload_arg:
+        raise MessageError(
+            "--payload and --text-file are mutually exclusive; "
+            "bodies with quotes, backticks, or $() go in --text-file, not argv. "
+            f"Correct syntax: {_post_text_file_syntax(dispatch_id=getattr(args, 'dispatch_id', ''))}"
+        )
+    if text_file is not None and text_arg is not None:
+        raise MessageError(
+            "--text and --text-file are mutually exclusive; "
+            "bodies with quotes, backticks, or $() go in --text-file, not argv. "
+            f"Correct syntax: {_post_text_file_syntax(dispatch_id=getattr(args, 'dispatch_id', ''))}"
+        )
+    if text_file is not None:
+        return {"text": read_text_file_argument(text_file)}
+    if payload_arg:
+        return json.loads(payload_arg)
+    return {"text": text_arg or ""}
+
+
 def cmd_from_text(args: argparse.Namespace) -> int:
-    text = Path(args.text_file).read_text() if args.text_file else sys.stdin.read()
+    text = read_text_file_argument(args.text_file)
     envelopes = markers_text_to_envelopes(
         text,
         dispatch_id=args.dispatch_id,
@@ -2940,7 +3030,8 @@ def cmd_post(args: argparse.Namespace) -> int:
     ):
         raise _unaddressed_controller_mail_error(args.type, dispatch_id=args.dispatch_id)
     try:
-        payload = json.loads(args.payload) if args.payload else {"text": args.text or ""}
+        _reject_unsendable_post_type(args.type, dispatch_id=args.dispatch_id)
+        payload = _post_payload_from_args(args)
     except (ValueError, RecursionError) as exc:
         detail = f"payload is invalid JSON: {exc}"
         if not to_controller:
@@ -8747,9 +8838,31 @@ def _run_cli(argv: list[str] | None = None) -> int:
 
     post = sub.add_parser("post", help="Append one envelope (canonical file path)")
     post.add_argument("--dispatch-id", required=True)
-    post.add_argument("--type", required=True, choices=sorted(EVENT_TYPE_REGISTRY))
+    post.add_argument(
+        "--type",
+        required=True,
+        metavar="{" + ",".join(sorted(POST_CLI_TYPES)) + "}",
+        help=(
+            "working-set envelope type. advisory and aliases such as note, "
+            "defect-notice, or qa-bug are not sendable; use controller-notice "
+            "with --to-controller LABEL. Bodies with quotes, backticks, or $() "
+            "go in --text-file, not argv"
+        ),
+    )
     post.add_argument("--payload", help="JSON object payload")
-    post.add_argument("--text", help="Shorthand payload.text when --payload omitted")
+    post.add_argument(
+        "--text",
+        help="Shorthand payload.text when --payload omitted; short strings only",
+    )
+    post.add_argument(
+        "--text-file",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "read payload.text from PATH. Use - or /dev/stdin for a heredoc. "
+            "Bodies with quotes, backticks, or $() go in --text-file, not argv"
+        ),
+    )
     post.add_argument(
         "--subject",
         help="Short scannable subject; shown in relay listings instead of the first body line",

@@ -155,6 +155,11 @@ incremented when meaningful skill behaviour changes.
 - `goalflight_dispatch.py drain --dispatch-id <id>` (repeatable) launches only
   the named queued envelope(s). A controller can drain its own work without
   walking the shared cross-project queue.
+- `goalflight_messages.py post` accepts `--text-file PATH` (`-` / `/dev/stdin`
+  for a heredoc) so mail bodies with quotes, backticks, or `$()` never pass
+  through argv. `--text` remains for short strings. `--type` help lists the
+  working set only; `advisory` and junk-drawer aliases bounce with
+  `controller-notice --to-controller LABEL`.
 
 ### Changed
 

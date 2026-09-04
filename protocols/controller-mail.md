@@ -72,6 +72,21 @@ python3 <skill-root>/scripts/goalflight_messages.py post \
   --text '<body>'
 ```
 
+`--text` is for short strings. Bodies with quotes, backticks, or `$()` go in
+`--text-file`, not argv: a double-quoted `--text "..."` is shell-substituted
+before Python runs, and English apostrophes break single quotes. `--text` and
+`--text-file` are mutually exclusive; so are `--payload` and `--text-file`.
+
+```bash
+python3 <skill-root>/scripts/goalflight_messages.py post \
+  --dispatch-id ID --type controller-notice --to-controller LABEL \
+  --subject '...' --text-file /dev/stdin <<'EOF'
+body with `backticks` and apostrophes
+EOF
+```
+
+`--text-file -` is the same stdin reader. Short bodies may still use `--text`.
+
 `--to-controller` uses a durable label. `--controller-project-root` defaults to the
 current canonical git project and is needed only for explicit cross-project mail.
 Passing `--controller-project-root` without `--to-controller` does not address
@@ -104,10 +119,10 @@ Do not push to the remote to land a branch. Post typed mail; the receiving
 controller applies it.
 
 ```bash
-python3 <skill-root>/scripts/goalflight_messages.py post \
+git format-patch --stdout origin/main | python3 <skill-root>/scripts/goalflight_messages.py post \
   --dispatch-id <topic-slug> --type merge-request \
   --to-controller <label> --subject '<what the patch does>' \
-  --text "$(git format-patch --stdout origin/main)"
+  --text-file /dev/stdin
 ```
 
 `patch` is the same apply path with a unified diff. Findings and questions use
