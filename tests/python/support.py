@@ -19,6 +19,7 @@ if str(SCRIPTS) not in sys.path:
 AMBIENT_IDENTITY_ENV = (
     "GOALFLIGHT_DISPATCH_ID",
     "GOALFLIGHT_DISPATCH_SCRIPT",
+    "GOALFLIGHT_ISOLATED_TEST_FILE",
     "GOALFLIGHT_PROJECT_ROOT",
     "GOALFLIGHT_PROMPT_FILE",
     "GOALFLIGHT_STEER_FILE",
@@ -44,6 +45,7 @@ AMBIENT_WEBHOOK_ENV = (
 MACHINE_PATH_ENV = (
     "GOALFLIGHT_DISPATCH_DIR",
     "GOALFLIGHT_STATE_DIR",
+    "GOALFLIGHT_CODEX_STATE_DIR",
     "GOALFLIGHT_JOURNAL_DIR",
     "GOALFLIGHT_MESSAGES_DIR",
     "GOALFLIGHT_TASK_STORE_DIR",
@@ -66,6 +68,7 @@ def isolated_machine_env(root: Path) -> dict[str, str]:
         "GOALFLIGHT_JOURNAL_DIR": str(root / "journals"),
         "GOALFLIGHT_TASK_STORE_DIR": str(root / "task-store"),
         "GOALFLIGHT_STATE_DIR": str(state),
+        "GOALFLIGHT_CODEX_STATE_DIR": str(root / "codex-state"),
         "GOALFLIGHT_DISPATCH_DIR": str(state / "dispatch"),
         "GOALFLIGHT_WAKE_LEDGER_DIR": str(root / "wake-ledger"),
         "GOAL_FLIGHT_PIDFILE_DIR": str(pids),

@@ -53,8 +53,11 @@ TEST_DIR = REPO_ROOT / "tests" / "python"
 # and reports a false failure.
 sys.path.insert(0, str(TEST_DIR))
 from support import (  # noqa: E402
+    AMBIENT_IDENTITY_ENV,
+    AMBIENT_WEBHOOK_ENV,
     acp_sdk_unavailable_reason,
     has_main_driver,
+    isolated_machine_env,
     requires_acp_sdk,
 )
 
@@ -134,30 +137,22 @@ def select_modules(paths: list[str]) -> tuple[list[Path], list[str]]:
 
 
 def isolated_env(base: Path) -> dict[str, str]:
-    """Mirror run_isolated_test_env() in tests/run.sh.
+    """Pin every machine-global writable surface to this module's root.
 
     This is load-bearing, not hygiene: ~20 live controllers share the real
     journal, ledger, and task store, and an unisolated module writes to them.
-    Kept deliberately in the same shape as the shell function so the two can be
-    diffed by eye when either changes.
+    Reuse the pytest driver's inventory so this parallel runner cannot drift to
+    a partial copy of the isolation contract.
     """
     env = dict(os.environ)
-    for unset in (
-        "GOALFLIGHT_STEER_FILE",
-        "GOALFLIGHT_ALLOW_EXTERNAL_STEER_FILE",
-        "GOALFLIGHT_ISOLATED_TEST_FILE",
-        "GOALFLIGHT_WORKTREE_LOCK_FD",
-        "GOALFLIGHT_OCCUPANCY_LOCK_FD",
-    ):
+    for unset in AMBIENT_IDENTITY_ENV + AMBIENT_WEBHOOK_ENV:
         env.pop(unset, None)
-    env["GOALFLIGHT_CAPACITY_CONF"] = env.get("GOALFLIGHT_CAPACITY_CONF") or "/dev/null"
-    env["GOALFLIGHT_MESSAGES_DIR"] = env.get("GOALFLIGHT_MESSAGES_DIR") or str(base / "messages")
-    env["GOALFLIGHT_JOURNAL_DIR"] = env.get("GOALFLIGHT_JOURNAL_DIR") or str(base / "journal")
-    env["GOALFLIGHT_TASK_STORE_DIR"] = env.get("GOALFLIGHT_TASK_STORE_DIR") or str(base / "task-store")
-    pidfiles = env.get("GOAL_FLIGHT_PIDFILE_DIR") or env.get("GOALFLIGHT_PIDFILE_DIR") or str(base / "pids")
-    env["GOAL_FLIGHT_PIDFILE_DIR"] = pidfiles
-    env["GOALFLIGHT_PIDFILE_DIR"] = pidfiles
-    env["XDG_STATE_HOME"] = str(base / "xdg")
+    env.pop("GOALFLIGHT_WAKE_LEDGER", None)
+    env.update(isolated_machine_env(base))
+    # The canonical suite launches direct-script modules from a pytest test,
+    # so they inherit this sentinel and do not union live ~/.goal-flight seat
+    # state into their isolated roots. Match that behavior outside pytest.
+    env["PYTEST_CURRENT_TEST"] = "goalflight_affected_tests.py (call)"
     return env
 
 
