@@ -932,6 +932,28 @@ def test_d13_registry_is_exhaustive_and_cli_mcp_compatible(
             env["GOALFLIGHT_MESSAGES_DIR"],
             "post",
             "--dispatch-id",
+            "cli-status",
+            "--type",
+            "status",
+            "--text",
+            "CLI status",
+            "--json",
+        ],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert cli.returncode == 0, cli.stderr
+    advisory_cli = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "goalflight_messages.py"),
+            "--messages-dir",
+            env["GOALFLIGHT_MESSAGES_DIR"],
+            "post",
+            "--dispatch-id",
             "cli-advisory",
             "--type",
             "advisory",
@@ -945,7 +967,10 @@ def test_d13_registry_is_exhaustive_and_cli_mcp_compatible(
         capture_output=True,
         check=False,
     )
-    assert cli.returncode == 0, cli.stderr
+    assert advisory_cli.returncode == 2
+    assert "--to-controller LABEL" in advisory_cli.stderr
+    assert "--type controller-notice" in advisory_cli.stderr
+    assert not messages.inbox_path(messages.default_messages_dir(), "cli-advisory").is_file()
     mcp = mcp_messages.handle_request(
         {
             "jsonrpc": "2.0",
@@ -963,7 +988,7 @@ def test_d13_registry_is_exhaustive_and_cli_mcp_compatible(
         messages_dir=messages.default_messages_dir(),
     )
     assert "result" in mcp and "error" not in mcp
-    assert messages.inbox_path(messages.default_messages_dir(), "cli-advisory").is_file()
+    assert messages.inbox_path(messages.default_messages_dir(), "cli-status").is_file()
     assert messages.inbox_path(messages.default_messages_dir(), "mcp-advisory").is_file()
 
     legacy_cli = subprocess.run(
@@ -987,7 +1012,9 @@ def test_d13_registry_is_exhaustive_and_cli_mcp_compatible(
         capture_output=True,
         check=False,
     )
-    assert legacy_cli.returncode == 0, legacy_cli.stderr
+    assert legacy_cli.returncode == 2
+    assert "--type controller-notice" in legacy_cli.stderr
+    assert not messages.inbox_path(messages.default_messages_dir(), "cli-legacy").is_file()
     legacy_mcp = mcp_messages.handle_request(
         {
             "jsonrpc": "2.0",
