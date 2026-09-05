@@ -109,6 +109,38 @@ def test_waiter_observes_dead_worker_without_casting_terminal_verdict() -> None:
     assert_eq("dead observation retained", row["progress"]["worker_alive"], False)
 
 
+def test_stale_dead_without_marker_terminalizes_wait_as_worker_dead() -> None:
+    rec = {
+        "dispatch_id": "measured-dead",
+        "classification": "stale_dead",
+        "state": "running",
+    }
+    row = _row(
+        _payload(rec),
+        rec["dispatch_id"],
+        now=10_000.0,
+    )
+    assert_eq("measured stale_dead is terminal", row["terminal"], True)
+    assert_eq("wait verdict is worker_dead", row["state"], "worker_dead")
+    assert_eq("done_code is terminal", status.done_code(rec), 0)
+
+
+def test_unknown_liveness_without_marker_still_waits() -> None:
+    for classification in (
+        "unknown",
+        "identity_indeterminate",
+        "stale_pid_reuse",
+    ):
+        rec = {
+            "dispatch_id": classification,
+            "classification": classification,
+            "state": "running",
+        }
+        row = _row(_payload(rec), classification, now=10_000.0)
+        assert_eq(f"{classification} remains nonterminal", row["terminal"], False)
+        assert_eq(f"{classification} state preserved", row["state"], classification)
+
+
 def test_waiter_observes_idle_live_worker_without_casting_stall_verdict() -> None:
     rec = {
         "dispatch_id": "idle-observer",
@@ -731,6 +763,39 @@ def test_narrow_snapshot_reuses_one_sidecar_generation() -> None:
         )
 
 
+def test_wait_returns_immediately_on_stale_dead_without_marker() -> None:
+    record = {
+        "dispatch_id": "measured-dead",
+        "classification": "stale_dead",
+        "state": "running",
+        "_wait_snapshot_complete": True,
+        "_wait_ledger_snapshot": {},
+        "_wait_status_snapshot": {},
+    }
+    saved_status = status.status_payload
+    saved_cycle = status._wait_cycle_payload
+    saved_mail = status._mail_watermark
+
+    def reject_machine_aggregate() -> dict:
+        raise AssertionError("stale_dead wait rebuilt machine aggregate")
+
+    status.status_payload = reject_machine_aggregate  # type: ignore[assignment]
+    status._wait_cycle_payload = lambda *args, **kwargs: _payload(record)  # type: ignore[assignment]
+    status._mail_watermark = lambda *args, **kwargs: None  # type: ignore[assignment]
+    try:
+        code = status._wait_for_dispatches_registered(
+            ["measured-dead"],
+            project_root=str(ROOT),
+            timeout_s=1.0,
+            poll_s=0.05,
+        )
+    finally:
+        status.status_payload = saved_status  # type: ignore[assignment]
+        status._wait_cycle_payload = saved_cycle  # type: ignore[assignment]
+        status._mail_watermark = saved_mail  # type: ignore[assignment]
+    assert_eq("stale_dead wait completes", code, 0)
+
+
 def test_wait_hot_loop_never_calls_machine_status_payload() -> None:
     saved_status = status.status_payload
     saved_cycle = status._wait_cycle_payload
@@ -769,6 +834,8 @@ def main() -> None:
     tests = [
         test_arming_a_wait_announces_mail_before_it_blocks,
         test_waiter_observes_dead_worker_without_casting_terminal_verdict,
+        test_stale_dead_without_marker_terminalizes_wait_as_worker_dead,
+        test_unknown_liveness_without_marker_still_waits,
         test_waiter_observes_idle_live_worker_without_casting_stall_verdict,
         test_completed_pid_dead_stays_complete_trust_clause,
         test_terminal_row_carries_marker_kind_and_verdict_distinguishes_checkpoint,
@@ -786,6 +853,7 @@ def main() -> None:
         test_unreadable_journal_requires_matching_terminal_snapshots,
         test_wait_journal_presence_distinguishes_absent_from_unobservable,
         test_narrow_snapshot_reuses_one_sidecar_generation,
+        test_wait_returns_immediately_on_stale_dead_without_marker,
         test_wait_hot_loop_never_calls_machine_status_payload,
     ]
     for test in tests:
