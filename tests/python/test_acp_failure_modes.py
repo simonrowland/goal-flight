@@ -1111,9 +1111,10 @@ def case_read_only_acp_buffered_work_survives_incident_duration() -> None:
     assert status.get("liveness_hard_wall_expired") is not True, status
     assert "finished" in (status.get("text_excerpt") or ""), status
 
-    # Null hypothesis/control: retain the old conflated 900-second outer walls
-    # while keeping every other worker and timing input identical. Production
-    # liveness must then terminate this same real work before its buffered end.
+    # Null hypothesis/control: the old conflated 900-second outer walls used
+    # to kill this same busy/silent work by treating unmeasurable liveness as
+    # death. Unknown is not a kill, so those walls no longer terminate the
+    # buffered end either.
     old_returncode, old_status, old_stdout, old_stderr = _run_fake_runner(
         "long_reasoning_busy",
         progress_stall_s=900.0,
@@ -1131,13 +1132,10 @@ def case_read_only_acp_buffered_work_survives_incident_duration() -> None:
         },
         timeout_s=30.0,
     )
-    assert old_returncode != 0, (old_stdout, old_stderr, old_status)
-    assert "finished" not in (old_status.get("text_excerpt") or ""), old_status
-    assert old_status["state"] in {
-        "remote_turn_silence",
-        "liveness_indeterminate",
-        "idle_timeout",
-    }, old_status
+    assert old_returncode == 0, (old_stdout, old_stderr, old_status)
+    assert "finished" in (old_status.get("text_excerpt") or ""), old_status
+    assert old_status["state"] == "complete", old_status
+    assert old_status["killed_by_heartbeat"] is False, old_status
     assert old_status["remote_turn_silence_s"] == 900.0, old_status
 
 
