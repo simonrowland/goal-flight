@@ -1014,4 +1014,32 @@ def test_hook_throttled_path_stays_cheap(tmp_path: Path) -> None:
         f"MEASURE hook-throttled per-call={hook_per * 1000:.3f}ms "
         f"bare-sh={bare_per * 1000:.3f}ms n={n}"
     )
-    assert hook_per < 0.030, f"throttled hook path too slow: {hook_per * 1000:.3f}ms"
+    # Compare against the MEASURED floor, not an absolute wall-clock constant.
+    #
+    # Derivation. The quantity that matters is "does the throttled hook skip
+    # the python start, or pay for it?", which is a RATIO to the cost of
+    # spawning any process at all -- not a millisecond count. An absolute
+    # threshold measures the box: `bare_per` here is a bare `sh -c exit 0`,
+    # and on a loaded host it is ~13ms against ~2ms quiet, so a 30ms gate
+    # fails on co-tenancy alone while the code is unchanged.
+    #
+    #   healthy  = hook skips the spawn      -> hook_per ~ 2-3x bare_per
+    #   regressed= hook pays a python start  -> hook_per ~ 43ms vs a ~2ms
+    #              floor quiet, i.e. ~20x bare_per
+    #
+    # Measured spread on this host, 5 trials at load average ~32:
+    #   hook 34.2-44.2ms, bare 11.9-21.2ms, ratio 1.92-2.98x (median 2.88x).
+    # MAX_RATIO 6.0 sits ~2x above the worst observed healthy ratio and ~3x
+    # below a python-start regression, so it separates the two without a
+    # quiet-box requirement.
+    #
+    # Units check: both terms are seconds-per-call, so the ratio is
+    # dimensionless. Sanity: at the historical regression (43ms hook, 2ms
+    # bare) the ratio is 21.5 and this assertion fires.
+    MAX_RATIO = 6.0
+    assert bare_per > 0, f"bare floor unmeasurable: {bare_per}"
+    assert hook_per < bare_per * MAX_RATIO, (
+        f"throttled hook path too slow: {hook_per * 1000:.3f}ms is "
+        f"{hook_per / bare_per:.2f}x the {bare_per * 1000:.3f}ms bare-spawn "
+        f"floor (limit {MAX_RATIO}x); a python start would be ~20x"
+    )
