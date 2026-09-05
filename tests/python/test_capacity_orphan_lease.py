@@ -16,9 +16,13 @@ at all: the acquire-then-spawn window must stay protected.
 
 from __future__ import annotations
 
+import datetime as dt
+import io
+import json
 import os
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
@@ -129,10 +133,86 @@ def test_unprobeable_claimant_is_not_reclaimed() -> None:
     check("unprobeable claimant holds its lease", "unknown" not in stale)
 
 
+def test_aged_unprobeable_claimant_is_not_released_at_any_age() -> None:
+    """Age plus an unprobeable claimant is not proof the holder is gone.
+
+    release-stale may drop a lease only when the claimant is measured dead.
+    An EPERM/unreadable claimant stays held, however old, and status reports
+    it as unknown_claimant rather than converting unknown into stale.
+    """
+    cap = _capacity_module()
+    now = cap.utc_now()
+    lease = _lease(
+        "aged-unknown",
+        worker=None,
+        claimant=1,
+        controller=_reaped_pid(),
+    )
+    lease["started_at"] = cap.iso(
+        now - dt.timedelta(seconds=cap.INDETERMINATE_LIVE_RETENTION_S + 120)
+    )
+    lease["expires_at"] = cap.iso(now - dt.timedelta(seconds=1))
+    data = {"leases": {"aged-unknown": lease}, "cooldowns": {}}
+
+    check(
+        "aged unprobeable claimant is not stale",
+        lease not in cap.stale_active_leases(data),
+    )
+    cap.prune_state(data)
+    kept = data["leases"].get("aged-unknown")
+    check(
+        "aged unprobeable claimant survives TTL prune",
+        kept is not None and kept.get("state") == "active",
+    )
+
+    cap.save_state(
+        {
+            "schema": cap.SCHEMA,
+            "machine_id": cap.machine_id(),
+            "leases": data["leases"],
+            "cooldowns": {},
+        }
+    )
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cap.main(["release-stale", "--keep"])
+    payload = json.loads(buf.getvalue())
+    check("release-stale of unknown claimant exits 0", rc == 0)
+    check(
+        "release-stale does not drop an unprobeable claimant at any age",
+        "aged-unknown" not in payload.get("released", []),
+    )
+    on_disk = json.loads(cap.state_path().read_text())
+    check(
+        "unknown claimant lease remains active after release-stale",
+        on_disk.get("leases", {}).get("aged-unknown", {}).get("state") == "active",
+    )
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cap.main(["status", "--json", "--ram-mb", "65536"])
+    status = json.loads(buf.getvalue())
+    unknown_ids = {
+        row.get("lease_id") for row in (status.get("unknown_claimant") or [])
+    }
+    check("status reports unknown_claimant", rc == 0 and "aged-unknown" in unknown_ids)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cap.main(["release-stale", "--keep", "--include-unknown-claimant"])
+    forced = json.loads(buf.getvalue())
+    check("operator flag exits 0", rc == 0)
+    check(
+        "operator flag is the only age-independent unknown-claimant release",
+        "aged-unknown" in forced.get("released", []),
+    )
+
+
 def main() -> int:
     test_orphaned_lease_is_stale_while_acquiring_and_working_are_not()
     test_a_live_controller_does_not_keep_an_orphaned_lease_alive()
     test_unprobeable_claimant_is_not_reclaimed()
+    test_aged_unprobeable_claimant_is_not_released_at_any_age()
     if _FAILS:
         print(f"\n{len(_FAILS)} FAILED: {_FAILS}")
         return 1

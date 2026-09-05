@@ -827,6 +827,31 @@ def attached_worker_group_holds_capacity(lease: dict) -> bool:
     return _pid_holds_capacity(worker_pid, lease)
 
 
+def _pre_attach_claimant_liveness(lease: dict) -> bool | None:
+    """Tri-state liveness of a no-worker lease's claimant.
+
+    True: measured live. False: measured dead or no claimant pid.
+    None: the probe could not complete. Missing worker_pid is what makes
+    this the acquire-then-spawn window; a worker pid uses the worker
+    predicates instead.
+    """
+    if lease.get("worker_pid") is not None:
+        return False
+    claimant_pid = lease.get("claimant_pid")
+    if not claimant_pid:
+        return False
+    return _probe_pid_liveness(claimant_pid)
+
+
+def unknown_claimant_leases(data: dict) -> list[dict]:
+    """Active no-worker leases whose claimant liveness cannot be measured."""
+    return [
+        lease
+        for lease in active_leases(data)
+        if _pre_attach_claimant_liveness(lease) is None
+    ]
+
+
 def _lease_pids_dead(lease: dict) -> bool:
     """True only when every process that can hold the lease is gone.
 
@@ -834,14 +859,17 @@ def _lease_pids_dead(lease: dict) -> bool:
     one with a live pid is still consuming RAM and must not be evicted by a
     clock-only TTL check (capacity.json is shared across sibling projects, so a
     TTL eviction here would over-subscribe the machine while the lease is LIVE).
-    An indeterminate probe is not treated as dead immediately (that reclaims a
-    live worker on EPERM) and not as live forever (that parks the slot for a
-    foreign pid's lifetime). Consult pid_liveness; None is bounded.
+    An indeterminate worker/controller probe is bounded. An unprobeable
+    pre-attach claimant is never dead: age is not a negative liveness
+    observation, and converting unknown into TTL expiry would free the slot
+    for a second worker against the same reservation.
     """
     if (
         retained_live_scope_holds_capacity(lease)
         or attached_worker_group_holds_capacity(lease)
     ):
+        return False
+    if _pre_attach_claimant_liveness(lease) is None:
         return False
     worker_pid = lease.get("worker_pid")
     claimant_pid = lease.get("claimant_pid") if worker_pid is None else None
@@ -1478,6 +1506,11 @@ def stale_active_leases(data: dict) -> list[dict]:
         # NOT proven gone and holds, so an indeterminate read never authorises
         # reclamation.
         claimant_pid = lease.get("claimant_pid")
+        if _pre_attach_claimant_liveness(lease) is None:
+            # Unprobeable claimant: never stale, however old. Status reports
+            # these separately as unknown_claimant. Operator reclaim is
+            # release-stale --include-unknown-claimant, not the age path.
+            continue
         if _pid_holds_capacity(claimant_pid, lease):
             continue
         if claimant_pid is None and _pid_holds_capacity(controller_pid, lease):
@@ -1490,10 +1523,19 @@ def stale_active_leases(data: dict) -> list[dict]:
 
 def cmd_release_stale(args: argparse.Namespace) -> int:
     released: list[str] = []
+    include_unknown = bool(getattr(args, "include_unknown_claimant", False))
     with StateLock():
         data = load_state()
         prune_state(data)
-        for lease in stale_active_leases(data):
+        candidates = list(stale_active_leases(data))
+        if include_unknown:
+            seen = {str(lease.get("lease_id")) for lease in candidates if lease.get("lease_id")}
+            for lease in unknown_claimant_leases(data):
+                lease_id = lease.get("lease_id")
+                if lease_id and str(lease_id) not in seen:
+                    candidates.append(lease)
+                    seen.add(str(lease_id))
+        for lease in candidates:
             lease_id = lease.get("lease_id")
             if not lease_id:
                 continue
@@ -1534,11 +1576,13 @@ def cmd_status(args: argparse.Namespace) -> int:
             return 1
     prune_state(data)
     pressure = current_rate_pressure(args)
+    unknown_claimant = unknown_claimant_leases(data)
     payload = {
         "schema": SCHEMA,
         "profile": profile(args),
         "state": data,
         "active": active_leases(data),
+        "unknown_claimant": unknown_claimant,
         "rate_pressure": pressure,
     }
     if args.json:
@@ -1546,6 +1590,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0
     prof = payload["profile"]
     print(f"capacity: active={len(payload['active'])}/{prof['operating_cap']} raw={prof['raw_ram_ceiling']} ram={prof['ram_mb']}MB")
+    unknown_ids = {row.get("lease_id") for row in unknown_claimant}
     for lease in payload["active"]:
         prio = lease.get("priority")
         prio_part = f" prio={prio}" if prio and prio != "normal" else ""
@@ -1555,7 +1600,17 @@ def cmd_status(args: argparse.Namespace) -> int:
                 f" retained-indeterminate-pgid={lease.get('accounted_live_pgid')}"
                 f" recheck-after={lease.get('accounted_live_until')}"
             )
-        print(f"- {lease['lease_id']} agent={lease['agent']} dispatch={lease.get('dispatch_id')} mem={lease.get('mem_mb')}MB{prio_part}{retained_part}")
+        unknown_part = (
+            " unknown_claimant" if lease.get("lease_id") in unknown_ids else ""
+        )
+        print(f"- {lease['lease_id']} agent={lease['agent']} dispatch={lease.get('dispatch_id')} mem={lease.get('mem_mb')}MB{prio_part}{retained_part}{unknown_part}")
+    if unknown_claimant:
+        print("unknown_claimant:")
+        for lease in unknown_claimant:
+            print(
+                f"- {lease['lease_id']} claimant_pid={lease.get('claimant_pid')} "
+                f"dispatch={lease.get('dispatch_id')}"
+            )
     if data.get("cooldowns"):
         print("cooldowns:")
         for cooldown in data["cooldowns"].values():
@@ -1610,6 +1665,11 @@ def build_parser() -> argparse.ArgumentParser:
     rel_stale.add_argument("--state", default="expired")
     rel_stale.add_argument("--reason", default="stale_controller")
     rel_stale.add_argument("--keep", action="store_true")
+    rel_stale.add_argument(
+        "--include-unknown-claimant",
+        action="store_true",
+        help="operator-driven: also release leases whose claimant liveness cannot be measured",
+    )
     rel_stale.set_defaults(func=cmd_release_stale)
 
     cool = sub.add_parser("cooldown")
