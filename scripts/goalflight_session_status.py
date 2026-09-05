@@ -2687,6 +2687,9 @@ def queue_active_now(front: dict, *, ttl_days: int = 7) -> tuple[bool, str]:
 def aggregate_status(project_root: Path, *, ttl_days: int = 7) -> dict:
     """Union the three signals (queue / leases / resume-notes) and return
     a single verdict with full breakdown. See module docstring.
+
+    ``active`` is True, False, or None. None means a present resume-note
+    read could not complete; callers must not treat it as inactive.
     """
     queues = find_queues(project_root)
     newest_queue = newest(queues)
@@ -2705,12 +2708,23 @@ def aggregate_status(project_root: Path, *, ttl_days: int = 7) -> dict:
     # work at exactly the moment the capacity view is unhealthy, so an
     # unmeasured capacity axis refuses to certify the session as inactive.
     capacity_measured = leases_for_project is not None
-    active = (
+    # Resume-note activation is tri-state. A failed read is not a measured
+    # negative: collapsing it into False makes --text claim "no active
+    # session" and orchestrators skip the resume. Union measured positives
+    # first; only then preserve unknown instead of certifying inactivity.
+    positive = (
         queue_active
-        or notes_active
+        or notes_active is True
         or not capacity_measured
         or bool(leases_for_project)
     )
+    active: bool | None
+    if positive:
+        active = True
+    elif notes_active is None:
+        active = None
+    else:
+        active = False
     backlog_counts, backlog_error = _task_backlog_counts(project_root)
     ready_frontier, ready_frontier_error = _ready_frontier(project_root)
     owner_alerts: list[str] = []
@@ -2855,10 +2869,13 @@ def _resume_directive_text(status: dict) -> str | None:
     return f"resume: run python3 goalflight_task.py next -> continue the top task{top}"
 
 
-def _resume_notes_active(notes_path: Path | None, *, ttl_days: int = 7) -> tuple[bool, str]:
+def _resume_notes_active(notes_path: Path | None, *, ttl_days: int = 7) -> tuple[bool | None, str]:
     """Read the newest RESUME-NOTES file and infer activation state from its
     front matter (if YAML) or its TL;DR section. Tolerant by design: if the
     file is unparseable or has no signal, returns (False, "no signal").
+
+    A present file whose read raises is UNKNOWN ``(None, ...)``, not inactive.
+    Absence is a completed negative; a failed read is not.
 
     Signals (any one is enough for active=True):
       - YAML frontmatter `state: active` (canonical)
@@ -2873,7 +2890,7 @@ def _resume_notes_active(notes_path: Path | None, *, ttl_days: int = 7) -> tuple
     try:
         head = notes_path.read_text(encoding="utf-8", errors="ignore")[:2048]
     except OSError:
-        return False, "resume notes unreadable"
+        return None, "resume notes unreadable"
     # Try YAML frontmatter first.
     if head.startswith("---\n"):
         front, _ = _parse_frontmatter(head)
@@ -2940,6 +2957,18 @@ def _active_leases_for(project_root: Path) -> tuple[list[dict] | None, str | Non
 def to_text(status: dict) -> str:
     counts_text = _backlog_counts_text(status)
     resume_text = _resume_directive_text(status)
+    if status["active"] is None:
+        reason = status.get("resume_notes_reason") or "session signal unreadable"
+        pieces = [f"goal-flight session status unknown ({reason})"]
+        if counts_text:
+            pieces.append(counts_text)
+        if resume_text:
+            pieces.append(resume_text)
+        for alert in status.get("owner_alerts") or []:
+            text_alert = str(alert).strip()
+            if text_alert:
+                pieces.append(text_alert)
+        return "; ".join(pieces)
     if not status["active"]:
         if status["queue_file"] is None:
             text = "no goal-flight queue files; not an active session"
@@ -3552,7 +3581,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     status = aggregate_status(project_root, ttl_days=args.ttl_days)
-    if args.text and status.get("active"):
+    # Nudging is a destination: only a measured True may act.
+    if args.text and status.get("active") is True:
         _post_resume_nudge(project_root)
     if args.json or not args.text:
         # Default to JSON for machine consumers; --text for humans.
