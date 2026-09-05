@@ -14632,6 +14632,31 @@ def _queue_entry_launch_backoff_ts(entry: dict | None) -> float | None:
     return parsed.timestamp() if parsed is not None else None
 
 
+_CAPACITY_DEFERRAL_FAIL_REASONS = frozenset(
+    {"capacity_unavailable", "capacity_state_unreadable"}
+)
+
+
+def _capacity_backoff_cleared_by_free_slot(entry: dict | None, slots: dict) -> bool:
+    """True when a capacity-sourced backoff must not park a free slot.
+
+    Drain stamps launch_backoff on a slow proven-transient capacity refusal
+    so the next pass does not spawn-churn against a still-full cap. Child
+    startup of this module often sits near the material-burn threshold
+    (min(1.0, max(0.05, 0.25 * pass_budget_s)) == 1.0s in production), so a
+    wait_s=0 refusal intermittently looks like a burn and parks queued work
+    for LAUNCH_BACKOFF_INITIAL_S even after a slot is free. Honor the
+    backoff only while remaining==0 or capacity state is unreadable.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if str(entry.get("launch_fail_reason") or "") not in _CAPACITY_DEFERRAL_FAIL_REASONS:
+        return False
+    if slots.get("unreadable"):
+        return False
+    return int(slots.get("global_remaining") or 0) > 0
+
+
 def _launch_backoff_delay_s(timeout_count: int) -> float:
     exponent = max(0, int(timeout_count) - 1)
     return min(LAUNCH_BACKOFF_CAP_S, LAUNCH_BACKOFF_INITIAL_S * (2 ** exponent))
@@ -15367,7 +15392,14 @@ def _drain_queue_once(args) -> dict:
         backoff_ts = _queue_entry_launch_backoff_ts(
             _scan_entry if isinstance(_scan_entry, dict) else None
         )
-        if backoff_ts is not None and backoff_ts > time.time():
+        if (
+            backoff_ts is not None
+            and backoff_ts > time.time()
+            and not _capacity_backoff_cleared_by_free_slot(
+                _scan_entry if isinstance(_scan_entry, dict) else None,
+                slots,
+            )
+        ):
             drain_acc["left_queued"] += 1
             until = (
                 _scan_entry.get("launch_backoff_until")

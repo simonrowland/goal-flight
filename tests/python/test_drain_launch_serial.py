@@ -22,6 +22,7 @@ queue at /tmp/goal-flight-501/dispatch-queue.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import subprocess
@@ -756,6 +757,89 @@ def test_launch_timeout_backs_off_next_pass(
     assert elapsed < HANG_S, elapsed
     reasons = [str(row.get("reason") or "") for row in second.get("details") or []]
     assert "launch_backoff" in reasons, second
+
+
+def _stamp_capacity_backoff(path: Path, *, seconds: float = 60.0) -> dict:
+    queued = json.loads(path.read_text(encoding="utf-8"))
+    until = (
+        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)
+    ).isoformat(timespec="seconds")
+    queued["launch_backoff_until"] = until
+    queued["launch_backoff_count"] = 1
+    queued["launch_fail_reason"] = "capacity_unavailable"
+    queued["launch_attempt_class"] = D.LAUNCH_ATTEMPT_CLASS_PROVEN_TRANSIENT
+    D._write_json_atomic(path, queued)
+    return queued
+
+
+def _slot_budget(*, remaining: int) -> dict:
+    return {
+        "unreadable": False,
+        "operating_cap": 1,
+        "active": 0 if remaining else 1,
+        "global_remaining": remaining,
+        "by_pool": {},
+    }
+
+
+def test_capacity_backoff_does_not_park_work_when_a_slot_is_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A free slot must launch even if a prior capacity refusal stamped backoff.
+
+    Revert-failure: launched==0 with details.reason launch_backoff while
+    timing.capacity_slots>=1 — the b-331 window, where child startup crossed
+    the 1s material-burn threshold and parked the envelope for 60s.
+    """
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    dispatch_id = "capacity-backoff-free-slot"
+    path = _write_entry(
+        queue,
+        dispatch_id,
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    _stamp_capacity_backoff(path)
+    monkeypatch.setattr(D, "_drain_capacity_slots", lambda: _slot_budget(remaining=1))
+    monkeypatch.setattr(D.subprocess, "run", _launched_run_factory(tmp_path))
+    payload = D._drain_queue_once(_drain_args(queue))
+    assert payload["launched"] == 1, payload
+    assert path.exists() is False, payload
+
+
+def test_capacity_backoff_still_skips_when_no_slot_remains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Capacity backoff must still prevent spawn-churn against a full cap."""
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    dispatch_id = "capacity-backoff-full-cap"
+    path = _write_entry(
+        queue,
+        dispatch_id,
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    _stamp_capacity_backoff(path)
+    monkeypatch.setattr(D, "_drain_capacity_slots", lambda: _slot_budget(remaining=0))
+    calls = {"n": 0}
+
+    def count_run(argv, *args, **kwargs):
+        argv_list = list(argv)
+        if _is_drain_child(argv_list):
+            calls["n"] += 1
+            return subprocess.CompletedProcess(argv_list, 0, stdout="", stderr="")
+        return _REAL_SUBPROCESS_RUN(argv, *args, **kwargs)
+
+    monkeypatch.setattr(D.subprocess, "run", count_run)
+    payload = D._drain_queue_once(_drain_args(queue))
+    assert calls["n"] == 0, payload
+    assert payload["launched"] == 0, payload
+    assert _reason_for(payload, dispatch_id) == "launch_backoff", payload
+    assert path.exists(), payload
 
 
 def test_pass_reports_launch_and_reconcile_timing(
