@@ -1111,9 +1111,10 @@ def case_read_only_acp_buffered_work_survives_incident_duration() -> None:
     assert status.get("liveness_hard_wall_expired") is not True, status
     assert "finished" in (status.get("text_excerpt") or ""), status
 
-    # Null hypothesis/control: retain the old conflated 900-second outer walls
-    # while keeping every other worker and timing input identical. Production
-    # liveness must then terminate this same real work before its buffered end.
+    # Null hypothesis/control: the old conflated 900-second outer walls used
+    # to kill this same busy/silent work by treating unmeasurable liveness as
+    # death. Unknown is not a kill, so those walls no longer terminate the
+    # buffered end either.
     old_returncode, old_status, old_stdout, old_stderr = _run_fake_runner(
         "long_reasoning_busy",
         progress_stall_s=900.0,
@@ -1131,13 +1132,10 @@ def case_read_only_acp_buffered_work_survives_incident_duration() -> None:
         },
         timeout_s=30.0,
     )
-    assert old_returncode != 0, (old_stdout, old_stderr, old_status)
-    assert "finished" not in (old_status.get("text_excerpt") or ""), old_status
-    assert old_status["state"] in {
-        "remote_turn_silence",
-        "liveness_indeterminate",
-        "idle_timeout",
-    }, old_status
+    assert old_returncode == 0, (old_stdout, old_stderr, old_status)
+    assert "finished" in (old_status.get("text_excerpt") or ""), old_status
+    assert old_status["state"] == "complete", old_status
+    assert old_status["killed_by_heartbeat"] is False, old_status
     assert old_status["remote_turn_silence_s"] == 900.0, old_status
 
 
@@ -1183,12 +1181,17 @@ def case_runner_outer_bound_with_unknown_cpu_and_idle_disabled() -> None:
         timeout_s=30.0,
     )
 
-    assert returncode != 0, (stdout, stderr, status)
-    assert status["state"] == "liveness_indeterminate", status
-    assert status["error"]["reason"] == "event_silence_outer_bound", status
-    assert status["error"]["quiet_for_s"] >= 0.15, status
-    assert status["killed_by_heartbeat"] is True, status
-    assert status["worker_alive"] is False, status
+    worker_pid = status.get("worker_pid")
+    try:
+        assert returncode != 0, (stdout, stderr, status)
+        assert status["state"] == "liveness_indeterminate", status
+        assert status["error"]["reason"] == "event_silence_outer_bound", status
+        assert status["error"]["quiet_for_s"] >= 0.15, status
+        assert status["killed_by_heartbeat"] is False, status
+        assert status["worker_alive"] is True, status
+        assert _pid_alive(worker_pid), (status, stderr)
+    finally:
+        _force_kill(worker_pid)
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -1299,9 +1302,13 @@ def case_runner_outer_bound_with_busy_cpu_and_idle_disabled() -> None:
         status["liveness_outer_bound_observation"]
         == "positive_cpu_without_observable_progress"
     ), status
-    assert status["killed_by_heartbeat"] is True, status
-    assert status["worker_alive"] is False, status
-    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+    worker_pid = status.get("worker_pid")
+    try:
+        assert status["killed_by_heartbeat"] is False, status
+        assert status["worker_alive"] is True, status
+        assert _pid_alive(worker_pid), (status, stderr)
+    finally:
+        _force_kill(worker_pid)
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -2238,20 +2245,25 @@ def case_runner_idle_descendant_cannot_override_hard_wall() -> None:
         process_rows = process_table_file.read_text(encoding="utf-8").splitlines()
         assert f"{child_pid} {status['worker_pid']}" in process_rows, process_rows
 
-    assert returncode != 0, (stdout, stderr, status)
-    assert status["state"] == "liveness_indeterminate", status
-    assert status["error"]["message"] == "liveness_indeterminate", status
-    assert status["error"]["reason"] == "event_silence_outer_bound", status
-    assert status.get("wedge_progress_seen", 0) >= 1, status
-    assert status.get("liveness_descendant_veto_observed") is True, status
-    assert status.get("liveness_descendant_veto_kind") == "live", status
-    assert status["error"]["quiet_for_s"] >= 0.3, status
-    assert status["state"] != "wedged", status
-    assert status.get("liveness_hard_wall_expired") is True, status
-    assert status["killed_by_heartbeat"] is True, status
-    assert status["worker_alive"] is False, status
-    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
-    assert not _pid_alive(child_pid), (child_pid, status, stderr)
+        worker_pid = status.get("worker_pid")
+        try:
+            assert returncode != 0, (stdout, stderr, status)
+            assert status["state"] == "liveness_indeterminate", status
+            assert status["error"]["message"] == "liveness_indeterminate", status
+            assert status["error"]["reason"] == "event_silence_outer_bound", status
+            assert status.get("wedge_progress_seen", 0) >= 1, status
+            assert status.get("liveness_descendant_veto_observed") is True, status
+            assert status.get("liveness_descendant_veto_kind") == "live", status
+            assert status["error"]["quiet_for_s"] >= 0.3, status
+            assert status["state"] != "wedged", status
+            assert status.get("liveness_hard_wall_expired") is True, status
+            assert status["killed_by_heartbeat"] is False, status
+            assert status["worker_alive"] is True, status
+            assert _pid_alive(worker_pid), (status, stderr)
+            assert _pid_alive(child_pid), (child_pid, status, stderr)
+        finally:
+            _force_kill(worker_pid)
+            _force_kill(child_pid)
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -2282,19 +2294,75 @@ def case_runner_unknown_descendants_cannot_override_hard_wall() -> None:
             },
             timeout_s=20.0,
         )
+        worker_pid = status.get("worker_pid")
+        try:
+            assert returncode != 0, (stdout, stderr, status)
+            assert status["state"] == "liveness_indeterminate", status
+            assert status["error"]["message"] == "liveness_indeterminate", status
+            assert status.get("wedge_progress_seen", 0) >= 1, status
+            assert status.get("liveness_descendant_veto_observed") is True, status
+            assert status.get("liveness_descendant_veto_kind") == "unknown", status
+            assert status["error"]["quiet_for_s"] >= 0.3, status
+            assert status["state"] != "wedged", status
+            assert status.get("liveness_hard_wall_expired") is True, status
+            assert status["killed_by_heartbeat"] is False, status
+            assert status["worker_alive"] is True, status
+            assert _pid_alive(worker_pid), (status, stderr)
+        finally:
+            _force_kill(worker_pid)
 
-    assert returncode != 0, (stdout, stderr, status)
-    assert status["state"] == "liveness_indeterminate", status
-    assert status["error"]["message"] == "liveness_indeterminate", status
-    assert status.get("wedge_progress_seen", 0) >= 1, status
-    assert status.get("liveness_descendant_veto_observed") is True, status
-    assert status.get("liveness_descendant_veto_kind") == "unknown", status
-    assert status["error"]["quiet_for_s"] >= 0.3, status
-    assert status["state"] != "wedged", status
-    assert status.get("liveness_hard_wall_expired") is True, status
-    assert status["killed_by_heartbeat"] is True, status
-    assert status["worker_alive"] is False, status
-    assert not _pid_alive(status.get("worker_pid")), (status, stderr)
+
+@skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
+def case_runner_indeterminate_liveness_does_not_kill() -> None:
+    """Unknown CPU and unavailable descendant ps must not authorize a kill.
+
+    A destination may terminate only on a measured negative. Unmeasurable
+    liveness is unknown, not dead: extend grace, re-probe, then surface and
+    leave the worker running for the operator.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        bindir = _descendant_ps_fail_bindir(tmp)
+        env = os.environ.copy()
+        env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+        probe = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,state="],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert probe.returncode != 0, "precondition failed: descendant ps probe succeeded"
+        state_snapshot: dict = {}
+        returncode, status, stdout, stderr = _run_fake_runner(
+            "long_reasoning_pause",
+            progress_stall_s=30.0,
+            heartbeat_interval=0.05,
+            wedge_samples=99,
+            idle_timeout=0.0,
+            max_quiet_s=0.15,
+            max_tool_s=30.0,
+            extra_env={
+                "PATH": env["PATH"],
+                "GOALFLIGHT_FAKE_ACP_LONG_PAUSE_S": "8",
+                "GOALFLIGHT_TEST_MODE": "1",
+                "GOALFLIGHT_TEST_PGROUP_CPU_PCT": "unavailable",
+            },
+            state_snapshot=state_snapshot,
+            timeout_s=20.0,
+        )
+        worker_pid = status.get("worker_pid")
+        try:
+            assert returncode != 0, (stdout, stderr, status)
+            assert status["state"] == "liveness_indeterminate", status
+            assert status["error"]["message"] == "liveness_indeterminate", status
+            assert status["error"]["reason"] == "event_silence_outer_bound", status
+            assert status["killed_by_heartbeat"] is False, status
+            assert status["worker_alive"] is True, status
+            assert status["worker_still_alive"] is True, status
+            assert _pid_alive(worker_pid), (status, stderr)
+            assert status.get("liveness_indeterminate_probes", 0) >= 1, status
+        finally:
+            _force_kill(worker_pid)
 
 
 @skipif(os.name == "nt", reason="native Windows ACP dispatch is refused in Phase 1")
@@ -2827,6 +2895,7 @@ def main() -> None:
     case_runner_idle_silent_idle_timeout_reaps()
     case_runner_idle_descendant_cannot_override_hard_wall()
     case_runner_unknown_descendants_cannot_override_hard_wall()
+    case_runner_indeterminate_liveness_does_not_kill()
     case_runner_oversized_frame_dropped_then_completes()
     case_runner_oversized_request_gets_safe_reply()
     case_runner_oversized_request_late_id_gets_safe_reply()

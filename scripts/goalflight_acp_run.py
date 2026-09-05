@@ -83,6 +83,10 @@ DEFAULT_MAX_CONSECUTIVE_TOOL_ERRORS = 5
 # measuring verbosity, not runaway.
 DEFAULT_MAX_ACP_EVENTS = 60000
 DEFAULT_STALL_WAKE_CAP = 3
+# Consecutive unmeasurable outer-wall probes before the runner surfaces
+# liveness_indeterminate and detaches. Unknown is never a kill; a measured
+# idle/dead verdict still terminates on the first confirmed sample.
+LIVENESS_INDETERMINATE_PROBE_LIMIT = 3
 DEFAULT_BETWEEN_TURN_STEER_GRACE_S = 10.0
 DEFAULT_EMPTY_BETWEEN_TURN_STEER_POLL_S = 0.25
 DEFAULT_USER_CONFIRM_TIMEOUT_S = 600.0
@@ -2785,6 +2789,7 @@ async def _run_acp_dispatch_impl(
     wedged_by_heartbeat = False
     detach_worker = False
     stall_wake_count = 0
+    liveness_indeterminate_probes = 0
     stall_detach_event = asyncio.Event()
     relayed_permission_keys: set[str] = set()
     user_confirm_questions: dict[str, dict[str, object]] = {
@@ -3364,7 +3369,14 @@ async def _run_acp_dispatch_impl(
         quiet_for_s: float,
         source: str,
     ) -> tuple[str | None, float | None, int | None]:
-        """Publish one evidence-based outer-wall verdict across ACP paths."""
+        """Publish one evidence-based outer-wall verdict across ACP paths.
+
+        Confirmed idle is a measured negative and may terminate. Unmeasurable
+        CPU/descendant probes are unknown: re-probe up to
+        ``LIVENESS_INDETERMINATE_PROBE_LIMIT``, then surface and return the
+        typed indeterminate state so the caller can detach without killing.
+        """
+        nonlocal liveness_indeterminate_probes, heartbeat_outcome, heartbeat_error
         async with liveness_outer_lock:
             if heartbeat_outcome is not None:
                 return (
@@ -3380,6 +3392,7 @@ async def _run_acp_dispatch_impl(
             descendants = await asyncio.to_thread(live_descendant_count, proc.pid)
             activity_snapshot = activity.snapshot(active_monotonic())
             if float(activity_snapshot["quiet_for_s"]) < cfg.max_quiet_s:
+                liveness_indeterminate_probes = 0
                 return None, measured_cpu, descendants
             known_idle = (
                 cpu_confirmed_idle(measured_cpu, cfg.cpu_epsilon)
@@ -3403,34 +3416,14 @@ async def _run_acp_dispatch_impl(
                     activity_snapshot["outstanding_count"]
                 ),
             }
-            outer_state = "wedged" if known_idle else LIVENESS_INDETERMINATE_STATE
-            outer_error = (
-                {
-                    "code": -1,
-                    "message": "idle_timeout_confirmed",
-                    "reason": "confirmed_idle",
-                    "quiet_for_s": round(quiet_for_s, 3),
-                    "hard_wall_s": cfg.max_quiet_s,
-                    **observation,
-                }
-                if known_idle
-                else {
-                    "code": -1,
-                    "message": LIVENESS_INDETERMINATE_STATE,
-                    "reason": "event_silence_outer_bound",
-                    "quiet_for_s": round(quiet_for_s, 3),
-                    "hard_wall_s": cfg.max_quiet_s,
-                    **observation,
-                }
-            )
-            await mark_heartbeat_terminal(outer_state, outer_error)
-            await update_status(
+            descendant_veto = descendants is None or descendants > 0
+            status_fields = dict(
                 pgroup_cpu_pct=measured_cpu,
                 live_descendants=descendants,
                 liveness_hard_wall_expired=True,
                 liveness_descendant_veto_observed=(
                     True
-                    if descendants is None or descendants > 0
+                    if descendant_veto
                     else payload.get("liveness_descendant_veto_observed")
                 ),
                 liveness_descendant_veto_kind=(
@@ -3440,15 +3433,80 @@ async def _run_acp_dispatch_impl(
                     if descendants > 0
                     else payload.get("liveness_descendant_veto_kind")
                 ),
-                liveness_outer_bound_classification=(
-                    "confirmed_idle" if known_idle else "indeterminate"
-                ),
                 liveness_outer_bound_observation=observed_state,
                 liveness_outer_bound_recent_forward_progress_observed=False,
                 liveness_outer_bound_source=source,
                 quiet_for_s=round(quiet_for_s, 3),
             )
-            return outer_state, measured_cpu, descendants
+            if known_idle:
+                outer_error = {
+                    "code": -1,
+                    "message": "idle_timeout_confirmed",
+                    "reason": "confirmed_idle",
+                    "quiet_for_s": round(quiet_for_s, 3),
+                    "hard_wall_s": cfg.max_quiet_s,
+                    **observation,
+                }
+                await mark_heartbeat_terminal("wedged", outer_error)
+                await update_status(
+                    **status_fields,
+                    liveness_outer_bound_classification="confirmed_idle",
+                )
+                return "wedged", measured_cpu, descendants
+
+            liveness_indeterminate_probes += 1
+            await update_status(
+                **status_fields,
+                liveness_outer_bound_classification="indeterminate",
+                liveness_indeterminate_probes=liveness_indeterminate_probes,
+                liveness_indeterminate_probe_limit=LIVENESS_INDETERMINATE_PROBE_LIMIT,
+                killed_by_heartbeat=False,
+                worker_alive=True,
+            )
+            if liveness_indeterminate_probes < LIVENESS_INDETERMINATE_PROBE_LIMIT:
+                return None, measured_cpu, descendants
+
+            outer_error = {
+                "code": -1,
+                "message": LIVENESS_INDETERMINATE_STATE,
+                "reason": "event_silence_outer_bound",
+                "quiet_for_s": round(quiet_for_s, 3),
+                "hard_wall_s": cfg.max_quiet_s,
+                "probes": liveness_indeterminate_probes,
+                **observation,
+            }
+            heartbeat_outcome = LIVENESS_INDETERMINATE_STATE
+            heartbeat_error = outer_error
+            if conn is not None:
+                setattr(conn, "heartbeat_outcome", LIVENESS_INDETERMINATE_STATE)
+                setattr(conn, "killed_by_heartbeat", False)
+            async with status_lock:
+                payload.update(
+                    state=LIVENESS_INDETERMINATE_STATE,
+                    ok=False,
+                    error=outer_error,
+                    killed_by_heartbeat=False,
+                    wedged_by_heartbeat=False,
+                    updated_at=_now(),
+                )
+                write_status(status_path, payload)
+            await update_status(
+                **status_fields,
+                liveness_outer_bound_classification="indeterminate",
+                liveness_indeterminate_probes=liveness_indeterminate_probes,
+                liveness_indeterminate_probe_limit=LIVENESS_INDETERMINATE_PROBE_LIMIT,
+                killed_by_heartbeat=False,
+                worker_alive=True,
+            )
+            print(
+                "goalflight_acp_run: WARN: liveness unobservable after "
+                f"{liveness_indeterminate_probes} probes; leaving worker "
+                f"pid {getattr(proc, 'pid', None)} running for operator "
+                "decision (unknown is not a kill)",
+                file=sys.stderr,
+                flush=True,
+            )
+            return LIVENESS_INDETERMINATE_STATE, measured_cpu, descendants
 
     async def mark_runaway_terminal(error: dict[str, object]) -> None:
         nonlocal heartbeat_outcome, heartbeat_error, wedged_by_heartbeat
@@ -3804,9 +3862,9 @@ async def _run_acp_dispatch_impl(
                 # Universal event-silence wall. This heartbeat runs even when
                 # run_prompt's ordinary idle timeout is disabled, so positive
                 # CPU and live/unknown descendants cannot make liveness
-                # unfalsifiable. Conversely this is not a death verdict: the
-                # typed state records indeterminate liveness, and finalization
-                # retains capacity unless later cleanup proves group death.
+                # unfalsifiable. Kill only a measured idle/dead outcome.
+                # Unmeasurable liveness is re-probed, then surfaced and
+                # detached; the operator decides whether to reap it.
                 outer_outcome, _, _ = await mark_liveness_outer_terminal(
                     pgid=pgid,
                     cpu=cpu_pct,
@@ -3816,7 +3874,12 @@ async def _run_acp_dispatch_impl(
                 if outer_outcome is None:
                     await asyncio.sleep(cfg.heartbeat_interval)
                     continue
-                await conn.kill()
+                if outer_outcome == "wedged":
+                    await conn.kill()
+                    return
+                mark_connection_detached(proc.pid)
+                detach_worker = True
+                stall_detach_event.set()
                 return
             decision = heartbeat_wedge_decision(
                 pid_alive=pid_alive,
@@ -3930,7 +3993,8 @@ async def _run_acp_dispatch_impl(
         # samples process-group CPU (with the transient-ps-failure grace):
         # > epsilon ⇒ keep waiting (the false-positive killer); at/below epsilon
         # (or unsamplable after grace), OR past the running_quiet hard wall ⇒
-        # wedged ⇒ let the runner cancel.
+        # wedged ⇒ let the runner cancel. Unmeasurable liveness detaches.
+        nonlocal detach_worker
         if proc is None or proc.returncode is not None:
             return False
         if awaiting_user_confirm and activity.turn_in_flight():
@@ -3972,7 +4036,12 @@ async def _run_acp_dispatch_impl(
             )
             if outer_outcome is None:
                 return True
-            return False
+            if outer_outcome == "wedged":
+                return False
+            mark_connection_detached(proc.pid)
+            detach_worker = True
+            stall_detach_event.set()
+            return True
         descendants = None
         descendant_veto = False
         if not keep_waiting:
@@ -4776,7 +4845,6 @@ async def _run_acp_dispatch_impl(
                 "wedged",
                 "tool_timeout",
                 "remote_turn_silence",
-                LIVENESS_INDETERMINATE_STATE,
             )
             or runaway_terminal,
             "wedged_by_heartbeat": state == "wedged",
@@ -4811,7 +4879,7 @@ async def _run_acp_dispatch_impl(
         else:
             raise
     except _AcpWorkerDetached:
-        if payload.get("state") != "stalled":
+        if payload.get("state") not in {"stalled", LIVENESS_INDETERMINATE_STATE}:
             payload.update(
                 {
                     "state": "stalled",
