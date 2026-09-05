@@ -31,6 +31,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 FAKE_AGENT = ROOT / "tests/fixtures/acp_fake_agent.py"
 
 from goalflight_acp_client import (  # noqa: E402
+    ACP_IMPORT_ERROR,
     AcpError,
     AcpLivenessActivity,
     AcpProcessPool,
@@ -39,6 +40,7 @@ from goalflight_acp_client import (  # noqa: E402
     MAX_PERMISSION_ROUTER_DECISIONS,
     JsonRpcLineFilterReader,
     PoolExhaustedError,
+    RequestPermissionResponse,
     _classify_oversized_json_rpc_head,
 )
 from goalflight_acp_run import (  # noqa: E402
@@ -635,6 +637,88 @@ def case_matrix_timeout_reaps_runner_process_group() -> None:
             if child_pid_file.exists():
                 with contextlib.suppress(Exception):
                     _force_kill(int(child_pid_file.read_text(encoding="utf-8")))
+
+
+def case_unimportable_sdk_permission_path_names_acp_import_error() -> None:
+    """Missing ACP SDK must fail with ACP_IMPORT_ERROR, not NameError."""
+
+    def _assert_unavailable(exc: BaseException, *, via: str) -> None:
+        text = str(exc)
+        assert "ACP_IMPORT_ERROR" in text, (via, text)
+        assert "ACP SDK is unavailable" in text, (via, text)
+
+    if ACP_IMPORT_ERROR is not None:
+        try:
+            RequestPermissionResponse()
+        except AcpError as exc:
+            _assert_unavailable(exc, via="RequestPermissionResponse")
+        else:
+            raise AssertionError("RequestPermissionResponse silently worked without the ACP SDK")
+
+        async def _run() -> None:
+            client = GoalflightClient(cwd=str(ROOT))
+            await client.request_permission(
+                [{"kind": "allow_once", "optionId": "ok"}],
+                "session-missing-sdk",
+                {"toolCallId": "t1", "title": "read", "kind": "read"},
+            )
+
+        try:
+            asyncio.run(_run())
+        except AcpError as exc:
+            _assert_unavailable(exc, via="request_permission")
+        else:
+            raise AssertionError("permission path silently worked without the ACP SDK")
+        return
+
+    script = r"""
+import builtins
+import sys
+real_import = builtins.__import__
+def blocked(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "acp" or name.startswith("acp."):
+        raise ModuleNotFoundError("No module named 'acp'")
+    return real_import(name, globals, locals, fromlist, level)
+builtins.__import__ = blocked
+sys.path.insert(0, sys.argv[1])
+import asyncio
+import goalflight_acp_client as c
+assert c.ACP_IMPORT_ERROR is not None
+try:
+    c.RequestPermissionResponse()
+except c.AcpError as exc:
+    text = str(exc)
+    if "ACP_IMPORT_ERROR" not in text:
+        raise SystemExit("missing ACP_IMPORT_ERROR: " + text)
+    if "ACP SDK is unavailable" not in text:
+        raise SystemExit("missing unavailable phrasing: " + text)
+else:
+    raise SystemExit("RequestPermissionResponse silently worked")
+async def _run():
+    client = c.GoalflightClient(cwd=".")
+    await client.request_permission(
+        [{"kind": "allow_once", "optionId": "ok"}],
+        "session-missing-sdk",
+        {"toolCallId": "t1", "title": "read", "kind": "read"},
+    )
+try:
+    asyncio.run(_run())
+except c.AcpError as exc:
+    text = str(exc)
+    if "ACP_IMPORT_ERROR" not in text:
+        raise SystemExit("missing ACP_IMPORT_ERROR on request_permission: " + text)
+    if "ACP SDK is unavailable" not in text:
+        raise SystemExit("missing unavailable phrasing on request_permission: " + text)
+else:
+    raise SystemExit("permission path silently worked")
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(ROOT / "scripts")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
 def case_permission_router_audit_bounded_and_truncated() -> None:
@@ -2844,6 +2928,7 @@ def case_acp_missing_prompt_commits_terminal_outbox() -> None:
 
 
 def main() -> None:
+    case_unimportable_sdk_permission_path_names_acp_import_error()
     case_vendor_flood_idle_waits_for_quiet_backstop()
     case_dropped_frame_records_are_bounded()
     case_empty_oversized_head_assumes_request_for_reply()
