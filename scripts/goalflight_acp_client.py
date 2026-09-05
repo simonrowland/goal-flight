@@ -77,6 +77,37 @@ class _ClientBase(Protocol):
     pass
 
 
+class AcpError(Exception):
+    pass
+
+
+class _UnavailableAcpSymbol:
+    """Fail loudly when an ACP SDK name is used without the SDK.
+
+    Bound in the import fallback so missing schema names raise a named
+    ACP_IMPORT_ERROR instead of NameError. Must not silently succeed.
+    """
+
+    __slots__ = ("_symbol_name",)
+
+    def __init__(self, name: str) -> None:
+        object.__setattr__(self, "_symbol_name", name)
+
+    def _unavailable(self, *_args: Any, **_kwargs: Any) -> Any:
+        name = object.__getattribute__(self, "_symbol_name")
+        detail = " ".join(str(ACP_IMPORT_ERROR).split()) or "no detail"
+        raise AcpError(
+            f"ACP_IMPORT_ERROR: ACP SDK is unavailable "
+            f"({type(ACP_IMPORT_ERROR).__name__}: {detail}); cannot use {name}"
+        ) from ACP_IMPORT_ERROR
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._unavailable()
+
+    def __getattr__(self, item: str) -> Any:
+        return self._unavailable()
+
+
 try:  # Import lazily enough that non-ACP commands still run without the SDK.
     from acp import (  # type: ignore
         Client as _SdkClient,
@@ -110,8 +141,15 @@ except BaseException as e:  # pragma: no cover - exercised by doctor/system pyth
         def invalid_params(cls, data: dict[str, Any] | None = None) -> "RequestError":
             return cls(f"Invalid params: {data}")
 
-    StreamDirection = None  # type: ignore[assignment]
-    StreamEvent = object  # type: ignore[assignment]
+    AllowedOutcome = _UnavailableAcpSymbol("AllowedOutcome")
+    ClientCapabilities = _UnavailableAcpSymbol("ClientCapabilities")
+    DeniedOutcome = _UnavailableAcpSymbol("DeniedOutcome")
+    Implementation = _UnavailableAcpSymbol("Implementation")
+    RequestPermissionResponse = _UnavailableAcpSymbol("RequestPermissionResponse")
+    StreamDirection = _UnavailableAcpSymbol("StreamDirection")
+    StreamEvent = _UnavailableAcpSymbol("StreamEvent")
+    connect_to_agent = _UnavailableAcpSymbol("connect_to_agent")
+    text_block = _UnavailableAcpSymbol("text_block")
 
 
 ACP_SDK_IMPORTABLE = "importable"
@@ -327,10 +365,6 @@ def _identity_token(identity: dict[str, Any] | None) -> dict[str, Any] | None:
         for key in ("pid", "start_token", "lstart", "comm")
         if identity.get(key)
     }
-
-
-class AcpError(Exception):
-    pass
 
 
 @dataclass(frozen=True)

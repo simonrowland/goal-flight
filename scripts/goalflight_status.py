@@ -1350,6 +1350,11 @@ def done_code(record: dict, *, worker_alive: bool | None = None) -> int:
         # polling acquire; the wait deadline bounds it). Without this branch
         # the raw-state fallback would misreport a queued dispatch as DONE.
         return 1
+    # stale_dead is a measured negative identity probe, not unknown liveness.
+    # --wait must resolve it; treating it like identity_indeterminate hangs
+    # the controller forever. Other stale_* reasons stay ambiguous.
+    if cls == "stale_dead":
+        return 0
     if cls in _AMBIGUOUS_CLASS or cls.startswith("stale_"):
         return 2
     if (
@@ -1884,6 +1889,8 @@ def _terminal_state(record: dict | None, *, code: int, timed_out: bool = False) 
     cls = record.get("classification") or record.get("state") or "unknown"
     if cls == "idle_timeout":
         return "idle_timeout"
+    if cls == "stale_dead":
+        return "worker_dead"
     return str(record.get("terminal_state") or cls)
 
 

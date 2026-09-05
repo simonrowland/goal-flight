@@ -380,6 +380,7 @@ def test_done_code() -> None:
         S.goalflight_ledger.read_records = orig_read_records
         S.goalflight_ledger.identity_matches = orig_identity_matches
         S.goalflight_compat.pid_alive = orig_pid_alive
+    check("stale_dead -> 0", S.done_code({"classification": "stale_dead"}) == 0)
     check("stale_* -> 2", S.done_code({"classification": "stale_pid_reuse"}) == 2)
     check("missing classification -> 2 (do not claim done)", S.done_code({}) == 2)
     check(
