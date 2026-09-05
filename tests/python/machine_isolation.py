@@ -22,6 +22,13 @@ pidfile dir               ``GOAL_FLIGHT_PIDFILE_DIR`` else ``/tmp/goal-flight-ac
                           (alias ``GOALFLIGHT_PIDFILE_DIR`` used by some paths) yes, both names
 state dir                 ``GOALFLIGHT_STATE_DIR`` else ``/tmp/goal-flight-<uid>``  yes
 Codex state / homes       ``GOALFLIGHT_CODEX_STATE_DIR`` else ``~/.goal-flight``   yes
+
+``isolated_machine_env(base)`` CREATES its directories under ``base``, so these
+names are reserved there: ``codex-state``, ``fleet``, ``journals``, ``messages``,
+``pids``, ``state``, ``task-store``, ``wake-ledger``, ``xdg``. A test that passes
+its own ``tmp_path`` as the base and then does a bare ``(tmp_path / "state").mkdir()``
+raises FileExistsError -- pass ``exist_ok=True`` or pick another name. Three
+local-only ext codex modules hit exactly this when the shared inventory landed.
 dispatch dir              ``GOALFLIGHT_DISPATCH_DIR`` else ``<state>/dispatch`` yes (per-test explicit)
 messages dir              ``GOALFLIGHT_MESSAGES_DIR``                           yes
 task store                ``GOALFLIGHT_TASK_STORE_DIR``                         yes
