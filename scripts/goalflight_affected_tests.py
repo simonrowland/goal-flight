@@ -122,9 +122,14 @@ def select_modules(paths: list[str]) -> tuple[list[Path], list[str]]:
         p = Path(rel)
         if p.suffix == ".py" and p.parts[:2] == ("tests", "python"):
             candidate = REPO_ROOT / rel
-            if candidate.exists():
+            if candidate.exists() and candidate.name.startswith("test_"):
                 selected.add(candidate)
-            continue
+                continue
+            # A changed HELPER under tests/python (support.py,
+            # machine_isolation.py, conftest.py) is not itself a module to run:
+            # running it reports "no tests ran", which the runner counts as
+            # FAILED and a name-level gate then reads as a regression. Fall
+            # through to stem matching so it selects the modules that USE it.
         stem = p.stem
         if not stem:
             continue
