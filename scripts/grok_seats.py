@@ -486,6 +486,8 @@ def select_seat(
         return None if best == HOST_KEY else best
     except NoUsableSeat:
         raise
+    except grok_usage.GrokUsageError as exc:
+        raise NoUsableSeat(f"no usable grok seat: {exc}") from exc
     except Exception as exc:
         raise NoUsableSeat("no usable grok seat: probe failed") from exc
 

@@ -118,6 +118,69 @@ def test_least_used_seat_wins(tmp_path: Path) -> None:
     assert seats.select_seat(path=path, now=NOW, allow_refresh=False) == "fresh"
 
 
+def test_missing_accounts_dir_may_select_measured_host(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """No named seats configured is a measured empty set; host may still win."""
+    home = tmp_path / "home"
+    (home / ".grok").mkdir(parents=True)
+    (home / ".grok" / "auth.json").write_text("{}")
+    monkeypatch.delenv("GROK_HOME", raising=False)
+    monkeypatch.setattr(seats.grok_usage.Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(seats.grok_usage, "ACCOUNTS_DIR", tmp_path / "accounts")
+
+    def reader(*, auth_path, timeout_s, account):
+        return {"ok": True, "used_percent": 5.0}
+
+    def refresh(*, path, now):
+        return seats.refresh_states(
+            path=path, now=now, reader=reader, recover=None
+        )
+
+    assert (
+        seats.select_seat(path=tmp_path / "s.json", now=NOW, refresher=refresh)
+        is None
+    )
+
+
+def test_unreadable_accounts_dir_does_not_select_the_host(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An unreadable accounts directory is unknown, never a host fallback."""
+    home = tmp_path / "home"
+    (home / ".grok").mkdir(parents=True)
+    (home / ".grok" / "auth.json").write_text("{}")
+    accounts_dir = tmp_path / "accounts"
+    seat_auth = accounts_dir / "fresh" / "grok" / ".grok" / "auth.json"
+    seat_auth.parent.mkdir(parents=True)
+    seat_auth.write_text("{}")
+
+    monkeypatch.delenv("GROK_HOME", raising=False)
+    monkeypatch.setattr(seats.grok_usage.Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(seats.grok_usage, "ACCOUNTS_DIR", accounts_dir)
+
+    original_iterdir = Path.iterdir
+
+    def deny_accounts(self):
+        if self == accounts_dir:
+            raise PermissionError("denied")
+        return original_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", deny_accounts)
+
+    def reader(*, auth_path, timeout_s, account):
+        # Host would be selectable if discovery collapsed to it.
+        return {"ok": True, "used_percent": 5.0}
+
+    def refresh(*, path, now):
+        return seats.refresh_states(
+            path=path, now=now, reader=reader, recover=None
+        )
+
+    with pytest.raises(seats.NoUsableSeat):
+        seats.select_seat(path=tmp_path / "s.json", now=NOW, refresher=refresh)
+
+
 def test_unknown_usage_is_not_selected_even_without_a_measured_seat(
     tmp_path: Path,
 ) -> None:
