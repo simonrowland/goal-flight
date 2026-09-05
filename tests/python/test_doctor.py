@@ -548,6 +548,39 @@ def test_doctor_accepts_canonical_inactive_session_status() -> None:
     case_doctor_accepts_canonical_inactive_session_status()
 
 
+def case_doctor_accepts_unknown_session_active() -> None:
+    unknown = {
+        "active": None,
+        "queue_file": None,
+        "queue_state": None,
+        "queue_reason": "no queue files",
+        "active_capacity_leases_in_project": 0,
+        "newest_resume_notes": "docs-private/RESUME-NOTES-2026-09-05.md",
+        "resume_notes_active": None,
+    }
+    with patch.object(
+        goalflight_doctor,
+        "run",
+        return_value={
+            "returncode": 0,
+            "stdout": json.dumps(unknown),
+            "stderr": "",
+        },
+    ):
+        result = goalflight_doctor.check_session_status(ROOT, ROOT)
+    assert result["ok"] is True
+    assert result["active"] is None
+    assert result["resume_notes_active"] is None
+    payload = _minimal_human_payload(session_status=result)
+    lines = goalflight_doctor.collect_human_lines(payload)
+    assert any(line.startswith("[OK] session status") for line in lines)
+    assert "active=False" not in "\n".join(lines)
+
+
+def test_doctor_accepts_unknown_session_active() -> None:
+    case_doctor_accepts_unknown_session_active()
+
+
 def test_doctor_failed_rate_pressure_probe_is_not_ok() -> None:
     case_doctor_failed_rate_pressure_probe_is_not_ok()
 
@@ -786,6 +819,7 @@ def main() -> None:
     case_doctor_failed_session_status_makes_verdict_warn()
     case_doctor_rejects_structurally_empty_session_status()
     case_doctor_accepts_canonical_inactive_session_status()
+    case_doctor_accepts_unknown_session_active()
     case_doctor_failed_rate_pressure_probe_is_not_ok()
     case_doctor_malformed_rate_pressure_record_is_unavailable()
     case_doctor_empty_rate_pressure_directory_is_measured_zero()

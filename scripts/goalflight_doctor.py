@@ -568,15 +568,18 @@ def check_session_status(skill_root: Path, project_root: Path) -> dict:
         leases = payload.get("active_capacity_leases_in_project")
         if missing:
             invalid_reason = f"missing fields: {', '.join(missing)}"
-        elif not isinstance(payload.get("active"), bool):
-            invalid_reason = "active must be boolean"
+        elif payload.get("active") is not None and not isinstance(payload.get("active"), bool):
+            invalid_reason = "active must be boolean or null"
         elif (
             leases is not None
             and (isinstance(leases, bool) or not isinstance(leases, int) or leases < 0)
         ):
             invalid_reason = "active_capacity_leases_in_project must be non-negative integer or null"
-        elif not isinstance(payload.get("resume_notes_active"), bool):
-            invalid_reason = "resume_notes_active must be boolean"
+        elif (
+            payload.get("resume_notes_active") is not None
+            and not isinstance(payload.get("resume_notes_active"), bool)
+        ):
+            invalid_reason = "resume_notes_active must be boolean or null"
         elif not isinstance(payload.get("queue_reason"), str):
             invalid_reason = "queue_reason must be string"
         elif any(
