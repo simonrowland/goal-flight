@@ -392,6 +392,35 @@ def test_grok_default_selection_refuses_when_no_seat_is_usable(
         D.grok_selected_account(_grok_args(account=None))
 
 
+def test_unpinned_codex_host_fallback_records_labelled_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """All-walled / unselectable managed seats must bill a labelled host, not None."""
+    monkeypatch.setattr(
+        D,
+        "_codex_seat_api",
+        lambda: SimpleNamespace(
+            resolve_codex_seat=lambda *_args, **_kwargs: (None, None)
+        ),
+    )
+    home, account = D.resolve_codex_home(tmp_path, None, "walled-fleet")
+    assert home is None
+    assert account == "host"
+    err = capsys.readouterr().err
+    assert "billing host" in err
+    assert "walled" in err or "discovery failed" in err
+
+
+def test_codex_seat_api_absent_does_not_label_a_host_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """None still means we did not look; that is not a measured host fallback."""
+    monkeypatch.setattr(D, "_codex_seat_api", lambda: None)
+    assert D.resolve_codex_home(tmp_path, None, "no-lib") == (None, None)
+
+
 def test_resume_refuses_live_grok_source(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

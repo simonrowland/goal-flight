@@ -382,13 +382,18 @@ def test_bash_resolve_none_preserves_inherited_environment(
         resolved=(None, None),
     )
     assert "CODEX_HOME" not in worker_spawn["env"]
-    assert all(call.get("effective_account") is None for call in ledger_calls)
+    billed = [
+        call.get("effective_account")
+        for call in ledger_calls
+        if call["state"] in {"starting", "running"}
+    ]
+    assert billed == ["host", "host"]
     row = D.goalflight_journal.Journal(tmp_path).read_all(
         """SELECT effective_account, engine
            FROM dispatch_attempts WHERE dispatch_id = ?""",
         ("bash-seat-seam",),
     )[0]
-    assert row["effective_account"] is None
+    assert row["effective_account"] == "host"
     assert row["engine"] == "codex"
 
 
@@ -756,7 +761,7 @@ def test_acp_rebuilds_spawn_env_and_writes_truthful_accounts(
     assert cleanups == [cfg.dispatch_id]
 
 
-def test_acp_resolve_none_does_not_override_or_write_effective_account(
+def test_acp_unselectable_seat_preserves_inherited_env_and_labels_host(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cfg, captured, cleanups = _run_acp_to_spawn_failure(
@@ -768,7 +773,7 @@ def test_acp_resolve_none_does_not_override_or_write_effective_account(
     assert captured == {"BASE": "captured"}
     record = json.loads(L.record_path(cfg.dispatch_id).read_text(encoding="utf-8"))
     assert record["account"] == "default"
-    assert "effective_account" not in record
+    assert record["effective_account"] == "host"
     assert cleanups == []
     assert cfg.context_mode == "enabled"
 

@@ -5950,6 +5950,11 @@ def resolve_codex_home(
     An explicit ``--account`` is honored as a pin. Unpinned selection skips
     recently quota-exhausted seats until their reset rather than dying on
     the first serial seat.
+
+    When the seat library is absent this returns ``(None, None)``: we did
+    not look. When it is present but no managed seat is selectable, the
+    launch still proceeds on the inherited host login and the billed
+    account is labelled ``host`` so the ledger does not record ``None``.
     """
     api = _codex_seat_api()
     if api is None:
@@ -5960,15 +5965,22 @@ def resolve_codex_home(
         )
     resolved = _call_resolve_codex_seat(api, project_root, None, dispatch_id)
     home, account = resolved
-    if account is None or not _account_quota_blocked(account, engine="codex"):
-        return resolved
-    alternative = _first_unblocked_account("codex", exclude={account})
-    if alternative is None:
-        return resolved
-    retried = _call_resolve_codex_seat(
-        api, project_root, alternative, dispatch_id
+    if account is not None and _account_quota_blocked(account, engine="codex"):
+        alternative = _first_unblocked_account("codex", exclude={account})
+        if alternative is not None:
+            retried = _call_resolve_codex_seat(
+                api, project_root, alternative, dispatch_id
+            )
+            if retried != (None, None):
+                home, account = retried
+    if account:
+        return home, account
+    print(
+        "goalflight_dispatch: WARN: no managed codex seat selectable "
+        "(all seats walled or discovery failed); billing host",
+        file=sys.stderr,
     )
-    return retried if retried != (None, None) else resolved
+    return home, "host"
 
 
 def cleanup_codex_dispatch_home(dispatch_id: str) -> None:
