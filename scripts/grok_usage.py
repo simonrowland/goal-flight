@@ -26,7 +26,9 @@ present but re-typed remains a failure - absent and re-typed are different
 events and are reported differently.
 
 Several logins are reported, not one: the host ``~/.grok`` plus every
-``~/.goal-flight/accounts/<seat>/.grok``. See ``accounts()``.
+``~/.goal-flight/accounts/<seat>/.grok``. See ``accounts()``. An unreadable
+accounts directory is unknown, not an empty fleet: discovery must raise
+rather than silently returning only the host login.
 """
 
 from __future__ import annotations
@@ -76,14 +78,24 @@ def accounts() -> list[tuple[str | None, Path]]:
 
     An explicit ``GROK_HOME`` is an operator override: honour it alone, so this
     still reports exactly one account when someone points it at one.
+
+    A missing accounts directory is a measured empty set (host only). A
+    directory that exists but cannot be listed is unknown: this raises
+    ``GrokUsageError`` so a destination that bills an account can refuse
+    instead of treating the host login as the whole fleet.
     """
     if os.environ.get("GROK_HOME"):
         return [(None, AUTH_PATH)]
     found: list[tuple[str | None, Path]] = [(None, Path.home() / ".grok" / "auth.json")]
     try:
         seat_dirs = sorted(p for p in ACCOUNTS_DIR.iterdir() if p.is_dir())
-    except OSError:
+    except FileNotFoundError:
         seat_dirs = []
+    except OSError as exc:
+        raise GrokUsageError(
+            "accounts directory unreadable",
+            probe_state=PROBE_UNKNOWN,
+        ) from exc
     for seat in seat_dirs:
         auth = seat / "grok" / ".grok" / "auth.json"
         if auth.is_file():

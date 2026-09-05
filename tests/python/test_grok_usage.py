@@ -191,6 +191,53 @@ def test_accounts_lists_host_then_each_seat(tmp_path: Path, monkeypatch) -> None
     assert labels == [None, "6f3c47", "aaa111"]
 
 
+def test_missing_accounts_dir_is_measured_empty_host_only(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A missing accounts directory is an empty set, not an unknown listing."""
+    home = tmp_path / "home"
+    (home / ".grok").mkdir(parents=True)
+    (home / ".grok" / "auth.json").write_text("{}")
+    monkeypatch.delenv("GROK_HOME", raising=False)
+    monkeypatch.setattr(grok.Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(grok, "ACCOUNTS_DIR", tmp_path / "accounts")
+    assert [label for label, _ in grok.accounts()] == [None]
+
+
+def test_unreadable_accounts_dir_is_not_host_only(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Permission/IO failure listing accounts is unknown, not 'no accounts'."""
+    home = tmp_path / "home"
+    (home / ".grok").mkdir(parents=True)
+    (home / ".grok" / "auth.json").write_text("{}")
+    accounts_dir = tmp_path / "accounts"
+    seat_auth = accounts_dir / "fresh" / "grok" / ".grok" / "auth.json"
+    seat_auth.parent.mkdir(parents=True)
+    seat_auth.write_text("{}")
+
+    monkeypatch.delenv("GROK_HOME", raising=False)
+    monkeypatch.setattr(grok.Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(grok, "ACCOUNTS_DIR", accounts_dir)
+
+    original_iterdir = Path.iterdir
+
+    def deny_accounts(self):
+        if self == accounts_dir:
+            raise PermissionError("denied")
+        return original_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", deny_accounts)
+    try:
+        labels = [label for label, _ in grok.accounts()]
+    except Exception:
+        return
+    pytest.fail(
+        "unreadable accounts dir must not resolve to a seat list; "
+        f"got {labels!r} (None is the host login)"
+    )
+
+
 def test_grok_home_override_reports_that_one_account(
     tmp_path: Path, monkeypatch
 ) -> None:
