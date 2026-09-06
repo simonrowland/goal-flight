@@ -65,6 +65,7 @@ import select
 import shlex
 import signal
 import shutil
+import urllib.parse
 import socket
 import subprocess
 import sys
@@ -4805,20 +4806,81 @@ def _resume_launch_argv(
             "codex_home_owner_dispatch_id"
         ]
     resume_account = getattr(resume_args, "account", None)
-    if isinstance(resume_account, str) and resume_account.strip():
-        replace["--account"] = resume_account.strip()
-    elif source["engine"] != "codex":
-        # Stay on the seat that owns the session files unless that seat is
-        # recently quota-exhausted. Codex rebuilds a per-dispatch home;
-        # grok/cursor/claude sessions live in the seat HOME.
-        account = record.get("effective_account") or record.get("account")
+    engine = source["engine"]
+    owner_account = record.get("effective_account") or record.get("account")
+    if not (isinstance(owner_account, str) and owner_account and owner_account != "default"):
+        owner_account = None
+    requested = resume_account.strip() if isinstance(resume_account, str) and resume_account.strip() else None
+
+    if engine == "codex":
+        # Codex carries --codex-resume-home, so the rollout is read from the
+        # ORIGINAL home regardless of which seat is billed. No migration needed.
+        if requested:
+            replace["--account"] = requested
+    elif engine in SEAT_SCOPED_SESSION_ENGINES:
+        # The session is FILES under the seat's HOME. Landing on a different
+        # seat without them makes the CLI fall back to its per-account remote
+        # registry and fail 404, losing the whole context. So: choose a seat
+        # that can actually run, then MOVE the session to it.
+        target = requested or owner_account
         if (
-            isinstance(account, str)
-            and account
-            and account != "default"
-            and not _account_quota_blocked(account, engine=source["engine"])
+            target
+            and owner_account
+            and target == owner_account
+            and _account_quota_blocked(owner_account, engine=engine)
         ):
-            replace["--account"] = account
+            # The owning seat is walled. Resume is still possible on any healthy
+            # seat once the session travels with it -- that is the whole point.
+            healthy = [
+                candidate
+                for candidate in _configured_account_names(engine)
+                if candidate != owner_account
+                and not _account_quota_blocked(candidate, engine=engine)
+            ]
+            if healthy:
+                target = healthy[0]
+            else:
+                # Every configured seat is walled. Launching anyway spends a
+                # dispatch to rediscover the same 402 and re-terminalizes the
+                # parent for nothing. Grok in particular meters a SHARED
+                # "Build usage balance", so a seat change cannot help once it
+                # is gone -- only its reset can.
+                raise DispatchUsageError(
+                    no_healthy_seat_message(
+                        engine, owner_account, _configured_account_names(engine)
+                    )
+                )
+        if target and owner_account and target != owner_account:
+            ok, detail = migrate_seat_session(
+                engine=engine,
+                session_id=source["session_id"],
+                worker_cwd=str(cwd),
+                from_account=owner_account,
+                to_account=target,
+            )
+            print(
+                f"goalflight_dispatch: resume seat move {owner_account} -> {target}: {detail}",
+                file=sys.stderr,
+            )
+            if not ok:
+                # Could not LOCATE the session to move it. That is an unknown,
+                # not proof the resume is doomed: the layout may differ, or the
+                # CLI may still restore from its own store. Warn and let the
+                # engine give the authoritative answer -- do not refuse on a
+                # read that did not complete. (The measured no-tokens case
+                # above is a different thing and does refuse.)
+                print(
+                    f"goalflight_dispatch: WARN: could not move the {engine} session from "
+                    f"seat {owner_account!r} to {target!r} ({detail}). The session lives in "
+                    f"the owning seat's HOME; if the CLI cannot restore it from its own "
+                    f"store the resume will fail and the context is lost. Resume on "
+                    f"{owner_account!r} once its quota resets to keep the context for sure.",
+                    file=sys.stderr,
+                )
+        if target:
+            replace["--account"] = target
+    elif requested:
+        replace["--account"] = requested
     argv = _reconstruct_launch_argv(
         base,
         replace=replace,
@@ -5636,6 +5698,84 @@ def _prepare_attempt_controller_registration(
 
 def _account_engine(agent: str) -> str | None:
     return ACCOUNT_ENGINE_BY_AGENT.get(agent)
+
+
+SEAT_SCOPED_SESSION_ENGINES = {"grok": ".grok", "cursor": ".cursor"}
+
+
+def _seat_session_dir(account: str, engine: str, worker_cwd: str, session_id: str) -> Path | None:
+    """Where a seat-HOME-scoped engine keeps one session's files.
+
+    Layout, verified against 80/80 live dirs on 2026-09-06:
+    ``<account-home>/<dot-dir>/sessions/<quote(worker_cwd, safe='')>/<session-id>``
+    A grok session is a DIRECTORY (chat_history.jsonl, events.jsonl,
+    summary.json, system_prompt.txt, terminal/, ...), not a single file.
+    """
+    dot = SEAT_SCOPED_SESSION_ENGINES.get(engine)
+    if not dot or not account or not worker_cwd or not session_id:
+        return None
+    encoded = urllib.parse.quote(str(worker_cwd), safe="")
+    return _account_home(account, engine) / dot / "sessions" / encoded / str(session_id)
+
+
+def no_healthy_seat_message(engine: str, owner_account: str, seats: list[str]) -> str:
+    """Why a resume is refused when no seat can run it, and what to do instead.
+
+    Grok meters a SHARED "Build usage balance", so once it is gone no seat
+    change helps; launching anyway spends a dispatch to rediscover the same 402
+    and re-terminalizes the parent. The session itself is untouched.
+    """
+    listed = ", ".join(seats) if seats else "none configured"
+    return (
+        f"resume refused: the seat that owns this {engine} session "
+        f"({owner_account!r}) is quota-blocked, and every other configured "
+        f"{engine} seat is too ({listed}). Moving the session cannot buy tokens "
+        "that no seat has. Check `goalflight_usage.py` for the soonest reset and "
+        "resume after it, or redispatch on a different engine. The session is "
+        "intact and still resumable; nothing was lost."
+    )
+
+
+def migrate_seat_session(
+    *,
+    engine: str,
+    session_id: str,
+    worker_cwd: str,
+    from_account: str,
+    to_account: str,
+) -> tuple[bool, str]:
+    """Copy one engine session between seat homes so a resume can change seats.
+
+    Why this exists: a seat-scoped engine looks for the session in the CURRENT
+    seat's home and, failing that, asks its remote registry -- which is keyed to
+    the account that created it. Resuming grok on a different seat therefore died
+    with ``session get failed: 404`` and the worker's whole context was lost, so
+    the operator paid for a fresh redispatch anyway. The session is just files;
+    copying them into the target seat makes the resume resolve LOCALLY and the
+    remote registry is never consulted.
+
+    Returns (ok, detail). Never raises on a missing source: the caller refuses.
+    """
+    if from_account == to_account:
+        return True, "same seat; no migration needed"
+    src = _seat_session_dir(from_account, engine, worker_cwd, session_id)
+    dst = _seat_session_dir(to_account, engine, worker_cwd, session_id)
+    if src is None or dst is None:
+        return False, f"engine {engine!r} has no known seat-scoped session layout"
+    if not src.is_dir():
+        return False, f"session not present on the owning seat: {src}"
+    if dst.is_dir() and any(dst.iterdir()):
+        return True, f"already present on {to_account}: {dst}"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # Skip lock files: they are the ORIGINAL process's flocks. Copying them
+    # hands the resumed worker a stale lock that belongs to a dead pid.
+    def _ignore(_dir, names):
+        return [n for n in names if n.endswith(".lock")]
+    tmp = dst.with_name(dst.name + ".migrating")
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.copytree(src, tmp, ignore=_ignore, symlinks=True)
+    os.replace(tmp, dst)
+    return True, f"migrated {from_account} -> {to_account}: {dst}"
 
 
 def _account_home(account: str, engine: str) -> Path:
