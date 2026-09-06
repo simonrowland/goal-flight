@@ -80,16 +80,19 @@ def test_pool_renamed_and_unified(monkeypatch) -> None:
 
 
 def _dispatch_args(**overrides) -> SimpleNamespace:
-    base = {
-        "agent": "codex",
-        "read_only": False,
-        "prompt": "COMPLETE: no-op",
-        "prompt_file": None,
-        "cwd": None,
-        "ignore_git_warn": False,
-        "model": None,
-        "max_idle_secs": None,
-    }
+    """Build args the way the CLI does, so this fixture cannot drift.
+
+    The hand-written dict this replaces listed eight keys and went stale the
+    moment the launch parser grew one that `_validate_before_side_effects`
+    reads: `args.account` raised AttributeError and this module has been red
+    since. A fixture that enumerates its own fields silently stops matching the
+    thing it stands in for; deriving them from the parser makes that class of
+    breakage impossible rather than merely fixed once.
+    """
+    parsed = D._build_launch_parser().parse_args(
+        ["--agent", "codex", "--prompt", "COMPLETE: no-op"]
+    )
+    base = vars(parsed)
     base.update(overrides)
     return SimpleNamespace(**base)
 
