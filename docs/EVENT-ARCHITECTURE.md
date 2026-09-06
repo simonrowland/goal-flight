@@ -425,7 +425,8 @@ and emits `event`/`listener-dead` when state is stale, faulted, missing, or inva
 The decomposed unsupervised path includes the exact re-arm command; under `supervise`
 the record keeps the reason but omits that action, and recovery is a supervisor restart.
 Unreadable follow state is not death: do not arm another doorbell on
-`journal-unavailable` / `journal-io-failure` / busy / vanished-witness. Before
+`journal-unavailable` / `journal-io-failure` / busy / vanished-witness /
+`monitor-state-io`. Before
 acting on `listener-dead`, take positive control with `relay --new` (does a new
 event round-trip, is mail arriving). If inbound coverage is intact, it is
 contention. The watchdog never claims a delivery slot or

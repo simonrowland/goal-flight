@@ -321,8 +321,9 @@ each poll; stale, faulted, missing, or invalid state makes it emit a structural
 `event`/`listener-dead` record on stdout and exit. In the decomposed unsupervised
 path that record carries the exact persistent re-arm command; under `supervise` it
 keeps the reason but omits the component action, and recovery is a supervisor restart.
-Unreadable follow state (journal-unavailable, journal-io-failure, busy, vanished-witness)
-is retryable degradation, not death: it must not set `backup_required` or a
+Unreadable follow state (journal-unavailable, journal-io-failure, busy,
+vanished-witness, monitor-state-io) is retryable degradation, not death:
+it must not set `backup_required` or a
 `rearm_command`. Before acting on `listener-dead`, take positive control with
 `relay --new` (does a new event round-trip, is mail arriving). If inbound coverage
 is intact, the alarm is journal contention — heartbeats the supervisor cannot
