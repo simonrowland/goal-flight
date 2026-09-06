@@ -799,6 +799,88 @@ def case_claude_acp_reports_pinned_build_when_orig_differs() -> None:
     assert "backup at" in payload["detail"]
 
 
+# ----- orphaned listeners (b-340) -----
+
+
+class _Rec:
+    """Minimal lease-record reader stand-in."""
+
+    def __init__(self, nonces):
+        self._nonces = nonces
+
+    def lease_records(self):
+        return [{"lease_nonce": n} for n in self._nonces]
+
+
+def _ps(*lines: str):
+    return type("R", (), {"stdout": "\n".join(lines)})()
+
+
+_LISTENER = "python3 /skill/scripts/goalflight_messages.py {kind} --lease-nonce {n}"
+
+
+def case_orphan_check_counts_only_generations_with_no_lease() -> None:
+    listing = _ps(
+        _LISTENER.format(kind="supervise", n="aaa"),
+        _LISTENER.format(kind="listen", n="aaa"),
+        _LISTENER.format(kind="follow", n="bbb"),
+        _LISTENER.format(kind="listen", n="ccc"),
+    )
+    with patch("subprocess.run", return_value=listing), patch.object(
+        goalflight_doctor.goalflight_journal.Journal, "open_reader",
+        staticmethod(lambda _root: _Rec(["aaa"])),
+    ):
+        got = goalflight_doctor.check_orphaned_listeners(Path("/x"))
+    assert got["known"] is True, got
+    assert got["listeners"] == 4, got
+    assert got["generations"] == 3, got
+    assert got["orphans"] == 2, got          # bbb + ccc
+    assert got["orphan_generations"] == 2, got
+    assert "double-deliver" in got["warning"], got
+
+
+def case_orphan_check_is_silent_when_every_listener_is_accounted_for() -> None:
+    listing = _ps(_LISTENER.format(kind="supervise", n="aaa"))
+    with patch("subprocess.run", return_value=listing), patch.object(
+        goalflight_doctor.goalflight_journal.Journal, "open_reader",
+        staticmethod(lambda _root: _Rec(["aaa"])),
+    ):
+        got = goalflight_doctor.check_orphaned_listeners(Path("/x"))
+    assert got["orphans"] == 0, got
+    assert "warning" not in got, got
+
+
+def case_orphan_check_reports_unknown_when_it_cannot_enumerate() -> None:
+    """"Cannot look" must never render as "nothing there"."""
+    with patch("subprocess.run", side_effect=OSError("no ps")):
+        got = goalflight_doctor.check_orphaned_listeners(Path("/x"))
+    assert got["known"] is False, got
+    assert "orphans" not in got, got
+
+    listing = _ps(_LISTENER.format(kind="listen", n="aaa"))
+
+    def _boom(_root):
+        raise RuntimeError("journal busy")
+
+    with patch("subprocess.run", return_value=listing), patch.object(
+        goalflight_doctor.goalflight_journal.Journal, "open_reader",
+        staticmethod(_boom),
+    ):
+        got = goalflight_doctor.check_orphaned_listeners(Path("/x"))
+    assert got["known"] is False, got
+    assert "orphans" not in got, got
+
+
+def case_orphan_check_ignores_processes_without_a_nonce() -> None:
+    listing = _ps("python3 /skill/scripts/goalflight_messages.py status", "unrelated proc")
+    with patch("subprocess.run", return_value=listing), patch.object(
+        goalflight_doctor.goalflight_journal.Journal, "open_reader",
+        staticmethod(lambda _root: _Rec([])),
+    ):
+        got = goalflight_doctor.check_orphaned_listeners(Path("/x"))
+    assert got["listeners"] == 0 and got["orphans"] == 0, got
+
+
 def main() -> None:
     case_doctor_reports_platform_fields_for_windows()
     case_doctor_reports_platform_fields_for_linux()
@@ -831,6 +913,10 @@ def main() -> None:
     case_doctor_unhealthy_still_reports_warn()
     case_doctor_json_untouched_by_human_filter()
     case_doctor_exit_codes_unchanged()
+    case_orphan_check_counts_only_generations_with_no_lease()
+    case_orphan_check_is_silent_when_every_listener_is_accounted_for()
+    case_orphan_check_reports_unknown_when_it_cannot_enumerate()
+    case_orphan_check_ignores_processes_without_a_nonce()
     print("OK: doctor tests pass")
 
 

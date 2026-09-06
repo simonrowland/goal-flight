@@ -692,6 +692,76 @@ def check_seat_state_freshness() -> dict:
     return detail
 
 
+def check_orphaned_listeners(project_root: Path) -> dict:
+    """Listener processes whose controller generation is gone (b-340).
+
+    A listener is spawned under a controller's lease nonce and is supposed to
+    end with that generation. When a session restarts or is taken over, the
+    lease record goes but the processes do not, and nothing says so -- the
+    count simply grows.
+
+    Measured 2026-09-06: 44 live listeners across 9 nonces, of which the
+    journal held ONE lease record; 35 processes belonged to eight generations
+    that no longer existed. That matters beyond tidiness, because SKILL.md's
+    own rule is that a supervisor plus loose listeners DOUBLE-DELIVER, so
+    orphans can duplicate mail into a live stream.
+
+    This REPORTS only. Reaping is a separate decision with real blast radius,
+    and a check is not the place to make it.
+    """
+    try:
+        listing = subprocess.run(
+            ["ps", "-ax", "-o", "args="],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        # Cannot enumerate -> unknown, never "no orphans".
+        return {"ok": True, "known": False,
+                "detail": "process listing unavailable; orphan count unknown"}
+
+    counts: dict[str, int] = {}
+    for line in listing.splitlines():
+        if "goalflight_messages.py" not in line:
+            continue
+        match = re.search(r"--lease-nonce ([0-9a-f]+)", line)
+        if match:
+            counts[match.group(1)] = counts.get(match.group(1), 0) + 1
+    if not counts:
+        return {"ok": True, "known": True, "listeners": 0, "orphans": 0}
+
+    try:
+        records = goalflight_journal.Journal.open_reader(
+            project_root.resolve()
+        ).lease_records()
+    except Exception:
+        return {"ok": True, "known": False, "listeners": sum(counts.values()),
+                "detail": "lease records unreadable; orphan count unknown"}
+
+    known = {
+        r.get("lease_nonce") or r.get("nonce")
+        for r in records
+        if isinstance(r, dict)
+    }
+    orphan_nonces = sorted(n for n in counts if n not in known)
+    orphans = sum(counts[n] for n in orphan_nonces)
+    detail = {
+        "ok": True,
+        "known": True,
+        "listeners": sum(counts.values()),
+        "generations": len(counts),
+        "orphans": orphans,
+        "orphan_generations": len(orphan_nonces),
+    }
+    if orphans:
+        detail["warning"] = (
+            f"{orphans} listener process(es) from {len(orphan_nonces)} ended "
+            "controller generation(s) are still running; they can double-deliver "
+            "mail into a live stream and they make host-measuring tests fail "
+            "(b-340). They are not this session's to kill."
+        )
+    return detail
+
+
 def check_controller_lease_liveness(project_root: Path) -> dict:
     """Report ACTIVE journal leases against their sole kernel liveness witness."""
     resolved_root = project_root.resolve()
@@ -3436,6 +3506,7 @@ def doctor(
         "session_status": check_session_status(skill_root, repo),
         "controller_lease_liveness": check_controller_lease_liveness(repo),
         "seat_state_freshness": check_seat_state_freshness(),
+        "orphaned_listeners": check_orphaned_listeners(repo),
         "wake_coverage": check_wake_coverage(repo),
         "resume_notes_pattern": check_resume_notes_pattern(repo),
         "cursor": {
