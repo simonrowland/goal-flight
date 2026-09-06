@@ -129,3 +129,66 @@ def test_the_known_roots_cover_every_engine_that_keeps_a_trace(tmp_path: Path) -
     for expected in (".codex/sessions", ".kimi-code/sessions",
                      ".grok/sessions", ".cursor/projects"):
         assert expected in joined, f"{expected} missing from {joined}"
+
+
+# --------------------------------------------------------------------------
+# false ALIVE: the inverse failure, found by review of 0043a20
+#
+# Worktree seats are POOLED. A previous dispatch in the same seat leaves its
+# trace in the same directory, and while that trace is younger than the idle
+# window it would vouch for a worker that has done nothing. That is worse than
+# the false death this channel exists to prevent, because a false death
+# eventually resolves and a false alive never does.
+# --------------------------------------------------------------------------
+
+
+def _sample_started(home: Path, engine: str, started_epoch: float) -> dict:
+    tl = W.TraceLiveness(
+        dispatch_id=None,
+        worker_pid=DEAD_PID,
+        engine=engine,
+        worker_cwd=CWD,
+        home=home,
+        started_epoch=started_epoch,
+    )
+    return tl.sample(
+        now_epoch=time.time(), now_mono=W.active_monotonic(), idle_threshold=900.0
+    )
+
+
+@pytest.mark.parametrize("engine", ["cursor", "grok"])
+def test_a_predecessors_trace_in_a_pooled_seat_does_not_vouch(
+    tmp_path: Path, engine: str
+) -> None:
+    """Recent, but written before THIS dispatch began: not our evidence."""
+    home = tmp_path / "home"
+    _seed(home, engine, age_s=120.0)             # a prior dispatch, 2 min ago
+    got = _sample_started(home, engine, started_epoch=time.time() - 60.0)
+    assert got.get("trace_path"), "it should still resolve, just not vouch"
+    assert got["trace_active"] is False, got
+    assert W._trace_vetoes_idle(trace_active=got["trace_active"]) is False
+
+
+@pytest.mark.parametrize("engine", ["cursor", "grok"])
+def test_a_trace_written_during_this_dispatch_still_vouches(
+    tmp_path: Path, engine: str
+) -> None:
+    """The fix must not silence the signal it exists to provide."""
+    home = tmp_path / "home"
+    _seed(home, engine, age_s=30.0)
+    got = _sample_started(home, engine, started_epoch=time.time() - 600.0)
+    assert got["trace_active"] is True, got
+
+
+def test_without_a_start_bound_the_old_permissive_behaviour_remains(
+    tmp_path: Path,
+) -> None:
+    """started_epoch=None must stay usable rather than fail closed.
+
+    Callers that cannot say when the dispatch began should not lose the channel
+    entirely; they simply get the weaker recency test.
+    """
+    home = tmp_path / "home"
+    _seed(home, "cursor", age_s=120.0)
+    got = _sample_started(home, "cursor", started_epoch=None)
+    assert got["trace_active"] is True, got

@@ -930,6 +930,7 @@ class TraceLiveness:
         cached_path: str | None = None,
         engine: str | None = None,
         worker_cwd: object = None,
+        started_epoch: float | None = None,
         state_dir: Path | None = None,
         home: Path | None = None,
         started_mono: float | None = None,
@@ -942,6 +943,7 @@ class TraceLiveness:
         self.effective_account = effective_account
         self.engine = engine
         self.worker_cwd = worker_cwd
+        self.started_epoch = started_epoch
         self.home = (home or Path.home()).expanduser()
         self.state_dir = (state_dir or goalflight_ledger.state_dir()).resolve(strict=False)
         self.roots = _known_trace_roots(state_dir=self.state_dir, home=home)
@@ -999,9 +1001,18 @@ class TraceLiveness:
             return {
                 "trace_path": str(self.path),
                 "trace_mtime": mtime,
+                # Written during THIS dispatch, not merely recent. Worktree
+                # seats are POOLED: a previous dispatch's trace sits in the same
+                # directory, and while it is younger than the idle window it
+                # would vouch for a worker that has done nothing -- a false
+                # ALIVE, the exact inverse of the false death this channel
+                # exists to prevent, and worse, because it never resolves.
+                # Found by review of 0043a20; same bound the cursor session
+                # harvester already applies.
                 "trace_active": bool(
                     idle_threshold > 0
                     and 0 <= now_epoch - mtime < idle_threshold
+                    and (self.started_epoch is None or mtime >= self.started_epoch)
                 ),
             }
         except (OSError, RuntimeError, ValueError):
@@ -3836,12 +3847,20 @@ def main() -> int:
     )
     steer_mailbox = goalflight_steer_mailbox.steer_file(args.dispatch_id)
     last_size = -1
+    watcher_started_epoch = _trace_ledger_started_epoch(args.dispatch_id) or time.time()
     trace_liveness = TraceLiveness(
         dispatch_id=args.dispatch_id,
         worker_pid=args.pid,
         effective_account=effective_account,
         cached_path=_cached_trace_path(status_path),
         engine=resume_engine,
+        # The LEDGER's dispatch start, deliberately not watcher_started_epoch's
+        # `or time.time()` fallback. The bound may only be applied when we
+        # actually know when this dispatch began; substituting "now" would
+        # reject a trace the worker wrote moments before the watcher attached,
+        # which is a false DEATH -- the failure this channel exists to prevent.
+        # Unknown start => no bound, and the weaker recency test still applies.
+        started_epoch=_trace_ledger_started_epoch(args.dispatch_id),
         # args.worker_cwd, not tree_leg: the tree leg is resolved further down
         # this function, and reaching forward for it raised UnboundLocalError
         # on every watcher start. Both derive from the same input anyway.
@@ -3855,7 +3874,6 @@ def main() -> int:
     # time.time() remains for epoch display fields and the deliberate wall-clock
     # controller-attention thresholds; it never drives idle termination.
     last_change = active_monotonic()
-    watcher_started_epoch = _trace_ledger_started_epoch(args.dispatch_id) or time.time()
     terminal = None
     markers: list[dict] = []
     exit_reason = "unknown"
