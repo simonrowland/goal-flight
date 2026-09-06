@@ -3080,15 +3080,32 @@ def harvest_headline_marker(
         return harvested
     # Success-only fallbacks: a completed worker's COMPLETE/READY/RESULT may
     # sit behind extra summary. Attention is never taken from extract_markers.
+    #
+    # Every fallback carries the SAME identity check as the primary path above.
+    # Without it these three scrapes accepted any success-kind marker in the
+    # tail, so a COMPLETE naming a different dispatch became this worker's
+    # headline and terminal mail delivered another worker's result. A reviewer
+    # confirmed a marker the identity predicate had already REJECTED was
+    # nevertheless harvested here (t-289). The rule is the one
+    # _terminal_marker_matches_dispatch documents and the sibling
+    # _recorded_terminal_success_marker already applies: a success marker must
+    # carry this dispatch's id. When the caller has no expected id the
+    # predicate stays permissive, so this narrows nothing that was legitimate.
+    def _owned(candidate: object) -> bool:
+        return _is_success_headline_kind(candidate) and _terminal_marker_matches_dispatch(
+            candidate if isinstance(candidate, dict) else None,
+            expected_dispatch_id,
+        )
+
     for candidate in (payload.get("terminal_marker"), payload.get("last_marker")):
-        if _is_success_headline_kind(candidate):
+        if _owned(candidate):
             return candidate  # type: ignore[return-value]
     for marker in reversed(list(payload.get("markers") or [])):
-        if _is_success_headline_kind(marker):
+        if _owned(marker):
             return marker
     markers, _size = extract_markers(tail, ignore_prefix_lines=ignore_prefix_lines)
     for marker in reversed(markers):
-        if _is_success_headline_kind(marker):
+        if _owned(marker):
             return marker
     return None
 
