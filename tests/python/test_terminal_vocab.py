@@ -791,7 +791,14 @@ def main() -> None:
     test_diff_prefixed_terminal_markers()
     test_marker_before_known_harness_trailer()
     test_recorded_terminal_success_marker()
-    test_terminal_marker_dispatch_identity_poison_pairs()
+    # This module is a hybrid: pytest-style tests that take fixtures, plus a
+    # script-style main() that the isolation runner executes directly. pytest
+    # injects monkeypatch and tmp_path; main() has to supply them itself, and
+    # calling this one bare raised TypeError before any assertion ran -- so the
+    # module passed under pytest and failed as a script, which is exactly the
+    # gap the isolation runner exists to catch.
+    with pytest.MonkeyPatch.context() as _mp, tempfile.TemporaryDirectory() as _td:
+        test_terminal_marker_dispatch_identity_poison_pairs(_mp, Path(_td))
     test_false_death_marker_poison_pairs()
     test_marker_docs_preserve_result_summary_workflows()
     print("OK: terminal vocabulary poison-pair tests pass")
