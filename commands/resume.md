@@ -7,6 +7,12 @@ disable-model-invocation: true
 
 Rebuild working context from files and procedural status.
 
+> **Resuming a WORKER is a different verb, and the one that saves tokens.** This
+> file is about resuming the CONTROLLER. If a dispatched worker stopped because
+> it hit a quota wall, returned `BLOCKED:`, or asked you something, answer it and
+> `goalflight_dispatch.py resume <id>` — never write it a fresh brief. See
+> `protocols/dispatch-resume.md`.
+
 Applies only when Goal Flight was already in play (see `protocols/state-handoff.md`).
 Read and run `protocols/session-preflight.md` as the controller-start hook before
 rebuilding status.

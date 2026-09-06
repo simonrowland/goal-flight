@@ -267,7 +267,8 @@ Evidence: `docs-private/research/goal-flight-gotchas-audit/addendum.md`.
 - **Command-form drift.** Adapter `forbidden_args` + the current invocation override old docs.
 - **Worker bypass.** On sandbox/permission/write/commit block, return `BLOCKED:`; alternate delivery is orchestrator-only.
 - **False worker death.** Reconcile pid+start-time, status, ledger, tail marker, output mtime, and dirty tree before discarding work.
-- **Throttled/quota-killed is not failed — RESUME it.** `transient_throttle`, `quota_exhausted` and sandbox `BLOCKED:` say nothing about the work's quality, and the worktree usually holds finished or nearly-finished uncommitted edits. Run `git -C <worktree> status --short`, then `goalflight_dispatch.py resume <id> --prompt-file <brief>`. Redispatching instead silently discards that work. (Controllers keep re-learning this one; it is an affordance gap, not a knowledge gap.)
+- **Stopped is not failed — RESUME it, with your answer.** A worker that hit a quota wall, returned `BLOCKED:`, or paused for a clarification/plan approval needs an ANSWER, not a new brief; redispatching re-derives its whole context to deliver one sentence (append the answer to its brief file, then `resume --prompt-file <that same file>`).
+- **Throttled/quota-killed is not failed — RESUME it.** `transient_throttle`, `quota_exhausted` and sandbox `BLOCKED:` say nothing about the work's quality, and the worktree usually holds finished or nearly-finished uncommitted edits. Run `git -C <worktree> status --short`, then `goalflight_dispatch.py resume <id> --prompt-file <the SAME brief, with your answer appended>`. Redispatching instead silently discards that work. (Controllers keep re-learning this one; it is an affordance gap, not a knowledge gap.)
 - **Quiet is not dead.** Network waits and child tests may show no output/CPU; confirm terminal markers, process tree, and idle.
 - **Terminal marker not final until reconciled.** COMPLETE/RESULT/READY still needs idle/controller-dead logic.
 - **Rollover loses notifications, not state.** Status JSON, ledgers, resume/reconcile are authoritative.
@@ -374,9 +375,31 @@ abandoned tree, and "clean and merged" alone will delete live work.
 
 ### ★ A dead worker is usually a RESUMABLE worker — check before redispatching
 
+**A worker that stopped to ASK YOU something is always a resume, never a fresh
+brief.** Quota wall, `BLOCKED:`, a clarification, a USER-NEED / `!READY` plan
+pause — answer it and resume. A redispatch is a NEW engine session that re-reads
+the corpus and re-derives every dead end the original already ruled out; you pay
+for all of it again to deliver one sentence. This is the main way worker tokens
+get burnt here.
+
+Resume RE-READS `--prompt-file` as authoritative over the worker's own memory,
+so do NOT point it at a short answer-only file — that replaces the brief.
+**Append your answer to the original brief and resume with that same path.**
+
 ```bash
-python3 <skill-root>/scripts/goalflight_dispatch.py resume <dispatch_id> --prompt-file <brief>
+cat >> <the-original-brief>.md <<'EOF'
+
+## Controller answer
+<the answer / the decision / what you did about the block>
+Continue from where you stopped; everything above still applies.
+EOF
+python3 <skill-root>/scripts/goalflight_dispatch.py resume <dispatch_id> \
+  --prompt-file <the-original-brief>.md
 ```
+
+Write a fresh brief only when the PREMISE changed (review findings, a redirect,
+a corrected policy) or the session is unrecoverable. See
+`protocols/dispatch-resume.md`.
 
 A dead worker is not automatically a lost worker: resume when its accumulated context outvalues a clean read (quota death mid-task, partial edits only its author understands), redispatch when the premise moved (fix rounds, steers, reviews — a reviewer must never resume the implementer). See `protocols/dispatch-resume.md`.
 

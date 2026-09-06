@@ -1,5 +1,46 @@
 # Resume or redispatch?
 
+## ★ The most expensive miss: a worker that stopped to ASK YOU something
+
+**If the worker ended because it needs something from you, RESUME it with the
+answer. Do not write a fresh brief.** This is the single most common way codex
+and grok tokens get burnt on this project, because a redispatch is a NEW engine
+session: it re-reads the corpus, re-explores the tree, and re-derives every dead
+end the original had already ruled out. You pay for all of that a second time to
+deliver one sentence of answer.
+
+The cases, all resumable, all routinely redispatched by mistake:
+
+| the worker stopped because | what it needs | verb |
+|---|---|---|
+| quota wall / `quota_exhausted` / `transient_throttle` | a seat with headroom | `resume --account <seat>` |
+| `BLOCKED:` on sandbox, permission, push, or an out-of-standard path | your decision or the action taken for it | `resume` |
+| a clarification or USER-NEED / `!READY` plan-approval pause | the answer | `resume` |
+| ferried/detached launch died with the tree dirty | nothing but a restart | `resume` |
+
+**The mechanic, and it is not obvious.** `resume` requires `--prompt-file`, and
+the worker RE-READS that file as authoritative over its own summarized memory.
+So do not point it at a short answer-only file — that silently replaces the
+brief and the worker continues with your one sentence as its whole instruction.
+**Append the answer to the existing brief file and resume with that same path:**
+
+```bash
+cat >> docs-private/briefs/<the-original-brief>.md <<'EOF'
+
+## Controller answer (2026-09-06)
+<the answer / the decision / what you did about the block>
+Continue from where you stopped; everything above still applies.
+EOF
+python3 <skill-root>/scripts/goalflight_dispatch.py resume <dispatch_id> \
+  --prompt-file docs-private/briefs/<the-original-brief>.md
+```
+
+**Only write a fresh brief when the premise actually changed** — review findings
+to fix, a redirect, a corrected policy — or when the session genuinely cannot be
+recovered (no engine session handle, seat recycled, context poisoned). Those
+cases are below. "The worker asked me a question" is never one of them.
+
+
 A dead or stopped worker is not automatically a lost worker. Resuming keeps
 the worker's accumulated reasoning — the files it has read, the dead ends it
 already ruled out, the half-finished edit it understands. Redispatching buys
