@@ -497,6 +497,30 @@ OS_SANDBOX_OFF = "off"
 OS_SANDBOX_PROFILES = ("workspace-write", "read-only", OS_SANDBOX_OFF)
 
 
+# Codex's accepted reasoning-effort levels. Same set autoreview validates
+# against (autoreview/scripts/autoreview), kept in one shape so a level that
+# works there works here.
+CODEX_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+
+
+def _parse_reasoning_effort(value: str) -> str:
+    """Reject an unknown level here rather than at the worker.
+
+    Codex takes this through `-c model_reasoning_effort=...`, which is a
+    free-form config assignment: a typo is not rejected by the CLI, it just
+    silently fails to raise the effort, and the dispatch looks like it ran at
+    the level asked for. Validating at the parser is what makes the flag
+    trustworthy.
+    """
+    level = str(value).strip().lower()
+    if level not in CODEX_REASONING_EFFORTS:
+        raise argparse.ArgumentTypeError(
+            f"unknown reasoning effort {value!r}; expected one of "
+            + ", ".join(sorted(CODEX_REASONING_EFFORTS))
+        )
+    return level
+
+
 def _parse_os_sandbox_arg(value: str) -> str:
     """Accept hyphen/underscore/collapsed aliases of the sanctioned profiles.
 
@@ -7052,6 +7076,7 @@ LAUNCH_ARGV_CLASS: dict[str, str] = {
     "--in-place": "preserve",
     "--skip-seat-reset": "inject",
     "--model": "preserve",
+    "--reasoning-effort": "preserve",
     "--read-only": "preserve",
     "--readonly": "preserve",
     "--os-sandbox": "preserve",
@@ -7111,6 +7136,7 @@ _REPLAY_VALUE_OPTIONS = {
     "--worktree",
     "--at",
     "--model",
+    "--reasoning-effort",
     "--os-sandbox",
     "--priority",
     "--capacity-wait-s",
@@ -17200,6 +17226,9 @@ def build_worker(args, prompt_path, raw_argv: list[str]):
             argv += ["-c", "mcp_servers.context-mode.enabled=false"]
         if model:
             argv += ["--model", str(model)]
+        effort = getattr(args, "reasoning_effort", None)
+        if effort:
+            argv += ["-c", f'model_reasoning_effort="{effort}"']
         if args.cwd:
             argv += ["-C", args.cwd]
         codex_session_id = goalflight_codex_sessions.valid_session_id(
@@ -17466,6 +17495,13 @@ def _build_launch_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None,
                         help="Worker model id (grok-code/grok-research/moonshot/codex --model passthrough). "
                              "Default = agent label's own default.")
+    parser.add_argument("--reasoning-effort", type=_parse_reasoning_effort,
+                        default=None,
+                        help="Codex reasoning effort for this dispatch "
+                             f"({', '.join(sorted(CODEX_REASONING_EFFORTS))}). "
+                             "Default = whatever the worker CLI config sets, so "
+                             "the machine keeps one source of truth for the "
+                             "default; pass this to raise a single dispatch.")
     parser.add_argument("--read-only", "--readonly", action="store_true",
                         help="Read-only sandbox (review/analysis dispatches). Equivalent to "
                              "--os-sandbox read-only.")

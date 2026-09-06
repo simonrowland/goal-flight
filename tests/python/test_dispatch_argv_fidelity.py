@@ -580,6 +580,7 @@ def test_preserve_class_flags_survive_original_argv_replay(tmp_path: Path) -> No
         "--at": "HEAD",
         "--os-sandbox": "off",
         "--model": "gpt-test",
+        "--reasoning-effort": "xhigh",
         "--priority": "bulk",
         "--account": "seat-a",
         "--billing": "sub",

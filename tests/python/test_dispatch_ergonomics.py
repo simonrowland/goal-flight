@@ -704,6 +704,49 @@ def test_dispatch_end_hint() -> None:
           ) is None)
 
 
+def test_codex_reasoning_effort_flag() -> None:
+    """The effort flag must reach the worker command, and only when asked for.
+
+    Codex takes the level through `-c model_reasoning_effort=...`, a free-form
+    config assignment the CLI does not validate, so a level that never reaches
+    argv fails silently: the dispatch runs at whatever the config default is
+    and reports success. Assert the argv, not the parse.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        prompt = Path(td) / "prompt.md"
+        prompt.write_text("Implement the change.\n", encoding="utf-8")
+
+        args = _args(agent="codex", cwd="/tmp/x")
+        argv, _ = D.build_worker(args, prompt, [])
+        check(
+            "codex omits reasoning effort by default (the CLI config owns it)",
+            "model_reasoning_effort" not in " ".join(argv),
+        )
+
+        args.reasoning_effort = "xhigh"
+        raised, _ = D.build_worker(args, prompt, [])
+        pairs = [
+            (raised[i], raised[i + 1])
+            for i in range(len(raised) - 1)
+            if raised[i] == "-c"
+        ]
+        check(
+            "codex carries the requested effort as a -c assignment",
+            ("-c", 'model_reasoning_effort="xhigh"') in pairs,
+        )
+        check(
+            "the effort assignment does not displace approval_policy",
+            ("-c", "approval_policy=never") in pairs,
+        )
+
+        args.reasoning_effort = "medium"
+        lowered, _ = D.build_worker(args, prompt, [])
+        check(
+            "a lower level is passed through the same way",
+            'model_reasoning_effort="medium"' in lowered,
+        )
+
+
 def main() -> int:
     test_default_idle_windows()
     test_read_only_review_artifact_guard()
@@ -711,6 +754,7 @@ def main() -> int:
     test_git_pin_warning()
     test_grok_model_passthrough_warning()
     test_moonshot_worker_argv()
+    test_codex_reasoning_effort_flag()
     test_moonshot_worker_dash_execution()
     test_moonshot_worker_preamble_is_neutral()
     test_windows_acp_warnings_written_to_tail()

@@ -218,6 +218,21 @@ substitute `--dangerously-bypass-approvals-and-sandbox` — classifiers reject
 it; `adapters/codex.json` `forbidden_args` forbids it. Apply P3-safe-easy
 findings inline; fix P0/P1/P2 before commit.
 
+**Reasoning effort is opt-in per dispatch.** The worker CLI config sets the
+default (medium), so ordinary implementation dispatches inherit it and nothing
+in goal-flight overrides it. Raise it where the extra thinking pays: reviews,
+adversarial passes, and hard debugging. The review recipe above already pins
+`xhigh` explicitly; for a worker dispatch use the flag, which validates the
+level at the parser rather than letting a typo silently run at the default:
+
+```bash
+python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex \
+  --reasoning-effort xhigh --prompt-file <brief>
+```
+
+Levels: `low`, `medium`, `high`, `xhigh`. The flag is preserve-class, so a
+resumed dispatch keeps the level it was launched with.
+
 ## Hard Invariants
 
 - Verification first. Every executor prompt starts by checking repo state,
