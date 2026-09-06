@@ -116,3 +116,46 @@ def test_the_verdict_is_still_worker_dead_and_the_marker_rule_is_untouched(
     got = _reason(seat, time.time() - 60)
     assert got.startswith("worker_dead_no_terminal_marker:"), got
     assert "COMPLETE" not in got and "complete" not in got, got
+
+
+# --------------------------------------------------------------------------
+# the operator surface: knowing WHICH seat to open
+# --------------------------------------------------------------------------
+
+import goalflight_status as S  # noqa: E402
+
+
+def test_the_row_names_the_seat_and_the_command() -> None:
+    """The capability belongs at the decision point, not in a runbook."""
+    hint = S._harvest_hint({
+        "reason": "worker_dead_no_terminal_marker:death_cause=unharvested_work_committed",
+        "wedge_tree_leg": {"scan_root": "/repo/worktrees/x/s-5"},
+    })
+    assert "UNHARVESTED WORK" in hint and "a commit" in hint, hint
+    assert "/repo/worktrees/x/s-5" in hint, hint
+    assert "git -C /repo/worktrees/x/s-5" in hint, "must be runnable as printed"
+
+
+def test_uncommitted_work_is_described_as_such() -> None:
+    hint = S._harvest_hint({
+        "reason": "worker_dead_no_terminal_marker:death_cause=unharvested_work_dirty",
+        "wedge_tree_leg": {"worker_cwd": "/repo/worktrees/x/s-5"},
+    })
+    assert "uncommitted changes" in hint, hint
+
+
+def test_a_missing_seat_path_says_so_rather_than_printing_a_broken_command() -> None:
+    hint = S._harvest_hint({
+        "reason": "worker_dead_no_terminal_marker:death_cause=unharvested_work_dirty",
+    })
+    assert "seat path not recorded" in hint, hint
+    assert "git -C" not in hint, "never print a command with a hole in it"
+
+
+def test_an_ordinary_dead_dispatch_gets_no_hint() -> None:
+    """A hint on every row is a hint nobody reads."""
+    assert S._harvest_hint({
+        "reason": "worker_dead_no_terminal_marker:death_cause=no_evidence",
+        "wedge_tree_leg": {"scan_root": "/repo/worktrees/x/s-5"},
+    }) == ""
+    assert S._harvest_hint({"reason": "marker:COMPLETE"}) == ""

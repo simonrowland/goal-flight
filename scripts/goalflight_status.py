@@ -650,6 +650,34 @@ def _reattach_hint(record: dict) -> str:
     return f"worker still alive - re-attach via goalflight_status.py --wait {dispatch_id}"
 
 
+def _harvest_hint(record: dict) -> str:
+    """Name the seat when a dead dispatch left work behind.
+
+    A worker whose terminal marker was rejected still scores worker_dead, and
+    the operator's only recourse was to inspect every seat by hand. The
+    watcher now distinguishes "no marker" from "no work", so the row can say
+    WHICH seat is worth opening and with what command -- the capability
+    belongs at the moment of the decision, not in a document.
+    """
+    reason = str(record.get("reason") or "")
+    if "unharvested_work" not in reason:
+        return ""
+    kind = "a commit" if reason.endswith("committed") else "uncommitted changes"
+    leg = record.get("wedge_tree_leg")
+    seat = None
+    if isinstance(leg, dict):
+        seat = leg.get("scan_root") or leg.get("worker_cwd")
+    if not seat:
+        return (
+            f"UNHARVESTED WORK ({kind}) — seat path not recorded; "
+            "find it via the dispatch's worktree before the seat is reused"
+        )
+    return (
+        f"UNHARVESTED WORK ({kind}) in {seat}: "
+        f"git -C {seat} status --short && git -C {seat} log --oneline -3"
+    )
+
+
 def _resume_hint(record: dict) -> str:
     """Name the resume command on a dead dispatch that still has its session.
 
@@ -1771,6 +1799,9 @@ def _dispatch_cells(record: dict) -> str:
         if hold_reason:
             hold_text += f" ({hold_reason})"
         cells += f" {hold_text}"
+    harvest = _harvest_hint(record)
+    if harvest:
+        cells += f" | {harvest}"
     resume = _resume_hint(record)
     if resume:
         cells += f" | {resume}"
