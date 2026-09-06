@@ -5700,7 +5700,17 @@ def _account_engine(agent: str) -> str | None:
     return ACCOUNT_ENGINE_BY_AGENT.get(agent)
 
 
-SEAT_SCOPED_SESSION_ENGINES = {"grok": ".grok", "cursor": ".cursor"}
+# Engines whose session is FILES under the billing seat's HOME, in the shape
+# <account-home>/<dot-dir>/sessions/<quote(cwd, safe='')>/<session-id>/.
+# grok only, and that is measured, not assumed: verified against 80/80 live
+# session dirs on 2026-09-06. Cursor was in this map on the strength of its
+# name and does NOT belong -- its account home holds only config JSON, its
+# state lives in ~/.cursor/{acp-sessions,projects} in a different shape, and a
+# cursor dispatch records no session handle at all, so resume refuses it before
+# migration could ever apply. Codex is absent on purpose: it carries
+# --codex-resume-home, so its rollout is read from the original home whatever
+# seat is billed. Add an engine here only with a verified layout.
+SEAT_SCOPED_SESSION_ENGINES = {"grok": ".grok"}
 
 
 def _seat_session_dir(account: str, engine: str, worker_cwd: str, session_id: str) -> Path | None:
@@ -5795,6 +5805,40 @@ def _configured_account_names(engine: str) -> list[str]:
     return [child.name for child in children if (child / engine).exists()]
 
 
+def _seat_probe_says_usable(seat: str, engine: str | None) -> bool | None:
+    """Did a FRESH probe measure this seat as usable? True / False / None.
+
+    None means the question could not be answered (no probe module, no
+    document, stale, or the seat absent) -- an unknown, never coerced to a
+    definite. Reuses the probe module's own state derivation so the meaning of
+    "usable" cannot drift between here and the selector.
+    """
+    if engine != "grok":
+        return None
+    try:
+        import grok_seats  # local, optional
+    except Exception:
+        return None
+    try:
+        document = grok_seats.load_states()
+        if not isinstance(document, dict):
+            return None
+        updated = document.get("updated_at")
+        if not isinstance(updated, (int, float)):
+            return None
+        age = time.time() - float(updated)
+        if not (0 <= age <= grok_seats.STATE_TTL_S):
+            return None
+        entry = (document.get("seats") or {}).get(seat)
+        if not isinstance(entry, dict):
+            return None
+        if grok_seats._record_auth_state(entry) != "valid":
+            return False
+        return grok_seats._record_probe_state(entry) == "usable"
+    except Exception:
+        return None
+
+
 def _account_quota_blocked(
     account: str | None,
     *,
@@ -5812,6 +5856,17 @@ def _account_quota_blocked(
     cooldown_ts = _parse_timestamp_s(cooldown) if cooldown else None
     if cooldown_ts is not None and current < cooldown_ts:
         return True
+    # A FRESH MEASUREMENT BEATS A STALE INFERENCE. Below, this function infers
+    # "still exhausted" from any past ledger record whose retry policy has not
+    # come eligible. That inference cannot be cleared by the seat recovering:
+    # observed 2026-09-06, the live probe read rpp usable at 38% while this
+    # returned True from that morning's 402s, so every dispatch AND every
+    # resume onto the one seat with tokens was refused. The seat-state probe
+    # is a measurement of the same question; when it is fresh and says usable,
+    # it wins. Only a definite `True` clears the inference -- an unreadable or
+    # stale probe is unknown and leaves the conservative path intact.
+    if _seat_probe_says_usable(seat, engine) is True:
+        return False
     try:
         records = goalflight_ledger.read_records()
     except OSError:
@@ -13786,8 +13841,40 @@ def _requeue_failure_kind(record: dict, tail: Path) -> str | None:
     return "auth" if _CODEX_AUTH_FAILURE_RE.search("\n".join(parts)) else None
 
 
-def _effective_account_cooldown(effective_account: str) -> str | None:
-    """Read only the daemon's non-secret health record for quota scheduling."""
+# How old the seat-state snapshot may be before its cooldowns stop counting as
+# a statement about now. The writing daemon ticks every 300s, so this is six
+# missed ticks -- long enough that an ordinary skipped tick never flaps a seat,
+# short enough that a stopped daemon is noticed within the half hour. It
+# deliberately matches the codex seat system's own pointer TTL; the value is
+# restated here rather than imported because this is a safety floor, and it has
+# to keep holding when the optional local seat library is absent.
+CODEX_SEAT_STATE_MAX_AGE_S = 30 * 60
+
+
+def _effective_account_cooldown(
+    effective_account: str, *, now: float | None = None
+) -> str | None:
+    """Read only the daemon's non-secret health record for quota scheduling.
+
+    A cooldown is a claim about the present, so it counts only while the
+    snapshot carrying it is current. The file records ``updated_at`` for
+    exactly that question; ignoring it lets the writer's last snapshot freeze
+    into a permanent verdict the moment the writer stops.
+
+    Observed 2026-09-06: codex-seatd had been refusing every tick for 31.7h
+    ("codex-version-drift-refusing expected=0.144.5" against an installed
+    codex-cli 0.153.3), so the file still held its 2026-09-04 probe --
+    ``worst_used`` 100.0 with a 2026-09-07 cooldown on all four seats. Every
+    codex seat therefore read blocked and ``_first_unblocked_account`` returned
+    None, including for cf9f50, which a probe taken that same minute measured
+    at 1% used. The daemon's refusal was correct; it simply never reached this
+    reader, and an unknown preserved upstream became a definite "walled" here.
+
+    Dropping a stale cooldown is not fail-open. The caller continues to the
+    ledger scan, which independently blocks any seat with a recent proven
+    exhaustion -- so a seat walled today stays blocked, and only a seat whose
+    sole evidence was the frozen snapshot is released.
+    """
     configured = os.environ.get("GOALFLIGHT_CODEX_STATE_DIR")
     state_root = (
         Path(configured).expanduser()
@@ -13805,6 +13892,15 @@ def _effective_account_cooldown(effective_account: str) -> str | None:
         or payload.get("version") != 1
         or not isinstance(payload.get("seats"), dict)
     ):
+        return None
+    # A snapshot that cannot say when it was taken cannot say that it is
+    # current. Treat it like the malformed payloads above rather than trusting
+    # it: the ledger scan downstream still sees today's exhaustions.
+    updated_ts = _parse_timestamp_s(payload.get("updated_at"))
+    if updated_ts is None:
+        return None
+    current = time.time() if now is None else float(now)
+    if current - updated_ts > CODEX_SEAT_STATE_MAX_AGE_S:
         return None
     record = payload["seats"].get(effective_account)
     if not isinstance(record, dict):
