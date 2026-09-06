@@ -307,15 +307,37 @@ def _model_in_record(buf: bytes, usage_at: int) -> str | None:
 def newest_assistant_in_bytes(
     buf: bytes,
 ) -> tuple[dict[str, Any], str | None] | None:
-    """Newest parseable usage in *buf*, plus that record's model if present."""
+    """Newest parseable usage in *buf*, plus the NEWEST model named in *buf*.
+
+    The model is resolved independently of the usage record, and that
+    distinction is the whole point. Binding the model to whichever record
+    happened to carry parseable usage sizes the window from a SUPERSEDED
+    model whenever the newest turn cannot be parsed: measured, an older Opus
+    record of 850,000 tokens followed by a newer turn naming an unknown model
+    with ``usage: null`` returned Opus's 1M window and emitted an 85% warning.
+
+    That contradicts this module's own contract, twice over -- "an unrecognized
+    model stays unknown, not a guessed number" and "there is no numeric
+    default: unknown stays silent". A later unknown model must silence the
+    meter, not inherit the previous model's window.
+
+    The usage NUMBERS still come from the newest record that parses; only the
+    model does not. Reporting stale token counts would be a different defect,
+    and the widen-once caller already bounds how far back that can reach.
+    """
     pos = len(buf)
     while True:
         pos = buf.rfind(USAGE_KEY, 0, pos)
         if pos < 0:
             return None
         usage = _parse_usage_object(buf, pos)
-        if usage is not None:
-            return usage, _model_in_record(buf, pos)
+        if usage is None:
+            continue
+        # A model named AFTER this usage record supersedes it. `None` here
+        # means no later record named one, not that the model is unknown.
+        line_end = buf.find(b"\n", pos)
+        newer = _last_model_string(buf[line_end:]) if line_end >= 0 else None
+        return usage, newer or _model_in_record(buf, pos)
 
 
 # Removed newest_usage_in_bytes: its model-blind result could mis-size the active context window.

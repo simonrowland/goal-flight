@@ -1043,3 +1043,51 @@ def test_hook_throttled_path_stays_cheap(tmp_path: Path) -> None:
         f"{hook_per / bare_per:.2f}x the {bare_per * 1000:.3f}ms bare-spawn "
         f"floor (limit {MAX_RATIO}x); a python start would be ~20x"
     )
+
+
+# ---------------------------------------------------------------------------
+# the window belongs to the NEWEST model, not to whichever record parsed
+# ---------------------------------------------------------------------------
+
+
+def _turn(model: str, usage: object) -> bytes:
+    import json as _json
+
+    return _json.dumps({"model": model, "message": {"usage": usage}}).encode() + b"\n"
+
+
+def test_a_newer_unknown_model_silences_rather_than_inheriting_the_old_window() -> None:
+    """The reviewer's measured case, and the module's own stated contract.
+
+    An older Opus turn carrying 850,000 tokens, followed by a newer turn naming
+    an unknown model whose usage does not parse, used to return OPUS's 1M
+    window and emit an 85% warning -- sizing the window from a model that is no
+    longer in use. The header says "an unrecognized model stays unknown, not a
+    guessed number" and "there is no numeric default: unknown stays silent".
+    """
+    buf = _turn("claude-opus-5", {"input_tokens": 850_000}) + _turn("unknown-new-model", None)
+    found = meter.newest_assistant_in_bytes(buf)
+    assert found is not None
+    usage, model = found
+    assert model == "unknown-new-model", f"the newest model must win, got {model!r}"
+    assert meter.window_for_model(model) is None, "an unknown model must stay silent"
+    assert usage.get("input_tokens") == 850_000, (
+        "the usage NUMBERS still come from the newest record that parses; only "
+        "the model is resolved separately"
+    )
+
+
+def test_the_known_model_still_resolves_when_nothing_supersedes_it() -> None:
+    """The fix must not silence the case the meter exists to serve."""
+    buf = _turn("claude-opus-5", {"input_tokens": 10})
+    found = meter.newest_assistant_in_bytes(buf)
+    assert found is not None
+    assert found[1] == "claude-opus-5"
+    assert meter.window_for_model(found[1]) == 1_000_000
+
+
+def test_a_newer_KNOWN_model_also_supersedes_an_older_one() -> None:
+    """Not only unknowns: the newest model wins whatever it is."""
+    buf = _turn("claude-opus-5", {"input_tokens": 5}) + _turn("claude-fable-5", None)
+    found = meter.newest_assistant_in_bytes(buf)
+    assert found is not None and found[1] == "claude-fable-5", found
