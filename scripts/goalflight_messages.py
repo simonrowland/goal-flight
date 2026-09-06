@@ -3925,7 +3925,17 @@ def controller_mail_summary(
             label = str(active[0]["label"]) if len(active) == 1 else None
         if label is None:
             return {}
-        rows = authority.pending_delivery_events(label, waking_only=True, limit=1000)
+        # COUNT everything pending; WAKE on only the waking subset. b-108's
+        # acceptance is explicit -- "periodic status stays quiet and remains in
+        # the unread count" -- and waking_only=True here delivered only the
+        # first half: a quiet periodic nudge left the summary reporting 0, so
+        # an operator reading status saw no mail while mail was waiting.
+        #
+        # This is the SUMMARY, not a wake. The two wake surfaces keep their own
+        # waking_only=True and are untouched: the mid-wait watermark in
+        # goalflight_status and the controller_pending_events default. Widening
+        # here restores the count without re-arming the wake this item silenced.
+        rows = authority.pending_delivery_events(label, waking_only=False, limit=1000)
     except (
         goalflight_journal.JournalBusy,
         goalflight_journal.JournalDisappeared,
