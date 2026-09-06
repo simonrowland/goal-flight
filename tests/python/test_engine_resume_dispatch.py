@@ -752,3 +752,65 @@ def test_cursor_harvest_ignores_a_directory_that_is_not_a_handle(tmp_path: Path)
     root.mkdir(parents=True)
     (root / "not-a-session-id").mkdir()
     assert E.harvest_cursor_session_id(home, work) is None
+
+
+# ---------------------------------------------------------------------------
+# the worker's cwd is not the project root (t-288)
+#
+# Every engine keys its session store by the directory the worker ran in. For a
+# seat dispatch that is the worktree, so harvesting with the PROJECT ROOT looks
+# somewhere the session never was and the worker silently loses its resumable
+# handle. This was fixed for cursor and left unfixed for the others; a reviewer
+# caught the missed half.
+# ---------------------------------------------------------------------------
+
+
+SEAT_CWD = Path("/Users/x/Repos/proj/worktrees/label/s-3")
+PROJECT_ROOT = Path("/Users/x/Repos/proj")
+
+
+def test_grok_handle_is_lost_when_harvested_at_the_project_root(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    import urllib.parse
+
+    d = (home / ".grok" / "sessions"
+         / urllib.parse.quote(str(SEAT_CWD), safe="") / GROK_SESSION)
+    d.mkdir(parents=True)
+    (d / "chat_history.jsonl").write_text("{}\n", encoding="utf-8")
+
+    assert E.harvest_grok_session_id(home, SEAT_CWD) == GROK_SESSION
+    assert E.harvest_grok_session_id(home, PROJECT_ROOT) is None, (
+        "the project root is a different directory; it must not resolve, and "
+        "passing it is what loses the handle"
+    )
+
+
+def test_kimi_handle_is_lost_when_harvested_at_the_project_root(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    sess = home / ".kimi-code" / "sessions" / KIMI_SESSION
+    sess.mkdir(parents=True)
+    index = home / ".kimi-code" / "session_index.jsonl"
+    index.write_text(
+        json.dumps({"workDir": str(SEAT_CWD), "sessionId": KIMI_SESSION,
+                    "sessionDir": str(sess)}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert E.harvest_kimi_session_id(home, SEAT_CWD) == KIMI_SESSION
+    assert E.harvest_kimi_session_id(home, PROJECT_ROOT) is None, (
+        "the index matches on an exact workDir; the project root never matches"
+    )
+
+
+def test_the_watcher_prefers_the_worker_cwd_for_every_engine() -> None:
+    """Pin the WIRING, not just the harvesters.
+
+    The harvesters were always correct; the bug was the caller handing them the
+    project root. This asserts the preference is applied once, before the
+    per-engine branches, so a new engine cannot inherit the old defect.
+    """
+    src = (ROOT / "scripts" / "goalflight_watch.py").read_text(encoding="utf-8")
+    block = src.split('if engine_session_id is None and resume_engine in')[1]
+    head = block.split('if resume_engine == "moonshot"')[0]
+    assert 'worker_cwd = getattr(args, "worker_cwd", None)' in head, head[:400]
+    assert "Path(worker_cwd)" in head, "the worker cwd must win over project_root"

@@ -3994,10 +3994,22 @@ def main() -> int:
                         "message": str(exc),
                     }
         if engine_session_id is None and resume_engine in {"moonshot", "grok", "cursor"}:
+            # The WORKER's own cwd, not the project root. Every engine here
+            # keys its session store by the directory the worker ran in, and
+            # for a seat dispatch that is the worktree. Passing the project
+            # root makes the harvester look somewhere the session never was,
+            # so a pooled-worktree worker loses its resumable handle after a
+            # mid-task death. Fixed for cursor first and left unfixed for the
+            # others; a reviewer caught the half that was missed (t-288).
+            worker_cwd = getattr(args, "worker_cwd", None)
             work_dir = (
-                Path(args.project_root)
-                if getattr(args, "project_root", None)
-                else Path.cwd()
+                Path(worker_cwd)
+                if worker_cwd
+                else (
+                    Path(args.project_root)
+                    if getattr(args, "project_root", None)
+                    else Path.cwd()
+                )
             )
             if resume_engine == "moonshot":
                 engine_session_id = (
@@ -4036,9 +4048,6 @@ def main() -> int:
                 # lookup found an unrelated directory of older sessions -- so
                 # this harvested nothing, and a project root that happened to
                 # hold one stale session would have been WORSE than nothing.
-                worker_cwd = getattr(args, "worker_cwd", None)
-                if worker_cwd:
-                    work_dir = Path(worker_cwd)
                 # Bound the search to this dispatch's own run. Worktree seats
                 # are pooled, so the seat's transcript directory accumulates one
                 # entry per dispatch that ever used it; unbounded, the harvest
