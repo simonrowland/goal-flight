@@ -43,6 +43,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import goalflight_dispatch as D  # noqa: E402
+import goalflight_doctor as DOC  # noqa: E402
 import goalflight_ledger as L  # noqa: E402
 import grok_seats  # noqa: E402
 
@@ -222,10 +223,100 @@ def test_an_unreadable_probe_is_unknown_not_usable(
     assert D._seat_probe_says_usable("rpp", "grok") is None
 
 
-def test_the_override_is_scoped_to_the_engine_that_has_a_probe() -> None:
-    """codex has no persisted fresh probe, so it must not claim one."""
-    assert D._seat_probe_says_usable(SEAT, "codex") is None
+def test_an_engine_with_no_probe_at_all_stays_unknown() -> None:
     assert D._seat_probe_says_usable(SEAT, None) is None
+    assert D._seat_probe_says_usable(SEAT, "moonshot") is None
+
+
+# --------------------------------------------------------------------------
+# the codex arm: the seat daemon's own snapshot is the fresh measurement
+#
+# This arm only became possible once the daemon was ticking again. While it
+# was refusing (31.7h of version drift), the snapshot was stale and every one
+# of these returns None -- which is the point: the override is available
+# exactly when there is a current measurement behind it, and silently absent
+# when there is not.
+# --------------------------------------------------------------------------
+
+
+def _write_probe(**record: object) -> None:
+    """Seed a FRESH snapshot carrying one seat record."""
+    import os
+
+    state = Path(os.environ["GOALFLIGHT_CODEX_STATE_DIR"])
+    payload = {
+        "version": 1,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "seats": {SEAT: dict(record)},
+    }
+    (state / "codex-seat-states.json").write_text(json.dumps(payload))
+
+
+def test_a_fresh_daemon_measurement_clears_the_ledger_inference() -> None:
+    """The seat the daemon just measured at 19% must not read as exhausted."""
+    L.write_record(
+        {
+            "dispatch_id": "codex-old-1",
+            "agent": "codex",
+            "engine": "codex",
+            "effective_account": SEAT,
+            "state": "quota_exhausted",
+            "reason": {
+                "limit_kind": "exhausted",
+                "limit_state": "quota_exhausted",
+                "provider": "openai",
+                "reset_at": FUTURE_RESET,
+            },
+            "updated_at": L.utc_now(),
+        }
+    )
+    assert D._seat_probe_says_usable(SEAT, "codex") is None, "no snapshot yet"
+    assert D._account_quota_blocked(SEAT, engine="codex") is True, (
+        "precondition: the ledger record must block, or this proves nothing"
+    )
+    _write_probe(healthy=True, worst_used=19.0, cooldown_until=None)
+    assert D._seat_probe_says_usable(SEAT, "codex") is True
+    assert D._account_quota_blocked(SEAT, engine="codex") is False
+
+
+@pytest.mark.parametrize(
+    "label, record",
+    [
+        ("at the exhaustion mark", dict(healthy=True, worst_used=100.0)),
+        ("daemon says unhealthy", dict(healthy=False, worst_used=1.0)),
+        ("daemon wrote a live cooldown", dict(healthy=True, worst_used=1.0,
+                                              cooldown_until=FUTURE_RESET)),
+    ],
+)
+def test_a_measured_exhausted_seat_is_not_overridden(label: str, record: dict) -> None:
+    _write_probe(**record)
+    assert D._seat_probe_says_usable(SEAT, "codex") is False, label
+
+
+@pytest.mark.parametrize(
+    "label, record",
+    [
+        ("no headroom figure", dict(healthy=True)),
+        ("headroom is not a number", dict(healthy=True, worst_used="lots")),
+        ("cooldown cannot be parsed", dict(healthy=True, worst_used=1.0,
+                                           cooldown_until="soon")),
+    ],
+)
+def test_an_unreadable_measurement_is_unknown_not_usable(label: str, record: dict) -> None:
+    """Unknown must stay unknown; only a definite True overrides."""
+    _write_probe(**record)
+    assert D._seat_probe_says_usable(SEAT, "codex") is None, label
+
+
+def test_a_stale_snapshot_cannot_vouch_for_a_codex_seat() -> None:
+    """The 31.7h-frozen-daemon case: the override must simply not be available."""
+    _write_snapshot(age_s=31.7 * 3600)
+    assert D._seat_probe_says_usable(SEAT, "codex") is None
+
+
+def test_a_seat_absent_from_the_snapshot_is_unknown() -> None:
+    _write_probe(healthy=True, worst_used=1.0)
+    assert D._seat_probe_says_usable("nosuchseat", "codex") is None
 
 
 # --------------------------------------------------------------------------
@@ -244,3 +335,34 @@ def test_only_engines_with_a_verified_seat_scoped_layout_are_listed() -> None:
     the rollout from the original home whatever seat is billed.
     """
     assert D.SEAT_SCOPED_SESSION_ENGINES == {"grok": ".grok"}
+
+
+# --------------------------------------------------------------------------
+# saying it out loud: the reader ignoring a stale snapshot stops the WEDGE,
+# but a fleet running on ledger inference alone still needs to be visible.
+# --------------------------------------------------------------------------
+
+
+def test_doctor_is_quiet_while_the_daemon_is_writing() -> None:
+    _write_probe(healthy=True, worst_used=19.0)
+    got = DOC.check_seat_state_freshness()
+    assert got["fresh"] is True
+    assert "warning" not in got, got
+
+
+def test_doctor_names_a_stopped_daemon_and_its_known_cause() -> None:
+    """The 31.7h case. A warning nobody can act on is not much better."""
+    _write_snapshot(age_s=31.7 * 3600)
+    got = DOC.check_seat_state_freshness()
+    assert got["fresh"] is False
+    warning = got["warning"]
+    assert "31.7h" in warning, warning
+    assert "unmanaged" in warning, warning
+    assert "version" in warning and "pin" in warning, "must point at the known cause"
+
+
+def test_doctor_distinguishes_an_absent_snapshot_from_a_stale_one() -> None:
+    got = DOC.check_seat_state_freshness()
+    assert got["fresh"] is False
+    assert "no seat-health snapshot" in got["warning"]
+    assert "age_s" not in got, "there is no age to report when nothing was written"

@@ -5829,6 +5829,86 @@ def _configured_account_names(engine: str) -> list[str]:
     return [child.name for child in children if (child / engine).exists()]
 
 
+def _codex_seat_state_payload(*, now: float | None = None) -> dict | None:
+    """The seat daemon's snapshot, or None when it cannot speak for the present.
+
+    One reader so that every consumer of this file applies the SAME freshness
+    rule. A snapshot that cannot say when it was taken cannot say that it is
+    current, so a missing or unparseable ``updated_at`` is treated like the
+    malformed payloads above rather than trusted.
+    """
+    configured = os.environ.get("GOALFLIGHT_CODEX_STATE_DIR")
+    state_root = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".goal-flight"
+    )
+    try:
+        payload = json.loads(
+            (state_root / "codex-seat-states.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != 1
+        or not isinstance(payload.get("seats"), dict)
+    ):
+        return None
+    updated_ts = _parse_timestamp_s(payload.get("updated_at"))
+    if updated_ts is None:
+        return None
+    current = time.time() if now is None else float(now)
+    if current - updated_ts > CODEX_SEAT_STATE_MAX_AGE_S:
+        return None
+    return payload
+
+
+# The seat daemon marks a seat exhausted at 100% of its worst window and writes
+# a cooldown for it, so anything strictly below that is headroom it measured.
+CODEX_SEAT_EXHAUSTED_AT_PERCENT = 100.0
+
+
+def _codex_seat_probe_says_usable(seat: str) -> bool | None:
+    """Did the seat daemon's LAST SNAPSHOT measure this seat as usable?
+
+    True / False / None, where None means the snapshot could not answer --
+    absent, malformed, stale, or missing this seat. Never coerced to a
+    definite, because the caller uses a definite True to override a
+    conservative inference.
+
+    This reads the same document `_effective_account_cooldown` reads and
+    reuses its freshness rule, so the two cannot disagree about whether the
+    snapshot still describes now. That rule is what makes this safe: while the
+    daemon was refusing to tick, the snapshot was stale and this returns None,
+    leaving the conservative path exactly as it was.
+
+    The daemon's own verdict is the cooldown it writes -- it sets one when it
+    measures a seat exhausted and clears it when it does not -- so a fresh
+    snapshot with no cooldown and measured headroom is that daemon saying the
+    seat is usable right now.
+    """
+    payload = _codex_seat_state_payload()
+    if payload is None:
+        return None
+    record = (payload.get("seats") or {}).get(seat)
+    if not isinstance(record, dict):
+        return None
+    if record.get("healthy") is not True:
+        return False
+    if record.get("cooldown_until"):
+        cooldown_ts = _parse_timestamp_s(record.get("cooldown_until"))
+        # An unparseable cooldown is an unknown, not an absent one.
+        if cooldown_ts is None:
+            return None
+        if time.time() < cooldown_ts:
+            return False
+    used = record.get("worst_used")
+    if not isinstance(used, (int, float)) or isinstance(used, bool):
+        return None
+    return float(used) < CODEX_SEAT_EXHAUSTED_AT_PERCENT
+
+
 def _seat_probe_says_usable(seat: str, engine: str | None) -> bool | None:
     """Did a FRESH probe measure this seat as usable? True / False / None.
 
@@ -5837,6 +5917,8 @@ def _seat_probe_says_usable(seat: str, engine: str | None) -> bool | None:
     definite. Reuses the probe module's own state derivation so the meaning of
     "usable" cannot drift between here and the selector.
     """
+    if engine == "codex":
+        return _codex_seat_probe_says_usable(seat)
     if engine != "grok":
         return None
     try:
@@ -13901,32 +13983,8 @@ def _effective_account_cooldown(
     exhaustion -- so a seat walled today stays blocked, and only a seat whose
     sole evidence was the frozen snapshot is released.
     """
-    configured = os.environ.get("GOALFLIGHT_CODEX_STATE_DIR")
-    state_root = (
-        Path(configured).expanduser()
-        if configured
-        else Path.home() / ".goal-flight"
-    )
-    try:
-        payload = json.loads(
-            (state_root / "codex-seat-states.json").read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
-    if (
-        not isinstance(payload, dict)
-        or payload.get("version") != 1
-        or not isinstance(payload.get("seats"), dict)
-    ):
-        return None
-    # A snapshot that cannot say when it was taken cannot say that it is
-    # current. Treat it like the malformed payloads above rather than trusting
-    # it: the ledger scan downstream still sees today's exhaustions.
-    updated_ts = _parse_timestamp_s(payload.get("updated_at"))
-    if updated_ts is None:
-        return None
-    current = time.time() if now is None else float(now)
-    if current - updated_ts > CODEX_SEAT_STATE_MAX_AGE_S:
+    payload = _codex_seat_state_payload(now=now)
+    if payload is None:
         return None
     record = payload["seats"].get(effective_account)
     if not isinstance(record, dict):

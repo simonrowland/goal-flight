@@ -22,6 +22,7 @@ import tempfile
 import time
 
 import goalflight_compat
+import goalflight_dispatch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -610,6 +611,85 @@ def check_session_status(skill_root: Path, project_root: Path) -> dict:
         "newest_resume_notes": payload.get("newest_resume_notes"),
         "resume_notes_active": payload.get("resume_notes_active"),
     }
+
+
+def check_seat_state_freshness() -> dict:
+    """Is the seat-health daemon still writing, or has the fleet gone quiet?
+
+    A snapshot that stops being written does not announce itself. It simply
+    keeps answering with whatever it last held, and every reader downstream
+    treats that as the present. On 2026-09-06 the writing daemon had been
+    refusing every 300s tick for 31.7h after the worker CLI moved past its
+    supported version pin, and the frozen snapshot -- every seat at 100%, all
+    of them carrying a cooldown -- was still being read as current. Selection
+    then found no usable seat anywhere while a live probe measured two of them
+    with most of their headroom intact.
+
+    The reader now ignores a stale snapshot, so that failure can no longer
+    wedge selection. This check exists for what the reader cannot do: SAY that
+    seat health is unmanaged. Without it the fleet still runs blind, just
+    without the wedge -- silently degraded to whatever the ledger alone can
+    infer, for as long as nobody happens to look.
+    """
+    try:
+        payload = goalflight_dispatch._codex_seat_state_payload()
+    except Exception as exc:  # a doctor check never takes the process down
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    if payload is not None:
+        seats = payload.get("seats") or {}
+        return {
+            "ok": True,
+            "fresh": True,
+            "seats": len(seats),
+            "updated_at": payload.get("updated_at"),
+        }
+
+    # Stale or unreadable. Separate the two, because they need different
+    # actions, and report the age when we can measure it.
+    state_root = Path(
+        os.environ.get("GOALFLIGHT_CODEX_STATE_DIR") or (Path.home() / ".goal-flight")
+    ).expanduser()
+    path = state_root / "codex-seat-states.json"
+    detail: dict = {
+        "ok": True,
+        "fresh": False,
+        "path": str(path),
+        "max_age_s": goalflight_dispatch.CODEX_SEAT_STATE_MAX_AGE_S,
+    }
+    if not path.exists():
+        detail["warning"] = (
+            "no seat-health snapshot: per-seat headroom is unmanaged and "
+            "selection is running on ledger inference alone"
+        )
+        return detail
+    # Age it by the SAME field the freshness decision uses. The file's mtime is
+    # a different clock and can disagree with the content -- a snapshot rewritten
+    # carrying an old `updated_at` has a brand-new mtime, and reporting that
+    # would print "0.0h stale" for a snapshot we just rejected as stale.
+    age_s = None
+    try:
+        stamp = json.loads(path.read_text(encoding="utf-8")).get("updated_at")
+        parsed = goalflight_dispatch._parse_timestamp_s(stamp)
+        if parsed is not None:
+            age_s = time.time() - parsed
+    except (OSError, ValueError, json.JSONDecodeError, AttributeError):
+        age_s = None
+
+    if age_s is None:
+        detail["warning"] = (
+            "seat-health snapshot cannot say when it was taken, so it cannot "
+            "say it is current; per-seat headroom is unmanaged"
+        )
+        return detail
+    detail["age_s"] = round(age_s, 1)
+    detail["warning"] = (
+        f"seat-health snapshot is {age_s / 3600:.1f}h stale, so the writing "
+        "daemon has stopped; per-seat headroom is unmanaged. Check its log "
+        "for a refusal (a worker-CLI version past the daemon's supported "
+        "pin is the known cause)."
+    )
+    return detail
 
 
 def check_controller_lease_liveness(project_root: Path) -> dict:
@@ -3355,6 +3435,7 @@ def doctor(
         "agents_md_state": check_agents_md_state(repo),
         "session_status": check_session_status(skill_root, repo),
         "controller_lease_liveness": check_controller_lease_liveness(repo),
+        "seat_state_freshness": check_seat_state_freshness(),
         "wake_coverage": check_wake_coverage(repo),
         "resume_notes_pattern": check_resume_notes_pattern(repo),
         "cursor": {
