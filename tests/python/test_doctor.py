@@ -800,85 +800,60 @@ def case_claude_acp_reports_pinned_build_when_orig_differs() -> None:
 
 
 # ----- orphaned listeners (b-340) -----
+#
+# The RULE is tested in test_listener_reap.py. These pin only that doctor
+# delegates to it and shapes the payload, so the two cannot disagree about
+# what "orphaned" means.
 
 
-class _Rec:
-    """Minimal lease-record reader stand-in."""
-
-    def __init__(self, nonces):
-        self._nonces = nonces
-
-    def lease_records(self):
-        return [{"lease_nonce": n} for n in self._nonces]
+import goalflight_listener_reap as _reap  # noqa: E402
 
 
-def _ps(*lines: str):
-    return type("R", (), {"stdout": "\n".join(lines)})()
-
-
-_LISTENER = "python3 /skill/scripts/goalflight_messages.py {kind} --lease-nonce {n}"
-
-
-def case_orphan_check_counts_only_generations_with_no_lease() -> None:
-    listing = _ps(
-        _LISTENER.format(kind="supervise", n="aaa"),
-        _LISTENER.format(kind="listen", n="aaa"),
-        _LISTENER.format(kind="follow", n="bbb"),
-        _LISTENER.format(kind="listen", n="ccc"),
-    )
-    with patch("subprocess.run", return_value=listing), patch.object(
-        goalflight_doctor.goalflight_journal.Journal, "open_reader",
-        staticmethod(lambda _root: _Rec(["aaa"])),
+def case_orphan_check_reports_counts_from_the_shared_rule() -> None:
+    with patch.object(
+        _reap, "orphaned_listeners",
+        lambda root, **kw: {
+            "known": True, "listeners": 4, "generations": 3,
+            "orphans": [11, 12], "orphan_generations": ["bbb", "ccc"],
+        },
     ):
         got = goalflight_doctor.check_orphaned_listeners(Path("/x"))
-    assert got["known"] is True, got
-    assert got["listeners"] == 4, got
-    assert got["generations"] == 3, got
-    assert got["orphans"] == 2, got          # bbb + ccc
+    assert got["known"] is True and got["orphans"] == 2, got
     assert got["orphan_generations"] == 2, got
     assert "double-deliver" in got["warning"], got
 
 
-def case_orphan_check_is_silent_when_every_listener_is_accounted_for() -> None:
-    listing = _ps(_LISTENER.format(kind="supervise", n="aaa"))
-    with patch("subprocess.run", return_value=listing), patch.object(
-        goalflight_doctor.goalflight_journal.Journal, "open_reader",
-        staticmethod(lambda _root: _Rec(["aaa"])),
+def case_orphan_check_is_silent_when_none_are_orphaned() -> None:
+    with patch.object(
+        _reap, "orphaned_listeners",
+        lambda root, **kw: {
+            "known": True, "listeners": 6, "generations": 1,
+            "orphans": [], "orphan_generations": [],
+        },
     ):
         got = goalflight_doctor.check_orphaned_listeners(Path("/x"))
-    assert got["orphans"] == 0, got
-    assert "warning" not in got, got
+    assert got["orphans"] == 0 and "warning" not in got, got
 
 
-def case_orphan_check_reports_unknown_when_it_cannot_enumerate() -> None:
+def case_orphan_check_passes_unknown_through_rather_than_zero() -> None:
     """"Cannot look" must never render as "nothing there"."""
-    with patch("subprocess.run", side_effect=OSError("no ps")):
-        got = goalflight_doctor.check_orphaned_listeners(Path("/x"))
-    assert got["known"] is False, got
-    assert "orphans" not in got, got
-
-    listing = _ps(_LISTENER.format(kind="listen", n="aaa"))
-
-    def _boom(_root):
-        raise RuntimeError("journal busy")
-
-    with patch("subprocess.run", return_value=listing), patch.object(
-        goalflight_doctor.goalflight_journal.Journal, "open_reader",
-        staticmethod(_boom),
+    with patch.object(
+        _reap, "orphaned_listeners",
+        lambda root, **kw: {"known": False, "reason": "lease records unreadable"},
     ):
         got = goalflight_doctor.check_orphaned_listeners(Path("/x"))
     assert got["known"] is False, got
     assert "orphans" not in got, got
+    assert "lease records unreadable" in got["detail"], got
 
 
-def case_orphan_check_ignores_processes_without_a_nonce() -> None:
-    listing = _ps("python3 /skill/scripts/goalflight_messages.py status", "unrelated proc")
-    with patch("subprocess.run", return_value=listing), patch.object(
-        goalflight_doctor.goalflight_journal.Journal, "open_reader",
-        staticmethod(lambda _root: _Rec([])),
-    ):
+def case_orphan_check_survives_a_raising_rule() -> None:
+    def _boom(root, **kw):
+        raise RuntimeError("journal exploded")
+
+    with patch.object(_reap, "orphaned_listeners", _boom):
         got = goalflight_doctor.check_orphaned_listeners(Path("/x"))
-    assert got["listeners"] == 0 and got["orphans"] == 0, got
+    assert got["known"] is False and "journal exploded" in got["detail"], got
 
 
 def main() -> None:
@@ -913,10 +888,10 @@ def main() -> None:
     case_doctor_unhealthy_still_reports_warn()
     case_doctor_json_untouched_by_human_filter()
     case_doctor_exit_codes_unchanged()
-    case_orphan_check_counts_only_generations_with_no_lease()
-    case_orphan_check_is_silent_when_every_listener_is_accounted_for()
-    case_orphan_check_reports_unknown_when_it_cannot_enumerate()
-    case_orphan_check_ignores_processes_without_a_nonce()
+    case_orphan_check_reports_counts_from_the_shared_rule()
+    case_orphan_check_is_silent_when_none_are_orphaned()
+    case_orphan_check_passes_unknown_through_rather_than_zero()
+    case_orphan_check_survives_a_raising_rule()
     print("OK: doctor tests pass")
 
 

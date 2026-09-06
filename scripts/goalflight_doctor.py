@@ -693,71 +693,46 @@ def check_seat_state_freshness() -> dict:
 
 
 def check_orphaned_listeners(project_root: Path) -> dict:
-    """Listener processes whose controller generation is gone (b-340).
+    """Listener processes of THIS project whose controller generation is gone.
 
-    A listener is spawned under a controller's lease nonce and is supposed to
-    end with that generation. When a session restarts or is taken over, the
-    lease record goes but the processes do not, and nothing says so -- the
-    count simply grows.
+    Delegates to goalflight_listener_reap so the rule lives in one place.
 
-    Measured 2026-09-06: 44 live listeners across 9 nonces, of which the
-    journal held ONE lease record; 35 processes belonged to eight generations
-    that no longer existed. That matters beyond tidiness, because SKILL.md's
-    own rule is that a supervisor plus loose listeners DOUBLE-DELIVER, so
-    orphans can duplicate mail into a live stream.
-
-    This REPORTS only. Reaping is a separate decision with real blast radius,
-    and a check is not the place to make it.
+    ★ The project scope is the whole correctness of this check. The process
+    table is machine-wide; lease records are per-project. The first version of
+    this compared every listener on the box against ONE project's journal and
+    reported 35 orphans -- of which zero were this project's. They were the
+    live fleets of five OTHER projects on the same machine, each perfectly
+    healthy under its own controller. State the population before trusting the
+    filter, or the count is an answer to a question nobody asked.
     """
     try:
-        listing = subprocess.run(
-            ["ps", "-ax", "-o", "args="],
-            capture_output=True, text=True, timeout=15,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        # Cannot enumerate -> unknown, never "no orphans".
+        import goalflight_listener_reap
+    except Exception as exc:
         return {"ok": True, "known": False,
-                "detail": "process listing unavailable; orphan count unknown"}
-
-    counts: dict[str, int] = {}
-    for line in listing.splitlines():
-        if "goalflight_messages.py" not in line:
-            continue
-        match = re.search(r"--lease-nonce ([0-9a-f]+)", line)
-        if match:
-            counts[match.group(1)] = counts.get(match.group(1), 0) + 1
-    if not counts:
-        return {"ok": True, "known": True, "listeners": 0, "orphans": 0}
-
+                "detail": f"orphan detection unavailable: {type(exc).__name__}: {exc}"}
     try:
-        records = goalflight_journal.Journal.open_reader(
-            project_root.resolve()
-        ).lease_records()
-    except Exception:
-        return {"ok": True, "known": False, "listeners": sum(counts.values()),
-                "detail": "lease records unreadable; orphan count unknown"}
-
-    known = {
-        r.get("lease_nonce") or r.get("nonce")
-        for r in records
-        if isinstance(r, dict)
-    }
-    orphan_nonces = sorted(n for n in counts if n not in known)
-    orphans = sum(counts[n] for n in orphan_nonces)
+        report = goalflight_listener_reap.orphaned_listeners(project_root)
+    except Exception as exc:
+        return {"ok": True, "known": False,
+                "detail": f"{type(exc).__name__}: {exc}"}
+    if not report.get("known"):
+        return {"ok": True, "known": False,
+                "detail": report.get("reason", "orphan status unknown")}
+    orphans = report.get("orphans") or []
     detail = {
         "ok": True,
         "known": True,
-        "listeners": sum(counts.values()),
-        "generations": len(counts),
-        "orphans": orphans,
-        "orphan_generations": len(orphan_nonces),
+        "listeners": report.get("listeners", 0),
+        "generations": report.get("generations", 0),
+        "orphans": len(orphans),
+        "orphan_generations": len(report.get("orphan_generations") or []),
     }
     if orphans:
         detail["warning"] = (
-            f"{orphans} listener process(es) from {len(orphan_nonces)} ended "
-            "controller generation(s) are still running; they can double-deliver "
-            "mail into a live stream and they make host-measuring tests fail "
-            "(b-340). They are not this session's to kill."
+            f"{len(orphans)} listener process(es) of this project, from "
+            f"{detail['orphan_generations']} ended controller generation(s), are "
+            "still running; a supervisor plus loose listeners double-deliver "
+            "(b-340)."
         )
     return detail
 
