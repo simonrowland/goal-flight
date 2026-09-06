@@ -26,6 +26,8 @@ GROK_SESSION = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 KIMI_SESSION = "session_bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
 CURSOR_SESSION = "0123456789abcdef0123456789abcdef"
 CLAUDE_SESSION = "cccccccc-dddd-4eee-8fff-000000000000"
+CURSOR_SESSION_UUID = "d128e49d-883f-44e2-8cca-1fe16902cba9"
+PRIOR_CURSOR_SESSION = "11111111-2222-4333-8444-555555555555"
 
 
 pytestmark = pytest.mark.skipif(
@@ -676,3 +678,77 @@ def test_grok_launch_then_resume_reuses_assigned_handle(tmp_path: Path) -> None:
     assert session_id in resume_argv
     assert "--fork-session" not in resume_argv
     assert "--session-id" not in resume_argv
+
+
+# ---------------------------------------------------------------------------
+# cursor session harvest (b-338)
+#
+# Cursor was the only engine in the fleet that could not be resumed at all, so
+# every cursor worker that hit a wall or stopped to ask cost a full redispatch.
+# It was not a cursor limitation: measured 2026-09-06, `~/.cursor/acp-sessions`
+# held 238 sessions and none had a pooled-seat cwd, while the dispatch that had
+# just run left its transcript under `~/.cursor/projects/<encoded cwd>/
+# agent-transcripts/<id>/`. We were looking at the wrong tree.
+# ---------------------------------------------------------------------------
+
+
+def _seed_cursor_transcript(
+    home: Path, work_dir: Path, session_id: str, *, mtime: float | None = None
+) -> Path:
+    encoded = str(work_dir).lstrip("/").replace("/", "-")
+    entry = home / ".cursor" / "projects" / encoded / "agent-transcripts" / session_id
+    entry.mkdir(parents=True)
+    (entry / f"{session_id}.jsonl").write_text('{"role":"user"}\n', encoding="utf-8")
+    if mtime is not None:
+        os.utime(entry, (mtime, mtime))
+    return entry
+
+
+def test_cursor_handle_is_harvested_from_the_projects_tree(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    work = Path("/Users/x/Repos/proj/worktrees/label/s-1")
+    _seed_cursor_transcript(home, work, CURSOR_SESSION_UUID)
+    assert (
+        E.harvest_cursor_session_id(home, work) == CURSOR_SESSION_UUID
+    )
+
+
+def test_cursor_harvest_is_bounded_to_this_dispatchs_run(tmp_path: Path) -> None:
+    """Pooled seats accumulate one transcript per dispatch that used them.
+
+    Without the window this returns None forever after the second dispatch --
+    correctly refusing to guess, but never resumable either.
+    """
+    home = tmp_path / "home"
+    work = Path("/Users/x/Repos/proj/worktrees/label/s-1")
+    now = time.time()
+    _seed_cursor_transcript(home, work, PRIOR_CURSOR_SESSION, mtime=now - 86400)
+    _seed_cursor_transcript(home, work, CURSOR_SESSION_UUID, mtime=now)
+
+    assert E.harvest_cursor_session_id(home, work) is None, (
+        "unbounded, two candidates must refuse rather than pick one"
+    )
+    assert (
+        E.harvest_cursor_session_id(home, work, after_mtime=now - 3600)
+        == CURSOR_SESSION_UUID
+    ), "the window must select this run's transcript"
+
+
+def test_cursor_harvest_refuses_a_path_it_cannot_encode(tmp_path: Path) -> None:
+    """Cursor truncates a long cwd and appends a hash we cannot reconstruct.
+
+    An absent directory is an unknown, and must not become a guess.
+    """
+    home = tmp_path / "home"
+    (home / ".cursor" / "projects").mkdir(parents=True)
+    assert E.harvest_cursor_session_id(home, Path("/some/never/used/path")) is None
+
+
+def test_cursor_harvest_ignores_a_directory_that_is_not_a_handle(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    work = Path("/Users/x/Repos/proj/worktrees/label/s-1")
+    encoded = str(work).lstrip("/").replace("/", "-")
+    root = home / ".cursor" / "projects" / encoded / "agent-transcripts"
+    root.mkdir(parents=True)
+    (root / "not-a-session-id").mkdir()
+    assert E.harvest_cursor_session_id(home, work) is None

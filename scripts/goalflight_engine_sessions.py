@@ -250,6 +250,64 @@ def harvest_kimi_session_id(
     return next(iter(found), None)
 
 
+def harvest_cursor_session_id(
+    home: Path,
+    work_dir: Path,
+    *,
+    after_mtime: float | None = None,
+) -> str | None:
+    """Return the sole cursor handle for ``work_dir``; never guess among many.
+
+    Cursor keeps a per-project transcript tree, not the ACP session store one
+    might expect: ``~/.cursor/projects/<encoded cwd>/agent-transcripts/<id>/``.
+    Measured 2026-09-06 -- ``~/.cursor/acp-sessions`` held 238 sessions and NONE
+    of them had a pooled-seat cwd, while the dispatch that had just run left its
+    transcript (prompt and all) under the projects tree. Harvesting the wrong
+    tree is why cursor looked unresumable.
+
+    The cwd encoding is ``lstrip('/')`` then ``/`` -> ``-``, verified against
+    real directory names. Cursor truncates a long path and appends a hash
+    instead; that form is not reconstructable from the path alone, so an absent
+    directory returns None -- an unknown, never a guess.
+
+    ``after_mtime`` matters here more than for the other engines because seats
+    are POOLED: one seat directory accumulates a transcript per dispatch that
+    ever ran in it, so without a window every harvest after the first would see
+    several and correctly refuse. Bound it to this dispatch's own run.
+    """
+    try:
+        wanted = Path(work_dir).expanduser().resolve(strict=False)
+    except OSError:
+        return None
+    encoded = str(wanted).lstrip("/").replace("/", "-")
+    transcripts = (
+        Path(home).expanduser() / ".cursor" / "projects" / encoded / "agent-transcripts"
+    )
+    if not transcripts.is_dir():
+        return None
+    found: set[str] = set()
+    try:
+        children = list(transcripts.iterdir())
+    except OSError:
+        return None
+    for child in children:
+        if not child.is_dir():
+            continue
+        handle = valid_session_id("cursor", child.name)
+        if handle is None:
+            continue
+        if after_mtime is not None:
+            try:
+                if child.stat().st_mtime < after_mtime:
+                    continue
+            except OSError:
+                continue
+        found.add(handle)
+        if len(found) > 1:
+            return None
+    return next(iter(found), None)
+
+
 def harvest_grok_session_id(home: Path, work_dir: Path) -> str | None:
     """Return the sole grok session dir for ``work_dir``; never guess."""
     sessions = Path(home).expanduser() / ".grok" / "sessions"

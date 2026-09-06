@@ -3881,7 +3881,7 @@ def main() -> int:
                         "type": type(exc).__name__,
                         "message": str(exc),
                     }
-        if engine_session_id is None and resume_engine in {"moonshot", "grok"}:
+        if engine_session_id is None and resume_engine in {"moonshot", "grok", "cursor"}:
             work_dir = (
                 Path(args.project_root)
                 if getattr(args, "project_root", None)
@@ -3914,6 +3914,34 @@ def main() -> int:
                 engine_session_id = (
                     goalflight_engine_sessions.harvest_grok_session_id(
                         Path.home(), work_dir
+                    )
+                )
+            elif resume_engine == "cursor":
+                # Bound the search to this dispatch's own run. Worktree seats
+                # are pooled, so the seat's transcript directory accumulates one
+                # entry per dispatch that ever used it; unbounded, the harvest
+                # would see several and correctly refuse to guess.
+                #
+                # The tail is created at launch, so its BIRTH is this run's
+                # start -- and st_ctime is not that. ctime is the last inode
+                # change, and the tail is appended to for the whole run, so it
+                # tracks the END of the run instead. Measured 2026-09-06 on a
+                # live dispatch: st_ctime 11:20:01 against a transcript written
+                # at 11:20:00, so the window opened one second after the thing
+                # it was meant to admit and harvested nothing. st_birthtime is
+                # the real creation time (11:19:24 for that same run); it is
+                # absent on Linux, where ctime is the closest available stand-in
+                # and is only ever too late by the length of the run.
+                try:
+                    tail_stat = Path(tail).stat()
+                    started_at = getattr(
+                        tail_stat, "st_birthtime", tail_stat.st_ctime
+                    )
+                except OSError:
+                    started_at = None
+                engine_session_id = (
+                    goalflight_engine_sessions.harvest_cursor_session_id(
+                        Path.home(), work_dir, after_mtime=started_at
                     )
                 )
         if engine_session_id is not None:
