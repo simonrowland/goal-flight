@@ -583,6 +583,29 @@ def test_existing_journal_gains_outbox_without_upgrade_env(
     assert columns == journal.CURRENT_SCHEMA_COLUMNS["wake_webhook_outbox"]
 
 
+def test_reader_opens_journal_missing_outbox_without_upgrade_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv(journal.ALLOW_MIGRATION_ENV, raising=False)
+    project = _git_project(tmp_path)
+    authority = journal.Journal.create(project)
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute("DROP TABLE wake_webhook_outbox")
+        connection.commit()
+    reader = journal.Journal.open_reader(project)
+    tables = {
+        str(row["name"])
+        for row in reader.read_all("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    assert "wake_webhook_outbox" not in tables
+    writer = journal.Journal(project)
+    restored = {
+        str(row["name"])
+        for row in writer.read_all("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    assert "wake_webhook_outbox" in restored
+
+
 def test_doctor_warns_when_grok_bot_host_missing_url(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

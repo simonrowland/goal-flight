@@ -1593,14 +1593,7 @@ class Journal:
             if not self._read_only_client:
                 created_wake_outbox = self._install_wake_webhook_outbox(connection)
             missing_before, malformed_before = self._current_schema_issues(connection)
-            if self._read_only_client:
-                # Readers must not require a writer-only additive table that
-                # this process cannot install. The first writer open creates it.
-                missing_before = [
-                    name
-                    for name in missing_before
-                    if name != "wake_webhook_outbox"
-                ]
+            missing_before = self._ignore_writer_only_schema_gaps(missing_before)
             outbox_columns = tuple(
                 str(column[1])
                 for column in connection.execute("PRAGMA table_info(terminal_outbox)")
@@ -1642,6 +1635,7 @@ class Journal:
             seat_columns_migrated = self._install_attempt_seat_columns(connection)
             outbox_events_migrated = self._install_outbox_event_types(connection, stored)
             missing, malformed = self._current_schema_issues(connection)
+            missing = self._ignore_writer_only_schema_gaps(missing)
             if malformed:
                 self._raise_integrity_failure(
                     "epoch-6 journal has structurally invalid tables: "
@@ -1661,6 +1655,7 @@ class Journal:
                 self._install_p3_schema(connection)
                 self._install_p4_schema(connection)
                 missing, malformed = self._current_schema_issues(connection)
+                missing = self._ignore_writer_only_schema_gaps(missing)
             if missing or malformed:
                 details = []
                 if missing:
@@ -1998,6 +1993,17 @@ class Journal:
             "VALUES ('terminal-outbox-event-types-v1', ?)", (utc_now(),),
         )
         return True
+
+    def _ignore_writer_only_schema_gaps(self, missing: list[str]) -> list[str]:
+        """Drop additive tables a reader cannot install.
+
+        ``wake_webhook_outbox`` is created on the first writer open. A
+        reader of an older epoch-6 journal must not treat that gap as
+        corruption or trigger the idempotent installer.
+        """
+        if not self._read_only_client:
+            return missing
+        return [name for name in missing if name != "wake_webhook_outbox"]
 
     @staticmethod
     def _current_schema_issues(
