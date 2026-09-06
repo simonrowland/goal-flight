@@ -295,6 +295,12 @@ def session_trace_dirs(
     if resolved == "cursor":
         encoded = str(cwd).lstrip("/").replace("/", "-")
         return [home_path / ".cursor" / "projects" / encoded / "agent-transcripts"]
+    if resolved == "claude":
+        # Same idea as cursor, DIFFERENT encoding: claude keeps the leading
+        # slash as a dash (/Users/x -> -Users-x) where cursor strips it.
+        # Verified against the live directory listing, not assumed from the
+        # cursor rule -- the two look alike and are not the same.
+        return [home_path / ".claude" / "projects" / str(cwd).replace("/", "-")]
     if resolved == "moonshot":
         # The index maps workDir -> sessionDir; only this cwd's dirs count.
         index = home_path / ".kimi-code" / "session_index.jsonl"

@@ -192,3 +192,27 @@ def test_without_a_start_bound_the_old_permissive_behaviour_remains(
     _seed(home, "cursor", age_s=120.0)
     got = _sample_started(home, "cursor", started_epoch=None)
     assert got["trace_active"] is True, got
+
+
+def test_claude_has_a_layout_too_with_its_own_encoding(tmp_path: Path) -> None:
+    """Found by a second reviewer that the first missed.
+
+    claude keeps per-cwd traces like cursor, but encodes the leading slash as
+    a dash instead of stripping it. Copying cursor's rule would silently
+    resolve nothing, which reads as 'no trace' rather than 'wrong path'.
+    """
+    import goalflight_engine_sessions as E
+
+    home = tmp_path / "home"
+    d = home / ".claude" / "projects" / CWD.replace("/", "-")
+    d.mkdir(parents=True)
+    f = d / "sess.jsonl"
+    f.write_text('{"turn":1}\n')
+
+    dirs = E.session_trace_dirs("claude", home=home, worker_cwd=CWD)
+    assert dirs and dirs[0].name.startswith("-"), dirs
+    assert E.session_trace_newest_mtime("claude", home=home, worker_cwd=CWD) is not None
+
+    # the cursor encoding must NOT resolve claude's tree
+    wrong = home / ".claude" / "projects" / CWD.lstrip("/").replace("/", "-")
+    assert not wrong.exists(), "fixture sanity"
