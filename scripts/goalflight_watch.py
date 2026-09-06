@@ -1915,6 +1915,62 @@ def _attention_kind_from_last_marker(last_marker: object) -> str | None:
     return None
 
 
+def worktree_work_evidence(worker_cwd: object, *, since_epoch: float | None = None) -> str | None:
+    """Did this dispatch leave work in its seat? "dirty" / "committed" / None.
+
+    None means the question could not be answered -- never "there is none".
+
+    Why this exists: a terminal marker is only accepted when it carries the
+    dispatch id, which is deliberate (a generic marker from any process could
+    otherwise terminalize someone else's dispatch). But a worker that does real
+    work and then emits an UNPREFIXED marker is scored `no_evidence`, identical
+    to one that did nothing -- and the seat is recycled, taking the work with
+    it. Measured 2026-09-06: cursor workers emit `!COMPLETE: <summary>` with no
+    id while moonshot emits the prefixed form from the same prompt, so every
+    cursor dispatch lands in that bucket. One operator lost a finished commit
+    of 11 files that way.
+
+    The marker rule is NOT relaxed here -- doing so would reopen the poisoning
+    it prevents. This only stops "no marker" being reported as "no work", so
+    the seat's contents can be harvested instead of discarded.
+    """
+    if not worker_cwd:
+        return None
+    root = Path(worker_cwd)
+    try:
+        if not root.is_dir():
+            return None
+    except OSError:
+        return None
+    try:
+        dirty = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if dirty.returncode != 0:
+        return None
+    if dirty.stdout.strip():
+        return "dirty"
+    if since_epoch is None:
+        return None
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(root), "log", "-1", "--format=%ct"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if head.returncode != 0:
+        return None
+    stamp = head.stdout.strip()
+    if not stamp.isdigit():
+        return None
+    # A commit made after this dispatch started is this dispatch's work.
+    return "committed" if int(stamp) >= int(since_epoch) else None
+
+
 def _worker_dead_no_marker_reason(
     path: Path,
     prompt_prefix: list[str] | None = None,
@@ -1923,11 +1979,20 @@ def _worker_dead_no_marker_reason(
     prompt_path: Path | None = None,
     prompt_signature: tuple[int, int, int] | None = None,
     last_marker: dict | None = None,
+    worker_cwd: object = None,
+    started_epoch: float | None = None,
 ) -> str:
     """Add postmortem evidence without changing the worker-dead verdict."""
 
-    if not prompt_provenance_available:
+    def _no_evidence() -> str:
+        """`no_evidence` means we looked in the SEAT too, and found none."""
+        found = worktree_work_evidence(worker_cwd, since_epoch=started_epoch)
+        if found:
+            return f"worker_dead_no_terminal_marker:death_cause=unharvested_work_{found}"
         return "worker_dead_no_terminal_marker:death_cause=no_evidence"
+
+    if not prompt_provenance_available:
+        return _no_evidence()
     effective_prompt_prefix = prompt_prefix or []
     if prompt_path is not None:
         prompt_snapshot = _read_prompt_exclusion_snapshot(prompt_path)
@@ -1937,7 +2002,7 @@ def _worker_dead_no_marker_reason(
             or prompt_snapshot[1] != prompt_signature
             or not any(line.strip() for line in prompt_snapshot[0])
         ):
-            return "worker_dead_no_terminal_marker:death_cause=no_evidence"
+            return _no_evidence()
         effective_prompt_prefix = prompt_snapshot[0]
     text = goalflight_terminal.read_tail_excerpt(
         path,
@@ -4973,6 +5038,8 @@ def main() -> int:
                             if isinstance(payload.get("last_marker"), dict)
                             else None
                         ),
+                        worker_cwd=tree_root,
+                        started_epoch=watcher_started_epoch,
                     )
                     if identity_reason == "dead"
                     else f"worker_identity_mismatch:{identity_reason}"
