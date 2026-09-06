@@ -250,6 +250,117 @@ def harvest_kimi_session_id(
     return next(iter(found), None)
 
 
+def session_trace_dirs(
+    engine: object,
+    *,
+    home: Path,
+    worker_cwd: object,
+    codex_home: object = None,
+) -> list[Path]:
+    """Where this engine journals a worker's turns, for THIS worker's cwd.
+
+    Every worker CLI writes a per-session trace as it works -- one entry per
+    turn or tool call -- even while its console stays silent. That makes the
+    trace an activity signal the console cannot provide, which is the whole
+    point of t-186: a worker thinking for ten minutes, or streaming into a
+    buffered pipe, looks identical to a dead one from the tail alone.
+
+    Scoped to the worker's own cwd on purpose. A machine-wide "some kimi
+    process wrote something" signal would let one worker's activity vouch for
+    another's, which is not evidence about this dispatch at all.
+    """
+    resolved = resume_engine(engine)
+    if resolved is None:
+        return []
+    try:
+        home_path = Path(home).expanduser()
+    except (OSError, TypeError):
+        return []
+    if resolved == "codex":
+        # codex's rollout lives under the dispatch's own home, not $HOME.
+        if not codex_home:
+            return []
+        try:
+            return [Path(codex_home).expanduser() / "sessions"]
+        except (OSError, TypeError):
+            return []
+    if not worker_cwd:
+        return []
+    try:
+        cwd = Path(worker_cwd).expanduser().resolve(strict=False)
+    except OSError:
+        return []
+    if resolved == "grok":
+        return [home_path / ".grok" / "sessions" / _grok_session_group_name(cwd)]
+    if resolved == "cursor":
+        encoded = str(cwd).lstrip("/").replace("/", "-")
+        return [home_path / ".cursor" / "projects" / encoded / "agent-transcripts"]
+    if resolved == "moonshot":
+        # The index maps workDir -> sessionDir; only this cwd's dirs count.
+        index = home_path / ".kimi-code" / "session_index.jsonl"
+        dirs: list[Path] = []
+        try:
+            lines = index.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            raw_wd = record.get("workDir")
+            session_dir = record.get("sessionDir")
+            if not isinstance(raw_wd, str) or not isinstance(session_dir, str):
+                continue
+            try:
+                if Path(raw_wd).expanduser().resolve(strict=False) != cwd:
+                    continue
+            except OSError:
+                continue
+            dirs.append(Path(session_dir).expanduser())
+        return dirs
+    return []
+
+
+def session_trace_newest_mtime(
+    engine: object,
+    *,
+    home: Path,
+    worker_cwd: object,
+    codex_home: object = None,
+) -> float | None:
+    """Newest mtime across this worker's session trace, or None if unknowable.
+
+    None means "could not answer" -- no known layout for the engine, nothing
+    on disk yet, or an unreadable path. It must never be read as "no activity";
+    the caller treats it as unknown, and unknown is not evidence of death.
+    """
+    newest: float | None = None
+    for root in session_trace_dirs(
+        engine, home=home, worker_cwd=worker_cwd, codex_home=codex_home
+    ):
+        try:
+            if not root.exists():
+                continue
+            candidates = [root]
+            if root.is_dir():
+                candidates.extend(root.iterdir())
+            for path in candidates:
+                try:
+                    stamp = path.stat().st_mtime
+                except OSError:
+                    continue
+                if newest is None or stamp > newest:
+                    newest = stamp
+        except OSError:
+            continue
+    return newest
+
+
 def harvest_cursor_session_id(
     home: Path,
     work_dir: Path,

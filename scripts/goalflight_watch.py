@@ -733,6 +733,11 @@ def _known_trace_roots(*, state_dir: Path | None = None, home: Path | None = Non
     roots = [
         user_home / ".codex" / "sessions",
         user_home / ".kimi-code" / "sessions",
+        # grok and cursor journal every turn too, and had no root here at all,
+        # so their workers could never earn a trace veto no matter how busy
+        # they were -- the tail was the only signal they had (t-186).
+        user_home / ".grok" / "sessions",
+        user_home / ".cursor" / "projects",
     ]
     dispatch_homes = (machine_state / "dispatch-homes").resolve(strict=False)
     try:
@@ -923,6 +928,8 @@ class TraceLiveness:
         worker_pid: int,
         effective_account: str | None = None,
         cached_path: str | None = None,
+        engine: str | None = None,
+        worker_cwd: object = None,
         state_dir: Path | None = None,
         home: Path | None = None,
         started_mono: float | None = None,
@@ -933,6 +940,9 @@ class TraceLiveness:
         self.dispatch_id = dispatch_id
         self.worker_pid = worker_pid
         self.effective_account = effective_account
+        self.engine = engine
+        self.worker_cwd = worker_cwd
+        self.home = (home or Path.home()).expanduser()
         self.state_dir = (state_dir or goalflight_ledger.state_dir()).resolve(strict=False)
         self.roots = _known_trace_roots(state_dir=self.state_dir, home=home)
         self.started_mono = active_monotonic() if started_mono is None else started_mono
@@ -959,6 +969,20 @@ class TraceLiveness:
                     if self.path is not None:
                         self.roots = pinned_roots
                         return
+        # Deterministic layout, same idea as the codex pin above. lsof can only
+        # see a trace the TRACKED pid holds open, which fails for an engine that
+        # appends-and-closes per turn, or whose real work runs in a process the
+        # watcher is not tracking. The path is derivable from engine + cwd, so
+        # derive it rather than hoping a file descriptor is visible.
+        for layout_root in goalflight_engine_sessions.session_trace_dirs(
+            self.engine, home=self.home, worker_cwd=self.worker_cwd
+        ):
+            resolved_root = layout_root.resolve(strict=False)
+            candidate = _newest_trace_file(resolved_root, self.roots + (resolved_root,))
+            if candidate is not None:
+                self.roots = self.roots + (resolved_root,)
+                self.path = candidate
+                return
         self.path = _trace_from_lsof(
             self.worker_pid,
             self.roots,
@@ -3817,6 +3841,11 @@ def main() -> int:
         worker_pid=args.pid,
         effective_account=effective_account,
         cached_path=_cached_trace_path(status_path),
+        engine=resume_engine,
+        # args.worker_cwd, not tree_leg: the tree leg is resolved further down
+        # this function, and reaching forward for it raised UnboundLocalError
+        # on every watcher start. Both derive from the same input anyway.
+        worker_cwd=getattr(args, "worker_cwd", None),
     )
     # Idle accounting uses the sleep-excluding clock (active_monotonic):
     # macOS CLOCK_UPTIME_RAW / Linux CLOCK_MONOTONIC freeze across system
