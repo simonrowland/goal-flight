@@ -3917,6 +3917,16 @@ def main() -> int:
                     )
                 )
             elif resume_engine == "cursor":
+                # Cursor keys its transcript tree by the worker's OWN cwd, which
+                # for a seat dispatch is the worktree, not the project root.
+                # Measured 2026-09-06: the dispatch wrote under
+                # ...-worktrees-goal-flight-s-1 while a project-root-keyed
+                # lookup found an unrelated directory of older sessions -- so
+                # this harvested nothing, and a project root that happened to
+                # hold one stale session would have been WORSE than nothing.
+                worker_cwd = getattr(args, "worker_cwd", None)
+                if worker_cwd:
+                    work_dir = Path(worker_cwd)
                 # Bound the search to this dispatch's own run. Worktree seats
                 # are pooled, so the seat's transcript directory accumulates one
                 # entry per dispatch that ever used it; unbounded, the harvest
