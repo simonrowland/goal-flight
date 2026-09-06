@@ -2494,7 +2494,7 @@ chunk-3a rationale:
 - **skill_md_compressed_form:**
     - **kind:** literal
     - **pattern:** "Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background exec."
-    - **pattern:** "reviewer must never resume the implementer."
+    - **pattern:** "reviewer must never resume the implementer"
     - **max_section_lines:** 31
 - **verifier:**
     - **kind:** behaviour-scenario
