@@ -3958,16 +3958,29 @@ class Journal:
         self,
         label: str,
         *,
-        nonce: str,
+        nonce: str | None,
         expected_cursor_version: int,
         expected_stream_snapshots: Mapping[str, str],
         advances: Mapping[str, int],
         actor: str,
+        allow_no_lease: bool = False,
     ) -> WriteResult[dict[str, object]]:
-        """Advance only to stream-safe positions in the authoritative journal."""
+        """Advance only to stream-safe positions in the authoritative journal.
+
+        An ACTIVE lease still authorizes the holder and refuses everyone else.
+        ``allow_no_lease`` is the operator opt-in for a label with no live
+        holder: it creates the cursor row when absent and records ``actor``.
+        It is refused when an ACTIVE lease exists. Stream-snapshot and
+        position checks are unchanged either way.
+        """
         project_root = str(self.project_root)
         resolved_label = self._identity_token(label, label="cursor label")
-        resolved_nonce = self._identity_token(nonce, label="cursor lease nonce")
+        if nonce is None:
+            if not allow_no_lease:
+                raise ValueError("cursor lease nonce must be a bounded identity token")
+            resolved_nonce = None
+        else:
+            resolved_nonce = self._identity_token(nonce, label="cursor lease nonce")
         actor_value = self._identity_token(actor, label="cursor actor")
         if (
             not isinstance(expected_cursor_version, int)
@@ -4001,21 +4014,49 @@ class Journal:
                    WHERE project_root = ? AND label = ? AND state = 'ACTIVE'""",
                 (project_root, resolved_label),
             ).fetchone()
-            if (
-                lease is None
-                or str(lease["nonce"]) != resolved_nonce
-            ):
+            if allow_no_lease:
+                if lease is not None:
+                    raise CASMismatch(
+                        "cursor CAS lost: an active lease exists for this label"
+                    )
+            elif lease is None:
+                raise CASMismatch("cursor CAS lost: no active lease exists")
+            elif resolved_nonce is None or str(lease["nonce"]) != resolved_nonce:
                 raise CASMismatch("cursor CAS lost: lease generation changed")
-            generation = int(lease["generation"])
             cursor = connection.execute(
                 """SELECT registry_generation, cursor_version
                    FROM controller_cursors
                    WHERE project_root = ? AND label = ?""",
                 (project_root, resolved_label),
             ).fetchone()
-            if cursor is None or int(cursor["registry_generation"]) != generation:
-                raise CASMismatch("cursor CAS lost: registry generation changed")
-            current_cursor_version = int(cursor["cursor_version"])
+            if allow_no_lease:
+                if cursor is None:
+                    generation = int(
+                        connection.execute(
+                            """SELECT COALESCE(MAX(generation), 1)
+                               FROM controller_leases
+                               WHERE project_root = ? AND label = ?""",
+                            (project_root, resolved_label),
+                        ).fetchone()[0]
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO controller_cursors (
+                            project_root, label, registry_generation,
+                            cursor_version, updated_at
+                        ) VALUES (?, ?, ?, 0, ?)
+                        """,
+                        (project_root, resolved_label, generation, utc_now()),
+                    )
+                    current_cursor_version = 0
+                else:
+                    generation = int(cursor["registry_generation"])
+                    current_cursor_version = int(cursor["cursor_version"])
+            else:
+                generation = int(lease["generation"])
+                if cursor is None or int(cursor["registry_generation"]) != generation:
+                    raise CASMismatch("cursor CAS lost: registry generation changed")
+                current_cursor_version = int(cursor["cursor_version"])
             if not self._cursor_snapshot_version_is_admissible(
                 expected_cursor_version=expected_cursor_version,
                 current_cursor_version=current_cursor_version,

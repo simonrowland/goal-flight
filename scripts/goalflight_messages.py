@@ -5535,17 +5535,37 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
         or os.environ.get("GOALFLIGHT_CONTROLLER_SESSION_ID")
         or ""
     ).strip() or None
+    orphaned = bool(getattr(args, "orphaned_label", False))
+    acked = bool(getattr(args, "acked", False))
     try:
         if not label:
             raise ValueError("active controller label is required")
-        if nonce is None:
+        if orphaned and acked:
+            raise ValueError(
+                "--acked is refused with --orphaned-label; name every stream "
+                "explicitly via --position STREAM=SEQ so nothing is skipped implicitly"
+            )
+        if orphaned and args.lease_nonce:
+            raise ValueError("--orphaned-label cannot be combined with --lease-nonce")
+        if orphaned:
+            # A session holds one lease. Env nonce from another label must not
+            # bind this write; the opt-in is the authority, not a nonce.
+            nonce = None
+            live = goalflight_journal.Journal.open_reader(project_root).active_lease(
+                label
+            )
+            if live is not None:
+                raise ValueError(
+                    f"--orphaned-label is refused because {label} has an active lease"
+                )
+        elif nonce is None:
             lease = goalflight_journal.Journal.open_reader(project_root).active_lease(
                 label
             )
             if lease is None:
                 raise ValueError(_no_active_lease_reconnect(label))
             nonce = lease.nonce
-        if getattr(args, "acked", False):
+        if acked:
             if args.position or args.stream_snapshot or args.cursor_version is not None:
                 raise ValueError(
                     "--acked derives cursor-version, stream-snapshot and position "
@@ -5580,7 +5600,12 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
             expected_cursor_version=args.cursor_version,
             expected_stream_snapshots=stream_snapshots,
             advances=advances,
-            actor=f"controller:{os.getpid()}",
+            actor=(
+                f"operator:{os.getpid()}:orphaned-label"
+                if orphaned
+                else f"controller:{os.getpid()}"
+            ),
+            allow_no_lease=orphaned,
         )
     except goalflight_journal.JournalUpgradeRequired:
         raise
@@ -5600,15 +5625,16 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
         print(f"advance: {result.reason or 'cursor CAS lost'}", file=sys.stderr)
         return 3
     try:
-        _acknowledge_pending_report_from_cursor(
-            project_root,
-            controller_label=label,
-            lease_nonce=nonce,
-            cursor_positions=_journal_cursor_positions(
-                goalflight_journal.Journal.open_reader(project_root),
-                label,
-            ),
-        )
+        if nonce is not None:
+            _acknowledge_pending_report_from_cursor(
+                project_root,
+                controller_label=label,
+                lease_nonce=nonce,
+                cursor_positions=_journal_cursor_positions(
+                    goalflight_journal.Journal.open_reader(project_root),
+                    label,
+                ),
+            )
     except (OSError, RuntimeError, ValueError):
         # The cursor already committed; preserving a provisional claim can
         # duplicate a report but cannot revoke the acknowledged delivery.
@@ -8972,6 +8998,16 @@ def _run_cli(argv: list[str] | None = None) -> int:
              "transcribing them by hand adds friction without adding safety: the "
              "compare-and-swap still fails if anything lands between the peek "
              "and the write.",
+    )
+    advance.add_argument(
+        "--orphaned-label",
+        action="store_true",
+        help=(
+            "acknowledge a label that has no ACTIVE lease. Refused if a lease "
+            "is active, so this is never a silent fallback. Requires explicit "
+            "--position and --stream-snapshot; --acked is refused so nothing "
+            "can be skipped by derivation."
+        ),
     )
     advance.add_argument(
         "--stream-snapshot",

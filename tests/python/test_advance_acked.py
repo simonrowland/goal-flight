@@ -547,3 +547,149 @@ def test_one_label_cannot_advance_anothers_cursor(
     assert rc_cross != 0
     assert "no longer active" in err_cross or "lease generation changed" in err_cross
     assert _pending(authority, "bob") == [("bob-stream", 1)]
+
+
+def _snapshot_token(
+    authority: journal.Journal, label: str, stream: str, position: int
+) -> str:
+    def action(connection: object) -> str:
+        token, has_unprojected = journal.Journal._cursor_stream_snapshot(
+            connection,
+            project_root=str(authority.project_root),
+            recipient_label=label,
+            stream_id=stream,
+            requested_position=position,
+        )
+        assert not has_unprojected
+        return token
+
+    return authority._read_with_retry("test stream snapshot", action)
+
+
+def test_orphaned_label_explicit_position_creates_cursor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A label with no lease can be acknowledged when every stream is named."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    messages_dir = Path(os.environ["GOALFLIGHT_MESSAGES_DIR"])
+    posted = _post(project, messages_dir, "webui-orphan", "backlog")
+    assert authority.cursor_status("webui-orphan") is None
+    assert authority.active_lease("webui-orphan") is None
+    seq = int(posted["envelope"]["seq"])
+    token = _snapshot_token(authority, "webui-orphan", STREAM, seq)
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LEASE_NONCE", "other-session-nonce")
+    rc, stdout, stderr = _advance(
+        project,
+        "webui-orphan",
+        "--orphaned-label",
+        "--cursor-version",
+        "0",
+        "--stream-snapshot",
+        f"{STREAM}={token}",
+        "--position",
+        f"{STREAM}={seq}",
+        "--json",
+    )
+    assert rc == 0, stderr or stdout
+    cursor = authority.cursor_status("webui-orphan")
+    assert cursor is not None
+    assert cursor["positions"] == {STREAM: seq}
+    assert str(cursor.get("advanced_by") or "").endswith(":orphaned-label")
+    assert _pending(authority, "webui-orphan") == []
+
+
+def test_orphaned_label_refuses_acked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """--acked derives positions; an orphaned advance must name every stream."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    journal.open_or_create_journal(project)
+    rc, _, stderr = _advance(
+        project, "webui-orphan", "--orphaned-label", "--acked"
+    )
+    assert rc != 0
+    assert "--acked is refused" in stderr
+    assert "orphaned-label" in stderr
+
+
+def test_orphaned_label_refused_when_lease_is_active(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """--orphaned-label is an opt-in, never a way around a live holder."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    lease = _claim(authority, "held")
+    messages_dir = Path(os.environ["GOALFLIGHT_MESSAGES_DIR"])
+    posted = _post(project, messages_dir, "held", "live holder mail")
+    seq = int(posted["envelope"]["seq"])
+    token = _snapshot_token(authority, "held", STREAM, seq)
+    rc_flag, _, err_flag = _advance(
+        project,
+        "held",
+        "--orphaned-label",
+        "--cursor-version",
+        "0",
+        "--stream-snapshot",
+        f"{STREAM}={token}",
+        "--position",
+        f"{STREAM}={seq}",
+    )
+    assert rc_flag != 0
+    assert "has an active lease" in err_flag
+    rc_cross, _, err_cross = _advance(
+        project,
+        "held",
+        "--cursor-version",
+        "0",
+        "--stream-snapshot",
+        f"{STREAM}={token}",
+        "--position",
+        f"{STREAM}={seq}",
+        nonce="not-the-holder",
+    )
+    assert rc_cross != 0
+    assert "lease generation changed" in err_cross
+    assert "no active lease exists" not in err_cross
+    assert _pending(authority, "held") == [(STREAM, seq)]
+    assert authority.active_lease("held") is not None
+    assert authority.active_lease("held").nonce == lease.nonce
+
+
+def test_no_active_lease_error_is_not_a_generation_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Lease-is-None must not be worded as a generation change."""
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    token = "a" * 64
+    missing = authority.advance_cursor(
+        "ghost",
+        nonce="not-a-lease",
+        expected_cursor_version=0,
+        expected_stream_snapshots={"ghost-stream": token},
+        advances={"ghost-stream": 1},
+        actor="test-operator",
+    )
+    assert missing.cas_lost
+    missing_reason = missing.reason or ""
+    assert "no active lease exists" in missing_reason
+    assert "lease generation changed" not in missing_reason
+    lease = _claim(authority, "held")
+    wrong = authority.advance_cursor(
+        "held",
+        nonce="not-the-holder",
+        expected_cursor_version=0,
+        expected_stream_snapshots={"ghost-stream": token},
+        advances={"ghost-stream": 1},
+        actor="test-operator",
+    )
+    assert wrong.cas_lost
+    wrong_reason = wrong.reason or ""
+    assert "lease generation changed" in wrong_reason
+    assert "no active lease exists" not in wrong_reason
+    assert lease.nonce != "not-the-holder"
