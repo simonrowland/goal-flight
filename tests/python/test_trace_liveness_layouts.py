@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import sys
 import time
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -38,26 +40,85 @@ CWD = "/Users/x/Repos/proj/worktrees/label/s-1"
 DEAD_PID = 999999  # deliberately not running: lsof must be irrelevant
 
 
-def _seed(home: Path, engine: str, *, age_s: float) -> Path:
+def _seed(home: Path, engine: str, *, age_s: float, session_id: str = "sess-1") -> Path:
     """Write a trace where `engine` really keeps one, aged `age_s`."""
     if engine == "cursor":
         enc = CWD.lstrip("/").replace("/", "-")
-        d = home / ".cursor" / "projects" / enc / "agent-transcripts" / "sess-1"
+        d = home / ".cursor" / "projects" / enc / "agent-transcripts" / session_id
     elif engine == "grok":
         import urllib.parse
 
-        d = home / ".grok" / "sessions" / urllib.parse.quote(CWD, safe="") / "sess-1"
+        d = home / ".grok" / "sessions" / urllib.parse.quote(CWD, safe="") / session_id
+    elif engine == "moonshot":
+        # The index is authoritative; directory names need not be session IDs.
+        d = home / ".kimi-code" / "sessions" / ("indexed-" + session_id)
+        d.parent.mkdir(parents=True, exist_ok=True)
+        with (home / ".kimi-code" / "session_index.jsonl").open("a") as index:
+            index.write(json.dumps({
+                "workDir": CWD, "sessionId": session_id, "sessionDir": str(d),
+            }) + "\n")
     else:
         raise AssertionError(engine)
     d.mkdir(parents=True)
     f = d / "trace.jsonl"
     f.write_text('{"turn":1}\n')
     stamp = time.time() - age_s
-    import os
-
     os.utime(f, (stamp, stamp))
     os.utime(d, (stamp, stamp))
     return f
+
+
+@pytest.mark.parametrize("engine", ["grok", "cursor", "moonshot"])
+@pytest.mark.parametrize("cached_foreign", [False, True])
+def test_session_identity_beats_recent_foreign_trace(tmp_path, engine, cached_foreign):
+    home = tmp_path / "home"
+    foreign = _seed(home, engine, age_s=1, session_id="previous")
+    # Previous occupant's directory is old, but its trace was recently touched.
+    os.utime(foreign.parent, (1, 1))
+    own = _seed(home, engine, age_s=60, session_id="current")
+    tracker = W.TraceLiveness(
+        dispatch_id=None, worker_pid=DEAD_PID, engine=engine,
+        engine_session_id="current", worker_cwd=CWD, home=home,
+        cached_path=str(foreign) if cached_foreign else None,
+    )
+    if cached_foreign:
+        assert tracker.path is None
+    got = tracker.sample(now_epoch=time.time(), now_mono=W.active_monotonic(), idle_threshold=900)
+    assert got["trace_path"] == str(own.resolve())
+    assert got["trace_root_keyed_by"] == "session"
+    assert got["trace_active"] is True
+
+
+@pytest.mark.parametrize("engine", ["grok", "cursor", "moonshot"])
+def test_unknown_session_falls_back_then_discovered_id_replaces_cached_trace(tmp_path, engine):
+    home = tmp_path / "home"
+    foreign = _seed(home, engine, age_s=1, session_id="previous")
+    own = _seed(home, engine, age_s=60, session_id="current")
+    tracker = W.TraceLiveness(
+        dispatch_id=None, worker_pid=DEAD_PID, engine=engine,
+        worker_cwd=CWD, home=home,
+    )
+    got = tracker.sample(now_epoch=time.time(), now_mono=W.active_monotonic(), idle_threshold=900)
+    assert got["trace_path"] == str(foreign.resolve())
+    assert got["trace_root_keyed_by"] == "cwd"
+    tracker.set_engine_session_id("current")
+    got = tracker.sample(now_epoch=time.time(), now_mono=W.active_monotonic(), idle_threshold=900)
+    assert got["trace_path"] == str(own.resolve())
+    assert got["trace_root_keyed_by"] == "session"
+
+
+@pytest.mark.parametrize("engine", ["grok", "cursor", "moonshot"])
+def test_known_session_without_trace_cannot_use_foreign_fallback(tmp_path, engine):
+    home = tmp_path / "home"
+    foreign = _seed(home, engine, age_s=1, session_id="previous")
+    tracker = W.TraceLiveness(
+        dispatch_id=None, worker_pid=DEAD_PID, engine=engine,
+        engine_session_id="current", worker_cwd=CWD, home=home,
+        cached_path=str(foreign),
+        lsof_runner=lambda *_args, **_kwargs: pytest.fail("foreign fallback attempted"),
+    )
+    got = tracker.sample(now_epoch=time.time(), now_mono=W.active_monotonic(), idle_threshold=900)
+    assert got == {"trace_root_keyed_by": "session"}
 
 
 def _sample(home: Path, engine: str, *, idle_threshold: float = 900.0) -> dict:

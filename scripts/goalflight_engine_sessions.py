@@ -256,6 +256,7 @@ def session_trace_dirs(
     home: Path,
     worker_cwd: object,
     codex_home: object = None,
+    engine_session_id: str | None = None,
 ) -> list[Path]:
     """Where this engine journals a worker's turns, for THIS worker's cwd.
 
@@ -291,10 +292,12 @@ def session_trace_dirs(
     except OSError:
         return []
     if resolved == "grok":
-        return [home_path / ".grok" / "sessions" / _grok_session_group_name(cwd)]
+        root = home_path / ".grok" / "sessions" / _grok_session_group_name(cwd)
+        return [root / engine_session_id if engine_session_id else root]
     if resolved == "cursor":
         encoded = str(cwd).lstrip("/").replace("/", "-")
-        return [home_path / ".cursor" / "projects" / encoded / "agent-transcripts"]
+        root = home_path / ".cursor" / "projects" / encoded / "agent-transcripts"
+        return [root / engine_session_id if engine_session_id else root]
     if resolved == "claude":
         # Same idea as cursor, DIFFERENT encoding: claude keeps the leading
         # slash as a dash (/Users/x -> -Users-x) where cursor strips it.
@@ -317,6 +320,8 @@ def session_trace_dirs(
             except json.JSONDecodeError:
                 continue
             if not isinstance(record, dict):
+                continue
+            if engine_session_id and record.get("sessionId") != engine_session_id:
                 continue
             raw_wd = record.get("workDir")
             session_dir = record.get("sessionDir")

@@ -929,6 +929,7 @@ class TraceLiveness:
         effective_account: str | None = None,
         cached_path: str | None = None,
         engine: str | None = None,
+        engine_session_id: str | None = None,
         worker_cwd: object = None,
         started_epoch: float | None = None,
         state_dir: Path | None = None,
@@ -952,13 +953,43 @@ class TraceLiveness:
         self.lsof_runner = lsof_runner
         self.ps_runner = ps_runner
         self.path = None
+        self.engine_session_id = None
+        self.session_roots = ()
+        self.set_engine_session_id(engine_session_id)
         if cached_path:
             candidate = Path(cached_path)
-            if _path_under_known_trace_root(candidate, self.roots):
+            if _path_under_known_trace_root(candidate, self.session_roots or self.roots) and (
+                not self.engine_session_id or self.session_roots
+            ):
                 self.path = candidate.resolve(strict=False)
+
+    def set_engine_session_id(self, session_id: str | None) -> None:
+        # These engines have session-keyed layouts; other trace channels retain
+        # their existing dispatch-home / process-descriptor resolution.
+        if self.engine not in {"grok", "cursor", "moonshot"}:
+            return
+        if session_id == self.engine_session_id:
+            return
+        self.engine_session_id = session_id
+        self.path = None
+        self.started_mono = active_monotonic()
+        self.session_roots = ()
 
     def _resolve(self, now_mono: float) -> None:
         if self.path is not None or now_mono - self.started_mono > self.retry_secs:
+            return
+        if self.engine_session_id:
+            self.session_roots = tuple(goalflight_engine_sessions.session_trace_dirs(
+                self.engine, home=self.home, worker_cwd=self.worker_cwd,
+                engine_session_id=self.engine_session_id,
+            ))
+            for root in self.session_roots:
+                resolved_root = root.resolve(strict=False)
+                self.path = _newest_trace_file(resolved_root, (resolved_root,))
+                if self.path is not None:
+                    return
+            # A known session with no trace is unknown. Neither another session
+            # in this seat nor an open foreign descriptor can supply evidence.
             return
         if self.dispatch_id and self.effective_account:
             dispatch_homes = (self.state_dir / "dispatch-homes").resolve(strict=False)
@@ -993,12 +1024,16 @@ class TraceLiveness:
         )
 
     def sample(self, *, now_epoch: float, now_mono: float, idle_threshold: float) -> dict:
+        keying = {"trace_root_keyed_by": "session" if self.engine_session_id else "cwd"} if (
+            self.engine in {"grok", "cursor", "moonshot"}
+        ) else {}
         try:
             self._resolve(now_mono)
             if self.path is None:
-                return {}
+                return keying
             mtime = self.path.stat().st_mtime
             return {
+                **keying,
                 "trace_path": str(self.path),
                 "trace_mtime": mtime,
                 # Written during THIS dispatch, not merely recent. Worktree
@@ -1016,7 +1051,7 @@ class TraceLiveness:
                 ),
             }
         except (OSError, RuntimeError, ValueError):
-            return {"trace_path": str(self.path)} if self.path is not None else {}
+            return {**keying, "trace_path": str(self.path)} if self.path is not None else keying
 
 
 def _trace_vetoes_idle(*, trace_active: bool) -> bool:
@@ -1563,6 +1598,7 @@ def _status_snapshot(payload: dict) -> dict:
         "tail_path",
         "status_path",
         "trace_path",
+        "trace_root_keyed_by",
         "trace_mtime",
         "trace_active",
         "terminal_marker",
@@ -3871,6 +3907,7 @@ def main() -> int:
         effective_account=effective_account,
         cached_path=_cached_trace_path(status_path),
         engine=resume_engine,
+        engine_session_id=engine_session_id,
         # The LEDGER's dispatch start, deliberately not watcher_started_epoch's
         # `or time.time()` fallback. The bound may only be applied when we
         # actually know when this dispatch began; substituting "now" would
@@ -4094,6 +4131,16 @@ def main() -> int:
                 )
         if engine_session_id is not None:
             payload["engine_session_id"] = engine_session_id
+            if resume_engine in {"grok", "cursor", "moonshot"} and (
+                engine_session_id != trace_liveness.engine_session_id
+            ):
+                trace_liveness.set_engine_session_id(engine_session_id)
+                for key in ("trace_path", "trace_mtime", "trace_active", "trace_root_keyed_by"):
+                    payload.pop(key, None)
+                payload.update(trace_liveness.sample(
+                    now_epoch=time.time(), now_mono=active_monotonic(),
+                    idle_threshold=args.max_idle_secs,
+                ))
             if not engine_session_recorded and args.dispatch_id:
                 try:
                     goalflight_ledger.record_engine_session_id(
