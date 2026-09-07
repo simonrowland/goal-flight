@@ -142,6 +142,26 @@ CHILD_DISTINCT_CAP = 32
 CURSOR_LAG_THRESHOLD = 16
 CHILD_BACKLOG_FLUSH_S = 1.0
 DISTINCT_WITHHELD_RETRIEVE = "relay --drain"
+# Never withheld by CHILD_DISTINCT_CAP. Two families, one rule: a signal the
+# controller cannot afford to miss must not lose a race against chatter.
+#
+# The listener/watchdog half is supervisor liveness. The second half is a
+# WORKER ESCALATION -- goalflight_terminal.ATTENTION_MARKERS
+# {BLOCKED, FAILED, USER-CONFIRM, USER-NEED} through
+# goalflight_messages.MARKER_TO_TYPE. Measured 2026-09-06: a worker's !BLOCKED
+# was journalled with wake_class "waking" and then WITHHELD here, because a
+# busy session had already forwarded 32 distinct envelopes in the window. The
+# drain hint was emitted, nothing drained, and the controller learned of the
+# dead worker ~25 minutes later from an unrelated fallback timer.
+#
+# Why not exempt every "waking" type instead: the registry marks 57 of 59 types
+# waking (only status and monitor are not), so that would delete the cap rather
+# than fix the hole. Escalations are bounded -- a worker raises one at most once
+# per dispatch -- so this cannot flood. These three strings are duplicated here
+# rather than imported because goalflight_messages imports THIS module for its
+# CLI; test_supervisor_escalation_passthrough pins them to the real sets so the
+# duplication cannot drift.
+_ESCALATION_EVENT_TYPES = frozenset({"blocked", "user_confirm", "user_need"})
 _PASSTHROUGH_EVENT_TYPES = frozenset(
     {
         "listener-dead",
@@ -151,7 +171,7 @@ _PASSTHROUGH_EVENT_TYPES = frozenset(
         "listener-degraded",
         "listener-recovered",
     }
-)
+) | _ESCALATION_EVENT_TYPES
 _DEAD_NONCE_MARKERS = (
     "controller-capability-mismatch",
     "lease-nonce-not-live",
