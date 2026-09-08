@@ -9957,9 +9957,18 @@ def _linked_task_truth_detail(
         store = goalflight_task.TaskStore(project_root)
         if task_store_locked and store.publish_marker_path.exists():
             store._recover_interrupted_publish_locked()
+        # Derived rows, not raw ones. _task_row_durably_complete consults
+        # derived_status, and load_items does not emit that field at all --
+        # measured: 0 of 758 raw rows carry it, so the predicate's derived
+        # branch was dead on this path and only the raw done/done_reviewed
+        # stamps decided. 26 rows in the live store flip to complete once the
+        # deriver runs. derived_rows_for_items (goalflight_task.py) is the
+        # authoritative deriver; stamps are inputs to it, never a substitute.
         by_id = {
             str(item.get("id")): item
-            for item in store.load_items(recover_publish=False)
+            for item in store.derived_rows_for_items(
+                store.load_items(recover_publish=False)
+            )
         }
         for task_id in task_ids:
             row = by_id.get(task_id)
