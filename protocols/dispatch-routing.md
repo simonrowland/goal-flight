@@ -714,20 +714,20 @@ Three delivery forms, in order of preference by situation:
     resume <session-id> - < revisions.md
   ```
 
-  **Resume survives seat rotation — do not pin seats to preserve it.** A codex
+  **Resume survives account rotation — do not pin accounts to preserve it.** A codex
   rollout is local transcript state, not server-side account-bound state, so
   ANY valid codex auth can resume ANY rollout. Verified 2026-07-28: a session
-  created under one seat, resumed under a home authenticated as a different
-  seat, returned its full prior context and answered a question only the
+  created under one account, resumed under a home authenticated as a different
+  account, returned its full prior context and answered a question only the
   earlier conversation could answer. The resume therefore needs the rollout
-  FILE, not the original seat — rebuild the dispatch home with the rollout
-  intact and whatever seat is currently healthy.
+  FILE, not the original account — rebuild the dispatch home with the rollout
+  intact and whatever account is currently healthy.
 
   Seat continuity is worth a little, but only a little: staying on the same
-  seat may keep the vendor-side prompt cache warm (short-lived, on the order of
+  account may keep the vendor-side prompt cache warm (short-lived, on the order of
   minutes), while a lost session costs the entire accumulated context. So
-  prefer the original seat when it is healthy and free, and never refuse,
-  block, or delay a resume to obtain it. Falling back to the current seat is
+  prefer the original account when it is healthy and free, and never refuse,
+  block, or delay a resume to obtain it. Falling back to the current account is
   always correct.
 
   Three mechanics, each of which fails in a way that looks like something else.

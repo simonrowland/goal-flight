@@ -13,7 +13,7 @@ The cases, all resumable, all routinely redispatched by mistake:
 
 | the worker stopped because | what it needs | verb |
 |---|---|---|
-| quota wall / `quota_exhausted` / `transient_throttle` | a seat with headroom | `resume --account <seat>` |
+| quota wall / `quota_exhausted` / `transient_throttle` | an account with headroom | `resume --account <account>` |
 | `BLOCKED:` on sandbox, permission, push, or an out-of-standard path | your decision or the action taken for it | `resume` |
 | a clarification or USER-NEED / `!READY` plan-approval pause | the answer | `resume` |
 | ferried/detached launch died with the tree dirty | nothing but a restart | `resume` |
@@ -37,7 +37,7 @@ python3 <skill-root>/scripts/goalflight_dispatch.py resume <dispatch_id> \
 
 **Only write a fresh brief when the premise actually changed** — review findings
 to fix, a redirect, a corrected policy — or when the session genuinely cannot be
-recovered (no engine session handle, seat recycled, context poisoned). Those
+recovered (no engine session handle, worktree seat recycled, context poisoned). Those
 cases are below. "The worker asked me a question" is never one of them.
 
 
@@ -49,8 +49,8 @@ you want to keep, not by what killed the worker.
 
 ## Resume when the worker's context is still worth more than a fresh start
 
-- **Provider/quota death mid-task.** The work was fine; the seat ran out.
-  Resume on a seat with headroom rather than paying for the same reading
+- **Provider/quota death mid-task.** The work was fine; the account ran out.
+  Resume on an account with headroom rather than paying for the same reading
   twice.
 - **Idle/quiet timeout on a worker that was genuinely working.** Reconcile
   first (`worker_still_alive`, tail growth, dirty tree): if the process is
@@ -87,7 +87,7 @@ you want to keep, not by what killed the worker.
   not. Resume reattaches to the existing worktree, branch, and partial
   artifacts — it does not acquire a sibling pooled seat. Quota-exhausted,
   dead-pid, stale_dead, and plan-approval pauses (USER-NEED / !READY) are
-  continuable. `--account <seat>` pins a surviving seat; default selection
+  continuable. `--account <account>` pins a surviving account; default selection
   skips recently quota-exhausted accounts until their reset.
 - Every wired worker CLI is resumable: Codex (`codex exec resume`), Grok
   (`--resume <id>`), cursor-agent (`--resume <chatId>`), Claude

@@ -357,6 +357,20 @@ Dispatch CLI workers via `scripts/goalflight_dispatch.py`, never bare background
 python3 <skill-root>/scripts/goalflight_dispatch.py --agent <ready-agent> --prompt-file p.md
 ```
 
+**★ VOCABULARY, and controllers get this wrong constantly.** A **seat** is a
+WORKTREE SLOT: one checkout directory at `worktrees/<controller-label>/s-N`
+that one worker occupies at a time. An **account** is a BILLING IDENTITY
+(`--account cf9f50`, `--account gmail`) and one account runs MANY concurrent
+sessions — roughly 20 for codex. They are different things and the counts are
+unrelated.
+
+Never call an account a seat. It reads as a capacity of one and misleads about
+real headroom: "three codex seats are walled" sounds like three workers lost
+when it means three billing identities, each of which could have run twenty.
+`goalflight_usage.py` gets this right — its column is **PROVIDER/ACCOUNT** —
+so when a report says "seat" and the tool says "account", the tool is right.
+The word "seat" belongs ONLY to the worktree pool below.
+
 Every dispatch acquires a **captive per-controller seat** at
 `worktrees/<controller-label>/s-N`. Isolation is not a mode. `--at <ref>`
 (alias `--worktree <ref>`) prepares that seat at a git ref; it is not an

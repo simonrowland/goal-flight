@@ -591,7 +591,7 @@ occasional concern-diverse lens. It relieves controller context; it does not
 replace abundant CLI-worker capacity.
 
 Route the scout from a different provider reservoir than the follow-on worker.
-Premise verification has no value if it consumes the same constrained seat and
+Premise verification has no value if it consumes the same constrained account and
 both jobs fail together. Keep campaign fan-out within current capacity limits.
 
 Every judgment-bearing host-subagent scout begins with

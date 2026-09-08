@@ -411,8 +411,12 @@ def test_failed_seat_rebuild_restores_original_home(
             SESSION_ID,
         )
 
+    # "account", not "seat": an account is a billing identity that runs many
+    # concurrent sessions, so calling it a seat implies a capacity of one and
+    # has repeatedly misled operators about real headroom. "seat" is reserved
+    # for a worktree slot.
     assert str(exc_info.value) == (
-        "could not rebuild dispatch home for restore-parent with a healthy codex seat"
+        "could not rebuild dispatch home for restore-parent with a healthy codex account"
     )
     assert (home / "auth.json").read_text(encoding="utf-8") == "old-seat"
     assert S.rollout_path(home, SESSION_ID) is not None

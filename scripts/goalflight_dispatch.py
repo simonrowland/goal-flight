@@ -4617,7 +4617,7 @@ def _rebuild_codex_resume_home(
         ):
             raise DispatchUsageError(
                 f"could not rebuild dispatch home for {parent_dispatch_id} "
-                "with a healthy codex seat"
+                "with a healthy codex account"
             )
         saved_sessions = saved_home / "sessions"
         rebuilt_sessions = expected_home / "sessions"
@@ -4646,9 +4646,9 @@ def _cmd_resume(argv: list[str]) -> int:
             "Reattaches to the existing worktree, prompt, branch, and partial "
             "artifacts; does not mint a sibling worktree. Continues quota-"
             "exhausted, dead, stale_dead, and plan-approval pauses. "
-            "Pass --account to continue on a specific surviving seat."
+            "Pass --account to continue on a specific surviving account."
         ),
-        usage_hint="try resume <dispatch-id> --prompt-file <path> [--account <seat>]",
+        usage_hint="try resume <dispatch-id> --prompt-file <path> [--account <account>]",
     )
     parser.add_argument("dispatch_id")
     parser.add_argument("--prompt-file", required=True)
@@ -4657,7 +4657,7 @@ def _cmd_resume(argv: list[str]) -> int:
         help=(
             "Seat to bill the resumed worker to. Honored as a pin. "
             "When omitted, default selection skips recently quota-exhausted "
-            "seats until their reset."
+            "accounts until their reset."
         ),
     )
     parser.add_argument(
@@ -4843,7 +4843,7 @@ def _resume_launch_argv(
             replace["--account"] = requested
     elif engine in SEAT_SCOPED_SESSION_ENGINES:
         # The session is FILES under the seat's HOME. Landing on a different
-        # seat without them makes the CLI fall back to its per-account remote
+        # account without them makes the CLI fall back to its per-account remote
         # registry and fail 404, losing the whole context. So: choose a seat
         # that can actually run, then MOVE the session to it.
         target = requested or owner_account
@@ -4853,7 +4853,7 @@ def _resume_launch_argv(
             and target == owner_account
             and _account_quota_blocked(owner_account, engine=engine)
         ):
-            # The owning seat is walled. Resume is still possible on any healthy
+            # The owning account is walled. Resume is still possible on any healthy
             # seat once the session travels with it -- that is the whole point.
             healthy = [
                 candidate
@@ -4867,7 +4867,7 @@ def _resume_launch_argv(
                 # Every configured seat is walled. Launching anyway spends a
                 # dispatch to rediscover the same 402 and re-terminalizes the
                 # parent for nothing. Grok in particular meters a SHARED
-                # "Build usage balance", so a seat change cannot help once it
+                # "Build usage balance", so an account change cannot help once it
                 # is gone -- only its reset can.
                 raise DispatchUsageError(
                     no_healthy_seat_message(
@@ -4883,7 +4883,7 @@ def _resume_launch_argv(
                 to_account=target,
             )
             print(
-                f"goalflight_dispatch: resume seat move {owner_account} -> {target}: {detail}",
+                f"goalflight_dispatch: resume account move {owner_account} -> {target}: {detail}",
                 file=sys.stderr,
             )
             if not ok:
@@ -4895,7 +4895,7 @@ def _resume_launch_argv(
                 # above is a different thing and does refuse.)
                 print(
                     f"goalflight_dispatch: WARN: could not move the {engine} session from "
-                    f"seat {owner_account!r} to {target!r} ({detail}). The session lives in "
+                    f"account {owner_account!r} to {target!r} ({detail}). The session lives in "
                     f"the owning seat's HOME; if the CLI cannot restore it from its own "
                     f"store the resume will fail and the context is lost. Resume on "
                     f"{owner_account!r} once its quota resets to keep the context for sure.",
@@ -4913,7 +4913,7 @@ def _resume_launch_argv(
         strip_options=("--tail", "--status-json", "--prompt", "--worktree"),
     )
     if "--account" not in replace:
-        # Drop a recorded pin onto a now-exhausted (or Codex-rotating) seat
+        # Drop a recorded pin onto a now-exhausted (or Codex-rotating) account
         # so default selection can skip recently exhausted accounts.
         argv = _remove_option_before_worker_remainder(argv, "--account")
     return argv
@@ -5753,18 +5753,22 @@ def _seat_session_dir(account: str, engine: str, worker_cwd: str, session_id: st
 
 
 def no_healthy_seat_message(engine: str, owner_account: str, seats: list[str]) -> str:
-    """Why a resume is refused when no seat can run it, and what to do instead.
+    """Why a resume is refused when no account can run it, and what to do instead.
 
-    Grok meters a SHARED "Build usage balance", so once it is gone no seat
+    Grok meters a SHARED "Build usage balance", so once it is gone no account
     change helps; launching anyway spends a dispatch to rediscover the same 402
     and re-terminalizes the parent. The session itself is untouched.
+
+    "account", never "seat": an account is a billing identity that runs many
+    concurrent sessions, so calling it a seat implies a one-worker capacity it
+    does not have and has repeatedly misled operators about real headroom.
     """
     listed = ", ".join(seats) if seats else "none configured"
     return (
-        f"resume refused: the seat that owns this {engine} session "
+        f"resume refused: the account that owns this {engine} session "
         f"({owner_account!r}) is quota-blocked, and every other configured "
-        f"{engine} seat is too ({listed}). Moving the session cannot buy tokens "
-        "that no seat has. Check `goalflight_usage.py` for the soonest reset and "
+        f"{engine} account is too ({listed}). Moving the session cannot buy tokens "
+        "that no account has. Check `goalflight_usage.py` for the soonest reset and "
         "resume after it, or redispatch on a different engine. The session is "
         "intact and still resumable; nothing was lost."
     )
