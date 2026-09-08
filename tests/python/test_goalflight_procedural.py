@@ -348,6 +348,10 @@ def test_doctor_json_shape() -> None:
     wake_coverage = payload["wake_coverage"]
     for key in ("ok", "present", "pools"):
         assert_true(f"wake_coverage.{key} present", key in wake_coverage)
+    assert_true("wake_webhook section", "wake_webhook" in payload)
+    wake_webhook = payload["wake_webhook"]
+    for key in ("ok", "configured", "grok_bot_host"):
+        assert_true(f"wake_webhook.{key} present", key in wake_webhook)
     assert_true("resume_notes_pattern section", "resume_notes_pattern" in payload)
     rnp = payload["resume_notes_pattern"]
     for key in ("present", "count", "pattern_violations", "ok"):
