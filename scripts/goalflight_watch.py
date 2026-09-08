@@ -1574,6 +1574,38 @@ def _finish_existing_ledger(
 
 
 def _status_snapshot(payload: dict) -> dict:
+    """The fields persisted to a dispatch's status record.
+
+    READ THIS BEFORE DRAWING A CONCLUSION FROM A STORED LIVENESS FIELD.
+    ``worker_alive``, ``controller_alive`` and ``liveness_state`` are
+    OBSERVATIONS AT LAST WRITE, not present-tense claims. A record whose
+    worker exited without a final write keeps whatever the last write said,
+    so a stale ``worker_alive: true`` is expected and is not a defect in the
+    record.
+
+    None of them is authority on the launch path:
+
+    * ``_abandoned_process_evidence`` (goalflight_dispatch.py) re-probes the
+      recorded pid against its recorded identity and, in its own words,
+      "Confirmed-dead overrides that stale flag". The stored flag is consulted
+      only when no pid could be measured at all.
+    * ``partial_task_supersession`` -- the refusal most often seen when a
+      re-dispatch is declined -- comes from ``_linked_task_truth_detail``
+      returning ``some_advanced``. That is a TASK-STORE condition and reads no
+      liveness field whatsoever.
+
+    So clearing stale flags unblocks nothing, and a reaper built to unblock
+    re-dispatch would be repairing a mechanism that does not exist. Measured
+    2026-09-08 by the battery-tool-v2 fleet: 84 of 2237 live records asserted
+    a dead worker alive, naming 54 rows, and none of them blocked anything.
+
+    Liveness must be MEASURED, never read from here. When measuring, compare
+    process identity on ``lstart`` and ``start_token`` as well as ``comm`` --
+    ``compare_process_identities`` (goalflight_ledger.py) does, and returns
+    ``pid_reused_lstart`` / ``pid_reused_start_token`` by name. In that same
+    census, all twelve records whose pid still answered ``ps`` were pid-REUSED,
+    and a comm-only check still passed one of them.
+    """
     keys = (
         "schema",
         "dispatch_id",
