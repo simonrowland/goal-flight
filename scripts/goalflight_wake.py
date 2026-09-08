@@ -71,11 +71,11 @@ _MONITOR_STATE_FILE_VERSION = "monitor-state-v1"
 MONITOR_STATE_SCHEMA = "goalflight.monitor-state.v1"
 _OBSERVED_WAITERS_UNSET = object()
 _LEASE_EVENT_SCHEMA = "goalflight.lease-generation-event.v1"
-# Depth is resilience, not efficiency: one event wakes exactly one slot, so
-# extra armed waiters are the margin for a controller that forgets to re-arm.
-# GOALFLIGHT_LISTENER_SLOTS is how many doorbells the supervisor chooses to
-# run (live/target), not a ceiling on how many may arm.
-# This knob is portable-pool only. Persistent backup depth is
+# Depth is resilience, not efficiency: one event wakes exactly one slot.
+# GOALFLIGHT_LISTENER_SLOTS is the live-depth ceiling: a new waiter must
+# not raise concurrent listeners above this target. Replacing a released
+# (dead) slot is fine. Exceeding the cap is contention protection, not a
+# ring. This knob is portable-pool only. Persistent backup depth is
 # DEFAULT_PERSISTENT_BACKUP_SLOTS / GOALFLIGHT_PERSISTENT_BACKUP_SLOTS.
 DEFAULT_LISTENER_SLOTS = 4
 # Persistent wake has three roles: 1 stream, N backup doorbells, 1 watchdog.
@@ -509,24 +509,50 @@ def activate_monitor_state(
     return payload
 
 
+def _probe_monitor_state(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    lease_nonce: str,
+) -> tuple[str, dict[str, object] | None]:
+    """Return ``(ok|missing|unreadable, payload)``.
+
+    ``missing`` is a readable observation that this generation has no state
+    file (or the file is for another generation). ``unreadable`` is present-
+    path IO or a torn/invalid parse — contention, not absence.
+    """
+    path = _monitor_state_path(project_root, controller_label=controller_label)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "unreadable", None
+    try:
+        payload = json.loads(text)
+    except (UnicodeError, json.JSONDecodeError):
+        return "unreadable", None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != MONITOR_STATE_SCHEMA
+        or payload.get("generation") != _monitor_generation_digest(lease_nonce)
+    ):
+        return "missing", None
+    return "ok", payload
+
+
 def _load_monitor_state(
     project_root: Path | str,
     *,
     controller_label: str,
     lease_nonce: str,
 ) -> dict[str, object] | None:
-    path = _monitor_state_path(project_root, controller_label=controller_label)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    if (
-        not isinstance(payload, dict)
-        or payload.get("schema") != MONITOR_STATE_SCHEMA
-        or payload.get("generation") != _monitor_generation_digest(lease_nonce)
-    ):
-        return None
-    return payload
+    kind, payload = _probe_monitor_state(
+        project_root,
+        controller_label=controller_label,
+        lease_nonce=lease_nonce,
+    )
+    return payload if kind == "ok" else None
 
 
 def record_monitor_emit(
@@ -589,12 +615,26 @@ def monitor_status(
     lease_nonce: str,
     now_epoch: float | None = None,
 ) -> dict[str, object] | None:
-    payload = _load_monitor_state(
+    kind, payload = _probe_monitor_state(
         project_root,
         controller_label=controller_label,
         lease_nonce=lease_nonce,
     )
-    if payload is None:
+    if kind == "unreadable":
+        return {
+            "capable": True,
+            "state": "unreadable",
+            "reason": "monitor-state-io",
+            "age_s": None,
+            "heartbeat_s": None,
+            "dead_after_s": None,
+            "last_kind": None,
+            "fault": {
+                "reason": "monitor-state-io",
+                "detail": "durable follow state exists but could not be read",
+            },
+        }
+    if kind != "ok" or payload is None:
         return None
     now = time.time() if now_epoch is None else float(now_epoch)
     try:
@@ -606,7 +646,19 @@ def monitor_status(
             float(payload["dead_after_s"]),
         )
     except (KeyError, TypeError, ValueError):
-        return None
+        return {
+            "capable": True,
+            "state": "unreadable",
+            "reason": "monitor-state-io",
+            "age_s": None,
+            "heartbeat_s": None,
+            "dead_after_s": None,
+            "last_kind": None,
+            "fault": {
+                "reason": "monitor-state-io",
+                "detail": "durable follow state is present but not parseable",
+            },
+        }
     age = max(0.0, now - (last_record if last_record is not None else activated))
     fault = payload.get("fault")
     state = (
@@ -1487,10 +1539,10 @@ class WaiterRegistration:
                 else:
                     if kind != "listener":
                         raise ValueError("generation slots are only valid for listeners")
-                    # Target depth is not a ceiling: take the first free
-                    # listener-slot-N lock with no upper bound.
+                    # Target depth is a ceiling. Replacing a released slot is
+                    # fine; taking slot N when 0..N-1 are all held is not.
                     slot = 0
-                    while self._generation_fd < 0:
+                    while self._generation_fd < 0 and slot < generation_slots:
                         candidate = _listener_slot_lock_path(
                             project_root,
                             label=normalized_label,
@@ -1508,6 +1560,14 @@ class WaiterRegistration:
                         self._generation_path = candidate
                         self._generation_fd = generation_fd
                         self.slot_index = slot
+                    if self._generation_fd < 0:
+                        raise BlockingIOError(
+                            errno.EAGAIN,
+                            (
+                                f"listener-slots cap is {generation_slots}; "
+                                "this is contention protection, not a ring"
+                            ),
+                        )
             pending_name = f".{record_name}.{uuid.uuid4().hex}.pending"
             self._fd = os.open(
                 pending_name,
@@ -1901,10 +1961,10 @@ def listener_low_water(target: int | None = None) -> int:
 
 
 def listener_slot_count(value: object = None) -> int:
-    """Resolve the listener-pool target depth (how many doorbells to run).
+    """Resolve the listener-pool live-depth ceiling.
 
-    This is not a ceiling on concurrent waiters. Registration takes the
-    first free slot with no upper bound.
+    A new waiter must not raise concurrent listeners above this target.
+    Replacing a released (dead) slot is fine.
     """
     raw = value
     if raw is None:
@@ -1921,8 +1981,8 @@ def listener_slot_count(value: object = None) -> int:
 def persistent_backup_slot_count(value: object = None) -> int:
     """Resolve the persistent backup-doorbell target depth.
 
-    This is not a ceiling on concurrent waiters. Registration takes the
-    first free slot with no upper bound.
+    Supervise starts this many backup children. Each child's
+    ``--listener-slots`` value is the live-depth ceiling for listen.
     """
     raw = value
     if raw is None:
@@ -1953,8 +2013,9 @@ def register_listener_waiter(
 ) -> WaiterRegistration:
     """Take the first free listener-slot-N lock for one lease generation.
 
-    ``slots`` selects the target depth (how many to run). It is not a
-    ceiling; this always takes the first free slot.
+    ``slots`` is the live-depth ceiling. Replacing a released slot is
+    fine; a waiter that would raise live depth above ``slots`` fails
+    closed with ``BlockingIOError`` (contention protection, not a ring).
     """
     resolved_slots = listener_slot_count(slots)
     return register_waiter(
@@ -2564,10 +2625,12 @@ def coverage_status(
             else "unavailable"
         )
         monitor_lock_live = bool(monitor_waiters)
+        # Unreadable is contention, not health and not absence. Fail closed
+        # as unavailable so coverage cannot claim a torn follow file is live.
         monitor_healthy = (
             monitor_lock_live
             and durable_monitor is not None
-            and durable_state not in {"fault", "stale"}
+            and durable_state not in {"fault", "stale", "unreadable"}
         )
         backup_target = persistent_backup_slot_count()
         backup_observed = len(portable_waiters)
@@ -2582,7 +2645,7 @@ def coverage_status(
         watchdog_live = bool(watchdog_waiters)
         monitor_state = (
             "unavailable"
-            if durable_monitor is None
+            if durable_monitor is None or durable_state == "unreadable"
             else durable_state
             if durable_state in {"fault", "stale"}
             else "live"
