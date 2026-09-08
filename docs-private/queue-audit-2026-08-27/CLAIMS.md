@@ -12,13 +12,13 @@ auditable rather than a bulk delete.
 | pm2 | pm2-bugs | **ALL ABANDON** | 2026-08-27 | Already re-submitted the one item they wanted as `bugs-b277b` (fresh id, current HEAD) — the intended shape: re-derive rather than re-fire. Their `bugs-b277a` queue record is therefore superseded, not lost. |
 | pm2 | pm2-main | **CLAIM 3 (live) · ABANDON 11 · REFER 2** | 2026-08-27 | Checked the STORE state behind each stale entry rather than judging from the queue record. CLAIM = `b13-1-reverse-mass-drivers` (pid 33893), `b285-ring-coherence-adjudication` (pid 60600), `t292-relativistic-gathered-mass` (pid 86778) — all live in their own worktrees, all mid-flight at inventory time. |
 | battery-tool-v2 | battery-bugs | **KEEP 2 · ABANDON 8 + 12 retired slices** | 2026-08-27 | Answered ONLY for rows carrying their own label; explicitly declined to speak for the other 34 rows. ★ KEEP = `codex-60942-1787841540` and `grok-code-70915-1787842258` — **LIVE AND RUNNING** at reply time. 2 more (`codex-69648`, `grok-code-84519`) already COMPLETE and harvested. Three abandons confirmed the thesis by measurement: the work LANDED after the record was queued. |
-| battery-tool-v2 | battery-main | — | | awaiting |
-| battery-tool-v2 | battery-engine | — | | awaiting (notified late, see correction) |
-| battery-tool-v2 | battery-webui | — | | awaiting (notified late) |
-| pm2 | pm2-engine | **KEEP 1 · ABANDON 2** | 2026-08-27 | ★ KEEP = `t801-fix1` — LIVE AND RUNNING at reply time (do not drain; it is mid-fix-round on commit b1b0a9c). ABANDON `t800-pulse` (superseded id; the work ran as `t800-pulse2`, converged through a 3-round review arc, and MERGED to main at afdd67d — nothing lost) and `t702-rev-seam` (t-702 shipped in the engine-lane merge f2aa933 with its review set converged; the missing prompt file confirms it predates the current arc; re-derive from the store if ever wanted, never re-fire). |
+| battery-tool-v2 | battery-main | **ABANDON all 5 owned records** | 2026-08-27 | Answered after reminder #2. Checked liveness by WORKER (not the queue record or status file) and found zero live; abandons the records, not the underlying work. Also killed `/tmp/goal-flight-501/wt-sweep.sh` after the at-risk list showed it would have deleted 23 trees with active workers (12 `running`), and took over the canonical reclaimer. |
+| battery-tool-v2 | battery-engine | **ALL ABANDON (3 rows)** | 2026-08-27 | Answered within minutes of the reminder, for rows carrying owner=battery-engine ONLY. `codex-20873-1787795343` (b-2710 seam test @ bt-b2080), `codex-35329-1787794960` (same b-2710 brief vs main), and a third — all premises SUPERSEDED by main's live b-2847 carrier. Correctly scoped to its own label, per the amended rule. |
+| battery-tool-v2 | battery-webui | **ABANDON 1 owned + 3 retired-by-webui** | 2026-08-27 | Answered after the reminder (RESEND — their first copy was `recorded_reached_nobody`, the same addressing error battery-engine hit and corrected with `--controller-project-root`). Owned row `codex-73102-…-retry-c2f707cf` (retry of b-2484): ★ ABANDON THE RECORD, explicitly NOT the work — base SHA ~1.5 days and many board rounds stale, and the tree has since taken the b-2715 land AND its revert plus b-2810/2855/2858/2786, so re-firing would run an owner-directive brief against a vanished premise. **b-2484 itself is LIVE — an owner directive given twice** (P1, deferred, sibling b-2101); they own re-submitting it FRESH under a new id, and state that if it goes quiet "that is a defect in my follow-through, not a decision". The 3 retired-by-webui rows (codex-62720/b-2101, codex-63597/t-554, codex-64518/t-555) CONFIRMED ABANDON — each already carries ledger terminal `inconclusive_no_final`. |
+| pm2 | pm2-engine | **KEEP 0 · ABANDON 3** (updated) | 2026-08-27 | ★ KEEP = `t801-fix1` — LIVE AND RUNNING at reply time (do not drain; it is mid-fix-round on commit b1b0a9c). ABANDON `t800-pulse` (superseded id; the work ran as `t800-pulse2`, converged through a 3-round review arc, and MERGED to main at afdd67d — nothing lost) and `t702-rev-seam` (t-702 shipped in the engine-lane merge f2aa933 with its review set converged; the missing prompt file confirms it predates the current arc; re-derive from the store if ever wanted, never re-fire). **UPDATE same day: the KEPT row `t801-fix1` has since COMPLETED (its work shipped in engine-t801-carriers @ dd7a726, merged to main at e35df1d), so pm2-engine now holds NOTHING — all three rows are purgeable on my account. Do not block the purge waiting on me.** |
 | pm2 | pm2-reports | **NOTHING TO CLAIM** | 2026-08-27 | Zero of the 16 pm2 rows carry their label. Verified their own live work by `ps` rather than by the status file, per the caveat. A clean nil return — distinct from silence, and recorded as an answer. |
 | regolith | regolith-engine | — | | awaiting (notified late) |
-| regolith | regolith-main | — | | awaiting |
+| regolith | regolith-main | **ABANDON x4** | 2026-08-27 | Answered after reminder #2, for rows carrying their own label. Notes t-748 was already answered separately. |
 | goal-flight/kiln | kiln | — | | awaiting |
 
 ## Purge rules (decide before acting, not during)
@@ -152,3 +152,66 @@ allowed to soften the conclusion. When the evidence says the thing moved while
 you were looking, the honest verdict is UNKNOWN / re-check, not a definite
 absence. Same shape as every could-not-tell-rendered-as-definite finding today,
 committed inside the very document written to prevent bad purges.
+
+## 2026-08-28 02:3xZ — pm2-engine resolved, battery-tool-v2 asked
+
+**pm2-engine: KEEP 0 / ABANDON all.** Asked with a pointer to the actual entry;
+they replied PURGE with reasoning: `t702-rev-seam` was a review dispatch for
+t-702, which shipped in `f2aa933` with its own review set converged, and F1a/F1b/
+t-801/t-810/t-811/t-818 have landed on top. Re-dispatching would review a base
+sha that no longer resembles main — "a stale review reads as current evidence".
+Their earlier claim-or-abandon answer stands; `t801-fix1`, the one row they had
+kept, has since completed and shipped.
+
+**PURGED with that consent:** `t702-rev-seam.json` →
+`t702-rev-seam.json.cancelled-by-controller` (renamed, not deleted — reversible).
+Queue 17 → 16 queued.
+
+Worth recording: the entry was NOT unrecoverable. Its cwd
+`/private/tmp/pm2-engine/pm2` and its prompt
+`docs-private/task-prompts/2026-08-26-engine/t702-rev-seam.md` both still existed
+— I verified both on disk before asking. It only *looked* dead because it has no
+top-level `worker_cwd`; the path lives in `dispatch_argv --cwd` and
+`request.cwd`. Establishing recoverability before proposing a purge is what made
+the ask answerable, and the answer still came back "purge" for a reason nothing
+in the queue could have told me.
+
+**battery-tool-v2: ASKED, awaiting reply.** Five entries with project_root
+battery-tool-v2 — 3 labelled `battery-bugs` (`codex-55728-1787845873`,
+`codex-61847-1787851034`, `codex-76368-1787851151`, all with removed
+`.cache/worktrees/bt-*` cwds) and 2 unlabelled (`codex-21996-1787791668`,
+`codex-36951-1787795932`). **All prompt files still exist** except the last, so
+four of five are re-dispatchable. Delivered to `battery-bugs`
+(`delivered_to_controller`, backlog_pending 1). Not purging any of them without
+their say-so.
+
+### CORRECTION 2026-08-28 02:45Z — the 02:3xZ purge above did NOT hold
+
+**I reported `t702-rev-seam` purged and the queue at 16. That was wrong for 15
+minutes and I did not notice until a later scan re-listed the entry.** Renaming
+the queue file at 02:25Z did drop the count to 16; at **02:40Z the file was
+recreated** (`restore_reason=normal_drain_restore`, new `restore_txn_id`) and the
+queue was back to 17.
+
+**Why: the queue file is a DERIVED artifact and the LEDGER is the source of
+truth.** `runs.d/t702-rev-seam.json` still read `state=queued`,
+`terminal_state=unknown`, so a drain pass re-lodged the queue entry. Deleting a
+queue entry without terminalizing its ledger record is a no-op with a ~15-minute
+half-life. **This is why "purge the stuck entries" has never stuck for anyone** —
+every such purge has been fighting a restore loop.
+
+**The sanctioned path, now verified to work:**
+
+```
+python3 scripts/goalflight_ledger.py finish --dispatch-id <id> \
+    --terminal-state superseded --reason '<why>'
+```
+
+Ledger then reads `state=complete` / `terminal_state=superseded`, and only THEN
+does removing the queue file hold. **Order matters: terminalize FIRST**, then
+remove — the gap between the two is enough for a drain to restore.
+
+Done for `t702-rev-seam` at 02:45Z with pm2-engine's consent recorded above;
+queue file moved to `.purged-ledger-terminalized`; a 20-minute watch is running
+to confirm it stays absent. Detail and the secondary `created_at: None`
+restore-loses-the-timestamp defect are on **b-219**.
