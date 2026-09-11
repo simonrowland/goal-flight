@@ -4158,9 +4158,17 @@ def main() -> int:
         if codex_home is not None:
             payload["codex_home"] = str(codex_home)
             if codex_session_id is None:
-                codex_session_id = goalflight_codex_sessions.discover_session_id(
-                    codex_home
+                canonical_home = goalflight_codex_sessions.canonical_account_home(
+                    effective_account
                 )
+                if canonical_home is not None and codex_home == canonical_home:
+                    codex_session_id = goalflight_codex_sessions.session_id_from_tail(
+                        codex_home, tail
+                    )
+                else:
+                    codex_session_id = goalflight_codex_sessions.discover_session_id(
+                        codex_home
+                    )
         if codex_session_id is not None:
             payload["codex_session_id"] = codex_session_id
             if engine_session_id is None:

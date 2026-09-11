@@ -4142,10 +4142,20 @@ def _codex_resume_home(record: dict, dispatch_id: str) -> tuple[Path, str]:
         else root / home_owner_dispatch_id
     )
     resolved = home.resolve(strict=False)
-    if (
-        resolved.parent != root
-        or resolved.name != home_owner_dispatch_id
-    ):
+    dispatch_home_valid = (
+        resolved.parent == root and resolved.name == home_owner_dispatch_id
+    )
+    canonical_home = goalflight_codex_sessions.canonical_account_home(
+        record.get("effective_account")
+    )
+    canonical_home_valid = False
+    if canonical_home is not None and home == canonical_home:
+        accounts_root = canonical_home.parent.parent.resolve(strict=False)
+        canonical_home_valid = (
+            resolved.parent == accounts_root / canonical_home.parent.name
+            and resolved.name == "codex"
+        )
+    if not dispatch_home_valid and not canonical_home_valid:
         raise DispatchUsageError(
             f"dispatch {dispatch_id} has invalid recorded codex home: {home}"
         )
@@ -18468,16 +18478,39 @@ def main(argv: list[str] | None = None) -> int:
                         expected_home_owner_dispatch_id=codex_home_owner_dispatch_id,
                         exclude_dispatch_id=args.dispatch_id,
                     )
-                    codex_dispatch_home, effective_account = (
-                        _rebuild_codex_resume_home(
-                            project_root,
-                            args.parent_dispatch_id,
-                            resume_home,
-                            args.codex_session_id,
-                            home_owner_dispatch_id=codex_home_owner_dispatch_id,
-                            explicit_account=getattr(args, "account", None),
-                        )
+                    parent_record = (
+                        _find_dispatch_record(args.parent_dispatch_id) or {}
                     )
+                    parent_account = parent_record.get("effective_account")
+                    canonical_home = goalflight_codex_sessions.canonical_account_home(
+                        parent_account
+                    )
+                    recorded_parent_home = parent_record.get("codex_home")
+                    source_is_canonical = (
+                        canonical_home is not None
+                        and isinstance(recorded_parent_home, str)
+                        and Path(recorded_parent_home).expanduser() == canonical_home
+                    )
+                    if source_is_canonical:
+                        if args.account and args.account != parent_account:
+                            raise DispatchUsageError(
+                                f"dispatch {args.parent_dispatch_id} canonical codex "
+                                f"home is bound to account {parent_account}; cannot "
+                                f"resume it with account {args.account}"
+                            )
+                        codex_dispatch_home = str(resume_home)
+                        effective_account = parent_account
+                    else:
+                        codex_dispatch_home, effective_account = (
+                            _rebuild_codex_resume_home(
+                                project_root,
+                                args.parent_dispatch_id,
+                                resume_home,
+                                args.codex_session_id,
+                                home_owner_dispatch_id=codex_home_owner_dispatch_id,
+                                explicit_account=getattr(args, "account", None),
+                            )
+                        )
             else:
                 try:
                     codex_dispatch_home, effective_account = resolve_codex_home(
@@ -18487,6 +18520,18 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 except BaseException:
                     codex_dispatch_home, effective_account = None, None
+                if codex_dispatch_home is None and effective_account is None:
+                    canonical_home = goalflight_codex_sessions.canonical_account_home(
+                        getattr(args, "account", None)
+                    )
+                    configured_home = account_env.get("CODEX_HOME")
+                    if (
+                        canonical_home is not None
+                        and isinstance(configured_home, str)
+                        and Path(configured_home).expanduser() == canonical_home
+                    ):
+                        codex_dispatch_home = str(canonical_home)
+                        effective_account = args.account
         request_envelope = _queue_request_envelope(args)
         worktree_seat = _bind_dispatch_worktree(args)
         if worktree_seat is not None:
@@ -18508,6 +18553,17 @@ def main(argv: list[str] | None = None) -> int:
             codex_home=codex_dispatch_home,
             request_envelope=request_envelope,
         )
+        if (
+            _account_engine(args.agent) == "codex"
+            and codex_session_id is None
+            and codex_dispatch_home is None
+        ):
+            print(
+                f"goalflight_dispatch: dispatch {args.dispatch_id} will not be "
+                "resumable: no recordable codex home",
+                file=sys.stderr,
+                flush=True,
+            )
 
         # 1. Launch the worker DETACHED, output -> tail (prompt -> stdin for codex).
         # Account guards ran before prompt/id/lease side effects; only apply the

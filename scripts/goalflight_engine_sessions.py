@@ -2,9 +2,8 @@
 
 Ledger ``session_id`` / ``logical_session_id`` is the Goal Flight dispatch id.
 That is not the engine's own conversation handle. Only Codex historically
-recorded its handle (``codex_session_id``, harvested from the per-dispatch
-rollout). Grok, cursor-agent, Claude, and Kimi can all resume; they were not
-wired.
+recorded its handle (``codex_session_id``, harvested from its recorded home).
+Grok, cursor-agent, Claude, and Kimi can all resume; they were not wired.
 
 Capture policy (checked against each CLI ``--help`` on this box, 2026-08-19):
 
@@ -278,7 +277,7 @@ def session_trace_dirs(
     except (OSError, TypeError):
         return []
     if resolved == "codex":
-        # codex's rollout lives under the dispatch's own home, not $HOME.
+        # Codex's rollout lives under its recorded CODEX_HOME, not $HOME.
         if not codex_home:
             return []
         try:

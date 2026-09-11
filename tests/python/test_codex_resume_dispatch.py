@@ -27,6 +27,8 @@ import goalflight_worktree_pool as WP  # noqa: E402
 
 
 SESSION_ID = "12345678-1234-4abc-8def-1234567890ab"
+CANONICAL_SESSION_ID = "01a09067-25ec-7250-9872-3a277abe5716"
+OTHER_CANONICAL_SESSION_ID = "01a09093-d6c7-7d72-b548-faaf31824d3f"
 
 
 pytestmark = pytest.mark.skipif(
@@ -80,6 +82,24 @@ def _write_rollout(home: Path, session_id: str = SESSION_ID) -> Path:
     rollout.parent.mkdir(parents=True, exist_ok=True)
     rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
     return rollout
+
+
+def _write_measured_rollout(home: Path, session_id: str, timestamp: str) -> Path:
+    rollout = (
+        home
+        / "sessions"
+        / "2026"
+        / "09"
+        / "11"
+        / f"rollout-{timestamp}-{session_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+    return rollout
+
+
+def _canonical_codex_home(tmp_path: Path, account: str) -> Path:
+    return tmp_path / "home" / ".goal-flight" / "accounts" / account / "codex"
 
 
 def _write_parent_record(
@@ -311,6 +331,291 @@ def test_handle_harvest_never_guesses_among_multiple_rollouts(
     _write_rollout(home, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
 
     assert S.discover_session_id(home) is None
+
+
+def test_shared_home_harvest_uses_this_dispatch_banner_not_newest_rollout(
+    tmp_path: Path,
+) -> None:
+    home = _canonical_codex_home(tmp_path, "d78343")
+    wanted = _write_measured_rollout(
+        home,
+        CANONICAL_SESSION_ID,
+        "2026-09-11T08-17-54",
+    )
+    newer = _write_measured_rollout(
+        home,
+        OTHER_CANONICAL_SESSION_ID,
+        "2026-09-11T09-06-40",
+    )
+    os.utime(wanted, (1_789_126_674, 1_789_126_674))
+    os.utime(newer, (1_789_129_600, 1_789_129_600))
+    tail = tmp_path / "codex-12150-1789129071.tail"
+    tail.write_text(
+        "OpenAI Codex v0.137.0\n"
+        "--------\n"
+        "workdir: /Users/simonrowland/Repos/goal-flight\n"
+        "model: gpt-5.5\n"
+        "provider: openai\n"
+        "approval: never\n"
+        "sandbox: workspace-write [workdir, /tmp, $TMPDIR]\n"
+        "reasoning effort: xhigh\n"
+        "reasoning summaries: none\n"
+        "session id: 01a09067-25ec-7250-9872-3a277abe5716\n"
+        "--------\n"
+        "user\n",
+        encoding="utf-8",
+    )
+
+    assert S.session_id_from_tail(home, tail) == CANONICAL_SESSION_ID
+    tail.write_text(
+        tail.read_text(encoding="utf-8").replace(
+            CANONICAL_SESSION_ID,
+            "01a09094-ffff-7d72-b548-faaf31824d3f",
+        ),
+        encoding="utf-8",
+    )
+    assert S.session_id_from_tail(home, tail) is None
+
+
+def test_canonical_home_launch_harvests_handle_and_validates_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "codex-12150-1789129071"
+    account = "d78343"
+    home = _canonical_codex_home(tmp_path, account)
+    home.mkdir(parents=True)
+    prompt = tmp_path / "brief-b359.md"
+    prompt.write_text("Implement b-359.\n", encoding="utf-8")
+    tail = tmp_path / f"{dispatch_id}.tail"
+    status_path = tmp_path / f"{dispatch_id}.status.json"
+    spawn_calls, leases = _stub_detached_runtime(monkeypatch)
+    monkeypatch.setattr(D, "_codex_seat_api", lambda: None)
+
+    rc = D.main(
+        [
+            "--agent",
+            "codex",
+            "--account",
+            account,
+            "--unregistered-forced",
+            "--shape",
+            "bash",
+            "--dispatch-id",
+            dispatch_id,
+            "--cwd",
+            str(tmp_path),
+            "--prompt-file",
+            str(prompt),
+            "--tail",
+            str(tail),
+            "--status-json",
+            str(status_path),
+            "--launch-detached",
+        ]
+    )
+
+    assert rc == 0
+    assert leases == ["lease-resume"]
+    worker = next(call for call in spawn_calls if call["label"] == "worker")
+    watcher = next(call for call in spawn_calls if call["label"] == "watcher")
+    assert worker["env"]["CODEX_HOME"] == str(home)
+    assert (
+        watcher["argv"][watcher["argv"].index("--codex-dispatch-home") + 1]
+        == str(home)
+    )
+    launch_record = json.loads(L.record_path(dispatch_id).read_text(encoding="utf-8"))
+    assert launch_record["codex_home"] == str(home)
+    assert launch_record["effective_account"] == account
+
+    _write_measured_rollout(
+        home,
+        CANONICAL_SESSION_ID,
+        "2026-09-11T08-17-54",
+    )
+    _write_measured_rollout(
+        home,
+        OTHER_CANONICAL_SESSION_ID,
+        "2026-09-11T09-06-40",
+    )
+    tail.write_text(
+        "OpenAI Codex v0.137.0\n"
+        "--------\n"
+        "workdir: /Users/simonrowland/Repos/goal-flight\n"
+        "model: gpt-5.5\n"
+        "provider: openai\n"
+        "approval: never\n"
+        "sandbox: workspace-write [workdir, /tmp, $TMPDIR]\n"
+        "reasoning effort: xhigh\n"
+        "reasoning summaries: none\n"
+        "session id: 01a09067-25ec-7250-9872-3a277abe5716\n"
+        "--------\n"
+        "user\n",
+        encoding="utf-8",
+    )
+    watcher_argv = list(watcher["argv"][1:])
+    watcher_argv[watcher_argv.index("--pid") + 1] = "99999999"
+    identity_index = watcher_argv.index("--worker-identity-json")
+    del watcher_argv[identity_index : identity_index + 2]
+    monkeypatch.setattr(sys, "argv", watcher_argv)
+
+    assert W.main() != 0
+    harvested = json.loads(L.record_path(dispatch_id).read_text(encoding="utf-8"))
+    harvested_status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert harvested["codex_session_id"] == CANONICAL_SESSION_ID
+    assert harvested["codex_home"] == str(home)
+    assert harvested["effective_account"] == account
+    assert harvested_status["codex_session_id"] == CANONICAL_SESSION_ID
+    assert harvested_status["codex_home"] == str(home)
+    assert harvested_status["effective_account"] == account
+    _, accepted_home, session_id, _ = D._validate_codex_resume_source(dispatch_id)
+    assert accepted_home == home.resolve()
+    assert session_id == CANONICAL_SESSION_ID
+
+
+def test_canonical_resume_home_is_exactly_bound_to_recorded_account(
+    tmp_path: Path,
+) -> None:
+    dispatch_id = "codex-48933-1789132000"
+    account = "4c9435"
+    home = _canonical_codex_home(tmp_path, account)
+    _write_measured_rollout(
+        home,
+        OTHER_CANONICAL_SESSION_ID,
+        "2026-09-11T09-06-40",
+    )
+    record = _write_parent_record(
+        tmp_path,
+        dispatch_id=dispatch_id,
+        session_id=OTHER_CANONICAL_SESSION_ID,
+        home=home,
+    )
+    record["effective_account"] = account
+    L.write_record(record)
+
+    _, accepted_home, session_id, _ = D._validate_codex_resume_source(dispatch_id)
+    assert accepted_home == home.resolve()
+    assert session_id == OTHER_CANONICAL_SESSION_ID
+
+    rejected_homes = [
+        _canonical_codex_home(tmp_path, "d78343"),
+        tmp_path / "arbitrary" / "codex",
+        home / ".." / "d78343" / "codex",
+    ]
+    for rejected in rejected_homes:
+        record["codex_home"] = str(rejected)
+        L.write_record(record)
+        with pytest.raises(D.DispatchUsageError, match="invalid recorded codex home"):
+            D._validate_codex_resume_source(dispatch_id)
+
+
+def test_canonical_home_resume_uses_shared_source_without_rebuilding_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parent_id = "codex-48933-1789132000"
+    child_id = "canonical-home-resume-child"
+    account = "4c9435"
+    home = _canonical_codex_home(tmp_path, account)
+    _write_measured_rollout(
+        home,
+        OTHER_CANONICAL_SESSION_ID,
+        "2026-09-11T09-06-40",
+    )
+    record = _write_parent_record(
+        tmp_path,
+        dispatch_id=parent_id,
+        session_id=OTHER_CANONICAL_SESSION_ID,
+        home=home,
+    )
+    record["effective_account"] = account
+    L.write_record(record)
+    prompt = tmp_path / "resume-canonical-home.md"
+    prompt.write_text("Continue this exact session.\n", encoding="utf-8")
+    spawn_calls, _leases = _stub_detached_runtime(monkeypatch)
+    monkeypatch.setattr(
+        D,
+        "_rebuild_codex_resume_home",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a shared canonical home must not be renamed or rebuilt"
+        ),
+    )
+
+    rc = D.main(
+        [
+            "--agent",
+            "codex",
+            "--unregistered-forced",
+            "--shape",
+            "bash",
+            "--dispatch-id",
+            child_id,
+            "--cwd",
+            str(tmp_path),
+            "--prompt-file",
+            str(prompt),
+            "--tail",
+            str(tmp_path / f"{child_id}.tail"),
+            "--status-json",
+            str(tmp_path / f"{child_id}.status.json"),
+            "--parent-dispatch-id",
+            parent_id,
+            "--codex-session-id",
+            OTHER_CANONICAL_SESSION_ID,
+            "--codex-resume-home",
+            str(home),
+            "--codex-home-owner-dispatch-id",
+            parent_id,
+            "--launch-detached",
+        ]
+    )
+
+    assert rc == 0
+    worker = next(call for call in spawn_calls if call["label"] == "worker")
+    assert worker["env"]["CODEX_HOME"] == str(home)
+    child = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
+    assert child["codex_home"] == str(home)
+    assert child["effective_account"] == account
+    assert child["codex_session_id"] == OTHER_CANONICAL_SESSION_ID
+
+
+def test_launch_without_recordable_codex_home_warns_not_resumable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dispatch_id = "codex-no-recordable-home"
+    prompt = tmp_path / "no-home.md"
+    prompt.write_text("Do isolated work.\n", encoding="utf-8")
+    _stub_detached_runtime(monkeypatch)
+    monkeypatch.setattr(D, "_codex_seat_api", lambda: None)
+
+    rc = D.main(
+        [
+            "--agent",
+            "codex",
+            "--unregistered-forced",
+            "--shape",
+            "bash",
+            "--dispatch-id",
+            dispatch_id,
+            "--cwd",
+            str(tmp_path),
+            "--prompt-file",
+            str(prompt),
+            "--tail",
+            str(tmp_path / f"{dispatch_id}.tail"),
+            "--status-json",
+            str(tmp_path / f"{dispatch_id}.status.json"),
+            "--launch-detached",
+        ]
+    )
+
+    assert rc == 0
+    assert (
+        f"goalflight_dispatch: dispatch {dispatch_id} will not be resumable: "
+        "no recordable codex home\n"
+    ) in capsys.readouterr().err
 
 
 def test_resume_argv_places_flags_before_subcommand_and_feeds_prompt_via_stdin(
