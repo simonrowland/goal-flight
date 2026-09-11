@@ -125,6 +125,165 @@ def test_stale_dead_without_marker_terminalizes_wait_as_worker_dead() -> None:
     assert_eq("done_code is terminal", status.done_code(rec), 0)
 
 
+def test_stale_dead_complete_tail_wins_before_watcher_final_write() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "codex-12150-1789129071.tail"
+        tail.write_text(
+            "tool output ended at 2026-09-11 08:54:37 -0400\n"
+            "!COMPLETE: codex-12150-1789129071 — committed 83dc9b1\n",
+            encoding="utf-8",
+        )
+        rec = {
+            "dispatch_id": "codex-12150-1789129071",
+            "classification": "stale_dead",
+            "state": "running",
+            "started_at": "2026-09-11T08:00:00-04:00",
+            "updated_at": "2026-09-11T08:54:38-04:00",
+            "worker_pid": 12150,
+            "worker_identity": {
+                "lstart": "Fri Sep 11 08:00:00 2026",
+                "comm": "codex",
+            },
+            "watcher_pid": 12151,
+            "tail_path": str(tail),
+            "_wait_snapshot_complete": True,
+            "_wait_ledger_snapshot": {},
+            "_wait_status_snapshot": {
+                "dispatch_id": "codex-12150-1789129071",
+                "state": "running",
+                "updated_at": "2026-09-11T08:54:38-04:00",
+            },
+        }
+        saved_identity = status.goalflight_ledger.identity_matches
+        saved_pid_alive = compat.pid_alive
+        status.goalflight_ledger.identity_matches = lambda _record: (False, "dead")
+        compat.pid_alive = lambda _pid: False  # type: ignore[assignment]
+        try:
+            row = _row(_payload(rec), rec["dispatch_id"], now=10_000.0)
+        finally:
+            status.goalflight_ledger.identity_matches = saved_identity
+            compat.pid_alive = saved_pid_alive  # type: ignore[assignment]
+
+    assert_eq("own COMPLETE tail is terminal", row["terminal"], True)
+    assert_eq("own COMPLETE tail reports complete", row["state"], "complete")
+    assert_eq(
+        "own COMPLETE tail never reports worker_dead",
+        status._wait_verdict_line(row),
+        "codex-12150-1789129071 -> complete",
+    )
+
+
+def test_stale_dead_complete_survives_trailing_ready_pointer() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "codex-77628-1789131379.tail"
+        tail.write_text(
+            "watcher evidence at 2026-09-11 09:02:28 -0400\n"
+            "!COMPLETE: codex-77628-1789131379 — review: 3 clean, 2 findings\n"
+            f"READY: {tmp}/review-findings.md\n",
+            encoding="utf-8",
+        )
+        rec = {
+            "dispatch_id": "codex-77628-1789131379",
+            "classification": "stale_dead",
+            "state": "running",
+            "started_at": "2026-09-11T09:00:00-04:00",
+            "updated_at": "2026-09-11T09:02:28-04:00",
+            "worker_pid": 77628,
+            "worker_identity": {
+                "lstart": "Fri Sep 11 09:00:00 2026",
+                "comm": "codex",
+            },
+            "watcher_pid": 77629,
+            "tail_path": str(tail),
+            "_wait_snapshot_complete": True,
+            "_wait_ledger_snapshot": {},
+            "_wait_status_snapshot": {
+                "dispatch_id": "codex-77628-1789131379",
+                "state": "running",
+                "updated_at": "2026-09-11T09:02:28-04:00",
+            },
+        }
+        saved_identity = status.goalflight_ledger.identity_matches
+        saved_pid_alive = compat.pid_alive
+        status.goalflight_ledger.identity_matches = lambda _record: (False, "dead")
+        compat.pid_alive = lambda _pid: False  # type: ignore[assignment]
+        try:
+            row = _row(_payload(rec), rec["dispatch_id"], now=10_000.0)
+        finally:
+            status.goalflight_ledger.identity_matches = saved_identity
+            compat.pid_alive = saved_pid_alive  # type: ignore[assignment]
+
+    assert_eq("COMPLETE before READY pointer is terminal", row["terminal"], True)
+    assert_eq("COMPLETE before READY pointer reports complete", row["state"], "complete")
+    assert_eq("identity-bound marker wins", row.get("marker_kind"), "COMPLETE")
+
+
+def test_live_watcher_gets_a_bounded_final_write_settle_window() -> None:
+    raw = {
+        "dispatch_id": "codex-12150-1789129071",
+        "state": "running",
+        "started_at": "2026-09-11T08:00:00-04:00",
+        "updated_at": "2026-09-11T08:54:38-04:00",
+        "worker_pid": 12150,
+        "worker_identity": {
+            "lstart": "Fri Sep 11 08:00:00 2026",
+            "comm": "codex",
+        },
+    }
+    sidecar = {
+        "dispatch_id": "codex-12150-1789129071",
+        "state": "running",
+        "updated_at": "2026-09-11T08:54:38-04:00",
+        "worker_pid": 12150,
+        "expected_worker_identity": {
+            "lstart": "Fri Sep 11 08:00:00 2026",
+            "comm": "codex",
+        },
+        "watcher_pid": 12151,
+    }
+    progress_state: dict[str, dict] = {}
+    saved_identity = status.goalflight_ledger.identity_matches
+    saved_pid_alive = compat.pid_alive
+    status.goalflight_ledger.identity_matches = lambda _record: (False, "dead")
+    compat.pid_alive = lambda pid: pid == 12151  # type: ignore[assignment]
+    try:
+        rec = status._wait_record_from_snapshots(
+            "codex-12150-1789129071",
+            raw,
+            sidecar,
+            None,
+        )
+        assert_true("wait record exists", isinstance(rec, dict))
+        first = _row(
+            _payload(rec),
+            rec["dispatch_id"],
+            now=10_000.0,
+            progress_state=progress_state,
+        )
+        within = _row(
+            _payload(rec),
+            rec["dispatch_id"],
+            now=10_000.0 + status._WAIT_WATCHER_SETTLE_S - 0.01,
+            progress_state=progress_state,
+        )
+        bounded = _row(
+            _payload(rec),
+            rec["dispatch_id"],
+            now=10_000.0 + status._WAIT_WATCHER_SETTLE_S,
+            progress_state=progress_state,
+        )
+    finally:
+        status.goalflight_ledger.identity_matches = saved_identity
+        compat.pid_alive = saved_pid_alive  # type: ignore[assignment]
+
+    assert_eq("wait snapshot carries watcher pid", rec.get("watcher_pid"), 12151)
+    assert_eq("live watcher does not immediately terminalize", first["terminal"], False)
+    assert_true("live watcher is not worker_dead", first["state"] != "worker_dead")
+    assert_eq("settle window remains nonterminal", within["terminal"], False)
+    assert_eq("settle window is bounded", bounded["terminal"], True)
+    assert_eq("bounded expiry preserves anti-hang verdict", bounded["state"], "worker_dead")
+
+
 def test_unknown_liveness_without_marker_still_waits() -> None:
     for classification in (
         "unknown",
@@ -835,6 +994,9 @@ def main() -> None:
         test_arming_a_wait_announces_mail_before_it_blocks,
         test_waiter_observes_dead_worker_without_casting_terminal_verdict,
         test_stale_dead_without_marker_terminalizes_wait_as_worker_dead,
+        test_stale_dead_complete_tail_wins_before_watcher_final_write,
+        test_stale_dead_complete_survives_trailing_ready_pointer,
+        test_live_watcher_gets_a_bounded_final_write_settle_window,
         test_unknown_liveness_without_marker_still_waits,
         test_waiter_observes_idle_live_worker_without_casting_stall_verdict,
         test_completed_pid_dead_stays_complete_trust_clause,

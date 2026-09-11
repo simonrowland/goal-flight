@@ -73,6 +73,10 @@ _OUTPUT_TAIL_RECONCILE_CLASSES = dispatch_states.OUTPUT_TAIL_RECONCILE_STATES
 _WAIT_LIVENESS_CONFIRMED_ALIVE = "confirmed_alive"
 _WAIT_LIVENESS_CONFIRMED_DEAD = "confirmed_dead"
 _WAIT_LIVENESS_INDETERMINATE = "indeterminate"
+# A live watcher normally publishes the worker's terminal marker within the
+# next poll or two. Give that authoritative write a small chance to land, but
+# never let a wedged watcher undo stale_dead's bounded anti-hang behavior.
+_WAIT_WATCHER_SETTLE_S = 5.0
 _DRAIN_LAUNCHD_LABEL = "com.goalflight.drain"
 _QUEUE_PENDING_NO_DRAINER = "queue_pending_no_drainer"
 # --wait anti-hang grace: how long a dispatch may stay ambiguous/stale WITH a
@@ -1603,6 +1607,7 @@ def _wait_record_from_snapshots(
         "trace_active",
         "liveness_state",
         "pgroup_cpu_pct",
+        "watcher_pid",
     ):
         if key in sidecar:
             record[key] = sidecar[key]
@@ -1978,6 +1983,18 @@ def _wait_worker_confirmed_alive(record: dict | None) -> bool:
     return _wait_worker_liveness(record) == _WAIT_LIVENESS_CONFIRMED_ALIVE
 
 
+def _wait_watcher_alive(record: dict | None) -> bool:
+    if record is None:
+        return False
+    watcher_pid = record.get("watcher_pid")
+    if not watcher_pid:
+        return False
+    try:
+        return goalflight_compat.pid_alive(int(watcher_pid))
+    except (TypeError, ValueError):
+        return False
+
+
 def _wait_record_pid(record: dict | None) -> int | None:
     if record is None:
         return None
@@ -2317,6 +2334,28 @@ def _wait_snapshot(
         state = _terminal_state(record, code=code)
         if progress.get("worker_alive_via_output") and not terminal:
             state = "running"
+        if terminal and state == "worker_dead" and record is not None:
+            # stale_dead can become terminal in done_code before the ordinary
+            # output reconciler's idle gate runs (or while the watcher is still
+            # publishing its final record). Re-run that existing reconciliation
+            # here so the wait consults the watcher's exact identity-bound tail
+            # predicate before it reports lost work.
+            reconciled = _reconcile_output_tail_record(record)
+            if reconciled is not record:
+                record = reconciled
+                code = done_code(record)
+                terminal = code == 0
+                state = _terminal_state(record, code=code)
+        settle_state = progress_state.setdefault(dispatch_id, {})
+        if terminal and state == "worker_dead" and _wait_watcher_alive(record):
+            settle_since = settle_state.setdefault("watcher_settle_since", now)
+            if now - float(settle_since) < _WAIT_WATCHER_SETTLE_S:
+                code = 1
+                terminal = False
+                state = _terminal_state(record, code=code)
+                worker_alive = False
+        else:
+            settle_state.pop("watcher_settle_since", None)
         confirmed_dead = False
         if code == 2:
             confirmed_dead = _wait_worker_confirmed_dead(record)
