@@ -17960,6 +17960,22 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = _build_launch_parser()
     args = parser.parse_args(argv)
+    # REMAINDER captures positional words even without the `--` the help text
+    # requires. An unknown first word (or a stray positional after options)
+    # was therefore exec'd as a raw worker. Observed 2026-09-11:
+    #   goalflight_dispatch.py cancel --help
+    # launched worker-71923-1789132096, which ran macOS /usr/bin/cancel.
+    # Known routed names appearing after an option are already refused above;
+    # this catches everything else before id reservation, seat, or spawn.
+    if args.worker and args.worker[0] != "--":
+        word = args.worker[0]
+        known = ", ".join(_ROUTED_SUBCOMMANDS)
+        print(
+            f"goalflight_dispatch: {word!r} is not a subcommand (known: {known}).\n"
+            "To run a program as a raw worker, put it after `--`.",
+            file=sys.stderr,
+        )
+        return 64
     try:
         args.task_ids = _parse_task_ids(args.tasks)
     except DispatchUsageError as e:

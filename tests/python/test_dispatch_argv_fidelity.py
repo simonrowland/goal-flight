@@ -69,6 +69,7 @@ def _isolated_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     state = tmp_path / "state"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("GOALFLIGHT_STATE_DIR", str(state))
+    monkeypatch.setenv("GOALFLIGHT_DISPATCH_DIR", str(state / "dispatch"))
     monkeypatch.setenv("GOALFLIGHT_CODEX_STATE_DIR", str(state))
     monkeypatch.setenv("GOALFLIGHT_TASK_STORE_DIR", str(tmp_path / "task-store"))
     monkeypatch.setenv("GOALFLIGHT_JOURNAL_DIR", str(tmp_path / "journal"))
@@ -1198,3 +1199,130 @@ def test_subcommand_first_is_still_routed_not_refused(capsys) -> None:
         D.main(["resume"])
     out = capsys.readouterr()
     assert "must come FIRST" not in (out.err + out.out), out
+
+
+def _forbid_real_launch(monkeypatch: pytest.MonkeyPatch) -> dict[str, list]:
+    """Seat/spawn backstop: never exec a real binary or acquire a live seat."""
+    calls: dict[str, list] = {"bind": [], "spawn": []}
+
+    def fake_bind(args):
+        calls["bind"].append(getattr(args, "dispatch_id", None))
+        raise D.DispatchUsageError("b361-test-must-not-bind-seat")
+
+    def fake_spawn(argv, **kwargs):
+        del kwargs
+        calls["spawn"].append(list(argv))
+        raise RuntimeError("b361-test-must-not-spawn")
+
+    monkeypatch.setattr(D, "_bind_dispatch_worktree", fake_bind)
+    monkeypatch.setattr(D, "_spawn_daemonized_process", fake_spawn)
+    return calls
+
+
+def _launch_artifacts() -> dict[str, list[Path]]:
+    dispatch_dir = Path(os.environ["GOALFLIGHT_DISPATCH_DIR"])
+    state_dir = Path(os.environ["GOALFLIGHT_STATE_DIR"])
+    ids_dir = dispatch_dir / ".dispatch-ids"
+    runs = state_dir / "runs.d"
+    return {
+        "id_reservations": sorted(ids_dir.glob("*.json")) if ids_dir.exists() else [],
+        "status": sorted(dispatch_dir.glob("*.status.json")),
+        "tails": sorted(dispatch_dir.glob("*.tail")),
+        "ledger": sorted(runs.glob("*.json")) if runs.exists() else [],
+    }
+
+
+def _assert_unknown_word_refused(
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    word: str,
+) -> None:
+    calls = _forbid_real_launch(monkeypatch)
+    before = _launch_artifacts()
+    code = D.main(argv)
+    err = capsys.readouterr().err
+    known = ", ".join(D._ROUTED_SUBCOMMANDS)
+    assert code == 64, (code, err)
+    assert f"{word!r} is not a subcommand (known: {known})" in err, err
+    assert "put it after `--`" in err, err
+    assert "must come FIRST" not in err, err
+    assert calls["bind"] == [], calls
+    assert calls["spawn"] == [], calls
+    after = _launch_artifacts()
+    assert after == before, (before, after)
+
+
+def test_unknown_first_word_cancel_help_refuses_before_launch(
+    capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unknown first word must not become a raw worker.
+
+    OBSERVED: looking for a supported way to stop a dispatch, the controller ran
+      python3 scripts/goalflight_dispatch.py cancel --help
+    expecting help or an 'unknown subcommand' error. It LAUNCHED a real dispatch instead:
+      worker-71923-1789132096  agent=worker  seat s-2  worker_pid 72325
+    whose tail is the usage text of macOS /usr/bin/cancel (the print-job cancel utility: 'Cancel all jobs', 'Purge jobs').
+    --help is not an option /usr/bin/cancel knows, so it printed usage and exited without acting; the dispatch is worker_dead,
+    watcher exited, s-2 clean at dbf718b. HARMLESS THIS TIME BY LUCK: the same path would exec any program on PATH whose name
+    a controller guesses as a verb, with whatever arguments follow.
+
+    source: controller probe 2026-09-11, dispatch worker-71923-1789132096
+    """
+    _assert_unknown_word_refused(
+        capsys, monkeypatch, ["cancel", "--help"], "cancel"
+    )
+
+
+def test_stray_positional_after_options_refuses_before_launch(
+    capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--agent codex cancel` is the same hole with the unknown word after options."""
+    _assert_unknown_word_refused(
+        capsys, monkeypatch, ["--agent", "codex", "cancel"], "cancel"
+    )
+
+
+def test_double_dash_raw_worker_help_still_reaches_launch(
+    capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`-- <cmd> --help` is the documented escape hatch and must still launch.
+
+    Capture argv at the pre-spawn launch validator. Never exec a real binary:
+    the fake program is not on PATH, and seat/spawn seams raise if reached.
+    """
+    seen: dict[str, list[str]] = {}
+    calls = _forbid_real_launch(monkeypatch)
+
+    def fake_validate(args, raw_argv: list[str]) -> None:
+        del args
+        seen["raw"] = list(raw_argv)
+        raise D.DispatchUsageError("b361-captured-raw-worker")
+
+    monkeypatch.setattr(D, "_validate_before_side_effects", fake_validate)
+    code = D.main(["--", "gf-b361-never-exec", "--help"])
+    err = capsys.readouterr().err
+    assert seen.get("raw") == ["gf-b361-never-exec", "--help"], (seen, err)
+    assert code == 64, (code, err)
+    assert "b361-captured-raw-worker" in err, err
+    assert "is not a subcommand" not in err, err
+    assert calls["bind"] == [], calls
+    assert calls["spawn"] == [], calls
+
+
+@pytest.mark.parametrize("name", D._ROUTED_SUBCOMMANDS)
+def test_every_routed_subcommand_help_still_routes(
+    name: str, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`<subcommand> --help` must route, not launch, and not hit the unknown-word guard."""
+    calls = _forbid_real_launch(monkeypatch)
+    with pytest.raises(SystemExit) as exc_info:
+        D.main([name, "--help"])
+    out = capsys.readouterr()
+    text = out.err + out.out
+    assert exc_info.value.code == 0, (name, exc_info.value.code, text)
+    assert "is not a subcommand" not in text, text
+    assert "must come FIRST" not in text, text
+    assert "usage" in text.lower(), text
+    assert calls["bind"] == [], calls
+    assert calls["spawn"] == [], calls
