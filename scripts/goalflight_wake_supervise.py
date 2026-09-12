@@ -919,8 +919,28 @@ def _actionable_stream_wake(
 
 
 def _next_payload_key(record: dict[str, object]) -> str:
-    """Stable identity of a terse kind=next payload for repeat suppression."""
-    return json.dumps(record.get("payload"), sort_keys=True, default=str)
+    """Stable identity of a terse kind=next payload for repeat suppression.
+
+    Keyed on the SUBJECT (directive + head row id), not the representation.
+    The two frontier producers describe one frontier differently -- the follow
+    child carries the head row alone, the supervisor snapshot carries up to
+    four items -- and the projection state flips projected/stale on its own
+    schedule.  Keying on the serialized payload made the repeat gate false on
+    almost every beat, so the floor never engaged and every controller was
+    woken by the same frontier several times an hour (battery-perf, 2026-09-12).
+    """
+    payload = record.get("payload")
+    source = payload if isinstance(payload, dict) else {}
+    head = source.get("id")
+    if head in (None, ""):
+        items = source.get("items")
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            head = items[0].get("id")
+    return json.dumps(
+        {"directive": source.get("directive"), "id": head},
+        sort_keys=True,
+        default=str,
+    )
 
 
 def _restart_record_key(record: dict[str, object]) -> str:
