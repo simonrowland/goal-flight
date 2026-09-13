@@ -3105,11 +3105,26 @@ def _refuse_launch_blocked_by_completion_authority(args) -> None:
     """
     if not getattr(args, "task_ids", None):
         return
-    decision = _entry_completion_authority(_launch_authority_entry(args))
+    entry = _launch_authority_entry(args)
+    diagnostics: list[str] = []
+    decision = _entry_completion_authority(entry, diagnostics=diagnostics)
     if not _completion_decision_blocks_restore(decision):
         return
     assert isinstance(decision, dict)
     message = str(decision.get("reason") or "partial_task_supersession")
+    if diagnostics:
+        # Human diagnostics leave the machine reason/schema stable. Capture
+        # evidence in the deciding read, never through a potentially newer scan.
+        print(
+            f"goalflight_dispatch: {message}; "
+            f"entry.created_at={json.dumps(entry.get('created_at'))}\n"
+            + "\n".join(diagnostics)
+            + "\nInspect the named records; correct missing or invalid completion "
+            "timestamps from verified evidence before retrying. For partial "
+            "supersession, reconcile stopped work or wait for active siblings, "
+            "then dispatch only remaining task IDs.",
+            file=sys.stderr,
+        )
     print(
         DISPATCH_REFUSED_PREFIX
         + json.dumps(
@@ -9816,10 +9831,7 @@ def _task_row_durably_complete(row: dict | None) -> bool:
         return False
     if row.get("done_reviewed") is True:
         return True
-    if row.get("done") is True:
-        return True
-    derived = str(row.get("derived_status") or "")
-    return derived in {"done-reviewed", "awaiting-review", "worker-finished"}
+    return row.get("done") is True
 
 
 def _task_row_completion_timestamp_s(row: dict | None) -> float | None:
@@ -9859,6 +9871,7 @@ def _ledger_task_ids_advanced(
     self_dispatch_id: str,
     entry_created_timestamp_s: float | None = None,
     self_project_root: object | None = None,
+    diagnostics: list[str] | None = None,
 ) -> tuple[int, int, str]:
     """Return counts plus the typed reason ledger authority is inconclusive.
 
@@ -9898,6 +9911,7 @@ def _ledger_task_ids_advanced(
             or goalflight_ledger.terminal_state_for(state, record.get("reason") or record.get("error"))
             or ""
         )
+        completion_order = "not_compared"
         if (
             state in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
             or terminal in goalflight_dispatch_states.SUCCESS_TERMINAL_RECORD_STATES
@@ -9910,23 +9924,34 @@ def _ledger_task_ids_advanced(
             )
             if completion_order == "equal":
                 equal_completion_tasks |= overlap
-                continue
-            if completion_order == "indeterminate":
+            elif completion_order == "indeterminate":
                 indeterminate_completion_tasks |= overlap
+            elif completion_order == "after":
+                complete_tasks |= overlap
+                advanced_tasks |= overlap
+            else:
                 continue
-            if completion_order != "after":
-                continue
-            complete_tasks |= overlap
-            advanced_tasks |= overlap
-            continue
         # Neutral reconciliation outcomes and live work both count as "advanced"
         # enough to block unsplit re-enqueue of this envelope.
-        if state in {"superseded", "worker_dead"} or terminal in {"superseded", "worker_dead"}:
+        elif state in {"superseded", "worker_dead"} or terminal in {"superseded", "worker_dead"}:
             advanced_tasks |= overlap
+        elif (
+            state
+            and not goalflight_dispatch_states.is_terminal_state(state)
+            and state not in {"queued", "waiting_capacity", "submitted"}
+        ):
+            advanced_tasks |= overlap
+        else:
             continue
-        if state and not goalflight_dispatch_states.is_terminal_state(state):
-            if state not in {"queued", "waiting_capacity", "submitted"}:
-                advanced_tasks |= overlap
+        if diagnostics is not None:
+            dispatch_id = str(record.get("dispatch_id") or "")
+            diagnostics.append(
+                f"ledger record={goalflight_ledger.record_path(dispatch_id, create=False)} "
+                f"task_ids={json.dumps(sorted(overlap))} "
+                f"dispatch_id={json.dumps(dispatch_id)} state={json.dumps(state)} "
+                f"terminal_state={json.dumps(terminal)} "
+                f"ended_at={json.dumps(record.get('ended_at'))} order={completion_order}"
+            )
     unresolved_indeterminate = indeterminate_completion_tasks - complete_tasks
     unresolved_equal = equal_completion_tasks - complete_tasks
     if unresolved_indeterminate:
@@ -9943,6 +9968,7 @@ def _linked_task_truth_detail(
     record: dict | None = None,
     *,
     task_store_locked: bool = False,
+    diagnostics: list[str] | None = None,
 ) -> tuple[str, str | None, tuple[str, ...]]:
     """Return task truth plus a typed indeterminate cause and its sources."""
     task_ids = _entry_task_ids(entry, record)
@@ -9961,13 +9987,8 @@ def _linked_task_truth_detail(
         store = goalflight_task.TaskStore(project_root)
         if task_store_locked and store.publish_marker_path.exists():
             store._recover_interrupted_publish_locked()
-        # Derived rows, not raw ones. _task_row_durably_complete consults
-        # derived_status, and load_items does not emit that field at all --
-        # measured: 0 of 758 raw rows carry it, so the predicate's derived
-        # branch was dead on this path and only the raw done/done_reviewed
-        # stamps decided. 26 rows in the live store flip to complete once the
-        # deriver runs. derived_rows_for_items (goalflight_task.py) is the
-        # authoritative deriver; stamps are inputs to it, never a substitute.
+        # Keep authoritative derived rows for task truth. Durable completion
+        # itself needs done/accept stamps; a finished dispatch leaves a row open.
         by_id = {
             str(item.get("id")): item
             for item in store.derived_rows_for_items(
@@ -9980,10 +10001,22 @@ def _linked_task_truth_detail(
                 continue
             store_seen += 1
             if _task_row_durably_complete(row):
+                completion_timestamp_s = _task_row_completion_timestamp_s(row)
                 completion_order = _completion_order(
-                    _task_row_completion_timestamp_s(row),
+                    completion_timestamp_s,
                     entry_created_timestamp_s,
                 )
+                if diagnostics is not None and completion_order != "before":
+                    stamps = " ".join(
+                        f"{key}={json.dumps(row.get(key))}"
+                        for key in ("done", "done_reviewed", "done_at", "done_reviewed_at", "closed_at")
+                    )
+                    diagnostics.append(
+                        f"task_store record={store.tasks_path} row={json.dumps(task_id)} "
+                        f"{stamps} completion_timestamp_s={completion_timestamp_s} "
+                        f"order={completion_order} dispatch_id=unbound "
+                        "(task completion stamps do not bind a dispatch)"
+                    )
                 if completion_order == "equal":
                     if store_issue is None:
                         store_issue = "timestamp_equal"
@@ -10006,6 +10039,7 @@ def _linked_task_truth_detail(
         self_dispatch_id=self_id,
         entry_created_timestamp_s=entry_created_timestamp_s,
         self_project_root=self_root,
+        diagnostics=diagnostics,
     )
 
     # Prefer explicit store truth when every linked id is present and complete.
@@ -10094,6 +10128,7 @@ def _entry_completion_authority(
     record: dict | None = None,
     *,
     task_store_locked: bool = False,
+    diagnostics: list[str] | None = None,
 ) -> dict | None:
     """Full completion-authority ladder (design §Reconciliation).
 
@@ -10168,6 +10203,7 @@ def _entry_completion_authority(
         entry,
         record,
         task_store_locked=task_store_locked,
+        diagnostics=diagnostics,
     )
     if task_truth == "all_complete":
         return {
