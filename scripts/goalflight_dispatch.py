@@ -10023,6 +10023,33 @@ def _ledger_task_ids_advanced(
         # Neutral reconciliation outcomes and live work both count as "advanced"
         # enough to block unsplit re-enqueue of this envelope.
         elif state in {"superseded", "worker_dead"} or terminal in {"superseded", "worker_dead"}:
+            # Legacy reconciliation stored ruling requests as worker_dead.
+            # A stopped question has not advanced the task; FAILED still has.
+            if state == "worker_dead" or terminal == "worker_dead":
+                reason = record.get("reason") or record.get("error") or ""
+                marker = record.get("terminal_marker")
+                marker_kind = marker.get("kind") if isinstance(marker, dict) else None
+                if not marker_kind and isinstance(reason, dict):
+                    marker_kind = reason.get("marker_kind")
+                death_cause = record.get("death_cause")
+                # Structured evidence outranks legacy reason text, including
+                # an explicit FAILED that contradicts an earlier question.
+                if death_cause:
+                    awaiting_ruling = death_cause in (
+                        "attention_marker:BLOCKED",
+                        "attention_marker:USER-NEED",
+                        "attention_marker:USER-CONFIRM",
+                    )
+                elif marker_kind:
+                    awaiting_ruling = marker_kind in ("BLOCKED", "USER-NEED", "USER-CONFIRM")
+                else:
+                    reason_text = reason.get("reason", "") if isinstance(reason, dict) else reason
+                    awaiting_ruling = bool(re.search(
+                        r"(?<![\w:-])attention_marker:(?:BLOCKED|USER-NEED|USER-CONFIRM)(?![\w:-])",
+                        str(reason_text),
+                    ))
+                if awaiting_ruling:
+                    continue
             advanced_tasks |= overlap
         elif (
             state

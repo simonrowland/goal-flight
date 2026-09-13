@@ -1052,16 +1052,17 @@ def case_post_terminal_idle_action_pins_hang_versus_exit() -> None:
     ) == "terminalize"
 
 
-def case_shared_cwd_complete_then_hang_is_inconclusive() -> None:
+def case_shared_cwd_complete_then_hang_is_inconclusive(signals: str = "COMPLETE") -> None:
     """COMPLETE then hang is inconclusive even when cwd is the canonical root.
 
     Dispatch launches with --cwd as both project_root and worker_cwd, so the
     tree probe is skipped and classify_liveness never wedges. Post-terminal
     idle must not wait on that wedge.
     """
+    kinds = signals.split()
     survivor = {
-        "line": 1,
-        "kind": "COMPLETE",
+        "line": len(kinds),
+        "kind": kinds[-1],
         "text": "shared-cwd-hang — signed off",
     }
 
@@ -1112,7 +1113,9 @@ def case_shared_cwd_complete_then_hang_is_inconclusive() -> None:
         status = tmp_path / "status.json"
         shared = tmp_path / "repo"
         shared.mkdir()
-        tail.write_text("synthetic tail\n", encoding="utf-8")
+        tail.write_text("".join(
+            f"!{kind}: shared-cwd-hang — signed off\n" for kind in kinds
+        ), encoding="utf-8")
         env = os.environ.copy()
         _isolate_state_env(env, tmp_path)
         argv = [
@@ -1147,7 +1150,7 @@ def case_shared_cwd_complete_then_hang_is_inconclusive() -> None:
         payload = json.loads(status.read_text(encoding="utf-8"))
         assert rc == 1, (rc, output.getvalue(), payload)
         assert payload.get("state") == "inconclusive_timeout", payload
-        assert payload.get("reason") == "marker:COMPLETE:post_terminal_idle_timeout", payload
+        assert payload.get("reason") == f"marker:{kinds[-1]}:post_terminal_idle_timeout", payload
         assert payload.get("worker_alive") is True, payload
         assert payload.get("terminal_pending_state") == "complete", payload
 

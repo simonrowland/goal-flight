@@ -3261,20 +3261,23 @@ def _select_dead_path_terminal(
     last_success: dict | None,
     last_attention: dict | None,
     last_output_line_no: int | None,
+    last_blocked: dict | None,
+    last_completed: dict | None,
 ) -> dict | None:
     """Dead-path terminal: success may be anywhere; attention only as last own line.
 
-    An attention marker terminalizes only as the worker's own terminal
+    An attention marker normally terminalizes only as the worker's own terminal
     signal: the last non-empty non-trailer line, already parsed by the
     shared own-signal allowlist, and not fenced (the caller skipped fences
     for the candidate). Quoted / list-item / fenced / indented / mid-tail
-    attention does not terminalize.
+    attention does not terminalize, except that BLOCKED outranks a later READY.
 
     Success markers still win from anywhere in the completed tail, including
     quote-prefixed forms, because a dead worker that signed off and then had
     a summary has finished. A later own-signal attention line outranks an
     earlier success (the worker stopped to escalate after previously signing
-    off).
+    off). READY may point to a blocker report; only a COMPLETE/RESULT after
+    the latest BLOCKED resolves that stop, even with a later READY pointer.
     """
     if (
         last_attention
@@ -3282,6 +3285,10 @@ def _select_dead_path_terminal(
         and last_attention.get("line") == last_output_line_no
     ):
         return last_attention
+    if last_blocked and last_success and last_success.get("kind") == "READY":
+        if last_completed and last_completed["line"] > last_blocked["line"]:
+            return last_completed
+        return last_blocked
     return last_success
 
 
@@ -3301,6 +3308,8 @@ def _scan_final_terminal_marker(
     in_hunk = False
     last_success: dict | None = None
     last_attention: dict | None = None
+    last_blocked: dict | None = None
+    last_completed: dict | None = None
     last_output_line_no: int | None = None
     previous_stripped = ""
     for idx, line in enumerate(lines, start=1):
@@ -3349,6 +3358,8 @@ def _scan_final_terminal_marker(
             ):
                 continue
             if is_attention:
+                if candidate.get("kind") == "BLOCKED":
+                    last_blocked = candidate
                 if (
                     rendered_response
                     and line.startswith("!")
@@ -3364,8 +3375,10 @@ def _scan_final_terminal_marker(
                     last_attention = candidate
             else:
                 last_success = candidate
+                if candidate.get("kind") in {"COMPLETE", "RESULT"}:
+                    last_completed = candidate
     return _select_dead_path_terminal(
-        last_success, last_attention, last_output_line_no
+        last_success, last_attention, last_output_line_no, last_blocked, last_completed
     )
 
 
@@ -3425,11 +3438,14 @@ def _stream_final_terminal_marker(
         in_hunk = False
         last_success: dict | None = None
         last_attention: dict | None = None
+        last_blocked: dict | None = None
+        last_completed: dict | None = None
         last_output_line_no: int | None = None
         previous_stripped = ""
 
         def consume(line: str, line_no: int, *, oversized: bool) -> None:
             nonlocal in_hunk, last_success, last_attention
+            nonlocal last_blocked, last_completed
             nonlocal last_output_line_no, previous_stripped
             stripped = line.strip()
             if line_no - 1 in prompt_echo_lines:
@@ -3485,15 +3501,21 @@ def _stream_final_terminal_marker(
                 return
             if is_attention:
                 last_attention = candidate
+                if candidate.get("kind") == "BLOCKED":
+                    last_blocked = candidate
             else:
                 last_success = candidate
+                if candidate.get("kind") in {"COMPLETE", "RESULT"}:
+                    last_completed = candidate
 
         for line_no, line, oversized in leading_records:
             consume(line, line_no, oversized=oversized)
         for line_no, line, oversized in line_iter:
             consume(line, line_no, oversized=oversized)
     return (
-        _select_dead_path_terminal(last_success, last_attention, last_output_line_no),
+        _select_dead_path_terminal(
+            last_success, last_attention, last_output_line_no, last_blocked, last_completed
+        ),
         fence.in_fence,
     )
 
@@ -3584,11 +3606,12 @@ def _final_terminal_marker(
 
     Success markers (COMPLETE/READY/RESULT) may appear anywhere in the
     completed tail, including quote-prefixed renderer forms. Attention
-    markers (BLOCKED/USER-NEED/USER-CONFIRM/FAILED) terminalize only as the
+    markers (BLOCKED/USER-NEED/USER-CONFIRM/FAILED) normally terminalize only as the
     worker's own final signal: last non-empty non-trailer line matching
-    ``parse_own_signal_attention_line``, unfenced. Quoted, list-item, fenced,
-    indented, or mid-tail attention is relayed or abandoned content and
-    does not stop the dispatch.
+    ``parse_own_signal_attention_line``, unfenced. A same-worker BLOCKED also
+    outranks a later READY unless a COMPLETE/RESULT after that BLOCKED resolves
+    it. Quoted, list-item, fenced, indented, or other mid-tail attention does
+    not stop the dispatch.
 
     Confirmed-dead callers may recover the final rendered response after a
     Codex ``tokens used`` / count footer. That response has its own Markdown
@@ -4314,6 +4337,20 @@ def main() -> int:
                 payload["last_marker"] = harvested_headline
             mail_marker = harvested_headline
             terminal_marker = payload.get("terminal_marker") or terminal_seen
+            if (
+                isinstance(harvested_headline, dict)
+                and harvested_headline.get("kind") in {"BLOCKED", "COMPLETE", "RESULT"}
+                and isinstance(terminal_marker, dict)
+                and terminal_marker.get("kind") == "READY"
+                and payload.get("state") == "complete"
+            ):
+                # Carry the completed-tail ordering verdict through publication:
+                # READY cannot resolve BLOCKED or hide the completion that did.
+                # Preserve a prior non-success verdict, such as a live timeout.
+                terminal_marker = harvested_headline
+                payload["terminal_marker"] = harvested_headline
+                payload["state"] = _marker_state(harvested_headline)
+                payload["reason"] = f"marker:{harvested_headline['kind']}"
             final_state, final_reason, _limit_reached = goalflight_terminal.terminal_rate_limit_outcome(
                 payload.get("state"),
                 payload.get("reason"),
