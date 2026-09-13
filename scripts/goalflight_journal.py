@@ -4097,146 +4097,256 @@ class Journal:
                     raise CASMismatch(
                         f"cursor CAS lost: unseen position exists at or below {stream}={position}"
                     )
-            now = utc_now()
-            adopted_wildcards = 0
-            for stream, position in normalized_advances.items():
-                current_position = current_positions[stream]
-                # A recipient can already have an exact fanout row at the same
-                # stream position as a wildcard (for example when another
-                # snapshotted recipient retired).  The wildcard cannot be
-                # renamed across the live stream-position uniqueness boundary,
-                # so the first successful processor withdraws that duplicate.
-                withdrawn = connection.execute(
-                    """
-                    UPDATE delivery_events
-                    SET withdrawn_at = ?
-                    WHERE rowid IN (
-                        SELECT wildcard.rowid
-                        FROM delivery_events AS wildcard
-                        JOIN delivery_events AS exact
-                          ON exact.project_root = wildcard.project_root
-                         AND exact.recipient_label = ?
-                         AND (
-                              (
-                                  exact.origin_node = wildcard.origin_node
-                                  AND exact.event_uuid = wildcard.event_uuid
-                              )
-                              OR (
-                                  exact.stream_id = wildcard.stream_id
-                                  AND exact.stream_seq = wildcard.stream_seq
-                                  AND exact.withdrawn_at IS NULL
-                              )
-                         )
-                        WHERE wildcard.project_root = ?
-                          AND wildcard.recipient_label = '*'
-                          AND wildcard.stream_id = ?
-                          AND wildcard.stream_seq > ? AND wildcard.stream_seq <= ?
-                          AND wildcard.projected_at IS NOT NULL
-                          AND wildcard.withdrawn_at IS NULL
-                    )
-                    """,
-                    (
-                        now,
-                        resolved_label,
-                        project_root,
-                        stream,
-                        current_position,
-                        position,
-                    ),
-                )
-                adopted_wildcards += int(withdrawn.rowcount)
-                adopted = connection.execute(
-                    """
-                    UPDATE delivery_events
-                    SET recipient_label = ?
-                    WHERE project_root = ? AND recipient_label = '*'
-                      AND stream_id = ? AND stream_seq > ? AND stream_seq <= ?
-                      AND projected_at IS NOT NULL AND withdrawn_at IS NULL
-                    """,
-                    (
-                        resolved_label,
-                        project_root,
-                        stream,
-                        current_position,
-                        position,
-                    ),
-                )
-                adopted_wildcards += int(adopted.rowcount)
-            if adopted_wildcards:
-                # Adoption removes rows from every other controller's wildcard
-                # view.  Invalidate their emitted commands in the same
-                # transaction; the advancing controller performs its ordinary
-                # version increment below.
-                self._invalidate_delivery_cursor_snapshots(
-                    connection,
-                    project_root=project_root,
-                    recipient_label="*",
-                    updated_at=now,
-                    exclude_label=resolved_label,
-                )
-            for stream, position in normalized_advances.items():
-                connection.execute(
-                    """
-                    INSERT INTO controller_stream_cursors (
-                        project_root, label, stream_id, position, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(project_root, label, stream_id) DO UPDATE SET
-                        position = MAX(position, excluded.position),
-                        updated_at = excluded.updated_at
-                    """,
-                    (project_root, resolved_label, stream, position, now),
-                )
-            pending = (
-                1
-                if self._label_has_unread_delivery(
-                    connection,
-                    project_root=project_root,
-                    label=resolved_label,
-                )
-                else 0
+            return self._write_cursor_positions(
+                connection,
+                resolved_label=resolved_label,
+                generation=generation,
+                current_cursor_version=current_cursor_version,
+                normalized_advances=normalized_advances,
+                current_positions=current_positions,
+                actor_value=actor_value,
             )
-            updated = connection.execute(
+
+        return self._domain_write(action)
+
+    def set_cursor(
+        self,
+        label: str,
+        *,
+        positions: Mapping[str, int] | None = None,
+        actor: str,
+    ) -> WriteResult[dict[str, object]]:
+        """Set the owner's private bookmark, without lease or snapshot gates.
+
+        None drains every currently deliverable stream in this write transaction.
+        Explicit positions are exact, including rewinds and positions whose
+        delivery range has changed. Anything beyond them remains pending.
+        The separate advance_cursor CAS API remains available to non-owner
+        callers such as the orphaned-label operator path.
+        """
+        project_root = str(self.project_root)
+        resolved_label = self._identity_token(label, label="cursor label")
+        actor_value = self._identity_token(actor, label="cursor actor")
+        normalized: dict[str, int] | None = None
+        if positions is not None:
+            if not isinstance(positions, Mapping) or not positions:
+                raise ValueError("cursor positions are empty or invalid")
+            normalized = {}
+            for stream, position in positions.items():
+                resolved_stream = self._identity_token(stream, label="cursor stream")
+                if not isinstance(position, int) or isinstance(position, bool) or position < 0:
+                    raise ValueError("cursor position must be a non-negative integer")
+                normalized[resolved_stream] = position
+
+        def action(connection: sqlite3.Connection) -> dict[str, object]:
+            connection.execute(
                 """
-                UPDATE controller_cursors
-                SET cursor_version = cursor_version + 1, updated_at = ?,
-                    backlog_pending = ?, advanced_at = ?, advanced_by = ?
-                WHERE project_root = ? AND label = ?
-                  AND registry_generation = ?
+                INSERT INTO controller_cursors (
+                    project_root, label, registry_generation, cursor_version, updated_at
+                ) VALUES (?, ?, (
+                    SELECT COALESCE(MAX(generation), 1) FROM controller_leases
+                    WHERE project_root = ? AND label = ?
+                ), 0, ?)
+                ON CONFLICT(project_root, label) DO NOTHING
+                """,
+                (project_root, resolved_label, project_root, resolved_label, utc_now()),
+            )
+            cursor = connection.execute(
+                """SELECT registry_generation, cursor_version FROM controller_cursors
+                   WHERE project_root = ? AND label = ?""",
+                (project_root, resolved_label),
+            ).fetchone()
+            current_positions = {
+                str(row["stream_id"]): int(row["position"])
+                for row in connection.execute(
+                    """SELECT stream_id, position FROM controller_stream_cursors
+                       WHERE project_root = ? AND label = ?""",
+                    (project_root, resolved_label),
+                )
+            }
+            targets = normalized
+            if targets is None:
+                # No peek limit, lease lookup, or token-producing read/write gap.
+                targets = {
+                    str(row["stream_id"]): int(row["position"])
+                    for row in connection.execute(
+                        """
+                        SELECT e.stream_id, MAX(e.stream_seq) AS position
+                        FROM delivery_events AS e
+                        LEFT JOIN controller_stream_cursors AS c
+                          ON c.project_root = e.project_root AND c.label = ?
+                         AND c.stream_id = e.stream_id
+                        WHERE e.project_root = ? AND e.recipient_label IN (?, '*')
+                          AND e.projected_at IS NOT NULL AND e.withdrawn_at IS NULL
+                          AND e.stream_seq > COALESCE(c.position, 0)
+                        GROUP BY e.stream_id
+                        """,
+                        (resolved_label, project_root, resolved_label),
+                    )
+                }
+            return self._write_cursor_positions(
+                connection,
+                resolved_label=resolved_label,
+                generation=int(cursor["registry_generation"]),
+                current_cursor_version=int(cursor["cursor_version"]),
+                normalized_advances=targets,
+                current_positions=current_positions,
+                actor_value=actor_value,
+            )
+
+        return self._domain_write(action)
+
+    def _write_cursor_positions(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        resolved_label: str,
+        generation: int,
+        current_cursor_version: int,
+        normalized_advances: Mapping[str, int],
+        current_positions: Mapping[str, int],
+        actor_value: str,
+    ) -> dict[str, object]:
+        """Commit positions and their consume side effects after caller validation."""
+        project_root = str(self.project_root)
+        now = utc_now()
+        adopted_wildcards = 0
+        for stream, position in normalized_advances.items():
+            current_position = current_positions.get(stream, 0)
+            # A recipient can already have an exact fanout row at the same
+            # stream position as a wildcard (for example when another
+            # snapshotted recipient retired).  The wildcard cannot be
+            # renamed across the live stream-position uniqueness boundary,
+            # so the first successful processor withdraws that duplicate.
+            withdrawn = connection.execute(
+                """
+                UPDATE delivery_events
+                SET withdrawn_at = ?
+                WHERE rowid IN (
+                    SELECT wildcard.rowid
+                    FROM delivery_events AS wildcard
+                    JOIN delivery_events AS exact
+                      ON exact.project_root = wildcard.project_root
+                     AND exact.recipient_label = ?
+                     AND (
+                          (
+                              exact.origin_node = wildcard.origin_node
+                              AND exact.event_uuid = wildcard.event_uuid
+                          )
+                          OR (
+                              exact.stream_id = wildcard.stream_id
+                              AND exact.stream_seq = wildcard.stream_seq
+                              AND exact.withdrawn_at IS NULL
+                          )
+                     )
+                    WHERE wildcard.project_root = ?
+                      AND wildcard.recipient_label = '*'
+                      AND wildcard.stream_id = ?
+                      AND wildcard.stream_seq > ? AND wildcard.stream_seq <= ?
+                      AND wildcard.projected_at IS NOT NULL
+                      AND wildcard.withdrawn_at IS NULL
+                )
                 """,
                 (
                     now,
-                    pending,
-                    now,
-                    actor_value,
-                    project_root,
                     resolved_label,
-                    generation,
+                    project_root,
+                    stream,
+                    current_position,
+                    position,
                 ),
             )
-            if updated.rowcount != 1:
-                raise CASMismatch(
-                    "cursor CAS lost: registry generation changed"
-                )
-            attributed = connection.execute(
+            adopted_wildcards += int(withdrawn.rowcount)
+            adopted = connection.execute(
                 """
-                SELECT advanced_by FROM controller_cursors
-                WHERE project_root = ? AND label = ?
+                UPDATE delivery_events
+                SET recipient_label = ?
+                WHERE project_root = ? AND recipient_label = '*'
+                  AND stream_id = ? AND stream_seq > ? AND stream_seq <= ?
+                  AND projected_at IS NOT NULL AND withdrawn_at IS NULL
                 """,
-                (project_root, resolved_label),
-            ).fetchone()
-            if attributed is None or not str(attributed["advanced_by"] or "").strip():
-                raise JournalIntegrityError(
-                    "cursor consume-path write left advanced_by NULL"
-                )
-            return {
-                "label": resolved_label,
-                "registry_generation": generation,
-                "previous_cursor_version": current_cursor_version,
-                "cursor_version": current_cursor_version + 1,
-                "advances": normalized_advances,
-            }
-
-        return self._domain_write(action)
+                (
+                    resolved_label,
+                    project_root,
+                    stream,
+                    current_position,
+                    position,
+                ),
+            )
+            adopted_wildcards += int(adopted.rowcount)
+        if adopted_wildcards:
+            # Adoption removes rows from every other controller's wildcard
+            # view.  Invalidate their emitted commands in the same
+            # transaction; the advancing controller performs its ordinary
+            # version increment below.
+            self._invalidate_delivery_cursor_snapshots(
+                connection,
+                project_root=project_root,
+                recipient_label="*",
+                updated_at=now,
+                exclude_label=resolved_label,
+            )
+        for stream, position in normalized_advances.items():
+            connection.execute(
+                """
+                INSERT INTO controller_stream_cursors (
+                    project_root, label, stream_id, position, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(project_root, label, stream_id) DO UPDATE SET
+                    position = excluded.position,
+                    updated_at = excluded.updated_at
+                """,
+                (project_root, resolved_label, stream, position, now),
+            )
+        pending = (
+            1
+            if self._label_has_unread_delivery(
+                connection,
+                project_root=project_root,
+                label=resolved_label,
+            )
+            else 0
+        )
+        updated = connection.execute(
+            """
+            UPDATE controller_cursors
+            SET cursor_version = cursor_version + 1, updated_at = ?,
+                backlog_pending = ?, advanced_at = ?, advanced_by = ?
+            WHERE project_root = ? AND label = ?
+              AND registry_generation = ?
+            """,
+            (
+                now,
+                pending,
+                now,
+                actor_value,
+                project_root,
+                resolved_label,
+                generation,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise CASMismatch(
+                "cursor CAS lost: registry generation changed"
+            )
+        attributed = connection.execute(
+            """
+            SELECT advanced_by FROM controller_cursors
+            WHERE project_root = ? AND label = ?
+            """,
+            (project_root, resolved_label),
+        ).fetchone()
+        if attributed is None or not str(attributed["advanced_by"] or "").strip():
+            raise JournalIntegrityError(
+                "cursor consume-path write left advanced_by NULL"
+            )
+        return {
+            "label": resolved_label,
+            "registry_generation": generation,
+            "previous_cursor_version": current_cursor_version,
+            "cursor_version": current_cursor_version + 1,
+            "advances": normalized_advances,
+        }
 
     def arm_listener(
         self,

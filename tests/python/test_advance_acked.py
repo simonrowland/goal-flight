@@ -693,3 +693,166 @@ def test_no_active_lease_error_is_not_a_generation_change(
     assert "lease generation changed" in wrong_reason
     assert "no active lease exists" not in wrong_reason
     assert lease.nonce != "not-the-holder"
+
+
+def _set_cursor(project: Path, label: str, *args: str) -> tuple[int, str, str]:
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        try:
+            rc = gm.main([
+                "set", "--project-root", str(project), "--controller-label", label,
+                "--json", *args,
+            ])
+        except SystemExit as exc:
+            rc = exc.code
+    return rc, stdout.getvalue(), stderr.getvalue()
+
+
+@pytest.mark.parametrize("drain", [False, True], ids=["position", "drain"])
+def test_owner_set_unwedges_changed_range_stale_version_and_retired_lease(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, drain: bool
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    lease = _claim(authority, "owner")
+    messages_dir = Path(os.environ["GOALFLIGHT_MESSAGES_DIR"])
+    _post(project, messages_dir, "owner", "withdrawn before acknowledgement")
+    _post(project, messages_dir, "owner", "processed through here")
+    peek = authority.cursor_peek("owner", nonce=lease.nonce)
+    first = peek.items[0]
+    assert authority.withdraw_delivery_event(
+        recipient_label="owner", origin_node=first["origin_node"],
+        event_uuid=first["event_uuid"],
+    ).committed
+    changed = authority.cursor_peek("owner", nonce=lease.nonce)
+    assert changed.cursor_version > peek.cursor_version
+    assert changed.stream_snapshots != peek.stream_snapshots
+    old_inputs = dict(
+        nonce=lease.nonce, expected_cursor_version=peek.cursor_version,
+        expected_stream_snapshots=peek.stream_snapshots,
+        advances={STREAM: 2}, actor="test-controller",
+    )
+    refused = authority.advance_cursor("owner", **old_inputs)
+    assert refused.cas_lost and "unseen position" in refused.reason
+    assert authority.release_lease("owner", nonce=lease.nonce).committed
+    assert authority.active_lease("owner") is None
+    refused = authority.advance_cursor("owner", **old_inputs)
+    assert refused.cas_lost and "no active lease" in refused.reason
+
+    # Even inherited stale identity must not become an owner-set precondition.
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LEASE_NONCE", lease.nonce)
+    args = ("--drain",) if drain else ("--position", f"{STREAM}=2")
+    rc, stdout, stderr = _set_cursor(project, "owner", *args)
+    assert rc == 0, stderr or stdout
+    assert json.loads(stdout)["advances"] == {STREAM: 2}
+    cursor = authority.cursor_status("owner")
+    assert cursor["positions"] == {STREAM: 2}
+    assert cursor["backlog_pending"] == 0
+    assert cursor["advanced_by"].startswith("controller:")
+    assert _pending(authority, "owner") == []
+
+
+def test_owner_set_keeps_mail_after_named_position_pending(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    _claim(authority, "owner")
+    _claim(authority, "peer")
+    messages_dir = Path(os.environ["GOALFLIGHT_MESSAGES_DIR"])
+    first = _post(project, messages_dir, "owner", "processed")
+    position = first["envelope"]["seq"]
+    # Arrivals between choosing the position and writing it remain unread.
+    _post(project, messages_dir, "owner", "arrived after position was chosen")
+    _post(project, messages_dir, "owner", "different stream", dispatch_id="untouched")
+    _post(project, messages_dir, "peer", "peer mail", dispatch_id="peer-stream")
+    for _ in range(2):  # Repeating an owner's set must also succeed.
+        rc, stdout, stderr = _set_cursor(project, "owner", "--position", f"{STREAM}={position}")
+        assert rc == 0, stderr or stdout
+        assert _pending(authority, "owner") == [(STREAM, 2), ("untouched", 1)]
+        assert authority.cursor_status("owner")["positions"] == {STREAM: position}
+        assert authority.cursor_status("owner")["backlog_pending"] == 1
+        assert _pending(authority, "peer") == [("peer-stream", 1)]
+
+
+def test_owner_set_names_exact_positions_without_a_lease_or_known_delivery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    assert authority.cursor_status("owner") is None
+    for position in (9, 3, 0):
+        rc, stdout, stderr = _set_cursor(
+            project, "owner", "--position", f"{STREAM}={position}", "other=4"
+        )
+        assert rc == 0, stderr or stdout
+        assert authority.cursor_status("owner")["positions"] == {STREAM: position, "other": 4}
+        assert authority.active_lease("owner") is None
+
+
+def test_owner_set_drain_includes_all_deliverable_streams_and_is_repeatable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    messages_dir = Path(os.environ["GOALFLIGHT_MESSAGES_DIR"])
+    _post(project, messages_dir, "owner", "first stream")
+    _post(project, messages_dir, "owner", "same stream")
+    _post(project, messages_dir, "owner", "last stream", dispatch_id="z-last")
+    for _ in range(2):
+        rc, stdout, stderr = _set_cursor(project, "owner", "--drain")
+        assert rc == 0, stderr or stdout
+        assert authority.cursor_status("owner")["positions"] == {STREAM: 2, "z-last": 1}
+        assert _pending(authority, "owner") == []
+
+
+def test_owner_set_drain_has_no_peek_cap_and_excludes_undeliverable_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _git_project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    _claim(authority, "owner")
+    messages_dir = Path(os.environ["GOALFLIGHT_MESSAGES_DIR"])
+    _post(project, messages_dir, "owner", "seed")
+
+    def seed(connection):
+        # Bulk fixture beyond cursor_peek's maximum of 10,000. Carrier content
+        # is irrelevant to setting a bookmark; delivery state is authoritative.
+        connection.execute(
+            """
+            WITH RECURSIVE seqs(n) AS (
+                SELECT 2 UNION ALL SELECT n + 1 FROM seqs WHERE n < 10003
+            )
+            INSERT INTO delivery_events (
+                project_root, recipient_label, origin_node, event_uuid,
+                stream_id, stream_seq, carrier_path, event_type, wake_class,
+                created_at, projected_at, withdrawn_at
+            )
+            SELECT e.project_root, e.recipient_label, e.origin_node,
+                   printf('%08x-0000-4000-8000-000000000000', n), e.stream_id,
+                   n, e.carrier_path, e.event_type, e.wake_class, e.created_at,
+                   CASE WHEN n = 10002 THEN NULL ELSE e.projected_at END,
+                   CASE WHEN n = 10003 THEN e.projected_at ELSE NULL END
+            FROM delivery_events AS e CROSS JOIN seqs WHERE e.stream_seq = 1
+            """
+        )
+
+    assert authority._domain_write(seed).committed
+    _post(project, messages_dir, "owner", "last stream", dispatch_id="z-last")
+    rc, stdout, stderr = _set_cursor(project, "owner", "--drain")
+    assert rc == 0, stderr or stdout
+    assert authority.cursor_status("owner")["positions"] == {STREAM: 10001, "z-last": 1}
+    assert _pending(authority, "owner") == []
+    # Projection beyond the drained boundary remains pending when it arrives.
+    row = authority.read_all(
+        "SELECT origin_node, event_uuid FROM delivery_events WHERE stream_seq = 10002"
+    )[0]
+    assert authority.mark_delivery_projected(
+        recipient_label="owner", origin_node=row["origin_node"], event_uuid=row["event_uuid"],
+    ).committed
+    assert _pending(authority, "owner") == [(STREAM, 10002)]

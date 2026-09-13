@@ -5451,6 +5451,8 @@ def cmd_relay(args: argparse.Namespace) -> int:
 
 def _parse_cursor_positions(
     values: list[str] | list[list[str]] | None,
+    *,
+    allow_zero: bool = False,
 ) -> dict[str, int]:
     advances: dict[str, int] = {}
     for group in values or []:
@@ -5466,7 +5468,9 @@ def _parse_cursor_positions(
                 position = int(position_text)
             except ValueError as exc:
                 raise ValueError("cursor position sequence must be an integer") from exc
-            if position <= 0:
+            if position < 0 or (position == 0 and not allow_zero):
+                if allow_zero:
+                    raise ValueError("cursor position sequence must be non-negative")
                 raise ValueError("cursor position sequence must be positive")
             advances[stream] = max(advances.get(stream, 0), position)
     if not advances:
@@ -5667,6 +5671,49 @@ def cmd_advance_cursor(args: argparse.Namespace) -> int:
             f"cursor advanced {result.value['previous_cursor_version']}"
             f"->{result.value['cursor_version']}"
         )
+    return 0
+
+
+def cmd_set_cursor(args: argparse.Namespace) -> int:
+    """Write an owner's bookmark without a lease, version, or range token."""
+    import goalflight_journal  # type: ignore
+    import goalflight_session_status as sessions  # type: ignore
+    import goalflight_task  # type: ignore
+
+    project_root = goalflight_task.resolve_project_root(
+        args.project_root or str(Path.cwd())
+    )
+    label = str(
+        args.controller_label
+        or sessions.resolve_controller_label(project_root=project_root)
+        or ""
+    ).strip()
+    try:
+        if not label:
+            raise ValueError("controller label is required")
+        positions = None if args.drain else _parse_cursor_positions(args.position, allow_zero=True)
+        result = goalflight_journal.Journal(project_root).set_cursor(
+            label, positions=positions, actor=f"controller:{os.getpid()}:set",
+        )
+    except goalflight_journal.JournalUpgradeRequired:
+        raise
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+        ValueError,
+    ) as exc:
+        print(f"set: {exc}", file=sys.stderr)
+        return 2
+    if not result.committed or result.value is None:
+        print(f"set: {result.reason or 'cursor write failed'}", file=sys.stderr)
+        return 3
+    if args.json:
+        print(json.dumps(result.value, sort_keys=True))
+    else:
+        print("cursor set " + " ".join(
+            f"{stream}={position}" for stream, position in result.value["advances"].items()
+        ))
     return 0
 
 
@@ -9059,6 +9106,24 @@ def _run_cli(argv: list[str] | None = None) -> int:
     )
     advance.add_argument("--json", action="store_true")
     advance.set_defaults(func=cmd_advance_cursor)
+
+    cursor_set = sub.add_parser(
+        "set",
+        help="Set the owner's cursor unconditionally; no lease or tokens required",
+    )
+    cursor_set.add_argument("--project-root", default=None)
+    cursor_set.add_argument("--controller-label", default=None)
+    target = cursor_set.add_mutually_exclusive_group(required=True)
+    target.add_argument(
+        "--position", action="append", nargs="+", metavar="STREAM=SEQ",
+        help="exact per-stream positions processed by the owner; zero rewinds to the start",
+    )
+    target.add_argument(
+        "--drain", action="store_true",
+        help="set through every currently deliverable stream in one journal transaction",
+    )
+    cursor_set.add_argument("--json", action="store_true")
+    cursor_set.set_defaults(func=cmd_set_cursor)
 
     def add_listen_arguments(command_parser: argparse.ArgumentParser) -> None:
         command_parser.add_argument("--project-root", default=None)
