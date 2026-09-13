@@ -484,6 +484,176 @@ def test_follow_emits_unacked_reported_backlog(
         proc.wait(timeout=5)
 
 
+@pytest.mark.parametrize("advance_during", ["materialization", "emission"])
+def test_follow_drops_replays_advanced_while_batch_is_in_flight(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    advance_during: str,
+) -> None:
+    """A live follower must discard a batch consumed since its last peek."""
+    project, env, lease = isolated
+    authority = journal.Journal(project)
+    streams = [f"replay-worker-{index:02d}" for index in range(10)]
+    for stream in streams:
+        messages.post_message(
+            dispatch_id=stream,
+            msg_type="controller-notice",
+            payload={"text": "consume this while follow stays alive"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(lease.label, project_root=project),
+        )
+
+    delivered: list[tuple[str, int]] = []
+    replayed: list[tuple[str, int]] = []
+    versions: list[int] = []
+    drained = False
+    fresh_delivered = False
+    polls = 0
+    original_materialize = messages._envelopes_with_rows
+
+    def advance(stream_id: str) -> None:
+        snapshot = authority.cursor_peek(lease.label, nonce=lease.nonce)
+        position = max(
+            int(row["stream_seq"])
+            for row in snapshot.items
+            if row["stream_id"] == stream_id
+        )
+        result = authority.advance_cursor(
+            lease.label,
+            nonce=lease.nonce,
+            expected_cursor_version=snapshot.cursor_version,
+            expected_stream_snapshots={stream_id: snapshot.stream_snapshots[stream_id]},
+            advances={stream_id: position},
+            actor="pytest",
+        )
+        assert result.committed
+        versions.append(authority.cursor_status(lease.label)["cursor_version"])
+
+    def drain_remaining() -> None:
+        nonlocal drained
+        for stream_id in streams[1:]:
+            advance(stream_id)
+        drained = True
+        assert not authority.cursor_peek(lease.label, nonce=lease.nonce).items
+        messages.post_message(
+            dispatch_id=streams[-1],
+            msg_type="controller-notice",
+            payload={"text": "new mail after the drain"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(lease.label, project_root=project),
+        )
+
+    def materialize(current_authority, rows, **kwargs):
+        nonlocal polls
+        polls += 1
+        assert polls < 20, "follow never settled after the controller drained"
+        visible = original_materialize(current_authority, rows, **kwargs)
+        if polls == 2 and advance_during == "materialization":
+            # Real carrier reads can outlive a controller advance. The returned
+            # rows were pending at peek time, but are acknowledged on return.
+            drain_remaining()
+        return visible
+
+    def write(record, **_kwargs):
+        nonlocal fresh_delivered
+        if record["kind"] != "event":
+            return True
+        payload = record["payload"]
+        assert payload["type"] == "controller-notice", record
+        identity = (payload["dispatch_id"], payload["stream_seq"])
+        positions = authority.cursor_status(lease.label)["positions"]
+        if payload["stream_seq"] <= positions.get(payload["stream_id"], 0):
+            assert identity in delivered, "the regression must exercise a replay"
+            replayed.append(identity)
+            return False
+        delivered.append(identity)
+        if identity == (streams[-1], 2):
+            fresh_delivered = True
+            return False
+        if len(delivered) == len(streams):
+            # Advance one stream to trigger another ring, keeping the other
+            # nine legitimately unread until the next batch is in flight.
+            advance(streams[0])
+        elif len(delivered) > len(streams) and not drained:
+            assert advance_during == "emission"
+            drain_remaining()
+        return True
+
+    _pin_listener_resolution(monkeypatch, lease)
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    monkeypatch.setattr(messages, "_envelopes_with_rows", materialize)
+    monkeypatch.setattr(messages, "_write_follow_record", write)
+    monkeypatch.setattr(messages, "_silence_broken_stdout", lambda _stream: None)
+    assert messages.main(_follow_argv(project, lease)) == 0
+    assert drained
+    assert len(versions) == len(streams)
+    assert versions == sorted(set(versions)), "cursor must keep advancing"
+    assert not replayed, f"follow re-emitted already-advanced envelopes: {replayed}"
+    assert fresh_delivered, "discarding stale rows must not suppress new mail"
+    assert set(delivered) == {(stream_id, 1) for stream_id in streams} | {(streams[-1], 2)}
+
+
+@pytest.mark.parametrize("failure", ["busy", "unreadable"])
+def test_follow_delivery_cursor_failure_does_not_consume_ring(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    project, env, lease = isolated
+    messages.post_message(
+        dispatch_id="delivery-cursor-failure",
+        msg_type="controller-notice",
+        payload={"text": "keep unread mail deliverable after a cursor read failure"},
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+        addressee=messages.controller_addressee(lease.label, project_root=project),
+    )
+    snapshot = journal.Journal(project).cursor_peek(lease.label, nonce=lease.nonce)
+    original_status = journal.Journal.cursor_status
+    reads = 0
+    records = []
+
+    def status(authority, label):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            assert not wake.claim_ring(
+                project, controller_label=label, cursor_version=snapshot.cursor_version
+            ), "inject the read failure only after follow owns the ring"
+            if failure == "busy":
+                raise journal.JournalBusy("delivery cursor temporarily busy")
+            return None
+        return original_status(authority, label)
+
+    def write(record, **_kwargs):
+        records.append(record)
+        assert len(records) < 20, "follow never retried mail after releasing the failed ring"
+        return record["kind"] != "heartbeat" or reads < 2
+
+    _pin_listener_resolution(monkeypatch, lease)
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    monkeypatch.setattr(messages, "_silence_broken_stdout", lambda _stream: None)
+    monkeypatch.setattr(messages, "_write_follow_record", write)
+    monkeypatch.setattr(journal.Journal, "cursor_status", status)
+    code = messages.main(_follow_argv(project, lease))
+    types = [row["payload"]["type"] for row in records if row["kind"] == "event"]
+    if failure == "busy":
+        assert code == 0
+        assert reads == 2
+        assert types.count("controller-notice") == 1
+        assert "listener-degraded" in types
+        assert "listener-recovered" in types
+    else:
+        assert code == 2
+        assert types == ["listener-fault"], "unknown consumption must not emit mail"
+        assert wake.claim_ring(
+            project, controller_label=lease.label, cursor_version=snapshot.cursor_version
+        ), "unreadability must leave the ring reclaimable by a replacement"
+    assert journal.Journal(project).cursor_peek(lease.label, nonce=lease.nonce).items
+
+
 def test_epipe_exits_and_releases_persistent_monitor_slot(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
 ) -> None:
@@ -524,6 +694,7 @@ def test_epipe_before_first_event_releases_ring_for_replacement(
     ]
     alive, emitted = messages._emit_claimed_follow_events(
         project,
+        authority=journal.Journal(project),
         controller_label=lease.label,
         cursor_version=77,
         visible=visible,

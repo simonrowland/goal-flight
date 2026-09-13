@@ -6734,12 +6734,13 @@ def _follow_inert_knob_warnings() -> list[str]:
 def _emit_claimed_follow_events(
     project_root: Path,
     *,
+    authority,
     controller_label: str,
     cursor_version: int,
     visible: list[tuple[dict, dict]],
     emit: Callable[[dict[str, object]], bool],
 ) -> tuple[bool, bool]:
-    """Reserve one cursor ring and roll it back unless every event was written."""
+    """Emit still-unread rows; roll back the ring if delivery fails."""
     if not visible:
         return True, False
     ring_claimed = goalflight_wake.claim_ring(
@@ -6749,8 +6750,14 @@ def _emit_claimed_follow_events(
     )
     if not ring_claimed:
         return True, False
+    emitted_event = False
     try:
         for row, envelope in visible:
+            # Carrier reads and earlier writes can outlive a controller drain.
+            # The batch is only a candidate list; the journal owns consumption.
+            positions = _journal_cursor_positions(authority, controller_label)
+            if int(row["stream_seq"]) <= positions.get(str(row["stream_id"]), 0):
+                continue
             if not emit(
                 _follow_event_record(
                     row, envelope, cursor_version=cursor_version
@@ -6766,6 +6773,7 @@ def _emit_claimed_follow_events(
                         "failed delivery could not release its cursor ring"
                     )
                 return False, False
+            emitted_event = True
     except BaseException:
         goalflight_wake.release_ring_claim(
             project_root,
@@ -6773,7 +6781,7 @@ def _emit_claimed_follow_events(
             cursor_version=cursor_version,
         )
         raise
-    return True, True
+    return True, emitted_event
 
 
 def cmd_follow(args) -> int:
@@ -7083,12 +7091,8 @@ def cmd_follow(args) -> int:
                         }
                     )
                     return 3
-                # Follow peeks the live cursor every poll. Backup doorbells
-                # snapshot cursor_version at arm. Those two clocks can
-                # diverge inside one supervisor; a stuck peek then re-emits
-                # the unread set every successful ring claim. The supervisor
-                # mux caps that flood; this peek must still carry
-                # cursor_version on each event so lag is observable.
+                # A fresh peek selects candidates; delivery rechecks positions
+                # because carrier reads and stdout writes can span advances.
                 snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)
                 candidate_rows = [
                     item
@@ -7102,6 +7106,20 @@ def cmd_follow(args) -> int:
                     controller_label=label,
                     lease_nonce=nonce,
                 )
+                try:
+                    alive, emitted_event = _emit_claimed_follow_events(
+                        project_root,
+                        authority=authority,
+                        controller_label=label,
+                        cursor_version=snapshot.cursor_version,
+                        visible=visible,
+                        emit=emit,
+                    )
+                except goalflight_journal.JournalError:
+                    # Delivery's position reads share peek's busy tolerance.
+                    raise
+                except (OSError, RuntimeError, ValueError) as exc:
+                    return fail("ring-stamp-unavailable", exc, code=2)
             except goalflight_journal.CASMismatch as exc:
                 current_lease = authority.active_lease(label)
                 if current_lease is None or current_lease.nonce != nonce:
@@ -7172,16 +7190,6 @@ def cmd_follow(args) -> int:
                 time.sleep(min(delay, max(0.0, next_heartbeat - time.monotonic())))
                 continue
 
-            try:
-                alive, emitted_event = _emit_claimed_follow_events(
-                    project_root,
-                    controller_label=label,
-                    cursor_version=snapshot.cursor_version,
-                    visible=visible,
-                    emit=emit,
-                )
-            except (OSError, RuntimeError, ValueError) as exc:
-                return fail("ring-stamp-unavailable", exc, code=2)
             if not alive:
                 return 0
             now = time.monotonic()
