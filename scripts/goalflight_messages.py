@@ -4212,7 +4212,14 @@ def _claimed_listen_lease_or_liveness(
             )
         except goalflight_journal.JournalBusy:
             raise
-        except goalflight_journal.JournalUpgradeRequired:
+        except goalflight_journal.JournalUpgradeRequired as exc:
+            if getattr(exc, "pending_migration", False):
+                return {
+                    "claimed": False,
+                    "reason": "pending-migration",
+                    "label": controller_label,
+                    "detail": str(exc),
+                }
             raise
         except (
             goalflight_journal.JournalDisappeared,
@@ -4223,6 +4230,29 @@ def _claimed_listen_lease_or_liveness(
                 "reason": _journal_failure_reason(exc),
                 "label": controller_label,
             }
+        try:
+            goalflight_journal.Journal(
+                project_root,
+                allow_migration=False,
+                retry_budget_s=0.05,
+                open_retry_budget_s=0.05,
+            )
+        except goalflight_journal.JournalUpgradeRequired as exc:
+            if getattr(exc, "pending_migration", False):
+                return {
+                    "claimed": False,
+                    "reason": "pending-migration",
+                    "label": controller_label,
+                    "detail": str(exc),
+                }
+            raise
+        except (
+            goalflight_journal.JournalBusy,
+            goalflight_journal.JournalDisappeared,
+            goalflight_journal.JournalIOError,
+            goalflight_journal.JournalError,
+        ):
+            pass
         return {
             "claimed": False,
             "reason": "journal-unavailable",
@@ -4255,6 +4285,16 @@ def _claimed_listen_lease_or_liveness(
     }
 
 
+def _listen_pending_migration_exit(prefix: str, detail: object) -> int:
+    """Name a pending migration instead of calling the unreadability retryable."""
+    text = str(detail or "").strip() or "run goalflight_journal.py migrate"
+    print(
+        f"{prefix}: journal-unavailable: pending migration; {text}",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def _listen_unclaimed_exit(
     prefix: str,
     resolved: dict[str, object],
@@ -4285,6 +4325,8 @@ def _listen_unclaimed_exit(
             file=sys.stderr,
         )
         return LISTENER_DID_NOT_ARM_EXIT
+    if reason == "pending-migration":
+        return _listen_pending_migration_exit(prefix, resolved.get("detail"))
     if reason in {"journal-unavailable", "journal-io-failure"}:
         print(
             f"{prefix}: {reason}: could not confirm a live controller lease; "
@@ -7752,7 +7794,9 @@ def cmd_listen(args) -> int:
             on_degraded=startup_degraded,
             on_recovered=startup_recovered,
         )
-    except goalflight_journal.JournalUpgradeRequired:
+    except goalflight_journal.JournalUpgradeRequired as exc:
+        if getattr(exc, "pending_migration", False):
+            return _listen_pending_migration_exit(prefix, exc)
         raise
     except (
         goalflight_journal.JournalBusy,
@@ -7826,7 +7870,9 @@ def cmd_listen(args) -> int:
         if not isinstance(identity, dict) or not identity.get("start_token"):
             raise MessageError("listener process identity is unavailable")
         parent_pid = os.getppid()
-    except goalflight_journal.JournalUpgradeRequired:
+    except goalflight_journal.JournalUpgradeRequired as exc:
+        if getattr(exc, "pending_migration", False):
+            return _listen_pending_migration_exit(prefix, exc)
         raise
     except (
         goalflight_journal.JournalBusy,

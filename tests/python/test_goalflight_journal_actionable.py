@@ -127,6 +127,90 @@ def test_migration_required_names_migrate_command_first(
     assert journal.main(["--project-root", str(project), "inspect"]) == 2
 
 
+def _pending_equal_epoch_rewind_journal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[Path, journal.Journal]:
+    """Epoch-current journal missing the additive rewind table."""
+    _set_state_env(monkeypatch, tmp_path)
+    monkeypatch.delenv(journal.ALLOW_MIGRATION_ENV, raising=False)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute("DROP TABLE IF EXISTS controller_stream_rewinds")
+        stored = tuple(
+            connection.execute(
+                """SELECT schema_epoch, protocol_epoch, registry_epoch,
+                          minimum_reader_epoch, minimum_writer_epoch
+                   FROM journal_epochs WHERE singleton = 1"""
+            ).fetchone()
+        )
+    assert stored == (
+        journal.CURRENT_SCHEMA_EPOCH,
+        journal.CURRENT_PROTOCOL_EPOCH,
+        journal.CURRENT_REGISTRY_EPOCH,
+        journal.CURRENT_READER_EPOCH,
+        journal.CURRENT_WRITER_EPOCH,
+    )
+    return project, authority
+
+
+def test_pending_structural_migration_permits_snapshot_and_dump(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, _authority = _pending_equal_epoch_rewind_journal(monkeypatch, tmp_path)
+    snapshot = tmp_path / "pre-migrate.sqlite3"
+
+    assert journal.main(
+        ["--project-root", str(project), "snapshot", "--output", str(snapshot)]
+    ) == 0
+    assert snapshot.is_file()
+    with sqlite3.connect(snapshot) as connection:
+        assert [str(row[0]) for row in connection.execute("PRAGMA integrity_check")] == [
+            "ok"
+        ]
+    assert journal._validate_snapshot_file(snapshot).schema == journal.CURRENT_SCHEMA_EPOCH
+
+    capsys.readouterr()
+    assert journal.main(["--project-root", str(project), "dump"]) == 0
+    sql = capsys.readouterr().out
+    assert "CREATE TABLE journal_meta" in sql
+    rebuilt = tmp_path / "from-dump.sqlite3"
+    with sqlite3.connect(rebuilt) as connection:
+        connection.executescript(sql)
+        assert [str(row[0]) for row in connection.execute("PRAGMA integrity_check")] == [
+            "ok"
+        ]
+
+    assert journal.main(["--project-root", str(project), "inspect"]) == 0
+    with pytest.raises(journal.JournalUpgradeRequired):
+        journal.Journal(project, allow_migration=False)
+
+
+def test_pending_structural_migration_refusal_names_change_and_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project, _authority = _pending_equal_epoch_rewind_journal(monkeypatch, tmp_path)
+
+    with pytest.raises(journal.JournalUpgradeRequired) as captured:
+        journal.Journal(project, allow_migration=False)
+
+    message = str(captured.value)
+    assert message.startswith("UPGRADE_REQUIRED: run ")
+    assert "goalflight_journal.py" in message
+    assert " migrate" in message
+    assert "adds table controller_stream_rewinds" in message
+    assert "--controller-startup" in message
+    assert '"claimed": true' in message
+    assert "inspect" in message
+    assert "journal epochs=" not in message
+    assert "client epochs=" not in message
+    assert message.count("\n") == 0
+
+
 def test_dual_open_failure_names_doctor_and_journal_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

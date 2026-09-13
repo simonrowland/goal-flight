@@ -42,7 +42,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Generic, TypeVar
 
 
@@ -269,6 +269,8 @@ class JournalIntegrityError(JournalError):
 
 class JournalUpgradeRequired(JournalError):
     """The client epochs are incompatible with the journal epochs."""
+
+    pending_migration = False
 
 
 class JournalUnavailable(JournalError):
@@ -1573,7 +1575,17 @@ class Journal:
                 bool(missing_before) or legacy_outbox or legacy_attempt_seat
             )
             if repairable_shape and not self.allow_migration:
-                self._raise_migration_required(stored)
+                changes = [f"adds table {table}" for table in missing_before]
+                if legacy_outbox:
+                    changes.append(
+                        "adds terminal_outbox columns projection_retry_at and "
+                        "projection_quarantined_at"
+                    )
+                if legacy_attempt_seat:
+                    changes.append(
+                        "adds dispatch_attempts columns effective_account and engine"
+                    )
+                self._raise_migration_required(stored, changes=changes)
             retry_columns_migrated = self._install_outbox_retry_columns(connection)
             seat_columns_migrated = self._install_attempt_seat_columns(connection)
             outbox_events_migrated = self._install_outbox_event_types(connection, stored)
@@ -1688,22 +1700,66 @@ class Journal:
         )
         return True
 
-    def _raise_migration_required(self, stored: tuple[int, ...]) -> None:
-        command = shlex.join(
+    def _raise_migration_required(
+        self,
+        stored: tuple[int, ...],
+        *,
+        changes: Sequence[str] = (),
+    ) -> None:
+        journal_script = str(Path(__file__).resolve())
+        migrate_command = shlex.join(
             [
                 sys.executable,
-                str(Path(__file__).resolve()),
+                journal_script,
                 "--project-root",
                 str(self.project_root),
                 "migrate",
             ]
         )
-        raise JournalUpgradeRequired(
-            f"UPGRADE_REQUIRED: run {command}; journal migration is disabled "
-            "for ordinary opens; "
-            f"journal epochs={stored}, client epochs="
-            f"{(CURRENT_SCHEMA_EPOCH, CURRENT_PROTOCOL_EPOCH, CURRENT_REGISTRY_EPOCH, CURRENT_READER_EPOCH, CURRENT_WRITER_EPOCH)}"
+        inspect_command = shlex.join(
+            [
+                sys.executable,
+                journal_script,
+                "--project-root",
+                str(self.project_root),
+                "inspect",
+            ]
         )
+        verify_command = shlex.join(
+            [
+                sys.executable,
+                str(SCRIPT_DIR / "goalflight_session_status.py"),
+                "--project-root",
+                str(self.project_root),
+                "--controller-startup",
+            ]
+        )
+        client = (
+            CURRENT_SCHEMA_EPOCH,
+            CURRENT_PROTOCOL_EPOCH,
+            CURRENT_REGISTRY_EPOCH,
+            CURRENT_READER_EPOCH,
+            CURRENT_WRITER_EPOCH,
+        )
+        detail = (
+            f"UPGRADE_REQUIRED: run {migrate_command}; journal migration is "
+            "disabled for ordinary opens"
+        )
+        if stored != client:
+            detail += f"; journal epochs={stored}, client epochs={client}"
+        else:
+            if changes:
+                detail += "; pending change: " + "; ".join(changes)
+            detail += (
+                "; writes refuse until migrate (peer mail and dispatch included); "
+                f"inspect, dump, and snapshot remain available; {inspect_command} "
+                "names the journal path; snapshot is the reversible pre-image "
+                f'(restore needs it); verify after migrate: {verify_command} '
+                'reports "claimed": true'
+            )
+        error = JournalUpgradeRequired(detail)
+        error.pending_migration = True
+        raise error
 
     @staticmethod
     def _install_attempt_owner_columns(connection: sqlite3.Connection) -> bool:
@@ -1806,7 +1862,13 @@ class Journal:
         if not legacy_check.search(sql):
             return False
         if not self.allow_migration:
-            self._raise_migration_required(stored)
+            self._raise_migration_required(
+                stored,
+                changes=[
+                    "widens terminal_outbox event_type CHECK to include "
+                    "user_need and user_confirm"
+                ],
+            )
         # Preserve the table's other constraints, every row/column, and its
         # explicit indexes. SQLite recreates UNIQUE autoindexes with the table.
         indexes = connection.execute(
@@ -6046,7 +6108,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "dump":
             print("\n".join(Journal.open_reader(args.project_root).dump_sql()))
         elif args.command == "snapshot":
-            print(Journal(args.project_root).snapshot(args.output))
+            print(Journal.open_reader(args.project_root).snapshot(args.output))
         else:
             print(
                 restore_snapshot(

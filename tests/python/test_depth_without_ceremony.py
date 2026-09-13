@@ -410,6 +410,29 @@ def test_listen_auto_propagates_journal_epoch_fence(
     assert "lease-nonce-not-live" not in refused.stderr
 
 
+def test_listen_pending_structural_migration_names_cause_not_retryable(
+    isolated: tuple[Path, dict[str, str]],
+) -> None:
+    project, env = isolated
+    lease = _claim(project)
+    authority = journal.Journal.open_reader(project)
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute("DROP TABLE IF EXISTS controller_stream_rewinds")
+    with wake.register_lease_holder(
+        project, controller_label="depth-ctl", lease_nonce=lease.nonce
+    ):
+        refused = _run(
+            project,
+            env,
+            _listen_auto_cmd(project, label="depth-ctl", nonce=lease.nonce),
+        )
+    assert refused.returncode == 2, refused.stderr
+    assert "journal-unavailable" in refused.stderr
+    assert "pending migration" in refused.stderr
+    assert "migrate" in refused.stderr
+    assert "this is retryable, not a dead nonce" not in refused.stderr
+
+
 def test_listen_auto_genuinely_stale_nonce_remains_distinct(
     isolated: tuple[Path, dict[str, str]],
 ) -> None:
