@@ -2203,6 +2203,79 @@ def test_terminal_outbox_retry_heals_partial_recipient_fanout(
     )[0]["projected_at"] is not None
 
 
+@pytest.mark.parametrize("foreign_owner", [True, False], ids=["foreign-skip", "own-corrupt"])
+def test_listen_task_store_missing_carrier_rechecks_delivery_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    foreign_owner: bool,
+) -> None:
+    import goalflight_task as task
+
+    _set_state_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("GOALFLIGHT_DISABLE_NUDGES", raising=False)
+    monkeypatch.setenv("GOALFLIGHT_TEST_LISTENER_START_TOKEN", "task-store-listener")
+    monkeypatch.setattr(wake, "_process_listing", lambda **_kwargs: [])
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    local = _claim(authority, "lane-a")
+    other = _claim(authority, "lane-b")
+    # _claim uses a constructed process identity; this test exercises delivery,
+    # not the separate live-holder probe.
+    monkeypatch.setattr(messages, "_resolve_listen_auto_lease", lambda *_args, **_kwargs: {
+        "claimed": True, "nonce": local.nonce,
+    })
+    task.post_done_suggest_nudge(["t-1"], project, "worker-b")
+    stale = authority.cursor_peek("lane-a", nonce=local.nonce)
+    assert len(stale.items) == 1
+    row = stale.items[0]
+    assert row["recipient_label"] == "*"
+    assert row["stream_id"] == task._next_nudge_dispatch_id(project)
+
+    if foreign_owner:
+        # Both lanes see the wildcard. B processes it after A's snapshot;
+        # another done nudge then removes its superseded carrier envelope.
+        other_peek = authority.cursor_peek("lane-b", nonce=other.nonce)
+        assert other_peek.items == stale.items
+        assert authority.advance_cursor(
+            "lane-b",
+            nonce=other.nonce,
+            expected_cursor_version=other_peek.cursor_version,
+            expected_stream_snapshots=other_peek.stream_snapshots,
+            advances={str(row["stream_id"]): int(row["stream_seq"])},
+            actor="lane-b",
+        ).committed
+        task.post_done_suggest_nudge(["t-2"], project, "worker-b-next")
+        current = authority.read_all(
+            "SELECT recipient_label FROM delivery_events WHERE event_uuid = ?",
+            (row["event_uuid"],),
+        )
+        assert current[0]["recipient_label"] == "lane-b"
+    else:
+        # No retirement, replacement, or other owner: the live wildcard
+        # assignment still belongs in A's view, but its carrier is corrupt.
+        messages.update_envelopes(Path(str(row["carrier_path"])), lambda _rows: ([], None))
+
+    assert not any(
+        envelope["id"] == row["event_uuid"]
+        for envelope in messages.read_envelopes(Path(str(row["carrier_path"])))
+    )
+    monkeypatch.setattr(journal.Journal, "cursor_peek", lambda *_args, **_kwargs: stale)
+    capsys.readouterr()
+    result = messages.main([
+        "listen", "--project-root", str(project),
+        "--controller-label", "lane-a", "--lease-nonce", local.nonce,
+        "--report-pending", "--poll-secs", "0.01", "--timeout-s", "1",
+    ])
+    output = capsys.readouterr()
+    if foreign_owner:
+        assert result == 1, output.err  # Quiet timeout: foreign row never rings.
+        assert "no projected carrier row" not in output.err
+    else:
+        assert result == 2, output.err
+        assert "journal delivery assignment has no projected carrier row" in output.err
+
+
 def test_first_wildcard_processor_adopts_once_while_unhandled_rows_wait(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

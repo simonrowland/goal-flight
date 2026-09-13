@@ -3626,8 +3626,9 @@ def _listener_envelope(
     authority,
     row: dict[str, object],
     *,
+    controller_label: str | None = None,
     attention_by_id: dict[str, dict[str, object]] | None = None,
-) -> dict:
+) -> dict | None:
     carrier_path = str(row.get("carrier_path") or "")
     # Synthetic journal carriers ("journal:goal-flight-resume:",
     # "journal:outbox-quarantine:", …) have no .jsonl file; their payload lives
@@ -3676,6 +3677,23 @@ def _listener_envelope(
         None,
     )
     if envelope is None:
+        if controller_label is not None:
+            # A peer can adopt a wildcard after our cursor snapshot, then a
+            # task-store replacement removes its old carrier. Only durable
+            # foreign ownership makes that missing envelope safe to skip.
+            assignments = authority.read_all(
+                """SELECT recipient_label FROM delivery_events
+                   WHERE project_root = ? AND origin_node = ? AND event_uuid = ?
+                     AND stream_id = ? AND stream_seq = ? AND withdrawn_at IS NULL""",
+                (str(authority.project_root), origin_node, event_uuid,
+                 str(row.get("stream_id") or ""), stream_seq),
+            )
+            if assignments and all(
+                item["recipient_label"]
+                and item["recipient_label"] not in {controller_label, "*"}
+                for item in assignments
+            ):
+                return None
         raise MessageError(
             f"journal delivery assignment has no projected carrier row: {path}:{stream_seq}"
         )
@@ -3948,9 +3966,11 @@ def controller_mail_summary(
     carrier_errors: list[dict[str, object]] = []
     for row in rows:
         try:
-            envelope = _listener_envelope(authority, row)
+            envelope = _listener_envelope(authority, row, controller_label=label)
         except MessageError as exc:
             carrier_errors.append({"error": str(exc), "carrier_path": row.get("carrier_path")})
+            continue
+        if envelope is None:
             continue
         payload = envelope.get("payload")
         payload = payload if isinstance(payload, dict) else {}
@@ -4944,21 +4964,22 @@ def _envelopes_with_rows(
     authority,
     rows: list[dict] | tuple[dict, ...],
     *,
+    controller_label: str | None = None,
     attention_by_id: dict[str, dict[str, object]] | None = None,
 ) -> list[tuple[dict, dict]]:
     if attention_by_id is None:
         attention_by_id = _attention_items_for_rows(authority, rows)
-    return [
-        (
+    items = []
+    for row in rows:
+        envelope = _listener_envelope(
+            authority,
             row,
-            _listener_envelope(
-                authority,
-                row,
-                attention_by_id=attention_by_id,
-            ),
+            controller_label=controller_label,
+            attention_by_id=attention_by_id,
         )
-        for row in rows
-    ]
+        if envelope is not None:
+            items.append((row, envelope))
+    return items
 
 
 def _foreign_controller_items(
@@ -5221,7 +5242,7 @@ def cmd_relay(args: argparse.Namespace) -> int:
             raise MessageError("active controller lease is unavailable")
         peek = authority.cursor_peek(controller_label, nonce=lease.nonce, limit=1000)
         rows = list(peek.items)
-        items_with_rows = _envelopes_with_rows(authority, rows)
+        items_with_rows = _envelopes_with_rows(authority, rows, controller_label=controller_label)
         if since is not None:
             items_with_rows = [
                 (row, envelope)
@@ -7077,7 +7098,7 @@ def cmd_follow(args) -> int:
                     > arm_high.get(str(item.get("stream_id") or ""), 0)
                 ]
                 visible: list[tuple[dict, dict]] | None = _foreign_controller_items(
-                    _envelopes_with_rows(authority, candidate_rows),
+                    _envelopes_with_rows(authority, candidate_rows, controller_label=label),
                     controller_label=label,
                     lease_nonce=nonce,
                 )
@@ -7778,6 +7799,7 @@ def cmd_listen(args) -> int:
                             _envelopes_with_rows(
                                 authority,
                                 list(arm_snapshot.items),
+                                controller_label=label,
                             ),
                             controller_label=label,
                             lease_nonce=nonce,
@@ -8261,7 +8283,7 @@ def cmd_listen(args) -> int:
             if visible_arm_items is None:
                 visible_arm_items = _retry_listener_journal_busy(
                     lambda: _foreign_controller_items(
-                        _envelopes_with_rows(authority, list(report_items)),
+                        _envelopes_with_rows(authority, list(report_items), controller_label=label),
                         controller_label=label,
                         lease_nonce=nonce,
                     ),
@@ -8487,6 +8509,7 @@ def cmd_listen(args) -> int:
             candidate_items = _envelopes_with_rows(
                 authority,
                 candidate_rows,
+                controller_label=label,
                 attention_by_id=candidate_attention,
             )
             wakeable_items = bool(
@@ -8508,6 +8531,7 @@ def cmd_listen(args) -> int:
                     _envelopes_with_rows(
                         authority,
                         list(peek.items),
+                        controller_label=label,
                         attention_by_id=candidate_attention,
                     ),
                     controller_label=label,
