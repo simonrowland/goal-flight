@@ -26,13 +26,14 @@ Pre-reconcile identity checks use ``identity_matches`` (the helper that
 existed before this gate) so a revert of the gate fails on ``committed`` /
 ledger state, not ``AttributeError: worker_identity_liveness``.
 
-Every liveness precondition here is REAL: the "worker" is an actual spawned
-child process whose pid and start token are recorded from the live process
-table. No double answers the liveness question (b-235).
+Workers are actual spawned children whose pid and start token are recorded
+from the live process table. Permission-denial cases fault only the OS probe;
+no double answers the liveness question (b-235).
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -303,18 +304,33 @@ def test_terminal_sidecar_terminalizes_genuinely_dead_worker(
     assert second.get("overruled", []) == [], second
 
 
-@pytest.mark.parametrize("liveness", ["dead", "live", "unknown"])
+@pytest.mark.parametrize(
+    "liveness, denied_probe, probe_errno",
+    [
+        ("dead", None, None),
+        ("live", None, None),
+        ("unknown", None, None),
+        ("unknown", "kill", errno.EPERM),
+        ("unknown", "kill", errno.EACCES),
+        ("unknown", "ps", errno.EPERM),
+        ("unknown", "ps", errno.EACCES),
+        ("unknown", "ps_exit", None),
+    ],
+)
 @pytest.mark.parametrize("already_terminal", [False, True])
 def test_pending_sidecar_settles_only_after_worker_death(
     tmp_path: Path,
     spawn_worker: SpawnWorker,
+    monkeypatch: pytest.MonkeyPatch,
     liveness: str,
+    denied_probe: str | None,
+    probe_errno: int | None,
     already_terminal: bool,
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
     dispatch_id = "pending-worker"
-    worker = spawn_worker() if liveness != "unknown" else None
+    worker = spawn_worker() if liveness != "unknown" or denied_probe else None
     identity = ledger.process_identity(worker.pid) if worker else None
     if worker:
         assert identity, "precondition: live child has a process identity"
@@ -350,10 +366,40 @@ def test_pending_sidecar_settles_only_after_worker_death(
         worker.wait(timeout=10)
         assert _identity_precondition(record) == (False, "dead")
 
-    _reconcile(project)
+    if denied_probe:
+        assert worker is not None
+        original_kill = os.kill
+        original_check_output = subprocess.check_output
+
+        def denied_kill(pid, sig):
+            if pid == worker.pid and sig == 0:
+                raise PermissionError(probe_errno, os.strerror(probe_errno))
+            return original_kill(pid, sig)
+
+        def denied_ps(command, *args, **kwargs):
+            if command[:3] == ["ps", "-p", str(worker.pid)]:
+                if denied_probe == "ps_exit":
+                    raise subprocess.CalledProcessError(
+                        1, command, stderr="ps: Operation not permitted"
+                    )
+                raise PermissionError(probe_errno, os.strerror(probe_errno))
+            return original_check_output(command, *args, **kwargs)
+
+        if denied_probe == "kill":
+            monkeypatch.setattr(os, "kill", denied_kill)
+        else:
+            monkeypatch.setattr(subprocess, "check_output", denied_ps)
+
+    reconciled = _reconcile(project)
     settled = json.loads(status_path.read_text())
     if liveness != "dead":
         assert settled == pending, "live/unknown worker must retain pending sidecar"
+        assert reconciled["committed"] == 0, reconciled
+        assert _ledger_row(dispatch_id)["state"] == (
+            "complete" if already_terminal else "running"
+        ), "an unreadable/live process must not terminalize the ledger"
+        if not already_terminal:
+            assert reconciled["overruled"][0]["liveness"] == liveness
         return
     expected = "complete" if already_terminal else "blocked"
     assert _ledger_row(dispatch_id)["state"] == expected
