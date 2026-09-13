@@ -107,7 +107,9 @@ def test_open_row_untimed_ledger_refusal_names_record(launch_authority, ended_at
     assert 'dispatch_id="untimed-earlier"' in output.err
     assert row["id"] in output.err
     assert "2026-01-02T00:00:00+00:00" in output.err
-    assert "correct" in output.err
+    assert "goalflight_ledger.py reconcile-outbox" in output.err
+    assert str(Path(D.__file__).with_name("goalflight_ledger.py")) in output.err
+    assert "correct missing" not in output.err
 
 
 @pytest.mark.parametrize("stamp", ["done", "done_reviewed"])
@@ -150,3 +152,47 @@ def test_partial_supersession_names_advanced_record(launch_authority, capsys):
     assert "ended_at=null" in output.err
     assert row["id"] in output.err
     assert "remaining task IDs" in output.err
+
+
+@pytest.mark.parametrize("status_kind", ["failed", "healthy", "foreign", "unreadable"])
+def test_partial_supersession_surfaces_publication_failure(
+    launch_authority, capsys, tmp_path, status_kind,
+):
+    args, store, row, records = launch_authority
+    row.update(done=False, done_at=None, closed_at=None)
+    store.tasks_path.write_text(json.dumps(row) + "\n")
+    status_path = tmp_path / "earlier.status.json"
+    status = {"dispatch_id": "earlier", "state": "running"}
+    if status_kind in {"failed", "foreign"}:
+        status.update(
+            state="terminal_pending", terminal_pending_state="blocked",
+            ledger_finalize_error={
+                "type": "IntegrityError",
+                "message": "CHECK constraint failed: event_type IN ('result', 'blocked')",
+            },
+        )
+    if status_kind == "foreign":
+        status["dispatch_id"] = "unrelated"
+    status_path.write_text("{broken" if status_kind == "unreadable" else json.dumps(status))
+    records.append({
+        "dispatch_id": "earlier", "project_root": args.project_root,
+        "task_ids": args.task_ids, "state": "running", "terminal_state": "unknown",
+        "status_path": str(status_path),
+    })
+
+    with pytest.raises(D.DispatchUsageError):
+        D._refuse_launch_blocked_by_completion_authority(args)
+    output = capsys.readouterr()
+    refusal = json.loads(output.out.removeprefix(D.DISPATCH_REFUSED_PREFIX))
+    assert refusal["reason"] == "partial_task_supersession"
+    assert "ended_at=null" in output.err
+    if status_kind == "failed":
+        assert "terminal publication FAILED" in output.err
+        assert "IntegrityError" in output.err
+        assert "CHECK constraint failed" in output.err
+        assert str(status_path) in output.err
+        assert "goalflight_ledger.py reconcile-outbox" in output.err
+        assert str(Path(D.__file__).with_name("goalflight_ledger.py")) in output.err
+    else:
+        assert "terminal publication FAILED" not in output.err
+        assert "IntegrityError" not in output.err

@@ -1573,6 +1573,7 @@ class Journal:
                 self._raise_migration_required(stored)
             retry_columns_migrated = self._install_outbox_retry_columns(connection)
             seat_columns_migrated = self._install_attempt_seat_columns(connection)
+            outbox_events_migrated = self._install_outbox_event_types(connection, stored)
             missing, malformed = self._current_schema_issues(connection)
             if malformed:
                 self._raise_integrity_failure(
@@ -1580,7 +1581,8 @@ class Journal:
                     + ", ".join(malformed)
                 )
             repaired = (
-                retry_columns_migrated or seat_columns_migrated or bool(missing)
+                retry_columns_migrated or seat_columns_migrated
+                or outbox_events_migrated or bool(missing)
             )
             if repaired:
                 # In-progress P3 builds could stamp epoch 3 before every final
@@ -1626,6 +1628,7 @@ class Journal:
         self._install_attempt_owner_columns(connection)
         self._install_attempt_seat_columns(connection)
         self._install_outbox_retry_columns(connection)
+        self._install_outbox_event_types(connection, stored)
         now = utc_now()
         connection.execute(
             """
@@ -1780,6 +1783,49 @@ class Journal:
             VALUES ('terminal-outbox-retry-quarantine-v1', ?)
             """,
             (utc_now(),),
+        )
+        return True
+
+    def _install_outbox_event_types(
+        self, connection: sqlite3.Connection, stored: tuple[int, ...],
+    ) -> bool:
+        """Replace the shipped two-event CHECK inside the bootstrap transaction."""
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'terminal_outbox'"
+        ).fetchone()
+        if row is None:
+            return False
+        sql = str(row[0])
+        legacy_check = re.compile(
+            r"CHECK\s*\(\s*event_type\s+IN\s*\(\s*'result'\s*,\s*'blocked'\s*\)\s*\)",
+            re.IGNORECASE,
+        )
+        if not legacy_check.search(sql):
+            return False
+        if not self.allow_migration:
+            self._raise_migration_required(stored)
+        # Preserve the table's other constraints, every row/column, and its
+        # explicit indexes. SQLite recreates UNIQUE autoindexes with the table.
+        indexes = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND tbl_name = 'terminal_outbox' AND sql IS NOT NULL"
+        ).fetchall()
+        sql = legacy_check.sub(
+            "CHECK (event_type IN ('result', 'blocked', 'user_need', 'user_confirm'))", sql,
+        )
+        sql = re.sub(
+            r'(CREATE\s+TABLE\s+)(?:"terminal_outbox"|terminal_outbox)(?=\s*\()',
+            r'\1terminal_outbox_upgrade', sql, count=1, flags=re.IGNORECASE,
+        )
+        connection.execute(sql)
+        connection.execute("INSERT INTO terminal_outbox_upgrade SELECT * FROM terminal_outbox")
+        connection.execute("DROP TABLE terminal_outbox")
+        connection.execute("ALTER TABLE terminal_outbox_upgrade RENAME TO terminal_outbox")
+        for index in indexes:
+            connection.execute(str(index[0]))
+        connection.execute(
+            "INSERT OR IGNORE INTO journal_migrations (migration_id, applied_at) "
+            "VALUES ('terminal-outbox-event-types-v1', ?)", (utc_now(),),
         )
         return True
 

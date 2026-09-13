@@ -3139,8 +3139,12 @@ def _refuse_launch_blocked_by_completion_authority(args) -> None:
             f"goalflight_dispatch: {message}; "
             f"entry.created_at={json.dumps(entry.get('created_at'))}\n"
             + "\n".join(diagnostics)
-            + "\nInspect the named records; correct missing or invalid completion "
-            "timestamps from verified evidence before retrying. For partial "
+            + "\nResolve any reported terminal publication failure first; journal "
+            "upgrades require owner-approved migration. Reconcile stopped work with "
+            + shlex.join([sys.executable, str(Path(__file__).with_name("goalflight_ledger.py"))])
+            + " reconcile-outbox --project-root "
+            + shlex.quote(str(entry["project_root"]))
+            + "; this projects committed terminal evidence without manual ledger edits. For partial "
             "supersession, reconcile stopped work or wait for active siblings, "
             "then dispatch only remaining task IDs.",
             file=sys.stderr,
@@ -10027,6 +10031,13 @@ def _ledger_task_ids_advanced(
                 f"terminal_state={json.dumps(terminal)} "
                 f"ended_at={json.dumps(record.get('ended_at'))} order={completion_order}"
             )
+            status, _status_evidence = _abandoned_status_payload(record)
+            if status is not None and status.get("ledger_finalize_error"):
+                diagnostics.append(
+                    f"terminal publication FAILED status={record.get('status_path')} "
+                    f"state={json.dumps(status.get('state'))} ledger_finalize_error="
+                    + json.dumps(goalflight_output_redact.redact_data(status["ledger_finalize_error"]))
+                )
     unresolved_indeterminate = indeterminate_completion_tasks - complete_tasks
     unresolved_equal = equal_completion_tasks - complete_tasks
     if unresolved_indeterminate:
