@@ -662,6 +662,88 @@ def test_dispatch_payload_includes_worktree_branch(
     assert marker.exists(), combined
 
 
+@pytest.mark.parametrize("resolution", ["null", "empty", "error"])
+def test_dispatch_refuses_unresolved_seat_base_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resolution: str
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    marker = tmp_path / "must-not-launch"
+    # Fault the prepared seat's SHA probe, leaving real acquisition and launch
+    # in place: an unknown base must never reach the worker.
+    driver = f"""
+import sys
+sys.path.insert(0, {str(SCRIPTS)!r})
+import goalflight_dispatch as dispatch
+import goalflight_worktree_pool as pool
+original_git = pool._git
+def git(cwd, *args, **kwargs):
+    if cwd.name == 's-1' and args == ('rev-parse', '--verify', 'HEAD^{{commit}}'):
+        if {resolution!r} == 'error':
+            raise pool.WorktreeSeatError('cannot read prepared HEAD')
+        return None if {resolution!r} == 'null' else ''
+    return original_git(cwd, *args, **kwargs)
+pool._git = git
+raise SystemExit(dispatch.main(sys.argv[1:]))
+"""
+    cmd = _dispatch_cmd(
+        tmp_path, repo, "unknown-base", sys.executable, "-c",
+        f"from pathlib import Path; Path({str(marker)!r}).write_text('launched')",
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", driver, *cmd[2:]],
+        cwd=str(repo), env=_env(tmp_path, seats=1), text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 1, combined
+    assert "s-1" in combined, combined
+    assert "base SHA" in combined, combined
+    assert "--at" in combined and "omitted" in combined, combined
+    assert "--at <ref>" in combined, combined
+    assert not _launched_payload(proc.stdout), combined
+    assert not marker.exists(), combined
+    # A refused launch must release its seat, including on a failed SHA probe.
+    lease = goalflight_worktree_pool.acquire_worktree_seat(repo, "after-refusal")
+    lease.release()
+
+
+@pytest.mark.parametrize("explicit_base", [False, True])
+def test_dispatch_records_resolved_base_and_launches_from_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit_base: bool
+) -> None:
+    monkeypatch.setenv("GOALFLIGHT_WORKTREE_SEATS", "1")
+    repo = _make_repo(tmp_path)
+    # Reuse a seat left at an older commit, after the project's base advances.
+    previous = goalflight_worktree_pool.acquire_worktree_seat(repo, "previous-base")
+    previous.release()
+    base = _commit_in(repo, "advance base", "new base\n")
+    marker = tmp_path / "launched-base"
+    worker = (
+        "from pathlib import Path; import subprocess; "
+        f"Path({str(marker)!r}).write_text("
+        "subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()); "
+        "print('COMPLETE: resolved-base — ok', flush=True)"
+    )
+    cmd = _dispatch_cmd(tmp_path, repo, "resolved-base", sys.executable, "-c", worker)
+    if explicit_base:
+        cmd[2:2] = ["--at", "main"]
+    proc = subprocess.run(
+        cmd, cwd=str(repo), env=_env(tmp_path, seats=1), text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, combined
+    deadline = time.time() + 10
+    while time.time() < deadline and not marker.exists():
+        time.sleep(0.05)
+    assert marker.exists(), combined
+    assert marker.read_text() == base
+    started, launched = _payloads(proc.stdout)
+    assert started.get("worktree_base") == base, started
+    assert launched.get("worktree_base") == base, launched
+
+
 def test_refuse_reset_when_detached_ahead_of_base(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

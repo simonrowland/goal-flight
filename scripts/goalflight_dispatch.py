@@ -1780,6 +1780,28 @@ def _controller_ring_label(args, project_root: Path) -> str:
     )
 
 
+def _record_dispatch_worktree(args, lease) -> None:
+    """Keep the prepared seat's SHA, refusing unknown bases before launch."""
+    try:
+        base_commit = goalflight_worktree_pool._git(
+            lease.path, "rev-parse", "--verify", "HEAD^{commit}"
+        )
+        if not base_commit:
+            raise goalflight_worktree_pool.WorktreeSeatError("resolved base SHA is null")
+    except goalflight_worktree_pool.WorktreeSeatError as exc:
+        lease.release()
+        requested = _requested_worktree_base(args)
+        request = f"--at {requested!r}" if requested else "--at omitted (project default)"
+        raise goalflight_worktree_pool.WorktreeSeatError(
+            f"dispatch refused: worktree seat {lease.seat_name} ({lease.path}) "
+            f"has no resolvable base SHA; requested {request}: {exc}. "
+            "Pass --at <ref> naming a valid commit to proceed deliberately."
+        ) from exc
+    args.cwd = str(lease.path)
+    args._worktree_base_commit = base_commit
+    args._worktree_seat = lease
+
+
 def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease | None:
     """Acquire a captive seat. Isolation is not a mode.
 
@@ -1852,8 +1874,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                     str(parent_dispatch_id) if parent_dispatch_id else None
                 ),
             )
-            args.cwd = str(lease.path)
-            args._worktree_seat = lease
+            _record_dispatch_worktree(args, lease)
             return lease
         if skip_reset:
             raise goalflight_worktree_pool.WorktreeCwdRefused(
@@ -1876,8 +1897,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
         controller_label=label,
         reset=not skip_reset,
     )
-    args.cwd = str(lease.path)
-    args._worktree_seat = lease
+    _record_dispatch_worktree(args, lease)
     return lease
 
 
@@ -18381,7 +18401,7 @@ def main(argv: list[str] | None = None) -> int:
             summary_head["worktree_seat"] = worktree_seat.seat_name
             summary_head["worktree_path"] = str(worktree_seat.path)
             summary_head["worktree_branch"] = worktree_seat.branch
-            summary_head["worktree_base"] = _requested_worktree_base(args)
+            summary_head["worktree_base"] = args._worktree_base_commit
         _record_ledger(
             args,
             project_root=project_root,

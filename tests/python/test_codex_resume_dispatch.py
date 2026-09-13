@@ -1496,6 +1496,7 @@ def test_bind_dispatch_worktree_reacquires_recorded_seat_without_reset(
     monkeypatch.setattr(D, "_project_root", lambda _args: tmp_path)
     monkeypatch.setattr(D, "_controller_ring_label", lambda *_args: "controller")
     monkeypatch.setattr(WP, "classify_dispatch_cwd", lambda *_args, **_kwargs: "ring-seat")
+    monkeypatch.setattr(WP, "_git", lambda *_args, **_kwargs: "a" * 40)
     args = SimpleNamespace(
         worktree="HEAD",
         parent_dispatch_id="parent-dispatch",
@@ -1514,6 +1515,7 @@ def test_bind_dispatch_worktree_reacquires_recorded_seat_without_reset(
     assert call_kwargs["occupy_path"] == seat.resolve()
     assert call_kwargs["expected_prior_dispatch_id"] == "parent-dispatch"
     assert args.cwd == str(seat)
+    assert args._worktree_base_commit == "a" * 40
 
 
 def test_resume_of_quota_exhausted_dispatch_honors_account(
