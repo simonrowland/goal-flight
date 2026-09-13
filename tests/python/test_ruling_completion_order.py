@@ -91,6 +91,28 @@ def test_blocked_ready_order(tmp_path, signals, expected, scanner):
 
 
 @pytest.mark.parametrize("signals, expected", SIGNAL_ORDERS)
+def test_dispatch_blocked_ready_order_beyond_tail_window(tmp_path, signals, expected):
+    dispatch_id = "ruling-worker"
+    kinds = signals.split()
+    prefix = "".join(f"!{kind}: {dispatch_id} — evidence\n" for kind in kinds[:-1])
+    tail = tmp_path / "worker.tail"
+    tail.write_text(
+        prefix + ("x" * 1000 + "\n") * 11_000
+        + f"!READY: {dispatch_id} — blocker report\n",
+        encoding="utf-8",
+    )
+    assert tail.stat().st_size - 10 * 1024 * 1024 > len(prefix.encode("utf-8"))
+
+    marker = dispatch._scan_entry_completion_marker({
+        "dispatch_id": dispatch_id, "request": {"tail": str(tail)},
+    })
+
+    assert marker is not None
+    assert marker["kind"] == expected
+    assert marker["line"] == max(i for i, kind in enumerate(kinds, 1) if kind == expected)
+
+
+@pytest.mark.parametrize("signals, expected", SIGNAL_ORDERS)
 def test_watcher_publishes_blocked_ready_order(signals, expected):
     dispatch_id = "ruling-worker"
     text = "".join(f"!{kind}: {dispatch_id} — evidence\n" for kind in signals.split())

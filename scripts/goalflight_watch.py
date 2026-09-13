@@ -3696,12 +3696,15 @@ def _final_terminal_marker(
                 recovered["line"] += response_start
                 if not terminal or recovered["line"] > terminal["line"]:
                     terminal = recovered
-    if terminal:
-        return terminal
-    if full_file_fallback and start > 0 and expected_dispatch_id:
+    if (
+        full_file_fallback and start > 0 and expected_dispatch_id
+        and (not terminal or terminal.get("kind") == "READY")
+    ):
         # The bounded live scan is intentionally cheap. Once worker identity is
         # dead, output is immutable, so one streamed whole-file pass is safe and
         # prevents >10 MiB of post-marker logs from erasing terminal evidence.
+        # READY may point to a blocker report; reconcile earlier BLOCKED and
+        # COMPLETE/RESULT evidence before accepting the bounded candidate.
         return _full_file_terminal_marker(
             path,
             prompt_prefix=prompt_prefix,
@@ -3709,7 +3712,7 @@ def _final_terminal_marker(
             kimi_output=kimi_output,
             expected_dispatch_id=expected_dispatch_id,
         )
-    return None
+    return terminal
 
 
 def _terminal_marker_from_ignored_prompt(

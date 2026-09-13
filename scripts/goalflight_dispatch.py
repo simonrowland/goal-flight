@@ -9824,6 +9824,7 @@ def _scan_entry_completion_marker(entry: dict) -> dict | None:
             ignore_prefix_lines=ignore_prefix_lines,
             suppress_unfenced_prompt_markers=True,
             expected_dispatch_id=dispatch_id,
+            full_file_fallback=True,
         )
     except Exception:
         return None
