@@ -94,9 +94,9 @@ def case_status_says_uniform_non_none_once() -> None:
     lines = ledger.format_status_lines(payload, limit=20)
     text = "\n".join(lines)
     assert text.count("sandbox requested=read-only supported=off enforced=none") == 1
-    assert lines[1] == "sandbox requested=read-only supported=off enforced=none"
-    assert "sandbox requested=" not in lines[2]
+    assert lines[2] == "sandbox requested=read-only supported=off enforced=none"
     assert "sandbox requested=" not in lines[3]
+    assert "sandbox requested=" not in lines[4]
 
 
 def case_status_shows_per_row_when_mixed() -> None:
@@ -161,6 +161,7 @@ def case_status_verbose_recovers_per_row_verbatim() -> None:
     verbose = ledger.format_status_lines(payload, limit=20, verbose=True)
     expected = [
         "dispatch ledger: /tmp/ledger-status-test",
+        "records: shown=3 total=3 failed=0 unknown=0",
         f"- complete: a agent=codex pid=1 state=complete{_legacy_suffix(rows[0]['os_sandbox'])}",
         f"- complete: b agent=codex pid=1 state=complete{_legacy_suffix(rows[1]['os_sandbox'])}",
         f"- complete: c agent=codex pid=1 state=complete{_legacy_suffix(rows[2]['os_sandbox'])}",
@@ -172,7 +173,7 @@ def case_status_verbose_recovers_per_row_verbatim() -> None:
     assert compact != verbose
     assert "requested=none supported=none enforced=none" in "\n".join(verbose)
     assert "requested=none" not in "\n".join(compact)
-    assert compact[1].startswith("- complete: a ")
+    assert compact[2].startswith("- complete: a ")
 
 
 def case_status_json_unchanged() -> None:
@@ -251,7 +252,48 @@ def case_status_unhealthy_sandbox_still_reports() -> None:
     assert "blocked_os_sandbox: blocked" in text
 
 
+def case_status_cap_distinguishes_failures_unknown_and_empty() -> None:
+    empty = "\n".join(ledger.format_status_lines(_payload([])))
+    assert "omitted" not in empty
+
+    rows = [_row(f"audit-{i:03d}") for i in range(118)]
+    unreadable = ledger._unreadable_record(Path("/tmp/ledger-status-test/runs.d/audit-118.json"))
+    unreadable["classification"] = ledger.classify(unreadable)
+    rows.extend([unreadable, _row("audit-119", classification="failed", state="failed")])
+    for limit in (0, 20, 120):
+        lines = ledger.format_status_lines(_payload(rows), limit=limit)
+        text = "\n".join(lines)
+        assert f"shown={limit} total=120 failed=1 unknown=1" in text, text
+        assert text != empty
+        if limit:
+            assert text.index("failed=1 unknown=1") < text.index("- complete:")
+        if limit < 120:
+            assert f"omitted {120 - limit} records" in text
+            assert "goalflight_ledger.py status --limit 120" in text
+            assert "/tmp/ledger-status-test/runs.d" in text
+        else:
+            assert "- failed: audit-119 " in text
+            assert "state=unreadable" in text
+            assert "omitted" not in text
+    assert "shown=0 total=0 failed=0 unknown=0" in empty, empty
+
+
+def case_status_counts_all_terminal_failures_without_reclassifying_live() -> None:
+    for state in ledger.goalflight_dispatch_states.TERMINAL_FAILURE_STATES:
+        text = "\n".join(ledger.format_status_lines(_payload([
+            _row("failure", classification=state, state=state),
+        ]), limit=0))
+        assert "failed=1 unknown=0" in text, (state, text)
+    for classification, state in (("expected_live", "controller_dead"), ("queued_capacity", "waiting_capacity"), ("complete", "complete")):
+        text = "\n".join(ledger.format_status_lines(_payload([
+            _row("healthy", classification=classification, state=state),
+        ]), limit=0))
+        assert "failed=0 unknown=0" in text, (classification, text)
+
+
 def main() -> None:
+    case_status_cap_distinguishes_failures_unknown_and_empty()
+    case_status_counts_all_terminal_failures_without_reclassifying_live()
     case_status_omits_uniform_none_sandbox()
     case_status_says_uniform_non_none_once()
     case_status_shows_per_row_when_mixed()

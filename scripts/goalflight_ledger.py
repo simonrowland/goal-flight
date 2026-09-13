@@ -2474,7 +2474,29 @@ def format_status_lines(
 ) -> list[str]:
     """Human ledger status. Uniform none-sandbox is omitted unless --verbose."""
     lines = [f"dispatch ledger: {payload['state_dir']}"]
-    rows = list(payload.get("records") or [])[:limit]
+    all_rows = list(payload.get("records") or [])
+    failed = unknown = 0
+    for row in all_rows:
+        classification = row.get("classification") or row.get("state")
+        outcome = terminal_state_for(classification)
+        if record_is_unreadable(row):
+            unknown += 1
+        elif classification in {"expected_live", "queued_capacity"}:
+            continue
+        elif outcome not in {"unknown", "complete"}:
+            failed += 1
+        elif outcome == "unknown":
+            unknown += 1
+    rows = all_rows[:limit]
+    lines.append(
+        f"records: shown={len(rows)} total={len(all_rows)} failed={failed} unknown={unknown}"
+    )
+    if len(rows) < len(all_rows):
+        lines.append(
+            f"omitted {len(all_rows) - len(rows)} records; "
+            f"detail: {Path(payload['state_dir']) / 'runs.d'}; "
+            f"goalflight_ledger.py status --limit {len(all_rows)} (or status --json)"
+        )
     triplets = [sandbox_triplet(row.get("os_sandbox")) for row in rows]
     interesting = {item for item in triplets if item and item != NONE_SANDBOX_TRIPLET}
     unique = set(triplets)

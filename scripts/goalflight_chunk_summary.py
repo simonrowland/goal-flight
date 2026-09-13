@@ -62,24 +62,35 @@ def read_json(path: Path | None) -> dict[str, Any] | None:
 def run_capacity_status(state_dir: Path) -> dict[str, Any]:
     env = os.environ.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
-    proc = subprocess.run(
-        [sys.executable, str(SCRIPT_DIR / "goalflight_capacity.py"), "status", "--json"],
-        cwd=SCRIPT_DIR.parent,
-        env=env,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if proc.returncode != 0:
-        return {"active": [], "state": {"leases": {}}}
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "goalflight_capacity.py"), "status", "--json"],
+            cwd=SCRIPT_DIR.parent,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        return {"measured": False, "error": f"capacity status failed: {exc}"}
     try:
         payload = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return {"active": [], "state": {"leases": {}}}
-    return payload if isinstance(payload, dict) else {"active": [], "state": {"leases": {}}}
+    except json.JSONDecodeError as exc:
+        return {
+            "measured": False,
+            "error": f"capacity status invalid JSON (exit {proc.returncode}): {exc}; {proc.stderr.strip()}",
+        }
+    if not isinstance(payload, dict):
+        return {"measured": False, "error": "capacity status JSON is not an object"}
+    if proc.returncode != 0:
+        payload["measured"] = False
+        payload.setdefault("error", f"capacity status exited {proc.returncode}: {proc.stderr.strip()}")
+    if payload.get("measured") is False:
+        payload.setdefault("error", "capacity status was not measured")
+    return payload
 
 
 def ledger_records(state_dir: Path) -> list[dict[str, Any]]:
@@ -319,7 +330,9 @@ def decision_hint(
 
 def summarize(slug: str, state_dir: Path) -> dict[str, Any]:
     capacity = run_capacity_status(state_dir)
-    leases = list(capacity.get("active") or capacity.get("state", {}).get("leases", {}).values() or [])
+    leases = [] if capacity.get("measured") is False else list(
+        capacity.get("active") or capacity.get("state", {}).get("leases", {}).values() or []
+    )
     records = ledger_records(state_dir)
     record, lease = choose_record(slug, records, leases)
     status, status_path = load_status(slug, record)
@@ -334,7 +347,7 @@ def summarize(slug: str, state_dir: Path) -> dict[str, Any]:
     log_path = (reconciled or {}).get("tail_path") or (status or {}).get("tail_path") or (record or {}).get("stdout_path") or (record or {}).get("stderr_path")
     dispatch_id = (reconciled or {}).get("dispatch_id") or (record or {}).get("dispatch_id") or (lease or {}).get("dispatch_id")
     marker = last_marker_kind(status) or last_marker_kind(reconciled)
-    return {
+    payload = {
         "slug": slug,
         "dispatch_id": dispatch_id,
         "state": state,
@@ -353,10 +366,15 @@ def summarize(slug: str, state_dir: Path) -> dict[str, Any]:
             retry_policy=retry_policy,
         ),
     }
+    if capacity.get("measured") is False:
+        payload.update(measured=False, error=capacity["error"], decision_hint="investigate")
+        if "reason" in capacity:
+            payload["reason"] = capacity["reason"]
+    return payload
 
 
 def text_summary(payload: dict[str, Any]) -> str:
-    return (
+    text = (
         f"{payload['slug']}: state={payload['state']} "
         f"dispatch={payload['dispatch_id'] or 'null'} "
         f"marker={payload['last_marker'] or 'null'} "
@@ -365,6 +383,12 @@ def text_summary(payload: dict[str, Any]) -> str:
         f"not-before={payload.get('not_retryable_before') or 'null'} "
         f"hint={payload['decision_hint']}"
     )
+    if payload.get("measured") is False:
+        text += (
+            f" measured=false reason={payload.get('reason') or 'null'}"
+            f" error={json.dumps(payload['error'])}"
+        )
+    return text
 
 
 def main(argv: list[str] | None = None) -> int:

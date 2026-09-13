@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import json
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Callable, TypeVar
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -207,8 +211,74 @@ def test_summary_agrees_with_status_tail_reconciled_complete() -> None:
     assert_eq("summary reconciled marker", payload["last_marker"], "READY")
 
 
+def test_capacity_failure_is_distinct_from_empty_in_json_and_text() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-summary-capacity-") as d:
+        state_dir = Path(d)
+        with patch.object(summary, "status_candidates", return_value=[]):
+            empty_capacity = summary.run_capacity_status(state_dir)
+            empty = summary.summarize("absent", state_dir)
+            empty_text = summary.text_summary(empty)
+            assert empty_capacity["active"] == []
+            assert empty["state"] == "missing"
+            assert empty.get("measured") is not False
+            assert "error" not in empty
+            assert "error=" not in empty_text
+
+            (state_dir / "capacity.json").write_text("{broken", encoding="utf-8")
+            failed_capacity = summary.run_capacity_status(state_dir)
+            assert failed_capacity.get("measured") is False, failed_capacity
+            assert failed_capacity["reason"] == "capacity_state_unreadable"
+            failed = summary.summarize("absent", state_dir)
+            assert failed["measured"] is False
+            assert failed["error"] == failed_capacity["error"]
+            assert failed["reason"] == failed_capacity["reason"]
+            assert str(state_dir / "capacity.json") in failed["error"]
+            assert failed != empty
+            assert failed["decision_hint"] == "investigate"
+            for mode in ("--json", "--text"):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    summary.main(["--slug", "absent", "--state-dir", str(state_dir), mode])
+                if mode == "--json":
+                    assert json.loads(output.getvalue())["error"] == failed["error"]
+                else:
+                    assert "measured=false" in output.getvalue()
+                    assert failed["reason"] in output.getvalue()
+                    assert str(state_dir / "capacity.json") in output.getvalue()
+                    assert output.getvalue().strip() != empty_text
+
+
+def test_capacity_subprocess_errors_are_not_empty_leases() -> None:
+    cases = [
+        (subprocess.CompletedProcess([], 0, "not-json", ""), "JSON"),
+        (subprocess.CompletedProcess([], 0, "[]", ""), "object"),
+        (subprocess.CompletedProcess([], 7, "", "capacity exploded"), "capacity exploded"),
+        (subprocess.CompletedProcess([], 7, '{"active":[]}', "capacity exploded"), "capacity exploded"),
+        (OSError("capacity executable unavailable"), "capacity executable unavailable"),
+    ]
+    with tempfile.TemporaryDirectory(prefix="gf-summary-capacity-errors-") as d:
+        with patch.object(summary.subprocess, "run", return_value=subprocess.CompletedProcess(
+            [], 0, '{"active":[],"state":{"leases":{}}}', ""
+        )), patch.object(summary, "status_candidates", return_value=[]):
+            empty = summary.summarize("absent", Path(d))
+        assert empty["state"] == "missing"
+        assert empty.get("measured") is not False
+        assert "error" not in empty
+        for result, error in cases:
+            kwargs = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
+            with patch.object(summary.subprocess, "run", **kwargs), patch.object(summary, "status_candidates", return_value=[]):
+                failed = summary.summarize("absent", Path(d))
+            assert failed.get("measured") is False, (result, failed)
+            assert failed != empty
+            assert error in failed["error"], failed
+            assert "measured=false" in summary.text_summary(failed)
+            assert "measured=false" not in summary.text_summary(empty)
+
+
 def main() -> None:
     tests = [
+        test_capacity_failure_is_distinct_from_empty_in_json_and_text,
+        test_capacity_subprocess_errors_are_not_empty_leases,
         test_idle_detached_identity_live_reads_running_wait,
         test_dead_worker_complete_tail_reads_complete,
         test_recycled_pid_identity_mismatch_is_not_alive,
