@@ -3677,25 +3677,38 @@ def _listener_envelope(
         None,
     )
     if envelope is None:
+        assignments = authority.read_all(
+            """SELECT recipient_label, projected_at, withdrawn_at FROM delivery_events
+               WHERE project_root = ? AND origin_node = ? AND event_uuid = ?
+                 AND stream_id = ? AND stream_seq = ? AND carrier_path = ?""",
+            (str(authority.project_root), origin_node, event_uuid,
+             str(row.get("stream_id") or ""), stream_seq, carrier_path),
+        )
+        # Nudge coalescing withdraws the old assignment before rewriting the
+        # carrier. A cursor snapshot can still contain that superseded row.
+        # Projection alone cannot distinguish compaction from lost mail.
+        if assignments and all(
+            item["projected_at"] is not None and item["withdrawn_at"] is not None
+            for item in assignments
+        ):
+            return None
         if controller_label is not None:
             # A peer can adopt a wildcard after our cursor snapshot, then a
-            # task-store replacement removes its old carrier. Only durable
-            # foreign ownership makes that missing envelope safe to skip.
-            assignments = authority.read_all(
-                """SELECT recipient_label FROM delivery_events
-                   WHERE project_root = ? AND origin_node = ? AND event_uuid = ?
-                     AND stream_id = ? AND stream_seq = ? AND withdrawn_at IS NULL""",
-                (str(authority.project_root), origin_node, event_uuid,
-                 str(row.get("stream_id") or ""), stream_seq),
-            )
-            if assignments and all(
+            # task-store replacement removes its old carrier. A still-live
+            # foreign assignment is outside this listener's delivery scope.
+            live_assignments = [item for item in assignments if item["withdrawn_at"] is None]
+            if live_assignments and all(
                 item["recipient_label"]
                 and item["recipient_label"] not in {controller_label, "*"}
-                for item in assignments
+                for item in live_assignments
             ):
                 return None
         raise MessageError(
-            f"journal delivery assignment has no projected carrier row: {path}:{stream_seq}"
+            "journal delivery assignment has no projected carrier row: "
+            f"event_uuid={event_uuid} origin_node={origin_node} "
+            f"stream_id={row.get('stream_id')} stream_seq={stream_seq}; "
+            f"carrier row absent from {path}; projection/withdrawal evidence incomplete; "
+            f"inspect delivery_events in {authority.path}"
         )
     return envelope
 

@@ -2204,14 +2204,18 @@ def test_terminal_outbox_retry_heals_partial_recipient_fanout(
 
 
 @pytest.mark.parametrize(
-    "owner_label", ["lane-b", "*", "lane-a"],
-    ids=["foreign-skip", "wildcard-corrupt", "own-corrupt"],
+    ("owner_label", "superseded"),
+    [("lane-b", True), ("*", False), ("lane-a", False),
+     ("*", True), ("lane-a", True), ("lane-b", False)],
+    ids=["foreign-compacted", "wildcard-corrupt", "own-corrupt",
+         "wildcard-compacted", "own-compacted", "foreign-skip"],
 )
 def test_listen_task_store_missing_carrier_rechecks_delivery_owner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     owner_label: str,
+    superseded: bool,
 ) -> None:
     import goalflight_task as task
 
@@ -2254,8 +2258,8 @@ def test_listen_task_store_missing_carrier_rechecks_delivery_owner(
         )
         assert current[0]["recipient_label"] == owner_label
 
-    if owner_label == "lane-b":
-        # Another done nudge removes the foreign-owned superseded carrier.
+    if superseded:
+        # Production coalescing removes this same-kind carrier after projection.
         task.post_done_suggest_nudge(["t-2"], project, "worker-b-next")
     else:
         # The live wildcard or exact local assignment has a corrupt carrier.
@@ -2273,12 +2277,53 @@ def test_listen_task_store_missing_carrier_rechecks_delivery_owner(
         "--report-pending", "--poll-secs", "0.01", "--timeout-s", "1",
     ])
     output = capsys.readouterr()
-    if owner_label == "lane-b":
-        assert result == 1, output.err  # Quiet timeout: foreign row never rings.
+    if superseded or owner_label == "lane-b":
+        assert result == 1, output.err  # Quiet timeout: stale row never rings.
         assert "no projected carrier row" not in output.err
     else:
         assert result == 2, output.err
         assert "journal delivery assignment has no projected carrier row" in output.err
+    if superseded:
+        recorded = authority.read_all(
+            "SELECT projected_at, withdrawn_at FROM delivery_events WHERE event_uuid = ?",
+            (row["event_uuid"],),
+        )
+        assert recorded and all(
+            item["projected_at"] is not None and item["withdrawn_at"] is not None
+            for item in recorded
+        ), "carrier compaction must durably withdraw even an adopted assignment"
+
+
+@pytest.mark.parametrize("withdrawn", [False, True], ids=["live", "withdrawn"])
+def test_missing_unprojected_carrier_remains_loud(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    withdrawn: bool,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    event_id = str(uuid.uuid4())
+    carrier = tmp_path / "messages" / "unprojected.jsonl"
+    assigned = authority.record_delivery_event(
+        recipient_label="lane-a", origin_node="local", event_uuid=event_id,
+        stream_id="unprojected", stream_seq=1, carrier_path=carrier,
+        event_type="user_need", wake_class="waking", created_at=journal.utc_now(),
+    )
+    assert assigned.committed and assigned.value is not None
+    if withdrawn:
+        assert authority.withdraw_delivery_event(
+            recipient_label="lane-a", origin_node="local", event_uuid=event_id,
+        ).committed
+    with pytest.raises(messages.MessageError) as caught:
+        messages._listener_envelope(authority, assigned.value, controller_label="lane-a")
+    # Name a journal identity and explicitly say the carrier row is absent;
+    # path:seq misleadingly sends operators to a nonexistent physical row.
+    diagnostic = str(caught.value)
+    assert f"event_uuid={event_id}" in diagnostic
+    assert "carrier row absent" in diagnostic
+    assert "projection/withdrawal evidence incomplete" in diagnostic
+    assert str(authority.path) in diagnostic
 
 
 def test_first_wildcard_processor_adopts_once_while_unhandled_rows_wait(

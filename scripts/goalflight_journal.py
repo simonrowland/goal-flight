@@ -3412,16 +3412,19 @@ class Journal:
                     )
             withdrawn_at = utc_now()
             for old_recipient, old_origin, old_event_id in replacement_keys:
+                # A consumed wildcard is renamed to its processor's label.
+                # Superseding its carrier must still withdraw that assignment.
                 connection.execute(
                     """
                     UPDATE delivery_events
                     SET withdrawn_at = COALESCE(withdrawn_at, ?)
-                    WHERE project_root = ? AND recipient_label = ?
+                    WHERE project_root = ? AND (? = '*' OR recipient_label = ?)
                       AND origin_node = ? AND event_uuid = ?
                     """,
                     (
                         withdrawn_at,
                         project_root,
+                        old_recipient,
                         old_recipient,
                         old_origin,
                         old_event_id,
