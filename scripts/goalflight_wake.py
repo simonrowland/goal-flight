@@ -55,6 +55,7 @@ LEASE_KIND = "lease"
 LOCK_KINDS = WAITER_KINDS | {LEASE_KIND}
 ENTRY_POLL_WINDOW_S = 1.0
 ENTRY_POLL_INTERVAL_S = 0.1
+MONITOR_PROCESS_PROBE_TIMEOUT_S = 0.2
 _FILE_VERSION = "v3"
 _LEGACY_FILE_VERSION = "v2"
 _GENERATION_FILE_VERSION = "generation-v1"
@@ -2936,7 +2937,11 @@ def coverage_supervise_command(
     )
 
 
-def _process_listing(*, timeout_s: float = 2.0) -> list[tuple[int | None, str]] | None:
+def _process_listing(
+    *,
+    timeout_s: float = 2.0,
+    pids: Iterable[int] | None = None,
+) -> list[tuple[int | None, str]] | None:
     """Live process argv table, or None when the listing cannot be trusted.
 
     Detection is process identity, not a wake-ledger lock: ``supervise`` does
@@ -2946,9 +2951,22 @@ def _process_listing(*, timeout_s: float = 2.0) -> list[tuple[int | None, str]] 
     """
     if os.name == "nt" or fcntl is None:
         return None
+    command = ["ps", "-axww", "-o", "pid=,command="]
+    if pids is not None:
+        selected_pids = tuple(sorted(set(pids)))
+        if not selected_pids:
+            return []
+        command = [
+            "ps",
+            "-ww",
+            "-p",
+            ",".join(str(pid) for pid in selected_pids),
+            "-o",
+            "pid=,command=",
+        ]
     try:
         output = subprocess.check_output(
-            ["ps", "-axww", "-o", "pid=,command="],
+            command,
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=timeout_s,
@@ -3004,10 +3022,12 @@ def _is_messages_argv_name(token: str) -> bool:
     return Path(token).name in _MESSAGES_ARGV_NAMES
 
 
-def _messages_supervise_index(parts: list[str]) -> int | None:
+def _messages_command_index(
+    parts: list[str], commands: frozenset[str]
+) -> int | None:
     for index, part in enumerate(parts):
         if _is_messages_argv_name(part):
-            if index + 1 < len(parts) and parts[index + 1] == "supervise":
+            if index + 1 < len(parts) and parts[index + 1] in commands:
                 return index
     return None
 
@@ -3143,22 +3163,25 @@ def _python_program_token(token: str, kind: str) -> str:
     return token
 
 
-def _probe_unknown_if_supervise(
-    parts: list[str],
+def _probe_unknown_if_messages_command(
+    parts: list[str], commands: frozenset[str]
 ) -> tuple[str, dict[str, str] | None]:
-    if _messages_supervise_index(parts) is not None:
+    if _messages_command_index(parts, commands) is not None:
         return _SUPERVISE_ARGV_UNKNOWN, None
     return _SUPERVISE_ARGV_SKIP, None
 
 
-def _match_messages_supervise(
-    parts: list[str], program_index: int
+def _match_messages_command(
+    parts: list[str], program_index: int, commands: frozenset[str]
 ) -> tuple[str, dict[str, str] | None]:
     if program_index >= len(parts):
         return _SUPERVISE_ARGV_SKIP, None
     if not _is_messages_argv_name(parts[program_index]):
         return _SUPERVISE_ARGV_SKIP, None
-    if program_index + 1 >= len(parts) or parts[program_index + 1] != "supervise":
+    if (
+        program_index + 1 >= len(parts)
+        or parts[program_index + 1] not in commands
+    ):
         return _SUPERVISE_ARGV_SKIP, None
     return (
         _SUPERVISE_ARGV_MATCH,
@@ -3166,19 +3189,19 @@ def _match_messages_supervise(
     )
 
 
-def _probe_shell_supervise_argv(
-    parts: list[str],
+def _probe_shell_messages_argv(
+    parts: list[str], commands: frozenset[str]
 ) -> tuple[str, dict[str, str] | None]:
     index = 1
     while index < len(parts):
         part = parts[index]
         if part == "-c":
             if index + 1 >= len(parts):
-                return _probe_unknown_if_supervise(parts)
+                return _probe_unknown_if_messages_command(parts, commands)
             return _SUPERVISE_ARGV_SKIP, None
         if part in {"-o", "-O"}:
             if index + 1 >= len(parts):
-                return _probe_unknown_if_supervise(parts)
+                return _probe_unknown_if_messages_command(parts, commands)
             index += 2
             continue
         if part == "--":
@@ -3191,48 +3214,58 @@ def _probe_shell_supervise_argv(
     return _SUPERVISE_ARGV_SKIP, None
 
 
-def _probe_supervise_argv(
-    command: str,
+def _probe_messages_argv(
+    command: str, *, commands: frozenset[str]
 ) -> tuple[str, dict[str, str] | None]:
-    """Classify one process command as supervise, foreign, or unreadable.
+    """Classify one process command as a wanted messages command or not.
 
-    ``match`` means the process is executing ``goalflight_messages … supervise``
-    in executable position. ``skip`` means it is not. ``unknown`` means argv
-    cannot establish that distinction (unparsable, truncated, or an
-    unfamiliar wrapper carrying supervise-shaped tokens).
+    ``match`` means the process is executing one of ``commands`` in executable
+    position. ``skip`` means it is not. ``unknown`` means argv cannot establish
+    that distinction (unparsable, truncated, or an unfamiliar wrapper carrying
+    command-shaped tokens).
     """
     try:
         parts = shlex.split(command)
     except ValueError:
-        return _probe_unknown_if_supervise(command.split())
+        return _probe_unknown_if_messages_command(command.split(), commands)
     if not parts:
         return _SUPERVISE_ARGV_SKIP, None
     unwrapped = _after_env_wrapper(parts)
     if unwrapped is None:
-        return _probe_unknown_if_supervise(parts)
+        return _probe_unknown_if_messages_command(parts, commands)
     parts = unwrapped
     if not parts:
         return _SUPERVISE_ARGV_SKIP, None
     if _is_messages_argv_name(parts[0]):
-        return _match_messages_supervise(parts, 0)
+        return _match_messages_command(parts, 0, commands)
     if _is_python_interpreter(parts[0]):
         program_index, kind = _locate_python_program(parts, 1)
         if kind == "unknown" or program_index is None:
-            return _probe_unknown_if_supervise(parts)
+            return _probe_unknown_if_messages_command(parts, commands)
         if kind not in {"script", "module"}:
             return _SUPERVISE_ARGV_SKIP, None
         token = _python_program_token(parts[program_index], kind)
         if not _is_messages_argv_name(token):
             return _SUPERVISE_ARGV_SKIP, None
-        if program_index + 1 >= len(parts) or parts[program_index + 1] != "supervise":
+        if (
+            program_index + 1 >= len(parts)
+            or parts[program_index + 1] not in commands
+        ):
             return _SUPERVISE_ARGV_SKIP, None
         return (
             _SUPERVISE_ARGV_MATCH,
             _supervise_flag_fields(parts, program_index + 2),
         )
     if _is_shell_binary(parts[0]):
-        return _probe_shell_supervise_argv(parts)
-    return _probe_unknown_if_supervise(parts)
+        return _probe_shell_messages_argv(parts, commands)
+    return _probe_unknown_if_messages_command(parts, commands)
+
+
+def _probe_supervise_argv(
+    command: str,
+) -> tuple[str, dict[str, str] | None]:
+    """Classify one process command as supervise, foreign, or unreadable."""
+    return _probe_messages_argv(command, commands=frozenset({"supervise"}))
 
 
 def _supervise_argv_fields(command: str) -> dict[str, str] | None:
@@ -3393,6 +3426,115 @@ def supervisor_generation_states(
         )
         for project_root, controller_label, lease_nonce in generations
     ]
+
+
+def live_monitor_lease_nonces(
+    project_root: Path | str,
+    *,
+    controller_label: str,
+    process_timeout_s: float = MONITOR_PROCESS_PROBE_TIMEOUT_S,
+) -> dict[str, object]:
+    """Parse lease nonces from this label's proven-live stream monitors.
+
+    The ``classification`` field uses the existing supervise argv vocabulary:
+    match means every live monitor was parsed and scoped, skip means there is
+    no live monitor for this label, and unknown means at least one
+    liveness/argv probe could not establish the answer. Unknown results retain
+    any nonces that were independently established from other monitors.
+    """
+    label = str(controller_label or "").strip()
+    if not label:
+        return {
+            "classification": _SUPERVISE_ARGV_UNKNOWN,
+            "reason": "controller-label-unavailable",
+        }
+    try:
+        waiters = live_waiters(
+            project_root,
+            controller_label=label,
+            kinds={MONITOR_KIND},
+            prune_dead=False,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        waiters = None
+    if waiters is None:
+        return {
+            "classification": _SUPERVISE_ARGV_UNKNOWN,
+            "reason": "monitor-waiter-probe-unavailable",
+        }
+    if not waiters:
+        return {
+            "classification": _SUPERVISE_ARGV_SKIP,
+            "reason": "no-live-monitor",
+            "live_monitors": 0,
+        }
+    listing = _process_listing(
+        timeout_s=process_timeout_s,
+        pids=tuple(waiter.pid for waiter in waiters),
+    )
+    if listing is None:
+        return {
+            "classification": _SUPERVISE_ARGV_UNKNOWN,
+            "reason": "monitor-process-list-unavailable",
+            "live_monitors": len(waiters),
+        }
+    commands_by_pid = {
+        pid: command for pid, command in listing if isinstance(pid, int)
+    }
+    expected_root = Path(project_root).expanduser().resolve(strict=False)
+    nonces: set[str] = set()
+    uncorroborated_nonces: set[str] = set()
+    unknown_reason: str | None = None
+    for waiter in waiters:
+        command = commands_by_pid.get(waiter.pid)
+        if command is None:
+            unknown_reason = unknown_reason or "monitor-argv-unavailable"
+            continue
+        classification, fields = _probe_messages_argv(
+            command,
+            commands=frozenset({"follow"}),
+        )
+        if classification != _SUPERVISE_ARGV_MATCH or fields is None:
+            unknown_reason = unknown_reason or (
+                "monitor-argv-unparseable"
+                if classification == _SUPERVISE_ARGV_UNKNOWN
+                else "monitor-argv-mismatch"
+            )
+            continue
+        raw_root = str(fields.get("project_root") or "").strip()
+        raw_label = str(fields.get("controller_label") or "").strip()
+        raw_nonce = str(fields.get("lease_nonce") or "").strip()
+        if not raw_root or not raw_label or not raw_nonce:
+            unknown_reason = unknown_reason or "monitor-argv-incomplete"
+            continue
+        if (
+            waiter.generation_hash is not None
+            and _waiter_generation_hash(raw_nonce) != waiter.generation_hash
+        ):
+            unknown_reason = unknown_reason or "monitor-argv-nonce-unverifiable"
+            continue
+        try:
+            parsed_root = Path(raw_root).expanduser().resolve(strict=False)
+        except OSError:
+            unknown_reason = unknown_reason or "monitor-project-root-unreadable"
+            continue
+        if parsed_root != expected_root or raw_label != label:
+            unknown_reason = unknown_reason or "monitor-argv-scope-mismatch"
+            continue
+        nonces.add(raw_nonce)
+        if waiter.generation_hash is None:
+            uncorroborated_nonces.add(raw_nonce)
+    return {
+        "classification": (
+            _SUPERVISE_ARGV_UNKNOWN
+            if unknown_reason is not None
+            else _SUPERVISE_ARGV_MATCH
+        ),
+        "reason": unknown_reason or "monitor-argv-parsed",
+        "live_monitors": len(waiters),
+        "lease_nonces": sorted(nonces),
+        "uncorroborated_lease_nonces": sorted(uncorroborated_nonces),
+    }
 
 
 def classify_wake_command(command: str) -> str:

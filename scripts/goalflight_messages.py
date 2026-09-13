@@ -45,6 +45,7 @@ DEFAULT_RELAY_BYTE_LIMIT = 4096
 TASKLESS_TERMINAL_STALE_AFTER = dt.timedelta(hours=24)
 PROJECT_MAIL_ALIASES_ENV = "GOALFLIGHT_PROJECT_MAIL_ALIASES"
 MIN_DERIVED_PROJECT_ALIAS_LEN = 4
+_MONITOR_JOURNAL_PROBE_BUDGET_S = 0.05
 
 sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -3883,6 +3884,143 @@ def format_mail_notice(count: int) -> str:
     return f"{count} new mail; peek: goalflight_messages.py relay --new"
 
 
+def _monitor_lease_status(
+    argv_probe: dict[str, object] | None,
+    *,
+    active_lease: object | None = None,
+    journal_error: str | None = None,
+) -> dict[str, object]:
+    if argv_probe is None:
+        return {"state": "unknown", "reason": "controller-label-unavailable"}
+    classification = argv_probe.get("classification")
+    live_monitors = argv_probe.get("live_monitors")
+    details = (
+        {"live_monitors": live_monitors}
+        if isinstance(live_monitors, int)
+        else {}
+    )
+    if classification == goalflight_wake._SUPERVISE_ARGV_SKIP:
+        return {"state": "absent", "reason": "no-live-monitor", **details}
+    if classification not in {
+        goalflight_wake._SUPERVISE_ARGV_MATCH,
+        goalflight_wake._SUPERVISE_ARGV_UNKNOWN,
+    }:
+        return {
+            "state": "unknown",
+            "reason": str(argv_probe.get("reason") or "monitor-argv-unreadable"),
+            **details,
+        }
+    if journal_error is not None:
+        return {"state": "unknown", "reason": journal_error, **details}
+    observed_nonces = argv_probe.get("lease_nonces")
+    if not isinstance(observed_nonces, list):
+        return {
+            "state": "unknown",
+            "reason": str(
+                (argv_probe.get("reason") or "monitor-argv-unreadable")
+                if classification == goalflight_wake._SUPERVISE_ARGV_UNKNOWN
+                else "lease-nonce-unreadable"
+            ),
+            **details,
+        }
+    if any(not isinstance(value, str) or not value for value in observed_nonces):
+        return {"state": "unknown", "reason": "lease-nonce-unreadable", **details}
+    if active_lease is None:
+        if observed_nonces:
+            return {"state": "orphaned", "reason": "no-active-lease", **details}
+        return {
+            "state": "unknown",
+            "reason": str(argv_probe.get("reason") or "monitor-argv-unreadable"),
+            **details,
+        }
+    active_nonce = str(getattr(active_lease, "nonce", "") or "").strip()
+    if not active_nonce:
+        return {"state": "unknown", "reason": "lease-nonce-unreadable", **details}
+    uncorroborated = argv_probe.get("uncorroborated_lease_nonces")
+    if not isinstance(uncorroborated, list):
+        uncorroborated = []
+    prefix_ambiguous = False
+    for observed_nonce in observed_nonces:
+        if observed_nonce == active_nonce:
+            continue
+        if observed_nonce in uncorroborated:
+            if active_nonce.startswith(observed_nonce):
+                prefix_ambiguous = True
+                continue
+        return {"state": "orphaned", "reason": "lease-nonce-mismatch", **details}
+    raw_deadline = str(
+        getattr(active_lease, "renew_deadline_at", "") or ""
+    ).strip()
+    try:
+        deadline = dt.datetime.fromisoformat(raw_deadline.replace("Z", "+00:00"))
+    except ValueError:
+        return {
+            "state": "unknown",
+            "reason": "renew-deadline-unreadable",
+            **details,
+        }
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=dt.timezone.utc)
+    if deadline.astimezone(dt.timezone.utc) <= dt.datetime.now(dt.timezone.utc):
+        return {"state": "orphaned", "reason": "renew-deadline-past", **details}
+    if prefix_ambiguous:
+        return {
+            "state": "unknown",
+            "reason": "lease-nonce-prefix-ambiguous",
+            **details,
+        }
+    if classification == goalflight_wake._SUPERVISE_ARGV_UNKNOWN:
+        return {
+            "state": "unknown",
+            "reason": str(argv_probe.get("reason") or "monitor-argv-unreadable"),
+            **details,
+        }
+    if not observed_nonces:
+        return {"state": "unknown", "reason": "lease-nonce-unreadable", **details}
+    return {"state": "current", "reason": "active-lease-current", **details}
+
+
+def format_monitor_lease_notice(status: dict[str, object]) -> str | None:
+    state = status.get("state")
+    if state == "orphaned":
+        if status.get("reason") == "lease-nonce-mismatch":
+            remedy = (
+                "restart goalflight_messages.py supervise for this label "
+                "with the active lease nonce."
+            )
+        else:
+            remedy = (
+                "renew the controller lease (--join), then restart "
+                "goalflight_messages.py supervise for this label."
+            )
+        return (
+            "WARNING: live wake monitor is ORPHANED from the controller lease; "
+            f"{remedy}"
+        )
+    if state == "unknown":
+        reason = sanitize_display(status.get("reason") or "probe unavailable", limit=80)
+        if not isinstance(status.get("live_monitors"), int) or int(
+            status["live_monitors"]
+        ) < 1:
+            return (
+                f"wake monitor status UNKNOWN ({reason}); run "
+                "goalflight_session_status.py --text before trusting monitor coverage."
+            )
+        return (
+            f"wake monitor lease UNKNOWN ({reason}); run "
+            "goalflight_session_status.py --text before trusting the live monitor."
+        )
+    return None
+
+
+def _monitor_lease_fields(status: dict[str, object]) -> dict[str, object]:
+    fields: dict[str, object] = {"monitor_lease": status}
+    notice = format_monitor_lease_notice(status)
+    if notice:
+        fields["monitor_lease_notice"] = notice
+    return fields
+
+
 def dispatch_mail_watermark(
     dispatch_ids: set[str] | list[str] | tuple[str, ...],
     *,
@@ -3936,6 +4074,7 @@ def controller_mail_summary(
     del owned_dispatch_ids, messages_dir, fleet_dir
     if task_store_project_root is None:
         return {}
+    monitor_argv: dict[str, object] | None = None
     try:
         import goalflight_journal  # type: ignore
         import goalflight_session_status as sessions  # type: ignore
@@ -3946,16 +4085,37 @@ def controller_mail_summary(
         root = goalflight_task.resolve_project_root_for_read(str(task_store_project_root))
         if root is None:
             return {"reason": "unresolvable-project-root"}
-        authority = goalflight_journal.Journal.open_reader(root)
         label = sessions.resolve_controller_label(
             controller_label,
             project_root=root,
+        )
+        if label is not None:
+            monitor_argv = goalflight_wake.live_monitor_lease_nonces(
+                root,
+                controller_label=label,
+            )
+        # This is an every-command advisory, so journal contention degrades to
+        # UNKNOWN within a tight bound instead of delaying the command.
+        authority = goalflight_journal.Journal.open_reader(
+            root,
+            retry_budget_s=_MONITOR_JOURNAL_PROBE_BUDGET_S,
+            open_retry_budget_s=_MONITOR_JOURNAL_PROBE_BUDGET_S,
+            transaction_budget_s=_MONITOR_JOURNAL_PROBE_BUDGET_S,
         )
         if label is None:
             active = authority.lease_records()
             label = str(active[0]["label"]) if len(active) == 1 else None
         if label is None:
             return {}
+        if monitor_argv is None:
+            monitor_argv = goalflight_wake.live_monitor_lease_nonces(
+                root,
+                controller_label=label,
+            )
+        monitor_lease = _monitor_lease_status(
+            monitor_argv,
+            active_lease=authority.active_lease(label),
+        )
         # COUNT everything pending; WAKE on only the waking subset. b-108's
         # acceptance is explicit -- "periodic status stays quiet and remains in
         # the unread count" -- and waking_only=True here delivered only the
@@ -3967,13 +4127,14 @@ def controller_mail_summary(
         # goalflight_status and the controller_pending_events default. Widening
         # here restores the count without re-arming the wake this item silenced.
         rows = authority.pending_delivery_events(label, waking_only=False, limit=1000)
-    except (
-        goalflight_journal.JournalBusy,
-        goalflight_journal.JournalDisappeared,
-        goalflight_journal.JournalIOError,
-        ValueError,
-    ):
-        return {}
+    except (goalflight_journal.JournalError, ValueError) as exc:
+        if monitor_argv is None:
+            return {}
+        monitor_lease = _monitor_lease_status(
+            monitor_argv,
+            journal_error=type(exc).__name__,
+        )
+        return _monitor_lease_fields(monitor_lease)
 
     items: list[dict[str, object]] = []
     carrier_errors: list[dict[str, object]] = []
@@ -3998,7 +4159,12 @@ def controller_mail_summary(
             }
         )
     if not items and not carrier_errors:
-        return {"count": 0, "needs": [], "controller_label": label}
+        return {
+            "count": 0,
+            "needs": [],
+            "controller_label": label,
+            **_monitor_lease_fields(monitor_lease),
+        }
     result: dict[str, object] = {
         "count": len(items),
         "needs": items,
@@ -4008,6 +4174,7 @@ def controller_mail_summary(
             else f"WARNING: {len(carrier_errors)} corrupt mail carrier(s)"
         ),
         "controller_label": label,
+        **_monitor_lease_fields(monitor_lease),
     }
     if carrier_errors:
         result["carrier_errors"] = carrier_errors
@@ -4597,7 +4764,10 @@ def emit_controller_mail_notice(
     fleet_dir: Path | None = None,
     stream=None,
 ) -> str | None:
-    """Compute and print the shared one-line mail notice, always fail-open."""
+    """Print post-command monitor/mail advisories, always fail-open.
+
+    The return value remains the unread-mail notice, when one was printed.
+    """
     try:
         resolved_owned_dispatch_ids = owned_dispatch_ids
         if resolved_owned_dispatch_ids is None:
@@ -4617,6 +4787,9 @@ def emit_controller_mail_notice(
             messages_dir=messages_dir,
             fleet_dir=fleet_dir,
         )
+        monitor_notice = str(summary.get("monitor_lease_notice") or "").strip()
+        if monitor_notice:
+            print(monitor_notice, file=sys.stderr if stream is None else stream)
         if "count" not in summary:
             # Unresolved or unread journal: not a measured 0.
             return None
