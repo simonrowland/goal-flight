@@ -1132,25 +1132,42 @@ def _line_cursor_version(line: str) -> int | None:
 
 
 def _is_backlog_capable_line(line: str) -> bool:
-    """Mail-like lines a stuck cursor can replay. Diagnostics always pass."""
+    """Normalize mail types before the shared exemption from both backlog caps."""
     text = str(line or "").strip()
     if not text:
         return False
-    if text.startswith("advance:"):
-        return True
+    passthrough_types = _ESCALATION_EVENT_TYPES
     record = _parse_child_record(text)
     if record is None:
-        return True
-    kind = str(record.get("kind") or "")
-    if kind in {"pending-at-arm", "ring"}:
-        return True
-    if kind != "event":
-        return False
-    payload = record.get("payload")
-    event_type = (
-        str(payload.get("type") or "") if isinstance(payload, dict) else ""
-    )
-    return event_type not in _PASSTHROUGH_EVENT_TYPES
+        # format_receipt_headline is shared by backup arm/ring and drain.
+        event_types = (
+            {text[1:].partition("] ")[0]}
+            if text.startswith("[") and "] " in text else set()
+        )
+    else:
+        kind = str(record.get("kind") or "")
+        if kind == "event":
+            passthrough_types = _PASSTHROUGH_EVENT_TYPES
+            payload = record.get("payload")
+            event_types = (
+                {str(payload.get("type") or "")}
+                if isinstance(payload, dict) else set()
+            )
+        elif kind == "pending-at-arm":
+            # One arm snapshot can contain routine mail alongside an escalation.
+            items = record.get("items")
+            event_types = {
+                str(item.get("event_type") or "")
+                for item in items
+                if isinstance(item, dict)
+            } if isinstance(items, list) else set()
+        elif kind == "ring":
+            event_types = set()  # Doorbells carry no mail type or body.
+        else:
+            return False  # Structured diagnostics are never backlog mail.
+    # Every typed representation reaches this decision before identity/copy
+    # accounting; a mixed snapshot passes intact if any item needs attention.
+    return not event_types.intersection(passthrough_types)
 
 
 def _backlog_line_identity(line: str) -> str:

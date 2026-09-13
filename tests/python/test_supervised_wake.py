@@ -5503,6 +5503,75 @@ def test_distinct_headlines_past_cap_are_forwarded() -> None:
     assert collapse == []
 
 
+@pytest.mark.parametrize("wire_kind", ["headline", "event", "event-summary", "pending-at-arm"])
+def test_escalations_reach_stdout_after_195_routine_headlines(wire_kind: str) -> None:
+    """Reproduce the audit burst with production formatters, including replays."""
+    routine = [
+        messages.format_receipt_headline(
+            {"stream_id": "routine", "stream_seq": index + 1},
+            {"type": "result", "payload": {"text": f"routine {index}"}},
+        )
+        for index in range(195)
+    ]
+    escalations = []
+    for index, event_type in enumerate(("blocked", "user_need", "user_confirm")):
+        row = {"stream_id": f"escalation-{index}", "stream_seq": 200 + index}
+        envelope = {
+            "dispatch_id": row["stream_id"],
+            "seq": row["stream_seq"],
+            "type": event_type,
+            "payload": {"text": "ruling required"},
+        }
+        if wire_kind == "headline":
+            line = messages.format_receipt_headline(row, envelope)
+        elif wire_kind == "pending-at-arm":
+            line = json.dumps({
+                "kind": "pending-at-arm",
+                "items": [
+                    {"stream_id": "routine", "stream_seq": 196, "event_type": "result"},
+                    {**row, "event_type": event_type},
+                ],
+                "cursor_version": 5220,
+                "advance_command": "relay --advance-cursor",
+            })
+        else:
+            if wire_kind == "event-summary":
+                envelope["payload"] = {"text": "ruling required " * 2000}
+            record = messages._follow_event_record(row, envelope, cursor_version=5220)
+            if wire_kind == "event-summary":
+                assert record["payload"]["data"] is None
+                assert record["payload"]["summary"]
+            line = json.dumps(record)
+        escalations.append(line)
+    # Replays must also bypass the duplicate-copy cap, even at one cursor.
+    copies = supervise.CHILD_BACKLOG_CAP + 1
+    incoming = routine + escalations * copies
+    host = FakeHost(
+        scripts={
+            "backup": [
+                PlannedExit(
+                    lifetime_s=80.0,
+                    returncode=0,
+                    armed=True,
+                    stdout_lines=[
+                        (index * 0.001, line) for index, line in enumerate(incoming)
+                    ],
+                )
+            ]
+        },
+        stop_after_waits=len(incoming) + 5,
+    )
+    _run(host, _items("backup"), heartbeat_s=50.0, coverage_s=50.0)
+    output = [line.rstrip("\n") for line in host.lines]
+    assert sum(line in output for line in routine) == supervise.CHILD_DISTINCT_CAP
+    delivered = [output.count(line) for line in escalations]
+    assert delivered == [copies] * 3, f"{wire_kind}: escalation stdout counts {delivered}"
+    withheld = [
+        record for record in _records(host) if record.get("type") == "distinct-withheld"
+    ]
+    assert sum(int(record["count"]) for record in withheld) == 195 - supervise.CHILD_DISTINCT_CAP
+
+
 def test_genuine_ring_after_backlog_cap_reaches_controller() -> None:
     """A kind=ring inside the 15-minute window after the cap fired must forward.
 
@@ -5553,7 +5622,11 @@ def test_distinct_volume_names_withheld_mail_and_how_to_retrieve_it(
     n = cap + 8
     headlines = []
     for index in range(n):
-        row = {"stream_id": f"flood-{index // 2}", "stream_seq": index + 1}
+        row = {
+            "stream_id": f"flood-{index // 2}",
+            "stream_seq": index + 1,
+            "event_type": "result",
+        }
         envelope = {
             "dispatch_id": row["stream_id"],
             "seq": row["stream_seq"],
