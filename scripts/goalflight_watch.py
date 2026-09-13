@@ -3144,9 +3144,19 @@ def harvest_headline_marker(
         kimi_output=kimi_output,
         expected_dispatch_id=expected_dispatch_id,
         full_file_fallback=True,
+        recover_final_response=payload.get("worker_alive") is False,
     )
     if _is_headline_kind(harvested):
         return harvested
+    if payload.get("worker_alive") is False:
+        try:
+            tail.stat()
+        except FileNotFoundError:
+            pass  # Recorded success can survive removal of its output file.
+        else:
+            # The completed-tail selector rejected the available evidence.
+            # Diagnostic scrapes must not resurrect a quoted marker as mail.
+            return None
     # Success-only fallbacks: a completed worker's COMPLETE/READY/RESULT may
     # sit behind extra summary. Attention is never taken from extract_markers.
     #
@@ -3303,6 +3313,7 @@ def _scan_final_terminal_marker(
     kimi_output: bool = False,
     expected_dispatch_id: str | None = None,
     rendered_response: bool = False,
+    rendered_response_start: int | None = None,
 ) -> dict | None:
     fence = goalflight_terminal.MarkdownFenceTracker()
     in_hunk = False
@@ -3312,7 +3323,16 @@ def _scan_final_terminal_marker(
     last_completed: dict | None = None
     last_output_line_no: int | None = None
     previous_stripped = ""
+    before_fence = (None, None, None, None, False)
     for idx, line in enumerate(lines, start=1):
+        if idx == rendered_response_start:
+            if fence.in_fence:
+                last_success, last_attention, last_blocked, last_completed, in_hunk = before_fence
+            fence = goalflight_terminal.MarkdownFenceTracker()
+            in_hunk = False
+            before_fence = (last_success, last_attention, last_blocked, last_completed, False)
+            rendered_response = True
+            echo_anchor_found = False
         stripped = line.strip()
         if idx - 1 in prompt_echo_lines:
             continue
@@ -3324,9 +3344,15 @@ def _scan_final_terminal_marker(
         )
         fence_was_open = fence.in_fence
         if fence.consume_boundary(line):
+            if fence.in_fence:
+                before_fence = (last_success, last_attention, last_blocked, last_completed, in_hunk)
+            else:
+                # Even on the unmatched-fence retry, a CLOSED example remains
+                # quoted. Only evidence in the final open fence may survive.
+                last_success, last_attention, last_blocked, last_completed, in_hunk = before_fence
             continue
         marker_in_fence = fence_was_open or fence.in_fence
-        if marker_in_fence and not ignore_fences:
+        if marker_in_fence and (not ignore_fences or rendered_response):
             continue
         if in_hunk:
             if line.startswith((" ", "+", "-", "\\")):
@@ -3415,6 +3441,7 @@ def _stream_final_terminal_marker(
     ignore_fences: bool,
     kimi_output: bool,
     expected_dispatch_id: str,
+    rendered_response_start: int | None = None,
 ) -> tuple[dict | None, bool]:
     """Scan a completed tail from disk without materializing the whole file."""
 
@@ -3442,11 +3469,25 @@ def _stream_final_terminal_marker(
         last_completed: dict | None = None
         last_output_line_no: int | None = None
         previous_stripped = ""
+        before_fence = (None, None, None, None, False)
+        rendered_response = False
+        prefix_unbalanced = False
 
         def consume(line: str, line_no: int, *, oversized: bool) -> None:
             nonlocal in_hunk, last_success, last_attention
             nonlocal last_blocked, last_completed
             nonlocal last_output_line_no, previous_stripped
+            nonlocal before_fence
+            nonlocal fence, rendered_response, echo_anchor_found, prefix_unbalanced
+            if line_no == rendered_response_start:
+                prefix_unbalanced = fence.in_fence
+                if fence.in_fence:
+                    last_success, last_attention, last_blocked, last_completed, in_hunk = before_fence
+                fence = goalflight_terminal.MarkdownFenceTracker()
+                in_hunk = False
+                before_fence = (last_success, last_attention, last_blocked, last_completed, False)
+                rendered_response = True
+                echo_anchor_found = False
             stripped = line.strip()
             if line_no - 1 in prompt_echo_lines:
                 return
@@ -3458,9 +3499,13 @@ def _stream_final_terminal_marker(
             )
             fence_was_open = fence.in_fence
             if fence.consume_boundary(line):
+                if fence.in_fence:
+                    before_fence = (last_success, last_attention, last_blocked, last_completed, in_hunk)
+                else:
+                    last_success, last_attention, last_blocked, last_completed, in_hunk = before_fence
                 return
             marker_in_fence = fence_was_open or fence.in_fence
-            if marker_in_fence and not ignore_fences:
+            if marker_in_fence and (not ignore_fences or rendered_response):
                 return
             if in_hunk:
                 if line.startswith((" ", "+", "-", "\\")):
@@ -3500,23 +3545,44 @@ def _stream_final_terminal_marker(
             ):
                 return
             if is_attention:
-                last_attention = candidate
                 if candidate.get("kind") == "BLOCKED":
                     last_blocked = candidate
+                if (
+                    rendered_response
+                    and not oversized
+                    and line.startswith("!")
+                    and _payload_binds_to_dispatch(
+                        candidate, expected_dispatch_id, require_terminated=True
+                    )
+                ):
+                    last_success = candidate
+                else:
+                    last_attention = candidate
             else:
                 last_success = candidate
                 if candidate.get("kind") in {"COMPLETE", "RESULT"}:
                     last_completed = candidate
 
-        for line_no, line, oversized in leading_records:
-            consume(line, line_no, oversized=oversized)
-        for line_no, line, oversized in line_iter:
-            consume(line, line_no, oversized=oversized)
+        records = itertools.chain(leading_records, line_iter)
+        for line_no, line, oversized in records:
+            if line_no == rendered_response_start:
+                # The response is a new prompt-echo search window too. Keep
+                # the same bounded lookahead used at the start of the file.
+                response_records = [(line_no, line, oversized)]
+                response_records.extend(itertools.islice(records, max(0, prompt_buffer_lines - 1)))
+                response_echoes, _anchor, _prompt_lines = _prompt_echo_scan(
+                    [item[1] for item in response_records], prompt_prefix
+                )
+                prompt_echo_lines.update(line_no - 1 + idx for idx in response_echoes)
+                for response_line_no, response_line, response_oversized in response_records:
+                    consume(response_line, response_line_no, oversized=response_oversized)
+            else:
+                consume(line, line_no, oversized=oversized)
     return (
         _select_dead_path_terminal(
             last_success, last_attention, last_output_line_no, last_blocked, last_completed
         ),
-        fence.in_fence,
+        prefix_unbalanced or fence.in_fence,
     )
 
 
@@ -3527,6 +3593,7 @@ def _full_file_terminal_marker(
     suppress_unfenced_prompt_markers: bool,
     kimi_output: bool,
     expected_dispatch_id: str,
+    rendered_response_start: int | None = None,
 ) -> dict | None:
     terminal, fence_unbalanced = _stream_final_terminal_marker(
         path,
@@ -3535,6 +3602,7 @@ def _full_file_terminal_marker(
         ignore_fences=False,
         kimi_output=kimi_output,
         expected_dispatch_id=expected_dispatch_id,
+        rendered_response_start=rendered_response_start,
     )
     if not fence_unbalanced:
         return terminal
@@ -3545,6 +3613,7 @@ def _full_file_terminal_marker(
         ignore_fences=True,
         kimi_output=kimi_output,
         expected_dispatch_id=expected_dispatch_id,
+        rendered_response_start=rendered_response_start,
     )
     if fence_agnostic and (
         not terminal or fence_agnostic.get("line", -1) >= terminal.get("line", -1)
@@ -3553,7 +3622,7 @@ def _full_file_terminal_marker(
     return terminal
 
 
-def _rendered_response_suffix_length(records, prompt_prefix: list[str]) -> int | None:
+def _rendered_response_boundary(records, prompt_prefix: list[str]) -> tuple[int, int] | None:
     """Locate an unquoted final renderer footer without losing large-tail context."""
     records = iter(records)
     leading = list(itertools.islice(
@@ -3564,7 +3633,10 @@ def _rendered_response_suffix_length(records, prompt_prefix: list[str]) -> int |
     )
     footer = None
     fenced_footer = None
+    fenced_footer_eligible = False
+    tool_fence = False
     fence = goalflight_terminal.MarkdownFenceTracker()
+    response_fence = goalflight_terminal.MarkdownFenceTracker()
     previous = ""
     line_no = 0
     for line_no, line, oversized in itertools.chain(leading, records):
@@ -3572,21 +3644,29 @@ def _rendered_response_suffix_length(records, prompt_prefix: list[str]) -> int |
             previous = ""
             continue
         stripped = line.strip()
+        response_quoted = fenced_footer is not None and (
+            response_fence.consume_boundary(line) or response_fence.in_fence
+        )
         if fence.consume_boundary(line):
-            # A footer inside a closed example cannot reset Markdown context.
-            fenced_footer = None
+            tool_fence = fence.in_fence and previous == "tool"
         elif (
             not oversized and previous == "tokens used"
             and HARNESS_TOKEN_COUNT_RE.fullmatch(stripped)
         ):
             if fence.in_fence:
-                fenced_footer = line_no
+                if not response_quoted:
+                    fenced_footer = line_no
+                    fenced_footer_eligible = footer is None or tool_fence
+                    response_fence = goalflight_terminal.MarkdownFenceTracker()
             else:
                 footer = line_no
         previous = stripped if not oversized else ""
-    if footer is None and fenced_footer is not None:
+    if fenced_footer is not None and fenced_footer_eligible and not response_fence.in_fence:
+        # Interpret the suffix independently: a balanced response snippet may
+        # use bare fences too. A lone closing delimiter from a quoted example
+        # instead leaves this suffix unbalanced, so retain the global footer.
         footer = fenced_footer
-    return line_no - footer if footer is not None else None
+    return (footer, line_no) if footer is not None else None
 
 
 def _final_terminal_marker(
@@ -3628,7 +3708,40 @@ def _final_terminal_marker(
         f.seek(start)
         text = f.read().decode(errors="replace")
     lines = text.splitlines()
+    response_start = None
+    if recover_final_response and expected_dispatch_id:
+        if start > 0:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                boundary = _rendered_response_boundary(
+                    _iter_bounded_text_lines(handle), prompt_prefix
+                )
+        else:
+            boundary = _rendered_response_boundary(
+                ((idx, line, False) for idx, line in enumerate(lines, 1)),
+                prompt_prefix,
+            )
+        if boundary:
+            response_start = boundary[0] + 1
+    if full_file_fallback and start > 0 and expected_dispatch_id:
+        # Every bounded candidate can have lost fence or physical-line context,
+        # including COMPLETE/RESULT. Select once with full context restored.
+        return _full_file_terminal_marker(
+            path,
+            prompt_prefix=prompt_prefix,
+            suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
+            kimi_output=kimi_output,
+            expected_dispatch_id=expected_dispatch_id,
+            rendered_response_start=response_start,
+        )
+    if response_start is not None and start > 0:
+        response_start -= boundary[1] - len(lines)
+        response_start = max(1, response_start)
     prompt_echo_lines, echo_anchor_found, prompt_line_set = _prompt_echo_scan(lines, prompt_prefix)
+    if response_start is not None:
+        response_echoes, _anchor, _prompt_lines = _prompt_echo_scan(
+            lines[response_start - 1:], prompt_prefix
+        )
+        prompt_echo_lines.update(response_start - 1 + idx for idx in response_echoes)
     terminal = _scan_final_terminal_marker(
         lines,
         prompt_echo_lines=prompt_echo_lines,
@@ -3638,8 +3751,9 @@ def _final_terminal_marker(
         ignore_fences=False,
         kimi_output=kimi_output,
         expected_dispatch_id=expected_dispatch_id,
+        rendered_response_start=response_start,
     )
-    if _fence_state_unbalanced(lines, prompt_echo_lines):
+    if response_start is not None or _fence_state_unbalanced(lines, prompt_echo_lines):
         fence_agnostic_terminal = _scan_final_terminal_marker(
             lines,
             prompt_echo_lines=prompt_echo_lines,
@@ -3649,69 +3763,13 @@ def _final_terminal_marker(
             ignore_fences=True,
             kimi_output=kimi_output,
             expected_dispatch_id=expected_dispatch_id,
+            rendered_response_start=response_start,
         )
         if fence_agnostic_terminal and (
             not terminal
             or fence_agnostic_terminal.get("line", -1) >= terminal.get("line", -1)
         ):
             terminal = fence_agnostic_terminal
-    if recover_final_response and expected_dispatch_id:
-        # Use the last renderer footer, not arbitrary earlier attention (for
-        # example, a question whose steer wait timed out and work continued).
-        if start > 0:
-            # The bounded slice can start inside a balanced quoted example.
-            # Stream its missing context before trusting a renderer boundary.
-            with path.open("r", encoding="utf-8", errors="replace") as handle:
-                response_length = _rendered_response_suffix_length(
-                    _iter_bounded_text_lines(handle), prompt_prefix
-                )
-        else:
-            response_length = _rendered_response_suffix_length(
-                ((idx, line, False) for idx, line in enumerate(lines, 1)),
-                prompt_prefix,
-            )
-        if response_length is not None and 0 < response_length <= len(lines):
-            response_start = len(lines) - response_length
-            response = lines[response_start:]
-            response_echoes, _anchor, response_prompt_lines = _prompt_echo_scan(
-                response, prompt_prefix
-            )
-            recovered = _scan_final_terminal_marker(
-                response,
-                prompt_echo_lines=response_echoes,
-                echo_anchor_found=False,
-                prompt_line_set=response_prompt_lines,
-                suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
-                ignore_fences=False,
-                kimi_output=kimi_output,
-                expected_dispatch_id=expected_dispatch_id,
-                rendered_response=True,
-            )
-            if (
-                recovered
-                and recovered.get("kind") in goalflight_terminal.ATTENTION_MARKERS
-                and response[recovered["line"] - 1].startswith("!")
-                and _payload_binds_to_dispatch(recovered, expected_dispatch_id)
-            ):
-                recovered["line"] += response_start
-                if not terminal or recovered["line"] > terminal["line"]:
-                    terminal = recovered
-    if (
-        full_file_fallback and start > 0 and expected_dispatch_id
-        and (not terminal or terminal.get("kind") == "READY")
-    ):
-        # The bounded live scan is intentionally cheap. Once worker identity is
-        # dead, output is immutable, so one streamed whole-file pass is safe and
-        # prevents >10 MiB of post-marker logs from erasing terminal evidence.
-        # READY may point to a blocker report; reconcile earlier BLOCKED and
-        # COMPLETE/RESULT evidence before accepting the bounded candidate.
-        return _full_file_terminal_marker(
-            path,
-            prompt_prefix=prompt_prefix,
-            suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
-            kimi_output=kimi_output,
-            expected_dispatch_id=expected_dispatch_id,
-        )
     return terminal
 
 
@@ -4438,9 +4496,10 @@ def main() -> int:
                 else None
             )
             headline_marker = (
-                mail_marker
-                if isinstance(mail_marker, dict)
-                else blocking_marker
+                terminal_marker
+                if isinstance(terminal_marker, dict)
+                and terminal_marker.get("kind") in goalflight_terminal.ATTENTION_MARKERS
+                else mail_marker
             )
             headline_text = None
             if isinstance(headline_marker, dict):

@@ -51,6 +51,7 @@ sys.path.insert(0, str(SCRIPTS))
 import goalflight_fleet_console as fleet  # noqa: E402
 import goalflight_journal as journal  # noqa: E402
 import goalflight_ledger as ledger  # noqa: E402
+import goalflight_messages as messages  # noqa: E402
 import goalflight_status as status  # noqa: E402
 
 
@@ -412,6 +413,51 @@ def test_pending_sidecar_settles_only_after_worker_death(
     assert settled["worker_pid"] == worker.pid
     _reconcile(project)
     assert json.loads(status_path.read_text()) == settled, "repair is idempotent"
+
+
+@pytest.mark.parametrize("kind", ["USER-NEED", "USER-CONFIRM", "BLOCKED", "FAILED"])
+def test_pending_repair_preserves_question_delivery(tmp_path, spawn_worker, kind):
+    project = tmp_path / "project"
+    project.mkdir()
+    dispatch_id = "pending-question-worker"
+    worker = spawn_worker()
+    identity = ledger.process_identity(worker.pid)
+    assert identity
+    _mark_attempt_running(project, dispatch_id, identity)
+    worker.terminate()
+    worker.wait(timeout=10)
+    status_path = tmp_path / "worker.status.json"
+    question = f"{dispatch_id} — Which release target should I use?"
+    marker = {"kind": kind, "text": question, "line": 4}
+    _write_sidecar(
+        status_path, dispatch_id=dispatch_id, state="terminal_pending",
+        worker_pid=worker.pid, reason=f"marker:{kind}:final_reconciliation",
+    )
+    pending = json.loads(status_path.read_text())
+    pending.update(
+        terminal_pending_state="blocked", worker_alive=False,
+        terminal_marker=marker, last_marker=marker,
+        ledger_finalize_error={"type": "TerminalCommitRefused", "message": "retry"},
+    )
+    status_path.write_text(json.dumps(pending))
+    _write_ledger_record(
+        project, dispatch_id=dispatch_id, status_path=status_path,
+        worker_pid=worker.pid, worker_identity=identity,
+    )
+
+    first = _reconcile(project)
+    assert first["committed"] == 1
+    inbox = messages.inbox_path(Path(os.environ["GOALFLIGHT_MESSAGES_DIR"]), dispatch_id)
+    delivered = messages.read_envelopes(inbox)
+    expected_type = {"USER-NEED": "user_need", "USER-CONFIRM": "user_confirm"}.get(kind, "blocked")
+    assert [(item["type"], item["payload"]["text"]) for item in delivered] == [
+        (expected_type, question),
+    ]
+    if kind != "FAILED":
+        assert _ledger_row(dispatch_id)["reason"]["marker_kind"] == kind
+    second = _reconcile(project)
+    assert second["committed"] == 0
+    assert messages.read_envelopes(inbox) == delivered
 
 
 def test_terminal_sidecar_holds_when_liveness_unknown(tmp_path: Path) -> None:

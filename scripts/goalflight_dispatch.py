@@ -1457,13 +1457,17 @@ def _repair_watcher_terminal_status(
         if expected_dispatch_id
         else None
     )
-    if not terminal_marker and not worker_is_alive and expected_dispatch_id:
+    if not worker_is_alive and expected_dispatch_id:
         terminal_marker = _final_terminal_marker(
             tail,
             ignore_prefix_lines=ignore_prefix_lines,
             suppress_unfenced_prompt_markers=True,
             kimi_output=moonshot_family(getattr(args, "agent", None)),
             expected_dispatch_id=expected_dispatch_id,
+            full_file_fallback=True,
+            recover_final_response=(
+                _queue_claim_identity_status(worker_pid, worker_identity)[0] == "dead"
+            ),
         )
     if not terminal_marker:
         recorded_marker = payload.get("terminal_marker")
@@ -9825,6 +9829,11 @@ def _scan_entry_completion_marker(entry: dict) -> dict | None:
             suppress_unfenced_prompt_markers=True,
             expected_dispatch_id=dispatch_id,
             full_file_fallback=True,
+            recover_final_response=classify_reconciliation_admission(
+                _entry_with_record_identity(entry, entry), time.time(),
+            ) in {
+                PreAdmitClass.CONFIRMED_DEAD, PreAdmitClass.PID_REUSED,
+            },
         )
     except Exception:
         return None
@@ -13887,6 +13896,12 @@ def _resolve_claim_terminal_outcome(
                 suppress_unfenced_prompt_markers=True,
                 kimi_output=moonshot_family(agent),
                 expected_dispatch_id=expected_dispatch_id,
+                full_file_fallback=True,
+                recover_final_response=classify_reconciliation_admission(
+                    _entry_with_record_identity(entry, entry), time.time(),
+                ) in {
+                    PreAdmitClass.CONFIRMED_DEAD, PreAdmitClass.PID_REUSED,
+                },
             )
         except Exception:
             return None
@@ -13913,6 +13928,14 @@ def _resolve_claim_terminal_outcome(
         terminal_marker,
     )
     state, final_reason = _quota_limited_state_reason(state, final_reason, tail, agent=agent)
+    if terminal_marker and terminal_marker.get("kind") in goalflight_terminal.ATTENTION_MARKERS:
+        # All claim/abandoned commit routes consume this reason. Preserve the
+        # selected question on the same structured carrier used by the watcher.
+        final_reason = {
+            "reason": final_reason,
+            "marker_kind": terminal_marker["kind"],
+            "text": str(terminal_marker.get("text") or "").strip(),
+        }
     return state or "worker_dead", final_reason, terminal_marker
 
 

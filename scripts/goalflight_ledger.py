@@ -1947,6 +1947,7 @@ def reconcile_terminal_outbox(
         terminal_state = _terminal_key(record)
         state = str(record.get("state") or "")
         reason: object = record.get("reason") or record.get("error")
+        headline = None
         status_observation = _terminal_sidecar_observation(record)
         expired_launch = str(record["dispatch_id"]) in expired_launches
         needs_ledger_projection = status_observation is not None or expired_launch or terminal_state in {
@@ -1960,6 +1961,15 @@ def reconcile_terminal_outbox(
                 or status_observation.get("state")
             )
             reason = status_observation.get("reason") or status_observation.get("error")
+            marker = status_observation.get("terminal_marker")
+            if isinstance(marker, dict):
+                headline = str(marker.get("text") or "").strip() or None
+                if marker.get("kind") in {"USER-NEED", "USER-CONFIRM", "BLOCKED"}:
+                    reason = {
+                        "reason": reason,
+                        "marker_kind": marker["kind"],
+                        "text": headline or "",
+                    }
             record_terminal_key = terminal_state
             terminal_state = terminal_state_for(state, reason)
             # Process identity outranks a sidecar verdict. A terminal sidecar
@@ -2078,6 +2088,7 @@ def reconcile_terminal_outbox(
                 reason=reason,
                 terminal_state=terminal_state,
                 worker_still_alive=False,
+                headline=headline,
             )
         if result.committed and result.value is not None:
             if result.value.idempotent:
