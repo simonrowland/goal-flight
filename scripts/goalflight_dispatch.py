@@ -4681,9 +4681,13 @@ def _cmd_resume(argv: list[str]) -> int:
             "Reattaches to the existing worktree, prompt, branch, and partial "
             "artifacts; does not mint a sibling worktree. Continues quota-"
             "exhausted, dead, stale_dead, and plan-approval pauses. "
-            "Pass --account to continue on a specific surviving account."
+            "Pass --account to continue on a specific surviving account, or "
+            "--os-sandbox to override an inherited sandbox profile."
         ),
-        usage_hint="try resume <dispatch-id> --prompt-file <path> [--account <account>]",
+        usage_hint=(
+            "try resume <dispatch-id> --prompt-file <path> [--account <account>] "
+            "[--os-sandbox <profile>]"
+        ),
     )
     parser.add_argument("dispatch_id")
     parser.add_argument("--prompt-file", required=True)
@@ -4693,6 +4697,17 @@ def _cmd_resume(argv: list[str]) -> int:
             "Seat to bill the resumed worker to. Honored as a pin. "
             "When omitted, default selection skips recently quota-exhausted "
             "accounts until their reset."
+        ),
+    )
+    parser.add_argument(
+        "--os-sandbox",
+        type=_parse_os_sandbox_arg,
+        default=None,
+        metavar="{workspace-write,read-only,off}",
+        help=(
+            "Override the recorded sandbox profile for this resumed attempt. "
+            "Omit to preserve the original profile; use workspace-write only "
+            "after authorizing the resumed worker's in-scope writes."
         ),
     )
     parser.add_argument(
@@ -4816,10 +4831,22 @@ def _synthesize_resume_base_argv(source: dict, *, cwd: Path) -> list[str]:
         str(cwd),
     ]
     posture = record.get("os_sandbox")
+    requested = None
     if isinstance(posture, dict):
         requested = posture.get("requested_profile")
         if isinstance(requested, str) and requested:
-            argv += ["--os-sandbox", requested]
+            if (
+                requested == "read-only"
+                and source["agent"] in {"grok-code", "grok-research"}
+                and source["shape"] == "bash"
+            ):
+                argv.append("--read-only")
+            else:
+                argv += ["--os-sandbox", requested]
+    if not requested and record.get("read_only") is True:
+        # Records written before canonical dispatch_argv capture can carry only
+        # this legacy bit. Preserve it rather than silently widening the resume.
+        argv.append("--read-only")
     task_ids = record.get("task_ids")
     if isinstance(task_ids, list):
         for task_id in task_ids:
@@ -4940,12 +4967,40 @@ def _resume_launch_argv(
             replace["--account"] = target
     elif requested:
         replace["--account"] = requested
+    resume_sandbox = getattr(resume_args, "os_sandbox", None)
+    sandbox_strip_flags: tuple[str, ...] = ()
+    sandbox_strip_options: tuple[str, ...] = ()
+    if resume_sandbox is not None:
+        sandbox_strip_flags = ("--read-only", "--readonly")
+        grok_bash = (
+            source["agent"] in {"grok-code", "grok-research"}
+            and source["shape"] == "bash"
+        )
+        if grok_bash and resume_sandbox in {"workspace-write", "read-only"}:
+            # Grok bash has no OS-sandbox flag. Its read-only posture is the
+            # launcher's deny-rule set, selected by the legacy boolean flag;
+            # writable is represented by omitting both forms.
+            sandbox_strip_options = ("--os-sandbox",)
+            if resume_sandbox == "read-only":
+                inject.append("--read-only")
+        else:
+            replace["--os-sandbox"] = str(resume_sandbox)
     argv = _reconstruct_launch_argv(
         base,
         replace=replace,
         inject=inject,
-        strip_flags=_replay_strip_flags() + ("--unregistered-forced", "--occupied-worktree-forced"),
-        strip_options=("--tail", "--status-json", "--prompt", "--worktree"),
+        strip_flags=(
+            _replay_strip_flags()
+            + ("--unregistered-forced", "--occupied-worktree-forced")
+            + sandbox_strip_flags
+        ),
+        strip_options=(
+            "--tail",
+            "--status-json",
+            "--prompt",
+            "--worktree",
+        )
+        + sandbox_strip_options,
     )
     if "--account" not in replace:
         # Drop a recorded pin onto a now-exhausted (or Codex-rotating) account
@@ -17629,9 +17684,18 @@ def _build_launch_parser() -> argparse.ArgumentParser:
                              "Default = whatever the worker CLI config sets, so "
                              "the machine keeps one source of truth for the "
                              "default; pass this to raise a single dispatch.")
-    parser.add_argument("--read-only", "--readonly", action="store_true",
-                        help="Read-only sandbox (review/analysis dispatches). Equivalent to "
-                             "--os-sandbox read-only.")
+    parser.add_argument(
+        "--read-only",
+        "--readonly",
+        action="store_true",
+        help=(
+            "Read-only worker posture for review/analysis. Grok denies "
+            "Bash/Write/Edit; OS-sandboxed workers cannot modify the worktree, "
+            "so they cannot commit or write a review artifact and must return "
+            "findings inline. On OS-sandbox-capable workers this selects "
+            "--os-sandbox read-only; Grok bash uses deny rules instead."
+        ),
+    )
     parser.add_argument("--os-sandbox", type=_parse_os_sandbox_arg, default=None,
                         metavar="{workspace-write,read-only,off}",
                         help="OS sandbox profile. Honoured by bash-shape codex (maps to "
@@ -17640,6 +17704,8 @@ def _build_launch_parser() -> argparse.ArgumentParser:
                              "adapter and platform can wrap the worker (macOS sandbox-exec). "
                              "Unset = workspace-write for bash-shape codex. An accepted-but-inert "
                              "request is refused; grok bash should pass --read-only instead. "
+                             "The read-only profile denies worktree writes, so the worker cannot "
+                             "commit or write its review artifact. "
                              "'off' disables codex's Seatbelt sandbox (codex --sandbox "
                              "danger-full-access) for TRUSTED LOCAL GPU/perf work. Sanctioned "
                              "adapter profile, DISTINCT from the always-forbidden "

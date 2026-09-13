@@ -44,6 +44,12 @@ def test_submit_flag_is_rejected_by_argparse() -> None:
     assert exc_info.value.code == 2
 
 
+def test_read_only_help_names_worker_limits() -> None:
+    help_text = " ".join(D._build_launch_parser().format_help().split())
+    assert "Bash/Write/Edit" in help_text
+    assert "cannot commit or write a review artifact" in help_text
+
+
 def test_removed_bulk_dispatch_commands_are_rejected_and_absent_from_help() -> None:
     parser = T.build_parser()
     help_text = parser.format_help()
@@ -376,6 +382,166 @@ def test_resume_preserves_read_only_without_os_sandbox(
     assert "--read-only" in launch
     assert "--os-sandbox" not in launch
     assert Path(_option_value(launch, "--cwd") or "").resolve() == worktree
+
+
+def test_resume_can_override_inherited_read_only_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _main, worktree = _make_repo_with_worktree(tmp_path)
+    parent_id = "resume-readonly-override-parent"
+    recorded = [
+        "--agent",
+        "codex",
+        "--shape",
+        "bash",
+        "--dispatch-id",
+        parent_id,
+        "--cwd",
+        str(worktree),
+        "--prompt-file",
+        str(worktree / "old.md"),
+        "--read-only",
+        "--task",
+        "t-123",
+    ]
+    _write_codex_parent(
+        tmp_path,
+        dispatch_id=parent_id,
+        worktree=worktree,
+        dispatch_argv=recorded,
+        worker_cwd=str(worktree),
+    )
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("continue with the authorized write.\n", encoding="utf-8")
+    captured = _capture_resume(monkeypatch, "codex-resume-writable-child")
+
+    assert (
+        D._cmd_resume(
+            [
+                parent_id,
+                "--prompt-file",
+                str(prompt),
+                "--unregistered-forced",
+                "--os-sandbox",
+                "workspace-write",
+            ]
+        )
+        == 0
+    )
+    launch = captured[0]
+    assert _option_value(launch, "--os-sandbox") == "workspace-write"
+    assert "--read-only" not in launch
+    assert "--readonly" not in launch
+
+
+def test_grok_resume_workspace_write_removes_read_only_deny_rules(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "grok-worktree"
+    worktree.mkdir()
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("continue with the authorized write.\n", encoding="utf-8")
+    parent_id = "grok-readonly-parent"
+    source = {
+        "record": {
+            "worker_cwd": str(worktree),
+            "dispatch_argv": [
+                "--agent",
+                "grok-code",
+                "--shape",
+                "bash",
+                "--dispatch-id",
+                parent_id,
+                "--cwd",
+                str(worktree),
+                "--prompt-file",
+                str(tmp_path / "old.md"),
+                "--read-only",
+            ],
+        },
+        "engine": "grok",
+        "agent": "grok-code",
+        "shape": "bash",
+        "session_id": SESSION_ID,
+    }
+    resume_args = argparse.Namespace(
+        dispatch_id=parent_id,
+        cwd=None,
+        unregistered_forced=True,
+        controller_label=None,
+        controller_pid=None,
+        controller_session_id=None,
+        account=None,
+        os_sandbox="workspace-write",
+    )
+
+    launch = D._resume_launch_argv(
+        source,
+        child_dispatch_id="grok-writable-child",
+        prompt_path=prompt,
+        resume_args=resume_args,
+    )
+
+    assert "--read-only" not in launch
+    assert "--readonly" not in launch
+    assert "--os-sandbox" not in launch
+    parsed = D._build_launch_parser().parse_args(launch)
+    D._validate_agent_os_sandbox(parsed)
+    worker_argv, _stdin = D.build_worker(parsed, prompt, [])
+    assert "--deny" not in worker_argv
+
+
+@pytest.mark.parametrize(
+    "recorded_sandbox",
+    [
+        {"read_only": True},
+        {"os_sandbox": {"requested_profile": "read-only"}},
+    ],
+    ids=["top-level-bit", "sandbox-posture"],
+)
+def test_synthesized_grok_resume_preserves_legacy_read_only_record(
+    tmp_path: Path,
+    recorded_sandbox: dict,
+) -> None:
+    worktree = tmp_path / "legacy-grok-worktree"
+    worktree.mkdir()
+    prompt = tmp_path / "revisions.md"
+    prompt.write_text("continue the review.\n", encoding="utf-8")
+    parent_id = "legacy-grok-readonly-parent"
+    source = {
+        "record": {
+            "worker_cwd": str(worktree),
+            **recorded_sandbox,
+        },
+        "engine": "grok",
+        "agent": "grok-code",
+        "shape": "bash",
+        "session_id": SESSION_ID,
+    }
+    resume_args = argparse.Namespace(
+        dispatch_id=parent_id,
+        cwd=None,
+        unregistered_forced=True,
+        controller_label=None,
+        controller_pid=None,
+        controller_session_id=None,
+        account=None,
+        os_sandbox=None,
+    )
+
+    launch = D._resume_launch_argv(
+        source,
+        child_dispatch_id="legacy-grok-readonly-child",
+        prompt_path=prompt,
+        resume_args=resume_args,
+    )
+
+    assert "--read-only" in launch
+    parsed = D._build_launch_parser().parse_args(launch)
+    D._validate_agent_os_sandbox(parsed)
+    worker_argv, _stdin = D.build_worker(parsed, prompt, [])
+    assert worker_argv.count("--deny") == 3
+    assert all(tool in worker_argv for tool in ("Write", "Edit", "Bash"))
 
 
 def test_resume_refuses_old_record_without_cwd_evidence(

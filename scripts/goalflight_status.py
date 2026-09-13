@@ -2388,8 +2388,11 @@ SANDBOX_REMEDIATIONS: tuple[tuple[str, str], ...] = (
     ),
     (
         "writing is blocked by read-only sandbox",
-        "the chunk edits files but was dispatched read-only: drop --read-only "
-        "and use --os-sandbox workspace-write.",
+        "the chunk edits files but was dispatched read-only: for the same "
+        "session, resume --os-sandbox workspace-write after authorizing writes. "
+        "For a new Grok bash dispatch, drop --read-only (Grok has no "
+        "--os-sandbox flag); other supported workers can use "
+        "--os-sandbox workspace-write.",
     ),
 )
 

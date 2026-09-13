@@ -103,3 +103,10 @@ def test_tmpdir_remedy_does_not_recommend_a_flag_that_changes_nothing():
         "--os-sandbox read-only` blocks", ""
     ) or "resolve to" in remedy
     assert "workspace-write" in remedy or "neither flag" in remedy
+
+
+def test_read_only_write_remedy_distinguishes_resume_from_new_grok_dispatch():
+    remedy = status.sandbox_remediation(READONLY_WRITE)
+    assert "resume --os-sandbox workspace-write" in remedy
+    assert "Grok bash" in remedy
+    assert "drop --read-only" in remedy

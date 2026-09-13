@@ -14,7 +14,7 @@ The cases, all resumable, all routinely redispatched by mistake:
 | the worker stopped because | what it needs | verb |
 |---|---|---|
 | quota wall / `quota_exhausted` / `transient_throttle` | an account with headroom | `resume --account <account>` |
-| `BLOCKED:` on sandbox, permission, push, or an out-of-standard path | your decision or the action taken for it | `resume` |
+| `BLOCKED:` on sandbox, permission, push, or an out-of-standard path | your decision or the action taken for it | `resume` (use `--os-sandbox workspace-write` only when the decision authorizes in-scope writes; Grok bash maps this to removing its deny rules) |
 | a clarification or USER-NEED / `!READY` plan-approval pause | the answer | `resume` |
 | ferried/detached launch died with the tree dirty | nothing but a restart | `resume` |
 
@@ -100,6 +100,13 @@ you want to keep, not by what killed the worker.
 - A resume still needs the brief on disk: the worker re-reads
   `$GOALFLIGHT_PROMPT_FILE`, which is authoritative over its summarized
   memory. Update that file BEFORE resuming if the plan changed.
+- Resume preserves the original sandbox profile by default. Pass
+  `--os-sandbox <workspace-write|read-only|off>` to override it for the resumed
+  attempt. This is the escape hatch for a worker blocked by an overly narrow
+  profile; broadening the profile is an explicit controller decision, not an
+  automatic retry behavior. Grok bash has no OS-sandbox flag: on that launch
+  path, `read-only` installs its Bash/Write/Edit deny rules and `workspace-write`
+  removes them. A fresh writable Grok dispatch simply omits `--read-only`.
 - Ownership is recorded at dispatch time; a resumed dispatch keeps its
   original owner, so wakes still route to the controller that started it.
 - Never resume a source that is still live or whose liveness is
