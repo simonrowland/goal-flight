@@ -7,8 +7,7 @@ already forwarded CHILD_DISTINCT_CAP (32) distinct envelopes in the window. The
 withhold emitted a `retrieve: relay --drain` hint, nothing drained, and the
 controller discovered the dead worker ~25 minutes later via an unrelated timer.
 
-The cap itself is right -- it stops a chatty child flooding the controller. The
-hole was that it had no notion of which envelope it was dropping.
+Envelope deduplication replaces the cap. Escalations still bypass suppression.
 """
 
 from __future__ import annotations
@@ -55,27 +54,13 @@ def test_an_escalation_is_never_backlog_gated(escalation: str) -> None:
     assert S._is_backlog_capable_line(_event_line(escalation, 1)) is False
 
 
-def test_an_escalation_survives_a_saturated_window(escalation: str = "blocked") -> None:
-    """The real scenario: cap already reached, then the worker escalates."""
-    gate = S._ChildBacklogGate(child="backup-1")
-    for i in range(S.CHILD_DISTINCT_CAP + 5):
-        gate.note(now=float(i), floor_s=0.0, cursor_version=None, lag=None,
-                  identity=f"routine-{i}")
-    assert gate.distinct_forwarded == S.CHILD_DISTINCT_CAP, "precondition: window saturated"
-    withheld, _ = gate.note(now=99.0, floor_s=0.0, cursor_version=None, lag=None,
-                            identity="one-more-routine")
-    assert withheld is False, "precondition: the cap is actually withholding by now"
-    # The escalation never reaches the gate at all.
-    assert S._is_backlog_capable_line(_event_line(escalation, 999)) is False
-
-
-def test_routine_traffic_is_still_capped() -> None:
-    """The fix must not delete the cap it is carving an exception out of."""
+def test_routine_traffic_is_deduplicable() -> None:
+    """Routine mail can be deduplicated; unique notices must all be delivered."""
     assert S._is_backlog_capable_line(_event_line("result", 1)) is True
     assert S._is_backlog_capable_line(_event_line("notice", 1)) is True
 
 
-def test_exempting_every_waking_type_would_have_deleted_the_cap() -> None:
+def test_waking_types_are_not_all_dedup_exempt() -> None:
     """Pins the reasoning, so nobody 'simplifies' this to wake_class == waking.
 
     The registry marks nearly everything waking; that predicate is not a

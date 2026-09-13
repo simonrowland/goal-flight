@@ -127,40 +127,9 @@ STREAM_FRONTIER_GRACE_S = 1.0
 # heartbeat/frontier feed. --debug may print the old heartbeat record.
 DEFAULT_NEXT_REPEAT_FLOOR_S = 15.0 * 60.0
 NEXT_REMINDER_REPEAT_FLOOR_S = math.inf
-# A stuck child can re-emit an unread backlog every cycle (incident: 330
-# envelopes from cursor 5220 while a sibling had reached 5550). Cap the
-# forwarded *copies of one identity* so volume cannot kill the host
-# monitor; collapse further copies into one named record. 8 is above a
-# legitimate doorbell burst and far below a host volume limit. Distinct
-# envelopes (new cursor versions, unique headlines) still forward past
-# that copy cap. Distinct *volume* is a different risk: bound first-copies
-# at CHILD_DISTINCT_CAP and name the withhold instead of folding it into
-# a dedup record. Flush named records after 1s so a live supervisor
-# reports without waiting for the 15-minute next-payload floor.
-CHILD_BACKLOG_CAP = 8
-CHILD_DISTINCT_CAP = 32
-CURSOR_LAG_THRESHOLD = 16
-CHILD_BACKLOG_FLUSH_S = 1.0
-DISTINCT_WITHHELD_RETRIEVE = "relay --drain"
-# Never withheld by CHILD_DISTINCT_CAP. Two families, one rule: a signal the
-# controller cannot afford to miss must not lose a race against chatter.
-#
-# The listener/watchdog half is supervisor liveness. The second half is a
-# WORKER ESCALATION -- goalflight_terminal.ATTENTION_MARKERS
-# {BLOCKED, FAILED, USER-CONFIRM, USER-NEED} through
-# goalflight_messages.MARKER_TO_TYPE. Measured 2026-09-06: a worker's !BLOCKED
-# was journalled with wake_class "waking" and then WITHHELD here, because a
-# busy session had already forwarded 32 distinct envelopes in the window. The
-# drain hint was emitted, nothing drained, and the controller learned of the
-# dead worker ~25 minutes later from an unrelated fallback timer.
-#
-# Why not exempt every "waking" type instead: the registry marks 57 of 59 types
-# waking (only status and monitor are not), so that would delete the cap rather
-# than fix the hole. Escalations are bounded -- a worker raises one at most once
-# per dispatch -- so this cannot flood. These three strings are duplicated here
-# rather than imported because goalflight_messages imports THIS module for its
-# CLI; test_supervisor_escalation_passthrough pins them to the real sets so the
-# duplication cannot drift.
+# Escalations and listener health must survive even a routine record carrying
+# the same envelope identity. Keep these types aligned with the message registry;
+# messages imports this module for its CLI, so importing it here would cycle.
 _ESCALATION_EVENT_TYPES = frozenset({"blocked", "user_confirm", "user_need"})
 _PASSTHROUGH_EVENT_TYPES = frozenset(
     {
@@ -1117,339 +1086,76 @@ def _parse_child_record(line: str) -> dict[str, object] | None:
     return record if isinstance(record, dict) else None
 
 
-def _line_cursor_version(line: str) -> int | None:
-    record = _parse_child_record(line)
+def _child_mail_rows(line: str) -> list[object]:
+    """Normalize the mail-bearing parts of headline, event and arm records.
+
+    Rings and diagnostics carry no mail. Pending reports also carry snapshot
+    metadata, which must survive even when every item was delivered already.
+    """
+    text = str(line or "").strip()
+    record = _parse_child_record(text)
     if record is None:
-        return None
-    version = record.get("cursor_version")
-    if version is None:
+        if text.startswith("[") and "] " in text:
+            event_type, _, receipt = text[1:].partition("] ")
+            stream, separator, tail = receipt.partition(" seq=")
+            seq = tail.partition(" — ")[0]
+            if separator and stream and seq.isdecimal():
+                return [{"stream_id": stream, "stream_seq": int(seq), "type": event_type}]
+        return []
+    if record.get("kind") == "event":
         payload = record.get("payload")
-        if isinstance(payload, dict):
-            version = payload.get("cursor_version")
-    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
-        return None
-    return version
+        return [payload] if isinstance(payload, dict) else []
+    if record.get("kind") == "pending-at-arm":
+        items = record.get("items")
+        return items if isinstance(items, list) else []
+    return []
+
+
+def _backlog_capable_row(row: object) -> bool:
+    if not isinstance(row, dict):
+        return False
+    event_type = str(row.get("event_type") or row.get("type") or "")
+    return event_type not in _PASSTHROUGH_EVENT_TYPES
 
 
 def _is_backlog_capable_line(line: str) -> bool:
-    """Normalize mail types before the shared exemption from both backlog caps."""
-    text = str(line or "").strip()
-    if not text:
-        return False
-    passthrough_types = _ESCALATION_EVENT_TYPES
-    record = _parse_child_record(text)
-    if record is None:
-        # format_receipt_headline is shared by backup arm/ring and drain.
-        event_types = (
-            {text[1:].partition("] ")[0]}
-            if text.startswith("[") and "] " in text else set()
-        )
-    else:
-        kind = str(record.get("kind") or "")
-        if kind == "event":
-            passthrough_types = _PASSTHROUGH_EVENT_TYPES
-            payload = record.get("payload")
-            event_types = (
-                {str(payload.get("type") or "")}
-                if isinstance(payload, dict) else set()
-            )
-        elif kind == "pending-at-arm":
-            # One arm snapshot can contain routine mail alongside an escalation.
-            items = record.get("items")
-            event_types = {
-                str(item.get("event_type") or "")
-                for item in items
-                if isinstance(item, dict)
-            } if isinstance(items, list) else set()
-        elif kind == "ring":
-            event_types = set()  # Doorbells carry no mail type or body.
-        else:
-            return False  # Structured diagnostics are never backlog mail.
-    # Every typed representation reaches this decision before identity/copy
-    # accounting; a mixed snapshot passes intact if any item needs attention.
-    return not event_types.intersection(passthrough_types)
+    """Apply the same escalation exemption to every mail representation."""
+    rows = _child_mail_rows(line)
+    return bool(rows) and all(_backlog_capable_row(row) for row in rows)
+
+
+def _envelope_identity(row: object) -> str | None:
+    if not isinstance(row, dict):
+        return None
+    stream = row.get("stream_id") or row.get("dispatch_id")
+    seq = row.get("stream_seq")
+    if not isinstance(stream, str) or not stream:
+        return None
+    # Older children may shorten IDs, and sanitization may redact one. Such
+    # display text cannot prove two envelopes equal; preserve both notices.
+    if "[redacted]" in stream or "…" in stream or stream.endswith("..."):
+        return None
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+        return None
+    return f"envelope:{stream}:{seq}"
 
 
 def _backlog_line_identity(line: str) -> str:
-    """Stable key for one envelope. Same key = a copy, not new mail.
-
-    JSON carrying ``cursor_version`` groups as one unread-snapshot identity
-    so a stuck child re-emitting 330 items from cursor 5220 still collapses.
-    Kind is part of that key: ``kind=ring`` at the same cursor is a
-    different envelope from the snapshot's events. Headlines and
-    ``advance:`` commands key on the line itself.
-    """
+    """Resolve envelope identity before any snapshot/kind fallback."""
+    rows = _child_mail_rows(line)
+    if len(rows) == 1:
+        identity = _envelope_identity(rows[0])
+        if identity is not None:
+            return identity
     text = str(line or "").strip()
-    if text.startswith("advance:"):
-        return f"advance:{text[len('advance:'):].strip()}"
     record = _parse_child_record(text)
-    if record is None:
-        return f"line:{text}"
-    kind = str(record.get("kind") or "") or "record"
-    version = _line_cursor_version(text)
-    if version is not None:
-        return f"snapshot:{kind}:{version}"
-    payload = record.get("payload")
-    payload_d = payload if isinstance(payload, dict) else {}
-    dispatch_id = payload_d.get("dispatch_id") or record.get("dispatch_id") or ""
-    stream_seq = payload_d.get("stream_seq")
-    if stream_seq is None:
-        stream_seq = record.get("stream_seq")
-    if dispatch_id or stream_seq is not None:
-        return f"{kind}:{dispatch_id}:{stream_seq}"
-    return f"{kind}:{text}"
-
-
-def _identity_copy_cap(identity: str) -> int:
-    """Cursor snapshots may show a burst of copies; a headline is itself."""
-    if identity.startswith("snapshot:"):
-        return CHILD_BACKLOG_CAP
-    return 1
-
-
-def _backlog_line_streams(line: str) -> set[str]:
-    """Stream names carried by follow events and listen arm reports."""
-    record = _parse_child_record(line)
-    if record is None:
-        # format_receipt_headline: [type] stream seq=N — headline.
-        text = line.strip()
-        if text.startswith("[") and "] " in text:
-            stream, separator, _ = text.split("] ", 1)[1].partition(" seq=")
-            if separator and stream:
-                return {stream}
-        return set()
-    rows = record.get("items")
-    if not isinstance(rows, list):
-        payload = record.get("payload")
-        rows = [payload if isinstance(payload, dict) else record]
-    return {
-        str(row.get("stream_id") or row.get("dispatch_id"))
-        for row in rows
-        if isinstance(row, dict) and (row.get("stream_id") or row.get("dispatch_id"))
-    }
-
-
-@dataclass
-class _CursorLedger:
-    """Per-child cursor versions observed on this supervisor's stdout.
-
-    Stream peeks live each poll; backup ``--report-pending`` snapshots at
-    arm; the watchdog has no cursor. Those clocks can diverge. A lag is
-    reportable only when it also produces a backlog burst — naming a
-    1-version peek jitter would make the feed noisier, which is the
-    failure being repaired.
-    """
-
-    versions: dict[str, int] = field(default_factory=dict)
-
-    def note(self, child: str, version: int | None) -> None:
-        if version is None:
-            return
-        self.versions[child] = version
-
-    def lag_for(self, child: str) -> tuple[int, int] | None:
-        mine = self.versions.get(child)
-        if mine is None or len(self.versions) < 2:
-            return None
-        ahead = max(self.versions.values())
-        if ahead - mine >= CURSOR_LAG_THRESHOLD:
-            return mine, ahead
-        return None
-
-
-@dataclass
-class _ChildBacklogPending:
-    child: str
-    count: int
-    first_at: float
-    last_at: float
-    cursor_version: int | None
-    behind: int | None
-    ahead: int | None
-
-
-@dataclass
-class _DistinctWithheldPending:
-    child: str
-    count: int
-    first_at: float
-    last_at: float
-    forwarded: int
-    streams: set[str] = field(default_factory=set)
-
-
-def _child_backlog_record(pending: _ChildBacklogPending) -> dict[str, object]:
-    """Stamp a collapsed burst. count is disjoint from already-forwarded copies."""
-    lagged = (
-        pending.behind is not None
-        and pending.ahead is not None
-        and pending.ahead - pending.behind >= CURSOR_LAG_THRESHOLD
-    )
-    record: dict[str, object] = {
-        "kind": "supervise",
-        "type": "cursor-lag" if lagged else "child-backlog",
-        "child": pending.child,
-        "count": pending.count,
-        "window_s": max(0.0, float(pending.last_at) - float(pending.first_at)),
-    }
-    if pending.cursor_version is not None:
-        record["cursor_version"] = pending.cursor_version
-    if lagged:
-        record["behind"] = pending.behind
-        record["ahead"] = pending.ahead
-        record["lag"] = pending.ahead - pending.behind
-    return record
-
-
-def _distinct_withheld_record(
-    pending: _DistinctWithheldPending,
-) -> dict[str, object]:
-    """Stamp withheld *new* envelopes. This is not a duplicate collapse."""
-    return {
-        "kind": "supervise",
-        "type": "distinct-withheld",
-        "child": pending.child,
-        "count": pending.count,
-        "forwarded": pending.forwarded,
-        "streams": sorted(pending.streams),
-        "retrieve": DISTINCT_WITHHELD_RETRIEVE,
-        "window_s": max(0.0, float(pending.last_at) - float(pending.first_at)),
-    }
-
-
-@dataclass
-class _ChildBacklogGate:
-    """Forward new envelopes; collapse duplicate copies of one identity.
-
-    First CHILD_BACKLOG_CAP copies of a cursor-snapshot identity emit.
-    Later copies in the window accumulate as child-backlog / cursor-lag.
-    A new identity still emits even after that copy cap, up to
-    CHILD_DISTINCT_CAP first-copies; further distinct identities flush as
-    distinct-withheld (count is how many new envelopes were held; retrieve
-    names relay --drain; streams names the held mail). Floor expiry starts a
-    new window so genuine later news is not held forever.
-    """
-
-    child: str
-    forwarded: int = 0
-    window_start: float = field(default=-math.inf)
-    pending: _ChildBacklogPending | None = None
-    distinct_pending: _DistinctWithheldPending | None = None
-    copies_by_identity: dict[str, int] = field(default_factory=dict)
-    distinct_forwarded: int = 0
-
-    def _reset_window(self, now: float) -> None:
-        self.forwarded = 0
-        self.window_start = now
-        self.copies_by_identity.clear()
-        self.distinct_forwarded = 0
-
-    def flush_at(self, floor_s: float) -> float | None:
-        del floor_s
-        due: list[float] = []
-        if self.pending is not None:
-            due.append(self.pending.first_at + CHILD_BACKLOG_FLUSH_S)
-        if self.distinct_pending is not None:
-            due.append(self.distinct_pending.first_at + CHILD_BACKLOG_FLUSH_S)
-        if not due:
-            return None
-        return min(due)
-
-    def _note_duplicate_copy(
-        self,
-        *,
-        now: float,
-        cursor_version: int | None,
-        lag: tuple[int, int] | None,
-    ) -> None:
-        behind, ahead = lag if lag is not None else (None, None)
-        if self.pending is None:
-            self.pending = _ChildBacklogPending(
-                child=self.child,
-                count=1,
-                first_at=now,
-                last_at=now,
-                cursor_version=cursor_version,
-                behind=behind,
-                ahead=ahead,
-            )
-            return
-        self.pending.count += 1
-        self.pending.last_at = now
-        if cursor_version is not None:
-            self.pending.cursor_version = cursor_version
-        if lag is not None:
-            self.pending.behind, self.pending.ahead = lag
-
-    def _note_distinct_withheld(self, now: float, line: str) -> None:
-        if self.distinct_pending is None:
-            self.distinct_pending = _DistinctWithheldPending(
-                child=self.child,
-                count=1,
-                first_at=now,
-                last_at=now,
-                forwarded=self.distinct_forwarded,
-                streams=_backlog_line_streams(line),
-            )
-            return
-        self.distinct_pending.count += 1
-        self.distinct_pending.last_at = now
-        self.distinct_pending.forwarded = self.distinct_forwarded
-        self.distinct_pending.streams.update(_backlog_line_streams(line))
-
-    def note(
-        self,
-        *,
-        now: float,
-        floor_s: float,
-        cursor_version: int | None,
-        lag: tuple[int, int] | None,
-        identity: str,
-        line: str = "",
-    ) -> tuple[bool, list[dict[str, object]]]:
-        emits: list[dict[str, object]] = []
-        if (
-            (self.forwarded > 0 or self.distinct_forwarded > 0)
-            and floor_s > 0
-            and now - self.window_start >= floor_s
-        ):
-            emits.extend(self.flush())
-            self._reset_window(now)
-        if self.forwarded == 0 and self.distinct_forwarded == 0:
-            self.window_start = now
-        copies = self.copies_by_identity.get(identity, 0)
-        if copies == 0:
-            if self.distinct_forwarded >= CHILD_DISTINCT_CAP:
-                self._note_distinct_withheld(now, line)
-                return False, emits
-            self.copies_by_identity[identity] = 1
-            self.distinct_forwarded += 1
-            self.forwarded += 1
-            return True, emits
-        if copies < _identity_copy_cap(identity):
-            self.copies_by_identity[identity] = copies + 1
-            self.forwarded += 1
-            return True, emits
-        self._note_duplicate_copy(
-            now=now, cursor_version=cursor_version, lag=lag
-        )
-        return False, emits
-
-    def flush(
-        self, ledger: _CursorLedger | None = None
-    ) -> list[dict[str, object]]:
-        records: list[dict[str, object]] = []
-        if self.pending is not None:
-            if ledger is not None:
-                lag = ledger.lag_for(self.child)
-                if lag is not None:
-                    self.pending.behind, self.pending.ahead = lag
-            records.append(_child_backlog_record(self.pending))
-            self.pending = None
-        if self.distinct_pending is not None:
-            records.append(_distinct_withheld_record(self.distinct_pending))
-            self.distinct_pending = None
-        return records
+    if record is not None:
+        kind = str(record.get("kind") or "record")
+        version = record.get("cursor_version")
+        if isinstance(version, int) and not isinstance(version, bool) and version >= 0:
+            return f"snapshot:{kind}:{version}"
+        return f"{kind}:{text}"
+    return f"line:{text}"
 
 
 @dataclass
@@ -1902,8 +1608,10 @@ def run_supervisor(
     active_forwarding_read: _ForwardingFrontierRead | None = None
     pending_forwarding_read: _ForwardingFrontierRead | None = None
     next_gate = _RepeatGate()
-    cursor_ledger = _CursorLedger()
-    backlog_gates: dict[str, _ChildBacklogGate] = {}
+    # Scoped to this stdout owner, shared across every child and replacement
+    # child. This is delivery memory, never journal acknowledgement. A new
+    # supervisor starts empty and can recover any partially delivered batch.
+    delivered_envelopes: set[str] = set()
 
     def emit_pending_stream_wake(*, paired_frontier: bool = False) -> bool:
         nonlocal latest_frontier
@@ -1974,38 +1682,40 @@ def run_supervisor(
         outgoing: list[dict[str, object]] = []
         for gate in restart_gates.values():
             outgoing.extend(gate.flush())
-        for gate in backlog_gates.values():
-            outgoing.extend(gate.flush(cursor_ledger))
         return emit_restart_records(outgoing)
 
-    def _slot_label_for(child: Any) -> str:
-        slot = next((row for row in slots if row.child is child), None)
-        if slot is not None:
-            return slot.label
-        return str(getattr(child, "kind", "") or "child")
-
     def forward_child_line(child: Any, line: str) -> bool:
-        label = _slot_label_for(child)
-        version = _line_cursor_version(line)
-        cursor_ledger.note(label, version)
-        if not _is_backlog_capable_line(line):
-            text = line if line.endswith("\n") else line + "\n"
-            return _write_stdout(host, text, source="write-child-output")
-        gate = backlog_gates.setdefault(label, _ChildBacklogGate(child=label))
-        forward, named = gate.note(
-            now=host.now,
-            floor_s=repeat_floor_s,
-            cursor_version=version,
-            lag=cursor_ledger.lag_for(label),
-            identity=_backlog_line_identity(line),
-            line=line,
-        )
-        if not emit_restart_records(named):
-            return False
-        if not forward:
-            return True
+        record = _parse_child_record(line)
+        identities: set[str] = set()
+        if record is not None and record.get("kind") == "pending-at-arm":
+            rows = _child_mail_rows(line)
+            remaining = []
+            for row in rows:
+                identity = _envelope_identity(row)
+                if (
+                    _backlog_capable_row(row) and identity is not None
+                    and (identity in delivered_envelopes or identity in identities)
+                ):
+                    continue
+                remaining.append(row)
+                if identity is not None:
+                    identities.add(identity)
+            if len(remaining) != len(rows):
+                # Keep cursor/advance and all other metadata intact; only
+                # repeated mail items disappear from the report.
+                record["items"] = remaining
+                line = json.dumps(record, ensure_ascii=False)
+        elif _is_backlog_capable_line(line):
+            identity = _backlog_line_identity(line)
+            if identity.startswith("envelope:"):
+                if identity in delivered_envelopes:
+                    return True
+                identities.add(identity)
         text = line if line.endswith("\n") else line + "\n"
-        return _write_stdout(host, text, source="write-child-output")
+        if not _write_stdout(host, text, source="write-child-output"):
+            return False
+        delivered_envelopes.update(identities)
+        return True
 
     while host.running():
         # Every detector reports to _PeerLossDetector; stop_for_stdout_detector
@@ -2042,10 +1752,6 @@ def run_supervisor(
             if slot.child is None and slot.stopped_reason is None:
                 wake_at = min(wake_at, slot.next_start)
         for gate in restart_gates.values():
-            flush_at = gate.flush_at(repeat_floor_s)
-            if flush_at is not None:
-                wake_at = min(wake_at, flush_at)
-        for gate in backlog_gates.values():
             flush_at = gate.flush_at(repeat_floor_s)
             if flush_at is not None:
                 wake_at = min(wake_at, flush_at)
@@ -2193,11 +1899,6 @@ def run_supervisor(
         coverage_ok, coverage_emitted = emit_coverage()
         if not coverage_ok:
             return stop_after_failed_write()
-        for gate in list(backlog_gates.values()):
-            flush_at = gate.flush_at(repeat_floor_s)
-            if flush_at is not None and host.now >= flush_at:
-                if not emit_restart_records(gate.flush(cursor_ledger)):
-                    return stop_after_failed_write()
         if host.now >= next_heartbeat:
             if not emit_heartbeat():
                 return stop_after_failed_write()

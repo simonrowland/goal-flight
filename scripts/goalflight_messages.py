@@ -4933,7 +4933,7 @@ def format_receipt_headline(row: dict, envelope: dict) -> str:
         envelope.get("type") or row.get("event_type") or "event",
         limit=32,
     )
-    stream = sanitize_display(row.get("stream_id") or envelope.get("dispatch_id") or "?", limit=80)
+    stream = sanitize_display(row.get("stream_id") or envelope.get("dispatch_id") or "?")
     seq = sanitize_display(row.get("stream_seq") or envelope.get("seq") or "?", limit=20)
     raw_type = str(envelope.get("type") or row.get("event_type") or "")
     if raw_type in DRAIN_PATCH_TYPES:
@@ -6159,7 +6159,7 @@ def _follow_event_record(
     record: dict[str, object] = {
         "kind": "event",
         "payload": {
-            "stream_id": _truncate_utf8(row.get("stream_id"), 72),
+            "stream_id": sanitize_display(row.get("stream_id")),
             "stream_seq": int(row.get("stream_seq") or 0),
             "dispatch_id": _truncate_utf8(envelope.get("dispatch_id"), 72),
             "type": _truncate_utf8(envelope.get("type"), 40),
@@ -6189,7 +6189,7 @@ def _follow_event_record(
         event_payload["summary"] = summary
         return _fit_follow_record(
             record,
-            shrink_fields=("summary", "dispatch_id", "stream_id", "type"),
+            shrink_fields=("summary", "dispatch_id", "type"),
         )
 
 
@@ -6800,8 +6800,9 @@ def _emit_claimed_follow_events(
     cursor_version: int,
     visible: list[tuple[dict, dict]],
     emit: Callable[[dict[str, object]], bool],
+    delivered: set[tuple[str, int]] | None = None,
 ) -> tuple[bool, bool]:
-    """Emit still-unread rows; roll back the ring if delivery fails."""
+    """Emit unread rows once per owner; a partial batch remains replayable."""
     if not visible:
         return True, False
     ring_claimed = goalflight_wake.claim_ring(
@@ -6812,12 +6813,19 @@ def _emit_claimed_follow_events(
     if not ring_claimed:
         return True, False
     emitted_event = False
+    batch_delivered: set[tuple[str, int]] = set()
     try:
         for row, envelope in visible:
             # Carrier reads and earlier writes can outlive a controller drain.
             # The batch is only a candidate list; the journal owns consumption.
             positions = _journal_cursor_positions(authority, controller_label)
             if int(row["stream_seq"]) <= positions.get(str(row["stream_id"]), 0):
+                continue
+            identity = (str(row["stream_id"]), int(row["stream_seq"]))
+            if (
+                delivered is not None and identity in delivered
+                and envelope.get("type") not in PRIORITY_BY_TYPE
+            ):
                 continue
             if not emit(
                 _follow_event_record(
@@ -6835,6 +6843,7 @@ def _emit_claimed_follow_events(
                     )
                 return False, False
             emitted_event = True
+            batch_delivered.add(identity)
     except BaseException:
         goalflight_wake.release_ring_claim(
             project_root,
@@ -6842,6 +6851,8 @@ def _emit_claimed_follow_events(
             cursor_version=cursor_version,
         )
         raise
+    if delivered is not None:
+        delivered.update(batch_delivered)
     return True, emitted_event
 
 
@@ -7072,6 +7083,10 @@ def cmd_follow(args) -> int:
         if pending_report is not None and pending_report.phase == "acknowledged"
         else {}
     )
+    # This stdout owner alone knows these deliveries. Never persist them or
+    # advance the journal: a replacement must replay unacknowledged mail.
+    delivered: set[tuple[str, int]] = set()
+    reset_owner_ring = True
 
     def emit(record: dict[str, object]) -> bool:
         alive = _write_follow_record(record, stream=sys.stdout)
@@ -7168,6 +7183,18 @@ def cmd_follow(args) -> int:
                     lease_nonce=nonce,
                 )
                 try:
+                    if reset_owner_ring:
+                        # The exclusive monitor slot proves the prior follow
+                        # owner is gone. Its pipe flush cannot prove delivery
+                        # through the supervisor to this host. Release only the
+                        # matching unread reservation, never journal consumption.
+                        if snapshot.items:
+                            goalflight_wake.release_ring_claim(
+                                project_root,
+                                controller_label=label,
+                                cursor_version=snapshot.cursor_version,
+                            )
+                        reset_owner_ring = False
                     alive, emitted_event = _emit_claimed_follow_events(
                         project_root,
                         authority=authority,
@@ -7175,6 +7202,7 @@ def cmd_follow(args) -> int:
                         cursor_version=snapshot.cursor_version,
                         visible=visible,
                         emit=emit,
+                        delivered=delivered,
                     )
                 except goalflight_journal.JournalError:
                     # Delivery's position reads share peek's busy tolerance.

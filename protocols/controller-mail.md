@@ -153,13 +153,18 @@ controller goes deaf with no diagnostic at all. A persistent (unbounded)
 monitor can also be killed for output volume: a child that falls behind its
 siblings re-emits the unread backlog every cycle, the host kills the monitor,
 no `type=stop` is written, and the controller goes deaf the same way.
-`supervise` caps that re-emission and names the stuck child (`cursor-lag` /
-`child-backlog`) instead of forwarding N duplicate envelopes. The cap keys on
-envelope identity (cursor-snapshot for JSON with `cursor_version`; the line
-itself for headlines and `advance:`), not raw line count: a new envelope still
-forwards after eight copies of a *different* identity. Distinct volume is a
-separate bound (`distinct-withheld`): it names how many new envelopes were
-held and that `relay --drain` retrieves them. On Claude Code, set
+`supervise` deduplicates mail by `(stream_id/dispatch_id, stream_seq)` across
+all children for this stdout owner. Cursor changes and child restarts do not
+replay delivered envelopes. Every distinct notice still forwards; there is no
+distinct-volume cap or withheld count. Pending reports retain their snapshot
+metadata while repeated items are removed. Escalations and listener health
+records bypass deduplication. Bare `follow` remembers successful batches for
+its stdout owner too; a partial or failed batch remains replayable. Delivery
+memory never advances the journal cursor or survives an owner replacement.
+After acquiring its exclusive monitor slot, a new follow owner releases a
+matching unread ring reservation once. This permits recovery even when the
+previous child flushed to the supervisor pipe before the host write failed.
+On Claude Code, set
 `persistent: true`; that makes `timeout_ms` inert, and where the host requires
 the field to be present it is a placeholder, never a knob.
 
@@ -209,10 +214,9 @@ follows:
   window, and the 3600s supervisor clock does not emit a second next line
 - backup: pending headlines plus one `advance: <command>` line, or a ring
 - watchdog: JSON `{"kind":"event",...}` with `listener-dead` / related payload
-- supervise: `{"kind":"supervise","type":"arm"|"heartbeat"|"coverage"|"restart"|"stop"|"exit"|"cursor-lag"|"child-backlog"|"distinct-withheld",...}`;
+- supervise: `{"kind":"supervise","type":"arm"|"heartbeat"|"coverage"|"restart"|"stop"|"exit",...}`;
   default output keeps the startup `arm` line, actionable `restart` records
-  (not healthy `rang`), `cursor-lag` / `child-backlog` / `distinct-withheld`
-  backlog records, and `stop` / signal-driven `exit` records with the exact
+  (not healthy `rang`), and `stop` / signal-driven `exit` records with the exact
   supervisor `rearm` command while suppressing `live` / `target`. `--debug`
   independently restores per-tick `heartbeat` and `coverage` emission, and
   chatty output restores raw keepalives plus `live` / `target` diagnostics
