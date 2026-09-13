@@ -303,6 +303,71 @@ def test_terminal_sidecar_terminalizes_genuinely_dead_worker(
     assert second.get("overruled", []) == [], second
 
 
+@pytest.mark.parametrize("liveness", ["dead", "live", "unknown"])
+@pytest.mark.parametrize("already_terminal", [False, True])
+def test_pending_sidecar_settles_only_after_worker_death(
+    tmp_path: Path,
+    spawn_worker: SpawnWorker,
+    liveness: str,
+    already_terminal: bool,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    dispatch_id = "pending-worker"
+    worker = spawn_worker() if liveness != "unknown" else None
+    identity = ledger.process_identity(worker.pid) if worker else None
+    if worker:
+        assert identity, "precondition: live child has a process identity"
+        _mark_attempt_running(project, dispatch_id, identity)
+    status_path = Path(os.environ["GOALFLIGHT_DISPATCH_DIR"]) / f"{dispatch_id}.status.json"
+    _write_sidecar(
+        status_path,
+        dispatch_id=dispatch_id,
+        state="terminal_pending",
+        worker_pid=worker.pid if worker else None,
+        reason="marker:USER-NEED",
+    )
+    pending = json.loads(status_path.read_text())
+    pending.update(
+        terminal_pending_state="blocked",
+        liveness_state="terminal_pending",
+        ledger_finalize_error={"type": "TerminalCommitRefused", "message": "retry"},
+    )
+    status_path.write_text(json.dumps(pending))
+    record = _write_ledger_record(
+        project,
+        dispatch_id=dispatch_id,
+        status_path=status_path,
+        worker_pid=worker.pid if worker else None,
+        worker_identity=identity,
+    )
+    if already_terminal:
+        result = ledger.commit_terminal_authority(record, state="complete", reason="earlier verdict")
+        assert result.committed, result
+    if liveness == "dead":
+        assert worker is not None
+        worker.terminate()
+        worker.wait(timeout=10)
+        assert _identity_precondition(record) == (False, "dead")
+
+    _reconcile(project)
+    settled = json.loads(status_path.read_text())
+    if liveness != "dead":
+        assert settled == pending, "live/unknown worker must retain pending sidecar"
+        return
+    expected = "complete" if already_terminal else "blocked"
+    assert _ledger_row(dispatch_id)["state"] == expected
+    assert settled["state"] == expected, "dead worker must not leave terminal_pending status"
+    assert settled["worker_alive"] is False
+    assert settled["liveness_state"] == ledger.goalflight_terminal.terminal_liveness_state(expected)
+    assert "terminal_pending_state" not in settled
+    assert "ledger_finalize_error" not in settled
+    assert settled["dispatch_id"] == dispatch_id
+    assert settled["worker_pid"] == worker.pid
+    _reconcile(project)
+    assert json.loads(status_path.read_text()) == settled, "repair is idempotent"
+
+
 def test_terminal_sidecar_holds_when_liveness_unknown(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()

@@ -31,6 +31,7 @@ import goalflight_dispatch_states
 import goalflight_fleet_console_history
 import goalflight_fs
 import goalflight_journal
+import goalflight_liveness
 import goalflight_output_redact
 import goalflight_task
 import goalflight_terminal
@@ -2110,6 +2111,34 @@ def reconcile_terminal_outbox(
                     preserve_first_terminal_time(current, result.value.terminal_at)
                     write_record(current)
                 history_records.append(dict(current))
+            if (
+                status_observation is not None
+                and status_observation.get("state") == "terminal_pending"
+                and worker_identity_liveness(record)[0] == "dead"
+            ):
+                # A failed watcher publication can outlive its worker. Repair
+                # only that pending mirror, from committed authority; ordinary
+                # heartbeat sidecars remain owned by the watcher. Re-read so a
+                # newer watcher verdict or a retired sidecar is not recreated.
+                pending_status = _terminal_sidecar_observation(record)
+                if pending_status is not None and pending_status.get("state") == "terminal_pending":
+                    settled_state = str(
+                        result.value.observation.get("state") or result.value.terminal_state
+                    )
+                    pending_status.update(
+                        state=settled_state,
+                        worker_alive=False,
+                        liveness_state=goalflight_terminal.terminal_liveness_state(settled_state),
+                        updated_at=int(time.time()),
+                    )
+                    pending_status.pop("terminal_pending_state", None)
+                    pending_status.pop("ledger_finalize_error", None)
+                    try:
+                        goalflight_liveness.write_status(Path(record["status_path"]), pending_status)
+                    except OSError:
+                        # Authority already committed; leave the pending copy
+                        # eligible for another reconciliation without losing mail.
+                        retryable += 1
         elif result.cas_lost:
             cas_lost += 1
         else:
