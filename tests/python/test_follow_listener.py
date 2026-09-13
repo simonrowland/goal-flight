@@ -294,6 +294,69 @@ def test_live_lines_flush_before_exit_and_heartbeat_cadence_carries_mail(
         proc.wait(timeout=3)
 
 
+def test_follow_does_not_replay_advanced_streams_across_polls_and_restart(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    """Guard the reported stale-snapshot hypothesis, which fresh peeks refute."""
+    project, env, lease = isolated
+    authority = journal.Journal(project)
+    streams = {f"follow-worker-{index}" for index in range(10)}
+    for restart in range(2):
+        proc = _spawn_follow(project, env, lease, heartbeat_s=0.1)
+        assert proc.stdout is not None
+        reader = _JsonLineReader(proc.stdout)
+        try:
+            for batch in range(3):
+                seq = restart * 3 + batch + 1
+                for stream in sorted(streams):
+                    messages.post_message(
+                        dispatch_id=stream,
+                        msg_type="controller-notice",
+                        payload={"text": f"batch {seq}"},
+                        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                        source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+                        addressee=messages.controller_addressee(lease.label, project_root=project),
+                    )
+                peek = authority.cursor_peek(lease.label, nonce=lease.nonce)
+                remaining = {(stream, seq) for stream in streams}
+                deadline = time.monotonic() + 10
+                while remaining:
+                    _raw, record = reader.read(timeout_s=max(0.01, deadline - time.monotonic()))
+                    if record["kind"] != "event":
+                        continue
+                    payload = record["payload"]
+                    identity = (payload["stream_id"], payload["stream_seq"])
+                    assert identity[0] in streams and identity[1] == seq, (
+                        f"replayed acknowledged envelope: {identity}"
+                    )
+                    # Posting can change cursor_version between polls and
+                    # legitimately re-ring unread rows. Consume the complete
+                    # final snapshot before acknowledging, not an early batch.
+                    if record["cursor_version"] == peek.cursor_version:
+                        remaining.discard(identity)
+                advanced = authority.advance_cursor(
+                    lease.label,
+                    nonce=lease.nonce,
+                    expected_cursor_version=peek.cursor_version,
+                    advances={stream: seq for stream in streams},
+                    expected_stream_snapshots=peek.stream_snapshots,
+                    actor="follow-replay-test",
+                )
+                assert advanced.committed
+                assert authority.cursor_peek(lease.label, nonce=lease.nonce).items == ()
+                # Cross an idle poll before the next batch or process restart.
+                while True:
+                    _raw, record = reader.read()
+                    assert record["kind"] != "event", f"replayed after advance: {record}"
+                    if record["kind"] == "heartbeat":
+                        break
+                assert proc.poll() is None
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+            proc.wait(timeout=3)
+
+
 def test_follow_recovers_corrupt_pending_report_and_stays_armed(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
 ) -> None:

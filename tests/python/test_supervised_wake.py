@@ -5539,19 +5539,40 @@ def test_genuine_ring_after_backlog_cap_reaches_controller() -> None:
     assert rings[0]["coverage_id"] == "cov-1"
 
 
-def test_distinct_volume_names_withheld_mail_and_how_to_retrieve_it() -> None:
+@pytest.mark.parametrize("wire_kind", ["headline", "event", "pending-at-arm"])
+def test_distinct_volume_names_withheld_mail_and_how_to_retrieve_it(
+    wire_kind: str,
+) -> None:
     """A flood of distinct headlines must not reopen the unbounded-output path.
 
     The duplicate collapse record (child-backlog) is the wrong name for
     withheld *new* envelopes. The loud record counts distinct items and
-    points at relay --drain.
+    names the withheld streams and points at relay --drain.
     """
     cap = supervise.CHILD_DISTINCT_CAP
     n = cap + 8
-    headlines = [
-        f"[notice] flood-{index} seq={index} — distinct body {index}"
-        for index in range(n)
-    ]
+    headlines = []
+    for index in range(n):
+        row = {"stream_id": f"flood-{index // 2}", "stream_seq": index + 1}
+        envelope = {
+            "dispatch_id": row["stream_id"],
+            "seq": row["stream_seq"],
+            "type": "result",
+            "payload": {"text": f"distinct body {index}"},
+        }
+        if wire_kind == "headline":
+            line = messages.format_receipt_headline(row, envelope)
+        elif wire_kind == "event":
+            line = json.dumps(messages._follow_event_record(
+                row, envelope, cursor_version=200 + index
+            ))
+        else:
+            line = json.dumps({
+                "kind": "pending-at-arm",
+                "items": [row],
+                "cursor_version": 200 + index,
+            })
+        headlines.append(line)
     host = FakeHost(
         scripts={
             "backup": [
@@ -5591,6 +5612,9 @@ def test_distinct_volume_names_withheld_mail_and_how_to_retrieve_it() -> None:
     assert loud[0]["child"] == "backup"
     assert int(loud[0]["count"]) == n - cap
     assert "relay --drain" in str(loud[0].get("retrieve") or "")
+    assert loud[0].get("streams") == sorted({
+        f"flood-{index // 2}" for index in range(cap, n)
+    })
 
 
 def test_backlog_identity_groups_cursor_snapshot_not_ring() -> None:

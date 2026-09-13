@@ -1190,6 +1190,28 @@ def _identity_copy_cap(identity: str) -> int:
     return 1
 
 
+def _backlog_line_streams(line: str) -> set[str]:
+    """Stream names carried by follow events and listen arm reports."""
+    record = _parse_child_record(line)
+    if record is None:
+        # format_receipt_headline: [type] stream seq=N — headline.
+        text = line.strip()
+        if text.startswith("[") and "] " in text:
+            stream, separator, _ = text.split("] ", 1)[1].partition(" seq=")
+            if separator and stream:
+                return {stream}
+        return set()
+    rows = record.get("items")
+    if not isinstance(rows, list):
+        payload = record.get("payload")
+        rows = [payload if isinstance(payload, dict) else record]
+    return {
+        str(row.get("stream_id") or row.get("dispatch_id"))
+        for row in rows
+        if isinstance(row, dict) and (row.get("stream_id") or row.get("dispatch_id"))
+    }
+
+
 @dataclass
 class _CursorLedger:
     """Per-child cursor versions observed on this supervisor's stdout.
@@ -1236,6 +1258,7 @@ class _DistinctWithheldPending:
     first_at: float
     last_at: float
     forwarded: int
+    streams: set[str] = field(default_factory=set)
 
 
 def _child_backlog_record(pending: _ChildBacklogPending) -> dict[str, object]:
@@ -1271,6 +1294,7 @@ def _distinct_withheld_record(
         "child": pending.child,
         "count": pending.count,
         "forwarded": pending.forwarded,
+        "streams": sorted(pending.streams),
         "retrieve": DISTINCT_WITHHELD_RETRIEVE,
         "window_s": max(0.0, float(pending.last_at) - float(pending.first_at)),
     }
@@ -1285,8 +1309,8 @@ class _ChildBacklogGate:
     A new identity still emits even after that copy cap, up to
     CHILD_DISTINCT_CAP first-copies; further distinct identities flush as
     distinct-withheld (count is how many new envelopes were held; retrieve
-    names relay --drain). Floor expiry starts a new window so genuine
-    later news is not held forever.
+    names relay --drain; streams names the held mail). Floor expiry starts a
+    new window so genuine later news is not held forever.
     """
 
     child: str
@@ -1340,7 +1364,7 @@ class _ChildBacklogGate:
         if lag is not None:
             self.pending.behind, self.pending.ahead = lag
 
-    def _note_distinct_withheld(self, now: float) -> None:
+    def _note_distinct_withheld(self, now: float, line: str) -> None:
         if self.distinct_pending is None:
             self.distinct_pending = _DistinctWithheldPending(
                 child=self.child,
@@ -1348,11 +1372,13 @@ class _ChildBacklogGate:
                 first_at=now,
                 last_at=now,
                 forwarded=self.distinct_forwarded,
+                streams=_backlog_line_streams(line),
             )
             return
         self.distinct_pending.count += 1
         self.distinct_pending.last_at = now
         self.distinct_pending.forwarded = self.distinct_forwarded
+        self.distinct_pending.streams.update(_backlog_line_streams(line))
 
     def note(
         self,
@@ -1362,6 +1388,7 @@ class _ChildBacklogGate:
         cursor_version: int | None,
         lag: tuple[int, int] | None,
         identity: str,
+        line: str = "",
     ) -> tuple[bool, list[dict[str, object]]]:
         emits: list[dict[str, object]] = []
         if (
@@ -1376,7 +1403,7 @@ class _ChildBacklogGate:
         copies = self.copies_by_identity.get(identity, 0)
         if copies == 0:
             if self.distinct_forwarded >= CHILD_DISTINCT_CAP:
-                self._note_distinct_withheld(now)
+                self._note_distinct_withheld(now, line)
                 return False, emits
             self.copies_by_identity[identity] = 1
             self.distinct_forwarded += 1
@@ -1954,6 +1981,7 @@ def run_supervisor(
             cursor_version=version,
             lag=cursor_ledger.lag_for(label),
             identity=_backlog_line_identity(line),
+            line=line,
         )
         if not emit_restart_records(named):
             return False
