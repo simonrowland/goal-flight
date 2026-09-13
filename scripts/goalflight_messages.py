@@ -5186,15 +5186,21 @@ def _explicit_controller_label() -> str | None:
     return label[:64] or None
 
 
-def _require_relay_controller_label(authority) -> str:
+def _require_relay_controller_label(
+    authority,
+    explicit_label: str | None = None,
+) -> str:
     """Return the unique mailbox relay may inspect.
 
-    ``GOALFLIGHT_CONTROLLER_LABEL`` is explicit identity. A unique ACTIVE
-    lease is the bash-tool fallback (those calls drop the session label).
-    Zero or several ACTIVE leases without an explicit match are a
-    refusal: drain must never report empty without looking.
+    ``--controller-label`` wins, then ``GOALFLIGHT_CONTROLLER_LABEL``. A
+    unique ACTIVE lease is the bash-tool fallback (those calls drop the
+    session label). Zero or several ACTIVE leases without an explicit match
+    are a refusal: drain must never report empty without looking.
     """
-    explicit = _explicit_controller_label()
+    explicit = (
+        str(explicit_label or "").strip()[:64]
+        or _explicit_controller_label()
+    )
     labels = _active_controller_labels(authority)
     roster = ", ".join(labels) if labels else "(none)"
     if explicit:
@@ -5207,11 +5213,12 @@ def _require_relay_controller_label(authority) -> str:
         return labels[0]
     if not labels:
         raise MessageError(
-            "no ACTIVE controller lease; set GOALFLIGHT_CONTROLLER_LABEL"
+            "no ACTIVE controller lease; pass --controller-label or set "
+            "GOALFLIGHT_CONTROLLER_LABEL"
         )
     raise MessageError(
         f"ambiguous ACTIVE controller leases: {roster}; "
-        "set GOALFLIGHT_CONTROLLER_LABEL"
+        "pass --controller-label or set GOALFLIGHT_CONTROLLER_LABEL"
     )
 
 
@@ -5220,9 +5227,13 @@ def cmd_relay(args: argparse.Namespace) -> int:
     drain = bool(getattr(args, "drain", False))
     summary_only = bool(getattr(args, "summary_only", False))
     since_text = str(getattr(args, "since", None) or "").strip()
-    project_root = _current_project_root()
+    project_root = getattr(args, "project_root", None) or _current_project_root()
     if project_root is None:
-        print("relay: no current git project", file=sys.stderr)
+        print(
+            "relay: project root is unavailable; pass --project-root or run "
+            "from the project checkout",
+            file=sys.stderr,
+        )
         return 2
     try:
         import goalflight_journal  # type: ignore
@@ -5236,7 +5247,10 @@ def cmd_relay(args: argparse.Namespace) -> int:
             authority = goalflight_journal.Journal(root)
         else:
             authority = goalflight_journal.Journal.open_reader(root)
-        controller_label = _require_relay_controller_label(authority)
+        controller_label = _require_relay_controller_label(
+            authority,
+            getattr(args, "controller_label", None),
+        )
         lease = authority.active_lease(controller_label)
         if lease is None:
             raise MessageError("active controller lease is unavailable")
@@ -9024,6 +9038,15 @@ def _run_cli(argv: list[str] | None = None) -> int:
     status.set_defaults(func=cmd_status)
 
     relay = sub.add_parser("relay")
+    relay.add_argument("--project-root", default=None)
+    relay.add_argument(
+        "--controller-label",
+        default=None,
+        help=(
+            "controller mailbox label; defaults to GOALFLIGHT_CONTROLLER_LABEL, "
+            "then the unique ACTIVE lease"
+        ),
+    )
     relay.add_argument("--new", action="store_true", help="Peek at events pending after the journal cursor")
     relay.add_argument(
         "--drain",
@@ -9315,9 +9338,14 @@ def _run_cli(argv: list[str] | None = None) -> int:
     if args.cmd not in {"listen", "listen-auto", "follow", "supervise"} and not (
         args.cmd == "relay" and args.drain
     ):
-        entry_root = getattr(args, "controller_project_root", None) or Path.cwd()
+        entry_root = (
+            getattr(args, "controller_project_root", None)
+            or getattr(args, "project_root", None)
+            or Path.cwd()
+        )
         emit_wake_entry_notice(
             project_root=entry_root,
+            controller_label=getattr(args, "controller_label", None),
             messages_dir=args.messages_dir,
             fleet_dir=args.fleet_dir,
             mail_bearing=role == "controller",

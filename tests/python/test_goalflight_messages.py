@@ -532,6 +532,101 @@ def test_relay_drain_ambiguous_identity_refuses_instead_of_no_mail() -> None:
         )
 
 
+def test_relay_foreign_cwd_fails_loudly() -> None:
+    """An unresolved journal must not look like an empty mailbox."""
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        foreign = base / "foreign"
+        foreign.mkdir()
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        fleet_dir = Path(env["GOALFLIGHT_FLEET_DIR"])
+
+        with mock.patch.dict(os.environ, env, clear=False):
+            for name in (
+                "GOALFLIGHT_CONTROLLER_LABEL",
+                "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+                "GOALFLIGHT_CONTROLLER_SESSION_ID",
+                "GOALFLIGHT_DISPATCH_ID",
+            ):
+                os.environ.pop(name, None)
+            unresolved = run_messages_cli(
+                messages_dir,
+                fleet_dir,
+                ["relay", "--new", "--json"],
+                cwd=foreign,
+            )
+            assert_true("foreign-cwd relay exits nonzero", unresolved.returncode != 0)
+            assert_true("foreign-cwd relay writes no empty result", unresolved.stdout == "")
+            assert_true(
+                "foreign-cwd relay names the unresolved journal",
+                "relay: journal database is absent:" in unresolved.stderr,
+            )
+
+
+def test_relay_explicit_address_succeeds_from_foreign_cwd() -> None:
+    """Explicit address wins over both cwd and ambient controller identity."""
+    import goalflight_journal
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        project = base / "project"
+        foreign = base / "foreign"
+        init_git_project(project)
+        foreign.mkdir()
+        env = _journal_test_env(base)
+        messages_dir = Path(env["GOALFLIGHT_MESSAGES_DIR"])
+        fleet_dir = Path(env["GOALFLIGHT_FLEET_DIR"])
+        label = "foreign-cwd-controller"
+
+        with mock.patch.dict(os.environ, env, clear=False):
+            authority = goalflight_journal.open_or_create_journal(project)
+            claimed = authority.claim_or_renew_lease(
+                label,
+                principal={"principal_id": "foreign-cwd-test"},
+            )
+            assert_true("foreign-cwd controller lease claimed", claimed.committed)
+            other = authority.claim_or_renew_lease(
+                "other-controller",
+                principal={"principal_id": "foreign-cwd-other-test"},
+            )
+            assert_true("second controller makes label selection material", other.committed)
+            _post_journal_controller_mail(
+                project=project,
+                messages_dir=messages_dir,
+                label=label,
+                dispatch_id="foreign-cwd-mail",
+            )
+            os.environ["GOALFLIGHT_CONTROLLER_LABEL"] = "other-controller"
+            explicit = run_messages_cli(
+                messages_dir,
+                fleet_dir,
+                [
+                    "relay",
+                    "--new",
+                    "--json",
+                    "--project-root",
+                    str(project),
+                    "--controller-label",
+                    label,
+                ],
+                cwd=foreign,
+            )
+        assert_true(
+            f"explicit foreign-cwd relay succeeds: {explicit.stderr}",
+            explicit.returncode == 0,
+        )
+        payload = json.loads(explicit.stdout)
+        assert_true(
+            "explicit relay selects the requested controller",
+            payload["controller_label"] == label,
+        )
+        assert_true(
+            "explicit relay retrieves the pending envelope",
+            [item["dispatch_id"] for item in payload["items"]] == ["foreign-cwd-mail"],
+        )
+
+
 def test_relay_skips_self_peek_but_drain_receipts_self_and_foreign_mutation_pair() -> None:
     import goalflight_journal
 
