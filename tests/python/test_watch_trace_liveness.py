@@ -72,6 +72,12 @@ def _isolated_env(root: Path) -> dict[str, str]:
             "GOALFLIGHT_WAKE_LEDGER_DIR": str(root / "wake-ledger"),
             "GOAL_FLIGHT_PIDFILE_DIR": str(root / "pids"),
             "GOALFLIGHT_CAPACITY_CONF": "/dev/null",
+            # Without this the watcher's shutdown publishes into the INSTALLED
+            # shared console history under ~/.goal-flight/ (measured 46,908,698
+            # bytes), which it must lock, parse and fully re-serialize. That
+            # regularly exceeds the two-second cleanup wait at the end of these
+            # tests, and it lets a test mutate deployment state.
+            "GOALFLIGHT_FLEET_CONSOLE_OUTPUT_DIR": str(root / "fleet-console"),
             "GOALFLIGHT_TEST_MODE": "1",
         }
     )
