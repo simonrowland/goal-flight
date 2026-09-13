@@ -354,6 +354,7 @@ def _run(
     debug: bool = False,
     chatty: bool = False,
     forwarding_frontier: Callable[[], dict[str, object]] | None = None,
+    cursor_rewinds: Callable[[], dict[str, int]] | None = None,
     next_repeat_floor_s: float = supervise.DEFAULT_NEXT_REPEAT_FLOOR_S,
     on_startup_probe: Callable[[Path, str, str], str | None] | None = None,
 ) -> int:
@@ -370,6 +371,7 @@ def _run(
         debug=debug,
         chatty=chatty,
         forwarding_frontier=forwarding_frontier,
+        cursor_rewinds=cursor_rewinds,
         next_repeat_floor_s=next_repeat_floor_s,
         on_startup_probe=on_startup_probe,
     )
@@ -5233,7 +5235,7 @@ def test_divergent_cursor_children_deliver_each_envelope_once() -> None:
         for index in range(n_live)
     ]
     stuck_lines = [
-        (1.0 + index * 0.001, _cursor_event_line(stuck_version, index % n_stuck))
+        (1.0 + index * 0.001, _cursor_event_line(stuck_version, index % n_stuck + 1))
         for index in range(n_stuck * 2)
     ]
     host = FakeHost(
@@ -5298,7 +5300,7 @@ def test_divergent_cursor_children_deliver_each_envelope_once() -> None:
     assert named == []
     joined = "".join(host.lines)
     assert '"type":"listener-dead"' in joined
-    assert joined.count(_cursor_event_line(stuck_version, 0)) == 1
+    assert joined.count(_cursor_event_line(stuck_version, 1)) == 1
 
 
 def test_same_cursor_distinct_envelopes_all_reach_stdout() -> None:
@@ -5522,7 +5524,7 @@ def test_escalations_reach_stdout_after_195_routine_headlines(wire_kind: str) ->
                 assert record["payload"]["summary"]
             line = json.dumps(record)
         escalations.append(line)
-    # Replays must also bypass the duplicate-copy cap, even at one cursor.
+    # A first escalation survives the routine burst; exact copies deduplicate.
     copies = 9
     incoming = routine + escalations * copies
     host = FakeHost(
@@ -5551,7 +5553,7 @@ def test_escalations_reach_stdout_after_195_routine_headlines(wire_kind: str) ->
         ) for event_type in ("blocked", "user_need", "user_confirm")]
     else:
         delivered = [output.count(line) for line in escalations]
-    assert delivered == [copies] * 3, f"{wire_kind}: escalation stdout counts {delivered}"
+    assert delivered == [1] * 3, f"{wire_kind}: escalation stdout counts {delivered}"
     withheld = [
         record for record in _records(host) if record.get("type") == "distinct-withheld"
     ]
@@ -5666,14 +5668,14 @@ def test_distinct_volume_delivers_every_envelope(
 
 def test_backlog_identity_prefers_envelope_before_cursor_snapshot() -> None:
     """A new cursor cannot rename an envelope; distinct rows cannot share it."""
-    event_a = _cursor_event_line(5220, 0)
-    event_b = _cursor_event_line(5220, 1)
-    event_new = _cursor_event_line(5221, 2)
+    event_a = _cursor_event_line(5220, 1)
+    event_b = _cursor_event_line(5220, 2)
+    event_new = _cursor_event_line(5221, 3)
     ring = _ring_line(5220)
     headline = "[notice] mail-1 seq=1 — body"
     ident = supervise._backlog_line_identity
     assert ident(event_a) != ident(event_b)
-    assert ident(event_a) == ident(_cursor_event_line(5221, 0))
+    assert ident(event_a) == ident(_cursor_event_line(5221, 1))
     assert ident(event_a) != ident(event_new)
     assert ident(event_a) != ident(ring)
     assert ident(headline) == ident(headline)
@@ -5696,6 +5698,59 @@ def test_one_envelope_across_children_reaches_host_once(children: int, wire_kind
     _run(host, _items(*(["backup"] * children)))
     delivered = [line.strip() for line in host.lines if line.strip() in {event, headline}]
     assert len(delivered) == 1, f"{children} children delivered {len(delivered)} copies"
+
+
+@pytest.mark.parametrize("wire_kind", ["event", "headline", "pending-at-arm"])
+def test_live_supervisor_rewind_only_replays_affected_stream_across_replacement(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity], wire_kind: str,
+) -> None:
+    project, _env, lease = isolated
+    authority = journal.Journal(project)
+    incoming = []
+    for stream in ("rewind-stream", "unrelated-stream"):
+        row = {"stream_id": stream, "stream_seq": 1, "event_type": "result"}
+        envelope = {"type": "result", "payload": {"text": stream}}
+        if wire_kind == "headline":
+            line = messages.format_receipt_headline(row, envelope)
+        elif wire_kind == "pending-at-arm":
+            line = json.dumps({"kind": wire_kind, "items": [row]})
+        else:
+            line = json.dumps(messages._follow_event_record(row, envelope, cursor_version=100))
+        incoming.append(line)
+
+    class RewindingHost(FakeHost):
+        def spawn(self, kind: str, command: str):
+            if len(self.spawns) == 1:
+                assert authority.set_cursor(lease.label, positions={"rewind-stream": 1}, actor="test").committed
+                assert authority.set_cursor(lease.label, positions={"rewind-stream": 0}, actor="test").committed
+            return super().spawn(kind, command)
+
+    plans = [PlannedExit(0.1, 0, armed=True,
+                        stdout_lines=[(i * 0.01, line) for i, line in enumerate(incoming * 2)]),
+             PlannedExit(80.0, 0, armed=True,
+                         stdout_lines=[(i * 0.01, line) for i, line in enumerate(incoming * 2)])]
+    host = RewindingHost(scripts={"backup": plans}, stop_after_waits=12)
+    _run(host, _items("backup"), cursor_rewinds=lambda: authority._cursor_rewinds(lease.label))
+    delivered = [row["stream_id"] for line in host.lines for row in supervise._child_mail_rows(line)]
+    assert delivered == ["rewind-stream", "unrelated-stream", "rewind-stream"]
+
+
+def test_unmigrated_rewind_evidence_forwards_unknown_instead_of_crashing(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    import sqlite3
+
+    project, _env, lease = isolated
+    authority = journal.Journal(project)
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute("DROP TABLE controller_stream_rewinds")
+    reader = journal.Journal.open_reader(project, retry_budget_s=0, open_retry_budget_s=0)
+    line = _cursor_event_line(100, 1)
+    host = FakeHost(scripts={"backup": [PlannedExit(
+        80.0, 0, armed=True, stdout_lines=[(0.0, line), (0.01, line)],
+    )]}, stop_after_waits=4)
+    _run(host, _items("backup"), cursor_rewinds=lambda: reader._cursor_rewinds(lease.label))
+    assert [output.strip() for output in host.lines].count(line) == 2
 
 
 def test_unread_delivery_survives_cursor_bump_and_repeat_floor() -> None:
@@ -5741,7 +5796,7 @@ def test_replacement_owner_replays_after_failed_delivery(partial: bool) -> None:
     assert delivered == list(range(10)), f"replacement lost unacknowledged mail: {delivered}"
 
 
-@pytest.mark.parametrize("wire_kind", ["event", "headline", "pending-at-arm"])
+@pytest.mark.parametrize("wire_kind", ["event", "headline", "pending-at-arm", "ring"])
 @pytest.mark.parametrize("event_type", ["blocked", "user_need", "user_confirm"])
 def test_escalation_survives_routine_envelope_collision(wire_kind: str, event_type: str) -> None:
     row = {"stream_id": "mail-1", "stream_seq": 1}
@@ -5749,6 +5804,8 @@ def test_escalation_survives_routine_envelope_collision(wire_kind: str, event_ty
                 "payload": {"text": "ruling required"}}
     if wire_kind == "headline":
         escalation = messages.format_receipt_headline(row, envelope)
+    elif wire_kind == "ring":
+        escalation = _ring_line(100)
     elif wire_kind == "pending-at-arm":
         escalation = json.dumps({"kind": wire_kind, "cursor_version": 100,
                                  "items": [{**row, "event_type": event_type}]})
@@ -5758,7 +5815,11 @@ def test_escalation_survives_routine_envelope_collision(wire_kind: str, event_ty
         stdout_lines=[(0.0, _cursor_event_line(100, 1)), (0.01, escalation),
                       (0.02, escalation)])]}, stop_after_waits=6)
     _run(host, _items("backup"))
-    assert [line.strip() for line in host.lines].count(escalation) == 2
+    # Rings carry no body/identity; both wakes survive. Mail delivers the first
+    # escalation despite a routine collision, then suppresses its exact repeat.
+    assert [line.strip() for line in host.lines].count(escalation) == (
+        2 if wire_kind == "ring" else 1
+    )
 
 
 def test_overlapping_pending_reports_dedup_items_and_preserve_metadata() -> None:
@@ -5820,12 +5881,34 @@ def test_long_stream_ids_remain_distinct_across_wire_formats(length: int, wire_k
     assert identities == streams, f"display IDs corrupted envelope identity: {identities}"
 
 
-@pytest.mark.parametrize("stream", ["[redacted]", "prefix…", "prefix..."])
-def test_altered_display_ids_are_unknown_not_duplicate_envelopes(stream: str) -> None:
-    lines = [json.dumps({"kind": "event", "payload": {
-        "stream_id": stream, "stream_seq": 1, "type": "result", "data": {"text": text},
-    }}) for text in ("first", "second")]
+@pytest.mark.parametrize("stream,seq", [
+    ("[redacted]", 1), ("prefix…", 1), ("prefix...", 1), ("?", 1),
+    (" ", 1), ("bad/id", 1), ("None", 1), (None, 1), (None, 0),
+    ("valid-stream", 0), ("valid-stream", 1),
+])
+@pytest.mark.parametrize("wire_kind", ["event", "headline", "pending-at-arm"])
+def test_altered_display_ids_are_unknown_not_duplicate_envelopes(
+    stream: str | None, seq: int, wire_kind: str,
+) -> None:
+    known = stream == "valid-stream" and seq == 1
+    lines = []
+    for text in ("first", "first" if known else "second"):
+        row = {"stream_id": stream, "stream_seq": seq, "event_type": "result"}
+        envelope = {"type": "result", "payload": {"text": text}}
+        if wire_kind == "headline":
+            line = messages.format_receipt_headline(row, envelope)
+        elif wire_kind == "event":
+            line = json.dumps(messages._follow_event_record(row, envelope, cursor_version=100))
+        else:
+            line = json.dumps({"kind": "pending-at-arm", "items": [{**row, "text": text}]})
+        lines.append(line)
     host = FakeHost(scripts={"backup": [PlannedExit(80.0, 0, armed=True,
         stdout_lines=[(i * 0.001, line) for i, line in enumerate(lines)])]}, stop_after_waits=4)
     _run(host, _items("backup"))
-    assert all(line in [output.strip() for output in host.lines] for line in lines)
+    if known:
+        rows = [row for line in host.lines for row in supervise._child_mail_rows(line)]
+        assert len(rows) == 1, "a genuine repeat must still deduplicate"
+    else:
+        assert all(line in [output.strip() for output in host.lines] for line in lines), (
+            "an unestablishable identity must preserve both different bodies"
+        )

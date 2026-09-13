@@ -93,6 +93,9 @@ CURRENT_SCHEMA_COLUMNS = {
     "controller_stream_cursors": (
         "project_root", "label", "stream_id", "position", "updated_at",
     ),
+    "controller_stream_rewinds": (
+        "project_root", "label", "stream_id", "rewind_version",
+    ),
     "listener_coverage": (
         "coverage_id", "project_root", "label", "lease_generation", "lease_nonce",
         "pid", "start_token", "parent_pid", "armed_at", "state", "exited_at",
@@ -1990,6 +1993,14 @@ class Journal:
                 PRIMARY KEY (project_root, label, stream_id),
                 FOREIGN KEY (project_root, label)
                     REFERENCES controller_cursors(project_root, label) ON DELETE CASCADE
+            )""",
+            """CREATE TABLE IF NOT EXISTS controller_stream_rewinds (
+                project_root TEXT NOT NULL,
+                label TEXT NOT NULL,
+                stream_id TEXT NOT NULL,
+                rewind_version INTEGER NOT NULL
+                    CHECK (typeof(rewind_version) = 'integer' AND rewind_version >= 1),
+                PRIMARY KEY (project_root, label, stream_id)
             )""",
             """CREATE TABLE IF NOT EXISTS listener_coverage (
                 coverage_id TEXT PRIMARY KEY,
@@ -3951,6 +3962,18 @@ class Journal:
             for row in rows
         }
 
+    def _cursor_rewinds(self, label: str) -> dict[str, int]:
+        """Durable per-stream rewind evidence, independent of cursor snapshots."""
+        resolved_label = self._identity_token(label, label="cursor label")
+        return {
+            str(row["stream_id"]): int(row["rewind_version"])
+            for row in self.read_all(
+                """SELECT stream_id, rewind_version FROM controller_stream_rewinds
+                   WHERE project_root = ? AND label = ?""",
+                (str(self.project_root), resolved_label),
+            )
+        }
+
     def cursor_status(self, label: str) -> dict[str, object] | None:
         resolved_label = self._identity_token(label, label="controller label")
         rows = self.read_all(
@@ -4336,6 +4359,17 @@ class Journal:
                 exclude_label=resolved_label,
             )
         for stream, position in normalized_advances.items():
+            if position < current_positions.get(stream, 0):
+                # Same transaction as the bookmark: never infer a rewind from
+                # assignment/projection bumps or an ordinary consume write.
+                connection.execute(
+                    """INSERT INTO controller_stream_rewinds
+                       (project_root, label, stream_id, rewind_version)
+                       VALUES (?, ?, ?, 1)
+                       ON CONFLICT(project_root, label, stream_id) DO UPDATE SET
+                           rewind_version = rewind_version + 1""",
+                    (project_root, resolved_label, stream),
+                )
             connection.execute(
                 """
                 INSERT INTO controller_stream_cursors (

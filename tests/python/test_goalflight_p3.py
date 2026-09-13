@@ -196,6 +196,62 @@ def test_epoch_four_migration_is_race_safe_idempotent_and_corruption_fails_close
         journal.Journal(corrupt_project)
 
 
+def test_cursor_rewind_versions_are_backward_only_scoped_and_atomic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    assert authority.set_cursor("owner", positions={"a": 2, "b": 2}, actor="test").committed
+    assert authority._cursor_rewinds("owner") == {}
+    assert authority.set_cursor("owner", positions={"a": 3, "b": 2}, actor="test").committed
+    assert authority._cursor_rewinds("owner") == {}, "forward/same writes are not rewinds"
+    assert authority.set_cursor("owner", positions={"a": 1}, actor="test").committed
+    assert journal.Journal(project)._cursor_rewinds("owner") == {"a": 1}
+    assert authority._cursor_rewinds("another-owner") == {}
+    assert authority.set_cursor("owner", positions={"a": 0, "b": 1}, actor="test").committed
+    assert authority._cursor_rewinds("owner") == {"a": 2, "b": 1}
+    other = tmp_path / "other-project"
+    other.mkdir()
+    assert journal.open_or_create_journal(other)._cursor_rewinds("owner") == {}
+
+    def fail_after_positions(*_args, **_kwargs):
+        raise RuntimeError("rollback after cursor update")
+
+    monkeypatch.setattr(authority, "_label_has_unread_delivery", fail_after_positions)
+    with pytest.raises(RuntimeError, match="rollback after cursor update"):
+        authority.set_cursor("owner", positions={"b": 0}, actor="test")
+    assert authority._cursor_rewinds("owner") == {"a": 2, "b": 1}
+    assert authority.cursor_status("owner")["positions"] == {"a": 0, "b": 1}
+
+
+def test_rewind_table_migration_is_explicit_additive_and_idempotent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _set_state_env(monkeypatch, tmp_path)
+    monkeypatch.delenv(journal.ALLOW_MIGRATION_ENV, raising=False)
+    project = _project(tmp_path)
+    authority = journal.open_or_create_journal(project)
+    assert authority.set_cursor("owner", positions={"a": 2}, actor="test").committed
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute("DROP TABLE IF EXISTS controller_stream_rewinds")
+    before = authority.path.read_bytes()
+    with pytest.raises(journal.JournalUpgradeRequired, match="UPGRADE_REQUIRED"):
+        journal.Journal(project, allow_migration=False)
+    assert authority.path.read_bytes() == before
+    migrated = journal.Journal(project, allow_migration=True)
+    assert migrated._cursor_rewinds("owner") == {}
+    assert migrated.cursor_status("owner")["positions"] == {"a": 2}
+    assert migrated.epochs() == journal.JournalEpochs(6, 6, 6, 6, 6)
+    assert migrated.set_cursor("owner", positions={"a": 1}, actor="test").committed
+    assert journal.Journal(project, allow_migration=True)._cursor_rewinds("owner") == {"a": 1}
+    # The old shape validator requires exact columns in known tables, but
+    # accepts extra tables. Keep the original epoch fence and old shapes.
+    monkeypatch.delitem(journal.CURRENT_SCHEMA_COLUMNS, "controller_stream_rewinds")
+    old_reader = journal.Journal(project, allow_migration=False)
+    assert old_reader.cursor_status("owner")["positions"] == {"a": 1}
+
+
 def test_older_journal_requires_explicit_migration_without_mutating(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

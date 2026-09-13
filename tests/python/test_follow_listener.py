@@ -355,19 +355,23 @@ def test_follow_does_not_replay_advanced_streams_across_polls_and_restart(
             proc.wait(timeout=3)
 
 
+@pytest.mark.parametrize("event_type", ["controller-notice", "blocked", "user_need", "user_confirm"])
 def test_follow_new_arrival_does_not_replay_delivered_unread_mail(
     isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
 ) -> None:
     project, env, lease = isolated
 
     def post(stream: str) -> None:
+        kind = event_type if stream == "first-unread" else "controller-notice"
         messages.post_message(
-            dispatch_id=stream, msg_type="controller-notice",
-            payload={"text": "remain unread"},
+            dispatch_id=stream, msg_type=kind,
+            payload={"text": "remain unread", "project_root": str(project)},
             messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
             source={"node": "peer", "adapter": "pytest", "transport": "controller"},
-            addressee=messages.controller_addressee(lease.label, project_root=project),
+            addressee=(messages.controller_addressee(lease.label, project_root=project)
+                       if kind == "controller-notice" else None),
         )
 
     post("first-unread")
@@ -389,6 +393,209 @@ def test_follow_new_arrival_does_not_replay_delivered_unread_mail(
     assert messages.main(_follow_argv(project, lease)) == 0
     assert delivered == ["first-unread", "new-arrival"]
     assert len(journal.Journal(project).cursor_peek(lease.label, nonce=lease.nonce).items) == 2
+
+
+def test_live_follow_redelivers_after_explicit_rewind_only(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+) -> None:
+    project, env, lease = isolated
+    for stream in ("rewind-stream", "rewind-stream", "unrelated-stream"):
+        messages.post_message(
+            dispatch_id=stream, msg_type="controller-notice",
+            payload={"text": "replay only on rewind"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(lease.label, project_root=project),
+        )
+    proc = _spawn_follow(project, env, lease, heartbeat_s=0.12)
+    assert proc.stdout is not None
+    reader = _JsonLineReader(proc.stdout)
+    try:
+        observed = []
+
+        def three_beats() -> None:
+            beats = 0
+            while beats < 3:
+                record = reader.read()[1]
+                if record["kind"] == "event":
+                    observed.append(record["payload"]["stream_id"])
+                beats += record["kind"] == "heartbeat"
+
+        three_beats()
+        assert sorted(observed) == ["rewind-stream", "rewind-stream", "unrelated-stream"], (
+            "continuously unread mail replayed"
+        )
+        authority = journal.Journal(project)
+        for _ in range(2):
+            assert authority.set_cursor(lease.label, positions={"rewind-stream": 1}, actor="test").committed
+            three_beats()
+            assert len(observed) == 3, "forward/same cursor writes replayed unread mail"
+        # Both writes can occur between polls; observing the forward position
+        # in an intermediate heartbeat is not a prerequisite for a rewind.
+        assert authority.set_cursor(lease.label, positions={"rewind-stream": 2}, actor="test").committed
+        assert authority.set_cursor(lease.label, positions={"rewind-stream": 0}, actor="test").committed
+        assert len(authority.cursor_peek(lease.label, nonce=lease.nonce).items) == 3
+        three_beats()
+        assert proc.poll() is None, "the same follow owner must deliver the replay"
+        assert observed.count("rewind-stream") == 4, "explicit rewind was suppressed"
+        assert observed.count("unrelated-stream") == 1, "rewind resurrected unrelated mail"
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=3)
+
+
+def test_follow_rewind_between_evidence_read_and_peek_releases_ring(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, env, lease = isolated
+    messages.post_message(
+        dispatch_id="rewind-race", msg_type="controller-notice",
+        payload={"text": "rewind between polls"},
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+        addressee=messages.controller_addressee(lease.label, project_root=project),
+    )
+    authority = journal.Journal(project)
+    original = journal.Journal._cursor_rewinds
+    observed = []
+    rewound = False
+    beats = 0
+
+    def rewind_after_read(self, label):
+        nonlocal rewound
+        evidence = original(self, label)
+        if observed and not rewound:
+            rewound = True
+            assert authority.set_cursor(label, positions={"rewind-race": 1}, actor="test").committed
+            assert authority.set_cursor(label, positions={"rewind-race": 0}, actor="test").committed
+        return evidence
+
+    def write(record, **_kwargs):
+        nonlocal beats
+        if record["kind"] == "event":
+            observed.append(record["payload"]["stream_id"])
+        if record["kind"] == "heartbeat":
+            beats += 1
+        return beats < 4 and len(observed) < 2
+
+    _pin_listener_resolution(monkeypatch, lease)
+    monkeypatch.setattr(journal.Journal, "_cursor_rewinds", rewind_after_read)
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    monkeypatch.setattr(messages, "_write_follow_record", write)
+    monkeypatch.setattr(messages, "_silence_broken_stdout", lambda _stream: None)
+    assert messages.main(_follow_argv(project, lease)) == 0
+    assert observed == ["rewind-race", "rewind-race"], "new-version ring blocked the rewind replay"
+
+
+@pytest.mark.parametrize("event_type", ["blocked", "user_need", "user_confirm"])
+def test_follow_batch_escalation_collision_then_exact_repeat(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity], event_type: str,
+) -> None:
+    project, _env, lease = isolated
+    row = {"stream_id": "collision", "stream_seq": 1}
+    routine = {"type": "controller-notice", "payload": {"text": "routine"}}
+    escalation = {"type": event_type, "payload": {"text": "ruling required"}}
+    emitted = []
+    assert messages._emit_claimed_follow_events(
+        project, authority=journal.Journal(project), controller_label=lease.label,
+        cursor_version=77, visible=[(row, routine), (row, escalation), (row, escalation)],
+        delivered=set(), emit=lambda record: emitted.append(record["payload"]["type"]) or True,
+    ) == (True, True)
+    assert emitted == ["controller-notice", event_type]
+
+
+def test_follow_rewind_invalidates_acknowledged_arm_watermark(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, env, lease = isolated
+    messages.post_message(
+        dispatch_id="acknowledged-stream", msg_type="controller-notice",
+        payload={"text": "replay past the arm watermark"},
+        messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+        source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+        addressee=messages.controller_addressee(lease.label, project_root=project),
+    )
+    authority = journal.Journal(project)
+    assert authority.set_cursor(lease.label, positions={"acknowledged-stream": 1}, actor="test").committed
+    monkeypatch.setattr(wake, "recover_pending_report_state", lambda *_args, **_kwargs:
+                        SimpleNamespace(phase="acknowledged", positions={"acknowledged-stream": 1}))
+    observed = []
+    beats = 0
+
+    def write(record, **_kwargs):
+        nonlocal beats
+        if record["kind"] == "event":
+            observed.append(record["payload"]["stream_id"])
+            return False
+        if record["kind"] == "heartbeat":
+            beats += 1
+            if beats == 1:
+                assert authority.set_cursor(lease.label, positions={"acknowledged-stream": 0}, actor="test").committed
+        return beats < 4
+
+    _pin_listener_resolution(monkeypatch, lease)
+    monkeypatch.setattr(messages, "_follow_stdout_refusal", lambda _stream: None)
+    monkeypatch.setattr(messages, "_write_follow_record", write)
+    monkeypatch.setattr(messages, "_silence_broken_stdout", lambda _stream: None)
+    assert messages.main(_follow_argv(project, lease)) == 0
+    assert observed == ["acknowledged-stream"]
+
+
+@pytest.mark.parametrize("event_type", ["blocked", "user_need", "user_confirm", "controller-notice"])
+def test_real_follow_backlog_delivers_40_unique_envelopes_once(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity], event_type: str,
+) -> None:
+    from test_supervised_wake import FakeHost, PlannedExit, _items, _records, _run
+
+    project, env, lease = isolated
+
+    def post(stream, kind):
+        messages.post_message(
+            dispatch_id=stream, msg_type=kind,
+            payload={"text": "unread backlog", "project_root": str(project)},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=(messages.controller_addressee(lease.label, project_root=project)
+                       if kind == "controller-notice" else None),
+        )
+
+    for index in range(20):
+        post(f"backlog-{index:02d}", event_type)
+    proc = _spawn_follow(project, env, lease, heartbeat_s=0.12)
+    assert proc.stdout is not None
+    reader = _JsonLineReader(proc.stdout)
+    lines = []
+
+    def read_through(stream):
+        while True:
+            raw, record = reader.read()
+            if record["kind"] == "event":
+                lines.append(raw.decode().strip())
+                if record["payload"].get("stream_id") == stream:
+                    return
+
+    try:
+        read_through("backlog-19")
+        for index in range(20):
+            stream = f"arrival-{index:02d}"
+            post(stream, "controller-notice")
+            read_through(stream)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait(timeout=3)
+    host = FakeHost(scripts={"stream": [PlannedExit(
+        80.0, 0, armed=True, stdout_lines=[(i * 0.001, line) for i, line in enumerate(lines)],
+    )]}, stop_after_waits=len(lines) + 4)
+    _run(host, _items("stream"))
+    forwarded = [r for r in _records(host) if r.get("kind") == "event"]
+    assert len(lines) == 40, "follow replayed unread envelopes on cursor-version changes"
+    assert len(forwarded) == 40
+    assert len({(r["payload"]["stream_id"], r["payload"]["stream_seq"]) for r in forwarded}) == 40
+    assert journal.Journal(project).cursor_status(lease.label)["positions"] == {}
 
 
 def test_follow_recovers_corrupt_pending_report_and_stays_armed(
@@ -749,7 +956,7 @@ def test_partial_follow_batch_is_replayable_without_acknowledgement(
     visible = [({"stream_id": "peer", "stream_seq": i + 1},
                 {"dispatch_id": "peer", "type": "controller-notice",
                  "payload": {"text": f"notice {i}"}}) for i in range(10)]
-    delivered: set[tuple[str, int]] = set()
+    delivered: set[tuple[str, int, str]] = set()
     output = []
 
     def emit(record):

@@ -6813,7 +6813,7 @@ def _emit_claimed_follow_events(
     cursor_version: int,
     visible: list[tuple[dict, dict]],
     emit: Callable[[dict[str, object]], bool],
-    delivered: set[tuple[str, int]] | None = None,
+    delivered: set[tuple[str, int, str]] | None = None,
 ) -> tuple[bool, bool]:
     """Emit unread rows once per owner; a partial batch remains replayable."""
     if not visible:
@@ -6826,7 +6826,7 @@ def _emit_claimed_follow_events(
     if not ring_claimed:
         return True, False
     emitted_event = False
-    batch_delivered: set[tuple[str, int]] = set()
+    batch_delivered: set[tuple[str, int, str]] = set()
     try:
         for row, envelope in visible:
             # Carrier reads and earlier writes can outlive a controller drain.
@@ -6834,11 +6834,10 @@ def _emit_claimed_follow_events(
             positions = _journal_cursor_positions(authority, controller_label)
             if int(row["stream_seq"]) <= positions.get(str(row["stream_id"]), 0):
                 continue
-            identity = (str(row["stream_id"]), int(row["stream_seq"]))
-            if (
-                delivered is not None and identity in delivered
-                and envelope.get("type") not in PRIORITY_BY_TYPE
-            ):
+            event_type = str(envelope.get("type") or "")
+            identity = (str(row["stream_id"]), int(row["stream_seq"]),
+                        event_type if event_type in PRIORITY_BY_TYPE else "")
+            if identity in batch_delivered or (delivered is not None and identity in delivered):
                 continue
             if not emit(
                 _follow_event_record(
@@ -7098,7 +7097,8 @@ def cmd_follow(args) -> int:
     )
     # This stdout owner alone knows these deliveries. Never persist them or
     # advance the journal: a replacement must replay unacknowledged mail.
-    delivered: set[tuple[str, int]] = set()
+    delivered: set[tuple[str, int, str]] = set()
+    seen_rewinds: dict[str, int] = {}
     reset_owner_ring = True
 
     def emit(record: dict[str, object]) -> bool:
@@ -7180,6 +7180,23 @@ def cmd_follow(args) -> int:
                         }
                     )
                     return 3
+                rewinds = authority._cursor_rewinds(label)
+                changed_streams = {
+                    stream for stream, version in rewinds.items()
+                    if version != seen_rewinds.get(stream, 0)
+                }
+                if changed_streams:
+                    # A rewind can commit between the previous evidence read
+                    # and peek, leaving its new-version ring claimed before
+                    # delivery memory was invalidated. Reclaim that reservation.
+                    reset_owner_ring = True
+                    delivered.difference_update(
+                        identity for identity in tuple(delivered)
+                        if identity[0] in changed_streams
+                    )
+                    for stream in changed_streams:
+                        arm_high.pop(stream, None)
+                seen_rewinds = rewinds
                 # A fresh peek selects candidates; delivery rechecks positions
                 # because carrier reads and stdout writes can span advances.
                 snapshot = authority.cursor_peek(label, nonce=nonce, limit=1000)

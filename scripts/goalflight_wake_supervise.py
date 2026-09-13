@@ -17,6 +17,7 @@ from pathlib import Path
 import select
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -140,7 +141,7 @@ _PASSTHROUGH_EVENT_TYPES = frozenset(
         "listener-degraded",
         "listener-recovered",
     }
-) | _ESCALATION_EVENT_TYPES
+)
 _DEAD_NONCE_MARKERS = (
     "controller-capability-mismatch",
     "lease-nonce-not-live",
@@ -1119,24 +1120,33 @@ def _backlog_capable_row(row: object) -> bool:
 
 
 def _is_backlog_capable_line(line: str) -> bool:
-    """Apply the same escalation exemption to every mail representation."""
+    """Apply the same health-record exemption to every mail representation."""
     rows = _child_mail_rows(line)
     return bool(rows) and all(_backlog_capable_row(row) for row in rows)
 
 
 def _envelope_identity(row: object) -> str | None:
+    from goalflight_messages import MessageError, validate_stream_id
+
     if not isinstance(row, dict):
         return None
     stream = row.get("stream_id") or row.get("dispatch_id")
     seq = row.get("stream_seq")
-    if not isinstance(stream, str) or not stream:
+    if stream == "None":
         return None
-    # Older children may shorten IDs, and sanitization may redact one. Such
-    # display text cannot prove two envelopes equal; preserve both notices.
-    if "[redacted]" in stream or "…" in stream or stream.endswith("..."):
+    # Reuse ingress validation: malformed or shortened display text cannot
+    # establish envelope identity. Unknown identity always forwards.
+    try:
+        validate_stream_id(stream)
+    except MessageError:
         return None
-    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
         return None
+    event_type = str(row.get("event_type") or row.get("type") or "")
+    if event_type in _ESCALATION_EVENT_TYPES:
+        # A routine collision cannot suppress the first escalation, but an
+        # exact repeat of that escalation still belongs to this owner's memory.
+        return f"envelope:{stream}:{seq}:{event_type}"
     return f"envelope:{stream}:{seq}"
 
 
@@ -1262,6 +1272,7 @@ def run_supervisor(
     debug: bool = False,
     chatty: bool = False,
     forwarding_frontier: Callable[[], dict[str, object]] | None = None,
+    cursor_rewinds: Callable[[], dict[str, int]] | None = None,
     next_repeat_floor_s: float = DEFAULT_NEXT_REPEAT_FLOOR_S,
     on_startup_probe: Callable[[Path, str, str], str | None] | None = None,
 ) -> int:
@@ -1611,7 +1622,8 @@ def run_supervisor(
     # Scoped to this stdout owner, shared across every child and replacement
     # child. This is delivery memory, never journal acknowledgement. A new
     # supervisor starts empty and can recover any partially delivered batch.
-    delivered_envelopes: set[str] = set()
+    delivered_envelopes: dict[str, str] = {}
+    seen_rewinds: dict[str, int] = {}
 
     def emit_pending_stream_wake(*, paired_frontier: bool = False) -> bool:
         nonlocal latest_frontier
@@ -1685,10 +1697,28 @@ def run_supervisor(
         return emit_restart_records(outgoing)
 
     def forward_child_line(child: Any, line: str) -> bool:
+        nonlocal seen_rewinds
         record = _parse_child_record(line)
-        identities: set[str] = set()
+        rows = _child_mail_rows(line)
+        if rows and cursor_rewinds is not None:
+            try:
+                rewinds = cursor_rewinds()
+            except (OSError, RuntimeError, ValueError, sqlite3.DatabaseError):
+                # No current evidence cannot prove a duplicate. Preserve both
+                # the output and old memory until a later successful read.
+                text = line if line.endswith("\n") else line + "\n"
+                return _write_stdout(host, text, source="write-child-output")
+            changed_streams = {
+                stream for stream, version in rewinds.items()
+                if version != seen_rewinds.get(stream, 0)
+            }
+            if changed_streams:
+                for identity, stream in tuple(delivered_envelopes.items()):
+                    if stream in changed_streams:
+                        del delivered_envelopes[identity]
+            seen_rewinds = rewinds
+        identities: dict[str, str] = {}
         if record is not None and record.get("kind") == "pending-at-arm":
-            rows = _child_mail_rows(line)
             remaining = []
             for row in rows:
                 identity = _envelope_identity(row)
@@ -1699,7 +1729,7 @@ def run_supervisor(
                     continue
                 remaining.append(row)
                 if identity is not None:
-                    identities.add(identity)
+                    identities[identity] = str(row.get("stream_id") or row.get("dispatch_id"))
             if len(remaining) != len(rows):
                 # Keep cursor/advance and all other metadata intact; only
                 # repeated mail items disappear from the report.
@@ -1710,7 +1740,7 @@ def run_supervisor(
             if identity.startswith("envelope:"):
                 if identity in delivered_envelopes:
                     return True
-                identities.add(identity)
+                identities[identity] = str(rows[0].get("stream_id") or rows[0].get("dispatch_id"))
         text = line if line.endswith("\n") else line + "\n"
         if not _write_stdout(host, text, source="write-child-output"):
             return False
@@ -2663,6 +2693,7 @@ def cmd_supervise(
     """CLI entry used by goalflight_messages.py supervise."""
     import goalflight_session_status as sessions  # type: ignore
     import goalflight_task  # type: ignore
+    import goalflight_journal  # type: ignore
 
     if str(os.environ.get("GOALFLIGHT_DISPATCH_ID") or "").strip():
         print(
@@ -2746,11 +2777,20 @@ def cmd_supervise(
         controller_label=label,
         lease_nonce=live_nonce,
     )
+
+    def cursor_rewinds() -> dict[str, int]:
+        # Read-only and without contention waits: mail/peer handling must stay
+        # responsive even when the journal cannot currently establish identity.
+        return goalflight_journal.Journal.open_reader(
+            project_root, retry_budget_s=0, open_retry_budget_s=0,
+        )._cursor_rewinds(label)
+
     return run_supervisor(
         project_root=project_root,
         controller_label=label,
         lease_nonce=live_nonce,
         host=host,
+        cursor_rewinds=cursor_rewinds,
         heartbeat_s=heartbeat_s,
         coverage_s=coverage_s,
         emit_depth=bool(getattr(args, "chatty", False)),

@@ -7,7 +7,7 @@ already forwarded CHILD_DISTINCT_CAP (32) distinct envelopes in the window. The
 withhold emitted a `retrieve: relay --drain` hint, nothing drained, and the
 controller discovered the dead worker ~25 minutes later via an unrelated timer.
 
-Envelope deduplication replaces the cap. Escalations still bypass suppression.
+Envelope deduplication replaces the cap. Routine collisions cannot hide escalations.
 """
 
 from __future__ import annotations
@@ -49,9 +49,12 @@ def test_the_escalation_set_matches_its_sources_and_cannot_drift() -> None:
 
 
 @pytest.mark.parametrize("escalation", sorted(S._ESCALATION_EVENT_TYPES))
-def test_an_escalation_is_never_backlog_gated(escalation: str) -> None:
-    """Not backlog-capable => it bypasses the gate, so the cap cannot hold it."""
-    assert S._is_backlog_capable_line(_event_line(escalation, 1)) is False
+def test_an_escalation_repeat_is_deduplicable_without_a_routine_collision(escalation: str) -> None:
+    assert S._is_backlog_capable_line(_event_line(escalation, 1)) is True
+    row = {"stream_id": "peer-1", "stream_seq": 1}
+    assert S._envelope_identity({**row, "type": escalation}) != S._envelope_identity(
+        {**row, "type": "result"}
+    )
 
 
 def test_routine_traffic_is_deduplicable() -> None:
