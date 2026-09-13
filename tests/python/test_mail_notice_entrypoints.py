@@ -6,6 +6,7 @@ from dataclasses import replace
 import io
 from pathlib import Path
 import shlex
+import sqlite3
 import sys
 
 import pytest
@@ -403,6 +404,35 @@ def test_live_monitor_with_invalid_journal_reports_unknown(
     assert summary["monitor_lease"]["reason"] == "JournalIntegrityError"
     assert "UNKNOWN" in output
     assert "ORPHANED" not in output
+
+
+def test_live_monitor_with_pending_journal_upgrade_propagates_refusal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A live-monitor probe must not swallow JournalUpgradeRequired.
+
+    Mixed-epoch refusal is raised from read_all after a successful
+    open_reader, not from open_reader itself. Stubbing open_reader would
+    miss a split try that swallows pending_delivery_events.
+    """
+    root, authority = _mail(monkeypatch, tmp_path)
+    active = authority.active_lease("notice")
+    assert active is not None
+    _stub_live_monitor(monkeypatch, root, label="notice", nonce=active.nonce)
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute(
+            """UPDATE journal_epochs
+               SET schema_epoch = 4, protocol_epoch = 4, registry_epoch = 4,
+                   minimum_reader_epoch = 4, minimum_writer_epoch = 4
+               WHERE singleton = 1"""
+        )
+
+    def ordinary_open_forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("probe used a migration-capable Journal open")
+
+    monkeypatch.setattr(journal.Journal, "__init__", ordinary_open_forbidden)
+    with pytest.raises(journal.JournalUpgradeRequired, match="UPGRADE_REQUIRED"):
+        messages.controller_mail_summary(task_store_project_root=root)
 
 
 def test_unreadable_waiter_ledger_reports_status_unknown(

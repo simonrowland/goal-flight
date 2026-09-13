@@ -4127,7 +4127,16 @@ def controller_mail_summary(
         # goalflight_status and the controller_pending_events default. Widening
         # here restores the count without re-arming the wake this item silenced.
         rows = authority.pending_delivery_events(label, waking_only=False, limit=1000)
-    except (goalflight_journal.JournalError, ValueError) as exc:
+    except goalflight_journal.JournalUpgradeRequired:
+        # Must propagate: converting this into UNKNOWN hides a pending migration.
+        raise
+    except (
+        goalflight_journal.JournalBusy,
+        goalflight_journal.JournalDisappeared,
+        goalflight_journal.JournalIOError,
+        goalflight_journal.JournalError,
+        ValueError,
+    ) as exc:
         if monitor_argv is None:
             return {}
         monitor_lease = _monitor_lease_status(
