@@ -275,8 +275,91 @@ def test_capacity_subprocess_errors_are_not_empty_leases() -> None:
             assert "measured=false" not in summary.text_summary(empty)
 
 
+def test_corrupt_newer_ledger_row_qualifies_older_success() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-summary-ledger-") as d:
+        state_dir = Path(d)
+        _write_json(state_dir / "runs.d" / "older.json", {
+            "dispatch_id": "older", "slug": "chunk", "state": "complete",
+            "updated_at": "2026-09-11T00:00:00Z",
+        })
+        # Its name reveals neither project nor slug; unreadable evidence cannot
+        # be ruled irrelevant to this shared ledger's requested chunk.
+        corrupt = state_dir / "runs.d" / "newer.json"
+        corrupt.write_text('{"updated_at":"2026-09-12T00:00:00Z",', encoding="utf-8")
+        with patch.object(summary, "run_capacity_status", return_value={"active": []}), \
+                patch.object(summary, "status_candidates", return_value=[]):
+            payload = summary.summarize("chunk", state_dir)
+            assert_eq("older success remains diagnostic", payload["dispatch_id"], "older")
+            assert_eq("unreadable newer evidence is unmeasured", payload.get("measured"), False)
+            assert_eq("unreadable newer evidence is not done", payload["decision_hint"], "investigate")
+            assert str(corrupt) in payload["error"], payload
+            for mode in ("--json", "--text"):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    summary.main(["--slug", "chunk", "--state-dir", str(state_dir), mode])
+                if mode == "--json":
+                    assert json.loads(output.getvalue())["measured"] is False
+                else:
+                    assert "measured=false" in output.getvalue()
+                assert str(corrupt) in output.getvalue()
+
+        with patch.object(summary, "run_capacity_status", return_value={
+            "measured": False, "error": "capacity unavailable", "reason": "capacity_state_unreadable",
+        }), patch.object(summary, "status_candidates", return_value=[]):
+            both = summary.summarize("chunk", state_dir)
+        assert both["reason"] == "capacity_state_unreadable"
+        assert "capacity unavailable" in both["error"]
+        assert str(corrupt) in both["error"]
+        assert both["decision_hint"] == "investigate"
+
+
+def test_corrupt_ledger_row_is_distinct_from_genuinely_empty_slug() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-summary-ledger-empty-") as d:
+        state_dir = Path(d)
+        with patch.object(summary, "run_capacity_status", return_value={"active": []}), \
+                patch.object(summary, "status_candidates", return_value=[]):
+            empty = summary.summarize("absent", state_dir)
+            assert empty["state"] == "missing"
+            assert empty["dispatch_id"] is None
+            assert empty.get("measured") is not False
+            assert "error" not in empty
+            corrupt = state_dir / "runs.d" / "unrelated-name.json"
+            corrupt.parent.mkdir()
+            corrupt.write_text("{broken", encoding="utf-8")
+            failed = summary.summarize("absent", state_dir)
+        assert_eq("corrupt-only ledger is unmeasured", failed.get("measured"), False)
+        assert failed != empty
+        assert failed["dispatch_id"] is None
+        assert str(corrupt) in failed["error"]
+        assert "measured=false" in summary.text_summary(failed)
+        assert "measured=false" not in summary.text_summary(empty)
+
+
+def test_clean_ledger_pair_chooses_newer_attempt() -> None:
+    with tempfile.TemporaryDirectory(prefix="gf-summary-ledger-clean-") as d:
+        state_dir = Path(d)
+        for dispatch_id, state, updated_at in (
+            ("older", "complete", "2026-09-11T00:00:00Z"),
+            ("newer", "failed", "2026-09-12T00:00:00Z"),
+        ):
+            _write_json(state_dir / "runs.d" / f"{dispatch_id}.json", {
+                "dispatch_id": dispatch_id, "slug": "chunk", "state": state,
+                "updated_at": updated_at,
+            })
+        with patch.object(summary, "run_capacity_status", return_value={"active": []}), \
+                patch.object(summary, "status_candidates", return_value=[]):
+            payload = summary.summarize("chunk", state_dir)
+        assert payload["dispatch_id"] == "newer", payload
+        assert payload["state"] == "failed", payload
+        assert payload.get("measured") is not False
+        assert "error" not in payload
+
+
 def main() -> None:
     tests = [
+        test_corrupt_newer_ledger_row_qualifies_older_success,
+        test_corrupt_ledger_row_is_distinct_from_genuinely_empty_slug,
+        test_clean_ledger_pair_chooses_newer_attempt,
         test_capacity_failure_is_distinct_from_empty_in_json_and_text,
         test_capacity_subprocess_errors_are_not_empty_leases,
         test_idle_detached_identity_live_reads_running_wait,

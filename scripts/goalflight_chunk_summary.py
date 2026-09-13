@@ -14,6 +14,7 @@ from typing import Any
 
 import goalflight_compat
 import goalflight_dispatch_states as dispatch_states
+import goalflight_ledger
 import goalflight_status
 from goalflight_watch import BLOCKING_TERMINAL_MARKERS, SUCCESS_TERMINAL_MARKERS
 
@@ -97,9 +98,10 @@ def ledger_records(state_dir: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for path in sorted((state_dir / "runs.d").glob("*.json")):
         data = read_json(path)
-        if data is not None:
-            data["_record_path"] = str(path)
-            records.append(data)
+        if data is None:
+            data = goalflight_ledger._unreadable_record(path)
+        data["_record_path"] = str(path)
+        records.append(data)
     return records
 
 
@@ -276,7 +278,8 @@ def latest_timestamp(record: dict[str, Any] | None, status: dict[str, Any] | Non
 
 
 def choose_record(slug: str, records: list[dict[str, Any]], leases: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    matches = [record for record in records if record_matches(record, slug)]
+    matches = [record for record in records
+               if not goalflight_ledger.record_is_unreadable(record) and record_matches(record, slug)]
     lease_matches = [lease for lease in leases if record_matches(lease, slug)]
 
     def freshness(record: dict[str, Any]) -> dt.datetime:
@@ -370,6 +373,14 @@ def summarize(slug: str, state_dir: Path) -> dict[str, Any]:
         payload.update(measured=False, error=capacity["error"], decision_hint="investigate")
         if "reason" in capacity:
             payload["reason"] = capacity["reason"]
+    unreadable = [row["_record_path"] for row in records if goalflight_ledger.record_is_unreadable(row)]
+    if unreadable:
+        # Shared ledger rows with unreadable contents cannot be scoped to a
+        # project or slug. Keep readable evidence, but qualify its verdict.
+        error = "unreadable ledger records: " + ", ".join(unreadable)
+        if payload.get("error"):
+            error = payload["error"] + "; " + error
+        payload.update(measured=False, error=error, decision_hint="investigate")
     return payload
 
 

@@ -2483,9 +2483,9 @@ def format_status_lines(
             unknown += 1
         elif classification in {"expected_live", "queued_capacity"}:
             continue
-        elif outcome not in {"unknown", "complete"}:
+        elif outcome in goalflight_dispatch_states.TERMINAL_FAILURE_STATES:
             failed += 1
-        elif outcome == "unknown":
+        elif outcome != "complete":
             unknown += 1
     rows = all_rows[:limit]
     lines.append(

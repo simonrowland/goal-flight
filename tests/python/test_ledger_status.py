@@ -291,7 +291,20 @@ def case_status_counts_all_terminal_failures_without_reclassifying_live() -> Non
         assert "failed=0 unknown=0" in text, (classification, text)
 
 
+def case_status_watcher_stopped_is_unknown_not_confirmed_failure() -> None:
+    stopped = _row("stopped", state="watcher_stopped", pid=None)
+    stopped["classification"] = ledger.classify(stopped)
+    assert stopped["classification"] == "watcher_stopped"
+    assert not ledger.goalflight_dispatch_states.is_terminal_state(stopped["state"])
+    failure = _row("failed", classification="failed", state="failed", pid=None)
+    for rows, failed in (([stopped], 0), ([stopped, failure], 1)):
+        for limit in (0, len(rows)):
+            text = "\n".join(ledger.format_status_lines(_payload(rows), limit=limit))
+            assert f"failed={failed} unknown=1" in text, text
+
+
 def main() -> None:
+    case_status_watcher_stopped_is_unknown_not_confirmed_failure()
     case_status_cap_distinguishes_failures_unknown_and_empty()
     case_status_counts_all_terminal_failures_without_reclassifying_live()
     case_status_omits_uniform_none_sandbox()
