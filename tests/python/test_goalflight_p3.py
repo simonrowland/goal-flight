@@ -2203,12 +2203,15 @@ def test_terminal_outbox_retry_heals_partial_recipient_fanout(
     )[0]["projected_at"] is not None
 
 
-@pytest.mark.parametrize("foreign_owner", [True, False], ids=["foreign-skip", "own-corrupt"])
+@pytest.mark.parametrize(
+    "owner_label", ["lane-b", "*", "lane-a"],
+    ids=["foreign-skip", "wildcard-corrupt", "own-corrupt"],
+)
 def test_listen_task_store_missing_carrier_rechecks_delivery_owner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
-    foreign_owner: bool,
+    owner_label: str,
 ) -> None:
     import goalflight_task as task
 
@@ -2232,28 +2235,30 @@ def test_listen_task_store_missing_carrier_rechecks_delivery_owner(
     assert row["recipient_label"] == "*"
     assert row["stream_id"] == task._next_nudge_dispatch_id(project)
 
-    if foreign_owner:
-        # Both lanes see the wildcard. B processes it after A's snapshot;
-        # another done nudge then removes its superseded carrier envelope.
-        other_peek = authority.cursor_peek("lane-b", nonce=other.nonce)
-        assert other_peek.items == stale.items
+    if owner_label != "*":
+        # A processor adopts the wildcard after the listener's snapshot.
+        owner = other if owner_label == "lane-b" else local
+        owner_peek = authority.cursor_peek(owner_label, nonce=owner.nonce)
+        assert owner_peek.items == stale.items
         assert authority.advance_cursor(
-            "lane-b",
-            nonce=other.nonce,
-            expected_cursor_version=other_peek.cursor_version,
-            expected_stream_snapshots=other_peek.stream_snapshots,
+            owner_label,
+            nonce=owner.nonce,
+            expected_cursor_version=owner_peek.cursor_version,
+            expected_stream_snapshots=owner_peek.stream_snapshots,
             advances={str(row["stream_id"]): int(row["stream_seq"])},
-            actor="lane-b",
+            actor=owner_label,
         ).committed
-        task.post_done_suggest_nudge(["t-2"], project, "worker-b-next")
         current = authority.read_all(
             "SELECT recipient_label FROM delivery_events WHERE event_uuid = ?",
             (row["event_uuid"],),
         )
-        assert current[0]["recipient_label"] == "lane-b"
+        assert current[0]["recipient_label"] == owner_label
+
+    if owner_label == "lane-b":
+        # Another done nudge removes the foreign-owned superseded carrier.
+        task.post_done_suggest_nudge(["t-2"], project, "worker-b-next")
     else:
-        # No retirement, replacement, or other owner: the live wildcard
-        # assignment still belongs in A's view, but its carrier is corrupt.
+        # The live wildcard or exact local assignment has a corrupt carrier.
         messages.update_envelopes(Path(str(row["carrier_path"])), lambda _rows: ([], None))
 
     assert not any(
@@ -2268,7 +2273,7 @@ def test_listen_task_store_missing_carrier_rechecks_delivery_owner(
         "--report-pending", "--poll-secs", "0.01", "--timeout-s", "1",
     ])
     output = capsys.readouterr()
-    if foreign_owner:
+    if owner_label == "lane-b":
         assert result == 1, output.err  # Quiet timeout: foreign row never rings.
         assert "no projected carrier row" not in output.err
     else:
