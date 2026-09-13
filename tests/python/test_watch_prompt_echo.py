@@ -1909,6 +1909,120 @@ def case_dead_pid_unbound_attention_markers_block_not_die() -> None:
     assert not term, term
 
 
+def _recovered_dead_marker(tail_text: str, dispatch_id: str, prompt_text: str = "Do the requested work.\n"):
+    with tempfile.TemporaryDirectory() as tmp:
+        tail = Path(tmp) / "tail.txt"
+        tail.write_text(tail_text, encoding="utf-8")
+        # Recovery must not widen the live last-line predicate.
+        assert goalflight_watch._last_line_is_terminal_marker(
+            tail, ignore_prefix_lines=prompt_text.splitlines(),
+            expected_dispatch_id=dispatch_id,
+        ) is None
+        return goalflight_watch._final_terminal_marker(
+            tail, ignore_prefix_lines=prompt_text.splitlines(),
+            expected_dispatch_id=dispatch_id, recover_final_response=True,
+        )
+
+
+def test_dead_sigiled_attention_survives_unbalanced_tool_fence() -> None:
+    # Reduced codex-32170 tail: tool output leaves an unmatched fence, then
+    # the worker exits with its own BLOCKED as the final physical line.
+    dispatch_id = "codex-32170-1789257943"
+    marker = (
+        f"!BLOCKED: {dispatch_id} — Fast-forward to requested base hit sandbox "
+        "denial creating `.git/packed-refs.lock`. Stopped as instructed; "
+        "resulting base transition remains unverified."
+    )
+    tail_text = (
+        "tool output: truncated skill read\n## Preamble (run first)\n```bash\n"
+        "+    assert row[\"id\"] in output.err\n"
+        "hook: Stop\nhook: Stop Completed\ntokens used\n148,654\n"
+        "Fix staged. Verification: 166 passed. No commit or push.\n\n"
+        + marker + "\n"
+    )
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        tail_text, dispatch_id=dispatch_id,
+    )
+    assert payload.get("state") == "blocked", payload
+    assert rc == 4, payload
+    assert term.get("kind") == "BLOCKED", term
+    assert term.get("text") == marker.split(": ", 1)[1], term
+    assert _recovered_dead_marker(tail_text, dispatch_id) == term
+
+
+def test_dead_sigiled_attention_survives_trailing_summary() -> None:
+    # Reduced codex-30697 tail: an own signal followed by the final summary.
+    dispatch_id = "codex-30697-1789257936"
+    marker = f"!BLOCKED: {dispatch_id} — sandbox denied `ps`; stopped as instructed."
+    tail_text = (
+        "hook: Stop Completed\ntokens used\n132,380\n" + marker
+        + "\n\nBranch recorded. No commit or push.\n\n"
+        "- Draft remains staged and unready.\n- Broader suite pending.\n"
+    )
+    rc, _elapsed, term, payload = _run_dead_worker_tail(
+        tail_text, dispatch_id=dispatch_id,
+    )
+    assert payload.get("state") == "blocked", payload
+    assert rc == 4, payload
+    assert term.get("kind") == "BLOCKED", term
+    assert term.get("text") == marker.split(": ", 1)[1], term
+    assert _recovered_dead_marker(tail_text, dispatch_id) == term
+
+
+def test_dead_sigiled_attention_recovery_rejects_echoes_and_quotes() -> None:
+    dispatch_id = "watch-sigiled-attention"
+    marker = f"!BLOCKED: {dispatch_id} — sandbox denied write"
+    cases = (
+        (f"work\n> {marker}\n", "Do the work.\n"),
+        (f"work\n- {marker}\n", "Do the work.\n"),
+        (f"work\n    {marker}\n", "Do the work.\n"),
+        (f"example\n```\n{marker}\n```\n", "Do the work.\n"),
+        # A separate unmatched fence must not unquote an earlier closed one.
+        (f"example\n```\n{marker}\n```\n```diff\n+more output\n", "Do the work.\n"),
+        (f"Do the work.\n{marker}\n", f"Do the work.\n{marker}\n"),
+        (f"tail after anchor\n```diff\n{marker}\n", f"Do the work.\n{marker}\n"),
+        ("work\n!BLOCKED: no dispatch identity\nsummary\n", "Do the work.\n"),
+        (f"work\n{marker.replace(dispatch_id, dispatch_id + '-other')}\nsummary\n", "Do the work.\n"),
+        (f"work\n{marker[1:]}\nsummary\n", "Do the work.\n"),
+        (f"work\n```diff\n{marker[1:]}\n", "Do the work.\n"),
+    )
+    for tail_text, prompt_text in cases:
+        tail_text = "tokens used\n500\n" + tail_text
+        rc, _elapsed, term, payload = _run_dead_worker_tail(
+            tail_text, prompt_text=prompt_text, dispatch_id=dispatch_id
+        )
+        assert payload.get("state") == "worker_dead", (tail_text, payload)
+        assert rc == 1, (tail_text, payload)
+        assert not term, (tail_text, term)
+        assert _recovered_dead_marker(tail_text, dispatch_id, prompt_text) is None
+
+    for tail_text in (
+        f"example\n```text\ntokens used\n123\n{marker}\n```\nsummary\n",
+        f"tokens used\n500\nexample\n```text\ntokens used\n123\n{marker}\n```\nsummary\n",
+        f"tokens used\n500\nexample\n```text\ntokens used\n123\n{marker}\nsummary\n",
+        f"work\n{marker}\nSTEER-WAIT timeout\nmore work\ntokens used\n500\nNo sign-off.\n",
+    ):
+        rc, _elapsed, term, payload = _run_dead_worker_tail(
+            tail_text, dispatch_id=dispatch_id
+        )
+        assert payload.get("state") == "worker_dead", (tail_text, payload)
+        assert rc == 1 and not term, (tail_text, payload)
+        assert _recovered_dead_marker(tail_text, dispatch_id) is None
+
+    padding = "ordinary tool output\n" * 550_000  # Push opener out of 10 MiB scan.
+    long_echo = marker + "x" * (goalflight_watch.STREAM_READ_CHUNK_CHARS + 1)
+    for tail_text, prompt_text in (
+        (f"```text\n{padding}tokens used\n123\n{marker}\n```\nsummary\n", "Do the work.\n"),
+        (f"tokens used\n500\n{long_echo}\n{padding}summary\n", f"Do the work.\n{long_echo}\n"),
+    ):
+        rc, _elapsed, term, payload = _run_dead_worker_tail(
+            tail_text, prompt_text=prompt_text, dispatch_id=dispatch_id
+        )
+        assert payload.get("state") == "worker_dead", payload
+        assert rc == 1 and not term, payload
+        assert _recovered_dead_marker(tail_text, dispatch_id, prompt_text) is None
+
+
 def test_worker_dead_reason_does_not_claim_no_evidence_for_blocked_transcript() -> None:
     """The death-cause classifier must not assert ignorance of a BLOCKED line.
 
@@ -2720,6 +2834,9 @@ def case_balanced_fence_marker_still_suppressed() -> None:
 
 
 def main() -> None:
+    test_dead_sigiled_attention_survives_unbalanced_tool_fence()
+    test_dead_sigiled_attention_survives_trailing_summary()
+    test_dead_sigiled_attention_recovery_rejects_echoes_and_quotes()
     case_ignores_echoed_prompt_marker()
     case_without_ignore_accepts_echo_only_after_live_worker_exit()
     case_prompt_ignore_stops_at_first_mismatch()

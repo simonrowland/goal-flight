@@ -568,6 +568,38 @@ def _assert_live_controller_loss_is_nonterminal(
     assert row["terminal_state"] is None, row
 
 
+def test_final_response_recovery_waits_for_worker_exit_with_live_trace() -> None:
+    dispatch_id = "dead-controller-rendered-attention"
+    with _dead_controller_case(dispatch_id) as case:
+        root, env, process, status_path, tail = case
+        _assert_live_controller_loss_is_nonterminal(
+            root, env, dispatch_id, process, status_path
+        )
+        tail.write_text(
+            "tokens used\n500\n"
+            f"!BLOCKED: {dispatch_id} — earlier issue resolved\n"
+            "Continuing the requested work.\n",
+            encoding="utf-8",
+        )
+        trace = root / "state" / "dispatch-homes" / dispatch_id / "sessions" / "turn.jsonl"
+        def refresh_trace() -> bool:
+            with trace.open("a", encoding="utf-8") as handle:
+                handle.write("{}\n")
+            return bool(_payload(status_path).get("trace_active"))
+
+        assert _wait_for(refresh_trace), _payload(status_path)
+        payload = _payload(status_path)
+        assert payload.get("worker_alive") is True, payload
+        assert payload.get("state") != "blocked", payload
+        assert process.poll() is None, payload
+        assert _journal_row(root, env, dispatch_id)["terminal_state"] is None
+
+        os.killpg(payload["worker_pid"], signal.SIGTERM)
+        os.waitpid(payload["worker_pid"], 0)
+        assert process.wait(timeout=3) == 4
+        assert _payload(status_path)["terminal_marker"]["kind"] == "BLOCKED"
+
+
 def test_dead_controller_live_worker_with_stale_trace_stays_nonterminal() -> None:
     dispatch_id = "dead-controller-live-worker-stale-trace"
     with _dead_controller_case(dispatch_id) as case:

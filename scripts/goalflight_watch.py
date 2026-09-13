@@ -8,6 +8,7 @@ import atexit
 from collections import deque
 import contextlib
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -3294,6 +3295,7 @@ def _scan_final_terminal_marker(
     ignore_fences: bool,
     kimi_output: bool = False,
     expected_dispatch_id: str | None = None,
+    rendered_response: bool = False,
 ) -> dict | None:
     fence = goalflight_terminal.MarkdownFenceTracker()
     in_hunk = False
@@ -3347,7 +3349,19 @@ def _scan_final_terminal_marker(
             ):
                 continue
             if is_attention:
-                last_attention = candidate
+                if (
+                    rendered_response
+                    and line.startswith("!")
+                    and expected_dispatch_id
+                    and _payload_binds_to_dispatch(
+                        candidate, expected_dispatch_id, require_terminated=True
+                    )
+                ):
+                    # A dispatch-bound sign-off in the final rendered response
+                    # survives its trailing summary, like a success sign-off.
+                    last_success = candidate
+                else:
+                    last_attention = candidate
             else:
                 last_success = candidate
     return _select_dead_path_terminal(
@@ -3517,6 +3531,42 @@ def _full_file_terminal_marker(
     return terminal
 
 
+def _rendered_response_suffix_length(records, prompt_prefix: list[str]) -> int | None:
+    """Locate an unquoted final renderer footer without losing large-tail context."""
+    records = iter(records)
+    leading = list(itertools.islice(
+        records, PROMPT_ECHO_ANCHOR_SEARCH_LINES + len(prompt_prefix)
+    ))
+    echo_lines, _anchor, _prompt_lines = _prompt_echo_scan(
+        [line for _number, line, _oversized in leading], prompt_prefix
+    )
+    footer = None
+    fenced_footer = None
+    fence = goalflight_terminal.MarkdownFenceTracker()
+    previous = ""
+    line_no = 0
+    for line_no, line, oversized in itertools.chain(leading, records):
+        if line_no - 1 in echo_lines:
+            previous = ""
+            continue
+        stripped = line.strip()
+        if fence.consume_boundary(line):
+            # A footer inside a closed example cannot reset Markdown context.
+            fenced_footer = None
+        elif (
+            not oversized and previous == "tokens used"
+            and HARNESS_TOKEN_COUNT_RE.fullmatch(stripped)
+        ):
+            if fence.in_fence:
+                fenced_footer = line_no
+            else:
+                footer = line_no
+        previous = stripped if not oversized else ""
+    if footer is None and fenced_footer is not None:
+        footer = fenced_footer
+    return line_no - footer if footer is not None else None
+
+
 def _final_terminal_marker(
     path: Path,
     ignore_prefix_lines: list[str] | None = None,
@@ -3525,6 +3575,7 @@ def _final_terminal_marker(
     kimi_output: bool = False,
     expected_dispatch_id: str | None = None,
     full_file_fallback: bool = False,
+    recover_final_response: bool = False,
 ) -> dict | None:
     """Return the terminal marker from a completed post-prompt tail.
 
@@ -3538,6 +3589,12 @@ def _final_terminal_marker(
     ``parse_own_signal_attention_line``, unfenced. Quoted, list-item, fenced,
     indented, or mid-tail attention is relayed or abandoned content and
     does not stop the dispatch.
+
+    Confirmed-dead callers may recover the final rendered response after a
+    Codex ``tokens used`` / count footer. That response has its own Markdown
+    context: an unmatched fence in earlier tool output cannot quote it. Only
+    own sigiled, dispatch-bound attention gains trailing-summary tolerance;
+    prompt, quote and response-local fence exclusions still apply.
     """
     if not path.exists():
         return None
@@ -3575,6 +3632,47 @@ def _final_terminal_marker(
             or fence_agnostic_terminal.get("line", -1) >= terminal.get("line", -1)
         ):
             terminal = fence_agnostic_terminal
+    if recover_final_response and expected_dispatch_id:
+        # Use the last renderer footer, not arbitrary earlier attention (for
+        # example, a question whose steer wait timed out and work continued).
+        if start > 0:
+            # The bounded slice can start inside a balanced quoted example.
+            # Stream its missing context before trusting a renderer boundary.
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                response_length = _rendered_response_suffix_length(
+                    _iter_bounded_text_lines(handle), prompt_prefix
+                )
+        else:
+            response_length = _rendered_response_suffix_length(
+                ((idx, line, False) for idx, line in enumerate(lines, 1)),
+                prompt_prefix,
+            )
+        if response_length is not None and 0 < response_length <= len(lines):
+            response_start = len(lines) - response_length
+            response = lines[response_start:]
+            response_echoes, _anchor, response_prompt_lines = _prompt_echo_scan(
+                response, prompt_prefix
+            )
+            recovered = _scan_final_terminal_marker(
+                response,
+                prompt_echo_lines=response_echoes,
+                echo_anchor_found=False,
+                prompt_line_set=response_prompt_lines,
+                suppress_unfenced_prompt_markers=suppress_unfenced_prompt_markers,
+                ignore_fences=False,
+                kimi_output=kimi_output,
+                expected_dispatch_id=expected_dispatch_id,
+                rendered_response=True,
+            )
+            if (
+                recovered
+                and recovered.get("kind") in goalflight_terminal.ATTENTION_MARKERS
+                and response[recovered["line"] - 1].startswith("!")
+                and _payload_binds_to_dispatch(recovered, expected_dispatch_id)
+            ):
+                recovered["line"] += response_start
+                if not terminal or recovered["line"] > terminal["line"]:
+                    terminal = recovered
     if terminal:
         return terminal
     if full_file_fallback and start > 0 and expected_dispatch_id:
@@ -5084,6 +5182,7 @@ def main() -> int:
                     kimi_output=moonshot_family(args.agent),
                     expected_dispatch_id=args.dispatch_id,
                     full_file_fallback=not worker_is_alive,
+                    recover_final_response=not worker_is_alive,
                 )
                 if reconciled:
                     terminal_seen = reconciled
@@ -5111,6 +5210,7 @@ def main() -> int:
                 kimi_output=moonshot_family(args.agent),
                 expected_dispatch_id=args.dispatch_id,
                 full_file_fallback=True,
+                recover_final_response=True,
             )
             if not reconciled:
                 recorded = _recorded_terminal_success_marker(
@@ -5146,6 +5246,7 @@ def main() -> int:
                         kimi_output=moonshot_family(args.agent),
                         expected_dispatch_id=args.dispatch_id,
                         full_file_fallback=True,
+                        recover_final_response=not worker_is_alive,
                     )
                     if reconciled:
                         terminal_seen = reconciled
