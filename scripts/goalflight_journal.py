@@ -147,8 +147,18 @@ JOURNAL_OPEN_RETRY_MAX_S = 5.0
 # writer instance inherit this default; those paths were not timed. General
 # read clients retain the 1s responsiveness contract; stricter liveness probes
 # opt into 0.05s.
+#
+# JOURNAL_READER_RETRY_BUDGET_S is the probe/poll contract (fleet roster,
+# liveness, drain skip): a busy table must not stall on the projects that
+# contend most. JOURNAL_LAUNCH_READER_RETRY_BUDGET_S is a policy choice for the
+# one launch-critical read, the attempt peek of an already-admitted worker
+# launch: it gets the writer-sized SQL busy allowance, so an idempotent read is
+# not the first contender on a busy project journal to give up, while still
+# opening through open_reader and so never taking the writer construction lock.
+# The construction measurement above does not time this read.
 JOURNAL_WRITER_RETRY_BUDGET_S = 5.0
 JOURNAL_READER_RETRY_BUDGET_S = 1.0
+JOURNAL_LAUNCH_READER_RETRY_BUDGET_S = JOURNAL_WRITER_RETRY_BUDGET_S
 ALLOW_MIGRATION_ENV = "GOALFLIGHT_ALLOW_JOURNAL_MIGRATION"
 _SQL_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _STATE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")

@@ -131,7 +131,18 @@ def _stub_bash_launch(
     monkeypatch.setattr(D, "_record_ledger", record_ledger)
     monkeypatch.setattr(D, "_reap_quota_stuck_before_bash_launch", lambda: None)
     monkeypatch.setattr(D, "_mark_queue_claim_launch_started", lambda _args: None)
-    monkeypatch.setattr(D, "_mark_queue_claim_worker_spawn_intent", lambda _args: None)
+    monkeypatch.setattr(
+        D,
+        "_mark_queue_claim_worker_spawn_intent",
+        lambda _args: ordering.append("spawn_intent"),
+    )
+    real_attempt_peek = D._attempt_claiming_worker_argv
+
+    def recorded_attempt_peek(*peek_args, **peek_kwargs):
+        ordering.append("attempt_peek")
+        return real_attempt_peek(*peek_args, **peek_kwargs)
+
+    monkeypatch.setattr(D, "_attempt_claiming_worker_argv", recorded_attempt_peek)
     monkeypatch.setattr(
         D, "_mark_queue_claim_worker_spawned", lambda _args, _pid: None
     )
@@ -199,6 +210,11 @@ def _stub_bash_launch(
         assert ordering.index("capacity") < ordering.index("ledger:starting")
     if failure_phase != "pre_spawn":
         assert ordering.index("ledger:starting") < ordering.index("spawn:worker")
+        # The attempt peek may busy-wait for the launch budget. It must finish
+        # before the claim is stamped with spawn intent: a launcher killed
+        # between intent and spawn leaves a claim recovery cannot restore.
+        assert ordering.index("attempt_peek") < ordering.index("spawn_intent")
+        assert ordering.index("spawn_intent") < ordering.index("spawn:worker")
     worker_spawn = next(
         (call for call in spawn_calls if call["label"] == "worker"),
         {},
@@ -351,7 +367,16 @@ def test_attempt_claiming_worker_argv_peeks_through_open_reader(
     assert claimed is True
     assert argv == [sys.executable, "-c", "pass"]
     assert recorded
-    _assert_reader_peek_budget(recorded[0])
+    # The launch peek reads through open_reader (no writer construction lock)
+    # but must not be the first contender to give up on a busy shared journal:
+    # it waits as long as a writer would.
+    retry = float(
+        recorded[0].get(
+            "retry_budget_s",
+            D.goalflight_journal.JOURNAL_READER_RETRY_BUDGET_S,
+        )
+    )
+    assert retry >= D.goalflight_journal.JOURNAL_WRITER_RETRY_BUDGET_S
 
 
 def test_queue_launch_token_peeks_through_open_reader(

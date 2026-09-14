@@ -6919,7 +6919,8 @@ def _attempt_claiming_worker_argv(
         # An unreadable present journal raises JournalIOError and must not skip
         # attempt fencing.
         attempt = goalflight_journal.Journal.open_reader(
-            project_root
+            project_root,
+            retry_budget_s=goalflight_journal.JOURNAL_LAUNCH_READER_RETRY_BUDGET_S,
         ).attempt_for_dispatch(dispatch_id)
     except goalflight_journal.JournalDisappeared:
         # Embedders can replace the ledger-recording seam when they own launch
@@ -18692,12 +18693,16 @@ def main(argv: list[str] | None = None) -> int:
         if _account_engine(args.agent) == "codex":
             worker_argv = _guard_codex_context_mode_disable(worker_argv, env)
 
-        _mark_queue_claim_worker_spawn_intent(args)
+        # The attempt peek may busy-wait for the launch retry budget. Finish it
+        # before stamping spawn intent, and keep intent immediately before
+        # spawn: a launcher killed between intent and spawn leaves a claim that
+        # recovery treats as indeterminate and cannot restore.
         worker_argv, wait_for_worker_claim = _attempt_claiming_worker_argv(
             project_root,
             str(args.dispatch_id),
             worker_argv,
         )
+        _mark_queue_claim_worker_spawn_intent(args)
         worker_pid = _spawn_daemonized_process(
             worker_argv,
             env=env,
