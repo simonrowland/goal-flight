@@ -31,6 +31,7 @@ import goalflight_status as S  # noqa: E402
 @contextlib.contextmanager
 def _isolated_env(tmp: Path):
     old_env = os.environ.copy()
+    old_disable_flag = D._DASHBOARD_REFRESH_DISABLE_FLAG
     env = old_env.copy()
     env["GOALFLIGHT_STATE_DIR"] = str(tmp / "state")
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
@@ -42,9 +43,11 @@ def _isolated_env(tmp: Path):
     env["GOALFLIGHT_CAPACITY_CONF"] = "/dev/null"
     os.environ.clear()
     os.environ.update(env)
+    D._DASHBOARD_REFRESH_DISABLE_FLAG = tmp / "dashboard-refresh.disabled"
     try:
         yield env
     finally:
+        D._DASHBOARD_REFRESH_DISABLE_FLAG = old_disable_flag
         os.environ.clear()
         os.environ.update(old_env)
 
@@ -449,6 +452,26 @@ def test_dashboard_refresh_liveness_ignores_stale_queued_rows_but_display_count_
     assert live is False
 
 
+def test_dashboard_refresh_liveness_is_unknown_without_queued_timestamp() -> None:
+    for started_at in (None, "not-a-timestamp"):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            project = (tmp / "project").resolve()
+            record = {
+                "schema": goalflight_ledger.SCHEMA,
+                "dispatch_id": "queued-without-time",
+                "project_root": str(project),
+                "state": "queued",
+                "terminal_state": "unknown",
+            }
+            if started_at is not None:
+                record["started_at"] = started_at
+
+            with _isolated_env(tmp):
+                _write_raw_ledger_record(record)
+                assert D._dashboard_project_has_live_dispatch(project) is None
+
+
 def test_dashboard_refresh_loop_honors_absolute_lifetime(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as td:
         project = (Path(td) / "project").resolve()
@@ -456,6 +479,7 @@ def test_dashboard_refresh_loop_honors_absolute_lifetime(monkeypatch) -> None:
         exports: list[Path] = []
         ticks = iter([0.0, 11.0])
 
+        monkeypatch.setattr(D, "_dashboard_refresh_disabled", lambda: False)
         monkeypatch.setattr(D, "_export_dashboard_status_for_project", lambda root: exports.append(root))
         monkeypatch.setattr(D, "_dashboard_project_has_live_dispatch", lambda _root: True)
         monkeypatch.setattr(D.time, "monotonic", lambda: next(ticks))
@@ -468,6 +492,200 @@ def test_dashboard_refresh_loop_honors_absolute_lifetime(monkeypatch) -> None:
         assert D._dashboard_refresh_loop(project, interval_s=1, max_lifetime_s=10) == 0
 
     assert exports == [project]
+
+
+def test_dashboard_refresh_loop_retries_one_failed_ledger_read(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = (tmp / "project").resolve()
+        (project / "dashboard").mkdir(parents=True)
+        now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        record = {
+            "schema": goalflight_ledger.SCHEMA,
+            "dispatch_id": "refresh-read-retry",
+            "agent": "test-dispatch",
+            "engine": "test-dispatch",
+            "shape": "bash",
+            "transport": "dispatch",
+            "project_root": str(project),
+            "state": "running",
+            "terminal_state": "unknown",
+            "started_at": now,
+            "updated_at": now,
+        }
+        exports: list[Path] = []
+        sleeps: list[float] = []
+
+        with _isolated_env(tmp):
+            _write_raw_ledger_record(record)
+            real_read_records = goalflight_ledger.read_records
+            reads = 0
+
+            def flaky_read(*args: object, **kwargs: object) -> list[dict]:
+                nonlocal reads
+                reads += 1
+                if reads == 1:
+                    raise OSError("ledger busy")
+                return real_read_records(*args, **kwargs)
+
+            def finish_during_retry(seconds: float) -> None:
+                sleeps.append(seconds)
+                record.update(
+                    {
+                        "state": "complete",
+                        "terminal_state": "complete",
+                        "ended_at": goalflight_ledger.utc_now(),
+                        "updated_at": goalflight_ledger.utc_now(),
+                    }
+                )
+                _write_raw_ledger_record(record)
+
+            monkeypatch.setattr(D, "_dashboard_refresh_disabled", lambda: False)
+            monkeypatch.setattr(D, "_export_dashboard_status_for_project", exports.append)
+            monkeypatch.setattr(goalflight_ledger, "read_records", flaky_read)
+            monkeypatch.setattr(D.time, "sleep", finish_during_retry)
+
+            assert D._dashboard_refresh_loop(
+                project, interval_s=1, max_lifetime_s=10
+            ) == 0
+
+    assert reads == 2
+    assert sleeps == [1.0]
+    assert exports == [project, project]
+
+
+def test_dashboard_refresh_loop_exits_after_readable_no_live_scan(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = (tmp / "project").resolve()
+        (project / "dashboard").mkdir(parents=True)
+        exports: list[Path] = []
+
+        with _isolated_env(tmp):
+            monkeypatch.setattr(D, "_dashboard_refresh_disabled", lambda: False)
+            monkeypatch.setattr(D, "_export_dashboard_status_for_project", exports.append)
+            monkeypatch.setattr(
+                D.time,
+                "sleep",
+                lambda _seconds: (_ for _ in ()).throw(
+                    AssertionError("readable no-live scan must exit without sleeping")
+                ),
+            )
+
+            assert D._dashboard_refresh_loop(
+                project, interval_s=1, max_lifetime_s=10
+            ) == 0
+
+    assert exports == [project]
+
+
+def test_dashboard_project_liveness_is_unknown_for_unreadable_row() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = (tmp / "project").resolve()
+
+        with _isolated_env(tmp):
+            path = goalflight_ledger.record_path("unreadable-row", create=True)
+            path.write_text("{", encoding="utf-8")
+
+            assert D._dashboard_project_has_live_dispatch(project) is None
+
+
+def test_dashboard_project_liveness_is_unknown_for_ambiguous_record() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        project = (tmp / "project").resolve()
+
+        with _isolated_env(tmp):
+            _write_raw_ledger_record(
+                {
+                    "schema": goalflight_ledger.SCHEMA,
+                    "dispatch_id": "ambiguous-row",
+                    "project_root": str(project),
+                    "state": "running",
+                    "terminal_state": "unknown",
+                }
+            )
+
+            assert D._dashboard_project_has_live_dispatch(project) is None
+
+
+def test_dashboard_project_liveness_live_wins_over_invalid_row() -> None:
+    for invalid_id, live_id in (
+        ("a-invalid", "z-live"),
+        ("z-invalid", "a-live"),
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            project = (tmp / "project").resolve()
+
+            with _isolated_env(tmp):
+                _write_raw_ledger_record(
+                    {
+                        "schema": goalflight_ledger.SCHEMA,
+                        "dispatch_id": invalid_id,
+                        "project_root": str(project),
+                        "state": [],
+                    }
+                )
+                assert D._dashboard_project_has_live_dispatch(project) is None
+
+                _write_raw_ledger_record(
+                    {
+                        "schema": goalflight_ledger.SCHEMA,
+                        "dispatch_id": live_id,
+                        "project_root": str(project),
+                        "state": "running",
+                        "terminal_state": "unknown",
+                        "worker_pid": os.getpid(),
+                        "worker_identity": goalflight_ledger.process_identity(
+                            os.getpid()
+                        ),
+                    }
+                )
+                assert D._dashboard_project_has_live_dispatch(project) is True
+
+
+def test_dashboard_project_liveness_handles_unscoped_records_conservatively() -> None:
+    worker_pid = os.getpid()
+    worker_identity = goalflight_ledger.process_identity(worker_pid)
+
+    for dispatch_id, fields, expected in (
+        (
+            "unscoped-live",
+            {
+                "state": "running",
+                "worker_pid": worker_pid,
+                "worker_identity": worker_identity,
+            },
+            None,
+        ),
+        ("unscoped-ambiguous", {"state": "running"}, None),
+        ("unscoped-terminal", {"state": "complete"}, False),
+        (
+            "other-project-live",
+            {
+                "state": "running",
+                "project_root": "/different/project",
+                "worker_pid": worker_pid,
+                "worker_identity": worker_identity,
+            },
+            False,
+        ),
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            project = (tmp / "project").resolve()
+            record = {
+                "schema": goalflight_ledger.SCHEMA,
+                "dispatch_id": dispatch_id,
+                "terminal_state": "unknown",
+                **fields,
+            }
+
+            with _isolated_env(tmp):
+                _write_raw_ledger_record(record)
+                assert D._dashboard_project_has_live_dispatch(project) is expected
 
 
 def test_foreground_dispatch_refreshes_dashboard_status_data() -> None:

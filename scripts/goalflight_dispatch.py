@@ -2124,14 +2124,18 @@ def _dashboard_record_seen_at(record: dict) -> dt.datetime | None:
     return None
 
 
-def _dashboard_queued_record_within_grace(record: dict, *, now: dt.datetime) -> bool:
+def _dashboard_queued_record_within_grace(
+    record: dict, *, now: dt.datetime
+) -> bool | None:
     seen_at = _dashboard_record_seen_at(record)
     if seen_at is None:
-        return False
+        return None
     return (now - seen_at).total_seconds() <= _DASHBOARD_REFRESH_QUEUED_GRACE_S
 
 
-def _dashboard_refresh_record_counts_as_live(record: dict, *, now: dt.datetime, goalflight_status) -> bool:
+def _dashboard_refresh_record_counts_as_live(
+    record: dict, *, now: dt.datetime, goalflight_status
+) -> bool | None:
     classification = goalflight_ledger.classify(record)
     queued_states = {"queued", "queued_capacity", "waiting_capacity"}
     if str(record.get("state") or "") in queued_states or str(classification or "") in queued_states:
@@ -2141,26 +2145,54 @@ def _dashboard_refresh_record_counts_as_live(record: dict, *, now: dt.datetime, 
         record.get("reason") or record.get("error"),
     )
     status_record = dict(record, classification=classification, terminal_state=terminal_state)
-    return goalflight_status.done_code(status_record) == 1
+    code = goalflight_status.done_code(status_record)
+    if code == 1:
+        return True
+    return None if code == 2 else False
 
 
-def _dashboard_project_has_live_dispatch(project_root: Path) -> bool:
+def _dashboard_project_has_live_dispatch(project_root: Path) -> bool | None:
+    """Return whether this project has live work, or ``None`` if unreadable.
+
+    A failed ledger/import/root probe is not evidence that no dispatch is
+    live. The refresher keeps running on ``None`` so a transient read cannot
+    strand the dashboard; its absolute lifetime remains the retry bound.
+    """
     try:
         import goalflight_status
 
         root = str(project_root.resolve())
         now = dt.datetime.now(dt.timezone.utc)
-        records = [
-            record
-            for record in goalflight_ledger.read_records()
-            if record.get("project_root") == root
-        ]
+        candidates = []
+        scan_unknown = False
+        for record in goalflight_ledger.read_records():
+            if not isinstance(record, dict) or goalflight_ledger.record_is_unreadable(
+                record
+            ):
+                scan_unknown = True
+                continue
+            record_root = record.get("project_root")
+            if record_root == root:
+                candidates.append((record, True))
+            elif not isinstance(record_root, str) or not record_root.strip():
+                candidates.append((record, False))
     except Exception:
-        return False
-    return any(
-        _dashboard_refresh_record_counts_as_live(record, now=now, goalflight_status=goalflight_status)
-        for record in records
-    )
+        return None
+    for record, matches_project in candidates:
+        try:
+            live = _dashboard_refresh_record_counts_as_live(
+                record, now=now, goalflight_status=goalflight_status
+            )
+        except Exception:
+            scan_unknown = True
+            continue
+        if live is True:
+            if matches_project:
+                return True
+            scan_unknown = True
+        if live is None:
+            scan_unknown = True
+    return None if scan_unknown else False
 
 
 def _dashboard_refresh_disabled() -> bool:
@@ -2191,7 +2223,8 @@ def _dashboard_refresh_loop(
         _export_dashboard_status_for_project(project_root)
         if time.monotonic() - started >= float(max_lifetime_s):
             return 0
-        if not _dashboard_project_has_live_dispatch(project_root):
+        live = _dashboard_project_has_live_dispatch(project_root)
+        if live is False:
             return 0
         time.sleep(interval)
 
