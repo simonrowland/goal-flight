@@ -52,6 +52,13 @@ incremented when meaningful skill behaviour changes.
 
 ### Fixed
 
+- Wake-pool contention loop: unreadable follow/journal state is no longer
+  treated as `listener-dead` with `backup_required` / `rearm_command`.
+  `--listener-slots` is a live-depth ceiling again; extras that would
+  exceed the cap fail closed as contention protection, not a ring.
+  `supervise` still only respawns its configured slots (it does not
+  mint extra backups from a `listener-dead` passthrough). Before acting
+  on `listener-dead`, positive control is `relay --new`.
 - `goalflight_dispatch.py resume` reattaches to the existing worktree instead
   of acquiring a sibling pooled seat, so quota-exhausted / dead / plan-approval
   pauses continue in place. `--account` is honored; default seat order skips
