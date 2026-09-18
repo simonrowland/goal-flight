@@ -24,9 +24,12 @@ SPEC.loader.exec_module(grok)
 SECRET = "session-token-must-never-appear"
 
 
-def _auth(tmp_path: Path, token: str = SECRET) -> Path:
+def _auth(tmp_path: Path, token: str = SECRET, *, user_id: str | None = None) -> Path:
+    entry: dict[str, str] = {"key": token}
+    if user_id is not None:
+        entry["user_id"] = user_id
     path = tmp_path / "auth.json"
-    path.write_text(json.dumps({"https://auth.x.ai::abc": {"key": token}}))
+    path.write_text(json.dumps({"https://auth.x.ai::abc": entry}))
     return path
 
 
@@ -387,3 +390,54 @@ def test_unparseable_period_end_keeps_the_percentage(tmp_path: Path) -> None:
     assert record["ok"] is True
     assert record["used_percent"] == 12.0
     assert record["reset_at"] is None
+
+
+def test_identity_is_emitted_from_auth_user_id_without_the_token(
+    tmp_path: Path,
+) -> None:
+    """The aggregator folds host vs seat by identity. user_id is that key.
+
+    The session token must never ride along: identity is a folding handle,
+    not a credential dump.
+    """
+    record = grok.read_usage(
+        auth_path=_auth(tmp_path, user_id="acct-11111111-aaaa"),
+        fetcher=lambda url, timeout: {"config": {"creditUsagePercent": 4.0}},
+        account="simon",
+    )
+    assert record["ok"] is True
+    assert record["identity"] == "acct-11111111-aaaa"
+    assert record["account"] == "simon"
+    dumped = json.dumps(record)
+    assert SECRET not in dumped
+    assert "key" not in record
+
+
+def test_identity_is_omitted_when_auth_has_no_user_id(tmp_path: Path) -> None:
+    """Documents without user_id keep the historical payload shape."""
+    record = grok.read_usage(
+        auth_path=_auth(tmp_path),
+        fetcher=lambda url, timeout: {"config": {"creditUsagePercent": 4.0}},
+    )
+    assert record["ok"] is True
+    assert "identity" not in record
+
+
+def test_identity_survives_an_auth_invalid_probe(tmp_path: Path) -> None:
+    """A 401 still has to name WHICH identity failed, or the host row cannot
+    be folded against a live seat of the same user."""
+
+    def boom(url, timeout):
+        raise grok.GrokUsageError(
+            "billing endpoint returned HTTP 401",
+            probe_state=grok.PROBE_UNUSABLE,
+            auth_state=grok.AUTH_INVALID,
+        )
+
+    record = grok.read_usage(
+        auth_path=_auth(tmp_path, user_id="acct-11111111-aaaa"),
+        fetcher=boom,
+    )
+    assert record["ok"] is False
+    assert record["identity"] == "acct-11111111-aaaa"
+    assert SECRET not in json.dumps(record)

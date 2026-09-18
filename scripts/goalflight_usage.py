@@ -515,6 +515,80 @@ def _normalize_codex(record: Mapping[str, Any], now: float) -> dict[str, object]
     )
 
 
+_STALE_HOST_TOKEN_NOTE = "stale host token"
+
+
+def _grok_identity(record: Mapping[str, Any]) -> str | None:
+    raw = record.get("identity")
+    if not isinstance(raw, str):
+        return None
+    identity = raw.strip()
+    return identity or None
+
+
+def _fold_stale_grok_host(records: Sequence[object]) -> list[object]:
+    """Drop a host-login auth failure when a named seat of the same identity is ok.
+
+    The host ~/.grok token is often a stale copy of a configured seat. A 401
+    there is not a logged-out identity when that same user_id already measured
+    headroom under a named account. Folding happens here, not in the reader,
+    so grok_usage.py --json stays one record per login.
+    """
+    healthy_named: set[str] = set()
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        identity = _grok_identity(record)
+        if identity and record.get("account") and record.get("ok") is True:
+            healthy_named.add(identity)
+
+    stale_identities: set[str] = set()
+    kept: list[object] = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            kept.append(record)
+            continue
+        identity = _grok_identity(record)
+        is_host = not record.get("account")
+        failure = _failed_record(record)
+        if (
+            is_host
+            and identity
+            and identity in healthy_named
+            and failure is not None
+            and failure[1] == "auth-broken"
+        ):
+            stale_identities.add(identity)
+            continue
+        kept.append(record)
+
+    if not stale_identities:
+        return kept
+
+    annotated: list[object] = []
+    for record in kept:
+        if (
+            isinstance(record, Mapping)
+            and record.get("account")
+            and record.get("ok") is True
+            and _grok_identity(record) in stale_identities
+        ):
+            copy = dict(record)
+            copy["stale_host_token"] = True
+            annotated.append(copy)
+        else:
+            annotated.append(record)
+    return annotated
+
+
+def _note_stale_host_token(row: dict[str, object]) -> None:
+    remaining = str(row.get("remaining") or "unknown")
+    row["remaining"] = f"{remaining} · {_STALE_HOST_TOKEN_NOTE}"
+    used = row.get("used")
+    if used:
+        row["used"] = f"{used} · {_STALE_HOST_TOKEN_NOTE}"
+
+
 def _normalize_grok(record: Mapping[str, Any], now: float) -> dict[str, object]:
     """One subscription credit pool, shaped like a codex seat window.
 
@@ -787,6 +861,9 @@ def normalize_payload(
     else:
         return [unavailable_row(spec.provider)]
 
+    if spec.key == "grok":
+        records = _fold_stale_grok_host(records)
+
     normalizer = NORMALIZERS[spec.key]
     rows = []
     for record in records:
@@ -794,6 +871,8 @@ def normalize_payload(
             continue
         row = normalizer(record, current_time)
         _apply_reported_headroom(row, record)
+        if spec.key == "grok" and record.get("stale_host_token"):
+            _note_stale_host_token(row)
         for key in ("probed_at", "measured_at", "checked_at", "updated_at"):
             observed_at = parse_reset(record.get(key))
             if observed_at is not None:

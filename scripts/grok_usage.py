@@ -158,6 +158,35 @@ def _product_usage(value: object) -> dict[str, float] | None:
     return out or None
 
 
+def _auth_identity(auth_path: Path) -> str | None:
+    """Return the auth document's user_id, or None.
+
+    Best-effort and never raises. Identity is a folding key for the aggregator,
+    not a credential: a missing, unreadable, or token-only document simply
+    cannot be folded against another login. The session token is never returned.
+    """
+    try:
+        document = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(document, dict) or not document:
+        return None
+    entry = next(iter(document.values()))
+    if not isinstance(entry, dict):
+        return None
+    raw = entry.get("user_id")
+    if not isinstance(raw, str):
+        return None
+    identity = raw.strip()
+    return identity or None
+
+
+def _with_identity(record: dict, identity: str | None) -> dict:
+    if identity:
+        record["identity"] = identity
+    return record
+
+
 def _session_token(auth_path: Path) -> str:
     """Return the bearer token from the CLI's auth document.
 
@@ -275,6 +304,7 @@ def read_usage(
     WHICH login it failed for is not actionable when several are configured.
     """
     auth_path = AUTH_PATH if auth_path is None else auth_path
+    identity = _auth_identity(auth_path)
     try:
         payload = (
             fetcher(url, timeout_s)
@@ -282,25 +312,31 @@ def read_usage(
             else _fetch(_session_token(auth_path), url=url, timeout_s=timeout_s)
         )
     except GrokUsageError as exc:
-        return {
-            "label": LABEL,
-            "account": account,
-            "ok": False,
-            "probe_state": exc.probe_state,
-            "auth_state": exc.auth_state,
-            "error": str(exc),
-        }
+        return _with_identity(
+            {
+                "label": LABEL,
+                "account": account,
+                "ok": False,
+                "probe_state": exc.probe_state,
+                "auth_state": exc.auth_state,
+                "error": str(exc),
+            },
+            identity,
+        )
 
     config = payload.get("config")
     if not isinstance(config, dict):
-        return {
-            "label": LABEL,
-            "account": account,
-            "ok": False,
-            "probe_state": PROBE_UNKNOWN,
-            "auth_state": AUTH_VALID,
-            "error": "billing response lacks config",
-        }
+        return _with_identity(
+            {
+                "label": LABEL,
+                "account": account,
+                "ok": False,
+                "probe_state": PROBE_UNKNOWN,
+                "auth_state": AUTH_VALID,
+                "error": "billing response lacks config",
+            },
+            identity,
+        )
 
     # ABSENT and RE-TYPED are different events and must not be conflated.
     #
@@ -325,14 +361,17 @@ def read_usage(
         or not 0.0 <= used_raw <= 100.0
         or not math.isfinite(float(used_raw))
     ):
-        return {
-            "label": LABEL,
-            "account": account,
-            "ok": False,
-            "probe_state": PROBE_UNKNOWN,
-            "auth_state": AUTH_VALID,
-            "error": "billing response re-typed creditUsagePercent",
-        }
+        return _with_identity(
+            {
+                "label": LABEL,
+                "account": account,
+                "ok": False,
+                "probe_state": PROBE_UNKNOWN,
+                "auth_state": AUTH_VALID,
+                "error": "billing response re-typed creditUsagePercent",
+            },
+            identity,
+        )
     used = None if used_absent else float(used_raw)
 
     # `creditUsagePercent` alone does NOT mean the seat is unusable. Subscription
@@ -343,27 +382,30 @@ def read_usage(
     # knew prepaid was the deciding field. Pass it through and let the display
     # decide; `_balance` returns None (unknown) rather than 0 on a shape change,
     # so a contract change can never read as "no money left".
-    return {
-        "label": LABEL,
-        "account": account,
-        "ok": True,
-        "probe_state": PROBE_UNKNOWN if used_absent else PROBE_USABLE,
-        "auth_state": AUTH_VALID,
-        # None = the endpoint did not report it for this account (see above).
-        "used_percent": used,
-        "used_percent_absent": used_absent,
-        "reset_at": _epoch(config.get("billingPeriodEnd")),
-        "source": "grok_billing_credits",
-        "prepaid_balance": _balance(config.get("prepaidBalance")),
-        # Pass-through only. Their semantics are not established, so nothing
-        # downstream may derive a verdict from them until they are.
-        "on_demand_cap": _balance(config.get("onDemandCap")),
-        "on_demand_used": _balance(config.get("onDemandUsed")),
-        "product_usage": _product_usage(config.get("productUsage")),
-        "period_type": (config.get("currentPeriod") or {}).get("type")
-        if isinstance(config.get("currentPeriod"), dict)
-        else None,
-    }
+    return _with_identity(
+        {
+            "label": LABEL,
+            "account": account,
+            "ok": True,
+            "probe_state": PROBE_UNKNOWN if used_absent else PROBE_USABLE,
+            "auth_state": AUTH_VALID,
+            # None = the endpoint did not report it for this account (see above).
+            "used_percent": used,
+            "used_percent_absent": used_absent,
+            "reset_at": _epoch(config.get("billingPeriodEnd")),
+            "source": "grok_billing_credits",
+            "prepaid_balance": _balance(config.get("prepaidBalance")),
+            # Pass-through only. Their semantics are not established, so nothing
+            # downstream may derive a verdict from them until they are.
+            "on_demand_cap": _balance(config.get("onDemandCap")),
+            "on_demand_used": _balance(config.get("onDemandUsed")),
+            "product_usage": _product_usage(config.get("productUsage")),
+            "period_type": (config.get("currentPeriod") or {}).get("type")
+            if isinstance(config.get("currentPeriod"), dict)
+            else None,
+        },
+        identity,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

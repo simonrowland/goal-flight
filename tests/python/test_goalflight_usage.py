@@ -1290,6 +1290,147 @@ def test_grok_rows_are_per_account_and_host_stays_unlabelled():
     assert rows[0]["remaining"] != rows[1]["remaining"]
 
 
+def test_grok_stale_host_token_folds_into_matching_named_account():
+    """Fixture A: host 401 and named seat share user_id; named probe is ok.
+
+    The readout must not raise ⚠auth for an identity that is logged in and
+    measured under the named seat. One row, labelled as that seat, carrying
+    its headroom, plus a note that the host token is the stale duplicate.
+    """
+    spec = next(spec for spec in usage.READERS if spec.key == "grok")
+    identity = "acct-11111111-aaaa"
+    rows = usage.normalize_payload(
+        spec,
+        [
+            {
+                "label": "grok",
+                "account": None,
+                "ok": False,
+                "error": "billing endpoint returned HTTP 401",
+                "auth_state": "invalid",
+                "probe_state": "unusable",
+                "identity": identity,
+            },
+            {
+                "label": "grok",
+                "account": "simon",
+                "ok": True,
+                "used_percent": 4.0,
+                "identity": identity,
+            },
+        ],
+    )
+    assert len(rows) == 1
+    row = rows[0]
+    assert tuple(row) == usage.ROW_KEYS
+    assert row["provider"] == "grok"
+    assert row["account"] == "simon"
+    assert row["used"] == "4% · stale host token"
+    assert row["remaining"] == "96% · stale host token"
+    assert row["flags"] == []
+    rendered = usage.render_table(rows, now=2_000_000_000)
+    assert "grok simon" in rendered
+    assert "stale host token" in rendered
+    assert "⚠auth" not in rendered
+    assert "needs-login" not in rendered
+
+
+def test_grok_unmatched_host_auth_failure_still_needs_login():
+    """Fixture B: host 401 whose user_id matches no configured account.
+
+    A genuine logged-out host identity must keep the bare grok needs-login
+    row. A live seat of a different identity does not absorb it.
+    """
+    spec = next(spec for spec in usage.READERS if spec.key == "grok")
+    rows = usage.normalize_payload(
+        spec,
+        [
+            {
+                "label": "grok",
+                "account": None,
+                "ok": False,
+                "error": "billing endpoint returned HTTP 401",
+                "identity": "acct-unmatched",
+            },
+            {
+                "label": "grok",
+                "account": "simon",
+                "ok": True,
+                "used_percent": 4.0,
+                "identity": "acct-other",
+            },
+        ],
+    )
+    assert len(rows) == 2
+    assert rows[0]["account"] is None
+    assert rows[0]["remaining"] == "needs-login"
+    assert rows[0]["flags"] == ["auth-broken"]
+    assert rows[1]["account"] == "simon"
+    assert "auth-broken" not in rows[1]["flags"]
+    assert "stale" not in str(rows[1]["remaining"]).lower()
+    rendered = usage.render_table(rows, now=2_000_000_000)
+    assert "needs-login  ⚠auth" in rendered
+
+
+def test_grok_distinct_identities_stay_two_rows():
+    """Fixture C: two configured accounts, distinct identities, both ok."""
+    spec = next(spec for spec in usage.READERS if spec.key == "grok")
+    rows = usage.normalize_payload(
+        spec,
+        [
+            {
+                "label": "grok",
+                "account": "alpha",
+                "ok": True,
+                "used_percent": 10.0,
+                "identity": "id-alpha",
+            },
+            {
+                "label": "grok",
+                "account": "beta",
+                "ok": True,
+                "used_percent": 20.0,
+                "identity": "id-beta",
+            },
+        ],
+    )
+    assert len(rows) == 2
+    assert [row["account"] for row in rows] == ["alpha", "beta"]
+    assert rows[0]["used"] == "10%"
+    assert rows[1]["used"] == "20%"
+    assert rows[0]["flags"] == []
+    assert rows[1]["flags"] == []
+    assert all("stale" not in str(row["remaining"]).lower() for row in rows)
+
+
+def test_grok_matching_identity_does_not_clear_a_failed_named_account():
+    """A duplicate host 401 must not launder a named seat that also failed."""
+    spec = next(spec for spec in usage.READERS if spec.key == "grok")
+    identity = "acct-11111111-aaaa"
+    rows = usage.normalize_payload(
+        spec,
+        [
+            {
+                "label": "grok",
+                "account": None,
+                "ok": False,
+                "error": "billing endpoint returned HTTP 401",
+                "identity": identity,
+            },
+            {
+                "label": "grok",
+                "account": "simon",
+                "ok": False,
+                "error": "billing endpoint returned HTTP 401",
+                "identity": identity,
+            },
+        ],
+    )
+    assert len(rows) == 2
+    assert [row["remaining"] for row in rows] == ["needs-login", "needs-login"]
+    assert all(row["flags"] == ["auth-broken"] for row in rows)
+
+
 def test_grok_account_label_survives_a_reader_failure():
     """A failed row must still say which login failed, or it is unactionable."""
     spec = next(spec for spec in usage.READERS if spec.key == "grok")
