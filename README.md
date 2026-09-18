@@ -5,6 +5,8 @@
 ![Last commit](https://img.shields.io/github/last-commit/simonrowland/goal-flight)
 ![Stars](https://img.shields.io/github/stars/simonrowland/goal-flight)
 
+Author: Simon Rowland <simon@simonrowland.com>
+
 goal-flight turns a Claude Code session into the **orchestrator** of a long-running
 software project. You bring a goal. The orchestrator collects the requirements worth your
 attention, settles the architecture with you before code is written, then dispatches the
