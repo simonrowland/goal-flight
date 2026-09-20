@@ -2644,6 +2644,7 @@ def test_stale_claim_launch_token_requires_matching_worker_record() -> None:
                         "schema": D.DISPATCH_QUEUE_SCHEMA,
                         "state": "claimed",
                         "dispatch_id": "token-only",
+                        "project_root": str(tmp),
                         "dispatch_argv": ["--agent", "test-dispatch"],
                         "task_ids": ["token-only-task"],
                         "queue_launch_token": "token-only",
@@ -2676,12 +2677,12 @@ def test_stale_claim_launch_token_requires_matching_worker_record() -> None:
                         "dispatch_id": "crash-window",
                         "agent": "test-dispatch",
                         "shape": "bash",
-                        "project_root": str(ROOT),
+                        "project_root": str(tmp),
                         "dispatch_argv": ["--agent", "test-dispatch"],
                         "task_ids": ["b-065-crash"],
                         "request": {
                             "agent": "test-dispatch",
-                            "cwd": str(ROOT),
+                            "cwd": str(tmp),
                             "tail": str(crash_tail),
                             "status_json": str(crash_status),
                             "task_ids": ["b-065-crash"],
@@ -3177,12 +3178,12 @@ def test_stale_claim_result_marker_with_rate_limit_text_completes() -> None:
                         "dispatch_id": dispatch_id,
                         "agent": "codex",
                         "shape": "bash",
-                        "project_root": str(ROOT),
+                        "project_root": str(tmp),
                         "dispatch_argv": ["--agent", "codex"],
                         "task_ids": ["queued-result-rate-mention-task"],
                         "request": {
                             "agent": "codex",
-                            "cwd": str(ROOT),
+                            "cwd": str(tmp),
                             "tail": str(tail),
                             "status_json": str(status),
                             "task_ids": ["queued-result-rate-mention-task"],
@@ -3414,6 +3415,7 @@ def test_legacy_claim_dead_worker_without_token_defers_fail_closed() -> None:
                 {
                     "schema": D.goalflight_ledger.SCHEMA,
                     "dispatch_id": "legacy-dead-worker",
+                    "project_root": str(tmp),
                     "state": "running",
                     "terminal_state": "unknown",
                     "worker_pid": dead_pid,
@@ -3429,6 +3431,7 @@ def test_legacy_claim_dead_worker_without_token_defers_fail_closed() -> None:
                         "schema": D.DISPATCH_QUEUE_SCHEMA,
                         "state": "claimed",
                         "dispatch_id": "legacy-dead-worker",
+                        "project_root": str(tmp),
                         "dispatch_argv": ["--agent", "test-dispatch"],
                         "task_ids": ["legacy-dead-worker-task"],
                     }
@@ -3701,6 +3704,8 @@ def test_worker_dead_tail_rate_limit_reaches_pressure_sensor() -> None:
 
 
 def _b065_env(tmp: Path) -> dict[str, str]:
+    # Entries must also use tmp as project_root: an empty task store can still
+    # read legacy docs-private/tasks.jsonl beneath the declared project root.
     env = _env(tmp)
     env["GOALFLIGHT_TASK_STORE_DIR"] = str(tmp / "task-store")
     env["GOALFLIGHT_DISABLE_NUDGES"] = "1"
@@ -3741,12 +3746,12 @@ def test_b065_state_flips_to_terminal_so_wait_resolves() -> None:
                         "dispatch_id": dispatch_id,
                         "agent": "test-dispatch",
                         "shape": "bash",
-                        "project_root": str(ROOT),
+                        "project_root": str(tmp),
                         "dispatch_argv": ["--agent", "test-dispatch"],
                         "task_ids": ["b-065"],
                         "request": {
                             "agent": "test-dispatch",
-                            "cwd": str(ROOT),
+                            "cwd": str(tmp),
                             "tail": str(tail),
                             "status_json": str(status_path),
                             "task_ids": ["b-065"],
@@ -3778,7 +3783,7 @@ def test_b065_state_flips_to_terminal_so_wait_resolves() -> None:
                     "started_at": started_iso,
                     "status_path": str(status_path),
                     "stdout_path": str(tail),
-                    "project_root": str(ROOT),
+                    "project_root": str(tmp),
                     "agent": "test-dispatch",
                 }
             )
@@ -3821,12 +3826,12 @@ def test_b065_linked_vs_unlinked_action_matrix() -> None:
                         "dispatch_id": linked_id,
                         "agent": "test-dispatch",
                         "shape": "bash",
-                        "project_root": str(ROOT),
+                        "project_root": str(tmp),
                         "dispatch_argv": ["--agent", "test-dispatch"],
                         "task_ids": ["b-065-l"],
                         "request": {
                             "agent": "test-dispatch",
-                            "cwd": str(ROOT),
+                            "cwd": str(tmp),
                             "tail": str(linked_tail),
                             "status_json": str(linked_status),
                             "task_ids": ["b-065-l"],
@@ -3854,11 +3859,11 @@ def test_b065_linked_vs_unlinked_action_matrix() -> None:
                         "dispatch_id": unlinked_id,
                         "agent": "test-dispatch",
                         "shape": "bash",
-                        "project_root": str(ROOT),
+                        "project_root": str(tmp),
                         "dispatch_argv": ["--agent", "test-dispatch"],
                         "request": {
                             "agent": "test-dispatch",
-                            "cwd": str(ROOT),
+                            "cwd": str(tmp),
                             "tail": str(unlinked_tail),
                             "status_json": str(unlinked_status),
                         },
@@ -4022,7 +4027,7 @@ def test_b065_launch_age_ignores_updated_at_heartbeats() -> None:
                     "updated_at": D.goalflight_ledger.utc_now(),  # heartbeat "just now"
                     "status_path": str(status_path),
                     "stdout_path": str(tail),
-                    "project_root": str(ROOT),
+                    "project_root": str(tmp),
                     "agent": "test-dispatch",
                     "queue_launch_token": "hb-token",
                 }
@@ -4108,7 +4113,7 @@ def test_b065_weak_worker_pid_claim_unlink_then_ledger_terminalizes() -> None:
                     "started_at": started,
                     "status_path": str(status_path),
                     "stdout_path": str(tail),
-                    "project_root": str(ROOT),
+                    "project_root": str(tmp),
                     "agent": "test-dispatch",
                 }
             )
@@ -4149,12 +4154,12 @@ def test_b065_late_complete_wins_over_worker_dead() -> None:
                 "dispatch_id": dispatch_id,
                 "agent": "test-dispatch",
                 "shape": "bash",
-                "project_root": str(ROOT),
+                "project_root": str(tmp),
                 "dispatch_argv": ["--agent", "test-dispatch"],
                 "task_ids": ["b-065-lc"],
                 "request": {
                     "agent": "test-dispatch",
-                    "cwd": str(ROOT),
+                    "cwd": str(tmp),
                     "tail": str(tail),
                     "status_json": str(status_path),
                     "task_ids": ["b-065-lc"],
@@ -4180,7 +4185,7 @@ def test_b065_late_complete_wins_over_worker_dead() -> None:
                     "started_at": D.goalflight_ledger.utc_now(),
                     "status_path": str(status_path),
                     "stdout_path": str(tail),
-                    "project_root": str(ROOT),
+                    "project_root": str(tmp),
                     "agent": "test-dispatch",
                 }
             )
@@ -4369,11 +4374,11 @@ def test_b065_unlinked_nonterminal_claim_is_preserved() -> None:
                 "dispatch_id": dispatch_id,
                 "agent": "test-dispatch",
                 "shape": "bash",
-                "project_root": str(ROOT),
+                "project_root": str(tmp),
                 "dispatch_argv": ["--agent", "test-dispatch", "--prompt", "keep-me"],
                 "request": {
                     "agent": "test-dispatch",
-                    "cwd": str(ROOT),
+                    "cwd": str(tmp),
                     "tail": str(tail),
                     "status_json": str(status_path),
                 },
