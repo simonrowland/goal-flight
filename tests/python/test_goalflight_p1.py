@@ -1371,8 +1371,8 @@ def test_concurrent_rotation_and_append_both_succeed_under_the_carrier_lock(
         return real_lstat(candidate, *args, **kwargs)
 
     @contextlib.contextmanager
-    def observed_mail_lock(candidate: Path):
-        with real_mail_lock(candidate):
+    def observed_mail_lock(candidate: Path, **kwargs):
+        with real_mail_lock(candidate, **kwargs):
             lock_state.held = True
             try:
                 yield

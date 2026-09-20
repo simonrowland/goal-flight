@@ -1085,7 +1085,6 @@ def post_trace_attention(
 ) -> None:
     if not dispatch_id or state not in {"long_running", "long_running_review"} or state in posted_states:
         return
-    posted_states.add(state)
     try:
         if post_func is None:
             import goalflight_messages as gm
@@ -1104,6 +1103,7 @@ def post_trace_attention(
             },
             source={"node": "local", "adapter": "watcher", "transport": "trace-liveness"},
         )
+        posted_states.add(state)
     except Exception:
         return
 

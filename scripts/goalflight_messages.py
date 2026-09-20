@@ -23,11 +23,12 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 import sys
 import time
-from typing import TypeVar
+from typing import TextIO, TypeVar
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -36,6 +37,7 @@ AGGREGATE_SCHEMA = "goalflight.fleet.register.aggregate.v1"
 INGESTION_ORDER_FILE = ".ingestion-order"
 INGESTION_IDENTITY_FILE = ".ingestion-identities.json"
 INGESTION_IDENTITY_SCHEMA = "goalflight.ingestion-identities.v1"
+_HELD_MAIL_LOCKS: dict[tuple[int, int, Path], TextIO] = {}
 _INBOX_CURSOR_KEY_FIELD = "_goalflight_inbox_cursor_key"
 _INBOX_CURSOR_KEYS_FIELD = "_goalflight_inbox_cursor_keys"
 _INBOX_SOURCE_PATHS_FIELD = "_goalflight_inbox_source_paths"
@@ -441,47 +443,72 @@ def mail_lock_path(path: Path) -> Path:
 @contextlib.contextmanager
 def mail_lock(path: Path, *, timeout_secs: float | None = None):
     lock = mail_lock_path(path)
+    # Re-entry (including a Python signal handler) must use the same open-file
+    # description, but the registry is NOT proof of ownership: always flock it.
+    # Threads and fresh calls in forked children still contend normally.
+    owner = (os.getpid(), threading.get_ident(), lock)
+    held = _HELD_MAIL_LOCKS.get(owner)
+    # A terminating handler can interrupt registry deletion during cleanup.
+    # The owning context still closes its handle; never reuse that stale entry.
+    if held is not None and held.closed:
+        held = None
     lock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if lock.is_symlink():
         raise MessageError(f"{lock}: symlinked lock refused")
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    try:
-        fd = os.open(lock, flags, 0o600)
-    except OSError as exc:
-        raise MessageError(f"{lock}: cannot open carrier lock: {exc}") from exc
-    with os.fdopen(fd, "r+", encoding="utf-8") as fh:
-        if timeout_secs is None:
-            goalflight_compat.flock(fh, goalflight_compat.LOCK_EX)
-        else:
-            try:
-                timeout = float(timeout_secs)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError("carrier lock timeout must be a number") from exc
-            if not math.isfinite(timeout) or timeout < 0:
-                raise ValueError("carrier lock timeout must be finite and >= 0")
-            deadline = time.monotonic() + timeout
-            while True:
-                try:
-                    goalflight_compat.flock(
-                        fh,
-                        goalflight_compat.LOCK_EX | goalflight_compat.LOCK_NB,
-                    )
-                    break
-                except OSError as exc:
-                    if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
-                        raise
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError(
-                            f"{lock}: carrier lock deadline reached"
-                        ) from exc
-                    time.sleep(min(0.01, remaining))
+    if held is None:
         try:
+            fd = os.open(lock, flags, 0o600)
+        except OSError as exc:
+            raise MessageError(f"{lock}: cannot open carrier lock: {exc}") from exc
+        handle = os.fdopen(fd, "r+", encoding="utf-8")
+    else:
+        handle = contextlib.nullcontext(held)
+    with handle as fh:
+        acquired = False
+        try:
+            # Publish the descriptor before flock: a signal may interrupt the
+            # syscall after acquisition but before Python regains control.
+            _HELD_MAIL_LOCKS[owner] = fh
+            if timeout_secs is None:
+                goalflight_compat.flock(fh, goalflight_compat.LOCK_EX)
+            else:
+                try:
+                    timeout = float(timeout_secs)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError("carrier lock timeout must be a number") from exc
+                if not math.isfinite(timeout) or timeout < 0:
+                    raise ValueError("carrier lock timeout must be finite and >= 0")
+                deadline = time.monotonic() + timeout
+                while True:
+                    try:
+                        goalflight_compat.flock(
+                            fh,
+                            goalflight_compat.LOCK_EX | goalflight_compat.LOCK_NB,
+                        )
+                        break
+                    except OSError as exc:
+                        if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                            raise
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(
+                                f"{lock}: carrier lock deadline reached (lock contention)"
+                            ) from exc
+                        time.sleep(min(0.01, remaining))
+            acquired = True
             yield
         finally:
-            goalflight_compat.flock(fh, goalflight_compat.LOCK_UN)
+            if held is None:
+                try:
+                    # A fork inherits this context and open-file description.
+                    # Child cleanup closes its copy without unlocking the parent.
+                    if acquired and os.getpid() == owner[0]:
+                        goalflight_compat.flock(fh, goalflight_compat.LOCK_UN)
+                finally:
+                    del _HELD_MAIL_LOCKS[owner]
 
 
 def _next_ingestion_order(messages_dir: Path) -> int:
@@ -546,7 +573,7 @@ def _ingestion_order_for_envelope(messages_dir: Path, envelope: dict) -> int:
     identity = _canonical_envelope_identity(envelope)
     path = messages_dir / INGESTION_IDENTITY_FILE
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with mail_lock(path):
+    with mail_lock(path, timeout_secs=5.0):
         orders = _load_ingestion_identity_orders(path)
         existing = orders.get(identity)
         if existing is not None:
