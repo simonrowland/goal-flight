@@ -527,12 +527,12 @@ def _grok_identity(record: Mapping[str, Any]) -> str | None:
 
 
 def _fold_stale_grok_host(records: Sequence[object]) -> list[object]:
-    """Drop a host-login auth failure when a named seat of the same identity is ok.
+    """Drop a host login when a named account of the same identity is ok.
 
-    The host ~/.grok token is often a stale copy of a configured seat. A 401
-    there is not a logged-out identity when that same user_id already measured
-    headroom under a named account. Folding happens here, not in the reader,
-    so grok_usage.py --json stays one record per login.
+    Keep the named account's headroom whether the host probe succeeded or
+    failed. Only an auth-broken host warrants a stale-token note. Folding
+    happens here, not in the reader, so grok_usage.py --json stays one record
+    per login.
     """
     healthy_named: set[str] = set()
     for record in records:
@@ -550,15 +550,10 @@ def _fold_stale_grok_host(records: Sequence[object]) -> list[object]:
             continue
         identity = _grok_identity(record)
         is_host = not record.get("account")
-        failure = _failed_record(record)
-        if (
-            is_host
-            and identity
-            and identity in healthy_named
-            and failure is not None
-            and failure[1] == "auth-broken"
-        ):
-            stale_identities.add(identity)
+        if is_host and identity and identity in healthy_named:
+            failure = _failed_record(record)
+            if failure is not None and failure[1] == "auth-broken":
+                stale_identities.add(identity)
             continue
         kept.append(record)
 

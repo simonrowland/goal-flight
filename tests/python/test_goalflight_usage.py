@@ -1335,6 +1335,70 @@ def test_grok_stale_host_token_folds_into_matching_named_account():
     assert "needs-login" not in rendered
 
 
+@pytest.mark.parametrize("host_first", [True, False])
+def test_grok_healthy_host_folds_into_matching_named_account(host_first):
+    """A refreshed host is the same pool; retain the named measurement."""
+    spec = next(spec for spec in usage.READERS if spec.key == "grok")
+    host = {
+        "label": "grok",
+        "account": None,
+        "ok": True,
+        "used_percent": 91.0,
+        "identity": "acct-shared",
+    }
+    named = {**host, "account": "simon", "used_percent": 92.0}
+    records = [host, named] if host_first else [named, host]
+    original = json.dumps(records, sort_keys=True)
+
+    rows = usage.normalize_payload(spec, records)
+
+    assert len(rows) == 1
+    assert tuple(rows[0]) == usage.ROW_KEYS
+    assert rows[0]["account"] == "simon"
+    assert rows[0]["used"] == "92%"
+    assert rows[0]["remaining"] == "8%"
+    assert rows[0]["flags"] == []
+    rendered = usage.render_table(rows, now=2_000_000_000)
+    assert "grok simon" in rendered
+    assert "stale host token" not in rendered
+    assert "needs-login" not in rendered
+    assert json.dumps(records, sort_keys=True) == original
+
+
+def test_grok_unmatched_healthy_host_keeps_own_headroom():
+    spec = next(spec for spec in usage.READERS if spec.key == "grok")
+    rows = usage.normalize_payload(
+        spec,
+        [
+            {"account": None, "ok": True, "used_percent": 91.0,
+             "identity": "acct-host"},
+            {"account": "simon", "ok": True, "used_percent": 4.0,
+             "identity": "acct-other"},
+        ],
+    )
+    assert [row["account"] for row in rows] == [None, "simon"]
+    assert [row["remaining"] for row in rows] == ["9%", "96%"]
+    assert all(row["flags"] == [] for row in rows)
+
+
+def test_grok_healthy_host_does_not_clear_matching_failed_named_account():
+    spec = next(spec for spec in usage.READERS if spec.key == "grok")
+    rows = usage.normalize_payload(
+        spec,
+        [
+            {"account": None, "ok": True, "used_percent": 91.0,
+             "identity": "acct-shared"},
+            {"account": "simon", "ok": False,
+             "error": "billing endpoint returned HTTP 401",
+             "identity": "acct-shared"},
+        ],
+    )
+    assert [row["account"] for row in rows] == [None, "simon"]
+    assert [row["remaining"] for row in rows] == ["9%", "needs-login"]
+    assert rows[0]["flags"] == []
+    assert rows[1]["flags"] == ["auth-broken"]
+
+
 def test_grok_unmatched_host_auth_failure_still_needs_login():
     """Fixture B: host 401 whose user_id matches no configured account.
 
