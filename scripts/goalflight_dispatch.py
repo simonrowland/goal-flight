@@ -59,6 +59,7 @@ except ImportError:  # pragma: no cover - Windows fallback path
     fcntl = None
 import io
 import json
+import math
 import os
 import re
 import select
@@ -12853,18 +12854,27 @@ def _reconcile_ledger_prelaunch_orphans(
                 )
             ):
                 mark_refusals: list[_ReconcileRefusal] = []
+                mark_pending_reasons: list[str] = []
                 if not _mark_claim_worker_dead(
                     entry,
                     reason="watcher_terminal_reconcile",
                     queue_dir=queue_dir,
                     stale_s=stale_s,
                     refusal_out=mark_refusals,
+                    pending_reason_out=mark_pending_reasons,
                 ):
                     pending += 1
                     pending_reasons.append(
                         mark_refusals[0].as_dict(dispatch_id)
                         if mark_refusals
-                        else {"dispatch_id": dispatch_id, "reason": "terminal_requeue_deferred"}
+                        else {
+                            "dispatch_id": dispatch_id,
+                            "reason": (
+                                mark_pending_reasons[0]
+                                if mark_pending_reasons
+                                else "terminal_requeue_deferred"
+                            ),
+                        }
                     )
             continue
         state = str(record.get("state") or "")
@@ -12950,12 +12960,14 @@ def _reconcile_ledger_prelaunch_orphans(
             continue
         if linked:
             mark_refusals = []
+            mark_pending_reasons = []
             if _mark_claim_worker_dead(
                 entry,
                 reason="claim_carrier_missing",
                 queue_dir=queue_dir,
                 stale_s=stale_s,
                 refusal_out=mark_refusals,
+                pending_reason_out=mark_pending_reasons,
             ):
                 terminalized += 1
             else:
@@ -12963,7 +12975,14 @@ def _reconcile_ledger_prelaunch_orphans(
                 pending_reasons.append(
                     mark_refusals[0].as_dict(dispatch_id)
                     if mark_refusals
-                    else {"dispatch_id": dispatch_id, "reason": "ledger_terminalization_deferred"}
+                    else {
+                        "dispatch_id": dispatch_id,
+                        "reason": (
+                            mark_pending_reasons[0]
+                            if mark_pending_reasons
+                            else "ledger_terminalization_deferred"
+                        ),
+                    }
                 )
         else:
             # Unlinked ledger-only zombie: alert, do not auto-terminalize (E).
@@ -14238,19 +14257,19 @@ def _requeue_disposition_is_terminal(intent: object) -> bool:
 def _requeue_record_event_ts(record: dict) -> float | None:
     for key in ("ended_at", "started_at", "updated_at"):
         ts = _parse_timestamp_s(record.get(key))
-        if ts is not None:
+        if ts is not None and math.isfinite(ts):
             return ts
     intent = record.get("requeue")
     if isinstance(intent, dict):
         ts = _parse_timestamp_s(intent.get("requeued_at"))
-        if ts is not None:
+        if ts is not None and math.isfinite(ts):
             return ts
     return None
 
 
 def _requeue_intent_age_s(intent: dict, *, now_s: float | None = None) -> float | None:
     ts = _parse_timestamp_s(intent.get("requeued_at"))
-    if ts is None:
+    if ts is None or not math.isfinite(ts):
         return None
     now = time.time() if now_s is None else float(now_s)
     return max(0.0, now - ts)
@@ -14269,13 +14288,17 @@ def _requeue_attempt_count(intent: dict) -> int | None:
     return count
 
 
-def _later_complete_successor_id(record: dict, entry: dict) -> str | None:
-    """A later success-terminal dispatch for the same task_ids, if proven.
+def _later_complete_successor_id(
+    record: dict,
+    entry: dict,
+) -> tuple[str | None, bool, str | None]:
+    """Return successor id, scan authority, and any unavailable-scan reason.
 
-    Unlinked work, unlistable/unreadable ledger rows, and candidates whose
-    timestamps cannot be ordered are not a determination of "no successor".
-    They simply fail to prove one. Callers must retain the intent in those
-    cases rather than treating absence of a return value as expiry.
+    ``(None, True, None)`` is a readable scan proving no later completion, or
+    work with no successor relation to scan. A false authority bit carries a
+    reason suitable for reconciliation's existing pending-reason reporting.
+    Callers retain unavailable evidence only while an existing expiry bound is
+    computable; otherwise they fall back to the pre-scan requeue behavior.
 
     Task ids collide across projects on this box by design. A successor is
     only proven when both rows name a project_root and those roots match.
@@ -14283,23 +14306,41 @@ def _later_complete_successor_id(record: dict, entry: dict) -> str | None:
     """
     task_ids = set(_entry_task_ids(entry, record))
     if not task_ids:
-        return None
+        return None, True, None
     self_root = _entry_owner_fields(entry, record)[1]
     if not self_root:
-        return None
+        return None, True, None
     self_id = str(record.get("dispatch_id") or entry.get("dispatch_id") or "")
     self_ts = _requeue_record_event_ts(record)
     if self_ts is None:
-        return None
+        return None, True, None
     try:
         records = goalflight_ledger.read_records()
-    except OSError:
-        return None
+    except OSError as exc:
+        return (
+            None,
+            False,
+            "requeue_successor_scan_unavailable:"
+            f"ledger_read_failure:{type(exc).__name__}",
+        )
+    unavailable_reason: str | None = None
     for other in records:
-        if not isinstance(other, dict) or goalflight_ledger.record_is_unreadable(other):
+        if not isinstance(other, dict):
+            unavailable_reason = unavailable_reason or (
+                "requeue_successor_scan_unavailable:unreadable_row"
+            )
             continue
         other_id = str(other.get("dispatch_id") or "")
-        if not other_id or other_id == self_id:
+        if other_id and other_id == self_id:
+            continue
+        if goalflight_ledger.record_is_unreadable(other):
+            unavailable_reason = unavailable_reason or (
+                "requeue_successor_scan_unavailable:unreadable_row:"
+                f"dispatch_id={other_id or '<unknown>'}:"
+                f"path={other.get('path') or '<unknown>'}"
+            )
+            continue
+        if not other_id:
             continue
         if not (task_ids & set(_entry_task_ids(None, other))):
             continue
@@ -14314,10 +14355,17 @@ def _later_complete_successor_id(record: dict, entry: dict) -> str | None:
         ):
             continue
         other_ts = _requeue_record_event_ts(other)
-        if other_ts is None or other_ts < self_ts:
+        if other_ts is None:
+            unavailable_reason = unavailable_reason or (
+                "requeue_successor_scan_unavailable:"
+                "unorderable_matching_success:"
+                f"dispatch_id={other_id}"
+            )
             continue
-        return other_id
-    return None
+        if other_ts < self_ts:
+            continue
+        return other_id, True, None
+    return None, unavailable_reason is None, unavailable_reason
 
 
 def _requeue_child_success_id(intent: dict) -> str | None:
@@ -14349,35 +14397,61 @@ def _requeue_stop_decision(
     *,
     regenerating: bool = False,
     now_s: float | None = None,
-) -> dict | None:
-    """Return a terminal disposition when the retry is proven obsolete.
+) -> tuple[dict | None, bool, str | None]:
+    """Return disposition, successor-scan authority, and pending reason.
 
-    Missing timestamps or attempt counts are UNKNOWN and must retain.
+    Missing timestamps or attempt counts are UNKNOWN. Existing age/attempt
+    bounds may still expire an intent while the successor scan is unavailable;
+    callers hold only while the intent age supplies a computable bound.
     """
-    successor = _later_complete_successor_id(record, entry)
+    (
+        successor,
+        successor_scan_authoritative,
+        successor_scan_pending_reason,
+    ) = _later_complete_successor_id(record, entry)
     if successor:
-        return {
-            "disposition": "satisfied",
-            "reason": "successor_complete",
-            "satisfied_by": successor,
-        }
+        return (
+            {
+                "disposition": "satisfied",
+                "reason": "successor_complete",
+                "satisfied_by": successor,
+            },
+            True,
+            None,
+        )
     intent = record.get("requeue")
     if isinstance(intent, dict):
         child_done = _requeue_child_success_id(intent)
         if child_done:
-            return {
-                "disposition": "satisfied",
-                "reason": "retry_complete",
-                "satisfied_by": child_done,
-            }
+            return (
+                {
+                    "disposition": "satisfied",
+                    "reason": "retry_complete",
+                    "satisfied_by": child_done,
+                },
+                successor_scan_authoritative,
+                successor_scan_pending_reason,
+            )
         age_s = _requeue_intent_age_s(intent, now_s=now_s)
         if age_s is not None and age_s >= REQUEUE_MAX_AGE_S:
-            return {"disposition": "expired", "reason": "max_age"}
+            return (
+                {"disposition": "expired", "reason": "max_age"},
+                successor_scan_authoritative,
+                successor_scan_pending_reason,
+            )
         if regenerating:
             attempts = _requeue_attempt_count(intent)
             if attempts is not None and attempts >= REQUEUE_MAX_ATTEMPTS:
-                return {"disposition": "expired", "reason": "max_attempts"}
-    return None
+                return (
+                    {"disposition": "expired", "reason": "max_attempts"},
+                    successor_scan_authoritative,
+                    successor_scan_pending_reason,
+                )
+    return (
+        None,
+        successor_scan_authoritative,
+        successor_scan_pending_reason,
+    )
 
 
 def _requeue_child_created_at(intent: dict) -> str:
@@ -14538,6 +14612,7 @@ def _maybe_requeue_terminal_claim(
     *,
     queue_dir: Path,
     tail: Path,
+    pending_reason_out: list[str] | None = None,
 ) -> bool:
     """Run the flag-first, fixed-child-id first-failure transaction.
 
@@ -14570,14 +14645,48 @@ def _maybe_requeue_terminal_claim(
     if _requeue_disposition_is_terminal(intent):
         return True
     would_requeue = _requeue_failure_kind(record, tail) in {"auth", "quota"}
+    successor_scan_authoritative = True
+    successor_scan_pending_reason: str | None = None
     if isinstance(intent, dict) or would_requeue:
-        decision = _requeue_stop_decision(record, entry, regenerating=False)
+        (
+            decision,
+            successor_scan_authoritative,
+            successor_scan_pending_reason,
+        ) = _requeue_stop_decision(record, entry, regenerating=False)
         if decision is not None:
             seed = intent if isinstance(intent, dict) else {}
             return _commit_requeue_disposition(
                 record, seed, decision, queue_dir=queue_dir
             )
+    first_lodge_without_expiry_bound = False
     if intent is None:
+        if not successor_scan_authoritative:
+            # Terminal ended_at is stable across ledger rewrites. started_at is
+            # the only fallback; updated_at is mutable and must not reset this
+            # first-lodge expiry window on every recovery pass.
+            parent_event_ts = _parse_timestamp_s(record.get("ended_at"))
+            if parent_event_ts is None or not math.isfinite(parent_event_ts):
+                parent_event_ts = _parse_timestamp_s(record.get("started_at"))
+            if parent_event_ts is not None and not math.isfinite(parent_event_ts):
+                parent_event_ts = None
+            if (
+                parent_event_ts is not None
+                and max(0.0, time.time() - parent_event_ts) >= REQUEUE_MAX_AGE_S
+            ):
+                return _commit_requeue_disposition(
+                    record,
+                    {},
+                    {"disposition": "expired", "reason": "max_age"},
+                    queue_dir=queue_dir,
+                )
+            if pending_reason_out is not None:
+                pending_reason_out.append(
+                    successor_scan_pending_reason
+                    or "requeue_successor_scan_unavailable"
+                )
+            if parent_event_ts is not None:
+                return False
+            first_lodge_without_expiry_bound = True
         effective_account = record.get("effective_account")
         if not isinstance(effective_account, str) or not effective_account:
             return True
@@ -14605,11 +14714,29 @@ def _maybe_requeue_terminal_claim(
         return False
     if _requeue_child_exists(queue_dir, child_id):
         return True
-    decision = _requeue_stop_decision(record, entry, regenerating=True)
+    (
+        decision,
+        successor_scan_authoritative,
+        successor_scan_pending_reason,
+    ) = _requeue_stop_decision(record, entry, regenerating=True)
     if decision is not None:
         return _commit_requeue_disposition(
             record, intent, decision, queue_dir=queue_dir
         )
+    if not successor_scan_authoritative:
+        if (
+            pending_reason_out is not None
+            and not first_lodge_without_expiry_bound
+        ):
+            pending_reason_out.append(
+                successor_scan_pending_reason
+                or "requeue_successor_scan_unavailable"
+            )
+        if (
+            not first_lodge_without_expiry_bound
+            and _requeue_intent_age_s(intent) is not None
+        ):
+            return False
 
     failure_kind = _requeue_failure_kind(record, tail)
     effective_account = record.get("effective_account")
@@ -14681,6 +14808,7 @@ def _mark_claim_worker_dead(
     queue_dir: Path | None = None,
     stale_s: float = 0.0,
     refusal_out: list[_ReconcileRefusal] | None = None,
+    pending_reason_out: list[str] | None = None,
 ) -> bool:
     """Terminalize a claim/ledger orphan. Sets record ``state`` (not only
     ``terminal_state``) so ``goalflight_status.py --wait`` resolves (b-065 B).
@@ -14767,6 +14895,7 @@ def _mark_claim_worker_dead(
             fresh,
             queue_dir=queue_dir,
             tail=tail,
+            pending_reason_out=pending_reason_out,
         ):
             return False
         if claim is not None:
