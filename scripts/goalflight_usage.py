@@ -318,6 +318,17 @@ def _fields_remaining(
         unit = None
 
     if remaining is not None and limit is not None:
+        if used_percent is None and limit > 0:
+            # A count-based reader ("92 of 100 left") pins the consumed share
+            # just as firmly as one that reports a percentage, so the operator-
+            # facing USED column should not go blank for it.
+            #   used% = 100 * (limit - remaining) / limit
+            #         = 100 * (100 - 92) / 100 = 8%
+            # Units: (count - count) / count is dimensionless; *100 is percent.
+            # Limiting cases: remaining == limit -> 0% used; remaining == 0 ->
+            # 100% used. limit <= 0 is degenerate (nothing to be a share OF), so
+            # it stays None and the column renders blank rather than dividing.
+            used_percent = 100.0 * (limit - remaining) / limit
         return (
             f"{_format_number(remaining)}/{_format_number(limit)}",
             remaining,
@@ -415,8 +426,16 @@ def _percent_remaining(used_percent: float) -> float:
     return min(100.0, max(0.0, 100.0 - used_percent))
 
 
+def _used_text(used: float | None) -> str | None:
+    if used is None:
+        return None
+    return f"{_format_number(min(100.0, max(0.0, used)))}%"
+
+
 def _usage_remaining(
     usage: object,
+    *,
+    render: str = "remaining",
 ) -> tuple[str | None, float | None, float | None]:
     """Return display text, numeric remaining, and numeric used percent.
 
@@ -424,9 +443,14 @@ def _usage_remaining(
     constraint — the tightest remaining/limit ratio across the cycle budget
     and every rate window. Engines that report no windows keep the
     cycle-only reading unchanged.
+
+    ``render="used"`` returns the consumed-side text for the SAME binding
+    constraint, carrying the same window annotation. The numeric elements are
+    identical either way, so a caller that needs both columns asks twice rather
+    than duplicating the binding pick and drifting from it.
     """
     if isinstance(usage, str):
-        return _label(usage), None, None
+        return (None if render == "used" else _label(usage)), None, None
     if not isinstance(usage, Mapping):
         return None, None, None
 
@@ -434,11 +458,18 @@ def _usage_remaining(
     if isinstance(windows, list) and windows:
         binding = _pick_binding(usage)
         text, remaining_value, used = _fields_remaining(binding)
+        if render == "used":
+            text = _used_text(used)
         if text and binding.get("is_window"):
             text = _with_window_annotation(text, binding)
         return text, remaining_value, used
 
-    return _fields_remaining(_constraint_from_mapping(usage, is_window=False))
+    text, remaining_value, used = _fields_remaining(
+        _constraint_from_mapping(usage, is_window=False)
+    )
+    if render == "used":
+        text = _used_text(used)
+    return text, remaining_value, used
 
 
 def _apply_reported_headroom(
@@ -650,6 +681,10 @@ def _normalize_kimi(record: Mapping[str, Any], now: float) -> dict[str, object]:
         )
 
     remaining, remaining_value, used = _usage_remaining(usage)
+    # This reader speaks in counts, so the consumed share is derived rather
+    # than reported; ask for the same binding constraint rendered used-side so
+    # the column matches codex and grok instead of showing what is LEFT.
+    used_text, _, _ = _usage_remaining(usage, render="used")
     flags = ()
     if (remaining_value is not None and remaining_value <= 0) or (
         used is not None and used >= 100
@@ -659,6 +694,7 @@ def _normalize_kimi(record: Mapping[str, Any], now: float) -> dict[str, object]:
         "moonshot",
         account=account,
         remaining=remaining or "unknown",
+        used=used_text,
         reset_at=reset_at,
         flags=flags,
     )

@@ -152,7 +152,13 @@ def test_exhausted_rate_window_is_the_binding_reading(new_york_tz):
 
     now = datetime.fromisoformat("2026-08-18T16:29:00+00:00").timestamp()
     rendered = usage.render_table([row], now=now)
-    assert "0/100" in rendered
+    # The USED column renders the consumed side: a window with 0 of 100 left is
+    # 100% used. The remaining-side "0/100" stays in the payload (asserted
+    # above) for --json consumers and the binding-constraint ranking.
+    assert "100%" in rendered
+    # The cycle's 65/100 would render as 35% used; the binding window must win
+    # on the rendered side too, not just in the payload.
+    assert "35%" not in rendered
     assert "5h window" in rendered
     assert "12:47" in rendered
     assert "⛔wall" in rendered
@@ -232,6 +238,77 @@ def test_neither_exhausted_uses_tighter_constraint_and_its_reset():
     assert "5h window" in window_tighter["remaining"]
     assert window_tighter["reset_at"] == sooner_ts
     assert window_tighter["flags"] == []
+
+
+def test_count_based_reading_renders_used_not_remaining():
+    """A remaining/limit reader must still fill the operator-facing USED column.
+
+    Moonshot reports counts (92 of 100 requests left), not a used percent, so
+    the normalizer had no `used` to pass and the row rendered "92/100" under a
+    header that says USED -- reading as 92% consumed when the truth is 8%.
+    used% = 100 * (limit - remaining) / limit = 100 * (100 - 92) / 100 = 8%.
+    """
+    row = _kimi_usage_row(
+        {
+            "remaining": 99,
+            "limit": 100,
+            "resetTime": "2026-09-23T04:47:56Z",
+            "windows": [
+                {
+                    "duration": 300,
+                    "timeUnit": "TIME_UNIT_MINUTE",
+                    "remaining": 92,
+                    "limit": 100,
+                    "resetTime": "2026-09-21T20:47:56Z",
+                }
+            ],
+        }
+    )
+    # remaining is the payload/ranking field and must not move.
+    assert row["remaining"].startswith("92/100")
+    assert row["used"].startswith("8%")
+    # The window annotation belongs on whichever column is rendered.
+    assert "5h window" in row["used"]
+
+
+def test_used_percent_is_scaled_by_limit_not_copied_from_the_count():
+    """limit=100 makes the count and the percent coincide; a real limit must not.
+
+    375 of 500 remaining is 125 used, i.e. 100 * 125 / 500 = 25% -- a reading
+    that copied the count would say 125%, and one that copied remaining 75%.
+    """
+    row = _kimi_usage_row({"remaining": 375, "limit": 500, "resetTime": None})
+    assert row["remaining"].startswith("375/500")
+    assert row["used"] == "25%"
+
+
+def test_used_percent_follows_the_binding_constraint():
+    """The used reading must track the same constraint the row already reports."""
+    row = _kimi_usage_row(
+        {
+            "remaining": 80,
+            "limit": 100,
+            "resetTime": "2026-08-19T04:47:00Z",
+            "windows": [
+                {
+                    "duration": 300,
+                    "timeUnit": "TIME_UNIT_MINUTE",
+                    "remaining": 50,
+                    "limit": 100,
+                    "resetTime": "2026-08-18T16:47:56Z",
+                }
+            ],
+        }
+    )
+    # The window binds at 50/100, so used is 50% -- not the cycle's 20%.
+    assert row["remaining"].startswith("50/100")
+    assert row["used"].startswith("50%")
+
+
+def test_zero_limit_yields_no_used_reading_rather_than_dividing():
+    """A degenerate limit must leave the column blank, never raise or show 0%."""
+    row = _kimi_usage_row({"remaining": 0, "limit": 0, "resetTime": None})
+    assert row["used"] is None
 
 
 def test_binding_constraint_is_the_minimum_across_every_window():
