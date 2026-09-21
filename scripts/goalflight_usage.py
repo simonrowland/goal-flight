@@ -1187,6 +1187,29 @@ def _apply_headroom_to_row(
         # Do not inherit a wall from a dispatch record we refused to promote,
         # and do not invent a healthy percentage.
         flags = [flag for flag in flags if flag != "walled"]
+        # An unmeasurable probe means "could not measure", not "not usable".
+        # A dispatch that SERVED is positive evidence this seat works, and
+        # "unavailable" is the same text a missing or broken reader produces,
+        # so leaving it there makes a healthy account indistinguishable from a
+        # dead one and hides real capacity at the moment it is most needed.
+        #
+        # The verdict stays UNKNOWN on purpose: headroom is still unmeasured
+        # and drain gating depends on that reading. Only the rendered row
+        # changes, and it never gains a percentage -- service proves the seat
+        # is usable, not how much is left in it.
+        #
+        # Deliberately narrow. An exhaustion record is still never promoted
+        # (see headroom_verdict), and an auth failure stays actionable however
+        # recently a dispatch served, because a credential that lapsed after
+        # that dispatch is exactly the case the operator must still be told
+        # about. Only the plain "could not measure" shape is rewritten.
+        if (
+            _measurable_dispatch_claim(dispatch) == HEADROOM_HEALTHY
+            and str(row.get("remaining") or "") == "unavailable"
+        ):
+            row["remaining"] = "usable · quota unreadable"
+            row["used"] = None
+            flags = [flag for flag in flags if flag != "unavailable"]
     row["flags"] = flags
 
 

@@ -979,6 +979,69 @@ def test_conflict_requires_dispatch_evidence_newer_than_probe():
     assert usage.headroom_verdict(reported, older_exhausted)["verdict"] == "healthy"
 
 
+def _row_after_headroom(remaining, flags, dispatch):
+    """Run one normalized row through the headroom arbitration."""
+    row = usage._row("grok", account="seat", remaining=remaining, reset_at=None, flags=flags)
+    verdict_info = usage.headroom_verdict(
+        {"state": "unavailable", "observed_at": 1_787_000_000.0}
+        if remaining == "unavailable"
+        else {"state": "auth_broken", "observed_at": 1_787_000_000.0},
+        dispatch,
+    )
+    usage._apply_headroom_to_row(row, verdict_info, dispatch)
+    return row, verdict_info
+
+
+def test_unreadable_quota_plus_recent_service_is_not_rendered_unavailable():
+    """A seat that demonstrably served must not read as unavailable.
+
+    An unmeasurable probe means "could not measure", not "not usable". When a
+    dispatch served recently we hold positive evidence the seat works, and
+    "unavailable" is the same text used for a missing or broken reader -- so a
+    healthy account becomes indistinguishable from a dead one, and its capacity
+    is hidden exactly when it is most needed.
+    """
+    served = {"state": "served", "observed_at": 1_787_000_600.0}
+    row, verdict_info = _row_after_headroom("unavailable", ("unavailable",), served)
+
+    # The gating verdict deliberately stays UNKNOWN: we still cannot measure
+    # headroom, and drain gating depends on that. Only the display changes.
+    assert verdict_info["verdict"] == "unknown"
+    assert row["remaining"] != "unavailable"
+    assert "unavailable" not in row["flags"]
+    # No invented percentage -- we know it works, not how much is left.
+    assert row["used"] is None
+
+
+def test_unreadable_quota_without_service_evidence_stays_unavailable():
+    """With nothing positive to go on, the row must keep saying unavailable."""
+    row, verdict_info = _row_after_headroom("unavailable", ("unavailable",), None)
+    assert verdict_info["verdict"] == "unknown"
+    assert row["remaining"] == "unavailable"
+    assert "unavailable" in row["flags"]
+
+
+def test_unreadable_quota_plus_exhaustion_record_does_not_become_usable():
+    """Guards the existing intent: a dispatch WALL is still never promoted."""
+    exhausted = {"state": "quota_exhausted", "observed_at": 1_787_000_600.0}
+    row, verdict_info = _row_after_headroom("unavailable", ("unavailable",), exhausted)
+    assert verdict_info["verdict"] == "unknown"
+    assert "walled" not in row["flags"]
+    assert row["remaining"] == "unavailable"
+
+
+def test_recent_service_does_not_mask_a_broken_credential():
+    """auth-broken is actionable regardless of what served ten minutes ago.
+
+    A token that lapsed after a dispatch served is exactly the case where the
+    operator must still be told to log in; silencing it would hide real work.
+    """
+    served = {"state": "served", "observed_at": 1_787_000_600.0}
+    row, _ = _row_after_headroom("needs-login", ("auth-broken",), served)
+    assert row["remaining"] == "needs-login"
+    assert "auth-broken" in row["flags"]
+
+
 def test_claude_reader_invoked_with_skip_tui(tmp_path):
     """The claude sweep's full-TUI default exceeds the reader timeout; the
     aggregator must request the fast login-health pass (t-189)."""
