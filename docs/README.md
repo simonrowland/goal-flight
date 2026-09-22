@@ -10,7 +10,8 @@ root.
 | [architecture.md](architecture.md) | Portable core, runtime scripts, capacity, and validation boundaries |
 | [fleet.md](fleet.md) | Multi-node SSH fleet: bootstrap, dispatch, watch, reconcile |
 | [hosts/cursor.md](hosts/cursor.md) | Cursor install, MCP, and project-local setup |
-| [hosts/grok-bot.md](hosts/grok-bot.md) | Grok Bot controller wrapper, workflows-library install, and dual doorbell (listen + durable wake-webhook) |
+| [hosts/grok-bot.md](hosts/grok-bot.md) | Grok Bot controller wrapper, workflows-library install, dual doorbell, and journal-host mail RPC |
+| [hosts/mail-rpc.md](hosts/mail-rpc.md) | Authenticated peek/post/relay against the journal host (no second store) |
 | [hosts/linux.md](hosts/linux.md) | Linux/WSL dispatch baseline, OS sandbox scope, and filesystem caveats |
 | [hosts/opencode.md](hosts/opencode.md) | OpenCode install, skills, MCP, and bash-tail workers |
 
