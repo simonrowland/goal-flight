@@ -579,6 +579,268 @@ def test_canonical_home_resume_uses_shared_source_without_rebuilding_it(
     assert child["codex_session_id"] == OTHER_CANONICAL_SESSION_ID
 
 
+def _tree_snapshot(root: Path) -> dict[str, tuple[int, bytes | None]]:
+    """Every path under ``root`` mapped to (mode, bytes); directories carry None."""
+    snapshot: dict[str, tuple[int, bytes | None]] = {}
+    for path in sorted(root.rglob("*")):
+        rel = str(path.relative_to(root))
+        mode = path.lstat().st_mode
+        snapshot[rel] = (mode, None if path.is_dir() else path.read_bytes())
+    return snapshot
+
+
+def _canonical_resume_argv(
+    tmp_path: Path,
+    *,
+    parent_id: str,
+    child_id: str,
+    home: Path,
+    prompt: Path,
+    session_id: str,
+    account: str | None = None,
+) -> list[str]:
+    argv = [
+        "--agent",
+        "codex",
+        "--unregistered-forced",
+        "--shape",
+        "bash",
+        "--dispatch-id",
+        child_id,
+        "--cwd",
+        str(tmp_path),
+        "--prompt-file",
+        str(prompt),
+        "--tail",
+        str(tmp_path / f"{child_id}.tail"),
+        "--status-json",
+        str(tmp_path / f"{child_id}.status.json"),
+        "--parent-dispatch-id",
+        parent_id,
+        "--codex-session-id",
+        session_id,
+        "--codex-resume-home",
+        str(home),
+        "--codex-home-owner-dispatch-id",
+        parent_id,
+        "--launch-detached",
+    ]
+    if account is not None:
+        argv += ["--account", account]
+    return argv
+
+
+def _write_canonical_parent(
+    tmp_path: Path,
+    *,
+    parent_id: str,
+    account: str,
+    with_rollout: bool = True,
+) -> tuple[Path, Path | None]:
+    home = _canonical_codex_home(tmp_path, account)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "auth.json").write_text(f"{account}-login", encoding="utf-8")
+    rollout = None
+    if with_rollout:
+        rollout = _write_measured_rollout(
+            home, OTHER_CANONICAL_SESSION_ID, "2026-09-11T09-06-40"
+        )
+    # Another session this account ran. It belongs to the account, not to the
+    # resumed dispatch, and must not follow the resume anywhere.
+    _write_measured_rollout(home, CANONICAL_SESSION_ID, "2026-09-10T08-00-00")
+    record = _write_parent_record(
+        tmp_path,
+        dispatch_id=parent_id,
+        session_id=OTHER_CANONICAL_SESSION_ID,
+        home=home,
+    )
+    record["effective_account"] = account
+    L.write_record(record)
+    return home, rollout
+
+
+def _configure_account(tmp_path: Path, account: str) -> Path:
+    """Give an account its canonical home, as a configured account has."""
+    home = _canonical_codex_home(tmp_path, account)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "auth.json").write_text(f"{account}-login", encoding="utf-8")
+    return home
+
+
+def test_cross_account_resume_copies_rollout_out_of_canonical_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A walled account's canonical-home session resumes on another account.
+
+    A canonical account home is shared state -- that account's login and every
+    session it has run -- so the resume must COPY the one rollout into a fresh
+    home for the new account and leave the source byte-identical. Real case:
+    codex-31568-1790103580 walled on d78343 after 21 commits and its resume on
+    cf9f50 was refused outright.
+    """
+    parent_id = "codex-31568-1790103580"
+    child_id = "cross-account-canonical-child"
+    source, rollout = _write_canonical_parent(
+        tmp_path, parent_id=parent_id, account="d78343"
+    )
+    assert rollout is not None
+    target_account_home = _configure_account(tmp_path, "cf9f50")
+    target_account_before = _tree_snapshot(target_account_home)
+    before = _tree_snapshot(source)
+    prompt = tmp_path / "resume.md"
+    prompt.write_text("Continue this exact session.\n", encoding="utf-8")
+    spawn_calls, _leases = _stub_detached_runtime(monkeypatch)
+    target = _dispatch_home(tmp_path, child_id)
+    resolve_calls: list[tuple[str | None, str]] = []
+
+    def resolve(
+        _project_root: Path, explicit_account: str | None, dispatch_id: str
+    ) -> tuple[str, str]:
+        resolve_calls.append((explicit_account, dispatch_id))
+        target.mkdir(parents=True)
+        (target / "auth.json").write_text(f"{explicit_account}-login", encoding="utf-8")
+        return str(target), str(explicit_account)
+
+    monkeypatch.setattr(D, "resolve_codex_home", resolve)
+    monkeypatch.setattr(
+        D,
+        "_rebuild_codex_resume_home",
+        lambda *_a, **_k: pytest.fail(
+            "a canonical home must never be renamed, rebuilt, or deleted"
+        ),
+    )
+
+    rc = D.main(
+        _canonical_resume_argv(
+            tmp_path,
+            parent_id=parent_id,
+            child_id=child_id,
+            home=source,
+            prompt=prompt,
+            session_id=OTHER_CANONICAL_SESSION_ID,
+            account="cf9f50",
+        )
+    )
+
+    assert rc == 0
+    # The new account's home was built for THIS dispatch, pinned to cf9f50.
+    assert resolve_calls == [("cf9f50", child_id)]
+    # The source account's canonical home is untouched, bytes and modes alike.
+    assert _tree_snapshot(source) == before
+    worker = next(call for call in spawn_calls if call["label"] == "worker")
+    assert worker["env"]["CODEX_HOME"] == str(target)
+    copied = S.rollout_path(target, OTHER_CANONICAL_SESSION_ID)
+    assert copied is not None
+    assert copied.read_bytes() == rollout.read_bytes()
+    # Only the resumed session travels; the account's other sessions stay put.
+    assert S.rollout_path(target, CANONICAL_SESSION_ID) is None
+    child = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
+    assert child["codex_home"] == str(target)
+    assert child["effective_account"] == "cf9f50"
+    assert child["codex_session_id"] == OTHER_CANONICAL_SESSION_ID
+    # The child owns its new home, so the resumed dispatch is itself resumable.
+    assert child["codex_home_owner_dispatch_id"] == child_id
+    resumable_home, owner = D._codex_resume_home(child, child_id)
+    assert resumable_home == target.resolve()
+    assert owner == child_id
+    # The new account's own canonical home is not written either.
+    assert _tree_snapshot(target_account_home) == target_account_before
+
+
+def test_same_account_canonical_resume_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Naming the parent's own account keeps the shared-source path exactly."""
+    parent_id = "codex-48933-1789132000"
+    child_id = "same-account-canonical-child"
+    source, _rollout = _write_canonical_parent(
+        tmp_path, parent_id=parent_id, account="4c9435"
+    )
+    before = _tree_snapshot(source)
+    prompt = tmp_path / "resume.md"
+    prompt.write_text("Continue this exact session.\n", encoding="utf-8")
+    spawn_calls, _leases = _stub_detached_runtime(monkeypatch)
+    monkeypatch.setattr(
+        D,
+        "resolve_codex_home",
+        lambda *_a, **_k: pytest.fail("same-account resume must not build a home"),
+    )
+    monkeypatch.setattr(
+        D,
+        "_rebuild_codex_resume_home",
+        lambda *_a, **_k: pytest.fail("a canonical home must not be rebuilt"),
+    )
+
+    rc = D.main(
+        _canonical_resume_argv(
+            tmp_path,
+            parent_id=parent_id,
+            child_id=child_id,
+            home=source,
+            prompt=prompt,
+            session_id=OTHER_CANONICAL_SESSION_ID,
+            account="4c9435",
+        )
+    )
+
+    assert rc == 0
+    worker = next(call for call in spawn_calls if call["label"] == "worker")
+    assert worker["env"]["CODEX_HOME"] == str(source)
+    child = json.loads(L.record_path(child_id).read_text(encoding="utf-8"))
+    assert child["codex_home"] == str(source)
+    assert child["effective_account"] == "4c9435"
+    assert child["codex_home_owner_dispatch_id"] == parent_id
+    assert _tree_snapshot(source) == before
+    assert not _dispatch_home(tmp_path, child_id).exists()
+
+
+def test_cross_account_canonical_resume_without_rollout_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No rollout, no resume: refuse before building anything for the new account."""
+    parent_id = "codex-31568-1790103580"
+    child_id = "cross-account-no-rollout-child"
+    source, _rollout = _write_canonical_parent(
+        tmp_path, parent_id=parent_id, account="d78343", with_rollout=False
+    )
+    _configure_account(tmp_path, "cf9f50")
+    before = _tree_snapshot(source)
+    prompt = tmp_path / "resume.md"
+    prompt.write_text("Continue this exact session.\n", encoding="utf-8")
+    _stub_detached_runtime(monkeypatch)
+    monkeypatch.setattr(
+        D,
+        "resolve_codex_home",
+        lambda *_a, **_k: pytest.fail(
+            "no home may be built for the new account before the rollout is proven"
+        ),
+    )
+
+    rc = D.main(
+        _canonical_resume_argv(
+            tmp_path,
+            parent_id=parent_id,
+            child_id=child_id,
+            home=source,
+            prompt=prompt,
+            session_id=OTHER_CANONICAL_SESSION_ID,
+            account="cf9f50",
+        )
+    )
+
+    assert rc == 64
+    error = capsys.readouterr().err
+    assert "rollout missing" in error
+    assert OTHER_CANONICAL_SESSION_ID in error
+    assert "Traceback" not in error
+    assert _tree_snapshot(source) == before
+    assert not _dispatch_home(tmp_path, child_id).exists()
+
+
 def test_launch_without_recordable_codex_home_warns_not_resumable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

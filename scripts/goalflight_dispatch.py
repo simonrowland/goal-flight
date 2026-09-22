@@ -4725,6 +4725,83 @@ def _rebuild_codex_resume_home(
     return str(expected_home), effective_account
 
 
+def _seed_codex_resume_home_from_canonical(
+    project_root: Path,
+    parent_dispatch_id: str,
+    source_home: Path,
+    session_id: str,
+    *,
+    dispatch_id: str,
+    account: str,
+) -> tuple[str, str]:
+    """Resume a canonical-home session on another account from a rollout COPY.
+
+    _rebuild_codex_resume_home is only safe for a per-dispatch home: it renames
+    the home aside, rebuilds it in place, moves sessions/ across and deletes
+    the original. A canonical account home is shared state -- that account's
+    login and every session it has run -- so it must never take that path.
+    Instead the resumed worker gets a fresh per-dispatch home for the target
+    account, built by the ordinary seat path and keyed by THIS dispatch, and a
+    byte copy of the one rollout it resumes at the same path relative to the
+    home, which is where `codex exec resume <session>` looks. The source home
+    is only read. The prompt-token cache does not carry over; after a quota
+    wall it is stale anyway.
+    """
+    rollout = goalflight_codex_sessions.rollout_path(source_home, session_id)
+    if rollout is None:
+        raise DispatchUsageError(
+            f"rollout missing for dispatch {parent_dispatch_id}: session "
+            f"{session_id} under {source_home / 'sessions'}"
+        )
+    source = source_home.resolve(strict=False)
+    try:
+        relative = rollout.resolve(strict=True).relative_to(source)
+    except (OSError, ValueError) as exc:
+        raise DispatchUsageError(
+            f"rollout for dispatch {parent_dispatch_id} is not inside its "
+            f"recorded home {source_home}"
+        ) from exc
+    # The home must be exactly dispatch-homes/<this dispatch>: that is the only
+    # shape _codex_resume_home accepts later, so the resumed dispatch stays
+    # resumable, and it can never alias the source account's canonical home.
+    expected_home = (_codex_dispatch_homes_dir() / dispatch_id).resolve(strict=False)
+    built_home, built_account = resolve_codex_home(project_root, account, dispatch_id)
+    try:
+        if (
+            built_home is None
+            or built_account != account
+            or Path(built_home).resolve(strict=False) != expected_home
+        ):
+            raise DispatchUsageError(
+                f"could not build a codex home for account {account} to resume "
+                f"dispatch {parent_dispatch_id}"
+            )
+        destination = expected_home / relative
+        if destination.exists():
+            raise DispatchUsageError(
+                f"resume home for {dispatch_id} already holds a rollout at "
+                f"{destination}"
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        partial = destination.with_name(
+            f"{destination.name}.partial-{uuid.uuid4().hex}"
+        )
+        try:
+            shutil.copy2(rollout, partial)
+            os.replace(partial, destination)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                partial.unlink()
+            raise
+    except BaseException:
+        # Keyed by this dispatch id, so it can only remove the home just built
+        # for this resume, never the source account's canonical home.
+        if built_home is not None:
+            cleanup_codex_dispatch_home(dispatch_id)
+        raise
+    return str(built_home), str(built_account)
+
+
 def _cmd_resume(argv: list[str]) -> int:
     parser = _TerseArgumentParser(
         prog=f"{Path(sys.argv[0]).name} resume",
@@ -18705,13 +18782,29 @@ def main(argv: list[str] | None = None) -> int:
                         and isinstance(recorded_parent_home, str)
                         and Path(recorded_parent_home).expanduser() == canonical_home
                     )
-                    if source_is_canonical:
-                        if args.account and args.account != parent_account:
-                            raise DispatchUsageError(
-                                f"dispatch {args.parent_dispatch_id} canonical codex "
-                                f"home is bound to account {parent_account}; cannot "
-                                f"resume it with account {args.account}"
+                    if source_is_canonical and args.account and (
+                        args.account != parent_account
+                    ):
+                        # Cross-account resume of a canonical-home session:
+                        # copy the rollout into a fresh home for the new
+                        # account; the source account's home is only read.
+                        codex_dispatch_home, effective_account = (
+                            _seed_codex_resume_home_from_canonical(
+                                project_root,
+                                args.parent_dispatch_id,
+                                resume_home,
+                                args.codex_session_id,
+                                dispatch_id=args.dispatch_id,
+                                account=args.account,
                             )
+                        )
+                        # The new home is dispatch-homes/<this dispatch>, so this
+                        # dispatch owns it; recording the parent as owner would
+                        # make the resumed dispatch itself unresumable.
+                        codex_home_owner_dispatch_id = args.dispatch_id
+                        args.codex_home_owner_dispatch_id = args.dispatch_id
+                        summary_head["codex_home_owner_dispatch_id"] = args.dispatch_id
+                    elif source_is_canonical:
                         codex_dispatch_home = str(resume_home)
                         effective_account = parent_account
                     else:
