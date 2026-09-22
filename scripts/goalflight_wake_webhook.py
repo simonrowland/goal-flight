@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Best-effort outbound wake nudge for controller mail harvest.
+"""Durable outbound wake nudge for listen-visible harvest.
 
 This is not a second inbox and not a mail transport. The journal remains
 durable truth. When a waking delivery event becomes visible (the same
@@ -7,7 +7,16 @@ projection ``listen`` already waits on), an operator may optionally HTTP
 POST a small JSON nudge to an external host so a Grok Bot webhook routine
 can wake without depending on a flaky Mac local-exec ``listen`` session.
 
-Failure to POST never raises to the caller. Config is env/file only.
+Either doorbell may fire. Duplicate wakes are OK (the controller peeks
+the journal and stays quiet if nothing is pending). Missing a wake is
+not OK: a configured URL enqueues a journal outbox row in the same
+transaction as projection, then a sender retries until HTTP 2xx or the
+event is no longer listen-visible.
+
+Failure to POST never raises to the caller and never rolls back journal
+commit. Unset URL means zero HTTP and no enqueue (safer: a later-configured
+host does not inherit an unbounded historical outbox). Config is env/file
+only.
 """
 
 from __future__ import annotations
@@ -20,6 +29,8 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
+from typing import Any
 
 
 WAKE_WEBHOOK_URL_ENV = "GOALFLIGHT_WAKE_WEBHOOK_URL"
@@ -35,6 +46,7 @@ AUTH_BEARER = "bearer"
 AUTH_X_WEBHOOK_KEY = "x-webhook-key"
 AUTH_MODES = frozenset({AUTH_BEARER, AUTH_X_WEBHOOK_KEY})
 USER_AGENT = "goal-flight-wake-webhook/1"
+DEFAULT_FLUSH_LIMIT = 8
 
 # Terminal harvest of a worker. ``blocked`` is a finished attempt, not mail.
 _COMPLETE_EVENT_TYPES = frozenset({"result", "blocked"})
@@ -52,6 +64,10 @@ _MAIL_EVENT_TYPES = frozenset(
         "finding",
         "advisory",
     }
+)
+# Supervise / follow Monitor-local pings. They are not journal doorbells.
+_MONITOR_LOCAL_EVENT_TYPES = frozenset(
+    {"heartbeat", "coverage", "next", "frontier", "keepalive"}
 )
 _ATTENTION_STREAM = "attention"
 
@@ -72,6 +88,18 @@ def classify_nudge_kind(event_type: object) -> str:
     if kind in _MAIL_EVENT_TYPES:
         return "mail"
     return "wake"
+
+
+def should_enqueue_delivery(row: Mapping[str, object] | None) -> bool:
+    """True for a listen-visible waking delivery that is not Monitor-local."""
+    if not isinstance(row, Mapping):
+        return False
+    if str(row.get("wake_class") or "") != "waking":
+        return False
+    event_type = str(row.get("event_type") or "").strip()
+    if event_type in _MONITOR_LOCAL_EVENT_TYPES:
+        return False
+    return bool(event_type)
 
 
 def default_config_path() -> Path:
@@ -155,7 +183,7 @@ def load_config() -> WakeWebhookConfig | None:
     )
 
 
-def nudge_payload(row: dict[str, object]) -> dict[str, object]:
+def nudge_payload(row: dict[str, object] | Mapping[str, object]) -> dict[str, object]:
     """Build the nudge body. No mail text, secrets, or task tables."""
     event_type = str(row.get("event_type") or "").strip()
     payload: dict[str, object] = {
@@ -207,7 +235,8 @@ def post_nudge(config: WakeWebhookConfig, payload: dict[str, object]) -> bool:
     try:
         with urllib.request.urlopen(request, timeout=config.timeout_s) as response:
             response.read()
-        return True
+            status = int(getattr(response, "status", 0) or 0)
+        return 200 <= status < 300 or status == 0
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
         print(f"wake-webhook: POST failed: {_safe_reason(exc)}", file=sys.stderr)
         return False
@@ -216,17 +245,88 @@ def post_nudge(config: WakeWebhookConfig, payload: dict[str, object]) -> bool:
         return False
 
 
-def nudge_projected_delivery(row: dict[str, object] | None) -> bool:
-    """Best-effort nudge after a waking delivery becomes listen-visible.
+def _outbox_identity(row: Mapping[str, object]) -> tuple[str, str, str]:
+    return (
+        str(row.get("recipient_label") or ""),
+        str(row.get("origin_node") or ""),
+        str(row.get("event_uuid") or ""),
+    )
 
-    Returns True only when a POST was attempted and the server accepted it.
-    Missing config, quiet events, and transport failures return False.
+
+def flush_due(authority: Any, *, limit: int = DEFAULT_FLUSH_LIMIT) -> dict[str, int]:
+    """Deliver due wake-outbox rows at-least-once. Never raises.
+
+    Marks delivered on HTTP 2xx. Failed POSTs stay pending with bounded
+    backoff. Rows the controller has already drained or withdrawn are
+    abandoned so a stale doorbell cannot retry forever.
+    """
+    summary = {"attempted": 0, "delivered": 0, "retried": 0, "abandoned": 0}
+    config = load_config()
+    if config is None:
+        return summary
+    try:
+        rows = authority.due_wake_webhook_outbox(limit=limit)
+    except Exception as exc:  # noqa: BLE001 — doorbell must not break harvest
+        print(f"wake-webhook: outbox read failed: {_safe_reason(exc)}", file=sys.stderr)
+        return summary
+    for row in rows:
+        recipient, origin, event_id = _outbox_identity(row)
+        if not recipient or not origin or not event_id:
+            continue
+        try:
+            still_visible = authority.wake_webhook_is_listen_visible(row)
+        except Exception:
+            still_visible = True
+        if not still_visible:
+            try:
+                authority.mark_wake_webhook_abandoned(
+                    recipient_label=recipient,
+                    origin_node=origin,
+                    event_uuid=event_id,
+                    reason="no-longer-listen-visible",
+                )
+                summary["abandoned"] += 1
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"wake-webhook: abandon failed: {_safe_reason(exc)}",
+                    file=sys.stderr,
+                )
+            continue
+        summary["attempted"] += 1
+        accepted = post_nudge(config, nudge_payload(row))
+        try:
+            if accepted:
+                authority.mark_wake_webhook_delivered(
+                    recipient_label=recipient,
+                    origin_node=origin,
+                    event_uuid=event_id,
+                )
+                summary["delivered"] += 1
+            else:
+                authority.mark_wake_webhook_retry(
+                    recipient_label=recipient,
+                    origin_node=origin,
+                    event_uuid=event_id,
+                    error="POST failed",
+                )
+                summary["retried"] += 1
+        except Exception as exc:  # noqa: BLE001 — crash between POST and mark may double-wake
+            print(f"wake-webhook: outbox mark failed: {_safe_reason(exc)}", file=sys.stderr)
+    return summary
+
+
+def nudge_projected_delivery(row: dict[str, object] | None) -> bool:
+    """Compatibility gate used by unit tests of classification.
+
+    Harvest uses journal enqueue + ``flush_due``. This helper still
+    refuses quiet / Monitor-local / already-projected rows and does not
+    POST when config is missing.
     """
     if not isinstance(row, dict):
         return False
-    if str(row.get("wake_class") or "") != "waking":
-        return False
     if not row.get("newly_projected"):
+        return False
+    if not should_enqueue_delivery(row):
         return False
     config = load_config()
     if config is None:
