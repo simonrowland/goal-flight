@@ -6,6 +6,14 @@ incremented when meaningful skill behaviour changes.
 
 ## [Unreleased]
 
+### Added
+
+- Journal-host mail RPC (`scripts/goalflight_mail_rpc.py`) so a Grok Bot
+  controller can peek, drain, and post through `goalflight_messages.py`
+  over Tailscale or loopback. Bearer auth, default bind `127.0.0.1:8787`,
+  public `0.0.0.0` / `::` refused without an explicit opt-in. Wake webhooks
+  stay nudge-only. See `docs/hosts/mail-rpc.md`.
+
 ### Changed
 
 - Worker dispatch now launches immediately and reports capacity refusal as

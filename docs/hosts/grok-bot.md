@@ -217,8 +217,11 @@ it as the default.
 **Missed wake is latency, not data loss.** Resume still pulls
 `goalflight_status.py`, `goalflight_task.py next`, and `relay --new`.
 
-This port documents the listen doorbell mapping only. Do not implement a Grok
-Bot-native mail transport.
+Mac local-exec `listen` is the doorbell when that session is up. A controller
+that cannot local-exec or listen reads and posts through the journal-host
+mail RPC ([mail-rpc.md](mail-rpc.md)), which calls `goalflight_messages.py`
+against the same journal. Do not add a second mail store. Wake webhooks stay
+nudge-only.
 
 ## Compaction
 
@@ -362,9 +365,10 @@ promptness until something else wakes it.
 
 Two independent planes, both required for promptness on this host:
 
-1. **Inbox / truth** = the journal on the laptop. Mail bodies, task tables, and
-   secrets never leave that store. `relay` / `advance` are how the controller
-   reads. The operator is not the mailman.
+1. **Inbox / truth** = the journal on the laptop. `relay` / `advance` are how
+   the controller reads. A host that cannot local-exec uses the mail RPC
+   ([mail-rpc.md](mail-rpc.md)) against that same journal. The operator is
+   not the mailman. Wake POSTs still carry no mail body.
 2. **Wake** = how a host without a persistent stdout Monitor gets a turn.
    Portable `listen` (exit-as-wake) and the outbound webhook are *independent*
    alternative doorbells. Claude keeps `supervise` on Monitor; Grok Bot keeps
@@ -377,6 +381,19 @@ wake is not OK.
 **Deafness** is both `listen` unarmed *and* the webhook failing (or unconfigured).
 Re-arm listen and fix the webhook URL. Do not ask the operator to paste mail
 or to tell another session to check mail.
+
+## Mail RPC
+
+When the Grok controller cannot run Mac local-exec `listen`, peek and post
+through `scripts/goalflight_mail_rpc.py` on the journal host (Tailscale or
+loopback). The journal remains the store. The webhook above is still only a
+nudge: it does not carry mail bodies.
+
+Provisioning (generate the token on the journal host, run the daemon, set
+Grok secret-request env `MAIL_RPC_URL` / `MAIL_RPC_TOKEN`) is
+[mail-rpc.md](mail-rpc.md). Startup prompts name those env vars and
+`docs/hosts/mail-rpc.md` only. Never paste token values into chat.
+Template: `configs/grok-bot/mail-rpc.env.example`.
 
 ## Optional outbound wake webhook
 
@@ -464,3 +481,5 @@ POST failure is logged to stderr and recorded on the outbox row; the journal
 delivery write already committed.
 
 Portable listen semantics stay in `protocols/controller-mail.md`.
+Peek and post from a host that cannot local-exec `listen` use the mail RPC
+in [mail-rpc.md](mail-rpc.md). Webhook bodies stay nudge-only.
