@@ -320,6 +320,8 @@ def decision_hint(
         return "done"
     if state == "missing":
         return "investigate"
+    if worker_live is None:
+        return "unknown"
     if state == "wedged":
         return "takeover"
     if state == "failed":
@@ -336,8 +338,6 @@ def decision_hint(
         if retryable:
             return "cooldown_retry"
         return "investigate"
-    if worker_live is None:
-        return "unknown"
     if not worker_live:
         return "takeover"
     if mins is not None and mins > 30:

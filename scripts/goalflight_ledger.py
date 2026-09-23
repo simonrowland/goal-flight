@@ -315,6 +315,12 @@ def compare_process_identities(
         actual_lstart = current_identity.get("lstart")
         expected_start_token = expected_identity.get("start_token")
         actual_start_token = current_identity.get("start_token")
+        # A changed legacy lstart still proves PID reuse even when the old
+        # record has no fine-grained start token. Matching lstart remains
+        # indeterminate below; status-only consumers may treat it as
+        # alive-probable, but destructive callers must not claim ownership.
+        if expected_lstart and actual_lstart and actual_lstart != expected_lstart:
+            return False, "pid_reused_lstart"
         if not expected_start_token or not actual_start_token:
             # lstart has only second-granularity wall-clock precision and is
             # not a process-generation identity. Old records remain readable,
@@ -322,8 +328,6 @@ def compare_process_identities(
             return True, "identity_indeterminate"
         if actual_start_token != expected_start_token:
             return False, "pid_reused_start_token"
-        if expected_lstart and actual_lstart and actual_lstart != expected_lstart:
-            return False, "pid_reused_lstart"
         # exec(2) preserves the process generation while replacing comm.
         return True, "live"
     return True, "identity_indeterminate"

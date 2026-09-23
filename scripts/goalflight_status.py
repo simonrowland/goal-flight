@@ -1440,9 +1440,15 @@ def terminal_marker_done_code(
     *,
     worker_alive: bool | None = None,
 ) -> int | None:
-    """Return the shared marker/liveness verdict, or None without a marker."""
-    if not _record_has_terminal_marker(record):
+    """Return the marker verdict, or None without a validated terminal marker."""
+    marker = _record_marker_info(record)
+    if marker is None:
         return None
+    # A validated success marker is the worker's completion evidence. Current
+    # process liveness still gates destructive actions, but cannot keep --wait
+    # open after the worker has signed off.
+    if marker.get("kind") in _OUTPUT_TAIL_SUCCESS_MARKERS:
+        return 0
     # An attention marker resolves terminal WHETHER OR NOT the worker is alive.
     # A worker parked on USER-CONFIRM:/USER-NEED:/BLOCKED: is alive *because* it
     # is waiting for the controller, so treating liveness as a contradiction --

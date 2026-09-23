@@ -256,7 +256,7 @@ def test_fleet_pid_identity_uses_fine_token(monkeypatch, capsys) -> None:
     assert payload["identity_reason"] == "pid_reused_start_token"
 
 
-def test_fleet_partial_identity_without_start_token_is_unknown(monkeypatch, capsys) -> None:
+def test_fleet_partial_identity_lstart_mismatch_is_reused(monkeypatch, capsys) -> None:
     partial = base64.b64encode(json.dumps({"pid": PID}).encode("utf-8")).decode(
         "ascii"
     )
@@ -279,8 +279,8 @@ def test_fleet_partial_identity_without_start_token_is_unknown(monkeypatch, caps
 
     assert goalflight_fleet_launch_detached._pid_identity(args) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["alive"] is None
-    assert payload["identity_reason"] == "identity_indeterminate"
+    assert payload["alive"] is False
+    assert payload["identity_reason"] == "pid_reused_lstart"
 
 
 def test_steer_liveness_warning_preserves_legacy_lstart_evidence(monkeypatch) -> None:
@@ -299,7 +299,7 @@ def test_steer_liveness_warning_preserves_legacy_lstart_evidence(monkeypatch) ->
     reused = _identity(start_token=None, lstart="actual process start", comm="node")
     monkeypatch.setattr(goalflight_ledger, "process_identity", lambda _pid: reused)
     warning = goalflight_dispatch._worker_liveness_warning(record)
-    assert warning and "identity indeterminate" in warning
+    assert warning and "pid_reused_lstart" in warning
 
 
 def test_lstart_without_fine_token_is_readable_but_not_confirmed(monkeypatch) -> None:
@@ -341,6 +341,7 @@ def test_lstart_without_fine_token_is_readable_but_not_confirmed(monkeypatch) ->
     )
 
     legacy_record = {
+        "dispatch_id": "legacy-live",
         "state": "watcher_stopped",
         "worker_pid": PID,
         "worker_identity": identity,
@@ -362,7 +363,7 @@ def test_lstart_without_fine_token_is_readable_but_not_confirmed(monkeypatch) ->
         **legacy_record,
         "terminal_marker": {"kind": "COMPLETE", "text": "legacy-live — done"},
     }
-    assert goalflight_status.done_code(marked) == 1
+    assert goalflight_status.done_code(marked) == 0
 
 
 def test_fine_start_token_survives_snapshot_and_watcher_projection(monkeypatch) -> None:

@@ -152,10 +152,11 @@ def test_missing_identity_does_not_claim_pid_ownership() -> None:
 
 
 def test_unknown_liveness_does_not_suggest_takeover() -> None:
-    assert_eq("unknown liveness hint", summary.decision_hint("running", None, 1), "unknown")
+    for state in ("running", "liveness_indeterminate", "idle_timeout", "wedged"):
+        assert_eq(f"unknown {state} liveness hint", summary.decision_hint(state, None, 1), "unknown")
 
 
-def test_confirmed_live_worker_with_scraped_complete_stays_running_wait() -> None:
+def test_confirmed_live_worker_with_scraped_complete_is_done() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-summary-live-marker-") as d:
         base = Path(d)
         state_dir = base / "state"
@@ -176,7 +177,7 @@ def test_confirmed_live_worker_with_scraped_complete_stays_running_wait() -> Non
                 "state": "running",
                 "worker_pid": 4242,
                 "tail_path": str(tail),
-                "terminal_marker": {"kind": "COMPLETE", "text": "", "line": 2},
+                "terminal_marker": {"kind": "COMPLETE", "text": "live-marker — done", "line": 2},
             },
         )
 
@@ -186,9 +187,9 @@ def test_confirmed_live_worker_with_scraped_complete_stays_running_wait() -> Non
             lambda: summary.summarize("live-marker", state_dir),
         )
 
-    assert_eq("live scraped marker state", payload["state"], "running")
-    assert_eq("live scraped marker hint", payload["decision_hint"], "wait")
-    assert_eq("live scraped marker remains diagnostic", payload["last_marker"], "COMPLETE")
+    assert_eq("live scraped marker state", payload["state"], "complete")
+    assert_eq("live scraped marker hint", payload["decision_hint"], "done")
+    assert_eq("live scraped marker", payload["last_marker"], "COMPLETE")
 
 
 def test_summary_agrees_with_status_tail_reconciled_complete() -> None:
@@ -374,7 +375,7 @@ def main() -> None:
         test_dead_worker_complete_tail_reads_complete,
         test_recycled_pid_identity_mismatch_is_not_alive,
         test_missing_identity_does_not_claim_pid_ownership,
-        test_confirmed_live_worker_with_scraped_complete_stays_running_wait,
+        test_confirmed_live_worker_with_scraped_complete_is_done,
         test_summary_agrees_with_status_tail_reconciled_complete,
     ]
     for test in tests:
