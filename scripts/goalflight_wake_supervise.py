@@ -2029,6 +2029,50 @@ class RealChild:
     output: str = ""  # diagnostic: stderr + structured child-exit reasons
 
 
+class _JournalWALHolder:
+    """Keep WAL sidecars alive without pinning a read transaction."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.connection: sqlite3.Connection | None = None
+        self._identity: tuple[int, int] | None = None
+        self.refresh()
+
+    def close(self) -> None:
+        connection, self.connection = self.connection, None
+        self._identity = None
+        if connection is not None:
+            connection.close()
+
+    def refresh(self) -> None:
+        connection = None
+        try:
+            stat = self.path.stat()
+            identity = (stat.st_dev, stat.st_ino)
+            if self.connection is not None and self._identity == identity:
+                return
+            self.close()
+            connection = sqlite3.connect(
+                f"{self.path.as_uri()}?mode=rw", uri=True,
+                timeout=0, isolation_level=None,
+            )
+            connection.execute("PRAGMA query_only = ON")
+            # connect() alone is lazy in SQLite too. Finish a schema read to
+            # attach to the WAL, then leave no statement or transaction open.
+            connection.execute("SELECT rootpage FROM sqlite_schema LIMIT 1").fetchall()
+            stat = self.path.stat()
+            if (stat.st_dev, stat.st_ino) != identity:
+                return
+            self.connection, connection = connection, None
+            self._identity = identity
+        except (OSError, sqlite3.Error):
+            # No contention wait or bootstrap here: retry on the next tick.
+            self.close()
+        finally:
+            if connection is not None:
+                connection.close()
+
+
 class RealHost:
     """Spawn coverage_rearm commands with piped stdout; never a regular file."""
 
@@ -2049,6 +2093,7 @@ class RealHost:
         self._nonce_reader = nonce_reader
         self._children: list[RealChild] = []
         self._stop = False
+        self._journal_holder: _JournalWALHolder | None = None
         self._stdout_detector = _PeerLossDetector()
         # Consecutive poll EAGAIN is one host-level outage, even when shorter
         # semantic waits return to the supervisor loop. Only a successful
@@ -2088,6 +2133,8 @@ class RealHost:
             pass
 
     def running(self) -> bool:
+        if not self._stop and self._journal_holder is not None:
+            self._journal_holder.refresh()
         return not self._stop
 
     def live_nonce(self) -> str | None:
@@ -2845,29 +2892,50 @@ def cmd_supervise(
         controller_label=label,
         lease_nonce=live_nonce,
     )
+    try:
+        reader = goalflight_journal.Journal.open_reader(
+            project_root,
+            persistent=True,
+            retry_budget_s=0,
+            open_retry_budget_s=0,
+        )
+    except goalflight_journal.JournalError as exc:
+        print(f"supervise: journal holder unavailable: {exc}", file=sys.stderr)
+        return SUPERVISE_START_EXIT
 
     def cursor_rewinds() -> dict[str, int]:
         # Read-only and without contention waits: mail/peer handling must stay
         # responsive even when the journal cannot currently establish identity.
-        return goalflight_journal.Journal.open_reader(
-            project_root, retry_budget_s=0, open_retry_budget_s=0,
-        )._cursor_rewinds(label)
+        return reader._cursor_rewinds(label)
 
-    return run_supervisor(
-        project_root=project_root,
-        controller_label=label,
-        lease_nonce=live_nonce,
-        host=host,
-        cursor_rewinds=cursor_rewinds,
-        heartbeat_s=heartbeat_s,
-        coverage_s=coverage_s,
-        emit_depth=bool(getattr(args, "chatty", False)),
-        debug=bool(getattr(args, "debug", False)),
-        chatty=bool(getattr(args, "chatty", False)),
-        forwarding_frontier=(
-            (lambda: forwarding_frontier(project_root))
-            if forwarding_frontier is not None
-            else None
-        ),
-        on_startup_probe=on_startup_probe,
-    )
+    try:
+        # Independent of the lazy mail reader: attach before the first mail.
+        host._journal_holder = _JournalWALHolder(reader.path)
+        return run_supervisor(
+            project_root=project_root,
+            controller_label=label,
+            lease_nonce=live_nonce,
+            host=host,
+            cursor_rewinds=cursor_rewinds,
+            heartbeat_s=heartbeat_s,
+            coverage_s=coverage_s,
+            emit_depth=bool(getattr(args, "chatty", False)),
+            debug=bool(getattr(args, "debug", False)),
+            chatty=bool(getattr(args, "chatty", False)),
+            forwarding_frontier=(
+                (lambda: forwarding_frontier(project_root))
+                if forwarding_frontier is not None
+                else None
+            ),
+            on_startup_probe=on_startup_probe,
+        )
+    finally:
+        if host._journal_holder is not None:
+            host._journal_holder.close()
+        connection = getattr(reader, "_reader_connection", None)
+        if connection is not None:
+            reader._reader_connection = None
+            reader._reader_pid = None
+            if connection.in_transaction:
+                connection.rollback()
+            connection.close()
