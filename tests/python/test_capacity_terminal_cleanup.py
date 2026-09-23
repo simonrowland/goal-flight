@@ -419,6 +419,38 @@ def test_release_does_not_free_unattached_live_worker(tmp_path, monkeypatch):
     assert cap.load_state()["leases"][lease["lease_id"]]["state"] == "active"
 
 
+@pytest.mark.parametrize("role", ["worker", "claimant"])
+@pytest.mark.parametrize("caller", ["owner", "other_pid", "reused_pid", "missing_token", "controller"])
+def test_release_requires_owner_identity_while_worker_alive(tmp_path, monkeypatch, role, caller):
+    pid = os.getpid()
+    monkeypatch.setattr(cap, "_probe_pid_liveness", lambda _pid: True)
+    monkeypatch.setattr(cap, "_process_start_identity", lambda _pid: {"start_token": "current"})
+    lease = {
+        "lease_id": "owned", "state": "active", "agent": "codex",
+        "worker_pid": pid + 1,
+        "worker_identity": {"start_token": "current"},
+    }
+    owner_role = "controller" if caller == "controller" else role
+    lease[f"{owner_role}_pid"] = pid + 1 if caller == "other_pid" else pid
+    lease[f"{owner_role}_identity"] = {
+        "start_token": None if caller == "missing_token" else "old" if caller == "reused_pid" else "current",
+    }
+    # The worker remains live even when the attempted owner's token is wrong.
+    monkeypatch.setattr(cap, "_pid_generation_matches", lambda _pid, _lease: True)
+    cap.save_state({"leases": {"owned": lease}, "cooldowns": {}})
+    output = io.StringIO()
+    with redirect_stdout(output):
+        rc = cap.cmd_release(argparse.Namespace(
+            lease_id="owned", state="released", reason="finished", keep=True,
+        ))
+    assert rc == (0 if caller == "owner" else 1)
+    assert cap.load_state()["leases"]["owned"]["state"] == (
+        "released" if caller == "owner" else "active"
+    )
+    if caller != "owner":
+        assert json.loads(output.getvalue())["reason"] == "worker_alive"
+
+
 def test_terminal_authority_survives_capacity_cleanup_error(tmp_path, monkeypatch):
     record = seed(tmp_path)
     def fail_cleanup(*_args):

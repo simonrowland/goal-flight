@@ -1108,7 +1108,11 @@ def main(argv: list[str] | None = None) -> int:
                 f"journal terminal emitter exited {terminal_code}"
             )
     write_status(status_path, payload)
-    if lease_id:
+    if (
+        lease_id
+        and monitor_payload.get("worker_alive") is False
+        and monitor_payload.get("process_group_drained") is not False
+    ):
         with contextlib.redirect_stdout(io.StringIO()):
             goalflight_capacity.cmd_release(argparse.Namespace(lease_id=lease_id, state=payload["state"], reason=payload.get("error"), keep=True))
     if state == "blocked_session_limit":

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import io
 
 from support import skip_posix_on_native_windows
 
@@ -27,6 +28,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_review_job
 import goalflight_rate_pressure
+import goalflight_capacity
 
 
 def isolate_state_env(env: dict[str, str], state_dir: Path) -> dict[str, str]:
@@ -286,10 +288,11 @@ def capacity_test_env(state_dir: Path, **extra: str) -> dict[str, str]:
 
 
 def hold_capacity(state_dir: Path, *, agent: str = "codex", dispatch_id: str = "held-review-capacity") -> str:
-    proc = run(
-        [
-            sys.executable,
-            "scripts/goalflight_capacity.py",
+    # Keep acquire/release in the holder process so its recorded identity
+    # proves ownership, just as the review-job finalizer does.
+    output = io.StringIO()
+    with patch.dict(os.environ, capacity_test_env(state_dir)), contextlib.redirect_stdout(output):
+        code = goalflight_capacity.main([
             "acquire",
             "--agent",
             agent,
@@ -299,18 +302,42 @@ def hold_capacity(state_dir: Path, *, agent: str = "codex", dispatch_id: str = "
             str(ROOT),
             "--ttl-s",
             "60",
-        ],
-        state_dir=state_dir,
-        env={"GOALFLIGHT_CAPACITY_MAX_TOTAL": "1"},
-    )
-    return json.loads(proc.stdout)["lease"]["lease_id"]
+        ])
+    assert code == 0
+    return json.loads(output.getvalue())["lease"]["lease_id"]
 
 
 def release_capacity(state_dir: Path, lease_id: str) -> None:
-    run(
-        [sys.executable, "scripts/goalflight_capacity.py", "release", "--lease-id", lease_id],
-        state_dir=state_dir,
-    )
+    with patch.dict(os.environ, capacity_test_env(state_dir)), contextlib.redirect_stdout(io.StringIO()):
+        assert goalflight_capacity.main(["release", "--lease-id", lease_id]) == 0
+
+
+def test_review_finalizer_only_surrenders_finished_worker() -> None:
+    monitor = goalflight_review_job._monitor_process
+    for worker_alive, group_drained, expected_releases in (
+        (True, False, 0), (False, False, 0), (False, True, 1),
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            fake = tmp / "fake-codex"
+            write_fake_codex(fake)
+            command = review_command(tmp, fake, "release-owner", timeout_s=5)
+
+            def measured_cleanup(**kwargs):
+                payload = monitor(**kwargs)
+                payload.update(worker_alive=worker_alive, process_group_drained=group_drained)
+                return payload
+
+            with (
+                patch.dict(os.environ, capacity_test_env(
+                    tmp / "state", FAKE_REVIEW_MODE="complete_with_stderr",
+                )),
+                patch.object(goalflight_review_job, "_monitor_process", side_effect=measured_cleanup),
+                patch.object(goalflight_capacity, "cmd_release", wraps=goalflight_capacity.cmd_release) as release,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                assert goalflight_review_job.main(command[2:]) == 0
+                assert release.call_count == expected_releases
 
 
 def wait_for_status(path: Path, state: str, *, timeout_s: float = 5.0) -> dict:
@@ -875,6 +902,7 @@ def test_missing_prompt_after_capacity_commits_terminal_outbox() -> None:
 
 def main() -> None:
     tests = [
+        test_review_finalizer_only_surrenders_finished_worker,
         test_review_job_capacity_wait_queues_until_slot_frees,
         test_review_job_capacity_wait_deadline_blocks,
         test_review_job_capacity_wait_zero_single_shot,
