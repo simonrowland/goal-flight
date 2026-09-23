@@ -229,15 +229,21 @@ default (medium), so ordinary implementation dispatches inherit it and nothing
 in goal-flight overrides it. Raise it where the extra thinking pays: reviews,
 adversarial passes, and hard debugging. The review recipe above already pins
 `xhigh` explicitly; for a worker dispatch use the flag, which validates the
-level at the parser rather than letting a typo silently run at the default:
+level at the parser and checks model support before launching:
 
 ```bash
 python3 <skill-root>/scripts/goalflight_dispatch.py --agent codex \
   --reasoning-effort xhigh --prompt-file <brief>
 ```
 
-Levels: `low`, `medium`, `high`, `xhigh`. The flag is preserve-class, so a
-resumed dispatch keeps the level it was launched with.
+Levels: `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. Model support comes
+from `models_cache.json` in the effective Codex launch home (including
+per-dispatch homes), using `--model` or the configured/catalog default.
+Missing, unreadable, or unmatched cache entries fall back to `low`, `medium`,
+`high`, `xhigh`; refusals name this fallback and list supported levels.
+The flag is preserve-class, so a resumed dispatch keeps its requested level.
+Codex accepts this flag only on the bash route; `--shape acp` and
+`--interactive` refuse it rather than silently dropping the setting.
 
 ## Hard Invariants
 

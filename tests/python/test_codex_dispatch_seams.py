@@ -78,6 +78,8 @@ def _stub_bash_launch(
     foreground: bool = False,
     persist_ledger: bool = True,
     drop_starting_projection: bool = False,
+    preset_options: list[str] | None = None,
+    expected_refusal: bool = False,
 ) -> tuple[dict, list[dict]]:
     monkeypatch.delenv("GOALFLIGHT_CONTROLLER_LABEL", raising=False)
     monkeypatch.delenv("GOALFLIGHT_CONTROLLER_SESSION_ID", raising=False)
@@ -202,8 +204,13 @@ def _stub_bash_launch(
         canonical_home = Path.home() / ".goal-flight" / "accounts" / account / "codex"
         canonical_home.mkdir(parents=True)
         argv.extend(["--account", account])
-    argv.extend(["--", sys.executable, "-c", "pass"])
+    argv.extend(preset_options if preset_options is not None else
+                ["--", sys.executable, "-c", "pass"])
     rc = D.main(argv)
+    if expected_refusal:
+        assert rc == 64
+        assert not spawn_calls
+        return {}, ledger_calls
     assert rc == (1 if failure_phase else 0)
     assert resolve_accounts == ([] if api_missing or agent != "codex" else [account])
     if not api_missing and agent == "codex":
@@ -223,6 +230,33 @@ def _stub_bash_launch(
         {},
     )
     return worker_spawn, ledger_calls
+
+
+@pytest.mark.parametrize("supports_max", [True, False])
+def test_bash_effort_uses_resolved_dispatch_home(
+    monkeypatch, tmp_path, capsys, supports_max,
+):
+    home = tmp_path / "dispatch-home"
+    home.mkdir()
+    (home / "config.toml").write_text('model = "selected"\n')
+    levels = ["high", "max"] if supports_max else ["high"]
+    (home / "models_cache.json").write_text(json.dumps({"models": [{
+        "slug": "selected",
+        "supported_reasoning_levels": [{"effort": level} for level in levels],
+    }]}))
+    # Inherited home must not win over the home chosen after capacity.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "unrelated-home"))
+    worker, _ = _stub_bash_launch(
+        monkeypatch, tmp_path, resolved=(str(home), "seat-a"),
+        preset_options=["--prompt", "Implement the requested change.",
+                        "--reasoning-effort", "max"],
+        expected_refusal=not supports_max,
+    )
+    if supports_max:
+        assert worker["env"]["CODEX_HOME"] == str(home)
+        assert 'model_reasoning_effort="max"' in worker["argv"]
+    else:
+        assert "'selected'; supported levels: high" in capsys.readouterr().err
 
 
 def test_bash_pin_is_applied_after_capacity_and_reaches_spawn(

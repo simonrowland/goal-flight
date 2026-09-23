@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 ENGINES = ("codex", "claude", "droid", "copilot", "grok-acp")
 THINKING_LEVELS_BY_ENGINE = {
-    "codex": {"low", "medium", "high", "xhigh"},
+    "codex": {"low", "medium", "high", "xhigh", "max", "ultra"},
     "claude": {"low", "medium", "high", "xhigh", "max"},
     "droid": set(),
     "copilot": set(),
@@ -1028,7 +1028,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reviewers", help="Comma-separated review panel, e.g. codex,claude or codex:gpt-5:high.")
     parser.add_argument("--panel", action="store_true", help="Run a Codex/Claude review panel unless --engine changes the first reviewer.")
     parser.add_argument("--model", action="append", help="Model for all reviewers or engine=model. Repeatable.")
-    parser.add_argument("--thinking", action="append", help="Thinking/effort for all reviewers or engine=level. Repeatable. Codex: low, medium, high, xhigh. Claude: low, medium, high, xhigh, max.")
+    parser.add_argument("--thinking", action="append", help="Thinking/effort for all reviewers or engine=level. Repeatable. Codex: low, medium, high, xhigh, max, ultra (model-dependent). Claude: low, medium, high, xhigh, max.")
     parser.add_argument("--allow-partial-panel", action="store_true", help="Continue panel output when one reviewer fails.")
     parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
