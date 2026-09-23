@@ -213,7 +213,7 @@ def test_aged_unprobeable_claimant_is_not_released_at_any_age() -> None:
 
 def main() -> int:
     test_orphaned_lease_is_stale_while_acquiring_and_working_are_not()
-    test_a_live_controller_does_not_keep_an_orphaned_lease_alive()
+    test_a_live_controller_does_not_change_an_unattached_lease()
     test_unprobeable_claimant_is_not_reclaimed()
     test_aged_unprobeable_claimant_is_not_released_at_any_age()
     if _FAILS:

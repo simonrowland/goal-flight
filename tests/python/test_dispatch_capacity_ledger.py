@@ -33,6 +33,7 @@ def _env(tmp: Path) -> dict[str, str]:
     env = os.environ.copy()
     for key in (
         "GOALFLIGHT_DISPATCH_ID",
+        "GOALFLIGHT_DISPATCH_DIR",
         "GOALFLIGHT_WORKTREE_LOCK_FD",
         "GOALFLIGHT_OCCUPANCY_LOCK_FD",
     ):

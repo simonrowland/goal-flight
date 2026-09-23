@@ -77,7 +77,19 @@ def test_capacity_acquire_release_cooldown() -> None:
         assert_true("second acquire waits", json.loads(wait.stdout)["decision"] == "wait")
 
         lease_id = first["lease"]["lease_id"]
-        run(["python3", "scripts/goalflight_capacity.py", "release", "--lease-id", lease_id], state_dir=state_dir)
+        run(
+            [
+                "python3",
+                "scripts/goalflight_capacity.py",
+                "release",
+                "--lease-id",
+                lease_id,
+                "--operator-confirmed",
+                "--reason",
+                "test cleanup",
+            ],
+            state_dir=state_dir,
+        )
         run(["python3", "scripts/goalflight_capacity.py", "cooldown", "set", "--agent", "codex", "--seconds", "60", "--reason", "session_limit"], state_dir=state_dir)
         blocked = run(["python3", "scripts/goalflight_capacity.py", "acquire", "--agent", "codex", "--dispatch-id", "d3", "--ram-mb", "16384"], state_dir=state_dir, check=False)
         assert_true("cooldown blocks", blocked.returncode == 2 and "cooldown" in json.loads(blocked.stdout)["reason"])
@@ -108,7 +120,7 @@ def test_chunk_summary_empty_state_dir_json_shape() -> None:
     assert_true("chunk summary slug", payload["slug"] == "missing-chunk")
     assert_true("chunk summary state", payload["state"] == "missing")
     assert_true("chunk summary dispatch id", payload["dispatch_id"] is None)
-    assert_true("chunk summary worker liveness", payload["worker_pid_alive"] is False)
+    assert_true("chunk summary worker liveness", payload["worker_pid_alive"] is None)
     for key in (
         "slug",
         "dispatch_id",
@@ -196,6 +208,8 @@ def test_ledger_record_finish_status() -> None:
                 "weird/id",
                 "--prompt-path",
                 str(prompt),
+                "--project-root",
+                str(ROOT),
                 "--agent",
                 "codex",
                 "--transport",
@@ -223,6 +237,8 @@ def test_ledger_record_finish_status() -> None:
                     dispatch_id,
                     "--prompt-path",
                     str(prompt),
+                    "--project-root",
+                    str(ROOT),
                     "--agent",
                     "codex",
                     "--transport",
@@ -259,6 +275,8 @@ def test_ledger_record_finish_status() -> None:
                 "review-timeout",
                 "--prompt-path",
                 str(prompt),
+                "--project-root",
+                str(ROOT),
                 "--agent",
                 "codex",
                 "--transport",
@@ -835,7 +853,11 @@ def test_instruction_split_contract() -> None:
             if path.suffix not in {".md", ".py", ".sh"}:
                 continue
             for line in path.read_text(errors="replace").splitlines():
-                if "SKILL.md" in line and "§" in line:
+                valid_dispatch_model_ref = (
+                    path.relative_to(ROOT).as_posix() == "protocols/dispatch-routing.md"
+                    and "§Dispatch Model" in line
+                )
+                if "SKILL.md" in line and "§" in line and not valid_dispatch_model_ref:
                     stale.append(str(path.relative_to(ROOT)))
                 if "~/.claude/skills/goal-flight" in line:
                     stale.append(str(path.relative_to(ROOT)))
@@ -1522,6 +1544,7 @@ def test_session_status_helper_contract() -> None:
             "  id: 22222222-2222-2222-2222-222222222222\n"
             "  pid: 1\n"  # init pid is alive but very unlikely to belong to us;
             # use a high pid that's almost certainly dead instead
+            "  process_start_token: stale-generation\n"
             "  started_at: 2026-05-28T00:00:00Z\n"
             "  hostname: testhost\n"
             "---\n\n"

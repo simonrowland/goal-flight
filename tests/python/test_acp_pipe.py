@@ -916,6 +916,7 @@ def case_direct_default_status_uses_dispatch_state_dir() -> None:
     old_agent_command = goalflight_acp_run.agent_command
     old_adapters_dir = goalflight_adapter_readiness.ADAPTERS_DIR
     old_state_dir = os.environ.get("GOALFLIGHT_STATE_DIR")
+    old_dispatch_dir = os.environ.get("GOALFLIGHT_DISPATCH_DIR")
     old_pidfile_dir = os.environ.get("GOAL_FLIGHT_PIDFILE_DIR")
     goalflight_acp_run.agent_command = lambda agent, model=None, fast=False: (sys.executable, [str(FAKE)])
     try:
@@ -927,6 +928,7 @@ def case_direct_default_status_uses_dispatch_state_dir() -> None:
             adapters_dir.mkdir()
             state_dir = tmp_path / "state"
             goalflight_adapter_readiness.ADAPTERS_DIR = adapters_dir
+            os.environ.pop("GOALFLIGHT_DISPATCH_DIR", None)
             os.environ["GOALFLIGHT_STATE_DIR"] = str(state_dir)
             os.environ["GOAL_FLIGHT_PIDFILE_DIR"] = str(tmp_path / "pids")
             dispatch_id = f"direct-default-{os.getpid()}"
@@ -958,6 +960,10 @@ def case_direct_default_status_uses_dispatch_state_dir() -> None:
             os.environ.pop("GOALFLIGHT_STATE_DIR", None)
         else:
             os.environ["GOALFLIGHT_STATE_DIR"] = old_state_dir
+        if old_dispatch_dir is None:
+            os.environ.pop("GOALFLIGHT_DISPATCH_DIR", None)
+        else:
+            os.environ["GOALFLIGHT_DISPATCH_DIR"] = old_dispatch_dir
         if old_pidfile_dir is None:
             os.environ.pop("GOAL_FLIGHT_PIDFILE_DIR", None)
         else:
