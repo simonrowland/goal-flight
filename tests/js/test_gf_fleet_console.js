@@ -331,9 +331,11 @@ function producerProbe() {
   if (producerProbeCache) return producerProbeCache;
   const code = String.raw`
 import json, os, pathlib, sys, tempfile
+from unittest import mock
 sys.path.insert(0, str(pathlib.Path.cwd() / "scripts"))
 import goalflight_fleet_console as F
 sampled_at = F._parse_timestamp("2030-01-01T00:03:00Z")
+fixture_identity = {"pid": 4242, "start_token": "fleet-console-fixture"}
 def worker(dispatch_id, started_at, **overrides):
     record = {
         "dispatch_id": dispatch_id, "state": "running",
@@ -369,10 +371,17 @@ with tempfile.TemporaryDirectory() as tmp:
     status_path.write_text(json.dumps({
         "dispatch_id": "resumed-status-worker", "worker_alive": True,
         "heartbeat_at": "2030-01-01T00:03:30Z",
+        "worker_pid": fixture_identity["pid"],
+        "worker_identity": fixture_identity,
     }))
-    old_status_live = worker(
-        "resumed-status-worker", "2029-12-31T12:02:59Z", status_path=str(status_path),
-    )
+    with mock.patch.object(
+        F.goalflight_status.goalflight_ledger,
+        "identity_matches",
+        return_value=(True, "fixture_live"),
+    ):
+        old_status_live = worker(
+            "resumed-status-worker", "2029-12-31T12:02:59Z", status_path=str(status_path),
+        )
     missing_id_status_path = project_root / "status-missing-id.json"
     missing_id_status_path.write_text(json.dumps({
         "worker_alive": True, "heartbeat_at": "2030-01-01T00:03:30Z",
@@ -407,7 +416,17 @@ terminal_conflict = F._worker_row({
     "dispatch_id": "terminal-conflict", "state": "complete", "classification": "worker_dead",
 })
 old = worker("old-worker", "2029-12-31T12:02:59Z")
-old_live = worker("resumed-old-worker", "2029-12-31T12:02:59Z", worker_still_alive=True)
+with mock.patch.object(
+    F.goalflight_status.goalflight_ledger,
+    "identity_matches",
+    return_value=(True, "fixture_live"),
+):
+    old_live = worker(
+        "resumed-old-worker", "2029-12-31T12:02:59Z",
+        worker_still_alive=True,
+        worker_pid=fixture_identity["pid"],
+        worker_identity=fixture_identity,
+    )
 recent = worker("recent-worker", "2030-01-01T00:02:00Z")
 malformed = worker("unknown-age-worker", "not-a-timestamp")
 future = worker("future-worker", "2030-01-01T00:04:00Z")
@@ -796,7 +815,7 @@ print(json.dumps({
     defaultDispatches[0] === "resumed-old-worker",
     probe.old_live.observed_live === true,
     probe.old_live.age_filter_reason === "observed_live",
-    probe.old_status_live.observed_live_source === "fresh_status",
+    probe.old_status_live.observed_live_source === "worker_identity",
     probe.old_status_live.age_filter_match === false,
     probe.old_status_missing_id.observed_live_source === "unobserved",
     probe.old_status_missing_id.age_filter_match === true,
