@@ -47,6 +47,10 @@ def _fake_identity(pid: int) -> dict[str, object]:
     return {"pid": pid, "start_token": f"test:{pid}"}
 
 
+def _fake_argv(monkeypatch, argv_by_pid: dict[int, list[str]]) -> None:
+    monkeypatch.setattr(R, "_process_argv", lambda pid: argv_by_pid.get(pid))
+
+
 def _ps_liveness_available(pid: int) -> bool:
     try:
         result = subprocess.run(
@@ -117,6 +121,23 @@ def test_a_process_with_no_nonce_is_never_attributed(monkeypatch) -> None:
         R.subprocess, "run",
         lambda *a, **k: type("P", (), {"stdout": listing})(),
     )
+    _fake_argv(
+        monkeypatch,
+        {
+            101: [
+                "python3", "/s/goalflight_messages.py", "listen",
+                "--project-root", "/repos/mine", "--lease-nonce", DEAD,
+            ],
+            102: [
+                "python3", "/s/goalflight_messages.py", "status",
+                "--project-root", "/repos/mine",
+            ],
+            103: [
+                "python3", "/s/unrelated.py", "--project-root", "/repos/mine",
+                "--lease-nonce", DEAD,
+            ],
+        },
+    )
     monkeypatch.setattr(R.goalflight_compat, "process_start_identity", _fake_identity)
     got = R.listener_processes_by_nonce(Path("/repos/mine"))
     assert got == {DEAD: [{"pid": 101, "start_token": "test:101"}]}, got
@@ -129,6 +150,15 @@ def test_argv_poison_process_is_not_selected(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         R.subprocess, "run", lambda *a, **k: type("P", (), {"stdout": listing})()
+    )
+    _fake_argv(
+        monkeypatch,
+        {
+            101: [
+                "python3", "/s/other.py", "goalflight_messages.py", "listen",
+                "--project-root", "/repos/mine", "--lease-nonce", DEAD,
+            ],
+        },
     )
     assert R.listener_processes_by_nonce(Path("/repos/mine")) == {}
 
@@ -165,6 +195,19 @@ def test_truncated_listener_argv_refuses_the_entire_scan(monkeypatch) -> None:
         return subprocess.CompletedProcess(command, 0, stdout=listing, stderr="")
 
     monkeypatch.setattr(R.subprocess, "run", fake_run)
+    _fake_argv(
+        monkeypatch,
+        {
+            101: [
+                "python3", "/s/goalflight_messages.py", "listen",
+                "--project-root", "/repos/mine", "--lease-nonce",
+            ],
+            102: [
+                "python3", "/s/goalflight_messages.py", "listen",
+                "--project-root", "/repos/mine", "--lease-nonce", DEAD,
+            ],
+        },
+    )
     monkeypatch.setattr(R.goalflight_compat, "process_start_identity", _fake_identity)
     monkeypatch.setattr(R, "_known_lease_nonces", lambda _root: {LIVE})
     monkeypatch.setattr(R, "_liveness", lambda _pids: {})
@@ -277,6 +320,19 @@ def test_listeners_of_other_projects_are_never_enumerated(monkeypatch) -> None:
     monkeypatch.setattr(
         R.subprocess, "run", lambda *a, **k: type("P", (), {"stdout": listing})()
     )
+    _fake_argv(
+        monkeypatch,
+        {
+            101: [
+                "python3", "/s/goalflight_messages.py", "supervise",
+                "--project-root", "/repos/mine", "--lease-nonce", DEAD,
+            ],
+            102: [
+                "python3", "/s/goalflight_messages.py", "listen",
+                "--project-root", "/repos/other", "--lease-nonce", DEAD,
+            ],
+        },
+    )
     monkeypatch.setattr(R.goalflight_compat, "process_start_identity", _fake_identity)
     got = R.listener_processes_by_nonce(Path("/repos/mine"))
     assert got == {DEAD: [{"pid": 101, "start_token": "test:101"}]}, (
@@ -293,6 +349,15 @@ def test_a_foreign_projects_live_generation_is_not_reapable(
     )
     monkeypatch.setattr(
         R.subprocess, "run", lambda *a, **k: type("P", (), {"stdout": listing})()
+    )
+    _fake_argv(
+        monkeypatch,
+        {
+            201: [
+                "python3", "/s/goalflight_messages.py", "supervise",
+                "--project-root", "/repos/other", "--lease-nonce", DEAD,
+            ],
+        },
     )
     monkeypatch.setattr(R.goalflight_compat, "process_start_identity", _fake_identity)
     monkeypatch.setattr(R, "_known_lease_nonces", lambda _root: set())
@@ -320,3 +385,33 @@ def test_reused_pid_with_new_start_token_is_not_signalled(monkeypatch, tmp_path:
     out = R.reap_orphaned_listeners(tmp_path)
     assert killed == [] and out["reaped"] == 0, out
     assert out["refused_identity"] == [{"pid": 777, "why": "identity-unverified"}], out
+
+
+def test_project_root_with_spaces_uses_exact_argv_boundaries(monkeypatch) -> None:
+    root = "/repos/project with spaces"
+    listing = (
+        "  303 python3 /s/goalflight_messages.py supervise --project-root "
+        + root
+        + " --lease-nonce "
+        + DEAD
+        + "\n"
+    )
+    monkeypatch.setattr(
+        R.subprocess,
+        "run",
+        lambda *a, **k: type("P", (), {"returncode": 0, "stdout": listing})(),
+    )
+    _fake_argv(
+        monkeypatch,
+        {
+            303: [
+                "python3", "/s/goalflight_messages.py", "supervise",
+                "--project-root", root, "--lease-nonce", DEAD,
+            ],
+        },
+    )
+    monkeypatch.setattr(R.goalflight_compat, "process_start_identity", _fake_identity)
+
+    got = R.listener_processes_by_nonce(Path(root))
+
+    assert got == {DEAD: [{"pid": 303, "start_token": "test:303"}]}, got

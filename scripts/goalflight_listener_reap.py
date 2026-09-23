@@ -33,8 +33,11 @@ cannot answer yields `known=False` and the caller kills nothing:
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 from pathlib import Path
+import shlex
 import signal
 import subprocess
 import sys
@@ -54,6 +57,71 @@ PS_TIMEOUT_S = 15.0
 # only has to cover process teardown, not any work they might be doing.
 TERM_GRACE_S = 0.5
 _LISTENER_COMMANDS = frozenset({"listen", "listen-auto", "follow", "supervise"})
+
+
+def _process_argv(pid: int) -> list[str] | None:
+    """Read one process's argv without flattening argument boundaries."""
+    if sys.platform.startswith("linux"):
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except FileNotFoundError:
+            return []
+        except OSError:
+            return None
+        if not raw:
+            return None
+        fields = raw.split(b"\0")
+        if fields and fields[-1] == b"":
+            fields.pop()
+        try:
+            return [os.fsdecode(field) for field in fields]
+        except UnicodeDecodeError:
+            return None
+
+    if sys.platform == "darwin":
+        # KERN_PROCARGS2 returns: argc, executable path, argv[0..argc-1],
+        # followed by the environment. Unlike ps(1)'s args column, this keeps
+        # every argument as a distinct value, including roots containing spaces.
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            sysctl = libc.sysctl
+            sysctl.argtypes = [
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.c_uint,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            sysctl.restype = ctypes.c_int
+            mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
+            size = ctypes.c_size_t(4096)
+            for _ in range(4):
+                buffer = (ctypes.c_ubyte * size.value)()
+                actual = ctypes.c_size_t(size.value)
+                if sysctl(mib, 3, buffer, ctypes.byref(actual), None, 0) == 0:
+                    raw = bytes(buffer[: actual.value])
+                    if len(raw) < 4:
+                        return None
+                    argc = int.from_bytes(raw[:4], sys.byteorder, signed=True)
+                    if argc < 1:
+                        return None
+                    fields = raw[4:].split(b"\0")
+                    argv_fields = fields[1 : argc + 1]
+                    if len(argv_fields) != argc:
+                        return None
+                    try:
+                        return [os.fsdecode(field) for field in argv_fields]
+                    except UnicodeDecodeError:
+                        return None
+                if ctypes.get_errno() != errno.ENOMEM:
+                    return None
+                size.value = max(size.value * 2, actual.value * 2)
+        except (OSError, AttributeError, TypeError, ValueError):
+            return None
+        return None
+
+    return None
 
 
 def listener_processes_by_nonce(project_root: Path) -> dict[str, list[dict[str, object]]] | None:
@@ -81,7 +149,7 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[dict[str, 
         return None
     try:
         result = subprocess.run(
-            ["ps", "-axww", "-o", "pid=,args="],
+            ["ps", "-axww", "-o", "pid="],
             capture_output=True,
             text=True,
             timeout=PS_TIMEOUT_S,
@@ -96,11 +164,17 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[dict[str, 
 
     found: dict[str, list[dict[str, object]]] = {}
     for line in listing.splitlines():
-        head, _, rest = line.strip().partition(" ")
-        if not head.isdigit() or not rest:
+        columns = line.split(None, 1)
+        if not columns or not columns[0].isdigit():
             continue
+        pid = int(columns[0])
+        argv = _process_argv(pid)
+        if argv == []:
+            continue
+        if argv is None:
+            return None
         classification, fields = goalflight_wake._probe_messages_argv(
-            rest, commands=_LISTENER_COMMANDS
+            shlex.join(argv), commands=_LISTENER_COMMANDS
         )
         if classification == goalflight_wake._SUPERVISE_ARGV_UNKNOWN:
             return None
@@ -121,13 +195,13 @@ def listener_processes_by_nonce(project_root: Path) -> dict[str, list[dict[str, 
             # A truncated or unreadable nonce may belong to a live generation.
             # Do not let any other listener become reapable from this scan.
             return None
-        identity = goalflight_compat.process_start_identity(int(head))
+        identity = goalflight_compat.process_start_identity(pid)
         if not isinstance(identity, dict) or not identity.get("start_token"):
             # PID/argv alone is not ownership. A failed or incomplete identity
             # probe stays out of the actionable population.
             continue
         found.setdefault(nonce, []).append(
-            {"pid": int(head), "start_token": str(identity["start_token"])}
+            {"pid": pid, "start_token": str(identity["start_token"])}
         )
     return found
 

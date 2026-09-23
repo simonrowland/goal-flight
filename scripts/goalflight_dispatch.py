@@ -8873,6 +8873,7 @@ def _reap_dead_worker_pgroup(pidfile: Path, worker_pid: int) -> bool:
             return False
     except (TypeError, ValueError):
         return False
+    reused_leader = False
     current_identity = goalflight_ledger.process_identity(worker_pid)
     if current_identity is None:
         # process_identity() returns None for a dead PID. Confirm that the
@@ -8885,7 +8886,10 @@ def _reap_dead_worker_pgroup(pidfile: Path, worker_pid: int) -> bool:
             # The recorded generation is still alive, or its identity cannot be
             # established. Neither case authorizes a group signal.
             return False
-        # A different start token proves the recorded leader generation is gone.
+        # A different start token proves that this PID now belongs to a new,
+        # unrelated process. Its group may be another live worker's group, so
+        # the recorded group is no longer actionable evidence.
+        reused_leader = True
 
     # A process-group ID cannot be reused while a member of the original group
     # exists. Probe the group before signalling so a dead leader with lingering
@@ -8893,8 +8897,12 @@ def _reap_dead_worker_pgroup(pidfile: Path, worker_pid: int) -> bool:
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
-        return True  # the whole group is already absent; pidfile is safe to drop
+        # A reused leader PID is never permission to discard the evidence,
+        # even when the new group has already disappeared.
+        return False if reused_leader else True
     except (PermissionError, OSError, AttributeError):
+        return False
+    if reused_leader:
         return False
     try:
         os.killpg(pgid, getattr(signal, "SIGTERM", 15))

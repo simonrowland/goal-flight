@@ -181,17 +181,22 @@ def case_reap_refuses_reused_worker_pid() -> None:
     with tempfile.TemporaryDirectory() as td:
         pidfile = Path(td) / "ctrl.bashtail.worker.jsonl"
         _write_pidfile(pidfile, 999_999, 999_999)
+        probes: list[tuple[int, int]] = []
+
         def group_probe(_pgid: int, sig: int) -> None:
-            if sig == 0:
-                raise ProcessLookupError
-            raise AssertionError("reused group signalled")
+            probes.append((_pgid, sig))
 
         with patch.object(goalflight_compat, "pid_alive", return_value=False), patch.object(
             dispatch.goalflight_ledger,
             "process_identity",
             return_value={"pid": 999_999, "start_token": "new-worker"},
         ), patch.object(dispatch.os, "killpg", side_effect=group_probe):
-            dispatch._reap_dead_worker_pgroup(pidfile, 999_999)
+            assert dispatch._reap_dead_worker_pgroup(pidfile, 999_999) is False
+        assert probes == [(999_999, 0)], probes
+        assert all(
+            sig not in {signal.SIGTERM, signal.SIGKILL} for _, sig in probes
+        ), "a reused PID must not signal its new group"
+        assert pidfile.exists(), "reused-PID evidence must be preserved"
 
 
 def case_cleanup_preserves_legacy_pidfile_without_identity() -> None:

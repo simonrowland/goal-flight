@@ -120,6 +120,44 @@ def case_windows_cleanup_does_not_kill_indeterminate_pid() -> None:
     assert preserved
 
 
+def case_windows_cleanup_preserves_live_pidfile_without_creation_identity() -> None:
+    """A live Windows PID without creation identity remains recovery evidence."""
+    with tempfile.TemporaryDirectory() as td:
+        pid_dir = Path(td)
+        tracked = pid_dir / "999999.jsonl"
+        tracked.write_text(
+            json.dumps(
+                {
+                    "pid": 12345,
+                    "agent": "codex-acp",
+                    "controller_identity": {
+                        "pid": 999999,
+                        "start_token": "old-controller",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with patch("goalflight_acp_client._PIDFILE_DIR", pid_dir), \
+            patch("goalflight_acp_client._ps_meta", return_value=None), \
+            patch("goalflight_compat.is_windows", return_value=True), \
+            patch(
+                "goalflight_acp_client.goalflight_compat.process_start_identity",
+                return_value={"pid": 999999, "start_token": "new-controller"},
+            ), \
+            patch("goalflight_compat.pid_liveness", return_value=True), \
+            patch("goalflight_compat.pid_alive", return_value=True), \
+            patch(
+                "goalflight_compat.kill_pid",
+                side_effect=AssertionError("live PID without identity must not be killed"),
+            ):
+            killed = goalflight_acp_client.cleanup_ghosts()
+        preserved = tracked.exists()
+    assert killed == 0
+    assert preserved, "unknown Windows identity must preserve the pidfile"
+
+
 def case_windows_cleanup_kills_confirmed_live_identity() -> None:
     """A confirmed-live Windows pid with matching identity still reaps."""
     with tempfile.TemporaryDirectory() as td:
@@ -1286,6 +1324,7 @@ def main() -> None:
     case_unavailable_meta_preserves_kill_fallthrough()
     case_windows_cleanup_preserves_legacy_pidfile_without_identity()
     case_windows_cleanup_does_not_kill_indeterminate_pid()
+    case_windows_cleanup_preserves_live_pidfile_without_creation_identity()
     case_windows_cleanup_kills_confirmed_live_identity()
     case_windows_cleanup_unlinks_confirmed_dead_pid()
     case_posix_cleanup_preserves_live_legacy_pidfile()

@@ -710,9 +710,10 @@ def cleanup_ghosts(
                     continue
                 if not entry.get("creation_time"):
                     skipped_stale += 1
+                    preserve_pidfile = True
                     log.warning(
                         "ghost_cleanup: windows pid=%d missing creation identity; "
-                        "unlinking stale pidfile without killing",
+                        "preserving pidfile without killing",
                         pid,
                     )
                     continue
