@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import io
 import json
 from pathlib import Path
@@ -15,6 +16,7 @@ import pytest
 from support import SCRIPTS
 
 import goalflight_dispatch as dispatch
+import goalflight_capacity as capacity
 import goalflight_journal as journal
 import goalflight_ledger as ledger
 import goalflight_status as status
@@ -100,6 +102,7 @@ def test_claimed_worker_identity(prepared, claimed, alive):
         if not alive:
             child.terminate()
             child.wait(timeout=10)
+
         original = claimed.read_bytes()
         row = attempt_row(authority)
         record = ledger.record_path("withdraw-test").read_bytes()
@@ -122,6 +125,76 @@ def test_claimed_worker_identity(prepared, claimed, alive):
         if child.poll() is None:
             child.terminate()
         child.wait(timeout=10)
+
+
+def test_withdraw_releases_reserved_lease_after_projection(prepared):
+    project, _, _, _ = prepared
+    capacity.save_state(
+        {
+            "leases": {
+                "withdraw-lease": {
+                    "lease_id": "withdraw-lease",
+                    "dispatch_id": "withdraw-test",
+                    "state": "active",
+                    "agent": "codex",
+                    "machine_id": capacity.machine_id(),
+                    "lease_schema": capacity.LEASE_SCHEMA,
+                    "launch_state": "reserved",
+                    "project_root": str(project),
+                    "expires_at": capacity.iso(
+                        capacity.utc_now() + dt.timedelta(hours=1)
+                    ),
+                }
+            },
+            "cooldowns": {},
+        }
+    )
+    code, result = withdraw()
+    assert code == 0, result
+    assert (
+        capacity.load_state()["leases"]["withdraw-lease"]["state"]
+        == "withdrawn"
+    )
+
+
+def test_withdraw_retry_releases_after_initial_cleanup_failure(prepared, monkeypatch):
+    project, _, _, _ = prepared
+    capacity.save_state(
+        {
+            "leases": {
+                "withdraw-retry-lease": {
+                    "lease_id": "withdraw-retry-lease",
+                    "dispatch_id": "withdraw-test",
+                    "state": "active",
+                    "agent": "codex",
+                    "machine_id": capacity.machine_id(),
+                    "lease_schema": capacity.LEASE_SCHEMA,
+                    "launch_state": "reserved",
+                    "project_root": str(project),
+                    "expires_at": capacity.iso(
+                        capacity.utc_now() + dt.timedelta(hours=1)
+                    ),
+                }
+            },
+            "cooldowns": {},
+        }
+    )
+
+    def fail_cleanup(*_args):
+        raise RuntimeError("capacity unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dispatch, "_release_terminal_capacity", fail_cleanup)
+        code, result = withdraw()
+        assert code == 0, result
+        assert capacity.load_state()["leases"]["withdraw-retry-lease"]["state"] == "active"
+
+    code, result = withdraw()
+    assert code == 0 and result["status"] == "already withdrawn", result
+    assert (
+        capacity.load_state()["leases"]["withdraw-retry-lease"]["state"]
+        == "withdrawn"
+    )
 
 
 def test_claimed_spawn_intent_waits_for_stale_window(prepared, claimed, monkeypatch):
@@ -513,15 +586,15 @@ def test_spawn_intent_stale_window(prepared, age, allowed):
 
 
 @pytest.mark.parametrize("replacement", [None, "replacement-dispatch"])
-def test_withdraw_releases_seat_and_task(prepared, replacement):
+def test_queued_rows_never_own_worktree_and_withdraw_releases_task(prepared, replacement):
     project, authority, _, _ = prepared
     record = ledger.read_record("withdraw-test")
     record.update(worker_cwd=str(project), task_ids=["t-withdraw"])
     ledger.write_record(record)
     fresh = SimpleNamespace(cwd=str(project), dispatch_id="fresh-dispatch", agent="test")
-    # Exercise the real ledger + kernel-lock admission gate, not a mocked verdict.
-    with pytest.raises(dispatch.DispatchUsageError, match="withdraw-test"):
-        dispatch._prepare_attempt_worktree_occupancy(fresh)
+    # Queued rows never own a worktree, even when they record worker_cwd.
+    assert dispatch._prepare_attempt_worktree_occupancy(fresh) is None
+    dispatch._release_worktree_occupancy_lock(fresh)
     args = ["--superseded-by", replacement] if replacement else []
     code, result = withdraw(*args)
     assert code == 0, result
@@ -576,6 +649,57 @@ def test_settle_preserves_final_journal(prepared, claimed, tmp_path, terminal_st
     settled = snapshot(tmp_path)
     assert withdraw()[1]["status"] == "settled"
     assert snapshot(tmp_path) == settled
+
+
+@pytest.mark.parametrize("alive", [False, True])
+def test_settle_releases_capacity_only_for_dead_worker(prepared, alive):
+    project, authority, attempt, carrier = prepared
+    assert authority.commit_terminal(attempt.attempt_id, terminal_state="blocked").committed
+    row = attempt_row(authority)
+    assert ledger.read_record("withdraw-test")["state"] == "queued"
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        identity = ledger.process_identity(child.pid)
+        assert identity and identity.get("start_token"), identity
+        capacity.save_state({
+            "leases": {
+                "settle-lease": {
+                    "lease_id": "settle-lease",
+                    "dispatch_id": "withdraw-test",
+                    "state": "active",
+                    "agent": "codex",
+                    "machine_id": capacity.machine_id(),
+                    "lease_schema": capacity.LEASE_SCHEMA,
+                    "launch_state": "attached",
+                    "project_root": str(project),
+                    "worker_pid": child.pid,
+                    "worker_identity": identity,
+                    "expires_at": capacity.iso(capacity.utc_now() + dt.timedelta(hours=1)),
+                },
+            },
+            "cooldowns": {},
+        })
+        if not alive:
+            child.terminate()
+            child.wait(timeout=10)
+
+        code, result = withdraw()
+        assert code == 0 and result["status"] == "settled", result
+        assert ledger.read_record("withdraw-test")["terminal_state"] == "blocked"
+        assert attempt_row(authority) == row
+        assert not carrier.exists()
+        lease = capacity.load_state()["leases"]["settle-lease"]
+        assert lease["state"] == ("active" if alive else "blocked")
+        if alive:
+            assert child.poll() is None
+            assert "released_at" not in lease
+        else:
+            assert lease["released_at"]
+            assert lease["reason"] == "dispatch_terminal"
+    finally:
+        if child.poll() is None:
+            child.terminate()
+        child.wait(timeout=10)
 
 
 def test_settle_refuses_live_worker_in_parallel_carrier(prepared, claimed):

@@ -18,13 +18,23 @@ from pathlib import Path
 def main(argv: list[str]) -> None:
     drain_log, *command = argv
     log_dir = Path.home() / ".goal-flight"
-    logs = [drain_log] + [str(log_dir / name) for name in (
+    requested_logs = [Path(drain_log)] + [log_dir / name for name in (
         "fleet-console-fleet-launchd.log",
         "fleet-console-attention-launchd.log",
         "codex-seatd.log",
         "grok-seatd.log",
         "codex-rotate.log",
     )]
+    logs = []
+    for path in requested_logs:
+        try:
+            if path.is_symlink():
+                print(f"daemon log retention skipped symlink: {path}", file=sys.stderr, flush=True)
+                continue
+        except OSError as exc:
+            print(f"daemon log retention skipped unreadable path {path}: {exc}", file=sys.stderr, flush=True)
+            continue
+        logs.append(str(path))
     config = Path(__file__).resolve().parent / "templates/daemon-logs.newsyslog.conf"
     try:
         subprocess.run(

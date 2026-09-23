@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 from contextlib import ExitStack
+import ctypes
 import errno
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +14,7 @@ import select
 import shlex
 import signal
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
@@ -223,6 +227,22 @@ def _wait_for_waiter_kind(
         interval_s=0.01,
         message=f"{kind} waiter for pid={pid}",
     )
+
+
+def _mac_disk_bytes_written(pid: int) -> int:
+    """Read macOS proc_pid_rusage V4's cumulative disk-write counter."""
+    if sys.platform != "darwin":
+        raise RuntimeError("macOS-only disk-write counter")
+    proc = ctypes.CDLL(None, use_errno=True).proc_pid_rusage
+    proc.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    proc.restype = ctypes.c_int
+    buffer = ctypes.create_string_buffer(512)
+    if proc(pid, 4, ctypes.byref(buffer)) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    # uuid[16], followed by 17 uint64 fields through diskio_bytesread;
+    # diskio_byteswritten is the next field in rusage_info_v4.
+    return struct.unpack_from("<Q", buffer.raw, 16 + (17 * 8))[0]
 
 
 def _wait_for_monitor_slot(project: Path, label: str, pid: int) -> None:
@@ -1215,7 +1235,7 @@ def test_listener_survives_present_journal_open_failure_and_times_out(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     project, _env, lease = isolated
-    real_connect = journal.sqlite3.connect
+    real_connect = journal._sqlite_connect
     failed_opens = 0
 
     def fail_first_rw_open(database: object, *args: object, **kwargs: object):
@@ -1225,7 +1245,7 @@ def test_listener_survives_present_journal_open_failure_and_times_out(
             raise sqlite3.OperationalError("unable to open database file")
         return real_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(journal.sqlite3, "connect", fail_first_rw_open)
+    monkeypatch.setattr(journal, "_sqlite_connect", fail_first_rw_open)
     result = messages._run_cli(
         [
             "listen",
@@ -1321,9 +1341,21 @@ def test_every_record_is_structural_and_below_pipe_buf_with_long_frontier(
     assert frontier["payload"]["truncated"] is True
 
 
+def test_frontier_disabled_mirror_advises_task_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "0")
+    # No projection attributes: disabled mirrors must return before accessing files.
+    frontier = messages._follow_frontier_snapshot(SimpleNamespace())
+    assert frontier["payload"]["state"] == "unavailable"
+    assert frontier["payload"]["detail"] == (
+        "next-task hint unavailable; run goalflight_task.py next"
+    )
+
+
 def test_frontier_reads_only_materialized_projection_and_marks_stale(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
     projection = tmp_path / "tasks-data.js"
     projection.write_text(
         "// generated\nwindow.GF_ITEMS = "
@@ -2668,7 +2700,7 @@ def test_supervised_watchdog_stdout_loss_during_orphan_grace_restarts_supervisor
 
 # --- b-214: a transient journal-busy must not kill a persistent listener ---
 #
-# The busy condition is injected deterministically by gating sqlite3.connect on
+# The busy condition is injected deterministically by gating _sqlite_connect on
 # the temp journal's URI (the same injection style as
 # test_listener_survives_present_journal_open_failure_and_times_out), so the
 # tests drive goalflight_journal._connect's real _is_busy/_retry_delay path —
@@ -2758,9 +2790,9 @@ def _gate_journal_connects(
     project: Path,
     gate: threading.Event,
 ) -> list[str]:
-    """While `gate` is set, every fresh connect to this journal reports busy."""
+    """While `gate` is set, every fresh journal connection reports busy."""
     journal_uri = journal.resolve_journal_path(project).as_uri()
-    real_connect = journal.sqlite3.connect
+    real_connect = journal._sqlite_connect
     hits: list[str] = []
 
     def gated_connect(database: object, *args: object, **kwargs: object):
@@ -2769,8 +2801,30 @@ def _gate_journal_connects(
             raise sqlite3.OperationalError("database is locked")
         return real_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(journal.sqlite3, "connect", gated_connect)
+    monkeypatch.setattr(journal, "_sqlite_connect", gated_connect)
     return hits
+
+
+def _count_journal_connects(
+    monkeypatch: pytest.MonkeyPatch,
+    project: Path,
+    *,
+    phase: threading.Event | None = None,
+) -> list[str]:
+    """Count journal opens at the shared connection seam during ``phase``."""
+    journal_uri = journal.resolve_journal_path(project).as_uri()
+    real_connect = journal._sqlite_connect
+    opens: list[str] = []
+
+    def counted_connect(database: object, *args: object, **kwargs: object):
+        if str(database).startswith(journal_uri) and (
+            phase is None or phase.is_set()
+        ):
+            opens.append(str(database))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(journal, "_sqlite_connect", counted_connect)
+    return opens
 
 
 class _QueryBusyConnection:
@@ -2915,6 +2969,372 @@ def _pin_listener_resolution(
             "lease_generation": lease.generation,
         },
     )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS proc_pid_rusage only")
+def test_idle_listener_does_not_write_journal_each_poll(isolated) -> None:
+    project, env, lease = isolated
+    command = _backup_command(project, lease, timeout_s=3)
+    command[command.index("--listener-slots") + 1] = "2"
+    listener = subprocess.Popen(
+        command,
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", listener.pid)
+        time.sleep(0.05)
+        before = _mac_disk_bytes_written(listener.pid)
+        started = time.monotonic()
+        time.sleep(0.25)
+        elapsed = time.monotonic() - started
+        after = _mac_disk_bytes_written(listener.pid)
+        assert listener.poll() is None
+    finally:
+        if listener.poll() is None:
+            listener.terminate()
+        stdout, stderr = listener.communicate(timeout=5)
+    assert listener.returncode in {0, 1, -signal.SIGTERM, 128 + signal.SIGTERM}
+    cycles = max(1, round(elapsed / 0.01))
+    written = after - before
+    assert written < 64 * 1024, (
+        f"idle listener wrote {written} bytes over ~{cycles} poll cycles "
+        f"({written / cycles:.0f} bytes/cycle); stdout={stdout!r}; "
+        f"stderr={stderr!r}"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS proc_pid_rusage only")
+def test_listener_start_to_exit_writes_are_bounded(
+    isolated,
+    tmp_path: Path,
+) -> None:
+    project, env, lease = isolated
+    counter = tmp_path / "listener-connects.log"
+    env = dict(env)
+    env["GOALFLIGHT_TEST_SQLITE_CONNECT_COUNTER"] = str(counter)
+    command = _backup_command(project, lease, timeout_s=3)
+    command.remove("--report-pending")
+    listener = subprocess.Popen(
+        command,
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    total_written = None
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", listener.pid)
+        time.sleep(0.15)
+        _release_lease(project, lease)
+        assert listener.stdout is not None
+        exit_record = _JsonLineReader(listener.stdout).read(timeout_s=5)[1]
+        assert exit_record["kind"] == "exit", exit_record
+        total_written = _mac_disk_bytes_written(listener.pid)
+        stdout, stderr = listener.communicate(timeout=5)
+    finally:
+        if listener.poll() is None:
+            listener.terminate()
+        if listener.poll() is None:
+            listener.wait(timeout=5)
+    assert total_written is not None
+    assert listener.returncode == 3, (
+        f"unexpected listener exit {listener.returncode}; "
+        f"stdout={stdout!r}; stderr={stderr!r}"
+    )
+    entries = counter.read_text(encoding="utf-8").splitlines()
+    child_pids = {int(entry.split("\t", 1)[0]) for entry in entries}
+    reader_entries = [entry for entry in entries if "?mode=ro" in entry]
+    assert child_pids == {listener.pid}, (
+        f"counter did not observe the listener child: {entries!r}"
+    )
+    assert 1 <= len(reader_entries) <= 4, (
+        f"listener opened {len(reader_entries)} readonly journal connections: "
+        f"{reader_entries!r}"
+    )
+    assert total_written < 1024 * 1024, (
+        f"listener start-to-exit wrote {total_written} bytes"
+    )
+
+
+def test_reader_closes_connection_when_replaced_after_open(
+    isolated,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _env, _lease = isolated
+    reader = journal.Journal.open_reader(project, persistent=True)
+    connections = []
+    real_open = journal._open_readonly_connection
+
+    def open_then_replace(*args, **kwargs):
+        connection = real_open(*args, **kwargs)
+        connections.append(connection)
+        replacement = reader.path.with_suffix(".replacement")
+        replacement.write_bytes(reader.path.read_bytes())
+        replacement.replace(reader.path)
+        return connection
+
+    monkeypatch.setattr(journal, "_open_readonly_connection", open_then_replace)
+    try:
+        with pytest.raises(journal.JournalIntegrityError, match="database was replaced"):
+            reader._connect()
+        assert len(connections) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connections[0].execute("SELECT 1")
+        assert reader._reader_connection is None
+    finally:
+        for connection in connections:
+            connection.close()
+
+
+def test_listener_ring_broken_pipe_closes_reader(
+    isolated,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, env, lease = isolated
+    args = SimpleNamespace(
+        project_root=str(project),
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        poll_secs=0.01,
+        listener_slots=2,
+        timeout_s=5.0,
+        json=True,
+        report_pending=False,
+        watch_follow=False,
+    )
+    connections = []
+    real_data_version = journal.Journal._data_version
+
+    def post_after_reader_opens(authority):
+        version = real_data_version(authority)
+        if not connections:
+            connections.append(authority._reader_connection)
+            messages.post_message(
+                dispatch_id="broken-ring-output",
+                msg_type="controller-notice",
+                payload={"text": "ring output fails"},
+                messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+                addressee=messages.controller_addressee(lease.label, project_root=project),
+            )
+        return version
+
+    class BrokenRingOutput(io.StringIO):
+        def write(self, value):
+            if '"kind": "ring"' in value:
+                raise BrokenPipeError("ring consumer closed")
+            return super().write(value)
+
+    monkeypatch.setattr(journal.Journal, "_data_version", post_after_reader_opens)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "install", lambda _self: None)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "restore", lambda _self: None)
+    try:
+        with contextlib.redirect_stdout(BrokenRingOutput()):
+            with pytest.raises(BrokenPipeError, match="ring consumer closed"):
+                messages.cmd_listen(args)
+        assert len(connections) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connections[0].execute("SELECT 1")
+        snapshot = journal.Journal.open_reader(project).cursor_peek(
+            lease.label, nonce=lease.nonce,
+        )
+        assert wake.claim_ring(
+            project, controller_label=lease.label, cursor_version=snapshot.cursor_version,
+        )
+    finally:
+        for connection in connections:
+            connection.close()
+
+
+def test_idle_listener_reuses_journal_connection(
+    isolated,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _env, lease = isolated
+    args = SimpleNamespace(
+        project_root=str(project),
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        poll_secs=0.01,
+        listener_slots=2,
+        timeout_s=5.0,
+        json=True,
+        report_pending=False,
+        watch_follow=False,
+    )
+    poll_phase = threading.Event()
+    poll_count = 0
+    reader_ready = threading.Event()
+    polls_ready = threading.Event()
+    real_data_version = journal.Journal._data_version
+
+    def counted_data_version(authority):
+        nonlocal poll_count
+        version = real_data_version(authority)
+        if not reader_ready.is_set():
+            reader_ready.set()
+        elif poll_phase.is_set():
+            poll_count += 1
+            if poll_count >= 5:
+                polls_ready.set()
+        return version
+
+    monkeypatch.setattr(journal.Journal, "_data_version", counted_data_version)
+    opens = _count_journal_connects(monkeypatch, project, phase=poll_phase)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "install", lambda _self: None)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "restore", lambda _self: None)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    result: list[int] = []
+
+    def run_listener() -> None:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result.append(messages.cmd_listen(args))
+
+    thread = threading.Thread(target=run_listener)
+    thread.start()
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", os.getpid())
+        assert reader_ready.wait(5), "listener did not establish its reader"
+        poll_phase.set()
+        assert polls_ready.wait(5), f"listener did not reach poll phase: {poll_count}"
+        opens_after_idle = len(opens)
+    finally:
+        poll_phase.clear()
+        if thread.is_alive():
+            _release_lease(project, lease)
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert result == [3], stderr.getvalue()
+    assert opens_after_idle == 0, (
+        f"idle poll phase opened {opens_after_idle} journal connections: "
+        f"{opens!r}"
+    )
+
+
+def test_pending_unclaimed_ring_obeys_poll_interval(
+    isolated,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, env, lease = isolated
+    args = SimpleNamespace(
+        project_root=str(project),
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        poll_secs=0.2,
+        listener_slots=2,
+        timeout_s=1.5,
+        json=True,
+        report_pending=False,
+        watch_follow=False,
+    )
+    checks = 0
+    real_data_version = journal.Journal._data_version
+
+    def counted_data_version(authority):
+        nonlocal checks
+        checks += 1
+        return real_data_version(authority)
+
+    monkeypatch.setattr(journal.Journal, "_data_version", counted_data_version)
+    monkeypatch.setattr(wake, "claim_ring", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "install", lambda _self: None)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "restore", lambda _self: None)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    result: list[int] = []
+
+    def run_listener() -> None:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result.append(messages.cmd_listen(args))
+
+    thread = threading.Thread(target=run_listener)
+    thread.start()
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", os.getpid())
+        time.sleep(0.25)
+        before_event = checks
+        messages.post_message(
+            dispatch_id="unclaimed-ring",
+            msg_type="controller-notice",
+            payload={"text": "pending but not claimed"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(lease.label, project_root=project),
+        )
+        time.sleep(0.65)
+        after_event = checks
+    finally:
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert result == [1], stderr.getvalue()
+    assert after_event > before_event
+    assert after_event - before_event <= 5
+
+
+def test_pending_ring_retries_after_failed_claim(
+    isolated,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, env, lease = isolated
+    poll_secs = 0.05
+    args = SimpleNamespace(
+        project_root=str(project),
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        poll_secs=poll_secs,
+        listener_slots=2,
+        timeout_s=2.0,
+        json=True,
+        report_pending=False,
+        watch_follow=False,
+    )
+    claim_calls: list[float] = []
+
+    def claim_ring(*_args: object, **_kwargs: object) -> bool:
+        claim_calls.append(time.monotonic())
+        return len(claim_calls) > 1
+
+    monkeypatch.setattr(wake, "claim_ring", claim_ring)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "install", lambda _self: None)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "restore", lambda _self: None)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    result: list[int] = []
+
+    def run_listener() -> None:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result.append(messages.cmd_listen(args))
+
+    thread = threading.Thread(target=run_listener)
+    thread.start()
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", os.getpid())
+        messages.post_message(
+            dispatch_id="retry-after-ring-claim",
+            msg_type="controller-notice",
+            payload={"text": "ring release must be observed"},
+            messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+            source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+            addressee=messages.controller_addressee(
+                lease.label,
+                project_root=project,
+            ),
+        )
+        thread.join(timeout=5)
+    finally:
+        if thread.is_alive():
+            _release_lease(project, lease)
+            thread.join(timeout=5)
+
+    assert not thread.is_alive(), stderr.getvalue()
+    assert result == [0], stderr.getvalue()
+    assert len(claim_calls) == 2, claim_calls
+    assert claim_calls[1] - claim_calls[0] <= poll_secs * 2, claim_calls
+    assert json.loads(stdout.getvalue())["kind"] == "ring"
 
 
 def test_follow_survives_busy_during_constructor_startup(
@@ -3112,6 +3532,68 @@ def test_listen_coverage_arm_exits_promptly_when_journal_vanishes(
     assert results == [2]
     assert "journal-unavailable" in cap.stderr
     assert "listener degraded" not in cap.stderr
+
+
+def test_listen_finishes_when_restored_journal_replaces_live_path(
+    isolated: tuple[Path, dict[str, str], journal.LeaseIdentity],
+    tmp_path: Path,
+) -> None:
+    """A validated restore must not strand the listener coverage row ARMED."""
+    project, env, lease = isolated
+    command = _backup_command(project, lease, timeout_s=60)
+    listener = subprocess.Popen(
+        command,
+        cwd=project,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    snapshot = tmp_path / "restored-journal.sqlite3"
+    coverage = None
+    try:
+        _wait_for_waiter_kind(project, lease.label, "listener", listener.pid)
+
+        def coverage_is_armed() -> bool:
+            nonlocal coverage
+            observed = journal.Journal(project).active_coverage(lease.label)
+            if observed is None or observed["state"] != journal.COVERAGE_ARMED:
+                return False
+            coverage = observed
+            return True
+
+        wait_until(
+            coverage_is_armed,
+            timeout_s=15,
+            interval_s=0.01,
+            message="listener coverage arm",
+        )
+        assert coverage is not None
+        path = journal.resolve_journal_path(project)
+        with sqlite3.connect(path) as source, sqlite3.connect(snapshot) as target:
+            source.backup(target)
+        os.replace(snapshot, path)
+
+        stdout, stderr = listener.communicate(timeout=15)
+    finally:
+        if listener.poll() is None:
+            listener.terminate()
+        if listener.poll() is None:
+            listener.wait(timeout=5)
+
+    assert listener.returncode == 2, (stdout, stderr)
+    records = [
+        json.loads(line)
+        for line in stdout.decode().splitlines()
+        if line.strip()
+    ]
+    exits = [record for record in records if record.get("kind") == "exit"]
+    assert len(exits) == 1, (stdout, stderr)
+    assert exits[0]["reason"] == "journal-unavailable", exits[0]
+    assert "journal database was replaced" in exits[0]["detail"]
+    restored = journal.Journal(project).coverage(str(coverage["coverage_id"]))
+    assert restored is not None
+    assert restored["state"] == journal.COVERAGE_EXITED
+    assert restored["exit_reason"] == "journal-unavailable"
 
 
 def test_listen_coverage_arm_keeps_journal_io_failure_fatal(
@@ -3533,6 +4015,23 @@ def test_listen_survives_transient_journal_busy(
         if busy_stage == "connect"
         else _gate_journal_queries(monkeypatch, project, gate)
     )
+    if busy_stage == "connect":
+        real_data_version = journal.Journal._data_version
+
+        def reconnect_reader_before_data_version(authority):
+            if gate.is_set():
+                connection = getattr(authority, "_reader_connection", None)
+                if connection is not None:
+                    connection.close()
+                    authority._reader_connection = None
+                    authority._reader_pid = None
+            return real_data_version(authority)
+
+        monkeypatch.setattr(
+            journal.Journal,
+            "_data_version",
+            reconnect_reader_before_data_version,
+        )
     cap = _LiveCapture(capsys)
 
     thread, results = _run_in_thread(

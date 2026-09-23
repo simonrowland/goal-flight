@@ -65,6 +65,24 @@ Provider/session limits are cooldowns. A host session limit or provider rate
 limit (for example Claude, Codex, or Grok) blocks future acquire attempts
 before a worker is spawned.
 
+`python3 scripts/goalflight_capacity.py release --lease-id <id> --reason <text>`
+releases only when worker evidence proves release safe; `--keep` retains the
+terminal lease in history. Automatic cleanup never overrides unknown identity.
+For unresolved legacy leases, capacity `status` prints an operator command:
+
+```sh
+python3 scripts/goalflight_capacity.py release --lease-id <id> --operator-confirmed --reason manual_legacy_release
+```
+
+Run this only after checking the worker session and confirming that releasing
+its account capacity is appropriate. Replace the reason with the explanation
+of that check if needed. The flag requires a nonblank reason and accepts only
+unknown worker identity; a provably live worker is refused. Resolved dead workers
+use normal release. Remote leases must be handled on their owning machine.
+Operator confirmation, username (`released_by`), reason, and release time remain
+in the terminal lease's existing 24-hour history, even without `--keep`.
+Automatic release paths must never pass `--operator-confirmed`.
+
 ## Ledger
 
 Every long worker/review has:

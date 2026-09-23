@@ -63,10 +63,11 @@ into the active goal-queue's frontmatter:
 current_session:
   id: <uuid>
   pid: <orchestrator PID>
+  process_start_token: <kernel token>
   started_at: <ts>
   hostname: <host>
 session_history:
-  - {id, pid, started_at, claimed_at, ended_at, ended_reason}
+  - {id, pid, process_start_token, started_at, claimed_at, ended_at, ended_reason}
 ```
 
 `session_history` is append-only. Two layers of identity: the RUN
@@ -159,6 +160,12 @@ activation contract above; **not** for ordinary one-off coding.
 
 The dispatch ledger validates process identity with PID plus process start/command.
 PID alone is never authoritative.
+
+Queue session ownership follows the same rule: a live owner is an exact
+`(pid, start_token)` match. Missing or unreadable identity is `unknown`, not
+dead, so claim and stale-release paths refuse to treat a reused PID as the
+same controller generation. Legacy records without a process start token
+require an explicit force takeover.
 
 ## Cross-machine / takeover
 

@@ -742,8 +742,10 @@ def test_preserve_class_flags_survive_original_argv_replay(tmp_path: Path) -> No
         "/tmp/p.md",
     ]
     dummies = {
-        "--cwd": str(tmp_path),
-        "--worktree": "HEAD",
+            "--cwd": str(tmp_path),
+            "--worktree-root": str(tmp_path / "worktrees"),
+            "--worktree-pin-holder": "pin-holder",
+            "--worktree": "HEAD",
         "--at": "HEAD",
         "--os-sandbox": "off",
         "--model": "gpt-test",

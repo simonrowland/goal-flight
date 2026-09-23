@@ -644,6 +644,7 @@ def classify_dispatch_cwd(
     *,
     project_root: Path,
     controller_label: str | None,
+    managed_root: Path | None = None,
 ) -> str:
     """Classify ``--cwd`` as ``in-place``, ``ring-seat``, or ``refuse``.
 
@@ -676,7 +677,14 @@ def classify_dispatch_cwd(
             return "in-place"
     elif resolved == root:
         return "in-place"
-    if is_managed_worktree_path(resolved, project_root=root):
+    if managed_root is not None:
+        try:
+            ring_root = Path(managed_root).expanduser().resolve(strict=False)
+            if resolved.parent == ring_root and is_captive_seat_name(resolved.name):
+                return "ring-seat"
+        except OSError:
+            pass
+    elif is_managed_worktree_path(resolved, project_root=root):
         return "ring-seat"
     return "refuse"
 
@@ -1029,10 +1037,85 @@ def _create_seat_worktree(
     )
 
 
+def _seat_head_from_metadata(worktree_path: Path) -> str | None:
+    """Read a worktree HEAD without starting Git or inspecting its files."""
+    if not worktree_path.is_dir():
+        return None
+    try:
+        git_marker = worktree_path / ".git"
+        if git_marker.is_file():
+            marker = git_marker.read_text(encoding="utf-8").strip()
+            if not marker.startswith("gitdir:"):
+                return None
+            git_dir = Path(marker.split(":", 1)[1].strip())
+            if not git_dir.is_absolute():
+                git_dir = (worktree_path / git_dir).resolve()
+        elif git_marker.is_dir():
+            git_dir = git_marker.resolve()
+        else:
+            return None
+        head_text = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        if head_text.startswith("ref: "):
+            ref = head_text[5:].strip()
+            common_dir = git_dir
+            commondir = git_dir / "commondir"
+            if commondir.is_file():
+                common_dir = (git_dir / commondir.read_text(encoding="utf-8").strip()).resolve()
+            ref_path = common_dir / ref
+            if ref_path.is_file():
+                head_text = ref_path.read_text(encoding="utf-8").strip()
+            else:
+                packed = common_dir / "packed-refs"
+                head_text = next(
+                    (
+                        line.split(" ", 1)[1].strip()
+                        for line in packed.read_text(encoding="utf-8").splitlines()
+                        if line and not line.startswith(("#", "^")) and " " in line
+                        and line.split(" ", 1)[1] == ref
+                    ),
+                    "",
+                )
+        return head_text.strip() or None
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def _seat_head_is_ancestor(
+    project_root: Path, head: str | None, base_commit: str
+) -> bool | None:
+    """Return whether ``head`` is an ancestor, or None when unverifiable."""
+    if not head:
+        return None
+    proc = _git_proc(
+        project_root, "merge-base", "--is-ancestor", str(head), str(base_commit)
+    )
+    if proc is None:
+        return None
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    return None
+
+
+def _seat_base_distance(worktree_path: Path, base_commit: str) -> int | None:
+    """Return zero for an exact metadata HEAD, otherwise one when known."""
+    head = _seat_head_from_metadata(worktree_path)
+    if head is None:
+        return None
+    return 0 if head == str(base_commit).strip() else 1
+
+
 def _prepare_seat_checkout(
     worktree_path: Path, *, branch: str, base_commit: str
 ) -> None:
-    _git(worktree_path, "checkout", "-f", "-B", branch, base_commit)
+    current_branch = _git(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
+    current_head = _git(worktree_path, "rev-parse", "HEAD")
+    tracked_status = _git(
+        worktree_path, "status", "--porcelain", "--untracked-files=no"
+    )
+    if current_branch != branch or current_head != base_commit or tracked_status:
+        _git(worktree_path, "checkout", "-f", "-B", branch, base_commit)
     # Never ``git clean -fdx``. Preserve the reserved notes namespace even
     # when a temp repo has not gitignored ``.goal-flight/``.
     _git(worktree_path, "clean", "-fd", "-e", ".goal-flight")
@@ -1300,7 +1383,8 @@ def _busy_worktree_message(
         key=lambda item: str(item[1].get("acquired_at") or "9999"),
     )
     oldest = ", ".join(
-        f"{name}={payload.get('dispatch_id') or 'unknown-dispatch'}"
+        f"{Path(name).name}={payload.get('dispatch_id') or 'unknown-dispatch'}"
+        + (f" pid={payload['pid']}" if isinstance(payload.get("pid"), int) else "")
         for name, payload in ordered[:5]
     ) or "none recorded"
     return (
@@ -1353,8 +1437,6 @@ def acquire_worktree_seat(
         raise WorktreeSeatError(f"managed worktree root must not be a symlink: {managed_root}")
     if managed_root.exists() and not managed_root.is_dir():
         raise WorktreeSeatError(f"managed worktree root is not a directory: {managed_root}")
-    if occupy_path is None:
-        managed_root.mkdir(parents=True, exist_ok=True)
 
     lock_root = _seat_lock_root(project_root)
     if lock_root.is_symlink():
@@ -1378,6 +1460,51 @@ def acquire_worktree_seat(
         # diagnostic metadata between that occupant's flock and metadata write.
         fcntl.flock(allocation_file.fileno(), fcntl.LOCK_EX)
 
+        # Count every held global or legacy-ring lock before any checkout/reset
+        # or directory creation. Legacy rings are migration input, not extra
+        # capacity, so a full set of old holders must refuse immediately.
+        global_candidates = [
+            (
+                managed_root / f"{CAPTIVE_SEAT_PREFIX}{slot}",
+                lock_root / f"{CAPTIVE_SEAT_PREFIX}{slot}.lock",
+            )
+            for slot in range(1, seat_limit + 1)
+        ]
+        legacy_candidates = _legacy_ring_candidates(project_root)
+        capacity_occupants: list[tuple[str, dict]] = []
+        capacity_occupied_paths: set[Path] = set()
+        probe_flags = flags & ~os.O_CREAT
+
+        for candidate_path, candidate_lock in [*global_candidates, *legacy_candidates]:
+            if not candidate_lock.is_file():
+                continue
+            try:
+                probe_fd = os.open(candidate_lock, probe_flags, 0o600)
+            except OSError:
+                continue
+            probe_file = os.fdopen(probe_fd, "r+", encoding="utf-8")
+            try:
+                fcntl.flock(probe_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                resolved_candidate = candidate_path.resolve(strict=False)
+                if resolved_candidate not in capacity_occupied_paths:
+                    capacity_occupied_paths.add(resolved_candidate)
+                    capacity_occupants.append(
+                        (str(candidate_path), _lock_metadata(probe_file))
+                    )
+            finally:
+                probe_file.close()
+
+        if len(capacity_occupants) >= seat_limit:
+            detail = _busy_worktree_message(
+                project_root, seat_limit, capacity_occupants
+            )
+            raise WorktreeSeatUnavailable(
+                f"{detail}; refusing to create a new unmanaged worktree"
+            )
+        if occupy_path is None:
+            managed_root.mkdir(parents=True, exist_ok=True)
+
         if occupy_path is not None:
             worktree_path = Path(occupy_path).expanduser().resolve(strict=False)
             if not worktree_path.exists():
@@ -1389,7 +1516,7 @@ def acquire_worktree_seat(
                 seat_name, WORKTREE_SEAT_PREFIX
             ) is None:
                 raise WorktreeCwdRefused(
-                    f"--cwd {worktree_path} is not a captive seat in "
+                    f"--cwd {worktree_path} is not a managed repository worktree in "
                     f"{managed_root}; pass --in-place for the project root"
                 )
             if not is_managed_worktree_path(worktree_path, project_root=project_root):
@@ -1445,20 +1572,24 @@ def acquire_worktree_seat(
                 raise
 
         hwm = min(_read_ring_hwm(lock_root), seat_limit)
-        candidates: list[tuple[Path, Path]] = [
-            (managed_root / f"{CAPTIVE_SEAT_PREFIX}{slot}",
-             lock_root / f"{CAPTIVE_SEAT_PREFIX}{slot}.lock")
+        global_candidates = [
+            (
+                managed_root / f"{CAPTIVE_SEAT_PREFIX}{slot}",
+                lock_root / f"{CAPTIVE_SEAT_PREFIX}{slot}.lock",
+            )
             for slot in range(1, hwm + 1)
         ]
-        candidates.extend(_legacy_ring_candidates(project_root))
-        seen_paths: set[Path] = set()
-        occupants: list[tuple[str, dict]] = []
+        legacy_candidates = _legacy_ring_candidates(project_root)
+        occupants = list(capacity_occupants)
+        occupied_paths = set(capacity_occupied_paths)
         refused: list[str] = []
 
-        def try_candidate(worktree_path: Path, lock_path: Path):
-            if worktree_path in seen_paths:
-                return None
-            seen_paths.add(worktree_path)
+        def try_candidate(
+            worktree_path: Path,
+            lock_path: Path,
+            *,
+            require_ancestor: bool = False,
+        ):
             try:
                 lock_fd = os.open(lock_path, flags, 0o600)
             except OSError as exc:
@@ -1469,10 +1600,20 @@ def acquire_worktree_seat(
             try:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                occupants.append((str(worktree_path), _lock_metadata(lock_file)))
+                resolved_path = worktree_path.resolve(strict=False)
+                if resolved_path not in occupied_paths:
+                    occupied_paths.add(resolved_path)
+                    occupants.append((str(worktree_path), _lock_metadata(lock_file)))
                 lock_file.close()
                 return None
             try:
+                if require_ancestor and _seat_head_is_ancestor(
+                    project_root,
+                    _seat_head_from_metadata(worktree_path),
+                    base_commit,
+                ) is not True:
+                    lock_file.close()
+                    return None
                 seat_name = worktree_path.name
                 prior_dispatch_id = str(
                     _lock_metadata(lock_file).get("dispatch_id") or "unknown-dispatch"
@@ -1497,7 +1638,46 @@ def acquire_worktree_seat(
                 lock_file.close()
                 raise
 
-        for worktree_path, lock_path in candidates:
+        slots = list(range(1, hwm + 1))
+        heads = {
+            slot: _seat_head_from_metadata(
+                managed_root / f"{CAPTIVE_SEAT_PREFIX}{slot}"
+            )
+            for slot in slots
+        }
+        exact_slots = [slot for slot in slots if heads[slot] == base_commit]
+        other_slots = [slot for slot in slots if slot not in exact_slots]
+
+        for slot in exact_slots:
+            lease = try_candidate(
+                managed_root / f"{CAPTIVE_SEAT_PREFIX}{slot}",
+                lock_root / f"{CAPTIVE_SEAT_PREFIX}{slot}.lock",
+            )
+            if lease is not None:
+                return lease
+
+        ancestor_checks = 0
+        for slot in other_slots:
+            if ancestor_checks >= 8:
+                break
+            ancestor_checks += 1
+            lease = try_candidate(
+                managed_root / f"{CAPTIVE_SEAT_PREFIX}{slot}",
+                lock_root / f"{CAPTIVE_SEAT_PREFIX}{slot}.lock",
+                require_ancestor=True,
+            )
+            if lease is not None:
+                return lease
+
+        for slot in other_slots:
+            lease = try_candidate(
+                managed_root / f"{CAPTIVE_SEAT_PREFIX}{slot}",
+                lock_root / f"{CAPTIVE_SEAT_PREFIX}{slot}.lock",
+            )
+            if lease is not None:
+                return lease
+
+        for worktree_path, lock_path in legacy_candidates:
             lease = try_candidate(worktree_path, lock_path)
             if lease is not None:
                 return lease
@@ -1509,29 +1689,22 @@ def acquire_worktree_seat(
                 f"{detail}; refusing to create a new unmanaged worktree"
             )
 
-        next_slot = max(
-            [
-                _slot_from_seat_name(path.name, CAPTIVE_SEAT_PREFIX) or 0
-                for path in seen_paths
-                if path.parent.resolve() == managed_root.resolve()
-            ]
-            + [hwm]
-        ) + 1
-        if next_slot > seat_limit:
-            if refused:
-                raise WorktreeSeatResetRefused(
-                    f"all available worktrees would lose work on reset: {'; '.join(refused)}"
-                )
-            detail = _busy_worktree_message(project_root, seat_limit, occupants)
-            raise WorktreeSeatUnavailable(
-                f"{detail}; refusing to create a new unmanaged worktree"
+        def create_next_slot() -> WorktreeSeatLease | None:
+            nonlocal hwm
+            if hwm >= seat_limit:
+                return None
+            hwm += 1
+            _write_ring_hwm(lock_root, hwm)
+            return try_candidate(
+                managed_root / f"{CAPTIVE_SEAT_PREFIX}{hwm}",
+                lock_root / f"{CAPTIVE_SEAT_PREFIX}{hwm}.lock",
             )
-        _write_ring_hwm(lock_root, next_slot)
-        new_path = managed_root / f"{CAPTIVE_SEAT_PREFIX}{next_slot}"
-        new_lock = lock_root / f"{new_path.name}.lock"
-        lease = try_candidate(new_path, new_lock)
-        if lease is not None:
-            return lease
+
+        while hwm < seat_limit and len(occupants) + 1 <= seat_limit:
+            lease = create_next_slot()
+            if lease is not None:
+                return lease
+
         lost = "; ".join(refused)
         if lost:
             raise WorktreeSeatResetRefused(

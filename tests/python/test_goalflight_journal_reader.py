@@ -382,21 +382,25 @@ def test_startup_context_preserves_nonbusy_journal_failure_type(
     """The schema-open context wrapper must not erase the fatal subtype."""
     _set_state_env(monkeypatch, tmp_path)
     project = _project(tmp_path)
-    journal.Journal.create(project)
+    authority = journal.Journal.create(project)
+    with sqlite3.connect(authority.path) as connection:
+        # Force the legacy bootstrap path: current-schema opens intentionally
+        # avoid the construction transaction after the read-only probe.
+        connection.execute("PRAGMA user_version = 0")
     real_connect = journal.Journal._connect
     calls: list[str] = []
 
-    def fail_second_connect(authority: journal.Journal, **kwargs: object):
+    def fail_startup_connect(authority: journal.Journal, **kwargs: object):
         calls.append("connect")
-        if len(calls) == 2:
+        if len(calls) == 1:
             raise failure
         return real_connect(authority, **kwargs)
 
-    monkeypatch.setattr(journal.Journal, "_connect", fail_second_connect)
+    monkeypatch.setattr(journal.Journal, "_connect", fail_startup_connect)
 
     with pytest.raises(type(failure), match="journal startup could not open"):
         journal.Journal(project)
-    assert calls == ["connect", "connect"], "failure did not bind at schema startup"
+    assert calls == ["connect"], "failure did not bind at schema startup"
 
 
 def test_construction_shares_one_busy_deadline_across_lock_and_open_stages(
@@ -406,7 +410,9 @@ def test_construction_shares_one_busy_deadline_across_lock_and_open_stages(
     """Integrity and bootstrap cannot each restart the writer construction budget."""
     _set_state_env(monkeypatch, tmp_path)
     project = _project(tmp_path)
-    journal.Journal.create(project)
+    authority = journal.Journal.create(project)
+    with sqlite3.connect(authority.path) as connection:
+        connection.execute("PRAGMA user_version = 0")
     clock = [100.0]
     observed: dict[str, float] = {}
 

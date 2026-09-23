@@ -71,6 +71,7 @@ _OUTPUT_TAIL_TERMINAL_MARKERS = _OUTPUT_TAIL_SUCCESS_MARKERS | _OUTPUT_TAIL_BLOC
 _OUTPUT_TAIL_IDLE_RECONCILE_S = 30.0
 _OUTPUT_TAIL_RECONCILE_CLASSES = dispatch_states.OUTPUT_TAIL_RECONCILE_STATES
 _WAIT_LIVENESS_CONFIRMED_ALIVE = "confirmed_alive"
+_WAIT_LIVENESS_ALIVE_PROBABLE = "alive_probable"
 _WAIT_LIVENESS_CONFIRMED_DEAD = "confirmed_dead"
 _WAIT_LIVENESS_INDETERMINATE = "indeterminate"
 # A live watcher normally publishes the worker's terminal marker within the
@@ -108,14 +109,50 @@ _DRAFT_ARTIFACT_FINALITY_FIELDS = frozenset(
 def _has_recorded_worker_identity(record: dict) -> bool:
     ident = record.get("worker_identity")
     if not isinstance(ident, dict):
+        ident = record.get("expected_worker_identity")
+    if not isinstance(ident, dict):
         return False
-    return bool(
-        ident.get("start_token")
-        or ident.get("lstart")
-        or ident.get("creation_time")
-        or ident.get("creation_time_filetime")
-        or ident.get("create_time")
-    )
+    # Old watchers recorded lstart without start_token. Keep those records in
+    # the reconciliation path: a changed lstart proves PID reuse, while a
+    # matching lstart remains only alive-probable.
+    return bool(ident.get("start_token") or ident.get("lstart"))
+
+
+def worker_process_identity_liveness(record: dict | None) -> bool | None:
+    """Read worker liveness from a status identity, or return UNKNOWN.
+
+    Live-observation consumers must not infer liveness from watcher freshness.
+    A pid without its exact start token is not ownership evidence, so it is
+    deliberately distinct from a confirmed dead identity mismatch.
+    """
+    if not isinstance(record, dict):
+        return None
+    identity = record.get("expected_worker_identity")
+    if not isinstance(identity, dict) or not identity.get("start_token"):
+        identity = record.get("worker_identity")
+    if not isinstance(identity, dict):
+        return None
+    pid = record.get("worker_pid") or identity.get("pid")
+    if not pid or not (identity.get("start_token") or identity.get("lstart")):
+        return None
+    if identity.get("identity_probe_error"):
+        return None
+    candidate = dict(record)
+    candidate["worker_pid"] = pid
+    candidate["worker_identity"] = identity
+    try:
+        matched, reason = goalflight_ledger.identity_matches(candidate)
+    except (OSError, TypeError, ValueError):
+        return None
+    if reason == "identity_indeterminate" and _is_legacy_lstart_identity(candidate):
+        _, legacy_reason = _legacy_lstart_liveness(candidate)
+        if legacy_reason == "pid_reused_lstart":
+            return False
+        # lstart equality is alive-probable, not a confirmed ownership signal.
+        return None
+    if reason == "identity_indeterminate":
+        return None
+    return bool(matched)
 
 
 def _status_json_worker_record(record: dict) -> dict | None:
@@ -220,6 +257,41 @@ def _identity_record_for_output_tail_reconcile(record: dict) -> dict | None:
     return None
 
 
+def _is_legacy_lstart_identity(record: dict | None) -> bool:
+    if not isinstance(record, dict):
+        return False
+    identity = record.get("worker_identity")
+    if not isinstance(identity, dict):
+        identity = record.get("expected_worker_identity")
+    return isinstance(identity, dict) and bool(identity.get("lstart")) and not bool(
+        identity.get("start_token")
+    )
+
+
+def _legacy_lstart_liveness(record: dict) -> tuple[bool | None, str]:
+    identity = record.get("worker_identity")
+    if not isinstance(identity, dict):
+        identity = record.get("expected_worker_identity")
+    pid = record.get("worker_pid") or (identity or {}).get("pid")
+    if not isinstance(identity, dict) or not pid:
+        return None, "identity_indeterminate"
+    try:
+        current = goalflight_ledger.process_identity(int(pid))
+    except (OSError, TypeError, ValueError):
+        return None, "identity_indeterminate"
+    if current is None:
+        return False, "dead"
+    if current.get("identity_probe_error"):
+        return None, "identity_indeterminate"
+    expected_lstart = identity.get("lstart")
+    actual_lstart = current.get("lstart")
+    if expected_lstart and actual_lstart and actual_lstart != expected_lstart:
+        return False, "pid_reused_lstart"
+    if expected_lstart and actual_lstart:
+        return True, "lstart_match"
+    return None, "identity_indeterminate"
+
+
 def _record_pid_alive(record: dict) -> bool:
     source = _wait_liveness_record(record) or record
     pid = source.get("worker_pid")
@@ -231,13 +303,28 @@ def _record_pid_alive(record: dict) -> bool:
         return False
 
 
-def _rechecked_worker_alive(record: dict) -> bool:
+def _rechecked_worker_alive(record: dict) -> bool | None:
     if not _needs_liveness_recheck(record):
         return False
+    source = _wait_liveness_record(record)
+    if source is not None and source.get("worker_pid") and not _has_recorded_worker_identity(source):
+        # A legacy or incomplete record cannot establish the PID generation.
+        # Raw PID presence is not a confirmed ownership signal.
+        try:
+            return False if goalflight_compat.pid_liveness(int(source["worker_pid"])) is False else None
+        except (TypeError, ValueError):
+            return False
     identity_record = _identity_record_for_liveness_recheck(record)
     if identity_record is not None:
-        ok, _reason = goalflight_ledger.identity_matches(identity_record)
-        return ok
+        ok, reason = goalflight_ledger.identity_matches(identity_record)
+        if reason == "identity_indeterminate" and _is_legacy_lstart_identity(identity_record):
+            legacy_match, legacy_reason = _legacy_lstart_liveness(identity_record)
+            if legacy_reason == "pid_reused_lstart":
+                return False
+            # Matching lstart keeps a legacy dispatch on the running path, but
+            # this is not ownership evidence for destructive consumers.
+            return True if legacy_match is True else None
+        return ok if reason != "identity_indeterminate" else None
     return _record_pid_alive(record)
 
 
@@ -296,6 +383,16 @@ def _output_tail_reconcile_gate(record: dict, *, tail_mtime: float | None) -> tu
     if identity_record is None:
         return False, "liveness_indeterminate"
     ok, reason = goalflight_ledger.identity_matches(identity_record)
+    if reason == "identity_indeterminate" and _is_legacy_lstart_identity(identity_record):
+        legacy_match, legacy_reason = _legacy_lstart_liveness(identity_record)
+        if legacy_reason == "pid_reused_lstart":
+            ok, reason = False, legacy_reason
+        elif legacy_match is True:
+            # A terminal tail marker is the completion evidence for an old
+            # watcher record. Matching lstart is only alive-probable, not a veto.
+            return True, "worker_liveness_unconfirmed_legacy_lstart"
+        else:
+            return False, "liveness_indeterminate"
     if not ok:
         idle_s = time.time() - float(tail_mtime or 0)
         if str(reason).startswith("pid_reused_") and idle_s <= _OUTPUT_TAIL_IDLE_RECONCILE_S:
@@ -1095,6 +1192,15 @@ def _elapsed_s(started_at: object, *, now: dt.datetime) -> float | None:
     return round(elapsed, 1)
 
 
+def _tail_idle_s(path: object, *, now_epoch: float) -> float | None:
+    if not path:
+        return None
+    try:
+        return max(0.0, now_epoch - Path(str(path)).expanduser().stat().st_mtime)
+    except (OSError, ValueError):
+        return None
+
+
 def _split_task_ids(value: object) -> list[str]:
     values = value if isinstance(value, list) else [value]
     out: list[str] = []
@@ -1215,6 +1321,12 @@ def dashboard_status_payload(project_root: str | Path | None) -> dict:
             or status_sidecar.get("last_marker")
         )
         tail_path = status_sidecar.get("tail_path") or record.get("stdout_path")
+        activity_path = (
+            tail_path
+            or status_sidecar.get("trace_path")
+            or record.get("trace_path")
+        )
+        idle_s = _tail_idle_s(activity_path, now_epoch=time.time())
         dispatches.append(
             {
                 "dispatch_id": record.get("dispatch_id"),
@@ -1230,11 +1342,10 @@ def dashboard_status_payload(project_root: str | Path | None) -> dict:
                 "started_at": record.get("started_at"),
                 "ended_at": record.get("ended_at"),
                 "age_s": _elapsed_s(record.get("started_at"), now=now),
-                "idle_s": (
-                    round(float(status_sidecar["seconds_since_event"]), 1)
-                    if isinstance(status_sidecar.get("seconds_since_event"), (int, float))
-                    else None
-                ),
+                # Watcher status is intentionally quiet between state changes;
+                # derive activity age from worker output, not a watcher
+                # heartbeat or its frozen seconds_since_event observation.
+                "idle_s": round(idle_s, 1) if idle_s is not None else None,
                 "tail_last_line": _last_nonempty_tail_line(tail_path),
                 "marker": marker,
                 "status_path": record.get("status_path"),
@@ -1329,9 +1440,15 @@ def terminal_marker_done_code(
     *,
     worker_alive: bool | None = None,
 ) -> int | None:
-    """Return the shared marker/liveness verdict, or None without a marker."""
-    if not _record_has_terminal_marker(record):
+    """Return the marker verdict, or None without a validated terminal marker."""
+    marker = _record_marker_info(record)
+    if marker is None:
         return None
+    # A validated success marker is the worker's completion evidence. Current
+    # process liveness still gates destructive actions, but cannot keep --wait
+    # open after the worker has signed off.
+    if marker.get("kind") in _OUTPUT_TAIL_SUCCESS_MARKERS:
+        return 0
     # An attention marker resolves terminal WHETHER OR NOT the worker is alive.
     # A worker parked on USER-CONFIRM:/USER-NEED:/BLOCKED: is alive *because* it
     # is waiting for the controller, so treating liveness as a contradiction --
@@ -1341,7 +1458,10 @@ def terminal_marker_done_code(
         return 0
     if worker_alive is None:
         liveness = _wait_worker_liveness(record)
-        worker_alive = liveness == _WAIT_LIVENESS_CONFIRMED_ALIVE
+        worker_alive = liveness in {
+            _WAIT_LIVENESS_CONFIRMED_ALIVE,
+            _WAIT_LIVENESS_ALIVE_PROBABLE,
+        }
     return 1 if worker_alive else 0
 
 
@@ -1374,7 +1494,7 @@ def done_code(record: dict, *, worker_alive: bool | None = None) -> int:
     if _needs_liveness_recheck(record):
         if worker_alive is None:
             worker_alive = _rechecked_worker_alive(record)
-        return 1 if worker_alive else 0
+        return 1 if worker_alive is True else 2 if worker_alive is None else 0
     if cls == _LIVE_CLASS:
         return 1
     if cls in {"queued_capacity", "waiting_capacity", "queued"}:
@@ -1939,6 +2059,15 @@ def _wait_worker_liveness_detail(record: dict | None) -> tuple[str, str]:
         record = source
     if _has_recorded_worker_identity(record):
         ok, reason = goalflight_ledger.identity_matches(record)
+        if reason == "identity_indeterminate" and _is_legacy_lstart_identity(record) and ok:
+            legacy_match, legacy_reason = _legacy_lstart_liveness(record)
+            if legacy_reason == "pid_reused_lstart":
+                return _WAIT_LIVENESS_CONFIRMED_DEAD, legacy_reason
+            if legacy_match is True:
+                # Matching legacy lstart is enough to keep a terminal marker
+                # from declaring a worker done, but never enough for
+                # destructive callers to treat the process as owned.
+                return _WAIT_LIVENESS_ALIVE_PROBABLE, "lstart_match"
         if reason == "identity_indeterminate":
             return _WAIT_LIVENESS_INDETERMINATE, str(reason)
         return (
@@ -2303,7 +2432,10 @@ def _wait_snapshot(
             liveness, liveness_reason = _wait_worker_liveness_detail(record)
             worker_alive = (
                 True
-                if liveness == _WAIT_LIVENESS_CONFIRMED_ALIVE
+                if liveness in {
+                    _WAIT_LIVENESS_CONFIRMED_ALIVE,
+                    _WAIT_LIVENESS_ALIVE_PROBABLE,
+                }
                 else False
                 if liveness == _WAIT_LIVENESS_CONFIRMED_DEAD
                 else None
@@ -3180,6 +3312,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.export_dashboard is not None:
         export_dashboard_status(project_root, args.export_dashboard or None)
+        if not goalflight_task._dashboard_export_enabled():
+            print(goalflight_task.DASHBOARD_EXPORT_DISABLED)
         return 0
 
     if args.wait:

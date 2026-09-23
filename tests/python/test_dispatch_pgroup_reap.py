@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 from support import skip_posix_on_native_windows
 
@@ -42,9 +43,18 @@ def _wait_dead(pid: int, timeout: float = 5.0) -> bool:
     return not _alive(pid)
 
 
-def _write_pidfile(path: Path, worker_pid: int, pgid: int | None) -> None:
+def _write_pidfile(
+    path: Path,
+    worker_pid: int,
+    pgid: int | None,
+    worker_identity: dict | None = None,
+) -> None:
     entry = {"pid": worker_pid, "controller_pid": os.getpid(),
-             "agent": "test-dispatch", "session_id": "reap-test"}
+             "agent": "test-dispatch", "session_id": "reap-test",
+             "worker_identity": worker_identity or {
+                 "pid": worker_pid,
+                 "start_token": "test-worker",
+             }}
     if pgid is not None:
         entry["pgid"] = pgid
     path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
@@ -61,45 +71,50 @@ _ORPHAN_CHILD_CODE = (
 )
 
 
-def _spawn_worker_with_orphan() -> tuple[int, int, int]:
+def _spawn_worker_with_orphan() -> tuple[int, int, int, dict]:
     """Spawn a worker in its own session/group that leaves a SIGHUP-ignoring child
-    behind, then exits. Returns (worker_pid, pgid, orphan_child_pid); the child
-    outlives the leader and keeps the worker's pgid."""
+    behind, then exits. Returns (worker_pid, pgid, orphan_child_pid, identity);
+    the child outlives the leader and keeps the worker's pgid."""
     worker_code = (
-        "import os, subprocess, sys\n"
+        "import os, subprocess, sys, time\n"
         "c = subprocess.Popen([sys.executable, '-c', __ORPHAN__], "
         "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
-        "sys.stdout.write('%d %d %d' % (os.getpid(), os.getpgrp(), c.pid))\n"
+        "sys.stdout.write('%d %d %d\\n' % (os.getpid(), os.getpgrp(), c.pid))\n"
         "sys.stdout.flush()\n"
+        "time.sleep(1)\n"
     ).replace("__ORPHAN__", repr(_ORPHAN_CHILD_CODE))
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         [sys.executable, "-c", worker_code],
-        capture_output=True, text=True, start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True,
     )
-    worker_pid, pgid, child_pid = (int(x) for x in proc.stdout.split())
-    return worker_pid, pgid, child_pid
+    assert proc.stdout is not None
+    worker_pid, pgid, child_pid = (int(x) for x in proc.stdout.readline().split())
+    worker_identity = dispatch.goalflight_ledger.process_identity(worker_pid)
+    assert worker_identity and worker_identity.get("start_token"), worker_identity
+    proc.wait(timeout=5)
+    return worker_pid, pgid, child_pid, worker_identity
 
 
 def case_cleanup_reaps_dead_worker_orphans() -> None:
     # Full integration through _cleanup_pidfile_if_worker_dead: a dead worker
     # with an orphan still in its group must be reaped, then the pidfile unlinked.
-    # pid_alive(worker) is stubbed False to make "leader is dead" deterministic
-    # (avoids a pid-reuse race); the orphan + pgid + killpg are all real.
-    worker_pid, pgid, child_pid = _spawn_worker_with_orphan()
-    orig_pid_alive = goalflight_compat.pid_alive
-    goalflight_compat.pid_alive = lambda p, _w=worker_pid: False if p == _w else orig_pid_alive(p)
+    # The leader's recorded identity is captured while it is alive; the orphan,
+    # pgid, liveness transition, and killpg are all real.
+    worker_pid, pgid, child_pid, worker_identity = _spawn_worker_with_orphan()
     try:
         assert pgid == worker_pid, (pgid, worker_pid)  # worker is the group leader
         assert _alive(child_pid), "orphan child should be alive before reaping"
         with tempfile.TemporaryDirectory() as td:
             pidfile = Path(td) / "ctrl.bashtail.worker.jsonl"
-            _write_pidfile(pidfile, worker_pid, pgid)
+            _write_pidfile(pidfile, worker_pid, pgid, worker_identity)
             # killpg(pgid) targets the group (the orphan), not the dead leader pid.
             dispatch._cleanup_pidfile_if_worker_dead(pidfile, worker_pid)
             assert _wait_dead(child_pid), "orphan child should be reaped by teardown"
             assert not pidfile.exists(), "pidfile should be unlinked after reap"
     finally:
-        goalflight_compat.pid_alive = orig_pid_alive
         with contextlib.suppress(OSError):
             os.kill(child_pid, signal.SIGKILL)  # never leak the test's own child
 
@@ -162,12 +177,71 @@ def case_reap_skips_pgid_neq_worker() -> None:
         assert True, "reaper must skip when pgid != worker_pid"
 
 
+def case_reap_refuses_reused_worker_pid() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        pidfile = Path(td) / "ctrl.bashtail.worker.jsonl"
+        _write_pidfile(pidfile, 999_999, 999_999)
+        probes: list[tuple[int, int]] = []
+
+        def group_probe(_pgid: int, sig: int) -> None:
+            probes.append((_pgid, sig))
+
+        with patch.object(goalflight_compat, "pid_alive", return_value=False), patch.object(
+            dispatch.goalflight_ledger,
+            "process_identity",
+            return_value={"pid": 999_999, "start_token": "new-worker"},
+        ), patch.object(dispatch.os, "killpg", side_effect=group_probe):
+            assert dispatch._reap_dead_worker_pgroup(pidfile, 999_999) is False
+        assert probes == [(999_999, 0)], probes
+        assert all(
+            sig not in {signal.SIGTERM, signal.SIGKILL} for _, sig in probes
+        ), "a reused PID must not signal its new group"
+        assert pidfile.exists(), "reused-PID evidence must be preserved"
+
+
+def case_cleanup_preserves_legacy_pidfile_without_identity() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        pidfile = Path(td) / "ctrl.bashtail.worker.jsonl"
+        pidfile.write_text(
+            json.dumps({"pid": 999_999, "pgid": 999_999}) + "\n",
+            encoding="utf-8",
+        )
+        with patch.object(goalflight_compat, "pid_alive", return_value=False), patch.object(
+            dispatch.os, "killpg", side_effect=AssertionError("legacy evidence must not be signalled")
+        ):
+            dispatch._cleanup_pidfile_if_worker_dead(pidfile, 999_999)
+        assert pidfile.exists(), "legacy pidfile must be retained as recovery evidence"
+
+
+def case_cleanup_preserves_pidfile_when_identity_probe_is_unknown() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        pidfile = Path(td) / "ctrl.bashtail.worker.jsonl"
+        _write_pidfile(pidfile, 999_999, 999_999)
+        def unknown_group_probe(_pgid: int, sig: int) -> None:
+            if sig == 0:
+                raise PermissionError
+            raise AssertionError("unknown identity must not signal")
+
+        with patch.object(goalflight_compat, "pid_alive", return_value=False), patch.object(
+            dispatch.goalflight_ledger,
+            "process_identity",
+            return_value=None,
+        ), patch.object(
+            dispatch.os, "killpg", side_effect=unknown_group_probe
+        ):
+            dispatch._cleanup_pidfile_if_worker_dead(pidfile, 999_999)
+        assert pidfile.exists(), "unknown identity must preserve the pidfile"
+
+
 def main() -> None:
     case_cleanup_reaps_dead_worker_orphans()
     case_cleanup_preserves_live_worker()
     case_reap_safe_on_bad_pidfile()
     case_reap_skips_pgid_neq_worker()
+    case_reap_refuses_reused_worker_pid()
     case_guard_skips_own_pgroup()
+    case_cleanup_preserves_legacy_pidfile_without_identity()
+    case_cleanup_preserves_pidfile_when_identity_probe_is_unknown()
     print("OK: dispatch pgroup-reap teardown tests pass")
 
 

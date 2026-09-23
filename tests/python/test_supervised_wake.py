@@ -926,13 +926,23 @@ def test_supervise_cli_default_heartbeat_lands_and_bounds_refuse(
         "resolve_startup_lease_nonce",
         lambda **_kwargs: ("nonce-1", None, None),
     )
-    monkeypatch.setattr(supervise, "RealHost", lambda **_kwargs: object())
-    calls: list[dict[str, object]] = []
     monkeypatch.setattr(
         supervise,
-        "run_supervisor",
-        lambda **kwargs: calls.append(kwargs) or 0,
+        "_renew_controller_lease_before_arm",
+        lambda **kwargs: str(kwargs["nonce"]),
     )
+    monkeypatch.setattr(supervise, "RealHost", lambda **_kwargs: SimpleNamespace())
+    calls: list[dict[str, object]] = []
+
+    def run_with_holder(**kwargs: object) -> int:
+        holder = kwargs["host"]._journal_holder
+        assert holder.connection is not None
+        assert not holder.connection.in_transaction
+        calls.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(supervise, "run_supervisor", run_with_holder)
+    journal.Journal.create(tmp_path)
 
     parsed = subprocess.run(
         [
@@ -996,6 +1006,16 @@ def test_supervise_cli_default_heartbeat_lands_and_bounds_refuse(
         on_startup_probe=migration_callback,
     ) == 0
     assert calls[3]["on_startup_probe"] is migration_callback
+    assert all(call["host"]._journal_holder.connection is None for call in calls)
+
+    def failed_start(**kwargs: object) -> int:
+        run_with_holder(**kwargs)
+        raise RuntimeError("startup failed")
+
+    monkeypatch.setattr(supervise, "run_supervisor", failed_start)
+    with pytest.raises(RuntimeError, match="startup failed"):
+        supervise.cmd_supervise(args)
+    assert calls[-1]["host"]._journal_holder.connection is None
 
 
 def test_supervise_start_renews_lease_before_arm(
@@ -1026,6 +1046,7 @@ def test_supervise_start_renews_lease_before_arm(
         assert lease is not None
         seen["deadline"] = lease.renew_deadline_at
         seen["nonce"] = str(kwargs["lease_nonce"])
+        seen["rewinds"] = str(kwargs["cursor_rewinds"]())
         return 0
 
     monkeypatch.setattr(supervise, "run_supervisor", arm)
@@ -1044,6 +1065,7 @@ def test_supervise_start_renews_lease_before_arm(
         result = supervise.cmd_supervise(args)
     assert result == 0, capsys.readouterr().err
     assert seen["nonce"] == nonce
+    assert seen["rewinds"] == "{}"
     assert seen["deadline"] > before
     after = authority.active_lease(label)
     assert after is not None
@@ -4343,6 +4365,7 @@ def test_messages_supervise_wires_the_forwarding_only_projection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
     store = task.TaskStore(tmp_path)
     store.save_items_atomic(
         [
@@ -4509,6 +4532,8 @@ def test_actual_follow_computes_projected_and_unavailable_directives(
 ) -> None:
     """Classification comes from cmd_follow, not a scripted frontier record."""
     project, env, lease = isolated
+    env["GOALFLIGHT_DASHBOARD_EXPORT_ENABLED"] = "1"
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
     monkeypatch.setattr(supervise.wake, "live_waiters", lambda *args, **kwargs: [])
     store = task.TaskStore(project)
     if projection == "projected":
@@ -4559,6 +4584,8 @@ def test_actual_follow_keeps_working_item_empty_but_supervisor_forwards_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, env, lease = isolated
+    env["GOALFLIGHT_DASHBOARD_EXPORT_ENABLED"] = "1"
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
     monkeypatch.setattr(supervise.wake, "live_waiters", lambda *args, **kwargs: [])
     store = task.TaskStore(project)
     store.save_items_atomic(
@@ -4657,6 +4684,8 @@ def test_forwarding_projection_refreshes_after_active_only_transition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, env, lease = isolated
+    env["GOALFLIGHT_DASHBOARD_EXPORT_ENABLED"] = "1"
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
     monkeypatch.setattr(supervise.wake, "live_waiters", lambda *args, **kwargs: [])
     store = task.TaskStore(project)
     store.save_items_atomic(

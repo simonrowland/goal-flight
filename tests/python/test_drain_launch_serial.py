@@ -480,6 +480,38 @@ def test_healthy_entry_launches_promptly_when_capacity_available(
     assert elapsed < 2.0, elapsed
 
 
+def test_current_drainer_replays_legacy_v1_carrier_after_pin_rollout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh post-update drainer must keep accepting unpinned v1 input."""
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = _write_entry(
+        queue,
+        "legacy-v1-carrier",
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    carrier = json.loads(path.read_text(encoding="utf-8"))
+    assert carrier["schema"] == D.DISPATCH_QUEUE_SCHEMA
+    monkeypatch.setattr(D.subprocess, "run", _launched_run_factory(tmp_path))
+
+    payload = D._drain_queue_once(_drain_args(queue))
+
+    assert payload["launched"] == 1, payload
+    assert not path.exists(), payload
+
+
+def test_launch_timeout_includes_capacity_and_seat_preparation_window(
+    tmp_path: Path,
+) -> None:
+    args = _drain_args(_queue_dir(tmp_path), capacity_wait_s=7.0)
+    assert D._drain_launch_timeout_s(args) == pytest.approx(
+        7.0 + D.DRAIN_LAUNCH_PREPARATION_S + D.DRAIN_LAUNCH_CONFIRM_S
+    )
+
+
 def test_real_pre_spawn_refusal_terminalizes_after_bounded_attempts(
     tmp_path: Path,
 ) -> None:
@@ -543,6 +575,13 @@ def test_real_pre_spawn_refusal_terminalizes_after_bounded_attempts(
     status = json.loads((project / f"{dispatch_id}.status.json").read_text(encoding="utf-8"))
     assert status.get("state") == "failed", status
     assert str(status.get("reason") or "").startswith("launch_attempt_limit_exceeded:"), status
+    attention = [
+        item
+        for payload in payloads
+        for item in payload.get("attention") or []
+        if item.get("dispatch_id") == dispatch_id
+    ]
+    assert attention and attention[-1]["attention"] == "launch_attempt_limit_exceeded", attention
 
 
 def test_legacy_launch_timeout_count_does_not_spend_new_failure_budget(
@@ -621,6 +660,77 @@ def test_transient_local_pre_spawn_gate_does_not_spend_failure_budget(
     assert queued.get("launch_fail_reason") == (
         f"launch_refused_pre_spawn:{returncode}:{diagnostic}"
     ), queued
+
+
+def test_old_dispatcher_v2_carrier_emits_one_attention_and_backs_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    dispatch_id = "old-dispatcher-v2-carrier"
+    path = _write_entry(
+        queue,
+        dispatch_id,
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    carrier = json.loads(path.read_text(encoding="utf-8"))
+    carrier["schema"] = D.DISPATCH_QUEUE_PINNED_SCHEMA
+    carrier["worktree_pin_holder"] = dispatch_id
+    carrier["worktree_seat"] = "s-1"
+    carrier["worktree_path"] = str(project / "s-1")
+    carrier["worktree_base_sha"] = "a" * 40
+    split = carrier["dispatch_argv"].index("--")
+    carrier["dispatch_argv"][split:split] = [
+        "--worktree-pin-holder",
+        dispatch_id,
+    ]
+    D._write_json_atomic(path, carrier)
+    _write_queued_ledger(path)
+
+    def old_dispatcher(argv, *args, **kwargs):
+        argv_list = list(argv)
+        if not _is_drain_child(argv_list):
+            return _REAL_SUBPROCESS_RUN(argv, *args, **kwargs)
+        return subprocess.CompletedProcess(
+            argv_list,
+            2,
+            stdout="",
+            stderr=(
+                "goalflight_dispatch.py: error: unrecognized arguments: "
+                f"--worktree-pin-holder {dispatch_id}\n"
+            ),
+        )
+
+    monkeypatch.setattr(D.subprocess, "run", old_dispatcher)
+    first = D._drain_queue_once(_drain_args(queue))
+    attention = [
+        item
+        for item in first.get("attention") or []
+        if item.get("dispatch_id") == dispatch_id
+    ]
+    assert len(attention) == 1, first
+    assert attention[0]["attention"] == "mixed_version_pinned_carrier", attention
+    assert dispatch_id in attention[0]["carrier"], attention
+    assert attention[0]["fix"] == D.PINNED_CARRIER_MIXED_VERSION_FIX, attention
+
+    queued = json.loads(path.read_text(encoding="utf-8"))
+    assert queued.get("launch_attempt_class") == D.LAUNCH_ATTEMPT_CLASS_UNDETERMINED
+    assert queued.get("launch_backoff_until"), queued
+    assert str(queued.get("launch_fail_reason")).startswith(
+        D.PINNED_CARRIER_MIXED_VERSION_PREFIX
+    ), queued
+
+    queued.pop("launch_backoff_until", None)
+    D._write_json_atomic(path, queued)
+    second = D._drain_queue_once(_drain_args(queue))
+    repeated = [
+        item
+        for item in second.get("attention") or []
+        if item.get("dispatch_id") == dispatch_id
+    ]
+    assert not repeated, second
 
 
 def test_remote_fleet_gate_does_not_spend_failure_budget(
@@ -1120,6 +1230,45 @@ def test_launch_backoff_counter_saturates_at_capped_delay(tmp_path: Path) -> Non
     record = ledger.read_record("saturated-backoff")
     assert record is not None
     assert record["launch_backoff_count"] == D.MAX_LAUNCH_BACKOFF_COUNT, record
+
+
+def test_proven_failure_backoff_grows_between_retries(tmp_path: Path) -> None:
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = _write_entry(
+        queue,
+        "growing-backoff",
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    entry = _write_queued_ledger(path)
+
+    assert D._stamp_launch_attempt(
+        path,
+        entry,
+        backoff=True,
+        failed=True,
+        fail_reason="launch_timeout_pending_ledger",
+        attempt_class=D.LAUNCH_ATTEMPT_CLASS_PROVEN_FAILURE,
+    ) is None
+    first = json.loads(path.read_text(encoding="utf-8"))
+    first_until = ledger.parse_utc(first["launch_backoff_until"])
+    assert first["launch_backoff_count"] == 1, first
+
+    assert D._stamp_launch_attempt(
+        path,
+        first,
+        backoff=True,
+        failed=True,
+        fail_reason="launch_timeout_pending_ledger",
+        attempt_class=D.LAUNCH_ATTEMPT_CLASS_PROVEN_FAILURE,
+    ) is None
+    second = json.loads(path.read_text(encoding="utf-8"))
+    second_until = ledger.parse_utc(second["launch_backoff_until"])
+    assert second["launch_backoff_count"] == 2, second
+    assert first_until is not None and second_until is not None
+    assert second_until > first_until, (first, second)
 
 
 def test_two_drain_threads_on_one_dispatch_id_yield_one_launch(

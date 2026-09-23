@@ -15,6 +15,11 @@ Repository: <absolute-repository-path>
    It supplies orientation only and does not expand this task's scope.
 3. North star: <one sentence from the project or lane>.
 
+Search inside your own worktree with `git ls-files`, `rg --files`, or `rg <pattern>`.
+Never run `find` or recursive globbing above your worktree: not from a repo root that contains `worktrees/`,
+`$HOME`, `~/.goal-flight`, `/tmp`, `/private/tmp`, or `$TMPDIR`.
+For a file outside your worktree, use its known path.
+
 You are READ-ONLY unless this prompt explicitly authorizes exact edit paths.
 Do not commit. Do not run rm -rf or cleanup traps. Never print credential,
 secret, or token values. If a sandbox, permission, missing-context, or scope

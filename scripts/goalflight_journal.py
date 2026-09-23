@@ -5,7 +5,8 @@ P1 creates the epoch/fencing substrate and the smallest honest operator surface:
 ``inspect``, ``dump``, validated online ``snapshot``, and guarded ``restore``.
 The full backup schedule, retention/RPO policy, restore drills, and outbox-aware
 post-restore reconciliation arrive in P2+; this module does not pretend those
-operational policies already exist.
+operational policies already exist. History retention and compaction are
+deliberately deferred; v1.7.1 never deletes journal history or runs VACUUM.
 
 Journal writes accept only pre-built declarative row mutations.  No caller code
 runs after ``BEGIN IMMEDIATE``.  A transaction is limited to
@@ -40,6 +41,7 @@ import socket
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -147,6 +149,22 @@ WAKE_WEBHOOK_OUTBOX_FLUSH_LIMIT = 8
 JOURNAL_OPEN_RETRY_BUDGET_S = 75.0
 JOURNAL_OPEN_RETRY_INITIAL_S = 0.050
 JOURNAL_OPEN_RETRY_MAX_S = 5.0
+
+# Startup validation is a process-level guard, not a claim that an SQLite file
+# can never be corrupted after it was checked. The file identity is part of the
+# key so a restore/replace gets a fresh validation in this process. The cache is
+# intentionally memory-only: a process restart (including recovery after an
+# unclean shutdown) makes the next open run a full check without a disk write.
+# Before caching, one full integrity check per open read roughly 85 MiB.
+# tests/python/test_goalflight_journal_b1.py::test_large_journal_open_benchmark
+# measured 28.4 -> 12.4 ms per open on an 89 MB journal. Fifteen minutes bounds
+# the accepted window while avoiding repeated checks in a process. SQLite detects
+# corruption on pages an operation touches, and _handle_corruption latches the
+# first SQLITE_CORRUPT/NOTADB failure so subsequent writes fail closed.
+INTEGRITY_CHECK_INTERVAL_S = 15 * 60.0
+_INTEGRITY_CHECKED_AT: dict[tuple[str, int, int], float] = {}
+_INTEGRITY_FAILURES: dict[tuple[str, int, int], str] = {}
+_INTEGRITY_CHECK_LOCK = threading.RLock()
 # Writer-capable clients sit on durable launch, lifecycle, and cursor-CAS paths:
 # failing them can poison an id or replay acknowledged-looking mail.  Under 64
 # concurrent writers, successful *construction* measured 0.024-3.725s (N=7,
@@ -879,7 +897,14 @@ def _sqlite_connect(
     timeout: float = 5.0,
     isolation_level: str | None = "",
 ) -> sqlite3.Connection:
-    """Small injection seam for deterministic readonly-open failure tests."""
+    """Shared connection seam for deterministic journal-open tests."""
+    counter_path = os.environ.get("GOALFLIGHT_TEST_SQLITE_CONNECT_COUNTER", "").strip()
+    if counter_path:
+        try:
+            with open(counter_path, "a", encoding="utf-8") as counter:
+                counter.write(f"{os.getpid()}\t{database}\n")
+        except OSError:
+            pass
     return sqlite3.connect(
         database,
         uri=uri,
@@ -1076,6 +1101,16 @@ class Journal:
             jitter_max_s=jitter_max_s,
         )
         self._require_existing_database()
+        # A current schema can be established with a read-only marker probe;
+        # avoid taking the construction lock and running the bootstrap
+        # transaction on every short-lived writer open.
+        if self._schema_is_current_readonly():
+            self._open_validated(
+                created_here=False,
+                busy_deadline_s=None,
+                bootstrap=False,
+            )
+            return
         write_lock, deadline = self._acquire_construction_lock()
         try:
             self._require_existing_database()
@@ -1148,6 +1183,7 @@ class Journal:
         project_root: Path | str,
         *,
         client_epochs: ClientEpochs | None = None,
+        persistent: bool = False,
         retry_budget_s: float = JOURNAL_READER_RETRY_BUDGET_S,
         open_retry_budget_s: float = JOURNAL_OPEN_RETRY_BUDGET_S,
         transaction_budget_s: float = 1.0,
@@ -1160,7 +1196,9 @@ class Journal:
         whole-database startup integrity check and schema bootstrap performed by
         the ordinary constructor. Every read uses either a mode=ro connection or
         a mode=rw handle immediately hardened with query_only, then checks the
-        live epoch fence in ``read_all``.
+        live epoch fence in ``read_all``. A persistent reader keeps that
+        read-only connection between calls and ends each read transaction before
+        returning.
         """
         root = goalflight_task.resolve_project_root_for_read(str(project_root))
         if root is None:
@@ -1182,6 +1220,9 @@ class Journal:
         )
         self._require_existing_database()
         self._read_only_client = True
+        self._persistent_reader = bool(persistent)
+        self._reader_connection: sqlite3.Connection | None = None
+        self._reader_pid: int | None = None
         return self
 
     def _configure(
@@ -1218,6 +1259,9 @@ class Journal:
         self.jitter_min_s = jitter_min_s
         self.jitter_max_s = jitter_max_s
         self._read_only_client = False
+        self._persistent_reader = False
+        self._reader_connection: sqlite3.Connection | None = None
+        self._reader_pid: int | None = None
         self._file_identity: tuple[int, int] | None = None
 
     def _acquire_construction_lock(self) -> tuple[goalflight_task.FileLock, float]:
@@ -1283,13 +1327,113 @@ class Journal:
                 "different database cannot inherit this client's authority."
             )
 
-    def _open_validated(
-        self, *, created_here: bool, busy_deadline_s: float | None = None
-    ) -> None:
-        self._startup_integrity_check(busy_deadline_s=busy_deadline_s)
-        self._bootstrap_schema(
-            created_here=created_here, busy_deadline_s=busy_deadline_s
+    def _integrity_cache_key(self) -> tuple[str, int, int]:
+        self._require_existing_database()
+        if self._file_identity is None:
+            raise JournalIOError(f"journal file identity is unavailable: {self.path}")
+        return (str(self.path), self._file_identity[0], self._file_identity[1])
+
+    def _integrity_check_cached(self) -> bool:
+        key = self._integrity_cache_key()
+        now = time.monotonic()
+        with _INTEGRITY_CHECK_LOCK:
+            failure = _INTEGRITY_FAILURES.get(key)
+            checked_at = _INTEGRITY_CHECKED_AT.get(key)
+        if failure is not None:
+            raise self._integrity_error(failure)
+        return (
+            checked_at is not None
+            and now - checked_at < INTEGRITY_CHECK_INTERVAL_S
         )
+
+    def _schema_is_current_readonly(self) -> bool:
+        """Read the SQLite schema marker without taking the construction lock."""
+        try:
+            with contextlib.closing(
+                _open_readonly_connection(self.path, timeout=0, isolation_level=None)
+            ) as connection:
+                row = connection.execute("PRAGMA user_version").fetchone()
+                if row is None:
+                    raise JournalIntegrityError(
+                        f"journal schema probe returned no user_version for {self.path}"
+                    )
+                try:
+                    user_version = int(row[0])
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise JournalIntegrityError(
+                        f"journal schema probe returned invalid user_version for {self.path}: {row[0]!r}"
+                    ) from exc
+                if user_version != CURRENT_SCHEMA_EPOCH:
+                    return False
+                mode_row = connection.execute("PRAGMA journal_mode").fetchone()
+                if mode_row is None or str(mode_row[0]).lower() != "wal":
+                    # _bootstrap_schema is the repair path for a valid current
+                    # schema that has been switched out of WAL mode.
+                    return False
+                epoch_row = connection.execute(
+                    """
+                    SELECT schema_epoch, protocol_epoch, registry_epoch,
+                           minimum_reader_epoch, minimum_writer_epoch
+                    FROM journal_epochs WHERE singleton = 1
+                    """
+                ).fetchone()
+                try:
+                    epochs = tuple(int(value) for value in epoch_row) if epoch_row else ()
+                except (TypeError, ValueError, OverflowError):
+                    epochs = ()
+                if epochs != (
+                    CURRENT_SCHEMA_EPOCH,
+                    CURRENT_PROTOCOL_EPOCH,
+                    CURRENT_REGISTRY_EPOCH,
+                    CURRENT_READER_EPOCH,
+                    CURRENT_WRITER_EPOCH,
+                ):
+                    return False
+                outbox_sql_row = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'terminal_outbox'"
+                ).fetchone()
+                if outbox_sql_row is not None and re.search(
+                    r"CHECK\s*\(\s*event_type\s+IN\s*\(\s*'result'\s*,\s*'blocked'\s*\)\s*\)",
+                    str(outbox_sql_row[0]),
+                    flags=re.IGNORECASE,
+                ):
+                    return False
+                identity_row = connection.execute(
+                    "SELECT value FROM journal_meta WHERE key = ?",
+                    (JOURNAL_IDENTITY_KEY,),
+                ).fetchone()
+                if identity_row is None or str(identity_row[0]) != JOURNAL_IDENTITY_VALUE:
+                    return False
+                missing, malformed = self._current_schema_issues(connection)
+        except sqlite3.DatabaseError as exc:
+            if _is_busy(exc):
+                return False
+            if _is_corruption_error(exc):
+                self._handle_corruption(exc)
+            raise JournalIOError(
+                f"journal schema probe unavailable/unreadable for {self.path}: {exc}"
+            ) from exc
+        return not missing and not malformed
+
+    def _open_validated(
+        self,
+        *,
+        created_here: bool,
+        busy_deadline_s: float | None = None,
+        bootstrap: bool = True,
+    ) -> None:
+        if not self._integrity_check_cached():
+            self._startup_integrity_check(busy_deadline_s=busy_deadline_s)
+        if bootstrap:
+            bootstrap_changed = self._bootstrap_schema(
+                created_here=created_here, busy_deadline_s=busy_deadline_s
+            )
+            if bootstrap_changed and not created_here:
+                # A migration or schema repair changes the pages that the
+                # pre-bootstrap check validated; validate the resulting file.
+                self._startup_integrity_check(
+                    force=True, busy_deadline_s=busy_deadline_s
+                )
         # Enforced on open even though P1 has only epoch 1.  Reads repeat the
         # fence so a long-lived client cannot outlive a migration unnoticed.
         self._read_with_retry(
@@ -1313,6 +1457,27 @@ class Journal:
             os.close(fd)
 
     def _connect(self, *, busy_deadline_s: float | None = None) -> sqlite3.Connection:
+        if (
+            self._read_only_client
+            and self._persistent_reader
+            and self._reader_connection is not None
+        ):
+            if self._reader_pid != os.getpid():
+                # Never use a sqlite handle inherited across fork in the child.
+                self._reader_connection.close()
+                self._reader_connection = None
+                self._reader_pid = None
+            else:
+                try:
+                    self._require_existing_database()
+                except BaseException:
+                    # A replacement database cannot safely inherit this reader's
+                    # authority; the existing identity fence intentionally fails
+                    # closed instead of reopening against a new file.
+                    self._reader_connection.close()
+                    self._reader_connection = None
+                    raise
+                return self._reader_connection
         started = time.monotonic()
         open_started = started
         attempts = 0
@@ -1328,7 +1493,7 @@ class Journal:
                         isolation_level=None,
                     )
                 else:
-                    connection = sqlite3.connect(
+                    connection = _sqlite_connect(
                         self.path.as_uri() + "?mode=rw",
                         uri=True,
                         timeout=0,
@@ -1353,8 +1518,8 @@ class Journal:
                         f"journal connection remained busy after {attempts} attempts "
                         f"within {self.retry_budget_s:.3f}s: {self.path}"
                     ) from exc
-                if self._read_only_client and _is_corruption_error(exc):
-                    self._raise_integrity_failure(f"journal reader parse failed: {exc}")
+                if _is_corruption_error(exc):
+                    self._handle_corruption(exc, run_integrity_check=False)
                 if _is_cantopen(exc):
                     open_failures += 1
                     self._raise_disappeared_or_unverified(exc)
@@ -1368,16 +1533,24 @@ class Journal:
                     ) from exc
                 raise
             try:
-                connection.row_factory = sqlite3.Row
-                connection.execute("PRAGMA busy_timeout = 0")
-                connection.execute("PRAGMA foreign_keys = ON")
-                connection.execute("PRAGMA synchronous = FULL")
-                self._require_existing_database()
-                return connection
+                configured = False
+                try:
+                    connection.row_factory = sqlite3.Row
+                    connection.execute("PRAGMA busy_timeout = 0")
+                    connection.execute("PRAGMA foreign_keys = ON")
+                    connection.execute("PRAGMA synchronous = FULL")
+                    self._require_existing_database()
+                    if self._read_only_client and self._persistent_reader:
+                        self._reader_connection = connection
+                        self._reader_pid = os.getpid()
+                    configured = True
+                    return connection
+                finally:
+                    if not configured:
+                        connection.close()
             except sqlite3.OperationalError as exc:
-                connection.close()
-                if self._read_only_client and _is_corruption_error(exc):
-                    self._raise_integrity_failure(f"journal reader parse failed: {exc}")
+                if _is_corruption_error(exc):
+                    self._handle_corruption(exc, run_integrity_check=False)
                 if not _is_busy(exc):
                     if _is_cantopen(exc):
                         open_failures += 1
@@ -1399,8 +1572,35 @@ class Journal:
                         f"journal connection remained busy after {attempts} attempts "
                         f"within {self.retry_budget_s:.3f}s: {self.path}"
                     ) from exc
+            except sqlite3.DatabaseError as exc:
+                if _is_corruption_error(exc):
+                    self._handle_corruption(exc, run_integrity_check=False)
+                raise
 
-    def _startup_integrity_check(self, *, busy_deadline_s: float | None = None) -> None:
+    def _startup_integrity_check(
+        self,
+        *,
+        busy_deadline_s: float | None = None,
+        force: bool = False,
+    ) -> None:
+        key = self._integrity_cache_key()
+        with _INTEGRITY_CHECK_LOCK:
+            failure = _INTEGRITY_FAILURES.get(key)
+            if failure is not None:
+                raise self._integrity_error(failure)
+            checked_at = _INTEGRITY_CHECKED_AT.get(key)
+            if (
+                not force
+                and checked_at is not None
+                and time.monotonic() - checked_at < INTEGRITY_CHECK_INTERVAL_S
+            ):
+                return
+            self._startup_integrity_check_uncached(busy_deadline_s=busy_deadline_s)
+            _INTEGRITY_CHECKED_AT[key] = time.monotonic()
+
+    def _startup_integrity_check_uncached(
+        self, *, busy_deadline_s: float | None = None
+    ) -> None:
         started = time.monotonic()
         deadline = (
             started + self.retry_budget_s
@@ -1411,13 +1611,15 @@ class Journal:
         while True:
             attempts += 1
             try:
-                with contextlib.closing(
-                    self._connect(busy_deadline_s=deadline)
-                ) as connection:
+                connection = self._connect(busy_deadline_s=deadline)
+                try:
                     rows = [
                         str(row[0])
                         for row in connection.execute("PRAGMA integrity_check")
                     ]
+                finally:
+                    if not (self._read_only_client and self._persistent_reader):
+                        connection.close()
             except sqlite3.DatabaseError as exc:
                 if _is_busy(exc) and self._retry_delay(started, deadline_s=deadline):
                     continue
@@ -1431,17 +1633,36 @@ class Journal:
                 self._raise_integrity_failure("; ".join(rows) or "no result")
             return
 
-    def _raise_integrity_failure(self, detail: str) -> None:
-        raise JournalIntegrityError(
+    def _integrity_error(self, detail: str) -> JournalIntegrityError:
+        return JournalIntegrityError(
             f"journal integrity check failed for {self.path}: {detail}. "
             "Failing closed: this journal is authoritative and streams cannot rebuild it. "
             "Restore a validated WAL-safe backup or use audited repair; raw SQLite edits "
             "are unsupported."
         )
 
+    def _raise_integrity_failure(self, detail: str) -> None:
+        try:
+            key = self._integrity_cache_key()
+        except JournalError:
+            key = None
+        if key is not None:
+            with _INTEGRITY_CHECK_LOCK:
+                _INTEGRITY_FAILURES[key] = detail
+        raise self._integrity_error(detail)
+
+    def _handle_corruption(
+        self, exc: BaseException, *, run_integrity_check: bool = True
+    ) -> None:
+        if run_integrity_check:
+            # The original operation may have touched only one damaged page;
+            # run the complete check before latching the journal closed.
+            self._startup_integrity_check(force=True)
+        self._raise_integrity_failure(str(exc))
+
     def _bootstrap_schema(
         self, *, created_here: bool, busy_deadline_s: float | None = None
-    ) -> None:
+    ) -> bool:
         started = time.monotonic()
         deadline = (
             started + self.retry_budget_s
@@ -1471,8 +1692,23 @@ class Journal:
                 required = {"journal_meta", "journal_epochs"}
                 if required <= tables:
                     self._assert_identity(connection)
+                    user_version = int(
+                        connection.execute("PRAGMA user_version").fetchone()[0]
+                    )
+                    if user_version > CURRENT_SCHEMA_EPOCH:
+                        connection.rollback()
+                        raise JournalUpgradeRequired(
+                            _upgrade_required_resume(
+                                f"journal user_version={user_version} is newer than "
+                                f"client schema={CURRENT_SCHEMA_EPOCH}; refusing downgrade"
+                            )
+                        )
                     migrated = self._migrate_to_current(connection)
-                    if migrated:
+                    if migrated or user_version != CURRENT_SCHEMA_EPOCH:
+                        self._assert_epoch_fence(connection, for_write=False)
+                        connection.execute(
+                            f"PRAGMA user_version = {CURRENT_SCHEMA_EPOCH}"
+                        )
                         connection.commit()
                     else:
                         self._assert_epoch_fence(connection, for_write=False)
@@ -1481,7 +1717,7 @@ class Journal:
                     if mode != "wal":
                         self._assert_epoch_fence(connection, for_write=True)
                         connection.execute("PRAGMA journal_mode = WAL")
-                    return
+                    return migrated or user_version != CURRENT_SCHEMA_EPOCH or mode != "wal"
                 if not created_here:
                     connection.rollback()
                     if self._retry_delay(started, deadline_s=deadline):
@@ -1547,9 +1783,10 @@ class Journal:
                 self._install_p2_schema(connection)
                 self._install_p3_schema(connection)
                 self._install_p4_schema(connection)
+                connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_EPOCH}")
                 connection.commit()
                 connection.execute("PRAGMA journal_mode = WAL")
-                return
+                return True
             except sqlite3.OperationalError as exc:
                 if connection.in_transaction:
                     connection.rollback()
@@ -2458,6 +2695,8 @@ class Journal:
         busy_deadline_s: float | None = None,
     ) -> T:
         """Run every SQL read stage within one bounded busy-classification path."""
+        if not self._integrity_check_cached():
+            self._startup_integrity_check()
         started = time.monotonic()
         deadline = (
             started + self.retry_budget_s
@@ -2467,16 +2706,28 @@ class Journal:
         attempts = 0
         while True:
             attempts += 1
+            connection: sqlite3.Connection | None = None
             try:
-                with contextlib.closing(
-                    self._connect(busy_deadline_s=deadline)
-                ) as connection:
+                connection = self._connect(busy_deadline_s=deadline)
+                try:
                     return action(connection)
+                finally:
+                    if self._read_only_client and self._persistent_reader:
+                        if connection.in_transaction:
+                            connection.rollback()
+                    else:
+                        connection.close()
             except JournalBusy:
                 # _connect already spent this operation's retry budget. Starting
                 # another full window here would silently double the contract.
                 raise
             except sqlite3.OperationalError as exc:
+                if connection is not None and self._read_only_client and self._persistent_reader:
+                    self._reader_connection = None
+                    self._reader_pid = None
+                    connection.close()
+                if _is_corruption_error(exc):
+                    self._handle_corruption(exc)
                 if not _is_busy(exc):
                     self._raise_disappeared_or_unverified(exc)
                     raise
@@ -2486,6 +2737,24 @@ class Journal:
                     f"{operation} remained busy after {attempts} attempts "
                     f"within {self.retry_budget_s:.3f}s: {self.path}"
                 ) from exc
+            except sqlite3.DatabaseError as exc:
+                if connection is not None and self._read_only_client and self._persistent_reader:
+                    self._reader_connection = None
+                    self._reader_pid = None
+                    connection.close()
+                if _is_corruption_error(exc):
+                    self._handle_corruption(exc)
+                raise
+
+    def _data_version(self) -> int:
+        """Read SQLite's cheap cross-connection commit counter."""
+        def action(connection: sqlite3.Connection) -> int:
+            row = connection.execute("PRAGMA data_version").fetchone()
+            if row is None:
+                raise JournalIntegrityError("journal data version is unavailable")
+            return int(row[0])
+
+        return self._read_with_retry("journal data version read", action)
 
     def epochs(self) -> JournalEpochs:
         return self._read_with_retry(
@@ -2538,6 +2807,8 @@ class Journal:
         """
         if self._read_only_client:
             raise JournalError("read-only journal client cannot write")
+        if not self._integrity_check_cached():
+            self._startup_integrity_check()
         if isinstance(operations, RowOperation):
             prepared_operations = (operations,)
         else:
@@ -2655,6 +2926,8 @@ class Journal:
             except sqlite3.OperationalError as exc:
                 if connection.in_transaction:
                     connection.rollback()
+                if _is_corruption_error(exc):
+                    self._handle_corruption(exc)
                 if "interrupted" in str(exc).lower():
                     return WriteResult(
                         WriteDisposition.RETRYABLE,
@@ -2672,6 +2945,12 @@ class Journal:
                             f"{self.retry_budget_s:.3f}s"
                         ),
                     )
+            except sqlite3.DatabaseError as exc:
+                if connection.in_transaction:
+                    connection.rollback()
+                if _is_corruption_error(exc):
+                    self._handle_corruption(exc)
+                raise
             finally:
                 connection.set_progress_handler(None, 0)
                 connection.close()
@@ -2679,6 +2958,8 @@ class Journal:
 
     def _domain_write(self, action: Callable[[sqlite3.Connection], T]) -> WriteResult[T]:
         """Run one module-owned bounded transaction for P2 state machines."""
+        if not self._integrity_check_cached():
+            self._startup_integrity_check()
         started = time.monotonic()
         operation_deadline = started + self.retry_budget_s
         attempts = 0
@@ -2754,6 +3035,8 @@ class Journal:
             except sqlite3.OperationalError as exc:
                 if connection.in_transaction:
                     connection.rollback()
+                if _is_corruption_error(exc):
+                    self._handle_corruption(exc)
                 if "interrupted" in str(exc).lower():
                     return WriteResult(
                         WriteDisposition.RETRYABLE,
@@ -2768,6 +3051,12 @@ class Journal:
                         attempts=attempts,
                         reason=f"journal busy timeout within {self.retry_budget_s:.3f}s",
                     )
+            except sqlite3.DatabaseError as exc:
+                if connection.in_transaction:
+                    connection.rollback()
+                if _is_corruption_error(exc):
+                    self._handle_corruption(exc)
+                raise
             finally:
                 connection.set_progress_handler(None, 0)
                 connection.close()
@@ -5733,7 +6022,23 @@ class Journal:
                 idempotent=False,
             )
 
-        return self._domain_write(action)
+        result = self._domain_write(action)
+        if result.committed and result.value is not None:
+            # Outside the journal transaction: a cleanup failure cannot undo
+            # terminal authority. Idempotent observations retry the release.
+            try:
+                import goalflight_capacity
+
+                goalflight_capacity.release_terminal_dispatch(
+                    result.value.dispatch_id, result.value.terminal_state,
+                )
+            except Exception as exc:
+                print(
+                    "goalflight_journal: terminal capacity cleanup deferred: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+        return result
 
     def commit_expired_attempt(
         self,

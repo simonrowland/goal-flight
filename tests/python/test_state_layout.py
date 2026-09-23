@@ -13,6 +13,12 @@ import contextlib
 import io
 import json
 import re
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def enable_dashboard_export(monkeypatch):
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
@@ -959,6 +965,7 @@ def test_state_protocols_are_discoverable_from_index_and_commands() -> None:
 
 
 def main() -> None:
+    os.environ["GOALFLIGHT_DASHBOARD_EXPORT_ENABLED"] = "1"
     tests = [
         test_scaffold_project_state_is_idempotent_and_respects_existing_files,
         test_scaffold_project_state_empty_store_has_no_ready_frontier,

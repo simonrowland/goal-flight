@@ -136,7 +136,7 @@ def _process_identity_after_spawn(pid: int) -> dict[str, Any] | None:
         current = _process_identity(pid)
         if current:
             identity = current
-        if current and current.get("lstart"):
+        if current and current.get("start_token"):
             break
         time.sleep(0.05)
     return identity
@@ -284,9 +284,12 @@ def _recorded_worker_live(pid_raw: Any, identity: Any) -> tuple[bool | None, str
     current = _process_identity(pid)
     if current is None:
         return False, "dead"
-    if not isinstance(identity, dict):
+    if not isinstance(identity, dict) or not identity.get("start_token"):
         return None, "identity_missing"
-    return goalflight_ledger.compare_process_identities(pid, identity, current)
+    matched, reason = goalflight_ledger.compare_process_identities(pid, identity, current)
+    if reason == "identity_indeterminate":
+        return None, reason
+    return matched, reason
 
 
 def _receipt_live_identity(receipt: dict[str, Any]) -> dict[str, Any] | None:
@@ -300,17 +303,15 @@ def _receipt_live_identity(receipt: dict[str, Any]) -> dict[str, Any] | None:
         return None
     recorded = receipt.get("remote_identity") or receipt.get("worker_identity") or receipt.get("expected_worker_identity")
     remote_lstart = receipt.get("remote_lstart")
-    if isinstance(recorded, dict) and remote_lstart and not recorded.get("lstart"):
+    if not isinstance(recorded, dict) or not recorded.get("start_token"):
+        return None
+    if remote_lstart and not recorded.get("lstart"):
         recorded = {**recorded, "lstart": remote_lstart}
-    elif not isinstance(recorded, dict):
-        if not remote_lstart:
-            return None
-        recorded = {"pid": pid, "lstart": remote_lstart}
     if isinstance(recorded, dict):
-        matched, _reason = goalflight_ledger.compare_process_identities(
+        matched, reason = goalflight_ledger.compare_process_identities(
             pid, recorded, current
         )
-        if not matched:
+        if not matched or reason == "identity_indeterminate":
             return None
     return current
 
@@ -372,7 +373,7 @@ def _recovery_lock_owner_live(payload: dict[str, Any]) -> tuple[bool | None, str
         int(pid_raw)
     except (TypeError, ValueError):
         return None, "no_pid"
-    if not isinstance(identity, dict) or not identity.get("lstart"):
+    if not isinstance(identity, dict) or not identity.get("start_token"):
         return None, "identity_missing"
     return _recorded_worker_live(pid_raw, identity)
 
@@ -685,48 +686,6 @@ def _launch(args: argparse.Namespace) -> int:
         )
         return 1
 
-    try:
-        worktree_seat = goalflight_worktree_pool.acquire_worktree_seat(
-            repo_root,
-            args.dispatch_id,
-            base=args.base_sha,
-            managed_root=state_dir / "worktrees",
-            controller_label=args.node_id,
-        )
-    except goalflight_worktree_pool.WorktreeSeatError as exc:
-        _update_launch_marker(
-            marker_path,
-            {
-                "state": "worktree_acquire_failed",
-                "error": str(exc),
-            },
-        )
-        if recovery_lock_acquired:
-            _remove_file(recovery_lock_path)
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "dispatch_id": args.dispatch_id,
-                    "node_id": args.node_id,
-                    "error": str(exc),
-                },
-                sort_keys=True,
-            ),
-            file=sys.stderr,
-        )
-        return 1
-    _update_launch_marker(
-        marker_path,
-        {
-            "worktree_path": str(worktree_seat.path),
-            "worktree_id": worktree_seat.seat_name,
-            "worktree_seat": worktree_seat.seat_name,
-            "worktree_branch": worktree_seat.branch,
-            "quarantine_branch": worktree_seat.quarantine_branch,
-        },
-    )
-
     dispatch_py = repo_root / "scripts" / "goalflight_dispatch.py"
     cmd = [
         sys.executable,
@@ -737,8 +696,10 @@ def _launch(args: argparse.Namespace) -> int:
         "acp",
         "--prompt-file",
         str(prompt_path),
-        "--cwd",
-        str(worktree_seat.path),
+        "--worktree",
+        args.base_sha,
+        "--worktree-root",
+        str(state_dir / "worktrees"),
         "--dispatch-id",
         args.dispatch_id,
         "--status-json",
@@ -750,7 +711,6 @@ def _launch(args: argparse.Namespace) -> int:
     env = _sanitized_env(os.environ)
     env["GOALFLIGHT_STATE_DIR"] = str(state_dir)
     env["GOALFLIGHT_FLEET_NODE_ID"] = args.node_id
-    env[goalflight_worktree_pool.WORKTREE_LOCK_FD_ENV] = str(worktree_seat.fileno())
     _ensure_local_bin_on_path(env)
 
     popen_cmd = cmd
@@ -770,10 +730,8 @@ def _launch(args: argparse.Namespace) -> int:
                 cwd=str(repo_root),
                 start_new_session=(os.name != "nt"),
                 close_fds=True,
-                pass_fds=(worktree_seat.fileno(),),
             )
     except OSError as exc:
-        worktree_seat.release()
         _update_launch_marker(
             marker_path,
             {
@@ -810,7 +768,6 @@ def _launch(args: argparse.Namespace) -> int:
         },
     )
     if proc.poll() is not None:
-        worktree_seat.release()
         _update_launch_marker(
             marker_path,
             {
@@ -836,8 +793,6 @@ def _launch(args: argparse.Namespace) -> int:
         )
         return 1
 
-    worktree_seat.release()
-
     receipt = {
         "schema": "goalflight.fleet.launch_receipt.v1",
         "dispatch_id": args.dispatch_id,
@@ -851,11 +806,12 @@ def _launch(args: argparse.Namespace) -> int:
         "launcher_log_path": str(log_path),
         "started_at": _utc_now(),
         "worktree_base_sha": getattr(args, "base_sha", ""),
-        "worktree_path": str(worktree_seat.path),
-        "worktree_id": worktree_seat.seat_name,
-        "worktree_seat": worktree_seat.seat_name,
-        "worktree_branch": worktree_seat.branch,
-        "quarantine_branch": worktree_seat.quarantine_branch,
+        "worktree_path": None,
+        "worktree_id": None,
+        "worktree_seat": None,
+        "worktree_branch": None,
+        "quarantine_branch": None,
+        "worktree_admission": "child_dispatch",
     }
     receipt_file = _receipt_path(state_dir, args.dispatch_id)
     receipt_file.write_text(json.dumps(receipt, sort_keys=True) + "\n")
@@ -897,9 +853,13 @@ def _pid_identity(args: argparse.Namespace) -> int:
         alive, reason = goalflight_ledger.compare_process_identities(
             args.pid, expected_identity, identity
         )
+        if reason == "identity_indeterminate":
+            alive = None
     elif expected_lstart:
-        alive = bool(identity and identity.get("lstart") == expected_lstart)
-        reason = "live" if alive else "pid_reused_lstart"
+        # Old callers may still provide lstart, but it is not a
+        # PID-generation identity and must never confirm a reused PID.
+        alive = None
+        reason = "identity_indeterminate"
     payload = {
         "schema": "goalflight.fleet.pid_identity.v1",
         "pid": args.pid,

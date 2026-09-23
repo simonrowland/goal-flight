@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+
 from support import skip_posix_on_native_windows
 
 skip_posix_on_native_windows("review job tests use POSIX process groups and ps")
@@ -17,6 +20,7 @@ import sys
 import tempfile
 import textwrap
 import time
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
@@ -24,6 +28,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import goalflight_review_job
 import goalflight_rate_pressure
+import goalflight_capacity
 
 
 def isolate_state_env(env: dict[str, str], state_dir: Path) -> dict[str, str]:
@@ -283,10 +288,11 @@ def capacity_test_env(state_dir: Path, **extra: str) -> dict[str, str]:
 
 
 def hold_capacity(state_dir: Path, *, agent: str = "codex", dispatch_id: str = "held-review-capacity") -> str:
-    proc = run(
-        [
-            sys.executable,
-            "scripts/goalflight_capacity.py",
+    # Keep acquire/release in the holder process so its recorded identity
+    # proves ownership, just as the review-job finalizer does.
+    output = io.StringIO()
+    with patch.dict(os.environ, capacity_test_env(state_dir)), contextlib.redirect_stdout(output):
+        code = goalflight_capacity.main([
             "acquire",
             "--agent",
             agent,
@@ -296,18 +302,42 @@ def hold_capacity(state_dir: Path, *, agent: str = "codex", dispatch_id: str = "
             str(ROOT),
             "--ttl-s",
             "60",
-        ],
-        state_dir=state_dir,
-        env={"GOALFLIGHT_CAPACITY_MAX_TOTAL": "1"},
-    )
-    return json.loads(proc.stdout)["lease"]["lease_id"]
+        ])
+    assert code == 0
+    return json.loads(output.getvalue())["lease"]["lease_id"]
 
 
 def release_capacity(state_dir: Path, lease_id: str) -> None:
-    run(
-        [sys.executable, "scripts/goalflight_capacity.py", "release", "--lease-id", lease_id],
-        state_dir=state_dir,
-    )
+    with patch.dict(os.environ, capacity_test_env(state_dir)), contextlib.redirect_stdout(io.StringIO()):
+        assert goalflight_capacity.main(["release", "--lease-id", lease_id]) == 0
+
+
+def test_review_finalizer_only_surrenders_finished_worker() -> None:
+    monitor = goalflight_review_job._monitor_process
+    for worker_alive, group_drained, expected_releases in (
+        (True, False, 0), (False, False, 0), (False, True, 1),
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            fake = tmp / "fake-codex"
+            write_fake_codex(fake)
+            command = review_command(tmp, fake, "release-owner", timeout_s=5)
+
+            def measured_cleanup(**kwargs):
+                payload = monitor(**kwargs)
+                payload.update(worker_alive=worker_alive, process_group_drained=group_drained)
+                return payload
+
+            with (
+                patch.dict(os.environ, capacity_test_env(
+                    tmp / "state", FAKE_REVIEW_MODE="complete_with_stderr",
+                )),
+                patch.object(goalflight_review_job, "_monitor_process", side_effect=measured_cleanup),
+                patch.object(goalflight_capacity, "cmd_release", wraps=goalflight_capacity.cmd_release) as release,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                assert goalflight_review_job.main(command[2:]) == 0
+                assert release.call_count == expected_releases
 
 
 def wait_for_status(path: Path, state: str, *, timeout_s: float = 5.0) -> dict:
@@ -644,7 +674,7 @@ def test_prompt_write_cannot_block_monitor_before_timeout() -> None:
 
 
 @skipif(os.name == "nt" or not ps_pgid_available(), reason="POSIX process-group kill test requires ps pgid listing")
-def test_parent_exit_with_live_child_is_inconclusive_and_reaped() -> None:
+def test_parent_exit_with_live_child_refuses_unknown_leader_identity() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         state_dir = tmp / "state"
@@ -652,25 +682,82 @@ def test_parent_exit_with_live_child_is_inconclusive_and_reaped() -> None:
         child_pid_file = tmp / "child.pid"
         child_term_file = tmp / "child.term"
         write_fake_codex(fake)
-        proc = run(
-            review_command(tmp, fake, "leak-child", timeout_s=2, max_quiet_s=5),
-            state_dir=state_dir,
-            env={
-                "FAKE_REVIEW_MODE": "leak_child",
-                "FAKE_CHILD_PID_FILE": str(child_pid_file),
-                "FAKE_CHILD_TERM_FILE": str(child_term_file),
-            },
-            check=False,
+        try:
+            proc = run(
+                review_command(tmp, fake, "leak-child", timeout_s=2, max_quiet_s=5),
+                state_dir=state_dir,
+                env={
+                    "FAKE_REVIEW_MODE": "leak_child",
+                    "FAKE_CHILD_PID_FILE": str(child_pid_file),
+                    "FAKE_CHILD_TERM_FILE": str(child_term_file),
+                },
+                check=False,
+            )
+            status = json.loads((tmp / "out" / "leak-child.status.json").read_text())
+            assert_true("leak-child exits nonzero", proc.returncode != 0)
+            assert_true("leak-child classified inconclusive", status["state"] == "inconclusive_timeout")
+            assert_true("leak-child reason recorded", status["timeout_reason"] == "process_group_alive_after_parent_exit")
+            assert_true("unknown leader identity refuses teardown", status["process_group_drained"] is False)
+            assert_true("leaked child is not signalled without identity", not child_term_file.exists())
+            assert_true("leaked child pid was recorded", child_pid_file.exists())
+            assert_true("leaked child remains as evidence", process_exists(int(child_pid_file.read_text())))
+        finally:
+            if child_pid_file.exists():
+                with contextlib.suppress(OSError):
+                    os.kill(int(child_pid_file.read_text()), signal.SIGKILL)
+
+
+@skipif(os.name == "nt", reason="POSIX process-group identity test")
+def test_process_group_reap_refuses_reused_leader_identity() -> None:
+    class FakeProcess:
+        pid = 101
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    signals: list[tuple[int, int]] = []
+    with patch.object(goalflight_review_job.goalflight_compat, "is_windows", return_value=False), \
+        patch.object(goalflight_review_job.os, "killpg", side_effect=lambda pgid, sig: signals.append((pgid, sig))):
+        drained = goalflight_review_job._terminate_process_group(
+            FakeProcess(),
+            101,
+            grace_s=0,
+            expected_identity={"pid": 101, "start_token": "old"},
+            identity_probe=lambda _pid: {"pid": 101, "start_token": "new"},
         )
-        status = json.loads((tmp / "out" / "leak-child.status.json").read_text())
-        assert_true("leak-child exits nonzero", proc.returncode != 0)
-        assert_true("leak-child classified inconclusive", status["state"] == "inconclusive_timeout")
-        assert_true("leak-child reason recorded", status["timeout_reason"] == "process_group_alive_after_parent_exit")
-        assert_true("leak-child process group drained before release", status["process_group_drained"] is True)
-        assert_true("leaked child process group was terminated", child_term_file.exists())
-        assert_true("leaked child pid was recorded", child_pid_file.exists())
-        assert_true("leaked child pid is gone", not process_exists(int(child_pid_file.read_text())))
-        assert_true("worker process group is gone", not pgroup_has_processes(int(status["pgid"])))
+    assert_true("reused leader group is not drained", drained is False)
+    assert_true("reused leader group is never signalled", signals == [])
+
+
+@skipif(os.name == "nt", reason="POSIX process-group ps probe test")
+def test_process_group_reap_uses_one_final_ps_confirmation() -> None:
+    class FakeProcess:
+        pid = 101
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    ps_confirmation = lambda _pgid: True
+    with patch.object(goalflight_review_job.goalflight_compat, "is_windows", return_value=False), \
+        patch.object(goalflight_review_job.os, "killpg"), \
+        patch.object(goalflight_review_job, "_pgroup_liveness", side_effect=[True]), \
+        patch.object(goalflight_review_job, "_pgroup_has_live_processes", side_effect=ps_confirmation) as ps_probe, \
+        patch.object(goalflight_review_job.time, "time", side_effect=[0.0, 1.0]), \
+        patch.object(goalflight_review_job.time, "sleep"):
+        goalflight_review_job._terminate_process_group(
+            FakeProcess(),
+            101,
+            grace_s=0,
+            expected_identity={"pid": 101, "start_token": "same"},
+            identity_probe=lambda _pid: {"pid": 101, "start_token": "same"},
+        )
+    assert_true("review teardown uses one final process-table probe", ps_probe.call_count == 1)
 
 
 def test_auth_classifier_ignores_negative_probe_metadata() -> None:
@@ -815,6 +902,7 @@ def test_missing_prompt_after_capacity_commits_terminal_outbox() -> None:
 
 def main() -> None:
     tests = [
+        test_review_finalizer_only_surrenders_finished_worker,
         test_review_job_capacity_wait_queues_until_slot_frees,
         test_review_job_capacity_wait_deadline_blocks,
         test_review_job_capacity_wait_zero_single_shot,
@@ -825,7 +913,9 @@ def main() -> None:
         test_cpu_sample_unavailable_does_not_timeout_live_worker,
         test_jsonl_partial_and_malformed_lines_are_tolerated,
         test_prompt_write_cannot_block_monitor_before_timeout,
-        test_parent_exit_with_live_child_is_inconclusive_and_reaped,
+        test_parent_exit_with_live_child_refuses_unknown_leader_identity,
+        test_process_group_reap_refuses_reused_leader_identity,
+        test_process_group_reap_uses_one_final_ps_confirmation,
         test_auth_classifier_ignores_negative_probe_metadata,
         test_failed_stderr_excerpt_reaches_pressure_scanner,
         test_failed_stdout_rate_limit_is_classified_and_recorded,

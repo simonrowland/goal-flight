@@ -158,7 +158,8 @@ python3 <skill-root>/scripts/goalflight_setup.py \
 Inspect the dry-run JSON first. To mutate, rerun with `--apply --yes`.
 
 The scaffolder copies missing store files into `docs-private/`, copies
-browser-facing HTML/JS plus `tasks-data.js` into repo-root `dashboard/`, creates
+browser-facing HTML/JS into repo-root `dashboard/` (including `tasks-data.js`
+only with `GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1`; off by default), creates
 the canonical state directories, and creates
 `docs-private/RESUME-NOTES-<YYYY-MM-DD>.md` from `templates/resume-notes.md`
 when no canonical resume pin exists. The canonical state contract is

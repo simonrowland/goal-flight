@@ -1033,3 +1033,81 @@ def test_release_requires_exact_process_generation(
     token["value"] = "generation-a"
     assert sessions.release_session(root, pid=71001)["released"] is True
     assert journal.Journal(root).active_lease("controller") is None
+
+
+def test_ensure_session_reuses_inode_when_record_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        sessions,
+        "_controller_process_identity",
+        lambda pid: {"pid": pid, "start_token": "session-generation"},
+    )
+    first = sessions.ensure_session(root, pid=71001)
+    path = root / sessions.SESSION_FILE_REL
+    inode = path.stat().st_ino
+    second = sessions.ensure_session(root, pid=71001)
+    assert second == first
+    assert path.stat().st_ino == inode
+    assert first["process_identity"]["start_token"] == "session-generation"
+
+
+def test_ensure_session_does_not_pin_same_pid_across_generation_reuse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    token = {"value": "old"}
+    monkeypatch.setattr(
+        sessions, "_controller_process_identity",
+        lambda pid: {"pid": pid, "start_token": token["value"]},
+    )
+    first = sessions.ensure_session(root, pid=71001)
+    token["value"] = "new"
+    second = sessions.ensure_session(root, pid=71001)
+    assert second["pid"] == first["pid"] == 71001
+    assert second["id"] != first["id"]
+    assert second["process_identity"]["start_token"] == "new"
+
+
+def test_release_does_not_clear_reused_pid_session_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    pid = os.getpid()
+    path = root / sessions.SESSION_FILE_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old_record = {
+        "id": "old-generation",
+        "pid": pid,
+        "started_at": "2026-09-23T00:00:00Z",
+        "hostname": "test-host",
+        "process_identity": {"pid": pid, "start_token": "old-token"},
+    }
+    path.write_text(json.dumps({str(pid): old_record}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        sessions,
+        "_controller_process_identity",
+        lambda current_pid: {"pid": current_pid, "start_token": "new-token"},
+    )
+
+    released, _message = sessions.release(root, None)
+
+    assert released is False
+    assert json.loads(path.read_text(encoding="utf-8"))[str(pid)] == old_record
+
+
+def test_queue_claim_refuses_when_process_identity_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = _root(monkeypatch, tmp_path)
+    queue = root / "docs-private" / "goal-queue-unknown.md"
+    queue.parent.mkdir(parents=True)
+    queue.write_text(
+        sessions._dump_frontmatter({"state": "active"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sessions, "_controller_process_identity", lambda _pid: None)
+    claimed, message = sessions.claim(root, queue)
+    assert not claimed
+    assert "identity unavailable" in message

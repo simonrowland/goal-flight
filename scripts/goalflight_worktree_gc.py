@@ -482,7 +482,9 @@ def check_unowned(path: str, ledger_dir: Path) -> dict[str, str]:
     return _condition(YES, "no non-terminal dispatch records this path")
 
 
-def check_pool_unlocked(repo: Path, path: str) -> dict[str, str]:
+def check_pool_unlocked(
+    repo: Path, path: str, *, held_lock=None
+) -> dict[str, str]:
     """Include the kernel worktree lease in the ownership conjunction."""
     verdict, reason = goalflight_worktree_pool.registered_pool_seat_verdict(
         path, project_root=repo
@@ -491,6 +493,8 @@ def check_pool_unlocked(repo: Path, path: str) -> dict[str, str]:
         return _condition(YES, "path is not a registered pool worktree")
     if verdict == UNKNOWN:
         return _condition(UNKNOWN, reason)
+    if held_lock is not None:
+        return _condition(YES, "registered pool worktree lock held for action")
     lock_path = goalflight_worktree_pool.worktree_lock_path_for_path(repo, Path(path))
     try:
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -509,6 +513,34 @@ def check_pool_unlocked(repo: Path, path: str) -> dict[str, str]:
     finally:
         handle.close()
     return _condition(YES, "registered pool worktree has no live kernel lease")
+
+
+def _acquire_pool_action_lock(
+    repo: Path, path: str
+) -> tuple[object | None, str | None]:
+    """Hold a registered pool lock across recheck, pin, and removal."""
+    verdict, reason = goalflight_worktree_pool.registered_pool_seat_verdict(
+        path, project_root=repo
+    )
+    if verdict != YES:
+        return None, None
+    lock_path = goalflight_worktree_pool.worktree_lock_path_for_path(repo, Path(path))
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        return None, f"pool worktree lock could not be opened ({exc})"
+    handle = os.fdopen(fd, "r+", encoding="utf-8")
+    try:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None, "registered pool worktree became held before action"
+    except OSError as exc:
+        handle.close()
+        return None, f"pool worktree lease could not be evaluated ({exc})"
+    return handle, None
 
 
 def check_not_current(
@@ -541,6 +573,7 @@ def classify(
     main_path: str | None,
     current_checkout: str | None,
     current_error: str | None,
+    pool_lock=None,
 ) -> dict[str, Any]:
     """Evaluate one listed worktree against the full conjunction."""
     path = entry["path"]
@@ -582,7 +615,7 @@ def classify(
         ),
     }
     if seat_verdict == YES:
-        lease = check_pool_unlocked(repo, path)
+        lease = check_pool_unlocked(repo, path, held_lock=pool_lock)
         if lease["verdict"] != YES:
             conditions["unowned"] = lease
         pool = {"verdict": seat_verdict, "reason": seat_reason}
@@ -662,14 +695,10 @@ def apply_removals(
     ``changed_before_remove`` instead.
     """
     targets = [e for e in entries if e["decision"] in {"remove", "prune"}]
-    if not targets:
-        return
-
     for entry in targets:
         path = entry["path"]
 
         # Re-list: the fresh listing is the only authority on what exists NOW.
-        # A path that dropped off the list was reclaimed by someone else.
         listed, list_error = list_worktrees(repo)
         fresh = next(
             (item for item in listed if _resolve(item["path"]) == _resolve(path)),
@@ -678,67 +707,79 @@ def apply_removals(
         if list_error is not None or fresh is None:
             entry["outcome"] = "retained"
             entry["reason"] = (
-                f"changed_before_remove: worktree listing changed ({list_error or 'path no longer listed'})"
+                "changed_before_remove: worktree listing changed "
+                f"({list_error or 'path no longer listed'})"
             )
             continue
-        current = classify(
-            repo,
-            fresh,
-            into=into,
-            ledger_dir=ledger_dir,
-            main_path=main_path,
-            current_checkout=current_checkout,
-            current_error=current_error,
-        )
-        if current["decision"] not in {"remove", "prune"}:
+
+        pool_lock, lock_error = _acquire_pool_action_lock(repo, path)
+        if lock_error is not None:
             entry["outcome"] = "retained"
-            entry["reason"] = f"changed_before_remove: {current['reason']}"
+            entry["reason"] = f"changed_before_remove: {lock_error}"
             continue
-
-        if current["decision"] == "remove":
-            keep_ref, pin_error = _pin_before_remove(repo, path)
-            if pin_error is not None:
-                entry["outcome"] = "failed"
-                entry["error"] = f"keep pin failed: {pin_error}"
+        try:
+            current = classify(
+                repo,
+                fresh,
+                into=into,
+                ledger_dir=ledger_dir,
+                main_path=main_path,
+                current_checkout=current_checkout,
+                current_error=current_error,
+                pool_lock=pool_lock,
+            )
+            if current["decision"] not in {"remove", "prune"}:
+                entry["outcome"] = "retained"
+                entry["reason"] = f"changed_before_remove: {current['reason']}"
                 continue
-            entry["keep_ref"] = keep_ref
 
-        # ``git worktree prune`` clears the admin entry of EVERY worktree
-        # whose directory is gone — it takes no path argument. Run it only
-        # when the set of stale entries git would clear is exactly the set we
-        # vetted; otherwise pruning would also clear entries that never passed
-        # the conjunction.
-        stale = {item["path"] for item in listed if _presence(Path(item["path"])) == "absent"}
-        prune_allowed = stale <= {path}
+            if current["decision"] == "remove":
+                keep_ref, pin_error = _pin_before_remove(repo, path)
+                if pin_error is not None:
+                    entry["outcome"] = "failed"
+                    entry["error"] = f"keep pin failed: {pin_error}"
+                    continue
+                entry["keep_ref"] = keep_ref
 
-        if current["decision"] == "prune":
-            if not prune_allowed:
-                entry["outcome"] = "failed"
-                entry["error"] = (
-                    "git worktree prune would also clear administrative entries "
-                    "that did not pass the conjunction; skipped"
-                )
+            # ``git worktree prune`` clears every stale administrative entry,
+            # so only allow it when this is the sole stale path.
+            stale = {
+                item["path"]
+                for item in listed
+                if _presence(Path(item["path"])) == "absent"
+            }
+            prune_allowed = stale <= {path}
+
+            if current["decision"] == "prune":
+                if not prune_allowed:
+                    entry["outcome"] = "failed"
+                    entry["error"] = (
+                        "git worktree prune would also clear administrative entries "
+                        "that did not pass the conjunction; skipped"
+                    )
+                    continue
+                ok, detail = _prune_worktrees(repo)
+                entry["outcome"] = "pruned" if ok else "failed"
+                if not ok:
+                    entry["error"] = detail
                 continue
-            ok, detail = _prune_worktrees(repo)
+
+            ok, detail = _remove_worktree(repo, path)
             if ok:
-                entry["outcome"] = "pruned"
+                entry["outcome"] = "removed"
+            elif _presence(Path(path)) == "absent" and prune_allowed:
+                # The directory disappeared between scan and removal; reclaim
+                # the administrative entry instead of reporting an error.
+                ok, detail = _prune_worktrees(repo)
+                entry["outcome"] = "pruned" if ok else "failed"
+                if not ok:
+                    entry["error"] = detail
             else:
                 entry["outcome"] = "failed"
                 entry["error"] = detail
-            continue
-        ok, detail = _remove_worktree(repo, path)
-        if ok:
-            entry["outcome"] = "removed"
-        elif _presence(Path(path)) == "absent" and prune_allowed:
-            # The directory disappeared between scan and removal; reclaim the
-            # administrative entry instead of reporting an error.
-            ok, detail = _prune_worktrees(repo)
-            entry["outcome"] = "pruned" if ok else "failed"
-            if not ok:
-                entry["error"] = detail
-        else:
-            entry["outcome"] = "failed"
-            entry["error"] = detail
+        finally:
+            if pool_lock is not None:
+                pool_lock.close()
 
 
 # --------------------------------------------------------------------------

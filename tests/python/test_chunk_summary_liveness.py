@@ -58,7 +58,11 @@ def _record(
         "classification": state,
         "terminal_state": status.dispatch_states.terminal_state_for(state),
         "worker_pid": 4242,
-        "worker_identity": {"lstart": "Tue Jun  9 09:00:00 2026", "comm": "python3"},
+        "worker_identity": {
+            "lstart": "Tue Jun  9 09:00:00 2026",
+            "start_token": "worker-token",
+            "comm": "python3",
+        },
         "stdout_path": str(tail),
         "status_path": str(status_path),
         "project_root": str(ROOT),
@@ -144,10 +148,22 @@ def test_missing_identity_does_not_claim_pid_ownership() -> None:
     finally:
         status.goalflight_compat.pid_alive = saved
 
-    assert_eq("pid-only liveness is not confirmed ownership", live, False)
+    assert_eq("pid-only liveness is unknown", live, None)
 
 
-def test_confirmed_live_worker_with_scraped_complete_stays_running_wait() -> None:
+def test_unknown_liveness_does_not_suggest_takeover() -> None:
+    for state in ("running", "liveness_indeterminate", "idle_timeout", "wedged"):
+        assert_eq(f"unknown {state} liveness hint", summary.decision_hint(state, None, 1), "unknown")
+
+
+def test_failed_record_without_pid_keeps_retry_hint() -> None:
+    """A launch-time quota wall leaves no pid; unknown liveness must not hide the retry."""
+    policy = {"mode": "retry_after_reset", "eligible": True}
+    assert_eq("failed + unknown keeps retry", summary.decision_hint("failed", None, 1, retry_policy=policy), "retry_now")
+    assert_eq("failed + unknown retryable", summary.decision_hint("failed", None, 1, retryable=True), "cooldown_retry")
+
+
+def test_confirmed_live_worker_with_scraped_complete_is_done() -> None:
     with tempfile.TemporaryDirectory(prefix="gf-summary-live-marker-") as d:
         base = Path(d)
         state_dir = base / "state"
@@ -168,7 +184,7 @@ def test_confirmed_live_worker_with_scraped_complete_stays_running_wait() -> Non
                 "state": "running",
                 "worker_pid": 4242,
                 "tail_path": str(tail),
-                "terminal_marker": {"kind": "COMPLETE", "text": "", "line": 2},
+                "terminal_marker": {"kind": "COMPLETE", "text": "live-marker — done", "line": 2},
             },
         )
 
@@ -178,9 +194,9 @@ def test_confirmed_live_worker_with_scraped_complete_stays_running_wait() -> Non
             lambda: summary.summarize("live-marker", state_dir),
         )
 
-    assert_eq("live scraped marker state", payload["state"], "running")
-    assert_eq("live scraped marker hint", payload["decision_hint"], "wait")
-    assert_eq("live scraped marker remains diagnostic", payload["last_marker"], "COMPLETE")
+    assert_eq("live scraped marker state", payload["state"], "complete")
+    assert_eq("live scraped marker hint", payload["decision_hint"], "done")
+    assert_eq("live scraped marker", payload["last_marker"], "COMPLETE")
 
 
 def test_summary_agrees_with_status_tail_reconciled_complete() -> None:
@@ -366,7 +382,9 @@ def main() -> None:
         test_dead_worker_complete_tail_reads_complete,
         test_recycled_pid_identity_mismatch_is_not_alive,
         test_missing_identity_does_not_claim_pid_ownership,
-        test_confirmed_live_worker_with_scraped_complete_stays_running_wait,
+        test_unknown_liveness_does_not_suggest_takeover,
+        test_failed_record_without_pid_keeps_retry_hint,
+        test_confirmed_live_worker_with_scraped_complete_is_done,
         test_summary_agrees_with_status_tail_reconciled_complete,
     ]
     for test in tests:

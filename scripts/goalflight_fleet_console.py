@@ -87,9 +87,6 @@ CONTROLLER_LIVENESS_STATES = frozenset(
 # seconds. This deliberately removes the reported 15-100 hour non-terminal
 # records while leaving shorter long-running work in the default view.
 WORKER_AGE_FILTER_SECONDS = 12 * 60 * 60
-# Two 60-second fleet refresh intervals = 120 seconds. A status-sidecar
-# liveness sample older than that cannot make an old ledger row reappear.
-WORKER_LIVE_SAMPLE_FRESH_SECONDS = 2 * 60
 WORKER_AGE_FILTER_POLICY = {
     "threshold_seconds": WORKER_AGE_FILTER_SECONDS,
     "default_enabled": True,
@@ -1961,29 +1958,31 @@ def _worker_age_filter_fields(
 def _worker_observed_live_fields(
     record: dict[str, Any],
     *,
-    sampled_at: dt.datetime | None,
     status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    alive = record.get("worker_still_alive")
-    if isinstance(alive, bool):
-        return {"observed_live": alive, "observed_live_source": "identity_recheck"}
     status = status or {}
     dispatch_id = record.get("dispatch_id")
-    if not status or not dispatch_id or status.get("dispatch_id") != dispatch_id:
-        return {"observed_live": None, "observed_live_source": "unobserved"}
-    observed_at = _parse_timestamp(status.get("heartbeat_at"))
-    if observed_at is None:
-        updated_at = _number(status.get("updated_at"))
-        if updated_at is not None:
-            with contextlib.suppress(OverflowError, OSError, ValueError):
-                observed_at = dt.datetime.fromtimestamp(updated_at, tz=dt.timezone.utc)
-    status_alive = status.get("worker_alive")
-    if sampled_at is None or observed_at is None or not isinstance(status_alive, bool):
-        return {"observed_live": None, "observed_live_source": "unobserved"}
-    sample_age_s = (sampled_at - observed_at).total_seconds()
-    if abs(sample_age_s) <= WORKER_LIVE_SAMPLE_FRESH_SECONDS:
-        return {"observed_live": status_alive, "observed_live_source": "fresh_status"}
-    return {"observed_live": None, "observed_live_source": "unobserved"}
+    status_matches_record = bool(
+        status
+        and dispatch_id
+        and status.get("dispatch_id") in (None, dispatch_id)
+    )
+    if not status_matches_record:
+        source = dict(record)
+    else:
+        source = dict(record)
+        source.update(status)
+    observed = goalflight_status.worker_process_identity_liveness(source)
+    identity = source.get("expected_worker_identity") or source.get("worker_identity")
+    has_process_identity = (
+        isinstance(identity, dict)
+        and bool(source.get("worker_pid") or identity.get("pid"))
+        and bool(identity.get("start_token"))
+    )
+    return {
+        "observed_live": observed,
+        "observed_live_source": "worker_identity" if has_process_identity else "unobserved",
+    }
 
 
 def _worker_row(
@@ -2015,7 +2014,6 @@ def _worker_row(
     )
     observed_live = _worker_observed_live_fields(
         record,
-        sampled_at=sampled_at,
         status=status,
     )
     os_sandbox = record.get("os_sandbox")

@@ -23,6 +23,7 @@ import time
 
 import goalflight_compat
 import goalflight_dispatch
+import goalflight_task
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -1141,6 +1142,7 @@ def canonical_dashboard_files(skill_root: Path | None = None) -> list[str]:
         rel
         for rel in DASHBOARD_ASSETS
         if (skeleton / rel).is_file()
+        and (rel != "tasks-data.js" or goalflight_task._dashboard_export_enabled())
     )
 
 
@@ -1331,6 +1333,8 @@ def classify_managed_view_asset(source: Path, target: Path, manifest: dict | Non
 
 
 def _check_tasks_mirror(project_root: Path, skill_root: Path) -> dict:
+    if not goalflight_task._dashboard_export_enabled():
+        return {"ok": True, "present": False, "skipped": goalflight_task.DASHBOARD_EXPORT_DISABLED}
     docs_private = project_root / "docs-private"
     dashboard = project_root / "dashboard"
     tasks_jsonl = docs_private / "tasks.jsonl"
@@ -1536,6 +1540,8 @@ def check_project_state_layout(project_root: Path, skill_root: Path | None = Non
             advisories.append(_state_layout_warning(entry["message"], path=entry["asset"]))
 
     for rel in DASHBOARD_ASSETS:
+        if rel == "tasks-data.js" and not goalflight_task._dashboard_export_enabled():
+            continue
         legacy = docs_private / rel
         canonical = dashboard / rel
         if legacy.exists() and legacy.is_file():
@@ -4199,6 +4205,8 @@ def collect_human_lines(payload: dict) -> list[str]:
             f"{readiness.get('skill_root', {}).get('path')} source={readiness.get('skill_root', {}).get('source')}",
         ),
     ])
+    if not goalflight_task._dashboard_export_enabled():
+        lines.append(goalflight_task.DASHBOARD_EXPORT_DISABLED)
     lines.append(
         status_line(
             router.get("ok"),

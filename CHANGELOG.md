@@ -16,6 +16,10 @@ incremented when meaningful skill behaviour changes.
 
 ### Changed
 
+- After `goalflight update`, re-arm `supervise` and let old watchers finish (or
+  restart them). Opted-in old processes may log refused task-store mutations
+  after the dashboard mirror is disabled; canonical task data remains intact. Old watchers that permit mirror repair can regenerate the full mirror
+  until they finish or restart.
 - Worker dispatch now launches immediately and reports capacity refusal as
   `blocked_capacity` / `DISPATCH-BLOCKED` with a nonzero exit. New durable-queue
   producers and the bulk frontier dispatcher were removed; the drain consumer
@@ -484,6 +488,11 @@ incremented when meaningful skill behaviour changes.
   sibling worktree writes as this worker's life. Last CPU sample and
   candidate announcement persist in the status sidecar so a watcher
   restart does not reset the window or re-announce.
+
+### Deferred
+
+- Dispatch-artifact retention is deferred until the worktree GC design covers
+  dry-run, re-verification, and resume-aware cleanup together.
 
 ## [1.5.1] - 2026-08-23
 

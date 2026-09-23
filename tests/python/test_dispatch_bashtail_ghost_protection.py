@@ -82,13 +82,6 @@ def _free_dead_pid() -> int:
     return p.pid
 
 
-def case_lstart_padding_is_normalized() -> None:
-    """Ledger and cleanup ps timestamp formatting must compare identically."""
-    recorded = ("Sun Aug  2 12:34:56 2026", "python")
-    observed = ("Sun Aug 2 12:34:56 2026", "python")
-    assert goalflight_acp_client._same_process(recorded, observed)
-
-
 def case_real_pidfile_identity_round_trip() -> None:
     """A real writer identity must survive cleanup's independently read format."""
     worker = _spawn_live_worker()
@@ -455,7 +448,6 @@ def case_dead_worker_pidfile_unlinked_not_marked() -> None:
 
 
 def main() -> None:
-    case_lstart_padding_is_normalized()
     case_from_queue_detached_pidfile_spares_live_worker()
     case_dead_unowned_pidfile_is_unlinked()
     case_reused_controller_pid_does_not_pin_dead_bashtail_pidfile()

@@ -258,7 +258,34 @@ def test_resolution_retries_then_gives_up() -> None:
         assert channel.sample(now_epoch=1, now_mono=1, idle_threshold=30) == {}
         assert channel.sample(now_epoch=2, now_mono=2, idle_threshold=30) == {}
         assert channel.sample(now_epoch=7, now_mono=7, idle_threshold=30) == {}
+        # The first attempt is at t=1 and the second at t=7 after the
+        # exponential retry schedule. The post-horizon backoff intentionally
+        # keeps a late trace discoverable instead of creating a cutoff hole.
         assert len(calls) == 2
+
+
+def test_resolution_backoff_bounds_quiet_poll_process_spawns() -> None:
+    ps_calls: list[list[str]] = []
+    lsof_calls: list[list[str]] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        channel = watch.TraceLiveness(
+            dispatch_id="d-backoff",
+            worker_pid=10,
+            effective_account="seat-a",
+            state_dir=Path(tmp) / "state",
+            home=Path(tmp) / "home",
+            started_mono=0,
+            retry_secs=300,
+            ps_runner=_runner("10 1\n", ps_calls),
+            lsof_runner=_runner("", lsof_calls),
+        )
+        for tick in range(0, 20, 2):
+            assert channel.sample(now_epoch=tick, now_mono=tick, idle_threshold=30) == {}
+
+    # Attempts occur at 0, 2, 6, and 14 seconds (2s, 4s, 8s backoff), not
+    # once per 2s poll. Each attempt has one ps and one lsof probe.
+    assert len(ps_calls) == 4
+    assert len(lsof_calls) == 4
 
 
 def test_lsof_timeout_degrades_to_absent_channel() -> None:

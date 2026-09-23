@@ -11,6 +11,7 @@ import asyncio
 import argparse
 import contextlib
 from dataclasses import dataclass, field
+from functools import lru_cache
 import io
 import inspect
 import json
@@ -345,18 +346,6 @@ def _normalize_lstart(value: str) -> str:
     return " ".join(value.split())
 
 
-def _same_process(
-    started_meta: tuple[str, str] | None,
-    live_meta: tuple[str, str] | None,
-) -> bool:
-    """Return false only when a live process has a different start time."""
-    return (
-        started_meta is None
-        or live_meta is None
-        or _normalize_lstart(started_meta[0]) == _normalize_lstart(live_meta[0])
-    )
-
-
 def _identity_token(identity: dict[str, Any] | None) -> dict[str, Any] | None:
     if not identity:
         return None
@@ -452,6 +441,9 @@ def _write_through_pidfile_locked() -> None:
         log.warning("could not create pidfile dir %s: %s", _PIDFILE_DIR, e)
         return
     own_pidfile = _PIDFILE_DIR / f"{os.getpid()}.jsonl"
+    controller_identity = _identity_token(
+        goalflight_compat.process_start_identity(os.getpid())
+    )
     entries: list[str] = []
     for conn in _live_connections.values():
         if goalflight_compat.is_windows():
@@ -463,6 +455,7 @@ def _write_through_pidfile_locked() -> None:
                     {
                         "pid": conn.proc.pid,
                         "pgid": conn.verified_pgid,
+                        "controller_identity": controller_identity,
                         "creation_time": identity.get("creation_time"),
                         "identity_source": identity.get("identity_source"),
                         "agent": conn.agent,
@@ -483,6 +476,7 @@ def _write_through_pidfile_locked() -> None:
                 {
                     "pid": conn.proc.pid,
                     "pgid": conn.verified_pgid,
+                    "controller_identity": controller_identity,
                     "started_at": lstart,
                     "cmd": comm,
                     "worker_identity": _identity_token(identity),
@@ -526,22 +520,36 @@ def _shim_owner_marker() -> str:
     return f"goal-flight:{os.getpid()}"
 
 
-def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
+def cleanup_ghosts(
+    active_worker_pids: set[int] | None = None,
+    *,
+    process_rows: list[dict[str, Any]] | None = None,
+) -> int:
     """Reap owned ACP ghosts while preserving live bash-tail workers."""
-    own_pid = os.getpid()
     own_worker_pids = active_worker_pids or set()
+    rows = process_rows
+    if rows is None and not goalflight_compat.is_windows():
+        rows = _list_posix_process_rows()
+    shim_paths = None if goalflight_compat.is_windows() else _claude_acp_shim_executable_paths()
     killed = 0
     if not _PIDFILE_DIR.exists():
         return (
             killed
-            + _shim_reap_killed_count(reap_orphaned_acp_shims(active_worker_pids=own_worker_pids))
-            + _quota_reap_killed_count(reap_quota_stuck_workers())
+            + _shim_reap_killed_count(
+                reap_orphaned_acp_shims(
+                    active_worker_pids=own_worker_pids,
+                    process_rows=rows,
+                    shim_paths=shim_paths,
+                )
+            )
+            + _quota_reap_killed_count(reap_quota_stuck_workers(process_rows=rows))
         )
     skipped_stale = 0
     skipped_live_controller = 0
     skipped_live_bashtail = 0
     skipped_detached = 0
     skipped_unowned = 0
+    controller_identities: dict[int, dict[str, Any] | None] = {}
     for pf in _PIDFILE_DIR.glob("*.jsonl"):
         owner_key = pf.stem.split(".", 1)[0]
         try:
@@ -549,23 +557,11 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
         except ValueError:
             continue
         is_bash_tail_pidfile = ".bashtail." in pf.name
-        if (
-            not is_bash_tail_pidfile
-            and controller_pid is not None
-            and controller_pid == own_pid
-        ):
-            continue
-        if not is_bash_tail_pidfile and controller_pid is not None and (
-            _ps_meta(controller_pid) is not None
-            or goalflight_compat.pid_alive(controller_pid)
-        ):
-            skipped_live_controller += 1
-            continue
         try:
             lines = pf.read_text().splitlines()
         except OSError:
             continue
-        preserve_pidfile = False
+        entries: list[dict[str, Any]] = []
         for line in lines:
             line = line.strip()
             if not line or not line.startswith("{"):
@@ -574,9 +570,67 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+        if not is_bash_tail_pidfile and controller_pid is not None:
+            if not any(
+                isinstance(entry.get("controller_identity"), dict)
+                and entry["controller_identity"].get("start_token")
+                for entry in entries
+            ):
+                # Older pidfiles cannot prove which controller generation owns
+                # the worker. Preserve them; unknown ownership is not a reap
+                # warrant during the mixed-version upgrade window.
+                skipped_stale += 1
+                continue
+            if controller_pid not in controller_identities:
+                controller_identities[controller_pid] = (
+                    goalflight_compat.process_start_identity(controller_pid)
+                )
+            current_controller = controller_identities[controller_pid]
+            if not isinstance(current_controller, dict) or not current_controller.get(
+                "start_token"
+            ):
+                # An unavailable controller probe cannot distinguish a dead
+                # owner from a reused or inaccessible PID. Preserve the whole
+                # pidfile and defer the decision to a later proven sweep.
+                skipped_stale += 1
+                log.warning(
+                    "ghost_cleanup: controller pid=%d identity unavailable; "
+                    "preserving pidfile",
+                    controller_pid,
+                )
+                continue
+            owner_matches = False
+            for entry in entries:
+                recorded_controller = entry.get("controller_identity")
+                if not isinstance(recorded_controller, dict):
+                    continue
+                matched, _reason = goalflight_ledger.compare_fine_process_identities(
+                    controller_pid, recorded_controller, current_controller
+                )
+                if matched:
+                    owner_matches = True
+                    break
+            if owner_matches:
+                skipped_live_controller += 1
+                continue
+        preserve_pidfile = False
+        for entry in entries:
             pid = entry.get("pid")
             if not isinstance(pid, int) or pid in own_worker_pids:
                 continue
+            try:
+                pgid = int(entry.get("pgid", pid))
+            except (TypeError, ValueError):
+                pgid = pid
+
+            def group_not_proven_gone() -> bool:
+                # Never pass an invalid/low PGID to killpg(0): that could probe
+                # the controller's own process group. Unknown group identity
+                # retains the pidfile as recovery evidence.
+                return pgid <= 1 or _pgid_liveness(pgid) is not False
+
             is_bash_tail = is_bash_tail_pidfile and str(
                 entry.get("agent", "")
             ).endswith("-bash-tail")
@@ -586,7 +640,7 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                 # A bash-tail worker can outlive its controller before the launcher's
                 # finally block detach-stamps it. None is a ghost merely because no
                 # live owner is known. Keep an identity-matching live worker and its
-                # pidfile; once the worker dies, unlink the stale pidfile below.
+                # pidfile; once the worker and its whole group are gone, unlink it.
                 protected_live = False
                 if goalflight_compat.is_windows():
                     protected_live = goalflight_compat.pid_alive(pid)
@@ -608,9 +662,10 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                             )
                         )
                     else:
-                        protected_live = meta is not None and _same_process(
-                            recorded_meta, meta
-                        )
+                        # Legacy pidfiles have no generation token. A live PID
+                        # is still preserved as unknown; it is never treated
+                        # as identity-confirmed for a destructive action.
+                        protected_live = goalflight_compat.pid_alive(pid)
                     if (is_bash_tail or controller_pid is None) and meta is None:
                         # Bash-tail and unowned entries lack an explicit reapable
                         # transition. When ps identity is unavailable, kill(0)
@@ -626,6 +681,11 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                         skipped_unowned += 1
                     preserve_pidfile = True
                     continue
+                if group_not_proven_gone():
+                    # A dead or unprobeable leader does not prove its group is
+                    # gone. Retain the pidfile until a later sweep can recover
+                    # the remaining group or prove the group absent.
+                    preserve_pidfile = True
                 continue
             if goalflight_compat.is_windows():
                 liveness = goalflight_compat.pid_liveness(pid)
@@ -639,9 +699,10 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                     continue
                 if not entry.get("creation_time"):
                     skipped_stale += 1
+                    preserve_pidfile = True
                     log.warning(
                         "ghost_cleanup: windows pid=%d missing creation identity; "
-                        "unlinking stale pidfile without killing",
+                        "preserving pidfile without killing",
                         pid,
                     )
                     continue
@@ -659,18 +720,12 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
             recorded_identity = entry.get("worker_identity")
             if not isinstance(recorded_identity, dict):
                 skipped_stale += 1
-                live_meta = _ps_meta(pid)
-                recorded_lstart = entry.get("started_at")
-                recorded_comm = entry.get("cmd")
-                recorded_meta = (
-                    (recorded_lstart, recorded_comm)
-                    if isinstance(recorded_lstart, str)
-                    and isinstance(recorded_comm, str)
-                    else None
-                )
-                if goalflight_compat.pid_alive(pid) and _same_process(
-                    recorded_meta, live_meta
-                ):
+                # Legacy lstart-only pidfiles cannot confirm a PID generation.
+                # Preserve a currently live PID as unknown so cleanup never
+                # discards re-attach metadata or authorizes a kill.
+                if goalflight_compat.pid_alive(pid):
+                    preserve_pidfile = True
+                elif group_not_proven_gone():
                     preserve_pidfile = True
                 log.warning(
                     "ghost_cleanup: pid=%d missing fine process identity; skipping kill",
@@ -683,9 +738,7 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
             )
             if not matched:
                 skipped_stale += 1
-                if reason == "identity_indeterminate" and goalflight_compat.pid_alive(
-                    pid
-                ):
+                if group_not_proven_gone():
                     preserve_pidfile = True
                 log.warning(
                     "ghost_cleanup: pid=%d stale reason=%s live=%r recorded=%r",
@@ -696,17 +749,14 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                 )
                 continue
             current_identity2 = goalflight_ledger.process_identity(pid)
-            matched2, reason2 = goalflight_ledger.compare_fine_process_identities(
+            matched2, _reason2 = goalflight_ledger.compare_fine_process_identities(
                 pid, current_identity, current_identity2
             )
             if not matched2:
                 skipped_stale += 1
-                if reason2 == "identity_indeterminate" and goalflight_compat.pid_alive(
-                    pid
-                ):
+                if group_not_proven_gone():
                     preserve_pidfile = True
                 continue
-            pgid = entry.get("pgid", pid)
             agent = entry.get("agent", "")
             is_bash_tail = str(agent).endswith("-bash-tail")
             hard_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
@@ -725,6 +775,12 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
                 killed += 1
                 killed_worker = True
             if not killed_worker and goalflight_compat.pid_alive(pid):
+                preserve_pidfile = True
+            if not killed_worker and group_not_proven_gone():
+                preserve_pidfile = True
+            if killed_worker and group_not_proven_gone():
+                # A successful signal is not proof that the whole group has
+                # reaped. Keep recovery evidence while any group remains.
                 preserve_pidfile = True
         if not preserve_pidfile:
             pf.unlink(missing_ok=True)
@@ -748,8 +804,14 @@ def cleanup_ghosts(active_worker_pids: set[int] | None = None) -> int:
         )
     return (
         killed
-        + _shim_reap_killed_count(reap_orphaned_acp_shims(active_worker_pids=own_worker_pids))
-        + _quota_reap_killed_count(reap_quota_stuck_workers())
+        + _shim_reap_killed_count(
+            reap_orphaned_acp_shims(
+                active_worker_pids=own_worker_pids,
+                process_rows=rows,
+                shim_paths=shim_paths,
+            )
+        )
+        + _quota_reap_killed_count(reap_quota_stuck_workers(process_rows=rows))
     )
 
 
@@ -793,6 +855,25 @@ def _parse_etime_seconds(etime: str) -> float | None:
     return None
 
 
+@lru_cache(maxsize=1)
+def _npm_root_global(npm_path: str) -> Path | None:
+    try:
+        npm_root = subprocess.run(
+            [npm_path, "root", "-g"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=4,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if npm_root.returncode != 0 or not npm_root.stdout.strip():
+        return None
+    return Path(npm_root.stdout.strip())
+
+
 def _claude_acp_shim_executable_paths() -> set[str]:
     paths: set[str] = set()
     launcher = shutil.which(CLAUDE_ACP_SHIM_BASENAME)
@@ -808,43 +889,31 @@ def _claude_acp_shim_executable_paths() -> set[str]:
         if candidate.is_file():
             with contextlib.suppress(OSError):
                 paths.add(os.path.realpath(str(candidate)))
-    if shutil.which("npm"):
-        try:
-            npm_root = subprocess.run(
-                ["npm", "root", "-g"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=4,
-                check=False,
+    npm_path = shutil.which("npm")
+    root = _npm_root_global(npm_path) if npm_path else None
+    if root is not None:
+        platform_name = {
+            "darwin": "darwin",
+            "linux": "linux",
+            "win32": "win32",
+        }.get(sys.platform)
+        machine = os.uname().machine.lower() if hasattr(os, "uname") else ""
+        arch = {
+            "x86_64": "x64",
+            "amd64": "x64",
+            "arm64": "arm64",
+            "aarch64": "arm64",
+        }.get(machine)
+        if platform_name and arch:
+            exe = (
+                f"{CLAUDE_ACP_SHIM_BASENAME}.exe"
+                if platform_name == "win32"
+                else CLAUDE_ACP_SHIM_BASENAME
             )
-            if npm_root.returncode == 0 and npm_root.stdout.strip():
-                root = Path(npm_root.stdout.strip())
-                platform_name = {
-                    "darwin": "darwin",
-                    "linux": "linux",
-                    "win32": "win32",
-                }.get(sys.platform)
-                machine = os.uname().machine.lower() if hasattr(os, "uname") else ""
-                arch = {
-                    "x86_64": "x64",
-                    "amd64": "x64",
-                    "arm64": "arm64",
-                    "aarch64": "arm64",
-                }.get(machine)
-                if platform_name and arch:
-                    exe = (
-                        f"{CLAUDE_ACP_SHIM_BASENAME}.exe"
-                        if platform_name == "win32"
-                        else CLAUDE_ACP_SHIM_BASENAME
-                    )
-                    candidate = root / f"{CLAUDE_ACP_SHIM_BASENAME}-{platform_name}-{arch}" / "bin" / exe
-                    if candidate.is_file():
-                        with contextlib.suppress(OSError):
-                            paths.add(os.path.realpath(str(candidate)))
-        except (OSError, subprocess.SubprocessError):
-            pass
+            candidate = root / f"{CLAUDE_ACP_SHIM_BASENAME}-{platform_name}-{arch}" / "bin" / exe
+            if candidate.is_file():
+                with contextlib.suppress(OSError):
+                    paths.add(os.path.realpath(str(candidate)))
     return paths
 
 
@@ -1244,9 +1313,15 @@ def _terminate_process_group(
     if any(action.startswith("SIGKILL") for action in actions):
         deadline = time.monotonic() + _SHIM_REAP_POST_KILL_GRACE_S
         while time.monotonic() < deadline:
-            if not _termination_targets_live(pid=worker_pid, pgid=target):
+            if not _pgid_alive(target):
                 break
             time.sleep(0.05)
+        if _pgid_alive(target):
+            # Intermediate killpg(0) probes are cheap and bounded. Only the
+            # deadline confirmation needs the process table, and it must happen
+            # once so a stubborn group cannot turn a one-second grace into a
+            # 20 Hz ps storm.
+            _termination_targets_live(pid=worker_pid, pgid=target)
     return "+".join(actions) if actions else "noop"
 
 
@@ -1268,6 +1343,7 @@ def reap_orphaned_acp_shims(
     active_worker_pids: set[int] | None = None,
     ttl_s: float = DEFAULT_SHIM_ORPHAN_TTL_S,
     process_rows: list[dict[str, Any]] | None = None,
+    shim_paths: set[str] | None = None,
     terminate_group: Callable[[int], str] | None = None,
     provenance_check: Callable[[int], bool] | None = None,
     identity_probe: Callable[[int], dict[str, Any] | None] | None = None,
@@ -1287,7 +1363,7 @@ def reap_orphaned_acp_shims(
     if goalflight_compat.is_windows():
         return {"skipped": "windows", "reaped": [], "candidates": []}
     try:
-        shim_paths = _claude_acp_shim_executable_paths()
+        paths = shim_paths if shim_paths is not None else _claude_acp_shim_executable_paths()
         rows = process_rows if process_rows is not None else _list_posix_process_rows()
         tracked = _ledger_tracked_worker_pids(active_worker_pids)
         prov = provenance_check or _shim_has_goalflight_provenance
@@ -1295,7 +1371,7 @@ def reap_orphaned_acp_shims(
         preliminary_candidates = _orphan_shim_candidates(
             rows,
             tracked_pids=tracked,
-            shim_paths=shim_paths,
+            shim_paths=paths,
             min_age_s=ttl_s,
             provenance_check=None,
         )

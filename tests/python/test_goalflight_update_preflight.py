@@ -203,7 +203,7 @@ def case_ambiguous_liveness_fails_closed_busy() -> None:
         assert payload["live_dispatches"][0]["id"] == "codex-unknown", payload
 
 
-def case_no_pid_missing_status_does_not_block() -> None:
+def case_no_pid_missing_status_fails_closed_busy() -> None:
     with _state_env() as (state_dir, env):
         _write_dispatch(
             state_dir,
@@ -214,12 +214,12 @@ def case_no_pid_missing_status_does_not_block() -> None:
         )
         proc = _run(env, "--agent", "codex")
         payload = _payload(proc)
-        assert proc.returncode == 0, payload
-        assert payload["idle"] is True, payload
-        assert payload["live_dispatches"] == [], payload
+        assert proc.returncode == 3, payload
+        assert payload["idle"] is False, payload
+        assert payload["live_dispatches"][0]["id"] == "codex-no-evidence", payload
 
 
-def case_no_pid_stale_status_does_not_block() -> None:
+def case_no_pid_stale_status_fails_closed_busy() -> None:
     with _state_env() as (state_dir, env):
         _write_dispatch(
             state_dir,
@@ -230,9 +230,9 @@ def case_no_pid_stale_status_does_not_block() -> None:
         )
         proc = _run(env, "--agent", "codex")
         payload = _payload(proc)
-        assert proc.returncode == 0, payload
-        assert payload["idle"] is True, payload
-        assert payload["live_dispatches"] == [], payload
+        assert proc.returncode == 3, payload
+        assert payload["idle"] is False, payload
+        assert payload["live_dispatches"][0]["id"] == "codex-stale-status", payload
 
 
 def case_reconciled_stale_dead_row_does_not_block() -> None:
@@ -283,8 +283,8 @@ def main() -> None:
     case_per_cli_scoping_keeps_unrelated_binary_idle()
     case_terminal_states_do_not_block_even_with_leases()
     case_ambiguous_liveness_fails_closed_busy()
-    case_no_pid_missing_status_does_not_block()
-    case_no_pid_stale_status_does_not_block()
+    case_no_pid_missing_status_fails_closed_busy()
+    case_no_pid_stale_status_fails_closed_busy()
     case_reconciled_stale_dead_row_does_not_block()
     case_force_override_returns_success_but_preserves_busy_payload()
     case_update_command_documents_gate_wiring()

@@ -124,6 +124,11 @@ If a review tool or required artifact is blocked or unavailable:
 Edit policy:
 - {{EDIT_POLICY — one of: review-only (do NOT edit any code), diagnostic-only (edit only docs-private/*, no simulator/* writes), full (edit per ACCEPTANCE)}}
 
+Search inside your own worktree with `git ls-files`, `rg --files`, or `rg <pattern>`.
+Never run `find` or recursive globbing above your worktree: not from a repo root that contains `worktrees/`,
+`$HOME`, `~/.goal-flight`, `/tmp`, `/private/tmp`, or `$TMPDIR`.
+For a file outside your worktree, use its known path.
+
 Final response (must include all of the following, in this order):
 - Memo path: <path to the written memo>
 - Key conclusion: <one paragraph>

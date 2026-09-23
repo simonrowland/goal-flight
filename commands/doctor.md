@@ -41,7 +41,9 @@ Project-local checks cover `docs-private/env-caveats.md`, the canonical
 `docs-private/` state tree, repository `SKILL.md`, `AGENTS.md` Goal Flight
 routing, the `AGENTS.md` newest-`RESUME-NOTES` living-state pin, project
 verification commands, resume notes, missing state files, managed-view
-schema/template skew, and the `tasks.jsonl` <-> `tasks-data.js` mirror.
+schema/template skew, and the `tasks.jsonl` <-> `tasks-data.js` mirror when
+`GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1`. Mirror export defaults off; doctor
+skips its parity/missing-file checks and prints the enablement hint.
 Package plugin validation applies only when `--project-root` is the Goal Flight
 package repository; for normal target projects it is skipped as INFO.
 
@@ -103,7 +105,7 @@ package repository; for normal target projects it is skipped as INFO.
   - managed static view assets match the templates from
     `templates/state-skeleton/`; schema/template skew is a layout warning
   - `docs-private/tasks.jsonl` and `dashboard/tasks-data.js` mirror
-    validation when either task-store file exists
+    validation when mirror export is enabled and either task-store file exists
 - Check machine capacity profile.
 - **Cursor model currency** (`cursor_models_probe`): runs `cursor-agent models`,
   identifies the leading internal `composer-X.Y` (non-`-fast`), compares against
