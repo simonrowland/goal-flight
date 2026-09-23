@@ -926,6 +926,11 @@ def test_supervise_cli_default_heartbeat_lands_and_bounds_refuse(
         "resolve_startup_lease_nonce",
         lambda **_kwargs: ("nonce-1", None, None),
     )
+    monkeypatch.setattr(
+        supervise,
+        "_renew_controller_lease_before_arm",
+        lambda **kwargs: str(kwargs["nonce"]),
+    )
     monkeypatch.setattr(supervise, "RealHost", lambda **_kwargs: object())
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(
