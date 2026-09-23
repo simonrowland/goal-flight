@@ -7781,7 +7781,13 @@ def cmd_follow(args) -> int:
                         emit=emit,
                         delivered=delivered,
                     )
-                except goalflight_journal.JournalError:
+                except (
+                    goalflight_journal.JournalBusy,
+                    goalflight_journal.JournalDisappeared,
+                    goalflight_journal.JournalIOError,
+                    goalflight_journal.JournalIntegrityError,
+                    goalflight_journal.JournalUpgradeRequired,
+                ):
                     # Delivery's position reads share peek's busy tolerance.
                     raise
                 except (OSError, RuntimeError, ValueError) as exc:
@@ -9497,6 +9503,60 @@ def cmd_listen_auto(args) -> int:
     return cmd_listen(args)
 
 
+def _pid_in_caller_process_group(pid: int) -> bool | None:
+    """Return whether *pid* belongs to this supervisor's caller group."""
+    try:
+        caller_pid = os.getppid()
+        if caller_pid <= 1:
+            return None
+        caller_pgid = os.getpgid(caller_pid)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    try:
+        target_pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return False
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return target_pgid == caller_pgid
+
+
+def _pid_in_caller_ancestry(pid: int) -> bool | None:
+    """Return whether *pid* is this supervisor or one of its ancestors.
+
+    The PPID chain is read from the same native process identity probe used for
+    start-token validation.  Missing ancestry evidence is UNKNOWN, never proof
+    that a candidate is safe to signal.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    current_pid = os.getpid()
+    seen: set[int] = set()
+    while True:
+        if current_pid == pid:
+            return True
+        if current_pid == 1:
+            return False
+        if current_pid in seen:
+            return None
+        seen.add(current_pid)
+        identity = goalflight_compat.process_start_identity(
+            current_pid,
+            include_ancestry=True,
+        )
+        if not isinstance(identity, dict) or not identity.get("start_token"):
+            return None
+        parent_pid = identity.get("ppid")
+        if (
+            isinstance(parent_pid, bool)
+            or not isinstance(parent_pid, int)
+            or parent_pid <= 0
+            or parent_pid == current_pid
+        ):
+            return None
+        current_pid = parent_pid
+
+
 def cmd_supervise(args) -> int:
     """One tracked task that owns the persistent wake pool."""
     import goalflight_wake_supervise as supervise
@@ -9583,6 +9643,25 @@ def cmd_supervise(args) -> int:
                 if goalflight_wake._start_hash(start_token) == record.start_hash:
                     if pid == os.getpid():
                         return f"refused to signal current process {pid}; coverage retained"
+                    caller_ancestry = _pid_in_caller_ancestry(pid)
+                    if caller_ancestry is None:
+                        identity_unknown.append(
+                            f"pid {pid} caller ancestry is unavailable"
+                        )
+                        continue
+                    if caller_ancestry:
+                        identity_unknown.append(
+                            f"pid {pid} is the caller or a caller ancestor"
+                        )
+                        continue
+                    caller_group = _pid_in_caller_process_group(pid)
+                    if caller_group is None:
+                        identity_unknown.append(
+                            f"pid {pid} caller process group is unavailable"
+                        )
+                        continue
+                    if caller_group:
+                        continue
                     verified_records[pid] = record
                 # A different start token proves the incumbent exited and its
                 # PID was reused. It is already released; never signal the new
@@ -9628,6 +9707,19 @@ def cmd_supervise(args) -> int:
                     failures.append(f"pid {pid} owner is unavailable")
                     continue
                 if goalflight_wake._start_hash(start_token) != record.start_hash:
+                    continue
+                caller_ancestry = _pid_in_caller_ancestry(pid)
+                if caller_ancestry is None:
+                    failures.append(f"pid {pid} caller ancestry is unavailable")
+                    continue
+                if caller_ancestry:
+                    failures.append(f"pid {pid} is the caller or a caller ancestor")
+                    continue
+                caller_group = _pid_in_caller_process_group(pid)
+                if caller_group is None:
+                    failures.append(f"pid {pid} caller process group is unavailable")
+                    continue
+                if caller_group:
                     continue
                 os.kill(pid, signal.SIGTERM)
                 signal_sent = True

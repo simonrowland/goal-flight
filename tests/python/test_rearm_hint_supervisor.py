@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import time
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -392,6 +393,15 @@ def test_session_start_hook_startup_and_resume_use_live_supervisor_policy(
     assert absent_command in initial_context, initial_context
     env["GOALFLIGHT_CONTROLLER_SESSION_ID"] = lease.nonce
     env["GOALFLIGHT_CONTROLLER_LEASE_NONCE"] = lease.nonce
+    # The migration preflight must prove supervisor absence before replacing
+    # coverage.  Supply that evidence explicitly; a denied host process table
+    # is UNKNOWN and must not be treated as absence.
+    env = _ps_listing_env(
+        tmp_path,
+        env,
+        name="probe-absent-supervisor",
+        rows=[],
+    )
 
     supervise_parts = shlex.split(
         wake.coverage_supervise_command(
@@ -1938,10 +1948,146 @@ def test_dead_event_contracts_scope_actions_to_unsupervised_paths() -> None:
     assert "no component command" in fleet_contract
 
 
+def test_supervise_migration_never_signals_caller_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid caller-owned waiter is not a safe supervisor migration target."""
+    record = wake.WaiterRecord(
+        kind=wake.WATCHDOG_KIND,
+        label_hash="label",
+        pid=43210,
+        start_hash=wake._start_hash("caller-start"),
+        instance_id="i" * 32,
+        path=tmp_path / "watchdog.lock",
+        generation_hash="generation",
+    )
+    captured: dict[str, object] = {}
+    killed: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(
+        messages.goalflight_wake,
+        "live_waiters",
+        lambda *args, **kwargs: [record],
+    )
+    monkeypatch.setattr(
+        messages.goalflight_compat,
+        "process_start_identity",
+        lambda _pid, **kwargs: (
+            {"start_token": "caller-start", "ppid": 1}
+            if kwargs.get("include_ancestry")
+            else {"start_token": "caller-start"}
+        ),
+    )
+    monkeypatch.setattr(messages.os, "getppid", lambda: 12345)
+    monkeypatch.setattr(messages.os, "getpgid", lambda _pid: 77)
+    monkeypatch.setattr(
+        messages.os,
+        "kill",
+        lambda pid, signum: killed.append((pid, signum)),
+    )
+
+    def fake_cmd_supervise(args: object, **kwargs: object) -> int:
+        captured.update(kwargs)
+        root = Path(args.project_root)  # type: ignore[attr-defined]
+        before = kwargs["before_renewal"]
+        on_probe = kwargs["on_startup_probe"]
+        assert callable(before) and callable(on_probe)
+        assert before(root, "label", "nonce") is None
+        assert on_probe(root, "label", "nonce") is None
+        return 0
+
+    monkeypatch.setattr(supervise, "cmd_supervise", fake_cmd_supervise)
+    result = messages.cmd_supervise(
+        SimpleNamespace(
+            project_root=str(tmp_path),
+            controller_label="label",
+            lease_nonce="nonce",
+        )
+    )
+
+    assert result == 0
+    assert captured["before_renewal"] is not None
+    assert killed == []
+
+
+def test_supervise_migration_never_signals_caller_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller ancestor is unsafe even when it has a different process group."""
+    record = wake.WaiterRecord(
+        kind=wake.WATCHDOG_KIND,
+        label_hash="label",
+        pid=54321,
+        start_hash=wake._start_hash("ancestor-start"),
+        instance_id="a" * 32,
+        path=tmp_path / "watchdog.lock",
+        generation_hash="generation",
+    )
+    identities = {
+        90000: {"start_token": "self-start", "ppid": 70000},
+        70000: {"start_token": "caller-start", "ppid": 54321},
+        54321: {"start_token": "ancestor-start", "ppid": 1},
+    }
+    captured: dict[str, object] = {}
+    killed: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(
+        messages.goalflight_wake,
+        "live_waiters",
+        lambda *args, **kwargs: [record],
+    )
+    monkeypatch.setattr(
+        messages.goalflight_compat,
+        "process_start_identity",
+        lambda pid, **kwargs: identities[pid],
+    )
+    monkeypatch.setattr(messages.os, "getpid", lambda: 90000)
+    monkeypatch.setattr(messages.os, "getppid", lambda: 70000)
+    monkeypatch.setattr(
+        messages.os,
+        "getpgid",
+        lambda pid: {70000: 77, 54321: 88}[pid],
+    )
+    monkeypatch.setattr(
+        messages.os,
+        "kill",
+        lambda pid, signum: killed.append((pid, signum)),
+    )
+
+    def fake_cmd_supervise(args: object, **kwargs: object) -> int:
+        captured.update(kwargs)
+        root = Path(args.project_root)  # type: ignore[attr-defined]
+        before = kwargs["before_renewal"]
+        on_probe = kwargs["on_startup_probe"]
+        assert callable(before) and callable(on_probe)
+        before_result = before(root, "label", "nonce")
+        captured["before_result"] = before_result
+        captured["probe_result"] = on_probe(root, "label", "nonce")
+        return 0
+
+    monkeypatch.setattr(supervise, "cmd_supervise", fake_cmd_supervise)
+    result = messages.cmd_supervise(
+        SimpleNamespace(
+            project_root=str(tmp_path),
+            controller_label="label",
+            lease_nonce="nonce",
+        )
+    )
+
+    assert result == 0
+    assert "caller ancestor" in str(captured["before_result"])
+    assert captured["probe_result"] is None
+    assert killed == []
+
+
 def test_doctor_wake_coverage_reports_supervisor_state(
     isolated: tuple[Path, journal.LeaseIdentity],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if wake._process_listing() is None:
+        pytest.skip("real process-table probe unavailable")
     project, lease = isolated
     supervise_cmd = wake.coverage_supervise_command(
         project,
