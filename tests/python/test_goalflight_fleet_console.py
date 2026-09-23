@@ -3119,12 +3119,49 @@ def test_controller_panel_aggregates_owned_workers_across_worktrees() -> None:
         parent = (temp_root / "battery-tool-v2").resolve()
         worktree = (temp_root / "bt-adapter").resolve()
         parent.mkdir()
-        worktree.mkdir()
-        (parent / ".git").mkdir()
-        worktree_git = parent / ".git" / "worktrees" / "bt-adapter"
-        worktree_git.mkdir(parents=True)
-        (worktree_git / "commondir").write_text("../..\n", encoding="utf-8")
-        (worktree / ".git").write_text(f"gitdir: {worktree_git}\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main"],
+            cwd=parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.invalid"],
+            cwd=parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Goal Flight Test"],
+            cwd=parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        (parent / "seed.txt").write_text("seed\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "seed.txt"],
+            cwd=parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-qm", "seed"],
+            cwd=parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "bt-adapter", str(worktree)],
+            cwd=parent,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         isolated_env = _controller_test_env(temp_root)
         with mock.patch.dict(os.environ, isolated_env, clear=False):
             authority = F.goalflight_journal.open_or_create_journal(parent)

@@ -1348,9 +1348,11 @@ class Journal:
 
     def _schema_is_current_readonly(self) -> bool:
         """Read the SQLite schema marker without taking the construction lock."""
+        previous_read_only_client = self._read_only_client
+        self._read_only_client = True
         try:
             with contextlib.closing(
-                _open_readonly_connection(self.path, timeout=0, isolation_level=None)
+                self._connect()
             ) as connection:
                 row = connection.execute("PRAGMA user_version").fetchone()
                 if row is None:
@@ -1369,6 +1371,17 @@ class Journal:
                 if mode_row is None or str(mode_row[0]).lower() != "wal":
                     # _bootstrap_schema is the repair path for a valid current
                     # schema that has been switched out of WAL mode.
+                    return False
+                base_tables = {
+                    str(schema_row[0])
+                    for schema_row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                if not {"journal_meta", "journal_epochs"} <= base_tables:
+                    return False
+                missing, malformed = self._current_schema_issues(connection)
+                if missing or malformed:
                     return False
                 epoch_row = connection.execute(
                     """
@@ -1404,7 +1417,6 @@ class Journal:
                 ).fetchone()
                 if identity_row is None or str(identity_row[0]) != JOURNAL_IDENTITY_VALUE:
                     return False
-                missing, malformed = self._current_schema_issues(connection)
         except sqlite3.DatabaseError as exc:
             if _is_busy(exc):
                 return False
@@ -1413,7 +1425,9 @@ class Journal:
             raise JournalIOError(
                 f"journal schema probe unavailable/unreadable for {self.path}: {exc}"
             ) from exc
-        return not missing and not malformed
+        finally:
+            self._read_only_client = previous_read_only_client
+        return True
 
     def _open_validated(
         self,
@@ -1644,7 +1658,7 @@ class Journal:
     def _raise_integrity_failure(self, detail: str) -> None:
         try:
             key = self._integrity_cache_key()
-        except JournalError:
+        except (JournalBusy, JournalDisappeared, JournalIOError):
             key = None
         if key is not None:
             with _INTEGRITY_CHECK_LOCK:

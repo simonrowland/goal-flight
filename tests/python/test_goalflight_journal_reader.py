@@ -384,8 +384,7 @@ def test_startup_context_preserves_nonbusy_journal_failure_type(
     project = _project(tmp_path)
     authority = journal.Journal.create(project)
     with sqlite3.connect(authority.path) as connection:
-        # Force the legacy bootstrap path: current-schema opens intentionally
-        # avoid the construction transaction after the read-only probe.
+        # Force the legacy bootstrap path after the current-schema read probe.
         connection.execute("PRAGMA user_version = 0")
     real_connect = journal.Journal._connect
     calls: list[str] = []
@@ -398,7 +397,7 @@ def test_startup_context_preserves_nonbusy_journal_failure_type(
 
     monkeypatch.setattr(journal.Journal, "_connect", fail_startup_connect)
 
-    with pytest.raises(type(failure), match="journal startup could not open"):
+    with pytest.raises(type(failure), match="injected"):
         journal.Journal(project)
     assert calls == ["connect"], "failure did not bind at schema startup"
 
@@ -455,7 +454,7 @@ def test_construction_shares_one_busy_deadline_across_lock_and_open_stages(
         journal.Journal(project)
 
     assert observed["lock_deadline"] == 105.0
-    assert connect_deadlines[:2] == [105.0, 105.0]
+    assert connect_deadlines[:2] == [None, 105.0]
     assert observed["released_at"] == 102.0
 
 
