@@ -27,7 +27,7 @@ def run_task(project_root: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(TASK), "--project-root", str(project_root), *args],
         cwd=str(ROOT),
-        env=os.environ.copy(),
+        env={**os.environ, "GOALFLIGHT_DASHBOARD_EXPORT_ENABLED": "1"},
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -39,6 +39,7 @@ def run_task(project_root: Path, *args: str) -> subprocess.CompletedProcess:
 def run_checker(project_root: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         [NODE, str(CHECKER), str(project_root / "docs-private"), str(project_root / "dashboard")],
+        env={**os.environ, "GOALFLIGHT_DASHBOARD_EXPORT_ENABLED": "1"},
         cwd=str(ROOT),
         text=True,
         stdout=subprocess.PIPE,

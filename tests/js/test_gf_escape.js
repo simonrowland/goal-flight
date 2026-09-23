@@ -293,7 +293,9 @@ function assertCheckerRejectsMissingDerivedStatus() {
     };
     fs.writeFileSync(path.join(dir, "tasks.jsonl"), JSON.stringify(item) + "\n");
     fs.writeFileSync(path.join(dir, "tasks-data.js"), "window.GF_ITEMS = " + JSON.stringify([item], null, 2) + ";\n");
-    const result = childProcess.spawnSync(process.execPath, [CHECKER, dir], { encoding: "utf8" });
+    const result = childProcess.spawnSync(process.execPath, [CHECKER, dir], {
+      encoding: "utf8", env: { ...process.env, GOALFLIGHT_DASHBOARD_EXPORT_ENABLED: "1" }
+    });
     const output = String(result.stdout || "") + String(result.stderr || "");
     assert("checker rejects mirror item missing derived_status", result.status !== 0);
     assert("checker reports missing derived_status", output.includes("derived_status"));
@@ -1136,3 +1138,18 @@ assert("live rows suppress idle banner", legacyActivity.idleBanner.hidden === tr
 });
 
 console.log("OK: gf.js escaping/autolink test pass");
+
+const notices = [];
+const mirrorlessWindow = {
+  document: {
+    createElement: () => ({ setAttribute() {} }),
+    querySelector: () => ({ prepend: node => notices.push(node.textContent) }),
+    addEventListener() {}, removeEventListener() {}
+  },
+  addEventListener() {}, removeEventListener() {}
+};
+vm.runInNewContext(fs.readFileSync(GF_JS, "utf8"), { window: mirrorlessWindow, URL, URLSearchParams });
+const mirrorlessDriver = mirrorlessWindow.GF.attach({});
+assert("missing mirror displays enablement hint", notices.some(text => text.includes("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1")));
+assert("missing mirror has empty usable store", mirrorlessWindow.GF.store.items.length === 0);
+mirrorlessDriver.destroy();

@@ -15,6 +15,20 @@ console preview. Zero-JS here keeps the controller's *editing* context light
 
 ## Tier 2 — json-derived views (self-contained HTML+JS, no backend, no generator)
 
+The dashboard mirror is **off by default** to avoid rewriting large task stores.
+Enable it using the existing environment configuration mechanism:
+`export GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1`, then run
+`python3 goalflight_task.py --project-root <project> sync`. Keep that variable
+set for subsequent writers and dashboard refresh processes. Accepted true values
+are `1`, `true`, `yes`, and `on` (case-insensitive); unset or other values disable it.
+When disabled, full mirror generation, snapshots, scaffolding, and mirror checks
+are skipped. The first save or recovery replaces retained `tasks-data.js` files
+with a tiny disabled stub; subsequent writes leave that stub unchanged. Directory
+symlinks are refused; file symlinks are replaced without touching their referents.
+Pages with the stub or without a mirror display an enablement hint. JSONL,
+markdown, task queries, and the separate status/fleet
+exports remain available.
+
 Views derived from `tasks.jsonl` are STATIC pages + a shared JS include that
 reads the data client-side and renders — there is **no Python page-generator**:
 
@@ -34,8 +48,8 @@ Mechanics (offline, no server):
   blocked on `file://` — that's why the data is a `.js`.
 - A shared **`gf.js`** renders list/details + **autolinks** every `t-NNN` /
   `b-NNN` / `d-NNN` / `q-NNN` id it finds (incl. in the recap) to the ticket views.
-- Pages are static, vendored once (no per-change build); they always show current
-  data because they read it live — **no staleness, no generator-must-run hazard.**
+- Pages are static, vendored once (no per-change build); with mirror export
+  enabled, they show the latest successfully published snapshot on reload.
 - LIFO / grey-done / sort / filter are JS here; CSS + JS inlined or vendored
   locally (no external deps; keep it self-contained).
 - Trade-off: JS pages render in a real browser only — NOT the chat-console

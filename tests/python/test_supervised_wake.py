@@ -4343,6 +4343,7 @@ def test_messages_supervise_wires_the_forwarding_only_projection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
     store = task.TaskStore(tmp_path)
     store.save_items_atomic(
         [
@@ -4509,6 +4510,8 @@ def test_actual_follow_computes_projected_and_unavailable_directives(
 ) -> None:
     """Classification comes from cmd_follow, not a scripted frontier record."""
     project, env, lease = isolated
+    env["GOALFLIGHT_DASHBOARD_EXPORT_ENABLED"] = "1"
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
     monkeypatch.setattr(supervise.wake, "live_waiters", lambda *args, **kwargs: [])
     store = task.TaskStore(project)
     if projection == "projected":
@@ -4559,6 +4562,8 @@ def test_actual_follow_keeps_working_item_empty_but_supervisor_forwards_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, env, lease = isolated
+    env["GOALFLIGHT_DASHBOARD_EXPORT_ENABLED"] = "1"
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
     monkeypatch.setattr(supervise.wake, "live_waiters", lambda *args, **kwargs: [])
     store = task.TaskStore(project)
     store.save_items_atomic(
@@ -4657,6 +4662,8 @@ def test_forwarding_projection_refreshes_after_active_only_transition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project, env, lease = isolated
+    env["GOALFLIGHT_DASHBOARD_EXPORT_ENABLED"] = "1"
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
     monkeypatch.setattr(supervise.wake, "live_waiters", lambda *args, **kwargs: [])
     store = task.TaskStore(project)
     store.save_items_atomic(

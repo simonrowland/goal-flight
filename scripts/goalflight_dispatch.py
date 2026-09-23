@@ -2210,7 +2210,7 @@ def _dashboard_project_has_live_dispatch(project_root: Path) -> bool | None:
 
 
 def _dashboard_refresh_disabled() -> bool:
-    """True while the operator kill switch file exists.
+    """True when mirror export is off or the operator kill switch exists.
 
     A file rather than an environment variable: the refresher is spawned
     detached by whichever controller session happens to dispatch next, so an
@@ -2218,7 +2218,7 @@ def _dashboard_refresh_disabled() -> bool:
     also lets daemons that are already running exit at their next cycle
     instead of having to be hunted down by pid.
     """
-    return _DASHBOARD_REFRESH_DISABLE_FLAG.exists()
+    return not goalflight_task._dashboard_export_enabled() or _DASHBOARD_REFRESH_DISABLE_FLAG.exists()
 
 
 def _dashboard_refresh_loop(
@@ -2252,6 +2252,9 @@ def _cmd_dashboard_refresh(argv: list[str]) -> int:
     parser.add_argument("--interval-s", type=float, default=15.0)
     parser.add_argument("--max-lifetime-s", type=float, default=_DASHBOARD_REFRESH_MAX_LIFETIME_S)
     args = parser.parse_args(argv)
+    if not goalflight_task._dashboard_export_enabled():
+        print(goalflight_task.DASHBOARD_EXPORT_DISABLED)
+        return 0
     return _dashboard_refresh_loop(
         Path(args.project_root).resolve(),
         interval_s=args.interval_s,

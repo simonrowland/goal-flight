@@ -23,6 +23,12 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def enable_dashboard_export(monkeypatch):
+    monkeypatch.setenv("GOALFLIGHT_DASHBOARD_EXPORT_ENABLED", "1")
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts" / "check_tasks_mirror.js"
@@ -2081,6 +2087,7 @@ def test_goalflight_task_sync_generates_markdown_views() -> None:
 
 
 def main() -> None:
+    os.environ["GOALFLIGHT_DASHBOARD_EXPORT_ENABLED"] = "1"
     if not NODE:
         print("SKIP: test_tasks_mirror.py: node not found on PATH")
         return

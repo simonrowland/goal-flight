@@ -352,7 +352,8 @@ def test_check_tasks_mirror_accepts_next_fixture_without_status() -> None:
     if not NODE:
         print("SKIP: test_next_frontier.py mirror checker: node not found on PATH")
         return
-    with tempfile.TemporaryDirectory() as td:
+    from unittest.mock import patch
+    with patch.dict(os.environ, {"GOALFLIGHT_DASHBOARD_EXPORT_ENABLED": "1"}), tempfile.TemporaryDirectory() as td:
         project = Path(td) / "project"
         store = T.TaskStore(project)
         store.save_items_atomic(_frontier_fixture())

@@ -25,7 +25,8 @@ Decisions-needed section below). Ids `t-NNN` / `b-NNN` / `d-NNN` / `ADR-NNN`
 (plus legacy `q-NNN`), one allocator per family.
 
 The HTML views are self-contained **HTML+JS** filter-views that read the data
-client-side from `tasks-data.js` (a mirror of this file) — no Python page
+client-side from `tasks-data.js` (an optional mirror, off by default; enable with
+`GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1` and run `sync`) — no Python page
 generator; see [progress-dashboard.md](progress-dashboard.md). Optional flat
 markdown snapshots (`task-decomposition.md`, `tasks-done.md`, `bug-backlog.md`,
 `bugs-done.md`) are emitted for git-diffability. *"Separate bugs json" vs
@@ -208,11 +209,15 @@ mirror.
 - `accept <id>` -> require latest clean review, then mark DONE-REVIEWED
 - `list [outstanding|awaiting-review|working|waiting|delegated|done-reviewed] [--since T] [--kind K] [--blocked-by ID] [--tag TAG] [--json]`
 - `status [--json]` -> print derived status rows
-- `sync` -> write `tasks-data.js` plus markdown snapshots from the store and project dispatch ledger
+- `sync` -> write markdown snapshots from the store and project dispatch ledger;
+  also write `tasks-data.js` when `GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1`
 - `harvest [--dry-run] [--source GLOB] [--no-history] [--kind K] [--lane L] [--json]` -> draft open work from RESUME-NOTES/review/source files
 - `migrate --source GLOB [--kind K] [--lane L] [--apply]` -> preview/apply harvest from existing markdown lists
 - `pipe [--agent AGENT] [--dry-run] [--json]` -> emit queue-ready task prompts for worker dispatch
-- check: `node scripts/check_tasks_mirror.js docs-private dashboard` validates mirror parity; `goalflight_task.py` runs it on writes.
+- check: `GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1 node scripts/check_tasks_mirror.js docs-private dashboard`
+  validates mirror parity; `goalflight_task.py` runs it on writes only when mirror
+  export is enabled. The mirror defaults off; save/recovery replaces retained
+  mirrors with a tiny disabled stub once, without rewriting an existing stub.
 
 Importable Python read API (any agent, no grep):
 
@@ -247,7 +252,8 @@ review transition goes through `goalflight_task.py`. That buys three things:
    unless `--force`; `accept` requires the latest review breadcrumb to be clean).
    `done <id> [--resolution R]` accepts a free resolution string, defaulting to
    `done`; v1.1 has no `close` verb or fixed resolution enum.
-3. **No drift** — every write re-emits `tasks-data.js` from the canonical record,
+3. **No drift when enabled** — every write with `GOALFLIGHT_DASHBOARD_EXPORT_ENABLED=1`
+   re-emits `tasks-data.js` from the canonical record,
    so the browser mirror can't fall out of sync (the mirror test becomes a backstop
    for a rare hand-edit, not the primary guard).
 

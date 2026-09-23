@@ -6706,6 +6706,10 @@ def _follow_projection_rows(task_store) -> tuple[list[dict[str, object]], os.sta
     can repair interrupted publishes. A heartbeat must not take that lock or
     mutate the store, so the stream consumes the already-materialized JS view.
     """
+    import goalflight_task
+
+    if not goalflight_task._dashboard_export_enabled():
+        raise ValueError(goalflight_task.DASHBOARD_EXPORT_DISABLED)
     projection_candidates = (
         task_store.data_js_path,
         task_store.export_dashboard_dir / "tasks-data.js",
