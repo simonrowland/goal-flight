@@ -189,8 +189,10 @@ drain if it rang (`relay --drain`, act), flush RESUME-NOTES (Compaction
 below), quote-check Hard Invariants from a fresh disk read, re-arm,
 then `goalflight_task.py next`. The 900s quiet timeout is this host's
 substitute for Claude's 80% context-meter hint. The portable
-four-listen pool is full depth
-(resilience; see `protocols/controller-mail.md`). One listen is the MVP.
+listener pool uses `--listener-slots` as a concurrency ceiling, not a required
+four-listener depth (see `protocols/controller-mail.md`). One listen is the MVP.
+Do not raise the ceiling to cure a missed wake: inspect listener/lease state
+and drain the journal, which remains the authoritative inbox.
 If you arm more than one listen, put `--timeout-s 900` on a single slot
 and leave the others at `--timeout-s 0` so four quiet timeouts do not
 fire together. Branch on listen exit codes instead of blindly

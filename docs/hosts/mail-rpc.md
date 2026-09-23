@@ -36,6 +36,7 @@ picks.
 Which bearers are loaded:
 
 1. If `GOALFLIGHT_MAIL_RPC_USERS_FILE` is set, that file is authoritative.
+   An explicitly empty or whitespace-only value refuses startup.
    `GOALFLIGHT_MAIL_RPC_TOKEN` is not accepted and is not a second door.
    `GOALFLIGHT_CONTROLLER_LABEL` is not applied. Remove the legacy token from
    the daemon environment after you migrate so the process does not keep a
@@ -43,7 +44,7 @@ Which bearers are loaded:
 2. If that variable is unset and `GOALFLIGHT_MAIL_RPC_TOKEN` is set, the
    daemon stays in single-token mode. A file at the default path is not read.
 3. If the token is also unset and `~/.goal-flight/mail-rpc.users.json`
-   exists, that default file is used.
+   exists, that default file is used and its path is logged at startup.
 4. Otherwise the process refuses to start.
 
 Request header `X-Goalflight-Controller-Label` supplies the label only in
@@ -86,23 +87,35 @@ Rules the loader enforces:
 - `token` is required, at least 16 characters, and unique. The process keeps
   a SHA-256 digest and compares digests with `hmac.compare_digest`. It does
   not log the token or the `Authorization` header.
-- `controller_label` is required on every entry. It must match the same
+- `controller_label` is required and unique on every entry. It must match the same
   bounded pattern as `GOALFLIGHT_CONTROLLER_LABEL`. After the bearer matches,
   that label is the only mailbox the request may peek, drain, or post as.
   Omitting the request label is fine. A different header or body label is
   **403**.
-- `project_root` is optional. When set, that entry is confined to that
-  directory; a different request path is **403**. The same pin covers
-  `controller_project_root` on `/v1/post`. When omitted, the entry uses
-  `GOALFLIGHT_PROJECT_ROOT` if that is set, and is confined to it. When
-  neither is set, the request may still pass `project_root`, as in
-  single-token mode.
+- `project_root` is optional but must be absolute when set. The loader freezes
+  the journal's canonical root (including linked and managed worktrees).
+  Requests are refused if that root changes after startup. A different
+  delivery project is **403**, including explicit controller, payload, and
+  dispatch-ledger destinations. When omitted, `GOALFLIGHT_PROJECT_ROOT`, if
+  set, supplies the same absolute pin.
+- **Without either root, a bearer can name any checkout on the journal host.**
+  The second example entry above has this authority unless a global root is
+  set. Optional roots preserve the existing configuration and support a
+  controller intentionally spanning projects; requiring them would change
+  that contract. Set a root for every controller that needs project confinement.
 - Single-token mode does not confine `project_root` or
   `controller_project_root`. The request path still wins, then
   `GOALFLIGHT_PROJECT_ROOT`.
-- Duplicate tokens, an empty users array, unknown keys, and a users file
-  that is group- or world-accessible are startup errors. `chmod 600` the
-  file. The error text does not include token values.
+- Duplicate tokens or labels, an empty users array, unknown keys, and unsafe
+  users files are startup errors. The file must be regular, owned by the daemon's
+  effective UID, and inaccessible to group or others (`chmod 600`). Symlinks
+  are refused. Validation and reading use the same open descriptor. Keep the
+  containing directory trusted. Duplicate-label errors name the label; errors
+  never include token values.
+
+CLI children discard inherited controller nonce/session credentials and store
+routing overrides. They use the journal host's default stores; a bearer cannot
+mint the launching controller's authorship proof from its environment.
 
 Point each bot at the same URL and its own token:
 

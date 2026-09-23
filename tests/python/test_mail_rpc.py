@@ -7,7 +7,10 @@ temp journal. No test contacts a live ``~/.goal-flight`` or a public address.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+from types import SimpleNamespace
 import threading
 import urllib.error
 import urllib.request
@@ -16,11 +19,33 @@ import pytest
 
 import goalflight_journal as journal
 import goalflight_mail_rpc as rpc
+import goalflight_ledger as ledger
 
 
 LABEL = "goalflight-grokbot"
 OTHER = "other-controller"
 TOKEN = "mail-rpc-test-token-0123456789abcdef"
+
+
+@pytest.fixture(autouse=True)
+def isolated_rpc_child(monkeypatch, isolate_goalflight_machine_state):
+    """After production scrubbing, relocate stores into the test sandbox.
+
+    The scrub itself is asserted separately. Never let a real messages child
+    fall through to the host's default stores while testing that boundary.
+    """
+    isolated = dict(isolate_goalflight_machine_state)
+    run = subprocess.run
+
+    def isolated_run(command, **kwargs):
+        if "env" in kwargs and (
+            str(rpc.MESSAGES_SCRIPT) in command
+            or any("_confined_messages_main" in str(arg) for arg in command)
+        ):
+            kwargs["env"] = {**kwargs["env"], **isolated}
+        return run(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", isolated_run)
 
 
 def _project(tmp_path: Path) -> Path:
@@ -198,6 +223,223 @@ def test_drain_other_controller_forbidden(mail_server: str, tmp_path: Path) -> N
 TOKEN_A = "mail-rpc-user-a-token-0123456789abcdef"
 TOKEN_B = "mail-rpc-user-b-token-0123456789abcdef"
 LEGACY_TOKEN = "mail-rpc-legacy-token-0123456789abcd"
+
+
+@pytest.mark.parametrize("file_mode", [False, True])
+@pytest.mark.parametrize("capability", [
+    "GOALFLIGHT_CONTROLLER_LEASE_NONCE", "GOALFLIGHT_CONTROLLER_SESSION_ID",
+])
+def test_parent_capability_cannot_mint_rpc_authorship(monkeypatch, tmp_path, capability, file_mode):
+    project = _project(tmp_path)
+    _claim(project, LABEL)
+    _clear_daemon_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(rpc.TOKEN_ENV, TOKEN)
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", LABEL)
+    if file_mode:
+        users = _users_file(tmp_path, [{
+            "token": TOKEN_A, "controller_label": LABEL, "project_root": str(project),
+        }])
+        monkeypatch.setenv(rpc.USERS_FILE_ENV, str(users))
+    monkeypatch.setenv(capability, "parent-private-capability")
+    config = rpc.load_config()
+    status, result = rpc.handle_post(config, config.users[0], header_label=None, body={
+        "dispatch_id": "authorship-probe", "type": "controller-notice",
+        "to_controller": LABEL, "project_root": str(project), "text": "hello",
+    })
+    assert status == 200, result
+    envelope = result["result"]["envelope"]
+    assert "author_digest" not in envelope
+    assert "parent-private-capability" not in json.dumps(envelope)
+
+
+def test_child_environment_drops_store_routing(monkeypatch):
+    # Inventory: messages defaults, task root/store, journal and dispatch ledger.
+    names = (
+        "GOALFLIGHT_DISPATCH_ID", "GOALFLIGHT_CONTROLLER_LEASE_NONCE",
+        "GOALFLIGHT_CONTROLLER_SESSION_ID", "GOALFLIGHT_PROJECT_ROOT",
+        "GOALFLIGHT_MESSAGES_DIR", "GOALFLIGHT_FLEET_DIR",
+        "GOALFLIGHT_TASK_STORE_DIR", "GOALFLIGHT_JOURNAL_DIR",
+        "GOALFLIGHT_STATE_DIR", "GOALFLIGHT_DISPATCH_DIR", "XDG_STATE_HOME",
+    )
+    for name in names:
+        monkeypatch.setenv(name, "parent-routing")
+    child = rpc._child_env(LABEL)
+    assert not set(names).intersection(child)
+    assert child["GOALFLIGHT_CONTROLLER_LABEL"] == LABEL
+
+
+@pytest.mark.parametrize("route", ["explicit", "payload", "dispatch"])
+@pytest.mark.parametrize("msg_type", ["status", "result", "blocked", "user_need"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_actual_delivery_project_confinement(monkeypatch, tmp_path, route, msg_type, legacy):
+    project = _project(tmp_path)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    _claim(foreign, OTHER)
+    _clear_daemon_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("GOALFLIGHT_CONTROLLER_LABEL", LABEL)
+    monkeypatch.setenv("GOALFLIGHT_PROJECT_ROOT", str(project))
+    if legacy:
+        monkeypatch.setenv(rpc.TOKEN_ENV, TOKEN)
+    else:
+        users = _users_file(tmp_path, [{
+            "token": TOKEN_A, "controller_label": LABEL, "project_root": str(project),
+        }])
+        monkeypatch.setenv(rpc.USERS_FILE_ENV, str(users))
+    dispatch_id = "foreign-route-probe"
+    body = {"dispatch_id": dispatch_id, "type": msg_type, "text": "probe"}
+    if route == "explicit":
+        body.update(type="controller-notice", to_controller=OTHER,
+                    controller_project_root=str(foreign))
+    elif route == "payload":
+        body.pop("text")
+        body["payload"] = {"text": "probe", "project_root": str(foreign)}
+    else:
+        ledger.record_path(dispatch_id).write_text(json.dumps({
+            "dispatch_id": dispatch_id, "project_root": str(foreign),
+            "controller_label": OTHER,
+        }))
+    config = rpc.load_config()
+    server, thread, url = _serve(config)
+    monkeypatch.setenv("GOALFLIGHT_MAIL_RPC_URL", url)
+    monkeypatch.setenv(rpc.TOKEN_ENV, TOKEN if legacy else TOKEN_A)
+    # Compare durable journal and carrier bytes, including newly created files.
+    roots = [Path(os.environ[name]) for name in (
+        "GOALFLIGHT_MESSAGES_DIR", "GOALFLIGHT_JOURNAL_DIR",
+    )]
+    def snapshot():
+        return {str(p): p.read_bytes() for root in roots for p in root.rglob("*")
+                if p.is_file() and not p.name.endswith("-shm")}
+    before = snapshot()
+    try:
+        status, result = rpc.client_call("/v1/post", body, label="")
+        assert status == (200 if legacy else 403), result
+        if not legacy:
+            assert snapshot() == before
+    finally:
+        _stop(server, thread)
+
+
+@pytest.mark.parametrize("layout", ["managed", "gitdir"])
+def test_users_pin_canonical_journal_root(monkeypatch, tmp_path, layout):
+    root = _project(tmp_path)
+    if layout == "managed":
+        checkout = root / ".claude" / "worktrees" / "worker"
+        checkout.mkdir(parents=True)
+    else:
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        checkout = tmp_path / "linked-checkout"
+        subprocess.run(["git", "-C", str(root), "worktree", "add", "--orphan",
+                        "-b", "rpc-pin-test", str(checkout)], check=True, capture_output=True)
+    users = _users_file(tmp_path, [{
+        "token": TOKEN_A, "controller_label": LABEL, "project_root": str(checkout),
+    }])
+    _clear_daemon_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(rpc.USERS_FILE_ENV, str(users))
+    config = rpc.load_config()
+    assert config.users[0].project_root == str(root.resolve())
+    assert rpc.resolve_project_root(str(checkout), config, config.users[0]) == root.resolve()
+
+
+def test_users_pin_refuses_canonical_root_move(monkeypatch, tmp_path):
+    root = _project(tmp_path)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    link = tmp_path / "pinned-link"
+    link.symlink_to(root, target_is_directory=True)
+    users = _users_file(tmp_path, [{
+        "token": TOKEN_A, "controller_label": LABEL, "project_root": str(link),
+    }])
+    _clear_daemon_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(rpc.USERS_FILE_ENV, str(users))
+    config = rpc.load_config()
+    link.unlink()
+    link.symlink_to(foreign, target_is_directory=True)
+    with pytest.raises(rpc.Forbidden, match="changed"):
+        rpc.resolve_project_root(None, config, config.users[0])
+    monkeypatch.setattr(rpc, "MailRpcServer", lambda *_: pytest.fail("must refuse before bind"))
+    with pytest.raises(rpc.Forbidden, match="changed"):
+        rpc.serve(config)
+
+
+def test_users_file_rejects_symlink(tmp_path):
+    users = _users_file(tmp_path, [{"token": TOKEN_A, "controller_label": LABEL}])
+    link = tmp_path / "linked-users.json"
+    link.symlink_to(users)
+    with pytest.raises(rpc.MailRpcError):
+        rpc.load_users_file(link, global_project_root="")
+
+
+def test_users_file_rejects_foreign_owner(monkeypatch, tmp_path):
+    users = _users_file(tmp_path, [{"token": TOKEN_A, "controller_label": LABEL}])
+    original = os.fstat
+    def foreign_owner(fd):
+        info = original(fd)
+        return SimpleNamespace(st_mode=info.st_mode, st_uid=os.geteuid() + 1)
+    monkeypatch.setattr(os, "fstat", foreign_owner)
+    with pytest.raises(rpc.MailRpcError, match="owner"):
+        rpc.load_users_file(users, global_project_root="")
+
+
+def test_users_file_reads_validated_descriptor(monkeypatch, tmp_path):
+    users = _users_file(tmp_path, [{"token": TOKEN_A, "controller_label": LABEL}])
+    replacement = tmp_path / "replacement.json"
+    replacement.write_text(json.dumps({"users": [{"token": TOKEN_B, "controller_label": OTHER}]}))
+    original_fstat, original_stat = os.fstat, Path.stat
+    replaced = False
+    def replace():
+        nonlocal replaced
+        if not replaced:
+            replacement.replace(users)
+            replaced = True
+    def fstat(fd):
+        info = original_fstat(fd)
+        replace()
+        return info
+    def path_stat(path, *args, **kwargs):
+        info = original_stat(path, *args, **kwargs)
+        if path == users:
+            replace()
+        return info
+    monkeypatch.setattr(os, "fstat", fstat)
+    monkeypatch.setattr(Path, "stat", path_stat)
+    loaded = rpc.load_users_file(users, global_project_root="")
+    assert replaced
+    assert loaded[0].controller_label == LABEL
+
+
+@pytest.mark.parametrize("blank", ["", "  \t "])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_explicit_blank_users_file_never_falls_back(monkeypatch, tmp_path, blank, legacy):
+    users = _users_file(tmp_path, [{"token": TOKEN_A, "controller_label": LABEL}])
+    _clear_daemon_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(rpc, "default_users_file", lambda: users)
+    monkeypatch.setenv(rpc.USERS_FILE_ENV, blank)
+    if legacy:
+        monkeypatch.setenv(rpc.TOKEN_ENV, TOKEN)
+    with pytest.raises(rpc.MailRpcError, match="empty"):
+        rpc.load_config()
+
+
+def test_implicit_users_file_logs_path(monkeypatch, tmp_path, capsys):
+    users = _users_file(tmp_path, [{"token": TOKEN_A, "controller_label": LABEL}])
+    _clear_daemon_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(rpc, "default_users_file", lambda: users)
+    rpc.load_config()
+    assert str(users) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("duplicate", ["controller_label", "token"])
+def test_users_file_rejects_duplicate_identity(tmp_path, duplicate):
+    second = {"token": TOKEN_B, "controller_label": OTHER}
+    second[duplicate] = LABEL if duplicate == "controller_label" else TOKEN_A
+    users = _users_file(tmp_path, [{"token": TOKEN_A, "controller_label": LABEL}, second])
+    with pytest.raises(rpc.MailRpcError, match="duplicate") as caught:
+        rpc.load_users_file(users, global_project_root="")
+    assert TOKEN_A not in str(caught.value)
+    assert TOKEN_B not in str(caught.value)
+    if duplicate == "controller_label":
+        assert LABEL in str(caught.value)
 
 
 def _users_file(tmp_path: Path, users: list[dict[str, str]]) -> Path:
@@ -422,7 +664,7 @@ def test_default_users_file_when_token_unset(
     pinned, fallback = config.users
     assert pinned.project_root == str(project)
     assert pinned.pin_project_root is True
-    assert fallback.project_root == ""
+    assert fallback.project_root == str(global_root.resolve())
     assert fallback.pin_project_root is True
     assert rpc.resolve_project_root(None, config, pinned) == project.resolve()
     assert rpc.resolve_project_root(str(project), config, pinned) == project.resolve()
@@ -511,7 +753,7 @@ def test_legacy_load_config_without_label(
     assert rpc.resolve_identity(config.users[0], header_label=LABEL) == LABEL
 
 
-def test_pinned_relative_project_root_stays_the_authorized_directory(
+def test_users_file_rejects_relative_project_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     checkout = tmp_path / "proj"
@@ -519,22 +761,11 @@ def test_pinned_relative_project_root_stays_the_authorized_directory(
     checkout.mkdir()
     nested.mkdir()
     monkeypatch.chdir(tmp_path)
-    user = rpc.MailRpcUser(
-        token_digest=b"\x02" * 32,
-        controller_label=LABEL,
-        project_root="proj",
-        pin_project_root=True,
-    )
-    config = rpc.MailRpcConfig(
-        users=(user,),
-        bind_host="127.0.0.1",
-        bind_port=8787,
-        project_root="",
-        users_from_file=True,
-    )
-    found = rpc.resolve_project_root(None, config, user)
-    assert found == checkout.resolve()
-    assert found.is_absolute()
+    users = _users_file(tmp_path, [
+        {"token": TOKEN_A, "controller_label": LABEL, "project_root": "proj"},
+    ])
+    with pytest.raises(rpc.MailRpcError, match="absolute"):
+        rpc.load_users_file(users, global_project_root="")
 
 
 def test_relative_controller_project_root_stays_on_the_pin(
