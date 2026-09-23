@@ -1640,6 +1640,25 @@ def cmd_acquire(args: argparse.Namespace) -> int:
     return 0
 
 
+def _release_caller_owns_lease(lease: dict, record: dict | None = None) -> bool:
+    """An in-process worker or claimant can surrender its own reservation."""
+    pid = os.getpid()
+    current = _process_start_identity(pid)
+    token = current.get("start_token") if current else None
+    if not token:
+        return False
+    worker = _worker_lease_view(lease, record)
+    for role, source in (("worker", worker), ("claimant", lease)):
+        identity = source.get(f"{role}_identity")
+        if (
+            source.get(f"{role}_pid") == pid
+            and isinstance(identity, dict)
+            and identity.get("start_token") == token
+        ):
+            return True
+    return False
+
+
 def cmd_release(args: argparse.Namespace) -> int:
     operator_confirmed = bool(getattr(args, "operator_confirmed", False))
     if operator_confirmed and (not args.reason or not args.reason.strip()):
@@ -1669,7 +1688,7 @@ def cmd_release(args: argparse.Namespace) -> int:
                 reason = "worker_alive" if liveness == "live" else "worker_identity_resolved"
                 print(json.dumps({"ok": False, "reason": reason, "lease_id": args.lease_id}, sort_keys=True))
                 return 1
-        elif not _terminal_worker_gone(lease, record):
+        elif not _release_caller_owns_lease(lease, record) and not _terminal_worker_gone(lease, record):
             print(json.dumps({"ok": False, "reason": "worker_alive", "lease_id": args.lease_id}, sort_keys=True))
             return 1
         lease["state"] = args.state

@@ -20026,7 +20026,9 @@ def main(argv: list[str] | None = None) -> int:
                         file=sys.stderr,
                         flush=True,
                     )
-        if not detached_launched and not keep_live_watcher_open:
+        # The claimant can now surrender its own lease while alive. Do not
+        # surrender a worker left running for reattachment after a marker.
+        if not detached_launched and final_worker_alive is False:
             try:
                 _release_capacity(lease_id, str(capacity_state or final_state), capacity_reason)
             except Exception as exc:
