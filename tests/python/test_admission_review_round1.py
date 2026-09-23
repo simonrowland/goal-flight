@@ -11,7 +11,9 @@ import goalflight_dispatch as dispatch
 import goalflight_worktree_pool
 
 
-def test_waiting_capacity_is_not_a_worktree_incumbent(
+@pytest.mark.parametrize("state", ["queued", "waiting_capacity", "submitted", "claimed"])
+def test_prelaunch_state_is_not_a_worktree_incumbent(
+    state: str,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seat = tmp_path / "s-1"
@@ -22,7 +24,7 @@ def test_waiting_capacity_is_not_a_worktree_incumbent(
         lambda: [
             {
                 "dispatch_id": "waiting-owner",
-                "state": "waiting_capacity",
+                "state": state,
                 "worker_cwd": str(seat),
                 "project_root": str(tmp_path),
             }

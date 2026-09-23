@@ -175,15 +175,7 @@ def test_dispatcher_bound_acp_uses_one_seat_and_records_actual_cwd() -> None:
 
         goalflight_acp_run.spawn_and_handshake_with_retry = capture_spawn
         try:
-            with (
-                contextlib.chdir(repo),
-                patch.dict(os.environ, env, clear=True),
-                patch.object(
-                    goalflight_acp_run,
-                    "create_and_route_dispatch_worktree",
-                    side_effect=AssertionError("ACP runner attempted a second seat bind"),
-                ) as inner_bind,
-            ):
+            with contextlib.chdir(repo), patch.dict(os.environ, env, clear=True):
                 outer = dispatch_mod._bind_dispatch_worktree(args)
                 assert outer is not None
                 seat = outer.path
@@ -203,7 +195,6 @@ def test_dispatcher_bound_acp_uses_one_seat_and_records_actual_cwd() -> None:
                 args._worktree_seat.release()
 
         assert rc == 0
-        assert inner_bind.call_count == 0
         assert ledger["project_root"] == str(repo.resolve())
         assert ledger["worker_cwd"] == str(seat.resolve())
         assert runner_spawn["cwd"] == str(seat.resolve())
@@ -247,11 +238,7 @@ def test_standalone_acp_worktree_creation_remains_enabled() -> None:
         try:
             with (
                 patch.dict(os.environ, env, clear=True),
-                patch.object(
-                    goalflight_acp_run,
-                    "create_and_route_dispatch_worktree",
-                    return_value=fake_seat,
-                ) as inner_bind,
+                patch.object(dispatch_mod, "_admit_dispatch_worktree", return_value=fake_seat) as central_admit,
             ):
                 payload = asyncio.run(goalflight_acp_run.run_acp_dispatch(cfg))
                 ledger = json.loads(
@@ -265,7 +252,7 @@ def test_standalone_acp_worktree_creation_remains_enabled() -> None:
                 fake_seat.release()
 
         assert payload["state"] == "complete"
-        assert inner_bind.call_count == 1
+        assert central_admit.call_count == 1
         assert payload["worker_cwd"] == str(fake_seat.path)
         assert ledger["worker_cwd"] == str(fake_seat.path)
 
@@ -349,13 +336,6 @@ def test_detached_acp_child_inherits_outer_seat_fd_and_cwd() -> None:
                 patch.object(dispatch_mod, "_mark_queue_claim_worker_spawn_intent"),
                 patch.object(dispatch_mod, "_mark_queue_claim_worker_spawned"),
                 patch.object(dispatch_mod, "_release_worktree_occupancy_lock"),
-                patch.object(
-                    goalflight_acp_run,
-                    "create_and_route_dispatch_worktree",
-                    side_effect=AssertionError(
-                        "detached ACP child attempted a second seat bind"
-                    ),
-                ) as inner_bind,
             ):
                 rc = dispatch_mod._run_acp_detached_launcher(
                     args,
@@ -376,7 +356,6 @@ def test_detached_acp_child_inherits_outer_seat_fd_and_cwd() -> None:
         assert captured["child_cwd"] == str(seat.resolve())
         assert captured["child_worktree"] == "off"
         assert captured["child_payload"]["state"] == "complete"
-        assert inner_bind.call_count == 0
         assert released
         assert args._worktree_seat is None
 

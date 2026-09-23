@@ -1948,6 +1948,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
     in_place = bool(getattr(args, "in_place", False))
     cwd_raw = getattr(args, "cwd", None)
     base = _requested_worktree_base(args)
+    force_captive = getattr(args, "worktree", None) == "create"
 
     if in_place:
         if cwd_raw:
@@ -1986,7 +1987,7 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
                 else None
             ),
         )
-        if kind == "in-place":
+        if kind == "in-place" and not force_captive:
             return None
         if kind == "ring-seat":
             parent_dispatch_id = getattr(args, "parent_dispatch_id", None)
@@ -2016,7 +2017,9 @@ def _bind_dispatch_worktree(args) -> goalflight_worktree_pool.WorktreeSeatLease 
             )
             _record_dispatch_worktree(args, lease)
             return lease
-        if skip_reset:
+        if kind == "in-place" and force_captive:
+            pass
+        elif skip_reset:
             raise goalflight_worktree_pool.WorktreeCwdRefused(
                 f"resume refused: recorded worker cwd {cwd} is not a captive "
                 f"seat in this controller ring (worktrees/{label}/s-N); "
