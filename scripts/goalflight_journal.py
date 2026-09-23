@@ -1405,17 +1405,22 @@ class Journal:
                     ) from exc
                 raise
             try:
-                connection.row_factory = sqlite3.Row
-                connection.execute("PRAGMA busy_timeout = 0")
-                connection.execute("PRAGMA foreign_keys = ON")
-                connection.execute("PRAGMA synchronous = FULL")
-                self._require_existing_database()
-                if self._read_only_client and self._persistent_reader:
-                    self._reader_connection = connection
-                    self._reader_pid = os.getpid()
-                return connection
+                configured = False
+                try:
+                    connection.row_factory = sqlite3.Row
+                    connection.execute("PRAGMA busy_timeout = 0")
+                    connection.execute("PRAGMA foreign_keys = ON")
+                    connection.execute("PRAGMA synchronous = FULL")
+                    self._require_existing_database()
+                    if self._read_only_client and self._persistent_reader:
+                        self._reader_connection = connection
+                        self._reader_pid = os.getpid()
+                    configured = True
+                    return connection
+                finally:
+                    if not configured:
+                        connection.close()
             except sqlite3.OperationalError as exc:
-                connection.close()
                 if self._read_only_client and _is_corruption_error(exc):
                     self._raise_integrity_failure(f"journal reader parse failed: {exc}")
                 if not _is_busy(exc):

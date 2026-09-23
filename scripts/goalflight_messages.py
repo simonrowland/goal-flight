@@ -9476,10 +9476,10 @@ def cmd_listen(args) -> int:
                     controller_label=label,
                     cursor_version=snapshot.cursor_version,
                 )
-                death_watch.restore()
                 raise
-            death_watch.restore()
-            close_read_authority()
+            finally:
+                close_read_authority()
+                death_watch.restore()
             return 0
         poll_result = wait_for_next_poll()
         if poll_result is not None:

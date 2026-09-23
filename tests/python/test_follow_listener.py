@@ -3047,6 +3047,96 @@ def test_listener_start_to_exit_writes_are_bounded(
     )
 
 
+def test_reader_closes_connection_when_replaced_after_open(
+    isolated,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _env, _lease = isolated
+    reader = journal.Journal.open_reader(project, persistent=True)
+    connections = []
+    real_open = journal._open_readonly_connection
+
+    def open_then_replace(*args, **kwargs):
+        connection = real_open(*args, **kwargs)
+        connections.append(connection)
+        replacement = reader.path.with_suffix(".replacement")
+        replacement.write_bytes(reader.path.read_bytes())
+        replacement.replace(reader.path)
+        return connection
+
+    monkeypatch.setattr(journal, "_open_readonly_connection", open_then_replace)
+    try:
+        with pytest.raises(journal.JournalIntegrityError, match="database was replaced"):
+            reader._connect()
+        assert len(connections) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connections[0].execute("SELECT 1")
+        assert reader._reader_connection is None
+    finally:
+        for connection in connections:
+            connection.close()
+
+
+def test_listener_ring_broken_pipe_closes_reader(
+    isolated,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, env, lease = isolated
+    args = SimpleNamespace(
+        project_root=str(project),
+        controller_label=lease.label,
+        lease_nonce=lease.nonce,
+        poll_secs=0.01,
+        listener_slots=2,
+        timeout_s=5.0,
+        json=True,
+        report_pending=False,
+        watch_follow=False,
+    )
+    connections = []
+    real_data_version = journal.Journal._data_version
+
+    def post_after_reader_opens(authority):
+        version = real_data_version(authority)
+        if not connections:
+            connections.append(authority._reader_connection)
+            messages.post_message(
+                dispatch_id="broken-ring-output",
+                msg_type="controller-notice",
+                payload={"text": "ring output fails"},
+                messages_dir=Path(env["GOALFLIGHT_MESSAGES_DIR"]),
+                source={"node": "peer", "adapter": "pytest", "transport": "controller"},
+                addressee=messages.controller_addressee(lease.label, project_root=project),
+            )
+        return version
+
+    class BrokenRingOutput(io.StringIO):
+        def write(self, value):
+            if '"kind": "ring"' in value:
+                raise BrokenPipeError("ring consumer closed")
+            return super().write(value)
+
+    monkeypatch.setattr(journal.Journal, "_data_version", post_after_reader_opens)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "install", lambda _self: None)
+    monkeypatch.setattr(messages._ListenerDeathWatch, "restore", lambda _self: None)
+    try:
+        with contextlib.redirect_stdout(BrokenRingOutput()):
+            with pytest.raises(BrokenPipeError, match="ring consumer closed"):
+                messages.cmd_listen(args)
+        assert len(connections) == 1
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            connections[0].execute("SELECT 1")
+        snapshot = journal.Journal.open_reader(project).cursor_peek(
+            lease.label, nonce=lease.nonce,
+        )
+        assert wake.claim_ring(
+            project, controller_label=lease.label, cursor_version=snapshot.cursor_version,
+        )
+    finally:
+        for connection in connections:
+            connection.close()
+
+
 def test_idle_listener_reuses_journal_connection(
     isolated,
     monkeypatch: pytest.MonkeyPatch,
