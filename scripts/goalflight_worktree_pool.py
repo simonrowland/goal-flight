@@ -1334,7 +1334,13 @@ def _legacy_ring_candidates(project_root: Path) -> list[tuple[Path, Path]]:
         if not label_root.is_dir() or label_root.name.startswith("."):
             continue
         for path in sorted(label_root.iterdir(), key=lambda item: item.name):
-            if not path.is_dir() or not is_captive_seat_name(path.name):
+            if not is_captive_seat_name(path.name):
+                continue
+            if path.is_symlink():
+                raise WorktreeSeatError(
+                    f"managed worktree path must not be a symlink: {path}"
+                )
+            if not path.is_dir():
                 continue
             lock_path = _seat_lock_root(project_root, controller_label=label_root.name) / (
                 f"{path.name}.lock"

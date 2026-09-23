@@ -1522,7 +1522,10 @@ def test_capacity_refused_resume_does_not_bind_recorded_seat(
     assert exc_info.value.code == 2
     assert bind_calls == []
     assert json.loads(L.record_path(child_id).read_text(encoding="utf-8"))["state"] == "blocked_capacity"
-    assert not WP.worktree_seat_lock_path(tmp_path, seat.name).exists()
+    # Repository-scoped pool lock files persist as registration metadata; the
+    # refused child must not replace the recorded parent occupant.
+    lock_path = WP.worktree_seat_lock_path(tmp_path, seat.name)
+    assert json.loads(lock_path.read_text(encoding="utf-8"))["dispatch_id"] == parent_id
 
 
 def test_parent_child_grandchild_resume_preserves_original_home_owner(
@@ -2194,7 +2197,7 @@ def test_bind_dispatch_worktree_reacquires_recorded_seat_without_reset(
     tmp_path: Path,
 ) -> None:
     seat = tmp_path / "worktrees" / "controller" / "s-1"
-    lease = SimpleNamespace(path=seat)
+    lease = SimpleNamespace(path=seat, seat_name=seat.name)
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     def acquire(*args, **kwargs):

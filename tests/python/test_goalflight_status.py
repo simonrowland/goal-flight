@@ -646,7 +646,7 @@ def test_effective_account_status_line_regression_pair() -> None:
         10,
     )
     assert (
-        f"  {'seatprobe':<30} complete codex [seat seat-a]  "
+        f"  {'seatprobe':<30} complete codex [account seat-a]  "
         "/tmp/seatprobe.status.json"
     ) in present
 

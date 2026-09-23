@@ -126,11 +126,9 @@ def test_worktree_create_routes_distinct_cwds_and_stale_probe() -> None:
             # `repo` for comparison so the assertion isn't fooled by the /private prefix.
             resolved_repo = repo.resolve()
             assert_true("distinct worktrees", wt_one != wt_two)
-            ring = resolved_repo / "worktrees" / goalflight_worktree_pool.default_controller_ring_label(
-                None, project_root=resolved_repo
-            )
-            assert_true("first under captive ring", wt_one.parent == ring)
-            assert_true("second under captive ring", wt_two.parent == ring)
+            pool = resolved_repo / "worktrees"
+            assert_true("first under repository pool", wt_one.parent == pool)
+            assert_true("second under repository pool", wt_two.parent == pool)
             assert_true("captive seat names", {wt_one.name, wt_two.name} == {"s-1", "s-2"})
             assert_true("first cfg cwd admitted seat", args_one.cwd == str(wt_one))
             assert_true("second cfg cwd admitted seat", args_two.cwd == str(wt_two))
@@ -295,15 +293,18 @@ def test_execute_parallel_docs_require_worktree_create() -> None:
         "never move another owner's WIP",
         "Never stash, move, or discard another owner's WIP" in text,
     )
-    assert_true("captive slot range documented", "worktrees/<controller-label>/s-1" in text)
-    assert_true("hard ceiling documented", "hard ceiling" in text)
-    assert_true("fuse default documented", "default 24" in text)
-    assert_true("index the captive ring", "Index the captive ring" in protocol)
+    assert_true("repository pool range documented", "worktrees/s-1" in text)
+    assert_true("full pool refusal documented", "full pool fails" in text)
+    assert_true("fuse default documented", "default 15" in text)
+    assert_true("index the managed pool", "Index the managed pool" in protocol)
     assert_true(
         "do not exclude captive seats",
-        "Do **not** exclude `worktrees/s-*`" in protocol,
+        "Do not exclude\n`worktrees/s-*`" in protocol,
     )
-    assert_true("codedb ignore location documented", "`.codedbignore`" in protocol)
+    assert_true(
+        "indexer reuse documented",
+        "codedb and other project-keyed indexers" in protocol,
+    )
     assert_true(
         "protocol forbids sequential-root split",
         "sequential dispatch" not in protocol.lower()
@@ -418,9 +419,6 @@ def test_runner_worktree_status_and_capacity_contract() -> None:
             worktree_path = (
                 repo.resolve()
                 / "worktrees"
-                / goalflight_worktree_pool.default_controller_ring_label(
-                    None, project_root=repo.resolve()
-                )
                 / "s-1"
             )
             assert_true("runner complete", payload["state"] == "complete")
@@ -514,9 +512,6 @@ def test_runner_worktree_create_failure_writes_failed_status() -> None:
             existing = (
                 repo
                 / "worktrees"
-                / goalflight_worktree_pool.default_controller_ring_label(
-                    None, project_root=repo
-                )
                 / "s-1"
             )
             existing.mkdir(parents=True)
