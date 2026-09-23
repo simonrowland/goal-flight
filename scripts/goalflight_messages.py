@@ -6709,7 +6709,7 @@ def _follow_projection_rows(task_store) -> tuple[list[dict[str, object]], os.sta
     import goalflight_task
 
     if not goalflight_task._dashboard_export_enabled():
-        raise ValueError(goalflight_task.DASHBOARD_EXPORT_DISABLED)
+        raise ValueError("next-task hint unavailable; run goalflight_task.py next")
     projection_candidates = (
         task_store.data_js_path,
         task_store.export_dashboard_dir / "tasks-data.js",
