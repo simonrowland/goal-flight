@@ -17,9 +17,8 @@ incremented when meaningful skill behaviour changes.
 ### Changed
 
 - After `goalflight update`, re-arm `supervise` and let old watchers finish (or
-  restart them). Opted-in old processes may log refused task-store breadcrumb
-  writes after the dashboard mirror is disabled; canonical task data remains
-  intact. Old watchers that permit mirror repair can regenerate the full mirror
+  restart them). Opted-in old processes may log refused task-store mutations
+  after the dashboard mirror is disabled; canonical task data remains intact. Old watchers that permit mirror repair can regenerate the full mirror
   until they finish or restart.
 - Worker dispatch now launches immediately and reports capacity refusal as
   `blocked_capacity` / `DISPATCH-BLOCKED` with a nonzero exit. New durable-queue
