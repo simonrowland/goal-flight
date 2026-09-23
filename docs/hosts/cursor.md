@@ -28,6 +28,19 @@ and can run `cursor-agent` as an ACP worker.
   approval is needed, and `cursor-agent mcp list-tools context-mode` to verify
   MCP discovery after restarting Cursor.
 - Keep long worker logs in files and summarize status JSON, not raw transcripts.
+- Dispatched Cursor workers disable context-mode on both text and ACP paths.
+  Set `GOALFLIGHT_CURSOR_CONTEXT_MODE=1` to retain Cursor's normal MCP loading.
+  The dispatcher sets a private `CURSOR_DATA_DIR` under the system temporary
+  directory, copies the workspace's MCP auth/approvals/selections and existing
+  disabled entries, and disables `context-mode` plus its plugin identifier
+  `plugin-context-mode-context-mode`. Global and project MCP configs, plugin
+  installations, login credentials, and other servers remain unchanged. Nothing
+  is written into the checkout; the private data remains a temporary artifact
+  for the worker lifetime, including detached runs.
+  This uses the data-directory and disabled-store behavior verified in Cursor
+  CLI `2026.09.18-9a7762b`: `CURSOR_CONFIG_DIR` alone does not redirect global
+  MCP definitions, and removing a global definition alone leaves project and
+  plugin definitions active. The public CLI has no MCP exclusion flag.
 - Cursor ACP workers that need tool-use/file-writing chunks must use
   `--permission-mode inline` (or `--interactive`). Plain `auto` permission mode
   can escalate shell/tool calls to `USER-CONFIRM` and block the worker; inline

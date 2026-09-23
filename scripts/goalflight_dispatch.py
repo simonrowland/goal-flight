@@ -75,6 +75,7 @@ import uuid
 from pathlib import Path
 
 import goalflight_compat
+import goalflight_cursor
 import goalflight_output_redact
 import goalflight_capacity
 import goalflight_codex_sessions
@@ -17869,8 +17870,7 @@ def _cursor_context_mode_enabled() -> bool:
     Headless workers do not need it. Opt back in with
     GOALFLIGHT_CURSOR_CONTEXT_MODE in {1,true,yes,enabled,on}.
     """
-    raw = os.environ.get("GOALFLIGHT_CURSOR_CONTEXT_MODE", "").strip().lower()
-    return raw in {"1", "true", "yes", "enabled", "on"}
+    return goalflight_cursor.context_mode_enabled(os.environ)
 
 
 def _acp_context_mode_default(args) -> str:
@@ -19276,6 +19276,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.billing == "sub" and _account_engine(args.agent) == "codex":
             env.pop("OPENAI_API_KEY", None)  # subscription billing for the selected account, not the API
         _apply_web_qa_env(env, args, project_root)
+        goalflight_cursor.isolate_context_mode(
+            args.agent, env, cwd=str(_worker_cwd(args)),
+        )
         if _account_engine(args.agent) == "codex":
             worker_argv = _guard_codex_context_mode_disable(worker_argv, env)
 

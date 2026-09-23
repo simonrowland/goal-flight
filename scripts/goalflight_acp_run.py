@@ -43,6 +43,7 @@ import uuid
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import goalflight_compat  # noqa: E402
+import goalflight_cursor  # noqa: E402
 import goalflight_dispatch_paths  # noqa: E402
 import goalflight_steer_mailbox  # noqa: E402
 import goalflight_worktree_pool  # noqa: E402
@@ -4168,6 +4169,9 @@ async def _run_acp_dispatch_impl(
                 worktree_branch=worktree_seat.branch,
                 quarantine_branch=worktree_seat.quarantine_branch,
             )
+        goalflight_cursor.isolate_context_mode(
+            cfg.agent, spawn_env, cwd=worker_cwd,
+        )
         try:
             if os_sandbox_profile != OS_SANDBOX_OFF:
                 prepare_os_sandbox_command(
