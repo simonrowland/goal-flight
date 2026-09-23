@@ -480,6 +480,29 @@ def test_healthy_entry_launches_promptly_when_capacity_available(
     assert elapsed < 2.0, elapsed
 
 
+def test_current_drainer_replays_legacy_v1_carrier_after_pin_rollout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh post-update drainer must keep accepting unpinned v1 input."""
+    queue = _queue_dir(tmp_path)
+    project = tmp_path / "proj"
+    project.mkdir()
+    path = _write_entry(
+        queue,
+        "legacy-v1-carrier",
+        project_root=project,
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    carrier = json.loads(path.read_text(encoding="utf-8"))
+    assert carrier["schema"] == D.DISPATCH_QUEUE_SCHEMA
+    monkeypatch.setattr(D.subprocess, "run", _launched_run_factory(tmp_path))
+
+    payload = D._drain_queue_once(_drain_args(queue))
+
+    assert payload["launched"] == 1, payload
+    assert not path.exists(), payload
+
+
 def test_launch_timeout_includes_capacity_and_seat_preparation_window(
     tmp_path: Path,
 ) -> None:

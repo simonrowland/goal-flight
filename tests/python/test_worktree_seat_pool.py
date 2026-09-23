@@ -541,6 +541,44 @@ def test_free_seat_nearest_to_target_base_is_selected() -> None:
             selected.release()
 
 
+def test_free_ancestor_base_beats_lower_slot_unrelated_base() -> None:
+    with tempfile.TemporaryDirectory() as td, seat_limit(2):
+        repo = make_repo(Path(td))
+        ancestor = git(repo, "rev-parse", "HEAD")
+
+        git(repo, "checkout", "-b", "unrelated")
+        (repo / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+        git(repo, "add", "unrelated.txt")
+        git(repo, "commit", "-m", "unrelated")
+        unrelated = git(repo, "rev-parse", "HEAD")
+
+        git(repo, "checkout", "main")
+        (repo / "target.txt").write_text("target\n", encoding="utf-8")
+        git(repo, "add", "target.txt")
+        git(repo, "commit", "-m", "target")
+        target = git(repo, "rev-parse", "HEAD")
+
+        lower_unrelated = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "lower-unrelated", base=unrelated
+        )
+        higher_ancestor = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "higher-ancestor", base=ancestor
+        )
+        lower_path = lower_unrelated.path
+        higher_path = higher_ancestor.path
+        lower_unrelated.release()
+        higher_ancestor.release()
+
+        selected = goalflight_worktree_pool.acquire_worktree_seat(
+            repo, "target-dispatch", base=target
+        )
+        try:
+            assert_true("ancestor base beats unrelated lower slot", selected.path == higher_path)
+            assert_true("lower slot remains unrelated", lower_path != selected.path)
+        finally:
+            selected.release()
+
+
 def test_exact_retry_base_skips_checkout() -> None:
     with tempfile.TemporaryDirectory() as td, seat_limit(1):
         repo = make_repo(Path(td))
@@ -865,6 +903,7 @@ def main() -> None:
         test_parent_release_keeps_inherited_worker_lease_until_worker_dies,
         test_default_seat_count_is_not_a_per_controller_cap,
         test_registration_ignores_basename_without_a_lock,
+        test_free_ancestor_base_beats_lower_slot_unrelated_base,
         test_notes_survive_acquire_reset_and_result_is_quarantined,
         test_skip_reset_keeps_dirty_product_files,
         test_two_controller_labels_get_separate_rings,

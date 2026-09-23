@@ -541,6 +541,71 @@ def test_acp_detached_launcher_reads_final_capacity_status_before_exit() -> None
         assert "DISPATCH-BLOCKED" in stdout.getvalue(), stdout.getvalue()
 
 
+def test_spawn_handoff_marks_spawning_and_releases_on_spawn_failure() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        repo = _make_repo(tmp)
+        env = _env(tmp)
+        dispatch_id = "spawn-failure-capacity-lifecycle"
+        events: list[tuple[str, str | None]] = []
+        original_spawning = D.goalflight_capacity.mark_lease_spawning
+        original_spawn_failed = D.goalflight_capacity.mark_lease_spawn_failed
+        lease_rows: list[dict] = []
+
+        def mark_spawning(lease_id: str | None) -> bool:
+            events.append(("spawning", lease_id))
+            return original_spawning(lease_id)
+
+        def mark_spawn_failed(lease_id: str | None, *, reason: str = "spawn_failed") -> bool:
+            events.append(("spawn_failed", lease_id))
+            return original_spawn_failed(lease_id, reason=reason)
+
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update(env)
+            with (
+                patch.object(D.goalflight_capacity, "mark_lease_spawning", mark_spawning),
+                patch.object(D.goalflight_capacity, "mark_lease_spawn_failed", mark_spawn_failed),
+                patch.object(D, "_spawn_daemonized_process", side_effect=RuntimeError("spawn failure")),
+            ):
+                result = D.main(
+                    [
+                        "--unregistered-forced",
+                        "--agent",
+                        "test-dispatch",
+                        "--dispatch-id",
+                        dispatch_id,
+                        "--cwd",
+                        str(repo),
+                        "--in-place",
+                        "--foreground",
+                        "--capacity-wait-s",
+                        "0",
+                        "--tail",
+                        str(tmp / f"{dispatch_id}.tail"),
+                        "--status-json",
+                        str(tmp / f"{dispatch_id}.status.json"),
+                        "--",
+                        sys.executable,
+                        "-c",
+                        "print('must not run')",
+                    ]
+                )
+                lease_rows = list(
+                    D.goalflight_capacity.load_state().get("leases", {}).values()
+                )
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        assert result == 1
+        assert [event[0] for event in events] == ["spawning", "spawn_failed"], events
+        lease = next(row for row in lease_rows if row.get("dispatch_id") == dispatch_id)
+        assert lease.get("launch_state") == "spawn_failed", lease
+        assert lease.get("state") == "failed", lease
+
+
 def test_detached_capacity_wait_interrupt_does_not_enqueue() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)

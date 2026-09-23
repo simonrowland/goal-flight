@@ -912,14 +912,8 @@ def _prepare_seat_checkout(
     _git(worktree_path, "clean", "-fd", "-e", ".goal-flight")
 
 
-def _seat_base_distance(worktree_path: Path, base_commit: str) -> int | None:
-    """Return a cheap base-affinity rank from worktree metadata.
-
-    Admission may inspect hundreds of seats. Reading HEAD and refs directly
-    avoids one ``git`` process (and a potentially large diff) per candidate.
-    Exact matches sort first; every other readable seat is equivalent because
-    the normal reset-safety path decides whether it can be reused.
-    """
+def _seat_head_from_metadata(worktree_path: Path) -> str | None:
+    """Read a seat HEAD without starting Git or inspecting its working tree."""
     if not worktree_path.is_dir():
         return None
     try:
@@ -959,7 +953,41 @@ def _seat_base_distance(worktree_path: Path, base_commit: str) -> int | None:
         return None
     if not head:
         return None
+    return head
+
+
+def _seat_base_distance(worktree_path: Path, base_commit: str) -> int | None:
+    """Return the exact-match rank from worktree metadata.
+
+    This is deliberately metadata-only. Ancestor checks are deferred until a
+    seat has been proven free and are capped by the caller.
+    """
+    head = _seat_head_from_metadata(worktree_path)
+    if head is None:
+        return None
     return 0 if head == str(base_commit).strip() else 1
+
+
+def _seat_head_is_ancestor(
+    project_root: Path, head: str | None, base_commit: str
+) -> bool | None:
+    """Return whether ``head`` is an ancestor, or ``None`` when unverifiable."""
+    if not head:
+        return None
+    proc = _git_proc(
+        project_root,
+        "merge-base",
+        "--is-ancestor",
+        str(head),
+        str(base_commit),
+    )
+    if proc is None:
+        return None
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    return None
 
 
 def _assert_seat_on_named_branch(worktree_path: Path, *, seat_name: str, branch: str) -> str:
@@ -1290,23 +1318,20 @@ def acquire_worktree_seat(
 
         refused: list[str] = []
         occupants = []
-        distances = {
-            slot: _seat_base_distance(
-                managed_root / f"{CAPTIVE_SEAT_PREFIX}{slot}", base_commit
+        slots = list(range(1, hwm + 1))
+        # Exact matching is a metadata-only pass: do not start Git, and do not
+        # let a lower-numbered unrelated seat win before a free exact seat.
+        heads = {
+            slot: _seat_head_from_metadata(
+                managed_root / f"{CAPTIVE_SEAT_PREFIX}{slot}"
             )
-            for slot in range(1, hwm + 1)
+            for slot in slots
         }
-        candidate_slots = sorted(
-            range(1, hwm + 1),
-            key=lambda slot: (
-                distances[slot] is None,
-                distances[slot] if distances[slot] is not None else 0,
-                slot,
-            ),
-        )
-        for slot in candidate_slots:
+        exact_slots = [slot for slot in slots if heads[slot] == base_commit]
+        other_slots = [slot for slot in slots if slot not in exact_slots]
+
+        def _open_free_slot(slot: int) -> TextIO | None:
             seat_name = f"{CAPTIVE_SEAT_PREFIX}{slot}"
-            worktree_path = managed_root / seat_name
             lock_path = lock_root / f"{seat_name}.lock"
             try:
                 lock_fd = os.open(lock_path, flags, 0o600)
@@ -1320,8 +1345,12 @@ def acquire_worktree_seat(
             except BlockingIOError:
                 occupants.append(_occupant_description(lock_file, seat_name))
                 lock_file.close()
-                continue
+                return None
+            return lock_file
 
+        def _prepare_free_slot(slot: int, lock_file: TextIO) -> WorktreeSeatLease | None:
+            seat_name = f"{CAPTIVE_SEAT_PREFIX}{slot}"
+            worktree_path = managed_root / seat_name
             try:
                 prior_dispatch_id = str(
                     _lock_metadata(lock_file).get("dispatch_id") or "unknown-dispatch"
@@ -1340,10 +1369,51 @@ def acquire_worktree_seat(
             except WorktreeSeatResetRefused as exc:
                 refused.append(f"{seat_name}: {exc}")
                 lock_file.close()
-                continue
+                return None
             except BaseException:
                 lock_file.close()
                 raise
+
+        # Exact HEAD first, including an exact seat whose slot is not the
+        # lowest. This is the zero-checkout retry path for a pinned carrier.
+        for slot in exact_slots:
+            lock_file = _open_free_slot(slot)
+            if lock_file is None:
+                continue
+            lease = _prepare_free_slot(slot, lock_file)
+            if lease is not None:
+                return lease
+
+        # For non-exact free seats, spend at most eight cheap merge-base probes
+        # to prefer a seat already behind the target. Candidates are locked
+        # while probed, so "free" and the observed HEAD belong to one
+        # allocation transaction. Non-ancestors are released and considered
+        # again in the deterministic lowest-slot fallback below.
+        ancestor_checks = 0
+        for slot in other_slots:
+            if ancestor_checks >= 8:
+                break
+            lock_file = _open_free_slot(slot)
+            if lock_file is None:
+                continue
+            ancestor_checks += 1
+            if _seat_head_is_ancestor(project_root, heads[slot], base_commit) is not True:
+                lock_file.close()
+                continue
+            lease = _prepare_free_slot(slot, lock_file)
+            if lease is not None:
+                return lease
+
+        # No exact/ancestor candidate was usable. Preserve the old safety and
+        # deterministic tie-break: the lowest free slot gets the normal reset
+        # safety decision, regardless of its Git distance.
+        for slot in other_slots:
+            lock_file = _open_free_slot(slot)
+            if lock_file is None:
+                continue
+            lease = _prepare_free_slot(slot, lock_file)
+            if lease is not None:
+                return lease
 
         while hwm < seat_limit and refused and len(occupants) + 1 <= seat_limit:
             hwm += 1

@@ -129,6 +129,12 @@ _ROUTED_SUBCOMMANDS = (
 )
 DISPATCH_QUEUE_SCHEMA = "goalflight.dispatch-queue.v1"
 DISPATCH_QUEUE_PINNED_SCHEMA = "goalflight.dispatch-queue.v2"
+# The installed macOS drainer is a fresh process every 60 seconds
+# (protocols/drainer.md and com.goalflight.drain), not a long-lived loop. During
+# a skill update one old process can therefore see one v2 pinned carrier and
+# reject its new flag; its existing pre-worker backoff is bounded and surfaces
+# attention, while the next fresh process uses the current dispatcher. Keep
+# v1 replay compatible forever: old unpinned carriers remain valid input.
 QUEUE_CLAIM_STALE_S = 300.0
 LAUNCH_TIMEOUT_S = QUEUE_CLAIM_STALE_S
 # Drain launch-confirmation wait. Per-entry subprocess.run used to use this
