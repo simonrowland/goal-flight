@@ -9482,8 +9482,10 @@ def cmd_listen(args) -> int:
                 )
                 raise
             finally:
-                close_read_authority()
-                death_watch.restore()
+                try:
+                    close_read_authority()
+                finally:
+                    death_watch.restore()
             return 0
         poll_result = wait_for_next_poll()
         if poll_result is not None:
