@@ -66,6 +66,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
+import time
 from typing import Any
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -143,7 +144,36 @@ def git_add_is_forbidden(argv: list[str] | tuple[str, ...]) -> bool:
 
 
 def _archive_root(project_root: Path) -> Path:
-    return project_root.resolve() / "docs-private" / "traces"
+    return project_root / "docs-private" / "traces"
+
+
+def _safe_archive_destination(root: Path, dest: Path) -> bool:
+    """Verify existing destination components before reading or writing."""
+
+    try:
+        if root.is_symlink() or dest.is_symlink():
+            return False
+        resolved_root = root.resolve(strict=False)
+        resolved_dest = dest.resolve(strict=False)
+        if not resolved_dest.is_relative_to(resolved_root):
+            return False
+        current = root
+        for component in dest.relative_to(root).parts:
+            current = current / component
+            if current.is_symlink():
+                return False
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _write_private(path: Path, payload: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(payload)
 
 
 def _record_day(record: dict[str, Any]) -> str:
@@ -252,6 +282,8 @@ def archive_finished_dispatch(
         return {"ok": False, "keep": False, "reason": "missing project_root"}
     root = Path(str(root_raw)).expanduser()
     try:
+        if root.is_symlink():
+            return {"ok": False, "keep": True, "reason": "project_root_is_symlink"}
         root = root.resolve()
     except OSError:
         return {"ok": False, "keep": False, "reason": "project_root unresolvable"}
@@ -272,6 +304,8 @@ def archive_finished_dispatch(
         return result
 
     dest = _dest_dir(root, record)
+    if not _safe_archive_destination(root, dest):
+        return {"ok": False, "keep": True, "reason": "archive_destination_unsafe", "dest": str(dest)}
     result["dest"] = str(dest)
     result["tail_bytes"] = decision.get("tail_bytes")
     result["dropped_bytes"] = decision.get("dropped_bytes")
@@ -304,7 +338,7 @@ def archive_finished_dispatch(
     try:
         dest.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(dest, 0o700)
-        (dest / "tail.log").write_bytes(redacted)
+        _write_private(dest / "tail.log", redacted)
         os.chmod(dest / "tail.log", 0o600)
         status_copied = False
         status_raw = record.get("status_path")
@@ -316,7 +350,7 @@ def archive_finished_dispatch(
                     and status_path.is_file()
                     and status_path.stat().st_size <= STATUS_MAX_BYTES
                 ):
-                    (dest / "status.json").write_bytes(status_path.read_bytes())
+                    _write_private(dest / "status.json", status_path.read_bytes())
                     os.chmod(dest / "status.json", 0o600)
                     status_copied = True
             except OSError:
@@ -335,9 +369,9 @@ def archive_finished_dispatch(
         manifest["redactions"] = redaction_count
         manifest["redaction_kinds"] = redaction_kinds
         manifest["drop_list"] = list(DROP_LIST)
-        (dest / "MANIFEST.json").write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        _write_private(
+            dest / "MANIFEST.json",
+            (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8"),
         )
         os.chmod(dest / "MANIFEST.json", 0o600)
         result["ok"] = True
@@ -364,47 +398,54 @@ def ensure_receipt(
     dispatch_id = record.get("dispatch_id")
     if not isinstance(root_raw, (str, Path)) or not str(root_raw).strip() or not dispatch_id:
         return {"ok": False, "keep": True, "reason": "missing_receipt_identity"}
-    root = Path(str(root_raw)).expanduser().resolve(strict=False)
+    root_raw_path = Path(str(root_raw)).expanduser()
+    if root_raw_path.is_symlink():
+        return {"ok": False, "keep": True, "reason": "project_root_is_symlink"}
+    root = root_raw_path.resolve(strict=False)
     dest = _dest_dir(root, record)
+    if not _safe_archive_destination(root, dest):
+        return {"ok": False, "keep": True, "reason": "receipt_destination_unsafe", "dest": str(dest)}
     result = {"ok": True, "keep": True, "apply": bool(apply), "dest": str(dest), "dispatch_id": str(dispatch_id)}
     if not apply:
         return result
     try:
         dest.mkdir(parents=True, exist_ok=True, mode=0o700)
         receipt = dest / "RECEIPT.json"
-        if not receipt.exists():
-            receipt.write_text(
-                json.dumps(
-                    {
-                        "schema": "goalflight.trace-receipt.v1",
-                        "dispatch_id": str(dispatch_id),
-                        "state": record.get("state"),
-                        "terminal_state": record.get("terminal_state"),
-                        "ended_at": record.get("ended_at"),
-                        "project_root": str(root),
-                    },
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+        payload = {
+            "schema": "goalflight.trace-receipt.v1",
+            "dispatch_id": str(dispatch_id),
+            "state": record.get("state"),
+            "terminal_state": record.get("terminal_state"),
+            "ended_at": record.get("ended_at"),
+            "project_root": str(root),
+        }
+        if receipt.exists() or receipt.is_symlink():
+            if receipt.is_symlink() or not receipt.is_file():
+                return {**result, "ok": False, "reason": "invalid_receipt"}
+            try:
+                existing = json.loads(receipt.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return {**result, "ok": False, "reason": "invalid_receipt"}
+            if (
+                not isinstance(existing, dict)
+                or existing.get("schema") != payload["schema"]
+                or existing.get("dispatch_id") != payload["dispatch_id"]
+                or existing.get("project_root") != payload["project_root"]
+            ):
+                return {**result, "ok": False, "reason": "invalid_receipt"}
+        else:
+            _write_private(receipt, (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"))
             os.chmod(receipt, 0o600)
         manifest = dest / "MANIFEST.json"
-        if not manifest.exists():
-            manifest.write_text(
-                json.dumps(
-                    {
-                        "schema": "goalflight.trace-receipt.v1",
-                        "dispatch_id": str(dispatch_id),
-                        "kind": "terminal_receipt",
-                        "kept": ["RECEIPT.json", "MANIFEST.json"],
-                    },
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n",
-                encoding="utf-8",
+        if not manifest.exists() and not manifest.is_symlink():
+            _write_private(
+                manifest,
+                (json.dumps({
+                    "schema": "goalflight.trace-receipt.v1",
+                    "dispatch_id": str(dispatch_id),
+                    "kind": "terminal_receipt",
+                    "kept": ["RECEIPT.json", "MANIFEST.json"],
+                }, indent=2, sort_keys=True) + "\n").encode("utf-8"),
             )
             os.chmod(manifest, 0o600)
     except OSError as exc:
@@ -412,7 +453,9 @@ def ensure_receipt(
     return result
 
 
-def _tree_bytes(path: Path) -> int:
+def _tree_bytes(path: Path, *, deadline: float | None = None) -> int:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("trace archive scan deadline exceeded")
     total = 0
     try:
         stat = path.lstat()
@@ -427,7 +470,7 @@ def _tree_bytes(path: Path) -> int:
         return 0
     try:
         for child in path.iterdir():
-            total += _tree_bytes(child)
+            total += _tree_bytes(child, deadline=deadline)
     except OSError:
         return 0
     return total
@@ -487,6 +530,8 @@ def retain_archives(
     max_bytes: int,
     apply: bool = False,
     identity_probe: Any,
+    authority_reader: Any = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Retain terminal trace archives by age and total allocated bytes.
 
@@ -496,22 +541,48 @@ def retain_archives(
     removed first when either policy would otherwise be exceeded.
     """
 
-    before = _tree_bytes(root) if root.exists() else 0
+    try:
+        before = _tree_bytes(root, deadline=deadline) if root.exists() else 0
+    except TimeoutError:
+        return {
+            "root": str(root),
+            "before_bytes": 0,
+            "after_bytes": 0,
+            "reclaimed_bytes": 0,
+            "max_bytes": max_bytes,
+            "files": [{"path": str(root), "eligible": False, "deleted": False, "reason": "scan_budget_exceeded"}],
+        }
     rows: list[dict[str, Any]] = []
     candidates: list[tuple[dt.datetime, Path, int, dict[str, Any]]] = []
+    timed_out = False
     if root.is_dir() and not root.is_symlink():
         try:
-            archive_dirs = [
-                child
-                for day in root.iterdir()
-                if day.is_dir() and not day.is_symlink()
-                for child in day.iterdir()
-                if child.is_dir() and not child.is_symlink()
-            ]
+            archive_dirs = []
+            for day in root.iterdir():
+                if deadline is not None and time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                if day.is_dir() and not day.is_symlink():
+                    for child in day.iterdir():
+                        if deadline is not None and time.monotonic() >= deadline:
+                            timed_out = True
+                            break
+                        if child.is_dir() and not child.is_symlink():
+                            archive_dirs.append(child)
+                    if timed_out:
+                        break
         except OSError:
             archive_dirs = []
         for path in sorted(archive_dirs):
+            if timed_out:
+                break
+            if not _safe_archive_destination(root, path):
+                rows.append({"path": str(path), "eligible": False, "deleted": False, "reason": "unsafe_archive_path"})
+                continue
             manifest_path = path / "MANIFEST.json"
+            if manifest_path.is_symlink():
+                rows.append({"path": str(path), "eligible": False, "deleted": False, "reason": "manifest_symlink"})
+                continue
             dispatch_id = path.name
             manifest: dict[str, Any] = {}
             try:
@@ -522,7 +593,12 @@ def retain_archives(
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 rows.append({"path": str(path), "eligible": False, "deleted": False, "reason": "manifest_unknown"})
                 continue
-            size = _tree_bytes(path)
+            try:
+                size = _tree_bytes(path, deadline=deadline)
+            except TimeoutError:
+                timed_out = True
+                rows.append({"path": str(path), "eligible": False, "deleted": False, "reason": "scan_budget_exceeded"})
+                break
             record = records.get(dispatch_id)
             pinned = manifest.get("pinned") is True or (path / "PINNED").is_file()
             if pinned:
@@ -551,6 +627,8 @@ def retain_archives(
     # Age retention is always applied.  If the byte cap is exceeded, consume
     # additional old eligible archives in the same order; recent/pinned/
     # unknown data is never selected merely because the cap is tight.
+    if timed_out:
+        candidates.clear()
     candidates.sort(key=lambda item: (item[0], str(item[1])))
     selected: set[Path] = set()
     running = before
@@ -560,21 +638,34 @@ def retain_archives(
             running -= size
     for _ended, path, size, record in candidates:
         eligible = path in selected
-        deleted = bool(eligible and apply and path.exists() and not path.is_symlink())
+        deleted = bool(eligible and apply and authority_reader is not None and path.exists() and not path.is_symlink())
         if deleted:
+            latest, latest_reason = authority_reader(str(record.get("dispatch_id") or ""))
+            if latest is None:
+                eligible = False
+                deleted = False
+                reason = f"changed_before_delete:{latest_reason or 'authority_unavailable'}"
+            else:
+                record = latest
             identity_ok, identity_reason = _archive_identity_ok(record, identity_probe)
-            if not identity_ok:
+            if deleted and not identity_ok:
                 eligible = False
                 deleted = False
                 reason = f"changed_before_delete:{identity_reason}"
-            else:
+            elif deleted:
                 try:
                     shutil.rmtree(path)
                 except OSError:
                     deleted = False
                 reason = "terminal_past_retention" if deleted else "delete_failed"
         else:
-            reason = "terminal_past_retention" if eligible else "keep_within_policy"
+            reason = (
+                "authority_not_rechecked"
+                if eligible and apply and authority_reader is None
+                else "terminal_past_retention" if eligible else "keep_within_policy"
+            )
+            if reason == "authority_not_rechecked":
+                eligible = False
         rows.append({
             "path": str(path),
             "dispatch_id": record.get("dispatch_id"),
@@ -583,7 +674,10 @@ def retain_archives(
             "deleted": deleted,
             "reason": reason,
         })
-    after = _tree_bytes(root) if root.exists() else 0
+    try:
+        after = _tree_bytes(root, deadline=deadline) if root.exists() else 0
+    except TimeoutError:
+        after = before
     if not apply:
         after = max(0, before - sum(size for _ended, _path, size, _record in candidates if _path in selected))
     return {

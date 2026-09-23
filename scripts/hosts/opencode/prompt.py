@@ -30,9 +30,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from goalflight_maintenance import rotate_log  # noqa: E402
-
-
 DEFAULT_PORT = 4096
 DEFAULT_MODEL = "litellm/frontier-coder"
 ROUTING_PROMPT = (
@@ -95,12 +92,8 @@ def _health_ok(base: str) -> bool:
         return False
 
 
-def _start_server(port: int, directory: Path, log_path: Path) -> subprocess.Popen[bytes]:
+def _start_server(port: int, directory: Path, log_path: Path) -> tuple[subprocess.Popen[bytes], subprocess.Popen[bytes]]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    # OpenCode reopens this path only when a new server starts.  Rotate before
-    # opening it so repeated one-shot prompts cannot grow one unbounded log.
-    rotate_log(log_path)
-    log_file = log_path.open("ab")
     cmd = [
         "opencode",
         "serve",
@@ -110,14 +103,18 @@ def _start_server(port: int, directory: Path, log_path: Path) -> subprocess.Pope
         "127.0.0.1",
     ]
     env = os.environ.copy()
-    return subprocess.Popen(
-        cmd,
-        cwd=str(directory),
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        env=env,
+    server = subprocess.Popen(
+        cmd, cwd=str(directory), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env=env, start_new_session=True,
+    )
+    assert server.stdout is not None
+    writer = subprocess.Popen(
+        [sys.executable, str(REPO_ROOT / "scripts" / "goalflight_opencode_log_writer.py"), str(log_path)],
+        stdin=server.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    server.stdout.close()
+    return server, writer
 
 
 def _wait_for_health(base: str, timeout_s: float) -> None:
@@ -199,15 +196,18 @@ def prompt_once(
     provider_id, model_id = _parse_model(model)
     started_server = False
     server_proc: subprocess.Popen[bytes] | None = None
+    writer_proc: subprocess.Popen[bytes] | None = None
 
     if not _health_ok(base):
-        server_proc = _start_server(port, directory, log_path)
+        server_proc, writer_proc = _start_server(port, directory, log_path)
         started_server = True
         try:
             _wait_for_health(base, boot_timeout_s)
         except RuntimeError:
             if server_proc.poll() is None:
                 os.killpg(server_proc.pid, signal.SIGTERM)
+            if writer_proc is not None and writer_proc.poll() is None:
+                writer_proc.terminate()
             raise
 
     try:
@@ -252,6 +252,11 @@ def prompt_once(
                 server_proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 os.killpg(server_proc.pid, signal.SIGKILL)
+        if started_server and not keep_server and writer_proc is not None:
+            try:
+                writer_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                writer_proc.terminate()
 
 
 def main() -> int:
